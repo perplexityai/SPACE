@@ -978,7 +978,7 @@ impl SandboxManagerService {
         let wake_lock = self.auto_lifecycle.wake_lock(&sandbox_id_string);
         let wake_guard = wake_lock.lock_owned().await;
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox_id_string);
-        let artifact_guard = artifact_lock.lock_owned().await;
+        let artifact_guard = artifact_lock.lock_for_capture().await;
         let status = {
             let db = self.db_conn()?;
             crate::db::read::sandbox_view(&db, &sandbox_id_string)

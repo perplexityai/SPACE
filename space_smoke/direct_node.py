@@ -98,6 +98,25 @@ class MemoryObservation:
     counter: int
 
 
+@dataclass(frozen=True)
+class GuestMaintenanceObservation:
+    operation_id: str | None
+    phase: str
+    outcome: str | None
+    incarnation: str | None
+    version: str | None
+    committed_digest: str | None
+    admission_held: bool
+
+    @classmethod
+    def parse(cls, text: str) -> GuestMaintenanceObservation:
+        value = json.loads(text)
+        guest = value.get("guest") or {}
+        return cls(value.get("operation_id"), value["phase"], value.get("outcome"),
+                   guest.get("incarnation"), guest.get("version"), guest.get("committed_digest"),
+                   guest.get("admission_held", False))
+
+
 class DirectNodeRecoveryFixture:
     fixture_name = "direct-node-recovery"
     timeout_minutes = 15
@@ -213,7 +232,7 @@ class DirectNodeRecoveryFixture:
         )
         self.context.record("machine_id", self.config.machine_id)
 
-    def prepare(self, *, firmware: bool = False) -> None:
+    def prepare(self, *, firmware: bool = False, rootfs_size_mib: int | None = None) -> None:
         self.prepare_node(firmware=firmware)
         self.context.scope.defer("remove recovery sandbox", self.cleanup, critical=True)
         self.create_directory = self.command(
@@ -232,6 +251,8 @@ class DirectNodeRecoveryFixture:
             "deploy@local",
             "--auto-lifecycle-off",
         ]
+        if rootfs_size_mib is not None:
+            arguments.extend(["--rootfs-size-mb", str(rootfs_size_mib)])
         # Retain the response on the node before transmitting it over SSH, so
         # cleanup can recover the run's selector if that connection is lost.
         response = self.create_directory + "/response"
@@ -321,6 +342,67 @@ class DirectNodeRecoveryFixture:
             "guest disk marker changed across recovery",
         )
         return self.guest("cat /proc/sys/kernel/random/boot_id")
+
+    def guest_maintenance_status(self, operation: str | None = None) -> GuestMaintenanceObservation:
+        arguments = ["space-sbxmgr", "guest-update", "status", self.owned_selector(), "--json"]
+        if operation is not None:
+            arguments.extend(["--operation", operation])
+        return GuestMaintenanceObservation.parse(self.command(arguments, timeout=20))
+
+    def guest_maintenance(self, *, update: bool, force: bool = False) -> str:
+        arguments = ["space-sbxmgr", "guest-update", "apply"] if update else ["space-sbxmgr", "guest-restart"]
+        arguments.extend([self.owned_selector(), "--json"])
+        if force:
+            arguments.append("--force")
+        receipt = GuestMaintenanceObservation.parse(self.command(arguments, timeout=20))
+        if receipt.operation_id is None:
+            raise RuntimeError("maintenance did not return an operation identity")
+        return receipt.operation_id
+
+    def await_guest_maintenance(self, operation: str) -> GuestMaintenanceObservation:
+        deadline = time.monotonic() + 720
+        while True:
+            receipt = self.guest_maintenance_status(operation)
+            # The generation observer may briefly own a separate configuration
+            # hold after maintenance releases its own. Await usable admission.
+            if receipt.phase == "GUEST_UPDATE_OPERATION_PHASE_COMPLETE" and not receipt.admission_held:
+                return receipt
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"maintenance did not settle: {receipt}")
+            self.context.wait(1)
+
+    def start_agent_workload(self) -> int:
+        output = self._agent_run(["--background", "--", "/usr/bin/gnusleep", "infinity"])
+        pid = re.search(r"\bpid=(\d+)\b", output)
+        if pid is None:
+            raise RuntimeError("process start did not return its guest PID")
+        return int(pid[1])
+
+    def _agent_run(self, arguments: list[str]) -> str:
+        # The per-sandbox bridge socket is private to root and service users.
+        # This fixture already requires a privileged standalone-node operator.
+        command = ["sudo", "-n", "/space/bin/spaced-host", "--sandbox", self.owned_selector(), "run",
+                   "--idempotency-key", str(uuid.uuid4()), *arguments]
+        # A new generation can acquire its configuration hold between a status
+        # read and dispatch. Reuse the command key across bounded retries so an
+        # ambiguous response cannot duplicate an admitted process.
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                return self.command(command, timeout=45)
+            except ScenarioTimedOut:
+                raise
+            except RuntimeError:
+                if time.monotonic() >= deadline:
+                    raise
+                self.context.wait(0.5)
+
+    def agent_command(self, command: str) -> str:
+        output = self._agent_run(["--user", "root", "--", "/bin/sh", "-c", command])
+        lines = output.splitlines()
+        if not lines or not lines[0].startswith("started process_id=") or lines[-1] != "exit_code=0":
+            raise RuntimeError(f"agent command did not complete successfully: {output}")
+        return "\n".join(lines[1:-1])
 
     def restart_managers(self) -> None:
         if self.config.firmware_lifecycle:
