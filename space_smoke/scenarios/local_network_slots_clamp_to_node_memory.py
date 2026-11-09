@@ -4,6 +4,8 @@ import space_smoke as smoke
 
 # How the API fails a create whose pod the scheduler never places.
 UNPLACED = ("sandbox pod is unschedulable", "pod_never_ready")
+# How the API's network-slot preflight refuses a create before creating a pod.
+NO_SLOT_CAPACITY = "no Kubernetes network-slot capacity available"
 PLACED_CREATES = 3
 
 
@@ -81,16 +83,19 @@ def network_slots_clamp_to_node_memory(test: smoke.KindEcw) -> None:
         with test.phase(f"clamp on: a create the scheduler can only place on {refusing} is never bound there"):
             with admission.cordoned(admitting):
                 held = admission.timed_create("clamp_on_cordoned")
+            # Either the API's network-slot preflight turns the create away
+            # before any pod exists, or a pod reaches the scheduler and is
+            # never bound. Either way no pod lands on the refusing worker.
+            preflight = held.attempt.status_code == 503 and NO_SLOT_CAPACITY in held.attempt.body
+            unplaced = held.attempt.status_code == 503 and any(reason in held.attempt.body for reason in UNPLACED)
+            test.record("clamp_on_cordoned_outcome", "preflight" if preflight else "unplaced" if unplaced else None)
             test.verify(
-                held.attempt.status_code == 503 and any(reason in held.attempt.body for reason in UNPLACED),
-                "with the only schedulable worker full the create did not fail as an unplaced pod",
+                (preflight and not held.new_pod_nodes)
+                or (unplaced and bool(held.new_pod_nodes) and all(node == "" for node in held.new_pod_nodes.values())),
+                "with the clamp on the create neither failed the slot preflight with no pod "
+                "nor left a pod the scheduler never bound",
                 status=held.attempt.status_code,
                 body=held.attempt.body[:600],
-            )
-            # A pod was created and reached the scheduler, and was never bound.
-            test.verify(
-                bool(held.new_pod_nodes) and all(node == "" for node in held.new_pod_nodes.values()),
-                "with the clamp on the create's pod was bound, or never reached the scheduler",
                 new_pod_nodes=held.new_pod_nodes,
             )
 
