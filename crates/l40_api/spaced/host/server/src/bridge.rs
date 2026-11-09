@@ -772,6 +772,7 @@ impl SpacedHostService {
         };
         Self {
             inner: Arc::new(SpacedHostServiceInner {
+                update: crate::update::HostUpdate::new(),
                 shutdown,
                 guest_agent: config.guest_agent,
                 socket_path: config.socket_path,
@@ -838,6 +839,7 @@ impl SpacedHostService {
         )
         .await?;
 
+        self.inner.update.drain().await;
         tracing::info!("spaced host service stopped");
         Ok(())
     }
@@ -866,6 +868,10 @@ impl SpacedHostService {
                     .layer(host_request_limiter())
                     .layer(pplx_space_grpc_server::grpc_trace_layer())
                     .add_service(MetaServer::new(self.clone()))
+                    .add_service(
+                        proto::guest_update_server::GuestUpdateServer::new(self.clone())
+                            .max_decoding_message_size(128 * 1024),
+                    )
                     .add_service(self.filesystem_grpc_service())
                     .add_service(self.process_grpc_service())
                     .add_service(NetworkingServer::new(self.clone()))
