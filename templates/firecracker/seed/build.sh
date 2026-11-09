@@ -350,6 +350,9 @@ if [[ ${#MISSING_BINS[@]} -gt 0 ]]; then
   echo "  cargo build --workspace --${PROFILE} --target ${RUST_TARGET}" >&2
   exit 1
 fi
+if [[ -f "${GUEST_BIN_DIR}/artifact.json" ]]; then
+  DOCKER_ARGS+=(-v "${GUEST_BIN_DIR}/artifact.json:/guest-bin/artifact.json:ro")
+fi
 echo "Guest binaries (${PROFILE}): ${GUEST_BINS[*]}"
 
 # ── Build Docker image ────────────────────────────────────────────────────────

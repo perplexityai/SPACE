@@ -38,8 +38,10 @@ members = [
     "crates/l40_api/spaced/guest/execution",
     "crates/l20_domain/spaced/guest/protocol",
     "crates/l20_domain/spaced/common",
+    "crates/l20_domain/spaced/update",
     "crates/l40_api/spaced/guest/client",
     "crates/l40_api/spaced/guest/server",
+    "crates/l40_api/spaced/guest/update",
     "crates/l40_api/spaced/guest/windows",
     "crates/l40_api/spaced/host/client",
     "crates/l40_api/spaced/host/server",
@@ -489,6 +491,8 @@ pplx-space-spaced-build = { path = "crates/l10_foundation/spaced/build" }
 pplx-space-spaced-guest-protocol = { path = "crates/l20_domain/spaced/guest/protocol" }
 pplx-space-spaced-guest-execution = { path = "crates/l40_api/spaced/guest/execution" }
 pplx-space-spaced-common = { path = "crates/l20_domain/spaced/common" }
+pplx-space-spaced-update = { path = "crates/l20_domain/spaced/update" }
+pplx-space-spaced-guest-update = { path = "crates/l40_api/spaced/guest/update" }
 pplx-space-spaced-guest-client = { path = "crates/l40_api/spaced/guest/client" }
 pplx-space-spaced-guest-server = { path = "crates/l40_api/spaced/guest/server" }
 pplx-space-spaced-guest-windows = { path = "crates/l40_api/spaced/guest/windows" }

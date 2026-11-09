@@ -7753,8 +7753,26 @@ dependencies = [
  "anyhow",
  "clap",
  "pplx-space-spaced-guest-server",
+ "pplx-space-spaced-guest-update",
  "pplx-space-spaced-guest-windows",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pplx-space-spaced-guest-update"
+version = "0.8.1"
+dependencies = [
+ "aws-lc-rs",
+ "libc",
+ "pplx-space-content-digest",
+ "pplx-space-cpu-arch",
+ "pplx-space-spaced-update",
+ "pplx-space-test-env",
+ "semver",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]
@@ -7898,6 +7916,21 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pplx-space-spaced-update"
+version = "0.8.1"
+dependencies = [
+ "aws-lc-rs",
+ "jiff",
+ "pplx-space-content-digest",
+ "pplx-space-cpu-arch",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]
