@@ -313,7 +313,8 @@ async fn auto_lifecycle_error_after_row_removal_does_not_scan_inventory() {
         .db
         .lock()
         .unwrap()
-        .trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(trace));
+        .trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(trace))
+        .unwrap();
     service
         .handle_auto_lifecycle_error(
             &removed_id.to_string(),
@@ -325,7 +326,8 @@ async fn auto_lifecycle_error_after_row_removal_does_not_scan_inventory() {
         .db
         .lock()
         .unwrap()
-        .trace_v2(TraceEventCodes::empty(), None);
+        .trace_v2(TraceEventCodes::empty(), None)
+        .unwrap();
     assert!(
         STEPS.load(Ordering::Relaxed) < 500,
         "error handling scanned unrelated sandboxes"

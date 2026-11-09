@@ -64,7 +64,6 @@ pub fn snapshot(conn: &Connection) -> Snapshot {
                     .unwrap();
                 let names: Vec<String> = statement
                     .column_names()
-                    .into_iter()
                     .skip(1)
                     .map(str::to_owned)
                     .collect();

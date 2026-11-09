@@ -300,7 +300,7 @@ pub fn open_rusqlite(db_path: &Path, options: RusqliteOpenOptions) -> SqliteResu
             .with_context(|| format!("failed to create SQLite directory {}", parent.display()))?;
     }
 
-    let conn = Connection::open(db_path)
+    let mut conn = Connection::open(db_path)
         .with_context(|| format!("failed to open SQLite database {}", db_path.display()))?;
     conn.busy_timeout(options.busy_timeout)
         .with_context(|| format!("failed to set busy timeout for {}", db_path.display()))?;
@@ -317,7 +317,13 @@ pub fn open_rusqlite(db_path: &Path, options: RusqliteOpenOptions) -> SqliteResu
     conn.trace_v2(
         TraceEventCodes::SQLITE_TRACE_PROFILE,
         Some(profile_rusqlite_trace_event),
-    );
+    )
+    .with_context(|| {
+        format!(
+            "failed to configure SQLite tracing for {}",
+            db_path.display()
+        )
+    })?;
     restrict_database_permissions(db_path)?;
     Ok(conn)
 }

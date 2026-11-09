@@ -12,6 +12,7 @@ use super::{
 
 pub struct GuestBundle {
     archive: tempfile::NamedTempFile,
+    pub(crate) slots: bool,
     managed_directories: Vec<PathBuf>,
 }
 
@@ -25,6 +26,54 @@ impl GuestBundle {
         cache_dir: &Path,
         as_root: bool,
     ) -> Result<Self, GuestBundleError> {
+        let contract = seed_root.join("etc/spaced/update-contract");
+        let slots = match fs::symlink_metadata(&contract) {
+            Ok(metadata) if metadata.is_file() => true,
+            Ok(_) => return Err(GuestBundleError::UnsafeTarget { path: contract }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(source) => {
+                return Err(GuestBundleError::Io {
+                    operation: GuestBundleOperation::Inspect,
+                    path: contract,
+                    source,
+                });
+            }
+        };
+        if slots {
+            let bytes = fs::read(&contract).map_err(|source| GuestBundleError::Io {
+                operation: GuestBundleOperation::Inspect,
+                path: contract.clone(),
+                source,
+            })?;
+            if bytes != b"linux-systemd-selector-v1\n" {
+                return Err(GuestBundleError::UnsafeTarget { path: contract });
+            }
+            let unit = seed_root.join("etc/systemd/system/space-workloads.service");
+            let contents = fs::read_to_string(&unit).map_err(|source| GuestBundleError::Io {
+                operation: GuestBundleOperation::Inspect,
+                path: unit.clone(),
+                source,
+            })?;
+            let holder = ["usr/bin/sleep", "usr/bin/gnusleep"]
+                .into_iter()
+                .find(|binary| {
+                    contents
+                        .lines()
+                        .any(|line| line == format!("ExecStart=/{binary} infinity"))
+                })
+                .ok_or(GuestBundleError::UnsafeTarget { path: unit })?;
+            if !seed_root.join(holder).is_file() {
+                return Err(GuestBundleError::MissingPath {
+                    path: seed_root.join(holder),
+                });
+            }
+            for relative in ["usr/bin/systemctl", "var/lib/spaced/slots/a/artifact.json"] {
+                let path = seed_root.join(relative);
+                if !path.is_file() {
+                    return Err(GuestBundleError::MissingPath { path });
+                }
+            }
+        }
         for relative in REQUIRED_PATHS {
             let path = seed_root.join(relative);
             if !path.exists() && !path.is_symlink() {
@@ -75,6 +124,7 @@ impl GuestBundle {
 
         Ok(Self {
             archive,
+            slots,
             managed_directories,
         })
     }

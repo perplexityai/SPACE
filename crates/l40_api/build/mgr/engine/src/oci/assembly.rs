@@ -147,7 +147,12 @@ fn assemble(request: RootfsAssemblyRequest<'_>) -> Result<(), RootfsAssemblyErro
         |root| {
             copy_tree(request.oci_rootfs, root)?;
             bundle.extract(root)?;
-            install_current_guest(root, request.guest_bin_dir, request.bundle_version)?;
+            install_current_guest(
+                root,
+                request.guest_bin_dir,
+                request.bundle_version,
+                bundle.slots,
+            )?;
             // WORKDIR lives in the OCI config, not in the unpacked filesystem.
             install_working_directory(root, request.working_dir, true)?;
             Ok(())
