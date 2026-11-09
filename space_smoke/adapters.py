@@ -5569,7 +5569,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         program = (
             "[.payloads[].data[] | select(.metric | endswith(\"cluster_reconciler.outcome\"))"
             " | select(.tags | index(\"loop:retired_execution_pod_gc\"))"
-            " | {tags, points: [.points[]? | select((.timestamp // 0) >= $since) | (.value // 0)]}]"
+            # The agent ships a DogStatsD count as a rate (type 2) per interval.
+            " | (if .type == 2 then (.interval // 10) else 1 end) as $scale"
+            " | {tags, points: [.points[]? | select((.timestamp // 0) >= $since) | (.value // 0) * $scale]}]"
         )
         script = (
             f"kubectl --context {shlex.quote(self.config.context)} get --raw {shlex.quote(path)}"
