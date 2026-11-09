@@ -1337,9 +1337,10 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
     );
 }
 
-/// An accepted probe yields its guest's used memory only for a `started`
-/// sandbox, including idle warm-pool members; a discarded probe yields
-/// nothing. Memory never moves health:
+/// An accepted probe yields memory only for a `started` sandbox. Unclaimed
+/// warm-pool members are normally paused and yield none; pool metadata alone
+/// does not exclude a running sandbox. A discarded probe yields nothing.
+/// Memory never moves health:
 /// each case's status matches the same probe without it.
 #[tokio::test]
 async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
@@ -1400,8 +1401,14 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
             ..case("quarantined", Some(used), Some(None))
         },
         Case {
+            row: Some(Paused),
+            lifecycle: Some(Paused),
             warm_pool_member: true,
-            ..case("idle warm-pool member", Some(used), Some(Some(used)))
+            ..case("unclaimed paused warm-pool member", Some(used), Some(None))
+        },
+        Case {
+            warm_pool_member: true,
+            ..case("running pool-marked sandbox", Some(used), Some(Some(used)))
         },
         Case {
             row: None,
