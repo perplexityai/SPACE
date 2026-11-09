@@ -49,11 +49,6 @@ const DELETED_LIFECYCLE: &str = "deleted";
 /// The `sandboxes.lifecycle` values outside [`SandboxLifecycle`].
 const TOMBSTONE_LIFECYCLES: [&str; 1] = [DELETED_LIFECYCLE];
 
-/// Values no writer stores any more that the filter still takes, for one
-/// release, so an older console or a saved link gets an empty page rather
-/// than a 400. They match no row. Remove them when the cleanup states retire.
-const RETIRED_LIFECYCLES: [&str; 1] = ["cleanup_required"];
-
 /// A stored lifecycle (`sandboxes.lifecycle`) the admin list filters on: a
 /// [`SandboxLifecycle`] state or a tombstone, in the column's form.
 ///
@@ -77,7 +72,6 @@ impl FromStr for AdminStoredLifecycle {
         let normalized = value.trim().to_ascii_lowercase();
         if let Some(tombstone) = TOMBSTONE_LIFECYCLES
             .into_iter()
-            .chain(RETIRED_LIFECYCLES)
             .find(|tombstone| *tombstone == normalized)
         {
             return Ok(Self(tombstone));

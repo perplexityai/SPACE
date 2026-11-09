@@ -141,17 +141,12 @@ manager publishes it as `cleanup.state` (`REQUIRED` or `FAILED`) on `State`,
 `Wait`, `List` and `ListBuildReferencingSandboxes`, beside the lifecycle the
 cleanup is over (`STOPPING`, `DELETING` or `SUSPENDING`). `Wait` answers only
 once the wait completes, which a cleanup does only when it has failed, so it
-reports `FAILED` and never `REQUIRED`.
-
-Earlier sandbox managers fold the cleanup into the lifecycle as
-`CLEANUP_REQUIRED` or `CLEANUP_FAILED`, and a reader that predates
-`cleanup.state` takes a `STOPPING` row with a failed cleanup for a live stop.
-Upgrade every reader of these RPCs, including the shim, to a release that reads
-`cleanup.state`, and let shim processes started before it exit, before
-upgrading sandbox manager past the fold. Those readers accept both shapes, so
-rolling sandbox manager back is safe for them whichever one the restored
-release publishes: the folded lifecycle by default, or the native one where
-its `publish_native_lifecycle` was on.
+reports `FAILED` and never `REQUIRED`. The retired `CLEANUP_REQUIRED` and
+`CLEANUP_FAILED` lifecycle values are reserved, and readers, the shim included,
+treat them as unknown, so don't roll sandbox manager back to a release that can
+publish them. Rolling sandbox manager back past this release also needs this
+image's down migrations run first: a release refuses a database whose applied
+migrations it doesn't bundle.
 
 ## API, admission and limits
 

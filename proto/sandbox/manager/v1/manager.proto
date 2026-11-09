@@ -254,7 +254,7 @@ service SandboxManager {
   // Internal: find a paused pool sandbox, reassign to user, resume it.
   rpc AdoptPoolSandbox(AdoptPoolSandboxRequest) returns (AdoptPoolSandboxResponse);
 
-  // Wait for stopped, failed, cleanup_failed, suspended, or quarantined, or time out.
+  // Wait for stopped, failed, suspended, quarantined, or a failed cleanup, or time out.
   // Quarantine completes the wait without implying that runtime or files were removed.
   rpc Wait(WaitRequest) returns (WaitResponse);
 
@@ -620,11 +620,10 @@ enum SandboxLifecycleState {
   SANDBOX_LIFECYCLE_STATE_SUSPENDING = 12;
   SANDBOX_LIFECYCLE_STATE_SUSPENDED = 13;
   SANDBOX_LIFECYCLE_STATE_RESTORING = 14;
-  // Published only by an older node, for a row a cleanup owns, with or without
-  // `SandboxCleanup.state`. A current node publishes the lifecycle the cleanup
-  // is over and names the cleanup in `SandboxCleanup.state`.
-  SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED = 15;
-  SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED = 16;
+  // Retired CLEANUP_REQUIRED and CLEANUP_FAILED. A row a cleanup owns is
+  // published with the lifecycle the cleanup is over and `SandboxCleanup.state`.
+  reserved 15, 16;
+  reserved "SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED", "SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED";
   SANDBOX_LIFECYCLE_STATE_QUARANTINED = 17;
   SANDBOX_LIFECYCLE_STATE_FAILED = 18;
 }
@@ -732,8 +731,7 @@ message SandboxInfo {
 // as does a stop, suspend or delete admitted with a persisted intent. A row a
 // cleanup owns keeps the completion it was admitted with, but can also have
 // none, for example one that sbx-manager's cleanup recovery will quarantine.
-// A node that sets `state` publishes such a row with `state` set and
-// `completion` UNSPECIFIED; an older node publishes no message for it.
+// Such a row is published with `state` set and `completion` UNSPECIFIED.
 message SandboxCleanup {
   // What the cleanup does to the row when it finishes. Every writer of
   // MARK_STOPPED keeps the rootfs: a stop, whether a user's or sbx-manager's
@@ -749,9 +747,7 @@ message SandboxCleanup {
   // field, not the presence of this message, to tell a cleanup-owned row. A
   // row can be REQUIRED or FAILED with no completion recorded. A node publishes
   // such a row with the teardown transition the cleanup is over (STOPPING,
-  // DELETING or SUSPENDING). An older node may instead publish the
-  // CLEANUP_REQUIRED or CLEANUP_FAILED lifecycle, with or without this field
-  // set: honor those too.
+  // DELETING or SUSPENDING).
   SandboxCleanupState state = 2;
 }
 
@@ -780,11 +776,9 @@ enum SandboxCleanupCompletion {
 enum SandboxCleanupState {
   // No cleanup owns the row.
   SANDBOX_CLEANUP_STATE_UNSPECIFIED = 0;
-  // A forced teardown owns the row and is owed. An older node may also publish
-  // it as the CLEANUP_REQUIRED lifecycle.
+  // A forced teardown owns the row and is owed.
   SANDBOX_CLEANUP_STATE_REQUIRED = 1;
-  // A teardown owns the row and its last attempt failed; it is retried. An
-  // older node may also publish it as the CLEANUP_FAILED lifecycle.
+  // A teardown owns the row and its last attempt failed; it is retried.
   SANDBOX_CLEANUP_STATE_FAILED = 2;
 }
 

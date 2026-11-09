@@ -2402,10 +2402,9 @@ fn node_reported_artifact_from_info(
         pin_unreadable,
         // An undecodable lifecycle reads as not stopped, which the caller
         // treats as the node disagreeing: a deferral, never a teardown.
-        reports_stopped: matches!(
-            info.observed_lifecycle(),
-            Ok(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Stopped)
-        ),
+        reports_stopped: info.observed_status().is_ok_and(|status| {
+            status.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Stopped)
+        }),
         // `namespace`, not `pid`: the node sets `namespace` from its live
         // process probe alone, while `pid` also needs the row's persisted pid,
         // which every write into `stopped` clears.
