@@ -1669,7 +1669,9 @@ async fn process_start_counts_a_stream_that_ends_without_its_exit() {
     let lost = vec![
         started(),
         output(),
-        Err(tonic::Status::unavailable("process stream repeatedly closed")),
+        Err(tonic::Status::unavailable(
+            "process stream repeatedly closed",
+        )),
     ];
     assert_eq!(terminal_lost_count(lost).await, 1);
 
