@@ -19,6 +19,18 @@ pub(super) fn dispatch() -> windows_service::Result<()> {
     service_dispatcher::start(SERVICE_NAME, service_entry)
 }
 
+/// Query only; diagnostics never request service start/stop privileges.
+pub(super) fn query_status() -> windows_service::Result<ServiceStatus> {
+    use windows_service::{
+        service::ServiceAccess,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)?
+        .query_status()
+}
+
 fn status(
     handle: ServiceStatusHandle,
     state: ServiceState,

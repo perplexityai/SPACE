@@ -135,7 +135,6 @@
 "pplx-space-spaced-guest-client" = { to = "crates/l40_api/spaced/guest/client" }
 "pplx-space-spaced-guest-execution" = { to = "crates/l40_api/spaced/guest/execution" }
 "pplx-space-spaced-guest-server" = { to = "crates/l40_api/spaced/guest/server" }
-"pplx-space-spaced-guest-windows" = { to = "crates/l40_api/spaced/guest/windows" }
 "pplx-space-spaced-host-client" = { to = "crates/l40_api/spaced/host/client" }
 "pplx-space-spaced-host-server" = { to = "crates/l40_api/spaced/host/server" }
 "pplx-space-template-mgr-client" = { to = "crates/l40_api/template/mgr/client" }

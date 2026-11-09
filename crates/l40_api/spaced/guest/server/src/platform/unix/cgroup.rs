@@ -36,7 +36,7 @@
 //!     `supervisor/memory.min` keeps spaced's pages resident under the
 //!     pressure that remains, as far as its ancestors' floors allow. Without
 //!     swap only file pages are reclaimed, and spaced's text is locked
-//!     (`crate::memlock`).
+//!     (`crate::platform::unix::memlock`).
 //!   - I/O: `supervisor/io.weight` dominates, so spaced's own disk I/O (reading
 //!     `/proc`, fs metadata, writing logs) is serviced ahead of a workload
 //!     saturating the device, rather than queuing behind it. This is the one

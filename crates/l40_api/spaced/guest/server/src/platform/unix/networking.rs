@@ -1,5 +1,5 @@
 //! `Networking` bridge-guest service handler. Thin shim over
-//! [`crate::port_forward::LoopbackBridgeManager`].
+//! [`crate::platform::unix::port_forward::LoopbackBridgeManager`].
 
 use std::time::Duration;
 
@@ -9,7 +9,7 @@ use pplx_space_spaced_common::proto::bridge_guest::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::SpacedGuestService;
+use crate::platform::unix::SpacedGuestService;
 
 /// Convert an optional protobuf duration to `std::time::Duration`. Rejects
 /// malformed values (negative seconds/nanos, or `nanos >= 1_000_000_000`) with
