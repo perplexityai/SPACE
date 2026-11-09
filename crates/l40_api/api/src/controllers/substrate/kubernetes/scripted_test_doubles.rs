@@ -40,11 +40,16 @@ pub(super) const WORKER_NODE: &str = "node-a";
 pub(crate) struct KubeRequest {
     pub(crate) method: Method,
     pub(crate) path: String,
+    /// The query string, when the request has one.
+    pub(crate) query: Option<String>,
     pub(crate) body: Option<serde_json::Value>,
 }
 
 pub(crate) enum KubeReply {
     Json(StatusCode, serde_json::Value),
+    /// A watch that sends these `{"type": ..., "object": ...}` events, then
+    /// ends.
+    WatchEvents(Vec<serde_json::Value>),
     /// Never answer, for callers that bound the read with their own budget.
     Hang,
 }
@@ -74,11 +79,17 @@ where
         async move {
             let method = req.method().clone();
             let path = req.uri().path().to_string();
+            let query = req.uri().query().map(str::to_owned);
             let bytes = req.into_body().collect().await?.to_bytes();
             let body = (!bytes.is_empty())
                 .then(|| serde_json::from_slice(&bytes))
                 .transpose()?;
-            let request = KubeRequest { method, path, body };
+            let request = KubeRequest {
+                method,
+                path,
+                query,
+                body,
+            };
             log.lock().unwrap().push(request.clone());
             match reply(request).await {
                 KubeReply::Json(status, body) => Ok::<_, BoxError>(
@@ -87,6 +98,17 @@ where
                         .header("content-type", "application/json")
                         .body(KubeBody::from(serde_json::to_vec(&body)?))?,
                 ),
+                KubeReply::WatchEvents(events) => {
+                    let mut lines = Vec::new();
+                    for event in &events {
+                        serde_json::to_writer(&mut lines, event)?;
+                        lines.push(b'\n');
+                    }
+                    Ok(http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(KubeBody::from(lines))?)
+                }
                 KubeReply::Hang => std::future::pending().await,
             }
         }

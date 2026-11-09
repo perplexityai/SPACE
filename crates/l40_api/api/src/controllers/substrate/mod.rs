@@ -576,6 +576,11 @@ pub enum SubstrateError {
     Failed { message: String },
     #[error("{message}")]
     NotFound { message: String },
+    /// The node refused the request as invalid, a verdict every retry and
+    /// every node would repeat, such as a disk smaller than the template's
+    /// rootfs. Callers report it as the caller's error instead of retrying.
+    #[error("{message}")]
+    InvalidRequest { message: String },
     /// A readiness wait exhausted its window. `phase` is `Some` when the
     /// timeout fired inside a specific readiness wait (see
     /// [`WaitReadyTimeoutPhase`]); `None` for outer budgets that wrap the
@@ -876,6 +881,7 @@ impl From<SubstrateError> for ControllerError {
             }
             SubstrateError::Failed { message } => ControllerError::internal(message),
             SubstrateError::NotFound { message } => ControllerError::not_found(message),
+            SubstrateError::InvalidRequest { message } => ControllerError::bad_request(message),
             // A substrate wait that exhausted its ALB-aware budget is not a
             // dead end: the node keeps converging, so surface a retryable
             // 503 + `Retry-After` rather than an opaque 504. The

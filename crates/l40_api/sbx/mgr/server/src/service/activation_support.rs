@@ -2097,11 +2097,14 @@ impl ActivationFailureStage {
     ///   `InvalidArgument` as "this request fails identically everywhere".
     /// - On the Kubernetes path the code does not survive the hop. containerd's
     ///   CRI layer drops it, leaving only the shim's `[space-err=<Code>]`
-    ///   message marker in the pod event, and nothing in the control plane
-    ///   reads that marker yet. Kubelet keeps retrying `RunPodSandbox` on its
-    ///   own backoff whatever is returned here, and a wedged pod is still
-    ///   reaped by the age-based stuck-`ContainerCreating` sweep rather than
-    ///   failed at the first attempt.
+    ///   message marker in the pod event. A create waiting for its pod's IP
+    ///   reads the `InvalidArgument` marker (`INVALID_ARGUMENT_MARKER` in the
+    ///   API's Kubernetes substrate) and fails with the node's reason; nothing
+    ///   in the control plane reads the other codes yet. Kubelet keeps
+    ///   retrying `RunPodSandbox` on its own backoff whatever is returned
+    ///   here, and any other wedged pod is still reaped by the age-based
+    ///   stuck-`ContainerCreating` sweep rather than failed at the first
+    ///   attempt.
     ///
     /// So this is the classification, not the enforcement. Flattening every
     /// failure to `Internal` would destroy the verdict before any consumer
