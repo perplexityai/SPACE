@@ -191,6 +191,7 @@ impl std::fmt::Debug for LoopbackBridgeManager {
 }
 
 struct ManagerState {
+    execution: std::sync::OnceLock<pplx_space_spaced_guest_execution::ExecutionService>,
     bind_ip: tokio::sync::OnceCell<IpAddr>,
     ports: Mutex<HashMap<u16, AuthorizedPort>>,
     shutdown_token: CancellationToken,
@@ -243,6 +244,48 @@ struct AuthorizedPort {
 }
 
 impl LoopbackBridgeManager {
+    pub(crate) async fn authorized_ports(&self) -> Vec<u32> {
+        self.state
+            .ports
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .map(u32::from)
+            .collect()
+    }
+
+    pub(crate) async fn replace_ports(&self, ports: &[u16]) -> Result<(), tonic::Status> {
+        let previous: Vec<_> = self.state.ports.lock().await.keys().copied().collect();
+        for port in previous {
+            if !ports.contains(&port) {
+                self.close(port).await;
+            }
+        }
+        for port in ports {
+            let (status, detail) = self.open(*port, Some(Duration::ZERO)).await;
+            if !matches!(
+                status,
+                LoopbackBridgeStatus::Direct
+                    | LoopbackBridgeStatus::LoopbackForwarded
+                    | LoopbackBridgeStatus::WaitingForListener
+            ) {
+                return Err(tonic::Status::failed_precondition(
+                    detail.unwrap_or_else(|| "forwarding authorization failed".into()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_execution_admission(
+        &self,
+        execution: pplx_space_spaced_guest_execution::ExecutionService,
+    ) {
+        // Constructed and installed once before any listener starts.
+        assert!(self.state.execution.set(execution).is_ok());
+    }
+
     pub(crate) async fn shutdown(&self) {
         self.state.shutdown_token.cancel();
         let ports = std::mem::take(&mut *self.state.ports.lock().await);
@@ -260,6 +303,7 @@ impl LoopbackBridgeManager {
     pub fn new(shutdown_token: CancellationToken) -> Self {
         Self {
             state: Arc::new(ManagerState {
+                execution: std::sync::OnceLock::new(),
                 bind_ip: tokio::sync::OnceCell::new(),
                 ports: Mutex::new(HashMap::new()),
                 shutdown_token,
@@ -282,6 +326,7 @@ impl LoopbackBridgeManager {
     ) -> Self {
         Self {
             state: Arc::new(ManagerState {
+                execution: std::sync::OnceLock::new(),
                 bind_ip: tokio::sync::OnceCell::new_with(Some(bind_ip)),
                 ports: Mutex::new(HashMap::new()),
                 shutdown_token,
@@ -554,6 +599,7 @@ mod port_forwarder {
                         state.active_connections.clone(),
                         state.connection_idle_timeout,
                         forwarder_cancel,
+                        state.execution.get().cloned(),
                     )
                     .await;
                     return;
