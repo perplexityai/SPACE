@@ -16,7 +16,11 @@
 //! epoch, so it survives a restart; a stopped sandbox's row keeps its own.
 //!
 //! A call never waits for that work. It plans from the rows as they are,
-//! starts what is not already running, and answers. [`DrainPlan`] is that
+//! starts what is not already running, and answers. It paces what it starts:
+//! at most a window of suspends and disk publications is in flight at once,
+//! uploads they leave pending included, and a suspend starts only while the
+//! cache disk covers its snapshot; the rest wait, `pending`, for a later
+//! call. An upload whose job is still queued or running is left to it. [`DrainPlan`] is that
 //! decision, a pure function of what the call read, and `done` is true only
 //! when nothing is left: no VM, nothing pending or blocked, every scan that
 //! can reveal a resident or an artifact succeeded, and the seal held, under
@@ -60,6 +64,65 @@ pub(super) const MAX_ACTION_FAILURES: u32 = 3;
 /// moving them on.
 pub(super) const SETTLE_BOUND: Duration = Duration::from_secs(15 * 60);
 
+/// How many of the drain's suspends and disk publications may be in flight
+/// on the node at once, the uploads they leave pending included, unless
+/// [`DRAIN_NODE_WINDOW_ENV`] sets another positive number. Beside the idle
+/// auto-suspend scheduler's 8, at most 16 suspends reach node-manager's
+/// Filesystem lane at once, below the 20 arrivals (4 permits and 16 waiting)
+/// past which it refuses one, which would roll that suspend back. It is also
+/// vol-mgr's push concurrency per kind, so a VM the drain has paused uploads
+/// rather than waiting behind the node's backlog.
+pub(super) const DEFAULT_DRAIN_NODE_WINDOW: usize = 8;
+pub(super) const DRAIN_NODE_WINDOW_ENV: &str = "SPACE_DRAIN_NODE_WINDOW";
+
+/// [`DEFAULT_DRAIN_NODE_WINDOW`], or the positive number
+/// [`DRAIN_NODE_WINDOW_ENV`] sets.
+pub(super) fn drain_node_window_from_env() -> usize {
+    drain_node_window(std::env::var(DRAIN_NODE_WINDOW_ENV).ok().as_deref())
+}
+
+/// The window `raw`, [`DRAIN_NODE_WINDOW_ENV`]'s value, sets.
+pub(super) fn drain_node_window(raw: Option<&str>) -> usize {
+    match raw {
+        Some(raw) => raw
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|window| *window > 0)
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    var = DRAIN_NODE_WINDOW_ENV,
+                    raw = %raw,
+                    default = DEFAULT_DRAIN_NODE_WINDOW,
+                    "not a positive drain window; using the default"
+                );
+                DEFAULT_DRAIN_NODE_WINDOW
+            }),
+        None => DEFAULT_DRAIN_NODE_WINDOW,
+    }
+}
+
+/// The bytes of cache disk the drain may still commit to snapshots before
+/// the cache reaches the floor its disk admission keeps free, the margin
+/// every new allocation leaves; none while admission refuses allocations.
+pub(super) fn drain_disk_headroom(
+    config: pplx_space_common_core::host::disk_admission::CacheDiskAdmissionConfig,
+    measurement: pplx_space_common_core::host::disk_admission::CacheDiskMeasurement,
+) -> u64 {
+    let decision = pplx_space_common_core::host::disk_admission::evaluate_cache_disk_measurement(
+        config,
+        measurement,
+        0,
+    );
+    if decision.allows_new_allocation() {
+        decision
+            .effective_available_bytes
+            .saturating_sub(decision.hard_floor_bytes)
+    } else {
+        0
+    }
+}
+
 /// What the drain is doing for a sandbox.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) enum DrainAction {
@@ -90,8 +153,9 @@ type SeenLifecycles = BTreeMap<String, (SandboxState, tokio::time::Instant)>;
 
 /// The drain's work in flight in this process, by sandbox, and what it
 /// remembers between calls.
-#[derive(Default)]
 pub(super) struct DrainActions {
+    /// How many suspends and disk publications may be in flight at once.
+    window: usize,
     running: Mutex<BTreeMap<String, DrainAction>>,
     /// The failures counted under the epoch they were counted under; a call
     /// under another epoch starts the count again.
@@ -100,9 +164,28 @@ pub(super) struct DrainActions {
     /// the epoch it was seen under; a call under another epoch starts the
     /// clock again.
     seen: Mutex<(Option<u64>, SeenLifecycles)>,
+    /// Since when each row has waited for cache disk for its suspend, under
+    /// the epoch it waited under.
+    disk_waits: Mutex<(Option<u64>, BTreeMap<String, tokio::time::Instant>)>,
+}
+
+impl Default for DrainActions {
+    fn default() -> Self {
+        Self::with_window(DEFAULT_DRAIN_NODE_WINDOW)
+    }
 }
 
 impl DrainActions {
+    pub(super) fn with_window(window: usize) -> Self {
+        Self {
+            window: window.max(1),
+            running: Mutex::default(),
+            failures: Mutex::default(),
+            seen: Mutex::default(),
+            disk_waits: Mutex::default(),
+        }
+    }
+
     fn running(&self) -> BTreeMap<String, DrainAction> {
         lock(&self.running).clone()
     }
@@ -179,6 +262,35 @@ impl DrainActions {
         unchanged
     }
 
+    /// The rows that have waited for cache disk for [`SETTLE_BOUND`] or
+    /// longer under `epoch`.
+    fn disk_waits_past_bound(&self, epoch: u64, now: tokio::time::Instant) -> BTreeSet<String> {
+        let guard = lock(&self.disk_waits);
+        if guard.0 != Some(epoch) {
+            return BTreeSet::new();
+        }
+        guard
+            .1
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) >= SETTLE_BOUND)
+            .map(|(sandbox_id, _)| sandbox_id.clone())
+            .collect()
+    }
+
+    /// Note the rows waiting for cache disk at `now` under `epoch`: a row
+    /// keeps the time it began waiting, and one no longer waiting is
+    /// forgotten.
+    fn note_disk_waits(&self, epoch: u64, waiting: &[String], now: tokio::time::Instant) {
+        let mut guard = lock(&self.disk_waits);
+        if guard.0 != Some(epoch) {
+            *guard = (Some(epoch), BTreeMap::new());
+        }
+        guard.1.retain(|sandbox_id, _| waiting.contains(sandbox_id));
+        for sandbox_id in waiting {
+            guard.1.entry(sandbox_id.clone()).or_insert(now);
+        }
+    }
+
     /// Wait, at most ten seconds, until no drain action is running.
     #[cfg(test)]
     pub(super) async fn wait_idle(&self) {
@@ -212,6 +324,9 @@ pub(super) struct DrainRow {
     pub(super) pin: Option<(String, pplx_space_common_core::types::ArtifactKind)>,
     /// Why a suspend would be refused, if it would.
     pub(super) suspend_refusal: Option<String>,
+    /// What a suspend's snapshot would take of the cache disk: the guest's
+    /// memory, for a started or paused row.
+    pub(super) snapshot_bytes: u64,
 }
 
 /// Something the planner wants started.
@@ -237,6 +352,8 @@ pub(super) struct DrainPlan {
     pub(super) pending: Vec<(String, String)>,
     pub(super) blocked: Vec<(Option<String>, String)>,
     pub(super) actions: Vec<PlannedAction>,
+    /// The rows whose suspend waits for cache disk, pending or blocked.
+    pub(super) disk_waits: Vec<String>,
 }
 
 /// Whether a row in `state` may hold a VM.
@@ -257,7 +374,7 @@ pub(super) type LocalOnlyArtifacts =
     BTreeMap<String, Vec<(String, pplx_space_common_core::types::ArtifactKind)>>;
 
 /// Everything the planner reads besides the rows.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) struct PlanInputs {
     /// The pinned artifacts still without a durable copy, by sandbox,
     /// including a pin that names no artifact row.
@@ -272,27 +389,101 @@ pub(super) struct PlanInputs {
     pub(super) failures: DrainFailures,
     /// The rows in the same lifecycle for [`SETTLE_BOUND`] or longer.
     pub(super) unchanged: BTreeSet<String>,
+    /// How many suspends and disk publications may be in flight at once.
+    pub(super) window: usize,
+    /// The bytes of cache disk the drain may commit to new snapshots; `None`
+    /// when the node admits cache allocations without measuring.
+    pub(super) disk_headroom: Option<u64>,
+    /// The artifacts whose upload job is still queued or running.
+    pub(super) active_uploads: BTreeSet<String>,
+    /// The rows that have waited for cache disk for [`SETTLE_BOUND`] or
+    /// longer.
+    pub(super) disk_waits: BTreeSet<String>,
+}
+
+impl Default for PlanInputs {
+    fn default() -> Self {
+        Self {
+            pending_backups: BTreeMap::new(),
+            local_only: LocalOnlyArtifacts::new(),
+            evacuations: BTreeMap::new(),
+            running: BTreeMap::new(),
+            failures: DrainFailures::new(),
+            unchanged: BTreeSet::new(),
+            window: DEFAULT_DRAIN_NODE_WINDOW,
+            disk_headroom: None,
+            active_uploads: BTreeSet::new(),
+            disk_waits: BTreeSet::new(),
+        }
+    }
+}
+
+impl PlanInputs {
+    /// Whether `sandbox_id`'s `action` has failed [`MAX_ACTION_FAILURES`]
+    /// times under this epoch.
+    fn failed_too_often(&self, sandbox_id: &str, action: DrainAction) -> bool {
+        self.failures
+            .get(&(sandbox_id.to_owned(), action))
+            .is_some_and(|(failures, _)| *failures >= MAX_ACTION_FAILURES)
+    }
+
+    /// How much of the window is taken: the suspends and disk publications
+    /// running, and the rows whose pinned artifact is still uploading, short
+    /// of one blocked on its failures.
+    fn window_in_flight(&self, rows: &[DrainRow]) -> usize {
+        let running = self
+            .running
+            .values()
+            .filter(|action| matches!(action, DrainAction::Suspend | DrainAction::PublishDisk))
+            .count();
+        let uploading = rows
+            .iter()
+            .filter(|row| {
+                !self.running.contains_key(&row.sandbox_id)
+                    && row.pin.as_ref().is_some_and(|(artifact, _)| {
+                        self.pending_backups
+                            .get(&row.sandbox_id)
+                            .is_some_and(|pending| pending.contains(artifact))
+                    })
+                    && !self.failed_too_often(&row.sandbox_id, DrainAction::Upload)
+            })
+            .count();
+        running + uploading
+    }
 }
 
 impl DrainPlan {
     /// Wait for `action` on `sandbox_id`, or report it `blocked` once it has
     /// failed [`MAX_ACTION_FAILURES`] times under this epoch.
     fn wait_for(&mut self, inputs: &PlanInputs, sandbox_id: &str, action: DrainAction) {
+        self.wait_as(inputs, sandbox_id, action, action.as_str());
+    }
+
+    /// [`Self::wait_for`], reporting a pending row with `reason`.
+    fn wait_as(
+        &mut self,
+        inputs: &PlanInputs,
+        sandbox_id: &str,
+        action: DrainAction,
+        reason: &str,
+    ) {
         match inputs.failures.get(&(sandbox_id.to_owned(), action)) {
-            Some((failures, reason)) if *failures >= MAX_ACTION_FAILURES => {
+            Some((failures, last)) if *failures >= MAX_ACTION_FAILURES => {
                 self.blocked.push((
                     Some(sandbox_id.to_owned()),
-                    format!("{} failed {failures} times: {reason}", action.as_str()),
+                    format!("{} failed {failures} times: {last}", action.as_str()),
                 ));
             }
             _ => self
                 .pending
-                .push((sandbox_id.to_owned(), action.as_str().to_owned())),
+                .push((sandbox_id.to_owned(), reason.to_owned())),
         }
     }
 
     /// Start `action` unless something is already running for its sandbox,
-    /// and wait for whichever it is.
+    /// and wait for whichever it is. An upload whose job is still queued or
+    /// running is left to that job: enqueueing it again would only ask the
+    /// control plane for its location once more.
     fn drive(&mut self, inputs: &PlanInputs, action: PlannedAction) {
         let (sandbox_id, kind) = action.target();
         let sandbox_id = sandbox_id.to_owned();
@@ -300,10 +491,83 @@ impl DrainPlan {
             Some(running) => self.wait_for(inputs, &sandbox_id, *running),
             None => {
                 self.wait_for(inputs, &sandbox_id, kind);
-                self.actions.push(action);
+                let uploading = matches!(
+                    &action,
+                    PlannedAction::Upload { artifact_id, .. }
+                        if inputs.active_uploads.contains(artifact_id)
+                );
+                if !uploading {
+                    self.actions.push(action);
+                }
             }
         }
     }
+
+    /// Start the suspends and disk publications `waiting` names while the
+    /// window has room, paused VMs first, then started ones, then stopped
+    /// disks, and a suspend only while the cache disk still covers its
+    /// snapshot. The rest wait, `queued` for the window or `disk` for the
+    /// disk; one that has waited for disk past [`SETTLE_BOUND`] is
+    /// blocked.
+    fn start_in_window(
+        &mut self,
+        rows: &[DrainRow],
+        inputs: &PlanInputs,
+        mut waiting: Vec<(WindowOrder, &DrainRow, PlannedAction)>,
+    ) {
+        waiting.sort_by(|(left, left_row, _), (right, right_row, _)| {
+            (left, &left_row.sandbox_id).cmp(&(right, &right_row.sandbox_id))
+        });
+        let mut in_flight = inputs.window_in_flight(rows);
+        let mut committed: u64 = rows
+            .iter()
+            .filter(|row| inputs.running.get(&row.sandbox_id) == Some(&DrainAction::Suspend))
+            .map(|row| row.snapshot_bytes)
+            .sum();
+        for (_, row, action) in waiting {
+            let id = &row.sandbox_id;
+            let kind = action.target().1;
+            if in_flight >= inputs.window {
+                self.wait_as(inputs, id, kind, "queued");
+                continue;
+            }
+            if kind == DrainAction::Suspend {
+                let needed = committed.saturating_add(row.snapshot_bytes);
+                if inputs
+                    .disk_headroom
+                    .is_some_and(|headroom| needed > headroom)
+                {
+                    self.disk_waits.push(id.clone());
+                    if inputs.disk_waits.contains(id) && !inputs.failed_too_often(id, kind) {
+                        self.blocked.push((
+                            Some(id.clone()),
+                            format!(
+                                "the cache disk hasn't had room for a {} MiB snapshot for over \
+                                 {} minutes",
+                                row.snapshot_bytes / (1024 * 1024),
+                                SETTLE_BOUND.as_secs() / 60
+                            ),
+                        ));
+                    } else {
+                        self.wait_as(inputs, id, kind, "disk");
+                    }
+                    continue;
+                }
+                committed = needed;
+            }
+            in_flight += 1;
+            self.drive(inputs, action);
+        }
+    }
+}
+
+/// The order the window starts the drain's work in: a paused VM serves no
+/// one, so it goes first; a stopped disk holds no VM, so it goes last.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(super) enum WindowOrder {
+    PausedVm,
+    StartedVm,
+    StoppedDisk,
 }
 
 impl PlannedAction {
@@ -320,6 +584,7 @@ impl PlannedAction {
 pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
     use pplx_space_common_core::types::ArtifactKind;
     let mut plan = DrainPlan::default();
+    let mut windowed = Vec::new();
     for (sandbox_id, artifacts) in &inputs.local_only {
         if !rows.iter().any(|row| row.sandbox_id == *sandbox_id) {
             for (artifact, _) in artifacts {
@@ -374,17 +639,26 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
                 plan.blocked
                     .push((Some(id.clone()), "cleanup failed".into()));
             }
-            SandboxState::Started | SandboxState::Paused => match &row.suspend_refusal {
-                Some(refusal) if !running => {
-                    plan.blocked.push((Some(id.clone()), refusal.clone()));
+            SandboxState::Started | SandboxState::Paused => {
+                let suspend = PlannedAction::Suspend {
+                    sandbox_id: id.clone(),
+                };
+                match &row.suspend_refusal {
+                    Some(refusal) if !running => {
+                        plan.blocked.push((Some(id.clone()), refusal.clone()));
+                    }
+                    _ if running => plan.drive(inputs, suspend),
+                    _ => windowed.push((
+                        if row.lifecycle == SandboxState::Paused {
+                            WindowOrder::PausedVm
+                        } else {
+                            WindowOrder::StartedVm
+                        },
+                        row,
+                        suspend,
+                    )),
                 }
-                _ => plan.drive(
-                    inputs,
-                    PlannedAction::Suspend {
-                        sandbox_id: id.clone(),
-                    },
-                ),
-            },
+            }
             SandboxState::Stopped => match (&durable_pin, pending_pin) {
                 _ if row.volume_encryption && !running => {
                     plan.blocked.push((
@@ -397,12 +671,19 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
                         .push((id.clone(), DrainPrior::Stopped, artifact.clone()));
                 }
                 (_, Some(pin @ (_, ArtifactKind::Disk))) => plan.drive(inputs, upload(pin)),
-                _ => plan.drive(
+                _ if running => plan.drive(
                     inputs,
                     PlannedAction::PublishDisk {
                         sandbox_id: id.clone(),
                     },
                 ),
+                _ => windowed.push((
+                    WindowOrder::StoppedDisk,
+                    row,
+                    PlannedAction::PublishDisk {
+                        sandbox_id: id.clone(),
+                    },
+                )),
             },
             SandboxState::Suspended | SandboxState::Failed => {
                 if let Some(pin) = pending_pin {
@@ -459,6 +740,7 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
             }
         }
     }
+    plan.start_in_window(rows, inputs, windowed);
     plan
 }
 
@@ -470,6 +752,10 @@ pub(super) struct DrainScans {
     /// named for. node-manager knows only its slots: a directory whose
     /// sandbox has a row here is the row's, and the plan accounts for it.
     pub(super) orphan_dirs: Vec<(String, String)>,
+    /// The bytes of cache disk the drain may commit to new snapshots
+    /// ([`drain_disk_headroom`]); `None` when the node admits cache
+    /// allocations without measuring.
+    pub(super) disk_headroom: Option<u64>,
 }
 
 /// node-manager's orphan inventory, read as the drain needs it.
@@ -564,6 +850,7 @@ impl SandboxManagerService {
                 .map(|reason| (None, reason))
                 .collect(),
             orphan_dirs: orphans.dirs,
+            disk_headroom: read_disk_headroom().await,
         };
         Ok(Response::new(self.finish_drain(epoch, &first, scans)))
     }
@@ -578,7 +865,7 @@ impl SandboxManagerService {
         first: &ActivationSealStatus,
         scans: DrainScans,
     ) -> DrainNodeResponse {
-        let (mut plan, rows) = match self.read_drain_plan(epoch) {
+        let (mut plan, rows) = match self.read_drain_plan(epoch, scans.disk_headroom) {
             Ok(read) => read,
             Err(reason) => (
                 DrainPlan {
@@ -668,7 +955,11 @@ impl SandboxManagerService {
     /// Read every row, the artifacts without a durable copy and the
     /// evacuation record, and plan, with the ids of the rows read. An error
     /// is the scan that failed, which blocks the drain.
-    fn read_drain_plan(&self, epoch: u64) -> Result<(DrainPlan, BTreeSet<String>), String> {
+    fn read_drain_plan(
+        &self,
+        epoch: u64,
+        disk_headroom: Option<u64>,
+    ) -> Result<(DrainPlan, BTreeSet<String>), String> {
         let (sandboxes, local_only_rows, evacuations, pending_rows) = {
             let conn = self
                 .db_conn()
@@ -698,6 +989,18 @@ impl SandboxManagerService {
                 .or_default()
                 .insert(pending.local_artifact_id.to_string());
         }
+        let active_uploads = pending_backups
+            .values()
+            .flatten()
+            .chain(local_only.values().flatten().map(|(artifact, _)| artifact))
+            .filter(|artifact| self.upload_job_active(artifact))
+            .cloned()
+            .collect();
+        // A snapshot without a recorded guest memory is sized as disk
+        // admission sizes an allocation it can't measure.
+        let unknown_snapshot_bytes =
+            pplx_space_common_core::host::disk_admission::CacheDiskAdmissionConfig::from_env()
+                .allocation_reservation_bytes;
         let rows: Vec<DrainRow> = sandboxes
             .iter()
             .map(|row| DrainRow {
@@ -715,6 +1018,15 @@ impl SandboxManagerService {
                 )
                 .then(|| self.drain_suspend_refusal(row))
                 .flatten(),
+                snapshot_bytes: if matches!(
+                    row.lifecycle,
+                    SandboxState::Started | SandboxState::Paused
+                ) {
+                    super::tail_support::sandbox_guest_memory(&row.id)
+                        .map_or(unknown_snapshot_bytes, |memory| memory.as_bytes())
+                } else {
+                    0
+                },
             })
             .collect();
         let evacuations = evacuations
@@ -726,26 +1038,42 @@ impl SandboxManagerService {
             .iter()
             .map(|row| (row.sandbox_id.clone(), row.lifecycle))
             .collect();
+        let now = tokio::time::Instant::now();
         let inputs = PlanInputs {
             pending_backups,
             local_only,
             evacuations,
             running: self.drain_actions.running(),
             failures: self.drain_actions.failures(epoch),
-            unchanged: self.drain_actions.unchanged_since_bound(
-                epoch,
-                &lifecycles,
-                tokio::time::Instant::now(),
-            ),
+            unchanged: self
+                .drain_actions
+                .unchanged_since_bound(epoch, &lifecycles, now),
+            window: self.drain_actions.window,
+            disk_headroom,
+            active_uploads,
+            disk_waits: self.drain_actions.disk_waits_past_bound(epoch, now),
         };
         let plan = plan(&rows, &inputs);
+        self.drain_actions
+            .note_disk_waits(epoch, &plan.disk_waits, now);
         // A failure counts toward the bound only while the drain still works
-        // on its sandbox; one that succeeded, or moved on, starts over.
+        // on its sandbox, starting it, waiting for it or reporting it
+        // blocked; one that succeeded, or moved on, starts over.
         let working = plan
             .actions
             .iter()
             .map(|action| action.target().0.to_owned())
             .chain(inputs.running.keys().cloned())
+            .chain(
+                plan.pending
+                    .iter()
+                    .map(|(sandbox_id, _)| sandbox_id.clone()),
+            )
+            .chain(
+                plan.blocked
+                    .iter()
+                    .filter_map(|(sandbox_id, _)| sandbox_id.clone()),
+            )
             .collect();
         self.drain_actions.keep_failures_of(&working);
         Ok((plan, ids))
@@ -848,6 +1176,24 @@ impl SandboxManagerService {
         }
     }
 
+    /// Whether `artifact_id`'s upload job is still queued or running. A job
+    /// that can't be read counts as none, so the upload is enqueued again.
+    fn upload_job_active(&self, artifact_id: &str) -> bool {
+        let Ok(artifact) = artifact_id.parse::<pplx_space_common_core::types::LocalArtifactId>()
+        else {
+            return false;
+        };
+        self.snapshot_upload_worker
+            .find_job_by_dedup_key(
+                crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                &crate::snapshot_upload_jobs::artifact_backup_dedup_key(artifact),
+            )
+            .ok()
+            .flatten()
+            .and_then(|job| job.status.parse::<pplx_space_common_jobs::JobStatus>().ok())
+            .is_some_and(|status| !status.is_terminal())
+    }
+
     /// Why the latest upload of `artifact_id` failed, if the backup worker
     /// gave up on it.
     fn failed_upload(&self, artifact_id: &str) -> Result<Option<String>, Status> {
@@ -940,6 +1286,30 @@ impl SandboxManagerService {
         drop(wake_guard);
         suspended
     }
+}
+
+/// [`drain_disk_headroom`] of `/space/cache` as disk admission measures it;
+/// none when it can't be measured.
+async fn read_disk_headroom() -> Option<u64> {
+    use pplx_space_common_core::host::disk_admission::{
+        CacheDiskAdmissionConfig, read_cache_disk_measurement,
+    };
+    let config = CacheDiskAdmissionConfig::from_env();
+    if !config.enabled {
+        return None;
+    }
+    let measured = tokio::task::spawn_blocking(read_cache_disk_measurement).await;
+    Some(match measured {
+        Ok(Ok(measurement)) => drain_disk_headroom(config, measurement),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "node drain: can't measure the cache disk; no suspend starts");
+            0
+        }
+        Err(error) => {
+            tracing::warn!(%error, "node drain: the cache disk probe failed; no suspend starts");
+            0
+        }
+    })
 }
 
 fn report(status: &ActivationSealStatus, plan: DrainPlan, done: bool) -> DrainNodeResponse {

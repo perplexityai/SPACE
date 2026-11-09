@@ -1829,7 +1829,9 @@ impl SandboxManagerService {
             )),
             activation_admission_limiter: Arc::new(ActivationAdmissionLimiter::from_env()),
             activation_seal,
-            drain_actions: Arc::default(),
+            drain_actions: Arc::new(drain_node::DrainActions::with_window(
+                drain_node::drain_node_window_from_env(),
+            )),
             teardown_suspend_drivers: Arc::new(dashmap::DashMap::new()),
             teardown_suspend_driver_sem: Arc::new(tokio::sync::Semaphore::new(
                 teardown_suspend_driver_concurrency,

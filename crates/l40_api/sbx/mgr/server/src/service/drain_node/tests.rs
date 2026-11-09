@@ -12,6 +12,7 @@ fn row(id: &str, lifecycle: SandboxState) -> DrainRow {
         volume_encryption: false,
         pin: None,
         suspend_refusal: None,
+        snapshot_bytes: 0,
     }
 }
 
@@ -1217,4 +1218,238 @@ async fn a_busy_inventory_is_asked_again() {
         .into_inner();
     assert!(report.done, "{report:?}");
     assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+const MIB: u64 = 1024 * 1024;
+
+fn suspend(id: &str) -> PlannedAction {
+    PlannedAction::Suspend {
+        sandbox_id: id.into(),
+    }
+}
+
+/// The window starts paused VMs, then started ones, then stopped disks,
+/// while the suspends and disk publications running and the uploads still
+/// pending take fewer than its size; the rest are pending `queued`, or
+/// blocked once they have failed the bound times.
+#[test]
+fn the_window_starts_paused_then_started_then_stopped_and_queues_the_rest() {
+    let mut uploading = row("u", SandboxState::Suspended);
+    uploading.pin = Some((FULL_ARTIFACT.into(), ArtifactKind::Full));
+    let rows = [
+        row("s1", SandboxState::Started),
+        row("d1", SandboxState::Stopped),
+        row("p2", SandboxState::Paused),
+        row("p1", SandboxState::Paused),
+        row("s2", SandboxState::Started),
+        row("r", SandboxState::Started),
+        uploading,
+    ];
+    let inputs = |window: usize| PlanInputs {
+        window,
+        pending_backups: pending("u", FULL_ARTIFACT),
+        active_uploads: BTreeSet::from([FULL_ARTIFACT.to_owned()]),
+        running: BTreeMap::from([("r".to_owned(), DrainAction::Suspend)]),
+        failures: BTreeMap::from([(
+            ("s2".to_owned(), DrainAction::Suspend),
+            (MAX_ACTION_FAILURES, "no space".to_owned()),
+        )]),
+        ..PlanInputs::default()
+    };
+    // The running suspend and the pending upload take two of five.
+    let plan_five = plan(&rows, &inputs(5));
+    assert_eq!(
+        plan_five.actions,
+        [suspend("p1"), suspend("p2"), suspend("s1")]
+    );
+    let pending_of = |plan: &DrainPlan, id: &str| -> Vec<String> {
+        plan.pending
+            .iter()
+            .filter(|(sandbox_id, _)| sandbox_id == id)
+            .map(|(_, reason)| reason.clone())
+            .collect()
+    };
+    assert_eq!(pending_of(&plan_five, "s2"), Vec::<String>::new());
+    assert_eq!(
+        plan_five.blocked,
+        [(
+            Some("s2".into()),
+            format!("suspend failed {MAX_ACTION_FAILURES} times: no space")
+        )],
+        "past the bound a queued row is blocked"
+    );
+    assert_eq!(pending_of(&plan_five, "d1"), ["queued"]);
+    assert_eq!(pending_of(&plan_five, "r"), ["suspend"]);
+    assert_eq!(pending_of(&plan_five, "u"), ["upload"]);
+
+    // Room for everything: the stopped disk starts last.
+    let plan_nine = plan(&rows, &inputs(9));
+    assert_eq!(
+        plan_nine.actions,
+        [
+            suspend("p1"),
+            suspend("p2"),
+            suspend("s1"),
+            suspend("s2"),
+            PlannedAction::PublishDisk {
+                sandbox_id: "d1".into()
+            },
+        ]
+    );
+    assert!(
+        plan_nine
+            .pending
+            .iter()
+            .all(|(_, reason)| reason != "queued")
+    );
+}
+
+/// A suspend starts only while the cache disk's headroom covers its snapshot
+/// beside the snapshots of the suspends already running; otherwise it is
+/// pending `disk`, and blocked once it has waited past the bound. A smaller
+/// snapshot behind it still starts, and a node that doesn't measure its disk
+/// starts every one.
+#[test]
+fn a_suspend_waits_for_disk_and_blocks_past_the_bound() {
+    let sized = |id: &str, mib: u64| {
+        let mut row = row(id, SandboxState::Started);
+        row.snapshot_bytes = mib * MIB;
+        row
+    };
+    let rows = [
+        sized("a", 600),
+        sized("b", 600),
+        sized("c", 100),
+        sized("r", 300),
+    ];
+    let inputs = |disk_headroom: Option<u64>, disk_waits: &[&str]| PlanInputs {
+        disk_headroom,
+        disk_waits: disk_waits.iter().map(|id| (*id).to_owned()).collect(),
+        running: BTreeMap::from([("r".to_owned(), DrainAction::Suspend)]),
+        ..PlanInputs::default()
+    };
+
+    let tight = plan(&rows, &inputs(Some(1024 * MIB), &[]));
+    assert_eq!(tight.actions, [suspend("a"), suspend("c")]);
+    assert!(tight.pending.contains(&("b".into(), "disk".into())));
+    assert_eq!(tight.disk_waits, ["b"]);
+    assert!(tight.blocked.is_empty());
+
+    let past_bound = plan(&rows, &inputs(Some(1024 * MIB), &["b"]));
+    assert_eq!(
+        past_bound.blocked,
+        [(
+            Some("b".into()),
+            "the cache disk hasn't had room for a 600 MiB snapshot for over 15 minutes".into()
+        )]
+    );
+    assert_eq!(past_bound.disk_waits, ["b"], "it keeps waiting");
+
+    let unmeasured = plan(&rows, &inputs(None, &[]));
+    assert_eq!(
+        unmeasured.actions,
+        [suspend("a"), suspend("b"), suspend("c")]
+    );
+    assert!(unmeasured.disk_waits.is_empty());
+}
+
+/// An upload whose job is still queued or running is pending and not
+/// enqueued again; once the job has ended, the drain enqueues it.
+#[test]
+fn an_upload_with_an_active_job_is_not_enqueued_again() {
+    let mut suspended = row("a", SandboxState::Suspended);
+    suspended.pin = Some((FULL_ARTIFACT.into(), ArtifactKind::Full));
+    let plan_with = |active: bool| {
+        plan(
+            std::slice::from_ref(&suspended),
+            &PlanInputs {
+                pending_backups: pending("a", FULL_ARTIFACT),
+                evacuations: [evacuation("a", DrainPrior::Started)].into_iter().collect(),
+                active_uploads: active
+                    .then(|| FULL_ARTIFACT.to_owned())
+                    .into_iter()
+                    .collect(),
+                ..PlanInputs::default()
+            },
+        )
+    };
+    let active = plan_with(true);
+    assert_eq!(active.pending, [("a".into(), "upload".into())]);
+    assert!(active.actions.is_empty());
+
+    let ended = plan_with(false);
+    assert_eq!(ended.pending, [("a".into(), "upload".into())]);
+    assert_eq!(
+        ended.actions,
+        [PlannedAction::Upload {
+            sandbox_id: "a".into(),
+            artifact_id: FULL_ARTIFACT.into(),
+            kind: ArtifactKind::Full,
+        }]
+    );
+}
+
+/// A row's wait for disk is clocked from the first call that saw it wait,
+/// under one epoch; a call it no longer waits in, or another epoch, starts
+/// it over.
+#[test]
+fn a_disk_wait_is_past_the_bound_only_after_waiting_that_long() {
+    let actions = DrainActions::default();
+    let start = tokio::time::Instant::now();
+    let a = ["a".to_owned()];
+    let past = |epoch: u64, at: Duration| actions.disk_waits_past_bound(epoch, start + at);
+
+    actions.note_disk_waits(7, &a, start);
+    actions.note_disk_waits(7, &a, start + SETTLE_BOUND / 2);
+    assert!(past(7, SETTLE_BOUND - Duration::from_secs(1)).is_empty());
+    assert_eq!(past(7, SETTLE_BOUND), BTreeSet::from(["a".to_owned()]));
+    assert!(past(8, SETTLE_BOUND).is_empty(), "another epoch's wait");
+
+    actions.note_disk_waits(7, &[], start + SETTLE_BOUND);
+    actions.note_disk_waits(7, &a, start + SETTLE_BOUND);
+    assert!(
+        past(7, SETTLE_BOUND * 2 - Duration::from_secs(1)).is_empty(),
+        "a row that stopped waiting starts over"
+    );
+}
+
+/// The window is the positive number its variable sets, or the default.
+#[test]
+fn the_drain_window_reads_a_positive_number_or_the_default() {
+    for (raw, window) in [
+        (None, DEFAULT_DRAIN_NODE_WINDOW),
+        (Some("3"), 3),
+        (Some(" 12 "), 12),
+        (Some("0"), DEFAULT_DRAIN_NODE_WINDOW),
+        (Some("-1"), DEFAULT_DRAIN_NODE_WINDOW),
+        (Some("eight"), DEFAULT_DRAIN_NODE_WINDOW),
+    ] {
+        assert_eq!(drain_node_window(raw), window, "{raw:?}");
+    }
+}
+
+/// The disk's headroom is what is available above the floor disk admission
+/// keeps free, and none once admission refuses allocations.
+#[test]
+fn the_disk_headroom_is_what_lies_above_the_admission_floor() {
+    use pplx_space_common_core::host::disk::DiskStatus;
+    use pplx_space_common_core::host::disk_admission::{
+        CacheDiskAdmissionConfig, CacheDiskMeasurement,
+    };
+    const GIB: u64 = 1024 * MIB;
+    let config = CacheDiskAdmissionConfig {
+        min_available_bytes: GIB,
+        ..CacheDiskAdmissionConfig::default()
+    };
+    let measured = |available_bytes: u64| CacheDiskMeasurement {
+        status: DiskStatus {
+            total_bytes: 40 * GIB,
+            free_bytes: available_bytes,
+            available_bytes,
+        },
+        btrfs: None,
+    };
+    // The floor is the larger of 5 % of the disk (2 GiB) and 1 GiB.
+    assert_eq!(drain_disk_headroom(config, measured(10 * GIB)), 8 * GIB);
+    assert_eq!(drain_disk_headroom(config, measured(GIB)), 0);
 }
