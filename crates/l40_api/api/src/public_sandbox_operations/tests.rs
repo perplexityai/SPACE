@@ -1434,6 +1434,106 @@ fn claimed_delete_operation(
     }
 }
 
+/// A pause of a sandbox without a resident runtime fails at once as a
+/// conflict naming the sandbox's state and the request that brings it back,
+/// rather than retrying until its attempts run out.
+#[tokio::test]
+async fn pause_of_a_sandbox_without_a_runtime_fails_as_a_conflict() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let executor = SandboxLifecycleOperationExecutor::new(
+        db.pool.clone(),
+        direct_sandbox_controller(&db.pool),
+    );
+    for (lifecycle, state, wake) in [
+        (SandboxLifecycle::Suspended, "suspended", Some(":wake")),
+        (SandboxLifecycle::Stopped, "stopped", Some(":start")),
+        (SandboxLifecycle::Failed, "failed", None),
+    ] {
+        let sandbox_id = seed_sandbox(
+            &db.pool,
+            SandboxSeed {
+                org_id,
+                user_id,
+                lifecycle,
+                placement: SeedSandboxPlacement::Unplaced,
+            },
+        )
+        .await?;
+        let public_sandbox_id = PublicSandboxId::from(sandbox_id);
+        let operation = ClaimedPublicOperation {
+            kind: OperationKind::PauseSandbox,
+            payload: serde_json::to_value(SandboxLifecycleOperationPayload {
+                sandbox_id: public_sandbox_id,
+                action: SandboxLifecycleAction::Pause,
+                rollback: None,
+                wake_activity: None,
+            })?,
+            ..claimed_delete_operation(sandbox_id, org_id, Some(user_id), ApiProduct::Native)
+        };
+
+        let result = executor.execute(&operation).await;
+
+        assert_eq!(result.state, OperationState::Failed, "{state}");
+        assert_eq!(
+            result.terminal_error_code,
+            Some(PublicErrorCode::Conflict),
+            "{state}"
+        );
+        let error = result
+            .terminal_error_json
+            .ok_or("a failed operation records its error")?;
+        assert_eq!(error["reason"], "sandbox_not_running", "{state}: {error}");
+        assert_eq!(error["state"], state, "{error}");
+        match wake {
+            Some(action) => assert!(
+                error["wake"]
+                    .as_str()
+                    .is_some_and(|wake| wake.ends_with(&format!("{public_sandbox_id}{action}"))),
+                "{state}: {error}"
+            ),
+            None => assert!(error.get("wake").is_none(), "{state}: {error}"),
+        }
+        assert_eq!(
+            fetch_sandbox(&db.pool, sandbox_id)
+                .await?
+                .map(|sandbox| sandbox.lifecycle),
+            Some(lifecycle.as_str().to_string()),
+            "{state}: a refused pause leaves the sandbox as it was"
+        );
+    }
+
+    // A checkpoint returns the sandbox to the state it left, with its runtime,
+    // so a pause during one is not refused, though its public state reads as
+    // suspending.
+    let sandbox_id = seed_sandbox(
+        &db.pool,
+        SandboxSeed {
+            org_id,
+            user_id,
+            lifecycle: SandboxLifecycle::Checkpointing,
+            placement: SeedSandboxPlacement::Unplaced,
+        },
+    )
+    .await?;
+    let operation = ClaimedPublicOperation {
+        kind: OperationKind::PauseSandbox,
+        payload: serde_json::to_value(SandboxLifecycleOperationPayload {
+            sandbox_id: PublicSandboxId::from(sandbox_id),
+            action: SandboxLifecycleAction::Pause,
+            rollback: None,
+            wake_activity: None,
+        })?,
+        ..claimed_delete_operation(sandbox_id, org_id, Some(user_id), ApiProduct::Native)
+    };
+    let result = executor.execute(&operation).await;
+    // It goes on to dispatch, which waits for this unplaced sandbox's node.
+    assert_eq!(result.state, OperationState::Queued, "{result:?}");
+    assert_eq!(result.terminal_error_code, None, "{result:?}");
+    Ok(())
+}
+
 const UPLOAD_CONFLICT_MESSAGE: &str = "sandbox has a suspend-snapshot upload in flight; retry the DELETE after the snapshot finalizes";
 
 async fn finalize_snapshot(pool: &PgPool, snapshot_id: SnapshotId) -> Result<(), sqlx::Error> {

@@ -834,7 +834,8 @@ impl SandboxLifecycleOperationExecutor {
             return Err(SandboxLifecycleExecutionError::SandboxNotFound);
         };
         let current_state = public_lifecycle_state(&sandbox.lifecycle)?;
-        if let Some(state) = completed_lifecycle_target_state(payload.action, current_state) {
+        if let Some(state) = completed_lifecycle_target_state(payload.action, current_state.clone())
+        {
             return Ok(lifecycle_success_result(
                 payload.sandbox_id,
                 payload.action,
@@ -847,6 +848,15 @@ impl SandboxLifecycleOperationExecutor {
                 }),
                 "sandbox lifecycle action already completed",
             ));
+        }
+        if payload.action == SandboxLifecycleAction::Pause
+            && pause_cannot_succeed(sandbox.lifecycle.parse()?)
+        {
+            return Err(SandboxLifecycleExecutionError::NotRunning {
+                sandbox_id: payload.sandbox_id,
+                action: payload.action,
+                state: current_state,
+            });
         }
         if payload.action == SandboxLifecycleAction::Rollback {
             admit_user_lifecycle(sandbox_uuid.into(), UserLifecycleRequest::Rollback);
@@ -1108,6 +1118,32 @@ fn completed_lifecycle_target_state(
     }
 }
 
+/// Whether a pause of a sandbox in `lifecycle` can only fail: it needs the
+/// resident runtime these lifecycles lack or are giving up, and no retry
+/// brings it back. A checkpoint returns the sandbox to the state it left, so
+/// it reaches the node like the other transient lifecycles, and the node
+/// pauses a running sandbox or answers why it cannot.
+fn pause_cannot_succeed(lifecycle: SandboxLifecycle) -> bool {
+    match lifecycle {
+        SandboxLifecycle::Suspending
+        | SandboxLifecycle::Suspended
+        | SandboxLifecycle::Stopping
+        | SandboxLifecycle::Stopped
+        | SandboxLifecycle::Deleting
+        | SandboxLifecycle::Failed
+        | SandboxLifecycle::Quarantined => true,
+        SandboxLifecycle::Created
+        | SandboxLifecycle::Creating
+        | SandboxLifecycle::Starting
+        | SandboxLifecycle::Started
+        | SandboxLifecycle::Restoring
+        | SandboxLifecycle::Pausing
+        | SandboxLifecycle::Paused
+        | SandboxLifecycle::Resuming
+        | SandboxLifecycle::Checkpointing => false,
+    }
+}
+
 /// A native wake operation with no actor is the system's wake for a session
 /// (`create_or_join_active_sandbox_wake`): no caller asked for it, so it runs
 /// only while the sandbox's wake policy, read now, still lets the session's
@@ -1242,6 +1278,12 @@ enum SandboxLifecycleExecutionError {
     UnsupportedAction(SandboxLifecycleAction),
     #[error("the sandbox's wake policy no longer lets the waiting session's activity wake it")]
     ImplicitWakeNotAllowed,
+    #[error("cannot {action} a sandbox that is {state}")]
+    NotRunning {
+        sandbox_id: PublicSandboxId,
+        action: SandboxLifecycleAction,
+        state: SandboxLifecycleState,
+    },
     #[error("unknown sandbox lifecycle: {0}")]
     UnknownLifecycle(#[from] SandboxLifecycleParseError),
     #[error("database error: {0}")]
@@ -1276,6 +1318,25 @@ impl SandboxLifecycleExecutionError {
                 PublicErrorCode::Conflict,
                 terminal_error_json(operation, self.to_string()),
             ),
+            Self::NotRunning {
+                sandbox_id,
+                ref state,
+                ..
+            } => {
+                let mut terminal_error = terminal_error_json(operation, self.to_string());
+                if let Some(fields) = terminal_error.as_object_mut() {
+                    for detail in
+                        pplx_space_public_api::sandbox_not_running_details(sandbox_id, state)
+                    {
+                        fields.insert(detail.key, detail.value.into());
+                    }
+                }
+                PublicOperationExecutionResult::failed(
+                    "sandbox is not running",
+                    PublicErrorCode::Conflict,
+                    terminal_error,
+                )
+            }
             Self::Sql(error) => {
                 tracing::warn!(
                     operation_id = %operation.id,
