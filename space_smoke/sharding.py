@@ -81,7 +81,7 @@ _DURATION_SECONDS = {
         "local.fork_suspended_cross_node": 13,
         "local.gentle_drain_leaves_sandbox_resident": 35,
         "local.leader_election_brownout_keeps_one_leader": 302,
-        "local.network_slots_clamp_to_node_memory": 240,
+        "local.network_slots_clamp_to_node_memory": 300,
         "local.node_ctl_fence_refuses_and_reconciles": 11,
         "local.node_group_boundary_schedules": 36,
         "local.node_selector_extras_render_and_enforce": 62,

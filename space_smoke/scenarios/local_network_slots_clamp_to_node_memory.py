@@ -16,16 +16,17 @@ PLACED_CREATES = 3
 # worker Node's allocatable network slots and the pods' `nodeName`.
 @smoke.scenario(
     "local.network_slots_clamp_to_node_memory",
-    # Three node-manager and two node-ctl rollouts, one create that waits out the ready budget.
+    # Three node-manager and two node-ctl rollouts, and up to two creates that wait out the ready budget.
     sandbox=smoke.SandboxConfig(timeout=900),
 )
 def network_slots_clamp_to_node_memory(test: smoke.KindEcw) -> None:
     """With one worker's node-manager refusing new sandboxes at memory
     admission and node-ctl's slot clamp off, a create placed on that worker
     is bound there and fails. With the clamp on, that worker advertises no
-    network slots beyond those its bound pods hold, the other worker still
-    advertises free slots (clamped to its own memory, never above standing),
-    and creates succeed on the other worker. Once the reserve is back, with
+    network slots beyond those its bound pods hold, the same cordoned create
+    is never bound to it, the other worker still advertises free slots
+    (clamped to its own memory, never above standing), and creates succeed on
+    the other worker. Once the reserve is back, with
     the clamp still on, the refusing worker advertises free slots again."""
 
     admission = test.node_memory_admission
@@ -65,6 +66,7 @@ def network_slots_clamp_to_node_memory(test: smoke.KindEcw) -> None:
         with test.phase(f"clamp on: {refusing} advertises no slot past its bound pods"):
             admission.set_clamp(True)
             admission.expect_capacity(
+                "clamp_on",
                 lambda seen: (
                     (seen[refusing]["advertised"] or 0) <= (seen[refusing]["bound"] or 0)
                     and (seen[admitting]["bound"] or 0) + PLACED_CREATES
@@ -72,6 +74,20 @@ def network_slots_clamp_to_node_memory(test: smoke.KindEcw) -> None:
                     <= (standing[admitting]["advertised"] or 0)
                 ),
                 "the refusing worker still advertises free network slots, or the admitting one has no room",
+            )
+
+        with test.phase(f"clamp on: a create the scheduler can only place on {refusing} is never bound there"):
+            with admission.cordoned(admitting):
+                held = admission.timed_create("clamp_on_cordoned")
+            test.verify(
+                not 200 <= held.attempt.status_code < 300,
+                "a create succeeded with the only schedulable worker refusing",
+                status=held.attempt.status_code,
+            )
+            test.verify(
+                refusing not in held.new_pod_nodes.values(),
+                "with the clamp on a create's pod was still bound to the refusing worker",
+                new_pod_nodes=held.new_pod_nodes,
             )
 
         with test.phase(f"clamp on: creates are placed on {admitting}"):
@@ -92,6 +108,7 @@ def network_slots_clamp_to_node_memory(test: smoke.KindEcw) -> None:
         with test.phase(f"reserve back, clamp on: {refusing} advertises free slots again"):
             admission.admit_new_sandboxes()
             admission.expect_capacity(
+                "reserve_back",
                 lambda seen: (seen[refusing]["bound"] or 0)
                 < (seen[refusing]["advertised"] or 0)
                 <= (standing[refusing]["advertised"] or 0),

@@ -1,27 +1,34 @@
 """Node memory admission refusals: the create fail-fast and the slot clamp.
 
 The refusal comes from the real admission check. node-manager decides a new
-sandbox against the node's `/proc/meminfo`, and the scenarios raise its
-`--memory-admission-reserve-mib` far above any node's memory, so every
-allocation on every node is refused the way a full node refuses it. Kind
-nodes share the host kernel, so they all read the host's `/proc/meminfo` and
-one node can't be made full while another isn't. The scenarios run with every
-worker refusing.
+sandbox against the node's `/proc/meminfo`, and a scenario raises its
+`--memory-admission-reserve-mib` far above any node's memory, so every new
+allocation on that node is refused the way a full node refuses it. Kind
+nodes share the host kernel and read the same `/proc/meminfo`, so the reserve
+is what makes one node full: the fail-fast scenario raises it on every
+worker, and the clamp scenario raises it on one worker only, through a
+command wrapper that adds the flag when `KUBE_NODE_NAME` matches.
 
-There are three knobs, each captured before it is written and put back
-verbatim, each under its own mutation Lease:
+Four knobs, each restored by compensation as the scope unwinds:
 
-- node-manager's reserve, a command flag (node-manager has no env for it).
-- node-ctl's `SPACE_NETWORK_SLOTS_MEMORY_CLAMP`.
-- the API's `SPACE_CREATE_FAIL_FAST_ON_NODE_REJECTION`.
+- node-manager's reserve, a command flag (node-manager has no env for it),
+  captured before it is written and put back verbatim.
+- node-ctl's `SPACE_NETWORK_SLOTS_MEMORY_CLAMP`, captured and put back.
+- the API's `SPACE_CREATE_FAIL_FAST_ON_NODE_REJECTION`, captured and put back.
+- a worker cordon, so a create can only be placed on one named worker.
+
+The first three are each written under their own mutation Lease, and the
+restore is verified.
 
 Every observable is public state: the create response and how long it took,
-the sandbox namespace's pods, and each worker Node's allocatable
-`space.pplx.net/network-slots`.
+the sandbox namespace's pods (sampled while the create runs, so a pod's
+binding is seen even if the API deletes it before answering), and each
+worker Node's allocatable `space.pplx.net/network-slots`.
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -40,6 +47,8 @@ REFUSING_RESERVE_MIB = 1 << 20
 # The kubelet publishes it on its next device-plugin update.
 CAPACITY_SETTLE_SECONDS = 90
 POLL_SECONDS = 3
+# How often a create's new pods are sampled while it runs.
+POD_SAMPLE_SECONDS = 1
 
 Capacity = dict[str, dict[str, int | None]]
 
@@ -213,15 +222,39 @@ class NodeMemoryAdmissionAssertions:
         """
 
         before = {pod.pod_name for pod in self._control.all_sandbox_pods()}
+        # Pods are sampled while the create runs too, so a pod the API binds
+        # and deletes before it answers still shows where it was bound.
+        nodes: dict[str, str] = {}
+        done = threading.Event()
+
+        def sample() -> None:
+            for pod in self._control.all_sandbox_pods():
+                if pod.pod_name not in before and (pod.node_name or pod.pod_name not in nodes):
+                    nodes[pod.pod_name] = pod.node_name
+
+        def sampler() -> None:
+            while not done.wait(POD_SAMPLE_SECONDS):
+                try:
+                    sample()
+                except RuntimeError:
+                    pass
+
+        thread = threading.Thread(target=sampler, name="create-pod-sampler", daemon=True)
         started = time.monotonic()
-        attempt = self._fixture.sandboxes.attempt_create(definitive_statuses=(503,))
+        thread.start()
+        try:
+            attempt = self._fixture.sandboxes.attempt_create(definitive_statuses=(503,))
+        finally:
+            done.set()
+            thread.join()
         elapsed = time.monotonic() - started
         new = [pod for pod in self._control.all_sandbox_pods() if pod.pod_name not in before]
+        sample()
         timed = TimedCreate(
             attempt=attempt,
             elapsed_seconds=round(elapsed, 1),
             leftover_pods=tuple(pod.pod_name for pod in new if not pod.deleting),
-            new_pod_nodes={pod.pod_name: pod.node_name for pod in new},
+            new_pod_nodes=dict(sorted(nodes.items())),
         )
         self._fixture.record(
             f"create_{label}",
@@ -245,13 +278,13 @@ class NodeMemoryAdmissionAssertions:
             for node in self.workers()
         }
 
-    def expect_capacity(self, settled: Callable[[Capacity], bool], message: str) -> Capacity:
+    def expect_capacity(self, label: str, settled: Callable[[Capacity], bool], message: str) -> Capacity:
         deadline = time.monotonic() + CAPACITY_SETTLE_SECONDS
         seen = self.capacity()
         while not settled(seen) and time.monotonic() < deadline:
             self._fixture.wait(POLL_SECONDS)
             seen = self.capacity()
-        self._fixture.record("capacity", seen)
+        self._fixture.record(f"capacity_{label}", seen)
         self._fixture.verify(settled(seen), message, capacity=seen)
         return seen
 
