@@ -1000,7 +1000,9 @@ struct SandboxPortExposureApplyObservation {
 
 #[derive(Debug, Clone)]
 struct SandboxPortExposureApplyError {
-    error: ControllerError,
+    // Boxed: with the observation beside it, an inline `ControllerError`
+    // makes this the large `Err` that `clippy::result_large_err` refuses.
+    error: Box<ControllerError>,
     observation: Option<SandboxPortExposureApplyObservation>,
 }
 
@@ -1009,7 +1011,10 @@ impl SandboxPortExposureApplyError {
         error: ControllerError,
         observation: Option<SandboxPortExposureApplyObservation>,
     ) -> Self {
-        Self { error, observation }
+        Self {
+            error: Box::new(error),
+            observation,
+        }
     }
 }
 

@@ -208,3 +208,42 @@ fn process_page_orders_processes_and_resumes_after_cursor() {
     );
     assert_eq!(second.next_cursor, None);
 }
+
+/// A process call refused because the sandbox is at rest and may not be woken
+/// answers as `createCommand` does, with the reason, state and wake request in
+/// `details`; any other conflict keeps none.
+#[tokio::test]
+async fn a_sandbox_at_rest_answers_with_the_command_refusal_details() {
+    use http_body_util::BodyExt;
+    use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+    use pplx_space_public_api::{PublicErrorCode, PublicErrorEnvelope};
+
+    async fn envelope(error: ControllerError) -> PublicErrorEnvelope {
+        let response = controller_error(error).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    let sandbox_id = SandboxId::new();
+    let refused = envelope(ControllerError::sandbox_not_running(
+        crate::controllers::SandboxNotRunning {
+            sandbox_id,
+            lifecycle: SandboxLifecycle::Paused,
+        },
+        "sandbox is not running",
+    ))
+    .await;
+    assert_eq!(refused.code, PublicErrorCode::Conflict);
+    assert!(!refused.retryable);
+    assert_eq!(
+        refused.details,
+        pplx_space_public_api::sandbox_not_running_details(
+            sandbox_id.into(),
+            &pplx_space_public_api::SandboxLifecycleState::Paused,
+        )
+    );
+
+    let other = envelope(ControllerError::conflict("process is busy")).await;
+    assert!(other.details.is_empty(), "{other:?}");
+}
