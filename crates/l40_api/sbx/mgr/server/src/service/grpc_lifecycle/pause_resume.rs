@@ -268,7 +268,8 @@ impl SandboxManagerService {
             event_details,
         );
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-        let _artifact_guard = artifact_lock.lock().await;
+        let _artifact_guard = artifact_lock.lock_for_capture().await;
+        self.settle_guest_update_for_lifecycle(&sandbox.id).await?;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         self.authorize_template_manager_sandbox(&peer, &sandbox, "Pause")?;
         sandbox
