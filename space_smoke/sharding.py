@@ -91,7 +91,7 @@ _DURATION_SECONDS = {
         "local.retention_restore_source_guard": 43,
         "local.sandbox_manager_restart_leaves_teardown_suspend_to_its_teardown": 53,
         "local.sandbox_network_isolation_holds": 20,
-        "local.stalled_node_delete_releases_its_dispatcher_slot": 150,
+        "local.stalled_node_delete_releases_its_dispatcher_slot": 75,
         "local.storage_exchange_scoping": 26,
         "local.suspend_snapshot_rows_are_per_attempt": 15,
         "local.telemetry_reaches_local_backends": 16,

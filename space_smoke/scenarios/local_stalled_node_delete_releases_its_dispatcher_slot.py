@@ -17,8 +17,8 @@ NOT_ADMITTED_ATTEMPTS = 2
 # after the teardown's budget while the sandbox stays, and once thawed the
 # delete succeeds. Admitted: with node-manager frozen, sandbox-manager admits
 # the delete (its row reads `deleting`) and its cleanup hangs, so the teardown
-# continues after the budget and the operation succeeds while the node's
-# cleanup is still pending, which finishes once thawed. Each attempt's slot
+# continues after the budget and the operation succeeds on its first attempt
+# while node-manager is still frozen; the node's row goes once thawed. Each attempt's slot
 # hold is read from the operation's public events (`space_smoke.node_delete_stall`).
 # Do not run concurrently with other scenarios on the same workers.
 @smoke.scenario(
@@ -68,8 +68,11 @@ def stalled_node_delete_releases_its_dispatcher_slot(test: smoke.KindEcw) -> Non
         test.record("admitted_node", node)
         stall.freeze(node, NODE_MANAGER)
         operation_id = stall.delete(admitted.sandbox_id)
+        stall.expect_service_hangs(node, NODE_MANAGER)
 
     with test.phase("admitted: the teardown continues after its budget"):
+        # sandbox-manager's own reads wait on the frozen node-manager, so the
+        # node's row is read only after the thaw.
         holds = stall.expect_succeeded(operation_id, timeout=30)
         test.record("admitted_slot_holds", holds)
         test.verify(
@@ -78,14 +81,6 @@ def stalled_node_delete_releases_its_dispatcher_slot(test: smoke.KindEcw) -> Non
             holds=holds,
         )
         stall.expect_gone(admitted)
-        row = stall.node_row(node, admitted.sandbox_id)
-        test.record("admitted_node_row_after_delete", row)
-        test.verify(
-            row == "deleting",
-            "the node's cleanup was not still pending when the delete succeeded",
-            row_state=row,
-        )
-        stall.expect_service_hangs(node, NODE_MANAGER)
         stall.thaw()
 
     with test.phase("admitted: once thawed, the node's cleanup finishes"):
