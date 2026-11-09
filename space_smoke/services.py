@@ -848,12 +848,22 @@ class _ScenarioSandboxes:
         *,
         allow_internet_access: bool | None = None,
         network: NetworkConfig | None = None,
+        confirmed_absent: Callable[[], bool] | None = None,
     ) -> EcwCreateAttempt:
-        """Issue a tracked raw create when the HTTP response is the invariant."""
+        """Issue a tracked raw create when the HTTP response is the invariant.
+
+        `confirmed_absent` lets a caller that has seen the API delete the
+        sandbox skip the run-marker reconciliation, which would find nothing.
+        """
 
         create_metadata = self._create_metadata()
         observed_ids: list[str] = []
-        cleanup = self._arm_cleanup(create_metadata, [], observed_ids=observed_ids)
+        cleanup = self._arm_cleanup(
+            create_metadata,
+            [],
+            observed_ids=observed_ids,
+            reconcile_uncreated=None if confirmed_absent is None else lambda: not confirmed_absent(),
+        )
         observed = self._ecw.attempt_create(
             template=self._template,
             timeout=self._timeout,

@@ -2967,7 +2967,7 @@ class KindEcw(Ecw):
                 self._retired_execution_pod_gc_control,
                 self._context.scope,
                 # Off the scenario thread: the tracked raw create, without a phase.
-                lambda: sandboxes.attempt_create(),
+                lambda absent: sandboxes.attempt_create(confirmed_absent=absent),
             )
         return self._retired_execution_pod_gc_assertions
 

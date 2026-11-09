@@ -5587,6 +5587,12 @@ ON CONFLICT (key_hash) DO NOTHING;
             counts[key] = counts.get(key, 0) + int(round(sum(series.get("points") or [])))
         return counts
 
+    def sandbox_row_exists(self, sandbox_id: str) -> bool:
+        out = self._psql(
+            f"SELECT 1 FROM sandboxes WHERE id = '{_sql_uuid(sandbox_id)}';\n", action="read the sandbox row"
+        )
+        return bool(out.strip())
+
     def run_sandbox_ids(self, sibling_sandbox_id: str) -> list[str]:
         out = self._psql(
             "SELECT s.id FROM sandboxes s, sandboxes sibling "
@@ -5611,7 +5617,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 "SELECT e.pod_name, e.sandbox_id, e.generation, e.state, e.active FROM sandbox_k8s_executions e "
                 "JOIN sandboxes s ON s.id = e.sandbox_id "
                 f"WHERE e.pod_name IN ({quoted}) AND e.pod_namespace = '{KIND_SANDBOX_NAMESPACE}' "
-                "AND s.managed_by = 'kubernetes';\n",
+                "AND s.managed_by = 'k8s';\n",
                 action="read the sandbox pods' execution rows",
             )
             for line in out.splitlines():
@@ -5685,6 +5691,19 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def remove_planted_pods(self, token: str) -> None:
         self.remove_planted_restore_pods(token)
+
+    def delete_sandbox_pod_if_uid(self, pod_name: str, uid: str) -> None:
+        self._require_isolated_kind("deleting a sandbox pod")
+        name = _kube_pod_name(pod_name)
+        body = json.dumps(
+            {"kind": "DeleteOptions", "apiVersion": "v1", "gracePeriodSeconds": 0, "preconditions": {"uid": str(uuid.UUID(uid))}}
+        )
+        result = self.kubectl(
+            "delete", "--raw", f"/api/v1/namespaces/{KIND_SANDBOX_NAMESPACE}/pods/{name}", "-f", "-",
+            input_text=body, timeout=30, namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        if result.returncode != 0 and "NotFound" not in (result.stderr or ""):
+            _require_ok(result, f"delete sandbox pod {name}")
 
     # --- node-ctl's unanswered-template wait ---------------------------------
     #

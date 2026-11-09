@@ -184,7 +184,9 @@ class RetiredExecutionPodGcAssertions:
     """Produce retired pods, scope the GC's config, and judge what it deletes."""
 
     # Generous: a cold create, a sandbox-manager restart and node-ctl publishing.
-    STRAND_TIMEOUT_SECONDS = 120
+    # kubelet backs off each sandbox-manager restart (10 s, doubling), and the
+    # rollback is published only once it is back up.
+    STRAND_TIMEOUT_SECONDS = 240
     STRAND_ATTEMPTS = 3
 
     def __init__(
@@ -192,7 +194,7 @@ class RetiredExecutionPodGcAssertions:
         fixture: KindEcw,
         control: RetiredExecutionPodGcControl,
         scope: ResourceScope,
-        attempt_create: Callable[[], object],
+        attempt_create: Callable[[Callable[[], bool]], object],
     ) -> None:
         self._fixture = fixture
         self._control = control
@@ -203,6 +205,7 @@ class RetiredExecutionPodGcAssertions:
         self._standing: dict[str, str | None] | None = None
         self._settings: GcSettings | None = None
         self._removals: dict[str, Compensation] = {}
+        self._strand_attempts = 0
 
     # --- the scoped config ---------------------------------------------------
 
@@ -276,7 +279,7 @@ class RetiredExecutionPodGcAssertions:
     def idle_suspended_pod(self, *, idle_timeout_seconds: int = 3) -> RetiredPod:
         """A second sandbox left access-idle until the node suspends it; its Succeeded pod remains."""
 
-        sandbox = self._fixture.create()
+        sandbox = self._fixture.sandboxes.create()
         sandbox_id = _bare(sandbox.sandbox_id)
         pods = self._wait_bound_pods(sandbox_id)
         sandbox.set_timeout(idle_timeout_seconds)
@@ -310,10 +313,19 @@ class RetiredExecutionPodGcAssertions:
         wins the race the sandbox is simply live; the next attempt tries again.
         """
 
-        for attempt in range(1, self.STRAND_ATTEMPTS + 1):
+        for _ in range(self.STRAND_ATTEMPTS):
+            self._strand_attempts += 1
+            attempt = self._strand_attempts
             known = set(self._control.run_sandbox_ids(self._fixture.sandbox.sandbox_id))
-            work = background("in-flight create", self._create_ignoring_outcome)
+            created: list[str] = []
+            work = background(
+                "in-flight create",
+                lambda: self._create_ignoring_outcome(
+                    lambda: bool(created) and not self._control.sandbox_row_exists(created[0])
+                ),
+            )
             sandbox_id = self._wait_new_run_sandbox(known)
+            created.append(sandbox_id)
             name = self._wait_bound_pods(sandbox_id, require_node=True)[0]
             node = self._control.sandbox_pods(sandbox_id)[0].node_name
             crashed_at = self._control.crash_sandbox_manager_at(node, sandbox_id, "starting", timeout=60)
@@ -328,11 +340,12 @@ class RetiredExecutionPodGcAssertions:
         self._fixture.verify(False, "no cold create was stranded `replaced` in its Pending pod", attempts=self.STRAND_ATTEMPTS)
         raise AssertionError("unreachable")
 
-    def _create_ignoring_outcome(self) -> None:
+    def _create_ignoring_outcome(self, confirmed_absent: Callable[[], bool]) -> None:
         # The create's response is not the subject: a stranded create fails or
-        # times out, and its run-marker cleanup stays armed either way.
+        # times out. When it fails the API deletes the sandbox, and the
+        # run-marker cleanup would find nothing to kill.
         try:
-            self._attempt_create()
+            self._attempt_create(confirmed_absent)
         except Exception:  # noqa: BLE001 - the outcome is judged from state
             pass
 
@@ -381,16 +394,18 @@ class RetiredExecutionPodGcAssertions:
         finally:
             release()
 
-    def plant_pending_with_ip(self, at: RetiredPod, *, template_pod: str) -> RetiredPod:
-        """A Pending clone at `at`'s name and identity with a pod IP: the reaper must leave it.
+    def plant_pending_with_ip(self, at: RetiredPod) -> RetiredPod:
+        """Swap `at`'s Pending pod for a clone with a pod IP: the reaper must leave it.
 
-        `at`'s own pod must be gone, so the clone is the only pod its retired
-        `replaced` row names.
+        The clone keeps the name and identity, so its execution row is still
+        the real `replaced` retirement; only the pod IP differs.
         """
 
-        template = self._control.restore_pod_document(template_pod)
-        self._fixture.verify(template is not None, "the template pod vanished", pod=template_pod)
+        template = self._control.restore_pod_document(at.name)
+        self._fixture.verify(template is not None, "the stranded pod vanished before the swap", pod=at.name)
         assert template is not None
+        self._control.delete_sandbox_pod_if_uid(at.name, at.uid)
+        self.expect_gone(at, timeout=60, message="the stranded pod was not deleted for the swap")
         token = secrets.token_hex(4)
         self._removals[token] = self._scope.defer(
             f"remove the planted pod {at.name}",
@@ -432,6 +447,19 @@ class RetiredExecutionPodGcAssertions:
         started = time.monotonic()
         while self._present(pod):
             self._fixture.verify(time.monotonic() - started < timeout, message, pod=pod.name, timeout_seconds=timeout)
+            self._fixture.wait(1)
+        return round(time.monotonic() - started, 1)
+
+    def expect_sandbox_deleted(self, pod: RetiredPod, *, timeout: float) -> float:
+        """The API deleted the ended create's sandbox; its run-marker cleanup has nothing to find."""
+
+        started = time.monotonic()
+        while self._control.sandbox_row_exists(pod.sandbox_id):
+            self._fixture.verify(
+                time.monotonic() - started < timeout,
+                "the ended create's sandbox was not deleted",
+                sandbox_id=pod.sandbox_id,
+            )
             self._fixture.wait(1)
         return round(time.monotonic() - started, 1)
 

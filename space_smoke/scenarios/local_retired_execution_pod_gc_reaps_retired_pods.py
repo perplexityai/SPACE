@@ -19,8 +19,8 @@ CREATE_END_SECONDS = 240
 # which state is judged.
 @smoke.scenario(
     "local.retired_execution_pod_gc_reaps_retired_pods",
-    # A cold create, an idle suspend, two stranded creates (each up to three
-    # attempts), an API restart, two controller rollouts there and back, and
+    # A cold create, an idle suspend, three stranded creates (each up to three
+    # attempts), two API restarts, two controller rollouts there and back, and
     # the survival windows.
     sandbox=smoke.SandboxConfig(timeout=1800),
 )
@@ -46,14 +46,18 @@ def retired_execution_pod_gc_reaps_retired_pods(test: smoke.KindEcw) -> None:
             cancelled, timeout=60, message="the ended create left its retired Pending pod behind"
         )
         test.record("create_cleanup_deleted_pod_after_seconds", took)
+        gc.expect_sandbox_deleted(cancelled, timeout=60)
 
-    with test.phase("a stranded create whose API is killed leaves its Pending pod"):
+    with test.phase("two stranded creates whose API is killed leave their Pending pods"):
         stranded, create = gc.strand_cold_create()
         gc.kill_public_api()
         create.join(timeout=CREATE_END_SECONDS)
+        to_swap, create = gc.strand_cold_create()
+        gc.kill_public_api()
+        create.join(timeout=CREATE_END_SECONDS)
 
-    with test.phase("plant a Pending pod with a pod IP on the deleted pod's retired row"):
-        with_ip = gc.plant_pending_with_ip(cancelled, template_pod=stranded.name)
+    with test.phase("swap one stranded pod for a Pending clone with a pod IP"):
+        with_ip = gc.plant_pending_with_ip(to_swap)
 
     with test.phase("GC off: the retired pods stay"):
         gc.expect_persist(suspended, stranded, with_ip, seconds=GC_OFF_WINDOW_SECONDS, record_key="gc_off_kept")

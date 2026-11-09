@@ -859,6 +859,10 @@ class RetiredExecutionPodGcControl(Protocol):
         """The GC's reap counter in the stack's metrics intake since `since_epoch`, keyed `mode/verdict`."""
         ...
 
+    def sandbox_row_exists(self, sandbox_id: str) -> bool:
+        """Whether the control plane still has the sandbox's row."""
+        ...
+
     def run_sandbox_ids(self, sibling_sandbox_id: str) -> list[str]:
         """Every sandbox id carrying the same smoke run marker as the sibling's row."""
         ...
@@ -884,6 +888,10 @@ class RetiredExecutionPodGcControl(Protocol):
 
     def plant_pending_pod_with_ip(self, manifest: Mapping[str, Any], *, pod_ip: str) -> str:
         """Create an unschedulable pod and set a status pod IP and `PodReadyToStartContainers=False`; its uid."""
+        ...
+
+    def delete_sandbox_pod_if_uid(self, pod_name: str, uid: str) -> None:
+        """Delete one sandbox pod at once under a UID precondition; absent is success."""
         ...
 
     def remove_planted_pods(self, token: str) -> None:
