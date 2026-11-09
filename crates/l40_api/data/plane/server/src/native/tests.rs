@@ -2364,6 +2364,8 @@ struct ProcessFake {
     bound_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
     calls: Arc<std::sync::Mutex<Vec<String>>>,
     started_stdin: Arc<std::sync::Mutex<Vec<bool>>>,
+    /// Whether the guest lists the session's process as running.
+    running: Arc<AtomicBool>,
 }
 
 impl ProcessFake {
@@ -2413,6 +2415,7 @@ async fn spawn_process_fake(
         bound_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         started_stdin: Arc::new(std::sync::Mutex::new(Vec::new())),
+        running: Arc::new(AtomicBool::new(true)),
     };
     let bound = Arc::clone(&fake.bound);
     let calls = Arc::clone(&fake.calls);
@@ -2421,6 +2424,7 @@ async fn spawn_process_fake(
     let release = Arc::clone(&fake.release);
     let bind_started = Arc::clone(&fake.bind_started);
     let bound_process_ids = Arc::clone(&fake.bound_process_ids);
+    let running = Arc::clone(&fake.running);
     let service = axum::Router::new().fallback(move |request: Request<Body>| {
         let mut route = route.clone();
         let process_id = process_id.clone();
@@ -2433,6 +2437,7 @@ async fn spawn_process_fake(
         let calls = Arc::clone(&calls);
         let started_stdin = Arc::clone(&started_stdin);
         let route_lookups = Arc::clone(&route_lookups);
+        let running = Arc::clone(&running);
         async move {
             let path = request.uri().path().to_string();
             calls.lock().unwrap().push(path.clone());
@@ -2464,6 +2469,21 @@ async fn spawn_process_fake(
             }
             if path.ends_with("/RecordDataPlaneSessionReconnect") {
                 return crate::tests::grpc_test_response(Vec::new());
+            }
+            if path.ends_with("/SpacedListProcesses") {
+                let processes = if running.load(Ordering::SeqCst) {
+                    vec![pplx_space_sbx_mgr_client::operations::ProcessInfo {
+                        process_id: process_id.clone(),
+                        pid: 42,
+                        ..Default::default()
+                    }]
+                } else {
+                    Vec::new()
+                };
+                return crate::tests::grpc_test_response(
+                    pplx_space_sbx_mgr_client::proto::SpacedListProcessesResponse { processes }
+                        .encode_to_vec(),
+                );
             }
             let open = if path.ends_with("/SpacedWatch") {
                 // A file-watch session's watch is answered as a start, so a
@@ -2790,6 +2810,96 @@ async fn evicted_output_continues_where_the_guest_reports_the_stream_starts() {
     assert_eq!(stdout_text(&resumed), "three\nfour\n");
     assert_ids_above(&resumed, gap);
     assert_eq!(*fake.opens.lock().unwrap(), connects(&[Some(0), Some(2)]));
+}
+
+/// A guest too old to say where its retained output starts answers an
+/// evicted cursor with a bare lag status. Once the process has exited, and
+/// the guest no longer lists it as running, the stream finds that start
+/// itself and continues there behind one `resync_required`, as with a guest
+/// that reports it; ids keep their positions, so a resume from the gap's id
+/// is exact. While the process runs, the stream follows the live tail.
+#[tokio::test]
+async fn exited_output_from_a_guest_that_does_not_report_its_start_continues_there() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    const LINES: [&str; 8] = ["1\n", "2\n", "3\n", "4\n", "5\n", "6\n", "7\n", "8\n"];
+    const FIRST_RETAINED: u64 = 5;
+    for has_exited in [true, false] {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let fake = spawn_journal_fake(
+            session_id,
+            true,
+            Arc::new(|_, open| match open {
+                FakeOpen::Connect(Some(cursor)) if cursor < FIRST_RETAINED => {
+                    vec![connected(), untagged_lagged()]
+                }
+                // Past the output, such a guest sends the exit.
+                FakeOpen::Connect(Some(cursor)) => {
+                    let mut replies = vec![connected()];
+                    replies.extend(LINES.iter().skip(cursor as usize).map(|line| stdout(line)));
+                    replies.push(exited());
+                    replies
+                }
+                FakeOpen::Connect(None) => vec![started(), stdout("live\n"), exited()],
+                FakeOpen::Start => panic!("the process is already bound"),
+            }),
+        )
+        .await;
+        fake.running.store(!has_exited, Ordering::SeqCst);
+
+        let frames = process_events_to_close(&fake.endpoint, session_id, None).await;
+
+        assert_eq!(
+            resync_reasons(&frames),
+            ["cursor_out_of_window"],
+            "{has_exited}"
+        );
+        if !has_exited {
+            assert_eq!(stdout_text(&frames), "live\n");
+            assert_eq!(*fake.opens.lock().unwrap(), connects(&[Some(0), None]));
+            continue;
+        }
+        assert_eq!(
+            stdout_text(&frames),
+            LINES[FIRST_RETAINED as usize..].concat()
+        );
+        // The exit must not call this transcript whole: cursors 0 to 4 were
+        // skipped. A data plane that reports `output_truncated` says `true`;
+        // one that predates it omits it.
+        let exits: Vec<_> = frames_of_type(&frames, "process_exited").collect();
+        assert_eq!(exits.len(), 1, "{frames:?}");
+        assert!(
+            matches!(
+                exits[0].1.get("output_truncated"),
+                None | Some(serde_json::Value::Bool(true))
+            ),
+            "{:?}",
+            exits[0].1
+        );
+        let gap = frames_of_type(&frames, "resync_required")
+            .next()
+            .unwrap()
+            .0
+            .unwrap();
+        let resumed = process_events_to_close(&fake.endpoint, session_id, Some(gap)).await;
+        assert_eq!(resync_reasons(&resumed), Vec::<String>::new());
+        assert_eq!(
+            stdout_text(&resumed),
+            LINES[FIRST_RETAINED as usize..].concat()
+        );
+        let opens = fake.opens.lock().unwrap();
+        assert_eq!(opens.first(), Some(&FakeOpen::Connect(Some(0))));
+        assert_eq!(
+            opens.iter().rev().take(2).collect::<Vec<_>>(),
+            [
+                &FakeOpen::Connect(Some(FIRST_RETAINED)),
+                &FakeOpen::Connect(Some(FIRST_RETAINED))
+            ],
+            "the stream and its resume both read from the oldest retained output: {opens:?}"
+        );
+        assert!(!opens.contains(&FakeOpen::Connect(None)), "{opens:?}");
+    }
 }
 
 /// A guest older than the lag reason does not say where its retained output
