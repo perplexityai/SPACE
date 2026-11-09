@@ -276,8 +276,9 @@ class _Ecw:
         *,
         attempts: int = 10,
         interval_seconds: float = 1,
+        absent_ok: bool = False,
     ) -> None:
-        del attempts, interval_seconds
+        del attempts, interval_seconds, absent_ok
         self.trace.append(f"ecw.kill-matching:{metadata['space_smoke_run']}")
 
     def attempt_create(

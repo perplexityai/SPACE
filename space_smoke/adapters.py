@@ -564,6 +564,14 @@ NODE_API = "node-api"
 WORKER_NODE_CTL_DAEMONSET = f"space-{NODE_CTL}"
 UNANSWERED_TEMPLATE_EVICT_AFTER_ENV = "SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS"
 UNANSWERED_TEMPLATE_EVICT_AFTER_BOUNDS = (10, 600)
+# Node memory admission scenarios: the worker node-manager DaemonSet's
+# `--memory-admission-reserve-mib` (the one knob of node-mgr's admission rule,
+# read once at start), node-ctl's capacity clamp, and the API's fail-fast.
+WORKER_NODE_MANAGER_DAEMONSET = f"space-{NODE_MANAGER}"
+MEMORY_ADMISSION_RESERVE_FLAG = "--memory-admission-reserve-mib"
+NETWORK_SLOTS_MEMORY_CLAMP_ENV = "SPACE_NETWORK_SLOTS_MEMORY_CLAMP"
+CREATE_FAIL_FAST_ENV = "SPACE_CREATE_FAIL_FAST_ON_NODE_REJECTION"
+NETWORK_SLOTS_RESOURCE = "space.pplx.net/network-slots"
 NODE_TEMPLATE_PRESENCE_PREFIX = "space.pplx.net/template-build-"
 # The node services that read the object store, by DaemonSet and the
 # container that does: each holds the store's static keys in
@@ -1171,6 +1179,7 @@ class KindHarness:
         self._public_api_lease_ownership: _LeaseOwnership | None = None
         self._drain_gate_lease_ownership: _LeaseOwnership | None = None
         self._node_ctl_lease_ownership: _LeaseOwnership | None = None
+        self._node_manager_lease_ownership: _LeaseOwnership | None = None
         # The public API autoscaler's bounds before `scale_public_api` pinned
         # them: (name, uid, minReplicas, maxReplicas).
         self._public_api_autoscaler_bounds: tuple[str, str, int, int] | None = None
@@ -5267,6 +5276,14 @@ ON CONFLICT (key_hash) DO NOTHING;
         pods = [_sandbox_pod_view(pod) for pod in json.loads(result.stdout or "{}").get("items", [])]
         return sorted(pods, key=lambda p: p.pod_name)
 
+    def all_sandbox_pods(self) -> list[SandboxPodView]:
+        """Every pod in the sandbox namespace, whichever sandbox owns it."""
+
+        result = self.kubectl("get", "pods", "-o", "json", timeout=15, namespace=KIND_SANDBOX_NAMESPACE)
+        _require_ok(result, "list sandbox namespace pods")
+        pods = [_sandbox_pod_view(pod) for pod in json.loads(result.stdout or "{}").get("items", [])]
+        return sorted(pods, key=lambda p: p.pod_name)
+
     def watch_sandbox_pods(self, sandbox_id: str) -> KubectlPodWatch:
         selector = quote(f"{SANDBOX_ID_LABEL}={_sql_uuid(sandbox_id)}", safe="")
         path = f"/api/v1/namespaces/{KIND_SANDBOX_NAMESPACE}/pods?labelSelector={selector}"
@@ -5556,6 +5573,183 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"set env on {WORKER_NODE_CTL_DAEMONSET}",
         )
         self._await_daemonset_rollout(WORKER_NODE_CTL_DAEMONSET, timeout=300)
+
+    # --- node memory admission: node-manager, node-ctl and API knobs -----------
+    #
+    # Each knob is captured literally and put back verbatim. node-manager's
+    # reserve is a command flag (it has no env), so its whole container
+    # `command` is captured and restored.
+
+    def acquire_node_manager_mutation(self) -> Callable[[], None]:
+        context_hash = hashlib.sha256(self.config.context.encode()).hexdigest()[:16]
+        ownership = self._acquire_named_mutation_lease(
+            f"space-smoke-node-manager-{context_hash}", "worker node-manager DaemonSet mutation"
+        )
+        self._node_manager_lease_ownership = ownership
+
+        def release() -> None:
+            self._release_lease(ownership)
+            if self._node_manager_lease_ownership is ownership:
+                self._node_manager_lease_ownership = None
+
+        return release
+
+    def _node_manager_container(self) -> tuple[int, dict[str, Any]]:
+        daemonset = json.loads(
+            _require_ok(
+                self.kubectl("get", "daemonset", WORKER_NODE_MANAGER_DAEMONSET, "-o", "json", timeout=15),
+                f"read {WORKER_NODE_MANAGER_DAEMONSET}",
+            )
+        )
+        containers = daemonset["spec"]["template"]["spec"]["containers"]
+        for index, container in enumerate(containers):
+            if container.get("name") == NODE_MANAGER:
+                return index, container
+        raise SmokeConfigurationError(f"{WORKER_NODE_MANAGER_DAEMONSET} has no {NODE_MANAGER} container")
+
+    def node_manager_command(self) -> tuple[str, ...]:
+        _, container = self._node_manager_container()
+        if container.get("args"):
+            raise SmokeConfigurationError(
+                f"{WORKER_NODE_MANAGER_DAEMONSET} sets container args; refusing to edit its command"
+            )
+        return tuple(container.get("command") or ())
+
+    def set_node_manager_memory_admission_reserve(
+        self, standing: Sequence[str], mib: int | None, *, nodes: Sequence[str] | None = None
+    ) -> None:
+        """Run node-manager with `standing` plus the reserve flag (none when `mib` is None).
+
+        With `nodes`, only node-manager on those nodes gets the flag: the
+        command becomes a `sh -c` that adds it when `KUBE_NODE_NAME` (the
+        pod's `spec.nodeName`) is one of them and runs `standing` unchanged
+        elsewhere.
+        """
+
+        if mib is not None and (isinstance(mib, bool) or not isinstance(mib, int) or mib < 0):
+            raise ValueError(f"refusing a memory admission reserve of {mib!r} MiB")
+        if not standing or any(arg.startswith(MEMORY_ADMISSION_RESERVE_FLAG) for arg in standing):
+            raise SmokeConfigurationError(
+                f"refusing to edit a {NODE_MANAGER} command that is empty or already sets "
+                f"{MEMORY_ADMISSION_RESERVE_FLAG}: {list(standing)}"
+            )
+        command = list(standing)
+        if mib is not None and nodes is not None:
+            names = [_kube_node_name(node) for node in nodes]
+            if not names:
+                raise ValueError("refusing a per-node memory admission reserve for no node")
+            script = (
+                f'case "$KUBE_NODE_NAME" in {"|".join(names)}) '
+                f'exec "$@" {MEMORY_ADMISSION_RESERVE_FLAG}={mib};; *) exec "$@";; esac'
+            )
+            command = ["/bin/sh", "-c", script, NODE_MANAGER, *standing]
+        elif mib is not None:
+            command.append(f"{MEMORY_ADMISSION_RESERVE_FLAG}={mib}")
+        self._write_node_manager_command(command)
+
+    def _write_node_manager_command(self, command: Sequence[str]) -> None:
+        self._require_isolated_kind("worker node-manager command override")
+        ownership = self._node_manager_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                "refusing a worker node-manager DaemonSet write without the caller's live mutation Lease"
+            )
+        self._assert_lease_owned(ownership, "a worker node-manager DaemonSet write")
+        index, container = self._node_manager_container()
+        if list(container.get("command") or ()) != list(command):
+            patch = [{"op": "replace", "path": f"/spec/template/spec/containers/{index}/command",
+                      "value": list(command)}]
+            _require_ok(
+                self.kubectl(
+                    "patch", "daemonset", WORKER_NODE_MANAGER_DAEMONSET, "--type=json",
+                    "-p", json.dumps(patch), timeout=30,
+                ),
+                f"set the {NODE_MANAGER} command",
+            )
+        self._await_daemonset_rollout(WORKER_NODE_MANAGER_DAEMONSET, timeout=300)
+
+    def network_slots_memory_clamp_env(self) -> str | None:
+        result = self.kubectl(
+            "get", "daemonset", WORKER_NODE_CTL_DAEMONSET, "-o",
+            f"jsonpath={{.spec.template.spec.containers[?(@.name=='{NODE_CTL}')].env}}",
+            timeout=15,
+        )
+        _require_ok(result, f"read env of {WORKER_NODE_CTL_DAEMONSET}")
+        return _env_literals(
+            json.loads(result.stdout or "[]"), (NETWORK_SLOTS_MEMORY_CLAMP_ENV,),
+            owner=WORKER_NODE_CTL_DAEMONSET,
+            value_from_refusal="; refusing to override what a literal restore could not put back",
+        )[NETWORK_SLOTS_MEMORY_CLAMP_ENV]
+
+    def set_network_slots_memory_clamp_env(self, value: str | None) -> None:
+        self._require_isolated_kind("worker node-ctl env override")
+        ownership = self._node_ctl_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                "refusing a worker node-ctl DaemonSet write without the caller's live mutation Lease"
+            )
+        self._assert_lease_owned(ownership, "a worker node-ctl DaemonSet write")
+        key = NETWORK_SLOTS_MEMORY_CLAMP_ENV
+        _require_ok(
+            self.kubectl(
+                "set", "env", f"daemonset/{WORKER_NODE_CTL_DAEMONSET}", "-c", NODE_CTL,
+                f"{key}-" if value is None else f"{key}={value}", timeout=30,
+            ),
+            f"set env on {WORKER_NODE_CTL_DAEMONSET}",
+        )
+        self._await_daemonset_rollout(WORKER_NODE_CTL_DAEMONSET, timeout=300)
+
+    def create_fail_fast_env(self) -> str | None:
+        return self.public_api_env((CREATE_FAIL_FAST_ENV,))[CREATE_FAIL_FAST_ENV]
+
+    def set_create_fail_fast_env(self, value: str | None) -> None:
+        self._require_isolated_kind("public API env override")
+        ownership = self._held_public_api_lease("a public API create fail-fast override")
+        self._assert_lease_owned(ownership, "a public API create fail-fast override")
+        key = CREATE_FAIL_FAST_ENV
+        name = self._public_api_deployment()
+        container = self._public_api_container(name)
+        with self._fast_rollout(name, ownership):
+            _require_ok(
+                self.kubectl(
+                    "set", "env", f"deploy/{name}", "-c", container,
+                    f"{key}-" if value is None else f"{key}={value}", timeout=30,
+                ),
+                "set the public API create fail-fast env",
+            )
+            self.wait_public_api_rollout(timeout=240)
+        self.wait_public_api_ready(timeout=120)
+
+    def advertised_network_slots(self, node_name: str) -> int | None:
+        node = json.loads(
+            _require_ok(
+                self.kubectl("get", "node", _kube_node_name(node_name), "-o", "json", timeout=15),
+                f"read Node {node_name}",
+            )
+        )
+        value = (node.get("status") or {}).get("allocatable", {}).get(NETWORK_SLOTS_RESOURCE)
+        return int(value) if value is not None else None
+
+    def bound_network_slot_requests(self, node_name: str) -> int:
+        """Network slots requested by the non-terminal pods bound to the node, as the scheduler counts them."""
+
+        pods = json.loads(
+            _require_ok(
+                self.kubectl(
+                    "get", "pods", "-A", "--field-selector",
+                    f"spec.nodeName={_kube_node_name(node_name)}", "-o", "json", timeout=15,
+                ),
+                f"list pods on {node_name}",
+            )
+        ).get("items", [])
+        total = 0
+        for pod in pods:
+            if (pod.get("status") or {}).get("phase") in {"Succeeded", "Failed"}:
+                continue
+            for container in pod["spec"].get("containers", []):
+                requested = ((container.get("resources") or {}).get("requests") or {}).get(NETWORK_SLOTS_RESOURCE)
+                total += int(requested or 0)
+        return total
 
     def _await_daemonset_rollout(self, name: str, *, timeout: float) -> None:
         """`rollout status`, then until each node runs one pod and none is Terminating.
@@ -8875,6 +9069,7 @@ class EcwSdk:
         *,
         attempts: int = 10,
         interval_seconds: float = 1.0,
+        absent_ok: bool = False,
     ) -> None:
         if attempts <= 0:
             raise ValueError("reconciliation attempts must be positive")
@@ -8898,6 +9093,8 @@ class EcwSdk:
                 return
             if attempt + 1 < attempts:
                 time.sleep(interval_seconds)
+        if absent_ok:
+            return
         raise RuntimeError(
             "sandbox create may have committed, but no sandbox became visible "
             "during run-metadata reconciliation"

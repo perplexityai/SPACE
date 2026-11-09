@@ -8,7 +8,7 @@ import secrets
 import shutil
 import time
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from threading import Lock
@@ -398,6 +398,7 @@ class SmokeServices:
             fixture._orphaned_restore_pod_gc_control = cast(Any, kind)
             fixture._reconcile_queue_gc_control = cast(Any, kind)
             fixture._unanswered_template_control = cast(Any, kind)
+            fixture._node_memory_admission_control = cast(Any, kind)
             fixture._template_build_control = cast(Any, kind)
             fixture._template_builder = cast(Any, self.ecw)
             fixture._rate_limit_probe = cast(Any, self.ecw)
@@ -847,12 +848,19 @@ class _ScenarioSandboxes:
         *,
         allow_internet_access: bool | None = None,
         network: NetworkConfig | None = None,
+        definitive_statuses: Collection[int] = (),
     ) -> EcwCreateAttempt:
         """Issue a tracked raw create when the HTTP response is the invariant."""
 
         create_metadata = self._create_metadata()
         observed_ids: list[str] = []
-        cleanup = self._arm_cleanup(create_metadata, [], observed_ids=observed_ids)
+        status: list[int] = []
+        cleanup = self._arm_cleanup(
+            create_metadata,
+            [],
+            observed_ids=observed_ids,
+            absent_ok=lambda: bool(status) and status[0] in definitive_statuses,
+        )
         observed = self._ecw.attempt_create(
             template=self._template,
             timeout=self._timeout,
@@ -862,6 +870,7 @@ class _ScenarioSandboxes:
         )
         # A client rejection is definitive. Success and server failures remain
         # commit-ambiguous, so run-marker reconciliation stays armed for them.
+        status.append(observed.status_code)
         if 400 <= observed.status_code < 500:
             cleanup.disarm()
         if observed.sandbox_id is not None:
@@ -956,10 +965,13 @@ class _ScenarioSandboxes:
         *,
         reconcile_uncreated: Callable[[], bool] | None = None,
         observed_ids: list[str] | None = None,
+        absent_ok: Callable[[], bool] | None = None,
     ) -> Compensation:
         def delete() -> None:
             if created:
                 created[0].kill()
+            elif absent_ok is not None and absent_ok():
+                self._ecw.kill_matching(create_metadata, absent_ok=True)
             elif reconcile_uncreated is None or reconcile_uncreated():
                 self._ecw.kill_matching(create_metadata)
 

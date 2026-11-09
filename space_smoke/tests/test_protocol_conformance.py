@@ -31,6 +31,7 @@ PAIRS: tuple[tuple[str, type], ...] = tuple(
         ("OrphanedRestorePodGcControl", adapters.KindHarness),
         ("ReconcileQueueGcControl", adapters.KindHarness),
         ("UnansweredTemplateEvictionControl", adapters.KindHarness),
+        ("NodeMemoryAdmissionControl", adapters.KindHarness),
         ("TemplateBuildControl", adapters.KindHarness),
         ("SandboxNetworkIsolationControl", adapters.KindHarness),
         ("ConcurrentRestoreControl", adapters.KindHarness),
