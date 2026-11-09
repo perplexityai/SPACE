@@ -272,7 +272,13 @@ fn invalid_candidate_consumes_attempt_then_next_start_restores_committed() {
     let (_dir, store, old) = fixture();
     let boot = Uuid::now_v7();
     let _attempt = arm(&store, boot);
-    fs::write(store.slot_path(Slot::B).join("spaced"), b"bad").unwrap();
+    fs::write(
+        store
+            .slot_path(Slot::B)
+            .join(files::binary_name(Binary::Cli)),
+        b"bad",
+    )
+    .unwrap();
     let Err(_) = store.select(boot, 1) else {
         panic!("operation must be rejected");
     };
@@ -465,7 +471,13 @@ fn selection_samples_clock_only_after_committed_verification() {
     let (_dir, store, _) = fixture();
     let boot = Uuid::now_v7();
     let _attempt = arm(&store, boot);
-    fs::write(store.slot_path(Slot::A).join("spaced"), b"corrupt").unwrap();
+    fs::write(
+        store
+            .slot_path(Slot::A)
+            .join(files::binary_name(Binary::Cli)),
+        b"corrupt",
+    )
+    .unwrap();
     let sampled = std::cell::Cell::new(false);
     let result = store.select_with_clock(|| {
         sampled.set(true);
