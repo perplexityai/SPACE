@@ -35,6 +35,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from space_smoke.adapters import MEMORY_ADMISSION_RESERVE_FLAG
 from space_smoke.capabilities import EcwCreateAttempt, NodeMemoryAdmissionControl
 from space_smoke.runtime import Compensation, ResourceScope
 
@@ -114,11 +115,16 @@ class NodeMemoryAdmissionAssertions:
         self._fixture.record("memory_clamp_env_before", clamp)
         self._fixture.record("create_fail_fast_env_before", fail_fast)
         # No chart sets these, so a value here is one an earlier run left behind.
+        # The reserve flag counts anywhere in the command, including inside a
+        # leaked per-node `sh -c` wrapper.
+        leaked_reserve = any(MEMORY_ADMISSION_RESERVE_FLAG in arg for arg in command)
         self._fixture.verify(
-            clamp is None and fail_fast is None,
-            "the memory clamp or create fail-fast env is already set; an earlier run likely left it behind",
+            clamp is None and fail_fast is None and not leaked_reserve,
+            "the memory clamp, create fail-fast env, or node-manager reserve flag is already set; "
+            "an earlier run likely left it behind",
             clamp=clamp,
             fail_fast=fail_fast,
+            node_manager_command=list(command),
         )
         # Armed before any write, so a write that half-applies is still put back.
         self._arm(

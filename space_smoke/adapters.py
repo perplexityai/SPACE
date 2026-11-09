@@ -5628,7 +5628,7 @@ ON CONFLICT (key_hash) DO NOTHING;
 
         if mib is not None and (isinstance(mib, bool) or not isinstance(mib, int) or mib < 0):
             raise ValueError(f"refusing a memory admission reserve of {mib!r} MiB")
-        if not standing or any(arg.startswith(MEMORY_ADMISSION_RESERVE_FLAG) for arg in standing):
+        if not standing or any(MEMORY_ADMISSION_RESERVE_FLAG in arg for arg in standing):
             raise SmokeConfigurationError(
                 f"refusing to edit a {NODE_MANAGER} command that is empty or already sets "
                 f"{MEMORY_ADMISSION_RESERVE_FLAG}: {list(standing)}"
