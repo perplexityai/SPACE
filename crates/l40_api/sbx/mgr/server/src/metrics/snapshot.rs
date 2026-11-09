@@ -46,6 +46,10 @@ use std::time::Instant;
 use pplx_space_metrics_emit::{counter, elapsed_ms, gauge, metric_vocabulary, tag, timing_ms};
 
 /// Bounded `size_bucket:` tag value for a snapshot or artifact of `bytes`.
+/// Callers pass apparent (logical) bytes, the same size vol-mgr reports as an
+/// upload's bytes, so one snapshot lands in the same bucket on create and on
+/// delivery. Sparse holes count, so this tracks VM size rather than bytes
+/// written to disk.
 pub fn size_bucket(bytes: u64) -> &'static str {
     const GIB: u64 = 1 << 30;
     match bytes {

@@ -1430,7 +1430,8 @@ pub(in crate::service) enum RetainedUploadError {
 }
 
 /// Apparent size of the files a published snapshot directory holds, for the
-/// create metrics' size bucket. `None` when the directory can't be read.
+/// create metrics' size bucket. The directory is flat: each artifact is a
+/// top-level file. `None` when the directory can't be read.
 async fn published_snapshot_bytes(dir: &std::path::Path) -> Option<u64> {
     let mut entries = tokio::fs::read_dir(dir).await.ok()?;
     let mut total = 0u64;
