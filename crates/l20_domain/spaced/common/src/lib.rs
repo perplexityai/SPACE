@@ -16,7 +16,9 @@ pub mod proto {
         pub use super::activity::*;
     }
 
-    pub use pplx_space_spaced_guest_protocol::proto::{bridge_guest, operations, platform, worker};
+    pub use pplx_space_spaced_guest_protocol::proto::{
+        bridge_guest, operations, platform, update, worker,
+    };
 
     pub mod activity {
         tonic::include_proto!("space.spaced.activity.v1");
@@ -52,7 +54,7 @@ pub mod proto {
 /// travels as one DATA frame instead of five.
 pub const BULK_HTTP2_MAX_FRAME_SIZE: u32 = 256 * 1024;
 
-pub use pplx_space_spaced_guest_protocol::admission_queue;
+pub use pplx_space_spaced_guest_protocol::{admission_queue, update};
 mod compatibility;
 pub use compatibility::spaced_guest_requires_platform_descriptor;
 mod error;

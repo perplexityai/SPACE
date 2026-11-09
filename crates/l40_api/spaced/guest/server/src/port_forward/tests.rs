@@ -399,6 +399,7 @@ async fn start_forwarder_with_limits(
         Arc::new(tokio::sync::Semaphore::new(active_connection_limit)),
         idle_timeout,
         cancel.clone(),
+        None,
     ));
     (bind_addr, cancel, join)
 }

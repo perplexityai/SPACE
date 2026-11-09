@@ -86,6 +86,7 @@ mod authorization;
 mod bridge;
 mod compat;
 mod guest_connection;
+mod update;
 use guest_connection::OperationClient;
 use pplx_space_spaced_common::proto::platform::GuestOperation;
 mod filesystem;
@@ -231,6 +232,7 @@ impl GuestReadinessCoordinator {
 }
 
 struct SpacedHostServiceInner {
+    update: update::HostUpdate,
     guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
     shutdown: CancellationToken,
     socket_path: PathBuf,
