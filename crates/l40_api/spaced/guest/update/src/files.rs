@@ -3,12 +3,24 @@ use aws_lc_rs::digest::{Context, SHA256};
 use pplx_space_spaced_update::BinaryIdentity;
 
 pub(crate) fn directory(path: &Path) -> Result<(), UpdateError> {
-    if !fs::symlink_metadata(path)?.is_dir() {
+    let metadata = fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Err(UpdateError::Layout);
+        }
+    }
+    if !metadata.is_dir() {
         return Err(UpdateError::Layout);
     }
     Ok(())
 }
 
+#[cfg(unix)]
 pub(crate) fn open_regular(path: &Path) -> Result<File, UpdateError> {
     let file = OpenOptions::new()
         .read(true)
@@ -40,10 +52,15 @@ pub(crate) fn remove_file_if_present(path: &Path) -> Result<(), UpdateError> {
 }
 
 pub(crate) fn verify_binary(path: &Path, expected: &BinaryIdentity) -> Result<(), UpdateError> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     let mut file = open_regular(path)?;
     let metadata = file.metadata()?;
-    if metadata.len() != expected.length || metadata.permissions().mode() & 0o111 == 0 {
+    if metadata.len() != expected.length {
+        return Err(UpdateError::Identity);
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
         return Err(UpdateError::Identity);
     }
     let mut context = Context::new(&SHA256);
@@ -70,3 +87,49 @@ pub(crate) fn verify_binary(path: &Path, expected: &BinaryIdentity) -> Result<()
     }
     Ok(())
 }
+
+#[cfg(unix)]
+pub(crate) fn create(path: &Path, executable: bool) -> Result<File, UpdateError> {
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(if executable { 0o700 } else { 0o600 })
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?)
+}
+#[cfg(unix)]
+pub(crate) fn replace(from: &Path, to: &Path) -> Result<(), UpdateError> {
+    fs::rename(from, to)?;
+    Ok(())
+}
+#[cfg(unix)]
+pub(crate) fn sync_directory(path: &Path) -> Result<(), UpdateError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+pub(crate) fn binary_name(binary: Binary) -> &'static str {
+    #[cfg(unix)]
+    {
+        binary.file_name()
+    }
+    #[cfg(windows)]
+    {
+        match binary {
+            Binary::Service => "spaced-svc.exe",
+            Binary::Cli => "spaced.exe",
+        }
+    }
+}
+pub(crate) fn seed_contract() -> &'static str {
+    #[cfg(unix)]
+    {
+        pplx_space_spaced_update::SEED_CONTRACT
+    }
+    #[cfg(windows)]
+    {
+        pplx_space_spaced_update::WINDOWS_SEED_CONTRACT
+    }
+}
+#[cfg(windows)]
+pub(crate) use super::windows::{create, open_regular, replace, sync_directory};

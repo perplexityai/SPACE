@@ -361,39 +361,107 @@ Windows APIs out of Unix builds. The service entry point selects the current
 OS backend explicitly. macOS retains its development/test capabilities; it is
 not a qualified sandbox guest image.
 
-## Guest update workstream
+## Guest update recovery
 
-Windows guest updates are under development. Existing images and host update
-policy still refuse this backend; publishing a descriptor does not enable it.
-The bundle publisher accepts `--platform windows --arch x86_64`, hashes
-`spaced-svc.exe` and `spaced.exe`, and records the reserved
-`windows-scm-two-slot-v1` recovery contract. Its schema-1 canonical encoding and
-logical service/CLI payload roles are unchanged. Linux remains the default.
-This packaging path requires both Windows executables from the build above.
-The native `spaced.exe --version` reports the workspace version, and
-`spaced.exe status` queries the installed service's SCM state and PID without
-requesting start/stop privileges. A Running state is not a live RPC probe.
-The Unix activity/shutdown commands are not exposed by this Windows CLI.
+The experimental Windows backend implements the same manager-owned guest
+update RPCs, version ordering, execution fences and host SQLite receipts as
+Linux. It requires an explicitly qualified `windows-scm-two-slot-v1` image;
+legacy Windows services remain usable and refuse maintenance RPCs. Automatic
+rollout remains disabled. See [guest updates](../../../docs/spaced-upgrades.md)
+for policy, qualification and manager commands.
 
-The implementation must retain the existing update RPC meanings, fencing,
-release versions, and host SQLite receipts. Windows paths remain local to the
-Windows backend. Current Linux selectors and host policy must continue to
-reject Windows bundles. No Windows capability is advertised until the native
-recovery path and its image have been qualified.
+Build the service and CLI together, then write their descriptor beside the two
+executables. Supply the clean source revision, actual build timestamp, workspace
+release and guest-update marker used for that build:
 
-The next implementation boundary is local recovery. Unlike the Linux
-pre-start selector, SCM start checkpoints and wait hints do not supply the
-independent bounded trial supervisor this feature requires. See Microsoft's
-[service startup contract](https://learn.microsoft.com/en-us/windows/win32/services/service-startup).
-The recovery design must kill a hung candidate, select the committed bundle
-after a crash or reboot, and release every mapped executable before reusing
-its slot. It must keep at most two agent bundles. Any separate template-owned
-bootstrap must be small, have an explicit compatibility contract, and have a
-documented replacement policy; copying an entire old agent into a permanent
-launcher would undermine the storage bound.
+```sh
+python3 scripts/build/agent-bundle.py "$BUNDLE_DIRECTORY" \
+  --platform windows --arch x86_64 \
+  --revision "$SOURCE_REVISION" --built-at "$BUILT_AT" \
+  --version "$WORKSPACE_VERSION" \
+  --guest-update-required-since "$GUEST_UPDATE_REQUIRED_SINCE"
+```
 
-Before enabling the backend, prove durable commit and rollback on NTFS, shared
-process/filesystem admission, Job Object descendant termination under force,
-empty-environment configuration, and boot/deadline identity across CH pause,
-restore and fork. Native Windows unit tests and cross-compilation are useful
-component checks; they do not qualify those VM lifecycle guarantees.
+`SOURCE_REVISION` is the full lowercase commit hash; `BUILT_AT` is a UTC RFC3339
+timestamp ending in `Z`. Both version values are stable SemVer releases, and the
+marker cannot be newer than the workspace version. The logical service/CLI roles
+and schema-1 canonical hashing stay unchanged. Image
+preparation runs `install-spaced.ps1 -Bundle <directory> -EnableOperations` as
+Administrator, with `recover-spaced.ps1` beside the installer. `-EnableOperations`
+is required for update-capable images because the candidate self-test validates
+filesystem access through the provisioned workload account. The directory
+must contain `artifact.json`, `spaced-svc.exe` and `spaced.exe`. This is image
+assembly, not a way to reset update history in a running guest. Remove the
+assembly inputs before capturing the image. The qualified layout requires
+`C:\ProgramData` and `C:\Windows` on the system drive.
+
+Only slots A and B contain agent bundles. Selectors are bounded regular files
+under `C:\ProgramData\SPACE\agent`, protected by SYSTEM/Administrators ACLs.
+Journal writes precede selector replacement; NTFS rename uses write-through
+and successful transitions flush the local volume. Reparse points are refused.
+Inactive-slot replacement refuses mapped executables and open payload handles.
+
+SCM runs the selected `spaced-svc.exe` directly. There is no separate launcher
+binary and no permanently running old agent. Two SYSTEM scheduled tasks invoke
+the committed agent's short `--recover-update` mode:
+
+- `SPACE-Guest-Recovery` runs at boot and after an SCM failure. The service is
+  demand-started, so the selector runs before every boot start. Arm and restart
+  also request this task after persisting intent.
+- `SPACE-Guest-Expiry` runs every minute with `--expired-only`, recovering armed
+  work, expired trials and stuck startup. It preserves an ordinary stopped
+  service when no maintenance needs settlement.
+
+The template-owned PowerShell entry point pins the committed executable while
+holding the journal lock, releases that lock, invokes recovery and closes the
+pin. This closes the read-selector/slot-reuse race without retaining a third
+copy. Its CLI, paths and journal interpretation are permanent seed ABI, just
+as Linux's selector entry point is. Changes require qualification against the
+previous committed release; incompatible behavior requires a new contract.
+
+Recovery checks current durable authority under the same disk lock as Commit.
+A late task does not roll back a committed candidate. It terminates the old
+service and its nested workload Job Objects, waits for their processes to
+exit, selects once, updates SCM's executable path and starts the next daemon.
+SCM checkpoint/wait-hint reports cannot extend the recovery-owned 30-second
+startup bound. A durable commit followed by a startup hang restarts the
+committed release. An uncommitted trial instead selects the fallback.
+
+The expiry cadence adds up to one minute before recovery begins. Each task has
+a 60-second execution limit and bounded retries; the manager retains its
+210-second activation budget, not a claimed 40-second Windows bound. A task
+execution limit alone does not kill a candidate: recovery explicitly terminates
+and reaps its workload job. Failures stay visible in Task Scheduler history and
+manager status. An unreadable journal is retried without replacing authority;
+malformed metadata on a stopped or startup-expired daemon falls back through
+the verified committed selector.
+
+The boot UUID lives in a volatile registry key and survives service restarts.
+The per-boot clock is `GetTickCount64`; recovery records the independent startup
+deadline before asking SCM to start. A cold boot creates a fresh UUID. CH memory
+restore retains guest kernel state, so the host's execution fence and restore
+configuration remain necessary. Qualification must cover pause, restore and
+fork; a successful native unit test does not establish those VM guarantees.
+
+The shared maintenance gate counts process/file RPCs, open streams, retained
+processes, live filesystem idempotency records and nested workload jobs. Force
+terminates them; it never replays interrupted work. Environment configuration
+uses Windows case-insensitive keys and accepts an empty map. Existing Windows
+image policy still governs customer-visible capabilities: guest update does not
+add PTYs, file watches or Linux loopback forwarding. Nonempty forwarding requests
+are explicitly refused instead of silently discarded.
+
+For image qualification, exercise committed crash recovery, failed candidate
+exec/self-test, missing and late confirmation, a fully hung candidate, durable
+commit before READY, boot interruption, force with descendants, two-slot reuse,
+and CH lifecycle restoration. Keep the template outside production admission
+until this matrix and the manager-driven canary pass.
+
+`node.windows_guest_update` is the manager-driven canary. Use the standalone
+node fixture above with `SPACE_SMOKE_NODE_RECOVERY=firmware-lifecycle`, a pinned
+updater-capable image, and an installed policy selecting a newer Windows bundle.
+It checks idle commit, repeated apply without restart, busy deferral, forced
+termination of a parent and its child, checkpoint admission, pause/resume,
+suspend/restore and cold-boot persistence. It creates and deletes its own VM.
+Recovery fault injection and explicit rollback/slot-reuse qualification remain
+additional checks; the canary does not replace them.
