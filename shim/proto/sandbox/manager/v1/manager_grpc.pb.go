@@ -21,6 +21,9 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	SandboxManager_GuestUpdateStatus_FullMethodName                      = "/space.sandbox.manager.v1.SandboxManager/GuestUpdateStatus"
+	SandboxManager_ApplyGuestUpdate_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/ApplyGuestUpdate"
+	SandboxManager_RestartGuest_FullMethodName                           = "/space.sandbox.manager.v1.SandboxManager/RestartGuest"
 	SandboxManager_GetExecutionCapabilities_FullMethodName               = "/space.sandbox.manager.v1.SandboxManager/GetExecutionCapabilities"
 	SandboxManager_Create_FullMethodName                                 = "/space.sandbox.manager.v1.SandboxManager/Create"
 	SandboxManager_Start_FullMethodName                                  = "/space.sandbox.manager.v1.SandboxManager/Start"
@@ -108,6 +111,10 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type SandboxManagerClient interface {
+	// Node-local operator maintenance. Never wakes a dormant sandbox.
+	GuestUpdateStatus(ctx context.Context, in *GuestUpdateStatusRequest, opts ...grpc.CallOption) (*GuestUpdateOperation, error)
+	ApplyGuestUpdate(ctx context.Context, in *ApplyGuestUpdateRequest, opts ...grpc.CallOption) (*GuestUpdateOperation, error)
+	RestartGuest(ctx context.Context, in *RestartGuestRequest, opts ...grpc.CallOption) (*GuestUpdateOperation, error)
 	// Advisory readiness only. The environment input also fails closed on old readers.
 	GetExecutionCapabilities(ctx context.Context, in *GetExecutionCapabilitiesRequest, opts ...grpc.CallOption) (*GetExecutionCapabilitiesResponse, error)
 	// Create a new sandbox (allocate resources, prepare filesystem) without starting the VM.
@@ -326,6 +333,36 @@ type sandboxManagerClient struct {
 
 func NewSandboxManagerClient(cc grpc.ClientConnInterface) SandboxManagerClient {
 	return &sandboxManagerClient{cc}
+}
+
+func (c *sandboxManagerClient) GuestUpdateStatus(ctx context.Context, in *GuestUpdateStatusRequest, opts ...grpc.CallOption) (*GuestUpdateOperation, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GuestUpdateOperation)
+	err := c.cc.Invoke(ctx, SandboxManager_GuestUpdateStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) ApplyGuestUpdate(ctx context.Context, in *ApplyGuestUpdateRequest, opts ...grpc.CallOption) (*GuestUpdateOperation, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GuestUpdateOperation)
+	err := c.cc.Invoke(ctx, SandboxManager_ApplyGuestUpdate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) RestartGuest(ctx context.Context, in *RestartGuestRequest, opts ...grpc.CallOption) (*GuestUpdateOperation, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GuestUpdateOperation)
+	err := c.cc.Invoke(ctx, SandboxManager_RestartGuest_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *sandboxManagerClient) GetExecutionCapabilities(ctx context.Context, in *GetExecutionCapabilitiesRequest, opts ...grpc.CallOption) (*GetExecutionCapabilitiesResponse, error) {
@@ -1226,6 +1263,10 @@ func (c *sandboxManagerClient) ResolveSandboxMemory(ctx context.Context, in *Res
 // All implementations must embed UnimplementedSandboxManagerServer
 // for forward compatibility.
 type SandboxManagerServer interface {
+	// Node-local operator maintenance. Never wakes a dormant sandbox.
+	GuestUpdateStatus(context.Context, *GuestUpdateStatusRequest) (*GuestUpdateOperation, error)
+	ApplyGuestUpdate(context.Context, *ApplyGuestUpdateRequest) (*GuestUpdateOperation, error)
+	RestartGuest(context.Context, *RestartGuestRequest) (*GuestUpdateOperation, error)
 	// Advisory readiness only. The environment input also fails closed on old readers.
 	GetExecutionCapabilities(context.Context, *GetExecutionCapabilitiesRequest) (*GetExecutionCapabilitiesResponse, error)
 	// Create a new sandbox (allocate resources, prepare filesystem) without starting the VM.
@@ -1446,6 +1487,15 @@ type SandboxManagerServer interface {
 // pointer dereference when methods are called.
 type UnimplementedSandboxManagerServer struct{}
 
+func (UnimplementedSandboxManagerServer) GuestUpdateStatus(context.Context, *GuestUpdateStatusRequest) (*GuestUpdateOperation, error) {
+	return nil, status.Error(codes.Unimplemented, "method GuestUpdateStatus not implemented")
+}
+func (UnimplementedSandboxManagerServer) ApplyGuestUpdate(context.Context, *ApplyGuestUpdateRequest) (*GuestUpdateOperation, error) {
+	return nil, status.Error(codes.Unimplemented, "method ApplyGuestUpdate not implemented")
+}
+func (UnimplementedSandboxManagerServer) RestartGuest(context.Context, *RestartGuestRequest) (*GuestUpdateOperation, error) {
+	return nil, status.Error(codes.Unimplemented, "method RestartGuest not implemented")
+}
 func (UnimplementedSandboxManagerServer) GetExecutionCapabilities(context.Context, *GetExecutionCapabilitiesRequest) (*GetExecutionCapabilitiesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetExecutionCapabilities not implemented")
 }
@@ -1708,6 +1758,60 @@ func RegisterSandboxManagerServer(s grpc.ServiceRegistrar, srv SandboxManagerSer
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&SandboxManager_ServiceDesc, srv)
+}
+
+func _SandboxManager_GuestUpdateStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GuestUpdateStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).GuestUpdateStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_GuestUpdateStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).GuestUpdateStatus(ctx, req.(*GuestUpdateStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_ApplyGuestUpdate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ApplyGuestUpdateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).ApplyGuestUpdate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_ApplyGuestUpdate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).ApplyGuestUpdate(ctx, req.(*ApplyGuestUpdateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_RestartGuest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestartGuestRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).RestartGuest(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_RestartGuest_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).RestartGuest(ctx, req.(*RestartGuestRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _SandboxManager_GetExecutionCapabilities_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -3075,6 +3179,18 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "space.sandbox.manager.v1.SandboxManager",
 	HandlerType: (*SandboxManagerServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GuestUpdateStatus",
+			Handler:    _SandboxManager_GuestUpdateStatus_Handler,
+		},
+		{
+			MethodName: "ApplyGuestUpdate",
+			Handler:    _SandboxManager_ApplyGuestUpdate_Handler,
+		},
+		{
+			MethodName: "RestartGuest",
+			Handler:    _SandboxManager_RestartGuest_Handler,
+		},
 		{
 			MethodName: "GetExecutionCapabilities",
 			Handler:    _SandboxManager_GetExecutionCapabilities_Handler,
