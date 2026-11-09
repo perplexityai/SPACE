@@ -391,6 +391,7 @@ class SmokeServices:
             fixture._concurrent_restore_control = cast(Any, kind)
             fixture._rate_limiter_control = cast(Any, kind)
             fixture._node_group_control = cast(Any, kind)
+            fixture._parent_memory_control = cast(Any, kind)
             fixture._node_selector_extras_control = cast(Any, kind)
             fixture._node_fence_control = cast(Any, kind)
             fixture._pending_backup_control = cast(Any, kind)

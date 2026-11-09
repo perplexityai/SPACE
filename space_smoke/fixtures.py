@@ -24,6 +24,7 @@ from space_smoke.capabilities import (
     DrainGateControl,
     NodeDrainControl,
     NodeGroupControl,
+    ParentMemoryAdmissionControl,
     NodeFenceControl,
     NodeSelectorExtrasControl,
     PendingBackupControl,
@@ -104,6 +105,7 @@ from space_smoke.adapters import (
 from space_smoke.concurrent_restore import ConcurrentRestoreAssertions
 from space_smoke.node_drain import NodeDrainAssertions
 from space_smoke.node_groups import NodeGroupAssertions
+from space_smoke.parent_memory_admission import ParentMemoryAdmissionAssertions
 from space_smoke.node_fence import NodeFenceAssertions
 from space_smoke.node_selector_extras import NodeSelectorExtrasAssertions
 from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
@@ -2874,6 +2876,23 @@ class KindEcw(Ecw):
                 self, self._node_group_control, self._rate_limit_probe, self._context.scope
             )
         return self._node_group_assertions
+
+    _parent_memory_control: ParentMemoryAdmissionControl | None = None
+    _parent_memory_assertions: ParentMemoryAdmissionAssertions | None = None
+
+    @property
+    def parent_memory_admission(self) -> ParentMemoryAdmissionAssertions:
+        """Privileged assertions for memory admission against the sandbox parent cgroup."""
+
+        if self._parent_memory_control is None or self._rate_limit_probe is None:
+            raise SmokeConfigurationError(
+                "parent memory admission control is only available on the kind backend"
+            )
+        if self._parent_memory_assertions is None:
+            self._parent_memory_assertions = ParentMemoryAdmissionAssertions(
+                self, self._parent_memory_control, self._rate_limit_probe, self._context.scope
+            )
+        return self._parent_memory_assertions
 
     def admin_org_id(self) -> str:
         """The kind admin's org id, for admin routes that scope a resource to an org."""

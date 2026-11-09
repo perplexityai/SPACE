@@ -33,6 +33,8 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
+    CgroupMemory,
+    SandboxParentMemory,
     ControllerLease,
     ControllerPod,
     NodeContainer,
@@ -621,6 +623,15 @@ REDIS_REPLICAS_ANNOTATION = "space.pplx.net/smoke-redis-replicas"
 FAST_ROLLOUT_STANDING_ANNOTATION = "space.pplx.net/smoke-fast-rollout-standing"
 FAST_ROLLOUT_MAX_SURGE = "100%"
 DRAIN_KEEP_ANNOTATION = "space.pplx.net/drain-keep"
+# The parent-memory scenario's record of each worker's standing
+# `/sys/fs/cgroup/space/memory.max` (JSON node -> value), written before the
+# first change and cleared once every value is back.
+PARENT_MEMORY_MAX_ANNOTATION = "space.pplx.net/smoke-parent-memory-max"
+# Run a command in node-manager's mount namespace from the operator shell,
+# which shares the node's PID namespace.
+_IN_NODE_MANAGER_MOUNTS = (
+    "nsenter --mount --target \"$(pgrep -o -f /opt/space/bin/space-nodemgr-svc)\" --"
+)
 NODE_GROUP_BOUNDARY_LABEL = "node-restriction.kubernetes.io/space-node-group"
 NODE_GROUP_GATE_ENV = "SPACE_SANDBOX_NODE_GROUP_PLACEMENT"
 NODE_GROUP_LABELER_ENV = "SPACE_NODE_GROUP_LABELER_ENABLED"
@@ -6603,6 +6614,213 @@ ON CONFLICT (key_hash) DO NOTHING;
             return f"has no {container} container"
         missing = sorted(set(OBJECT_STORE_STATIC_KEYS) - static_keys(consumer)[0])
         return f"has container {container} lacking static keys ({', '.join(missing)})" if missing else ""
+
+    # --- sandbox parent cgroup memory (local.parent_memory_admission) ---------
+
+    def acquire_parent_memory_mutation(self) -> Callable[[], None]:
+        context_hash = hashlib.sha256(self.config.context.encode()).hexdigest()[:16]
+        name = f"space-smoke-parent-memory-{context_hash}"
+
+        def repair(previous: Mapping[str, object], ownership: _LeaseOwnership) -> None:
+            metadata = previous.get("metadata")
+            annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+            recorded = (
+                annotations.get(PARENT_MEMORY_MAX_ANNOTATION)
+                if isinstance(annotations, dict)
+                else None
+            )
+            if isinstance(recorded, str) and recorded:
+                self._assert_lease_owned(ownership, "an orphaned parent-memory repair")
+                self._restore_parent_memory_from(name, json.loads(recorded))
+
+        ownership = self._acquire_named_mutation_lease(
+            name, "sandbox parent memory mutation", repair=repair
+        )
+        self._parent_memory_lease = ownership
+
+        def release() -> None:
+            self._release_lease(ownership)
+            if getattr(self, "_parent_memory_lease", None) is ownership:
+                self._parent_memory_lease = None
+
+        return release
+
+    def parent_memory_workers(self) -> list[str]:
+        workers = set(self.sandbox_worker_nodes())
+        result = self.kubectl("get", "nodes", "-o", "json", timeout=15)
+        ready = []
+        for node in json.loads(_require_ok(result, "list nodes")).get("items", []):
+            name = node["metadata"]["name"]
+            conditions = (node.get("status") or {}).get("conditions") or []
+            if name in workers and any(
+                c.get("type") == "Ready" and c.get("status") == "True" for c in conditions
+            ):
+                ready.append(name)
+        return sorted(ready)
+
+    def read_sandbox_parent_memory(self, node_name: str) -> SandboxParentMemory:
+        script = r"""
+set -eu
+cg() {
+  max=$(cat "$1/memory.max") || return 1
+  current=$(cat "$1/memory.current") || return 1
+  file=$(awk '$1 == "active_file" || $1 == "inactive_file" { s += $2 } END { print s + 0 }' "$1/memory.stat") || return 1
+  echo "$2 $current $max $file"
+}
+cg /sys/fs/cgroup/space parent
+for d in /sys/fs/cgroup/space/*/; do
+  name=$(basename "$d")
+  case "$name" in
+    # The jailer's cgroup, named by the bare sandbox id, holds the guest and
+    # is the one admission charges growth for; sbx-<id> holds host helpers.
+    sbx-*) ;;
+    # A sandbox cgroup can go away between the listing and the read.
+    *-*-*-*-*) cg "${d%/}" "sandbox:$name" 2>/dev/null || true ;;
+  esac
+done
+echo "host $(awk '$1 == "MemAvailable:" { print $2 * 1024 }' /proc/meminfo)"
+"""
+        output = _require_ok(
+            self._node_shell_exec(node_name, script, timeout=30),
+            f"read the sandbox parent cgroup on {node_name}",
+        )
+        parent: CgroupMemory | None = None
+        sandboxes: list[CgroupMemory] = []
+        host_available = 0
+        for line in output.splitlines():
+            fields = line.split()
+            if fields[:1] == ["host"]:
+                host_available = int(fields[1])
+            elif len(fields) == 4:
+                memory = CgroupMemory(
+                    name=fields[0].removeprefix("sandbox:"),
+                    current=int(fields[1]),
+                    maximum=None if fields[2] == "max" else int(fields[2]),
+                    reclaimable_file=int(fields[3]),
+                )
+                if fields[0] == "parent":
+                    parent = memory
+                else:
+                    sandboxes.append(memory)
+        if parent is None:
+            raise SmokeConfigurationError(f"{node_name} has no sandbox parent cgroup")
+        return SandboxParentMemory(node_name, parent, tuple(sandboxes), host_available)
+
+    def record_standing_parent_memory_max(self, standing: Mapping[str, str]) -> None:
+        ownership = getattr(self, "_parent_memory_lease", None)
+        if ownership is None:
+            raise SmokeConfigurationError("the parent-memory mutation Lease is not held")
+        self._assert_lease_owned(ownership, "recording the standing parent memory.max")
+        self._annotate_lease(
+            ownership.name, PARENT_MEMORY_MAX_ANNOTATION, json.dumps(dict(standing))
+        )
+
+    def write_parent_memory_max(self, node_name: str, value: str) -> None:
+        if not (value == "max" or value.isdigit()):
+            raise ValueError(f"memory.max must be bytes or max, got {value!r}")
+        ownership = getattr(self, "_parent_memory_lease", None)
+        if ownership is None:
+            raise SmokeConfigurationError("the parent-memory mutation Lease is not held")
+        self._assert_lease_owned(ownership, f"writing the parent memory.max on {node_name}")
+        _require_ok(
+            self._node_shell_exec(
+                node_name, f"echo {value} > /sys/fs/cgroup/space/memory.max", timeout=30
+            ),
+            f"write the sandbox parent memory.max on {node_name}",
+        )
+
+    def hide_parent_memory_stat(self, node_name: str) -> None:
+        _require_ok(
+            self._node_shell_exec(
+                node_name,
+                f"{_IN_NODE_MANAGER_MOUNTS} mount --bind /dev/null /sys/fs/cgroup/space/memory.stat",
+                timeout=30,
+            ),
+            f"hide the sandbox parent memory.stat from node-manager on {node_name}",
+        )
+
+    def unhide_parent_memory_stat(self, node_name: str) -> None:
+        _require_ok(
+            self._node_shell_exec(
+                node_name,
+                f"while {_IN_NODE_MANAGER_MOUNTS} umount /sys/fs/cgroup/space/memory.stat "
+                "2>/dev/null; do :; done",
+                timeout=30,
+            ),
+            f"unhide the sandbox parent memory.stat on {node_name}",
+        )
+
+    def parent_memory_stat_visible(self, node_name: str) -> bool:
+        result = self._node_shell_exec(
+            node_name,
+            f"{_IN_NODE_MANAGER_MOUNTS} grep -q '^inactive_file ' /sys/fs/cgroup/space/memory.stat",
+            timeout=30,
+        )
+        if result.returncode not in (0, 1):
+            _require_ok(result, f"read the sandbox parent memory.stat as node-manager on {node_name}")
+        return result.returncode == 0
+
+    def restore_parent_memory(self) -> None:
+        ownership = getattr(self, "_parent_memory_lease", None)
+        if ownership is None:
+            return
+        metadata, _ = self._assert_lease_owned(ownership, "restoring the parent memory")
+        annotations = metadata.get("annotations")
+        recorded = (
+            annotations.get(PARENT_MEMORY_MAX_ANNOTATION) if isinstance(annotations, dict) else None
+        )
+        if isinstance(recorded, str) and recorded:
+            self._restore_parent_memory_from(ownership.name, json.loads(recorded))
+
+    def _restore_parent_memory_from(self, lease_name: str, standing: object) -> None:
+        if not isinstance(standing, dict) or not all(
+            isinstance(value, str) and (value == "max" or value.isdigit())
+            for value in standing.values()
+        ):
+            raise SmokeConfigurationError(
+                f"lease {lease_name} records a malformed parent memory.max map: {standing!r}"
+            )
+        failures: list[str] = []
+        for node, value in standing.items():
+            node_name = _kube_node_name(node)
+            try:
+                self.unhide_parent_memory_stat(node_name)
+                _require_ok(
+                    self._node_shell_exec(
+                        node_name, f"echo {value} > /sys/fs/cgroup/space/memory.max", timeout=30
+                    ),
+                    f"restore the sandbox parent memory.max on {node_name}",
+                )
+            except Exception as error:  # noqa: BLE001 - every node is attempted, then reported
+                failures.append(f"{node_name}: {error}")
+        if failures:
+            # The record stays on the Lease, so the next holder repairs these nodes.
+            raise RuntimeError("parent memory.max restore failed: " + "; ".join(failures))
+        self._annotate_lease(lease_name, PARENT_MEMORY_MAX_ANNOTATION, None)
+
+    def node_manager_logs_since(self, node_name: str, since_time: str) -> str:
+        return self._node_service_logs(node_name, NODE_MANAGER, since_time=since_time)
+
+    def sandbox_pod_names(self) -> set[str]:
+        result = self.kubectl(
+            "get", "pods", "-o", "jsonpath={.items[*].metadata.name}", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        return set(_require_ok(result, "list the sandbox pods").split())
+
+    def pod_sandbox_failures_since(self, since_time: str) -> list[tuple[str, str]]:
+        result = self.kubectl(
+            "get", "events", "--field-selector", "reason=FailedCreatePodSandBox,involvedObject.kind=Pod",
+            "-o", "json", timeout=30, namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        since = _kube_epoch(since_time)
+        messages = []
+        for event in json.loads(_require_ok(result, "list pod sandbox failures")).get("items", []):
+            seen = _kube_epoch(event.get("lastTimestamp") or event.get("eventTime"))
+            if seen is not None and seen >= since:
+                pod = str((event.get("involvedObject") or {}).get("name", ""))
+                messages.append((pod, str(event.get("message", ""))))
+        return messages
 
     def sandbox_worker_nodes(self) -> list[str]:
         result = self.kubectl(

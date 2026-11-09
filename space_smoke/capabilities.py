@@ -500,7 +500,7 @@ class RateLimitProbe(Protocol):
         gate: Callable[[], None] | None = None,
     ) -> LimiterProbeOutcome: ...
 
-    def kill_matching(self, metadata: Mapping[str, str]) -> None: ...
+    def kill_matching(self, metadata: Mapping[str, str], *, absent_ok: bool = False) -> None: ...
 
     def kill_sandbox(self, sandbox_id: str) -> None:
         """ECW kill of one bare sandbox uuid, not-found counting as done."""
@@ -3017,3 +3017,85 @@ class ConsoleControl(Protocol):
     def reclaim_local_sandbox_everywhere(self, sandbox_id: str) -> None:
         """Remove a deleted sandbox's node-local rows, which SPACE would reclaim later."""
         ...
+
+
+@dataclass(frozen=True)
+class CgroupMemory:
+    """One cgroup's `memory.current`, `memory.max` (None for `max`) and the
+    `active_file + inactive_file` it holds, in bytes."""
+
+    name: str
+    current: int
+    maximum: int | None
+    reclaimable_file: int
+
+
+@dataclass(frozen=True)
+class SandboxParentMemory:
+    """A worker's sandbox parent cgroup (`/sys/fs/cgroup/space`), every
+    sandbox cgroup under it, and the host's `MemAvailable`, in bytes."""
+
+    node_name: str
+    parent: CgroupMemory
+    sandboxes: tuple[CgroupMemory, ...]
+    host_available: int
+
+
+class ParentMemoryAdmissionControl(Protocol):
+    """Kind-only faults on a worker's sandbox parent cgroup.
+
+    node-manager sets `/sys/fs/cgroup/space/memory.max` once at start and reads
+    it, with `memory.current` and `memory.stat`, on every memory admission.
+    The scenario lowers that limit on every Ready worker and can hide the
+    parent's `memory.stat` from node-manager alone (a bind mount in its mount
+    namespace), all under one mutation Lease that records the standing limits
+    so an expired holder's faults are undone on takeover.
+    """
+
+    def acquire_parent_memory_mutation(self) -> Callable[[], None]:
+        """Take the parent-memory mutation Lease; the returned callable releases it."""
+        ...
+
+    def parent_memory_workers(self) -> list[str]:
+        """Ready sandbox workers, each with its operator shell."""
+        ...
+
+    def read_sandbox_parent_memory(self, node_name: str) -> SandboxParentMemory: ...
+
+    def record_standing_parent_memory_max(self, standing: Mapping[str, str]) -> None:
+        """Write each worker's standing `memory.max` onto the Lease before any change."""
+        ...
+
+    def write_parent_memory_max(self, node_name: str, value: str) -> None:
+        """Write `value` (bytes or `max`) to the worker's parent `memory.max`."""
+        ...
+
+    def hide_parent_memory_stat(self, node_name: str) -> None:
+        """Bind an empty file over the parent's `memory.stat`, for node-manager only."""
+        ...
+
+    def unhide_parent_memory_stat(self, node_name: str) -> None:
+        """Undo `hide_parent_memory_stat`; a no-op when nothing is hidden."""
+        ...
+
+    def restore_parent_memory(self) -> None:
+        """Unhide `memory.stat` and write back every limit the Lease records, then clear it."""
+        ...
+
+    def node_manager_logs_since(self, node_name: str, since_time: str) -> str:
+        """node-manager's log on the worker since an RFC 3339 time, as evidence."""
+        ...
+
+    def parent_memory_stat_visible(self, node_name: str) -> bool:
+        """Whether node-manager's mounts show the parent's `memory.stat` with its fields."""
+        ...
+
+    def sandbox_pod_names(self) -> set[str]:
+        """Names of the sandbox pods that exist now."""
+        ...
+
+    def pod_sandbox_failures_since(self, since_time: str) -> list[tuple[str, str]]:
+        """(sandbox pod, message) of `FailedCreatePodSandBox` Events seen at or after an RFC 3339 time."""
+        ...
+
+    def sandbox_pod_phase_and_node(self, sandbox_id: str) -> tuple[str | None, str | None]: ...

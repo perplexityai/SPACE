@@ -163,6 +163,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.node_group_boundary_schedules",
                 "local.node_selector_extras_render_and_enforce",
                 "local.orphaned_restore_pod_gc_reaps_only_superseded",
+                "local.parent_memory_admission",
                 "local.pending_backup_census_reports_blocked_upload",
                 "local.private_template_build_isolation",
                 "local.rate_limiters_enforce_and_fail_open",
