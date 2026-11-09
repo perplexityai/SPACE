@@ -253,6 +253,8 @@ class NodeMemoryAdmissionAssertions:
         try:
             attempt = self._fixture.sandboxes.attempt_create(definitive_statuses=(503,))
         finally:
+            # Before join, so a sampler mid-listing doesn't add to the create's time.
+            elapsed = time.monotonic() - started
             done.set()
             thread.join()
         self._fixture.verify(
@@ -260,7 +262,6 @@ class NodeMemoryAdmissionAssertions:
             "sampling the create's pods failed, so where its pod was bound is unknown",
             error=repr(sample_errors[0])[:600] if sample_errors else None,
         )
-        elapsed = time.monotonic() - started
         new = [pod for pod in self._control.all_sandbox_pods() if pod.pod_name not in before]
         sample()
         timed = TimedCreate(

@@ -35,7 +35,11 @@ def network_slots_clamp_to_node_memory(test: smoke.KindEcw) -> None:
 
     admission = test.node_memory_admission
     workers = admission.workers()
-    test.verify(len(workers) >= 2, "the scenario needs two sandbox workers", workers=workers)
+    test.verify(
+        len(workers) == 2,
+        "the scenario needs exactly two sandbox workers: it cordons one to force placement on the other",
+        workers=workers,
+    )
     refusing, admitting = workers[0], workers[1]
     test.record("refusing_worker", refusing)
     test.record("admitting_worker", admitting)
