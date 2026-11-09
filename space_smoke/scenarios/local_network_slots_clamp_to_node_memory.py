@@ -1,11 +1,14 @@
 """With the clamp on, a worker that refuses new sandboxes advertises no free network slots."""
 
 import space_smoke as smoke
+from space_smoke.adapters import NETWORK_SLOTS_RESOURCE
 
 # How the API fails a create whose pod the scheduler never places.
 UNPLACED = ("sandbox pod is unschedulable", "pod_never_ready")
 # How the API's network-slot preflight refuses a create before creating a pod.
 NO_SLOT_CAPACITY = "no Kubernetes network-slot capacity available"
+# How the scheduler reports a node with no free network slots.
+SLOT_SHORTFALL = f"Insufficient {NETWORK_SLOTS_RESOURCE}"
 PLACED_CREATES = 3
 
 
@@ -93,9 +96,12 @@ def network_slots_clamp_to_node_memory(test: smoke.KindEcw) -> None:
             preflight = held.attempt.status_code == 503 and NO_SLOT_CAPACITY in held.attempt.body
             unplaced = held.attempt.status_code == 503 and any(reason in held.attempt.body for reason in UNPLACED)
             test.record("clamp_on_cordoned_outcome", "preflight" if preflight else "unplaced" if unplaced else None)
+            # The pod can be deleted before the sampler sees it; the
+            # scheduler naming the slot shortfall shows it reached scheduling.
+            reached_scheduler = bool(held.new_pod_nodes) or SLOT_SHORTFALL in held.attempt.body
             test.verify(
                 (preflight and not held.new_pod_nodes)
-                or (unplaced and bool(held.new_pod_nodes) and all(node == "" for node in held.new_pod_nodes.values())),
+                or (unplaced and reached_scheduler and all(node == "" for node in held.new_pod_nodes.values())),
                 "with the clamp on the create neither failed the slot preflight with no pod "
                 "nor left a pod the scheduler never bound",
                 status=held.attempt.status_code,
