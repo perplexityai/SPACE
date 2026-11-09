@@ -83,6 +83,8 @@ use std::sync::Arc;
 /// `workloads/` leaf is present and writable.
 #[derive(Debug)]
 pub(crate) struct GuestCgroups {
+    #[cfg(target_os = "linux")]
+    pub(crate) workloads: std::path::PathBuf,
     pub(crate) placement: Arc<pplx_space_spaced_guest_execution::ExecutionCgroups>,
 }
 
@@ -426,6 +428,7 @@ mod linux {
 
         Ok((
             GuestCgroups {
+                workloads,
                 placement: std::sync::Arc::new(
                     pplx_space_spaced_guest_execution::ExecutionCgroups::new(
                         workloads_procs,

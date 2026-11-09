@@ -7734,6 +7734,7 @@ dependencies = [
  "pplx-space-guest-process",
  "pplx-space-pii",
  "pplx-space-spaced-build",
+ "pplx-space-spaced-update",
  "prost",
  "prost-types",
  "semver",
@@ -7742,6 +7743,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "uuid",
  "zeroize",
 ]
 
@@ -7765,10 +7767,14 @@ dependencies = [
  "pplx-space-spaced-common",
  "pplx-space-spaced-guest-client",
  "pplx-space-spaced-guest-execution",
+ "pplx-space-spaced-guest-protocol",
+ "pplx-space-spaced-guest-update",
+ "pplx-space-spaced-update",
  "pplx-space-test-env",
  "prost",
  "prost-types",
  "rustix",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -7926,6 +7932,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

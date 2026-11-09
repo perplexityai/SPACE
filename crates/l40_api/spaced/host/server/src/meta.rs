@@ -102,6 +102,7 @@ impl Meta for SpacedHostService {
         &self,
         request: Request<NotifyResumeRequest>,
     ) -> Result<Response<NotifyResumeResponse>, Status> {
+        self.inner.update.resume_observation();
         let request = request.into_inner();
         self.clear_guest_ready();
         let response = self
@@ -175,6 +176,29 @@ impl Meta for SpacedHostService {
         &self,
         request: Request<PrepareSuspendRequest>,
     ) -> Result<Response<PrepareSuspendResponse>, Status> {
+        let _transition = self.inner.update.capture_transition()?;
+        // The manager capture lock excludes Arm/Restart/Commit; this local
+        // barrier drains Stage and observation. Fresh maintenance evidence is
+        // required: a cached stable phase cannot exclude an intervening trial.
+        // Consequently a maintenance read failure also prevents capture.
+        match self.read_guest_update_status(false).await {
+            Ok(status)
+                if matches!(
+                    pplx_space_spaced_common::proto::update::Phase::try_from(status.phase),
+                    Ok(pplx_space_spaced_common::proto::update::Phase::Armed
+                        | pplx_space_spaced_common::proto::update::Phase::Trial
+                        | pplx_space_spaced_common::proto::update::Phase::Restarting)
+                ) || status.running != status.committed =>
+            {
+                return Err(Status::failed_precondition(
+                    "manager must settle guest maintenance before capture",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.code() == tonic::Code::Unimplemented => {}
+            Err(error) => return Err(error),
+        }
+        let pause = self.inner.update.pause_observation().await?;
         let timeout = RetryContext::with_timeout(Duration::from_secs(180))
             .with_grpc_timeout_metadata(request.metadata())
             .remaining()
@@ -195,6 +219,7 @@ impl Meta for SpacedHostService {
             .await;
         self.clear_all_bridge_guest_clients().await;
         flush_result?;
+        pause.keep_paused();
         tracing::info!(
             command = "prepare_suspend",
             "guest filesystems flushed and spaced host bridge guest clients cleared before suspend"
