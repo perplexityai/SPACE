@@ -1200,6 +1200,7 @@ impl SandboxManagerService {
                 create_kind,
                 create_codec,
                 sandbox.volume_encryption,
+                published_snapshot_bytes(&snapshot_dir).await,
                 create_started_at,
             );
             Ok(())
@@ -1423,4 +1424,18 @@ pub(in crate::service) enum RetainedUploadError {
         retained: crate::retained_source::RetainedSource,
         check: crate::retained_source::RetainedSourceCheck,
     },
+}
+
+/// Apparent size of the files a published snapshot directory holds, for the
+/// create metrics' size bucket. `None` when the directory can't be read.
+async fn published_snapshot_bytes(dir: &std::path::Path) -> Option<u64> {
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    let mut total = 0u64;
+    while let Some(entry) = entries.next_entry().await.ok()? {
+        let metadata = entry.metadata().await.ok()?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Some(total)
 }
