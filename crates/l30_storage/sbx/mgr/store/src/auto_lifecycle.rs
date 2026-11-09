@@ -38,6 +38,7 @@ pub struct LifecycleMutex {
     sandbox_id: String,
     registry: Weak<LifecycleLockRegistry>,
     mutex: Arc<tokio::sync::Mutex<()>>,
+    waiters: tokio::sync::watch::Sender<()>,
 }
 
 #[derive(Debug)]
@@ -58,6 +59,19 @@ impl LifecycleMutex {
             _guard: guard,
             _owner: self,
         }
+    }
+
+    /// Request priority over optional maintenance before waiting for capture.
+    pub async fn lock_for_capture(self: &Arc<Self>) -> LifecycleMutexGuard {
+        self.waiters.send_replace(());
+        self.lock().await
+    }
+
+    /// Subscribe before try_lock to observe subsequent capture requests.
+    /// Optional maintenance can yield to capture without racing registration.
+    /// Cancellation of a capture does not undo its request for priority.
+    pub fn subscribe_capture_requests(&self) -> tokio::sync::watch::Receiver<()> {
+        self.waiters.subscribe()
     }
 
     pub fn try_lock(self: &Arc<Self>) -> Result<LifecycleMutexGuard, tokio::sync::TryLockError> {
@@ -105,6 +119,7 @@ fn lifecycle_lock(registry: &Arc<LifecycleLockRegistry>, sandbox_id: &str) -> Ar
         sandbox_id: sandbox_id.to_owned(),
         registry: Arc::downgrade(registry),
         mutex: Arc::new(tokio::sync::Mutex::new(())),
+        waiters: tokio::sync::watch::channel(()).0,
     });
     locks.insert(sandbox_id.to_owned(), Arc::downgrade(&lock));
     lock
@@ -194,7 +209,12 @@ impl AutoLifecycleCoordinator {
         } else {
             None
         };
-        let artifact_guard = self.artifact_lock(sandbox_id).lock_owned().await;
+        let artifact = self.artifact_lock(sandbox_id);
+        let artifact_guard = if artifact_kind == ArtifactKind::Full {
+            artifact.lock_for_capture().await
+        } else {
+            artifact.lock_owned().await
+        };
         (wake_guard, artifact_guard)
     }
 

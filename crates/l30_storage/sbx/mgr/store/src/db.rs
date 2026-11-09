@@ -43,6 +43,7 @@ pub mod cleanup_jobs;
 pub mod cleanup_target_scan;
 pub mod eviction_scan;
 pub mod guest_health_scan;
+pub mod guest_updates;
 pub mod inventory;
 pub mod inventory_read;
 pub mod local_artifact_leases;
@@ -129,6 +130,8 @@ pub use pplx_space_common_core::types::QuarantineRecoveryNoProgressReason;
 /// the node-wide counts. Each keeps the decoder, missing-row rule and
 /// tolerance of the reader it consolidates.
 pub mod read {
+    mod guest_update;
+    pub use guest_update::*;
     mod cleanup_job;
     mod counts;
     mod eviction;
@@ -153,6 +156,8 @@ pub mod read {
 /// Named scans over many rows. Each keeps its own pinning, filter, cap,
 /// budget and policy for rows that do not decode.
 pub mod scan {
+    mod guest_updates;
+    pub use guest_updates::*;
     mod all_sandboxes;
     mod by_peer;
     mod due_auto_lifecycle;
@@ -520,6 +525,14 @@ pub fn emit_auto_lifecycle_delete_receipt_superseded_if_present(
 /// the cleanup. It deliberately skips `network_policy_reconcile_queue`, which
 /// nothing writes or reads any more and a later release drops.
 fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM guest_update_operations WHERE sandbox_id = ?1",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM guest_update_policy WHERE sandbox_id = ?1",
+        params![id],
+    )?;
     teardown_jobs::fail_active(tx, id, TeardownSuspendFailure::Deleted)?;
     crate::db::route_activation_claims::close_claim(tx, id)?;
     tx.execute(
