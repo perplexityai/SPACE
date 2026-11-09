@@ -2,7 +2,7 @@
 
 import space_smoke as smoke
 from space_smoke.node_delete_stall import (
-    NODE_DELETE_BUDGET_SECONDS,
+    MIN_STALLED_HOLD_SECONDS,
     NODE_MANAGER,
     SANDBOX_MANAGER,
 )
@@ -52,7 +52,7 @@ def stalled_node_delete_releases_its_dispatcher_slot(test: smoke.KindEcw) -> Non
             operation_id, not_admitted, attempts=NOT_ADMITTED_ATTEMPTS, timeout=30
         )
         test.verify(
-            all(held >= NODE_DELETE_BUDGET_SECONDS - 2 for held, _ in holds),
+            all(held >= MIN_STALLED_HOLD_SECONDS for held, _ in holds),
             "an attempt ended before the teardown's budget, so the node answered",
             holds=holds,
         )
@@ -76,7 +76,7 @@ def stalled_node_delete_releases_its_dispatcher_slot(test: smoke.KindEcw) -> Non
         holds = stall.expect_succeeded(operation_id, timeout=30)
         test.record("admitted_slot_holds", holds)
         test.verify(
-            len(holds) == 1 and holds[0][0] >= NODE_DELETE_BUDGET_SECONDS - 2,
+            len(holds) == 1 and holds[0][0] >= MIN_STALLED_HOLD_SECONDS,
             "the admitted delete did not succeed on one attempt cut at the budget",
             holds=holds,
         )
