@@ -193,6 +193,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "native.v2_drain_evacuates_every_resident",
                 "native.v2_drain_meets_user_calls",
                 "native.v2_drain_moves_ten_residents",
+                "native.v2_drain_outlived_by_a_dead_worker",
                 "native.v2_drain_restore_outlives_its_destination",
                 "native.v2_drain_survives_controller_restarts",
                 "native.v2_drain_survives_sandbox_manager_restarts",
