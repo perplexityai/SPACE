@@ -1157,6 +1157,46 @@ pub(super) fn drain_block_conflict(
     ))
 }
 
+/// How long a wake refused while a v2 drain still makes its sandbox durable
+/// is told to wait before it asks again.
+const DRAIN_DURABILITY_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The 503 a wake gets while its node's v2 drain still makes the sandbox
+/// durable: once it is, the same wake lands it on another node, so a client
+/// that gives up on a 409 retries this instead.
+fn drain_durability_unavailable(action: SandboxAction) -> ControllerError {
+    ControllerError::service_unavailable(format!(
+        "sandbox cannot {action} yet: its node is draining and is still making it durable \
+         elsewhere; retry shortly"
+    ))
+    .with_retry_after_header(DRAIN_DURABILITY_RETRY_AFTER)
+}
+
+/// Whether the v2 drain of the sandbox's resolved node
+/// (`COALESCE(target_node_id, active_node_id)`) still works on it: its last
+/// report lists the sandbox pending, or evacuated but not yet recorded.
+async fn v2_drain_still_making_durable(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+           SELECT 1
+             FROM sandboxes s
+             JOIN nodes n ON n.id = COALESCE(s.target_node_id, s.active_node_id)
+            WHERE s.id = $1
+              AND n.drain_engine = 'v2'
+              AND n.drain_phase = 'draining'
+              AND (n.drain_status->'report'->'pending'
+                     @> jsonb_build_array(jsonb_build_object('sandbox_id', s.id::TEXT))
+                   OR n.drain_status->'report'->'unrecorded'
+                     @> jsonb_build_array(jsonb_build_object('sandbox_id', s.id::TEXT))))"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Drain gate for paths that will unconditionally place / re-place the sandbox
 /// on its resolved node (`COALESCE(target_node_id, active_node_id)`),
 /// regardless of lifecycle: the explicit-action gate in
@@ -1167,7 +1207,10 @@ pub(super) fn drain_block_conflict(
 ///
 /// Returns 409 when the resolved node is `drained` or `terminating`, or is
 /// `draining` under a **forced** drain. A gentle drain does not block — see
-/// [`NodeDrainState::blocks_placement`].
+/// [`NodeDrainState::blocks_placement`]. A wake, start or restore that a v2
+/// drain refuses while it still makes the sandbox durable gets a 503 with a
+/// `Retry-After` instead: retried once the sandbox is durable, it lands on
+/// another node.
 pub(super) async fn ensure_resolved_node_not_draining(
     pool: &PgPool,
     sandbox_id: SandboxId,
@@ -1181,6 +1224,24 @@ pub(super) async fn ensure_resolved_node_not_draining(
     if let Some(state) = drain_state
         && state.blocks_placement()
     {
+        if matches!(
+            action,
+            SandboxAction::Start
+                | SandboxAction::Wake
+                | SandboxAction::ImplicitWake(_)
+                | SandboxAction::Restore
+        ) && state.phase == NodeDrainPhase::Draining
+            && v2_drain_still_making_durable(pool, sandbox_id)
+                .await
+                .map_err(|err| {
+                    crate::controllers::db_contention_error(
+                        "failed to load the node drain's report",
+                        &err,
+                    )
+                })?
+        {
+            return Err(drain_durability_unavailable(action));
+        }
         return Err(drain_block_conflict(action, state.phase));
     }
     Ok(())

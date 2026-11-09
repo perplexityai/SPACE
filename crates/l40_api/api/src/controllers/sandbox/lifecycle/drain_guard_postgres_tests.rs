@@ -996,3 +996,93 @@ async fn a_v2_drain_waiting_for_a_slot_blocks_nothing_until_admitted() -> TestRe
     }
     Ok(())
 }
+
+/// While the node's v2 drain reports a sandbox pending, or evacuated but not
+/// yet recorded, a wake, start or restore the gate refuses gets 503 with a
+/// `Retry-After`; another action, a sandbox the report doesn't list, and a
+/// v1 drain's sandbox still get the 409.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wake_the_v2_drain_still_makes_durable_is_told_to_retry() -> TestResult {
+    let db = pg_test_db().await?;
+    let v2 = NodeId::new();
+    let v1 = NodeId::new();
+    let pending = SandboxId::new();
+    let unrecorded = SandboxId::new();
+    let unlisted = SandboxId::new();
+    let on_v1 = SandboxId::new();
+    insert_node(&db.pool, v2, Some("draining")).await?;
+    insert_node(&db.pool, v1, Some("draining")).await?;
+    for (sandbox_id, node_id) in [(pending, v2), (unrecorded, v2), (unlisted, v2), (on_v1, v1)] {
+        insert_sandbox(
+            &db.pool,
+            sandbox_id,
+            "started",
+            Some(node_id),
+            Some(node_id),
+        )
+        .await?;
+    }
+    let report = serde_json::json!({
+        "epoch": 1,
+        "waiting": false,
+        "report": {
+            "sealed_epoch": 1,
+            "done": false,
+            "pending": [{"sandbox_id": pending.to_string(), "action": "queued"}],
+            "unrecorded": [{"sandbox_id": unrecorded.to_string(), "reason": "not yet"}],
+            "evacuated": [],
+            "blocked": [],
+        },
+    });
+    set_v2_status(&db.pool, v2, report.clone()).await?;
+    // A v1 drain's status never carries this report; one that did must not
+    // turn its 409 into a retry.
+    sqlx::query(sql!("UPDATE nodes SET drain_status = $2 WHERE id = $1"))
+        .bind(v1)
+        .bind(serde_json::json!({
+            "report": {"pending": [{"sandbox_id": on_v1.to_string(), "action": "queued"}]},
+        }))
+        .execute(&db.pool)
+        .await?;
+
+    for sandbox_id in [pending, unrecorded] {
+        for action in [
+            SandboxAction::Wake,
+            SandboxAction::Start,
+            SandboxAction::Restore,
+            SandboxAction::ImplicitWake(ExecutionActivityKind::Command),
+        ] {
+            let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, action)
+                .await
+                .expect_err("the drain still blocks it");
+            let response = err.clone().into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{action:?}"
+            );
+            assert!(
+                response
+                    .headers()
+                    .contains_key(axum::http::header::RETRY_AFTER),
+                "{action:?}"
+            );
+        }
+    }
+    for (sandbox_id, action) in [
+        (pending, SandboxAction::Resume),
+        (pending, SandboxAction::Stats),
+        (unlisted, SandboxAction::Wake),
+        (on_v1, SandboxAction::Wake),
+    ] {
+        let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, action)
+            .await
+            .expect_err("the drain still blocks it");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::CONFLICT,
+            "{sandbox_id} {action:?}"
+        );
+    }
+    Ok(())
+}
