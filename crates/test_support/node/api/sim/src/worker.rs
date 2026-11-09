@@ -1390,6 +1390,9 @@ impl WorkerApi for SimWorkerApiService {
             tag: operation.tag,
             pty: operation.pty.is_some(),
             background: operation.background,
+            // The simulator mints every id, as a guest that predates assigned
+            // ids does.
+            process_id: None,
         };
         let stream = self.state.processes().start(&req.sandbox_id, spec).await;
         Ok(Response::new(stream))

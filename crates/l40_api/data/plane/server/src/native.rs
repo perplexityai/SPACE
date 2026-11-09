@@ -1131,7 +1131,11 @@ pub(super) async fn bind_session_process(
 /// commit it. Until it settles, nothing can start the command a second time:
 /// the binding holds the session's start permit, so another attach on this
 /// replica is refused, and a start of the derived process id the guest
-/// already holds connects to it instead (`initial_process_stream`).
+/// already holds connects to it instead (`initial_process_stream`). A guest
+/// that predates assigned ids mints its own id and never reports the derived
+/// one as taken, so for it an attach on another replica before the binding
+/// commits is held back only by the guest's handling of the start's
+/// idempotency key.
 ///
 /// The write runs in its own task so a client that disconnects mid-bind does
 /// not cancel it; the cluster API client's RPC timeout bounds it. Streams

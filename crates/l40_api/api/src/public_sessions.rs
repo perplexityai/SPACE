@@ -1,6 +1,7 @@
 use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
 
 use pplx_space_common_core::sql;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use pplx_space_common_core::types::IdempotencyKey;
@@ -388,6 +389,74 @@ impl PublicSessionStore {
 
         PublicSessionRow::try_into_public(row, None, self.data_plane_base_url.as_str()).map(Some)
     }
+
+    /// The guest process id the data plane bound `session_id` to, if it has
+    /// bound one.
+    ///
+    /// Expired and revoked sessions are read too: the process can outlive
+    /// its session. Session retention keeps a row bound to an id other than
+    /// its session id until the sandbox is deleted, so the binding lasts as
+    /// long as the process can.
+    pub async fn bound_process_id(
+        &self,
+        org_id: OrgId,
+        sandbox_id: PublicSandboxId,
+        session_id: DataPlaneSessionId,
+    ) -> Result<Option<String>, PublicSessionStoreError> {
+        let process_id = sqlx::query_scalar::<_, Option<String>>(sql!(
+            "SELECT backend_process_id
+             FROM data_plane_sessions
+             WHERE org_id = $1
+               AND sandbox_id = $2
+               AND session_id = $3"
+        ))
+        .bind(org_id)
+        .bind(sandbox_id.as_uuid())
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(process_id.flatten())
+    }
+
+    /// The sessions in `sandbox_id` the data plane bound to any of
+    /// `process_ids`, keyed by the guest process id each is bound to.
+    /// Expired and revoked sessions are read too, as in
+    /// [`Self::bound_process_id`].
+    pub async fn sessions_bound_to_processes(
+        &self,
+        org_id: OrgId,
+        sandbox_id: PublicSandboxId,
+        process_ids: &[String],
+    ) -> Result<HashMap<String, DataPlaneSessionId>, PublicSessionStoreError> {
+        let rows = sqlx::query_as::<_, SessionProcessBindingRow>(sql!(
+            "SELECT session_id,
+                    backend_process_id
+             FROM data_plane_sessions
+             WHERE org_id = $1
+               AND sandbox_id = $2
+               AND backend_process_id = ANY($3)"
+        ))
+        .bind(org_id)
+        .bind(sandbox_id.as_uuid())
+        .bind(process_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let session_id = row
+                    .session_id
+                    .parse()
+                    .map_err(|_| PublicSessionStoreError::InvalidStoredSessionId(row.session_id))?;
+                Ok((row.backend_process_id, session_id))
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct SessionProcessBindingRow {
+    session_id: String,
+    backend_process_id: String,
 }
 
 #[derive(Debug, Clone)]
