@@ -76,10 +76,22 @@ fn service_main(_: Vec<OsString>) {
             return;
         }
     };
+    // Register first so containment failure is visible to SCM's failure policy,
+    // including on legacy images that do not have scheduled recovery tasks.
+    let _workload_job = match super::recovery::contain_service() {
+        Ok(job) => job,
+        Err(error) => {
+            tracing::error!(%error, "cannot contain guest service workloads");
+            if let Err(error) = status(handle, ServiceState::Stopped, true) {
+                tracing::error!(%error, "cannot publish Windows containment failure");
+            }
+            return;
+        }
+    };
     let result = status(handle, ServiceState::StartPending, false)
         .map_err(super::RunError::Service)
         .and_then(|()| {
-            super::serve(shutdown, || {
+            super::serve(shutdown, move || {
                 status(handle, ServiceState::Running, false).map_err(super::RunError::Service)
             })
         });

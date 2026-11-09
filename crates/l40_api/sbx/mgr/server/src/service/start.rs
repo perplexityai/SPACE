@@ -2900,7 +2900,12 @@ impl SandboxManagerService {
                 return Err(e);
             }
         };
-        let endpoint_proof = if let Some(spaced_host_resp) = &spaced_host_resp {
+        // Windows recreates the CH listener during viosock initialization.
+        // Readiness publishes its proof before Started, including nonblocking
+        // starts; serving paths cannot capture a premature proof while Starting.
+        let endpoint_proof = if super::spaced_bridge::endpoint_proof_after_readiness(&sandbox)? {
+            None
+        } else if let Some(spaced_host_resp) = &spaced_host_resp {
             match activation_endpoint_proof_requirement(
                 &route_identity,
                 sandbox.pool_template.as_deref(),
