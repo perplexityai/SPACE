@@ -71,8 +71,51 @@ where
         if let Err(status) = self.host.authorize_http_request(&request) {
             return Box::pin(async move { Ok(status.into_http()) });
         }
+        let path = request.uri().path();
+        let customer = path.starts_with("/space.spaced.host.v1.Process/")
+            || path.starts_with("/space.spaced.host.v1.Filesystem/")
+            || path.starts_with("/space.spaced.host.v1.Networking/");
+        let guard = if customer {
+            match self.host.inner.update.admit() {
+                Ok(guard) => Some(guard),
+                Err(status) => return Box::pin(async move { Ok(status.into_http()) }),
+            }
+        } else {
+            None
+        };
         let response = self.inner.call(request);
-        Box::pin(async move { response.await.map(|response| response.map(Body::new)) })
+        Box::pin(async move {
+            response.await.map(|response| {
+                response.map(|body| {
+                    Body::new(AdmittedBody {
+                        body: Box::pin(body),
+                        _guard: guard,
+                    })
+                })
+            })
+        })
+    }
+}
+
+struct AdmittedBody<B> {
+    body: Pin<Box<B>>,
+    _guard: Option<super::update::DispatchGuard>,
+}
+
+impl<B: http_body::Body> http_body::Body for AdmittedBody<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.get_mut().body.as_mut().poll_frame(cx)
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
     }
 }
 

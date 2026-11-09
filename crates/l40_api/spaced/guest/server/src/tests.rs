@@ -54,7 +54,7 @@ async fn listener_failures_preserve_drain_and_initial_error_priority() {
             assert!(match result {
                 Err(RunGuestServerError::Local(_)) => fail_local,
                 Err(RunGuestServerError::Bridge(_)) => !fail_local,
-                Ok(()) => false,
+                Ok(()) | Err(RunGuestServerError::Update(_)) => false,
             });
         }
     }
