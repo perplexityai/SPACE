@@ -2,6 +2,8 @@
 
 import space_smoke as smoke
 
+# How the API fails a create whose pod the scheduler never places.
+UNPLACED = ("sandbox pod is unschedulable", "pod_never_ready")
 PLACED_CREATES = 3
 
 
@@ -80,13 +82,15 @@ def network_slots_clamp_to_node_memory(test: smoke.KindEcw) -> None:
             with admission.cordoned(admitting):
                 held = admission.timed_create("clamp_on_cordoned")
             test.verify(
-                not 200 <= held.attempt.status_code < 300,
-                "a create succeeded with the only schedulable worker refusing",
+                held.attempt.status_code == 503 and any(reason in held.attempt.body for reason in UNPLACED),
+                "with the only schedulable worker full the create did not fail as an unplaced pod",
                 status=held.attempt.status_code,
+                body=held.attempt.body[:600],
             )
+            # A pod was created and reached the scheduler, and was never bound.
             test.verify(
-                refusing not in held.new_pod_nodes.values(),
-                "with the clamp on a create's pod was still bound to the refusing worker",
+                bool(held.new_pod_nodes) and all(node == "" for node in held.new_pod_nodes.values()),
+                "with the clamp on the create's pod was bound, or never reached the scheduler",
                 new_pod_nodes=held.new_pod_nodes,
             )
 

@@ -238,12 +238,14 @@ class NodeMemoryAdmissionAssertions:
                 if pod.pod_name not in before and (pod.node_name or pod.pod_name not in nodes):
                     nodes[pod.pod_name] = pod.node_name
 
+        sample_errors: list[BaseException] = []
+
         def sampler() -> None:
-            while not done.wait(POD_SAMPLE_SECONDS):
-                try:
+            try:
+                while not done.wait(POD_SAMPLE_SECONDS):
                     sample()
-                except RuntimeError:
-                    pass
+            except Exception as error:  # noqa: BLE001 - reported after join
+                sample_errors.append(error)
 
         thread = threading.Thread(target=sampler, name="create-pod-sampler", daemon=True)
         started = time.monotonic()
@@ -253,6 +255,11 @@ class NodeMemoryAdmissionAssertions:
         finally:
             done.set()
             thread.join()
+        self._fixture.verify(
+            not sample_errors,
+            "sampling the create's pods failed, so where its pod was bound is unknown",
+            error=repr(sample_errors[0])[:600] if sample_errors else None,
+        )
         elapsed = time.monotonic() - started
         new = [pod for pod in self._control.all_sandbox_pods() if pod.pod_name not in before]
         sample()
