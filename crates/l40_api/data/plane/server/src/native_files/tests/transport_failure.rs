@@ -154,6 +154,30 @@ async fn harness_behind_proxy() -> (
     (Harness { state, api, worker }, proxy, log, guard)
 }
 
+/// A runtime that resets every call's stream before answering it, and the
+/// number of calls it has received.
+async fn start_resetting_runtime() -> (SocketAddr, Arc<AtomicU64>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let calls = Arc::<AtomicU64>::default();
+    let received = Arc::clone(&calls);
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let received = Arc::clone(&received);
+            tokio::spawn(async move {
+                let Ok(mut connection) = h2::server::handshake(socket).await else {
+                    return;
+                };
+                while let Some(Ok((_, mut respond))) = connection.accept().await {
+                    received.fetch_add(1, Ordering::SeqCst);
+                    respond.send_reset(h2::Reason::CANCEL);
+                }
+            });
+        }
+    });
+    (addr, calls)
+}
+
 fn stat_ok(harness: &Harness) {
     harness.worker.reply(Reply::Stat(Ok(StatResponse {
         info: Some(file_info("/workspace/a.txt", 5)),
@@ -221,4 +245,43 @@ async fn a_mutation_whose_connection_was_reset_is_not_sent_again() {
     assert!(!envelope.retryable);
     assert_eq!(harness.worker.calls().len(), 1);
     assert_eq!(log.transport_failures(), [tracing::Level::ERROR]);
+}
+
+/// The runtime resetting a call's stream is its own refusal of the call, not a
+/// connection that failed under it, so neither a read-only call nor a stream
+/// open sends it again, and its trace logs the failure as the error it is.
+#[tokio::test]
+async fn a_call_whose_stream_the_runtime_reset_is_not_sent_again_and_logs_an_error() {
+    if !test_process() {
+        return;
+    }
+    for (operation, body) in [
+        ("stat", json!({"path": "/workspace/a.txt"})),
+        ("list", json!({"path": "/workspace"})),
+    ] {
+        let log = ClientLog::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let (worker, _) = FakeWorker::start().await;
+        let (runtime, calls) = start_resetting_runtime().await;
+        let (api, api_addr) = FakeApi::start(runtime).await;
+        let mut state = crate::tests::test_data_plane_state().await;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{api_addr}"))
+            .unwrap()
+            .connect_lazy();
+        state.native_files = Some(Arc::new(NativeFiles::new(
+            NativeFileAccessClient::new(channel),
+            None,
+        )));
+        let harness = Harness { state, api, worker };
+
+        let response = harness.send(harness.post(operation, body)).await;
+        assert!(!response.status().is_success(), "{operation}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{operation}");
+        assert_eq!(
+            log.transport_failures(),
+            [tracing::Level::ERROR],
+            "{operation}"
+        );
+    }
 }

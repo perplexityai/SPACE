@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -114,17 +114,114 @@ impl std::fmt::Debug for ClientSpanFields {
     }
 }
 
-/// A call its caller sends once more, over a new connection, if its
-/// connection fails before the call is answered. That failure is logged as a
-/// warning, not an error: the second attempt, which is not marked, reports
-/// whether the callee could be reached.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RetriedOnTransportFailure;
+/// A call its caller may send once more, over a new connection, if its
+/// connection fails before the call is answered. Whether it does depends on
+/// the status the failure becomes, which the client trace does not see, so
+/// the trace leaves a transport failure of the marked call for the caller to
+/// [`report`](Self::report): a warning if the call is sent again, since the
+/// second attempt, which is not marked, reports whether the callee could be
+/// reached, and an error otherwise. A failure still unreported when the mark
+/// is dropped, or that comes after the report, is logged as an error.
+#[derive(Clone, Debug, Default)]
+pub struct RetriedOnTransportFailure(Arc<DeferredTransportFailure>);
 
 impl RetriedOnTransportFailure {
-    /// Mark `request` as one its caller retries after a transport failure.
-    pub fn mark<T>(self, request: &mut tonic::Request<T>) {
-        request.extensions_mut().insert(self);
+    /// Mark `request` as one whose transport failure this caller reports.
+    pub fn mark<T>(&self, request: &mut tonic::Request<T>) {
+        request.extensions_mut().insert(self.clone());
+    }
+
+    /// Log the transport failure the trace left for this caller, if the call
+    /// had one: as a warning if `retried`, the call being sent again, and as
+    /// an error otherwise.
+    pub fn report(&self, retried: bool) {
+        let state = std::mem::replace(&mut *self.0.lock(), DeferredState::Reported);
+        if let DeferredState::Failed(failure) = state {
+            failure.log(retried);
+        }
+    }
+
+    fn defer(&self, failure: TransportFailure) {
+        let mut state = self.0.lock();
+        match std::mem::replace(&mut *state, DeferredState::Reported) {
+            DeferredState::Reported => {
+                drop(state);
+                failure.log(false);
+            }
+            DeferredState::Pending => *state = DeferredState::Failed(failure),
+            DeferredState::Failed(earlier) => {
+                *state = DeferredState::Failed(failure);
+                drop(state);
+                earlier.log(false);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DeferredTransportFailure(Mutex<DeferredState>);
+
+impl DeferredTransportFailure {
+    fn lock(&self) -> std::sync::MutexGuard<'_, DeferredState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Drop for DeferredTransportFailure {
+    fn drop(&mut self) {
+        let state = self.0.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if let DeferredState::Failed(failure) = std::mem::take(state) {
+            failure.log(false);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+enum DeferredState {
+    #[default]
+    Pending,
+    Failed(TransportFailure),
+    Reported,
+}
+
+/// A transport failure before a status was returned, in the client span of
+/// the call it failed.
+#[derive(Debug)]
+struct TransportFailure {
+    error: String,
+    latency_ms: u64,
+    span: tracing::Span,
+}
+
+impl TransportFailure {
+    fn log(self, retried: bool) {
+        let Self {
+            error,
+            latency_ms,
+            span,
+        } = self;
+        if retried {
+            tracing::warn!(
+                target: "grpc.client",
+                parent: &span,
+                rpc_log_side = "client",
+                grpc_error = %error,
+                latency_ms,
+                failure_origin = "transport",
+                "gRPC client transport error before status was returned; \
+                 the call is retried over a new connection",
+            );
+            return;
+        }
+        tracing::error!(
+            target: "grpc.client",
+            parent: &span,
+            rpc_log_side = "client",
+            grpc_error = %error,
+            latency_ms,
+            failure_origin = "transport",
+            "gRPC client transport error before status was returned",
+        );
     }
 }
 
@@ -166,7 +263,7 @@ impl MakeClassifier for GrpcClientMakeClassifier {
             transport_failure_retried: request
                 .extensions()
                 .get::<RetriedOnTransportFailure>()
-                .is_some(),
+                .cloned(),
             service_port_ingress: matches!(
                 path,
                 "/space.node.api.v1.WorkerApi/ServicePortIngress"
@@ -185,15 +282,15 @@ impl MakeClassifier for GrpcClientMakeClassifier {
 pub struct GrpcClientClassifier {
     inner: GrpcErrorsAsFailures,
     service_port_ingress: bool,
-    /// The request is marked [`RetriedOnTransportFailure`].
-    transport_failure_retried: bool,
+    /// The request's [`RetriedOnTransportFailure`] mark.
+    transport_failure_retried: Option<RetriedOnTransportFailure>,
 }
 
 #[derive(Clone, Debug)]
 pub struct GrpcClientEosClassifier {
     inner: GrpcEosErrorsAsFailures,
     service_port_ingress: bool,
-    transport_failure_retried: bool,
+    transport_failure_retried: Option<RetriedOnTransportFailure>,
 }
 
 /// Carry the request-specific error decision to OnFailure, which cannot recover
@@ -202,8 +299,8 @@ pub struct GrpcClientEosClassifier {
 pub struct GrpcClientFailureClass {
     inner: GrpcFailureClass,
     is_error: bool,
-    /// A transport failure on a call its caller retries.
-    transport_failure_retried: bool,
+    /// The mark of a call whose caller reports this transport failure.
+    transport_failure_retried: Option<RetriedOnTransportFailure>,
 }
 
 impl GrpcClientFailureClass {
@@ -222,13 +319,18 @@ impl GrpcClientFailureClass {
         Self {
             inner,
             is_error,
-            transport_failure_retried: false,
+            transport_failure_retried: None,
         }
     }
 
     /// A failure classified from a transport error rather than a status.
-    fn transport(inner: GrpcFailureClass, service_port_ingress: bool, retried: bool) -> Self {
-        let transport_failure_retried = retried && matches!(inner, GrpcFailureClass::Error(_));
+    fn transport(
+        inner: GrpcFailureClass,
+        service_port_ingress: bool,
+        retried: Option<RetriedOnTransportFailure>,
+    ) -> Self {
+        let transport_failure_retried =
+            retried.filter(|_| matches!(inner, GrpcFailureClass::Error(_)));
         Self {
             transport_failure_retried,
             ..Self::new(inner, service_port_ingress, false)
@@ -518,26 +620,15 @@ impl OnFailure<GrpcClientFailureClass> for GrpcClientOnFailure {
             GrpcFailureClass::Error(error) => {
                 span.record("otel.status_code", "ERROR");
                 span.record("otel.status_description", error.as_str());
-                if failure.transport_failure_retried {
-                    tracing::warn!(
-                        target: "grpc.client",
-                        rpc_log_side = "client",
-                        grpc_error = %error,
-                        latency_ms,
-                        failure_origin = "transport",
-                        "gRPC client transport error before status was returned; \
-                         the call is retried over a new connection",
-                    );
-                    return;
-                }
-                tracing::error!(
-                    target: "grpc.client",
-                    rpc_log_side = "client",
-                    grpc_error = %error,
+                let transport_failure = TransportFailure {
+                    error,
                     latency_ms,
-                    failure_origin = "transport",
-                    "gRPC client transport error before status was returned",
-                );
+                    span: span.clone(),
+                };
+                match failure.transport_failure_retried {
+                    Some(mark) => mark.defer(transport_failure),
+                    None => transport_failure.log(false),
+                }
             }
             _ => {
                 span.record("otel.status_code", "ERROR");

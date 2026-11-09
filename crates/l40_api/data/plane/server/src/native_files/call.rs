@@ -138,7 +138,8 @@ impl Reconnect {
         }
     }
 
-    /// Whether a first attempt whose connection fails is sent again.
+    /// Whether a first attempt whose connection fails may be sent again, as
+    /// [`Self::applies`] decides from the status it failed with.
     fn retries_transport_failures(self) -> bool {
         matches!(self, Self::ReadOnly | Self::BeforeStream)
     }
@@ -189,7 +190,7 @@ impl<'a> SandboxCall<'a> {
         Call: Fn(WorkerClient, tonic::Request<Msg>) -> Fut,
         Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
     {
-        self.attempt(operation, None, message, &call, false)
+        self.attempt(operation, None, message, &call, None)
             .await
             .map_err(CallFailure::Worker)
     }
@@ -210,17 +211,20 @@ impl<'a> SandboxCall<'a> {
         Call: Fn(WorkerClient, tonic::Request<Msg>) -> Fut,
         Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
     {
-        match self
-            .attempt(
-                operation,
-                budget,
-                message.clone(),
-                &call,
-                reconnect.retries_transport_failures(),
-            )
-            .await
-        {
-            Err(WorkerCallError::Status(status)) if reconnect.applies(&status) => {
+        let mark = reconnect
+            .retries_transport_failures()
+            .then(RetriedOnTransportFailure::default);
+        let result = self
+            .attempt(operation, budget, message.clone(), &call, mark.as_ref())
+            .await;
+        let retried =
+            matches!(&result, Err(WorkerCallError::Status(status)) if reconnect.applies(status));
+        // Only now is it known whether a transport failure is retried.
+        if let Some(mark) = mark {
+            mark.report(retried);
+        }
+        match result {
+            Err(WorkerCallError::Status(_)) if retried => {
                 // Later calls to this runtime need a new connection too.
                 self.state
                     .backend_channels
@@ -234,7 +238,7 @@ impl<'a> SandboxCall<'a> {
                     .grant
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = grant;
-                self.attempt(operation, budget, message, &call, false)
+                self.attempt(operation, budget, message, &call, None)
                     .await
                     .map_err(CallFailure::Worker)
             }
@@ -242,15 +246,16 @@ impl<'a> SandboxCall<'a> {
         }
     }
 
-    /// Send `message` once. `retried` marks it as a call sent again if its
-    /// connection fails before it is answered.
+    /// Send `message` once. `retried` marks it as a call that may be sent
+    /// again if its connection fails before it is answered; the caller then
+    /// reports that failure through the mark.
     async fn attempt<Msg, Resp, Call, Fut>(
         &self,
         operation: &'static str,
         budget: Option<NodeApiOperationBudget>,
         message: Msg,
         call: &Call,
-        retried: bool,
+        retried: Option<&RetriedOnTransportFailure>,
     ) -> Result<Resp, WorkerCallError>
     where
         Call: Fn(WorkerClient, tonic::Request<Msg>) -> Fut,
@@ -272,8 +277,8 @@ impl<'a> SandboxCall<'a> {
                 WorkerCallError::NotSent("sandbox runtime is not reachable".to_owned())
             })?;
         let mut request = grant.request(message)?;
-        if retried {
-            RetriedOnTransportFailure.mark(&mut request);
+        if let Some(mark) = retried {
+            mark.mark(&mut request);
         }
         let pending = call(
             WorkerApiClient::new(wrap_grpc_client_channel(channel)),
