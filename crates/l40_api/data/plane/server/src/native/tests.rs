@@ -2864,6 +2864,19 @@ async fn exited_output_from_a_guest_that_does_not_report_its_start_continues_the
             stdout_text(&frames),
             LINES[FIRST_RETAINED as usize..].concat()
         );
+        // The exit must not call this transcript whole: cursors 0 to 4 were
+        // skipped. A data plane that reports `output_truncated` says `true`;
+        // one that predates it omits it.
+        let exits: Vec<_> = frames_of_type(&frames, "process_exited").collect();
+        assert_eq!(exits.len(), 1, "{frames:?}");
+        assert!(
+            matches!(
+                exits[0].1.get("output_truncated"),
+                None | Some(serde_json::Value::Bool(true))
+            ),
+            "{:?}",
+            exits[0].1
+        );
         let gap = frames_of_type(&frames, "resync_required")
             .next()
             .unwrap()
