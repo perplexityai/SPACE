@@ -1,6 +1,7 @@
 use super::*;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 /// One bounded streaming writer. Dropping it abandons only inactive partials;
@@ -27,7 +28,7 @@ impl SlotStore {
             || !descriptor
                 .seed_contracts
                 .iter()
-                .any(|contract| contract == pplx_space_spaced_update::SEED_CONTRACT)
+                .any(|contract| contract == files::seed_contract())
         {
             return Err(UpdateError::Identity);
         }
@@ -82,8 +83,8 @@ impl SlotStore {
             }
             self.verify(&attempt.target)?;
             let path = self.slot_path(attempt.target.slot);
-            let service = files::open_regular(&path.join(Binary::Service.file_name()))?;
-            let cli = files::open_regular(&path.join(Binary::Cli.file_name()))?;
+            let service = files::open_regular(&path.join(files::binary_name(Binary::Service)))?;
+            let cli = files::open_regular(&path.join(files::binary_name(Binary::Cli)))?;
             return Ok(Staging {
                 store: self,
                 descriptor,
@@ -121,14 +122,11 @@ impl SlotStore {
             descriptor.service.length + descriptor.cli.length,
         )?;
         fs::create_dir(&path)?;
+        #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-        File::open(self.root.join("slots"))?.sync_all()?;
+        files::sync_directory(&self.root.join("slots"))?;
         let create = |binary: Binary| -> Result<File, UpdateError> {
-            Ok(OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o700)
-                .open(path.join(binary.file_name()))?)
+            files::create(&path.join(files::binary_name(binary)), true)
         };
         let service = create(Binary::Service)?;
         let cli = create(Binary::Cli)?;
@@ -190,14 +188,10 @@ impl Staging {
             return Ok(self.attempt);
         }
         let path = self.store.slot_path(self.attempt.target.slot);
-        let mut descriptor = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path.join("artifact.json"))?;
+        let mut descriptor = files::create(&path.join("artifact.json"), false)?;
         descriptor.write_all(&self.descriptor.canonical_bytes()?)?;
         descriptor.sync_all()?;
-        File::open(&path)?.sync_all()?;
+        files::sync_directory(&path)?;
         self.store.verify(&self.attempt.target)?;
         let mut journal = self.store.journal()?;
         journal.state = JournalState::Staged {
@@ -227,7 +221,7 @@ fn ensure_capacity(root: &Path, bytes: u64) -> Result<(), UpdateError> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn ensure_capacity(_: &Path, _: u64) -> Result<(), UpdateError> {
     Err(UpdateError::Layout)
 }
@@ -243,7 +237,7 @@ fn ensure_unreferenced(slot: &Path) -> Result<(), UpdateError> {
     // on inaccessible live processes or excessive procfs traversal.
     let mut identities = Vec::new();
     for binary in Binary::ALL {
-        match fs::symlink_metadata(slot.join(binary.file_name())) {
+        match fs::symlink_metadata(slot.join(files::binary_name(binary))) {
             Ok(meta) if meta.is_file() => identities.push((meta.dev(), meta.ino())),
             Ok(_) => return Err(UpdateError::Layout),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -354,7 +348,10 @@ fn ensure_fds_unreferenced(
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn ensure_unreferenced(_: &Path) -> Result<(), UpdateError> {
     Err(UpdateError::Layout)
 }
+
+#[cfg(windows)]
+use super::windows::{ensure_capacity, ensure_unreferenced};

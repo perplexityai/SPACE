@@ -1,5 +1,6 @@
 use super::*;
-use pplx_space_spaced_update::{BinaryIdentity, SEED_CONTRACT, TrialProgress};
+use pplx_space_spaced_update::{BinaryIdentity, TrialProgress};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 fn fixture() -> (tempfile::TempDir, SlotStore, BundleDescriptor) {
@@ -15,9 +16,10 @@ fn bundle(store: &SlotStore, slot: Slot, bytes: &[u8]) -> BundleDescriptor {
     let path = store.slot_path(slot);
     fs::create_dir_all(&path).unwrap();
     for binary in Binary::ALL {
-        fs::write(path.join(binary.file_name()), bytes).unwrap();
+        fs::write(path.join(files::binary_name(binary)), bytes).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(
-            path.join(binary.file_name()),
+            path.join(files::binary_name(binary)),
             fs::Permissions::from_mode(0o700),
         )
         .unwrap();
@@ -34,7 +36,7 @@ fn bundle(store: &SlotStore, slot: Slot, bytes: &[u8]) -> BundleDescriptor {
         guest_update_required_since: "0.8.1".parse().unwrap(),
         compatibility_family: "0.8".into(),
         architecture: pplx_space_cpu_arch::Arch::X86_64,
-        seed_contracts: vec![SEED_CONTRACT.into()],
+        seed_contracts: vec![files::seed_contract().into()],
         service: identity.clone(),
         cli: identity,
     };
@@ -69,6 +71,7 @@ fn arm(store: &SlotStore, boot: Uuid) -> Attempt {
     attempt
 }
 
+#[cfg(unix)]
 #[test]
 fn stable_start_does_not_require_writable_metadata() {
     if !pplx_space_test_env::unprivileged_or_skip("read-only metadata permissions") {
@@ -146,7 +149,13 @@ fn corrupt_journal_falls_back_but_corrupt_fallback_never_executes() {
         store.journal().unwrap().state,
         JournalState::RecoveryRequired
     ));
-    fs::write(store.slot_path(Slot::A).join("spaced-svc"), b"corrupt").unwrap();
+    fs::write(
+        store
+            .slot_path(Slot::A)
+            .join(files::binary_name(Binary::Service)),
+        b"corrupt",
+    )
+    .unwrap();
     let Err(_) = store.select(Uuid::now_v7(), 0) else {
         panic!("operation must be rejected");
     };
@@ -172,6 +181,7 @@ fn additive_journal_metadata_preserves_a_durable_commit_before_link_repair() {
     assert_eq!(store.select(boot, 3).unwrap(), attempt.target);
 }
 
+#[cfg(unix)]
 #[test]
 fn journal_read_errors_do_not_replace_durable_authority() {
     let (dir, store, _) = fixture();
@@ -250,7 +260,7 @@ fn stage_rejects_incompatible_bundles_before_reusing_a_slot() {
         ));
         for binary in Binary::ALL {
             assert_eq!(
-                fs::read(dir.path().join("slots/b").join(binary.file_name())).unwrap(),
+                fs::read(dir.path().join("slots/b").join(files::binary_name(binary))).unwrap(),
                 b"wrong-architecture"
             );
         }
@@ -313,7 +323,10 @@ fn lock_and_path_validation_prevent_concurrent_writers_and_selector_escape() {
         Err(UpdateError::Busy)
     ));
     fs::remove_file(dir.path().join("committed")).unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink("../escape", dir.path().join("committed")).unwrap();
+    #[cfg(windows)]
+    fs::write(dir.path().join("committed"), b"../escape").unwrap();
     fs::write(dir.path().join("update-state"), b"broken").unwrap();
     assert!(matches!(
         store.select(Uuid::now_v7(), 0),
@@ -333,7 +346,12 @@ fn streaming_stage_enforces_two_slots_and_does_not_unlink_an_open_previous_relea
     store.select(boot, 1).unwrap();
     store.self_test_passed(&attempt).unwrap();
     store.commit(&attempt, boot, 2).unwrap();
-    let old_fd = File::open(store.slot_path(Slot::A).join("spaced-svc")).unwrap();
+    let old_fd = File::open(
+        store
+            .slot_path(Slot::A)
+            .join(files::binary_name(Binary::Service)),
+    )
+    .unwrap();
     let mut descriptor = store.descriptor(Slot::B).unwrap();
     let payload = b"next-release";
     descriptor.service = BinaryIdentity {
