@@ -192,7 +192,7 @@ impl SandboxManagerService {
             ));
         }
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-        let artifact_guard = artifact_lock.lock_owned().await;
+        let artifact_guard = artifact_lock.lock_for_capture().await;
         // A blocking suspend commits the full artifact before replying. If the
         // caller loses the response or its control-plane marker write fails,
         // retrying must return that exact committed artifact instead of trying
@@ -257,6 +257,8 @@ impl SandboxManagerService {
         _artifact_guard: &crate::auto_lifecycle::LifecycleMutexGuard,
     ) -> Result<(String, SuspendSnapshotPublicationContext), Status> {
         self.ensure_snapshot_restore_supported("suspend")?;
+        self.settle_guest_update_for_lifecycle(&context.sandbox_id)
+            .await?;
         // Cleanup takes its fence before any artifact lock. Never wait for it
         // while holding the wake/artifact locks: an admitted delete must win,
         // and retrying avoids an inverted lock-order cycle.

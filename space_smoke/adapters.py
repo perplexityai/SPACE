@@ -2581,10 +2581,14 @@ ON CONFLICT (key_hash) DO NOTHING;
         # A snapshots dir that does not exist is a legitimate "none". Any
         # other `ls` failure (it exits 2 for unreadable paths too) or an exec
         # failure must propagate rather than read as "reaped".
+        # Recheck absence after a failed listing: cleanup can remove the
+        # directory between the probe and ls. Existing-path failures propagate.
         # `-A`: GC staging, `.gc-pending-<id>`, is a dot entry.
         result = self._node_shell_exec(
             node_name,
-            f"if [ ! -e {path} ]; then exit 0; fi; ls -1A {path}",
+            f"if [ ! -e {path} ]; then exit 0; fi; "
+            f"if ls -1A {path}; then exit 0; else status=$?; fi; "
+            f'if [ ! -e {path} ]; then exit 0; fi; exit "$status"',
             timeout=30,
         )
         if result.returncode != 0:
