@@ -29,9 +29,9 @@ pub(super) fn admission<T>(result: &Result<T, ControllerError>) -> Option<Admiss
     }
 }
 
-/// Record a cold create's resolved size. `source` is `None` for a create
-/// whose shape the API did not resolve, such as a direct create, which emits
-/// nothing.
+/// Record a cold create's known disk size independently of its compute shape.
+/// `source` gates only compute samples: a direct create does not resolve its
+/// compute shape here but can still carry an explicit disk size.
 pub(super) fn record_create(
     surface: SandboxApiSurface,
     admission: AdmissionDecision,
@@ -39,16 +39,13 @@ pub(super) fn record_create(
     resources: &SandboxResources,
     source: Option<CreateShapeSource>,
 ) {
-    let Some(source) = source else {
-        return;
-    };
     emit(
         RequestedKind::Create,
         surface,
         admission,
         template,
-        create_size(resources),
-        Some(defaulted(source)),
+        source.and_then(|_| create_size(resources)),
+        source.map(defaulted),
         create_disk(resources),
     );
 }

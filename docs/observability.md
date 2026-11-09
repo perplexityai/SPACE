@@ -1235,10 +1235,11 @@ Resident resumes need no admission; recovering a missing runtime can require
 admission and be rejected. Eligible implicit wakes routed through the lifecycle
 action controller are included; data-plane paths that bypass it are not.
 
-Nothing is recorded for a fork; a create whose size the API did not resolve (a
-Direct create, or a Kubernetes create left to the node's default shape and
-template rootfs size); a wake of a running sandbox; a lifecycle action on a
-`restoring` sandbox, including a restore-lease takeover the substrate charges.
+Nothing is recorded for a fork; a wake of a running sandbox; a lifecycle action
+on a `restoring` sandbox, including a restore-lease takeover the substrate
+charges; or a create for which neither compute nor disk size is known.
+Direct cold creates omit compute samples because the API does not resolve their
+compute shape, but record a disk sample when `disk_mib` is known and positive.
 
 The disk size is the sandbox's `disk_mib`: the request's, or one a warm-pool
 config or policy supplied. It is the size the rootfs is configured to, not disk
