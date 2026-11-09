@@ -1807,7 +1807,7 @@ async fn mark_restore_after_network_ready(
     Ok(())
 }
 
-pub(super) async fn notify_resume_clock_sync_best_effort(
+pub(crate) async fn notify_resume_clock_sync_best_effort(
     sandbox_id: &str,
     reason: pplx_space_spaced_host_client::proto::ResumeReason,
 ) -> Result<(), String> {

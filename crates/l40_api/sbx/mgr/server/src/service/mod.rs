@@ -75,6 +75,7 @@ use crate::auto_lifecycle::{
 mod execution_startup;
 pub(crate) mod fork_artifact;
 mod gateway_authority;
+mod guest_update;
 pub(crate) mod network_policy;
 mod restart_admission;
 mod runtime_upgrade;
@@ -379,6 +380,9 @@ pub struct SandboxManagerService {
     /// Shared attempt capacity for foreground cleanup and durable retries.
     /// Excess work remains in SQLite until a slot is available.
     cleanup_sem: Arc<tokio::sync::Semaphore>,
+    /// Guest maintenance leaves excess intent durable instead of queueing
+    /// unbounded transfer/activation tasks alongside customer work.
+    guest_update_sem: Arc<tokio::sync::Semaphore>,
     /// Shared blocking cleanup I/O budget, acquired before task allocation.
     cleanup_io: Arc<tokio::sync::Semaphore>,
     cleanup_target_streams: Arc<tokio::sync::Semaphore>,
@@ -1803,6 +1807,7 @@ impl SandboxManagerService {
                     .as_deref(),
             ),
             cleanup_sem: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CLEANUP_CONCURRENCY_CAP)),
+            guest_update_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             cleanup_io: Arc::new(tokio::sync::Semaphore::new(CLEANUP_IO_CONCURRENCY_CAP)),
             cleanup_target_streams: Arc::new(tokio::sync::Semaphore::new(4)),
             artifact_io: Arc::new(tokio::sync::Semaphore::new(
@@ -2064,6 +2069,7 @@ async fn prune_local_artifact_metadata_once(
 mod activation;
 mod activation_support;
 pub(crate) use activation_support::NodeIdentitySource;
+pub(crate) use activation_support::notify_resume_clock_sync_best_effort;
 mod adapter;
 mod auth_lookup;
 #[cfg(test)]
