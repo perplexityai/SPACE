@@ -37,6 +37,20 @@ struct RejectionDiagnostics {
 }
 
 impl IdempotencyStore {
+    pub(super) fn has_live_records(&self) -> bool {
+        let mut state = self.state();
+        state.prune(Instant::now());
+        state.records.values().any(|record| {
+            !matches!(
+                record,
+                StoredIdempotencyRecord::Expired {
+                    in_progress_generation: None,
+                    ..
+                }
+            )
+        })
+    }
+
     pub(super) fn new(scope: &'static str) -> Self {
         Self {
             scope,

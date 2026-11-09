@@ -433,6 +433,13 @@ impl WorkerPool {
             .collect()
     }
 
+    pub(crate) async fn has_update_obligations(&self) -> bool {
+        self.workers.lock().await.values().any(|entry| match entry {
+            WorkerEntry::Resident(worker) => !worker.is_idle(),
+            _ => true,
+        })
+    }
+
     pub(crate) async fn set_ledger_enabled(&self, worker: &WorkerClient, enabled: bool) -> bool {
         if let Some(mut resident) = self.resident_mut(worker).await {
             resident.ledger_enabled = enabled;
