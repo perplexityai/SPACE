@@ -1238,10 +1238,10 @@ async fn backend_channels_accept_bare_direct_node_endpoints() {
         return;
     }
 
-    let channels = build_backend_channels("192.0.2.111:9800", 2)
+    let channels = build_backend_channels("192.0.2.111:9800", 2, Default::default())
         .await
         .expect("bare endpoint");
-    let dns_channels = build_backend_channels("worker:9800", 1)
+    let dns_channels = build_backend_channels("worker:9800", 1, Default::default())
         .await
         .expect("bare dns endpoint");
 
@@ -1264,7 +1264,7 @@ async fn backend_channels_advertise_the_configured_connection_window() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap().to_string();
-    let channel = build_backend_channels(&endpoint, 1)
+    let channel = build_backend_channels(&endpoint, 1, Default::default())
         .await
         .expect("backend channel")
         .remove(0);

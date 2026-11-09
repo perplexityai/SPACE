@@ -296,6 +296,22 @@ pub fn configure_node_api_endpoint(endpoint: Endpoint, config: NodeApiEndpointCo
     }
 }
 
+/// What a node-api connection that is kept and shared needs, on top of
+/// [`configure_node_api_endpoint`]: one connection per runtime endpoint that
+/// carries many callers' calls and outlives each of them.
+///
+/// - It pings while idle too, so a connection whose far end went away without
+///   a FIN, as a deleted pod's whose address a later pod can be given, is
+///   closed within the keep-alive interval and timeout. The next call then
+///   dials the endpoint anew, rather than waiting out the keep-alive timeout
+///   on a connection nothing answers or failing at once on one that is reset.
+/// - Its concurrent streams share [`MULTIPLEXED_CONNECTION_WINDOW_BYTES`].
+pub fn configure_kept_node_api_endpoint(endpoint: Endpoint) -> Endpoint {
+    endpoint
+        .keep_alive_while_idle(true)
+        .initial_connection_window_size(MULTIPLEXED_CONNECTION_WINDOW_BYTES)
+}
+
 fn configure_node_ctl_endpoint(endpoint: Endpoint) -> Endpoint {
     endpoint
         .connect_timeout(DEFAULT_TCP_CONNECT_TIMEOUT)
