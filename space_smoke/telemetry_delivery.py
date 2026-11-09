@@ -287,7 +287,7 @@ class TelemetryDeliveryAssertions:
 
         baseline = read()
         # Require fresh observations, not merely a retained sample. Allow two
-        # 24–37 s probe intervals, scheduler ticks, and exporter delay.
+        # 24-37 s probe intervals, scheduler ticks, and exporter delay.
         final = self._poll(
             read,
             lambda now: now["count"] - baseline["count"] >= 2,
