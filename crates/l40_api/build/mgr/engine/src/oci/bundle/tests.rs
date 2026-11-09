@@ -14,6 +14,35 @@ struct BundleFixture {
     cache: PathBuf,
 }
 
+#[rstest]
+fn selector_seed_refuses_missing_descriptor_without_overwriting_its_agent(
+    bundle_fixture: BundleFixture,
+) {
+    fs::create_dir_all(bundle_fixture.target.join("etc/spaced")).unwrap();
+    fs::write(
+        bundle_fixture.target.join("etc/spaced/update-contract"),
+        "linux-systemd-selector-v1\n",
+    )
+    .unwrap();
+    let executable = bundle_fixture.target.join("usr/local/bin/spaced-svc");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(&executable, "selected-seed-agent").unwrap();
+    assert!(matches!(
+        install_current_guest_with_privilege(
+            &bundle_fixture.target,
+            &bundle_fixture.guest_bins,
+            "1.2.3",
+            true,
+            false
+        ),
+        Err(GuestBundleError::MissingPath { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(executable).unwrap(),
+        "selected-seed-agent"
+    );
+}
+
 #[fixture]
 fn bundle_fixture() -> BundleFixture {
     let tempdir = tempfile::tempdir().expect("create bundle fixture");
@@ -236,10 +265,18 @@ fn bundle_injection_keeps_oci_userspace_and_replaces_the_guest_contract(
     bundle
         .extract_with_privilege(&bundle_fixture.target, false)
         .expect("inject seed bundle");
+    // A customer marker must not change the already-captured seed ABI.
+    fs::create_dir_all(bundle_fixture.target.join("etc/spaced")).unwrap();
+    fs::write(
+        bundle_fixture.target.join("etc/spaced/update-contract"),
+        "customer-marker",
+    )
+    .unwrap();
     install_current_guest_with_privilege(
         &bundle_fixture.target,
         &bundle_fixture.guest_bins,
         "1.2.3",
+        bundle.slots,
         false,
     )
     .expect("install current guest binaries");
@@ -357,6 +394,7 @@ fn bundle_injection_does_not_follow_oci_directory_symlinks(bundle_fixture: Bundl
         &bundle_fixture.target,
         &bundle_fixture.guest_bins,
         "1.2.3",
+        bundle.slots,
         false,
     )
     .expect("install current guest binaries");

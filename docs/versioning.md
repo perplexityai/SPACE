@@ -20,6 +20,34 @@ backward-compatible. From 1.0, compatible features increment the minor version,
 compatible fixes increment the patch version, and breaking changes require a new
 major version.
 
+## Workspace releases and existing guests
+
+The workspace version is the sole ordered release version for host and guest
+components. Running instances can differ during deployment or while dormant;
+one release history does not imply simultaneous fleet upgrades.
+
+Guest bundles record `guest_update_required_since`, the latest workspace release
+whose guest changes warrant restarting existing guests. It is an existing
+release reference at or below the bundle version, not a separately allocated
+number. A normal upgrade requires both the target version and marker to exceed
+the installed guest version. Compatibility, a deployment ceiling, idle admission
+and explicit artifact authorization remain independent requirements. Explicit
+rollback is separately authorized and preserves forward release history.
+
+[`ci/guest-update-required-since`](../ci/guest-update-required-since) supplies the
+marker when packaging a release. Release automation must allocate the final
+workspace version in a serialized publication process. A normalized spaced
+protobuf descriptor change requests a patch release and advances the marker;
+comments and source locations are excluded. Authors explicitly request the same
+for behavior changes that should reach existing guests. Other release triggers
+leave the marker unchanged. Descriptor comparison detects contract changes, not
+whether a breaking change is safe: the minor/major policy still applies.
+
+Current bundle CI publishes commit-tagged builds and does not allocate immutable
+workspace releases. Until serialized allocation and immutable publication are
+in place, same-version development builds cannot authorize automatic guest
+upgrades. Do not independently pick patch versions in concurrent feature PRs.
+
 ## Service contracts
 
 At 1.0, backward compatibility throughout 1.x covers:

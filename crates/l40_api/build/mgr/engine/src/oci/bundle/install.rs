@@ -11,23 +11,58 @@ pub fn install_current_guest(
     target_root: &Path,
     guest_bin_dir: &Path,
     bundle_version: &str,
+    slots: bool,
 ) -> Result<(), GuestBundleError> {
-    install_current_guest_with_privilege(target_root, guest_bin_dir, bundle_version, true)
+    install_current_guest_with_privilege(target_root, guest_bin_dir, bundle_version, slots, true)
 }
 
 pub(super) fn install_current_guest_with_privilege(
     target_root: &Path,
     guest_bin_dir: &Path,
     bundle_version: &str,
+    slots: bool,
     as_root: bool,
 ) -> Result<(), GuestBundleError> {
     validate_target_root(target_root)?;
+    if slots {
+        let descriptor = guest_bin_dir.join("artifact.json");
+        if !descriptor.is_file() {
+            return Err(GuestBundleError::MissingPath { path: descriptor });
+        }
+        // Image assembly replaces the seed's installed pair and history as
+        // one offline layout. It never overlays regular files on its symlinks.
+        replace_target_directory(
+            target_root,
+            Path::new("var/lib/spaced"),
+            GuestBundleOperation::Install,
+            as_root,
+        )?;
+        for slot in ["a", "b"] {
+            prepare_target_directory(
+                target_root,
+                &Path::new("var/lib/spaced/slots").join(slot),
+                GuestBundleOperation::Install,
+                as_root,
+            )?;
+        }
+        install(
+            &descriptor,
+            &target_root.join("var/lib/spaced/slots/a/artifact.json"),
+            0o644,
+            as_root,
+        )?;
+    }
     for binary in ["spaced", "spaced-svc"] {
         let source = guest_bin_dir.join(binary);
         if !source.is_file() {
             return Err(GuestBundleError::MissingPath { path: source });
         }
-        let relative = Path::new("usr/local/bin").join(binary);
+        let relative = Path::new(if slots {
+            "var/lib/spaced/slots/a"
+        } else {
+            "usr/local/bin"
+        })
+        .join(binary);
         prepare_target_file(
             target_root,
             &relative,
@@ -35,6 +70,31 @@ pub(super) fn install_current_guest_with_privilege(
             as_root,
         )?;
         install(&source, &target_root.join(relative), 0o755, as_root)?;
+    }
+
+    if slots {
+        let mut initialize = privileged_command(
+            path_arg(&guest_bin_dir.join("spaced-svc")).as_str(),
+            as_root,
+        );
+        initialize
+            .arg("--initialize-update")
+            .arg(target_root.join("var/lib/spaced"));
+        run_status(GuestBundleOperation::Install, &mut initialize)?;
+        for binary in ["spaced", "spaced-svc"] {
+            let relative = Path::new("usr/local/bin").join(binary);
+            prepare_target_file(
+                target_root,
+                &relative,
+                GuestBundleOperation::Install,
+                as_root,
+            )?;
+            let mut link = privileged_command("ln", as_root);
+            link.arg("-s")
+                .arg(format!("/var/lib/spaced/current/{binary}"))
+                .arg(target_root.join(relative));
+            run_status(GuestBundleOperation::Install, &mut link)?;
+        }
     }
 
     let mut version_file =
