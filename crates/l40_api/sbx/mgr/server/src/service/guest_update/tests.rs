@@ -539,11 +539,11 @@ fn fresh_authority_requires_the_current_template_attestation() {
             promotion: promotion.clone(),
             qualified_templates: templates.into_iter().map(str::to_owned).collect(),
         };
-        assert_eq!(policy.authorizes(&action, template), expected);
+        assert_eq!(policy::authorizes(&policy, &action, template), expected);
         policy.authorization = Uuid::now_v7();
-        assert!(!policy.authorizes(&action, template));
+        assert!(!policy::authorizes(&policy, &action, template));
         policy.authorization = authorization;
         policy.promotion.maximum_guest = "0.8.3".parse().unwrap();
-        assert!(!policy.authorizes(&action, template));
+        assert!(!policy::authorizes(&policy, &action, template));
     }
 }

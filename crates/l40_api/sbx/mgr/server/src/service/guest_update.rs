@@ -169,7 +169,7 @@ impl SandboxManagerService {
         )? {
             return Ok(Response::new(receipt));
         }
-        let bundle = policy::load().await?;
+        let bundle = policy::load(requested.target).await?;
         if requested != bundle.policy.promotion {
             return Err(Status::permission_denied(
                 "promotion is not the configured host authority",
@@ -529,7 +529,7 @@ impl SandboxManagerService {
                     .await?;
                 return Ok(());
             }
-            let bundle = match policy::load().await {
+            let bundle = match policy::load(promotion.target).await {
                 Ok(bundle)
                     if &bundle.policy.promotion == promotion.as_ref()
                         && &bundle.policy.authorization == authorization =>

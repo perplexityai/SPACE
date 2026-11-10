@@ -1,19 +1,11 @@
-//! Operator-installed promotion authority. The RPC supplies an identity to
-//! match, never an artifact path or a new authorization. Automatic rollout is
-//! deliberately absent. Template hashes are qualified, digest-bound seeds.
+//! Node-installed authority, preserving each platform target independently.
+//! RPC callers supply identities, never artifact paths or new authorization.
 use super::*;
-use serde::Deserialize;
+use model::catalog::Catalog;
+pub(super) use model::catalog::InstalledPolicy as Policy;
 
 const POLICY: &str = "/etc/space/guest-update/policy.json";
 const BUNDLES: &str = "/opt/space/guest-update";
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Policy {
-    pub authorization: Uuid,
-    pub promotion: model::policy::Promotion,
-    pub qualified_templates: Vec<String>,
-}
 
 pub(super) struct Bundle {
     pub policy: Policy,
@@ -62,19 +54,19 @@ fn metadata(path: &Path) -> Result<Vec<u8>, Status> {
     Ok(bytes)
 }
 
-pub(super) async fn load() -> Result<Bundle, Status> {
-    tokio::task::spawn_blocking(|| {
-        let policy: Policy =
-            serde_json::from_slice(&metadata(Path::new(POLICY))?).map_err(internal)?;
-        policy.promotion.accept_after(None).map_err(internal)?;
-        if policy.authorization.is_nil()
-            || policy.qualified_templates.is_empty()
-            || policy.qualified_templates.len() > 1024
-        {
-            return Err(Status::failed_precondition(
-                "promotion lacks authorization or qualified templates",
-            ));
-        }
+pub(super) async fn catalog() -> Result<Catalog, Status> {
+    tokio::task::spawn_blocking(|| Catalog::parse(&metadata(Path::new(POLICY))?).map_err(internal))
+        .await
+        .map_err(internal)?
+}
+
+pub(super) async fn load(target: model::ArtifactDigest) -> Result<Bundle, Status> {
+    let catalog = catalog().await?;
+    tokio::task::spawn_blocking(move || {
+        let (platform, architecture, policy) = catalog.target(target).ok_or_else(|| {
+            Status::permission_denied("target is not installed in the node catalog")
+        })?;
+        let policy = policy.clone();
         let root = Path::new(BUNDLES).join(policy.promotion.target.to_string());
         let descriptor = model::BundleDescriptor::parse(&metadata(&root.join("artifact.json"))?)
             .map_err(internal)?;
@@ -85,7 +77,8 @@ pub(super) async fn load() -> Result<Bundle, Status> {
             || descriptor.version > policy.promotion.maximum_guest
             || semver::Version::parse(env!("CARGO_PKG_VERSION")).map_err(internal)?
                 < policy.promotion.minimum_host
-            || descriptor.recovery_platform().is_err()
+            || descriptor.recovery_platform().ok() != Some(platform)
+            || descriptor.architecture != architecture
             || descriptor.architecture.to_string() != std::env::consts::ARCH
         {
             return Err(Status::failed_precondition(
@@ -141,23 +134,25 @@ pub(super) fn promotion(value: wire::Promotion) -> Result<model::policy::Promoti
     Ok(value)
 }
 
-impl Policy {
-    pub(super) fn authorizes(&self, action: &Action, template: Option<&str>) -> bool {
-        template.is_some_and(|template| {
-            self.qualified_templates
-                .iter()
-                .any(|qualified| qualified == template)
-        }) && matches!(action,
+pub(super) fn authorizes(policy: &Policy, action: &Action, template: Option<&str>) -> bool {
+    template.is_some_and(|template| {
+        policy
+            .qualified_templates
+            .iter()
+            .any(|qualified| qualified == template)
+    }) && matches!(action,
         Action::Apply { promotion, authorization }
-            if promotion.as_ref() == &self.promotion
-                && authorization == &self.authorization)
-    }
+            if promotion.as_ref() == &policy.promotion
+                && authorization == &policy.authorization)
 }
 
 /// Recheck current authority immediately before an irreversible guest transition.
 pub(super) async fn permits(action: &Action, template: Option<&str>) -> bool {
-    load()
+    let Action::Apply { promotion, .. } = action else {
+        return false;
+    };
+    load(promotion.target)
         .await
         .as_ref()
-        .is_ok_and(|bundle| bundle.policy.authorizes(action, template))
+        .is_ok_and(|bundle| authorizes(&bundle.policy, action, template))
 }
