@@ -24,11 +24,19 @@
 //!   terminated), reconciles what is left on it and deletes the row
 //!   (`dead_node`).
 //! - **undrained** (no phase, `drain_status.cancel`): cancel the epoch on the
-//!   node until it is unsealed, then clear the v2 columns.
+//!   node, and take back what the drain evacuated: the node hands back each
+//!   sandbox the drain suspended, the loop records it as a drain records it
+//!   (enqueueing the restore to its prior lifecycle, which may land on the
+//!   node again), and the node forgets the ones recorded. Once the node is
+//!   unsealed with nothing left to hand back, clear the v2 columns.
+//!
+//! An evacuation the loop can't record for [`UNRECORDED_BOUND`] is reported
+//! `blocked`, as the node reports work that doesn't settle.
 //!
 //! Every v1 writer keyed on drain phase skips a v2 row, so this loop is the
 //! only one that moves one.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use pplx_space_common_core::types::NodeId;
@@ -68,7 +76,14 @@ pub struct V2Node {
     pub cancel: bool,
     /// `drain_status.terminated`: the terminator acted on the node.
     pub terminated: bool,
+    /// Since when, in Unix seconds, each evacuation the last stored report
+    /// names unrecorded has been.
+    pub unrecorded_since: BTreeMap<String, i64>,
 }
+
+/// How long an evacuation may stay unrecorded before the report names it
+/// `blocked`: the node's own bound on a transition it doesn't drive.
+pub const UNRECORDED_BOUND: Duration = Duration::from_secs(15 * 60);
 
 /// What recording one reported evacuation found.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,11 +113,14 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         &self,
         node_id: NodeId,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    /// `forget`, with `cancel`: the evacuations recorded since a cancel call
+    /// reported them, for the node to forget.
     fn drain_node(
         &self,
         node_id: NodeId,
         epoch: u64,
         cancel: bool,
+        forget: &[String],
     ) -> impl std::future::Future<Output = Result<DrainNodeResponse, String>> + Send;
     fn record_evacuation(
         &self,
@@ -151,12 +169,56 @@ pub struct V2TickReport {
     pub terminated: Vec<NodeId>,
 }
 
+/// What the loop recorded of one report: each evacuation's record, and
+/// since when each one still unrecorded has been, in Unix seconds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recording {
+    pub records: Vec<(String, EvacuationRecord)>,
+    pub since: BTreeMap<String, i64>,
+    pub now: i64,
+}
+
+impl Recording {
+    /// The unrecorded evacuations, with their reason and since when.
+    fn unrecorded(&self) -> impl Iterator<Item = (&str, &str, i64)> {
+        self.records
+            .iter()
+            .filter_map(|(sandbox_id, record)| match record {
+                EvacuationRecord::NotYet(reason) => Some((
+                    sandbox_id.as_str(),
+                    reason.as_str(),
+                    self.since.get(sandbox_id).copied().unwrap_or(self.now),
+                )),
+                EvacuationRecord::Recorded => None,
+            })
+    }
+
+    /// The unrecorded evacuations past [`UNRECORDED_BOUND`], with why.
+    fn overdue(&self) -> Vec<(&str, String)> {
+        let bound = i64::try_from(UNRECORDED_BOUND.as_secs()).unwrap_or(i64::MAX);
+        self.unrecorded()
+            .filter(|(_, _, since)| self.now.saturating_sub(*since) >= bound)
+            .map(|(sandbox_id, reason, _)| {
+                (
+                    sandbox_id,
+                    format!(
+                        "not recorded for over {} minutes: {reason}",
+                        UNRECORDED_BOUND.as_secs() / 60
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn all_recorded(&self) -> bool {
+        self.records.iter().all(|(_, record)| record.is_recorded())
+    }
+}
+
 /// The JSON `drain_status.report` holds: the node's answer and what the loop
-/// recorded of it.
-pub fn report_json(
-    response: &DrainNodeResponse,
-    records: &[(String, EvacuationRecord)],
-) -> serde_json::Value {
+/// recorded of it. An evacuation unrecorded past [`UNRECORDED_BOUND`] is
+/// `blocked` as well.
+pub fn report_json(response: &DrainNodeResponse, recording: &Recording) -> serde_json::Value {
     let prior = |value: i32| match DrainPrior::try_from(value) {
         Ok(DrainPrior::Started) => "started",
         Ok(DrainPrior::Paused) => "paused",
@@ -178,15 +240,70 @@ pub fn report_json(
         "blocked": response.blocked.iter().map(|entry| serde_json::json!({
             "sandbox_id": entry.sandbox_id,
             "reason": entry.reason,
+        })).chain(recording.overdue().into_iter().map(|(sandbox_id, reason)| serde_json::json!({
+            "sandbox_id": sandbox_id,
+            "reason": reason,
+        }))).collect::<Vec<_>>(),
+        "unrecorded": recording.unrecorded().map(|(sandbox_id, reason, since)| serde_json::json!({
+            "sandbox_id": sandbox_id,
+            "reason": reason,
+            "since": since,
         })).collect::<Vec<_>>(),
-        "unrecorded": records.iter().filter_map(|(sandbox_id, record)| match record {
-            EvacuationRecord::NotYet(reason) => Some(serde_json::json!({
-                "sandbox_id": sandbox_id,
-                "reason": reason,
-            })),
-            _ => None,
-        }).collect::<Vec<_>>(),
     })
+}
+
+/// Unix seconds now, the clock `Recording::since` is kept in.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Record each evacuation `response` reports, carrying over since when each
+/// unrecorded one has been from the node's last stored report.
+async fn record_evacuations<S: DrainV2Sink>(
+    sink: &S,
+    node: &V2Node,
+    response: &DrainNodeResponse,
+) -> Recording {
+    let now = unix_now();
+    let mut recording = Recording {
+        now,
+        ..Recording::default()
+    };
+    for evacuated in &response.evacuated {
+        let record = match sink.record_evacuation(node.id, evacuated).await {
+            Ok(record) => record,
+            Err(error) => EvacuationRecord::NotYet(format!("recording failed: {error}")),
+        };
+        if !record.is_recorded() {
+            recording.since.insert(
+                evacuated.sandbox_id.clone(),
+                node.unrecorded_since
+                    .get(&evacuated.sandbox_id)
+                    .copied()
+                    .unwrap_or(now),
+            );
+        }
+        recording
+            .records
+            .push((evacuated.sandbox_id.clone(), record));
+    }
+    recording
+}
+
+/// Publish what `response` and the loop's `recording` of it leave to do:
+/// an evacuation unrecorded past the bound is blocked, one within it pending.
+fn publish_report(node: &V2Node, response: &DrainNodeResponse, recording: &Recording) {
+    let unrecorded = recording.unrecorded().count();
+    let overdue = recording.overdue().len();
+    crate::metrics::node_drain::v2_report(
+        &node.id.to_string(),
+        (response.blocked.len() + overdue) as u64,
+        (response.pending.len() + unrecorded - overdue) as u64,
+    );
 }
 
 /// How many v2 nodes one tick calls at once: each call waits on its node,
@@ -240,7 +357,7 @@ async fn step<S: DrainV2Sink, T: InstanceTerminator>(
         return None;
     };
     match node.phase.as_deref() {
-        None if node.cancel => cancel(sink, node.id, epoch)
+        None if node.cancel => cancel(sink, node, epoch)
             .await
             .then_some(NodeStep::Cancelled),
         None => None,
@@ -262,11 +379,15 @@ async fn step<S: DrainV2Sink, T: InstanceTerminator>(
 /// Ask the node, record what it reports, and advance a `draining` node that
 /// is done. Returns whether the node moved to `drained`.
 async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
-    if let Err(error) = sink.ensure_cordon(node.id).await {
-        sink.record_error(node.id, &format!("cordon convergence failed: {error}"))
-            .await;
+    let cordon_error = sink
+        .ensure_cordon(node.id)
+        .await
+        .err()
+        .map(|error| format!("cordon convergence failed: {error}"));
+    if let Some(error) = &cordon_error {
+        sink.record_error(node.id, error).await;
     }
-    let response = match sink.drain_node(node.id, epoch, false).await {
+    let response = match sink.drain_node(node.id, epoch, false, &[]).await {
         Ok(response) => response,
         Err(error) => {
             crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
@@ -275,24 +396,9 @@ async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
             return false;
         }
     };
-    let mut records = Vec::with_capacity(response.evacuated.len());
-    for evacuated in &response.evacuated {
-        let record = match sink.record_evacuation(node.id, evacuated).await {
-            Ok(record) => record,
-            Err(error) => EvacuationRecord::NotYet(format!("recording failed: {error}")),
-        };
-        records.push((evacuated.sandbox_id.clone(), record));
-    }
-    let all_recorded = records.iter().all(|(_, record)| record.is_recorded());
-    let unrecorded = records
-        .iter()
-        .filter(|(_, record)| !record.is_recorded())
-        .count();
-    crate::metrics::node_drain::v2_report(
-        &node.id.to_string(),
-        response.blocked.len() as u64,
-        (response.pending.len() + unrecorded) as u64,
-    );
+    let recording = record_evacuations(sink, node, &response).await;
+    publish_report(node, &response, &recording);
+    let all_recorded = recording.all_recorded();
     if !response.blocked.is_empty() {
         tracing::warn!(
             node_id = %node.id,
@@ -302,10 +408,16 @@ async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
         );
     }
     match sink
-        .record_report(node.id, epoch, report_json(&response, &records))
+        .record_report(node.id, epoch, report_json(&response, &recording))
         .await
     {
-        Ok(true) => {}
+        // Storing the report clears the last error; a cordon that failed
+        // this tick keeps its error until one succeeds.
+        Ok(true) => {
+            if let Some(error) = &cordon_error {
+                sink.record_error(node.id, error).await;
+            }
+        }
         Ok(false) => return false,
         Err(error) => {
             sink.record_error(
@@ -333,23 +445,74 @@ async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
     }
 }
 
-/// Cancel an undrained node's epoch, then clear its v2 columns once the node
-/// no longer holds the seal. Returns whether the columns were cleared.
-async fn cancel<S: DrainV2Sink>(sink: &S, node_id: NodeId, epoch: u64) -> bool {
-    match sink.drain_node(node_id, epoch, true).await {
-        Ok(response) if response.sealed_epoch != Some(epoch) => {
-            match sink.finish_cancel(node_id, epoch).await {
-                Ok(cleared) => cleared,
-                Err(error) => {
-                    sink.record_error(node_id, &format!("clearing the cancel failed: {error}"))
-                        .await;
-                    false
-                }
-            }
+/// Cancel an undrained node's epoch and take back what the drain
+/// evacuated: record each sandbox the node hands back, which enqueues its
+/// restore, and have the node forget the ones recorded. Clear the v2 columns
+/// once the node no longer holds the seal and has nothing left to hand back.
+/// Returns whether the columns were cleared.
+async fn cancel<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
+    let call = |forget: Vec<String>| async move {
+        let answer = sink.drain_node(node.id, epoch, true, &forget).await;
+        if let Err(error) = &answer {
+            crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
+            sink.record_error(node.id, &format!("DrainNode cancel failed: {error}"))
+                .await;
         }
-        Ok(_) => false,
+        answer.ok()
+    };
+    let Some(response) = call(Vec::new()).await else {
+        return false;
+    };
+    if response.sealed_epoch == Some(epoch) {
+        return false;
+    }
+    let recording = record_evacuations(sink, node, &response).await;
+    let recorded: Vec<String> = recording
+        .records
+        .iter()
+        .filter(|(_, record)| record.is_recorded())
+        .map(|(sandbox_id, _)| sandbox_id.clone())
+        .collect();
+    let response = if recorded.is_empty() {
+        response
+    } else {
+        let Some(response) = call(recorded).await else {
+            return false;
+        };
+        response
+    };
+    match sink
+        .record_report(node.id, epoch, report_json(&response, &recording))
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return false,
         Err(error) => {
-            sink.record_error(node_id, &format!("DrainNode cancel failed: {error}"))
+            sink.record_error(
+                node.id,
+                &format!("storing the cancel's report failed: {error}"),
+            )
+            .await;
+            return false;
+        }
+    }
+    // An earlier node answers a cancel with none of these lists: it has
+    // nothing to hand back.
+    let handed_back =
+        response.evacuated.is_empty() && response.pending.is_empty() && response.blocked.is_empty();
+    if !handed_back {
+        publish_report(node, &response, &recording);
+        return false;
+    }
+    match sink.finish_cancel(node.id, epoch).await {
+        Ok(cleared) => {
+            if cleared {
+                crate::metrics::node_drain::clear_v2_gauges(&node.id.to_string());
+            }
+            cleared
+        }
+        Err(error) => {
+            sink.record_error(node.id, &format!("clearing the cancel failed: {error}"))
                 .await;
             false
         }
@@ -375,8 +538,16 @@ async fn terminate<S: DrainV2Sink, T: InstanceTerminator>(
                 false
             }
         },
-        Err(TerminateError::StaleIdentity) => false,
+        Err(TerminateError::StaleIdentity) => {
+            tracing::warn!(
+                node_id = %node_id,
+                "node_drain v2: the terminator found the node's identity stale; the next \
+                 tick terminates it again"
+            );
+            false
+        }
         Err(error) => {
+            crate::metrics::node_drain::v2_terminate_failure(&node_id.to_string());
             sink.record_error(node_id, &format!("terminate failed: {error}"))
                 .await;
             false

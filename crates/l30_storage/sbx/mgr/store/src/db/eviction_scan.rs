@@ -66,7 +66,7 @@ db_private_outside_tests! {
     /// `(cursor_witness, cursor_sandbox_id)` keyset position, in witness then id
     /// order. A row a drain suspended is never one: its `drain_evacuations`
     /// record, which an eviction deletes with the row, holds the lifecycle the
-    /// drain restores it to, until a cancel forgets it.
+    /// drain restores it to, kept until a cancel has handed the sandbox back.
     fn idle_suspended_candidates(
         conn: &Connection,
         cutoff: i64,

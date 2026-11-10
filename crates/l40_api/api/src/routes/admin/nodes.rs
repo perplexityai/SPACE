@@ -2463,6 +2463,7 @@ impl V2DrainProbe for NodeApiV2DrainProbe {
                 .drain_node(pplx_space_sbx_mgr_client::proto::DrainNodeRequest {
                     epoch,
                     cancel: false,
+                    forget: Vec::new(),
                 })
                 .await
                 .map_err(|status| status.to_string())?

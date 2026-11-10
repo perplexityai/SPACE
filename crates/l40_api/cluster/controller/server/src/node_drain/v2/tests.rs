@@ -1,6 +1,6 @@
 //! The v2 loop's decisions against a scripted sink and terminator.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use pplx_space_sbx_mgr_client::proto::DrainEvacuated;
@@ -11,7 +11,11 @@ use super::*;
 struct FakeSink {
     nodes: Vec<V2Node>,
     responses: HashMap<(NodeId, bool), Result<DrainNodeResponse, String>>,
+    /// A cancel's answer once it names evacuations to forget; the cancel's
+    /// own answer when unset.
+    after_forget: HashMap<NodeId, DrainNodeResponse>,
     records: HashMap<String, EvacuationRecord>,
+    cordon_error: Option<String>,
     calls: Mutex<Vec<String>>,
     /// When set, each `DrainNode` call waits here before it answers.
     barrier: Option<tokio::sync::Barrier>,
@@ -34,7 +38,7 @@ impl DrainV2Sink for FakeSink {
 
     async fn ensure_cordon(&self, node_id: NodeId) -> Result<(), String> {
         self.log(format!("cordon {node_id}"));
-        Ok(())
+        self.cordon_error.clone().map_or(Ok(()), Err)
     }
 
     async fn drain_node(
@@ -42,10 +46,23 @@ impl DrainV2Sink for FakeSink {
         node_id: NodeId,
         epoch: u64,
         cancel: bool,
+        forget: &[String],
     ) -> Result<DrainNodeResponse, String> {
-        self.log(format!("drain_node {node_id} {epoch} cancel={cancel}"));
+        if forget.is_empty() {
+            self.log(format!("drain_node {node_id} {epoch} cancel={cancel}"));
+        } else {
+            self.log(format!(
+                "drain_node {node_id} {epoch} cancel={cancel} forget={}",
+                forget.join(",")
+            ));
+        }
         if let Some(barrier) = &self.barrier {
             barrier.wait().await;
+        }
+        if !forget.is_empty()
+            && let Some(answer) = self.after_forget.get(&node_id)
+        {
+            return Ok(answer.clone());
         }
         self.responses
             .get(&(node_id, cancel))
@@ -124,6 +141,7 @@ fn node(phase: Option<&str>, epoch: Option<u64>, cancel: bool) -> V2Node {
         epoch,
         cancel,
         terminated: false,
+        unrecorded_since: BTreeMap::new(),
     }
 }
 
@@ -269,15 +287,20 @@ async fn the_report_names_the_evacuations_not_yet_recorded() {
     let answer = response(Some(5), true, &["a", "b"]);
     let json = report_json(
         &answer,
-        &[
-            ("a".into(), EvacuationRecord::Recorded),
-            ("b".into(), EvacuationRecord::NotYet("uploading".into())),
-        ],
+        &Recording {
+            records: vec![
+                ("a".into(), EvacuationRecord::Recorded),
+                ("b".into(), EvacuationRecord::NotYet("uploading".into())),
+            ],
+            since: BTreeMap::from([("b".into(), 1_000)]),
+            now: 1_060,
+        },
     );
     assert_eq!(
         json["unrecorded"],
-        serde_json::json!([{"sandbox_id": "b", "reason": "uploading"}])
+        serde_json::json!([{"sandbox_id": "b", "reason": "uploading", "since": 1_000}])
     );
+    assert_eq!(json["blocked"], serde_json::json!([]));
     assert_eq!(json["sealed_epoch"], 5);
     assert_eq!(json["evacuated"][0]["prior"], "started");
 }
@@ -426,4 +449,271 @@ async fn a_node_that_does_not_answer_shows_on_the_unanswered_gauge() {
             .map(|value| value.value);
         assert_eq!(gauge, Some(unanswered), "{case}: {values:?}");
     }
+}
+
+/// An undrained node hands back what the drain evacuated: each sandbox it
+/// reports is recorded, the recorded ones are named for the node to forget,
+/// and the columns clear only once the node, unsealed, has nothing left to
+/// hand back. One not recorded yet, or work still pending, keeps the cancel
+/// open. Once it clears, the node's v2 gauges read 0.
+#[tokio::test(flavor = "current_thread")]
+async fn an_undrained_node_hands_back_its_evacuations_before_the_cancel_clears() {
+    let pending = DrainNodeResponse {
+        pending: vec![pplx_space_sbx_mgr_client::proto::DrainPending {
+            sandbox_id: "c".into(),
+            action: "upload".into(),
+        }],
+        ..response(None, false, &[])
+    };
+    for (case, answer, after_forget, record_b, clears) in [
+        (
+            "all recorded",
+            response(None, false, &["a", "b"]),
+            response(None, true, &[]),
+            EvacuationRecord::Recorded,
+            true,
+        ),
+        (
+            "one not recorded yet",
+            response(None, false, &["a", "b"]),
+            response(None, false, &["b"]),
+            EvacuationRecord::NotYet("the catalog doesn't hold the artifact as ready yet".into()),
+            false,
+        ),
+        (
+            "an upload pending",
+            response(None, false, &["a"]),
+            pending.clone(),
+            EvacuationRecord::Recorded,
+            false,
+        ),
+    ] {
+        let undrained = node(None, Some(5), true);
+        let sink = FakeSink {
+            nodes: vec![undrained.clone()],
+            responses: HashMap::from([((undrained.id, true), Ok(answer))]),
+            after_forget: HashMap::from([(undrained.id, after_forget)]),
+            records: HashMap::from([("b".to_owned(), record_b.clone())]),
+            ..FakeSink::default()
+        };
+        let capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
+        let report = tick(&sink, &FakeTerminator::ok()).await;
+        let gauges = capture.finish();
+        assert_eq!(report.cancelled == [undrained.id], clears, "{case}");
+        let calls = sink.calls();
+        let recorded = if record_b.is_recorded() { "a,b" } else { "a" };
+        let recorded = if case == "an upload pending" {
+            "a"
+        } else {
+            recorded
+        };
+        assert!(
+            calls.contains(&format!(
+                "drain_node {} 5 cancel=true forget={recorded}",
+                undrained.id
+            )),
+            "{case}: {calls:?}"
+        );
+        assert_eq!(
+            calls.iter().any(|call| call.starts_with("finish_cancel")),
+            clears,
+            "{case}: {calls:?}"
+        );
+        if clears {
+            let v2: Vec<_> = gauges
+                .iter()
+                .filter(|value| value.name.starts_with("node_drain.v2."))
+                .map(|value| (value.name.as_str(), value.value))
+                .collect();
+            assert_eq!(
+                v2,
+                [
+                    ("node_drain.v2.unanswered", 0.0),
+                    ("node_drain.v2.blocked", 0.0),
+                    ("node_drain.v2.pending", 0.0),
+                ],
+                "{case}"
+            );
+        }
+    }
+}
+
+/// A cordon that fails keeps its error past the report, which clears the
+/// last error; one that succeeds leaves none.
+#[tokio::test]
+async fn a_failed_cordon_keeps_its_error_until_a_cordon_succeeds() {
+    for (case, cordon_error, keeps) in [
+        ("failed", Some("node unreachable".to_owned()), true),
+        ("converged", None, false),
+    ] {
+        let draining = node(Some("draining"), Some(5), false);
+        let sink = FakeSink {
+            nodes: vec![draining.clone()],
+            responses: HashMap::from([((draining.id, false), Ok(response(Some(5), false, &[])))]),
+            cordon_error,
+            ..FakeSink::default()
+        };
+        tick(&sink, &FakeTerminator::ok()).await;
+        let calls = sink.calls();
+        let report = calls
+            .iter()
+            .position(|call| call.starts_with("report"))
+            .expect("a report");
+        assert_eq!(
+            calls[report..].iter().any(|call| call
+                == &format!(
+                    "error {} cordon convergence failed: node unreachable",
+                    draining.id
+                )),
+            keeps,
+            "{case}: {calls:?}"
+        );
+    }
+}
+
+/// An evacuation unrecorded since a stored report longer than the bound is
+/// reported `blocked` and counted on the blocked gauge, its clock carried
+/// from that report; one unrecorded within the bound stays pending.
+#[tokio::test(flavor = "current_thread")]
+async fn an_evacuation_unrecorded_past_the_bound_is_blocked() {
+    let bound = i64::try_from(UNRECORDED_BOUND.as_secs()).unwrap();
+    for (case, since_ago, blocked) in [
+        ("past the bound", bound + 60, true),
+        ("within it", bound - 60, false),
+    ] {
+        let since = unix_now() - since_ago;
+        let draining = V2Node {
+            unrecorded_since: BTreeMap::from([("a".to_owned(), since)]),
+            ..node(Some("draining"), Some(5), false)
+        };
+        let sink = FakeSink {
+            nodes: vec![draining.clone()],
+            responses: HashMap::from([(
+                (draining.id, false),
+                Ok(response(Some(5), false, &["a"])),
+            )]),
+            records: HashMap::from([(
+                "a".to_owned(),
+                EvacuationRecord::NotYet(
+                    "the row runs nowhere the control plane knows of yet".into(),
+                ),
+            )]),
+            ..FakeSink::default()
+        };
+        let capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
+        tick(&sink, &FakeTerminator::ok()).await;
+        let gauges = capture.finish();
+        let stored = sink
+            .calls()
+            .into_iter()
+            .find_map(|call| {
+                call.strip_prefix(&format!("report {} 5 ", draining.id))
+                    .map(str::to_owned)
+            })
+            .expect("a report");
+        let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(stored["unrecorded"][0]["since"], since, "{case}");
+        let reasons: Vec<_> = stored["blocked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["reason"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            reasons,
+            if blocked {
+                vec![
+                    "not recorded for over 15 minutes: the row runs nowhere the control plane \
+                     knows of yet"
+                        .to_owned(),
+                ]
+            } else {
+                vec![]
+            },
+            "{case}"
+        );
+        let gauge = |name: &str| {
+            gauges
+                .iter()
+                .find(|value| value.name == name)
+                .map(|value| value.value)
+        };
+        assert_eq!(
+            (
+                gauge("node_drain.v2.blocked"),
+                gauge("node_drain.v2.pending")
+            ),
+            if blocked {
+                (Some(1.0), Some(0.0))
+            } else {
+                (Some(0.0), Some(1.0))
+            },
+            "{case}"
+        );
+    }
+}
+
+/// A terminate that fails counts on `node_drain.v2.terminate_failures`; one
+/// the terminator answers with a stale identity counts nothing, writes no
+/// error, and is logged at warn.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_terminate_counts_and_a_stale_identity_is_logged() {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    struct StaleTerminator;
+    impl InstanceTerminator for StaleTerminator {
+        async fn terminate(&self, _node_id: NodeId) -> Result<(), TerminateError> {
+            Err(TerminateError::StaleIdentity)
+        }
+    }
+
+    let failed = node(Some("terminating"), Some(5), false);
+    let sink = FakeSink {
+        nodes: vec![failed.clone()],
+        ..FakeSink::default()
+    };
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
+    tick(
+        &sink,
+        &FakeTerminator {
+            result: Err("denied".into()),
+            calls: Mutex::default(),
+        },
+    )
+    .await;
+    let counted = counters.finish();
+    assert!(
+        counted
+            .iter()
+            .any(|counter| counter.name == "node_drain.v2.terminate_failures"
+                && counter.tags.contains(&format!("node:{}", failed.id))),
+        "{counted:?}"
+    );
+
+    let stale = node(Some("terminating"), Some(5), false);
+    let sink = FakeSink {
+        nodes: vec![stale.clone()],
+        ..FakeSink::default()
+    };
+    let layer = pplx_space_observability::test_capture::CapturedEventsLayer::new();
+    let events = layer.events();
+    // At warn: a stale identity leaves the node `terminating`, so it is
+    // logged where an operator looks.
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry()
+            .with(layer.with_filter(tracing_subscriber::filter::LevelFilter::WARN)),
+    );
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
+    tick(&sink, &StaleTerminator).await;
+    let counted = counters.finish();
+    drop(guard);
+    assert!(counted.is_empty(), "{counted:?}");
+    assert!(sink.calls().is_empty(), "{:?}", sink.calls());
+    let logged = events.fields();
+    assert!(
+        logged.iter().any(|(name, value)| name == "message"
+            && value.contains("the terminator found the node's identity stale")),
+        "{logged:?}"
+    );
 }

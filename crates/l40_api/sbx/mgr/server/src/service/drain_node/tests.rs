@@ -380,6 +380,145 @@ async fn done_needs_one_continuous_seal_under_the_calls_epoch() {
     assert!(service.finish_drain(8, &first, DrainScans::default()).done);
 }
 
+/// Under a cancel, each sandbox the drain suspended is handed back: one
+/// whose snapshot is durable is evacuated with its recorded prior, one still
+/// uploading has its upload driven, one whose suspend runs is waited for, and
+/// one the drain left without a durable snapshot blocks. A record whose
+/// sandbox runs again, is stopped, failed or gone is forgotten. Nothing is
+/// suspended: a started row with no record, the control, gets no work.
+#[test]
+fn a_cancel_hands_back_what_the_drain_suspended() {
+    use SandboxState as S;
+    let pinned = |id: &str, lifecycle, artifact: &str| DrainRow {
+        pin: Some((artifact.to_owned(), ArtifactKind::Full)),
+        ..row(id, lifecycle)
+    };
+    let rows = [
+        row("control", S::Started),
+        pinned("durable", S::Suspended, FULL_ARTIFACT),
+        pinned("uploading", S::Suspended, FULL_ARTIFACT),
+        row("suspending", S::Started),
+        row("resumed", S::Started),
+        row("stopped", S::Stopped),
+        row("failed", S::Failed),
+        row("lost", S::Suspended),
+    ];
+    let recorded = [
+        "durable",
+        "uploading",
+        "suspending",
+        "resumed",
+        "stopped",
+        "failed",
+        "lost",
+        "gone",
+    ];
+    let inputs = PlanInputs {
+        pending_backups: pending("uploading", FULL_ARTIFACT),
+        evacuations: recorded
+            .iter()
+            .map(|id| evacuation(id, DrainPrior::Paused))
+            .collect(),
+        running: BTreeMap::from([("suspending".to_owned(), DrainAction::Suspend)]),
+        ..PlanInputs::default()
+    };
+
+    let (plan, forget) = plan_cancel(&rows, &inputs);
+
+    assert_eq!(
+        plan.evacuated,
+        [(
+            "durable".to_owned(),
+            DrainPrior::Paused,
+            FULL_ARTIFACT.to_owned()
+        )]
+    );
+    assert_eq!(
+        plan.pending,
+        [
+            ("suspending".to_owned(), "suspend".to_owned()),
+            ("uploading".to_owned(), "upload".to_owned()),
+        ]
+    );
+    assert_eq!(
+        plan.actions,
+        [PlannedAction::Upload {
+            sandbox_id: "uploading".into(),
+            artifact_id: FULL_ARTIFACT.into(),
+            kind: ArtifactKind::Full,
+        }]
+    );
+    assert_eq!(
+        plan.blocked,
+        [(
+            Some("lost".to_owned()),
+            "the drain's suspend left the sandbox suspended without a durable snapshot".to_owned()
+        )]
+    );
+    assert_eq!(forget, ["failed", "gone", "resumed", "stopped"]);
+}
+
+/// A cancel keeps the drain's record and reports the sandbox evacuated, call
+/// after call, until a cancel names it in `forget`; then nothing is left to
+/// hand back and the cancel is done. The node stays unsealed throughout.
+#[tokio::test]
+async fn a_cancel_reports_an_evacuation_until_it_is_forgotten() {
+    let conn = crate::db::test_conn();
+    conn.execute(
+        "INSERT INTO sandboxes (
+             id, uuid8, state, template, user, runtime, created_at, updated_at,
+             process_env_json, auto_lifecycle_json, auto_lifecycle_state_json,
+             current_local_artifact_id, current_local_artifact_kind,
+             current_local_artifact_origin
+         ) VALUES ('sbx-a', 'uuid8', 'suspended', 'seed', 'u', 'fc', '0', '0',
+                   '{}', '{}', '{}', ?1, 'full', 'suspend')",
+        crate::db::fixture::params![FULL_ARTIFACT],
+    )
+    .unwrap();
+    insert_artifact(&conn, FULL_ARTIFACT, ("suspend", None), true, "ready");
+    crate::db::activation_seal::record_drain_suspend(&conn, "sbx-a", DrainPrior::Started).unwrap();
+    let clean = orphan_inventory(Default::default());
+    let service = service_with_node_manager(conn, &clean);
+    service.drain_node(drain_request(7, false)).await.unwrap();
+    let cancel = |forget: Vec<String>| {
+        crate::service::activation_support::internal_request(DrainNodeRequest {
+            epoch: 7,
+            cancel: true,
+            forget,
+        })
+    };
+    let handed_back = |report: &DrainNodeResponse| -> Vec<(String, i32)> {
+        report
+            .evacuated
+            .iter()
+            .map(|entry| (entry.sandbox_id.clone(), entry.prior))
+            .collect()
+    };
+    let started = vec![("sbx-a".to_owned(), crate::proto::DrainPrior::Started as i32)];
+
+    for _ in 0..2 {
+        let report = service
+            .drain_node(cancel(Vec::new()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(report.sealed_epoch, None);
+        assert_eq!(handed_back(&report), started);
+        assert!(!report.done, "{report:?}");
+    }
+    let report = service
+        .drain_node(cancel(vec!["sbx-a".into()]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(handed_back(&report), []);
+    assert!(report.done, "{report:?}");
+    assert_eq!(
+        crate::db::read::drain_evacuations(&service.db_conn().unwrap()).unwrap(),
+        []
+    );
+}
+
 /// A suspended sandbox the drain suspended is reported with its recorded
 /// prior lifecycle and its durable pin, and the seal and the record survive a
 /// restart of the service.
@@ -831,7 +970,11 @@ fn orphan_inventory(
 }
 
 fn drain_request(epoch: u64, cancel: bool) -> Request<DrainNodeRequest> {
-    crate::service::activation_support::internal_request(DrainNodeRequest { epoch, cancel })
+    crate::service::activation_support::internal_request(DrainNodeRequest {
+        epoch,
+        cancel,
+        forget: Vec::new(),
+    })
 }
 
 /// The whole call, through node-manager's inventory: a node with nothing on
@@ -896,7 +1039,7 @@ async fn drain_node_seals_reads_the_inventory_and_reports() {
         .unwrap()
         .into_inner();
     assert_eq!(cancelled.sealed_epoch, None);
-    assert!(!cancelled.done);
+    assert!(cancelled.done, "nothing to hand back: {cancelled:?}");
     assert_eq!(
         service
             .drain_node(drain_request(7, false))
@@ -952,6 +1095,7 @@ async fn only_root_and_node_api_drain_the_node() {
             DrainNodeRequest {
                 epoch: 7,
                 cancel: false,
+                forget: Vec::new(),
             },
         ))
         .await
@@ -968,6 +1112,7 @@ async fn only_root_and_node_api_drain_the_node() {
                 DrainNodeRequest {
                     epoch: 7,
                     cancel: false,
+                    forget: Vec::new(),
                 },
             ),
         )

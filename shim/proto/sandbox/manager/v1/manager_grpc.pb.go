@@ -278,12 +278,18 @@ type SandboxManagerClient interface {
 	// Epochs only move forward: an epoch below the current one is refused with
 	// `FailedPrecondition`, and so is the epoch of a cancelled drain. With
 	// `cancel`, the call cancels `epoch` instead: it clears the seal if it is
-	// under `epoch` or an earlier one, forgets the drain's evacuations, and
-	// remembers `epoch`, so no seal at or below it is taken again, even by a
-	// call that arrives after the cancel. A cancel below the current seal's
-	// epoch is refused with `FailedPrecondition`. A cancel stops no work
-	// already started: a suspend running when it lands completes, and leaves
-	// the sandbox suspended.
+	// under `epoch` or an earlier one, and remembers `epoch`, so no seal at or
+	// below it is taken again, even by a call that arrives after the cancel. A
+	// cancel below the current seal's epoch is refused with
+	// `FailedPrecondition`. A cancel starts no suspend and stops none already
+	// running; it hands back what the drain suspended: each cancel call reports
+	// every sandbox the drain suspended that it still holds, `evacuated` once
+	// its snapshot is durable (its upload driven as the drain drives it) and
+	// `pending` until then, so the control plane can restore it to the
+	// lifecycle it had. The drain's record of a sandbox is kept until a cancel
+	// call names it in `forget`, or the sandbox leaves the node; a record whose
+	// sandbox is running again, stopped or failed is forgotten, with nothing to
+	// hand back. A cancel answers `done` once nothing is left to hand back.
 	//
 	// `done` means the node may be terminated: sealed under `epoch` from before
 	// this call's walk to its end, no activation in flight at the walk's first
@@ -1449,12 +1455,18 @@ type SandboxManagerServer interface {
 	// Epochs only move forward: an epoch below the current one is refused with
 	// `FailedPrecondition`, and so is the epoch of a cancelled drain. With
 	// `cancel`, the call cancels `epoch` instead: it clears the seal if it is
-	// under `epoch` or an earlier one, forgets the drain's evacuations, and
-	// remembers `epoch`, so no seal at or below it is taken again, even by a
-	// call that arrives after the cancel. A cancel below the current seal's
-	// epoch is refused with `FailedPrecondition`. A cancel stops no work
-	// already started: a suspend running when it lands completes, and leaves
-	// the sandbox suspended.
+	// under `epoch` or an earlier one, and remembers `epoch`, so no seal at or
+	// below it is taken again, even by a call that arrives after the cancel. A
+	// cancel below the current seal's epoch is refused with
+	// `FailedPrecondition`. A cancel starts no suspend and stops none already
+	// running; it hands back what the drain suspended: each cancel call reports
+	// every sandbox the drain suspended that it still holds, `evacuated` once
+	// its snapshot is durable (its upload driven as the drain drives it) and
+	// `pending` until then, so the control plane can restore it to the
+	// lifecycle it had. The drain's record of a sandbox is kept until a cancel
+	// call names it in `forget`, or the sandbox leaves the node; a record whose
+	// sandbox is running again, stopped or failed is forgotten, with nothing to
+	// hand back. A cancel answers `done` once nothing is left to hand back.
 	//
 	// `done` means the node may be terminated: sealed under `epoch` from before
 	// this call's walk to its end, no activation in flight at the walk's first

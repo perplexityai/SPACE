@@ -525,7 +525,11 @@ pub(super) async fn handle(
         }
         Commands::DrainNode { epoch, cancel } => {
             let report = client
-                .drain_node(pplx_space_sbx_mgr_client::proto::DrainNodeRequest { epoch, cancel })
+                .drain_node(pplx_space_sbx_mgr_client::proto::DrainNodeRequest {
+                    epoch,
+                    cancel,
+                    forget: Vec::new(),
+                })
                 .await
                 .unwrap_or_else(|e| exit_error(e))
                 .into_inner();

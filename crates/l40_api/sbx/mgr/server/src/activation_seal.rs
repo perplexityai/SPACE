@@ -190,8 +190,8 @@ impl ActivationSeal {
     /// Cancel `epoch`: clear the seal if it is under `epoch` or an earlier
     /// one, and remember `epoch` so no seal at or below it is taken again,
     /// even one whose call arrives after this cancel. Every drain evacuation
-    /// is forgotten with it. An epoch below the current seal's is refused and
-    /// changes nothing.
+    /// is kept, for the cancel to hand back. An epoch below the current
+    /// seal's is refused and changes nothing.
     pub(crate) fn unseal(
         &self,
         db: &crate::db::SharedConnection,
@@ -292,8 +292,8 @@ fn persist(db: &crate::db::SharedConnection, record: ActivationSealRecord) -> Re
         .map_err(|error| Status::internal(format!("persist the activation seal: {error}")))
 }
 
-/// Persist a cancel and forget the drain evacuations it ends, in one
-/// transaction.
+/// Persist a cancel. The drain evacuations it ends are kept, for the cancel
+/// to hand back.
 fn persist_cancel(
     db: &crate::db::SharedConnection,
     record: ActivationSealRecord,

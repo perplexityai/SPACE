@@ -21,8 +21,16 @@ use crate::node_drain::v2::{DrainV2Sink, EvacuationRecord, V2Node};
 /// How long one `DrainNode` call may take; the node answers without waiting.
 const DRAIN_NODE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A v2 node's id, phase, epoch, cancel and terminated flags.
-type V2NodeRow = (NodeId, Option<String>, Option<i64>, bool, bool);
+/// A v2 node's id, phase, epoch, cancel and terminated flags, and its stored
+/// report's unrecorded evacuations.
+type V2NodeRow = (
+    NodeId,
+    Option<String>,
+    Option<i64>,
+    bool,
+    bool,
+    Option<serde_json::Value>,
+);
 
 /// Every v2 drain's node of the Kubernetes substrate.
 pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Error> {
@@ -30,7 +38,8 @@ pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Er
         "SELECT id, drain_phase,
                 (drain_status->>'epoch')::BIGINT,
                 COALESCE((drain_status->>'cancel')::BOOLEAN, FALSE),
-                COALESCE((drain_status->>'terminated')::BOOLEAN, FALSE)
+                COALESCE((drain_status->>'terminated')::BOOLEAN, FALSE),
+                drain_status->'report'->'unrecorded'
            FROM nodes
           WHERE drain_engine = 'v2' AND managed_by = $1
           ORDER BY id"
@@ -40,14 +49,36 @@ pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Er
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, phase, epoch, cancel, terminated)| V2Node {
-            id,
-            phase,
-            epoch: epoch.and_then(|epoch| u64::try_from(epoch).ok()),
-            cancel,
-            terminated,
-        })
+        .map(
+            |(id, phase, epoch, cancel, terminated, unrecorded)| V2Node {
+                id,
+                phase,
+                epoch: epoch.and_then(|epoch| u64::try_from(epoch).ok()),
+                cancel,
+                terminated,
+                unrecorded_since: unrecorded_since(unrecorded.as_ref()),
+            },
+        )
         .collect())
+}
+
+/// Since when each unrecorded evacuation of a stored report has been. An
+/// entry without a `since`, written before the report carried one, starts
+/// its clock again.
+fn unrecorded_since(
+    unrecorded: Option<&serde_json::Value>,
+) -> std::collections::BTreeMap<String, i64> {
+    unrecorded
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some((
+                entry.get("sandbox_id")?.as_str()?.to_owned(),
+                entry.get("since")?.as_i64()?,
+            ))
+        })
+        .collect()
 }
 
 /// Record that the terminator acted on the terminating v2 node under
@@ -307,6 +338,7 @@ impl DrainV2Sink for SubstrateSink {
         node_id: NodeId,
         epoch: u64,
         cancel: bool,
+        forget: &[String],
     ) -> Result<DrainNodeResponse, String> {
         let target = node_api_row(&self.pool, node_id)
             .await
@@ -320,7 +352,11 @@ impl DrainV2Sink for SubstrateSink {
         .await
         .map_err(|error| error.to_string())?;
         client
-            .drain_node(DrainNodeRequest { epoch, cancel })
+            .drain_node(DrainNodeRequest {
+                epoch,
+                cancel,
+                forget: forget.to_vec(),
+            })
             .await
             .map(tonic::Response::into_inner)
             .map_err(|status| status.to_string())

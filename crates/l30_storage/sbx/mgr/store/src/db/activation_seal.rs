@@ -144,15 +144,11 @@ pub(in crate::db) fn drain_evacuations(conn: &Connection) -> Result<Vec<DrainEva
         .map_err(Into::into)
 }
 
-/// Write `record`, the seal row after a cancel, and forget every
-/// evacuation, in one transaction: a node runs one drain at a time, and the
-/// cancel ends it.
+/// Write `record`, the seal row after a cancel. Every evacuation is kept: the
+/// cancel hands each back to the control plane, which restores it, and only
+/// then is it forgotten ([`forget_drain_suspend`]).
 pub fn cancel_drain(conn: &Connection, record: ActivationSealRecord) -> Result<()> {
-    let tx = crate::db::immediate_transaction(conn)?;
-    write_activation_seal(&tx, record)?;
-    tx.execute(sql!("DELETE FROM drain_evacuations"), [])?;
-    tx.commit()?;
-    Ok(())
+    write_activation_seal(conn, record)
 }
 
 #[cfg(test)]

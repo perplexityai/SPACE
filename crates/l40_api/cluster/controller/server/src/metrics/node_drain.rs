@@ -33,6 +33,29 @@ pub fn v2_unanswered(node_id: &str) {
     gauge("node_drain.v2.unanswered", 1.0, &[tag("node", node_id)]);
 }
 
+/// Zero a node's v2 gauges once it is no longer a v2 drain's: its cancel
+/// finished, or its row is gone. Left at their last values, a blocked or
+/// unanswered node would page after its drain ended.
+pub fn clear_v2_gauges(node_id: &str) {
+    for name in [
+        "node_drain.v2.unanswered",
+        "node_drain.v2.blocked",
+        "node_drain.v2.pending",
+    ] {
+        gauge(name, 0.0, &[tag("node", node_id)]);
+    }
+}
+
+/// The v2 loop's terminator failed to terminate a `terminating` node; the
+/// node stays `terminating` and the next tick tries again.
+pub fn v2_terminate_failure(node_id: &str) {
+    counter(
+        "node_drain.v2.terminate_failures",
+        1,
+        &[tag("node", node_id)],
+    );
+}
+
 /// Transition between two `nodes.drain_phase` values (driven by the reconciler).
 pub fn transition(from: &str, to: &str) {
     counter(
@@ -189,6 +212,7 @@ pub fn clear_node_gauges(node_id: &str) {
     // correct resting value — a node that no longer exists is not reading from
     // the queue.
     backup_queue_gated(node_id, false);
+    clear_v2_gauges(node_id);
 }
 
 /// Per-sandbox suspend latency. `pre_lifecycle` is the user-visible

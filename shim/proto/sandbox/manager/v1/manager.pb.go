@@ -13425,7 +13425,11 @@ type DrainNodeRequest struct {
 	// Nonzero, at most 2^63 - 1. Only moves forward (see `DrainNode`).
 	Epoch uint64 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	// Cancel `epoch` instead of draining.
-	Cancel        bool `protobuf:"varint,2,opt,name=cancel,proto3" json:"cancel,omitempty"`
+	Cancel bool `protobuf:"varint,2,opt,name=cancel,proto3" json:"cancel,omitempty"`
+	// With `cancel`: the sandboxes whose evacuation the control plane has
+	// recorded since a cancel call reported it; the node forgets the drain's
+	// record of each before it reports.
+	Forget        []string `protobuf:"bytes,3,rep,name=forget,proto3" json:"forget,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -13472,6 +13476,13 @@ func (x *DrainNodeRequest) GetCancel() bool {
 		return x.Cancel
 	}
 	return false
+}
+
+func (x *DrainNodeRequest) GetForget() []string {
+	if x != nil {
+		return x.Forget
+	}
+	return nil
 }
 
 // A resident the drain made durable elsewhere.
@@ -15218,10 +15229,11 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\rartifact_kind\x18\x03 \x01(\x0e2&.space.sandbox.manager.v1.ArtifactKindR\fartifactKind\" \n" +
 	"\x1eListPendingLocalBackupsRequest\"i\n" +
 	"\x1fListPendingLocalBackupsResponse\x12F\n" +
-	"\apending\x18\x01 \x03(\v2,.space.sandbox.manager.v1.PendingLocalBackupR\apending\"@\n" +
+	"\apending\x18\x01 \x03(\v2,.space.sandbox.manager.v1.PendingLocalBackupR\apending\"X\n" +
 	"\x10DrainNodeRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x16\n" +
-	"\x06cancel\x18\x02 \x01(\bR\x06cancel\"\x8c\x01\n" +
+	"\x06cancel\x18\x02 \x01(\bR\x06cancel\x12\x16\n" +
+	"\x06forget\x18\x03 \x03(\tR\x06forget\"\x8c\x01\n" +
 	"\x0eDrainEvacuated\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12:\n" +

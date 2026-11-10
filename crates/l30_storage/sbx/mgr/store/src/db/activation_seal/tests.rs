@@ -11,9 +11,10 @@ fn recorded(conn: &Connection) -> Vec<(String, DrainPrior)> {
 
 /// A later drain suspend of the same sandbox keeps its first record, and
 /// answers the prior it holds; a forget removes only its own, and a cancel
-/// writes the seal row and forgets every record together.
+/// writes the seal row and keeps every record, for the control plane to
+/// restore.
 #[test]
-fn a_record_is_kept_and_a_cancel_forgets_every_one() {
+fn a_record_is_kept_and_a_cancel_keeps_every_one() {
     let conn = test_conn();
     assert_eq!(
         record_drain_suspend(&conn, "sbx-a", DrainPrior::Started).unwrap(),
@@ -40,6 +41,12 @@ fn a_record_is_kept_and_a_cancel_forgets_every_one() {
         sealed: false,
     };
     cancel_drain(&conn, cancelled).unwrap();
-    assert_eq!(recorded(&conn), []);
+    assert_eq!(
+        recorded(&conn),
+        [
+            ("sbx-a".to_owned(), DrainPrior::Started),
+            ("sbx-b".to_owned(), DrainPrior::Paused),
+        ]
+    );
     assert_eq!(activation_seal(&conn).unwrap(), Some(cancelled));
 }

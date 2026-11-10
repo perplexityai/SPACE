@@ -105,7 +105,7 @@ fn a_cancelled_epoch_never_seals_again() {
 
 /// A drain suspend is recorded only while the node is sealed under the
 /// drain's epoch: not before the seal, not under another epoch, and not once
-/// the epoch is cancelled, whose cancel forgets what was recorded.
+/// the epoch is cancelled, whose cancel keeps what was recorded.
 #[test]
 fn a_drain_suspend_is_recorded_only_under_its_own_seal() {
     use crate::db::activation_seal::DrainPrior;
@@ -139,13 +139,13 @@ fn a_drain_suspend_is_recorded_only_under_its_own_seal() {
     assert_eq!(recorded(), ["sbx-a"]);
 
     seal.unseal(&db, 5).unwrap();
-    assert_eq!(recorded(), Vec::<String>::new());
+    assert_eq!(recorded(), ["sbx-a"]);
     assert!(
         seal.record_drain_suspend(&db, 5, "sbx-b", DrainPrior::Paused)
             .unwrap()
             .is_none()
     );
-    assert_eq!(recorded(), Vec::<String>::new());
+    assert_eq!(recorded(), ["sbx-a"]);
 }
 
 /// A seal row that cannot be read refuses every activation rather than

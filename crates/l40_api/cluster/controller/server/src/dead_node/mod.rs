@@ -769,7 +769,10 @@ impl<S: DeadNodeSink, K: NodeMembership> Reconciler<S, K> {
         let mut deleted = false;
         if self.config.is_live() && verdict.is_lost() && !rows_truncated && !write_failed {
             match self.sink.delete_node(node).await {
-                Ok(true) => deleted = true,
+                Ok(true) => {
+                    deleted = true;
+                    crate::metrics::node_drain::clear_node_gauges(&node.node_id.to_string());
+                }
                 Ok(false) => {}
                 Err(err) => {
                     tracing::warn!(

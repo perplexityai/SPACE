@@ -475,7 +475,9 @@ async fn live_tick_leaves_each_row_in_its_rules_state() -> TestResult {
         InstanceAuthority::Ec2(FakeEc2::dead_instances()),
         SubstrateKind::Kubernetes,
     );
+    let gauges = pplx_space_metrics_emit::test_capture::capture_values_guard();
     let report = reconciler.tick().await;
+    let gauges = gauges.finish();
     assert_eq!(report.errors, 0, "{report:?}");
 
     let mut mismatches = Vec::new();
@@ -537,6 +539,28 @@ async fn live_tick_leaves_each_row_in_its_rules_state() -> TestResult {
             .fetch_all(pool)
             .await?;
     assert_eq!(remaining, vec![dead]);
+    // The deleted node's gauges read 0, its v2 drain's with them; the node
+    // that stays keeps its own.
+    let zeroed = |node: NodeId| -> Vec<&str> {
+        let node = format!("node:{node}");
+        gauges
+            .iter()
+            .filter(|value| value.name.starts_with("node_drain.v2.") && value.tags.contains(&node))
+            .map(|value| {
+                assert_eq!(value.value, 0.0, "{}", value.name);
+                value.name.as_str()
+            })
+            .collect()
+    };
+    assert_eq!(
+        zeroed(emptied),
+        [
+            "node_drain.v2.unanswered",
+            "node_drain.v2.blocked",
+            "node_drain.v2.pending",
+        ]
+    );
+    assert_eq!(zeroed(dead), Vec::<&str>::new());
 
     // A lost row's quiet dead upload from the node is finalized `failed`,
     // and its `ready` snapshot is kept; a row that was not written off keeps

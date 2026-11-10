@@ -14,6 +14,9 @@
 //! A drain suspend records that lifecycle (`drain_evacuations`) under the
 //! sandbox's wake lock, while the node is still sealed under the drain's
 //! epoch, so it survives a restart; a stopped sandbox's row keeps its own.
+//! A cancel keeps the records and hands each sandbox back instead
+//! ([`plan_cancel`]): the control plane restores it, then names it for the
+//! node to forget.
 //!
 //! A call never waits for that work. It plans from the rows as they are,
 //! starts what is not already running, and answers. [`DrainPlan`] is that
@@ -462,6 +465,68 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
     plan
 }
 
+/// What a call under a cancelled epoch decides, from the rows it read: the
+/// drain starts no suspend, and hands back each sandbox it suspended,
+/// `evacuated` once its snapshot is durable, its upload driven until then.
+/// Work still running on one is waited for. The records with nothing left to
+/// hand back, their sandbox running again, stopped, failed or gone, are
+/// returned to be forgotten.
+pub(super) fn plan_cancel(rows: &[DrainRow], inputs: &PlanInputs) -> (DrainPlan, Vec<String>) {
+    use pplx_space_common_core::types::ArtifactKind;
+    let mut plan = DrainPlan::default();
+    let mut forget = Vec::new();
+    for (id, evacuation) in &inputs.evacuations {
+        let Some(row) = rows.iter().find(|row| row.sandbox_id == *id) else {
+            forget.push(id.clone());
+            continue;
+        };
+        if let Some(action) = inputs.running.get(id) {
+            plan.wait_for(inputs, id, *action);
+            continue;
+        }
+        let pending_pin = row.pin.clone().filter(|(artifact, _)| {
+            inputs
+                .pending_backups
+                .get(id)
+                .is_some_and(|pending| pending.contains(artifact))
+        });
+        match row.lifecycle {
+            SandboxState::Suspended => match (&row.pin, pending_pin) {
+                (_, Some((artifact_id, kind))) => plan.drive(
+                    inputs,
+                    PlannedAction::Upload {
+                        sandbox_id: id.clone(),
+                        artifact_id,
+                        kind,
+                    },
+                ),
+                (Some((artifact, ArtifactKind::Full)), None) => {
+                    plan.evacuated
+                        .push((id.clone(), evacuation.prior, artifact.clone()));
+                }
+                _ => plan.blocked.push((
+                    Some(id.clone()),
+                    "the drain's suspend left the sandbox suspended without a durable snapshot"
+                        .into(),
+                )),
+            },
+            SandboxState::Started
+            | SandboxState::Paused
+            | SandboxState::Stopped
+            | SandboxState::Failed => forget.push(id.clone()),
+            other if inputs.unchanged.contains(id) => plan.blocked.push((
+                Some(id.clone()),
+                format!(
+                    "{other} for over {} minutes, a transition the drain doesn't drive",
+                    SETTLE_BOUND.as_secs() / 60
+                ),
+            )),
+            other => plan.pending.push((id.clone(), format!("settle:{other}"))),
+        }
+    }
+    (plan, forget)
+}
+
 /// What node-manager's orphan inventory found.
 #[derive(Clone, Debug, Default)]
 pub(super) struct DrainScans {
@@ -545,14 +610,18 @@ impl SandboxManagerService {
         request: Request<DrainNodeRequest>,
     ) -> Result<Response<DrainNodeResponse>, Status> {
         self.authorize_peer(&request, "DrainNode", ALLOW_NODE_DRAIN)?;
-        let DrainNodeRequest { epoch, cancel } = request.into_inner();
+        let DrainNodeRequest {
+            epoch,
+            cancel,
+            forget,
+        } = request.into_inner();
         if self.activation_seal.load_error().is_some() {
             return Err(Status::internal("activation seal unreadable"));
         }
         if cancel {
             self.activation_seal.unseal(&self.db, epoch)?;
-            let status = self.activation_seal.status();
-            return Ok(Response::new(report(&status, DrainPlan::default(), false)));
+            self.forget_drain_suspends(&forget)?;
+            return Ok(Response::new(self.finish_cancel(epoch)));
         }
         self.activation_seal.seal(&self.db, epoch)?;
         let first = self.activation_seal.status();
@@ -616,6 +685,49 @@ impl SandboxManagerService {
         report(first, plan, done)
     }
 
+    /// Under a cancelled `epoch`: forget the records with nothing left to
+    /// hand back, start the uploads the hand-back waits for, and report.
+    /// `done` once nothing is left to hand back.
+    pub(super) fn finish_cancel(&self, epoch: u64) -> DrainNodeResponse {
+        let mut plan = match self.read_plan_inputs(epoch) {
+            Ok((rows, inputs)) => {
+                let (plan, stale) = plan_cancel(&rows, &inputs);
+                match self.forget_drain_suspends(&stale) {
+                    Ok(()) => plan,
+                    Err(status) => DrainPlan {
+                        blocked: vec![(None, status.message().to_owned())],
+                        ..plan
+                    },
+                }
+            }
+            Err(reason) => DrainPlan {
+                blocked: vec![(None, reason)],
+                ..DrainPlan::default()
+            },
+        };
+        self.start_actions(epoch, &mut plan);
+        let done = plan.evacuated.is_empty() && plan.pending.is_empty() && plan.blocked.is_empty();
+        report(&self.activation_seal.status(), plan, done)
+    }
+
+    /// Forget the drain's record of each of `sandbox_ids`.
+    fn forget_drain_suspends(&self, sandbox_ids: &[String]) -> Result<(), Status> {
+        if sandbox_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.db_conn()?;
+        for sandbox_id in sandbox_ids {
+            crate::db::activation_seal::forget_drain_suspend(&conn, sandbox_id).map_err(
+                |error| {
+                    Status::internal(format!(
+                        "forget the drain's record of {sandbox_id}: {error}"
+                    ))
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     /// Read node-manager's whole orphan inventory, one page at a time,
     /// within [`ORPHAN_INVENTORY_DEADLINE`].
     async fn read_orphan_inventory(&self) -> OrphanFindings {
@@ -669,6 +781,25 @@ impl SandboxManagerService {
     /// evacuation record, and plan, with the ids of the rows read. An error
     /// is the scan that failed, which blocks the drain.
     fn read_drain_plan(&self, epoch: u64) -> Result<(DrainPlan, BTreeSet<String>), String> {
+        let (rows, inputs) = self.read_plan_inputs(epoch)?;
+        let ids = rows.iter().map(|row| row.sandbox_id.clone()).collect();
+        let plan = plan(&rows, &inputs);
+        // A failure counts toward the bound only while the drain still works
+        // on its sandbox; one that succeeded, or moved on, starts over.
+        let working = plan
+            .actions
+            .iter()
+            .map(|action| action.target().0.to_owned())
+            .chain(inputs.running.keys().cloned())
+            .collect();
+        self.drain_actions.keep_failures_of(&working);
+        Ok((plan, ids))
+    }
+
+    /// Read every row, the artifacts without a durable copy and the
+    /// evacuation record, as the planners read them. An error is the scan
+    /// that failed.
+    fn read_plan_inputs(&self, epoch: u64) -> Result<(Vec<DrainRow>, PlanInputs), String> {
         let (sandboxes, local_only_rows, evacuations, pending_rows) = {
             let conn = self
                 .db_conn()
@@ -721,7 +852,6 @@ impl SandboxManagerService {
             .into_iter()
             .map(|evacuation| (evacuation.sandbox_id.clone(), evacuation))
             .collect();
-        let ids = rows.iter().map(|row| row.sandbox_id.clone()).collect();
         let lifecycles: Vec<_> = rows
             .iter()
             .map(|row| (row.sandbox_id.clone(), row.lifecycle))
@@ -738,17 +868,7 @@ impl SandboxManagerService {
                 tokio::time::Instant::now(),
             ),
         };
-        let plan = plan(&rows, &inputs);
-        // A failure counts toward the bound only while the drain still works
-        // on its sandbox; one that succeeded, or moved on, starts over.
-        let working = plan
-            .actions
-            .iter()
-            .map(|action| action.target().0.to_owned())
-            .chain(inputs.running.keys().cloned())
-            .collect();
-        self.drain_actions.keep_failures_of(&working);
-        Ok((plan, ids))
+        Ok((rows, inputs))
     }
 
     /// Why the Suspend RPC would refuse to suspend `row`, as the drain
@@ -798,11 +918,14 @@ impl SandboxManagerService {
         }
     }
 
-    /// Run one action, unless the node is no longer sealed under `epoch`:
-    /// a cancel or a later drain has taken over, and a later call plans
-    /// again.
+    /// Run one action. A suspend or a disk publication runs only while the
+    /// node is still sealed under `epoch`: once a cancel or a later drain has
+    /// taken over, a later call plans again. An upload runs either way: a
+    /// cancel hands its sandbox back once its snapshot is durable.
     async fn run_drain_action(&self, epoch: u64, action: PlannedAction) -> Result<(), Status> {
-        if self.activation_seal.status().sealed_epoch != Some(epoch) {
+        if !matches!(action, PlannedAction::Upload { .. })
+            && self.activation_seal.status().sealed_epoch != Some(epoch)
+        {
             return Ok(());
         }
         match action {
