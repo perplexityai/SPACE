@@ -5,7 +5,10 @@ use pplx_space_spaced_common::proto::{
 };
 use proto::guest_update_server::GuestUpdate;
 use std::sync::Mutex;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, watch};
+use tokio::time::Instant as Deadline;
+
+use pplx_space_spaced_common::update::ACTIVATION_BUDGET as ADMISSION_WAIT_BUDGET;
 
 // Only an explicit Finish represents upstream EOF. Dropping a forwarding
 // task (input error, timeout or cancellation) must reject the guest upload.
@@ -52,6 +55,7 @@ use pplx_space_spaced_common::update::HoldOwner as Owner;
 #[derive(Default)]
 struct Admission {
     owner: Option<Owner>,
+    hold_deadline: Option<Deadline>,
     active: usize,
     configuring: bool,
     incarnation: Option<String>,
@@ -60,6 +64,25 @@ struct Admission {
 }
 
 impl Admission {
+    fn hold(&mut self, owner: Owner) -> Result<(), Status> {
+        if self
+            .owner
+            .as_ref()
+            .is_some_and(|current| !owner.may_replace(current))
+        {
+            return Err(Status::failed_precondition(
+                "another operation owns admission",
+            ));
+        }
+        // Repeating Hold adopts the existing deadline, never a fresh wait budget.
+        if self.owner.as_ref() != Some(&owner) {
+            self.hold_deadline = (owner.operation != owner.execution)
+                .then(|| Deadline::now() + ADMISSION_WAIT_BUDGET);
+        }
+        self.owner = Some(owner);
+        Ok(())
+    }
+
     fn observe_incarnation(&mut self, incarnation: &str) {
         match self.incarnation.as_deref() {
             None => self.incarnation = Some(incarnation.to_owned()),
@@ -128,6 +151,7 @@ pub(super) struct HostUpdate {
     transition: Arc<Semaphore>,
     subscriber: Arc<Semaphore>,
     changed: Notify,
+    admission_changed: watch::Sender<()>,
     tasks: tokio_util::task::TaskTracker,
     ports: Mutex<Forwarding>,
 }
@@ -139,6 +163,7 @@ impl HostUpdate {
             transition: Arc::new(Semaphore::new(1)),
             subscriber: Arc::new(Semaphore::new(1)),
             changed: Notify::new(),
+            admission_changed: watch::channel(()).0,
             tasks: tokio_util::task::TaskTracker::new(),
             ports: Mutex::default(),
         }
@@ -163,22 +188,69 @@ impl HostUpdate {
             .observe(guest)
     }
 
-    pub(super) fn admit(&self) -> Result<DispatchGuard, Status> {
-        let mut state = self
-            .admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Capture pauses only the metadata stream. Lifecycle routing owns
-        // customer access while the VM is paused; a failed pause (including
-        // on legacy/pool guests with no observer) must not strand dispatch.
-        if state.customer_admission_held() {
-            return Err(pplx_space_common_grpc::refused_before_start(
-                Status::unavailable("guest maintenance admission is held"),
-                Duration::from_secs(1),
-            ));
+    /// Only operation-owned holds wait; ordinary generation configuration keeps
+    /// its existing refusal behavior. Waiters own no guest dispatch or payload.
+    pub(super) async fn admit_when_ready(
+        &self,
+        caller_deadline: Option<Deadline>,
+        shutdown: &CancellationToken,
+    ) -> Result<DispatchGuard, Status> {
+        let mut changed = self.admission_changed.subscribe();
+        let mut deadline = caller_deadline.unwrap_or(Deadline::now() + ADMISSION_WAIT_BUDGET);
+        let mut waiting_for: Option<Owner> = None;
+        loop {
+            if shutdown.is_cancelled() {
+                return Err(Status::cancelled("host is shutting down"));
+            }
+            if Deadline::now() >= deadline {
+                return Err(admission_wait_expired(caller_deadline));
+            }
+            {
+                let mut state = self
+                    .admission
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // A waiter cannot acquire a bridge after capture quiescence.
+                // Ordinary dispatch retains the existing lifecycle routing rule.
+                if state.paused && (waiting_for.is_some() || state.customer_admission_held()) {
+                    return Err(admission_refused(
+                        "guest lifecycle changed during maintenance",
+                    ));
+                }
+                if !state.customer_admission_held() {
+                    state.active += 1;
+                    return Ok(DispatchGuard(self.admission.clone()));
+                }
+                let Some(owner) = state
+                    .owner
+                    .as_ref()
+                    .filter(|owner| owner.operation != owner.execution)
+                else {
+                    return Err(admission_refused("guest configuration admission is held"));
+                };
+                if waiting_for
+                    .as_ref()
+                    .is_some_and(|previous| previous != owner)
+                {
+                    return Err(admission_refused("guest maintenance owner changed"));
+                }
+                waiting_for = Some(owner.clone());
+                deadline =
+                    deadline.min(state.hold_deadline.ok_or_else(|| {
+                        admission_refused("guest maintenance has no wait budget")
+                    })?);
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return Err(Status::cancelled("host is shutting down")),
+                _ = tokio::time::sleep_until(deadline) => return Err(admission_wait_expired(caller_deadline)),
+                result = changed.changed() => {
+                    if result.is_err() {
+                        return Err(admission_refused("guest admission closed"));
+                    }
+                },
+            }
         }
-        state.active += 1;
-        Ok(DispatchGuard(self.admission.clone()))
     }
 
     fn require_owner(&self, owner: &Owner) -> Result<(), Status> {
@@ -210,6 +282,7 @@ impl HostUpdate {
         // the pause until NotifyResume.
         let pause = ObservationPause((!was_paused).then_some(self));
         self.changed.notify_one();
+        self.admission_changed.send_replace(());
         let permit = tokio::time::timeout(
             Duration::from_secs(5),
             self.subscriber.clone().acquire_owned(),
@@ -315,6 +388,22 @@ impl HostUpdate {
             .try_acquire_owned()
             .map_err(|_| Status::unavailable("another maintenance or capture transition is active"))
     }
+}
+
+fn admission_refused(message: &'static str) -> Status {
+    pplx_space_common_grpc::refused_before_start(
+        Status::unavailable(message),
+        Duration::from_secs(1),
+    )
+}
+
+fn admission_wait_expired(caller_deadline: Option<Deadline>) -> Status {
+    let status = if caller_deadline.is_some_and(|deadline| Deadline::now() >= deadline) {
+        Status::deadline_exceeded("request deadline elapsed before guest dispatch")
+    } else {
+        Status::unavailable("guest maintenance wait budget exhausted")
+    };
+    pplx_space_common_grpc::refused_before_start(status, Duration::from_secs(1))
 }
 
 pub(super) struct ObservationPause<'a>(Option<&'a HostUpdate>);
@@ -434,17 +523,9 @@ impl GuestUpdate for SpacedHostService {
                 .admission
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state
-                .owner
-                .as_ref()
-                .is_some_and(|current| !owner.may_replace(current))
-            {
-                return Err(Status::failed_precondition(
-                    "another operation owns admission",
-                ));
-            }
-            state.owner = Some(owner);
+            state.hold(owner)?;
         }
+        self.inner.update.admission_changed.send_replace(());
         // A failed probe cannot release an accepted hold; the same manager
         // operation reconciles it explicitly after transport recovery.
         Ok(Response::new(self.guest_update_status().await?))
@@ -497,8 +578,10 @@ impl GuestUpdate for SpacedHostService {
                 ));
             }
             state.owner = None;
+            state.hold_deadline = None;
             state.configuring = false;
         }
+        self.inner.update.admission_changed.send_replace(());
         Ok(Response::new(self.guest_update_status().await?))
     }
 

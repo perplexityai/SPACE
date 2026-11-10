@@ -195,6 +195,16 @@ new trial. This read does not create a configuration hold for pool or builder gu
 Forwarded connections refused during maintenance are reset and logged at debug
 level; they are not queued across a guest replacement.
 
+During an operation-owned guest update, new command, file and forwarding
+requests wait at spaced-host until the configured terminal generation is ready.
+Authentication and existing request limits run before this wait; maintenance and
+configuration RPCs have separate capacity. Waiting does not decode stream bodies
+or count as guest work. Cancellation or deadline expiry removes the waiter without
+executing it later. The wait uses the caller's remaining deadline and a fixed
+210-second cap from the first Hold; repeated Hold calls do not extend it. Shorter
+client deadlines can still fail before dispatch. Ordinary configuration-only
+holds retain their existing refusal behavior.
+
 The trial self-test spawns the real filesystem worker, resolves/validates its
 account, checks its protocol handshake and stats `/` through it. It does not
 exercise the customer process API; qualify command execution separately in
