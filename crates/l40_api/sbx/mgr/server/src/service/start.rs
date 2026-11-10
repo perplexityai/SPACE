@@ -2597,6 +2597,9 @@ impl SandboxManagerService {
             start_ctx.space_api_route_identity.clone(),
         );
         let route_identity = normalized_route_identity.identity;
+        let defer_endpoint_proof =
+            super::spaced_bridge::endpoint_proof_after_readiness_for(&sandbox, &route_identity)
+                .map_err(|error| activation_cleanup.failure(error))?;
         let netgtw_route_identity = route_identity.clone();
         let netgtw_db = self.db.clone();
         let netgtw_launch_config =
@@ -2900,7 +2903,12 @@ impl SandboxManagerService {
                 return Err(e);
             }
         };
-        let endpoint_proof = if let Some(spaced_host_resp) = &spaced_host_resp {
+        // Windows recreates the CH listener during viosock initialization.
+        // Readiness publishes its proof before Started, including nonblocking
+        // starts; serving paths cannot capture a premature proof while Starting.
+        let endpoint_proof = if defer_endpoint_proof {
+            None
+        } else if let Some(spaced_host_resp) = &spaced_host_resp {
             match activation_endpoint_proof_requirement(
                 &route_identity,
                 sandbox.pool_template.as_deref(),
