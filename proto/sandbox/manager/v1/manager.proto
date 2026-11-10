@@ -318,6 +318,9 @@ message GuestUpdateOperation {
   GuestUpdateOperationPhase phase = 4;
   optional string outcome = 5;
   optional space.spaced.update.v1.Status guest = 6;
+  // Ephemeral bare scheduler reason when no operation is active; not a durable
+  // outcome. Reason vocabulary is documented in docs/spaced-upgrades.md.
+  optional string automatic_deferral = 7;
 }
 
 enum BootMode {
