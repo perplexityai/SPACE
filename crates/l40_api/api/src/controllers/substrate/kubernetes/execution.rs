@@ -2552,12 +2552,19 @@ impl KubernetesSubstrate {
         )
         .await;
 
-        if cleanup_on_failure
-            && restore_failure_should_revert_to_suspended(
+        let drain_timeout = drain_restore_timeout_reverts(
+            &intent.claim,
+            prepared.restore_claim,
+            result.as_ref().err(),
+        );
+        let reverts = drain_timeout
+            || restore_failure_should_revert_to_suspended(
                 prepared.restore_claim,
                 result.as_ref().err(),
                 wake_dispatch,
-            )
+            );
+        if cleanup_on_failure
+            && reverts
             && let Some(restore_claim) = prepared.restore_claim
         {
             self.revert_failed_restore_claim(
@@ -2566,13 +2573,18 @@ impl KubernetesSubstrate {
                 activation_assignment.assigned(),
             )
             .await;
+            // The retry runs under an attempt of its own; this one's lease
+            // would refuse it until it lapsed.
+            if drain_timeout && let Some((attempt, generation)) = activation_assignment.assigned() {
+                self.store
+                    .release_finished_activation_attempt_best_effort(
+                        sandbox_id, generation, attempt,
+                    )
+                    .await;
+            }
         }
         if cleanup_on_failure
-            && !restore_failure_should_revert_to_suspended(
-                prepared.restore_claim,
-                result.as_ref().err(),
-                wake_dispatch,
-            )
+            && !reverts
             && wake_failure_should_revert_to_suspended(result.as_ref().err(), wake_dispatch)
             && let Some(restore_lease_token) = prepared
                 .restore_claim
@@ -2720,6 +2732,22 @@ pub(super) fn wake_failure_should_revert_to_suspended(
                     | SubstrateError::ActivationInFlight { .. }
                 | SubstrateError::LockContention { .. }
         ))
+}
+
+/// A drain restore's fresh claim whose attempt timed out is reverted as a
+/// failed one is, so the operation's retry claims the row at once instead of
+/// waiting out the lease and the sweeper. A user's timed-out restore stays
+/// claimed: its caller retries the same sandbox and converges on the restore
+/// that may still land; nothing converges on a drain restore's attempt but
+/// its own retry.
+pub(super) fn drain_restore_timeout_reverts(
+    mode: &RestoreClaimMode,
+    claim: Option<RestoreClaim>,
+    err: Option<&SubstrateError>,
+) -> bool {
+    matches!(mode, RestoreClaimMode::DrainOperation(_))
+        && matches!(claim, Some(RestoreClaim::FreshFromSuspended { .. }))
+        && matches!(err, Some(SubstrateError::Timeout { .. }))
 }
 
 /// Root rollback invariant for failed restores: only a fresh

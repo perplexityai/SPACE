@@ -39,8 +39,27 @@ async fn drained_subject(
     ),
     BoxError,
 > {
+    drained_subject_waking_after(pool, sandbox_id, Some(1)).await
+}
+
+/// [`drained_subject`] whose worker refuses every Wake before attempt
+/// `succeed_after`, or every one when `None`, as a node that can't bring the
+/// VM up does.
+async fn drained_subject_waking_after(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+    succeed_after: Option<usize>,
+) -> Result<
+    (
+        KubernetesSubstrate,
+        Arc<AtomicUsize>,
+        kubernetes_tests::SequencedWakeWorkerHandle,
+        Uuid,
+    ),
+    BoxError,
+> {
     let (substrate, wake_attempts, _pod_gets, worker) =
-        paused_restore_test_subject(pool, sandbox_id, Some(1), true).await?;
+        paused_restore_test_subject(pool, sandbox_id, succeed_after, true).await?;
     sqlx::query(sql!(
         "UPDATE sandboxes SET evacuation_restore_target = NULL WHERE id = $1"
     ))
@@ -259,6 +278,47 @@ async fn a_pause_that_fails_reverts_the_claim_and_releases_the_attempt() -> Resu
         .expect_err("no running VM to pause");
 
     assert!(matches!(error, SubstrateError::Failed { .. }), "{error:?}");
+    let (lifecycle, _, lease, _) = landing(&db.pool, sandbox_id).await?;
+    assert_eq!((lifecycle.as_str(), lease), ("suspended", None));
+    let held: Vec<Option<Uuid>> = sqlx::query_scalar(sql!(
+        "SELECT activation_attempt_id FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_all(&db.pool)
+    .await?;
+    assert!(held.iter().all(Option::is_none), "{held:?}");
+    Ok(())
+}
+
+/// An attempt whose VM never comes up times out, and is reverted as a failed
+/// attempt is: the row is `suspended` again with its lease cleared, so the
+/// operation's retry claims it at once rather than waiting out the lease and
+/// the sweeper. The attempt the restore ran under is released.
+#[tokio::test(flavor = "current_thread")]
+async fn an_attempt_that_times_out_reverts_the_claim() -> Result<(), BoxError> {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    let (substrate, _wake_attempts, _worker, s) =
+        drained_subject_waking_after(&db.pool, sandbox_id, None).await?;
+
+    let error = substrate
+        .restore_drained_execution(
+            SandboxApiMetricIdentity::native("drain_restore"),
+            sandbox_id,
+            ActivationOptions {
+                ready_timeout: Duration::from_millis(500),
+                ..options()
+            },
+            None,
+            drain_restore(EvacuationRestoreTarget::Started, s),
+        )
+        .await
+        .expect_err("the VM never comes up");
+
+    assert!(matches!(error, SubstrateError::Timeout { .. }), "{error:?}");
     let (lifecycle, _, lease, _) = landing(&db.pool, sandbox_id).await?;
     assert_eq!((lifecycle.as_str(), lease), ("suspended", None));
     let held: Vec<Option<Uuid>> = sqlx::query_scalar(sql!(
