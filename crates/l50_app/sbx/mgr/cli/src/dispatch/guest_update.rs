@@ -52,15 +52,26 @@ pub(super) async fn handle(
     // retryable without requiring operators to allocate identifiers themselves.
     eprintln!("Guest maintenance retry: --operation {operation} --expected-execution {execution}");
     let result = if let Some(path) = policy {
-        #[derive(serde::Deserialize)]
-        struct Policy {
-            promotion: pplx_space_spaced_update::policy::Promotion,
-        }
         let bytes = std::fs::File::open(&path)
             .and_then(read_policy_bytes)
             .unwrap_or_else(|error| exit_error(error));
-        let policy: Policy = serde_json::from_slice(&bytes).unwrap_or_else(|e| exit_error(e));
-        let p = policy.promotion;
+        let catalog = pplx_space_spaced_update::catalog::Catalog::parse(&bytes)
+            .unwrap_or_else(|e| exit_error(e));
+        let contract = status
+            .guest
+            .as_ref()
+            .map(|guest| guest.seed_contract.as_str())
+            .unwrap_or_default();
+        let platform = pplx_space_spaced_update::RecoveryPlatform::from_contract(contract)
+            .unwrap_or_else(|| exit_error("guest has no supported update recovery contract"));
+        let architecture = std::env::consts::ARCH
+            .parse()
+            .unwrap_or_else(|e| exit_error(e));
+        let p = catalog
+            .select(platform, architecture)
+            .unwrap_or_else(|| exit_error("node policy has no target for this guest platform"))
+            .promotion
+            .clone();
         client
             .apply_guest_update(ApplyGuestUpdateRequest {
                 sandbox_id: status.sandbox_id,

@@ -119,6 +119,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 \
 COPY --from=rust-build /artifacts/bin/spaced /guest/spaced
 COPY --from=rust-build /artifacts/bin/spaced-svc /guest/spaced-svc
 COPY scripts/build/agent-bundle.py /tmp/space-agent-bundle.py
+COPY scripts/build/install-agent-bundle.py /tmp/install-agent-bundle.py
 COPY ci/guest-update-required-since /tmp/guest-update-required-since
 ARG SPACE_GIT_SHA=unknown
 ARG SPACE_BUILD_TIME=""
@@ -130,8 +131,9 @@ RUN if printf '%s' "${SPACE_GIT_SHA}" | grep -Eq '^[0-9a-f]{40,64}$'; then \
         --built-at "${SPACE_BUILD_TIME:?set SPACE_BUILD_TIME to the source commit timestamp}" \
         --version "$(/guest/spaced-svc --version | awk '{print $2}')" \
         --guest-update-required-since "$(cat /tmp/guest-update-required-since)" \
-        --arch "$(uname -m)"; \
-    fi
+        --arch "$(uname -m)" && \
+      python3 /tmp/install-agent-bundle.py /guest --root /installed; \
+    else mkdir -p /installed/opt/space/guest-update /installed/etc/space/guest-update; fi
 
 FROM runtime-deps
 
@@ -142,6 +144,8 @@ LABEL org.opencontainers.image.description="SPACE worker node services (node-man
 # Guest spaced artifacts are packaged for seed image injection only; they are
 # not host-facing executables and intentionally live outside /opt/space/bin.
 COPY --from=guest-bundle /guest/ /opt/space/data/spaced/
+COPY --from=guest-bundle /installed/opt/space/guest-update/ /opt/space/guest-update/
+COPY --from=guest-bundle /installed/etc/space/guest-update/ /etc/space/guest-update/
 COPY --from=rust-build /artifacts/bin/space-runtime-supervisor-svc /opt/space/bin/space-runtime-supervisor-svc
 COPY --from=rust-build /artifacts/etc/space-runtime-supervisor-compatibility /opt/space/etc/space-runtime-supervisor-compatibility
 COPY --from=rust-build /artifacts/bin/space-rtmgr-svc        /opt/space/bin/space-rtmgr-svc
