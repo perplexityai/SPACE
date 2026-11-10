@@ -2023,6 +2023,9 @@ impl SandboxManagerService {
                 .await?;
         }
         let sandbox = start_lookup.sandbox;
+        if !sandbox.state.is_unowned(SandboxState::Started) {
+            self.guest_auto_updates.activation(&sandbox.id);
+        }
         if let Some(policy) = &start_ctx.activation_auto_lifecycle {
             let runtime = sandbox
                 .runtime

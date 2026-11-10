@@ -383,6 +383,8 @@ pub struct SandboxManagerService {
     /// Guest maintenance leaves excess intent durable instead of queueing
     /// unbounded transfer/activation tasks alongside customer work.
     guest_update_sem: Arc<tokio::sync::Semaphore>,
+    guest_auto_updates: Arc<guest_update::automatic::Automatic>,
+    automatic_guest_updates: bool,
     /// Shared blocking cleanup I/O budget, acquired before task allocation.
     cleanup_io: Arc<tokio::sync::Semaphore>,
     cleanup_target_streams: Arc<tokio::sync::Semaphore>,
@@ -1032,6 +1034,7 @@ fn install_authoritative_route_epoch(
 
 #[derive(Clone)]
 pub struct SandboxManagerServiceOptions {
+    pub automatic_guest_updates: bool,
     pub host_control_socket_path: PathBuf,
     pub credential_manager_socket_path: PathBuf,
     pub sandbox_runtime_live: Arc<dyn Fn(&str) -> bool + Send + Sync>,
@@ -1074,6 +1077,7 @@ pub struct SandboxManagerServiceOptions {
 impl Default for SandboxManagerServiceOptions {
     fn default() -> Self {
         Self {
+            automatic_guest_updates: true,
             host_control_socket_path: PathBuf::from(
                 pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET,
             ),
@@ -1816,6 +1820,8 @@ impl SandboxManagerService {
             ),
             cleanup_sem: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CLEANUP_CONCURRENCY_CAP)),
             guest_update_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            guest_auto_updates: Arc::default(),
+            automatic_guest_updates: options.automatic_guest_updates,
             cleanup_io: Arc::new(tokio::sync::Semaphore::new(CLEANUP_IO_CONCURRENCY_CAP)),
             cleanup_target_streams: Arc::new(tokio::sync::Semaphore::new(4)),
             artifact_io: Arc::new(tokio::sync::Semaphore::new(

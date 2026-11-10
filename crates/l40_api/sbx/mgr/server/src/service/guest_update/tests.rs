@@ -312,7 +312,7 @@ async fn capture_excludes_new_admission_and_invalid_execution_never_probes() {
         .await;
     assert_eq!(
         service
-            .admit_guest_update(intent.clone())
+            .admit_guest_update(intent.clone(), false, None)
             .await
             .unwrap_err()
             .code(),
@@ -347,13 +347,25 @@ async fn capture_excludes_new_admission_and_invalid_execution_never_probes() {
     // A brief read must wait, then admit, without granting a capture race.
     service.shutdown_token.cancel();
     let reader = service.auto_lifecycle.artifact_lock(&id).lock().await;
-    let mut admission = Box::pin(service.admit_guest_update(intent));
+    // If another maintenance operation owns the permit, recovery must retain
+    // the manual request's semantics rather than imposing automatic quiet time.
+    let busy = service
+        .guest_update_sem
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let operation = intent.operation;
+    let mut admission = Box::pin(service.admit_guest_update(intent, false, None));
     assert!(futures_util::poll!(&mut admission).is_pending());
     drop(reader);
     assert_eq!(
         admission.await.unwrap().into_inner().phase,
         crate::proto::GuestUpdateOperationPhase::Pending as i32
     );
+    assert!(!service.guest_auto_updates.requires_quiet(operation));
+    assert_eq!(service.guest_update_sem.available_permits(), 0);
+    drop(busy);
     service.task_tracker.close();
     service.task_tracker.wait().await;
 }

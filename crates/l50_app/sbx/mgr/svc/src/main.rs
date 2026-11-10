@@ -18,6 +18,11 @@ struct Cli {
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
     _version: (),
 
+    /// Enable opportunistic node-local guest updates. Durable recovery stays enabled.
+    #[arg(long, env = "SPACE_GUEST_AUTO_UPDATE", default_value = "true",
+        action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+    automatic_guest_updates: bool,
+
     /// Production sandbox-manager Unix socket. Bound only after the service
     /// mutex is acquired.
     #[arg(long, default_value = SOCKET_PATH)]
@@ -50,6 +55,7 @@ struct Cli {
 impl From<Cli> for SbxMgrRunConfig {
     fn from(cli: Cli) -> Self {
         Self {
+            automatic_guest_updates: cli.automatic_guest_updates,
             socket_path: cli.socket,
             host_control_socket_path: cli.host_control_socket,
             health_socket_path: cli.health_socket,
@@ -70,3 +76,6 @@ fn main() -> anyhow::Result<()> {
             Ok(result?)
         })
 }
+
+#[cfg(test)]
+mod tests;

@@ -125,7 +125,7 @@ fn display(result: GuestUpdateOperation, json: bool) {
             "{}",
             serde_json::json!({"sandbox_id": result.sandbox_id,
             "execution_id": result.execution_id, "operation_id": result.operation_id,
-            "phase": result.phase().as_str_name(), "outcome": result.outcome, "guest": guest})
+            "phase": result.phase().as_str_name(), "outcome": result.outcome, "automatic_deferral": result.automatic_deferral, "guest": guest})
         );
         return;
     }
@@ -136,6 +136,9 @@ fn display(result: GuestUpdateOperation, json: bool) {
         result.operation_id.as_deref().unwrap_or("none"),
         result.phase()
     );
+    if let Some(reason) = result.automatic_deferral {
+        println!("Automatic deferral: {reason}");
+    }
     if let Some(outcome) = result.outcome {
         println!("Outcome: {outcome}");
     }
