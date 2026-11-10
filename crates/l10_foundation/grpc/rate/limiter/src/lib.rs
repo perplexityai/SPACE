@@ -41,6 +41,7 @@ pub enum UnknownPeerPolicy {
 pub enum GrpcRateLimitBucket {
     Business,
     Health,
+    Control,
 }
 
 impl GrpcRateLimitBucket {
@@ -48,6 +49,7 @@ impl GrpcRateLimitBucket {
         match self {
             Self::Business => "business",
             Self::Health => "health",
+            Self::Control => "control",
         }
     }
 }
@@ -141,7 +143,7 @@ impl GrpcRateLimiterConfig {
     fn bucket_limits(&self, bucket: GrpcRateLimitBucket) -> GrpcRateLimiterLimits {
         match bucket {
             GrpcRateLimitBucket::Business => self.default_limits,
-            GrpcRateLimitBucket::Health => self
+            GrpcRateLimitBucket::Health | GrpcRateLimitBucket::Control => self
                 .bucket_limits
                 .get(&bucket)
                 .copied()

@@ -33,7 +33,7 @@ const MAX_HOST_SERVER_CONNECTIONS: usize = 512;
 const MAX_BRIDGE_HOST_CONNECTIONS: usize = 64;
 const MIN_NON_GRPC_DESCRIPTOR_RESERVE: usize = 2048;
 
-fn host_request_limiter() -> pplx_space_grpc_rate_limiter::GrpcRateLimiterLayer {
+pub(super) fn host_request_limiter() -> pplx_space_grpc_rate_limiter::GrpcRateLimiterLayer {
     use pplx_space_grpc_rate_limiter::{
         GrpcRateLimitBucket, GrpcRateLimiterConfig, GrpcRateLimiterLimits,
     };
@@ -48,6 +48,13 @@ fn host_request_limiter() -> pplx_space_grpc_rate_limiter::GrpcRateLimiterLayer 
                 per_peer_request_window: Duration::from_secs(1),
             },
         );
+    config = config.with_bucket_limits(
+        GrpcRateLimitBucket::Control,
+        GrpcRateLimiterLimits::conservative_health_default()
+            .with_max_global_in_flight(256)
+            .with_max_in_flight_per_peer(128)
+            .with_max_requests_per_peer(2000, Duration::from_secs(1)),
+    );
     // Long-lived output streams cannot consume the capacity needed to inspect,
     // signal, or suspend their guest. Payload admission still bounds stdin.
     for (service, methods) in [
@@ -66,6 +73,21 @@ fn host_request_limiter() -> pplx_space_grpc_rate_limiter::GrpcRateLimiterLayer 
             ][..],
         ),
         (
+            "GuestUpdate",
+            &[
+                "GetStatus",
+                "Hold",
+                "Release",
+                "Stage",
+                "Arm",
+                "Configure",
+                "Commit",
+                "Abort",
+                "Restart",
+                "Subscribe",
+            ][..],
+        ),
+        (
             "Process",
             &["SendSignal", "SendInput", "CloseStdin", "Kill", "ResizePty"][..],
         ),
@@ -77,7 +99,13 @@ fn host_request_limiter() -> pplx_space_grpc_rate_limiter::GrpcRateLimiterLayer 
         for method in methods {
             config = config.with_method_bucket(
                 format!("/space.spaced.host.v1.{service}/{method}"),
-                GrpcRateLimitBucket::Health,
+                if matches!(service, "Meta" | "GuestUpdate") {
+                    // Update waiters must not consume the capacity that releases
+                    // their hold, including when networking's bucket is full.
+                    GrpcRateLimitBucket::Control
+                } else {
+                    GrpcRateLimitBucket::Health
+                },
             );
         }
     }
@@ -866,6 +894,7 @@ impl SpacedHostService {
                     .http2_keepalive_timeout(Some(Duration::from_secs(5)))
                     .layer(crate::authorization::HostAuthorizationLayer(self.clone()))
                     .layer(host_request_limiter())
+                    .layer(crate::admission::HostAdmissionLayer(self.clone()))
                     .layer(pplx_space_grpc_server::grpc_trace_layer())
                     .add_service(MetaServer::new(self.clone()))
                     .add_service(

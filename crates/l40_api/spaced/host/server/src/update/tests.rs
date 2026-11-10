@@ -384,3 +384,244 @@ fn capture_status_does_not_latch_a_configuration_hold() {
         );
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn update_wait_observes_release_deadline_shutdown_and_capture_without_dispatch() {
+    enum End {
+        Release,
+        CallerDeadline,
+        HoldDeadline,
+        Shutdown,
+        Capture,
+        Replaced,
+    }
+    for end in [
+        End::Release,
+        End::CallerDeadline,
+        End::HoldDeadline,
+        End::Shutdown,
+        End::Capture,
+        End::Replaced,
+    ] {
+        let update = HostUpdate::new();
+        let owner = Owner {
+            operation: Uuid::now_v7(),
+            execution: Uuid::now_v7(),
+        };
+        update
+            .admission
+            .lock()
+            .unwrap()
+            .hold(owner.clone())
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let caller_deadline =
+            matches!(end, End::CallerDeadline).then(|| Deadline::now() + Duration::from_secs(1));
+        let waiting = update.admit_when_ready(caller_deadline, &shutdown);
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        assert_eq!(update.admission.lock().unwrap().active, 0);
+        match end {
+            End::Release => update.admission.lock().unwrap().owner = None,
+            End::CallerDeadline => tokio::time::advance(Duration::from_secs(1)).await,
+            End::HoldDeadline => {
+                tokio::time::advance(ADMISSION_WAIT_BUDGET - Duration::from_secs(1)).await;
+                update.admission.lock().unwrap().hold(owner).unwrap();
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+            End::Shutdown => shutdown.cancel(),
+            End::Capture => update.pause_observation().await.unwrap().keep_paused(),
+            End::Replaced => {
+                update.admission.lock().unwrap().owner = Some(Owner {
+                    operation: Uuid::now_v7(),
+                    execution: Uuid::now_v7(),
+                })
+            }
+        }
+        update.admission_changed.send_replace(());
+        let result = waiting.await;
+        match end {
+            End::Release => {
+                let guard = result.expect("settled generation admits");
+                assert_eq!(update.admission.lock().unwrap().active, 1);
+                drop(guard);
+            }
+            End::CallerDeadline => {
+                assert_eq!(result.err().unwrap().code(), tonic::Code::DeadlineExceeded)
+            }
+            End::Shutdown => assert_eq!(result.err().unwrap().code(), tonic::Code::Cancelled),
+            End::HoldDeadline | End::Capture | End::Replaced => {
+                assert_eq!(result.err().unwrap().code(), tonic::Code::Unavailable)
+            }
+        }
+        assert_eq!(update.admission.lock().unwrap().active, 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn mounted_wait_is_bounded_by_existing_limits_and_preserves_control_capacity() {
+    use crate::admission::HostAdmissionLayer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tonic::codegen::http;
+    use tower::{Layer, Service};
+
+    let directory = tempfile::tempdir().unwrap();
+    let host = SpacedHostService::new_with_config(
+        CancellationToken::new(),
+        SpacedHostServiceConfig {
+            socket_path: directory.path().join("host.sock"),
+            bridge_host_socket_path: directory.path().join("bridge.sock"),
+            bridge_guest_connector: BridgeGuestConnector::Uds(directory.path().join("guest.sock")),
+            host_control_socket_path: directory.path().join("control.sock"),
+            ..Default::default()
+        },
+    );
+    host.inner
+        .update
+        .admission
+        .lock()
+        .unwrap()
+        .hold(Owner {
+            operation: Uuid::now_v7(),
+            execution: Uuid::now_v7(),
+        })
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let handler = tower::service_fn(move |_: http::Request<()>| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(Ok::<_, std::convert::Infallible>(http::Response::new(
+            tonic::body::Body::empty(),
+        )))
+    });
+    let mut service = crate::bridge::host_request_limiter()
+        .layer(HostAdmissionLayer(host.clone()).layer(handler));
+    let request = |method: &'static str| {
+        let mut request = http::Request::builder().uri(method).body(()).unwrap();
+        request
+            .extensions_mut()
+            .insert(pplx_space_uds_peer_auth::PeerIdentity::new(
+                1000,
+                1000,
+                Some(42),
+            ));
+        request
+    };
+    let mut waiting = Vec::new();
+    // Fill the existing per-peer networking/control-request bucket. The
+    // maintenance RPC must still be callable to release these waiting requests.
+    for _ in 0..128 {
+        let mut future = service.call(request(
+            "/space.spaced.host.v1.Networking/OpenLoopbackBridge",
+        ));
+        assert!(futures_util::poll!(&mut future).is_pending());
+        waiting.push(future);
+    }
+    let error = service
+        .call(request(
+            "/space.spaced.host.v1.Networking/OpenLoopbackBridge",
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.downcast::<Status>().unwrap().code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    drop(
+        service
+            .call(request("/space.spaced.host.v1.GuestUpdate/Release"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // Cancelling one request frees limiter capacity without executing it later.
+    drop(waiting.pop());
+    let mut replacement = service.call(request(
+        "/space.spaced.host.v1.Networking/OpenLoopbackBridge",
+    ));
+    assert!(futures_util::poll!(&mut replacement).is_pending());
+    host.inner.update.admission.lock().unwrap().owner = None;
+    host.inner.update.admission_changed.send_replace(());
+    drop(replacement.await.unwrap());
+    for future in waiting {
+        drop(future.await.unwrap());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 129);
+    assert_eq!(host.inner.update.admission.lock().unwrap().active, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn maintenance_wait_keeps_the_caller_deadline_across_customer_routes() {
+    use crate::admission::HostAdmissionLayer;
+    use tonic::codegen::http;
+    use tower::{Layer, Service};
+    for route in [
+        "Process/Start",
+        "Filesystem/Write",
+        "Networking/OpenLoopbackBridge",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let host = SpacedHostService::new_with_config(
+            CancellationToken::new(),
+            SpacedHostServiceConfig {
+                socket_path: directory.path().join("host.sock"),
+                bridge_host_socket_path: directory.path().join("bridge.sock"),
+                bridge_guest_connector: BridgeGuestConnector::Uds(
+                    directory.path().join("guest.sock"),
+                ),
+                host_control_socket_path: directory.path().join("control.sock"),
+                ..Default::default()
+            },
+        );
+        host.inner
+            .update
+            .admission
+            .lock()
+            .unwrap()
+            .hold(Owner {
+                operation: Uuid::now_v7(),
+                execution: Uuid::now_v7(),
+            })
+            .unwrap();
+        let (sender, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let handler = tower::service_fn(move |request: http::Request<()>| {
+            sender
+                .send(request.headers()["grpc-timeout"].clone())
+                .unwrap();
+            std::future::ready(Ok::<_, std::convert::Infallible>(http::Response::new(
+                tonic::body::Body::empty(),
+            )))
+        });
+        let mut service = HostAdmissionLayer(host.clone()).layer(handler);
+        let request = || {
+            http::Request::builder()
+                .uri(format!("/space.spaced.host.v1.{route}"))
+                .header("grpc-timeout", "3S")
+                .body(())
+                .unwrap()
+        };
+        let mut cancelled = service.call(request());
+        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        drop(cancelled);
+        let mut pending = service.call(request());
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        observed.try_recv().unwrap_err();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        host.inner.update.admission.lock().unwrap().owner = None;
+        host.inner.update.admission_changed.send_replace(());
+        drop(pending.await.unwrap());
+        let mut headers = http::HeaderMap::new();
+        headers.insert("grpc-timeout", observed.try_recv().unwrap());
+        let remaining = pplx_space_common_grpc::GrpcRetryContext::none()
+            .with_grpc_timeout_metadata(&tonic::metadata::MetadataMap::from_headers(headers))
+            .remaining()
+            .unwrap();
+        assert_eq!(remaining, Duration::from_secs(2));
+        assert!(
+            observed.try_recv().is_err(),
+            "cancelled request must never dispatch"
+        );
+    }
+}

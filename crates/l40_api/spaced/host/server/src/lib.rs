@@ -82,6 +82,7 @@ use proto::{
 use tokio_util::sync::CancellationToken;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
+mod admission;
 mod authorization;
 mod bridge;
 mod compat;
