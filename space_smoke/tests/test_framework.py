@@ -239,6 +239,8 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "network_policy.v1_udp_respects_ip_allow",
                 "network_policy.v1_udp_respects_ip_deny",
                 "network_policy.v1_wildcard_domain_allow",
+                "node.guest_auto_update",
+                "node.guest_auto_update_disabled",
                 "node.guest_update",
                 "node.guest_update_failure",
                 "node.runtime_base_memory",

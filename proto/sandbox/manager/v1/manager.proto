@@ -318,6 +318,8 @@ message GuestUpdateOperation {
   GuestUpdateOperationPhase phase = 4;
   optional string outcome = 5;
   optional space.spaced.update.v1.Status guest = 6;
+  // Ephemeral scheduler hint when no operation is active; not a durable outcome.
+  optional string automatic_deferral = 7;
 }
 
 enum BootMode {
