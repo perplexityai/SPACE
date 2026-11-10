@@ -11,6 +11,7 @@ use pplx_space_spaced_common::proto::update as wire;
 use pplx_space_spaced_host_client::RawSpacedHostGuestUpdateClient as Client;
 use pplx_space_spaced_update as model;
 
+pub(super) mod automatic;
 mod observation;
 mod policy;
 
@@ -133,11 +134,12 @@ impl SandboxManagerService {
         Ok(Response::new(match record {
             Some(record) => response(&record, guest),
             None => crate::proto::GuestUpdateOperation {
-                sandbox_id: sandbox.id,
+                sandbox_id: sandbox.id.clone(),
                 execution_id: sandbox
                     .node_execution_id
                     .map(|v| v.to_string())
                     .unwrap_or_default(),
+                outcome: self.guest_auto_updates.status(&sandbox.id),
                 guest,
                 ..Default::default()
             },
@@ -299,22 +301,30 @@ impl SandboxManagerService {
         if record.phase != Phase::Complete
             && let Ok(permit) = self.guest_update_sem.clone().try_acquire_owned()
         {
-            let service = self.clone();
-            let operation = record.intent.operation;
-            self.task_tracker.spawn(async move {
-                let _permit = permit;
-                tokio::select! {
-                    biased;
-                    _ = service.shutdown_token.cancelled() => {},
-                    result = service.run_guest_update(operation) => {
-                        if let Err(error) = result {
-                            tracing::warn!(%operation, %error, "guest update awaits reconciliation");
-                        }
-                    }
-                }
-            });
+            self.spawn_guest_update(record.intent.operation, permit, false);
         }
         Ok(Response::new(response(&record, None)))
+    }
+
+    fn spawn_guest_update(
+        &self,
+        operation: Uuid,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        quiet: bool,
+    ) {
+        let service = self.clone();
+        self.task_tracker.spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                biased;
+                _ = service.shutdown_token.cancelled() => {},
+                result = service.run_guest_update(operation, quiet) => {
+                    if let Err(error) = result {
+                        tracing::warn!(%operation, %error, "guest update awaits reconciliation");
+                    }
+                }
+            }
+        });
     }
 
     async fn probe_update_contract(
@@ -385,7 +395,9 @@ impl SandboxManagerService {
         if !store::advance(&*self.db_conn()?, record, to, seen).map_err(internal)? {
             return Err(Status::aborted("guest update phase or execution changed"));
         }
-        self.update_record(record.intent.operation)
+        let advanced = self.update_record(record.intent.operation)?;
+        self.guest_auto_updates.observe(&advanced);
+        Ok(advanced)
     }
 
     fn retire_stale_guest_update(&self, sandbox: &str) -> Result<(), Status> {
@@ -397,7 +409,7 @@ impl SandboxManagerService {
         Ok(())
     }
 
-    async fn run_guest_update(&self, operation: Uuid) -> Result<(), Status> {
+    async fn run_guest_update(&self, operation: Uuid, quiet: bool) -> Result<(), Status> {
         let record = self.update_record(operation)?;
         if record.phase == Phase::Complete {
             return Ok(());
@@ -416,7 +428,8 @@ impl SandboxManagerService {
             return Ok(());
         };
         let _writer = self.state_writer_lease("GuestUpdateRecovery")?;
-        self.drive_guest_update(record, false, priority).await
+        self.drive_guest_update(record, false, quiet, priority)
+            .await
     }
 
     /// Called with the artifact lock before a lifecycle transition. Pending
@@ -445,7 +458,7 @@ impl SandboxManagerService {
             .auto_lifecycle
             .artifact_lock(sandbox)
             .subscribe_capture_requests();
-        self.drive_guest_update(record, true, priority).await
+        self.drive_guest_update(record, true, false, priority).await
     }
 
     fn guest_update_execution_fence(
@@ -466,6 +479,7 @@ impl SandboxManagerService {
         &self,
         mut record: Record,
         lifecycle: bool,
+        quiet: bool,
         mut priority: tokio::sync::watch::Receiver<()>,
     ) -> Result<(), Status> {
         let operation = record.intent.operation;
@@ -553,7 +567,9 @@ impl SandboxManagerService {
                     .descriptor
                     .seed_contracts
                     .contains(&observed.seed_contract)
-                || (!record.intent.force && !observed.defer_reasons.is_empty())
+                || (!record.intent.force
+                    && (!observed.defer_reasons.is_empty()
+                        || (quiet && automatic::quiet_remaining(&sandbox, now_secs()) > 0)))
             {
                 return self
                     .finish_pending_guest_update(record, Outcome::Deferred, observed, &mut client)
@@ -604,7 +620,13 @@ impl SandboxManagerService {
             record = self.update_advance(&record, Phase::Staged, None)?;
         }
         if matches!(record.phase, Phase::Pending | Phase::Staged) {
-            if qualify(&self.update_execution(&record)?, None, ACTIVATION_BUDGET).is_err() {
+            let current = self.update_execution(&record)?;
+            if qualify(&current, None, ACTIVATION_BUDGET).is_err()
+                || (!record.intent.force
+                    && matches!(record.intent.action, Action::Apply { .. })
+                    && quiet
+                    && automatic::quiet_remaining(&current, now_secs()) > 0)
+            {
                 return self
                     .finish_pending_guest_update(record, Outcome::Deferred, observed, &mut client)
                     .await;
@@ -935,7 +957,7 @@ impl SandboxManagerService {
                         let service = &service;
                         async move {
                             let Ok(_permit) = service.guest_update_sem.clone().try_acquire_owned() else { return; };
-                            if let Err(error) = service.run_guest_update(record.intent.operation).await {
+                            if let Err(error) = service.run_guest_update(record.intent.operation, true).await {
                                 tracing::warn!(operation = %record.intent.operation, %error, "guest update recovery deferred");
                             }
                         }
