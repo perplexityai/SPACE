@@ -197,6 +197,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "native.v2_drain_paces_a_full_worker",
                 "native.v2_drain_restore_outlives_its_destination",
                 "native.v2_drain_resume_waits_for_its_restore",
+                "native.v2_drain_start_waits_for_durability",
                 "native.v2_drain_survives_controller_restarts",
                 "native.v2_drain_survives_sandbox_manager_restarts",
                 "native.v2_drain_terminates_its_worker",
