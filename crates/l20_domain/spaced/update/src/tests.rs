@@ -326,6 +326,19 @@ fn publisher_bytes_are_the_descriptor_identity() {
         let bytes = std::fs::read(directory.path().join("artifact.json")).unwrap();
         let descriptor = BundleDescriptor::parse(&bytes).unwrap();
         assert_eq!(descriptor.seed_contracts, [contract]);
+        let recovery = descriptor.recovery_platform().unwrap();
+        assert_eq!(recovery.contract(), contract);
+        for role in Binary::ALL {
+            assert!(directory.path().join(recovery.binary_name(role)).is_file());
+        }
+        for contracts in [
+            vec!["future-unsupported-v1".into()],
+            vec![SEED_CONTRACT.into(), WINDOWS_SEED_CONTRACT.into()],
+        ] {
+            let mut ambiguous = descriptor.clone();
+            ambiguous.seed_contracts = contracts;
+            ambiguous.recovery_platform().unwrap_err();
+        }
         for binary in Binary::ALL {
             assert_eq!(
                 descriptor.binary(binary).digest,

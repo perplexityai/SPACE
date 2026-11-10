@@ -10,12 +10,17 @@ use tonic::{Request, Response, Status};
 #[derive(Clone)]
 pub(super) struct Meta {
     operations: bool,
+    service: super::SpacedGuestService,
     flush_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
-pub(super) fn service(operations: bool) -> meta_server::MetaServer<Meta> {
+pub(super) fn service(
+    operations: bool,
+    service: super::SpacedGuestService,
+) -> meta_server::MetaServer<Meta> {
     meta_server::MetaServer::new(Meta {
         operations,
+        service,
         flush_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
     })
     .max_decoding_message_size(64 * 1024)
@@ -53,7 +58,7 @@ impl meta_server::Meta for Meta {
             ]);
         }
         Ok(Response::new(WaitReadyResponse {
-            ready: true,
+            ready: *self.service.inner.ready.borrow(),
             guest_uptime: Some(prost_types::Duration {
                 seconds: (milliseconds / 1000) as i64,
                 nanos: ((milliseconds % 1000) * 1_000_000) as i32,
@@ -69,11 +74,13 @@ impl meta_server::Meta for Meta {
     }
     async fn configure_process_env(
         &self,
-        _: Request<ConfigureProcessEnvRequest>,
+        request: Request<ConfigureProcessEnvRequest>,
     ) -> Result<Response<ConfigureProcessEnvResponse>, Status> {
-        Err(super::unsupported(
-            "process environment is not qualified on Windows",
-        ))
+        let _permit = self.service.inner.execution.admission.admit()?;
+        self.service.inner.execution.admission.configure(
+            super::update_backend::parse_environment(request.into_inner().env)?,
+        )?;
+        Ok(Response::new(ConfigureProcessEnvResponse {}))
     }
     async fn notify_resume(
         &self,
@@ -87,7 +94,7 @@ impl meta_server::Meta for Meta {
         }
         Ok(Response::new(NotifyResumeResponse {
             clock_sync_status: super::lifecycle::sync_clock(request.host_time)? as i32,
-            ready: true,
+            ready: *self.service.inner.ready.borrow(),
         }))
     }
     async fn flush_filesystems(

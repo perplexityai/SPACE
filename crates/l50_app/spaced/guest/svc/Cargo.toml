@@ -28,7 +28,7 @@ anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 pplx-space-spaced-guest-server = { workspace = true, features = ["service-entrypoint"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
 pplx-space-spaced-guest-update = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

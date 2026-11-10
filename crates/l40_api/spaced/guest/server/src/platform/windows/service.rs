@@ -47,6 +47,13 @@ fn status(
     })
 }
 
+pub(super) fn publish_running(handle: Option<ServiceStatusHandle>) -> windows_service::Result<()> {
+    if let Some(handle) = handle {
+        status(handle, ServiceState::Running, false)?;
+    }
+    Ok(())
+}
+
 fn service_main(_: Vec<OsString>) {
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
@@ -64,12 +71,23 @@ fn service_main(_: Vec<OsString>) {
             return;
         }
     };
+    // Register first so containment failure is visible to SCM's failure policy,
+    // including on legacy images that do not have scheduled recovery tasks.
+    let _workload_job = match super::recovery::contain_service() {
+        Ok(job) => job,
+        Err(error) => {
+            tracing::error!(%error, "cannot contain guest service workloads");
+            if let Err(error) = status(handle, ServiceState::Stopped, true) {
+                tracing::error!(%error, "cannot publish Windows containment failure");
+            }
+            return;
+        }
+    };
     let result = status(handle, ServiceState::StartPending, false)
         .map_err(super::RunError::Service)
         .and_then(|()| {
-            super::serve(shutdown, || {
-                status(handle, ServiceState::Running, false).map_err(super::RunError::Service)
-            })
+            super::recovery::register_startup()?;
+            super::serve(shutdown, Some(handle))
         });
     if let Err(error) = &result {
         tracing::error!(%error, "Windows guest service failed");
