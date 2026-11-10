@@ -365,9 +365,11 @@ not a qualified sandbox guest image.
 
 The experimental Windows backend implements the same manager-owned guest
 update RPCs, version ordering, execution fences and host SQLite receipts as
-Linux. It requires an explicitly qualified `windows-scm-two-slot-v1` image;
-legacy Windows services remain usable and refuse maintenance RPCs. Automatic
-rollout remains disabled. See [guest updates](../../../docs/spaced-upgrades.md)
+Linux. It requires a 0.8.2-or-newer `windows-scm-two-slot-v1` guest;
+legacy Windows services remain usable and refuse maintenance RPCs. Capable
+images are eligible for default-on node-local automatic guest updates when the
+node has a matching Windows bundle. `SPACE_GUEST_AUTO_UPDATE=0` disables new
+automatic admissions on that node. See [guest updates](../../../docs/spaced-upgrades.md)
 for policy, qualification and manager commands.
 
 Build the service and CLI together, then write their descriptor beside the two
@@ -395,6 +397,13 @@ must contain `artifact.json`, `spaced-svc.exe` and `spaced.exe`. This is image
 assembly, not a way to reset update history in a running guest. Remove the
 assembly inputs before capturing the image. The qualified layout requires
 `C:\ProgramData` and `C:\Windows` on the system drive.
+
+For manager-owned guest updates, build the image with a 0.8.2-or-newer bundle
+and the documented recovery tasks, ACLs, slots and workload account. The node
+matches guest-reported version and recovery contract to its trusted Windows
+image profile and installed target catalog. No template metadata edit or digest
+allowlist is required. Custom image changes that damage recovery may require
+manual repair; a reported version does not verify the installed SCM setup.
 
 The workload Job Object lives in a private namespace whose boundary and ACL
 require SYSTEM. A pre-existing job is refused rather than adopted. Tenant
