@@ -1746,6 +1746,17 @@ enum Inner {
 }
 
 impl Substrate {
+    /// The environment placement gate's mode
+    /// (`SPACE_ENVIRONMENT_PLACEMENT_GATE`), for placement outside the
+    /// adapter, such as warm-pool pods.
+    pub fn environment_placement(&self) -> environment_placement::EnvironmentPlacementGate {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.environment_placement(),
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.k8s.environment_placement,
+        }
+    }
+
     /// Run on the Direct substrate.
     pub fn from_direct(substrate: direct::DirectSubstrate) -> Self {
         Self {
@@ -1811,9 +1822,8 @@ impl Substrate {
         shutdown_token: CancellationToken,
         task_tracker: TaskTracker,
     ) -> Result<Self, SubstrateError> {
-        // Parsed on both substrates, so a typo fails startup wherever it's
-        // set; only Direct places under it so far, and Kubernetes refuses
-        // `on`.
+        // Parsed before either substrate starts, so a typo fails startup
+        // wherever it's set; Kubernetes reads it again for its pods.
         let environment_placement =
             environment_placement::EnvironmentPlacementGate::from_environment(
                 &pplx_space_common_core::env::ProcessEnvironment,

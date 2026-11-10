@@ -81,41 +81,237 @@ impl KubernetesSubstrate {
         claim: &SandboxExecutionClaim,
         context: &PodCreateContext<'_>,
     ) -> Result<ResolvedPlacement, SubstrateError> {
-        match self.resolve_node_group_placement(sandbox, context).await {
-            Ok(resolved) => Ok(resolved),
-            Err(err) => {
-                if execution_pod_create_in_flight(claim.row.state) {
-                    // The retirement's own failure must not replace `err`: the
-                    // caller needs to know why the *pod build* failed, and a
-                    // store error here only means the claim outlives this
-                    // attempt (the stale-create age then clears it). Log both,
-                    // return the one that explains the outcome.
-                    match self
-                        .store
-                        .abandon_created_unmaterialized_create_claim(sandbox.id, claim)
-                        .await
-                    {
-                        Ok(true) => tracing::warn!(
-                            sandbox_id = %sandbox.id,
-                            generation = claim.row.generation,
-                            error = %err,
-                            "retired unmaterialized Kubernetes pod create claim after node-group \
-                             placement could not be resolved"
-                        ),
-                        Ok(false) => {}
-                        Err(retire_error) => tracing::warn!(
-                            sandbox_id = %sandbox.id,
-                            generation = claim.row.generation,
-                            error = %err,
-                            %retire_error,
-                            "could not retire the unmaterialized create claim after node-group \
-                             placement failed; the claim clears at the stale-create age"
-                        ),
-                    }
-                }
-                Err(err)
+        let resolved = self.resolve_node_group_placement(sandbox, context).await;
+        self.retire_unmaterialized_claim_on_error(sandbox, claim, resolved, "node-group placement")
+            .await
+    }
+
+    /// [`Self::resolve_pod_environment`] for a pod build whose execution
+    /// claim is already outstanding, which a failure retires as
+    /// [`Self::resolve_node_group_placement_for_claim`] does.
+    pub(super) async fn resolve_pod_environment_for_claim(
+        &self,
+        sandbox: &Sandbox,
+        claim: &SandboxExecutionClaim,
+        context: &PodCreateContext<'_>,
+    ) -> Result<Option<PodEnvironment>, SubstrateError> {
+        let resolved = self.resolve_pod_environment(sandbox, context).await;
+        self.retire_unmaterialized_claim_on_error(sandbox, claim, resolved, "the pod's environment")
+            .await
+    }
+
+    /// Pass `resolved` through, retiring `claim` first when it failed and the
+    /// create is still in flight.
+    async fn retire_unmaterialized_claim_on_error<T>(
+        &self,
+        sandbox: &Sandbox,
+        claim: &SandboxExecutionClaim,
+        resolved: Result<T, SubstrateError>,
+        what: &'static str,
+    ) -> Result<T, SubstrateError> {
+        let Err(err) = resolved else {
+            return resolved;
+        };
+        if execution_pod_create_in_flight(claim.row.state) {
+            // The retirement's own failure must not replace `err`: the
+            // caller needs to know why the *pod build* failed, and a store
+            // error here only means the claim outlives this attempt (the
+            // stale-create age then clears it). Log both, return the one that
+            // explains the outcome.
+            match self
+                .store
+                .abandon_created_unmaterialized_create_claim(sandbox.id, claim)
+                .await
+            {
+                Ok(true) => tracing::warn!(
+                    sandbox_id = %sandbox.id,
+                    generation = claim.row.generation,
+                    error = %err,
+                    what,
+                    "retired unmaterialized Kubernetes pod create claim after a pod \
+                     placement input could not be resolved"
+                ),
+                Ok(false) => {}
+                Err(retire_error) => tracing::warn!(
+                    sandbox_id = %sandbox.id,
+                    generation = claim.row.generation,
+                    error = %err,
+                    %retire_error,
+                    what,
+                    "could not retire the unmaterialized create claim after a pod placement \
+                     input failed to resolve; the claim clears at the stale-create age"
+                ),
             }
         }
+        Err(err)
+    }
+
+    /// The environment this pod build's work is bound to, which the pod
+    /// records while the environment placement gate evaluates and requires a
+    /// node label for while it's on (`pod_environment`); `None` for unbound
+    /// work, and while the gate is off.
+    ///
+    /// The work is what the pod will boot: the template build for an
+    /// on-demand pod ([`Self::template_pod_environment`]), the checkpoint a
+    /// suspended sandbox restores, and the execution a stopped sandbox last
+    /// published for a disk restore, which cold boots it. Like the
+    /// node-group placement, it's resolved from the current rows at every
+    /// build.
+    pub(in crate::controllers::substrate::kubernetes) async fn resolve_pod_environment(
+        &self,
+        sandbox: &Sandbox,
+        context: &PodCreateContext<'_>,
+    ) -> Result<Option<PodEnvironment>, SubstrateError> {
+        let gate = self.k8s.environment_placement;
+        if !gate.evaluates() {
+            return Ok(None);
+        }
+        let restore = match context {
+            PodCreateContext::OnDemand => {
+                return match sandbox.content_hash.as_deref() {
+                    Some(content_hash) => {
+                        self.template_pod_environment(sandbox_template_name(sandbox), content_hash)
+                            .await
+                    }
+                    None => Ok(None),
+                };
+            }
+            PodCreateContext::Restore(restore) => restore,
+        };
+        let (storage_uri, pinned_disk) = match restore {
+            RestoreContext::UserRestore {
+                suspend_restore_storage_uri,
+                ..
+            } => (*suspend_restore_storage_uri, None),
+            RestoreContext::Evacuation {
+                suspend_restore_storage_uri,
+                stopped_materialization,
+                ..
+            } => (
+                *suspend_restore_storage_uri,
+                stopped_materialization.map(|materialization| materialization.artifact_id),
+            ),
+        };
+        let value = match pinned_disk {
+            Some(artifact_id) => {
+                self.stopped_environment(sandbox.id, Some(artifact_id))
+                    .await
+            }
+            None if sandbox.lifecycle.parse::<SandboxLifecycle>()
+                == Ok(SandboxLifecycle::Stopped) =>
+            {
+                self.stopped_environment(sandbox.id, None).await
+            }
+            None => self
+                .store
+                .restore_checkpoint_execution(sandbox.id, storage_uri)
+                .await
+                .map(|recorded| recorded.and_then(|recorded| recorded.execution.environment)),
+        };
+        let value = places_as_off_in_shadow(gate, "the restore's", value)?;
+        let environment =
+            rendered_pod_environment(gate, format_args!("sandbox {}", sandbox.id), value)?;
+        // A pod pre-bound to its source node skips kube-scheduler, so only
+        // kubelet admission checks the label, and its refusal is terminal for
+        // a restore whose bytes are on that node. Pre-check the source node's
+        // live labels, as `resolve_node_group_placement` does its node group,
+        // so the restore is refused before any pod exists, with the same 409
+        // and the same way out: draining the node publishes the sandbox's
+        // snapshot to remote storage, after which it restores on any node
+        // that publishes the environment. A node the cache doesn't have keeps
+        // the pin, with kubelet as the backstop.
+        if let (Some(required), Some(node_name)) = (
+            environment
+                .as_ref()
+                .filter(|environment| environment.required),
+            context.direct_node_name(),
+        ) && let Some(node) = self.k8s.caches.node_by_name(node_name)
+            && !node.metadata.labels.as_ref().is_some_and(|labels| {
+                pplx_space_common_core::kubernetes::node_publishes_environment(
+                    labels,
+                    &required.reference,
+                )
+            })
+        {
+            return Err(SubstrateError::Conflict {
+                message: format!(
+                    "sandbox {} can only restore from node {node_name}, which doesn't publish \
+                     its environment {} while the environment placement gate is on; drain \
+                     that node to publish this sandbox's snapshot to remote storage, after \
+                     which it can restore on a node that publishes the environment",
+                    sandbox.id, required.reference
+                ),
+            });
+        }
+        Ok(environment)
+    }
+
+    /// The environment a stopped sandbox's disk boots under: the one its
+    /// disk artifact was produced under (a drain's re-placement names the
+    /// pinned artifact `pinned`; otherwise it's the sandbox's current one),
+    /// else the execution the sandbox last published. The disk's own record
+    /// comes first because it outlives the node the sandbox stopped on, whose
+    /// deletion removes the published execution with it.
+    async fn stopped_environment(
+        &self,
+        sandbox_id: SandboxId,
+        pinned: Option<LocalArtifactId>,
+    ) -> Result<Option<String>, SubstrateError> {
+        let disk = match pinned {
+            Some(artifact_id) => {
+                self.store
+                    .disk_artifact_environment(sandbox_id, artifact_id)
+                    .await?
+            }
+            None => {
+                self.store
+                    .current_disk_artifact_environment(sandbox_id)
+                    .await?
+            }
+        };
+        if let Some(environment) = disk {
+            return Ok(Some(environment));
+        }
+        Ok(self
+            .store
+            .last_published_execution(sandbox_id)
+            .await?
+            .and_then(|recorded| recorded.execution.environment))
+    }
+
+    /// The environment a fork's pod renders under the gate: it boots the
+    /// disk artifact of source snapshot `snapshot_id`, so it's bound to the
+    /// environment that snapshot was produced under, not the template's.
+    pub(in crate::controllers::substrate::kubernetes) async fn fork_pod_environment(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<PodEnvironment>, SubstrateError> {
+        let gate = self.k8s.environment_placement;
+        if !gate.evaluates() {
+            return Ok(None);
+        }
+        let value = places_as_off_in_shadow(
+            gate,
+            "the fork source's",
+            self.store.snapshot_environment(snapshot_id).await,
+        )?;
+        rendered_pod_environment(gate, format_args!("snapshot {snapshot_id}"), value)
+    }
+
+    /// The environment a pod booting `template` at `content_hash` renders
+    /// under the gate: the build's binding
+    /// (`environment_placement::work_environment`).
+    pub(in crate::controllers::substrate::kubernetes) async fn template_pod_environment(
+        &self,
+        template: &str,
+        content_hash: &str,
+    ) -> Result<Option<PodEnvironment>, SubstrateError> {
+        let gate = self.k8s.environment_placement;
+        let value = self
+            .store
+            .work_environment(gate, template, content_hash)
+            .await?;
+        rendered_pod_environment(gate, format_args!("template {template}"), value)
     }
 
     /// `pub(super)` for the sibling test module, which renders each context's
@@ -132,6 +328,7 @@ impl KubernetesSubstrate {
             auto_lifecycle_json,
             network_policy_json,
             node_group_placement,
+            environment,
         } = inputs;
         let disk_io_limits = u64::try_from(sandbox.disk_io_max_operations_per_sec)
             .ok()
@@ -175,6 +372,7 @@ impl KubernetesSubstrate {
             content_hash: sandbox.content_hash.as_deref(),
             env: &sandbox.env.0,
             traceparent: pplx_space_observability::trace_propagation::current_traceparent(),
+            environment,
         };
 
         // `node_group_placement` is resolved by the caller — the pod build is
@@ -316,5 +514,41 @@ impl KubernetesSubstrate {
                 Err(err)
             }
         }
+    }
+}
+
+/// [`crate::controllers::substrate::environment_placement::bound_pod_environment`],
+/// with an unparseable binding failing the pod build.
+fn rendered_pod_environment(
+    gate: crate::controllers::substrate::environment_placement::EnvironmentPlacementGate,
+    subject: impl std::fmt::Display,
+    value: Option<String>,
+) -> Result<Option<PodEnvironment>, SubstrateError> {
+    crate::controllers::substrate::environment_placement::bound_pod_environment(
+        gate, subject, value,
+    )
+    .map_err(|error| SubstrateError::Failed {
+        message: error.to_string(),
+    })
+}
+
+/// `read` of the environment `what` work records, as template work's read is
+/// (`environment_placement::work_environment`): in shadow a failure is logged
+/// and reads as unbound, so shadow places exactly as off; on, it fails the
+/// pod build.
+fn places_as_off_in_shadow<T>(
+    gate: crate::controllers::substrate::environment_placement::EnvironmentPlacementGate,
+    what: &str,
+    read: Result<Option<T>, SubstrateError>,
+) -> Result<Option<T>, SubstrateError> {
+    match read {
+        Err(error) if !gate.refuses() => {
+            tracing::warn!(
+                %error,
+                "environment placement gate couldn't read {what} environment; shadow places as off"
+            );
+            Ok(None)
+        }
+        read => read,
     }
 }

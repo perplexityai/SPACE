@@ -1002,6 +1002,10 @@ impl DirectSubstrate {
         }
     }
 
+    pub(super) fn environment_placement(&self) -> EnvironmentPlacementGate {
+        self.environment_placement
+    }
+
     /// Place bound work under `gate`.
     pub fn with_environment_placement_gate(mut self, gate: EnvironmentPlacementGate) -> Self {
         self.environment_placement = gate;

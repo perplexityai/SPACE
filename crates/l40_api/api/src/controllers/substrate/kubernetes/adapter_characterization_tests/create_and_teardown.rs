@@ -185,6 +185,121 @@ async fn cold_create_seeds_the_network_policy_generation_on_the_sandbox_lineage(
     Ok(())
 }
 
+const E0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Seed template `seed` at `sha256:seed`, its release bound to `E1`, and a
+/// substrate with the gate on whose apiserver records the pod create and
+/// refuses it, so the create stops at the POST.
+async fn gated_create_fixture(pool: &PgPool) -> Result<(KubernetesSubstrate, KubeLog), BoxError> {
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, org_id) VALUES ($1, 'seed', $2)
+         ON CONFLICT (name) DO NOTHING"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(pplx_space_db_test_fixtures::SEED_ORG_ID)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "DELETE FROM template_releases WHERE template_name = 'seed'"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+         VALUES ('seed', 'fc', 'sha256:seed', $1)"
+    ))
+    .bind(sqlx::types::Json(
+        serde_json::json!({"environment": E1, "components": []}),
+    ))
+    .execute(pool)
+    .await?;
+    let (client, log) = scripted_kube_client(|request| match request.method {
+        Method::POST => kube_status(StatusCode::FORBIDDEN, "Forbidden"),
+        _ => kube_status(StatusCode::BAD_REQUEST, "BadRequest"),
+    });
+    let mut substrate = substrate_with_store_and_client(pool.clone(), client);
+    substrate.k8s.environment_placement =
+        crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::On;
+    Ok((substrate, log))
+}
+
+/// The one pod create `log` recorded.
+fn created_pod(log: &KubeLog) -> serde_json::Value {
+    let posts = requests_matching(log, &Method::POST);
+    let [pod_create] = posts.as_slice() else {
+        panic!("expected one pod create, got {posts:?}");
+    };
+    pod_create.body.clone().expect("a pod body")
+}
+
+/// A cold create boots the requested template build, so its pod records
+/// the release's environment and, with the gate on, requires its label.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_create_requires_the_release_environment_when_the_gate_is_on() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+    let (substrate, log) = gated_create_fixture(&db.pool).await?;
+    let inputs = CreateInputs::new();
+    let template_ref = inputs.template_ref();
+
+    let _ = substrate
+        .create_execution(inputs.create_request(sandbox_id, &template_ref))
+        .await;
+
+    assert_eq!(
+        super::super::tests::environment_placement::created_pod_environment(&created_pod(&log)),
+        (Some(E1.to_string()), true)
+    );
+    Ok(())
+}
+
+/// A fork boots its source's disk artifact, not the template build, so its
+/// pod requires the environment the source snapshot was produced under.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fork_requires_its_source_snapshot_environment_not_the_templates() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let source = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, source, "suspended").await?;
+    let snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, org_id, execution_metadata)
+         VALUES ($1, $2, 'full', 'ready', NOW(), $3, $4)"
+    ))
+    .bind(snapshot_id)
+    .bind(source)
+    .bind(pplx_space_db_test_fixtures::SEED_ORG_ID)
+    .bind(sqlx::types::Json(
+        serde_json::json!({"environment": E0, "components": []}),
+    ))
+    .execute(&db.pool)
+    .await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+    let (substrate, log) = gated_create_fixture(&db.pool).await?;
+    let inputs = CreateInputs::new();
+    let template_ref = inputs.template_ref();
+    let snapshot_id = snapshot_id.to_string();
+
+    let _ = substrate
+        .create_execution(CreateExecutionRequest {
+            restore_from: Some(crate::controllers::substrate::SnapshotRef {
+                snapshot_id: &snapshot_id,
+                storage_uri: Some("s3://synthetic-bucket/fork-source"),
+                source_sandbox_id: source,
+            }),
+            ..inputs.create_request(sandbox_id, &template_ref)
+        })
+        .await;
+
+    assert_eq!(
+        super::super::tests::environment_placement::created_pod_environment(&created_pod(&log)),
+        (Some(E0.to_string()), true)
+    );
+    Ok(())
+}
+
 // ── teardown_execution ──────────────────────────────────────────────────────
 
 /// Apiserver for teardown: the pod is live in the reflector, DELETEs succeed.

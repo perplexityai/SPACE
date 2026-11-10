@@ -2557,3 +2557,160 @@ async fn receipt_backstops_are_noops_inside_the_cadence_interval() {
         "a gated tick must not move the sweep lap"
     );
 }
+
+/// A refill hands the config's environment to the pods it creates: with the
+/// gate on, a warm pod of a bound release records the release's environment
+/// and requires its label.
+#[tokio::test]
+async fn refill_creates_pool_pods_that_require_the_release_environment() -> TestResult {
+    use pplx_space_api::controllers::substrate::environment_placement::EnvironmentPlacementGate;
+    const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    let db = pg_test_db().await?;
+    let store = WarmPoolStore::new(db.pool.clone());
+    let template_name = TemplateName::parse("app-runtime")?;
+    let template_release_id = Uuid::now_v7();
+    let config_id = Uuid::now_v7();
+    seed_pool_config(
+        &db.pool,
+        &template_name,
+        template_release_id,
+        config_id,
+        ContentHash::new(Digest::sha256([0x45; 32])),
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE template_releases SET execution_metadata = $2 WHERE id = $1"
+    ))
+    .bind(template_release_id)
+    .bind(sqlx::types::Json(
+        serde_json::json!({"environment": E1, "components": []}),
+    ))
+    .execute(&db.pool)
+    .await?;
+    let creates: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let captured = Arc::clone(&creates);
+    let kube = ClientBuilder::new(
+        tower::service_fn(move |request: Request<KubeBody>| {
+            let captured = Arc::clone(&captured);
+            async move {
+                match (request.method().clone(), request.uri().path()) {
+                    (Method::POST, "/api/v1/namespaces/space/pods") => {
+                        let body = http_body_util::BodyExt::collect(request.into_body())
+                            .await?
+                            .to_bytes();
+                        let pod: serde_json::Value = serde_json::from_slice(&body)?;
+                        captured.lock().unwrap().push(pod.clone());
+                        kubernetes_json_response(StatusCode::CREATED, &pod)
+                    }
+                    _ => kubernetes_json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "List",
+                            "metadata": {},
+                            "items": []
+                        }),
+                    ),
+                }
+            }
+        }),
+        "space",
+    )
+    .build();
+    let reconciler = Reconciler {
+        substrate: Arc::new(Substrate::from_direct(
+            DirectSubstrate::new(db.pool.clone())
+                .with_environment_placement_gate(EnvironmentPlacementGate::On),
+        )),
+        ..reconcile_test_reconciler(kube, store.clone(), db.pool.clone())
+    };
+    let config = seeded_pool_config(&store, config_id).await;
+
+    let summary = reconciler
+        .reconcile_config(&config, &HashSet::new())
+        .await?;
+
+    assert_eq!(summary.created_slots, 1);
+    let creates = creates.lock().unwrap();
+    let [pod] = creates.as_slice() else {
+        panic!("expected one pool pod create, got {}", creates.len());
+    };
+    let pod = pplx_space_api::controllers::substrate::kubernetes::SandboxPodView::from(
+        serde_json::from_value::<Pod>(pod.clone())?,
+    );
+    assert_eq!(
+        pod.annotation(
+            pplx_space_api::controllers::substrate::kubernetes::SandboxPodKey::Environment
+        ),
+        Some(E1)
+    );
+    assert!(pod.requires_environment_label());
+    Ok(())
+}
+
+/// With the gate on, a refill that can't read its build's environment creates
+/// nothing and books the failure, so the config reports as failing rather
+/// than succeeded, as it does for an unresolved candidate set.
+#[tokio::test]
+async fn refill_books_a_failed_environment_read_when_the_gate_is_on() -> TestResult {
+    use pplx_space_api::controllers::substrate::environment_placement::EnvironmentPlacementGate;
+    let db = pg_test_db().await?;
+    let store = WarmPoolStore::new(db.pool.clone());
+    let template_name = TemplateName::parse("app-runtime")?;
+    let template_release_id = Uuid::now_v7();
+    let config_id = Uuid::now_v7();
+    seed_pool_config(
+        &db.pool,
+        &template_name,
+        template_release_id,
+        config_id,
+        ContentHash::new(Digest::sha256([0x46; 32])),
+    )
+    .await?;
+    // A binding that doesn't parse as an environment reference.
+    sqlx::query(sql!(
+        "UPDATE template_releases SET execution_metadata = $2 WHERE id = $1"
+    ))
+    .bind(template_release_id)
+    .bind(sqlx::types::Json(
+        serde_json::json!({"environment": "E1", "components": []}),
+    ))
+    .execute(&db.pool)
+    .await?;
+    let posts = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&posts);
+    let kube = ClientBuilder::new(
+        tower::service_fn(move |request: Request<KubeBody>| {
+            let counted = Arc::clone(&counted);
+            async move {
+                if request.method() == Method::POST {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }
+                kubernetes_json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"apiVersion": "v1", "kind": "List", "metadata": {}, "items": []}),
+                )
+            }
+        }),
+        "space",
+    )
+    .build();
+    let reconciler = Reconciler {
+        substrate: Arc::new(Substrate::from_direct(
+            DirectSubstrate::new(db.pool.clone())
+                .with_environment_placement_gate(EnvironmentPlacementGate::On),
+        )),
+        ..reconcile_test_reconciler(kube, store.clone(), db.pool.clone())
+    };
+    let config = seeded_pool_config(&store, config_id).await;
+
+    let summary = reconciler
+        .reconcile_config(&config, &HashSet::new())
+        .await?;
+
+    assert_eq!(summary.created_slots, 0);
+    assert_eq!(posts.load(Ordering::SeqCst), 0, "no pool pod is created");
+    assert_eq!(summary.failed_required_operations, 1);
+    assert!(!summary.completed_required_operations());
+    Ok(())
+}

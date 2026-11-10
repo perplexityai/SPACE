@@ -40,6 +40,7 @@ use crate::controllers::substrate::{
 };
 
 mod activation_fence;
+mod environment_placement;
 mod execution_rows;
 mod node_inventory;
 mod pod_placement;
