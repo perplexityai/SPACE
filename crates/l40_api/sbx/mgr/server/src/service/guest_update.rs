@@ -169,13 +169,13 @@ impl SandboxManagerService {
         )? {
             return Ok(Response::new(receipt));
         }
-        let bundle = policy::load().await?;
+        let bundle = policy::load(requested.target).await?;
         if requested != bundle.policy.promotion {
             return Err(Status::permission_denied(
                 "promotion is not the configured host authority",
             ));
         }
-        qualify(&sandbox, Some(&bundle.policy), OPERATION_BUDGET)?;
+        qualify(&sandbox, OPERATION_BUDGET)?;
         let platform = self.probe_update_contract(&sandbox).await?;
         if bundle.descriptor.recovery_platform().map_err(internal)? != platform {
             return Err(Status::failed_precondition(
@@ -217,7 +217,7 @@ impl SandboxManagerService {
         )? {
             return Ok(Response::new(receipt));
         }
-        qualify(&sandbox, None, ACTIVATION_BUDGET)?;
+        qualify(&sandbox, ACTIVATION_BUDGET)?;
         self.probe_update_contract(&sandbox).await?;
         self.admit_guest_update(Intent {
             operation: uuid(&req.operation_id)?,
@@ -328,29 +328,13 @@ impl SandboxManagerService {
             .get_status(request(wire::StatusRequest {}))
             .await?
             .into_inner();
-        let reported =
-            model::RecoveryPlatform::from_contract(&status.seed_contract).ok_or_else(|| {
-                Status::failed_precondition("guest selector contract is not supported")
-            })?;
-        use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
-        let qualified = match super::guest_image::profile_for_sandbox(sandbox)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?
-            .agent_protocol()
-        {
-            QualifiedGuestAgent::LinuxV1 => model::RecoveryPlatform::Linux,
-            QualifiedGuestAgent::WindowsV1 => model::RecoveryPlatform::Windows,
-            QualifiedGuestAgent::Absent => {
-                return Err(Status::failed_precondition(
-                    "image has no qualified guest agent",
-                ));
-            }
-        };
-        if reported != qualified {
+        if !policy::supported_guest(policy::platform(sandbox), &status) {
             return Err(Status::failed_precondition(
-                "guest selector disagrees with qualified image",
+                "guest maintenance requires version 0.8.2 or newer and a recovery contract matching the image",
             ));
         }
-        Ok(qualified)
+        model::RecoveryPlatform::from_contract(&status.seed_contract)
+            .ok_or_else(|| Status::failed_precondition("guest recovery contract is unsupported"))
     }
 
     fn update_record(&self, operation: Uuid) -> Result<Record, Status> {
@@ -529,7 +513,7 @@ impl SandboxManagerService {
                     .await?;
                 return Ok(());
             }
-            let bundle = match policy::load().await {
+            let bundle = match policy::load(promotion.target).await {
                 Ok(bundle)
                     if &bundle.policy.promotion == promotion.as_ref()
                         && &bundle.policy.authorization == authorization =>
@@ -548,7 +532,8 @@ impl SandboxManagerService {
                         .await;
                 }
             };
-            if qualify(&sandbox, Some(&bundle.policy), OPERATION_BUDGET).is_err()
+            if qualify(&sandbox, OPERATION_BUDGET).is_err()
+                || !policy::supported_guest(policy::platform(&sandbox), &observed)
                 || !bundle
                     .descriptor
                     .seed_contracts
@@ -604,7 +589,7 @@ impl SandboxManagerService {
             record = self.update_advance(&record, Phase::Staged, None)?;
         }
         if matches!(record.phase, Phase::Pending | Phase::Staged) {
-            if qualify(&self.update_execution(&record)?, None, ACTIVATION_BUDGET).is_err() {
+            if qualify(&self.update_execution(&record)?, ACTIVATION_BUDGET).is_err() {
                 return self
                     .finish_pending_guest_update(record, Outcome::Deferred, observed, &mut client)
                     .await;
@@ -644,8 +629,8 @@ impl SandboxManagerService {
             }
             match maintenance_decision(&record, &observed)? {
                 Decision::Arm => {
-                    if !policy::permits(&record.intent.action, current.template_hash.as_deref())
-                        .await
+                    if !policy::permits(&record.intent.action).await
+                        || !policy::supported_guest(policy::platform(&current), &observed)
                     {
                         return self
                             .finish_guest_update(record, Outcome::Cancelled, observed, &mut client)
@@ -723,8 +708,7 @@ impl SandboxManagerService {
                     if confirmation_rejected
                         || lifecycle
                         || jiff::Timestamp::now().as_second() >= record.deadline
-                        || !policy::permits(&record.intent.action, current.template_hash.as_deref())
-                            .await
+                        || !policy::permits(&record.intent.action).await
                     {
                         if let Err(error) = client
                             .abort(request(wire::AbortRequest {
@@ -742,13 +726,8 @@ impl SandboxManagerService {
                             Ok(()) => {
                                 // Configuration awaits host/guest RPCs; revocation during
                                 // that work must still prevent the following commit.
-                                let current = self.update_execution(&record)?;
-                                if !policy::permits(
-                                    &record.intent.action,
-                                    current.template_hash.as_deref(),
-                                )
-                                .await
-                                {
+                                self.update_execution(&record)?;
+                                if !policy::permits(&record.intent.action).await {
                                     confirmation_rejected = true;
                                     continue;
                                 }
@@ -948,11 +927,7 @@ impl SandboxManagerService {
     }
 }
 
-fn qualify(
-    sandbox: &crate::db::SandboxRow,
-    policy: Option<&policy::Policy>,
-    budget: Duration,
-) -> Result<(), Status> {
+fn qualify(sandbox: &crate::db::SandboxRow, budget: Duration) -> Result<(), Status> {
     if !sandbox.state.is_unowned(SandboxState::Started)
         || sandbox.pool_template.is_some()
         || matches!(
@@ -974,16 +949,6 @@ fn qualify(
     }) {
         return Err(Status::failed_precondition(
             "insufficient lifecycle deadline headroom",
-        ));
-    }
-    if policy.is_some_and(|p| {
-        !sandbox
-            .template_hash
-            .as_ref()
-            .is_some_and(|hash| p.qualified_templates.contains(hash))
-    }) {
-        return Err(Status::failed_precondition(
-            "installed template has not been qualified for this selector contract",
         ));
     }
     Ok(())

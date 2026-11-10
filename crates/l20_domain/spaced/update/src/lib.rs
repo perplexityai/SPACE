@@ -4,6 +4,7 @@
 //! not service readiness or either filesystem selector, determines commitment.
 
 pub mod artifact;
+pub mod catalog;
 pub mod journal;
 pub mod policy;
 
