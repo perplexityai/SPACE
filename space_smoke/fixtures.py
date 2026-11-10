@@ -4548,8 +4548,11 @@ class StartupRecoveryAssertions:
     def tamper(self, planted: PlantedBuild) -> None:
         """No row, and the bootable artifact's bytes changed under an unchanged size."""
 
-        self.orphan(planted)
+        # Keep the catalog row until corruption is complete. Exposing valid
+        # row-less bytes first lets background recovery register them before
+        # the later corruption, which defeats this fixture's precondition.
         self._control.corrupt_template_rootfs(self._current_node(), planted.name, planted.digest)
+        self.orphan(planted)
 
     def drift(self, planted: PlantedBuild, *, bytes_removed: int = 4096) -> None:
         """Row kept, but the artifact on disk is shorter than the manifest declares."""
