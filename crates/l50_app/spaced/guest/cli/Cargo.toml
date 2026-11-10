@@ -16,6 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
 jiff = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
@@ -23,3 +25,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 pplx-space-common-cli = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-spaced-guest-client = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+anyhow = { workspace = true }
+windows-service = "0.8"

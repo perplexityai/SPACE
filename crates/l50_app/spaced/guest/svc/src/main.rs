@@ -1,6 +1,6 @@
 use clap::{ArgAction, Parser};
 #[cfg(unix)]
-use pplx_space_spaced_guest_server::SpacedGuestRunConfig;
+use pplx_space_spaced_guest_server::platform::current::SpacedGuestRunConfig;
 
 #[derive(Parser)]
 #[command(
@@ -71,7 +71,9 @@ fn main() -> anyhow::Result<()> {
     }
     #[cfg(unix)]
     {
-        Ok(pplx_space_spaced_guest_server::run(cli.into())?)
+        Ok(pplx_space_spaced_guest_server::platform::current::run(
+            cli.into(),
+        )?)
     }
     #[cfg(windows)]
     {
@@ -83,9 +85,11 @@ fn main() -> anyhow::Result<()> {
             tracing_subscriber::fmt()
                 .with_ansi(false)
                 .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
-                .with_writer(|| pplx_space_spaced_guest_windows::EventLogWriter)
+                .with_writer(|| pplx_space_spaced_guest_server::platform::windows::EventLogWriter)
                 .init();
         }
-        Ok(pplx_space_spaced_guest_windows::run(cli.console)?)
+        Ok(pplx_space_spaced_guest_server::platform::windows::run(
+            cli.console,
+        )?)
     }
 }

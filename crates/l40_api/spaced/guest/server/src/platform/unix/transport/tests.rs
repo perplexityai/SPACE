@@ -2,7 +2,7 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn incomplete_requests_are_bounded_per_connection_and_release_capacity() {
-    use crate::{
+    use crate::platform::unix::{
         LocalMetaServer, MAX_LOCAL_GUEST_STREAMS, SpacedGuestService, SpacedGuestServiceConfig,
         guest_grpc_server_builder,
     };
