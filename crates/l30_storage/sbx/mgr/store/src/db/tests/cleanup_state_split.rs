@@ -194,6 +194,14 @@ const UNOWNED_UP: &str = include_str!(
 const UNOWNED_DOWN: &str = include_str!(
     "../../../../../../../../db/sandbox-manager/20261108130000_sandbox_unowned_state.down.sql"
 );
+/// The release after drops `legacy_state`, which the split's down migration
+/// reads.
+const LEGACY_DROP_UP: &str = include_str!(
+    "../../../../../../../../db/sandbox-manager/20261109120000_drop_sandbox_legacy_state.up.sql"
+);
+const LEGACY_DROP_DOWN: &str = include_str!(
+    "../../../../../../../../db/sandbox-manager/20261109120000_drop_sandbox_legacy_state.down.sql"
+);
 
 /// Insert a row in the split form, keeping the filesystem for every
 /// completion that keeps the row.
@@ -345,6 +353,7 @@ fn the_migration_round_trips_every_cleanup_shape_and_keeps_historical_labels() {
             .collect()
     };
 
+    conn.execute_batch(LEGACY_DROP_DOWN).unwrap();
     conn.execute_batch(UNOWNED_DOWN).unwrap();
     conn.execute_batch(MIGRATION_DOWN).unwrap();
     assert_eq!(
@@ -362,6 +371,7 @@ fn the_migration_round_trips_every_cleanup_shape_and_keeps_historical_labels() {
 
     conn.execute_batch(MIGRATION_UP).unwrap();
     conn.execute_batch(UNOWNED_UP).unwrap();
+    conn.execute_batch(LEGACY_DROP_UP).unwrap();
     // A migration can't tell a handed-off suspend from a restore rollback, so
     // `c` comes back `stopping`; its combined status is unchanged.
     for (id, expected) in [

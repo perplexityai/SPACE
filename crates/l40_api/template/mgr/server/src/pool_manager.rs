@@ -235,15 +235,15 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
     // Unknown inventory cannot prove pool capacity or authorize its cleanup.
     for sandbox in &all_sandboxes {
         sandbox
-            .observed_lifecycle()
+            .observed_status()
             .map_err(|error| PoolError::SandboxClient(error.to_string()))?;
     }
 
     // Clean up failed pool sandboxes
     for sbx in &all_sandboxes {
         if sbx.pool_template.is_some()
-            && sbx.observed_lifecycle().is_ok_and(|state| {
-                state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Failed
+            && sbx.observed_status().is_ok_and(|state| {
+                state.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Failed)
             })
         {
             outcome.record_failure(PoolError::FailedSandbox {
@@ -285,8 +285,10 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
             .iter()
             .filter(|s| {
                 s.pool_template.as_deref() == Some(pool.template.as_str())
-                    && s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused
+                    && s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused,
+                        )
                     })
             })
             .count();
@@ -295,16 +297,26 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
             .iter()
             .filter(|s| {
                 s.pool_template.as_deref() == Some(pool.template.as_str())
-                    && (s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Creating
-                    }) || s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Created
-                    }) || s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Starting
-                    }) || s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started
-                    }) || s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Pausing
+                    && (s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Creating,
+                        )
+                    }) || s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Created,
+                        )
+                    }) || s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Starting,
+                        )
+                    }) || s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started,
+                        )
+                    }) || s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Pausing,
+                        )
                     }))
             })
             .count();
@@ -320,8 +332,10 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
             .iter()
             .find(|s| {
                 s.pool_template.as_deref() == Some(pool.template.as_str())
-                    && s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused
+                    && s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused,
+                        )
                     })
             })
             .map(|s| s.sandbox_id.clone());

@@ -863,7 +863,7 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
 }
 
 /// The filter takes every value `sandboxes.lifecycle` holds, as the stored
-/// vocabulary normalizes it, and otherwise only the retired values.
+/// vocabulary normalizes it, and nothing else.
 #[test]
 fn the_lifecycle_filter_takes_exactly_the_stored_lifecycles() {
     for stored in pplx_space_sandbox_store::StoredSandboxLifecycle::all() {
@@ -886,17 +886,7 @@ fn the_lifecycle_filter_takes_exactly_the_stored_lifecycles() {
             );
         }
     }
-    // A retired value is still taken, though no row stores it.
-    assert_eq!(
-        " Cleanup_Required "
-            .parse::<AdminStoredLifecycle>()
-            .map(AdminStoredLifecycle::as_str),
-        Ok("cleanup_required")
-    );
-    "cleanup_required"
-        .parse::<pplx_space_sandbox_store::StoredSandboxLifecycle>()
-        .unwrap_err();
-    for unknown in ["", "delete", "cleanup-required", "live"] {
+    for unknown in ["", "delete", "cleanup_required", "cleanup-required", "live"] {
         assert!(
             unknown.parse::<AdminStoredLifecycle>().is_err(),
             "{unknown:?}"

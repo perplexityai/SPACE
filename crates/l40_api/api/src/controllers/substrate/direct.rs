@@ -3201,9 +3201,13 @@ impl DirectSubstrate {
     ) -> Result<RouteCatchUp, SubstrateError> {
         use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
 
-        let (Ok(SandboxLifecycleState::Started), Some(record_generation)) =
-            (record.observed_lifecycle(), record.execution_generation)
-        else {
+        let (Some(SandboxLifecycleState::Started), Some(record_generation)) = (
+            record
+                .observed_status()
+                .ok()
+                .and_then(|status| status.unowned()),
+            record.execution_generation,
+        ) else {
             return Ok(RouteCatchUp::NotNeeded);
         };
         let trails = sqlx::query_scalar::<_, bool>(sql!(
@@ -3341,18 +3345,17 @@ impl DirectSubstrate {
         use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
 
         if !record
-            .observed_lifecycle()
-            .is_ok_and(lifecycle_holds_live_runtime)
+            .observed_status()
+            .is_ok_and(|status| status.unowned().is_some_and(lifecycle_holds_live_runtime))
         {
             return Ok(None);
         }
         let Some(execution_generation) = record.execution_generation else {
             return Ok(None);
         };
-        let started = matches!(
-            record.observed_lifecycle(),
-            Ok(SandboxLifecycleState::Started)
-        );
+        let started = record
+            .observed_status()
+            .is_ok_and(|status| status.is_unowned(SandboxLifecycleState::Started));
         self.adopt_live_execution(
             sandbox_id,
             read_lifecycle,
@@ -3478,14 +3481,14 @@ impl DirectSubstrate {
         .await
         {
             Ok(Ok(None)) => return Ok(()),
-            Ok(Ok(Some(record))) => match record.observed_lifecycle() {
-                Ok(lifecycle) if !lifecycle_holds_live_runtime(lifecycle) => {}
-                Ok(lifecycle) => {
+            Ok(Ok(Some(record))) => match record.observed_status() {
+                Ok(status) if !status.unowned().is_some_and(lifecycle_holds_live_runtime) => {}
+                Ok(status) => {
                     tracing::warn!(
                         sandbox_id = %sandbox_id,
                         source_node_id = %source_node_id,
                         restored_node_id = %restored_node_id,
-                        lifecycle = lifecycle.label(),
+                        lifecycle = status.label(),
                         "leaving the source-node copy after direct cross-node restore because it reports a live record"
                     );
                     return Ok(());
