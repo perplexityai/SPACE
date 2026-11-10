@@ -143,6 +143,18 @@ impl FcApiClient {
             .await
     }
 
+    /// Ask Firecracker to re-read a drive's backing file. Firecracker re-reads
+    /// the file size, updates the virtio-blk capacity and notifies a running
+    /// guest. The jailed path must name the same file the drive already uses.
+    pub async fn rescan_drive(&self, drive_id: &str, path_on_host: &str) -> Result<(), FcApiError> {
+        self.request(
+            "PATCH",
+            &format!("/drives/{drive_id}"),
+            &drive_rescan_request_body(drive_id, path_on_host),
+        )
+        .await
+    }
+
     /// Read the effective device configuration, including installed bucket sizes.
     pub async fn configuration(&self) -> Result<serde_json::Value, FcApiError> {
         self.get_json("/vm/config").await
@@ -364,6 +376,10 @@ fn create_snapshot_request_body(
         "mem_file_path": mem_file_path,
         "snapshot_type": CREATE_SNAPSHOT_TYPE
     }))
+}
+
+fn drive_rescan_request_body(drive_id: &str, path_on_host: &str) -> serde_json::Value {
+    serde_json::json!({ "drive_id": drive_id, "path_on_host": path_on_host })
 }
 
 fn drive_rate_limiter_request_body(drive_id: &str, limiter: &RateLimiter) -> serde_json::Value {

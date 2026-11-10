@@ -418,6 +418,17 @@ impl NodeManager for NodeManagerService {
         NodeManagerService::update_cgroup(self, request).await
     }
 
+    async fn grow_sandbox_rootfs(
+        &self,
+        request: Request<crate::proto::GrowSandboxRootfsRequest>,
+    ) -> Result<Response<crate::proto::GrowSandboxRootfsResponse>, Status> {
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        observe_rpc("GrowSandboxRootfs", sandbox_id, async {
+            NodeManagerService::grow_sandbox_rootfs(self, request).await
+        })
+        .await
+    }
+
     async fn clone_sandbox_into_prepared_root(
         &self,
         request: Request<CloneSandboxRequest>,

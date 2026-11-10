@@ -148,6 +148,14 @@ async fn a_drive_rate_limiter_update_patches_the_drive() {
 }
 
 #[test]
+fn drive_rescan_request_names_only_the_drive_and_its_path() {
+    assert_eq!(
+        drive_rescan_request_body("rootfs", "/rootfs.ext4"),
+        serde_json::json!({ "drive_id": "rootfs", "path_on_host": "/rootfs.ext4" })
+    );
+}
+
+#[test]
 fn balloon_device_json_matches_firecracker_contract_for_each_mode() {
     use pplx_space_common_core::types::{BalloonConfig, BalloonDevice};
     use std::num::NonZeroU32;

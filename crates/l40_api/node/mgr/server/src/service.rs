@@ -758,6 +758,7 @@ pub mod node_disk_metrics;
 mod orphan_inventory;
 mod permission_tree;
 mod prepared_rootfs;
+mod rootfs_grow;
 mod runtime;
 mod snapshot_inventory;
 mod snapshots;
