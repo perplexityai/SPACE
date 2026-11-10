@@ -151,7 +151,9 @@ jobs:
         if: steps.reuse.outputs.reused != 'true'
         env:
           SPACE_CI_IMAGE_MIRROR: ghcr
-          SPACE_KIND_RUST_ARTIFACTS: ${{ steps.state.outputs.restored == 'true' && 'incremental' || 'docker' }}
+          # TRIAL (not for merge): opt-level 1 binaries, to measure the smoke on them.
+          SPACE_KIND_RUST_ARTIFACTS: incremental
+          SPACE_TRIAL_OPT: "1"
           SPACE_KIND_RUST_BUILD: ${{ inputs.rust_build == 'release' && 'release' || '' }}
           SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
           SPACE_KIND_BUILD_CACHE_WRITE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '1' || '0' }}

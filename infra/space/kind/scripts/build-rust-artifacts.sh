@@ -471,6 +471,11 @@ in_builder() {
     -e CARGO_PROFILE_RELEASE_LTO="$RELEASE_LTO" \
     -e CARGO_PROFILE_RELEASE_INCREMENTAL="$([[ "$INCREMENTAL_CODEGEN" == 1 ]] && echo true || echo false)" \
     -e CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    -e CARGO_PROFILE_RELEASE_OPT_LEVEL="${SPACE_TRIAL_OPT:-3}" \
+    ${SPACE_TRIAL_FRONTEND:+-v "$REPO_ROOT/ci/scripts/rustc-parallel-front-end.sh:/opt/space/rustc-parallel-front-end.sh:ro"} \
+    ${SPACE_TRIAL_FRONTEND:+-e RUSTC_WRAPPER=/opt/space/rustc-parallel-front-end.sh} \
+    ${SPACE_TRIAL_FRONTEND:+-e SPACE_RUST_FRONTEND_THREADS=$SPACE_TRIAL_FRONTEND} \
+    ${SPACE_TRIAL_FRONTEND:+-e SPACE_RUSTC_WORKSPACE_ROOT=/workspace} \
     -e CARGO_TERM_COLOR=never \
     -w /workspace \
     "$CHEF_IMAGE" "$@"
@@ -564,6 +569,7 @@ build_incremental() {
 
   log "incremental mode: cargo $(cargo_profile_flag) ($RUST_BUILD, LTO $RELEASE_LTO) for ${#bins[@]} bins + runtime-supervisor inside $CHEF_IMAGE (target $TARGET_DIR)"
   local cargo_args=(cargo build --locked "$(cargo_profile_flag)" ${CARGO_SELECTION[@]+"${CARGO_SELECTION[@]}"})
+  [[ -z "${SPACE_TRIAL_API_OPT:-}" ]] || cargo_args+=(--config "profile.release.package.pplx-space-api.opt-level=${SPACE_TRIAL_API_OPT}")
   local f b
   for f in "${features[@]}"; do cargo_args+=(-F "$f"); done
   for b in "${bins[@]}"; do cargo_args+=(--bin "$b"); done
