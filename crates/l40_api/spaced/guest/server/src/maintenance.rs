@@ -1,7 +1,11 @@
 //! Maintenance bypasses ordinary readiness, never customer admission. Accepted
 //! mutations outlive their RPC observer; disk work runs off the async executor.
+#[cfg(windows)]
+use super::execution::MaintenanceHold;
 use super::*;
-use pplx_space_spaced_common::proto::{
+#[cfg(unix)]
+use pplx_space_spaced_guest_execution::MaintenanceHold;
+use pplx_space_spaced_guest_protocol::proto::{
     bridge_guest::guest_update_server::GuestUpdate, update as wire,
 };
 use pplx_space_spaced_guest_protocol::update::{binary, journal_status};
@@ -13,11 +17,13 @@ use uuid::Uuid;
 
 pub(crate) struct UpdateRuntime {
     root: std::path::PathBuf,
+    #[cfg(windows)]
+    lock_budget: Duration,
     clock: fn() -> Result<(Uuid, u64), UpdateError>,
     enabled: AtomicBool,
     gated: AtomicBool,
     boot: std::sync::OnceLock<Uuid>,
-    hold: Mutex<Option<pplx_space_spaced_guest_execution::MaintenanceHold>>,
+    hold: Mutex<Option<MaintenanceHold>>,
     configured: Mutex<Option<Attempt>>,
     serial: Arc<Semaphore>,
     disk_serial: Arc<Mutex<()>>,
@@ -31,6 +37,8 @@ impl UpdateRuntime {
     pub(crate) fn new() -> Self {
         Self {
             root: UPDATE_ROOT.into(),
+            #[cfg(windows)]
+            lock_budget: Duration::from_secs(2),
             clock,
             enabled: AtomicBool::new(false),
             gated: AtomicBool::new(false),
@@ -44,6 +52,9 @@ impl UpdateRuntime {
             subscribers: Arc::new(Semaphore::new(1)),
             cached_status: std::sync::Mutex::new(None),
         }
+    }
+    pub(super) fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
     }
     pub(crate) fn trial_gated(&self) -> bool {
         self.gated.load(Ordering::Acquire)
@@ -97,25 +108,34 @@ enum StageInput {
     Finish,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn clock() -> Result<(Uuid, u64), UpdateError> {
     pplx_space_spaced_guest_update::boot_clock()
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn clock() -> Result<(Uuid, u64), UpdateError> {
     Err(UpdateError::Layout)
 }
 
 impl UpdateRuntime {
-    async fn disk<T: Send + 'static>(
+    pub(super) async fn disk<T: Send + 'static>(
         &self,
         work: impl FnOnce(SlotStore) -> Result<T, UpdateError> + Send + 'static,
     ) -> Result<T, Status> {
         let root = self.root.clone();
+        #[cfg(windows)]
+        let lock_budget = self.lock_budget;
         let permit = self.disk_serial.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            work(SlotStore::open(&root)?)
+            // Windows recovery can briefly own the journal during startup or
+            // readiness publication. Retry acquisition, never the mutation body.
+            // Two seconds stays below the host's five-second RPC budget.
+            #[cfg(windows)]
+            let store = super::recovery::open_store(&root, lock_budget)?;
+            #[cfg(not(windows))]
+            let store = SlotStore::open(&root)?;
+            work(store)
         })
         .await
         .map_err(|e| Status::internal(format!("update worker failed: {e}")))?
@@ -125,7 +145,7 @@ impl UpdateRuntime {
 
 impl SpacedGuestService {
     pub(crate) async fn prepare_update_startup(&self) -> Result<(), Status> {
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", windows)) {
             return Ok(());
         }
         match tokio::fs::symlink_metadata(self.inner.update.root.join("committed")).await {
@@ -153,28 +173,7 @@ impl SpacedGuestService {
             .set(boot)
             .map_err(|_| Status::internal("update startup called twice"))?;
         if let Some(attempt) = trial {
-            // No listeners exist yet. Exercise the real filesystem worker before
-            // closing admission; this read creates no customer retry obligation.
-            use pplx_space_spaced_common::proto::bridge_guest::filesystem_server::Filesystem;
-            let response = tokio::time::timeout(
-                Duration::from_secs(10),
-                self.inner
-                    .execution
-                    .filesystem_service()
-                    .stat_info(Request::new(
-                        pplx_space_spaced_common::proto::bridge_guest::StatRequest {
-                            path: "/".into(),
-                            user: None,
-                        },
-                    )),
-            )
-            .await
-            .map_err(|_| Status::deadline_exceeded("candidate filesystem self-test timed out"))??;
-            if response.into_inner().info.is_none() {
-                return Err(Status::internal(
-                    "candidate filesystem self-test omitted root",
-                ));
-            }
+            self.update_self_test().await?;
             *self.inner.update.hold.lock().await =
                 Some(self.inner.execution.hold_for_update(attempt.operation)?);
             self.inner.update.gated.store(true, Ordering::Release);
@@ -188,7 +187,7 @@ impl SpacedGuestService {
     }
 
     fn require_updates(&self) -> Result<(), Status> {
-        if !self.inner.update.enabled.load(Ordering::Acquire) {
+        if !self.inner.update.enabled() {
             return Err(Status::unimplemented(
                 "installed guest has no qualified update contract",
             ));
@@ -213,6 +212,7 @@ impl SpacedGuestService {
             let journal = store.journal()?;
             let version = store.descriptor(journal.committed.slot)?.version;
             let mut status = journal_status(journal);
+            status.seed_contract = pplx_space_spaced_guest_update::seed_contract().into();
             status.committed_version = version.to_string();
             status.running = Some(store.running_selection()?.into());
             Ok::<_, UpdateError>(Some(status))
@@ -290,22 +290,7 @@ impl SpacedGuestService {
     }
 
     async fn update_blockers(&self) -> Vec<wire::DeferReason> {
-        let reasons = self.inner.execution.update_defer_reasons().await;
-        #[cfg(target_os = "linux")]
-        let mut reasons = reasons;
-        // The leaf excludes the holder; populated includes nested descendants.
-        // An unreadable cgroup cannot establish idleness, in status or Arm.
-        #[cfg(target_os = "linux")]
-        match crate::platform::unix::cgroup::GuestCgroups::initialize_for_process() {
-            Some(cgroups) => {
-                match tokio::fs::read_to_string(cgroups.workloads.join("cgroup.events")).await {
-                    Ok(events) if events.lines().any(|v| v == "populated 0") => {}
-                    _ => reasons.push(wire::DeferReason::Descendants),
-                }
-            }
-            None => reasons.push(wire::DeferReason::Descendants),
-        }
-        reasons
+        self.platform_update_blockers().await
     }
 
     async fn hold_update_admission(&self, owner: Uuid, force: bool) -> Result<(), Status> {
@@ -476,7 +461,7 @@ impl GuestUpdate for SpacedGuestService {
             if existing.phase == wire::Phase::Armed as i32
                 && existing.attempt == Some(attempt.clone().into())
             {
-                service.inner.shutdown.cancel();
+                service.restart_after_update().await;
                 return Ok(existing);
             }
             if existing.boot_id != attempt.boot.to_string()
@@ -500,7 +485,7 @@ impl GuestUpdate for SpacedGuestService {
                 return Err(error);
             }
             let response = service.update_status().await;
-            service.inner.shutdown.cancel();
+            service.restart_after_update().await;
             response
         })
         .await
@@ -512,7 +497,7 @@ impl GuestUpdate for SpacedGuestService {
     ) -> Result<Response<wire::Status>, Status> {
         let request = request.into_inner();
         let attempt = request.attempt.map(TryInto::try_into).transpose()?;
-        let env = parse_env(request.environment);
+        let env = super::update_backend::parse_environment(request.environment)?;
         if request.forward_ports.len() > 128 {
             return Err(Status::invalid_argument("too many forwarded ports"));
         }
@@ -613,6 +598,7 @@ impl GuestUpdate for SpacedGuestService {
                     store.commit(&attempt, boot, now)
                 })
                 .await?;
+            service.publish_platform_readiness().await?;
             service.inner.update.hold.lock().await.take();
             service.inner.update.gated.store(false, Ordering::Release);
             service.ready();
@@ -635,7 +621,7 @@ impl GuestUpdate for SpacedGuestService {
             let terminal_commit = matches!(journal.state, JournalState::Committed { .. });
             let response = service.update_status().await;
             if !terminal_commit && service.inner.update.trial_gated() {
-                service.inner.shutdown.cancel();
+                service.restart_after_update().await;
             } else if !terminal_commit {
                 service.inner.update.hold.lock().await.take();
             }
@@ -674,7 +660,7 @@ impl GuestUpdate for SpacedGuestService {
                     ));
                 }
                 if current.phase == wire::Phase::Restarting as i32 {
-                    service.inner.shutdown.cancel();
+                    service.restart_after_update().await;
                 }
                 return Ok(current);
             }
@@ -696,12 +682,18 @@ impl GuestUpdate for SpacedGuestService {
                 return Err(error);
             }
             let response = service.update_status().await;
-            service.inner.shutdown.cancel();
+            service.restart_after_update().await;
             response
         })
         .await
     }
 }
 
+#[cfg(unix)]
 #[cfg(test)]
+#[path = "maintenance/tests.rs"]
 mod tests;
+
+#[cfg(all(test, windows))]
+#[path = "maintenance/windows_tests.rs"]
+mod windows_tests;
