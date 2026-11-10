@@ -253,3 +253,7 @@ impl TryFrom<&wire::HoldRequest> for HoldOwner {
         })
     }
 }
+
+/// End-to-end activation/settlement bound shared by manager and host admission.
+/// This does not extend the candidate confirmation window or caller deadlines.
+pub const ACTIVATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(210);
