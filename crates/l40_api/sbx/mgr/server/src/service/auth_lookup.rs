@@ -841,6 +841,7 @@ impl SandboxManagerService {
             .await?;
         self.begin_resident_resume(&sandbox.id, activation_policy)
             .await?;
+        self.guest_auto_updates.activation(&sandbox.id);
         self.watchdog.record_lifecycle_edge(&sandbox.id).await;
 
         let mut node_client = connect_node(&self.node_manager)

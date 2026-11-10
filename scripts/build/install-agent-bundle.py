@@ -3,7 +3,8 @@
 
 Run during trusted node image assembly or as root during node installation.
 Qualification names exact published template digests; it is not inferred from
-contents reported by a guest. An empty list stages a target without enabling it.
+contents reported by a guest. Published recovery-contract metadata qualifies
+templates by default; the optional digest list covers older qualified images.
 """
 import argparse
 import fcntl
