@@ -513,7 +513,48 @@ fn malformed_promotion_fields_are_invalid_arguments() {
 }
 
 #[test]
-fn fresh_authority_requires_the_current_template_attestation() {
+fn guest_update_eligibility_requires_the_baseline_and_matching_image_contract() {
+    for platform in [
+        None,
+        Some(model::RecoveryPlatform::Linux),
+        Some(model::RecoveryPlatform::Windows),
+    ] {
+        for contract in [
+            "linux-systemd-selector-v1",
+            "windows-scm-two-slot-v1",
+            "unknown",
+            "",
+        ] {
+            for (version, baseline) in [
+                ("0.8.0", false),
+                ("0.8.1", false),
+                ("0.8.2-alpha.1", false),
+                ("0.8.2", true),
+                ("0.8.3", true),
+                ("invalid", false),
+            ] {
+                let seen = wire::Status {
+                    seed_contract: contract.into(),
+                    committed_version: version.into(),
+                    ..Default::default()
+                };
+                let matches = match platform {
+                    Some(model::RecoveryPlatform::Linux) => contract == "linux-systemd-selector-v1",
+                    Some(model::RecoveryPlatform::Windows) => contract == "windows-scm-two-slot-v1",
+                    None => false,
+                };
+                assert_eq!(
+                    policy::supported_guest(platform, &seen),
+                    baseline && matches,
+                    "{platform:?}, {contract}, {version}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn installed_authority_must_match_the_current_promotion_and_authorization() {
     let promotion = model::policy::Promotion {
         channel: "stable".into(),
         target: model::ArtifactDigest::of_bytes(b"candidate"),
@@ -528,22 +569,14 @@ fn fresh_authority_requires_the_current_template_attestation() {
         promotion: Box::new(promotion.clone()),
         authorization,
     };
-    for (templates, template, expected) in [
-        (vec!["current", "other"], Some("current"), true),
-        (vec!["other"], Some("current"), false),
-        (vec![], Some("current"), false),
-        (vec!["current"], None, false),
-    ] {
-        let mut policy = policy::Policy {
-            authorization,
-            promotion: promotion.clone(),
-            qualified_templates: templates.into_iter().map(str::to_owned).collect(),
-        };
-        assert_eq!(policy.authorizes(&action, template), expected);
-        policy.authorization = Uuid::now_v7();
-        assert!(!policy.authorizes(&action, template));
-        policy.authorization = authorization;
-        policy.promotion.maximum_guest = "0.8.3".parse().unwrap();
-        assert!(!policy.authorizes(&action, template));
-    }
+    let mut policy = policy::Policy {
+        authorization,
+        promotion,
+    };
+    assert!(policy::authorizes(&policy, &action));
+    policy.authorization = Uuid::now_v7();
+    assert!(!policy::authorizes(&policy, &action));
+    policy.authorization = authorization;
+    policy.promotion.maximum_guest = "0.8.3".parse().unwrap();
+    assert!(!policy::authorizes(&policy, &action));
 }
