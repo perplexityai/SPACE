@@ -431,15 +431,8 @@ class DrainV2Assertions:
                 self.expect_stopped_unplaced(sandbox_id)
             else:
                 self.expect_back_elsewhere(sandbox_id, lifecycle, timeout=timeout)
-                landed = self.drain_restores(sandbox_id)
-                restores[self.bare_id(sandbox_id)] = landed
-                self._fixture.verify(
-                    [state for state, _ in landed].count("succeeded") == 1
-                    and all(state in ("succeeded", "canceled", "failed") for state, _ in landed),
-                    "the sandbox was not landed by exactly one drain restore, with none left running",
-                    sandbox_id=sandbox_id,
-                    restores=landed,
-                )
+                restores[self.bare_id(sandbox_id)] = self.drain_restores(sandbox_id)
+                self.expect_landed_once(sandbox_id)
             self.expect_single_vm(sandbox_id, lifecycle)
         self._fixture.record("restores", restores)
         return restores
@@ -554,13 +547,13 @@ class DrainV2Assertions:
             )
             self._fixture.wait(3)
 
-    def expect_lifecycle_unplaced(self, sandbox_id: str, lifecycle: str, *, timeout: float) -> None:
-        """The sandbox row reaches `lifecycle` with no active node."""
+    def expect_lifecycle_back(self, sandbox_id: str, lifecycle: str, *, timeout: float) -> None:
+        """The sandbox row goes back to `lifecycle`, wherever it is placed."""
 
         deadline = time.monotonic() + timeout
         while True:
             current, node = self.residency(sandbox_id)
-            if current == lifecycle and node is None:
+            if current == lifecycle:
                 return
             self._fixture.verify(
                 time.monotonic() < deadline,
@@ -825,6 +818,19 @@ class DrainV2Assertions:
             self._fixture.verify(time.monotonic() < deadline, failure, restores=restores)
             self._fixture.wait(2)
 
+    def expect_landed_once(self, sandbox_id: str) -> None:
+        """Exactly one drain restore of the sandbox succeeded, and none is left running."""
+
+        restores = self.drain_restores(sandbox_id)
+        self._fixture.record(f"drain_restores_{self.bare_id(sandbox_id)}", restores)
+        self._fixture.verify(
+            [state for state, _ in restores].count("succeeded") == 1
+            and all(state in ("succeeded", "canceled", "failed") for state, _ in restores),
+            "the sandbox was not landed by exactly one drain restore, with none left running",
+            sandbox_id=sandbox_id,
+            restores=restores,
+        )
+
     def drain_restores(self, sandbox_id: str) -> list[tuple[str, int]]:
         """Each drain restore operation of the sandbox, oldest first: its state and attempts."""
 
@@ -1011,12 +1017,24 @@ class DrainV2Assertions:
         )
         return statuses
 
-    def undrain_and_expect_cancelled(self, *, timeout: float = 120) -> None:
-        """`:undrain` returns the node to no phase, and the controller cancels the epoch on it."""
+    def undrain(self) -> None:
+        """`:undrain` the node, without waiting for the cancel."""
 
         if self._undrain is not None:
             compensation, self._undrain = self._undrain, None
             compensation.release()
+
+    def undrain_and_expect_cancelled(self, *, timeout: float = 600) -> None:
+        """`:undrain` returns the node to no phase, and the controller cancels
+        the epoch on it, once the node has handed back what the drain
+        evacuated."""
+
+        self.undrain()
+        self.expect_cancelled(timeout=timeout)
+
+    def expect_cancelled(self, *, timeout: float = 600) -> None:
+        """The controller clears the undrained node's v2 columns."""
+
         deadline = time.monotonic() + timeout
         while True:
             status = self._control.drain_v2_status(self.node_id)
@@ -1029,7 +1047,8 @@ class DrainV2Assertions:
             )
             self._fixture.wait(2)
         # The controller clears the columns only once its cancel answered the
-        # node unsealed; the scenario then proves it by activating again.
+        # node unsealed with nothing left to hand back; the scenario then
+        # proves it by activating again.
 
     def expect_stale_epoch_refused(self) -> None:
         """A drain under the cancelled epoch is refused before it seals anything:

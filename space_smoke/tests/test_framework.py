@@ -200,6 +200,8 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "native.v2_drain_terminates_its_worker",
                 "native.v2_drain_waits_for_an_unreachable_node",
                 "native.v2_drain_waits_out_blocked_uploads",
+                "native.v2_undrain_before_enqueue",
+                "native.v2_undrain_mid_suspend",
                 "native.v2_undrain_unseals_the_worker",
                 "native_concurrency.command_idempotency",
                 "native_concurrency.create_idempotency",

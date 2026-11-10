@@ -18,10 +18,7 @@ HOLD_SECONDS = 20
     "native.v2_drain_restore_outlives_its_destination",
     api_surfaces=("native",),
     substrates=("kubernetes",),
-    # A timed-out attempt is not reverted while its restore may still be
-    # live: the sweeper reverts it once its lease and the restoring age
-    # have passed.
-    timeout_minutes=75,
+    timeout_minutes=45,
     test_hooks="SPACE_DRAIN_RESTORE_TEST_HOLD_SECS, which holds each claimed drain restore",
     ignored="cuts the destination's object store path under a drain, too invasive for the per-merge set",
 )
@@ -59,7 +56,8 @@ def v2_drain_restore_outlives_its_destination(test: smoke.CommandSandboxFixture)
                     timeout=900,
                 )
                 failed = time.monotonic()
-                drain.expect_lifecycle_unplaced(sandbox_id, "suspended", timeout=1800)
+                # A timed-out attempt is reverted at once, not by the sweeper.
+                drain.expect_lifecycle_back(sandbox_id, "suspended", timeout=120)
                 test.record(
                     f"seconds_to_suspended_{drain.bare_id(sandbox_id)}",
                     round(time.monotonic() - failed),
