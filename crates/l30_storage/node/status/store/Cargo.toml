@@ -1,0 +1,30 @@
+[package]
+name = "pplx-space-node-status-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.space.state]
+postgres = ["node_status_snapshots"]
+
+[lints]
+workspace = true
+
+[features]
+# Snapshot seeding for other crates' tests; enable only from [dev-dependencies].
+test-support = ["dep:pplx-space-common-core", "dep:sqlx"]
+
+[dependencies]
+thiserror = { workspace = true }
+pplx-space-common-core = { workspace = true, features = ["sqlx"], optional = true }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"], optional = true }
+
+[dev-dependencies]
+pplx-space-common-core = { workspace = true, features = ["sqlx"] }
+pplx-space-db-test-fixtures = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
+pplx-space-test-env = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

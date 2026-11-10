@@ -219,7 +219,6 @@ postgres = [
   "node_runtime_guests",
   "node_runtime_installations",
   "node_runtime_state_formats",
-  "node_status_snapshots",
   "node_template_components",
   "node_template_inventory",
   "nodes",

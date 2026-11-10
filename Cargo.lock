@@ -4909,6 +4909,7 @@ dependencies = [
  "pplx-space-node-api-sim",
  "pplx-space-node-mgr-client",
  "pplx-space-node-registration-store",
+ "pplx-space-node-status-store",
  "pplx-space-observability",
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
@@ -7010,6 +7011,18 @@ dependencies = [
  "clap",
  "pplx-space-common-core",
  "pplx-space-node-runtime-supervisor",
+]
+
+[[package]]
+name = "pplx-space-node-status-store"
+version = "0.8.1"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-test-env",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

@@ -25,6 +25,34 @@ pub use certifications::{
     recompute_all_edges, record_node_certifications,
 };
 
+/// A boolean SQL predicate, TRUE iff the node whose id is the SQL
+/// expression `node_id` certifies, in its own build's row, an upgrade edge
+/// from `source` to `target` (text SQL expressions).
+///
+/// A catalog edge alone doesn't prove that: the aggregate lets a build that
+/// doesn't know an edge's target abstain rather than veto, so
+/// `runtime_environments` can carry `A -> B` while some nodes hosting `A` run
+/// a build that doesn't know `B`. A caller choosing a node to run an upgrade
+/// on has to ask this of that node, alongside
+/// `pplx_space_node_status_store::environment_evidence`: these rows are
+/// replaced only from complete inventories, so they say what the node's build
+/// certifies, not that the node is fresh.
+///
+/// A NULL `node_id`, `source` or `target` is FALSE, never NULL. The statement
+/// reads only `node_environment_certifications`, so a caller builds it once
+/// (a `LazyLock<String>`) and binds the rest.
+pub fn node_certifies_upgrade(node_id: &str, source: &str, target: &str) -> String {
+    format!(
+        "EXISTS (\n\
+             SELECT 1\n\
+             FROM node_environment_certifications node_certification\n\
+             WHERE node_certification.node_id = {node_id}\n\
+               AND node_certification.environment_ref = {source}\n\
+               AND {target} = ANY(node_certification.upgrade_edges)\n\
+         )"
+    )
+}
+
 /// Reading the catalog failed. Every variant fails closed: the caller gets no
 /// list rather than a partial one.
 #[derive(Debug, thiserror::Error)]
