@@ -191,3 +191,46 @@ pub(crate) fn valid_label(value: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_'))
 }
+
+/// Platform selected by an installed recovery contract, not a host OS default.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryPlatform {
+    Linux,
+    Windows,
+}
+impl RecoveryPlatform {
+    pub fn from_contract(contract: &str) -> Option<Self> {
+        match contract {
+            crate::SEED_CONTRACT => Some(Self::Linux),
+            crate::WINDOWS_SEED_CONTRACT => Some(Self::Windows),
+            _ => None,
+        }
+    }
+    pub const fn contract(self) -> &'static str {
+        match self {
+            Self::Linux => crate::SEED_CONTRACT,
+            Self::Windows => crate::WINDOWS_SEED_CONTRACT,
+        }
+    }
+    pub const fn binary_name(self, binary: Binary) -> &'static str {
+        match (self, binary) {
+            (Self::Linux, binary) => binary.file_name(),
+            (Self::Windows, Binary::Service) => "spaced-svc.exe",
+            (Self::Windows, Binary::Cli) => "spaced.exe",
+        }
+    }
+}
+impl BundleDescriptor {
+    pub fn recovery_platform(&self) -> Result<RecoveryPlatform, DescriptorError> {
+        let mut supported = self
+            .seed_contracts
+            .iter()
+            .filter_map(|contract| RecoveryPlatform::from_contract(contract));
+        match (supported.next(), supported.next()) {
+            (Some(platform), None) => Ok(platform),
+            _ => Err(DescriptorError::Invalid(
+                "ambiguous or unsupported recovery platform",
+            )),
+        }
+    }
+}

@@ -351,11 +351,13 @@ impl SpacedHostService {
         ),
         Status,
     > {
-        if self.inner.guest_agent
-            != pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1
-        {
+        use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+        if !matches!(
+            self.inner.guest_agent,
+            QualifiedGuestAgent::LinuxV1 | QualifiedGuestAgent::WindowsV1
+        ) {
             return Err(Status::unimplemented(
-                "guest update requires the Linux guest contract",
+                "guest update requires a qualified native guest contract",
             ));
         }
         let (channel, pinned) =

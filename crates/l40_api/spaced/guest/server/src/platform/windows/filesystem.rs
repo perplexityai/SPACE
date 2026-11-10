@@ -25,6 +25,7 @@ const MUTATION_RETENTION: std::time::Duration = std::time::Duration::from_secs(9
 #[derive(Clone)]
 pub(super) struct Filesystem {
     identity: Arc<Identity>,
+    admission: super::execution::Admission,
     slots: Arc<Semaphore>,
     uploads: Arc<Semaphore>,
     mutations: Arc<Mutex<HashMap<IdempotencyKey, Mutation>>>,
@@ -36,14 +37,30 @@ struct Mutation {
     completed: Option<std::time::Instant>,
 }
 impl Filesystem {
-    pub(super) fn new(identity: Arc<Identity>, tasks: tokio_util::task::TaskTracker) -> Self {
+    pub(super) fn new(
+        identity: Arc<Identity>,
+        tasks: tokio_util::task::TaskTracker,
+        admission: super::execution::Admission,
+    ) -> Self {
         Self {
             identity,
+            admission,
             tasks,
             slots: Arc::new(Semaphore::new(8)),
             uploads: Arc::new(Semaphore::new(4)),
             mutations: Arc::default(),
         }
+    }
+    pub(super) fn has_update_obligations(&self) -> bool {
+        let Ok(mut records) = self.mutations.lock() else {
+            return true;
+        };
+        records.retain(|_, record| {
+            !record
+                .completed
+                .is_some_and(|at| at.elapsed() >= MUTATION_RETENTION)
+        });
+        !records.is_empty()
     }
     fn path(&self, path: &str, user: Option<&str>) -> Result<LocalPath, Status> {
         self.identity.check_user(user)?;
@@ -51,6 +68,16 @@ impl Filesystem {
     }
     async fn work<T: Send + 'static>(
         &self,
+        work: impl FnOnce(&Identity) -> Result<T, Status> + Send + 'static,
+    ) -> Result<T, Status> {
+        let admission = self.admission.admit()?;
+        self.work_admitted(admission, work).await
+    }
+    // An accepted stream keeps its admission while moving into a worker. A
+    // concurrent idle probe may close the gate, but cannot revoke this work.
+    async fn work_admitted<T: Send + 'static>(
+        &self,
+        admission: tokio_util::task::task_tracker::TaskTrackerToken,
         work: impl FnOnce(&Identity) -> Result<T, Status> + Send + 'static,
     ) -> Result<T, Status> {
         let permit = self
@@ -62,6 +89,7 @@ impl Filesystem {
         self.tasks
             .spawn_blocking(move || {
                 let _permit = permit;
+                let _admission = admission;
                 work(&identity)
             })
             .await
@@ -69,6 +97,7 @@ impl Filesystem {
     }
     async fn mutation(
         &self,
+        admission: tokio_util::task::task_tracker::TaskTrackerToken,
         key: Option<String>,
         fingerprint: blake3::Hash,
         work: impl FnOnce(&Identity) -> io::Result<u64> + Send + 'static,
@@ -78,7 +107,7 @@ impl Filesystem {
             .transpose()
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let records = self.mutations.clone();
-        self.work(move |identity| {
+        self.work_admitted(admission, move |identity| {
             if let Some(key) = &key {
                 let mut records = records
                     .lock()
@@ -299,6 +328,7 @@ impl filesystem_server::Filesystem for Filesystem {
         &self,
         r: Request<ListRequest>,
     ) -> Result<Response<Self::ListInfoStream>, Status> {
+        let admission = self.admission.admit()?;
         let r = r.into_inner();
         let p = self.path(&r.path, r.user.as_deref())?;
         let depth = r.depth.unwrap_or(1);
@@ -306,7 +336,7 @@ impl filesystem_server::Filesystem for Filesystem {
             return Err(Status::invalid_argument("depth must be 1..32"));
         }
         let entries = self
-            .work(move |i| {
+            .work_admitted(admission.clone(), move |i| {
                 i.run(|| {
                     let mut pending = vec![(p.as_path().to_path_buf(), depth)];
                     let mut entries = Vec::new();
@@ -354,13 +384,16 @@ impl filesystem_server::Filesystem for Filesystem {
                 .map_err(io_status)
             })
             .await?;
-        Ok(Response::new(Box::pin(tokio_stream::iter(
-            entries.into_iter().map(Ok),
-        ))))
+        Ok(Response::new(super::execution::retain_stream(
+            Box::pin(tokio_stream::iter(entries.into_iter().map(Ok))),
+            admission,
+        )))
     }
     async fn read(&self, r: Request<ReadRequest>) -> Result<Response<Self::ReadStream>, Status> {
+        let reply_admission = self.admission.admit()?;
         let r = r.into_inner();
         let p = self.path(&r.path, r.user.as_deref())?;
+        let admission = reply_admission.clone();
         let permit = self
             .slots
             .clone()
@@ -370,6 +403,7 @@ impl filesystem_server::Filesystem for Filesystem {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         self.tasks.spawn_blocking(move || {
             let _permit = permit;
+            let _admission = admission;
             let result = identity.run(|| {
                 let mut f = std::fs::File::open(p.as_path())?;
                 f.seek(SeekFrom::Start(r.offset))?;
@@ -395,14 +429,16 @@ impl filesystem_server::Filesystem for Filesystem {
                 let _ = tx.blocking_send(Err(io_status(e)));
             }
         });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(rx),
+        Ok(Response::new(super::execution::retain_stream(
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            reply_admission,
         )))
     }
     async fn write(
         &self,
         r: Request<tonic::Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
+        let admission = self.admission.admit()?;
         let _upload = self
             .uploads
             .clone()
@@ -438,7 +474,7 @@ impl filesystem_server::Filesystem for Filesystem {
         let fingerprint = h.finalize();
         let count = data.len() as u64;
         let bytes_written = self
-            .mutation(open.idempotency_key, fingerprint, move |_| {
+            .mutation(admission, open.idempotency_key, fingerprint, move |_| {
                 write_file(p.as_path(), &data, open.append)?;
                 Ok(count)
             })
@@ -467,12 +503,17 @@ impl filesystem_server::Filesystem for Filesystem {
         }
         let count = entries.len() as u64;
         let files_written = self
-            .mutation(r.idempotency_key, hash, move |_| {
-                for (p, e) in entries {
-                    write_file(p.as_path(), &e.data, e.append)?;
-                }
-                Ok(count)
-            })
+            .mutation(
+                self.admission.admit()?,
+                r.idempotency_key,
+                hash,
+                move |_| {
+                    for (p, e) in entries {
+                        write_file(p.as_path(), &e.data, e.append)?;
+                    }
+                    Ok(count)
+                },
+            )
             .await?;
         Ok(Response::new(WriteBatchResponse { files_written }))
     }
@@ -528,10 +569,15 @@ impl filesystem_server::Filesystem for Filesystem {
         let a = self.path(&r.old_path, r.user.as_deref())?;
         let b = self.path(&r.new_path, r.user.as_deref())?;
         let hash = fingerprint("rename", &r);
-        self.mutation(r.idempotency_key, hash, move |_| {
-            std::fs::rename(a.as_path(), b.as_path())?;
-            Ok(0)
-        })
+        self.mutation(
+            self.admission.admit()?,
+            r.idempotency_key,
+            hash,
+            move |_| {
+                std::fs::rename(a.as_path(), b.as_path())?;
+                Ok(0)
+            },
+        )
         .await?;
         Ok(Response::new(RenameResponse {}))
     }
