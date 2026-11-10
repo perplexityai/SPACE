@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_common_core::types::{
-    EnvironmentReference, INITIAL_FIRECRACKER_RUNTIME_VERSION,
+    ArtifactComponentKind, EnvironmentReference, INITIAL_FIRECRACKER_RUNTIME_VERSION,
     INITIAL_FIRECRACKER_STATE_FORMAT_VERSION, LocalArtifactId, SandboxId,
 };
 use pplx_space_runtime_environment_policy_store::{
@@ -115,6 +115,45 @@ pub struct RecordedExecution {
     pub state_format_version: Option<String>,
 }
 
+impl RecordedExecution {
+    /// The execution a stored record describes: its `execution_metadata`
+    /// document and the legacy identity columns beside it. Read leniently: a
+    /// record is evidence, and a field it lacks or holds in another shape
+    /// matches anything rather than failing the read.
+    pub fn from_record(
+        execution_metadata: Option<&serde_json::Value>,
+        runtime: Option<String>,
+        runtime_version: Option<String>,
+        state_format_name: Option<String>,
+        state_format_version: Option<String>,
+    ) -> Self {
+        let environment = execution_metadata
+            .and_then(|metadata| metadata.get("environment"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let kernel_version = execution_metadata
+            .and_then(|metadata| metadata.get("components"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|components| {
+                components.iter().find(|component| {
+                    component.get("kind").and_then(serde_json::Value::as_str)
+                        == Some(ArtifactComponentKind::Kernel.as_str())
+                })
+            })
+            .and_then(|kernel| kernel.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        Self {
+            environment,
+            runtime,
+            runtime_version,
+            kernel_version,
+            state_format_name,
+            state_format_version,
+        }
+    }
+}
+
 /// One row of the environment catalog, `runtime_environments`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogEnvironment {
@@ -128,6 +167,21 @@ pub struct CatalogEnvironment {
     pub upgrade_edges: BTreeSet<EnvironmentReference>,
     /// Upgrade edges whose target also loads this one's checkpoints.
     pub memory_edges: BTreeSet<EnvironmentReference>,
+}
+
+impl From<pplx_space_runtime_environment_catalog_store::CatalogEntry> for CatalogEnvironment {
+    fn from(entry: pplx_space_runtime_environment_catalog_store::CatalogEntry) -> Self {
+        Self {
+            reference: entry.reference,
+            runtime: entry.runtime,
+            runtime_version: entry.runtime_version,
+            kernel_version: entry.kernel_version,
+            state_format_name: entry.state_format_name,
+            state_format_version: entry.state_format_version,
+            upgrade_edges: entry.upgrade_edges.into_iter().collect(),
+            memory_edges: entry.memory_edges.into_iter().collect(),
+        }
+    }
 }
 
 /// The environment `recorded` ran under, as far as the control plane can tell
