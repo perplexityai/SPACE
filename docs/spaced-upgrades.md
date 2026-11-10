@@ -3,20 +3,71 @@
 [Documentation](../README.md)
 
 `spaced-svc` is the daemon inside the guest; `spaced` is its companion CLI.
-Updating the host or publishing a new template does not replace these binaries
-in an existing sandbox. Upgrade the pair from the same verified guest release.
+An existing sandbox keeps its own guest binaries until maintenance selects a
+replacement. A capable host can install its verified bundle under the automatic
+policy below, or an operator can request maintenance explicitly. Always replace
+the daemon and CLI together from the same verified guest release.
 
 ## Three upgrade modes
 
 | Mode | Status | Behavior |
 |---|---|---|
 | **1. Wake and upgrade** | Supported today as a manual operator procedure | Activate the sandbox through its normal lifecycle, replace and restart spaced, then persist the updated sandbox through normal snapshot publication. This is disruptive and counts as sandbox use. |
-| **2. Upgrade a running sandbox through its manager** | Experimental, explicit operator selection | Stage an authorized bundle and restart only when idle, or with explicit force. Requires a qualified two-slot guest template; never wakes dormant sandboxes. |
-| **3. Upgrade outside the customer-invoked lifecycle** | Planned; not implemented | Perform maintenance without advancing customer lifecycle/activity accounting or running customer workloads. Requires an isolated maintenance mechanism and coherent snapshot publication. |
+| **2. Upgrade a running sandbox through its manager** | Node-local automatic selection and operator commands | Stage an authorized bundle and restart only when idle, or with explicit force. Requires a qualified two-slot guest template; never wakes dormant sandboxes. |
+| **3. Maintain a dormant sandbox offline** | Planned; not implemented | Perform maintenance without advancing customer lifecycle/activity accounting or running customer workloads. Requires an isolated maintenance mechanism and coherent snapshot publication. |
 
-Automatic fleet rollout is disabled. The manager-owned mode below is available
-only on templates built with the selector contract; older guests retain the
-manual procedure. Offline maintenance remains unimplemented.
+Node-local automatic guest updates are enabled by default for qualified templates
+with an installed target catalog. Older guests retain the manual procedure.
+Offline maintenance remains unimplemented; dormant sandboxes are never woken.
+
+## Automatic node-local guest updates
+
+Sandbox-manager considers running customer sandboxes once per minute. New
+executions, resume/restore and manager restart rebuild a 30–120 second grace
+hint, followed by at least 120 seconds without customer activity. Discovery is
+off the activation response path; it does not touch activity or lifecycle clocks.
+Pool members, builders and unqualified images are excluded. An installed catalog
+entry must authorize the exact template digest, select `upgrade`, cap the guest
+at the installed target, and stay in the guest's compatibility family. The target
+version and guest-relevant marker must both be newer than the committed guest.
+
+Only one transfer/activation runs per node, shared with manual requests and
+recovery. The node's existing cache-disk status must be `READY`; this is not a
+CPU or memory pressure detector. Guest free-space and inode checks still apply.
+Each pass probes at most eight due guests, with a five-second end-to-end budget
+per probe. Busy guests, retained process obligations, lifecycle headroom, missing
+observations and disk pressure defer for 15 minutes plus 0–60 seconds of jitter.
+A known quiet-period expiry is reconsidered after that expiry (at least one
+pass later). Unsupported, unqualified and unchanged targets wait for execution,
+qualification or installed authority changes. `guest-update status --json`
+reports `auto_deferred:<reason>` when no operation is active.
+
+Three distinct terminal `candidate_failed` or `retry_exhausted` receipts stop
+new automatic admissions for that target digest on this node. Busy deferrals,
+customer lifecycle cancellation and successful rollback awaiting its authorized
+retry do not count. The cutoff is in memory: deleting a sandbox does not reset
+it, but restarting the manager does. Per-execution retry/quarantine history stays
+durable. Investigate before resetting by restart; a different bundle digest has
+its own cutoff. The cutoff retains at most 256 failed targets; reaching that
+capacity stops automatic admissions until manager restart instead of forgetting
+failures. No fleet or cluster rollout controller is required.
+
+Set `SPACE_GUEST_AUTO_UPDATE=0` in the sandbox-manager environment and restart
+it to disable new automatic admissions. Manual commands and unfinished receipt
+recovery continue. Before an incompatible host downgrade: disable automation,
+restart the manager, wait for operations to settle, then deploy the older host
+services. This drain requires two service restarts. A guest-marker bump affects
+every eligible idle sandbox on each enabled node; release review must verify
+that the change warrants restarting existing guests.
+
+Pause/suspend/capture cancel staging and settle an armed trial; stop/delete
+revoke its authority. Automatic work rechecks quiet time before arming. Pending
+receipt recovery also uses this conservative quiet check because origin is not
+stored; explicit newly requested maintenance keeps its existing idle semantics.
+Customer requests arriving during an operation hold wait at the host boundary,
+within their deadline and the fixed maintenance bound, rather than being
+replayed. A caller with a shorter deadline may still receive a before-start
+refusal. Long-lived work or short suspend deadlines can leave no update window.
 
 ## Manager-owned guest update and restart
 
@@ -189,10 +240,8 @@ refund twice. A timeout, missing evidence, or changed guest generation does not
 justify a refund.
 Previously used authorizations cannot be reintroduced to replenish that
 allowance. The worker activates at most one guest at a time; other accepted
-receipts remain queued. The rollout owner must implement a per-target
-failure-rate breaker in the fleet admission controller before enabling automatic rollout. It must stop
-new admissions for a failing target across workers; this operator-only
-mechanism neither runs that controller nor enables automatic rollout.
+receipts remain queued. Automatic selection has a node-local cutoff, described below.
+
 
 Timeout changes persist while maintenance runs. Stop/delete revokes maintenance
 authority. Explicit pause, suspend and memory-capture requests preempt optional
