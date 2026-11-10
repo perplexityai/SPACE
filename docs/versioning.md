@@ -119,6 +119,26 @@ then continue running against 0.9 hosts without a guest update or identity
 change. The 0.8 host's `<0.9.0` bound only limits which newer guests that host
 accepts; it does not constrain the support policy of a future host release.
 
+### Guest-update baseline
+
+Manager-owned and node-local automatic guest updates require a committed guest
+version of at least 0.8.2 and a recovery contract matching the sandbox's trusted
+image profile. Older guests keep serving work but are never selected; recreate
+them from a current template. The separate manual procedure supports only
+legacy Linux guests with regular spaced binary files, not Windows or two-slot
+guests; those require recreation or a separately qualified repair.
+
+This floor identifies the first supported maintenance release, not one immutable
+set of bytes. CI still publishes commit-tagged builds. The 0.8.2 bump reserves
+the baseline in the workspace; it does not create a release tag or implement
+serialized publication. Release owners must coordinate subsequent version
+allocations against main and advance both workspace version and guest marker
+for every guest-relevant change before publishing it to existing guests.
+Do not publish different guest bytes under the same workspace version. Reverting
+only the version bump leaves the maintenance floor unchanged and disables
+maintenance for newly built older guests; revert the feature or keep the baseline
+when rolling back a deployment.
+
 ## Sandbox lifetime from 1.0
 
 Every sandbox created on 1.0 must remain fully supported throughout 1.x. Later
