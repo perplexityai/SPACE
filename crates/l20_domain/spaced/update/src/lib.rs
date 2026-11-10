@@ -7,11 +7,14 @@ pub mod artifact;
 pub mod journal;
 pub mod policy;
 
-pub use artifact::{ArtifactDigest, Binary, BinaryIdentity, BundleDescriptor, DescriptorError};
+pub use artifact::{
+    ArtifactDigest, Binary, BinaryIdentity, BundleDescriptor, DescriptorError, RecoveryPlatform,
+};
 pub use journal::{Attempt, Journal, JournalState, Selection, Slot, TrialProgress};
 
 /// Installed unit/selector ABI; updating binaries cannot change this contract.
 pub const SEED_CONTRACT: &str = "linux-systemd-selector-v1";
+pub const WINDOWS_SEED_CONTRACT: &str = "windows-scm-two-slot-v1";
 /// Bound descriptor and journal reads independently of untrusted file metadata.
 pub const MAX_METADATA_BYTES: usize = 64 * 1024;
 /// Bound each agent payload before transfer or hashing begins.

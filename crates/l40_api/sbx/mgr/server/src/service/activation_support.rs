@@ -1407,16 +1407,24 @@ pub(super) async fn wait_ready_and_mark_started(
             .ok_or_else(|| Status::not_found("activation sandbox disappeared"))?;
         (row.guest_image, row.node_execution_id)
     };
-    let guest = async {
+    // Keep the RPC-heavy readiness future off the detached finalizer's stack.
+    let guest = Box::pin(async {
         match image_and_fence.0.readiness() {
             pplx_space_common_core::types::guest_image::GuestReadiness::Agent => {
-                wait_ready_via_spaced_host(
-                    sandbox_id,
-                    Duration::from_secs(ready_timeout_secs.into()),
-                    phase,
+                let budget = Duration::from_secs(ready_timeout_secs.into());
+                let deadline = tokio::time::Instant::now() + budget;
+                // The readiness wait owns its timeout outcome. An outer timer
+                // would drop that observation as Cancelled instead of TimedOut.
+                let ready = wait_ready_via_spaced_host(sandbox_id, budget, phase).await?;
+                tokio::time::timeout_at(
+                    deadline,
+                    super::spaced_bridge::publish_ready_endpoint_proof(&db, sandbox_id, cleanup_id),
                 )
                 .await
-                .map(GuestReadyEvidence::Agent)
+                .map_err(|_| {
+                    Status::deadline_exceeded("endpoint proof publication deadline exceeded")
+                })??;
+                Ok(GuestReadyEvidence::Agent(ready))
             }
             pplx_space_common_core::types::guest_image::GuestReadiness::TcpService { port } => {
                 let execution = image_and_fence.1.ok_or_else(|| {
@@ -1435,9 +1443,9 @@ pub(super) async fn wait_ready_and_mark_started(
                 Ok(GuestReadyEvidence::Service)
             }
         }
-    };
+    });
     complete_start_after_readiness(
-        db,
+        db.clone(),
         sandbox_id,
         process_env,
         ready_timeout_secs,

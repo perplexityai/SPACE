@@ -14,12 +14,14 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tonic::{Request, Response, Status};
 const PROCESS_RECORD_LIMIT: usize = 512;
 const OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
+const PROCESS_RETENTION: Duration = Duration::from_secs(900);
 
 type Stream =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<ProcessEvent, Status>> + Send>>;
 #[derive(Clone)]
 pub(super) struct Processes {
     identity: Arc<Identity>,
+    admission: super::execution::Admission,
     records: Arc<Mutex<Records>>,
     running: Arc<Semaphore>,
     output_limit: usize,
@@ -353,15 +355,36 @@ impl Processes {
         identity: Arc<Identity>,
         shutdown: CancellationToken,
         tasks: TaskTracker,
+        admission: super::execution::Admission,
     ) -> Self {
         Self {
             identity,
+            admission,
             records: Arc::default(),
             running: Arc::new(Semaphore::new(32)),
             output_limit: output_limit(),
             tasks,
             shutdown,
         }
+    }
+    pub(super) fn has_update_obligations(&self) -> bool {
+        let Ok(mut records) = self.records.lock() else {
+            return true;
+        };
+        records.processes.retain(|_, record| {
+            record
+                .state
+                .lock()
+                .map(|state| {
+                    !state
+                        .ended
+                        .is_some_and(|at| at.elapsed() >= PROCESS_RETENTION)
+                })
+                .unwrap_or(true)
+        });
+        let retained: std::collections::HashSet<_> = records.processes.keys().cloned().collect();
+        records.keys.retain(|_, id| retained.contains(id));
+        !records.processes.is_empty()
     }
     fn get(&self, id: &str) -> Result<Arc<Record>, Status> {
         let id = ProcessId::parse(id).map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -381,6 +404,7 @@ impl process_server::Process for Processes {
     type ListProcessesStream =
         std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<ProcessInfo, Status>> + Send>>;
     async fn start(&self, r: Request<StartRequest>) -> Result<Response<Stream>, Status> {
+        let _admission = self.admission.admit()?;
         let r = r.into_inner();
         let key = start_key(&r)?;
         self.identity.check_user(r.user.as_deref())?;
@@ -396,8 +420,7 @@ impl process_server::Process for Processes {
                 "process environment exceeds bound",
             ));
         }
-        let environment = pplx_space_guest_process::WindowsEnv::parse(r.env.clone())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let environment = self.admission.environment(r.env.clone())?;
         let cwd = LocalPath::parse(r.cwd.as_deref().unwrap_or("."), &self.identity.home)?;
         let timeout = validate_optional_duration("timeout", r.timeout)?;
         let id = r
@@ -440,7 +463,7 @@ impl process_server::Process for Processes {
                 ended.sort_by_key(|(_, time)| *time);
                 for (id, time) in ended {
                     if records.processes.len() < PROCESS_RECORD_LIMIT
-                        && time.elapsed() < Duration::from_secs(900)
+                        && time.elapsed() < PROCESS_RETENTION
                     {
                         break;
                     }
@@ -610,24 +633,30 @@ impl process_server::Process for Processes {
                 record.notify.notify_waiters();
             });
         }
-        Ok(Response::new(record.stream(Some(0), false, true).await?))
+        Ok(Response::new(super::execution::retain_stream(
+            record.stream(Some(0), false, true).await?,
+            _admission,
+        )))
     }
     async fn connect_process(
         &self,
         r: Request<ConnectProcessRequest>,
     ) -> Result<Response<Stream>, Status> {
+        let _admission = self.admission.admit()?;
         let r = r.into_inner();
         validate_optional_duration("timeout", r.timeout)?;
-        Ok(Response::new(
+        Ok(Response::new(super::execution::retain_stream(
             self.get(&r.process_id)?
                 .stream(r.output_cursor, r.resume_from_oldest_retained, false)
                 .await?,
-        ))
+            _admission,
+        )))
     }
     async fn list_processes(
         &self,
         r: Request<ListProcessesRequest>,
     ) -> Result<Response<Self::ListProcessesStream>, Status> {
+        let _admission = self.admission.admit()?;
         let r = r.into_inner();
         let records = self
             .records
@@ -647,12 +676,16 @@ impl process_server::Process for Processes {
                 result.push(Ok(info.clone()));
             }
         }
-        Ok(Response::new(Box::pin(tokio_stream::iter(result))))
+        Ok(Response::new(super::execution::retain_stream(
+            Box::pin(tokio_stream::iter(result)),
+            _admission,
+        )))
     }
     async fn send_signal(
         &self,
         r: Request<SendSignalRequest>,
     ) -> Result<Response<SendSignalResponse>, Status> {
+        let _admission = self.admission.admit()?;
         let r = r.into_inner();
         // Linux-numbered SIGKILL requests forced termination of the Windows job.
         require_supported_signal(r.signal)?;
@@ -670,6 +703,7 @@ impl process_server::Process for Processes {
         &self,
         r: Request<SendInputRequest>,
     ) -> Result<Response<SendInputResponse>, Status> {
+        let _admission = self.admission.admit()?;
         let r = r.into_inner();
         if r.data.len() > 1024 * 1024 {
             return Err(Status::resource_exhausted("stdin chunk exceeds 1 MiB"));
@@ -701,6 +735,7 @@ impl process_server::Process for Processes {
         &self,
         r: Request<CloseStdinRequest>,
     ) -> Result<Response<CloseStdinResponse>, Status> {
+        let _admission = self.admission.admit()?;
         let record = self.get(&r.into_inner().process_id)?;
         let _permit = record
             .input
@@ -718,6 +753,7 @@ impl process_server::Process for Processes {
         &self,
         _: Request<ResizePtyRequest>,
     ) -> Result<Response<ResizePtyResponse>, Status> {
+        let _admission = self.admission.admit()?;
         Err(super::unsupported("Windows PTY is not qualified"))
     }
 }

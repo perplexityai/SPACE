@@ -85,10 +85,7 @@ pub(super) async fn load() -> Result<Bundle, Status> {
             || descriptor.version > policy.promotion.maximum_guest
             || semver::Version::parse(env!("CARGO_PKG_VERSION")).map_err(internal)?
                 < policy.promotion.minimum_host
-            || !descriptor
-                .seed_contracts
-                .iter()
-                .any(|v| v == model::SEED_CONTRACT)
+            || descriptor.recovery_platform().is_err()
             || descriptor.architecture.to_string() != std::env::consts::ARCH
         {
             return Err(Status::failed_precondition(
@@ -100,8 +97,9 @@ pub(super) async fn load() -> Result<Bundle, Status> {
             Some(&descriptor.compatibility_family),
         )
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        let service = trusted_file(&root.join("spaced-svc"))?;
-        let cli = trusted_file(&root.join("spaced"))?;
+        let platform = descriptor.recovery_platform().map_err(internal)?;
+        let service = trusted_file(&root.join(platform.binary_name(model::Binary::Service)))?;
+        let cli = trusted_file(&root.join(platform.binary_name(model::Binary::Cli)))?;
         Ok(Bundle {
             policy,
             descriptor,
