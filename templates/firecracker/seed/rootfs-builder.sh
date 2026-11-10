@@ -948,6 +948,10 @@ resize2fs "${OUTPUT}/rootfs.ext4"
 e2fsck -fn "${OUTPUT}/rootfs.ext4"
 
 # ── Metadata ──────────────────────────────────────────────────────────────────
+SPACED_UPDATE_CONTRACT_JSON=null
+if [[ -f "${CHROOT}/etc/spaced/update-contract" ]]; then
+  SPACED_UPDATE_CONTRACT_JSON='"linux-systemd-selector-v1"'
+fi
 cat > "${OUTPUT}/metadata.json" <<EOF
 {
   "schema_version": 2,
@@ -970,6 +974,7 @@ cat > "${OUTPUT}/metadata.json" <<EOF
   "built_at": "$(date -Iseconds)",
   "base_image": "${SQUASHFS_URL}",
   "arch": "${ARCH}",
+  "spaced_update_contract": ${SPACED_UPDATE_CONTRACT_JSON},
   "spaced_version": "${SPACED_VERSION}",
   "spaced_compatibility_family": "${SPACED_COMPATIBILITY_FAMILY}",
   "recipe": "",

@@ -512,8 +512,8 @@ fn malformed_promotion_fields_are_invalid_arguments() {
     }
 }
 
-#[test]
-fn fresh_authority_requires_the_current_template_attestation() {
+#[tokio::test]
+async fn fresh_authority_requires_the_current_template_attestation() {
     let promotion = model::policy::Promotion {
         channel: "stable".into(),
         target: model::ArtifactDigest::of_bytes(b"candidate"),
@@ -528,22 +528,105 @@ fn fresh_authority_requires_the_current_template_attestation() {
         promotion: Box::new(promotion.clone()),
         authorization,
     };
-    for (templates, template, expected) in [
-        (vec!["current", "other"], Some("current"), true),
-        (vec!["other"], Some("current"), false),
-        (vec![], Some("current"), false),
-        (vec!["current"], None, false),
+    let mut policy = policy::Policy {
+        authorization,
+        promotion,
+        qualified_templates: vec![],
+    };
+    assert!(policy::authorizes(&policy, &action));
+    policy.authorization = Uuid::now_v7();
+    assert!(!policy::authorizes(&policy, &action));
+    policy.authorization = authorization;
+    policy.promotion.maximum_guest = "0.8.3".parse().unwrap();
+    assert!(!policy::authorizes(&policy, &action));
+
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    crate::db::fixture::insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    let mut row = crate::db::read::sandbox(&conn, &id).unwrap().unwrap();
+    row.template = "seed".into();
+    row.template_hash = Some(format!("blake3:{}", "a".repeat(64)));
+    let dir = tempfile::tempdir().unwrap();
+    let mut service = SandboxManagerService::for_test(conn);
+    // Exact cache receipts and publisher metadata are independent evidence:
+    // neither a guest claim nor a matching contract from another release works.
+    for (contract, cached, matching, allowlist, allowed) in [
+        (Some("linux-systemd-selector-v1"), true, true, false, true),
+        (None, true, true, false, false),
+        (Some("windows-scm-two-slot-v1"), true, true, false, false),
+        (Some("future-selector"), true, true, false, false),
+        (Some("linux-systemd-selector-v1"), false, true, false, false),
+        (Some("linux-systemd-selector-v1"), true, false, false, false),
+        (None, false, false, true, true),
     ] {
-        let mut policy = policy::Policy {
-            authorization,
-            promotion: promotion.clone(),
-            qualified_templates: templates.into_iter().map(str::to_owned).collect(),
+        let metadata = pplx_space_common_core::types::TemplateMetadata {
+            spaced_update_contract: contract.map(str::to_owned),
+            ..Default::default()
         };
-        assert_eq!(policy::authorizes(&policy, &action, template), expected);
-        policy.authorization = Uuid::now_v7();
-        assert!(!policy::authorizes(&policy, &action, template));
-        policy.authorization = authorization;
-        policy.promotion.maximum_guest = "0.8.3".parse().unwrap();
-        assert!(!policy::authorizes(&policy, &action, template));
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        policy.qualified_templates = if allowlist {
+            vec![row.template_hash.clone().unwrap()]
+        } else {
+            vec![]
+        };
+        let response = pplx_space_template_mgr_client::proto::GetTemplateResponse {
+            cached_only: cached,
+            template_dir: dir.path().to_string_lossy().into_owned(),
+            template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
+                name: "seed".into(),
+                content_hash: if matching {
+                    row.template_hash.clone()
+                } else {
+                    Some("wrong".into())
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolver = Arc::new(crate::template_resolver::fake::FakeTemplateResolver::new(
+            move || Ok(Response::new(response.clone())),
+        ));
+        service.template_resolver = resolver.clone();
+        let expected = if !allowlist && (!cached || !matching) {
+            None
+        } else {
+            Some(allowed)
+        };
+        assert_eq!(
+            service.update_template_qualified(&row, &policy).await.ok(),
+            expected,
+            "{contract:?}, {cached}, {matching}, {allowlist}"
+        );
+        if allowlist {
+            assert!(resolver.requests().is_empty());
+        } else {
+            let requests = resolver.requests();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].cached_only);
+            assert_eq!(
+                requests[0].template.as_ref().unwrap().content_hash,
+                row.template_hash
+            );
+        }
     }
+    // A cache failure must retry, including FailedPrecondition from a damaged
+    // cache entry; only an observed missing/mismatched attestation is definitive.
+    policy.qualified_templates.clear();
+    service.template_resolver = Arc::new(
+        crate::template_resolver::fake::FakeTemplateResolver::refusing(
+            Status::failed_precondition("cached rootfs unavailable"),
+        ),
+    );
+    assert_eq!(
+        service
+            .update_template_qualified(&row, &policy)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
 }

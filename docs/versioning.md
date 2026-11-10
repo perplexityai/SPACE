@@ -119,6 +119,15 @@ then continue running against 0.9 hosts without a guest update or identity
 change. The 0.8 host's `<0.9.0` bound only limits which newer guests that host
 accepts; it does not constrain the support policy of a future host release.
 
+### Guest-update baseline
+
+SPACE 0.8.2 is the complete guest-update and node-local automatic-update baseline
+for Linux and qualified Windows images. Its guest-update marker is also 0.8.2.
+Both use the shared workspace release history; there is no separate spaced
+version. The release stays in the 0.8 compatibility family. Older templates need
+published recovery-contract metadata or explicit digest qualification; a version
+number alone does not establish a working recovery layout.
+
 ## Sandbox lifetime from 1.0
 
 Every sandbox created on 1.0 must remain fully supported throughout 1.x. Later

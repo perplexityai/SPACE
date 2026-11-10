@@ -1291,7 +1291,7 @@ impl TemplateBuilder {
 
         // Write metadata
         let now = now_iso8601();
-        let (spaced_version, spaced_compatibility_family) =
+        let (spaced_version, spaced_compatibility_family, spaced_update_contract) =
             template_guest_runtime_metadata(&resolved_base, oci_guest_runtime.as_ref());
         let mut tmeta = TemplateMetadata {
             guest_image: None,
@@ -1305,6 +1305,10 @@ impl TemplateBuilder {
             built_at: now,
             spaced_version,
             spaced_compatibility_family,
+            // Recipe builds inherit the seed's recovery units and ABI. OCI
+            // assembly captures those units and initializes the new pair in
+            // slots; it refuses incomplete selector layouts.
+            spaced_update_contract,
             recipe: recipe_label.to_string(),
             steps_count: recipe.steps.len(),
             // The recipe build flow always knows these. Wrap in Some(_)
@@ -1904,17 +1908,20 @@ async fn current_guest_runtime_metadata(
 fn template_guest_runtime_metadata(
     resolved_base: &BaseTemplateBuild,
     oci_guest_runtime: Option<&GuestRuntimeMetadata>,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<String>) {
+    let contract = resolved_base.metadata.spaced_update_contract.clone();
     if let Some(metadata) = oci_guest_runtime {
         return (
             Some(metadata.spaced_version.clone()),
             Some(metadata.spaced_compatibility_family.clone()),
+            contract,
         );
     }
     let metadata = &resolved_base.metadata;
     (
         metadata.spaced_version.clone(),
         metadata.spaced_compatibility_family.clone(),
+        contract,
     )
 }
 

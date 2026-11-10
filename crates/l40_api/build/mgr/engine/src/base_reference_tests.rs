@@ -36,17 +36,21 @@ fn oci_guest_metadata_fixture() -> (BaseTemplateBuild, GuestRuntimeMetadata) {
 fn oci_template_metadata_tracks_the_guest_installed_during_assembly(
     oci_guest_metadata_fixture: (BaseTemplateBuild, GuestRuntimeMetadata),
 ) {
-    let (base, installed) = oci_guest_metadata_fixture;
-
-    let metadata = template_guest_runtime_metadata(&base, Some(&installed));
-
-    assert_eq!(
-        metadata,
-        (
-            Some(installed.spaced_version),
-            Some(installed.spaced_compatibility_family),
-        )
-    );
+    let (mut base, installed) = oci_guest_metadata_fixture;
+    for contract in [None, Some("linux-systemd-selector-v1".to_owned())] {
+        base.metadata.spaced_update_contract = contract.clone();
+        for oci in [None, Some(&installed)] {
+            let metadata = template_guest_runtime_metadata(&base, oci);
+            let expected = if oci.is_some() {
+                ("0.2.0", "0.2")
+            } else {
+                ("0.1.0", "0.1")
+            };
+            assert_eq!(metadata.0.as_deref(), Some(expected.0));
+            assert_eq!(metadata.1.as_deref(), Some(expected.1));
+            assert_eq!(metadata.2, contract);
+        }
+    }
 }
 
 #[test]

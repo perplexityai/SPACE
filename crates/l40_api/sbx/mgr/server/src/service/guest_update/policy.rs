@@ -134,25 +134,30 @@ pub(super) fn promotion(value: wire::Promotion) -> Result<model::policy::Promoti
     Ok(value)
 }
 
-pub(super) fn authorizes(policy: &Policy, action: &Action, template: Option<&str>) -> bool {
-    template.is_some_and(|template| {
-        policy
-            .qualified_templates
-            .iter()
-            .any(|qualified| qualified == template)
-    }) && matches!(action,
+pub(super) fn authorizes(policy: &Policy, action: &Action) -> bool {
+    matches!(action,
         Action::Apply { promotion, authorization }
             if promotion.as_ref() == &policy.promotion
                 && authorization == &policy.authorization)
 }
 
-/// Recheck current authority immediately before an irreversible guest transition.
-pub(super) async fn permits(action: &Action, template: Option<&str>) -> bool {
-    let Action::Apply { promotion, .. } = action else {
-        return false;
-    };
-    load(promotion.target)
-        .await
-        .as_ref()
-        .is_ok_and(|bundle| authorizes(&bundle.policy, action, template))
+impl SandboxManagerService {
+    /// Recheck authority and trusted template provenance before Arm or Commit.
+    pub(super) async fn permits_guest_update(
+        &self,
+        action: &Action,
+        sandbox: &crate::db::SandboxRow,
+    ) -> bool {
+        let Action::Apply { promotion, .. } = action else {
+            return false;
+        };
+        let Ok(bundle) = load(promotion.target).await else {
+            return false;
+        };
+        authorizes(&bundle.policy, action)
+            && self
+                .require_update_qualification(sandbox, &bundle.policy)
+                .await
+                .is_ok()
+    }
 }

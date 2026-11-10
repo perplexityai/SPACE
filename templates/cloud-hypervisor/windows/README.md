@@ -396,6 +396,15 @@ assembly, not a way to reset update history in a running guest. Remove the
 assembly inputs before capturing the image. The qualified layout requires
 `C:\ProgramData` and `C:\Windows` on the system drive.
 
+Before publishing a successfully qualified image, set
+`"spaced_update_contract": "windows-scm-two-slot-v1"` in its template
+`metadata.json`. This publisher attestation enables node-local automatic guest
+updates without distributing a template-digest allowlist to every worker. Publish
+it with the image, never by editing metadata for an existing digest. Images
+without the attestation still boot; updating them requires explicit digest
+qualification in node policy. Preserve the attestation only while the image
+retains the documented recovery tasks, ACLs, slot layout and workload account.
+
 The workload Job Object lives in a private namespace whose boundary and ACL
 require SYSTEM. A pre-existing job is refused rather than adopted. Tenant
 processes cannot squat on the service namespace or open its termination handle.

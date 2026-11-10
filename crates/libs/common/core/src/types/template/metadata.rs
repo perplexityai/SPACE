@@ -191,6 +191,15 @@ pub struct TemplateMetadata {
     )]
     pub spaced_compatibility_family: Option<String>,
 
+    /// Publisher attestation that this image installs the named guest recovery
+    /// contract. Older templates remain usable without automatic guest updates.
+    /// A running guest's self-report cannot replace this build provenance.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub spaced_update_contract: Option<String>,
+
     /// Recipe identifier that produced this build (for builder-flow
     /// builds; empty for seed/imported templates).
     #[cfg_attr(feature = "serde", serde(default))]
