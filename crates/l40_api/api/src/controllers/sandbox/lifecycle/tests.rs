@@ -21,6 +21,12 @@ fn cluster_delete_miss_reason_classifies_by_substrate_error() {
         "node_unavailable",
     );
     assert_eq!(
+        cluster_delete_miss_reason(&SubstrateError::Unschedulable {
+            message: "sandbox pod is unschedulable: 0/3 nodes are available".into(),
+        }),
+        "node_unavailable",
+    );
+    assert_eq!(
         cluster_delete_miss_reason(&SubstrateError::Failed {
             message: "node-api delete error".into(),
         }),
@@ -140,63 +146,62 @@ fn requested_size_kind_classifies_by_action_and_entry_lifecycle() {
 }
 
 /// Admission refusals at request entry and those the substrate charges later
-/// share one constructor, which marks them as admission refusals. Only a
-/// rate-limited refusal carries the backpressure cause the async dispatcher
-/// re-queues behind; an empty cluster keeps its bounded retry.
+/// share one constructor, [`ActivationRejectionKind::controller_error`], which
+/// marks them as admission refusals. Only a rate-limited refusal carries the
+/// backpressure cause the async dispatcher re-queues behind; an empty cluster
+/// and a cluster with no free slot keep their bounded retry, and only the
+/// slot refusal is a 503.
 #[test]
 fn admission_refusals_keep_their_dispatcher_retry_causes() {
-    use crate::cluster_admission::ClusterAdmissionError;
+    use crate::controllers::substrate::ActivationRejectionKind;
+    use axum::http::StatusCode;
 
-    let cases = [
+    let kinds = [
         (
-            "request entry, rate limited",
-            cluster_admission_controller_error(ClusterAdmissionError::RateLimited {
-                message: "activation budget exhausted".into(),
-                retry_after: Duration::from_secs(1),
-            }),
-            Some(Duration::from_secs(1)),
+            ActivationRejectionKind::RateLimited,
+            StatusCode::TOO_MANY_REQUESTS,
             Some(ControllerRetryAfterCause::ClusterActivationAdmission),
         ),
         (
-            "request entry, empty cluster",
-            cluster_admission_controller_error(ClusterAdmissionError::EmptyCluster {
-                message: "no eligible nodes".into(),
-                retry_after: Duration::from_secs(5),
-            }),
-            Some(Duration::from_secs(5)),
+            ActivationRejectionKind::EmptyCluster,
+            StatusCode::TOO_MANY_REQUESTS,
             None,
         ),
         (
-            "substrate charge, rate limited",
-            ControllerError::from(SubstrateError::AdmissionRejected {
-                message: "activation budget exhausted".into(),
-                retry_after: Some(Duration::from_secs(1)),
-                rate_limited: true,
-            }),
-            Some(Duration::from_secs(1)),
-            Some(ControllerRetryAfterCause::ClusterActivationAdmission),
-        ),
-        (
-            "substrate charge, empty cluster",
-            ControllerError::from(SubstrateError::AdmissionRejected {
-                message: "no eligible nodes".into(),
-                retry_after: None,
-                rate_limited: false,
-            }),
-            None,
+            ActivationRejectionKind::NoFreeSlot,
+            StatusCode::SERVICE_UNAVAILABLE,
             None,
         ),
     ];
-    for (case, error, retry_after_header, cause) in cases {
-        assert_eq!(
-            error.status(),
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            "{case}"
-        );
-        assert_eq!(error.retry_after_header(), retry_after_header, "{case}");
-        assert_eq!(error.retry_after(), None, "{case}");
-        assert_eq!(error.retry_after_cause(), cause, "{case}");
-        assert!(error.is_cluster_admission_rejection(), "{case}");
+    for (kind, status, cause) in kinds {
+        let cases = [
+            (
+                "request entry",
+                kind.controller_error("refused".into(), Some(Duration::from_secs(1))),
+                Some(Duration::from_secs(1)),
+            ),
+            (
+                "substrate charge",
+                ControllerError::from(SubstrateError::AdmissionRejected {
+                    message: "refused".into(),
+                    retry_after: None,
+                    kind,
+                }),
+                None,
+            ),
+        ];
+        for (case, error, retry_after_header) in cases {
+            assert_eq!(error.status(), status, "{kind:?}, {case}");
+            assert_eq!(
+                error.retry_after_header(),
+                retry_after_header,
+                "{kind:?}, {case}"
+            );
+            assert_eq!(error.retry_after(), None, "{kind:?}, {case}");
+            assert_eq!(error.retry_after_cause(), cause, "{kind:?}, {case}");
+            assert_eq!(error.activation_rejection(), Some(kind), "{kind:?}, {case}");
+            assert!(error.is_cluster_admission_rejection(), "{kind:?}, {case}");
+        }
     }
     // A 429 from anything else, such as a per-client limiter, is not one.
     assert!(
@@ -358,12 +363,7 @@ async fn rejected_activation_emits_no_orphaned_requested_event() -> TestResult {
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
-        crate::cluster_admission::ClusterSandboxAdmissionConfig {
-            enabled: true,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
-        },
+        crate::test_support::enabled_config(),
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
     let controller = SandboxController::with_cluster_admission(make_substrate(), admission);
@@ -432,12 +432,7 @@ async fn direct_start_restore_spends_deferred_admission_at_entry() -> TestResult
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
-        crate::cluster_admission::ClusterSandboxAdmissionConfig {
-            enabled: true,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
-        },
+        crate::test_support::enabled_config(),
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
     let controller = SandboxController::with_cluster_admission(make_substrate(), admission);
@@ -685,12 +680,7 @@ async fn invalid_activation_options_reject_before_admission_and_requested_event(
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
-        crate::cluster_admission::ClusterSandboxAdmissionConfig {
-            enabled: true,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
-        },
+        crate::test_support::enabled_config(),
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
     let controller = SandboxController::with_cluster_admission(make_substrate(), admission);
@@ -895,9 +885,7 @@ async fn exhausting_the_finalize_retry_budget_stays_retryable() -> TestResult {
         make_substrate(),
         crate::cluster_admission::ClusterSandboxAdmissionConfig {
             enabled: false,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
+            ..crate::test_support::enabled_config()
         },
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );

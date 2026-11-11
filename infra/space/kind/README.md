@@ -2238,7 +2238,9 @@ node, each sandbox worker's node-ctl advertises that extended resource on its
 Node's `status.capacity`, from its node-manager's `network_pool_max_slots`
 (`crates/l40_api/node/ctl/server/src/kubernetes_controller/network_slots.rs`), and
 re-advertises it on every periodic tick, including after the Node object is
-recreated. node-manager keeps no warm pool of slots, as deployed nodes do not
+recreated. That count is node-manager's own default unless the release sets
+`networkPoolMaxSlots` in `charts/space-node-manager-local`: a smoke can set a
+small count, such as 2, to fill each worker's slots with a few sandboxes. node-manager keeps no warm pool of slots, as deployed nodes do not
 (`SPACE_NODEMGR_NETWORK_POOL_TARGET`, `_RETAIN_READY` and `_MIN_READY` are `0`
 in `charts/space-node-manager-local`): each slot, a sandbox's or a build's, is
 set up when it is allocated and torn down when it is released, and no slot is

@@ -70,9 +70,7 @@ async fn exhausting_the_finalize_retry_budget_stays_retryable() -> TestResult {
         make_substrate(),
         crate::cluster_admission::ClusterSandboxAdmissionConfig {
             enabled: false,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
+            ..crate::test_support::enabled_config()
         },
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
@@ -226,6 +224,49 @@ async fn resume_uses_resolved_runtime_without_async_observation() -> TestResult 
         assert_eq!(request.expected_execution_generation, generation);
         client.resume_sandbox(request).await?;
         assert_eq!(worker.state().get(&id.to_string()).await?.status, "running");
+    }
+    Ok(())
+}
+
+/// Only a cold create reads the slot check. A start or wake of a `stopped`
+/// sandbox may be bound to the node its disk is on, a `created` one may
+/// already have a pod, and a restore may reuse one, so on a full cluster with
+/// the check on, every action and implicit wake is still admitted.
+#[tokio::test(flavor = "current_thread")]
+async fn actions_and_implicit_wakes_are_not_slot_checked() -> TestResult {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused@localhost/unused")
+        .expect("lazy pool builds without connecting");
+    let admission = std::sync::Arc::new(
+        crate::test_support::kubernetes::full_cluster_slot_check_admission(&pool),
+    );
+    admission
+        .admit_cold_create()
+        .await
+        .expect_err("the fixture's cluster is full");
+    let controller = SandboxController::with_cluster_admission(
+        kubernetes(
+            crate::controllers::substrate::kubernetes::tests::substrate_with_store(pool.clone()),
+        ),
+        crate::test_support::kubernetes::full_cluster_slot_check_admission(&pool),
+    );
+    for action in [SandboxAction::Start, SandboxAction::Wake] {
+        for lifecycle in [
+            None,
+            Some(SandboxLifecycle::Created),
+            Some(SandboxLifecycle::Stopped),
+            Some(SandboxLifecycle::Suspended),
+        ] {
+            controller
+                .admit_action_cluster_activation(action, lifecycle)
+                .await
+                .unwrap_or_else(|error| panic!("{action:?} from {lifecycle:?}: {error:?}"));
+        }
+    }
+    for lifecycle in ["created", "stopped", "suspended"] {
+        super::charge_implicit_activation(Some(&admission), lifecycle)
+            .await
+            .unwrap_or_else(|error| panic!("implicit wake from {lifecycle}: {error:?}"));
     }
     Ok(())
 }

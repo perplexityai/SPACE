@@ -78,6 +78,7 @@
 //! | Retire retry | Nothing retries a failed Direct retire (see below) | ac-pplx | The sweeper's failed-cleanup retry running for both substrates |
 //! | Drain and evacuation | [`SubstrateCapabilities::supports_node_drain`] is false. Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and `:force-upload-local-snapshots` return 501 before reading or writing the node. `:undrain` clears a `draining` or `drained` phase an earlier drain left, without a substrate call | ac-pplx | Core drain and evacuation for both substrates over a Direct `set_node_schedulability` |
 //! | Drain, orphan, failed-row repair and node-sync loops | Not started on Direct (below) | ac-pplx | Those loops running for both substrates through the adapter |
+//! | Network-slot headroom (`Substrate::network_slot_headroom`) | Reads `Unknown(Unsupported)`, so the activation limiter's slot check (`SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED`) admits every Direct cold create | ac-pplx | Slot capacity of registered nodes, read by an admission check that runs for both substrates |
 //!
 //! # Kubernetes-only reconcilers
 //!

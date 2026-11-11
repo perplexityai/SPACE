@@ -65,11 +65,14 @@ enum ControllerErrorKind {
     /// Carried so the native delete executor can wait for the upload to
     /// finalize instead of failing the operation.
     SnapshotUploadInFlight(SnapshotUploadInFlight),
-    /// Cluster activation admission refused this request, whether the
-    /// limiter was out of tokens or the cluster had no eligible node. Carried
-    /// so request metrics can count the refusal without reading the retry
-    /// cause, which only the rate-limited case sets.
-    ClusterAdmissionRejection,
+    /// Cluster activation admission refused this request, and why: the
+    /// limiter was out of tokens, the cluster had no eligible node, or no
+    /// eligible node had a free slot. Set only by
+    /// [`substrate::ActivationRejectionKind::controller_error`]. Request
+    /// metrics count the refusal from it without reading the status or the
+    /// retry cause, and a caller with a fallback passes it through rather
+    /// than retrying under a weaker charge.
+    ClusterAdmissionRejection(substrate::ActivationRejectionKind),
 }
 
 /// Why a template the caller may use resolved to no release.
@@ -144,6 +147,24 @@ impl ControllerError {
             retry_after_cause: None,
             refused_before_start: false,
             guest_path_not_found: false,
+        }
+    }
+
+    /// Mark this error as an activation admission refusal of `kind`. Leaves
+    /// the status and every retry hint as they are.
+    pub(crate) fn with_activation_rejection(
+        mut self,
+        kind: substrate::ActivationRejectionKind,
+    ) -> Self {
+        self.kind = ControllerErrorKind::ClusterAdmissionRejection(kind);
+        self
+    }
+
+    /// The activation admission refusal this error carries, if it is one.
+    pub(crate) const fn activation_rejection(&self) -> Option<substrate::ActivationRejectionKind> {
+        match self.kind {
+            ControllerErrorKind::ClusterAdmissionRejection(kind) => Some(kind),
+            _ => None,
         }
     }
 
@@ -387,31 +408,9 @@ impl ControllerError {
         Self::new(StatusCode::PRECONDITION_FAILED, message)
     }
 
-    /// A 429 from cluster activation admission, at request entry or charged
-    /// later by the substrate. Only `rate_limited` adds the
-    /// [`ControllerRetryAfterCause::ClusterActivationAdmission`] cause: an
-    /// empty cluster omits it, so the async dispatcher gives that refusal a
-    /// bounded retry rather than re-queueing it forever.
-    pub(crate) fn cluster_admission_rejected(
-        message: impl Into<String>,
-        retry_after: Option<Duration>,
-        rate_limited: bool,
-    ) -> Self {
-        let mut error = Self::rate_limited(message);
-        if let Some(retry_after) = retry_after {
-            error = error.with_retry_after_header(retry_after);
-        }
-        if rate_limited {
-            error =
-                error.with_retry_after_cause(ControllerRetryAfterCause::ClusterActivationAdmission);
-        }
-        error.kind = ControllerErrorKind::ClusterAdmissionRejection;
-        error
-    }
-
     /// Whether cluster activation admission refused this request.
     pub(crate) const fn is_cluster_admission_rejection(&self) -> bool {
-        matches!(self.kind, ControllerErrorKind::ClusterAdmissionRejection)
+        self.activation_rejection().is_some()
     }
 }
 

@@ -7,7 +7,9 @@ settings reach the authority alone, and the static
 object-store credentials no node service (volume-manager and build-manager,
 the services that transfer objects, exchange their credentials by default).
 The volume-manager budget check covers numeric formatting: zero stays zero
-and YAML numbers must not become exponent notation.
+and YAML numbers must not become exponent notation. Node-manager's
+network-slot count is unset by default, so the binary's default is the only
+one, and renders exactly as set.
 """
 
 import subprocess
@@ -44,6 +46,8 @@ OBJECT_STORE_STATIC = {
 }
 STREAM_BUDGET = "SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES"
 VOLUME_MANAGER_CHART = KIND_DIR / "charts/space-volume-manager-local"
+MAX_SLOTS = "SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS"
+NODE_MANAGER_CHART = KIND_DIR / "charts/space-node-manager-local"
 
 
 def _rendered_env(manifests: list[dict]) -> set[str]:
@@ -116,3 +120,29 @@ def test_the_authority_reads_the_secrets_manager_role_from_the_optional_aws_secr
         "optional": True,
     }
     assert not _rendered_env(manifests) & OBJECT_STORE_STATIC
+
+
+def _node_manager_max_slots(*extra: str) -> str | None:
+    for document in render(NODE_MANAGER_CHART, "space", *extra):
+        for container in document.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+            for entry in container.get("env", []):
+                if entry["name"] == MAX_SLOTS:
+                    return entry["value"]
+    return None
+
+
+def test_node_manager_leaves_an_empty_network_slot_count_unset():
+    assert _node_manager_max_slots() is None
+    assert _node_manager_max_slots("--set", "networkPoolMaxSlots=") is None
+
+
+@pytest.mark.parametrize("value", ["2", "1000000"])
+def test_node_manager_renders_a_set_network_slot_count_exactly(value):
+    # A number from a values file is parsed as a float and must not render in
+    # exponent form.
+    assert _node_manager_max_slots("--set-string", f"networkPoolMaxSlots={value}") == value
+    assert _node_manager_max_slots("--set", f"networkPoolMaxSlots={value}") == value
+    with tempfile.TemporaryDirectory() as directory:
+        values = Path(directory) / "values.yaml"
+        values.write_text(f"networkPoolMaxSlots: {value}\n")
+        assert _node_manager_max_slots("-f", str(values)) == value
