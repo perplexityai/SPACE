@@ -27,8 +27,14 @@ export interface Config {
   outDir: string;
   // Names of seeded objects start with this.
   prefix: string;
+  // Whether SPACE_UI_DATADOG_LOGS_URL is set (non-empty) in this environment,
+  // which should match the console under test; its value is never read.
+  datadogLogsConfigured: boolean;
   // Set by --allow-remote: act on a stack that is not on this host.
   allowRemote: boolean;
+  // The Kind cluster's kube context, for the node drain steps' drain-keep
+  // override (see nodes.ts).
+  kubeContext: string;
 }
 
 // A prefix names seeded objects and the seed state file, so it is kept to
@@ -48,7 +54,9 @@ export function loadConfig(args: string[]): Config {
     password: option(args, 'password', env.CONSOLE_LOOP_PASSWORD ?? env.SPACE_CONSOLE_PASSWORD ?? 'password')!,
     outDir: path.resolve(option(args, 'out', env.CONSOLE_LOOP_OUT ?? path.join(PACKAGE_DIR, 'out'))!),
     prefix,
+    datadogLogsConfigured: (env.SPACE_UI_DATADOG_LOGS_URL ?? '').trim() !== '',
     allowRemote: flag(args, 'allow-remote'),
+    kubeContext: option(args, 'kube-context', env.CONSOLE_LOOP_KUBE_CONTEXT ?? 'kind-space-local')!,
   };
 }
 

@@ -736,7 +736,7 @@ def otlp_endpoint_rejection(endpoint: str) -> str | None:
 SMOKE_SERVICE_NAME = "space-cluster-smoke"
 
 # Identity resolves SPACE > OTel > DD > default, matching
-# crates/libs/observability/src/identity.rs and the Go shim. A blank SPACE or
+# crates/l10_foundation/observability/src/identity.rs and the Go shim. A blank SPACE or
 # OTel value is skipped so the first nonblank one wins; the Datadog fallback is
 # used raw. DogStatsD output is unchanged because its formatter is untouched,
 # not because this resolver preserves it.

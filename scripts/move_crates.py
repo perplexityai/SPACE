@@ -11,8 +11,8 @@ the move can be regenerated on a newer main instead of rebased.
 
 Usage:
   move_crates.py --generate [--mapping FILE]
-  move_crates.py --apply [--layer L ...] [--mapping FILE]
-  move_crates.py --verify [--base REV] [--layer L ...] [--mapping FILE] [--skip-arch]
+  move_crates.py --apply [--mapping FILE]
+  move_crates.py --verify [--base REV] [--mapping FILE] [--skip-arch]
 
 The mapping (scripts/move_crates.toml) has one row per workspace crate in
 `[crates]`: its target directory, an optional new package name, or `"stay"` for
@@ -30,10 +30,10 @@ would nest inside another's with no leaf to resolve it, a rename of a package
 that archcheck's package-keyed baseline tables name (they have no rename map,
 so the entry would read as new), and a file outside any crate family.
 
---apply refuses a dirty tree or a mapping --generate would change. It moves the
-selected layers' crates with `git mv`, each crate's files keeping their layout
-so rename detection pairs them, and rewrites every tracked text file outside
-`[stale_paths]`:
+--apply refuses a dirty tree or a mapping --generate would change. It moves
+every mapped crate in one run with `git mv`, each crate's files keeping their
+layout so rename detection pairs them, and rewrites every tracked text file
+outside `[stale_paths]`:
 
 * a repository path into a moved crate (`crates/libs/x/src/lib.rs`), or into a
   directory of crates (`crates/libs/fam/**`), which becomes one target per
@@ -71,9 +71,9 @@ stay. It also leaves an unquoted bare `..`
 path that names nothing tracked and no moved crate, such as a test's synthetic
 paths, and a climb in a file that stays after a shell expansion.
 
---verify compares the workspace with REV's (default HEAD), for the selected
-layers' rows: the same packages modulo their renames, each at its mapped
-directory and every other crate where it was; at least one crate moved; git's
+--verify compares the workspace with REV's (default HEAD), for every row: the
+same packages modulo their renames, each at its mapped directory and every
+other crate where it was; at least one crate moved; git's
 detected rename pairs exactly the move's for regular files (identical
 symlinks, such as the `CLAUDE.md` links, can't be told apart and git pairs them
 arbitrarily, so they are listed instead, and an open edit to one may need
@@ -378,7 +378,7 @@ def generate(root: Path, existing: Mapping) -> tuple[Mapping, dict[str, str], li
     result = Mapping(stale_paths=dict(existing.stale_paths))
     names = set(crates)
     # A row stays keyed by the name it was reviewed under, so a crate an
-    # earlier --layer run renamed is found by its new name.
+    # earlier run renamed is found by its new name.
     renamed = {r.rename: k for k, r in existing.crates.items() if r.rename and k not in names}
     keys = {}
     for name, crate in sorted(crates.items()):
@@ -479,7 +479,7 @@ def generate(root: Path, existing: Mapping) -> tuple[Mapping, dict[str, str], li
     tracked_now = set(files)
     for f in sorted(set(existing.files) - set(result.files)):
         if existing.files[f] in tracked_now:
-            result.files[f] = existing.files[f]  # moved by an earlier --layer run
+            result.files[f] = existing.files[f]  # moved by an earlier run
         else:
             changes.append(f"dropped file row for {f}")
     if errors:
@@ -543,11 +543,11 @@ class Plan:
         ]
 
 
-def plan(root: Path, mapping: Mapping, layers: set[str]) -> Plan:
+def plan(root: Path, mapping: Mapping) -> Plan:
     crates = workspace(root)
     moved, renames, lib_renames, files = {}, {}, {}, {}
     for name, row in mapping.crates.items():
-        if row.to is None or layer_dir(row.to) not in layers:
+        if row.to is None:
             continue
         crate = crates.get(name) or crates[row.rename]
         if crate.dir != row.to:
@@ -559,7 +559,7 @@ def plan(root: Path, mapping: Mapping, layers: set[str]) -> Plan:
     old_files = tracked(root)
     present = set(old_files)
     for old, new in mapping.files.items():
-        if new and old in present and layer_dir(new) in layers:
+        if new and old in present:
             files[old] = new
     return Plan(crates, moved, files, renames, lib_renames, old_files, with_ancestors(old_files))
 
@@ -1074,7 +1074,7 @@ def is_text(path: Path) -> str | None:
     return text_of(path.read_bytes())
 
 
-def apply(root: Path, mapping_path: Path, layers: set[str]) -> int:
+def apply(root: Path, mapping_path: Path) -> int:
     mapping = load_mapping(mapping_path)
     regenerated, _, changes = generate(root, mapping)
     if changes or regenerated.crates != mapping.crates or regenerated.files != mapping.files:
@@ -1084,14 +1084,14 @@ def apply(root: Path, mapping_path: Path, layers: set[str]) -> int:
         )
     if run(["git", "status", "--porcelain"], root).stdout.strip():
         raise MoveError("the tree has uncommitted changes; --apply needs a clean one")
-    p = plan(root, mapping, layers)
+    p = plan(root, mapping)
     if not p.moved and not p.files:
         print("nothing to move")
         return 0
     for outer in p.moved:
         left = [d for d in p.crate_dirs if d.startswith(outer + "/") and d not in p.moved]
         if left:
-            raise MoveError(f"{outer} holds {', '.join(left)}, which this run leaves: move their layers together")
+            raise MoveError(f"{outer} holds {', '.join(left)}, which stays: move it too")
     before_arch = (root / "ARCHITECTURE.toml").read_text()
 
     # Move: the deepest crate first, so a crate's directory holds only its
@@ -1243,12 +1243,12 @@ def owner_in(path: str, dirs: list[str]) -> str | None:
     return next((d for d in sorted(dirs, key=len, reverse=True) if under(path, d)), None)
 
 
-def verify(root: Path, mapping_path: Path, rev: str, layers: set[str], skip_arch: bool) -> int:
+def verify(root: Path, mapping_path: Path, rev: str, skip_arch: bool) -> int:
     mapping = load_mapping(mapping_path)
     before = base_crates(root, rev)
     after = {n: c.dir for n, c in workspace(root).items()}
-    selected = {n for n, r in mapping.crates.items() if r.to and layer_dir(r.to) in layers}
-    renames = {n: r.rename for n, r in mapping.crates.items() if r.rename and n in selected}
+    targets = {n: r.to for n, r in mapping.crates.items() if r.to}
+    renames = {n: r.rename for n, r in mapping.crates.items() if r.rename}
     problems = []
     expected = {renames.get(n, n) for n in before}
     if set(after) != expected:
@@ -1258,7 +1258,7 @@ def verify(root: Path, mapping_path: Path, rev: str, layers: set[str], skip_arch
     moved = {}
     for name, old_dir in before.items():
         new_name = renames.get(name, name)
-        want = mapping.crates[name].to if name in selected else old_dir
+        want = targets.get(name, old_dir)
         new_dir = after.get(new_name)
         if new_dir is not None and new_dir != want:
             problems.append(f"{new_name} is at {new_dir}, not {want}")
@@ -1269,7 +1269,7 @@ def verify(root: Path, mapping_path: Path, rev: str, layers: set[str], skip_arch
     old_set, now_set = set(old_files), set(files_now)
     file_moves = {
         old: new for old, new in mapping.files.items()
-        if new and layer_dir(new) in layers and old in old_set and new in now_set
+        if new and old in old_set and new in now_set
     }
     if not moved and not file_moves:
         problems.append(f"no crate moved relative to {rev}: pass the revision before the move as --base")
@@ -1411,8 +1411,6 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--generate", action="store_true", help="refresh the mapping from the workspace")
     mode.add_argument("--apply", action="store_true", help="move the mapped crates and rewrite references")
     mode.add_argument("--verify", action="store_true", help="check a move against --base")
-    parser.add_argument("--layer", action="extend", nargs="+", choices=LAYERS,
-                        help="layers to move, or that moved for --verify (default: all)")
     parser.add_argument("--mapping", default=DEFAULT_MAPPING, help=f"mapping file (default: {DEFAULT_MAPPING})")
     parser.add_argument("--base", default="HEAD", help="revision before the move, for --verify (default: HEAD)")
     parser.add_argument("--skip-arch", action="store_true", help="do not run `cargo arch` in --verify")
@@ -1430,8 +1428,8 @@ def main(argv: list[str] | None = None) -> int:
             print(", ".join(f"{layer} {counts[layer]}" for layer in (*LAYERS, STAY) if counts[layer]))
             return 0
         if args.apply:
-            return apply(root, mapping_path, set(args.layer or LAYERS))
-        return verify(root, mapping_path, args.base, set(args.layer or LAYERS), args.skip_arch)
+            return apply(root, mapping_path)
+        return verify(root, mapping_path, args.base, args.skip_arch)
     except MoveError as e:
         print(f"move_crates: {e}", file=sys.stderr)
         return 1

@@ -1,5 +1,5 @@
 # Kind-only: the in-repo intermediate-key broker fixture
-# (crates/apps/mock/branching-key-provider), which the Kind credential-manager
+# (crates/test_support/mock/branching/key/provider/svc), which the Kind credential-manager
 # authority uses as its external key provider
 # (infra/space/kind/charts/space-kind-key-broker). It derives deterministic key
 # material from the tenant reference and is a connectivity fixture, not a key

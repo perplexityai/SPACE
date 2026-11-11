@@ -262,7 +262,7 @@ sbxmgr_assert_direct_dependents() {
     local allowed=" $* "
     local graph dependent
     local unexpected=()
-    graph="$(cargo tree --locked -p pplx-space-sbx-mgr -p pplx-space-sbxmgr-svc \
+    graph="$(cargo tree --locked -p pplx-space-sbx-mgr -p pplx-space-sbx-mgr-svc \
         "${feature_args[@]}" -e normal -i "${package}" --depth 1 --prefix none)"
     while read -r dependent; do
         if [[ "${allowed}" != *" ${dependent} "* ]]; then
@@ -284,14 +284,27 @@ sbxmgr_assert_direct_dependents() {
 # release images' set (docker/Dockerfile.rust-build-common) and the Kind
 # images' set (docker/Dockerfile.rust-build-kind). The migrator has no
 # features of its own.
+# The crates run_sbxmgr_production_checks lints, which run_clippy_checks also
+# asks lint_affects_any about.
+SBXMGR_PRODUCTION_CRATES=(
+    pplx-space-sbx-mgr-store
+    pplx-space-sbx-mgr
+    pplx-space-sbx-mgr-svc
+    pplx-space-db-migrate
+    pplx-space-db-migrator
+)
+
 run_sbxmgr_production_checks() {
     local target_dir="$1"
     local sbxmgr_feature_sets=(
         ""
-        "pplx-space-sbxmgr-svc/otel,pplx-space-sbxmgr-svc/datadog"
-        "pplx-space-sbxmgr-svc/otel,pplx-space-sbxmgr-svc/datadog,pplx-space-sbxmgr-svc/test-hooks"
+        "pplx-space-sbx-mgr-svc/otel,pplx-space-sbx-mgr-svc/datadog"
+        "pplx-space-sbx-mgr-svc/otel,pplx-space-sbx-mgr-svc/datadog,pplx-space-sbx-mgr-svc/test-hooks"
     )
-    local sbxmgr_features sbxmgr_feature_args sbxmgr_graph
+    local sbxmgr_features sbxmgr_feature_args sbxmgr_graph sbxmgr_crate sbxmgr_packages=()
+    for sbxmgr_crate in "${SBXMGR_PRODUCTION_CRATES[@]}"; do
+        sbxmgr_packages+=(-p "${sbxmgr_crate}")
+    done
     for sbxmgr_features in "${sbxmgr_feature_sets[@]}"; do
         sbxmgr_feature_args=()
         if [ -n "${sbxmgr_features}" ]; then
@@ -300,17 +313,13 @@ run_sbxmgr_production_checks() {
         echo "--- :rust: Running sbx-mgr production clippy without test-support (features: ${sbxmgr_features:-none})"
         CARGO_TARGET_DIR="${target_dir}" cargo clippy \
             --locked \
-            -p pplx-space-sbx-mgr-store \
-            -p pplx-space-sbx-mgr \
-            -p pplx-space-sbxmgr-svc \
-            -p pplx-space-db-migrate \
-            -p pplx-space-db-migrator \
+            "${sbxmgr_packages[@]}" \
             "${sbxmgr_feature_args[@]}" \
             --lib --bins \
             -- \
             -D warnings
         sbxmgr_graph="$(cargo tree --locked \
-            -p pplx-space-sbx-mgr -p pplx-space-sbxmgr-svc \
+            -p pplx-space-sbx-mgr -p pplx-space-sbx-mgr-svc \
             -p pplx-space-db-migrate -p pplx-space-db-migrator \
             "${sbxmgr_feature_args[@]}" \
             -e normal,features --prefix none)"
@@ -323,13 +332,13 @@ run_sbxmgr_production_checks() {
         sbxmgr_assert_direct_dependents pplx-space-sqlite "${sbxmgr_feature_args[@]}" -- \
             pplx-space-sbx-mgr-store
         # rusqlite enters only through the store, the helpers it depends on,
-        # and three shared crates whose rusqlite use hands no connection out:
-        # common-jobs' functions take a connection in, and common-core and
-        # accounts only implement rusqlite's value conversion traits for
-        # their types.
+        # and four shared crates whose rusqlite use hands no connection out:
+        # common-jobs' functions take a connection in, and common-core,
+        # accounts and job-id only implement rusqlite's value conversion
+        # traits for their types.
         sbxmgr_assert_direct_dependents rusqlite "${sbxmgr_feature_args[@]}" -- \
             pplx-space-sbx-mgr-store pplx-space-sqlite pplx-space-common-jobs pplx-space-common-core \
-            pplx-space-accounts
+            pplx-space-accounts pplx-space-job-id
     done
 }
 
@@ -359,29 +368,13 @@ run_clippy_checks() {
         return 1
     fi
 
-    # Preserve the feature-isolation check without a redundant cargo check;
-    # clippy compiles this same graph before running its lint passes.
-    echo "--- :rust: Running common-svc no-default-features clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-common-svc \
-        --no-default-features \
-        -- \
-        -D warnings
-
-    # Built alone, so a sqlx feature common-svc's migration-checksums feature
-    # needs but only gets through unification with the rest of the workspace
-    # fails here.
-    echo "--- :rust: Running common-svc migration-checksums clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-common-svc \
-        --no-default-features \
-        --features migration-checksums \
-        -- \
-        -D warnings
-
-    run_sbxmgr_production_checks "${target_dir}"
+    # Pull CI and the merge queue run these only when the change can affect
+    # the crates they lint (lint_affects_any in lib/rust-isolated-crates.sh).
+    if lint_affects_any "${target_dir}" "${SBXMGR_PRODUCTION_CRATES[@]}"; then
+        run_sbxmgr_production_checks "${target_dir}"
+    else
+        echo "--- :rust: Skipping sbx-mgr production clippy: the change affects none of its crates"
+    fi
 
     # The check above resolves a `-p` selection. The release images build
     # from the workspace root without one, so this one reads each release
@@ -402,24 +395,30 @@ run_clippy_checks() {
         -- \
         -D warnings
 
-    # Each of the account identity crate's features by itself, so one that
-    # relies on another being enabled fails here; the isolated-crates mode
-    # builds it only with no features and with all of them.
-    echo "--- :rust: Running account identity clippy with each feature alone"
-    local accounts_feature
-    for accounts_feature in serde sqlx rusqlite; do
-        CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-            --locked \
-            -p pplx-space-accounts \
-            --no-default-features \
-            --features "${accounts_feature}" \
-            --all-targets \
-            -- \
-            -D warnings
+    # Each feature of the account and job identity crates by itself, so one
+    # that relies on another being enabled fails here; the isolated-crates
+    # mode builds them only with no features and with all of them. Both call
+    # job-id's uuid_id! macro, whose impls follow the calling crate's own
+    # features. No workspace crate enables job-id's sqlx, so only the
+    # --all-features builds and this loop compile its Postgres impls, and only
+    # this loop compiles them without serde and rusqlite.
+    echo "--- :rust: Running account and job identity clippy with each feature alone"
+    local identity_crate identity_feature
+    for identity_crate in pplx-space-accounts pplx-space-job-id; do
+        for identity_feature in serde sqlx rusqlite; do
+            CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+                --locked \
+                -p "${identity_crate}" \
+                --no-default-features \
+                --features "${identity_feature}" \
+                --all-targets \
+                -- \
+                -D warnings
+        done
     done
 
-    # The crates split out of common-core and common-svc, and the other
-    # libraries beside them, are linted alone by run_isolated_crate_checks in
+    # The libraries that reach common-core at most directly, and those its
+    # ALSO list names, are linted alone by run_isolated_crate_checks in
     # lib/rust-isolated-crates.sh (the isolated-crates mode), which finds them
     # in the workspace metadata. A new crate needs no step here.
 }
@@ -469,6 +468,18 @@ cleanup_nextest_redis() {
 # Passing tests' captured stderr is hidden by nextest, so the log file is the
 # only place the markers survive; a Buildkite annotation makes the count
 # visible per build while the soak decides whether strictness can be flipped.
+# Every test of the run that just finished within its wall-time budget
+# (ci/test-duration-budget.toml), read from the JUnit report nextest writes
+# (.config/nextest.toml). CI only: a local machine's times are not the
+# runners' the budget was measured on.
+check_test_durations() {
+    [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+    # nextest's store, not the Cargo target directory: [store] in
+    # .config/nextest.toml.
+    python3 "${REPO_ROOT}/ci/scripts/check-test-durations.py" \
+        "${REPO_ROOT}/target/nextest/default/junit.xml" "${REPO_ROOT}/ci/test-duration-budget.toml"
+}
+
 report_test_dep_skips() {
     local log="${SPACE_TEST_DEP_SKIP_LOG:-}"
     [ -n "${log}" ] || return 0
@@ -717,6 +728,8 @@ run_test_checks() {
         --no-fail-fast \
         --test-threads "${test_threads}" \
         ${NEXTEST_PARTITION_ARGS[@]+"${NEXTEST_PARTITION_ARGS[@]}"} || nextest_status=$?
+    local duration_status=0
+    check_test_durations || duration_status=$?
 
     if [ "${test_partition}" = all ]; then
         wait "${image_pulls[@]}" || true
@@ -729,6 +742,9 @@ run_test_checks() {
     cat "${side_log}"
     if [ "${nextest_status}" -ne 0 ]; then
         return "${nextest_status}"
+    fi
+    if [ "${duration_status}" -ne 0 ]; then
+        return "${duration_status}"
     fi
     return "${side_status}"
 }
@@ -776,6 +792,8 @@ run_privileged_test_checks() {
         --no-fail-fast \
         --test-threads "${test_threads}" \
         -E "${PRIVILEGED_TESTS_FILTERSET}" || nextest_status=$?
+    local duration_status=0
+    check_test_durations || duration_status=$?
 
     cleanup_nextest_postgres "${SPACE_NEXTEST_POSTGRES_CLEANUP_ID}"
     cleanup_nextest_redis "${SPACE_NEXTEST_REDIS_CLEANUP_ID}"
@@ -784,6 +802,9 @@ run_privileged_test_checks() {
     check_m1_document "${target_dir}" || m1_status=$?
     if [ "${nextest_status}" -ne 0 ]; then
         return "${nextest_status}"
+    fi
+    if [ "${duration_status}" -ne 0 ]; then
+        return "${duration_status}"
     fi
     return "${m1_status}"
 }
@@ -1039,6 +1060,19 @@ if [ "${needs_build_dependencies}" = true ]; then
         echo "WARNING: sccache initialization failed; continuing without compiler caching." >&2
         unset RUSTC_WRAPPER
     fi
+fi
+
+# The workspace's own crates compile with rustc's parallel front end, in
+# front of sccache; see rustc-parallel-front-end.sh. Main, pull requests and
+# the merge queue all pass the same arguments, so they share compiler-cache
+# entries. SPACE_RUST_FRONTEND_THREADS=1 turns it off; CI reads it from the
+# repository variable of the same name.
+if [ "${needs_build_dependencies}" = true ]; then
+    export SPACE_RUST_FRONTEND_THREADS="${SPACE_RUST_FRONTEND_THREADS:-8}"
+    export SPACE_RUSTC_INNER_WRAPPER="${RUSTC_WRAPPER:-}"
+    export SPACE_RUSTC_WORKSPACE_ROOT="${REPO_ROOT}"
+    export RUSTC_WRAPPER="${SCRIPT_DIR}/rustc-parallel-front-end.sh"
+    echo "rustc front-end threads for workspace crates: ${SPACE_RUST_FRONTEND_THREADS}"
 fi
 
 if [ "${needs_build_dependencies}" = true ]; then

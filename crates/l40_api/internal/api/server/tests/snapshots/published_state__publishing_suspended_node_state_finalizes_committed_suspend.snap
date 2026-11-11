@@ -1,0 +1,9 @@
+---
+source: crates/l40_api/internal/api/server/tests/published_state.rs
+expression: "sandbox_execution_placement_row(&db.pool, sandbox_id).await?"
+---
+lifecycle: suspended
+placement: unplaced
+active_node_id: ~
+active: false
+state: suspended

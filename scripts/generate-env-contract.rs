@@ -1,6 +1,6 @@
 //! Compile the same contract module as EnvKey/EnvValue/EnvMap, without Cargo.
 
-#[path = "../crates/libs/guest-process/src/env/contract.rs"]
+#[path = "../crates/l20_domain/guest/process/src/env/contract.rs"]
 mod contract;
 
 use contract::*;

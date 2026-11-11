@@ -14,7 +14,7 @@ spec:
       {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
   # Surge: credential-manager holds /space/run/credential-manager/service.mutex
   # and its successor waits passively for it
-  # (crates/libs/credential/mgr/server/src/run.rs).
+  # (crates/l40_api/credmgr/server/src/run.rs).
   {{- include "space-node-service.updateStrategy" (dict "strategy" "surge") | nindent 2 }}
   template:
     metadata:
@@ -30,7 +30,7 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
       # space-sbxmgr (UID 950) with SPACE_CREDENTIAL_MANAGER_GROUPS, the
       # identity its volume-socket preflight pins
-      # (crates/libs/credential/mgr/server/src/run/volume_socket.rs). No host
+      # (crates/l40_api/credmgr/server/src/run/volume_socket.rs). No host
       # PID namespace: its optional peer-process check
       # (SPACE_UDS_PEER_PROCESS_CHECK) defaults to off.
       securityContext:
@@ -39,7 +39,7 @@ spec:
         # The volume-socket directory: owned by credential-manager's identity,
         # group space-volcredclients, mode 0750, exactly what the listener's
         # preflight requires before it binds there
-        # (crates/libs/credential/mgr/server/src/run/volume_socket.rs).
+        # (crates/l40_api/credmgr/server/src/run/volume_socket.rs).
         # volume-manager, which runs as space-volmgr, reaches the socket
         # through that group (docs/installation.md).
         {{- include "space-node-service.prepareRunDir" (dict "ctx" . "path" "/space/run/volume-credentials" "mode" "0750"
@@ -51,7 +51,7 @@ spec:
           # The node credential agent: it binds the node-local sockets under
           # the service mutex and forwards every RPC to the control-plane
           # authority, holding no database, KEK or AWS credential itself
-          # (run_agent, crates/libs/credential/mgr/server/src/run.rs;
+          # (run_agent, crates/l40_api/credmgr/server/src/run.rs;
           # node_service.rs).
           command:
             - /opt/space/bin/space-credmgr-svc

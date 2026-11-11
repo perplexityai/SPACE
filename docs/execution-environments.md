@@ -137,7 +137,7 @@ cold boot, even if another VMM can read the memory-state format.
 
 Today, bound snapshots require their exact qualified environment. The legacy
 Firecracker loader predicate in
-[`runtime_inventory.rs`](../crates/libs/node/runtime/core/src/runtime_inventory.rs)
+[`runtime_inventory.rs`](../crates/l40_api/node/runtime/core/src/runtime_inventory.rs)
 requires the same format name and major version, with the snapshot's minor
 version no greater than the loader's; patch versions do not affect that check.
 Passing this predicate alone does not authorize cross-environment restore.
@@ -249,8 +249,9 @@ projection, together with other writes in that request.
 sampling timestamp or an environment readiness attestation. Inventory receipt
 does not establish host prerequisites, operation compatibility, or freshness of
 particular bytes.
-Placement remains unchanged until environment observations, freshness rules and
-the separately activated enforcement gate are implemented. Deploy the migration
+Placement acts on these columns only while the environment placement gate is
+`on`; `shadow` only counts by them (see "Placing work by environment"
+below). Deploy the migration
 and cluster readers before node publishers; older readers ignore the new field.
 During a mixed cluster-reader rollout, old readers can update artifact rows
 without updating observation receipts. Neither strict rejection nor an
@@ -303,7 +304,7 @@ work. Keeping this publication separate isolates protocol errors from censuses.
 ## Canonical identity and stored representation
 
 The schema-1 canonical encoding is defined by
-[`canonical_descriptor`](../crates/libs/execution/common/src/environment.rs)
+[`canonical_descriptor`](../crates/l20_domain/execution/common/src/environment.rs)
 and the independent [E0 golden vector](../proto/execution/v1/fixtures/e0.canonical).
 It uses UTF-8 ASCII text, a domain separator, schema version, fixed field order,
 canonical scalar spellings, and a final LF. Identifiers exclude delimiters and
@@ -401,6 +402,8 @@ sandbox metadata. No table migration or backfill is required. The reference is
 not a substitute for binary verification or an arbitrary execution permission.
 A same-rootfs registration cannot add, remove or replace the retained manifest's
 binding by refreshing metadata; it fails before changing the existing release.
+A template-manager registration bound to another environment's cache partition
+is a separate node-local build instead (see "Template caches per environment").
 Control-plane registration likewise rejects contradictory execution metadata
 before changing tags or storage locations. Identical retries and metadata-free
 tag updates preserve the original evidence; a NULL record may be filled once.
@@ -441,7 +444,7 @@ of existing data.
 Schema anchors:
 [`PostgreSQL baseline`](../db/postgres/20261002070625_baseline.up.sql),
 [`runtime-manager artifact operations`](../db/runtime-manager/20261012064915_artifact_operations.up.sql),
-[`durable operation payloads`](../crates/libs/node/runtime/manager/server/src/installs/operations.rs),
+[`durable operation payloads`](../crates/l40_api/node/runtime/manager/server/src/installs/operations.rs),
 [`execution protocol`](../proto/execution/v1/execution.proto), and
 [`artifact diagnostics protocol`](../proto/node/runtime/manager/v1/manager.proto).
 
@@ -694,6 +697,32 @@ Disk metadata records its producer; it cannot override the saved selection, and
 conflicting guest or kernel inputs fail. Snapshot producer evidence stays in the
 snapshot manifest, independently of the sandbox's current consumer.
 
+### Admin system-template builds
+
+`POST /admin/api/v1/system-templates/{template}/builds` accepts an optional
+`environment` digest. Older API servers reject the new field because system
+build requests deny unknown fields. Clients omit it entirely when selecting
+the bundled recipe, retaining compatibility with those servers.
+`GET /admin/api/v1/system-template-environments` lists
+qualified runtime/kernel pairs and their immutable references; qualification does
+not imply installation or admission on a particular builder.
+
+After choosing an admitted pair from that catalog:
+
+```bash
+space-admin-cli template build seed --environment "$ENV_REF" --async
+```
+
+No `latest` tag moves unless `--publish-tag latest` is supplied. Selecting a pair
+makes its kernel authoritative instead of the bundled seed recipe's kernel pin.
+This builds seed independently of any other template. Promotion is a separate
+tag assignment and does not require another template to exist.
+
+The API forwards the fail-closed environment wire arm and requires an
+acknowledgement. If the gateway does not acknowledge selection, inspect the
+recorded job before retrying. Idempotency fingerprints include the pair, so a
+key cannot be reused for a different runtime/kernel selection.
+
 Unpinned scratch builds use the configured default, refusing when it is unusable.
 Derived builds and new node-local cold sandboxes prefer the bound source when
 allowed and usable. Only a revoked or unavailable source permits fallback to the
@@ -923,6 +952,270 @@ descriptor, a repeated known or usable entry, a repeated or self edge, a usable
 or edge reference outside `known`, a memory edge without an upgrade edge, or an
 out-of-range sort key.
 
+### Recording environment observations
+
+The cluster API records the observation from each complete inventory in the
+publication's transaction (`crates/l40_api/internal/api/server/src/environment_observation.rs`):
+
+- `node_status_snapshots.known_environment_refs` gets every known
+  environment, and `usable_environment_refs` the usable ones that aren't
+  retired, even where a copy still verifies on the node. Both arrays share
+  `environment_refs_received_at`.
+- A complete inventory without an observation, from an old node build, or with
+  one that fails to decode sets the arrays and their receipt to NULL and
+  withdraws the node's certifications, so the node has no environment
+  evidence. The decoder rejects the whole observation when any entry fails,
+  including an entry of a kind the reader doesn't know, so roll cluster-api
+  readers out before nodes that publish a new entry kind.
+- An unavailable or legacy report, or a publication with no execution
+  observation, leaves the arrays alone. Older cluster-api writers don't write
+  them either. Their receipt then stops advancing, so a reader that judges the
+  arrays by `environment_refs_received_at` sees them age out.
+
+Each node's certification of each known environment, its sort key and edges,
+is kept in `node_environment_certifications`, and the catalog row is
+aggregated from those rows. An edge counts while every node whose build knows
+both of its ends certifies it; a build that doesn't know the target abstains.
+So a fleet with several architectures or builds keeps every edge that the
+builds able to judge agree on, and an edge comes back once a node that vetoed
+it upgrades. The catalog row's identity comes from the definition (runtime
+alias, runtime version, kernel version, state format), so the upgrade decision
+can match unbound records against it. Its sort key is the one from the last
+node whose certifications changed. A definition without a kernel or a
+state format gets no row, and so is in no recipe.
+
+A publication recomputes the aggregate only when its node's certifications
+change, under a transaction-scoped advisory lock, so a steady fleet's
+publications write nothing to the catalog. A publication only tries the lock.
+When another node's change or the cluster controller's periodic recompute
+(below) holds it, the publication records the arrays but changes no
+certification or catalog row, withdrawals included, and the node's next
+complete inventory tries again; until then its new build's environments have
+no catalog rows and are in no recipe. Same-node publications serialize on the
+node row lock first, so those are the only two holders.
+
+A node's rows stay until a publication records a complete inventory without a
+valid observation, or until the node is deleted. A node that stops publishing
+but stays registered keeps voting until then. Deleting a node removes its rows
+without recomputing the edges it voted on, so the cluster controller recomputes
+every certified environment's edges every five minutes
+(`environment_edge_recompute`), under the same lock. A tick that finds the
+lock held, or fails, leaves the correction to the next one, so an edge vetoed
+only by a deleted node comes back on the first tick that gets the lock and
+completes. An environment no node certifies any more keeps its last edges, so
+its sandboxes keep their upgrade paths.
+
+Withdrawing a node's votes can widen edges as well as narrow them: a node that
+vetoed an edge and then publishes an observation cluster-api can't decode
+stops vetoing it until it decodes again. That's another reason to roll
+cluster-api readers out before nodes that publish a new entry kind.
+
+Every complete inventory also samples
+`internal_api.runtime_provisioning.recipe_environments`, the size of the
+recipe that node would be assigned, whether or not recipes are served, tagged
+`catalog:known` or `catalog:full` for a node with no known set. node-ctl
+refuses a recipe over 32 environments whole, so alert on the fleet maximum
+approaching 32, and retire environments before it's reached. Only complete
+inventories are sampled: a node whose reports are all legacy or unavailable
+produces no sample, and with no known set its recipe is the whole unretired
+catalog, which can pass 32 while the sampled maximum stays below it. Cover
+those nodes separately before relying on the alert, for example by checking the
+unretired catalog's size against the limit.
+
+Cluster-api replicas built before this writer serve the whole unretired
+catalog, every architecture and build included, to every node in the cohort.
+Keep `SPACE_INTERNAL_API_RUNTIME_PROVISIONING_RECIPE_ENABLED` off until every
+replica runs this build.
+
+### Placing work by environment
+
+`SPACE_ENVIRONMENT_PLACEMENT_GATE` (`off`, `shadow` or `on`; `off` by default)
+decides whether placement reads what nodes publish. Work is bound when
+its record names an environment in `execution_metadata.environment`. For a
+create or a warm-pool adoption that's the binding of the build each
+candidate holds, from its own inventory row, or the template release's when
+the row names none. One content hash can be cached bound to several
+environments (see "Template caches per environment"). Node-ctl publishes one
+build per template, its legacy-partition build when it has one, and Direct's
+create names no environment, so a node whose legacy-partition build is the
+digest runs the build its row reports. A node whose published build of the
+template is another one keeps no row for the digest once its next full
+inventory publish prunes it; one holding the digest
+only in two or more other partitions, and no other build of the template,
+publishes one of them, which needn't be the one its create resolves.
+
+A pull-on-create candidate that holds the digest is gated the same way, by
+its own row's binding, else the release's; a row that names a binding wins
+over one that doesn't, then the exact spelling of the digest. A candidate
+that holds nothing takes the release's binding, else the one every holder
+whose row names a binding reports, and none when they disagree. For a
+restore it's the checkpoint's.
+Unbound work keeps today's placement in every mode.
+
+A node's published environments are evidence only while all of these hold,
+as `pplx_space_node_status_store::environment_evidence` defines them:
+
+- its latest execution inventory report is `complete`;
+- its snapshot is fresh by `stale_after`;
+- its environment arrays were received within the node's freshness window,
+  `stale_after - observed_at`.
+
+For each candidate node and bound piece of work, the gate asks
+`environment_refusal` (in the same store, built from the same conditions)
+whether the node's snapshot is evidence listing the work's environment in
+`usable_environment_refs`, and if not, why not:
+
+| Reason | The node's snapshot |
+|---|---|
+| `no_evidence` | is missing, has no inventory report, or comes from a build that publishes no environments |
+| `incomplete` | has a latest inventory report that isn't `complete` |
+| `stale` | is past `stale_after`, or has arrays older than the freshness window |
+| `environment_not_usable` | is evidence that doesn't list the environment |
+
+- `off` places as before: the mode is a bound parameter, and with it off
+  each clause the gate adds to a candidate statement is either TRUE or
+  reduces to the check it extends.
+- `shadow` places exactly as `off`, and reports what `on` would refuse (see
+  "Environment placement shadow" in [observability.md](observability.md)).
+- `on` places bound work only on a node whose snapshot it doesn't refuse,
+  E0 work included, so a node without evidence takes no bound work. The
+  environment match replaces the state-format major-version comparison for a
+  base-snapshot create or a restore, so a format 12 environment can place on
+  nodes whose legacy inventory lists only format 9. It also replaces the
+  legacy runtime and guest projections (`node_runtime_installations`,
+  `node_runtime_guests`), and for a create or a warm-pool adoption the
+  legacy kernel check, since a node publishes a managed environment's kernel
+  only in its evidence, not in `node_artifact_components`. Every other
+  component the build records is still checked. The last-known create
+  fallback, which tolerates a missing or stale snapshot, places bound work
+  only on a node with evidence. When it refuses every node holding the
+  template, a create that names a build and needs neither a base snapshot
+  nor a pool goes on to the pull-on-create candidates, which a node with
+  evidence can take. A create no holder was refused for fails as it does
+  `off`.
+
+Run a cluster in `shadow` until its would-refuse count stays at zero, then
+switch to `on`. A non-zero count names the nodes and reasons `on` would turn
+away; nodes on a build that publishes no environments count as `no_evidence`
+until they're upgraded. The count covers only what `on` takes away. It can't
+show the nodes `on` adds: one with evidence for the work's environment but
+no matching state format, runtime installation, guest or kernel row, where
+the environment match replaces that legacy check, and, when `on` refuses
+every ready holder, a holder only the last-known fallback returns or a node
+the create then pulls onto.
+
+`node_certifies_upgrade` in `pplx-space-runtime-environment-catalog-store` is
+the companion check for upgrades, which no placement path calls yet: a
+catalog edge `A -> B` can stand while a node's build abstained on it because
+it doesn't know `B`, so a caller choosing a node to run that upgrade on has
+to require the node's own certification row for `A` to list `B`.
+
+#### On Kubernetes
+
+kube-scheduler places sandbox pods, so the evidence reaches it as Node
+labels. node-ctl labels its own Node with
+`space.pplx.net/env-<algorithm>-<digest prefix>=usable` (`environment_label_key`:
+`sha256-` and the digest's first 52 hex digits, to fit a label name) for each
+environment in its latest complete
+inventory's `usable_environments`, by server-side apply under its own field
+manager, so a label it stops sending is removed. A complete inventory with no
+valid observation removes them all; an unavailable one changes nothing. A
+chart that fences node-ctl's Node writes has to allow the
+`space.pplx.net/env-` label prefix, as the Kind chart's `nodeFence` does, or
+the fence refuses every apply and no node carries a label.
+
+While the gate evaluates, each bound pod records its environment in the
+`space.pplx.net/environment` annotation: the template build's binding for a
+create, a warm-pool pod or a materialized on-demand pod (its release's, or
+when the release records none, the one every node holding the build that
+names a binding reports, as for a Direct pull-on-create), the source snapshot's for a fork, which
+boots that snapshot's disk artifact, the checkpoint's for a suspended
+sandbox's restore, and, for a stopped sandbox's start, its current disk
+artifact's. A drain's stopped re-placement takes its pinned disk artifact's.
+A disk's record outlives the node it was written on, and the execution the
+sandbox last published stands in only when the disk records none. With the gate `on`, the pod also requires its
+environment's label in every node-affinity term, so a node without it can't
+take the pod, and a pre-bound restore pod is refused by kubelet. With the
+gate `on`, a binding that can't be read or doesn't parse fails the pod build
+before any pod exists, and on the warm pool it stops that config from growing
+until the next tick and reports the config as failing. In `shadow` it's logged
+and the pod places as with `off`.
+A restore pinned to its source node skips kube-scheduler, and kubelet's
+refusal there is terminal for a restore whose bytes are on that node, so with
+the gate `on` it's refused before any pod exists, as a conflict, when the Node
+reflector shows the source node not publishing the environment. A node the reflector doesn't
+have keeps the pin, with kubelet as the backstop.
+With the gate `on`, a create adopts a warm pod only from a node that publishes
+the environment of the pod's build: a warm pod built while the gate was off
+carries no requirement, and a node can lose its label under a pod it already
+runs. A refused slot leaves the pool, and the warm pool replaces it with a pod
+that requires the label.
+
+The labels say what node-ctl last observed, not how fresh that is: a node
+whose node-ctl stops reconciling keeps its labels. They also don't drop
+retired environments, which the cluster filters out of
+`usable_environment_refs` only.
+
+On Kubernetes, `on` fails startup for now (see "Not covered"), so what
+follows describes what it does once it's supported. It has no fleet-wide
+fallback and no E0 exemption. If every node lacks the
+labels at once, as on a new cluster or after node-managers roll out an
+observation this node-ctl can't decode, kube-scheduler can place no new bound
+pod, E0 included, and every restore pinned to its source node is refused: by
+the API before its pod exists when the Node reflector has the node, and by
+kubelet otherwise. A pod kubelet refuses fails, and neither census gauge
+counts a failed pod, so the census misses those restores. Pods already
+running keep running and count as `no_evidence` in
+`environment_placement.running_pods`, and the pods held back count as
+`no_evidence` in `environment_placement.pending_pods` (see "Environment
+placement shadow" in [observability.md](observability.md)). Switching the
+gate to `shadow` stops new pods from requiring the label.
+
+#### Not covered
+
+On Kubernetes, `on` fails startup with `SubstrateError::Unsupported` until the
+worker takes the pod's environment as its cache-partition preference. Today a
+Kubernetes create passes no preference, so template-manager boots the digest's
+legacy-partition build when the node holds one, whatever environment the pod's
+affinity required: a node that publishes the required environment can boot
+another environment's build of the same digest. A runtime-upgrade activation's
+pod also requires the recorded environment rather than the upgrade's target.
+`shadow` runs: it records, labels and counts without changing placement.
+
+The gate doesn't yet:
+
+- align the build a Kubernetes worker boots with the environment its pod
+  requires (above);
+- gate a Kubernetes pod whose release records no binding while the nodes
+  holding its build report different ones. Direct gates each candidate by its
+  own inventory row, but a pod requires one label, so with no agreed binding
+  it places as unbound work;
+- cover Kubernetes runtime-upgrade pods. The API renders none yet; when it
+  does, such a pod's environment is the upgrade's target, not its
+  checkpoint's producer;
+- read the cluster's execution policy or exclude a node lagging a narrowing
+  policy change;
+- admit a restore whose checkpoint loads under another environment through a
+  memory edge. It requires the producer to be usable, which is all a restore
+  can use until a memory edge is certified.
+- distinguish restore readiness from cold-boot usability. A node lists an
+  environment as usable when it can cold boot it, which a restore doesn't
+  need: per "Restore inputs" above, a node whose local kernel image is
+  missing or damaged can still load a checkpoint. With the gate on, such a
+  node takes no bound restore; the checkpoint restores on another node with
+  evidence from durable storage, or, if it's held only on that node, waits
+  until the kernel is repaired. Shadow counts these candidates under their
+  own reason, `restore_not_cold_bootable`, so a soak shows how often `on`
+  would hold one back. The remote restore statement returns a random sample
+  of its candidates, which is what shadow counts, while `on` refuses before
+  sampling.
+- impose a binding on a pull to a node that holds nothing when the release
+  records none and the holders that report one disagree. Such a pull places
+  as `off` would, and shadow can't count it.
+
+Node admission rechecks every placement, since published evidence isn't a
+reservation.
+
 ### Cluster desired policy
 
 Cluster policy lives in the control-plane tables `runtime_environment_policy`
@@ -955,8 +1248,8 @@ resolve to, or an enabled pool config pins it, which keeps creating slots. An
 in-use release counts when it's bound to an environment that stops, or when its
 environment can't be told, since new creates from it may run there. A superseded
 release doesn't count: it strands work only through the sandboxes made from it,
-which do count. Nor do sandboxes that can't run again: `cleanup_required` and
-`deleting` ones, and failed ones with no evidence the repair loop reads as live
+which do count. Nor do sandboxes that can't run again: `deleting` ones, and
+failed ones with no evidence the repair loop reads as live
 (an observation with a non-failed status, a pid or a node assignment, or an
 execution still active or holding a pod IP) that the repair loop, which runs
 only on Kubernetes, has nothing to revert to. Later defaults stop nothing, and
@@ -965,7 +1258,10 @@ checked, unless another policy write lands while the block waits for the lock.
 Both writes take an optional `If-Match: <generation>` (`--if-generation` in the
 CLI) and answer 412 without changing anything unless the policy is still at
 that generation, so an operator writing from a stale read can't undo another's
-change, such as re-allowing an environment that was just blocked.
+change, such as re-allowing an environment that was just blocked. A write
+that commits also queues a reconcile on every worker and builder node, except a
+Direct node without a live registration, so they apply it within trigger latency
+(see "Node runtime provisioning").
 `GET .../nodes` compares each node's published policy with the cluster's, a page
 of 100 nodes at a time, and `GET .../population` counts sandboxes and template
 releases per environment binding. Node status reports the generation each node
@@ -1149,7 +1445,7 @@ discards its memory, so it needs everything above whether or not the state
 format changes; E0 → Firecracker 1.17.0 / Linux 6.1.155 also changes it, from
 9.0.0 to 12.0.0. The compiled catalog records which of these same-kernel
 cold-boot moves are certified, as upgrade edges. `CERTIFIED_UPGRADE_EDGES` in
-`crates/libs/execution/catalog/src/catalog/environment.rs` lists them, and
+`crates/l40_api/execution/catalog/src/catalog/environment.rs` lists them, and
 `CompiledEnvironment::upgrade_targets` exposes each environment's targets.
 Listing a pair is the certification decision. An edge must change the runtime,
 and its target must pass the environment-level cold-boot source check
@@ -1258,7 +1554,9 @@ blocking cold `Start` to run, and whether the sandbox ends started or stopped.
 
 A retry with the same operation id resumes from the row: an interrupted upgrade
 rolls back and starts again, and a verified one finishes its retirement. A
-rolled-back upgrade leaves no row, so a retry after it starts over. An upgrade
+rolled-back upgrade leaves no row, so a retry after it starts over. Its failure
+stays in `sandbox_runtime_upgrade_outcomes`, as does an upgrade that found the
+sandbox already on its target, for `GetRuntimeUpgrade` below. An upgrade
 that must end stopped leaves the sandbox as it finds it if the sandbox stopped,
 suspended or started another execution first. A
 sandbox-manager recovery loop settles unfinished upgrades at startup and every
@@ -1269,19 +1567,115 @@ or the sandbox stops some other way. Deleting the sandbox deletes its
 upgrade rows; evicting it removes the preserved copy with the rest of its local
 presence, and the upgrade fails at its next claim.
 
+### Booting an upgrade in its pod
+
+On Kubernetes a sandbox's microVM launches in its pod's containerd shim at
+container create, never from a Wake, so an upgrade has to boot there too. A
+Wake carrying `runtime_upgrade` is refused with `FailedPrecondition`, before
+anything is staged, fenced or booted, when its route identity or the
+sandbox's local row names a Kubernetes pod; Direct keeps its Wake path. The
+pod carries the upgrade instead, and this is the node half of that: the api
+doesn't render it yet.
+
+- **Pod.** A restore pod's `space.pplx.net/checkpoint` is `runtime-upgrade`,
+  and `space.pplx.net/runtime-upgrade-*` annotations carry the operation id,
+  the target environment, the authorization's id, reason and memory-loss
+  consent, the target state (`started` or `stopped`), and for a suspended
+  source the local artifact of the checkpoint the upgrade was decided from
+  (`PodRuntimeUpgrade` in `crates/libs/common/core/src/k8s/runtime_upgrade.rs`).
+  The restore's storage URI and source node stay where they are.
+- **Shim.** The shim builds the `Start` it would send, with the pod's
+  namespace and route identity, as the blocking cold start the upgrade boots,
+  and calls `UpgradeRuntime` with it. For a suspended source the storage URI
+  and source node become `stage_from`. Any error fails the create; the shim
+  never falls back to a `Start`, which would boot the environment the upgrade
+  moves off. A started target attaches the execution the response returns. A
+  stopped target runs a placeholder task with no microVM, the one a stopped
+  materialization runs, so `Kill` and `Delete` never ask sandbox-manager to
+  suspend or delete the stopped sandbox, and exec, pause, resume and
+  checkpoint are refused.
+- **`UpgradeRuntime`.** Under the sandbox's upgrade lock, a suspended sandbox
+  absent from the node is staged from `stage_from` and left suspended, never
+  launched; a stage interrupted after it adopted the row is resumed the same
+  way. A suspended copy pinning another checkpoint is replaced first (see
+  "Dispatch" under "Upgrading at resume and start"). A suspended
+  sandbox is then upgraded only from the checkpoint
+  `checkpoint_local_artifact_id` names, which the upgrade checks for the RPC
+  and the Wake alike. For a started target the response always carries the
+  running execution. A sandbox already on the target is activated in place: a
+  stopped one cold-starts with the request's start and a suspended one
+  restores its checkpoint, so the pod needs no second RPC. An operation
+  starts the sandbox at most once: the start is claimed durably before it
+  runs, with the node execution the sandbox has then, and a retry starts it
+  again only while the sandbox is still at rest on that execution, as after a
+  start refused before its activation claimed the sandbox. The activation's
+  claim checks that execution too, so an ordinary start and stop in between
+  is never undone. An operation answered with the execution already running
+  records that answer instead, and a retry after a later stop never starts
+  the sandbox. The node keeps that record as long as it
+  keeps the sandbox. A sandbox already started, a replay of
+  an upgrade that already finished, and a retry of an activation answer with
+  the live execution only when its route identity names the same pod (pod UID
+  and execution generation), or to a caller that names no pod, such as an
+  operator upgrading a Direct sandbox, and are refused with
+  `FailedPrecondition` otherwise. A stopped target already reached, or
+  replayed, is answered only for a sandbox at rest; one that runs is refused.
+  A Wake replaying a retired upgrade is refused once the sandbox holds another
+  checkpoint than the one the upgrade names, even one the target produced:
+  the retry needs a new operation id. A replay never moves the
+  sandbox, and a retry must name the
+  sandbox, target and authorization the operation's recorded outcome names,
+  as for a live row. An operation that found its sandbox on the target never
+  boots it on a replay; one that finds the sandbox moved since is refused. An
+  operation id names one upgrade of one sandbox across both tables.
+  `GetRuntimeUpgrade` reports the upgrade's outcome, not the pod's: read it
+  with the pod's status.
+- **`GetRuntimeUpgrade`.** The shim's response doesn't reach the control
+  plane, which reads the outcome from this read-only RPC instead: absent, in
+  progress (with its phase), upgraded, rolled back (with its failure) or
+  already on target. Node-api forwards it on `WorkerApiInternal` only for a
+  caller with the control-plane authority a policy write needs.
+
+Only the control plane writes sandbox pods, and the annotations are the
+upgrade's authorization: a principal that can create a sandbox pod can request
+an upgrade, including one that discards a suspended sandbox's memory. The
+node still refuses any move that isn't a certified edge from the environment
+the sandbox ran under. The shim calls sandbox-manager as root, which
+`UpgradeRuntime` allows.
+
+The shim and sandbox-manager ship before the api renders the pod, and every
+node's sandbox-manager must be from this release first: an older one ignores
+`stage_from` and `checkpoint_local_artifact_id`, so it would upgrade whatever
+copy of a suspended sandbox the node holds. A shim that
+predates the checkpoint passes `runtime-upgrade` through as a `Start`
+checkpoint, which sandbox-manager refuses for a local row in any state and for
+a sandbox absent from the node, so the pod fails without booting anything. A
+sandbox-manager that predates activation answers `ALREADY_ON_TARGET` with no
+execution, and the shim fails the create.
+
+A sandbox-manager from this release applies the
+`sandbox_runtime_upgrade_outcomes` migration at startup, and an older one
+refuses a database whose migration history holds a version it doesn't bundle.
+So a rollback build reverts the code but keeps that migration, its files under
+`db/sandbox-manager/` and its entry in the store's migration list, as
+`db/README.md` requires of any binary rollback. The table only adds rows, and
+nothing older reads it.
+
 ### Upgrading at resume and start
 
 On Kubernetes, the control plane can decide a runtime upgrade when a stopped
 sandbox starts or a suspended one resumes, before it dispatches the activation.
 `SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` turns it on; it's off by default,
 and off, every start and restore proceeds as recorded. The decision lives in
-`crates/libs/api/src/controllers/substrate/runtime_upgrade.rs`, and the
+`crates/l40_api/api/src/controllers/substrate/runtime_upgrade.rs`, and the
 Kubernetes substrate runs it from its stopped-start path and from every
 restore into the started lifecycle: user resumes, connect-time wakes and
 started recovery. A drain's evacuation restore keeps the sandbox's
 environment. Direct doesn't decide upgrades. Edges come only from
-`runtime_environments`, which nothing writes yet, so until node publications
-populate it, every move off an environment that may not execute is stranded.
+`runtime_environments`, which node publications populate (see "Recording
+environment observations"), so until nodes on a build that publishes
+observations have reported, every move off an environment that may not execute
+is stranded.
 
 1. **Evidence.** A resume reads the producer of the checkpoint it would load,
    which the restore plan already chose: the full `snapshots` row at the
@@ -1348,16 +1742,84 @@ populate it, every move off an environment that may not execute is stranded.
    normally, where its execution policy refuses a runtime that may not run.
    Node-api serves Wake only on `WorkerApiInternal`, and forwards
    `runtime_upgrade` only for a caller with the control-plane authority a
-   policy write needs.
+   policy write needs. A Kubernetes sandbox launches in its pod's shim,
+   though, which never sees this Wake, so sandbox-manager now refuses the
+   field for a Kubernetes route identity (see "Booting an upgrade in its
+   pod"), and with the flag on these activations fail until the api moves
+   them onto the pod.
    A suspended sandbox's checkpoint on the node is booted only if it's the
    one the upgrade was decided from: the Wake names that checkpoint's local
    artifact, and the row must pin it, as it does on the checkpoint's source
    node and after staging, so the check holds across retries. An upgrade of a
-   suspended sandbox that names no checkpoint is refused. A stale copy is
-   refused with `FailedPrecondition` and left alone, where a plain restore
-   would have staged the chosen backup over it. Staging an encrypted
-   checkpoint writes no plaintext rootfs, so an encrypted sandbox restored
-   away from its checkpoint is refused before the fence.
+   suspended sandbox that names no checkpoint is refused. A stale copy, a
+   suspended row pinning another checkpoint, is refused with
+   `FailedPrecondition` on the Wake, which carries only a Direct sandbox's
+   upgrade, and left alone. For a Kubernetes sandbox's `UpgradeRuntime` with
+   `stage_from`, it's replaced: if the pinned artifact is proven backed up, by
+   its local backup marker or the cluster's exact-artifact readiness check as
+   eviction proves it, sandbox-manager evicts the copy through the eviction
+   executor, stages the named checkpoint in its place and upgrades that.
+   An unproven copy may be the only one of something, so it's refused with
+   `FailedPrecondition` before any node work, as is an unpinned one, one the
+   named checkpoint wasn't captured after (the decision is stale, and staging
+   it would roll the sandbox back) and an encrypted one. Which checkpoint is
+   newer isn't read from the checkpoint ids, whose order depends on the clocks
+   of the nodes that minted them, nor from which backup registered last, since
+   a re-upload registers an old checkpoint again. A backup registration
+   records the generation of the execution that captured the bytes
+   (`snapshots.generation`) when the node has evidence it's the capture's
+   own: the running execution just took the capture, the record the
+   capturing teardown published with it names it, or an earlier upload of
+   the same bytes recorded it so
+   (`BeginArtifactBackupRequest.execution_generation_names_capture`). A
+   generation the node only infers fences the registration but records
+   nothing: one from a teardown still running when it re-uploads an
+   unrecorded capture, or one startup recovery recorded. A teardown that
+   crashed before publishing leaves the previous capture in the canonical
+   directory, and recovery adopts it under the active teardown's generation,
+   so its record fences without ordering, as do records written before the
+   two were told apart. Recovery keeps a record the capturing teardown wrote
+   for the same capture and generation before the node went down. After proving the copy's backup ready the
+   node asks cluster-api whether the named checkpoint's ready backup was
+   captured by a later execution than the copy's (`BackupReadinessQuery`'s
+   `captured_after`). Only a yes replaces the copy. A backup that records no
+   capture generation answers no, as do backups registered before
+   generations were recorded: those copies are refused, as every copy pinning
+   another checkpoint was before replacement existed. A Direct sandbox's
+   captures run under no execution generation, so its copy is refused that
+   way without the cluster being asked. The eviction's claim is taken under
+   the sandbox's artifact lock, without waiting for it: a backup being
+   admitted holds it off, and one admitted behind it finds the row on its
+   way out and backs up nothing. The eviction deletes every local artifact
+   of the sandbox, so each other one without a backup stamp, a named
+   snapshot say, is first proven backed through the cluster and stamped, and
+   the copy stays while any isn't; the claim re-checks that none is left
+   unstamped. A request whose
+   stage would be refused for its form or its route identity, whose
+   generation the row already retained, or whose authorization doesn't
+   accept memory loss, deletes nothing; the upgrade's
+   edge check reads the staged checkpoint, so it runs after the stage. A
+   row that rolled back an activation keeps that activation's claim open, and
+   the claim is how each later attempt of it is asked whether its execution
+   was retired; removing the row closes it, and a retry after that would go
+   unasked. So a request retrying that activation deletes nothing, and the
+   copy is refused as it was before replacement existed, until a new
+   activation replaces it. A copy
+   another upgrade still fences or owes a retirement is left to that upgrade
+   with a retryable 503, one with an artifact upload pending, running or cancelling is
+   refused as retryable until the upload settles (when that upload is the
+   pin's own backup, the pin isn't proven yet, and it's refused as unproven
+   until the backup lands), and a sandbox the
+   operation already recorded an outcome for is left to that record. Once the
+   copy is gone the sandbox is absent, so a retry stages it as it would any
+   absent sandbox; the eviction's claim re-asserts the row's activation
+   generations rather than its `updated_at`, which is kept in whole seconds;
+   a cleanup that fails after the eviction's claim leaves the
+   row's cleanup failed, with its delete intent kept, until the cleanup
+   machinery finishes it. Staging an
+   encrypted checkpoint writes no plaintext rootfs, so an encrypted sandbox
+   restored away from its checkpoint is refused before the fence, and an
+   encrypted stale copy is left in place.
 
 While an upgrade holds the sandbox, other activations get the retryable 503
 the restore and activation leases already give, and a Wake that meets the
@@ -1377,13 +1839,16 @@ to node-manager, and installation never reads it. The cluster authenticates the 
 existing origin check before answering.
 
 While `SPACE_INTERNAL_API_RUNTIME_PROVISIONING_RECIPE_ENABLED` is on, the cluster
-API assigns workers and builders in the provisioning cohort a recipe of every
-environment in the `runtime_environments` catalog that isn't retired, read
+API assigns workers and builders in the provisioning cohort a recipe of the
+environments in the `runtime_environments` catalog that aren't retired and that
+the node's last complete inventory lists in `known_environment_refs`, read
 through the catalog store in
-`crates/libs/execution/runtime-environment-catalog-store`. Each row is an
-environment a node build has published as certified, and an operator retires
-one by setting `retired_at`. Nothing records node publishes in the catalog yet,
-so until that writer lands an enabled cohort receives an empty recipe and
+`crates/l30_storage/runtime/environment/catalog/store`. A node that hasn't
+reported a known set gets every unretired environment: NULL comes from a build
+that predates observations, or from an observation that failed to decode. Each
+row is an environment a node build has published as certified, and an operator
+retires one by setting `retired_at`. Until a node on a current build publishes,
+the catalog is empty, so an enabled cohort receives an empty recipe and
 installs nothing. The recipe ignores execution policy: an environment
 with no state, or a blocked one, stays installed, so a later policy change finds
 it already in place. That's what lets a 0-day on an already-certified
@@ -1441,9 +1906,29 @@ catalog. While the catalog is over it, the cluster API omits the recipe, still
 serves the policy, and logs an error on every call, so no node installs anything
 new until environments are retired. Retire them before the catalog passes it.
 
-A change to the catalog or the policy reaches nodes on their next periodic tick.
-Its writer is where a `RUNTIME_PROVISIONING` reconcile trigger belongs, enqueued
-in the same transaction, to reach them within trigger latency instead.
+A policy write through the admin API queues a whole-facet `runtime-provisioning`
+ref and a reconcile trigger for every worker and builder node in the write's own
+transaction, so a committed change reaches them within trigger latency, and a
+refused write, or one rolled back because its enqueue failed, queues nothing. A
+commit error is ambiguous: the write and its enqueue may still have landed. A
+`runtime-provisioning` ref already queued on a node, even one backing off after
+failures, is queued again as a new request and is due at once; one the node
+holds a claim on runs again once the claim is released or goes stale. A Direct
+node without a live registration isn't queued, and a node the trigger misses
+still gets the change on its next periodic tick. The trigger carries the existing `node_updated` reason, because
+a controller that decodes reasons strictly fails every claim batch holding a
+`state_reconciliation_reason` value it doesn't know. Claims skip unknown values
+from this change on, so a dedicated reason can follow once no controller you
+could roll back to predates it. A catalog change still waits for the next
+periodic tick; its writer is where the same enqueue belongs.
+
+Node-ctl and the internal API read a queued `runtime-provisioning` ref only
+from PR #900 on. An older node-ctl drops a claim holding one without
+completing it, and an older internal API fails the claim, so the ref never
+dead-letters and that node's cluster reconcile queue stalls until the ref is
+gone; periodic passes still converge. Before the first policy write, run
+node-ctl on every node and every internal API replica at a release from PR #900
+on, and don't roll either back below it while such a ref is queued.
 
 Node-ctl validates the complete recipe's size, reference syntax and uniqueness
 before submitting work. It expands host-supported compiled environments into
@@ -1504,6 +1989,312 @@ policy and retain compatibility checks at node admission. Retirement and garbage
 collection require a separate reference-aware operation; recipe omission alone
 never grants deletion authority.
 
+### Template cache recovery
+
+A template-manager build directory `{name}/{content_hash}` without a catalog row
+isn't served: a pull doesn't adopt or write into it, and fails retryably
+instead. A pull reads the release's binding before it picks a directory, so
+it refuses only when the directory of that binding's partition exists or
+can't be checked. A directory without a row in another partition of the
+digest, such as a twin recovery keeps, doesn't block it, and the pull leaves
+that directory alone. Such a directory is left when a read during startup recovery fails
+in a way that can clear, when a permanently invalid build's base snapshots
+or build directory can't be removed (its row goes, what's left stays), when
+a stuck
+eviction's repair or an eviction that couldn't remove its whole directory
+drops the row over what's left, or when a pull stops before registering. Pulls, imports,
+registration, background compression, `DeleteTemplateBuild`, eviction (the GC
+tick's and `DeleteIdleTemplate`'s), the publish step of a base-snapshot
+capture, startup recovery's per-directory check and the GC tick's check below
+each hold the digest's one claim while they write or remove its directories
+and rows, and `DeleteTemplate` holds one for the whole template, so no two of
+them hold the same digest at once. A registration copies and hashes its rootfs
+in staging before it claims, so it can overlap `DeleteTemplate`, and then
+fails. An eviction holds the claim from before it marks a build `deleting`
+until its row is gone, and doesn't wait for it: the GC tick leaves a build
+whose digest someone holds for a later tick, and `DeleteIdleTemplate` keeps the
+template and refuses with a retryable `ABORTED`. A base-snapshot capture runs
+without the claim, since it takes minutes, then waits for it to publish: if
+the build's row in its partition went meanwhile, or is still `deleting`, it
+records no snapshot and removes the captured files. The publish runs in its
+own task, so it finishes even when the capture's own timeout fires while it
+waits. Startup recovery skips a
+digest someone holds during its scan, then waits for each one and checks it if
+the directory is still there.
+
+Each template-cache GC tick runs startup recovery's check on a few build
+directories without a row: a valid one gets its row back, a permanently invalid
+one is removed, and one whose read still fails waits for a later tick. An
+invalid build a sandbox still depends on isn't removed, as eviction and
+`DeleteTemplateBuild` don't remove one either: the row of its partition goes
+and its directories wait for a later check, as they do when sandbox-manager
+can't be asked. Each startup recovery pass and each GC tick asks
+sandbox-manager at most once, waiting up to 5 seconds, and applies that
+answer, or its absence, to every directory it checks. Sandbox-manager names a build by template and content hash, so
+a sandbox that depends on a digest keeps every partition's build of it.
+Startup recovery's check follows the same rule, for every rejection, including
+a directory whose binding disagrees with its partition. A restored build's base
+snapshots are registered with its row, from its partition's snapshot directory
+and in its partition; if they can't be read or recorded, the build is served
+without them and each tick retries them until they register. Each tick takes up
+to two directories, in name order from just after the last one it examined, so
+with a stable set of N such directories every one is examined within `ceil(N /
+2)` ticks, however many keep failing, as long as each check and each retry of
+snapshot registration finishes within its wait. A check or retry still running
+past its tick keeps one of two slots shared across ticks, and a tick starts a
+check only while a slot is free; retries of snapshot registration, up to two a
+tick, take those slots first. While checks and retries left running hold both
+slots, no tick starts a check. With two checks and two
+retries each waited on for up to 10 minutes, a tick on a slow disk can start its
+eviction pass up to 40 minutes late. A create from such a build fails until a
+check restores its row or removes it, or until `DeleteTemplateBuild`, which also
+accepts a digest whose only trace is such a directory or a leftover
+base-snapshot directory, removes it. As with a build that has a row,
+`DeleteTemplateBuild` refuses while a pool references the template. The check
+runs on the GC interval even with template-cache eviction disabled.
+
+
+### Template caches per environment
+
+A content hash names rootfs bytes, not an environment, so template-manager
+caches one rootfs once per environment it's bound to. Each such build has its
+own manifest, base snapshots, btrfs subvolume and `received_uuid`, and its own
+rows in the build, component, base-snapshot and tag-pin tables, keyed by a
+cache partition:
+
+| Build | Partition key | Build directory |
+|---|---|---|
+| Unbound, or bound to the Linux/x86_64 initial environment (E0) | empty | `{name}/{content_hash}` |
+| Bound to any other environment | its reference | `{name}/{content_hash}@{environment}` |
+
+Base snapshots live under `{name}/snapshots/<build directory>/`. E0 shares the
+legacy partition because it was the only environment nodes executed before
+partitions existed: existing rows, directories and stamped `received_uuid`
+values keep their identity, and the migration rebuilds the tables without moving
+data. A build's binding is its manifest's execution metadata, else its
+metadata's, which registration copies into the manifest. Registration, import
+and pull file a build under the partition of that binding, and `upsert_build`
+refuses a row whose partition disagrees with its binding, with one exception:
+the legacy partition. A node that admitted another environment before
+partitions existed holds that environment's builds in the legacy layout, often
+under running and suspended sandboxes, and startup recovery adopts each one in
+place. It stays at `{name}/{content_hash}`, filed in the legacy partition with
+its row, base snapshots and stamped `received_uuid`, so a restore whose stream
+names it as its parent finds it, and a rollback to a release without
+partitions serves it unchanged. Its environment's lookups resolve it through
+the legacy fallback, so nothing is pulled again. Recovery drops a
+`{content_hash}@{environment}` directory, which only a release with partitions
+creates, when its binding names another partition or is invalid for its
+schema, and keeps one bound under a schema this release doesn't support yet,
+as a transient rejection: its row goes and the directory stays for a release
+that can read it.
+If a build's base snapshots or directory can't be removed, its row goes and
+what's left waits for the GC tick's check. While a sandbox depends on a digest
+recovery would remove, such as a suspended sandbox whose restore names it as
+its parent, or while sandbox-manager can't be asked, only its row goes: the
+directory stays, without a row, until a GC tick's check finds nothing depends
+on it.
+Startup recovery never deletes an installed build over a read that can clear:
+when reading its manifest or `metadata.json`, stating its files or hashing its
+bootable artifact fails with such an I/O error, it drops the build's row, keeps
+its directory, and logs a warning naming the build and the error. A missing file, invalid UTF-8 and a path of the
+wrong type, a loop or an invalid name don't clear. A build without
+`metadata.json`, or with an empty one, has no metadata, as registration
+installs it; one that reads but doesn't parse can't prove its binding and is
+removed, as a manifest that doesn't parse is. A permission error counts as
+one that can clear: a deploy that can't read the cache would otherwise delete
+every node's builds, including twins, which can't be pulled back. A pull
+doesn't adopt or write into a build directory that has no row in the
+partition its release lands in: it fails retryably and leaves the directory
+alone. A directory without a row in another partition doesn't block it. Pulls, imports, registration,
+`DeleteTemplateBuild` and the GC tick's check below all hold the digest's one
+claim while they write or remove its directories and rows, so none of them
+overlaps another; startup recovery skips a digest someone holds during its
+scan, then waits for each holder and checks the dir if it's still there.
+Leftover import, partition-probe and republish staging
+directories are removed before template-manager's socket binds, while nothing
+can own one, never once requests flow. Each template-cache GC tick runs
+startup recovery's check on a few build directories without a row, whether
+recovery dropped the row, a stuck eviction's repair did, or a pull stopped
+before registering: a valid one gets its row back, a permanently invalid one
+is removed, and one whose read still fails waits for a later tick. Each tick
+takes two directories, in name order from just after the last one it examined,
+so with N such directories every one is checked within `ceil(N / 2)` ticks,
+however many keep failing, as long as each check and each retry of snapshot
+registration finishes within its wait. A create from such a build fails until then, or
+until `DeleteTemplateBuild`, which also accepts a digest whose only trace is
+such a directory, removes it. The check runs on the GC interval even with
+template-cache eviction disabled.
+
+`TemplateRef.environment` is a preference: a lookup returns the build in
+the selected environment's partition, else the legacy build, else any other
+build of the digest. Absent, it prefers the legacy build, so
+environment-unaware callers keep their behavior; E0 selects the legacy
+partition. A lookup of a template's latest build returns the newest build of
+any partition, as before partitions existed. New tie-breaks send same-date
+builds to the larger content hash, and builds of one digest to the preferred
+partition, then the legacy one. The caller checks the build it gets as a
+compatible cold-boot source for the environment it runs under, which keeps
+compatible selection working when the selected environment has no build of
+its own. Sandbox-manager starts a sandbox preferring the build of its saved
+binding's environment, and checks the disk and boot inputs against that
+binding. A cache miss pulls the
+release without a selector: the pull reads the release manifest and metadata
+before choosing a directory and reuses those bytes. Responses echo the resolved
+build's environment. `ListTemplates` reports each build's partition key in
+`TemplateFullInfo.cache_partition`, and sandbox-manager's template catalog
+reads a build's supplemental `metadata.json` from the directory that key names,
+not its binding's, so an adopted build's metadata comes from its legacy
+directory. A template-manager without partitions leaves it unset, and the
+catalog reads the legacy directory.
+Every partition of one digest holds the same rootfs bytes, but only a row says
+a build directory holds them in full. Sandbox-manager's rootfs deltas, for
+sandbox and snapshot export and import, take their base from a
+`GetTemplate` lookup with `cached_only` set, which answers from a ready row
+and never pulls; with no such build, an export sends the full rootfs and a
+delta import is refused.
+Node-manager's template subvolume RPCs carry a partitioned build in
+`EnvironmentTemplateBuild` and leave the legacy `content_hash` empty, so an
+older node-manager rejects them rather than acting on the legacy build.
+`DeleteTemplateBuild` removes every partition of a cached hash that has a row,
+a build directory or a base-snapshot directory, and rejects a selector. It
+takes the digest's claim before touching anything: it refuses with a retryable
+`ABORTED` while a pull, import, registration, eviction or GC check of the
+digest holds it. While it runs, an import, registration or pull of the digest waits for it
+to finish, so a
+registration racing a delete either lands its build after the delete or holds
+the delete off. The delete never reports success while the build is still
+cached. It removes artifacts before rows, so one that fails between the two
+leaves rows without their directories; a retry finishes it, and startup
+recovery prunes rows whose artifacts are missing. Tag and release pins protect a digest in every partition, and a pull
+is refused with a retryable error while any partition of its digest is being
+evicted.
+
+Base-snapshot reconciliation runs per partition: each partition's newest build
+of a template gets its own snapshot. The legacy partition's newest build can be
+an adopted one bound to another environment; another environment's partition
+skips a row whose binding names a different partition. A build outside the legacy partition is
+captured through sandbox-manager's environment create path, so it cold-boots
+under its own environment, and a node that doesn't admit that environment
+refuses the capture. A rebuilt legacy snapshot invalidates the template's pool
+sandboxes, as before partitions. Another partition's snapshot invalidates only
+the pool sandboxes that booted that partition's build, as each one's execution
+reports it, and any whose partition can't be read.
+
+Pool selection, described below for Cloud Hypervisor, looks at every partition.
+Of the eligible builds it takes a Firecracker build first, then one in the
+legacy partition, then the newest, so a template with an E0 Firecracker build
+keeps booting it. Pool creates and clones reach sandbox-manager without an
+environment, and its lookup of a digest returns the row with the lowest
+partition key, legacy first. So of each digest's rows only that one can be a
+pool's build, which keeps every lookup on the build the pool chose. A legacy
+row can be one whatever its binding, since startup recovery adopts
+legacy-layout builds in place; a row in another environment's partition whose
+binding names a different partition never is. A refill records the use
+on the chosen build in its own partition. With nothing cached, a refill names
+no build, so sandbox-manager resolves and pulls the template's latest release
+for the first member.
+
+Deploy sandbox-manager, build-manager and node-ctl no later than
+template-manager. A sandbox-manager that predates partitions reads and writes
+only legacy directories: it publishes the base snapshot of any build bound to
+another environment into the legacy snapshot directory, which for a twin
+overwrites the legacy build's snapshot and otherwise leaves the capture
+unrecorded, and its rootfs deltas and transfers miss builds outside the legacy
+partition. A template-manager that predates `cached_only` ignores it and
+answers without the `cached_only` mark, so until it upgrades a newer
+sandbox-manager's delta-base lookup of an uncached digest pulls it, and no
+answer yields a delta base, cached build or not: sandbox and snapshot exports
+send the full rootfs, and delta imports fail with `FAILED_PRECONDITION`, so
+transfers into that node must be full. The other way round, a new sandbox-manager publishes a capture under the
+partition template-manager names, and under the legacy one when an older
+template-manager names none, which is where that template-manager looks.
+Node-manager can deploy in either order: an older one refuses partitioned
+subvolume requests, and a pull into another environment's partition lands in a
+plain directory, as on a host without btrfs. Sandbox-manager names a bound
+sandbox's parent partition in the btrfs codec requests beside the legacy
+`content_hash`, which an older node-manager resolves instead; for a sandbox
+booted from another partition, its suspend then falls back to the Full codec
+and its disk snapshots fail until node-manager upgrades and that build is a
+subvolume (a build pulled while node-manager couldn't create subvolumes stays
+a plain directory until it's re-pulled). A new node-manager's encodes take the
+named partition's build or the legacy one, whichever the sandbox descends
+from, and never another partition's: a restoring node holds one of those two
+but may not hold a third, so a sandbox that booted any other build suspends
+with the Full codec. Its receive also considers the digest's other cached
+partitions, since an older stream may name one, and takes the candidate whose
+stamped received UUID is the stream's parent, read from the stream's first
+command; with none, the restore fails as a precondition instead of reaching
+`btrfs receive` with the wrong parent. An older build-manager publishes
+a build bound to another environment from the legacy directory, which no longer
+holds it. An older node-ctl publishes a template's last listed build, which can
+be a twin.
+
+Roll back in the reverse order, template-manager before or together with the
+others. A template-manager released while this migration was withdrawn
+reverses it at startup when every build, tag pin and unfinished stamp job is in
+the legacy partition, so rolling back to one needs no database step;
+`db/README.md` describes the check and a read-only query that runs it. Remove
+the directories listed in step 3 first: the check counts rows, not
+directories. A database with environment-partition rows, or a rollback to a
+release that predates the migration, needs the procedure below: such a
+template-manager refuses the migrated database, and its migrator doesn't
+bundle the migration.
+
+1. Stop template-manager on the node and keep the new version from restarting:
+   at startup it re-applies the migration. Stop sandbox-manager too, and keep a
+   new sandbox-manager stopped until the older template-manager is running:
+   one can publish a `snapshots/{hash}@{environment}` directory after step 3,
+   which the older template-manager's first startup would register under an
+   invalid hash. Template-manager still rolls back before or with the others.
+2. While it's stopped, copy the template-manager database with its `-wal` and
+   `-shm` files. If the rollback fails, restore all three together and
+   redeploy the new template-manager. The directories removed in step 3 aren't
+   restored; their builds re-pull on demand, and twins of published releases
+   must be rebuilt. A btrfs-send suspend or disk snapshot encoded against a
+   `{hash}@{environment}` parent can't be restored once step 3 removes it: an
+   older release never stamps that parent's received UUID, so rolling back
+   loses such snapshots. Before removing anything, check the database's own history, since the
+   migrator's `status` lists only migrations its catalog bundles and would
+   omit a newer applied one:
+   `sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` must
+   print `20261026220935`, and
+   `sqlite3 -readonly <db> "SELECT version FROM _space_common_schema_migrations WHERE version > 20260930000000"`
+   must print nothing. If either check fails, stop: this procedure doesn't
+   cover that database, and no directory has been removed yet.
+3. Under the template cache root (`TEMPLATE_DIR`), remove each
+   `{name}/snapshots/{hash}@{environment}` directory, which the older
+   template-manager would register as snapshot rows of an invalid hash, and
+   delete each `{name}/{hash}@{environment}` build directory and each
+   `{name}/{hash}@{environment}.replaced.{uuid}` directory a replaced build
+   left behind; the older template-manager never sees or evicts them. On a
+   btrfs host most are read-only subvolumes: delete a directory for which
+   `btrfs subvolume show <dir>` succeeds with `btrfs subvolume delete <dir>`,
+   and remove any other, a plain directory left on a host without btrfs or by a
+   pull whose subvolume request failed, with `rm -rf <dir>`.
+4. Run a migrator that bundles this migration, last: once it commits, an older
+   template-manager can open the database. Run
+   `space-db-migrator template-manager --database-path <db> down` once. It
+   drops the rows of every environment partition and removes the migration's
+   history row. A second run reaches the baseline, which is a rollback floor:
+   it fails and changes nothing.
+5. Start the older template-manager, then the older sandbox-manager.
+
+Known limits until the cluster side carries partitions:
+
+- Release identity is `(template_name, hash)` in the control plane, its object
+  store layout and its node inventory, so a twin of a published release can't
+  be registered or published yet. Node-ctl publishes a template's
+  legacy-partition build, and another partition's only when it has none.
+- A restore of a btrfs-send stream needs the build its stream descends from.
+  Its lookup prefers the snapshot's binding but falls back to another
+  partition of the digest without pulling, so a node holding only another
+  partition's build of that digest can't restore a stream whose parent it
+  lacks, and nothing pulls that build for it: the restore keeps failing. Twins
+  exist only where a node admits an environment besides the initial one.
+- Prefetch names no environment: it pulls without a selector, counts a build
+  in any partition of a digest as cached, and its tag pins use the legacy
+  partition key.
 
 ## Runtime control transport
 
@@ -1584,8 +2375,8 @@ separate channel.
 Installing a release does not approve it for execution. The compiled
 `ch-54.0-linux-7.2.8` environment pairs the x86-64 static Cloud Hypervisor 54.0
 executable with its upstream 7.2.8+ ELF kernel with a PVH entry. SHA-256 and
-fs-verity measurements are pinned independently. The binding has no memory-state
-format or cross-release replacement qualification. Existing ARM64 unbound Firecracker defaults stay
+fs-verity measurements are pinned independently. The binding includes the `cloud-hypervisor-snapshot` state format, version
+`54.0.1`; cross-release replacement remains unqualified. Existing ARM64 unbound Firecracker defaults stay
 unchanged; CH requires explicit policy permission and an exact environment.
 
 Node-manager owns the CH control API and parses the supported boot device
@@ -1601,19 +2392,39 @@ peer authentication and reaps it on exit. An interrupted boot is cleaned through
 the existing fenced sandbox teardown path; boot mutations are never replayed.
 
 Local CH execution supports cold creation, start, stop, delete and resident
-pause/resume. Memory capture and restore additionally require the explicit
-`ch-54.0-linux-7.2.8-state-v1` environment. It uses the same executable and kernel
-but declares the `cloud-hypervisor-snapshot` state format, version `54.0.1`.
-The historical cold-only environment retains its reference and cannot capture or
-restore memory; existing templates do not silently gain a new contract.
+pause/resume, memory capture and restore through `ch-54.0-linux-7.2.8`.
+The former development-only cold binding has been removed. The canonical name
+now resolves to the existing snapshot-capable definition; remove the former
+`-state-v1` name from allowlists (deduplicate if both names were listed). Recreate
+cold-only development templates against the canonical definition rather than
+relabeling their recorded provenance.
 
-The state environment stores a bounded, versioned machine-state document and a
+Before replacing the catalog, stop and retire sandboxes and template builds
+recorded against the removed cold-only CH Linux binding and the previous
+`ch-54.0-windows-uefi` definition. Stop Windows guests while the previous
+services still recognize their binding and can request ACPI shutdown. Rebuild
+and register Windows images with the current agent and definition.
+The snapshot-capable CH Linux binding
+keeps its reference when renamed; update its allowlist name with the binary
+rollout. Old references are not migrated or aliased. Before rolling back, restore
+or retire snapshots created against bindings absent from the older catalog and
+disable their automatic dormancy policies. Reverting binaries alone does not
+translate a recorded execution contract. On CH Linux rollback, restore the
+`ch-54.0-linux-7.2.8-state-v1` name in the allowlist and configured default
+alongside the binaries: the old canonical name selects the cold-only binding.
+Disable pool refill intent before a rolling upgrade. Upgrade node-manager,
+sandbox-manager, and spaced-host before template-manager, then re-enable pools
+once all participants and Windows images are current. Upgrading template-manager
+first can send CH/Linux clones through the older stale-memory clone path.
+
+The environment stores a bounded, versioned machine-state document and a
 RAM artifact alongside the rootfs through the existing snapshot pipeline. Restore
 preserves guest device IDs, MAC and vsock CID while rebinding host network locators
-and resource limits to the new execution. CH also requires the authenticated boot
-kernel at restore: its configuration validation and Landlock setup still reference
-that artifact. RAM is restored into private memory rather than a writable mapping
-of the shared snapshot. Same-environment suspend/restore can use local checkpoints
+and resource limits to the new execution. CH also requires its authenticated boot
+artifact at restore (the Linux kernel or Windows UEFI firmware): configuration
+validation and Landlock still reference it. RAM is restored into private memory
+rather than a writable mapping of the shared snapshot. Same-environment
+suspend/restore can use local checkpoints
 or S3 materialization; producer identity and execution fences remain mandatory.
 
 Encrypted checkpoints use the existing volume-manager and credential-provider
@@ -1627,15 +2438,54 @@ and a credential authority that can recover the sandbox's key after restart.
 Older plaintext checkpoints can still derive RAM size from their memory file;
 an encrypted checkpoint without a recorded guest allocation fails explicitly.
 
-Upgrade all participating services before allowing the new state environment.
-Keep those versions available while its snapshots exist. Test repeated restore,
+Upgrade all participating services before allowing these snapshot-capable environments.
+Keep those versions available while their snapshots exist. Test repeated restore,
 guest-agent readiness, network traffic and manager restart before enabling automatic
 suspend/pause. Local base snapshots require the qualified state environment.
-Automatic in-node pool refill boots only the template's latest ready Firecracker
-build; when only CH builds are cached, their pools remain empty. Runtime pool
-capability and clone admission do not override that template-manager selection
-restriction. Ballooning, huge pages and live disk-I/O ceiling updates remain
-refused. GPU assignment is not implemented.
+The x86-64 `ch-54.0-windows-uefi` binding also declares the CH snapshot format.
+With the native spaced agent, it uses the same manual pause/resume,
+suspend/restore, wake and automatic dormancy paths. Agentless Windows remains
+cold-only. Windows image distribution and managed-tenant admission remain
+separate limitations; see [Windows image preparation](../templates/cloud-hypervisor/windows/README.md).
+
+Pool admission, shape defaults, snapshot checks and refill select the same
+build from the template's ready builds across every template-cache partition.
+Pool creates and clones reach sandbox-manager without an environment, and its
+lookup of a content hash returns the row with the lowest partition key, so
+only that row of each content hash is a candidate: a legacy-partition row
+before any environment-partition twin. A legacy row is a candidate whatever
+its binding, including a legacy-layout build that startup recovery adopted
+from another environment; an environment-partition row is one only when it's
+bound to that partition's environment. A content hash whose selected row
+isn't pool-capable offers no build, even if a twin in another partition is.
+A pool-capable build's runtime supports prewarmed pools and its guest profile
+supports memory lifecycle; a bound build needs a catalog environment that
+supports memory state. CH requires a current, bound, memory-capable environment and a
+qualified guest agent; an unbound or agentless CH build is not a donor candidate.
+Among the candidates, selection prefers a Firecracker build over any CH build,
+then a legacy-partition build over an environment-partition one, even a newer
+build of another content hash, then the latest recorded build date, then the
+greatest content hash.
+An existing pool can therefore continue using an older eligible build after an
+agentless build is published. Name-only sandbox creation still resolves the
+latest template build; pin the eligible content hash to claim that build's pool.
+Template-wide base-snapshot policy follows the latest build its reconciler
+prepares, independently of pool selection. Clones retain their donor's guest-image and execution contracts.
+Before copying a paused donor, sandbox-manager captures its current memory so
+the clone's disk and RAM describe the same point in time. This also supplies
+the checkpoint for cold-booted pool donors; capture failure leaves no child.
+Each clone performs this capture, including Firecracker clones. CH writes the
+full guest RAM, increasing I/O and the time a donor remains locked. Pool cloning
+uses a 20-minute RPC budget, longer than the node's 16-minute capture wait.
+A capture wait expiry does not cancel the owned capture: node guards remain
+held until it completes, so a retry cannot overwrite files still being written.
+A permanently stalled provider requires runtime recovery; a caller timeout is
+not evidence that the capture has stopped.
+Base snapshots and pools require an agent qualified for memory lifecycle.
+Windows capture waits for native agent readiness and flushes its volumes;
+the Linux-only systemd app declaration and observer do not apply to Windows.
+Ballooning, huge pages and live disk-I/O ceiling updates remain refused.
+GPU assignment is not implemented.
 Template finalization requires acknowledged Stop before copying the rootfs.
 Future runtime adapters own their boot and control implementation; the shared
 lifecycle retains selection, execution identity, resource fences and cleanup.
@@ -1675,10 +2525,8 @@ keeps the existing E0 default. Leave `SPACE_DEFAULT_EXECUTION_ENVIRONMENT`
 unset. Restart node-manager through the normal deployment mechanism. Installing
 artifacts does not change either setting.
 
-For persisted-state operations, also allow `ch-54.0-linux-7.2.8-state-v1` and use
-that environment's reference for `CH_ENV` throughout the build and create steps.
-Build a template with that binding; do not relabel an existing cold-only template.
-The runtime and kernel install commands are the same for both environments.
+Use the canonical environment reference for `CH_ENV` throughout build, create
+and persisted-state operations. The same binding supports cold boot and snapshots.
 
 On that node, install and resolve the exact sources:
 

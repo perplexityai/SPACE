@@ -1,0 +1,886 @@
+use super::{
+    ENC_SNAPSHOT_JAIL_SUBDIR, ENC_SNAPSHOT_MEMORY_NAME, ENC_SNAPSHOT_VMSTATE_NAME,
+    pin_encrypted_snapshot_bind, reown_encrypted_snapshot_inputs, restore_instance_snapshot_in,
+    set_snapshot_export_modes, validate_cache_artifact_path,
+};
+use crate::proto::node_manager_server::NodeManager as _;
+use std::os::unix::fs::PermissionsExt;
+
+#[test]
+fn snapshot_identity_inventory_survives_failed_or_exhausted_measurements() {
+    let root = tempfile::tempdir().unwrap();
+    let snapshots = root.path().join("snapshots");
+    std::fs::create_dir(&snapshots).unwrap();
+    for name in [
+        "d-1m-001",
+        "d-1m-002",
+        "d-1m-003",
+        "f-20260921T120000Z",
+        "invalid",
+    ] {
+        std::fs::create_dir(snapshots.join(name)).unwrap();
+    }
+    for budget in [
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(30),
+    ] {
+        let (paths, token, _) = super::super::snapshot_inventory::SnapshotInventory::default()
+            .page(super::SandboxId::new(), root.path(), "")
+            .unwrap();
+        assert!(token.is_empty());
+        let inventory = super::measure_snapshots(paths, budget, |path, _| {
+            assert!(
+                !budget.is_zero(),
+                "exhausted or skipped measurement must not start work"
+            );
+            if path.ends_with("001") {
+                Err("measurement timed out".into())
+            } else if path.ends_with("002") {
+                Ok(None)
+            } else {
+                Ok(Some(super::BtrfsDiskUsage {
+                    exclusive_bytes: 0,
+                    total_bytes: 12,
+                }))
+            }
+        });
+        assert_eq!(
+            inventory
+                .iter()
+                .map(|snapshot| snapshot.name.as_str())
+                .collect::<Vec<_>>(),
+            ["d-1m-001", "d-1m-002", "d-1m-003", "f-20260921T120000Z"]
+        );
+        assert!(inventory[0].exclusive_bytes.is_none());
+        assert!(inventory[1].exclusive_bytes.is_none());
+        assert_eq!(
+            inventory[2].exclusive_bytes,
+            (!budget.is_zero()).then_some(0)
+        );
+        assert_eq!(
+            inventory[2].referenced_bytes,
+            (!budget.is_zero()).then_some(12)
+        );
+    }
+    let invalid_root = root.path().join("invalid-root");
+    std::fs::create_dir(&invalid_root).unwrap();
+    std::fs::write(invalid_root.join("snapshots"), []).unwrap();
+    let error = super::super::snapshot_inventory::SnapshotInventory::default()
+        .page(super::SandboxId::new(), &invalid_root, "")
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+}
+
+#[test]
+fn plaintext_load_rejects_replaced_source_and_safely_retries_existing_destination() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let source = root.join("snapshot");
+    let jail = root.join("jail");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&jail).unwrap();
+    std::fs::write(source.join("memory"), b"memory").unwrap();
+    std::fs::write(source.join("vmstate"), b"snapshot").unwrap();
+    let victim = root.join("victim");
+    std::fs::write(&victim, b"private").unwrap();
+    // Replace an input after the RPC's preliminary pathname validation.
+    std::fs::rename(source.join("vmstate"), source.join("original")).unwrap();
+    for hard in [false, true] {
+        if hard {
+            std::fs::hard_link(&victim, source.join("vmstate")).unwrap();
+        } else {
+            symlink(&victim, source.join("vmstate")).unwrap();
+        }
+        super::stage_plaintext_snapshot_inputs(&source, &jail).unwrap_err();
+        assert!(!jail.join("vmstate").exists());
+        std::fs::remove_file(source.join("vmstate")).unwrap();
+    }
+    std::fs::rename(source.join("original"), source.join("vmstate")).unwrap();
+    for destination in ["absent", "regular", "symlink", "hardlink"] {
+        if jail.join("vmstate").symlink_metadata().is_ok() {
+            std::fs::remove_file(jail.join("vmstate")).unwrap();
+        }
+        match destination {
+            "regular" => std::fs::write(jail.join("vmstate"), b"old").unwrap(),
+            "symlink" => symlink(&victim, jail.join("vmstate")).unwrap(),
+            "hardlink" => std::fs::hard_link(&victim, jail.join("vmstate")).unwrap(),
+            _ => {}
+        }
+        super::stage_plaintext_snapshot_inputs(&source, &jail).unwrap();
+        super::stage_plaintext_snapshot_inputs(&source, &jail).unwrap();
+        assert_eq!(std::fs::read(jail.join("vmstate")).unwrap(), b"snapshot");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"private");
+    }
+}
+
+#[test]
+fn disk_snapshot_source_is_readable_by_the_shared_cache_group() {
+    let temp = tempfile::tempdir().unwrap();
+    let instance = temp.path().canonicalize().unwrap().join("instance");
+    std::fs::create_dir(&instance).unwrap();
+    let rootfs = instance.join("rootfs.ext4");
+    std::fs::write(&rootfs, b"disk").unwrap();
+    std::fs::set_permissions(&instance, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&rootfs, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    set_snapshot_export_modes(&instance).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(&instance).unwrap().permissions().mode() & 0o770,
+        0o770
+    );
+    assert_eq!(
+        std::fs::metadata(&rootfs).unwrap().permissions().mode() & 0o660,
+        0o660
+    );
+}
+
+/// Validate both restored inputs before changing any ownership. A jailed
+/// writer must not turn the privileged ownership transfer into a link escape.
+#[test]
+fn encrypted_load_rejects_links_before_changing_ownership() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+    let temp = tempfile::tempdir().unwrap();
+    let victim = temp.path().join("victim");
+    std::fs::write(&victim, b"outside").unwrap();
+    let original = std::fs::metadata(&victim).unwrap();
+    for name in [ENC_SNAPSHOT_VMSTATE_NAME, ENC_SNAPSHOT_MEMORY_NAME] {
+        for hard in [false, true] {
+            let volume = tempfile::tempdir_in(temp.path()).unwrap();
+            for input in [ENC_SNAPSHOT_VMSTATE_NAME, ENC_SNAPSHOT_MEMORY_NAME] {
+                let path = volume.path().join(input);
+                if input != name {
+                    std::fs::write(path, b"snapshot").unwrap();
+                } else if hard {
+                    std::fs::hard_link(&victim, path).unwrap();
+                } else {
+                    symlink(&victim, path).unwrap();
+                }
+            }
+            let pinned = std::fs::File::open(volume.path()).unwrap();
+            let error = reown_encrypted_snapshot_inputs(&pinned, original.uid()).unwrap_err();
+            assert!(
+                error
+                    .message()
+                    .contains(if hard { "multiply linked" } else { "ELOOP" }),
+                "{error}"
+            );
+            let after = std::fs::metadata(&victim).unwrap();
+            assert_eq!(
+                (after.uid(), after.gid(), after.mode()),
+                (original.uid(), original.gid(), original.mode())
+            );
+        }
+    }
+}
+
+#[test]
+fn encrypted_bind_target_is_pinned_inside_the_jail() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let (volume, jail, outside) = (root.join("volume"), root.join("jail"), root.join("outside"));
+    for dir in [&volume, &jail, &outside] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let target = jail.join(ENC_SNAPSHOT_JAIL_SUBDIR);
+    symlink(&outside, &target).unwrap();
+
+    // Suspend and restore share this pin; neither may follow the planted link.
+    let mut reowned = false;
+    let error = pin_encrypted_snapshot_bind(&volume, &jail, |_, _| {
+        reowned = true;
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(!reowned, "volume re-owned before its mountpoint was pinned");
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+
+    std::fs::remove_file(&target).unwrap();
+    let (pinned_volume, pinned_target) =
+        pin_encrypted_snapshot_bind(&volume, &jail, |_, _| Ok(())).unwrap();
+    assert_eq!(
+        pinned_volume.metadata().unwrap().ino(),
+        std::fs::metadata(&volume).unwrap().ino()
+    );
+    let created = std::fs::symlink_metadata(&target).unwrap();
+    assert!(created.is_dir());
+    assert_eq!(pinned_target.metadata().unwrap().ino(), created.ino());
+    // A retry reuses the existing mountpoint.
+    let (_, retried) = pin_encrypted_snapshot_bind(&volume, &jail, |_, _| Ok(())).unwrap();
+    assert_eq!(retried.metadata().unwrap().ino(), created.ino());
+}
+
+fn cache_root() -> &'static str {
+    pplx_space_common_core::host::linux::paths::SPACE_CACHE_DIR
+}
+
+#[test]
+fn accepts_paths_strictly_inside_the_cache_root() {
+    let root = super::CACHE_DIR;
+    let id = uuid::Uuid::now_v7();
+    for suffix in [
+        format!("{id}/snapshot"),
+        // GC staging, in the fixed-length form and the earlier long form.
+        format!("{id}/.gc-pending-{id}"),
+        format!("{id}/snapshots/.gc-pending-{id}"),
+        format!("{id}/snapshot.gc-pending-{id}"),
+        format!("{id}/snapshots/name.gc-pending-x"),
+        // Sandbox-manager retires superseded snapshots here for the sweep.
+        format!("{id}/snapshots/.suspend-gc-pending-{id}"),
+        format!(".fork-copies/{id}"),
+    ] {
+        validate_cache_artifact_path(&format!("{root}/{suffix}")).unwrap();
+    }
+    for path in [
+        format!("{root}/{id}"),
+        format!("{root}/{id}/instance"),
+        format!("{root}/{id}/gc-pending-{id}"),
+        format!("{root}/.fork-copies"),
+        format!("{}/firecracker/templates/name/hash", cache_root()),
+    ] {
+        assert!(validate_cache_artifact_path(&path).is_err());
+    }
+}
+
+/// `<root>/` and `<root>/.` both resolve to the cache root
+/// itself — deleting it would wipe every cached artifact on the
+/// node. The validator must reject anything that doesn't name an
+/// entry strictly inside the root.
+#[test]
+fn rejects_the_cache_root_itself() {
+    let root = cache_root();
+    assert!(validate_cache_artifact_path(root).is_err());
+    assert!(validate_cache_artifact_path(&format!("{root}/")).is_err());
+    assert!(validate_cache_artifact_path(&format!("{root}/.")).is_err());
+}
+
+#[test]
+fn rejects_traversal_and_degenerate_components() {
+    let root = cache_root();
+    assert!(validate_cache_artifact_path(&format!("{root}/foo/../bar")).is_err());
+    assert!(validate_cache_artifact_path(&format!("{root}/foo/..")).is_err());
+    assert!(validate_cache_artifact_path(&format!("{root}/./foo")).is_err());
+    assert!(validate_cache_artifact_path(&format!("{root}//foo")).is_err());
+    assert!(validate_cache_artifact_path(&format!("{root}/foo/")).is_err());
+    assert!(validate_cache_artifact_path("/other/root/foo").is_err());
+}
+
+/// A timed-out RPC must not release the capture's ownership before its actual
+/// work completes. This uses the same wait boundary as capture_runtime_state.
+#[tokio::test(start_paused = true)]
+async fn detached_capture_finishes_its_cleanup_after_the_caller_cancels() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let mounts = Arc::new(AtomicUsize::new(0));
+    let tracker = tokio_util::task::TaskTracker::new();
+    let (release, pending) = tokio::sync::oneshot::channel();
+    let observed = mounts.clone();
+    let body = super::run_detached(tracker.clone(), "test capture", async move {
+        observed.fetch_add(1, Ordering::SeqCst);
+        pending.await.unwrap();
+        observed.fetch_sub(1, Ordering::SeqCst);
+        Ok::<_, tonic::Status>(())
+    });
+    let error = super::wait_for_capture(async { body.await? })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+    assert_eq!(
+        mounts.load(Ordering::SeqCst),
+        1,
+        "capture lost its owner at the caller deadline"
+    );
+    release.send(()).unwrap();
+    tracker.close();
+    tracker.wait().await;
+    assert_eq!(mounts.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn snapshot_dispatch_uses_the_recorded_boot_contract() {
+    use pplx_space_common_core::types::Arch;
+    use pplx_space_node_runtime_core::{boot::BootSource, catalog::CompiledEnvironment};
+    let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    for (name, expected) in [
+        ("e0", None),
+        ("ch-54.0-linux-7.2.8", Some(BootSource::LinuxDirect)),
+        ("ch-54.0-windows-uefi", Some(BootSource::Uefi)),
+    ] {
+        let environment = catalog.iter().find(|entry| entry.name() == name).unwrap();
+        let execution = environment.definition().execution_requirements().unwrap();
+        assert_eq!(
+            super::snapshot_boot_source(Some(&execution)).unwrap(),
+            expected
+        );
+        if expected.is_some() {
+            let mut retired = serde_json::to_value(execution).unwrap();
+            retired["environment"] = serde_json::json!(format!("sha256:{}", "a".repeat(64)));
+            let retired = serde_json::from_value(retired).unwrap();
+            assert_eq!(
+                super::snapshot_boot_source(Some(&retired))
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
+    }
+    assert_eq!(super::snapshot_boot_source(None).unwrap(), None);
+}
+
+// A Firecracker API that accepts the connection and never answers fails the
+// pause or resume at its deadline instead of holding the VM gate forever.
+#[tokio::test]
+async fn a_firecracker_that_never_answers_fails_a_pause_state_change_at_its_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("firecracker.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let silent = tokio::spawn(async move {
+        let (connection, _) = listener.accept().await.unwrap();
+        // Hold the connection open without answering.
+        std::future::pending::<()>().await;
+        drop(connection);
+    });
+    let client = crate::fc_api::FcApiClient::new(&socket);
+    for paused in [false, true] {
+        let started = std::time::Instant::now();
+        let error =
+            super::set_firecracker_paused(&client, paused, std::time::Duration::from_millis(200))
+                .await
+                .expect_err("a silent Firecracker fails the change");
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded, "{paused}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+    silent.abort();
+}
+
+async fn service_with_stop(
+    code: tonic::Code,
+    failures: usize,
+) -> (
+    crate::service::NodeManagerService,
+    pplx_space_common_core::types::SandboxId,
+    tempfile::TempDir,
+    crate::runtime_supervisor_client::tests::StubSupervisorServer,
+) {
+    let (socket, client, server) =
+        crate::runtime_supervisor_client::tests::flaky_stop_client(code, failures).await;
+    let mut service = crate::service::tests::service_tests::service_for_unit_tests().await;
+    service.runtime_supervisor = client;
+    let id = pplx_space_common_core::types::SandboxId::new();
+    let fence = pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
+        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        None,
+    );
+    service.pool.bind_execution(&id.to_string(), fence).unwrap();
+    (service, id, socket, server)
+}
+
+/// The stub fails each stop at once, so the retry delay only paces attempts
+/// and a short one leaves what the cap counts unchanged.
+const TEST_STOP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
+#[tokio::test]
+async fn encrypted_seal_stop_retries_while_the_runtime_is_still_exiting() {
+    for code in [tonic::Code::Internal, tonic::Code::Unavailable] {
+        let (service, id, _socket, server) = service_with_stop(code, 2).await;
+        super::stop_runtime_for_encrypted_seal_retrying_after(
+            &service,
+            &id.to_string(),
+            TEST_STOP_RETRY_DELAY,
+        )
+        .await
+        .expect("stop succeeds once the runtime finishes exiting");
+        crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+    }
+}
+
+#[tokio::test]
+async fn encrypted_seal_stop_gives_up_after_the_attempt_cap() {
+    let (service, id, _socket, server) =
+        service_with_stop(tonic::Code::Internal, super::ENC_CAPTURE_STOP_ATTEMPTS).await;
+
+    let error = super::stop_runtime_for_encrypted_seal_retrying_after(
+        &service,
+        &id.to_string(),
+        TEST_STOP_RETRY_DELAY,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+
+    crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+}
+
+#[tokio::test]
+async fn encrypted_seal_stop_does_not_retry_other_failures() {
+    let (service, id, _socket, server) =
+        service_with_stop(tonic::Code::FailedPrecondition, 1).await;
+
+    let error = super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+    crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+}
+
+fn snapshot_volume(sandbox_id: &str) -> String {
+    format!("{}/{sandbox_id}/snapshot-vol", super::CACHE_DIR)
+}
+
+/// A service whose blocking host work is refused, with an allocated sandbox
+/// and a second sandbox whose execution is bound but which holds no lease.
+struct SnapshotFixture {
+    service: crate::service::NodeManagerService,
+    lease: crate::net::SlotInfo,
+    fence: crate::proto::ExecutionFence,
+    unallocated_id: String,
+    unallocated_fence: crate::proto::ExecutionFence,
+}
+
+impl SnapshotFixture {
+    async fn new() -> Self {
+        use crate::service::tests::service_tests::{
+            allocate_test_lease, bind_test_execution, refuse_host_work, service_for_unit_tests,
+        };
+
+        let mut service = service_for_unit_tests().await;
+        refuse_host_work(&mut service).await;
+        let id = super::SandboxId::new().to_string();
+        let fence = bind_test_execution(&service, &id);
+        let lease = allocate_test_lease(&service, &id);
+        let unallocated_id = super::SandboxId::new().to_string();
+        let unallocated_fence = bind_test_execution(&service, &unallocated_id);
+        Self {
+            service,
+            lease,
+            fence,
+            unallocated_id,
+            unallocated_fence,
+        }
+    }
+
+    fn lease_disturbed(&self, case: &str) -> Option<String> {
+        let current = self.service.pool.get(&self.lease.sandbox_id).unwrap();
+        (current
+            .as_ref()
+            .map(|lease| (lease.slot, lease.generation, lease.sandbox_uid, lease.pid))
+            != Some((
+                self.lease.slot,
+                self.lease.generation,
+                self.lease.sandbox_uid,
+                None,
+            )))
+        .then(|| format!("{case}: lease changed to {current:?}"))
+    }
+}
+
+// No case may pass validation for the allocated sandbox: the next step dials
+// the Firecracker API socket under the node's fixed jail directory. Rows whose
+// guard precedes the lease lookup use the unallocated sandbox, so dropping the
+// guard stops at the lease check instead. That includes the encrypted rows,
+// whose capture would otherwise bind into the jail.
+#[tokio::test]
+async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
+    use crate::proto::CaptureVmStateRequest;
+    use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
+    use tonic::Code;
+
+    let fixture = SnapshotFixture::new().await;
+    let id = fixture.lease.sandbox_id.clone();
+    let valid = CaptureVmStateRequest {
+        sandbox_id: id.clone(),
+        execution_fence: Some(fixture.fence.clone()),
+        artifacts: crate::snapshot_request::tests::artifacts("/vmstate".into(), "/memory".into()),
+        ..Default::default()
+    };
+    let unallocated = CaptureVmStateRequest {
+        sandbox_id: fixture.unallocated_id.clone(),
+        execution_fence: Some(fixture.unallocated_fence.clone()),
+        ..valid.clone()
+    };
+    let cases = [
+        (
+            "superseded execution",
+            CaptureVmStateRequest {
+                execution_fence: Some(stale_test_fence()),
+                ..unallocated.clone()
+            },
+            Code::FailedPrecondition,
+            "sandbox execution identity is missing or superseded",
+        ),
+        (
+            "vmstate path names another artifact",
+            CaptureVmStateRequest {
+                artifacts: crate::snapshot_request::tests::artifacts(
+                    "/memory".into(),
+                    "/memory".into(),
+                ),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "snapshot_path must reference Firecracker artifact 'vmstate'",
+        ),
+        (
+            "memory path names another artifact",
+            CaptureVmStateRequest {
+                artifacts: crate::snapshot_request::tests::artifacts(
+                    "/vmstate".into(),
+                    "/vmstate".into(),
+                ),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "mem_file_path must reference Firecracker artifact 'memory'",
+        ),
+        (
+            "destination outside the sandbox roots",
+            CaptureVmStateRequest {
+                storage: Some(crate::proto::VmStateStorage {
+                    directory: Some(format!(
+                        "{}/{}/snapshot",
+                        super::CACHE_DIR,
+                        fixture.unallocated_id
+                    )),
+                    ..Default::default()
+                }),
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "dest_dir is outside allowed runtime roots",
+        ),
+        (
+            "plaintext capture without a lease",
+            unallocated.clone(),
+            Code::Unavailable,
+            "snapshot lease is no longer active",
+        ),
+        (
+            "encrypted volume of another sandbox",
+            CaptureVmStateRequest {
+                storage: Some(crate::proto::VmStateStorage {
+                    encrypted_volume_mount: Some(snapshot_volume(&id)),
+                    ..Default::default()
+                }),
+                ..unallocated.clone()
+            },
+            Code::InvalidArgument,
+            "path does not belong to this sandbox",
+        ),
+        (
+            "encrypted capture without a lease",
+            CaptureVmStateRequest {
+                storage: Some(crate::proto::VmStateStorage {
+                    encrypted_volume_mount: Some(snapshot_volume(&fixture.unallocated_id)),
+                    ..Default::default()
+                }),
+                ..unallocated.clone()
+            },
+            Code::Unavailable,
+            "snapshot lease is no longer active",
+        ),
+    ];
+    let mut mismatches = Vec::new();
+    for (case, request, code, message) in cases {
+        let outcome = fixture
+            .service
+            .capture_vm_state(root_request(request))
+            .await;
+        mismatches.extend(refusal_mismatch(case, outcome, code, message));
+        mismatches.extend(fixture.lease_disturbed(case));
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+// No invalid case may pass validation: the next step stages files or binds the
+// volume into the node's fixed jail directory, or waits for the Firecracker
+// socket. The valid encrypted loads show where validation ends: their volume
+// bind is the first blocking host step, which the fixture refuses. Rows whose
+// guard precedes the lease lookup and that stage nothing use the unallocated
+// sandbox, so dropping the guard stops at the lease check instead of polling
+// the jail's Firecracker socket. The encrypted rate-limit row shows the limit
+// is refused before the refused bind. The checkpoint row only shows it is
+// refused before the path checks: the source check first reads the sandbox's
+// checkpoint files under the fixed cache root, which do not exist, so no
+// plaintext row can reach the staging step, and a valid checkpoint load has no
+// row because that read's outcome depends on the host.
+#[tokio::test]
+async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
+    use crate::lifecycle_limiter::LifecycleMethod;
+    use crate::proto::RestoreVmStateRequest;
+    use crate::proto::{DriveRateLimit, TokenBucket};
+    use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
+    use tonic::Code;
+
+    let fixture = SnapshotFixture::new().await;
+    let id = fixture.lease.sandbox_id.clone();
+    let valid = RestoreVmStateRequest {
+        sandbox_id: id.clone(),
+        execution_fence: Some(fixture.fence.clone()),
+        artifacts: crate::snapshot_request::tests::artifacts("/vmstate".into(), "/memory".into()),
+        ..Default::default()
+    };
+    let unallocated = RestoreVmStateRequest {
+        sandbox_id: fixture.unallocated_id.clone(),
+        execution_fence: Some(fixture.unallocated_fence.clone()),
+        ..valid.clone()
+    };
+    let bucket = Some(TokenBucket {
+        size: 1,
+        refill_time_ms: 1,
+    });
+    let cases = [
+        (
+            "superseded execution",
+            RestoreVmStateRequest {
+                execution_fence: Some(stale_test_fence()),
+                ..unallocated.clone()
+            },
+            Code::FailedPrecondition,
+            "sandbox execution identity is missing or superseded",
+        ),
+        (
+            "unallocated sandbox",
+            unallocated.clone(),
+            Code::Unavailable,
+            "snapshot lease is no longer active",
+        ),
+        (
+            "encrypted volume of another sandbox",
+            RestoreVmStateRequest {
+                storage: Some(crate::proto::VmStateStorage {
+                    encrypted_volume_mount: Some(snapshot_volume(&fixture.unallocated_id)),
+                    ..Default::default()
+                }),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "path does not belong to this sandbox",
+        ),
+        (
+            "vmstate path names another artifact",
+            RestoreVmStateRequest {
+                artifacts: crate::snapshot_request::tests::artifacts(
+                    "/memory".into(),
+                    "/memory".into(),
+                ),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "snapshot_path must reference Firecracker artifact 'vmstate'",
+        ),
+        (
+            "memory path names another artifact",
+            RestoreVmStateRequest {
+                artifacts: crate::snapshot_request::tests::artifacts(
+                    "/vmstate".into(),
+                    "/vmstate".into(),
+                ),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "mem_file_path must reference Firecracker artifact 'memory'",
+        ),
+        (
+            "source other than the sandbox checkpoint",
+            RestoreVmStateRequest {
+                storage: Some(crate::proto::VmStateStorage {
+                    directory: Some(format!(
+                        "{}/{}/snapshot",
+                        super::CACHE_DIR,
+                        fixture.unallocated_id
+                    )),
+                    ..Default::default()
+                }),
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "source_dir must be the sandbox checkpoint directory",
+        ),
+        (
+            "rate limit without bandwidth",
+            RestoreVmStateRequest {
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: None,
+                    operations: bucket,
+                }),
+                ..unallocated.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.bandwidth is required",
+        ),
+        (
+            "rate limit without operations",
+            RestoreVmStateRequest {
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: bucket,
+                    operations: None,
+                }),
+                ..unallocated.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.operations is required",
+        ),
+        (
+            "checkpoint load with a rate limit without bandwidth",
+            RestoreVmStateRequest {
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: None,
+                    operations: bucket,
+                }),
+                storage: Some(crate::proto::VmStateStorage {
+                    directory: Some(format!("{}/{id}/snapshot", super::CACHE_DIR)),
+                    ..Default::default()
+                }),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.bandwidth is required",
+        ),
+        (
+            "encrypted load with a rate limit without operations",
+            RestoreVmStateRequest {
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: bucket,
+                    operations: None,
+                }),
+                storage: Some(crate::proto::VmStateStorage {
+                    encrypted_volume_mount: Some(snapshot_volume(&id)),
+                    ..Default::default()
+                }),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.operations is required",
+        ),
+        (
+            "valid encrypted load",
+            RestoreVmStateRequest {
+                storage: Some(crate::proto::VmStateStorage {
+                    encrypted_volume_mount: Some(snapshot_volume(&id)),
+                    ..Default::default()
+                }),
+                ..valid.clone()
+            },
+            Code::Cancelled,
+            "artifact work cancelled",
+        ),
+        (
+            "valid encrypted load with a rate limit",
+            RestoreVmStateRequest {
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: bucket,
+                    operations: bucket,
+                }),
+                storage: Some(crate::proto::VmStateStorage {
+                    encrypted_volume_mount: Some(snapshot_volume(&id)),
+                    ..Default::default()
+                }),
+                ..valid.clone()
+            },
+            Code::Cancelled,
+            "artifact work cancelled",
+        ),
+    ];
+    let mut mismatches = Vec::new();
+    for (case, request, code, message) in cases {
+        let outcome = fixture
+            .service
+            .restore_vm_state(root_request(request))
+            .await;
+        mismatches.extend(refusal_mismatch(case, outcome, code, message));
+        mismatches.extend(fixture.lease_disturbed(case));
+        if fixture
+            .service
+            .lifecycle_limiter
+            .snapshot(LifecycleMethod::RestoreVmState)
+            != (0, 0)
+        {
+            mismatches.push(format!("{case}: refusal leaked its lifecycle permit"));
+            // A leaked permit would starve the remaining rows.
+            break;
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// A rollback prunes every snapshot that sorts after its target. Restoring an
+/// internal copy must leave the sandbox's other snapshots, and the copy
+/// itself, where they are.
+#[test]
+fn instance_restore_replaces_only_the_instance() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("instance")).unwrap();
+    std::fs::write(root.join("instance/rootfs.ext4"), "booted").unwrap();
+    let preserved = "d-operation-runtime-upgrade-019a0000-0000-7000-8000-000000000001";
+    let others = [
+        "d-1m-20990101T000000Z",
+        "f-1h-20990101T000000Z",
+        "d-manual-20990101T000000Z",
+        "d-stop-ffffffff-ffff-7fff-bfff-ffffffffffff",
+        "zz-later",
+    ];
+    for name in std::iter::once(preserved).chain(others) {
+        let snapshot = root.join("snapshots").join(name);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("rootfs.ext4"), name).unwrap();
+    }
+    let sandbox = super::super::trusted_paths::open_directory(&root).unwrap();
+
+    restore_instance_snapshot_in(&sandbox, preserved, nix::unistd::getegid().as_raw()).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("instance/rootfs.ext4")).unwrap(),
+        preserved
+    );
+    for name in std::iter::once(preserved).chain(others) {
+        assert_eq!(
+            std::fs::read_to_string(root.join("snapshots").join(name).join("rootfs.ext4")).unwrap(),
+            name,
+            "{name} must survive the restore"
+        );
+    }
+    assert!(
+        restore_instance_snapshot_in(&sandbox, "missing", 0)
+            .unwrap_err()
+            .code()
+            != tonic::Code::Ok
+    );
+}
+
+#[tokio::test]
+async fn instance_restore_accepts_only_internal_snapshots() {
+    let service = crate::service::tests::service_tests::service_for_unit_tests().await;
+    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    for name in [
+        "d-1m-20260922T120000Z",
+        "manual",
+        "../d-operation-x",
+        "d-operation",
+    ] {
+        let mut request = tonic::Request::new(crate::proto::RestoreInstanceSnapshotRequest {
+            sandbox_id: sandbox_id.clone(),
+            snapshot_name: name.into(),
+            execution_fence: None,
+        });
+        request
+            .extensions_mut()
+            .insert(pplx_space_uds_peer_auth::PeerIdentity::new(0, 0, None));
+        let error = service
+            .restore_instance_snapshot(request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::InvalidArgument,
+            "{name}: {error}"
+        );
+    }
+}

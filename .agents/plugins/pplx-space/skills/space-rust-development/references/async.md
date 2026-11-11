@@ -171,8 +171,8 @@ A `tokio::spawn` with no retained handle dies silently. That is the most common 
 
 Place long-running work according to its cardinality:
 
-- **Cluster-singleton** background loop → `crates/libs/cluster/controller/server/` (the `space-cluster-controller` library). Add a `tokio::spawn(...)` in `run_reconcilers()` plus config under `clusterController.reconcilers.<name>`. **Do not** create a new binary, Dockerfile, ECR repo, or Helm release.
-- **Per-node** background work → `crates/libs/node/ctl/server/` (the `space-node-ctl` DaemonSet library).
+- **Cluster-singleton** background loop → `crates/l40_api/cluster/controller/server/` (the `space-cluster-controller` library). Add a `tokio::spawn(...)` in `run_reconcilers()` plus config under `clusterController.reconcilers.<name>`. **Do not** create a new binary, Dockerfile, ECR repo, or Helm release.
+- **Per-node** background work → `crates/l40_api/node/ctl/server/` (the `space-node-ctl` DaemonSet library).
 - **Stateless API service** must remain stateless: no background threads, no controller loops in the API process. Persist intent and enqueue.
 - **API handlers** are latency-bounded to ~10 s. Anything longer is queued for background work.
 

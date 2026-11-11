@@ -1,0 +1,48 @@
+[package]
+name = "pplx-space-volmgr-svc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "space-volmgr-svc"
+path = "src/main.rs"
+
+[features]
+default = []
+otel = [
+    "pplx-space-service-host/otel",
+    "pplx-space-volmgr/otel",
+]
+datadog = [
+    "otel",
+    "pplx-space-service-host/datadog",
+    "pplx-space-volmgr/datadog",
+]
+# Deprecated for one release; use otel and datadog.
+datadog-otel = ["otel", "datadog"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["time"] }
+tonic = { workspace = true }
+
+# internal
+pplx-space-common-core = { workspace = true }
+pplx-space-credmgr-client = { workspace = true }
+pplx-space-service-host = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
+pplx-space-tokio-runtime = { workspace = true }
+pplx-space-volmgr = { workspace = true }
+
+[dev-dependencies]
+tokio-stream = { workspace = true, features = ["net"] }
+tower = { workspace = true }
+uuid = { workspace = true }

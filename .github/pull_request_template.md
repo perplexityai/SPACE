@@ -14,7 +14,9 @@ when there is one. -->
 
 <!-- What you ran and what it showed at this head, or "CI on this head". For a
 bug fix, name a test that fails on main for the expected reason and passes
-here. Say what you did not validate. -->
+here. For a Kind run, say where it ran (Pull CI, or a local or remote
+cluster), whether it ran every scenario or which ones, and which scenario
+reaches the changed code. Say what you did not validate. -->
 
 ## Severity and risk
 

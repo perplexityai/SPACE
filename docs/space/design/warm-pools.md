@@ -65,6 +65,19 @@ Manual configs are created through the UI, `space-admin-cli warm-pool` or
 `PUT /admin/api/v1/warm-pools`. Re-submitting the same release and shape
 updates the existing row.
 
+A template delete is refused while an enabled config, an enabled policy or a
+slot still uses the template. The delete operation checks again inside the
+transaction that deletes the releases, where the release keys and the config
+lock catch a config or slot added after the earlier checks. Nothing
+serializes policy writes with that transaction, so a policy enabled while it
+runs survives the delete and applies to a template later created with the
+same name. Disabling the configs and policies drains the
+open slots. A `claimed` slot settles within minutes, when its create finishes
+or the stale claim is swept. A `bound` slot stays until its sandbox's pod is
+retired, for example when the sandbox is deleted or suspended. The delete
+operation deletes the template's disabled configs that have no slots, and its
+disabled policies, before deleting the releases.
+
 ### Slots
 
 A slot is a pre-created Kubernetes pod backed by a node-local paused VM. The
@@ -284,6 +297,13 @@ For each enabled policy, on each tick:
    drain, and the empty config is deleted later. Claimed slots keep their
    parent config until sandbox cleanup removes the slot row.
 
+A policy or demand row that does not decode is skipped and logged, and the
+stale configs of the release it names stay enabled, since the row may have
+selected that release. A candidate whose config write fails is logged, the
+stale configs of its release stay enabled whatever their shape, and the others
+are still written. If the step itself fails, for example on a query
+timeout, the pass logs it and still reconciles the stored configs.
+
 Changing a policy's shape selects new keys. Configs at the old shape drain
 while configs at the new shape fill. Reconciliation is convergent rather than
 transactional: if the controller stops partway through, the next tick
@@ -294,11 +314,13 @@ caller-controlled series of content hashes from creating unbounded floors.
 The lookback, the threshold and the ratio of one ready slot per 10 sandboxes
 are fixed in the controller.
 
-The controller never adopts, changes or retires `manual` configs. To keep one
-policy-owned release warm beyond retention, detach its config, which sets
-`managed_by='manual'` with an explicit target. The UI's **Detach and Save**
-action does this. Returning a detached config to `autoscaler` must be
-deliberate, because the next tick can drain it straight away.
+The warm-pool reconciler never adopts, changes or retires `manual` configs.
+Only a template delete removes one, once it is disabled and has no slots (see
+[Pool configs](#pool-configs)). To keep one policy-owned release warm beyond
+retention, detach its config, which sets `managed_by='manual'` with an explicit
+target. The UI's **Detach and Save** action does this. Returning a detached
+config to `autoscaler` must be deliberate, because the next tick can drain it
+straight away.
 
 ### Release workflow
 
@@ -350,6 +372,7 @@ are draining during a rollover.
 | Unclaimed pod missing, mismatched or on a cordoned node | Slot deleted, refilled later. |
 | Warming slot never becomes ready | Deleted after the warming timeout. |
 | Pool pods cannot be scheduled | Refill stays bounded; creates fall back to cold. |
+| Autoscale step fails | The pass still reconciles the stored configs. Config writes the step made before it failed stay; the rest of the step waits for the next pass. |
 
 ## Limits
 

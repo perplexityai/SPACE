@@ -1,0 +1,65 @@
+[package]
+name = "pplx-space-observability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Test-only tracing event capture (see `src/test_capture.rs`). No optional
+# deps: tracing/tracing-subscriber are already core dependencies of this
+# crate.
+test-capture = []
+# Vendor-neutral traces, propagation, and OTLP metrics.
+otel = [
+    "otlp-metrics",
+    "dep:http",
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "opentelemetry-otlp/trace",
+    "dep:opentelemetry_sdk",
+    "dep:tokio",
+    "dep:tonic",
+    "dep:tracing-opentelemetry",
+]
+# The native trace adapter uses the shared OTel pipeline.
+datadog = ["otel", "dep:datadog-opentelemetry"]
+# Deprecated for one release; use otel and datadog.
+datadog-otel = ["otel", "datadog"]
+# Retain the existing metrics-only capability.
+otlp-metrics = [
+    "dep:http",
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+    "dep:tokio",
+    "dep:tonic",
+]
+
+[dependencies]
+datadog-opentelemetry = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "metrics"], optional = true }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "spec_unstable_metrics_views"], optional = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt"], optional = true }
+tonic = { workspace = true, optional = true }
+tracing = { workspace = true }
+tracing-log = { workspace = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+
+[dev-dependencies]
+opentelemetry-proto = { workspace = true, features = ["gen-tonic", "metrics"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+rstest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }

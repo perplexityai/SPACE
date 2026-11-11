@@ -85,7 +85,28 @@ test('a lone request applies for its own search only', () => {
 
 test('supplemental matches leave out the rows the main table shows', () => {
   const matches = [{ id: 'sbx_1' }, { id: 'sbx_2' }, { id: 'sbx_3' }];
-  assert.deepEqual(supplementalMatches(matches, [{ id: 'sbx_2' }]).map((r) => r.id), ['sbx_1', 'sbx_3']);
-  assert.deepEqual(supplementalMatches(matches, []).length, 3);
-  assert.deepEqual(supplementalMatches(matches, matches), []);
+  assert.deepEqual(supplementalMatches([matches], [{ id: 'sbx_2' }]).map((r) => r.id), ['sbx_3', 'sbx_1']);
+  assert.deepEqual(supplementalMatches([matches], []).length, 3);
+  assert.deepEqual(supplementalMatches([matches], matches), []);
+});
+
+test('the prefix and ID search matches merge once per sandbox, newest first, without the rows shown', () => {
+  const row = (id, minute) => ({ id, created_at: `2026-11-06T04:${String(minute).padStart(2, '0')}:00.000000Z` });
+  // A hex-looking name found by its prefix, an ID found by its end, and one
+  // sandbox both found, which the page also shows in one case.
+  const byPrefix = [row('sbx_e2e1-name', 30), row('sbx_both', 20)];
+  const byId = [row('sbx_both', 20), row('sbx_label', 25), row('sbx_older', 5)];
+  assert.deepEqual(
+    supplementalMatches([byPrefix, byId], []).map((r) => r.id),
+    ['sbx_e2e1-name', 'sbx_label', 'sbx_both', 'sbx_older'],
+  );
+  assert.deepEqual(
+    supplementalMatches([byPrefix, byId], [row('sbx_both', 20)]).map((r) => r.id),
+    ['sbx_e2e1-name', 'sbx_label', 'sbx_older'],
+  );
+  // Equal creation times order by ID, newest first, as the list does.
+  assert.deepEqual(supplementalMatches([[row('sbx_a', 1)], [row('sbx_b', 1)]], []).map((r) => r.id), ['sbx_b', 'sbx_a']);
+  // Either answer alone, or neither.
+  assert.deepEqual(supplementalMatches([[], byId], []).map((r) => r.id), ['sbx_label', 'sbx_both', 'sbx_older']);
+  assert.deepEqual(supplementalMatches([[], []], []), []);
 });

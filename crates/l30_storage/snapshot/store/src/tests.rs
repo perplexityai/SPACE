@@ -1,0 +1,814 @@
+use super::{
+    GetSnapshotError, InsertOutcome, InsertSnapshotError, NewSnapshot, RecordArtifactDigestsError,
+    SnapshotArtifact, SnapshotArtifactDigest, artifact_captured_after, artifact_digests,
+    artifact_registered_by_another_attempt, delete_snapshot_catalog, get, insert,
+    record_artifact_digests,
+};
+use jiff::Timestamp;
+use pplx_space_common_core::sql;
+use pplx_space_common_core::types::{
+    Arch, ArtifactKind, ArtifactOrigin, Digest, ExactStorageUri, ExecutionGeneration,
+    ExecutionMetadata, HostCpu, LocalArtifactId, NodeId, OrgId, SandboxId,
+    SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotExecutionMetadata,
+    SnapshotId, SnapshotKind, SnapshotName, SnapshotState, TemplateArtifactDigest, TemplateName,
+};
+use pplx_space_db_test_fixtures::{
+    SEED_ORG_ID as SEEDED_ORG_ID, SEED_USER_ID as SEEDED_USER_ID, try_pg_test_db,
+};
+use pplx_space_test_env::TestResult;
+use sqlx::types::Json;
+use uuid::Uuid;
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_catalog_store_contract() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation)
+         VALUES ($1, $2::UUID, $3::UUID, 1)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(SEEDED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+
+    let snapshot_id = SnapshotId::new();
+    let source_node_id = NodeId::new();
+    let local_artifact_id = LocalArtifactId::new();
+    let location_id = Uuid::now_v7();
+    let execution_metadata = SnapshotExecutionMetadata::new(
+        ExecutionMetadata::initial_firecracker(Arch::Aarch64, vec![]),
+    )?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, timestamp, source_node_id, label,
+             retention_tier, vcpu, memory_mib, size_bytes, template_id,
+             content_hash, org_id, failure_reason, last_attempt_at,
+             local_artifact_id, artifact_kind, artifact_origin,
+             artifact_snapshot_name, runtime, runtime_version, guest_os,
+             guest_arch, state_format_name, state_format_version,
+             execution_metadata, generation
+         ) VALUES (
+             $1, $2, 'full', 'failed', '2026-08-01T02:03:04.123456Z', $3,
+             'nightly', '10m', 8, 16384, 987654321, 'seed',
+             'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+             $4, 'upload failed', '2026-08-01T02:04:05.654321Z', $5,
+             'full', 'snapshot', 'checkpoint', 'ignored-runtime',
+             'ignored-version', 'ignored-os', 'ignored-arch',
+             'ignored-format', 'ignored-format-version', $6, 7
+         )"
+    ))
+    .bind(snapshot_id.as_uuid())
+    .bind(sandbox_id)
+    .bind(source_node_id)
+    .bind(SEEDED_ORG_ID)
+    .bind(local_artifact_id.as_uuid())
+    .bind(Json(&execution_metadata))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (
+             id, snapshot_id, storage_connection_string, created_at, org_id,
+             orphaned_at
+         ) VALUES (
+             $1, $2, 's3://test-bucket/snapshots/catalog?region=us-east-1',
+             '2026-08-01T02:05:06.123456Z', $3, NULL
+         )"
+    ))
+    .bind(location_id)
+    .bind(snapshot_id.as_uuid())
+    .bind(SEEDED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+
+    let record = get(&db.pool, snapshot_id)
+        .await?
+        .expect("populated snapshot exists");
+    assert_eq!(record.id(), snapshot_id);
+    assert_eq!(record.sandbox_id(), sandbox_id);
+    assert_eq!(record.kind(), SnapshotKind::Full);
+    assert_eq!(record.state(), SnapshotState::Failed);
+    assert_eq!(
+        record.timestamp(),
+        "2026-08-01T02:03:04.123456Z".parse::<Timestamp>()?
+    );
+    assert_eq!(record.source_node_id(), Some(source_node_id));
+    assert_eq!(record.label(), Some("nightly"));
+    assert_eq!(record.retention_tier(), Some("10m"));
+    assert_eq!(record.vcpu(), Some(8));
+    assert_eq!(record.memory_mib(), Some(16384));
+    assert_eq!(record.size_bytes(), Some(987654321));
+    let expected_template_name = TemplateName::parse("seed")?;
+    assert_eq!(record.template_id(), Some(&expected_template_name));
+    let expected_content_hash =
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            .parse::<TemplateArtifactDigest>()?;
+    assert_eq!(
+        record.content_hash(),
+        Some(&SnapshotContentHash::from(expected_content_hash))
+    );
+    assert_eq!(record.org_id(), Some(OrgId::from_uuid(SEEDED_ORG_ID)));
+    assert_eq!(record.failure_reason(), Some("upload failed"));
+    assert_eq!(
+        record.last_attempt_at(),
+        Some("2026-08-01T02:04:05.654321Z".parse::<Timestamp>()?)
+    );
+    assert_eq!(record.execution_metadata(), Some(&execution_metadata));
+    assert_eq!(record.generation(), Some(ExecutionGeneration::new(7)?));
+    assert!(!record.is_suspend_snapshot());
+    let artifact = record.artifact().expect("artifact identity");
+    assert_eq!(artifact.local_artifact_id(), Some(local_artifact_id));
+    assert_eq!(artifact.kind(), ArtifactKind::Full);
+    assert_eq!(artifact.origin(), ArtifactOrigin::Snapshot);
+    let expected_snapshot_name = SnapshotName::parse("checkpoint")?;
+    assert_eq!(artifact.snapshot_name(), Some(&expected_snapshot_name));
+    let location = record.storage_location().expect("linked storage location");
+    assert_eq!(location.id(), location_id);
+    assert_eq!(location.snapshot_id(), snapshot_id);
+    assert_eq!(
+        location.storage_connection_string(),
+        "s3://test-bucket/snapshots/catalog?region=us-east-1"
+    );
+    assert_eq!(
+        location.created_at(),
+        "2026-08-01T02:05:06.123456Z".parse::<Timestamp>()?
+    );
+    assert_eq!(location.org_id(), Some(OrgId::from_uuid(SEEDED_ORG_ID)));
+    assert_eq!(location.orphaned_at(), None);
+
+    let legacy_snapshot_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state)
+         VALUES ($1, $2, 'full', 'creating')"
+    ))
+    .bind(legacy_snapshot_id.as_uuid())
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let legacy = get(&db.pool, legacy_snapshot_id)
+        .await?
+        .expect("legacy snapshot exists");
+    assert!(legacy.is_suspend_snapshot());
+    assert_eq!(legacy.state(), SnapshotState::Creating);
+    assert_eq!(legacy.source_node_id(), None);
+    assert_eq!(legacy.label(), None);
+    assert_eq!(legacy.retention_tier(), None);
+    assert_eq!(legacy.vcpu(), None);
+    assert_eq!(legacy.memory_mib(), None);
+    assert_eq!(legacy.size_bytes(), None);
+    assert_eq!(legacy.template_id(), None);
+    assert_eq!(legacy.content_hash(), None);
+    assert_eq!(legacy.org_id(), None);
+    assert_eq!(legacy.failure_reason(), None);
+    assert_eq!(legacy.last_attempt_at(), None);
+    assert_eq!(legacy.artifact(), None);
+    assert_eq!(legacy.execution_metadata(), None);
+    assert_eq!(legacy.generation(), None);
+    assert_eq!(legacy.storage_location(), None);
+
+    let expected_uri =
+        ExactStorageUri::parse("s3://test-bucket/snapshots/legacy?region=us-east-1")?;
+    let different_uri =
+        ExactStorageUri::parse("s3://test-bucket/snapshots/different?region=us-east-1")?;
+    let inserted_snapshot_id = SnapshotId::new();
+    let inserted_execution_metadata = SnapshotExecutionMetadata::new(
+        ExecutionMetadata::initial_firecracker(Arch::Aarch64, vec![]),
+    )?;
+    let inserted_content_hash =
+        "sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            .parse::<TemplateArtifactDigest>()?;
+    let make_snapshot = |storage_uri: ExactStorageUri| {
+        NewSnapshot::new(
+            inserted_snapshot_id,
+            sandbox_id,
+            SnapshotKind::Full,
+            SnapshotState::Creating,
+            OrgId::from_uuid(SEEDED_ORG_ID),
+            storage_uri,
+        )
+        .with_source_node_id(Some(source_node_id))
+        .with_resources(Some(4), Some(8192))
+        .with_template(
+            Some(TemplateName::parse("seed").expect("valid template name")),
+            Some(SnapshotContentHash::from(inserted_content_hash)),
+        )
+        .with_execution_metadata(inserted_execution_metadata.clone())
+        .with_generation(Some(ExecutionGeneration::new(7).expect("valid generation")))
+    };
+    let snapshot = make_snapshot(expected_uri.clone());
+    let mut insert_tx = db.pool.begin().await?;
+    let (inserted, outcome) = insert(&mut insert_tx, &snapshot).await?;
+    assert_eq!(outcome, InsertOutcome::Created);
+    assert_eq!(inserted.id(), inserted_snapshot_id);
+    // The capture's generation is recorded with the attempt.
+    assert_eq!(inserted.generation(), Some(ExecutionGeneration::new(7)?));
+    assert_eq!(
+        inserted
+            .storage_location()
+            .expect("insert returns complete aggregate")
+            .storage_connection_string(),
+        expected_uri.as_wire()
+    );
+    insert_tx.commit().await?;
+
+    let mut retry_tx = db.pool.begin().await?;
+    let (retried, outcome) = insert(&mut retry_tx, &snapshot).await?;
+    assert_eq!(outcome, InsertOutcome::AlreadyRegistered);
+    assert_eq!(retried, inserted);
+    retry_tx.commit().await?;
+
+    // A replay that now carries the capture host CPU (the first registration
+    // went through a cluster API that dropped it) is the same attempt, and the
+    // persisted row is returned unchanged.
+    assert_eq!(
+        inserted
+            .execution_metadata()
+            .and_then(SnapshotExecutionMetadata::host_cpu),
+        None
+    );
+    let replay_with_host_cpu = make_snapshot(expected_uri.clone()).with_execution_metadata(
+        inserted_execution_metadata
+            .clone()
+            .with_host_cpu(Some(HostCpu::parse("genuineintel-6-85-7")?)),
+    );
+    let mut host_cpu_retry_tx = db.pool.begin().await?;
+    let (retried, outcome) = insert(&mut host_cpu_retry_tx, &replay_with_host_cpu).await?;
+    assert_eq!(outcome, InsertOutcome::AlreadyRegistered);
+    assert_eq!(retried, inserted);
+    host_cpu_retry_tx.commit().await?;
+
+    let mut location_conflict_tx = db.pool.begin().await?;
+    let error = insert(
+        &mut location_conflict_tx,
+        &make_snapshot(different_uri.clone()),
+    )
+    .await
+    .expect_err("one snapshot ID cannot identify two storage locations");
+    assert!(matches!(
+        error,
+        InsertSnapshotError::StorageLocationConflict { snapshot_id }
+            if snapshot_id == inserted_snapshot_id
+    ));
+    location_conflict_tx.rollback().await?;
+
+    let conflicting_artifact = SnapshotArtifact::new(
+        Some(LocalArtifactId::new()),
+        ArtifactKind::Full,
+        ArtifactOrigin::Suspend,
+        None,
+    )?;
+    let conflicting_snapshot =
+        make_snapshot(expected_uri.clone()).with_artifact(conflicting_artifact);
+    let mut identity_conflict_tx = db.pool.begin().await?;
+    let error = insert(&mut identity_conflict_tx, &conflicting_snapshot)
+        .await
+        .expect_err("one snapshot ID cannot identify two snapshots");
+    assert!(matches!(
+        error,
+        InsertSnapshotError::IdentityConflict { snapshot_id }
+            if snapshot_id == inserted_snapshot_id
+    ));
+    identity_conflict_tx.rollback().await?;
+
+    assert_eq!(
+        get(&db.pool, inserted_snapshot_id)
+            .await?
+            .expect("inserted snapshot exists")
+            .storage_location()
+            .expect("location inserted")
+            .storage_connection_string(),
+        expected_uri.as_wire()
+    );
+
+    let malformed_snapshot_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, execution_metadata)
+         VALUES ($1, $2, 'full', 'creating', $3)"
+    ))
+    .bind(malformed_snapshot_id.as_uuid())
+    .bind(sandbox_id)
+    .bind(Json(serde_json::json!({ "runtime": {} })))
+    .execute(&db.pool)
+    .await?;
+    let error = get(&db.pool, malformed_snapshot_id)
+        .await
+        .expect_err("malformed non-null execution metadata must fail");
+    assert!(matches!(
+        error,
+        GetSnapshotError::InvalidExecutionMetadata { snapshot_id, .. }
+            if snapshot_id == malformed_snapshot_id
+    ));
+
+    let unknown_retention_tier_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, retention_tier)
+         VALUES ($1, $2, 'full', 'creating', 'manual')"
+    ))
+    .bind(unknown_retention_tier_id.as_uuid())
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let unknown_retention_tier = get(&db.pool, unknown_retention_tier_id)
+        .await?
+        .expect("snapshot with unknown retention tier exists");
+    assert_eq!(unknown_retention_tier.retention_tier(), Some("manual"));
+
+    let invalid_template_name_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, template_id)
+         VALUES ($1, $2, 'full', 'creating', '../seed')"
+    ))
+    .bind(invalid_template_name_id.as_uuid())
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let error = get(&db.pool, invalid_template_name_id)
+        .await
+        .expect_err("path-unsafe template name must fail");
+    assert!(matches!(
+        error,
+        GetSnapshotError::InvalidTemplateName { snapshot_id, .. }
+            if snapshot_id == invalid_template_name_id
+    ));
+
+    let legacy_content_hash_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, content_hash)
+         VALUES ($1, $2, 'full', 'creating', 'legacy-hash')"
+    ))
+    .bind(legacy_content_hash_id.as_uuid())
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let legacy = get(&db.pool, legacy_content_hash_id)
+        .await?
+        .expect("legacy snapshot exists");
+    assert_eq!(
+        legacy.content_hash().map(SnapshotContentHash::as_stored),
+        Some("legacy-hash")
+    );
+
+    let invalid_snapshot_name_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, local_artifact_id, artifact_kind,
+             artifact_origin, artifact_snapshot_name
+         ) VALUES ($1, $2, 'full', 'creating', $3, 'full', 'snapshot', '../checkpoint')"
+    ))
+    .bind(invalid_snapshot_name_id.as_uuid())
+    .bind(sandbox_id)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    let error = get(&db.pool, invalid_snapshot_name_id)
+        .await
+        .expect_err("path-unsafe artifact snapshot name must fail");
+    assert!(matches!(
+        error,
+        GetSnapshotError::InvalidArtifactSnapshotName { snapshot_id, .. }
+            if snapshot_id == invalid_snapshot_name_id
+    ));
+
+    let mut delete_tx = db.pool.begin().await?;
+    assert!(delete_snapshot_catalog(&mut delete_tx, snapshot_id).await?);
+    assert!(!delete_snapshot_catalog(&mut delete_tx, snapshot_id).await?);
+    assert!(get(&mut *delete_tx, snapshot_id).await?.is_none());
+    delete_tx.rollback().await?;
+    let restored = get(&db.pool, snapshot_id)
+        .await?
+        .expect("rollback restores the aggregate");
+    assert_eq!(
+        restored.storage_location().map(|location| location.id()),
+        Some(location_id)
+    );
+    Ok(())
+}
+
+/// Digests recorded at finalize are read back for restore, a replay cannot
+/// rewrite them, and they leave the catalog with their snapshot.
+#[tokio::test(flavor = "current_thread")]
+async fn artifact_digests_follow_their_snapshot() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation)
+         VALUES ($1, $2::UUID, $3::UUID, 1)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(SEEDED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    let snapshot_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state)
+         VALUES ($1, $2, 'full', 'creating')"
+    ))
+    .bind(snapshot_id.as_uuid())
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+
+    let digests = [
+        SnapshotArtifactDigest {
+            artifact: SnapshotArtifactFile::Memory,
+            digest: Digest::sha256([0x22; 32]),
+            size_bytes: 1 << 30,
+        },
+        SnapshotArtifactDigest {
+            artifact: SnapshotArtifactFile::VmState,
+            digest: Digest::sha256([0x11; 32]),
+            size_bytes: 4096,
+        },
+    ];
+    let mut tx = db.pool.begin().await?;
+    record_artifact_digests(&mut tx, snapshot_id, &digests).await?;
+    tx.commit().await?;
+
+    let mut expected = digests.to_vec();
+    expected.sort_by_key(|digest| digest.artifact.file_name());
+    assert_eq!(artifact_digests(&db.pool, snapshot_id).await?, expected);
+
+    // An identical replay is a no-op; a conflicting one is refused and
+    // leaves the recorded digests untouched.
+    let mut tx = db.pool.begin().await?;
+    record_artifact_digests(&mut tx, snapshot_id, &digests[..1]).await?;
+    tx.commit().await?;
+    let mut tx = db.pool.begin().await?;
+    let conflict = record_artifact_digests(
+        &mut tx,
+        snapshot_id,
+        &[SnapshotArtifactDigest {
+            artifact: SnapshotArtifactFile::VmState,
+            digest: Digest::sha256([0x33; 32]),
+            size_bytes: 4096,
+        }],
+    )
+    .await;
+    assert!(matches!(
+        conflict,
+        Err(RecordArtifactDigestsError::Conflict { artifact, .. })
+            if artifact == SnapshotArtifactFile::VmState
+    ));
+    tx.rollback().await?;
+    assert_eq!(artifact_digests(&db.pool, snapshot_id).await?, expected);
+
+    let mut tx = db.pool.begin().await?;
+    assert!(delete_snapshot_catalog(&mut tx, snapshot_id).await?);
+    tx.commit().await?;
+    assert!(artifact_digests(&db.pool, snapshot_id).await?.is_empty());
+    Ok(())
+}
+
+/// A registration of the same bytes by any other attempt counts, whatever its
+/// state; the asking attempt itself and other artifacts of the sandbox don't.
+#[tokio::test(flavor = "current_thread")]
+async fn another_attempts_registration_of_an_artifact_is_found() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation)
+         VALUES ($1, $2::UUID, $3::UUID, 1)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(SEEDED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    let artifact = LocalArtifactId::new();
+    let other_artifact = LocalArtifactId::new();
+    let earlier = SnapshotId::new();
+    let asking = SnapshotId::new();
+    for (id, local_artifact_id, state) in [
+        (earlier, artifact, "failed"),
+        (asking, artifact, "creating"),
+        (SnapshotId::new(), other_artifact, "ready"),
+    ] {
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (
+                 id, sandbox_id, type, state, local_artifact_id, artifact_kind, artifact_origin
+             )
+             VALUES ($1, $2, 'full', $3, $4, 'full', 'suspend')"
+        ))
+        .bind(id.as_uuid())
+        .bind(sandbox_id)
+        .bind(state)
+        .bind(local_artifact_id.as_uuid())
+        .execute(&db.pool)
+        .await?;
+    }
+
+    assert!(artifact_registered_by_another_attempt(&db.pool, sandbox_id, artifact, asking).await?);
+    assert!(
+        artifact_registered_by_another_attempt(&db.pool, sandbox_id, artifact, earlier).await?,
+        "from the earlier attempt's side, the later one counts"
+    );
+    sqlx::query(sql!("DELETE FROM snapshots WHERE id = $1"))
+        .bind(earlier.as_uuid())
+        .execute(&db.pool)
+        .await?;
+    assert!(
+        !artifact_registered_by_another_attempt(&db.pool, sandbox_id, artifact, asking).await?,
+        "neither the asking attempt nor another artifact's row counts"
+    );
+    Ok(())
+}
+
+/// Captures are ordered by the generation of the execution that took them,
+/// not by when their backups registered: an older capture backed up again
+/// after a newer one still orders before it. A capture whose backups record
+/// no generation, or whose only ready backup lost its location, orders against
+/// nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn captures_order_by_the_generation_that_took_them() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation)
+         VALUES ($1, $2::UUID, $3::UUID, 1)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(SEEDED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    let (older, newer, unrecorded, orphaned) = (
+        LocalArtifactId::new(),
+        LocalArtifactId::new(),
+        LocalArtifactId::new(),
+        LocalArtifactId::new(),
+    );
+    // (artifact, its capture generation, minutes since its backup registered,
+    // whether its location is orphaned)
+    for (artifact, generation, minutes_ago, orphan) in [
+        (older, Some(4), 30, false),
+        (newer, Some(5), 20, false),
+        // The older capture, backed up again after the newer one.
+        (older, Some(4), 1, false),
+        (unrecorded, None, 10, false),
+        (orphaned, Some(9), 5, true),
+    ] {
+        let snapshot_id = insert_snapshot(
+            &db.pool,
+            sandbox_id,
+            "ready",
+            artifact,
+            None,
+            Some(orphan),
+            minutes_ago,
+        )
+        .await?;
+        sqlx::query(sql!("UPDATE snapshots SET generation = $2 WHERE id = $1"))
+            .bind(snapshot_id.as_uuid())
+            .bind(generation)
+            .execute(&db.pool)
+            .await?;
+    }
+    let full = |artifact| (artifact, ArtifactKind::Full);
+    let after =
+        |later, earlier| artifact_captured_after(&db.pool, sandbox_id, full(later), full(earlier));
+
+    assert!(after(newer, older).await?);
+    assert!(!after(older, newer).await?);
+    assert!(!after(older, older).await?, "a capture isn't after itself");
+    assert!(!after(unrecorded, older).await?);
+    assert!(!after(newer, unrecorded).await?);
+    assert!(
+        !after(orphaned, newer).await?,
+        "an orphaned backup orders nothing"
+    );
+    Ok(())
+}
+
+/// A catalog snapshot is in the object store only when it is `ready` with a
+/// live location, and node-local only when it is the current local artifact
+/// of a sandbox settled in `suspended` or `stopped` on the node it uploaded
+/// from. During a move, and after a failed cross-node restore rolls the row
+/// back with the placement still on the destination, no node-local copy is
+/// reported.
+#[tokio::test(flavor = "current_thread")]
+async fn storage_placements_report_object_store_and_node_copies() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let source = NodeId::new();
+    let destination = NodeId::new();
+    for node in [source, destination] {
+        pplx_space_db_test_fixtures::insert_ready_worker_node(&db.pool, node).await?;
+    }
+    let unsnapshotted = SandboxId::new();
+    insert_placed_sandbox(
+        &db.pool,
+        unsnapshotted,
+        "suspended",
+        Some(source),
+        None,
+        None,
+    )
+    .await?;
+    assert!(
+        super::storage_placements(&db.pool, unsnapshotted)
+            .await?
+            .is_empty()
+    );
+
+    // (case, lifecycle, target, active, uploaded from) -> the node a current
+    // artifact is local to.
+    for (case, lifecycle, target, active, uploaded_from, expected_node) in [
+        (
+            "suspended",
+            "suspended",
+            Some(source),
+            None,
+            Some(source),
+            Some(source),
+        ),
+        (
+            "stopped",
+            "stopped",
+            None,
+            Some(source),
+            Some(source),
+            Some(source),
+        ),
+        (
+            "restore placed on the destination",
+            "restoring",
+            Some(destination),
+            Some(destination),
+            Some(source),
+            None,
+        ),
+        // The same restore failed and rolled back: settled again, but both
+        // placement columns still name the destination.
+        (
+            "rolled-back restore",
+            "suspended",
+            Some(destination),
+            Some(destination),
+            Some(source),
+            None,
+        ),
+        (
+            "rolled-back restore, active cleared",
+            "suspended",
+            Some(destination),
+            None,
+            Some(source),
+            None,
+        ),
+        (
+            "no recorded source node",
+            "suspended",
+            Some(source),
+            None,
+            None,
+            None,
+        ),
+        (
+            "started",
+            "started",
+            Some(source),
+            Some(source),
+            Some(source),
+            None,
+        ),
+    ] {
+        let current = LocalArtifactId::new();
+        let sandbox_id = SandboxId::new();
+        insert_placed_sandbox(
+            &db.pool,
+            sandbox_id,
+            lifecycle,
+            target,
+            active,
+            Some(current),
+        )
+        .await?;
+        // (state, artifact, location orphaned?) newest first.
+        let rows = [
+            ("creating", current, Some(false)),
+            ("ready", current, Some(false)),
+            ("failed", LocalArtifactId::new(), Some(false)),
+            ("ready", LocalArtifactId::new(), Some(false)),
+            ("ready", LocalArtifactId::new(), Some(true)),
+            ("ready", LocalArtifactId::new(), None),
+        ];
+        let mut ids = Vec::new();
+        for (age, (state, artifact, orphaned)) in rows.into_iter().enumerate() {
+            ids.push(
+                insert_snapshot(
+                    &db.pool,
+                    sandbox_id,
+                    state,
+                    artifact,
+                    uploaded_from,
+                    orphaned,
+                    age,
+                )
+                .await?,
+            );
+        }
+        let current_node = expected_node;
+        assert_eq!(
+            super::storage_placements(&db.pool, sandbox_id)
+                .await?
+                .iter()
+                .map(|p| (p.snapshot_id, p.in_object_store, p.node_local_node_id))
+                .collect::<Vec<_>>(),
+            vec![
+                // Uploading: a live location does not make it stored yet.
+                (ids[0], false, current_node),
+                (ids[1], true, current_node),
+                (ids[2], false, None),
+                (ids[3], true, None),
+                (ids[4], false, None),
+                (ids[5], false, None),
+            ],
+            "{case}"
+        );
+    }
+    Ok(())
+}
+
+async fn insert_placed_sandbox(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+    lifecycle: &str,
+    target: Option<NodeId>,
+    active: Option<NodeId>,
+    artifact: Option<LocalArtifactId>,
+) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation, lifecycle,
+                                placement, target_node_id, active_node_id,
+                                current_local_artifact_id, current_local_artifact_kind,
+                                current_local_artifact_origin)
+         VALUES ($1, $2::UUID, $3::UUID, 1, $4, 'placed', $5, $6, $7,
+                 CASE WHEN $7::UUID IS NULL THEN NULL ELSE 'full' END,
+                 CASE WHEN $7::UUID IS NULL THEN NULL ELSE 'suspend' END)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(SEEDED_ORG_ID)
+    .bind(lifecycle)
+    .bind(target)
+    .bind(active)
+    .bind(artifact.map(LocalArtifactId::as_uuid))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A full suspend snapshot `minutes_ago` old, with a storage location unless
+/// `orphaned` is `None`.
+async fn insert_snapshot(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+    state: &str,
+    artifact: LocalArtifactId,
+    source_node: Option<NodeId>,
+    orphaned: Option<bool>,
+    minutes_ago: usize,
+) -> TestResult<SnapshotId> {
+    let snapshot_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, org_id,
+                                local_artifact_id, artifact_kind, artifact_origin,
+                                source_node_id)
+         VALUES ($1, $2, 'full', $3, NOW() - make_interval(mins => $4), $5::UUID, $6,
+                 'full', 'suspend', $7)"
+    ))
+    .bind(snapshot_id.as_uuid())
+    .bind(sandbox_id)
+    .bind(state)
+    .bind(i32::try_from(minutes_ago)?)
+    .bind(SEEDED_ORG_ID)
+    .bind(artifact.as_uuid())
+    .bind(source_node)
+    .execute(pool)
+    .await?;
+    if let Some(orphaned) = orphaned {
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations
+                 (snapshot_id, storage_connection_string, org_id, orphaned_at)
+             VALUES ($1, 's3://synthetic-bucket/snapshots/x', $2::UUID,
+                     CASE WHEN $3 THEN NOW() END)"
+        ))
+        .bind(snapshot_id.as_uuid())
+        .bind(SEEDED_ORG_ID)
+        .bind(orphaned)
+        .execute(pool)
+        .await?;
+    }
+    Ok(snapshot_id)
+}

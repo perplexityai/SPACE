@@ -1,0 +1,78 @@
+use super::*;
+
+#[test]
+fn template_hash_display_marks_stale_template_hashes() {
+    for algorithm in ["sha256", "blake3"] {
+        let mut template_hashes = HashMap::new();
+        template_hashes.insert("seed".to_string(), format!("{algorithm}:abcdef0123459999"));
+        let sandbox = SandboxInfo {
+            template: Some("seed".to_string()),
+            image_hash: Some(format!("{algorithm}:abcdef0123459999")),
+            ..Default::default()
+        };
+        assert_eq!(
+            template_hash_display(&sandbox, &template_hashes),
+            "abcdef012345"
+        );
+
+        let sandbox = SandboxInfo {
+            template: Some("seed".to_string()),
+            image_hash: Some(format!("{algorithm}:abcdef0123450000")),
+            ..Default::default()
+        };
+        assert_eq!(
+            template_hash_display(&sandbox, &template_hashes),
+            "abcdef012345*"
+        );
+    }
+}
+
+#[test]
+fn sandbox_health_renders_composed_status_for_running_states() {
+    let healthy = SandboxInfo {
+        lifecycle: Some(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started as i32),
+        health_status: pplx_space_sbx_mgr_client::proto::SandboxHealthStatus::Healthy as i32,
+        ..Default::default()
+    };
+    assert_eq!(sandbox_health(&healthy), "\u{2705}");
+
+    let degraded = SandboxInfo {
+        lifecycle: Some(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused as i32),
+        health_status: pplx_space_sbx_mgr_client::proto::SandboxHealthStatus::Degraded as i32,
+        ..Default::default()
+    };
+    assert_eq!(sandbox_health(&degraded), "\u{26a0}\u{fe0f}");
+
+    let initializing = SandboxInfo {
+        lifecycle: Some(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started as i32),
+        health_status: pplx_space_sbx_mgr_client::proto::SandboxHealthStatus::Initializing as i32,
+        ..Default::default()
+    };
+    assert_eq!(sandbox_health(&initializing), "\u{23f3}");
+
+    let stopped = SandboxInfo {
+        lifecycle: Some(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Stopped as i32),
+        ..Default::default()
+    };
+    assert_eq!(sandbox_health(&stopped), "-");
+}
+
+#[test]
+fn a_listed_sandbox_state_no_longer_finds_keeps_its_cleanup() {
+    use pplx_space_sbx_mgr_client::proto::{
+        SandboxCleanup, SandboxCleanupCompletion, SandboxCleanupState, SandboxLifecycleState,
+        SandboxListElement,
+    };
+    let cleanup = SandboxCleanup {
+        completion: SandboxCleanupCompletion::DeleteRow as i32,
+        state: SandboxCleanupState::Failed as i32,
+    };
+    let info = listed_sandbox_info(&SandboxListElement {
+        sandbox_id: "sbx".to_owned(),
+        lifecycle: Some(SandboxLifecycleState::Stopping as i32),
+        cleanup: Some(cleanup),
+        ..Default::default()
+    });
+    assert_eq!(info.lifecycle, Some(SandboxLifecycleState::Stopping as i32));
+    assert_eq!(info.cleanup, Some(cleanup));
+}

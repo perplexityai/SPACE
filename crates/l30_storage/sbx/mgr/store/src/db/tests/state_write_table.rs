@@ -1,0 +1,440 @@
+//! The persisted-edge table of the node-local SQLite `sandboxes.state` against
+//! `SandboxStatus::can_transition_to`, the RPC-admission machine. The table
+//! names a row by [`Node`]: a lifecycle no cleanup owns, or a cleanup whatever
+//! lifecycle it is over, which is all an edge's sources tell apart.
+//!
+//! Every pair on which the two disagree is listed in [`ALLOWLIST`] with a
+//! reason, so a new writer edge, a changed from-set, or a changed state
+//! machine fails here until the disagreement is recorded.
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use crate::db::{CLEANUP_EDGES, EDGES, EdgeKind};
+use crate::state::{CleanupState, SandboxState, SandboxStatus, Teardown};
+
+/// A row as the table names it: each lifecycle no cleanup owns, then each
+/// cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Node {
+    Creating,
+    Created,
+    Starting,
+    Started,
+    Stopping,
+    Stopped,
+    Deleting,
+    Pausing,
+    Paused,
+    Resuming,
+    Checkpointing,
+    Suspending,
+    Suspended,
+    Restoring,
+    CleanupRequired,
+    CleanupFailed,
+    Quarantined,
+    Failed,
+}
+
+use Node::*;
+
+impl Node {
+    const ALL: [Self; 18] = [
+        Creating,
+        Created,
+        Starting,
+        Started,
+        Stopping,
+        Stopped,
+        Deleting,
+        Pausing,
+        Paused,
+        Resuming,
+        Checkpointing,
+        Suspending,
+        Suspended,
+        Restoring,
+        CleanupRequired,
+        CleanupFailed,
+        Quarantined,
+        Failed,
+    ];
+
+    fn of_lifecycle(lifecycle: SandboxState) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|node| node.lifecycle() == Some(lifecycle))
+            .unwrap()
+    }
+
+    const fn of_cleanup(cleanup: CleanupState) -> Self {
+        match cleanup {
+            CleanupState::Required => CleanupRequired,
+            CleanupState::Failed => CleanupFailed,
+        }
+    }
+
+    const fn cleanup(self) -> Option<CleanupState> {
+        match self {
+            CleanupRequired => Some(CleanupState::Required),
+            CleanupFailed => Some(CleanupState::Failed),
+            _ => None,
+        }
+    }
+
+    const fn lifecycle(self) -> Option<SandboxState> {
+        Some(match self {
+            Creating => SandboxState::Creating,
+            Created => SandboxState::Created,
+            Starting => SandboxState::Starting,
+            Started => SandboxState::Started,
+            Stopping => SandboxState::Stopping,
+            Stopped => SandboxState::Stopped,
+            Deleting => SandboxState::Deleting,
+            Pausing => SandboxState::Pausing,
+            Paused => SandboxState::Paused,
+            Resuming => SandboxState::Resuming,
+            Checkpointing => SandboxState::Checkpointing,
+            Suspending => SandboxState::Suspending,
+            Suspended => SandboxState::Suspended,
+            Restoring => SandboxState::Restoring,
+            Quarantined => SandboxState::Quarantined,
+            Failed => SandboxState::Failed,
+            CleanupRequired | CleanupFailed => return None,
+        })
+    }
+
+    /// A row this node names. An edge's sources tell a cleanup apart only by
+    /// its state, so any teardown transition the cleanup may be over stands
+    /// for it.
+    fn status(self) -> SandboxStatus {
+        match (self.lifecycle(), self.cleanup()) {
+            (Some(lifecycle), _) => lifecycle.into(),
+            (None, Some(cleanup)) => SandboxStatus::owned(Teardown::Stopping, cleanup),
+            (None, None) => unreachable!("every node is a lifecycle or a cleanup"),
+        }
+    }
+
+    /// The admission machine has no cleanup target: only the cleanup writers
+    /// record one.
+    fn can_transition_to(self, to: Self) -> bool {
+        to.lifecycle()
+            .is_some_and(|target| self.status().can_transition_to(target))
+    }
+}
+
+impl fmt::Display for Node {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Disagreement {
+    /// A request edge writes the pair; `can_transition_to` forbids it.
+    RequestForbidden,
+    /// Only completion, compensation or recovery edges write the pair;
+    /// `can_transition_to` forbids it.
+    WriteForbidden,
+    /// `can_transition_to` allows the pair, but only completion,
+    /// compensation or recovery edges write it.
+    AllowedNotRequested,
+    /// `can_transition_to` allows the pair; no writer implements it.
+    AllowedUnwritten,
+}
+
+use Disagreement::*;
+
+/// Stop resolves its target only while the runtime is live; admission does not
+/// re-check it, and Stop does not consult `can_transition_to`.
+const STOP_LIVE_RUNTIME: &str = "Stop admits a live runtime in this transient state";
+const STOP_SETTLED_SOURCE: &str =
+    "Stop admission, only in the runtime gate-to-fence window or with a leaked runtime";
+const STOP_RUNTIME_OWNER: &str = "Stop admits a row in this state while its runtime is live";
+/// `can_transition_to` lists an operation's completion; only its completion
+/// writer implements it.
+const COMPLETION_ONLY: &str = "an in-flight operation's completion, not an admission";
+const RECOVERY_QUARANTINE: &str = "only recovery writers enter quarantine";
+const NO_QUARANTINE_WRITER: &str = "no production writer quarantines a row in this state";
+const CLEANUP_SETTLES_INTENT: &str = "cleanup completion settles the persisted intent's target";
+
+#[rustfmt::skip]
+const ALLOWLIST: &[(Node, Node, Disagreement, &str)] = &[
+    (Creating,        Created,         AllowedNotRequested, COMPLETION_ONLY),
+    (Creating,        Stopped,         WriteForbidden,      "import completion of a stopped export"),
+    (Creating,        Deleting,        RequestForbidden,    "Delete admission supersedes the create episode"),
+    (Creating,        Suspended,       WriteForbidden,      "pool clone and import completion"),
+    (Creating,        CleanupRequired, WriteForbidden,      "an interrupted create is handed to cleanup"),
+    (Creating,        Quarantined,     AllowedUnwritten,    NO_QUARANTINE_WRITER),
+    (Created,         Stopping,        RequestForbidden,    STOP_SETTLED_SOURCE),
+    (Created,         Suspended,       RequestForbidden,    "warm start restages a created row as suspended"),
+    (Created,         CleanupRequired, WriteForbidden,      "create's cleanup guard fires after its created write"),
+    (Created,         Quarantined,     AllowedUnwritten,    NO_QUARANTINE_WRITER),
+    (Starting,        Created,         WriteForbidden,      "cold-start rollback and startup recovery restore the entry state"),
+    (Starting,        Started,         AllowedNotRequested, COMPLETION_ONLY),
+    (Starting,        Stopping,        RequestForbidden,    STOP_LIVE_RUNTIME),
+    (Starting,        Stopped,         WriteForbidden,      "cold-start rollback and startup recovery restore the entry state"),
+    (Starting,        Suspended,       WriteForbidden,      "cold-start rollback restores a suspended entry state"),
+    (Starting,        CleanupRequired, WriteForbidden,      "an interrupted cold start is handed to cleanup"),
+    (Starting,        Quarantined,     AllowedUnwritten,    NO_QUARANTINE_WRITER),
+    (Started,         Suspending,      AllowedUnwritten,    "suspend pauses a started row first"),
+    (Started,         Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
+    (Stopping,        Stopped,         AllowedNotRequested, COMPLETION_ONLY),
+    (Stopping,        CleanupRequired, WriteForbidden,      "an interrupted stop is handed to cleanup"),
+    (Stopping,        CleanupFailed,   WriteForbidden,      "stop cleanup failed"),
+    (Stopping,        Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
+    (Stopped,         Stopping,        RequestForbidden,    STOP_SETTLED_SOURCE),
+    (Stopped,         Suspended,       RequestForbidden,    "warm start and process-snapshot rollback restage a stopped row"),
+    (Stopped,         Quarantined,     AllowedUnwritten,    NO_QUARANTINE_WRITER),
+    (Deleting,        CleanupRequired, WriteForbidden,      "an interrupted delete is handed to cleanup"),
+    (Deleting,        CleanupFailed,   WriteForbidden,      "delete cleanup failed"),
+    (Deleting,        Quarantined,     AllowedUnwritten,    NO_QUARANTINE_WRITER),
+    (Pausing,         Started,         WriteForbidden,      "pause rollback and startup pause recovery"),
+    (Pausing,         Stopping,        RequestForbidden,    STOP_LIVE_RUNTIME),
+    (Pausing,         Paused,          AllowedNotRequested, COMPLETION_ONLY),
+    (Pausing,         Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
+    (Paused,          Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
+    (Resuming,        Started,         AllowedNotRequested, COMPLETION_ONLY),
+    (Resuming,        Stopping,        RequestForbidden,    STOP_LIVE_RUNTIME),
+    (Resuming,        Paused,          WriteForbidden,      "resume rollback and startup resident recovery"),
+    (Resuming,        Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
+    (Checkpointing,   Started,         AllowedNotRequested, COMPLETION_ONLY),
+    (Checkpointing,   Stopping,        RequestForbidden,    STOP_LIVE_RUNTIME),
+    (Checkpointing,   Paused,          AllowedNotRequested, COMPLETION_ONLY),
+    (Checkpointing,   Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
+    (Suspending,      Stopping,        RequestForbidden,    STOP_LIVE_RUNTIME),
+    (Suspending,      Paused,          WriteForbidden,      "suspend rollback and startup suspend recovery"),
+    (Suspending,      Suspended,       AllowedNotRequested, COMPLETION_ONLY),
+    (Suspending,      CleanupRequired, WriteForbidden,      "an interrupted suspend is handed to cleanup"),
+    (Suspending,      CleanupFailed,   WriteForbidden,      "suspend cleanup failed"),
+    (Suspending,      Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
+    (Suspended,       Stopping,        RequestForbidden,    STOP_SETTLED_SOURCE),
+    (Suspended,       Stopped,         RequestForbidden,    "auto-lifecycle idle Stop of a suspended row bypasses every RPC"),
+    (Suspended,       CleanupRequired, WriteForbidden,      "base-snapshot create's cleanup guard fires after its suspended write"),
+    (Suspended,       Quarantined,     AllowedUnwritten,    NO_QUARANTINE_WRITER),
+    (Restoring,       Started,         AllowedNotRequested, COMPLETION_ONLY),
+    (Restoring,       Stopping,        RequestForbidden,    STOP_LIVE_RUNTIME),
+    (Restoring,       Stopped,         WriteForbidden,      "restore-as-new and stopped materialization publish a stopped disk"),
+    (Restoring,       Paused,          AllowedNotRequested, COMPLETION_ONLY),
+    (Restoring,       Suspended,       WriteForbidden,      "restore rollback, cross-node publication, restore recovery"),
+    (Restoring,       CleanupRequired, WriteForbidden,      "an interrupted or ambiguous restore is handed to cleanup"),
+    (Restoring,       Quarantined,     AllowedUnwritten,    NO_QUARANTINE_WRITER),
+    (CleanupRequired, Created,         WriteForbidden,      CLEANUP_SETTLES_INTENT),
+    (CleanupRequired, Stopping,        RequestForbidden,    STOP_RUNTIME_OWNER),
+    (CleanupRequired, Stopped,         WriteForbidden,      CLEANUP_SETTLES_INTENT),
+    (CleanupRequired, Suspended,       WriteForbidden,      "cleanup completion settles a mark_suspended intent"),
+    (CleanupRequired, CleanupFailed,   WriteForbidden,      "only cleanup records its own failure"),
+    (CleanupRequired, Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
+    (CleanupFailed,   Created,         WriteForbidden,      CLEANUP_SETTLES_INTENT),
+    (CleanupFailed,   Stopping,        RequestForbidden,    STOP_RUNTIME_OWNER),
+    (CleanupFailed,   Stopped,         WriteForbidden,      CLEANUP_SETTLES_INTENT),
+    (CleanupFailed,   Suspended,       WriteForbidden,      "cleanup completion settles a mark_suspended intent"),
+    (CleanupFailed,   CleanupRequired, WriteForbidden,      "only cleanup recovery re-requests cleanup"),
+    (CleanupFailed,   Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
+    (Quarantined,     Started,         WriteForbidden,      "pause-failed quarantine recovery"),
+    (Quarantined,     Paused,          WriteForbidden,      "pause-failed quarantine recovery"),
+    (Quarantined,     Restoring,       WriteForbidden,      "a restore adopts a quarantined synthetic orphan"),
+    (Quarantined,     CleanupRequired, RequestForbidden,    "Delete of a quarantined pool clone re-arms its disposal"),
+    (Failed,          Stopping,        RequestForbidden,    STOP_RUNTIME_OWNER),
+];
+
+fn position(node: Node) -> usize {
+    Node::ALL
+        .into_iter()
+        .position(|candidate| candidate == node)
+        .unwrap()
+}
+
+fn classify(from: Node, to: Node) -> Option<Disagreement> {
+    let lifecycle = EDGES
+        .iter()
+        .filter(|edge| to.lifecycle() == Some(edge.to()) && edge.from().contains(from.status()))
+        .map(|edge| edge.kind());
+    let cleanup = CLEANUP_EDGES
+        .iter()
+        .filter(|edge| to.cleanup() == Some(edge.to()) && edge.from().contains(from.status()))
+        .map(|edge| edge.kind());
+    let kinds: Vec<EdgeKind> = lifecycle.chain(cleanup).collect();
+    let requested = kinds.contains(&EdgeKind::Request);
+    match (from.can_transition_to(to), requested, !kinds.is_empty()) {
+        (true, true, _) | (false, false, false) => None,
+        (true, false, true) => Some(AllowedNotRequested),
+        (true, false, false) => Some(AllowedUnwritten),
+        (false, true, _) => Some(RequestForbidden),
+        (false, false, true) => Some(WriteForbidden),
+    }
+}
+
+#[test]
+fn persisted_edges_disagree_with_the_admission_machine_only_as_allowlisted() {
+    assert_eq!(
+        Node::ALL.map(Node::status),
+        SandboxStatus::sweep(),
+        "edge and indexed-writer sweeps must cover the same statuses in the same order"
+    );
+    let mut actual = BTreeMap::new();
+    for from in Node::ALL {
+        for to in Node::ALL {
+            if from == to {
+                continue;
+            }
+            if let Some(disagreement) = classify(from, to) {
+                actual.insert((position(from), position(to)), (from, to, disagreement));
+            }
+        }
+    }
+    let mut listed = BTreeMap::new();
+    for &(from, to, disagreement, reason) in ALLOWLIST {
+        assert!(!reason.trim().is_empty(), "{from} -> {to} needs a reason");
+        assert!(
+            listed
+                .insert((position(from), position(to)), (from, to, disagreement))
+                .is_none(),
+            "{from} -> {to} is listed twice"
+        );
+    }
+    let unlisted: Vec<String> = actual
+        .iter()
+        .filter(|(key, entry)| listed.get(*key) != Some(*entry))
+        .map(|(_, (from, to, disagreement))| format!("({from:?}, {to:?}, {disagreement:?}, \"\"),"))
+        .collect();
+    let stale: Vec<String> = listed
+        .iter()
+        .filter(|(key, entry)| actual.get(*key) != Some(*entry))
+        .map(|(_, (from, to, disagreement))| format!("{from:?} -> {to:?} ({disagreement:?})"))
+        .collect();
+    assert!(
+        unlisted.is_empty() && stale.is_empty(),
+        "the persisted-edge table and can_transition_to disagree outside the allowlist.\n\
+         Unlisted disagreements:\n{}\nAllowlist entries that no longer hold:\n{}",
+        unlisted.join("\n"),
+        stale.join("\n"),
+    );
+}
+
+#[test]
+fn no_edge_lists_its_own_target_as_a_source() {
+    for edge in EDGES {
+        assert!(
+            !edge.from().contains(edge.to().into()),
+            "{}: rewriting a row in its target state is not a transition",
+            edge.name()
+        );
+    }
+    for edge in CLEANUP_EDGES {
+        assert!(
+            !edge.from().contains(Node::of_cleanup(edge.to()).status()),
+            "{}: rewriting a row in its target state is not a transition",
+            edge.name()
+        );
+    }
+}
+
+/// Every edge's sources and target, as the table names them, in declaration
+/// order. `classify` merges edges that share a pair, so this
+/// pins each edge: a dropped edge, or one widened into a pair another edge
+/// already writes, fails here.
+#[rustfmt::skip]
+const EDGE_SOURCES: &[(&str, &[Node], Node)] = &[
+    ("CREATE_INSERT", &[], Creating),
+    ("CREATE_COMPLETE", &[Creating], Created),
+    ("CREATE_BASE_SNAPSHOT_COMPLETE", &[Created], Suspended),
+    ("CLONE_OR_IMPORT_COMPLETE_SUSPENDED", &[Creating], Suspended),
+    ("IMPORT_COMPLETE_STOPPED", &[Creating], Stopped),
+    ("COLD_START_BEGIN", &[Created, Stopped, Suspended], Starting),
+    ("RESTORE_BEGIN", &[Suspended], Restoring),
+    ("WARM_START_RESTAGE", &[Created, Stopped], Suspended),
+    ("CROSS_NODE_RESTORE_INSERT", &[], Restoring),
+    ("START_COMPLETE", &[Starting], Started),
+    ("RESTORE_COMPLETE_STARTED", &[Restoring], Started),
+    ("RESTORE_COMPLETE_PAUSED", &[Restoring], Paused),
+    ("CROSS_NODE_RESTORE_PUBLISHED", &[Restoring], Suspended),
+    ("RESTORED_DISK_AS_NEW", &[Restoring], Stopped),
+    ("START_ROLLBACK_CREATED", &[Starting], Created),
+    ("START_ROLLBACK_STOPPED", &[Starting], Stopped),
+    ("START_ROLLBACK_SUSPENDED", &[Starting], Suspended),
+    ("RESTORE_ROLLBACK", &[Restoring], Suspended),
+    ("PAUSE_BEGIN", &[Started], Pausing),
+    ("PAUSE_COMPLETE", &[Pausing], Paused),
+    ("PAUSE_ROLLBACK", &[Pausing], Started),
+    ("RESUME_BEGIN", &[Paused], Resuming),
+    ("RESUME_COMPLETE", &[Resuming], Started),
+    ("RESUME_ROLLBACK", &[Resuming], Paused),
+    ("CHECKPOINT_BEGIN", &[Started, Paused], Checkpointing),
+    ("TEMPLATE_SNAPSHOT_BEGIN", &[Paused], Checkpointing),
+    ("CHECKPOINT_COMPLETE_STARTED", &[Checkpointing], Started),
+    ("CHECKPOINT_COMPLETE_PAUSED", &[Checkpointing], Paused),
+    ("CHECKPOINT_ROLLBACK_STARTED", &[Checkpointing], Started),
+    ("CHECKPOINT_ROLLBACK_PAUSED", &[Checkpointing], Paused),
+    ("SUSPEND_BEGIN", &[Paused], Suspending),
+    ("SUSPEND_COMPLETE", &[Suspending], Suspended),
+    ("SUSPEND_ROLLBACK", &[Suspending], Paused),
+    ("PROCESS_SNAPSHOT_ROLLBACK_RESTAGE", &[Stopped], Suspended),
+    ("STOP_ADMISSION", &[Created, Starting, Started, Stopped, Pausing, Paused, Resuming, Checkpointing, Suspending, Suspended, Restoring, CleanupRequired, CleanupFailed, Failed], Stopping),
+    ("STOP_COMPLETE", &[Stopping], Stopped),
+    ("AUTO_LIFECYCLE_STOP_SUSPENDED", &[Suspended], Stopped),
+    ("DELETE_ADMISSION", &[Creating, Created, Starting, Started, Stopping, Stopped, Pausing, Paused, Resuming, Checkpointing, Suspending, Suspended, Restoring, CleanupRequired, CleanupFailed, Quarantined, Failed], Deleting),
+    ("EVICTION_CLAIM", &[Stopped, Suspending, Suspended, Restoring, Quarantined], Deleting),
+    ("CLEANUP_COMPLETE_CREATED", &[CleanupRequired, CleanupFailed], Created),
+    ("CLEANUP_COMPLETE_STOPPED", &[CleanupRequired, CleanupFailed], Stopped),
+    ("CLEANUP_COMPLETE_SUSPENDED", &[CleanupRequired, CleanupFailed], Suspended),
+    ("CLEANUP_QUARANTINE", &[CleanupRequired, CleanupFailed], Quarantined),
+    ("IN_FLIGHT_QUARANTINE", &[Stopping, Pausing, Resuming, Checkpointing], Quarantined),
+    ("SUSPEND_QUARANTINE", &[Suspending], Quarantined),
+    ("STARTUP_RESIDENT_QUARANTINE", &[Started, Paused, Resuming, Checkpointing], Quarantined),
+    ("ORPHAN_QUARANTINE_INSERT", &[], Quarantined),
+    ("PAUSE_FAILED_QUARANTINE_RECOVERY_STARTED", &[Quarantined], Started),
+    ("PAUSE_FAILED_QUARANTINE_RECOVERY_PAUSED", &[Quarantined], Paused),
+    ("ORPHAN_RESTORE_ADOPTION", &[Quarantined], Restoring),
+    ("INTERRUPTED_CREATE_RECOVERY", &[Creating], Created),
+    ("UNLAUNCHED_START_RECOVERY_STOPPED", &[Starting], Stopped),
+    ("UNLAUNCHED_START_RECOVERY_CREATED", &[Starting], Created),
+    ("INTERRUPTED_PAUSE_RECOVERY_STARTED", &[Pausing], Started),
+    ("INTERRUPTED_PAUSE_RECOVERY_PAUSED", &[Pausing], Paused),
+    ("STARTUP_RESIDENT_STARTED", &[Resuming, Checkpointing], Started),
+    ("STARTUP_RESIDENT_PAUSED", &[Resuming], Paused),
+    ("STARTUP_SUSPEND_ROLLBACK", &[Suspending], Paused),
+    ("INTERRUPTED_RESTORE_RECOVERY", &[Restoring], Suspended),
+    ("ORPHAN_SUSPENDED_INSERT", &[], Suspended),
+    ("ORPHAN_RESTORE_INSERT", &[], Restoring),
+    ("ACTIVATION_CLEANUP_REQUEST", &[Creating, Created, Starting, Suspended, Restoring], CleanupRequired),
+    ("CLEANUP_HANDOFF", &[Starting, Stopping, Deleting, Suspending, Restoring, CleanupFailed], CleanupRequired),
+    ("SUSPEND_ARTIFACT_CLEANUP", &[Suspending], CleanupRequired),
+    ("CLEANUP_FAILURE", &[Stopping, Deleting, Suspending, CleanupRequired], CleanupFailed),
+    ("QUARANTINE_CLEANUP_ADOPTION", &[Quarantined], CleanupRequired),
+    ("POOL_CLONE_DISPOSAL_REARM", &[Quarantined], CleanupRequired),
+    ("ORPHAN_CLEANUP_INSERT", &[], CleanupRequired),
+];
+
+#[test]
+fn each_edge_reads_exactly_its_listed_sources() {
+    let sources = |contains: &dyn Fn(SandboxStatus) -> bool| -> Vec<Node> {
+        Node::ALL
+            .into_iter()
+            .filter(|node| contains(node.status()))
+            .collect()
+    };
+    let actual: Vec<(&str, Vec<Node>, Node)> = EDGES
+        .iter()
+        .map(|edge| {
+            (
+                edge.name(),
+                sources(&|status| edge.from().contains(status)),
+                Node::of_lifecycle(edge.to()),
+            )
+        })
+        .chain(CLEANUP_EDGES.iter().map(|edge| {
+            (
+                edge.name(),
+                sources(&|status| edge.from().contains(status)),
+                Node::of_cleanup(edge.to()),
+            )
+        }))
+        .collect();
+    let expected: Vec<_> = EDGE_SOURCES
+        .iter()
+        .map(|(name, from, to)| (*name, from.to_vec(), *to))
+        .collect();
+    assert_eq!(actual, expected);
+}

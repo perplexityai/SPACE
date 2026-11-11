@@ -7,8 +7,13 @@ import "execution/v1/execution.proto";
 import "net/gateway/v1/gateway.proto";
 import "net/policy/v1/policy.proto";
 import "spaced/operations/v1/operations.proto";
+import "spaced/update/v1/update.proto";
 
 service SandboxManager {
+  // Node-local operator maintenance. Never wakes a dormant sandbox.
+  rpc GuestUpdateStatus(GuestUpdateStatusRequest) returns (GuestUpdateOperation);
+  rpc ApplyGuestUpdate(ApplyGuestUpdateRequest) returns (GuestUpdateOperation);
+  rpc RestartGuest(RestartGuestRequest) returns (GuestUpdateOperation);
   // Advisory readiness only. The environment input also fails closed on old readers.
   rpc GetExecutionCapabilities(GetExecutionCapabilitiesRequest) returns (GetExecutionCapabilitiesResponse);
 
@@ -115,8 +120,18 @@ service SandboxManager {
   // the old checkpoint. Files survive; memory and processes don't. A failed
   // boot restores the old pair and releases the fence. Idempotent per
   // `operation_id`: a retry resumes or settles the same upgrade. A rolled-back
-  // upgrade leaves no row behind, so a retry after it starts over.
+  // upgrade keeps only its outcome, so a retry after it starts over. A
+  // sandbox already on the target is activated in place for a STARTED
+  // target, and a suspended one absent from the node may be staged first;
+  // see `UpgradeRuntimeRequest.target_state` and `stage_from`, and
+  // `GetRuntimeUpgrade` for what the node records.
   rpc UpgradeRuntime(UpgradeRuntimeRequest) returns (UpgradeRuntimeResponse);
+
+  // Internal-only, read-only: where one `UpgradeRuntime` operation stands on
+  // this node, for a caller that can't see its response. A Kubernetes pod's
+  // shim runs the upgrade at container create, so the control plane reads the
+  // outcome here.
+  rpc GetRuntimeUpgrade(GetRuntimeUpgradeRequest) returns (GetRuntimeUpgradeResponse);
 
   // Enable rolling btrfs snapshots for a sandbox.
   rpc EnableSnapshots(EnableSnapshotsRequest) returns (EnableSnapshotsResponse);
@@ -244,7 +259,7 @@ service SandboxManager {
   // Internal: find a paused pool sandbox, reassign to user, resume it.
   rpc AdoptPoolSandbox(AdoptPoolSandboxRequest) returns (AdoptPoolSandboxResponse);
 
-  // Wait for stopped, failed, cleanup_failed, suspended, or quarantined, or time out.
+  // Wait for stopped, failed, suspended, quarantined, or a failed cleanup, or time out.
   // Quarantine completes the wait without implying that runtime or files were removed.
   rpc Wait(WaitRequest) returns (WaitResponse);
 
@@ -269,6 +284,40 @@ service SandboxManager {
 
   // Internal: resolve the effective sandbox memory policy for this node.
   rpc ResolveSandboxMemory(ResolveSandboxMemoryRequest) returns (ResolveSandboxMemoryResponse);
+}
+
+message GuestUpdateStatusRequest {
+  string sandbox_id = 1;
+  optional string operation_id = 2;
+}
+message ApplyGuestUpdateRequest {
+  string sandbox_id = 1;
+  string operation_id = 2;
+  string expected_execution_id = 3;
+  space.spaced.update.v1.Promotion promotion = 4;
+  bool force = 5;
+}
+message RestartGuestRequest {
+  string sandbox_id = 1;
+  string operation_id = 2;
+  string expected_execution_id = 3;
+  bool force = 4;
+}
+enum GuestUpdateOperationPhase {
+  GUEST_UPDATE_OPERATION_PHASE_UNSPECIFIED = 0;
+  GUEST_UPDATE_OPERATION_PHASE_PENDING = 1;
+  GUEST_UPDATE_OPERATION_PHASE_STAGED = 2;
+  GUEST_UPDATE_OPERATION_PHASE_ACTIVATING = 3;
+  GUEST_UPDATE_OPERATION_PHASE_SETTLING = 4;
+  GUEST_UPDATE_OPERATION_PHASE_COMPLETE = 5;
+}
+message GuestUpdateOperation {
+  string sandbox_id = 1;
+  string execution_id = 2;
+  optional string operation_id = 3;
+  GuestUpdateOperationPhase phase = 4;
+  optional string outcome = 5;
+  optional space.spaced.update.v1.Status guest = 6;
 }
 
 enum BootMode {
@@ -592,8 +641,8 @@ message CleanupTargetBatch {
   repeated CleanupTargetObservation targets = 1;
 }
 
-// Node-local lifecycle, including cleanup states that are not control-plane
-// desired lifecycles. Unknown observations are never evidence of a safe state.
+// Node-local lifecycle. Unknown observations are never evidence of a safe
+// state.
 enum SandboxLifecycleState {
   SANDBOX_LIFECYCLE_STATE_UNSPECIFIED = 0;
   SANDBOX_LIFECYCLE_STATE_CREATING = 1;
@@ -610,8 +659,10 @@ enum SandboxLifecycleState {
   SANDBOX_LIFECYCLE_STATE_SUSPENDING = 12;
   SANDBOX_LIFECYCLE_STATE_SUSPENDED = 13;
   SANDBOX_LIFECYCLE_STATE_RESTORING = 14;
-  SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED = 15;
-  SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED = 16;
+  // Retired CLEANUP_REQUIRED and CLEANUP_FAILED. A row a cleanup owns is
+  // published with the lifecycle the cleanup is over and `SandboxCleanup.state`.
+  reserved 15, 16;
+  reserved "SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED", "SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED";
   SANDBOX_LIFECYCLE_STATE_QUARANTINED = 17;
   SANDBOX_LIFECYCLE_STATE_FAILED = 18;
 }
@@ -710,6 +761,64 @@ message SandboxInfo {
   // artifact matches the disk. A time from any other machine isn't
   // comparable. Absent means unknown, not old: older nodes never set it.
   optional google.protobuf.Timestamp current_local_artifact_created_at = 58;
+  // The row's recorded node-local cleanup. Absent when none is recorded, or
+  // from an older node that never set it.
+  optional SandboxCleanup cleanup = 59;
+}
+
+// A node-local cleanup recorded on a sandbox row. An activation records one,
+// as does a stop, suspend or delete admitted with a persisted intent. A row a
+// cleanup owns keeps the completion it was admitted with, but can also have
+// none, for example one that sbx-manager's cleanup recovery will quarantine.
+// Such a row is published with `state` set and `completion` UNSPECIFIED.
+message SandboxCleanup {
+  // What the cleanup does to the row when it finishes. Every writer of
+  // MARK_STOPPED keeps the rootfs: a stop, whether a user's or sbx-manager's
+  // own (runtime exit, runtime upgrade, snapshot restore); a failed start of a
+  // stopped sandbox; and sbx-manager's recovery of an interrupted stop or
+  // start, a first start included. This is what tells those rows from a
+  // failed delete.
+  SandboxCleanupCompletion completion = 1;
+  // Whether a cleanup owns the row: a forced teardown is required, or a
+  // teardown attempt failed and is retried. UNSPECIFIED means no cleanup owns
+  // it. An armed activation, whose rollback target is recorded in
+  // `completion` while the start still runs, is UNSPECIFIED, so read this
+  // field, not the presence of this message, to tell a cleanup-owned row. A
+  // row can be REQUIRED or FAILED with no completion recorded. A node publishes
+  // such a row with the teardown transition the cleanup is over (STOPPING,
+  // DELETING or SUSPENDING).
+  SandboxCleanupState state = 2;
+}
+
+// What an admitted node-local cleanup does to the row when it finishes. For a
+// row a cleanup owns, the shim's legacy pod teardown stops the sandbox on Kill
+// and deletes it on Delete for any value it doesn't recognize, so a new value
+// that keeps the rootfs needs a shim that releases it to deploy first.
+enum SandboxCleanupCompletion {
+  SANDBOX_CLEANUP_COMPLETION_UNSPECIFIED = 0;
+  // Marks the row CREATED.
+  SANDBOX_CLEANUP_COMPLETION_MARK_CREATED = 1;
+  // Marks the row STOPPED.
+  SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED = 2;
+  // Marks the row SUSPENDED.
+  SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED = 3;
+  // Marks the row QUARANTINED.
+  SANDBOX_CLEANUP_COMPLETION_QUARANTINE = 4;
+  // Deletes the row.
+  SANDBOX_CLEANUP_COMPLETION_DELETE_ROW = 5;
+  // Deletes a pool clone's row.
+  SANDBOX_CLEANUP_COMPLETION_DELETE_POOL_CLONE = 6;
+}
+
+// Whether a node-local cleanup owns a sandbox row. This is the cleanup's own
+// state, kept apart from the sandbox lifecycle.
+enum SandboxCleanupState {
+  // No cleanup owns the row.
+  SANDBOX_CLEANUP_STATE_UNSPECIFIED = 0;
+  // A forced teardown owns the row and is owed.
+  SANDBOX_CLEANUP_STATE_REQUIRED = 1;
+  // A teardown owns the row and its last attempt failed; it is retried.
+  SANDBOX_CLEANUP_STATE_FAILED = 2;
 }
 
 enum SandboxHealthStatus {
@@ -783,6 +892,10 @@ message SandboxListElement {
   optional string created_at = 7;
   optional string owner = 8;
   optional SandboxLifecycleState lifecycle = 9;
+  // The row's recorded cleanup, from the same read as `lifecycle`, as on
+  // SandboxInfo. Absent when none is recorded, or from a node that doesn't
+  // publish it.
+  optional SandboxCleanup cleanup = 10;
 }
 
 message ListResponse {
@@ -1015,6 +1128,14 @@ message CreateTemplateBaseSnapshotRequest {
   string sandbox_id = 1;
   uint32 vcpu = 2;
   uint32 memory_mib = 3;
+  // The template-manager cache partition the snapshot is published under:
+  // empty for the legacy partition, else an environment reference. It names
+  // the partition of the build row the capture booted, which can differ from
+  // the capture sandbox's binding: a legacy-layout build bound to another
+  // environment is adopted in the legacy partition. Sandbox-manager accepts
+  // the legacy partition or its binding's own, and refuses any other. Absent
+  // from a template-manager without partitions, which reads the legacy one.
+  optional string cache_partition = 4;
 }
 message CreateTemplateBaseSnapshotResponse {
   string snapshot_hash = 1;
@@ -1134,8 +1255,48 @@ message UpgradeRuntimeRequest {
   // Lifecycle after a verified boot: STARTED (or unspecified) leaves the new
   // execution running; STOPPED stops it again, unless the sandbox stopped,
   // suspended or started another execution first, which the upgrade leaves
-  // as it is.
+  // as it is. A sandbox already on the target ends STOPPED only if it's
+  // stopped or suspended; one that runs is refused with FAILED_PRECONDITION.
+  //
+  // With STARTED the response always carries the running execution's
+  // `start`. A sandbox already on the target is activated in place: a stopped
+  // one is cold-started and a suspended one restored from its checkpoint,
+  // with this request's `start`. An operation starts the sandbox at most
+  // once while the node keeps its records: a start refused before its
+  // activation claimed the sandbox may be retried; once an activation has
+  // claimed it, this one or another, a retry is answered as below. The claim
+  // itself refuses a sandbox another activation moved off the execution the
+  // start was decided on. An operation answered with the execution already
+  // running is complete too: a retry after a later stop never starts it. A sandbox already started, a replay of
+  // an upgrade that already finished, and a retry of an activation answer
+  // with the live execution only when its route identity names the same pod
+  // (`pod_uid` and `execution_generation`), or to a caller whose `start`
+  // names no pod; anything else is refused with
+  // FAILED_PRECONDITION rather than moved, and a new attempt takes a new
+  // operation id.
   WakeTargetState target_state = 6;
+  // Requires `checkpoint_local_artifact_id`.
+  // Where to stage a suspended sandbox absent from this node from, before the
+  // upgrade inspects it, and where a stage interrupted after it adopted the
+  // row resumes from. Staging leaves the row suspended and never launches the
+  // checkpoint. Ignored when the node holds a row for the sandbox in any
+  // other state. Staging runs before the upgrade's own checks, so an upgrade
+  // refused afterwards (an uncertified edge, missing consent) leaves the
+  // staged sandbox suspended on this node.
+  optional RuntimeUpgradeStageFrom stage_from = 7;
+  // For a suspended sandbox, the local artifact of the checkpoint the control
+  // plane decided the upgrade from, as `WakeRuntimeUpgrade` names it. Required
+  // for a suspended sandbox: the node upgrades only a row whose current local
+  // artifact is that checkpoint, and refuses a stale copy or an upgrade that
+  // names none.
+  optional string checkpoint_local_artifact_id = 8;
+}
+
+// The suspend checkpoint an `UpgradeRuntime` stages a sandbox absent from
+// the node from: the same pair a restore `Start` carries.
+message RuntimeUpgradeStageFrom {
+  string suspend_restore_storage_uri = 1;
+  optional string suspend_restore_source_node = 2;
 }
 
 enum RuntimeUpgradeOutcome {
@@ -1152,8 +1313,66 @@ enum RuntimeUpgradeOutcome {
 
 message UpgradeRuntimeResponse {
   RuntimeUpgradeOutcome outcome = 1;
-  // Present when this call ran the cold boot.
+  // Present when this call ran the cold boot, and for a STARTED target
+  // whenever the call succeeds: see `UpgradeRuntimeRequest.target_state`.
   optional StartResponse start = 2;
+}
+
+message GetRuntimeUpgradeRequest {
+  string sandbox_id = 1;
+  string operation_id = 2;
+}
+
+enum RuntimeUpgradeStatus {
+  RUNTIME_UPGRADE_STATUS_UNSPECIFIED = 0;
+  // The node holds no record of the operation: it never reached this node,
+  // it was refused before fencing anything, or the sandbox was deleted from
+  // this node since, with its upgrade records.
+  RUNTIME_UPGRADE_STATUS_ABSENT = 1;
+  // The upgrade fences the sandbox, or its verified boot hasn't retired the
+  // old checkpoint yet. `phase` says which.
+  RUNTIME_UPGRADE_STATUS_IN_PROGRESS = 2;
+  // The sandbox booted under the target and its old checkpoint is retired.
+  RUNTIME_UPGRADE_STATUS_UPGRADED = 3;
+  // The old disk/checkpoint pair is back; `failure` says why.
+  RUNTIME_UPGRADE_STATUS_ROLLED_BACK = 4;
+  // The sandbox was already on the target; nothing was fenced or booted.
+  RUNTIME_UPGRADE_STATUS_ALREADY_ON_TARGET = 5;
+}
+
+// The phase of an upgrade that's IN_PROGRESS.
+enum RuntimeUpgradePhase {
+  RUNTIME_UPGRADE_PHASE_UNSPECIFIED = 0;
+  RUNTIME_UPGRADE_PHASE_FENCED = 1;
+  RUNTIME_UPGRADE_PHASE_PRESERVED = 2;
+  RUNTIME_UPGRADE_PHASE_BOOTING = 3;
+  RUNTIME_UPGRADE_PHASE_VERIFIED = 4;
+}
+
+// The upgrade's outcome on the node, not the outcome of the pod that asked
+// for it: an upgrade can be recorded UPGRADED or ALREADY_ON_TARGET while the
+// pod's create was refused, for one whose sandbox ran another pod's execution
+// or wasn't at rest for a STOPPED target. Read it together with the pod's
+// status. An operation the node recorded for another sandbox than the request
+// names is refused with INVALID_ARGUMENT.
+message GetRuntimeUpgradeResponse {
+  RuntimeUpgradeStatus status = 1;
+  // Set with IN_PROGRESS.
+  RuntimeUpgradePhase phase = 2;
+  // Set with ROLLED_BACK when the node recorded a reason.
+  optional string failure = 3;
+  // With ALREADY_ON_TARGET: the operation's `UpgradeRuntime` claimed its
+  // activation for a STARTED target, either by claiming the start of the
+  // sandbox, which is written before the start runs, so the start itself may
+  // have failed and the flag alone doesn't say the sandbox runs, or by
+  // answering with the execution already running. A Wake's upgrade that
+  // found its target starts the sandbox as a Wake does and claims nothing.
+  // Once anything has started the sandbox since, or the operation answered
+  // with a running execution, the operation never starts it again, and a
+  // sandbox that isn't running the caller's pod's execution needs a new
+  // operation id; a start refused before its activation claimed the sandbox
+  // may be retried under the same one.
+  bool activation_claimed = 4;
 }
 
 message EnableSnapshotsRequest { string sandbox_id = 1; }
@@ -1533,6 +1752,11 @@ message WaitRequest {
 message WaitResponse {
   string sandbox_id = 1;
   optional SandboxLifecycleState lifecycle = 3;
+  // The row's recorded cleanup, from the same read as `lifecycle`, as on
+  // SandboxInfo. Absent when none is recorded, or from a node that doesn't
+  // publish it. Wait answers only once the wait completes, so a cleanup it
+  // reports as owning the row has FAILED, never REQUIRED.
+  optional SandboxCleanup cleanup = 4;
 }
 
 message CloneFromDonorRequest {

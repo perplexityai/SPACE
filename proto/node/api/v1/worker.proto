@@ -115,10 +115,11 @@ service WorkerApi {
 }
 
 // WorkerApiInternal is the worker's control-plane surface, served on the same
-// listener as WorkerApi with its own credential: pool adoption, and the only Wake
+// listener as WorkerApi with its own credential: pool adoption, the only Wake
 // node-api serves, whose request can carry a privileged start_context or
-// runtime_upgrade.
+// runtime_upgrade, and the outcome of a runtime upgrade a pod's shim ran.
 service WorkerApiInternal {
   rpc AdoptPoolSandbox(space.sandbox.manager.v1.AdoptPoolSandboxRequest) returns (space.sandbox.manager.v1.AdoptPoolSandboxResponse);
   rpc WakeSandbox(space.sandbox.manager.v1.WakeRequest) returns (space.sandbox.manager.v1.WakeResponse);
+  rpc GetRuntimeUpgrade(space.sandbox.manager.v1.GetRuntimeUpgradeRequest) returns (space.sandbox.manager.v1.GetRuntimeUpgradeResponse);
 }

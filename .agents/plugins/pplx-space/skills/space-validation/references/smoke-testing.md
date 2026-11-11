@@ -54,7 +54,7 @@ retire the script when no tests remain in it.
 
 Some kind-chart values are cross-deployment invariants, not free knobs: the
 API's and cluster-controller's copies of the snapshot-retention grace must
-stay equal because fork admission (`crates/libs/api/src/fork_operations.rs`)
+stay equal because fork admission (`crates/l40_api/api/src/fork_operations.rs`)
 trusts the API's copy to describe what the controller will actually prune.
 Do not bake smoke-sized reconciler knobs (tick, grace, dry-run) into the kind
 chart values; before treating any chart value as arbitrary, grep the env var

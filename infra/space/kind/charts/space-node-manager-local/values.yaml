@@ -20,9 +20,9 @@ node: {}
 
 # node-manager drains for DEFAULT_DRAIN_TIMEOUT (25 s) and then keeps waiting
 # for tracked tasks while it holds its service mutex
-# (crates/libs/node/mgr/server/src/run.rs); the kubelet's SIGKILL ends that
+# (crates/l40_api/node/mgr/server/src/run.rs); the kubelet's SIGKILL ends that
 # wait. 60 s is the grace the shared lifecycle defaults are sized against
-# (crates/libs/service-lifecycle/src/lib.rs) and stays inside the successor's
+# (crates/l10_foundation/service/lifecycle/src/lib.rs) and stays inside the successor's
 # 180 s mutex wait (--service-mutex-timeout-secs default).
 terminationGracePeriodSeconds: 60
 
@@ -36,7 +36,7 @@ artifactInstalls:
   enabled: true
 
 # The loop-device pool node-manager raises its node to at startup
-# (crates/libs/node/mgr/server/src/loop_devices.rs). Empty means that
+# (crates/l40_api/node/mgr/server/src/loop_devices.rs). Empty means that
 # module's floor of 64, which the node image's space-loop-nodes.service also
 # stages before kubelet. The Tiltfile maps SPACE_LOOP_DEVICE_TARGET onto this
 # value. node-manager reads it only as a test hook

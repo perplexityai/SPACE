@@ -42,7 +42,7 @@ including `aws_lc_rs` for rustls and rcgen, `tls-aws-lc` for tonic, and
 
 Services install the process-wide rustls provider through
 `pplx_space_rustls_provider::install_default_rustls_crypto_provider`
-(re-exported from `pplx-space-common-svc`); downstream
+(which `pplx-space-service-host`'s `init_service` calls); downstream
 crates must not attempt to install a competing provider. A transitive dependency
 that offers no provider choice may retain ring temporarily, but record that
 constraint rather than adding SPACE-owned ring usage around it. Changing the
@@ -104,7 +104,7 @@ The point: you should be able to build the cluster-agnostic core of SPACE withou
 ## Logging / tracing: `tracing` everywhere, `tracing-subscriber` only in apps
 
 - **Libraries (`crates/libs/**` and the `l10`–`l40` layer directories) use the `tracing` crate.** Emit spans and events; never configure a global subscriber from a library. Never use `log`, `slog`, `env_logger`, or `println!` for diagnostic output in library code.
-- **Apps (`crates/apps/**` and `crates/l50_app/**`) own the subscriber.** They call into our common helpers for service / CLI runtime to set up subscribers consistently. Those helpers decide when to send to `journald`, when to send to Datadog, when to render to a terminal, what JSON layer to use in production, etc.
+- **Apps (`crates/l50_app/**`) own the subscriber.** They call into our common helpers for service / CLI runtime to set up subscribers consistently. Those helpers decide when to send to `journald`, when to send to Datadog, when to render to a terminal, what JSON layer to use in production, etc.
 - **Choosing the output sink is the app's job, not the library's.** A library that prints to stderr is broken in a service that wants structured JSON to Datadog and broken in a CLI that wants pretty terminal output.
 
 Span discipline (see `docs/rust/space-review-lessons.md` § 11 for the full lesson):
@@ -128,8 +128,7 @@ Reach for `Mutex<HashMap<_, _>>` or `RwLock<HashMap<_, _>>` only when you genuin
 ## SQL statements: wrap in the `sql!` locator macro
 
 Every SQL statement handed to `sqlx::query*` is wrapped in
-`pplx_space_common_core::sql!` (defined in `pplx-space-sql-locator`;
-re-exported from `pplx-space-common-svc`),
+`pplx_space_sql_locator::sql!` (re-exported as `pplx_space_common_core::sql!`),
 which prepends a `/*module_path:line*/` comment to the statement:
 
 ```rust
@@ -148,14 +147,14 @@ it, instead of leaving you to grep the workspace for a normalized query shape.
 The locator leads the statement (so `track_activity_query_size` truncation
 can't drop it) and contains no whitespace (so it consumes one word of sqlx's
 word-budgeted query summaries). The observability layer strips it when deriving
-OTel span names (`crates/libs/observability/src/sqlx_otel.rs`), so Datadog APM
+OTel span names (`crates/l10_foundation/observability/src/sqlx_otel.rs`), so Datadog APM
 resource names keep grouping by query shape, not by call site.
 
 SQL kept in a `const` or a `fn() -> &'static str` helper gets wrapped at the
 definition, where the SQL text lives. Don't route a caller's SQL through a
 wrapper that applies `sql!` for it: every statement would carry the wrapper's
 locator. The `execute` helper in
-`crates/libs/db/migrator/src/bootstrap_roles.rs` is the known exception, not a
+`crates/l30_storage/db/migrate/src/bootstrap_roles.rs` is the known exception, not a
 precedent. Node-local `rusqlite` call sites are not annotated today.
 
 ### Substrate values are bound parameters
@@ -178,12 +177,12 @@ sqlx::query_scalar::<_, NodeId>(sql!(
 
 The statement stays syntactically whole, as the store rules require: new code
 writes whole statements with bound values, not fragments around the value.
-The started- and failed-restorable repair guard builders
-(`started_repair_row_state_guards` and `failed_repair_row_state_guards` in
-`crates/libs/sandbox/store/src/repair.rs`, public only because the cluster
-controller's candidate scans compose them) and the shared
+The failed-restorable repair guard builder
+(`failed_repair_row_state_guards` in
+`crates/l30_storage/sandbox/store/src/repair.rs`, public only because the cluster
+controller's candidate scan composes it) and the shared
 `routable_execution_or_non_k8s` routability fragment
-(`crates/libs/sandbox/routability/src/lib.rs`) take their placeholder as an
+(`crates/l30_storage/sandbox/routability/src/lib.rs`) take their placeholder as an
 argument only because they are existing fragments; they are not a pattern for
 new code. Read a `managed_by` column back as `SubstrateKind`
 rather than comparing strings. Where one bad row must not fail the batch, read
@@ -220,7 +219,7 @@ the target of everything it logs. Datadog attribute queries accept wildcards,
 but an exact-value `@target` filter silently stops matching, so list renamed
 targets in the PR description.
 An event whose target searches depend on takes a literal `target: "..."`, as
-`space.admin.audit` does (`crates/libs/api/src/routes/admin/audit.rs`). A
+`space.admin.audit` does (`crates/l40_api/api/src/routes/admin/audit.rs`). A
 `const LOG_TARGET: &str = module_path!()` keeps a target when code moves into a
 child module, but not when the module that defines it is moved or renamed.
 
@@ -244,7 +243,7 @@ inline `#[cfg(test)] mod tests { … }` body; it carries only the declaration, a
 the body moves to a file named after the module:
 
 ```rust
-// crates/libs/node/mgr/server/src/slot_pool.rs:1489-1490 — the declaration sits
+// crates/l40_api/node/mgr/server/src/slot_pool.rs:1489-1490 — the declaration sits
 // among the production `mod` lines, gated exactly as the inline block was.
 mod db;
 mod reset;
@@ -255,7 +254,7 @@ mod worker;
 ```
 
 ```rust
-// crates/libs/node/mgr/server/src/slot_pool/tests.rs
+// crates/l40_api/node/mgr/server/src/slot_pool/tests.rs
 use super::db::*;
 use super::reset::*;
 use super::*;
@@ -295,7 +294,7 @@ flat variant at the end of this section, which exists to dodge it.
 One module, one file. A src file with two named test modules gets two sibling
 files, not one file with two `mod` blocks inside it. Nesting follows Rust's
 ordinary module resolution, so a test module inside an inline production module
-lands one directory deeper — `crates/libs/metrics-emit/src/lib.rs` declares
+lands one directory deeper — `crates/l10_foundation/metrics/emit/src/lib.rs` declares
 `pub mod test_capture`, whose own tests belong at `test_capture/tests.rs`.
 
 ### Why module-path preservation is the point
@@ -347,11 +346,11 @@ mod slot_pool_tests {
 ```
 
 The wrapper adds a path segment that shows up in every derived name. The live
-evidence is in `crates/libs/sbx/mgr/server/src/service/tests.rs`, whose
+evidence is in `crates/l40_api/sbx/mgr/server/src/service/tests.rs`, whose
 `pub(crate) mod service_tests` wrapper produced snapshot files named
 `pplx_space_sbx_mgr__service__tests__service_tests__*.snap` — one redundant
 segment, baked into seven checked-in filenames.
-`crates/libs/node/mgr/server/src/slot_pool/tests.rs` has the same wrapper. Both
+`crates/l40_api/node/mgr/server/src/slot_pool/tests.rs` has the same wrapper. Both
 are pre-existing; neither is a pattern to copy.
 
 ### `tests/` integration directories are reserved
@@ -366,8 +365,8 @@ unit tests. Use one only when the test genuinely wants integration semantics:
 - It **spawns the built binary** via `CARGO_BIN_EXE_*`.
 - It needs a **multi-file `support/` harness** shared across several test
   binaries, included per-binary with `#[path = "support/x.rs"]` — the shape used
-  by `crates/libs/spaced/guest/server/tests/` and
-  `crates/libs/spaced/host/server/tests/`. Note the repo has no
+  by `crates/l40_api/spaced/guest/server/tests/` and
+  `crates/l40_api/spaced/host/server/tests/`. Note the repo has no
   `tests/common/mod.rs` anywhere; don't introduce one.
 
 Why not by default: the large majority of existing test modules touch private
@@ -383,10 +382,10 @@ When test support has to cross a crate boundary, gate it behind a named
 `test-capture`-style feature rather than exporting it unconditionally or
 duplicating it. `pplx-space-metrics-emit` is the pattern: `test-capture = []`
 in its `[features]`, the helper gated `#[cfg(any(test, feature = "test-capture"))]`
-(`crates/libs/metrics-emit/src/lib.rs`), so the crate's own tests get it for
+(`crates/l10_foundation/metrics/emit/src/lib.rs`), so the crate's own tests get it for
 free and downstream crates opt in explicitly. `cfg(test)` does not reach a
 dependency, so a crate that re-exports such a helper forwards the feature and
-enables it on its own dev-dependency, as `pplx-space-metrics` does.
+enables it on its own dev-dependency.
 
 ### Watch items when moving or writing test files
 
@@ -394,7 +393,7 @@ enables it on its own dev-dependency, as `pplx-space-metrics` does.
   file.** Moving a test body one directory deeper needs a `../` on every such
   path — *unless* the path is anchored with
   `concat!(env!("CARGO_MANIFEST_DIR"), …)`, which is location-independent and
-  must be left alone (`crates/libs/sbx/mgr/server/src/restart_admission.rs`
+  must be left alone (`crates/l40_api/sbx/mgr/server/src/restart_admission.rs`
   is a live example).
 - **Expect cosmetic rustfmt reflow in the moved body.** Dedenting lets
   previously-wrapped lines fit the width limit, so rustfmt collapses them —
@@ -403,12 +402,12 @@ enables it on its own dev-dependency, as `pplx-space-metrics` does.
   content change in review.
 - **`insta::with_settings!({ snapshot_path => "fixtures" })` is file-relative
   too** (`crates/libs/common/core/src/k8s.rs`,
-  `crates/libs/node/mgr/server/src/firewall.rs`). Either move the fixture
+  `crates/l40_api/node/mgr/server/src/firewall.rs`). Either move the fixture
   directory with the tests or adjust the setting; a stale relative path fails as
   a missing snapshot, not as a compile error.
 - **A `//! # Test matrix` header is encouraged** on larger test files: a
   doc-comment mapping each required behavior to the test name that covers it.
-  `crates/libs/cluster/controller/server/src/node_drain/tests.rs` is the worked
+  `crates/l40_api/cluster/controller/server/src/node_drain/tests.rs` is the worked
   example — categories (`C`, `R`, `M`, `D`, `L`), one line per case, names
   following `<category>_<scenario>`.
 
@@ -416,9 +415,9 @@ enables it on its own dev-dependency, as `pplx-space-metrics` does.
 
 Three files keep their test body as a *flat* sibling named
 `<host>_tests.rs`, reached with an explicit `#[path = "…"]`:
-`crates/libs/sbx/mgr/server/src/sidecar_env.rs`,
-`crates/libs/internal/api/server/src/status.rs`, and
-`crates/libs/internal/api/server/src/published_state.rs`. This works, but it
+`crates/l40_api/sbx/mgr/server/src/sidecar_env.rs`,
+`crates/l40_api/internal/api/server/src/status.rs`, and
+`crates/l40_api/internal/api/server/src/published_state.rs`. This works, but it
 needs an attribute to say what `mod tests;` says for free, and it puts test
 files in the same directory listing as production ones. Don't propagate it; new
 test modules use the plain `#[cfg(test)] mod <name>;` + `<host>/<name>.rs` form.
@@ -439,6 +438,23 @@ opt-out. Set to empty or `0` it is still read as optional, a legacy reading
 rather than an opt-out to use: the NoCoW host-fixture tests treat any value of
 it as CI. Don't print the marker for a skip that is not a missing service, such
 as a main-CI-only test.
+
+To run the Postgres suites against a candidate schema change before it is
+written as a migration, set `SPACE_TEST_POSTGRES_SCHEMA_VARIANT`; the fixtures
+crate's README ("Schema variants") lists the variants and how to write test
+DDL that works under them.
+
+## Test duration: 2 seconds per test
+
+Each test in the Rust tests job should take up to 2 s. After each nextest
+run, CI reads nextest's JUnit report (`ci/scripts/check-test-durations.py`,
+`ci/test-duration-budget.toml`). It reports each test over 2 s as a warning
+and fails the job when a test takes over 4 s, or, for a listed test, over
+its own ceiling. The gap absorbs CI's run-to-run variance, which often
+doubles a test's time on a loaded runner. A test over the 2 s limit is still
+too slow: test the behaviour at a smaller size, against an injected clock, or
+without a fixed wait. A new test does not get an entry. Make a listed test
+faster and delete its entry; never raise a ceiling.
 
 ## Privileged tests and the CI host
 
@@ -511,7 +527,7 @@ when it returns false. Never call `std::env::set_var`.
 
 Every deployable service is a library crate that *is* the service plus a
 binary crate whose `main.rs` is only the seam between the process and that
-library. `crates/apps/data/plane/svc/src/main.rs` is the exemplar. A thin main
+library. `crates/l50_app/data/plane/svc/src/main.rs` is the exemplar. A thin main
 holds exactly:
 
 - the clap `Cli`, and `impl From<Cli> for <Svc>RunConfig` (clap `env = "..."`

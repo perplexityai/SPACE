@@ -133,7 +133,7 @@ export function matchesSandboxQuery(query: SandboxQuery, sandbox: { id: string; 
 }
 
 // The longest sandbox name (`MAX_SANDBOX_NAME_BYTES` in
-// crates/libs/public/api/src/limits.rs): a longer prefix starts no name.
+// crates/l20_domain/public/api/src/limits.rs): a longer prefix starts no name.
 const MAX_SANDBOX_NAME_BYTES = 256;
 const UUID_DASH_POSITIONS = [8, 13, 18, 23];
 
@@ -148,7 +148,28 @@ function startsUuid(value: string): boolean {
     dashed && UUID_DASH_POSITIONS.includes(position) ? character === '-' : /^[0-9a-f]$/.test(character));
 }
 
-// What the search box does on each list shape.
+// Text the server takes as `search` (`SandboxSearch` in
+// crates/l40_api/api/src/controllers/sandbox/list_page/admin.rs): an
+// optional `sbx_` in either case, then hex digits and dashes, with 4 to 32
+// digits. It matches IDs that end with the digits, such as the ID column's
+// label, and from 8 digits IDs that start with them; it never matches names.
+const ID_SEARCH_PATTERN = /^(?:[sS][bB][xX]_)?[0-9a-fA-F-]+$/;
+const MIN_ID_SEARCH_DIGITS = 4;
+const MAX_ID_SEARCH_DIGITS = 32;
+
+function isIdSearch(typed: string): boolean {
+  if (!ID_SEARCH_PATTERN.test(typed)) return false;
+  const digits = typed.replace(/^sbx_/i, '').replaceAll('-', '').length;
+  return digits >= MIN_ID_SEARCH_DIGITS && digits <= MAX_ID_SEARCH_DIGITS;
+}
+
+// What the search box does on each list shape. Every text is matched as on
+// a server without `search`; `serverSearch` says the server takes it, and
+// then text that is also an ID's hex digits (`isIdSearch`) carries
+// `idSearch` too: it is sent as `search`, in a request of its own, and its
+// matches are listed after the page with the `fragment` request's. So a
+// name made only of hex digits and dashes, such as `e2e-1`, is still found
+// by its name, and the ID column's label by the end of its ID.
 // - `ref`: a full identifier in any accepted form, looked up directly.
 // - `prefix`: sent to a paging server as typed. It matches the start of
 //   names case-sensitively, and the start of IDs: an `sbx_` ID prefix, or a
@@ -166,14 +187,23 @@ function startsUuid(value: string): boolean {
 // - `page`: matched within the loaded rows, ignoring case, anywhere in the ID
 //   or name. On a paging server this is only text no name can start with. A
 //   sampled list matches all free text this way, as it did before paging.
+// `idSearch`, when set, is the trimmed text, sent as `search` on a paging
+// server that takes it.
 export type SandboxSearch =
   | { kind: 'empty' }
   | { kind: 'ref'; ref: SandboxRef }
-  | { kind: 'prefix'; prefix: string }
-  | { kind: 'fragment'; prefix: string; query: Extract<SandboxQuery, { kind: 'text' }> }
-  | { kind: 'page'; query: Extract<SandboxQuery, { kind: 'text' }> };
+  | { kind: 'prefix'; prefix: string; idSearch?: string }
+  | { kind: 'fragment'; prefix: string; query: Extract<SandboxQuery, { kind: 'text' }>; idSearch?: string }
+  | { kind: 'page'; query: Extract<SandboxQuery, { kind: 'text' }>; idSearch?: string };
 
-export function sandboxSearch(input: string, mode: ListMode): SandboxSearch {
+export function sandboxSearch(input: string, mode: ListMode, serverSearch = false): SandboxSearch {
+  const search = searchWithoutServerSearch(input, mode);
+  if (!serverSearch || mode !== 'paged' || search.kind === 'empty' || search.kind === 'ref') return search;
+  const typed = input.trim();
+  return isIdSearch(typed) ? { ...search, idSearch: typed } : search;
+}
+
+function searchWithoutServerSearch(input: string, mode: ListMode): SandboxSearch {
   const query = sandboxQuery(input);
   if (query.kind === 'empty') return query;
   if (query.kind === 'ref') return query;

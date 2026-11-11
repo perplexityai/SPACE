@@ -65,6 +65,7 @@ from space_smoke.capabilities import (
     ColdCreatePod,
     ColdCreateSelection,
     ConsoleApiResponse,
+    DurableLifecycleSandbox,
     DrainGateBlocker,
     TerminateAttempt,
     EcwCommandResult,
@@ -500,13 +501,13 @@ SELECT id FROM snapshots
 
 KIND_CONTROLLER_SELECTOR = "app.kubernetes.io/name=space-cluster-controller"
 # The cluster-controller's leadership Lease, container and readiness marker
-# (crates/libs/cluster/controller/server/src/leader_election/mod.rs and the
+# (crates/l40_api/cluster/controller/server/src/leader_election/mod.rs and the
 # space-cluster-controller-local chart).
 CONTROLLER_LEASE_NAME = "cluster-controller"
 CONTROLLER_CONTAINER = "cluster-controller"
 CONTROLLER_READINESS_MARKER = "/tmp/space-cluster-controller-ready"
 # The leader-election kill switch: on unless one of these values turns it off
-# (truthy_default in crates/libs/cluster/controller/server/src/env_config.rs).
+# (truthy_default in crates/l40_api/cluster/controller/server/src/env_config.rs).
 LEADER_ELECTION_ENV = "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED"
 LEADER_ELECTION_FALSE_VALUES = frozenset({"0", "false", "False", "FALSE"})
 # The liveness-budget and lease-TTL test hooks the brownout scenario scopes to
@@ -798,10 +799,10 @@ LOCAL_SANDBOX_RECLAIM_POD_POLL_SECONDS = 0.5
 # Three delete refusals get their own handling. Two settle on their own and are
 # retried within the delete budget: sbx-manager's quarantine recovery
 # completing (`CleanupAdmissionError` in
-# crates/libs/sbx/mgr/server/src/service/cleanup.rs), and node-manager's
+# crates/l40_api/sbx/mgr/server/src/service/cleanup.rs), and node-manager's
 # sandbox mutation claim held by another host mutation or reset past
 # cleanup's bounded wait (`cleanup_sandbox_phases` in
-# crates/libs/node/mgr/server/src/service/cleanup_inspect.rs), which the
+# crates/l40_api/node/mgr/server/src/service/cleanup_inspect.rs), which the
 # delete's durable cleanup passes through. A pending suspend
 # publication cannot land once the cluster row is gone, so it is reported as
 # such. Every other refusal, `RetainedFilesystemOnlyCopy` included, is reported
@@ -826,7 +827,7 @@ ROOTFS_SEND_FILE = "rootfs.btrfs-send"
 # node-manager's relay refuses a send stream whose framing breaks, as a kernel
 # send restarted mid-pipe does, before forwarding it; volume-manager's failed
 # attempt carries the status message
-# (crates/libs/node/mgr/server/src/service/btrfs_send_transport.rs).
+# (crates/l40_api/node/mgr/server/src/service/btrfs_send_transport.rs).
 BTRFS_SEND_REJECTED_ERROR = "btrfs send stream rejected"
 # node-manager stages each send lease here; a lease's `.send-*` wire clone
 # exists only while its kernel send runs.
@@ -888,7 +889,7 @@ _TRANSFER_JOB_ROW = re.compile(r"│\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 # A storage URI's query can carry endpoint credentials; log evidence keeps the
 # scheme and drops the rest.
 _STORAGE_URI = re.compile(r"s3://[^\s\"',}\]]*")
-# `SPACE_TEMPLATE_RECEIVED_UUID_NS` (crates/libs/btrfs/src/lib.rs):
+# `SPACE_TEMPLATE_RECEIVED_UUID_NS` (crates/l10_foundation/btrfs/src/lib.rs):
 # a template installed from `(name, content_hash)` is stamped with
 # `UUIDv5(NS, "name@content_hash")` so a btrfs-send stream produced against
 # it on one node can be received against an independently installed copy
@@ -993,7 +994,7 @@ _TEMPLATE_PREFETCH_DEFAULT_LATEST_N = 5
 
 # The API's suspend-restore selector for a user restore (see
 # `selected_suspend_restore_storage_uri` in
-# crates/libs/api/.../store/restore_source.rs and the legacy suite's
+# crates/l40_api/api/.../store/restore_source.rs and the legacy suite's
 # `wait_for_restore_affinity_portable`): a durable remote
 # snapshot is selectable only when a `ready` full snapshot with a storage
 # location is newer than the last placement change. Until then the planner
@@ -1141,6 +1142,13 @@ NATIVE_OPERATION_AGE_ENV = "SPACE_PUBLIC_OPERATION_DISPATCHER_M1_MAX_AGE_SECS"
 NATIVE_OPERATION_READY_ENVS = (
     "SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS",
     "SPACE_CREATE_COMMAND_READY_TIMEOUT_SECS",
+)
+# The data plane's Native upload admission (NativeUploadAdmissionArgs,
+# crates/l40_api/data/plane/server/src/native_files/admission.rs).
+NATIVE_FILE_UPLOAD_ADMISSION_ENVS = (
+    "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION",
+    "SPACE_DATA_PLANE_MAX_CONCURRENT_NATIVE_UPLOADS_PER_SANDBOX",
+    "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION_WAIT_MS",
 )
 
 
@@ -2236,7 +2244,7 @@ ON CONFLICT (key_hash) DO NOTHING;
     ) -> list[tuple[str, dict[str, Any]]]:
         """(node, event) for every structured sandbox event of one type.
 
-        Sandbox events are a documented contract (`crates/libs/events/README.md`);
+        Sandbox events are a documented contract (`crates/l20_domain/events/README.md`);
         callers poll for one and judge its fields, never its absence or count.
         """
 
@@ -2573,10 +2581,14 @@ ON CONFLICT (key_hash) DO NOTHING;
         # A snapshots dir that does not exist is a legitimate "none". Any
         # other `ls` failure (it exits 2 for unreadable paths too) or an exec
         # failure must propagate rather than read as "reaped".
+        # Recheck absence after a failed listing: cleanup can remove the
+        # directory between the probe and ls. Existing-path failures propagate.
         # `-A`: GC staging, `.gc-pending-<id>`, is a dot entry.
         result = self._node_shell_exec(
             node_name,
-            f"if [ ! -e {path} ]; then exit 0; fi; ls -1A {path}",
+            f"if [ ! -e {path} ]; then exit 0; fi; "
+            f"if ls -1A {path}; then exit 0; else status=$?; fi; "
+            f'if [ ! -e {path} ]; then exit 0; fi; exit "$status"',
             timeout=30,
         )
         if result.returncode != 0:
@@ -3498,31 +3510,68 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def set_native_operation_probe_budgets(self, expected: list[dict], desired: list[dict], *, expected_uid: str, remove: bool = False) -> None:
         """Change only the three native invalid-create probe budget literals."""
+        self._patch_owned_deployment_env(
+            "space-cluster-controller",
+            {NATIVE_OPERATION_AGE_ENV, *NATIVE_OPERATION_READY_ENVS},
+            expected,
+            desired,
+            expected_uid=expected_uid,
+            remove=remove,
+            what="controller budget",
+        )
+
+    def set_native_file_upload_admission_env(self, expected: list[dict], desired: list[dict], *, expected_uid: str, remove: bool = False) -> None:
+        """Change only the data plane's upload admission literals."""
+        self._patch_owned_deployment_env(
+            "space-data-plane",
+            set(NATIVE_FILE_UPLOAD_ADMISSION_ENVS),
+            expected,
+            desired,
+            expected_uid=expected_uid,
+            remove=remove,
+            what="data-plane upload admission",
+        )
+
+    def _patch_owned_deployment_env(
+        self,
+        name: str,
+        allowed: set[str],
+        expected: list[dict],
+        desired: list[dict],
+        *,
+        expected_uid: str,
+        remove: bool,
+        what: str,
+    ) -> None:
+        """Move `name`'s first container env from `expected` to `desired`, touching only `allowed` names.
+
+        Only on owned local Kind control, and only while the Deployment and its
+        env are still the ones the caller read: a replaced Deployment or a
+        concurrent env change is refused rather than overwritten.
+        """
         if (
             self._retention_lease_ownership is None
             or not self.config.context.startswith("kind-")
             or urlsplit(self.config.api_url).hostname not in {"localhost", "127.0.0.1", "::1"}
         ):
-            raise SmokeConfigurationError("native probe budgets require owned local Kind control")
+            raise SmokeConfigurationError(f"the {what} env requires owned local Kind control")
         self._assert_retention_lease_owned()
-        name = "space-cluster-controller"
         observed = self.kubectl("get", "deployment", name, "-o", "json", timeout=15)
         if observed.returncode:
-            raise SmokeConfigurationError("could not inspect native probe controller")
+            raise SmokeConfigurationError(f"could not inspect {name}")
         deployment = json.loads(observed.stdout)
         if deployment["metadata"]["uid"] != expected_uid:
-            raise SmokeConfigurationError("refusing replaced native probe controller")
+            raise SmokeConfigurationError(f"refusing replaced {name}")
         containers = deployment["spec"]["template"]["spec"]["containers"]
         if len(containers) != 1 or containers[0].get("env", []) != expected:
-            raise SmokeConfigurationError("controller environment changed concurrently; refusing overwrite")
+            raise SmokeConfigurationError(f"{name} environment changed concurrently; refusing overwrite")
         path = "/spec/template/spec/containers/0/env"
         patch = [
             {"op": "test", "path": "/metadata/resourceVersion", "value": deployment["metadata"]["resourceVersion"]},
         ]
-        allowed = {NATIVE_OPERATION_AGE_ENV, *NATIVE_OPERATION_READY_ENVS}
         if remove:
             if desired or any(entry.get("name") not in allowed for entry in expected):
-                raise SmokeConfigurationError("refusing to remove unrelated controller environment")
+                raise SmokeConfigurationError(f"refusing to remove unrelated {name} environment")
             patch.append({"op": "remove", "path": path})
         else:
             if "env" not in containers[0]:
@@ -3532,22 +3581,21 @@ ON CONFLICT (key_hash) DO NOTHING;
                     continue
                 if (expected[index].get("name") not in allowed
                         or desired[index].get("name") != expected[index].get("name")):
-                    raise SmokeConfigurationError("refusing unrelated controller environment changes")
+                    raise SmokeConfigurationError(f"refusing unrelated {name} environment changes")
                 patch.append({"op": "replace", "path": f"{path}/{index}", "value": desired[index]})
             for index in range(len(expected) - 1, len(desired) - 1, -1):
                 if expected[index].get("name") not in allowed:
-                    raise SmokeConfigurationError("refusing to remove unrelated controller environment")
+                    raise SmokeConfigurationError(f"refusing to remove unrelated {name} environment")
                 patch.append({"op": "remove", "path": f"{path}/{index}"})
             for entry in desired[len(expected):]:
                 if entry.get("name") not in allowed:
-                    raise SmokeConfigurationError("refusing to add unrelated controller environment")
+                    raise SmokeConfigurationError(f"refusing to add unrelated {name} environment")
                 patch.append({"op": "add", "path": f"{path}/-", "value": entry})
         result = self.kubectl(
             "patch", "deployment", name, "--type=json", "--patch", json.dumps(patch), timeout=15
         )
         if result.returncode:
-            raise SmokeConfigurationError("controller budget patch failed; concurrent changes were not overwritten")
-
+            raise SmokeConfigurationError(f"{what} patch failed; concurrent changes were not overwritten")
 
     def _deployment_env_literals(self, name: str, keys: Sequence[str]) -> dict[str, str | None]:
         result = self.kubectl(
@@ -4917,6 +4965,37 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def console_operator_login(self) -> tuple[str, str]:
         return "root@local", self.environment.get("SPACE_CONSOLE_PASSWORD") or "password"
+
+    def console_sandbox(self, sandbox_id: str) -> DurableLifecycleSandbox:
+        from space_smoke.native import NativeConfig, NativeSandboxFactory
+
+        self._require_isolated_kind("console sandbox execution")
+        factory = NativeSandboxFactory(NativeConfig(
+            api_url=self.config.api_url,
+            data_plane_url=self.environment.get("ECW_DATA_PLANE_BASE_URL", self.config.data_plane_url),
+            token=self._admin_token(),
+            template="seed",
+        ))
+        return factory.connect(sandbox_id)
+
+    def console_runtime_version(self, sandbox_id: str) -> str:
+        self._require_isolated_kind("console runtime inspection")
+        sandbox_id = _sql_uuid(sandbox_id.removeprefix("sbx_"))
+        live_pods = [
+            pod for pod in self.sandbox_pods(sandbox_id)
+            if not pod.deleting and pod.phase == "Running" and pod.node_name
+        ]
+        node_name = live_pods[0].node_name if len(live_pods) == 1 else None
+        response = self.console_api("GET", f"/admin/api/v1/sandboxes/{sandbox_id}")
+        pid = response.body.get("pid") if isinstance(response.body, dict) else None
+        if node_name is None or not isinstance(pid, int) or pid <= 0:
+            raise SmokeConfigurationError("the console sandbox has no running runtime identity")
+        result = self._node_shell_exec(
+            node_name, f"/proc/{pid}/exe --version", timeout=15
+        )
+        return _require_ok(
+            result, "inspect the running sandbox runtime executable"
+        ).split("\n", 1)[0].strip()
 
     def console_api(
         self,
@@ -6413,7 +6492,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             KIND_NODE_SHELL_CONTAINER,
             "/space/run/volume-credentials/credmgr.sock",
             # volume-manager's account; the socket's group admits it
-            # (crates/libs/credential/mgr/server/src/run/volume_socket.rs).
+            # (crates/l40_api/credmgr/server/src/run/volume_socket.rs).
             user="space-volmgr",
             groups=("space-volcredclients",),
         )

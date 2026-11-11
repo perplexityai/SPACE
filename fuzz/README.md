@@ -31,7 +31,7 @@ are ignored. `Cargo.lock` and the small, curated seed set are committed.
 ## CI and maintenance
 
 The DHCP fuzz CI workflow runs only on pull requests that change
-`crates/libs/net/common/src/slot_dhcp.rs`. It checks formatting and runs
+`crates/l20_domain/net/common/src/slot_dhcp.rs`. It checks formatting and runs
 `slot_dhcp` for 30 seconds with AddressSanitizer and bounded memory and
 per-input time. Crash artifacts are uploaded on failure. Unrelated PRs,
 merge-queue events and pushes do not run it; there is no scheduled run.

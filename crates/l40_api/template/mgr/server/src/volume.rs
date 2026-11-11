@@ -1,0 +1,3318 @@
+//! Volume-pull glue for [`crate::service::TemplateManagerService`].
+//!
+//! Scoped and explicit-tag `GetTemplate` requests resolve an exact release before
+//! reading the local cache. Unscoped name-only and exact-digest requests retain
+//! local-first lookup. A resolved cache miss materializes that same release:
+//!
+//! 1. Asking `ClusterApi.FindTemplateRelease` (cluster-role node-api,
+//!    over TCP with SPACE internal bearer auth) for the release
+//!    matching the requested full digest or tag (default `latest`). Tenant
+//!    requests require an org authorization acknowledgement from ClusterApi.
+//! 2. Refusing a build dir that's already on disk without a DB row in the
+//!    partition the release lands in, which the pull learns from the
+//!    release's manifest first: one startup recovery dropped the row of over
+//!    a read that can clear, or one a pull stopped before registering. The
+//!    pull neither adopts nor writes into it: it fails retryably, and the GC
+//!    tick's rowless check or the next startup verifies the dir from
+//!    scratch. A dir without a row in another partition doesn't block it.
+//! 3. Issuing three synchronous `PullFile` RPCs against the on-node
+//!    `space-volume-manager` daemon — one each for `metadata.json`,
+//!    `manifest.json`, and `rootfs.ext4.zst`. Volume-manager handles
+//!    credmgr token exchange and the actual S3 GETs; template-manager
+//!    never talks to S3 directly. The three pulls run in parallel and
+//!    write directly into the digest dir — vol-mgr's per-file
+//!    `.partial → rename` provides per-file atomicity.
+//! 4. Materializing local `rootfs.ext4` in expanded runtime shape via
+//!    [`crate::rootfs_zstd::decompress_rootfs`] (process-unique tmp
+//!    filename + atomic rename, so two overlapping decompresses from a
+//!    cancellation race can't corrupt each other) and verifying its
+//!    digest against the resolved release `hash`. Mismatch is the only
+//!    hard failure on this path.
+//! 5. Atomically rewriting `manifest.json` with normalized fields (via
+//!    [`write_file_atomic`]) and inserting a `ready` build row in
+//!    SQLite.
+//!
+//! There is no staging dir. A process-local flight map coalesces
+//! concurrent pulls for the same `(template, content_hash)` so repeated
+//! `GetTemplate` misses wait on the owner instead of starting duplicate
+//! rootfs materializations. The owner work runs in a detached task; if one
+//! caller's future is cancelled, vol-mgr's `BackgroundWorker` keeps any
+//! started `PullFile` job running, `spawn_blocking` decompresses continue,
+//! and other callers keep waiting for the same commit.
+//!
+//! ## Storage URI format
+//!
+//! Connection strings returned by `ClusterApi.FindTemplateRelease` are
+//! self-describing: every bit needed to issue an S3 GET is encoded in
+//! the URI itself, so neither template-manager nor volume-manager has
+//! to read object-store env vars.
+//!
+//! ```text
+//! s3://<bucket>/<key-prefix>?region=<region>[&endpoint=<url>][&path_style=true|false]
+//! ```
+//!
+//! - `region` (required) — bucket region, e.g. `us-east-2`.
+//! - `endpoint` (optional) — custom S3-compatible endpoint
+//!   (e.g. `https://minio:9000`). Triggers `path_style=true` by default.
+//! - `path_style` (optional) — explicit override for path-style
+//!   addressing.
+
+use crate::rootfs_backing::RootfsBackingPolicy;
+use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use pplx_space_common_core::host::linux::paths::{
+    TEMPLATE_CACHE_DIR_MODE, TEMPLATE_CACHE_FILE_MODE, normalize_template_cache_tree,
+    set_template_cache_permissions,
+};
+use pplx_space_common_core::types::{
+    ContentHash, OrgId, StorageUri, SubjectId, TEMPLATE_ROOTFS_FILE, TemplateCachePartition,
+    TemplateName, ZSTD_FILENAME_SUFFIX,
+};
+use pplx_space_common_grpc::GrpcClientTrace;
+use pplx_space_node_api_client::cluster::connect_from_env as connect_cluster_api_from_env;
+use pplx_space_node_api_client::proto::{
+    FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest,
+    ListLatestTemplateReleasesRequest, TemplateVisibility,
+};
+use pplx_space_volmgr_client::{
+    RESTORE_PRIORITY, VOLMGR_SOCKET, VolumeManagerClient,
+    proto::{ExistingFilePolicy, PullFileRequest, SnapshotArtifact},
+};
+use tokio::sync::Notify;
+use tonic::Status;
+use tonic::transport::Channel;
+use tracing::{Instrument as _, debug, info, warn};
+
+/// Concrete client type returned by `pplx_space_volmgr_client::connect`.
+/// The vol-mgr client now wraps the gRPC `Channel` in `GrpcClientTrace`
+/// to propagate tracing context across the
+/// Unix-socket boundary, so the type we hold in `pull_one` is no longer
+/// the bare `Channel`.
+type VolmgrClient = VolumeManagerClient<GrpcClientTrace<Channel>>;
+
+const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_DIR;
+
+/// Default runtime passed to `FindTemplateRelease`. The cluster API accepts
+/// both full names and aliases, but the release column currently stores the
+/// legacy Firecracker alias `fc`, so this caller sends the stored spelling.
+pub(crate) const DEFAULT_RUNTIME: &str = pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS;
+
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, context: &'static str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!(context, "recovering poisoned mutex");
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Why a [`VolumePuller::pull`] was issued. Surfaced as the `trigger:`
+/// metric tag on every pull-path metric so dashboards can split S3
+/// download bandwidth, latency, and coalesce counts between caller-
+/// driven and prefetcher-driven work.
+///
+/// Threaded as a typed parameter rather than a tag string so adding a
+/// new caller forces a compile-time decision about which bucket it
+/// falls into. Keep the variant set small — this is a
+/// cardinality-bounded metric dimension, not free-form.
+#[derive(Copy, Clone, Debug)]
+pub enum PullTrigger {
+    /// A user-facing request hit the local-miss path and is waiting on
+    /// the pull. Latency here is what the caller experiences.
+    OnDemand,
+    /// Background prefetch driven by hardcoded `(template, tag)` tuples
+    /// resolved via `ClusterApi.FindTemplateRelease`. Intent-driven
+    /// warmer for tags like `main`/`prod`/`latest`. Artifact digests
+    /// reached this way are also recorded in `template_pinned_tags` so
+    /// a future GC won't evict them while the tag still resolves there.
+    PrefetchTag,
+    /// Background prefetch driven by the per-template "latest N
+    /// releases" warmer, resolved via
+    /// `ClusterApi.ListLatestTemplateReleases`. Artifact digests
+    /// reached this way are recorded in `template_pinned_releases` so
+    /// a future GC won't evict them while they're still in the
+    /// latest-N window.
+    PrefetchLatestRelease,
+}
+
+impl PullTrigger {
+    pub(crate) fn as_tag(&self) -> &'static str {
+        match self {
+            Self::OnDemand => "on_demand",
+            Self::PrefetchTag => "prefetch_tag",
+            Self::PrefetchLatestRelease => "prefetch_latest_release",
+        }
+    }
+
+    /// Whether this pull was initiated by the background prefetch loop
+    /// (either pass) rather than a user-facing request. Prefetch pulls
+    /// are subject to the template-visibility gate at the final resolve
+    /// (see [`prefetch_pull_blocked`]); on-demand pulls are not — they
+    /// serve an already-authorized sandbox create.
+    pub(crate) fn is_prefetch(&self) -> bool {
+        match self {
+            Self::OnDemand => false,
+            Self::PrefetchTag | Self::PrefetchLatestRelease => true,
+        }
+    }
+}
+
+/// Former opt-in switch for the visibility gate. The gate is now
+/// unconditional; the name is kept only so startup can warn when a
+/// deployment still sets it.
+pub(crate) const RETIRED_ENV_VISIBILITY_ENFORCEMENT: &str =
+    "SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT";
+
+/// Whether a resolved release must NOT be downloaded for this caller.
+/// Prefetch triggers fail closed on any final visibility other than a
+/// confirmed `Generic` — including `Unspecified`, which means "not known
+/// to be generic". This is the last line of the visibility gate: the
+/// prefetch tick's decision ran one RPC earlier, and the re-resolve here
+/// is the freshest answer before bytes hit the disk, so a visibility
+/// flip between the two must abort the download.
+///
+/// No setting opens this gate. Prefetch runs on every node, so an absent
+/// or unreadable visibility must never distribute a template beyond the
+/// nodes the control plane placed it on.
+pub(crate) fn prefetch_pull_blocked(trigger: PullTrigger, visibility: TemplateVisibility) -> bool {
+    trigger.is_prefetch() && visibility != TemplateVisibility::Generic
+}
+
+/// Cloneable failure classification published to coalesced pull callers.
+/// Detailed source errors are logged where they occur before conversion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum PullFailure {
+    #[error("template release is missing from cluster metadata")]
+    ClusterMetadataMissing,
+    #[error("cluster metadata lookup failed")]
+    ClusterMetadataUnavailable,
+    #[error("cluster metadata returned an invalid release")]
+    ClusterMetadataInvalid,
+    #[error("template is not generic; prefetch refused at the final resolve")]
+    TemplateNotGeneric,
+    #[error("template name is invalid")]
+    InvalidTemplateName,
+    #[error("cluster metadata returned an invalid content hash")]
+    InvalidContentHash,
+    #[error("local template database is unavailable")]
+    LocalDatabaseUnavailable,
+    #[error("template build eviction is in progress")]
+    EvictionInProgress,
+    #[error("template release has no remote storage locations")]
+    NoStorageLocations,
+    #[error("template release has no usable remote storage locations")]
+    NoUsableStorageLocations,
+    #[error("local template storage is unavailable")]
+    LocalStorageUnavailable,
+    #[error("volume manager is unavailable")]
+    VolumeManagerUnavailable,
+    #[error("template artifact is missing from object storage")]
+    StorageObjectMissing,
+    #[error("template object storage is unavailable")]
+    StorageUnavailable,
+    #[error("template manifest is malformed")]
+    ManifestMalformed,
+    #[error("template manifest contains an unsafe filename")]
+    ManifestUnsafeFilename,
+    #[error("template manifest has no artifacts")]
+    ManifestEmpty,
+    #[error("template manifest is missing an artifact digest")]
+    ManifestDigestMissing,
+    #[error("template manifest is missing a compressed artifact digest")]
+    ManifestCompressedDigestMissing,
+    #[error("template execution metadata is invalid")]
+    ExecutionMetadataInvalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PullFailureClass {
+    Missing,
+    Retryable,
+    InvalidInput,
+    FailedPrecondition,
+    DataLoss,
+}
+
+impl PullFailure {
+    pub(crate) const fn metric_reason(self) -> &'static str {
+        match self {
+            Self::ClusterMetadataMissing => "cluster_metadata_missing",
+            Self::ClusterMetadataUnavailable | Self::ClusterMetadataInvalid => {
+                "cluster_metadata_error"
+            }
+            Self::TemplateNotGeneric => "template_not_generic",
+            Self::InvalidTemplateName | Self::InvalidContentHash => "invalid_input",
+            Self::LocalDatabaseUnavailable => "local_db_error",
+            Self::EvictionInProgress => "eviction_in_progress",
+            Self::NoStorageLocations => "no_storage_locations",
+            Self::NoUsableStorageLocations => "no_usable_storage",
+            Self::LocalStorageUnavailable => "local_io_error",
+            Self::VolumeManagerUnavailable => "vol_mgr_unreachable",
+            Self::StorageObjectMissing => "storage_object_missing",
+            Self::StorageUnavailable => "storage_unreachable",
+            Self::ManifestMalformed => "manifest_parse_failed",
+            Self::ManifestUnsafeFilename => "manifest_unsafe_filename",
+            Self::ManifestEmpty => "manifest_empty",
+            Self::ManifestDigestMissing => "manifest_digest_missing",
+            Self::ManifestCompressedDigestMissing => "manifest_compressed_digest_missing",
+            Self::ExecutionMetadataInvalid => "execution_metadata_invalid",
+        }
+    }
+
+    pub(crate) const fn class(self) -> PullFailureClass {
+        match self {
+            Self::ClusterMetadataMissing | Self::StorageObjectMissing => PullFailureClass::Missing,
+            Self::InvalidTemplateName => PullFailureClass::InvalidInput,
+            Self::NoStorageLocations | Self::TemplateNotGeneric => {
+                PullFailureClass::FailedPrecondition
+            }
+            Self::ClusterMetadataInvalid
+            | Self::InvalidContentHash
+            | Self::NoUsableStorageLocations
+            | Self::ManifestMalformed
+            | Self::ManifestUnsafeFilename
+            | Self::ManifestEmpty
+            | Self::ManifestDigestMissing
+            | Self::ManifestCompressedDigestMissing
+            | Self::ExecutionMetadataInvalid => PullFailureClass::DataLoss,
+            Self::ClusterMetadataUnavailable
+            | Self::LocalDatabaseUnavailable
+            | Self::EvictionInProgress
+            | Self::LocalStorageUnavailable
+            | Self::VolumeManagerUnavailable
+            | Self::StorageUnavailable => PullFailureClass::Retryable,
+        }
+    }
+}
+
+impl PullFailureClass {
+    const fn metric_result(self) -> &'static str {
+        match self {
+            Self::Missing => "not_found",
+            Self::Retryable => "unavailable",
+            Self::InvalidInput => "invalid_argument",
+            Self::FailedPrecondition => "failed_precondition",
+            Self::DataLoss => "data_loss",
+        }
+    }
+
+    const fn is_retryable(self) -> bool {
+        matches!(self, Self::Retryable)
+    }
+}
+
+/// Outcome of [`VolumePuller::pull`].
+#[derive(Debug)]
+pub enum PullOutcome {
+    /// Build was successfully materialized to disk + inserted in DB.
+    /// The caller should re-run the local lookup, which now succeeds.
+    Materialized,
+    /// The pull could not materialize the build. The caller maps the typed
+    /// failure to its corresponding gRPC status and metric reason.
+    ClassifiedFailure(PullFailure),
+    /// A downstream service rejected the request with a retryable status.
+    /// The caller propagates this `Status` directly.
+    Retryable(Status),
+    /// A downstream service returned a status that should be preserved.
+    DownstreamFailure {
+        failure: PullFailure,
+        status: Status,
+    },
+    /// Rootfs hash didn't match the resolved release's hash.
+    HashMismatch(Status),
+}
+
+/// Pulls a template build from the cluster object-store volume.
+///
+/// Cheaply cloneable handle shared by on-demand `GetTemplate` requests and
+/// prefetch. The local in-flight map is keyed by resolved `(name,
+/// content_hash)`, after tag/hash lookup, so all callers that need the same
+/// digest wait on one materialization task. Entries are removed on task
+/// completion or drop; this is not a cache.
+///
+/// The map is also the digest claim: registration, imports, background rootfs
+/// compression, `DeleteTemplateBuild`, startup recovery's per-dir pass and the
+/// GC tick's rowless check hold a [`DigestClaim`] in it while they write or
+/// remove the digest's dirs and rows, and `DeleteTemplate` holds one for the
+/// whole template, so no two of them, and no pull, hold the same digest at
+/// once. Eviction coordinates through the eviction gate and the row's
+/// `deleting` state instead.
+#[derive(Clone, Default)]
+pub struct VolumePuller {
+    pub(crate) backing_policy: RootfsBackingPolicy,
+    in_flight: Arc<Mutex<HashMap<PullKey, Arc<InFlightPull>>>>,
+    /// Optional handle to tmplmgr's shared durable background worker
+    /// (see [`crate::background_jobs`]). When set, `try_pull_from`
+    /// enqueues a `template_stamp` job after any non-`FailedPrecondition`
+    /// finalize failure so the stamp converges in the background. When
+    /// `None` (the test constructor), failures stay warn-and-continue —
+    /// tests don't need a worker because they aren't asserting recovery.
+    background_worker: Option<
+        pplx_space_common_jobs::BackgroundWorker<
+            crate::background_jobs::TemplateBackgroundExecutor,
+        >,
+    >,
+}
+
+impl VolumePuller {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct a puller wired to the service's shared durable
+    /// background worker. Used by `TemplateManagerService::new`; tests
+    /// use [`Self::new`] and rely on the no-op fallback path.
+    pub fn new_with_background_worker(
+        background_worker: pplx_space_common_jobs::BackgroundWorker<
+            crate::background_jobs::TemplateBackgroundExecutor,
+        >,
+    ) -> Self {
+        Self {
+            backing_policy: RootfsBackingPolicy::default(),
+            in_flight: Arc::default(),
+            background_worker: Some(background_worker),
+        }
+    }
+
+    /// Materialize a build from the cluster-managed object-store volume.
+    /// Returns a typed failure classification or preserves a downstream status
+    /// when the build cannot be materialized.
+    ///
+    /// Cluster lookup is routed by which selector the caller supplies:
+    /// when `req_hash` is non-empty the call goes to
+    /// `ClusterApi.FindTemplateReleaseByHash(name, hash)` (the digest
+    /// is queried directly against `template_releases.hash`); otherwise
+    /// it goes to `ClusterApi.FindTemplateRelease(name, runtime, tag)`
+    /// with `tag = req_tag` (or `"latest"` when both are empty). The
+    /// resolved hash from whichever response wins is the integrity
+    /// ground truth — the rootfs is verified against that, not against
+    /// the caller's `req_hash`.
+    ///
+    /// `trigger` is recorded as the `trigger:` metric tag on every
+    /// pull-path metric (and on the tracing span) so dashboards can split
+    /// on-demand vs prefetch work.
+    ///
+    /// **Cancellation semantics.** If one caller's future is dropped
+    /// (e.g., gRPC deadline exceeded), the resolved pull task continues
+    /// and other callers for the same `(template, hash)` keep waiting on
+    /// the shared flight. If the task itself is aborted or the process
+    /// exits, the build dir it left has no row: later pulls refuse it
+    /// retryably until the GC tick's rowless check, or the next startup,
+    /// verifies it and restores its row or removes it.
+    ///
+    /// This keeps caller cancellation from multiplying rootfs
+    /// decompressions.
+    pub async fn pull(
+        &self,
+        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        name: &str,
+        req_hash: &str,
+        req_tag: &str,
+        trigger: PullTrigger,
+    ) -> PullOutcome {
+        self.pull_in_scope(
+            db,
+            name,
+            req_hash,
+            req_tag,
+            trigger,
+            Some(TemplateLookupScope::Cluster),
+        )
+        .await
+    }
+
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            template = name,
+            trigger = trigger.as_tag(),
+            req_hash = req_hash,
+            req_tag = req_tag,
+            content_hash = tracing::field::Empty,
+        )
+    )]
+    pub(crate) async fn pull_in_scope(
+        &self,
+        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        name: &str,
+        req_hash: &str,
+        req_tag: &str,
+        trigger: PullTrigger,
+        scope: Option<TemplateLookupScope>,
+    ) -> PullOutcome {
+        let started = Instant::now();
+        let base_tags = pull_metric_tags(name, req_hash, req_tag, trigger);
+        let mut path_taken = PullPath::FreshPull;
+
+        let spec = PullSpec {
+            name,
+            req_hash,
+            req_tag,
+            trigger,
+        };
+        let outcome = pull_inner(self, db, spec, &base_tags, &mut path_taken, scope).await;
+
+        crate::metrics::pull_duration(&base_tags, outcome_label(&outcome, path_taken), started);
+
+        outcome
+    }
+
+    /// Materializes a release the caller already resolved through
+    /// ClusterApi in `resolve_elapsed`. Records `template.pull.duration_ms`
+    /// like [`Self::pull`] does: tagged with the caller's original selector
+    /// and trigger, and measuring release resolution plus materialization.
+    /// The caller's own work between the two (local cache probe, snapshot
+    /// policy lookup) is excluded, as it is for [`Self::pull`], so both
+    /// paths report the same interval under the same tags. Resolution
+    /// failures never reach this method, so unlike [`Self::pull`] it records
+    /// no `cluster_metadata_*` outcomes and no `template.pull.find_release_ms`.
+    pub(crate) async fn materialize_release(
+        &self,
+        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        spec: PullSpec<'_>,
+        resolve_elapsed: Duration,
+        release: ResolvedRelease,
+    ) -> PullOutcome {
+        let started = Instant::now()
+            .checked_sub(resolve_elapsed)
+            .unwrap_or_else(Instant::now);
+        let tags = pull_metric_tags(spec.name, spec.req_hash, spec.req_tag, spec.trigger);
+        let result = self
+            .pull_resolved(
+                db,
+                spec.name.to_string(),
+                release.hash,
+                release.storage_uris,
+                &tags,
+            )
+            .await;
+        let outcome = result.outcome.into_outcome();
+
+        crate::metrics::pull_duration(&tags, outcome_label(&outcome, result.path), started);
+
+        outcome
+    }
+
+    async fn pull_resolved(
+        &self,
+        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        name: String,
+        resolved_hash: String,
+        storage_uris: Vec<String>,
+        base_tags: &[String],
+    ) -> PullTaskResult {
+        let key = PullKey::new(name.clone(), resolved_hash.clone());
+        loop {
+            let (flight, started) = self.start_or_join_flight(key.clone());
+            if started {
+                let guard = PullFlightGuard::new(
+                    key.clone(),
+                    Arc::clone(&flight),
+                    Arc::clone(&self.in_flight),
+                );
+                let db = Arc::clone(&db);
+                let name = name.clone();
+                let resolved_hash = resolved_hash.clone();
+                let storage_uris = storage_uris.clone();
+                let base_tags = base_tags.to_vec();
+                let background_worker = self.background_worker.clone();
+                let backing_policy = self.backing_policy;
+                // The caller that starts the pull waits for it below, so the
+                // pull runs under that caller's span.
+                tokio::spawn(
+                    async move {
+                        let (outcome, path_taken) = pull_resolved_owner(
+                            db,
+                            &name,
+                            &resolved_hash,
+                            &storage_uris,
+                            &base_tags,
+                            background_worker.as_ref(),
+                            backing_policy,
+                        )
+                        .await;
+                        guard.finish(PullTaskResult::new(&outcome, path_taken));
+                    }
+                    .in_current_span(),
+                );
+            } else if flight.claim {
+                info!(
+                    template = %name,
+                    content_hash = %resolved_hash,
+                    "waiting for a digest claim before pulling"
+                );
+            } else {
+                info!(
+                    template = %name,
+                    content_hash = %resolved_hash,
+                    "joining in-flight template pull"
+                );
+            }
+
+            match flight.wait_for_result().await {
+                Some(mut result) => {
+                    if !started && result.mark_coalesced_if_materialized() {
+                        crate::metrics::pull_coalesced(base_tags);
+                    }
+                    return result;
+                }
+                // A claim always ends without a result; a pull only when its
+                // owner task died.
+                None if flight.claim => {
+                    debug!(
+                        template = %name,
+                        content_hash = %resolved_hash,
+                        "digest claim released; retrying the pull"
+                    );
+                }
+                None => {
+                    warn!(
+                        template = %name,
+                        content_hash = %resolved_hash,
+                        "in-flight template pull ended without a result; retrying"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether a pull or a digest [`DigestClaim`] has `(name, content_hash)`'s
+    /// own entry, and so may own a build dir that has no row yet. A claim of
+    /// the whole template doesn't count; [`Self::try_claim_digest`] still
+    /// refuses under one.
+    pub(crate) fn is_claimed(&self, name: &str, content_hash: &str) -> bool {
+        lock_or_recover(&self.in_flight, "template pull in-flight map")
+            .contains_key(&PullKey::new(name, content_hash))
+    }
+
+    /// Claim `(name, content_hash)` the way a pull does, for work that must
+    /// not overlap one, such as deleting the digest's dirs. `None` while a
+    /// pull or another claim holds it. A pull that starts meanwhile waits for
+    /// the claim to go and then retries, as the owner or joined to another
+    /// pull that got there first.
+    pub(crate) fn try_claim_digest(&self, name: &str, content_hash: &str) -> Option<DigestClaim> {
+        self.claim_or_holder(PullKey::new(name, content_hash)).ok()
+    }
+
+    /// Claim every digest of template `name` at once, for `DeleteTemplate`.
+    /// `None` while a pull or a claim holds any of its digests, or the
+    /// template. While it's held, pulls and claims of any of the template's
+    /// digests, including ones not yet on disk, wait for it to go.
+    pub(crate) fn try_claim_template(&self, name: &str) -> Option<DigestClaim> {
+        self.claim_or_holder(PullKey::template(name)).ok()
+    }
+
+    /// [`Self::try_claim_digest`], waiting for the current holder to let go
+    /// instead of giving up.
+    pub(crate) async fn claim_digest(&self, name: &str, content_hash: &str) -> DigestClaim {
+        let key = PullKey::new(name, content_hash);
+        loop {
+            match self.claim_or_holder(key.clone()) {
+                Ok(claim) => return claim,
+                // Returns once the holder finishes or lets go. A finished
+                // pull reports its result just before it leaves the map, so
+                // yield between retries rather than spin hot through that
+                // window.
+                Err(holder) => {
+                    holder.wait_for_result().await;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    fn claim_or_holder(&self, key: PullKey) -> Result<DigestClaim, Arc<InFlightPull>> {
+        let (flight, started) = self.start_or_join_flight_as(key.clone(), true);
+        if !started {
+            return Err(flight);
+        }
+        Ok(DigestClaim {
+            _guard: PullFlightGuard::new(key, flight, Arc::clone(&self.in_flight)),
+        })
+    }
+
+    /// Join whatever holds `key`, or start a flight that owns it. A digest is
+    /// held by its own entry or by its template's; a template, by its own
+    /// entry or by any of its digests'.
+    fn start_or_join_flight(&self, key: PullKey) -> (Arc<InFlightPull>, bool) {
+        self.start_or_join_flight_as(key, false)
+    }
+
+    /// [`Self::start_or_join_flight`], marking a started flight as a claim
+    /// when `claim` is set.
+    fn start_or_join_flight_as(&self, key: PullKey, claim: bool) -> (Arc<InFlightPull>, bool) {
+        let mut in_flight = lock_or_recover(&self.in_flight, "template pull in-flight map");
+        let holder = match key.content_hash {
+            Some(_) => in_flight
+                .get(&key)
+                .or_else(|| in_flight.get(&PullKey::template(&key.name))),
+            None => in_flight
+                .iter()
+                .find(|(held, _)| held.name == key.name)
+                .map(|(_, flight)| flight),
+        };
+        if let Some(existing) = holder {
+            return (Arc::clone(existing), false);
+        }
+
+        let flight = Arc::new(InFlightPull {
+            claim,
+            ..InFlightPull::default()
+        });
+        in_flight.insert(key, Arc::clone(&flight));
+        (flight, true)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PullKey {
+    name: String,
+    /// `None` keys the whole template, for `DeleteTemplate`.
+    content_hash: Option<String>,
+}
+
+impl PullKey {
+    fn new(name: impl Into<String>, content_hash: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            content_hash: Some(content_hash.into()),
+        }
+    }
+
+    fn template(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            content_hash: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PullTaskResult {
+    outcome: PullOutcomeSnapshot,
+    path: PullPath,
+}
+
+impl PullTaskResult {
+    fn new(outcome: &PullOutcome, path: PullPath) -> Self {
+        Self {
+            outcome: PullOutcomeSnapshot::from(outcome),
+            path,
+        }
+    }
+
+    fn mark_coalesced_if_materialized(&mut self) -> bool {
+        if self.outcome.is_materialized() {
+            self.path = PullPath::Coalesced;
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PullOutcomeSnapshot {
+    Materialized,
+    ClassifiedFailure(PullFailure),
+    Retryable(Status),
+    DownstreamFailure {
+        failure: PullFailure,
+        status: Status,
+    },
+    HashMismatch(Status),
+}
+
+impl PullOutcomeSnapshot {
+    fn is_materialized(&self) -> bool {
+        matches!(self, Self::Materialized)
+    }
+
+    fn into_outcome(self) -> PullOutcome {
+        match self {
+            Self::Materialized => PullOutcome::Materialized,
+            Self::ClassifiedFailure(failure) => PullOutcome::ClassifiedFailure(failure),
+            Self::Retryable(status) => PullOutcome::Retryable(status),
+            Self::DownstreamFailure { failure, status } => {
+                PullOutcome::DownstreamFailure { failure, status }
+            }
+            Self::HashMismatch(status) => PullOutcome::HashMismatch(status),
+        }
+    }
+}
+
+impl From<&PullOutcome> for PullOutcomeSnapshot {
+    fn from(outcome: &PullOutcome) -> Self {
+        match outcome {
+            PullOutcome::Materialized => Self::Materialized,
+            PullOutcome::ClassifiedFailure(failure) => Self::ClassifiedFailure(*failure),
+            PullOutcome::Retryable(status) => Self::Retryable(status.clone()),
+            PullOutcome::DownstreamFailure { failure, status } => Self::DownstreamFailure {
+                failure: *failure,
+                status: status.clone(),
+            },
+            PullOutcome::HashMismatch(status) => Self::HashMismatch(status.clone()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct InFlightPull {
+    notify: Notify,
+    state: Mutex<InFlightPullState>,
+    /// A [`DigestClaim`], which ends without a result, rather than a pull.
+    claim: bool,
+}
+
+impl InFlightPull {
+    async fn wait_for_result(&self) -> Option<PullTaskResult> {
+        loop {
+            let mut notified = std::pin::pin!(self.notify.notified());
+            {
+                let state = lock_or_recover(&self.state, "template pull state");
+                if let Some(result) = state.result.clone() {
+                    return Some(result);
+                }
+                if state.released {
+                    return None;
+                }
+                notified.as_mut().enable();
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Default)]
+struct InFlightPullState {
+    result: Option<PullTaskResult>,
+    released: bool,
+}
+
+/// A digest's claim in the pull in-flight map, from
+/// [`VolumePuller::try_claim_digest`] or [`VolumePuller::claim_digest`], or a
+/// whole template's, from [`VolumePuller::try_claim_template`]. Held until
+/// dropped.
+pub(crate) struct DigestClaim {
+    _guard: PullFlightGuard,
+}
+
+struct PullFlightGuard {
+    key: PullKey,
+    flight: Arc<InFlightPull>,
+    in_flight: Arc<Mutex<HashMap<PullKey, Arc<InFlightPull>>>>,
+    released: bool,
+}
+
+impl PullFlightGuard {
+    fn new(
+        key: PullKey,
+        flight: Arc<InFlightPull>,
+        in_flight: Arc<Mutex<HashMap<PullKey, Arc<InFlightPull>>>>,
+    ) -> Self {
+        Self {
+            key,
+            flight,
+            in_flight,
+            released: false,
+        }
+    }
+
+    fn finish(mut self, result: PullTaskResult) {
+        {
+            let mut state = lock_or_recover(&self.flight.state, "template pull state");
+            state.result = Some(result);
+            state.released = true;
+        }
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        {
+            let mut state = lock_or_recover(&self.flight.state, "template pull state");
+            state.released = true;
+        }
+        {
+            let mut in_flight = lock_or_recover(&self.in_flight, "template pull in-flight map");
+            if in_flight
+                .get(&self.key)
+                .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+            {
+                in_flight.remove(&self.key);
+            }
+        }
+        self.released = true;
+        self.flight.notify.notify_waiters();
+    }
+}
+
+impl Drop for PullFlightGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Which path the caller ended up taking, used solely for metric tagging
+/// on `template.pull.duration_ms{result=...}`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PullPath {
+    /// Pulled fresh from object storage (cluster API → vol-mgr).
+    FreshPull,
+    /// DB row was present from a prior call — no work needed.
+    DbHit,
+    /// Another caller already owned the same resolved digest pull.
+    Coalesced,
+}
+
+/// One pull's identity as the caller specified it: the template name,
+/// the optional digest/tag lookup keys, and which caller class
+/// initiated it. Groups what [`VolumePuller::pull`] receives so the
+/// inner helpers stay within clippy's argument budget, and carries the
+/// original selector into [`VolumePuller::materialize_release`].
+#[derive(Copy, Clone)]
+pub(crate) struct PullSpec<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) req_hash: &'a str,
+    pub(crate) req_tag: &'a str,
+    pub(crate) trigger: PullTrigger,
+}
+
+async fn pull_inner(
+    puller: &VolumePuller,
+    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    spec: PullSpec<'_>,
+    base_tags: &[String],
+    path_taken: &mut PullPath,
+    scope: Option<TemplateLookupScope>,
+) -> PullOutcome {
+    let name = spec.name;
+    // 1. Resolve (release.hash, storage_uris) via ClusterApi.
+    let release = match find_release(spec, base_tags, scope).await {
+        Ok(found) => found,
+        Err(FindReleaseError::NotFound) => {
+            return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataMissing);
+        }
+        Err(FindReleaseError::Unavailable) => {
+            return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataUnavailable);
+        }
+        Err(FindReleaseError::InvalidResponse) => {
+            return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataInvalid);
+        }
+        Err(FindReleaseError::Status(status)) => {
+            return PullOutcome::DownstreamFailure {
+                failure: PullFailure::ClusterMetadataUnavailable,
+                status,
+            };
+        }
+    };
+
+    // The catalog has enforced generic-only selection in the same SQL snapshot
+    // as the release and locations. Cached visibility is only an additional
+    // conservative gate; it cannot authorize the final prefetch resolution.
+    if prefetch_pull_blocked(spec.trigger, release.visibility) {
+        warn!(
+            template = name,
+            content_hash = %release.hash,
+            visibility = ?release.visibility,
+            trigger = spec.trigger.as_tag(),
+            "prefetch pull aborted: template is not confirmed generic at the final resolve"
+        );
+        return PullOutcome::ClassifiedFailure(PullFailure::TemplateNotGeneric);
+    }
+
+    let ResolvedRelease {
+        hash: resolved_hash,
+        storage_uris,
+        ..
+    } = release;
+
+    // Record the resolved hash on the surrounding `pull` span so every log
+    // line emitted below this point carries both `template` and `content_hash`
+    // automatically — without us threading them as explicit parameters through
+    // every helper.
+    tracing::Span::current().record("content_hash", resolved_hash.as_str());
+    info!(
+        template = name,
+        content_hash = %resolved_hash,
+        storage_locations = storage_uris.len(),
+        "resolved template release; starting pull"
+    );
+
+    let result = puller
+        .pull_resolved(db, name.to_string(), resolved_hash, storage_uris, base_tags)
+        .await;
+    *path_taken = result.path;
+    result.outcome.into_outcome()
+}
+
+/// Picks the lookup tag for `FindTemplateRelease`: `req_tag` if set,
+/// else `"latest"`. Only used on the tag-based lookup path —
+/// `find_release_inner` routes hash-based callers to
+/// `FindTemplateReleaseByHash` directly, so `req_hash` is never
+/// re-fed into a tag lookup.
+fn lookup_tag(req_tag: &str) -> String {
+    if !req_tag.is_empty() {
+        req_tag.to_string()
+    } else {
+        "latest".to_string()
+    }
+}
+
+fn pull_metric_tags(
+    name: &str,
+    req_hash: &str,
+    req_tag: &str,
+    trigger: PullTrigger,
+) -> Vec<String> {
+    crate::metrics::request_tags(name, req_hash, req_tag, trigger.as_tag())
+}
+
+fn outcome_label(outcome: &PullOutcome, path: PullPath) -> &'static str {
+    match outcome {
+        PullOutcome::Materialized => match path {
+            PullPath::FreshPull => "materialized",
+            PullPath::DbHit => "db_hit",
+            PullPath::Coalesced => "coalesced",
+        },
+        PullOutcome::ClassifiedFailure(failure) => failure.class().metric_result(),
+        PullOutcome::Retryable(_) => "retryable",
+        PullOutcome::DownstreamFailure { .. } => "downstream_error",
+        PullOutcome::HashMismatch(_) => "hash_mismatch",
+    }
+}
+
+fn record_phase(base_tags: &[String], phase: &'static str, result: &'static str, started: Instant) {
+    crate::metrics::pull_s3_phase(base_tags, phase, result, started);
+}
+
+/// Why a pull refuses a build dir that's on disk without a catalog row.
+fn rowless_build_dir_refusal(
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> String {
+    format!(
+        "template {name} build {content_hash} is on disk without a catalog row \
+         in cache partition {partition}; retry after template-manager verifies it"
+    )
+}
+
+/// Why a pull refuses to write the build of `content_hash` in `partition`
+/// under `template_root`: its build dir exists already, or whether it does
+/// can't be told. Called once the pull has probed the release's partition,
+/// so a dir of the digest in any other partition, such as a twin recovery
+/// keeps without a row, neither blocks the pull nor is touched by it.
+///
+/// A dir on disk without a row isn't this pull's: startup recovery may have
+/// dropped its row over a read that can clear, or a pull may have stopped
+/// before writing its row. Adopting it would serve bytes nobody verified,
+/// and pulling into it would delete an installed build when the write fails.
+/// The GC tick's rowless check, or the next startup, verifies it from
+/// scratch; the pull refuses retryably until then.
+fn probed_partition_refusal(
+    template_root: &Path,
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> Option<String> {
+    let dir = template_root
+        .join(name)
+        .join(partition.build_dir_name(content_hash));
+    match dir.try_exists() {
+        Ok(false) => None,
+        Ok(true) => Some(rowless_build_dir_refusal(name, content_hash, partition)),
+        Err(error) => Some(format!(
+            "could not check build dir {} of template {name}: {error}",
+            dir.display()
+        )),
+    }
+}
+
+/// Refuses a pull, retryably, while a build of the digest is mid-eviction
+/// (`state='deleting'`): its row still counts as present and its dir is the
+/// one being deleted.
+async fn refuse_pull_during_eviction(
+    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    name: &str,
+    content_hash: &str,
+) -> Result<(), PullError> {
+    let n = name.to_string();
+    let h = content_hash.to_string();
+    let db_for_check = Arc::clone(db);
+    let is_deleting = tokio::task::spawn_blocking(move || {
+        let conn = db_for_check.lock().map_err(|_| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some("template DB mutex poisoned".to_string()),
+            )
+        })?;
+        crate::db::is_build_marked_deleting(&conn, &n, &h)
+    })
+    .await
+    .map_err(|err| {
+        warn!(error = %err, "is_build_marked_deleting spawn_blocking panicked");
+        PullError::Failure(PullFailure::LocalDatabaseUnavailable)
+    })?
+    .map_err(|err| {
+        warn!(error = %err, "is_build_marked_deleting failed");
+        PullError::Failure(PullFailure::LocalDatabaseUnavailable)
+    })?;
+    if is_deleting {
+        info!(
+            template = name,
+            content_hash,
+            "refusing pull: build is in state='deleting' (mid-eviction); retry after eviction completes"
+        );
+        return Err(PullError::Failure(PullFailure::EvictionInProgress));
+    }
+    Ok(())
+}
+
+/// The owner's work for one resolved digest.
+async fn pull_resolved_owner(
+    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    name: &str,
+    resolved_hash: &str,
+    storage_uris: &[String],
+    base_tags: &[String],
+    background_worker: Option<
+        &pplx_space_common_jobs::BackgroundWorker<
+            crate::background_jobs::TemplateBackgroundExecutor,
+        >,
+    >,
+    backing_policy: RootfsBackingPolicy,
+) -> (PullOutcome, PullPath) {
+    // A build of this digest mid-eviction refuses the pull, retryably,
+    // before the fast path: its row still counts as present, and its dir is
+    // the one being deleted. `do_pull` checks again for an eviction that
+    // starts in between.
+    if let Err(PullError::Failure(failure)) =
+        refuse_pull_during_eviction(&db, name, resolved_hash).await
+    {
+        return (PullOutcome::ClassifiedFailure(failure), PullPath::FreshPull);
+    }
+
+    // DB fast-path: a prior call (or startup recovery) already committed
+    // this build. This check intentionally runs inside the owner task too:
+    // a caller may have won the flight after another caller finished between
+    // its first local miss and the flight-map insert.
+    if local_build_exists(&db, name, resolved_hash) {
+        info!(
+            template = name,
+            content_hash = %resolved_hash,
+            "build already present in DB; no pull needed"
+        );
+        return (PullOutcome::Materialized, PullPath::DbHit);
+    }
+
+    // A build dir on disk without a row refuses the pull only in the
+    // partition the release lands in, which the pull learns from its
+    // manifest; `try_pull_from` checks once it has probed it.
+    // Fresh pull. Vol-mgr deduplicates concurrent PullFile calls server-side.
+    let outcome = match do_pull(
+        db,
+        name,
+        resolved_hash,
+        storage_uris,
+        base_tags,
+        background_worker,
+        backing_policy,
+    )
+    .await
+    {
+        Ok(()) => PullOutcome::Materialized,
+        Err(PullError::Failure(failure)) => PullOutcome::ClassifiedFailure(failure),
+        Err(PullError::Retryable(status)) => PullOutcome::Retryable(status),
+        Err(PullError::Failed(status)) => PullOutcome::DownstreamFailure {
+            failure: PullFailure::StorageUnavailable,
+            status,
+        },
+        Err(PullError::HashMismatch { expected, actual }) => {
+            PullOutcome::HashMismatch(Status::data_loss(format!(
+                "rootfs.ext4 hash mismatch: expected {expected}, got {actual}"
+            )))
+        }
+    };
+    (outcome, PullPath::FreshPull)
+}
+
+/// Connects to the cluster-role node-api and asks
+/// `FindTemplateRelease(name, runtime, tag)`.
+async fn find_release(
+    spec: PullSpec<'_>,
+    base_tags: &[String],
+    scope: Option<TemplateLookupScope>,
+) -> Result<ResolvedRelease, FindReleaseError> {
+    let started = Instant::now();
+    let PullSpec {
+        name,
+        req_hash,
+        req_tag,
+        trigger,
+    } = spec;
+    let generic_only = trigger.is_prefetch();
+    let result =
+        find_release_with_requirement(name, req_hash, req_tag, None, generic_only, scope).await;
+    let result_label = match &result {
+        Ok(_) => "ok",
+        Err(FindReleaseError::NotFound) => "not_found",
+        Err(
+            FindReleaseError::Unavailable
+            | FindReleaseError::InvalidResponse
+            | FindReleaseError::Status(_),
+        ) => "error",
+    };
+    crate::metrics::pull_find_release(base_tags, result_label, started);
+    // Propagate the ResolvedRelease (hash + storage URIs + template
+    // visibility) as-is; pull_inner reads `.visibility` for the prefetch
+    // final-resolve gate and destructures the rest. FindReleaseError is
+    // returned unchanged for the caller to classify.
+    result
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum FindReleaseError {
+    #[error("template release not found")]
+    NotFound,
+    #[error("cluster metadata service is unavailable")]
+    Unavailable,
+    #[error("cluster metadata service returned an invalid release")]
+    InvalidResponse,
+    #[error("cluster metadata lookup failed: {0}")]
+    Status(#[source] Status),
+}
+
+fn classify_find_release_status(status: Status) -> FindReleaseError {
+    match status.code() {
+        tonic::Code::NotFound => FindReleaseError::NotFound,
+        tonic::Code::Internal | tonic::Code::Unknown => FindReleaseError::Unavailable,
+        _ => FindReleaseError::Status(status),
+    }
+}
+
+/// An immutable release resolved by ClusterApi, authorized when caller-scoped.
+/// `visibility` is advisory prefetch metadata, not authorization evidence.
+pub(crate) struct ResolvedRelease {
+    pub(crate) hash: String,
+    pub(crate) storage_uris: Vec<String>,
+    pub(crate) visibility: TemplateVisibility,
+}
+
+pub(crate) async fn find_release_inner(
+    name: &str,
+    req_hash: &str,
+    req_tag: &str,
+    caller_org: Option<OrgId>,
+) -> Result<ResolvedRelease, FindReleaseError> {
+    find_release_in_scope(
+        name,
+        req_hash,
+        req_tag,
+        caller_org,
+        Some(TemplateLookupScope::Cluster),
+    )
+    .await
+}
+
+pub(crate) async fn find_release_in_scope(
+    name: &str,
+    req_hash: &str,
+    req_tag: &str,
+    caller_org: Option<OrgId>,
+    scope: Option<TemplateLookupScope>,
+) -> Result<ResolvedRelease, FindReleaseError> {
+    find_release_with_requirement(name, req_hash, req_tag, caller_org, false, scope).await
+}
+
+async fn find_release_with_requirement(
+    name: &str,
+    req_hash: &str,
+    req_tag: &str,
+    caller_org: Option<OrgId>,
+    generic_only: bool,
+    scope: Option<TemplateLookupScope>,
+) -> Result<ResolvedRelease, FindReleaseError> {
+    let mut client = connect_cluster_api_from_env().await.map_err(|error| {
+        warn!(error = %error, "cluster api connect failed");
+        FindReleaseError::Unavailable
+    })?;
+
+    // Route to the right cluster RPC based on which lookup key the
+    // caller supplied. Hash-based lookup hits `template_releases.hash`
+    // directly — the canonical home for the digest, no dependence on
+    // any auto-tag-by-hash convention. Tag-based lookup goes through
+    // `template_release_tags`. Runtime is needed for the tag path
+    // (since the same tag can map to different runtime artifacts),
+    // but not for the hash path (digests are runtime-scoped).
+    let resp = if !req_hash.is_empty() {
+        let hash = req_hash.to_string();
+        let mut request = tonic::Request::new(FindTemplateReleaseByHashRequest {
+            generic_only,
+            caller_org_id: caller_org.map(|org| org.to_string()),
+            template_name: name.to_string(),
+            hash: hash.clone(),
+        });
+        if let Some(scope) = scope {
+            scope.attach(&mut request);
+        }
+        match client.find_template_release_by_hash(request).await {
+            Ok(r) => r,
+            Err(status) => {
+                if status.code() == tonic::Code::NotFound {
+                    debug!(
+                        template = name,
+                        %hash,
+                        "FindTemplateReleaseByHash returned NotFound",
+                    );
+                } else {
+                    warn!(
+                        error = %status,
+                        template = name,
+                        %hash,
+                        "FindTemplateReleaseByHash failed",
+                    );
+                }
+                return Err(classify_find_release_status(status));
+            }
+        }
+    } else {
+        let tag = lookup_tag(req_tag);
+        let mut request = tonic::Request::new(FindTemplateReleaseRequest {
+            generic_only,
+            caller_org_id: caller_org.map(|org| org.to_string()),
+            template_name: name.to_string(),
+            runtime: DEFAULT_RUNTIME.to_string(),
+            tag: tag.clone(),
+        });
+        if let Some(scope) = scope {
+            scope.attach(&mut request);
+        }
+        match client.find_template_release(request).await {
+            Ok(r) => r,
+            Err(status) => {
+                if status.code() == tonic::Code::NotFound {
+                    debug!(template = name, %tag, "FindTemplateRelease returned NotFound");
+                } else {
+                    warn!(error = %status, template = name, %tag, "FindTemplateRelease failed");
+                }
+                return Err(classify_find_release_status(status));
+            }
+        }
+    };
+
+    if let Some(scope) = scope {
+        scope
+            .observe_response(&resp)
+            .map_err(FindReleaseError::Status)?;
+    }
+    let resp = resp.into_inner();
+    parse_release_response(name, req_hash, caller_org, generic_only, resp)
+}
+
+fn parse_release_response(
+    name: &str,
+    req_hash: &str,
+    caller_org: Option<OrgId>,
+    generic_only: bool,
+    resp: pplx_space_node_api_client::proto::FindTemplateReleaseResponse,
+) -> Result<ResolvedRelease, FindReleaseError> {
+    // Read the enum accessor before destructuring `resp.release` — taking
+    // the release out of the struct is a partial move, after which `resp`
+    // can no longer be borrowed as a whole.
+    if (generic_only && !resp.generic_authorized)
+        || resp.authorized_org_id != caller_org.map(|org| org.to_string())
+    {
+        return Err(FindReleaseError::InvalidResponse);
+    }
+    let visibility = resp.template_visibility();
+    let release = match resp.release {
+        Some(r) => r,
+        None => {
+            warn!("FindTemplateRelease returned empty release");
+            return Err(FindReleaseError::InvalidResponse);
+        }
+    };
+    let hash = release
+        .hash
+        .parse::<ContentHash>()
+        .map_err(|_| FindReleaseError::InvalidResponse)?;
+    if release.template_name != name
+        || release.runtime != DEFAULT_RUNTIME
+        || (!req_hash.is_empty() && req_hash.parse::<ContentHash>().ok() != Some(hash))
+    {
+        return Err(FindReleaseError::InvalidResponse);
+    }
+    let storage_uris: Vec<String> = resp
+        .storage_locations
+        .into_iter()
+        .map(|s| s.connection_string)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if storage_uris.is_empty() {
+        debug!(
+            template = name,
+            hash = %release.hash,
+            "release is local-only; no object-store storage_locations registered"
+        );
+    }
+    Ok(ResolvedRelease {
+        hash: hash.to_string(),
+        storage_uris,
+        visibility,
+    })
+}
+
+/// Materialized rootfs after the manifest-driven pull plan settles.
+/// `compressed` is `Some((hash, size))` when the manifest declared a
+/// `.zst` sibling (decompression produced the rootfs and gave us the
+/// compressed digest as a side effect) and `None` for legacy templates
+/// that only published the uncompressed artifact.
+#[derive(Debug)]
+struct RootfsMaterialization {
+    rootfs_size: u64,
+    rootfs_hash: String,
+    compressed: Option<(String, u64)>,
+}
+
+/// One file we plan to download as part of `do_pull`'s parallel join.
+/// Built from `manifest.files` by [`build_manifest_pull_plan`], which
+/// applies the dedup rule (download only `X.zst` when both `X` and
+/// `X.zst` are listed with a well-formed zstd descriptor).
+#[derive(Debug, Clone)]
+struct ManifestPullEntry {
+    manifest_key: String,
+    s3_uri: String,
+    local_path: String,
+    phase: &'static str,
+    raw: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum PullError {
+    #[error(transparent)]
+    Failure(#[from] PullFailure),
+    #[error("retryable volume pull failure: {0}")]
+    Retryable(#[source] Status),
+    #[error("volume pull failed: {0}")]
+    Failed(#[source] Status),
+    #[error("template artifact hash mismatch: expected {expected}, got {actual}")]
+    HashMismatch { expected: String, actual: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PullStatusDisposition {
+    Missing,
+    Unreachable,
+    Retryable,
+    Failed,
+}
+
+fn pull_status_disposition(status: &Status) -> PullStatusDisposition {
+    match status.code() {
+        tonic::Code::NotFound => PullStatusDisposition::Missing,
+        tonic::Code::ResourceExhausted => PullStatusDisposition::Retryable,
+        tonic::Code::Internal
+        | tonic::Code::Unknown
+        | tonic::Code::Unavailable
+        | tonic::Code::DeadlineExceeded
+        | tonic::Code::Aborted => PullStatusDisposition::Unreachable,
+        _ => PullStatusDisposition::Failed,
+    }
+}
+
+fn prefer_retryable_failure(current: PullFailure, candidate: PullFailure) -> PullFailure {
+    if current.class().is_retryable() && !candidate.class().is_retryable() {
+        return current;
+    }
+    candidate
+}
+
+fn finish_pull_failures(classified: PullFailure, downstream_status: Option<Status>) -> PullError {
+    if classified.class().is_retryable() {
+        return PullError::Failure(classified);
+    }
+    downstream_status
+        .map(PullError::Failed)
+        .unwrap_or(PullError::Failure(classified))
+}
+
+async fn do_pull(
+    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    name: &str,
+    content_hash: &str,
+    storage_uris: &[String],
+    base_tags: &[String],
+    background_worker: Option<
+        &pplx_space_common_jobs::BackgroundWorker<
+            crate::background_jobs::TemplateBackgroundExecutor,
+        >,
+    >,
+    backing_policy: RootfsBackingPolicy,
+) -> Result<(), PullError> {
+    // Validate name + hash once — both are URI-independent.
+    pplx_space_common_core::types::TemplateName::parse(name.to_string()).map_err(|err| {
+        warn!(error = %err, name, "invalid template name; volume pull skipped");
+        PullError::Failure(PullFailure::InvalidTemplateName)
+    })?;
+    if content_hash
+        .parse::<pplx_space_common_core::types::ContentHash>()
+        .is_err()
+    {
+        warn!(content_hash, "release hash is not a valid ContentHash");
+        return Err(PullError::Failure(PullFailure::InvalidContentHash));
+    }
+
+    // Early-abort guard: refuse to pull a build that's mid-eviction
+    // (the eviction loop has flipped its DB row to `state='deleting'`
+    // in Phase 1, but the disk delete / row delete haven't finished
+    // yet). Without this, the pull would write artifacts that
+    // eviction is about to delete, and the upsert at the end would
+    // either be no-op'd by the `state != 'deleting'` guard in
+    // `upsert_build` (leaving on-disk orphans) or silently resurrect
+    // the doomed row.
+    //
+    // The caller's `GetTemplate` handler surfaces this as retryable
+    // `Unavailable`. Retrying after eviction completes succeeds: the row is
+    // gone, `resolve_template_build` misses, and the next pull starts cleanly.
+    refuse_pull_during_eviction(&db, name, content_hash).await?;
+
+    if storage_uris.is_empty() {
+        debug!(
+            template = name,
+            content_hash,
+            "release is local-only and not cached on this node; skipping object-store pull"
+        );
+        return Err(PullError::Failure(PullFailure::NoStorageLocations));
+    }
+
+    // Iterate every parseable storage_location so replication / failover
+    // entries get a real chance. A failure on URI[0] falls through to URI[1],
+    // except for admission rejection and hash mismatch. HashMismatch is fatal
+    // because it means the cluster metadata disagrees with content-addressed
+    // bytes; trying further URIs would mask that corruption.
+    let mut tried_any = false;
+    let mut last_failure = PullFailure::NoUsableStorageLocations;
+    let mut last_downstream_status = None;
+    let cleanup = PullCleanupSlot::default();
+    let result = async {
+        for uri in storage_uris {
+            // A failed attempt's build dir must be gone before the next one
+            // starts: a pull refuses a build dir that exists when it starts.
+            cleanup.finish().await;
+            let parts = match StorageUri::parse(uri) {
+                Ok(p) => p,
+                Err(err) => {
+                    warn!(uri = %uri, error = %err, "skipping unusable storage_location");
+                    continue;
+                }
+            };
+            tried_any = true;
+            match try_pull_from(
+                Arc::clone(&db),
+                name,
+                content_hash,
+                &parts,
+                base_tags,
+                background_worker,
+                backing_policy,
+                &cleanup,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(PullError::HashMismatch { expected, actual }) => {
+                    return Err(PullError::HashMismatch { expected, actual });
+                }
+                Err(error @ PullError::Retryable(_)) => return Err(error),
+                Err(PullError::Failed(status)) => {
+                    warn!(
+                        uri = %uri,
+                        error = %status,
+                        "pull from storage_location returned a permanent status; trying next location",
+                    );
+                    last_downstream_status = Some(status);
+                }
+                Err(PullError::Failure(failure)) => {
+                    last_failure = prefer_retryable_failure(last_failure, failure);
+                    warn!(
+                        uri = %uri,
+                        reason = failure.metric_reason(),
+                        error = %failure,
+                        "pull from storage_location failed; trying next location",
+                    );
+                }
+            }
+        }
+
+        if !tried_any {
+            warn!(
+                ?storage_uris,
+                "no usable storage_location; skipping object-store pull"
+            );
+        }
+        Err(finish_pull_failures(last_failure, last_downstream_status))
+    }
+    .await;
+    // On every exit, including an early one: the owner releases the digest
+    // when this returns, and a retry that takes it must not meet the failed
+    // attempt's dir mid-delete.
+    cleanup.finish().await;
+    result
+}
+
+/// Cache partition of the environment a build is bound to; see
+/// [`crate::service::effective_environment`].
+fn manifest_partition(
+    manifest: &pplx_space_common_core::types::TemplateManifest,
+    metadata: &pplx_space_common_core::types::TemplateMetadata,
+) -> Result<TemplateCachePartition, PullFailure> {
+    let environment = crate::service::effective_environment(manifest, metadata)
+        .map_err(|_| PullFailure::ExecutionMetadataInvalid)?;
+    Ok(pplx_space_node_runtime_core::catalog::template_cache_partition(environment))
+}
+
+/// Learn the cache partition of a release by reading its manifest into a
+/// transient sibling dir before any build dir exists. Startup recovery reaps
+/// the sibling if this process dies first. The binding can come from
+/// metadata.json, so both are read; their bytes are returned so the pull
+/// doesn't fetch them again.
+async fn probe_release_partition(
+    client: &VolmgrClient,
+    subject: &SubjectId,
+    parts: &StorageUri,
+    name: &str,
+    content_hash: &str,
+    base_tags: &[String],
+) -> Result<ProbedRelease, PullError> {
+    let probe_dir = PathBuf::from(format!(
+        "{TEMPLATE_DIR}/{name}/{}",
+        partition_probe_dir_name(content_hash, uuid::Uuid::now_v7())
+    ));
+    let _probe_guard = ProbeDirGuard(probe_dir.clone());
+    if let Err(err) = tokio::fs::create_dir(&probe_dir).await {
+        warn!(error = %err, template = name, content_hash, dir = %probe_dir.display(), "create partition probe dir failed");
+        return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+    }
+    if let Err(err) = set_template_cache_permissions(&probe_dir, TEMPLATE_CACHE_DIR_MODE) {
+        warn!(error = %err, template = name, content_hash, dir = %probe_dir.display(), "set partition probe dir permissions failed");
+        return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+    }
+    let manifest_path = probe_dir.join("manifest.json");
+    let metadata_path = probe_dir.join("metadata.json");
+    // Await both even when one fails: volume-manager keeps a started job
+    // running after its waiter drops, and one still writing when the probe
+    // guard removes the dir would leave it behind. A job that outlives its
+    // own failed RPC can still do that; startup reaps the probe dir.
+    let (pulled_manifest, pulled_metadata) = tokio::join!(
+        pull_one(
+            client.clone(),
+            subject,
+            build_object_uri(parts, "manifest.json"),
+            manifest_path.display().to_string(),
+            PullOptions::control("manifest"),
+            base_tags,
+        ),
+        pull_one(
+            client.clone(),
+            subject,
+            build_object_uri(parts, "metadata.json"),
+            metadata_path.display().to_string(),
+            PullOptions::control("metadata"),
+            base_tags,
+        ),
+    );
+    for pulled in [pulled_manifest?, pulled_metadata?] {
+        crate::metrics::pull_s3_bytes(base_tags, Some(&parts.region), pulled);
+    }
+    let read = async |path: &Path| {
+        tokio::fs::read(path).await.map_err(|err| {
+            warn!(error = %err, template = name, content_hash, path = %path.display(), "read partition probe file failed");
+            PullError::Failure(PullFailure::LocalStorageUnavailable)
+        })
+    };
+    let manifest_bytes = read(&manifest_path).await?;
+    let metadata_bytes = read(&metadata_path).await?;
+    let partition = release_partition(&manifest_bytes, &metadata_bytes).map_err(|failure| {
+        warn!(
+            template = name,
+            content_hash,
+            reason = failure.metric_reason(),
+            "partition probe could not read the release binding"
+        );
+        PullError::Failure(failure)
+    })?;
+    Ok(ProbedRelease {
+        partition,
+        manifest: manifest_bytes,
+        metadata: metadata_bytes,
+    })
+}
+
+/// Cache partition of a release from its manifest and metadata bytes. The
+/// pull itself reads metadata leniently, so this does too.
+fn release_partition(
+    manifest_bytes: &[u8],
+    metadata_bytes: &[u8],
+) -> Result<TemplateCachePartition, PullFailure> {
+    let manifest: pplx_space_common_core::types::TemplateManifest =
+        serde_json::from_slice(manifest_bytes).map_err(|_| PullFailure::ManifestMalformed)?;
+    let metadata: pplx_space_common_core::types::TemplateMetadata =
+        serde_json::from_slice(metadata_bytes).unwrap_or_default();
+    manifest_partition(&manifest, &metadata)
+}
+
+/// What [`probe_release_partition`] learned about a release.
+struct ProbedRelease {
+    partition: TemplateCachePartition,
+    manifest: Vec<u8>,
+    metadata: Vec<u8>,
+}
+
+/// A probe dir's name: a transient sibling, never a build dir
+/// (`is_import_staging_dir`). One a crashed process left is reaped before the
+/// socket binds (`clean_transient_dirs_before_serving`), never while a pull
+/// can own it.
+fn partition_probe_dir_name(content_hash: &str, id: uuid::Uuid) -> String {
+    format!("{content_hash}.importing.partition-probe.{id}")
+}
+
+/// Removes a partition probe dir however the probe ends.
+struct ProbeDirGuard(PathBuf);
+
+impl Drop for ProbeDirGuard {
+    fn drop(&mut self) {
+        // `create_dir` can fail before the dir exists, so a missing dir is
+        // the normal case. Any other failure leaves it until startup's
+        // transient sweep reaps it.
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                dir = %self.0.display(),
+                %error,
+                "could not remove a partition probe dir; startup removes it"
+            ),
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one storage location's attempt: the pull's inputs plus its cleanup slot"
+)]
+async fn try_pull_from(
+    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    name: &str,
+    content_hash: &str,
+    parts: &StorageUri,
+    base_tags: &[String],
+    background_worker: Option<
+        &pplx_space_common_jobs::BackgroundWorker<
+            crate::background_jobs::TemplateBackgroundExecutor,
+        >,
+    >,
+    backing_policy: RootfsBackingPolicy,
+    cleanup: &PullCleanupSlot,
+) -> Result<(), PullError> {
+    // Parse the template name into the typed identity that becomes the
+    // SubjectId we hand to volume-manager. This is also the *only* boundary
+    // parse we need on the local-input side; credmgr-side identity (AWS STS
+    // exchange, IAM scoping) is owned by volume-manager.
+    let template_name = TemplateName::parse(name.to_string()).map_err(|err| {
+        warn!(error = %err, template = name, content_hash, "invalid template name; volume pull skipped");
+        PullError::Failure(PullFailure::InvalidTemplateName)
+    })?;
+    let subject = SubjectId::Template(template_name);
+
+    info!(
+        template = name,
+        content_hash,
+        bucket = %parts.bucket,
+        key_prefix = %parts.key_prefix,
+        region = %parts.region,
+        endpoint = parts.endpoint.as_deref().unwrap_or(""),
+        path_style = parts.path_style,
+        "materializing template build via volume-manager"
+    );
+
+    // Write directly into the content-addressed digest dir. No staging dir:
+    // vol-mgr's per-file `.partial → rename` gives us per-file atomicity, the
+    // digest dir is named by `content_hash`, and a pull refuses a dir it
+    // didn't create, so a stale dir from a prior attempt is never adopted.
+    let name_dir = format!("{TEMPLATE_DIR}/{name}");
+    if let Err(err) = tokio::fs::create_dir_all(&name_dir).await {
+        warn!(error = %err, template = name, content_hash, dir = %name_dir, "create name dir failed; falling through");
+        return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+    }
+    if let Err(err) = set_template_cache_permissions(Path::new(&name_dir), TEMPLATE_CACHE_DIR_MODE)
+    {
+        warn!(error = %err, template = name, content_hash, dir = %name_dir, "set name dir permissions failed; falling through");
+        return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+    }
+    // Connect to volume-manager once; clone the client per parallel pull.
+    // Tonic's generated client requires &mut self for each call, so a clone
+    // per concurrent call is the cheapest way to fan out three RPCs.
+    let client = pplx_space_volmgr_client::connect(VOLMGR_SOCKET)
+        .await
+        .map_err(|err| {
+            warn!(
+                error = %err,
+                template = name,
+                content_hash,
+                socket = %VOLMGR_SOCKET,
+                "vol-mgr connect failed; volume pull skipped"
+            );
+            PullError::Failure(PullFailure::VolumeManagerUnavailable)
+        })?;
+
+    // The build lands in the partition of the environment the release's
+    // manifest binds; read it before choosing the build dir.
+    let ProbedRelease {
+        partition,
+        manifest: probed_manifest,
+        metadata: probed_metadata,
+    } = probe_release_partition(&client, &subject, parts, name, content_hash, base_tags).await?;
+    let digest_dir = pplx_space_common_core::host::linux::paths::template_build_dir(
+        name,
+        content_hash,
+        partition,
+    );
+    // A pull never writes into, or deletes, a build dir it didn't create:
+    // the owner found no row for the digest, so a dir in this partition is
+    // one without a row. Dirs of other partitions are left alone.
+    if let Some(refusal) =
+        probed_partition_refusal(Path::new(TEMPLATE_DIR), name, content_hash, partition)
+    {
+        warn!(
+            template = name,
+            content_hash,
+            cache_partition = %partition,
+            dir = %digest_dir,
+            %refusal,
+            "refusing the pull until template-manager verifies the build dir"
+        );
+        return Err(PullError::Retryable(Status::unavailable(refusal)));
+    }
+    // Arm the cleanup guard before any subvolume create / file write
+    // touches the digest dir. Any error path below — including the
+    // create_subvolume fallback's plain-dir path, manifest parse failure,
+    // hash mismatch, and atomic write failure — drops the guard, which
+    // wipes the dir this pull created so a later pull starts clean.
+    // Disarmed below right before the final `Ok(())` once the sqlite upsert
+    // has committed.
+    let cleanup_guard = PullCleanupGuard::new(name, content_hash, &digest_dir, cleanup);
+    // Create the digest dir as a btrfs subvolume via node-manager.
+    // The ioctl requires CAP_SYS_ADMIN, so delegate to privileged
+    // node-manager. An unprivileged direct call would return EPERM and
+    // fall back to a plain directory, breaking btrfs-send's subvolume
+    // precondition. Non-btrfs hosts still fall back to plain mkdir.
+    match crate::btrfs_via_nodemgr::create_template_subvolume(name, content_hash, partition).await {
+        Ok(_path) => {
+            tracing::debug!(
+                template = name,
+                content_hash,
+                dir = %digest_dir,
+                "on-demand pull: digest dir created as btrfs subvolume (via nodemgr)"
+            );
+        }
+        Err(err) => {
+            tracing::info!(
+                template = name,
+                content_hash,
+                dir = %digest_dir,
+                error = %err,
+                "on-demand pull: nodemgr btrfs subvolume create failed; falling back to plain directory"
+            );
+            if let Err(err) = tokio::fs::create_dir_all(&digest_dir).await {
+                warn!(error = %err, template = name, content_hash, dir = %digest_dir, "create digest dir failed; falling through");
+                return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+            }
+        }
+    }
+    if let Err(err) =
+        set_template_cache_permissions(Path::new(&digest_dir), TEMPLATE_CACHE_DIR_MODE)
+    {
+        warn!(error = %err, template = name, content_hash, dir = %digest_dir, "set digest dir permissions failed; falling through");
+        return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+    }
+
+    let metadata_path = format!("{digest_dir}/metadata.json");
+    let manifest_path = format!("{digest_dir}/manifest.json");
+
+    // 1. Write metadata.json + manifest.json. These are tiny (sub-kB) and
+    //    unconditional — every build has both, and they're not listed in
+    //    `manifest.files` (the manifest can't list itself). The partition
+    //    probe already fetched both, so the pull reuses its bytes.
+    for (path, bytes) in [
+        (&metadata_path, &probed_metadata),
+        (&manifest_path, &probed_manifest),
+    ] {
+        write_file_atomic(Path::new(path), bytes).await.map_err(|err| {
+            warn!(error = %err, template = name, content_hash, path = %path, "write probed release file failed");
+            PullError::Failure(PullFailure::LocalStorageUnavailable)
+        })?;
+    }
+
+    // 2. Read + parse the manifest from disk so the rest of `do_pull`
+    //    decides what to pull based on what the manifest actually
+    //    declares, not on a hard-coded `(rootfs.ext4, rootfs.ext4.zst)`
+    //    set. Older templates published before zstd existed list only
+    //    `rootfs.ext4` in `files`; modern ones list both.
+    let metadata_bytes = match tokio::fs::read(&metadata_path).await {
+        Ok(b) => b,
+        Err(err) => {
+            warn!(
+                error = %err,
+                template = name,
+                content_hash,
+                path = %metadata_path,
+                "read staging metadata failed; falling through"
+            );
+            return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+        }
+    };
+    let manifest_bytes = match tokio::fs::read(&manifest_path).await {
+        Ok(b) => b,
+        Err(err) => {
+            warn!(
+                error = %err,
+                template = name,
+                content_hash,
+                path = %manifest_path,
+                "read staging manifest failed; falling through"
+            );
+            return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+        }
+    };
+    // Parse the manifest explicitly so a malformed `manifest.json`
+    // surfaces as `manifest_parse_failed` instead of silently
+    // collapsing to an empty `TemplateManifest::default()` (which would
+    // then hit the `manifest_empty` branch below, masking the real
+    // failure mode from logs + metrics).
+    let parsed_manifest: pplx_space_common_core::types::TemplateManifest =
+        match serde_json::from_slice(&manifest_bytes) {
+            Ok(m) => m,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    template = name,
+                    content_hash,
+                    path = %manifest_path,
+                    "manifest parse failed during pull"
+                );
+                return Err(PullError::Failure(PullFailure::ManifestMalformed));
+            }
+        };
+    // Defense-in-depth: a tampered or corrupted `manifest.json` could
+    // otherwise steer file writes out of the digest dir, since every
+    // `manifest.files` key (and `bootable_artifact`) is interpolated
+    // into a local path below. See [`TemplateManifest::validate_filenames`]
+    // for the rejection rules. Run at the manifest parse boundary,
+    // once per pull, before anything reads `manifest.files`.
+    if let Err(err) = parsed_manifest.validate_filenames() {
+        warn!(
+            template = name,
+            content_hash,
+            error = %err,
+            "manifest filename validation rejected the pulled manifest"
+        );
+        return Err(PullError::Failure(PullFailure::ManifestUnsafeFilename));
+    }
+
+    let metadata = crate::service::validate_guest_documents(&metadata_bytes, &manifest_bytes)
+        .map_err(|error| {
+            warn!(template = name, %error, "invalid pulled template documents");
+            PullError::Failure(PullFailure::ExecutionMetadataInvalid)
+        })?;
+
+    if metadata.guest_image.is_some() {
+        warn!(
+            template = name,
+            "refusing unsupported or local-only guest image in template pull"
+        );
+        return Err(PullError::Failure(PullFailure::ExecutionMetadataInvalid));
+    }
+    // 3. Build the download plan from `manifest.files` with the dedup
+    //    rule: when both `X` and `X.zst` are listed (with a well-formed
+    //    zstd descriptor), drop `X` and pull only `X.zst`. Decompression
+    //    regenerates `X` on disk. See [`build_manifest_pull_plan`].
+    let pull_plan = build_manifest_pull_plan(&parsed_manifest, parts, &digest_dir);
+    if pull_plan.is_empty() {
+        warn!(
+            template = name,
+            content_hash,
+            "manifest declares no files to pull; refusing to materialize an empty build"
+        );
+        return Err(PullError::Failure(PullFailure::ManifestEmpty));
+    }
+    info!(
+        template = name,
+        content_hash,
+        files = ?pull_plan.iter().map(|e| &e.manifest_key).collect::<Vec<_>>(),
+        "vol-mgr pull plan resolved from manifest"
+    );
+
+    // 4. Parallel-pull every entry in the plan, awaiting every one before
+    //    acting on a failure: vol-mgr's `BackgroundWorker` doesn't observe
+    //    a dropped waiter, so a pull still running after the cleanup guard
+    //    removed the dir would write it back without a row.
+    let pull_futs: Vec<_> = pull_plan
+        .iter()
+        .map(|entry| {
+            pull_one(
+                client.clone(),
+                &subject,
+                entry.s3_uri.clone(),
+                entry.local_path.clone(),
+                PullOptions::bulk(entry.phase, entry.raw),
+                base_tags,
+            )
+        })
+        .collect();
+    let pull_bytes = futures_util::future::join_all(pull_futs)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    for bytes in &pull_bytes {
+        crate::metrics::pull_s3_bytes(base_tags, Some(&parts.region), *bytes);
+    }
+    let manifest_wire_bytes: u64 = pull_bytes.iter().sum();
+    info!(
+        template = name,
+        content_hash,
+        rootfs_layout = if parsed_manifest.has_compressed_rootfs() {
+            "compressed"
+        } else {
+            "legacy"
+        },
+        manifest_wire_bytes,
+        "vol-mgr pulls completed; staging on disk"
+    );
+
+    // 5. Decompress every zstd entry in the manifest whose uncompressed
+    //    sibling is also listed — that's the dedup rule's other half.
+    //    Runs in parallel across entries via `spawn_blocking +
+    //    join_all`. Each decoder rehashes its decoded bytes and refuses
+    //    to publish them unless they match the manifest's expanded
+    //    digest; the bootable rootfs first checks that digest equals the
+    //    resolved release hash.
+    let rootfs_filename = if parsed_manifest.bootable_artifact.is_empty() {
+        TEMPLATE_ROOTFS_FILE
+    } else {
+        parsed_manifest.bootable_artifact.as_str()
+    };
+    let rootfs_outcome = materialize_rootfs(
+        &parsed_manifest,
+        &digest_dir,
+        rootfs_filename,
+        base_tags,
+        name,
+        content_hash,
+        backing_policy,
+    )
+    .await?;
+
+    // 6. Verify the digest against the resolved release hash.
+    if rootfs_outcome.rootfs_hash != content_hash {
+        warn!(
+            template = name,
+            expected = content_hash,
+            actual = %rootfs_outcome.rootfs_hash,
+            rootfs_size = rootfs_outcome.rootfs_size,
+            "rootfs hash mismatch; cluster metadata is inconsistent with object bytes"
+        );
+        // `decompress_rootfs` has already atomically renamed the (verified-
+        // hash-wrong) bytes onto rootfs.ext4. Without cleanup, the next
+        // startup recovery would hash the dir, reject it and remove it,
+        // and pulls of this `(name, content_hash)` would be refused until
+        // then. Wipe the dir so the next pull starts clean.
+        cleanup_digest_dir_after_hash_mismatch(name, content_hash, Path::new(&digest_dir)).await;
+        return Err(PullError::HashMismatch {
+            expected: content_hash.to_string(),
+            actual: rootfs_outcome.rootfs_hash,
+        });
+    }
+
+    let rootfs_size = rootfs_outcome.rootfs_size;
+    let artifact_size = rootfs_size;
+    let manifest = crate::service::normalize_template_manifest(
+        parsed_manifest,
+        name,
+        content_hash,
+        &metadata,
+        rootfs_size,
+        rootfs_outcome
+            .compressed
+            .as_ref()
+            .map(|(hash, size)| (hash.as_str(), *size)),
+    )
+    .map_err(|error| {
+        warn!(
+            template = name,
+            content_hash,
+            %error,
+            "template execution metadata validation failed"
+        );
+        PullError::Failure(PullFailure::ExecutionMetadataInvalid)
+    })?;
+    let manifest_json = serde_json::to_string_pretty(&manifest).unwrap_or_default();
+    // Atomic write: stream to a process-unique sibling tmp file and rename
+    // onto manifest.json. Two concurrent decompresses produce byte-identical
+    // bytes here, and `rename` is atomic, so either writer wins safely.
+    if let Err(err) = write_file_atomic(Path::new(&manifest_path), manifest_json.as_bytes()).await {
+        warn!(
+            error = %err,
+            template = name,
+            content_hash,
+            path = %manifest_path,
+            "atomic write of normalized manifest failed; falling through"
+        );
+        return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+    }
+    let build_date = manifest.build_date.clone();
+    let runtime = if manifest.runtime.is_empty() {
+        pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.to_string()
+    } else {
+        manifest.runtime.clone()
+    };
+    let arch = arch_from(&metadata, &manifest);
+
+    if let Err(err) = normalize_template_cache_tree(Path::new(&digest_dir)) {
+        warn!(
+            error = %err,
+            template = name,
+            content_hash,
+            dir = %digest_dir,
+            "normalize digest dir permissions failed; falling through"
+        );
+        return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+    }
+
+    // Stamp received_uuid + toggle the subvolume to read-only BEFORE
+    // committing `state = "ready"`. The upsert below is what makes the
+    // build externally observable as ready — to substrate's
+    // cached-ready filter (via `node_state_sync::mark_template_dirty`),
+    // to in-process GetTemplate queries that read the sqlite row, and
+    // to any out-of-process inspection. If we ran this AFTER the upsert,
+    // a consumer racing the post-step would see a "ready" template whose
+    // received_uuid isn't stamped and whose subvolume isn't yet RO — the
+    // btrfs-send codec would reject the build as a portable send parent
+    // (it verifies `received_uuid` matches the deterministic UUIDv5),
+    // and `btrfs send -p` against a writable parent is rejected by the
+    // kernel anyway. The btrfs-send codec correctness invariant
+    // ("state=ready ⇒ usable as a portable send parent") only holds
+    // when the on-disk subvolume is fully baked before the row commits.
+    //
+    // Always attempt finalize; nodemgr re-checks whether the digest
+    // dir is a subvolume on its own side, so the privileged answer is
+    // authoritative regardless of what an unprivileged local probe
+    // would say.
+    //
+    // FailedPrecondition from nodemgr (`needs subvolume`) is a
+    // benign skip — the digest dir was installed as a plain dir
+    // (non-btrfs host, or a future create_subvolume fallback path);
+    // those templates remain usable via the legacy create-and-
+    // reflink + Full-codec paths, just without btrfs-send
+    // portability. Any other status surfaces as a warn — the
+    // template lands as state=ready regardless (the codec is
+    // best-effort).
+    match crate::btrfs_via_nodemgr::finalize_template_subvolume(name, content_hash, partition).await
+    {
+        Ok(received_uuid) => tracing::debug!(
+            template = name,
+            content_hash,
+            %received_uuid,
+            "on-demand pull: stamped deterministic received_uuid + set RO (via nodemgr)"
+        ),
+        Err(crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc { status, .. })
+            if status.code() == tonic::Code::FailedPrecondition =>
+        {
+            tracing::debug!(
+                template = name,
+                content_hash,
+                reason = %status.message(),
+                "on-demand pull: digest dir not a subvolume; skipping finalize \
+                 (template will use Full codec only)"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                template = name,
+                content_hash,
+                error = %err,
+                "on-demand pull: nodemgr finalize-template-subvolume failed inline; \
+                 enqueuing durable retry — build commits as state='ready' for \
+                 the Full codec immediately; btrfs-send codec stays unavailable \
+                 until the durable retry succeeds"
+            );
+            // Enqueue a durable stamp-retry job. The job runs the
+            // finalize call against nodemgr with exponential backoff;
+            // `FailedPrecondition` from a future attempt resolves as
+            // permanent (digest dir is genuinely not a subvolume),
+            // anything else stays retriable. Idempotent: dedup_key is
+            // `{name}@{build_dir_name}`, so concurrent pulls of the
+            // same build coalesce to one in-flight job. Best-effort
+            // submission — if the worker isn't wired (tests) or
+            // submit fails, we still commit state='ready' so the Full
+            // codec is unblocked.
+            if let Some(worker) = background_worker {
+                let payload =
+                    crate::background_jobs::StampPayload::new(name, content_hash, partition);
+                let dedup = payload.dedup_key();
+                let subject = format!("template:{dedup}");
+                match worker.submit_json(
+                    crate::background_jobs::STAMP_JOB_KIND,
+                    &payload,
+                    Some(&subject),
+                    Some(&dedup),
+                ) {
+                    Ok(job_id) => tracing::info!(
+                        template = name,
+                        content_hash,
+                        job_id = %job_id,
+                        "enqueued durable template_stamp retry"
+                    ),
+                    Err(submit_err) => tracing::warn!(
+                        template = name,
+                        content_hash,
+                        error = %submit_err,
+                        "failed to enqueue durable template_stamp retry"
+                    ),
+                }
+            }
+        }
+    }
+
+    // Now commit the build row. The artifacts on disk are in their
+    // final shape — including RO + stamped received_uuid above — so
+    // this is the only remaining commit step.
+    let n = name.to_string();
+    let h = content_hash.to_string();
+    let db_for_mark = Arc::clone(&db);
+    let phase_started = Instant::now();
+    let upsert = tokio::task::spawn_blocking(move || {
+        let conn = db.lock().map_err(|_| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some("template DB mutex poisoned".to_string()),
+            )
+        })?;
+        crate::db::upsert_build(
+            &conn,
+            &crate::db::BuildUpsert {
+                name: &n,
+                content_hash: &h,
+                cache_partition: partition,
+                build_date: &build_date,
+                manifest_json: &manifest_json,
+                runtime: &runtime,
+                arch: &arch,
+                artifact_size_bytes: artifact_size,
+                state: "ready",
+            },
+        )
+    })
+    .await;
+
+    match upsert {
+        Ok(Ok(())) => {
+            record_phase(base_tags, "db_upsert", "ok", phase_started);
+            info!(
+                template = name,
+                content_hash,
+                bytes = artifact_size,
+                manifest_wire_bytes,
+                "materialized template build from object-store volume"
+            );
+            crate::node_state_sync::mark_template_dirty(&db_for_mark, name);
+            cleanup_guard.disarm();
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            record_phase(base_tags, "db_upsert", "error", phase_started);
+            warn!(
+                error = %err,
+                template = name,
+                content_hash,
+                "DB upsert_build failed after volume pull"
+            );
+            Err(PullError::Failure(PullFailure::LocalDatabaseUnavailable))
+        }
+        Err(err) => {
+            record_phase(base_tags, "db_upsert", "error", phase_started);
+            warn!(
+                error = %err,
+                template = name,
+                content_hash,
+                "spawn_blocking for DB upsert_build panicked"
+            );
+            Err(PullError::Failure(PullFailure::LocalDatabaseUnavailable))
+        }
+    }
+}
+
+/// Local sync fallback for the privileged delete RPC. Production
+/// callers go through nodemgr's `BtrfsDeleteTemplateSubvolume`
+/// because tmplmgr no longer has `CAP_SYS_ADMIN` to delete RO
+/// subvolumes locally. This helper is the fallback used when the RPC
+/// errors transiently: on a plain-dir digest it wipes the dir.
+///
+/// Subvolume-aware order:
+///  1. If RO (a prior install ran far enough to flip it), clear the
+///     flag first — `btrfs subvolume delete` rejects RO targets.
+///  2. Try `delete_subvolume_if_present`. On non-btrfs hosts / plain-dir
+///     installs this returns an error, which we tolerate and fall
+///     through to `remove_dir_all` for the directory case.
+///  3. Plain `remove_dir_all` as the fallback path.
+pub(crate) fn cleanup_digest_dir_sync(digest_dir: &Path) -> std::io::Result<()> {
+    if !digest_dir.exists() {
+        return Ok(());
+    }
+    if pplx_space_common_core::host::btrfs::is_subvolume(digest_dir) {
+        // The RO clear is what makes both delete attempts below
+        // possible on an installed (read-only) build; a refusal here
+        // means the `remove_dir_all` fallthrough will EROFS, so record
+        // it — otherwise that EROFS is indistinguishable from the
+        // pre-subvolume-aware bug this path fixed.
+        if let Err(err) = pplx_space_common_core::host::btrfs::set_readonly(digest_dir, false) {
+            warn!(
+                dir = %digest_dir.display(),
+                %err,
+                "clearing subvolume read-only flag failed ahead of local delete"
+            );
+        }
+        if pplx_space_common_core::host::btrfs::delete_subvolume_if_present(digest_dir).is_ok() {
+            return Ok(());
+        }
+    }
+    std::fs::remove_dir_all(digest_dir)
+}
+
+/// Run [`cleanup_digest_dir_sync`] on the blocking pool so the async
+/// caller's runtime isn't blocked by `btrfs subvolume show` /
+/// `remove_dir_all` syscalls. Used as the fallback when the
+/// privileged `delete_template_subvolume` RPC against nodemgr fails.
+async fn cleanup_digest_dir_local_fallback(digest_dir: PathBuf) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || cleanup_digest_dir_sync(&digest_dir))
+        .await
+        .map_err(|join_err| std::io::Error::other(format!("spawn_blocking join: {join_err}")))?
+}
+
+async fn cleanup_digest_dir_after_hash_mismatch(name: &str, content_hash: &str, digest_dir: &Path) {
+    remove_build_dir(name, content_hash, digest_dir, "hash_mismatch").await;
+}
+
+/// Cache partition of a build dir, read from its name.
+fn digest_dir_partition(digest_dir: &Path) -> Option<TemplateCachePartition> {
+    let name = digest_dir.file_name()?.to_str()?;
+    TemplateCachePartition::parse_build_dir_name(name).map(|(_, partition)| partition)
+}
+
+/// Delete a build dir through node-manager. The partition comes from the dir
+/// name so callers can't send the delete to a sibling partition's build.
+async fn delete_digest_dir_via_nodemgr(
+    name: &str,
+    content_hash: &str,
+    digest_dir: &Path,
+) -> Result<(), String> {
+    let partition = digest_dir_partition(digest_dir)
+        .ok_or_else(|| format!("{} is not a build dir", digest_dir.display()))?;
+    crate::btrfs_via_nodemgr::delete_template_subvolume(name, content_hash, partition)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+/// Remove a build dir this pull created: through node-manager, the
+/// privileged delete path, falling back to a local delete when the RPC
+/// fails. Even when the subvolume delete EPERMs (production tmplmgr is
+/// non-root), the local recursive removal still wipes the dir's contents.
+/// A subvolume root it can't remove stays without a row, and pulls refuse
+/// it until the GC tick's rowless check removes it.
+async fn remove_build_dir(name: &str, content_hash: &str, dir: &Path, reason: &'static str) {
+    match delete_digest_dir_via_nodemgr(name, content_hash, dir).await {
+        Ok(()) => {
+            info!(dir = %dir.display(), reason, "removed digest dir (via nodemgr)");
+            return;
+        }
+        Err(err) => warn!(
+            error = %err,
+            dir = %dir.display(),
+            reason,
+            "nodemgr delete_template_subvolume failed; trying local fallback"
+        ),
+    }
+    if let Err(err) = cleanup_digest_dir_local_fallback(dir.to_path_buf()).await {
+        warn!(
+            error = %err,
+            dir = %dir.display(),
+            reason,
+            "local fallback cleanup also failed; \
+             pulls of the build are refused until the GC tick's rowless check verifies the dir"
+        );
+    } else {
+        info!(
+            dir = %dir.display(),
+            reason,
+            "removed digest dir via local fallback after nodemgr RPC failed"
+        );
+    }
+}
+
+/// Best-effort RAII cleanup for an in-flight `pull_inner` digest dir.
+///
+/// On entry, `pull_inner` creates the digest dir (as a btrfs subvolume
+/// when possible) and proceeds through ~14 fallible steps — vol-mgr
+/// connect, metadata + manifest fetch, hash verify, manifest rewrite,
+/// permission normalization, …, sqlite upsert. Without a guard, any
+/// `return Err` between subvolume create and the final upsert leaks an
+/// empty subvolume, which later pulls refuse as a dir without a row until
+/// the GC tick's rowless check removes it, blocking a clean install of that
+/// `(name, content_hash)` meanwhile.
+///
+/// The guard is armed at digest-dir creation and explicitly
+/// [`Self::disarm`]ed right before `pull_inner` returns `Ok(())`. On any
+/// other exit path, Drop spawns an async `BtrfsDeleteTemplateSubvolume`
+/// RPC against node-manager on the calling tokio runtime and leaves its
+/// handle in the attempt's [`PullCleanupSlot`], which `do_pull` waits on.
+/// Drop itself is sync (Rust requirement) so it can't await. If the
+/// runtime is already shutting down, the GC tick's rowless check, or the
+/// next startup's recovery, rejects the incomplete dir and removes it.
+struct PullCleanupGuard {
+    name: String,
+    content_hash: String,
+    digest_dir: Option<PathBuf>,
+    slot: PullCleanupSlot,
+    remove: PullDirRemoval,
+}
+
+/// Removes a failed pull's build dir, given its template, hash and path.
+type PullDirRemoval =
+    fn(String, String, PathBuf) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// How a failed pull removes the build dir it created; see
+/// [`remove_build_dir`].
+fn remove_failed_pull_dir(
+    name: String,
+    content_hash: String,
+    dir: PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move { remove_build_dir(&name, &content_hash, &dir, "pull_failed").await })
+}
+
+/// Where a [`PullCleanupGuard`] leaves the cleanup it spawns, so the next
+/// storage location's attempt can wait for the dir to go first.
+#[derive(Clone, Default)]
+struct PullCleanupSlot(Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>);
+
+impl PullCleanupSlot {
+    /// Wait for the cleanup a failed attempt spawned, if any.
+    async fn finish(&self) {
+        let pending = lock_or_recover(&self.0, "pull cleanup slot").take();
+        if let Some(pending) = pending
+            && let Err(error) = pending.await
+        {
+            // The cleanup's own failures are logged where they happen; a
+            // panicked task reports nothing else, and its rowless dir keeps
+            // refusing pulls until the GC tick verifies it.
+            warn!(%error, "pull cleanup task failed");
+        }
+    }
+}
+
+impl PullCleanupGuard {
+    fn new(
+        name: &str,
+        content_hash: &str,
+        digest_dir: impl Into<PathBuf>,
+        slot: &PullCleanupSlot,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            content_hash: content_hash.to_string(),
+            digest_dir: Some(digest_dir.into()),
+            slot: slot.clone(),
+            remove: remove_failed_pull_dir,
+        }
+    }
+
+    /// Mark the install successful. Drop becomes a no-op.
+    fn disarm(mut self) {
+        self.digest_dir = None;
+    }
+}
+
+impl Drop for PullCleanupGuard {
+    fn drop(&mut self) {
+        let Some(dir) = self.digest_dir.take() else {
+            return;
+        };
+        let name = std::mem::take(&mut self.name);
+        let content_hash = std::mem::take(&mut self.content_hash);
+
+        // Cleanup goes through node-manager (the privileged delete
+        // path). Drop must be sync, so we spawn a task on the current
+        // tokio runtime and leave its handle in the slot. If no runtime
+        // is available (Drop fired outside an async context — shouldn't
+        // happen during pull_inner, but be defensive), the GC tick's
+        // rowless check catches up.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                dir = %dir.display(),
+                template = %name,
+                content_hash = %content_hash,
+                "PullCleanupGuard fired outside a tokio runtime; partial \
+                 digest dir may remain until the GC tick's rowless check removes it"
+            );
+            return;
+        };
+        let cleanup = handle.spawn((self.remove)(name, content_hash, dir));
+        *lock_or_recover(&self.slot.0, "pull cleanup slot") = Some(cleanup);
+    }
+}
+
+/// Stream `contents` to a process-unique sibling tmp file and atomically
+/// rename onto `path`. Two concurrent writers — possible when a cancelled
+/// future's `spawn_blocking` is still running and a fresh caller arrives —
+/// write to distinct tmp files; whichever rename lands last defines the
+/// final bytes. Used for the normalized `manifest.json` write, where both
+/// writers produce identical content so either is correct.
+async fn write_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("write");
+    let tmp = path.with_file_name(format!("{file_name}.{pid}-{n}.tmp"));
+    tokio::fs::write(&tmp, contents).await?;
+    tokio::fs::rename(&tmp, path).await
+}
+
+/// Percent-encode the characters that would break our query parser if they
+/// appeared in a query value: `&` (splits pairs), `?` and `#` (URL-part
+/// boundaries), `%` (to avoid double-decoding by any downstream consumer),
+/// and whitespace. Everything else passes through, including the `:` and
+/// `/` that legitimately appear in endpoint URLs.
+///
+/// `StorageUri::parse` itself doesn't percent-decode (today), so we only
+/// have to protect the in-band separators — not implement a full RFC 3986
+/// encoder.
+fn pct_encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' | '?' | '#' | '%' | ' ' | '\t' | '\n' | '\r' => {
+                let mut buf = [0u8; 4];
+                for &b in c.encode_utf8(&mut buf).as_bytes() {
+                    out.push_str(&format!("%{b:02X}"));
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Build a fully self-describing `s3://...` URI for one artifact under the
+/// release's storage prefix. Volume-manager owns S3 client construction and
+/// credentials, so all it needs from us is this URI.
+///
+/// `storage.endpoint` and `storage.region` are percent-encoded for the
+/// characters that would break the outer URI's query parser
+/// (`StorageUri::parse` splits on `&` and `=`). A registrar that emits an
+/// endpoint containing `&`, `?`, `#`, or whitespace therefore round-trips
+/// safely rather than producing a `MalformedQuery` on the vol-mgr side.
+fn build_object_uri(storage: &StorageUri, file_name: &str) -> String {
+    let prefix = storage.key_prefix.trim_matches('/');
+    let mut uri = if prefix.is_empty() {
+        format!("s3://{}/{}", storage.bucket, file_name)
+    } else {
+        format!("s3://{}/{}/{}", storage.bucket, prefix, file_name)
+    };
+    uri.push_str(&format!(
+        "?region={}",
+        pct_encode_query_value(&storage.region)
+    ));
+    if let Some(ep) = storage.endpoint.as_deref() {
+        uri.push_str(&format!("&endpoint={}", pct_encode_query_value(ep)));
+    }
+    if storage.path_style {
+        uri.push_str("&path_style=true");
+    }
+    uri
+}
+
+#[derive(Clone, Copy)]
+struct PullOptions {
+    phase: &'static str,
+    raw: bool,
+    priority: i32,
+}
+
+impl PullOptions {
+    const fn control(phase: &'static str) -> Self {
+        Self {
+            phase,
+            raw: false,
+            priority: RESTORE_PRIORITY,
+        }
+    }
+
+    const fn bulk(phase: &'static str, raw: bool) -> Self {
+        Self {
+            phase,
+            raw,
+            priority: 0,
+        }
+    }
+}
+
+fn build_pull_file_request(
+    subject_id: String,
+    s3_uri: String,
+    local_path: String,
+    options: PullOptions,
+) -> PullFileRequest {
+    PullFileRequest {
+        subject_id,
+        s3_uri,
+        local_path,
+        raw: options.raw,
+        file_mode: Some(TEMPLATE_CACHE_FILE_MODE),
+        existing_file_policy: ExistingFilePolicy::LegacySkipPresent as i32,
+        priority: options.priority,
+        snapshot_artifact: SnapshotArtifact::Unspecified as i32,
+        transfer_scope_id: None,
+    }
+}
+
+/// Issue one synchronous `PullFile` RPC against volume-manager.
+///
+/// Volume-manager streams the object to `<local_path>.partial` and renames to
+/// `local_path` on success, so on `Ok` the caller can read `local_path` and
+/// trust it is whole. Volume-manager surfaces retriable job failures as
+/// `Unavailable` and permanent failures as `FailedPrecondition`; this caller
+/// tries every replica before returning the final status.
+async fn pull_one(
+    mut client: VolmgrClient,
+    subject: &SubjectId,
+    s3_uri: String,
+    local_path: String,
+    options: PullOptions,
+    base_tags: &[String],
+) -> Result<u64, PullError> {
+    let phase = options.phase;
+    let phase_started = Instant::now();
+    let subject_id = subject.to_string();
+    let resp = client
+        .pull_file(build_pull_file_request(
+            subject_id.clone(),
+            s3_uri.clone(),
+            local_path.clone(),
+            options,
+        ))
+        .await;
+    match resp {
+        Ok(ok) => {
+            record_phase(base_tags, phase, "ok", phase_started);
+            let bytes = ok.into_inner().bytes_downloaded;
+            tracing::debug!(
+                phase,
+                subject_id = %subject_id,
+                s3_uri = %s3_uri,
+                local_path = %local_path,
+                bytes,
+                "vol-mgr pull_file completed"
+            );
+            Ok(bytes)
+        }
+        Err(status) => match pull_status_disposition(&status) {
+            PullStatusDisposition::Missing => {
+                record_phase(base_tags, phase, "not_found", phase_started);
+                warn!(
+                    phase,
+                    subject_id = %subject_id,
+                    s3_uri = %s3_uri,
+                    local_path = %local_path,
+                    "vol-mgr pull_file returned NotFound"
+                );
+                Err(PullError::Failure(PullFailure::StorageObjectMissing))
+            }
+            PullStatusDisposition::Retryable => {
+                record_phase(base_tags, phase, "retryable", phase_started);
+                info!(
+                    error = %status,
+                    phase,
+                    subject_id = %subject_id,
+                    s3_uri = %s3_uri,
+                    local_path = %local_path,
+                    "vol-mgr rejected pull; propagating retryable status"
+                );
+                Err(PullError::Retryable(status))
+            }
+            PullStatusDisposition::Unreachable => {
+                record_phase(base_tags, phase, "error", phase_started);
+                warn!(
+                    error = %status,
+                    phase,
+                    subject_id = %subject_id,
+                    s3_uri = %s3_uri,
+                    local_path = %local_path,
+                    "vol-mgr pull_file failed; falling through"
+                );
+                Err(PullError::Failure(PullFailure::StorageUnavailable))
+            }
+            PullStatusDisposition::Failed => {
+                record_phase(base_tags, phase, "failed", phase_started);
+                warn!(
+                    error = %status,
+                    phase,
+                    subject_id = %subject_id,
+                    s3_uri = %s3_uri,
+                    local_path = %local_path,
+                    "vol-mgr rejected pull with a non-retryable status"
+                );
+                Err(PullError::Failed(status))
+            }
+        },
+    }
+}
+
+/// Build the parallel-pull plan from `manifest.files`. Applies one
+/// dedup rule: when the manifest lists both `X` and `X.zst` (with a
+/// well-formed zstd descriptor on the latter), drop `X` — only `X.zst`
+/// is pulled and decompression by [`materialize_rootfs`] regenerates
+/// `X` on disk. This avoids paying for the same bytes twice and keeps
+/// the manifest as the single source of truth about which files
+/// actually exist in S3.
+///
+/// Single-file manifests (legacy templates that only ship
+/// `rootfs.ext4`) come through unchanged, yielding a plan with exactly
+/// one entry. Manifests that only declare a `.zst` (no uncompressed
+/// sibling) also come through unchanged; we decompress to produce the
+/// uncompressed file regardless.
+fn build_manifest_pull_plan(
+    manifest: &pplx_space_common_core::types::TemplateManifest,
+    storage: &StorageUri,
+    digest_dir: &str,
+) -> Vec<ManifestPullEntry> {
+    let mut plan = Vec::with_capacity(manifest.files.len());
+    for (key, file) in &manifest.files {
+        // Skip an uncompressed entry when its `.zst` sibling is listed
+        // with a usable zstd descriptor. Decompression regenerates it
+        // after the parallel pull settles.
+        let zst_sibling_key = format!("{key}{ZSTD_FILENAME_SUFFIX}");
+        if manifest
+            .files
+            .get(&zst_sibling_key)
+            .is_some_and(|sibling| sibling.is_zstd_compressed())
+        {
+            continue;
+        }
+
+        let raw = file.is_zstd_compressed();
+        // Phase tag dispatches on bootable artifact + compression so the
+        // existing `rootfs_zstd` dashboards stay stable: the rootfs's
+        // `.zst` keeps the `rootfs_zstd` label, the uncompressed rootfs
+        // gets `rootfs_legacy`, and any future non-rootfs files fall
+        // through to a generic `manifest_file` bucket (none today).
+        let phase = if key == &manifest.bootable_artifact {
+            "rootfs_legacy"
+        } else if key == &format!("{}{ZSTD_FILENAME_SUFFIX}", manifest.bootable_artifact) && raw {
+            "rootfs_zstd"
+        } else {
+            "manifest_file"
+        };
+        plan.push(ManifestPullEntry {
+            manifest_key: key.clone(),
+            s3_uri: build_object_uri(storage, key),
+            local_path: format!("{digest_dir}/{key}"),
+            phase,
+            raw,
+        });
+    }
+    plan
+}
+
+/// Materialize the bootable rootfs after the manifest pull plan
+/// settled. Two paths:
+///
+/// - **Compressed-pair manifest** — `files` lists both the
+///   uncompressed rootfs and its `.zst` sibling. The pull plan
+///   downloaded only the `.zst`; here we decompress. The compressed
+///   digest is verified against the manifest, and the expanded digest
+///   is recomputed from the decoded bytes and verified the same way.
+///   For the bootable rootfs the manifest digest must first equal the
+///   resolved release hash, so the decoded bytes are bound to the
+///   release rather than to whatever the artifact prefix declares.
+/// - **Uncompressed-only manifest** — `files` lists just the rootfs.
+///   The pull plan downloaded it directly; here we stream-hash it for
+///   SHA verification. Equally valid under the manifest-driven design
+///   — see [`crate::rootfs_zstd::hash_rootfs_file`].
+///
+/// Either way the returned `rootfs_hash` is what the caller compares
+/// against `content_hash` to decide HashMismatch.
+/// One post-pull decompression: a zstd entry in the manifest whose
+/// uncompressed sibling is also declared. The dedup rule in
+/// [`build_manifest_pull_plan`] is the symmetric half — it skips the
+/// uncompressed entry at download time on the promise that this step
+/// will regenerate it from the `.zst`.
+#[derive(Debug, Clone)]
+struct DecompressTarget {
+    /// Filename of the uncompressed sibling that decompression
+    /// regenerates. Equals the compressed manifest key minus the
+    /// `.zst` suffix.
+    uncompressed_name: String,
+    compressed_path: String,
+    uncompressed_path: String,
+    /// Expected algorithm-prefixed digest of the decompressed bytes per the manifest's
+    /// `files[uncompressed_name].digest`. Compressed-pair
+    /// materialization requires this digest and compares the rehashed
+    /// expanded bytes against it.
+    expected_uncompressed_digest: String,
+    /// Expected SHA-256 of the on-disk `.zst` bytes per the manifest's
+    /// `files[<compressed key>].digest`. The decompressor emits the
+    /// compressed digest as a side effect; comparing it here catches
+    /// drift between the manifest the publisher wrote and the
+    /// compressed object the bucket served. Empty when the manifest
+    /// didn't carry one.
+    expected_compressed_digest: String,
+}
+
+fn build_decompress_targets(
+    manifest: &pplx_space_common_core::types::TemplateManifest,
+    digest_dir: &str,
+) -> Vec<DecompressTarget> {
+    let mut targets = Vec::new();
+    for (key, entry) in &manifest.files {
+        if !entry.is_zstd_compressed() {
+            continue;
+        }
+        let Some(stem) = key.strip_suffix(ZSTD_FILENAME_SUFFIX) else {
+            continue;
+        };
+        let Some(sibling) = manifest.files.get(stem) else {
+            // No uncompressed sibling declared. The `.zst` is on disk
+            // (downloaded by the pull plan), but nothing asks us to
+            // produce a decompressed form.
+            continue;
+        };
+        targets.push(DecompressTarget {
+            uncompressed_name: stem.to_string(),
+            compressed_path: format!("{digest_dir}/{key}"),
+            uncompressed_path: format!("{digest_dir}/{stem}"),
+            expected_uncompressed_digest: sibling.digest.clone(),
+            expected_compressed_digest: entry.digest.clone(),
+        });
+    }
+    targets
+}
+
+/// Fail fast on a manifest that cannot be verified: both digests of a
+/// compressed pair must be present, and the bootable rootfs's declared
+/// digest must be the resolved release hash. Passing proves only that
+/// the manifest is well-formed; the decoded bytes are still rehashed
+/// and compared after decompression.
+fn check_manifest_digests_for_target(
+    target: &DecompressTarget,
+    rootfs_filename: &str,
+    content_hash: &str,
+) -> Result<(), PullError> {
+    if target.expected_uncompressed_digest.is_empty() {
+        return Err(PullError::Failure(PullFailure::ManifestDigestMissing));
+    }
+    if target.expected_compressed_digest.is_empty() {
+        return Err(PullError::Failure(
+            PullFailure::ManifestCompressedDigestMissing,
+        ));
+    }
+    if target.uncompressed_name == rootfs_filename
+        && target.expected_uncompressed_digest != content_hash
+    {
+        return Err(PullError::HashMismatch {
+            expected: content_hash.to_string(),
+            actual: target.expected_uncompressed_digest.clone(),
+        });
+    }
+    Ok(())
+}
+
+#[tracing::instrument(skip_all, err)]
+async fn materialize_rootfs(
+    manifest: &pplx_space_common_core::types::TemplateManifest,
+    digest_dir: &str,
+    rootfs_filename: &str,
+    base_tags: &[String],
+    name: &str,
+    content_hash: &str,
+    backing_policy: RootfsBackingPolicy,
+) -> Result<RootfsMaterialization, PullError> {
+    let rootfs_path = format!("{digest_dir}/{rootfs_filename}");
+    // Decompress every zstd-paired entry the manifest declares — not
+    // just the bootable rootfs. Each runs on its own `spawn_blocking`
+    // and they fan out via `try_join_all` so a manifest with several
+    // compressed pairs decodes in parallel. Each decompression rehashes
+    // the decoded bytes; the manifest's declared digests are checked
+    // up front only so an unverifiable manifest fails before any
+    // decoding starts.
+    let targets = build_decompress_targets(manifest, digest_dir);
+    let mut decompress_jobs = Vec::with_capacity(targets.len());
+    for target in &targets {
+        match check_manifest_digests_for_target(target, rootfs_filename, content_hash) {
+            Ok(()) => {}
+            Err(error) => {
+                match &error {
+                    PullError::HashMismatch { expected, actual } => {
+                        warn!(
+                            template = name,
+                            file = %target.uncompressed_name,
+                            expected,
+                            actual,
+                            "manifest rootfs digest disagrees with resolved release hash"
+                        );
+                    }
+                    PullError::Failure(failure) => {
+                        warn!(
+                            template = name,
+                            file = %target.uncompressed_name,
+                            reason = failure.metric_reason(),
+                            error = %failure,
+                            "manifest compressed pair is missing required digest"
+                        );
+                    }
+                    PullError::Retryable(status) => {
+                        warn!(
+                            template = name,
+                            file = %target.uncompressed_name,
+                            error = %status,
+                            "rootfs materialization was rejected"
+                        );
+                    }
+                    PullError::Failed(status) => {
+                        warn!(
+                            template = name,
+                            file = %target.uncompressed_name,
+                            error = %status,
+                            "rootfs materialization failed"
+                        );
+                    }
+                }
+                cleanup_digest_dir_after_hash_mismatch(name, content_hash, Path::new(digest_dir))
+                    .await;
+                return Err(error);
+            }
+        }
+        decompress_jobs.push((
+            target.compressed_path.clone(),
+            target.uncompressed_path.clone(),
+            target.expected_uncompressed_digest.clone(),
+            if target.uncompressed_name == rootfs_filename {
+                backing_policy
+            } else {
+                RootfsBackingPolicy::Inherit
+            },
+        ));
+    }
+    let phase_started = Instant::now();
+    let decompress_futs = decompress_jobs.into_iter().map(
+        |(compressed, uncompressed, expected_digest, policy)| async move {
+            let span = tracing::Span::current();
+            tokio::task::spawn_blocking(move || {
+                span.in_scope(|| {
+                    crate::rootfs_zstd::decompress_rootfs(
+                        Path::new(&compressed),
+                        Path::new(&uncompressed),
+                        Some(&expected_digest),
+                        policy,
+                    )
+                })
+            })
+            .await
+        },
+    );
+    let decompress_results = futures_util::future::join_all(decompress_futs).await;
+    let mut rootfs_outcome: Option<RootfsMaterialization> = None;
+    for (target, joined) in targets.iter().zip(decompress_results) {
+        let stats = match joined {
+            Ok(Ok(stats)) => stats,
+            Ok(Err(crate::rootfs_zstd::RootfsZstdError::ExpandedDigestMismatch {
+                expected,
+                actual,
+            })) => {
+                // The decoder left nothing at the output path; wipe the
+                // rest of the digest dir so the next pull starts clean.
+                let phase = decompress_phase(target, rootfs_filename);
+                record_phase(base_tags, phase, "expanded_digest_mismatch", phase_started);
+                warn!(
+                    template = name,
+                    file = %target.uncompressed_name,
+                    expected = %expected,
+                    actual = %actual,
+                    "decoded bytes disagree with the manifest's expanded digest"
+                );
+                cleanup_digest_dir_after_hash_mismatch(name, content_hash, Path::new(digest_dir))
+                    .await;
+                return Err(PullError::HashMismatch { expected, actual });
+            }
+            Ok(Err(error)) => {
+                let phase = decompress_phase(target, rootfs_filename);
+                record_phase(base_tags, phase, error.reason(), phase_started);
+                warn!(
+                    error = %error,
+                    template = name,
+                    content_hash,
+                    source = %target.compressed_path,
+                    target = %target.uncompressed_path,
+                    "decompress manifest entry failed; falling through"
+                );
+                return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+            }
+            Err(error) => {
+                let phase = decompress_phase(target, rootfs_filename);
+                record_phase(base_tags, phase, "error", phase_started);
+                warn!(
+                    error = %error,
+                    template = name,
+                    content_hash,
+                    source = %target.compressed_path,
+                    "decompress manifest entry task failed; falling through"
+                );
+                return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+            }
+        };
+
+        // Defense-in-depth SHA verification: vol-mgr wrote the
+        // compressed bytes via `.partial → rename` but doesn't itself
+        // verify content, so a corrupt object at the bucket would
+        // round-trip through decompression. Compare the compressed
+        // bytes against the manifest. The expanded bytes were already
+        // verified by the decoder before it published them: for the
+        // rootfs target the manifest digest equals the release hash
+        // (checked above), so that is what binds the bytes that boot to
+        // the release.
+        if stats.compressed_hash != target.expected_compressed_digest {
+            warn!(
+                template = name,
+                file = %target.uncompressed_name,
+                expected = %target.expected_compressed_digest,
+                actual = %stats.compressed_hash,
+                "manifest .zst digest mismatch — compressed object disagrees with manifest"
+            );
+            cleanup_digest_dir_after_hash_mismatch(name, content_hash, Path::new(digest_dir)).await;
+            return Err(PullError::HashMismatch {
+                expected: target.expected_compressed_digest.clone(),
+                actual: stats.compressed_hash,
+            });
+        }
+
+        if target.uncompressed_name == rootfs_filename {
+            record_phase(base_tags, "rootfs_zstd_decompress", "ok", phase_started);
+            rootfs_outcome = Some(RootfsMaterialization {
+                rootfs_size: stats.rootfs_size,
+                rootfs_hash: stats.rootfs_hash,
+                compressed: Some((stats.compressed_hash, stats.compressed_size)),
+            });
+        } else {
+            record_phase(base_tags, "manifest_file_decompress", "ok", phase_started);
+        }
+    }
+    if let Some(outcome) = rootfs_outcome {
+        return Ok(outcome);
+    }
+
+    // Uncompressed-only manifest: `files` declared no `.zst` sibling
+    // for the bootable rootfs, so the pull plan downloaded the rootfs
+    // directly. Stream-hash it using the release identity.
+    let algorithm = content_hash
+        .parse::<pplx_space_common_core::types::Digest>()
+        .map_err(|error| PullError::Failed(tonic::Status::invalid_argument(error.to_string())))?
+        .algorithm();
+    let hash_source = rootfs_path.to_string();
+    let phase_started = Instant::now();
+    let span = tracing::Span::current();
+    let (rootfs_hash, rootfs_size) = match tokio::task::spawn_blocking(move || {
+        span.in_scope(|| {
+            tracing::info_span!("rootfs.raw_setup")
+                .in_scope(|| backing_policy.prepare_raw(Path::new(&hash_source)))
+                .map_err(|source| crate::rootfs_zstd::RootfsZstdError::Io {
+                    operation: "set raw rootfs backing policy",
+                    path: hash_source.clone(),
+                    source,
+                })?;
+            crate::rootfs_zstd::hash_rootfs_file(Path::new(&hash_source), algorithm)
+        })
+    })
+    .await
+    {
+        Ok(Ok(stats)) => {
+            record_phase(base_tags, "rootfs_legacy_hash", "ok", phase_started);
+            stats
+        }
+        Ok(Err(error)) => {
+            record_phase(
+                base_tags,
+                "rootfs_legacy_hash",
+                error.reason(),
+                phase_started,
+            );
+            warn!(
+                error = %error,
+                template = name,
+                content_hash,
+                path = %rootfs_path,
+                "hash legacy rootfs failed; falling through"
+            );
+            return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+        }
+        Err(error) => {
+            record_phase(base_tags, "rootfs_legacy_hash", "error", phase_started);
+            warn!(
+                error = %error,
+                template = name,
+                content_hash,
+                "hash legacy rootfs task failed; falling through"
+            );
+            return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+        }
+    };
+    Ok(RootfsMaterialization {
+        rootfs_size,
+        rootfs_hash,
+        compressed: None,
+    })
+}
+
+/// Metric phase tag for one decompression: keep the rootfs's
+/// pre-existing `rootfs_zstd_decompress` tag stable so dashboards
+/// don't break, and bucket every other manifest entry into
+/// `manifest_file_decompress`. Today only the rootfs is paired, so the
+/// latter is forward-compat.
+fn decompress_phase(target: &DecompressTarget, rootfs_filename: &str) -> &'static str {
+    if target.uncompressed_name == rootfs_filename {
+        "rootfs_zstd_decompress"
+    } else {
+        "manifest_file_decompress"
+    }
+}
+
+/// Whether a build row exists for the digest in any cache partition.
+pub(crate) fn local_build_exists(
+    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    name: &str,
+    content_hash: &str,
+) -> bool {
+    let Ok(conn) = db.lock() else {
+        warn!(
+            template = name,
+            content_hash, "template DB mutex poisoned while checking local build"
+        );
+        return false;
+    };
+    crate::db::build_exists(&conn, name, content_hash).unwrap_or(false)
+}
+
+/// Resolution outcome for a single `(template_name, tag)` lookup used
+/// by the tag-prefetch loop. Distinguishing `Unresolved` from
+/// `Error` matters because the former is normal (a template that
+/// doesn't define the tag) while the latter is operational noise.
+pub(crate) enum TagResolveOutcome {
+    Resolved {
+        hash: String,
+        /// Template-level visibility reported by the cluster alongside
+        /// the release. The prefetch loop only warms `Generic`
+        /// templates; see the visibility gate in `prefetch::tick`.
+        visibility: TemplateVisibility,
+    },
+    Unresolved,
+    Error,
+}
+
+/// Resolve `(template_name, tag) → artifact_digest` via
+/// `ClusterApi.FindTemplateRelease`. Used by the tag-prefetch loop to
+/// (a) record the pin in `template_pinned_tags` and (b) decide whether
+/// a pull dispatch is needed. Errors and unresolved lookups are
+/// non-fatal — prefetch is best-effort.
+///
+/// This intentionally bypasses the metric reporting on
+/// [`find_release`]: the prefetch tick already emits its own
+/// `template.prefetch.tag.candidates` counter with the outcome, and
+/// double-counting under both `template.pull.find_release_ms` and the
+/// prefetch metric would muddy on-demand find-release latency.
+pub(crate) async fn resolve_tag(template_name: &str, tag: &str) -> TagResolveOutcome {
+    match find_release_inner(template_name, "", tag, None).await {
+        Ok(release) => TagResolveOutcome::Resolved {
+            hash: release.hash,
+            visibility: release.visibility,
+        },
+        Err(FindReleaseError::NotFound) => TagResolveOutcome::Unresolved,
+        Err(
+            FindReleaseError::Unavailable
+            | FindReleaseError::InvalidResponse
+            | FindReleaseError::Status(_),
+        ) => TagResolveOutcome::Error,
+    }
+}
+
+/// Minimal projection of one entry from
+/// `ClusterApi.ListLatestTemplateReleases` for the prefetcher. Only
+/// the fields needed to drive pulls + record release pins are
+/// surfaced; storage locations are deliberately dropped because the
+/// pull path re-resolves them via `FindTemplateReleaseByHash` so a
+/// single coalesce point handles both the on-demand and prefetch
+/// codepaths.
+pub(crate) struct LatestRelease {
+    pub(crate) release_id: String,
+    pub(crate) content_hash: String,
+    pub(crate) created_at: String,
+}
+
+pub(crate) enum LatestReleasesOutcome {
+    /// May be empty: the template exists cluster-side but has no
+    /// releases registered yet. The caller treats this as a normal
+    /// resting state, not an error.
+    ///
+    /// `visibility` combines the response-level field with a fold
+    /// across the per-entry fields (see [`combine_response_visibility`]).
+    /// The response-level field is what keeps the signal alive for a
+    /// template with zero remaining releases — an org-specific verdict
+    /// must reach the prefetch loop even when nothing resolves anymore,
+    /// or its stale pins would never drop. `Unspecified` when the
+    /// cluster couldn't determine it (old server/schema).
+    Resolved {
+        visibility: TemplateVisibility,
+        releases: Vec<LatestRelease>,
+    },
+    /// Cluster-side error (RPC failure, validation rejection, ...);
+    /// counted as `resolve_error` and skipped without touching the
+    /// pin table for this template.
+    Error,
+}
+
+/// Fold two visibility reports for the *same* template into the most
+/// restrictive one, for prefetch purposes: a confirmed `OrgSpecific`
+/// beats everything (the loop must actively drop pins), `Unspecified`
+/// beats `Generic` (not known to be generic → don't warm). Disagreeing
+/// entries can only happen during cluster-side skew; resolving toward
+/// the restrictive answer keeps the data-isolation property.
+pub(crate) fn fold_visibility(a: TemplateVisibility, b: TemplateVisibility) -> TemplateVisibility {
+    use TemplateVisibility::{Generic, OrgSpecific, Unspecified};
+    match (a, b) {
+        (OrgSpecific, _) | (_, OrgSpecific) => OrgSpecific,
+        (Unspecified, _) | (_, Unspecified) => Unspecified,
+        (Generic, Generic) => Generic,
+    }
+}
+
+/// Combine the response-level visibility with the fold of the per-entry
+/// fields into the template-level verdict the prefetch loop acts on.
+/// With no entries the response-level field stands alone — that's what
+/// lets a zero-release org-specific template still report `OrgSpecific`
+/// so its stale pins drop. With entries, the two sources are folded
+/// restrictively so a disagreement (cluster-side skew or bug) can never
+/// soften a verdict.
+pub(crate) fn combine_response_visibility(
+    response_level: TemplateVisibility,
+    entry_fold: Option<TemplateVisibility>,
+) -> TemplateVisibility {
+    match entry_fold {
+        Some(entries) => fold_visibility(response_level, entries),
+        None => response_level,
+    }
+}
+
+/// Fetch the most recent `limit` releases for `(template_name,
+/// DEFAULT_RUNTIME)` via `ClusterApi.ListLatestTemplateReleases`.
+/// Same metric-bypass rationale as [`resolve_tag`]: the prefetch
+/// tick emits its own per-template counter and we don't want this
+/// path to skew on-demand find-release latency.
+pub(crate) async fn list_latest_releases(template_name: &str, limit: u32) -> LatestReleasesOutcome {
+    let mut client = match connect_cluster_api_from_env().await {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(error = %error, "cluster api connect failed");
+            return LatestReleasesOutcome::Error;
+        }
+    };
+
+    let resp = match client
+        .list_latest_template_releases(ListLatestTemplateReleasesRequest {
+            template_name: template_name.to_string(),
+            runtime: DEFAULT_RUNTIME.to_string(),
+            limit,
+        })
+        .await
+    {
+        Ok(r) => r.into_inner(),
+        Err(status) => {
+            warn!(
+                error = %status,
+                template = template_name,
+                limit,
+                "ListLatestTemplateReleases failed",
+            );
+            return LatestReleasesOutcome::Error;
+        }
+    };
+
+    let response_visibility = resp.template_visibility();
+    let mut releases = Vec::with_capacity(resp.entries.len());
+    let mut entry_fold: Option<TemplateVisibility> = None;
+    for entry in resp.entries {
+        let entry_visibility = entry.template_visibility();
+        entry_fold = Some(match entry_fold {
+            Some(folded) => fold_visibility(folded, entry_visibility),
+            None => entry_visibility,
+        });
+        let Some(release) = entry.release else {
+            warn!(
+                template = template_name,
+                "ListLatestTemplateReleases entry missing release; skipping",
+            );
+            continue;
+        };
+        if release.hash.is_empty() {
+            warn!(
+                template = template_name,
+                "ListLatestTemplateReleases entry has empty hash; skipping",
+            );
+            continue;
+        }
+        releases.push(LatestRelease {
+            release_id: release.id,
+            content_hash: release.hash,
+            created_at: release.created_at,
+        });
+    }
+    LatestReleasesOutcome::Resolved {
+        visibility: combine_response_visibility(response_visibility, entry_fold),
+        releases,
+    }
+}
+
+/// Mirrors the `template_arch` extraction in service.rs's import path:
+/// reads `arch` from metadata if present, else manifest, else falls
+/// back to `"aarch64"`. Kept separate from
+/// `crate::service::import_helpers::template_arch` so the volume-pull
+/// path doesn't need to reach into the service module's privacy
+/// surface, but the behavior matches.
+fn arch_from(
+    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    manifest: &pplx_space_common_core::types::TemplateManifest,
+) -> String {
+    if let Some(a) = metadata.arch.as_deref().filter(|s| !s.is_empty()) {
+        return a.to_string();
+    }
+    if !manifest.arch.is_empty() {
+        return manifest.arch.clone();
+    }
+    "aarch64".to_string()
+}
+
+#[cfg(test)]
+pub(crate) mod tests;

@@ -1,0 +1,43 @@
+[package]
+name = "pplx-space-sandbox-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.space.state]
+postgres = ["sandboxes"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Exposes `test_support` to other crates' test suites as a dev-dependency
+# feature: `StoredSandboxLifecycle::all`, every value Postgres
+# `sandboxes.lifecycle` can hold, and the reader for writer × stored-lifecycle
+# expectation tables. This crate's unit tests get it under `cfg(test)`.
+test-support = []
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid", "time"] }
+thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+# internal
+pplx-space-cluster-pool = { workspace = true }
+pplx-space-common-core = { workspace = true, features = ["sqlx", "serde"] }
+pplx-space-sandbox-portability = { workspace = true }
+pplx-space-sandbox-residency = { workspace = true }
+pplx-space-sandbox-routability = { workspace = true }
+pplx-space-sandbox-teardown = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+pplx-space-db-test-fixtures = { workspace = true }
+pplx-space-test-env = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -1,0 +1,1645 @@
+//! Privileged btrfs delegation handlers.
+//!
+//! These six RPCs let the unprivileged template-manager and sandbox-
+//! manager services delegate the btrfs operations that need
+//! `CAP_SYS_ADMIN` to node-manager — which runs as the privileged
+//! daemon in production (root + `privileged: true` in the K8s
+//! daemonset; `User=root` in the systemd direct-deploy unit). In
+//! the retired compose harness all three services ran as root too, but
+//! tmplmgr and sbxmgr had `CAP_SYS_ADMIN` dropped from their bounding set
+//! via `setpriv` to mirror the production capability boundary.
+//!
+//! The six RPCs split into two clusters:
+//!
+//! - **Template volume lifecycle** (caller: tmplmgr) —
+//!   `BtrfsCreateTemplateSubvolume`,
+//!   `BtrfsFinalizeTemplateSubvolume`,
+//!   `BtrfsDeleteTemplateSubvolume`.
+//! - **Sandbox suspend/restore codec** (caller: sbxmgr) —
+//!   `BtrfsEncodeRootfsSend`,
+//!   `BtrfsReceiveInstance`,
+//!   `BtrfsDeleteSandboxInstance`.
+//!
+//! Each RPC accepts domain identifiers (`template_name + content_hash`,
+//! `sandbox_id`) and derives the canonical host paths internally.
+//! Callers never pass arbitrary paths, so a compromised caller can't
+//! ask nodemgr to act on filesystem locations outside the SPACE cache.
+
+use std::path::{Path, PathBuf};
+
+use pplx_space_common_core::host::linux::identities::user_names;
+use pplx_space_uds_peer_auth::UdsPeerPrincipal;
+use tonic::{Request, Response, Status};
+
+use crate::proto::{
+    BtrfsCreateSandboxInstanceRequest, BtrfsCreateSandboxInstanceResponse,
+    BtrfsCreateTemplateSubvolumeRequest, BtrfsCreateTemplateSubvolumeResponse,
+    BtrfsDeleteSandboxInstanceRequest, BtrfsDeleteSandboxInstanceResponse,
+    BtrfsDeleteTemplateSubvolumeRequest, BtrfsDeleteTemplateSubvolumeResponse,
+    BtrfsEncodeRootfsSendRequest, BtrfsEncodeRootfsSendResponse,
+    BtrfsEncodeSnapshotRootfsSendRequest, BtrfsEncodeSnapshotRootfsSendResponse,
+    BtrfsFinalizeTemplateSubvolumeRequest, BtrfsFinalizeTemplateSubvolumeResponse,
+    BtrfsReceiveInstanceRequest, BtrfsReceiveInstanceResponse, EnvironmentTemplateBuild,
+};
+
+use pplx_space_common_core::host::linux::paths::TEMPLATE_CACHE_DIR_MODE;
+use pplx_space_common_core::{host::linux::identities::gids, host::linux::identities::users};
+
+use super::validation::validate_sandbox_id;
+use super::{CACHE_DIR, NodeManagerService};
+use super::{artifact_fs, trusted_paths};
+
+const ALLOW_NODEMGR_ADMIN_OR_TMPLMGR: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(pplx_space_uds_peer_auth::LocalRole::Admin),
+    UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
+];
+
+const ALLOW_NODEMGR_ADMIN_OR_SBXMGR: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(pplx_space_uds_peer_auth::LocalRole::Admin),
+    UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
+];
+
+fn log_best_effort_cleanup<T, E: std::fmt::Display>(
+    operation: &str,
+    path: &Path,
+    result: Result<T, E>,
+) {
+    if let Err(error) = result {
+        tracing::debug!(
+            operation,
+            path = %path.display(),
+            %error,
+            "best-effort btrfs cleanup failed"
+        );
+    }
+}
+
+// Template-identifier validators. These keep callers from smuggling
+// path-traversal sequences via `template_name` or `content_hash`. The
+// callers' own typed wrappers (`TemplateName`, `ContentHash`) enforce
+// the same rules, but nodemgr re-validates because it can't trust
+// peers — this is the privilege boundary.
+
+fn validate_template_name(name: &str) -> Result<(), Status> {
+    if name.is_empty() {
+        return Err(Status::invalid_argument("template_name must not be empty"));
+    }
+    // Match the allowed character set the cluster-Postgres
+    // `templates.name` column accepts: ASCII alphanumeric + `-`, `_`,
+    // `.`. Crucially excludes `/`, `..`, NUL, anything that would
+    // escape the template_root.
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(Status::invalid_argument(format!(
+            "template_name must be ASCII alphanumeric or [-_.]: got '{name}'"
+        )));
+    }
+    if name == "." || name == ".." || name.starts_with('.') {
+        return Err(Status::invalid_argument(format!(
+            "template_name must not start with '.': got '{name}'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_content_hash(hash: &str) -> Result<(), Status> {
+    hash.parse::<pplx_space_common_core::types::Digest>()
+        .map(|_| ())
+        .map_err(|error| {
+            Status::invalid_argument(format!("invalid content_hash '{hash}': {error}"))
+        })
+}
+
+/// A template build named by a btrfs request: the legacy `content_hash`
+/// field, or an [`EnvironmentTemplateBuild`] for a build in an environment's
+/// cache partition. Both forms are validated here, at the privilege boundary,
+/// and the partition is derived from the environment rather than trusted.
+#[derive(Clone, Debug)]
+struct TemplateBuildTarget {
+    name: String,
+    content_hash: String,
+    partition: pplx_space_common_core::types::TemplateCachePartition,
+}
+
+/// The parent template build a sandbox codec request names; see
+/// [`TemplateBuildTarget::for_sandbox_codec`].
+trait SandboxCodecRequest {
+    fn parent_target(&self) -> Result<TemplateBuildTarget, Status>;
+
+    /// The builds that can be the sandbox's parent, most specific first: the
+    /// partition its binding names, then the legacy build. A sandbox bound to
+    /// another environment can descend from the legacy build: compatible
+    /// selection boots it there when its environment has no build of its own,
+    /// and a stream encoded before the field existed names the legacy build.
+    /// Handlers append the digest's other cached partitions with
+    /// [`with_cached_partitions`], for requests that name a partition only. A
+    /// request without `environment_build` has the legacy build alone, exactly
+    /// as before partitions, so it never encodes a stream against a build
+    /// another node may not hold.
+    /// The encodes take the first candidate the instance descends from, by
+    /// their lineage checks. Receive takes the first that's a stamped
+    /// subvolume; `btrfs receive` finds the stream's parent by its received
+    /// UUID, so a candidate it doesn't descend from fails the receive rather
+    /// than being used.
+    fn parent_candidates(&self) -> Result<Vec<TemplateBuildTarget>, Status>;
+}
+
+/// The first candidate whose check passes and that `accepts`, else the first
+/// whose check passed, else the first check's error: a handler's lineage
+/// check then reports what it always did for the binding's own partition.
+fn first_parent_candidate<V>(
+    candidates: Vec<TemplateBuildTarget>,
+    check: impl FnMut(&TemplateBuildTarget) -> Result<V, Status>,
+    accepts: impl Fn(&V) -> bool,
+) -> Result<(TemplateBuildTarget, V), Status> {
+    choose_parent_candidate(checked_parent_candidates(candidates, check)?, accepts)
+}
+
+/// The candidates whose check passes, in order, else the first check's
+/// error. A handler that validates its parent before reading other state
+/// calls this where it always validated, then [`choose_parent_candidate`].
+fn checked_parent_candidates<V>(
+    candidates: Vec<TemplateBuildTarget>,
+    mut check: impl FnMut(&TemplateBuildTarget) -> Result<V, Status>,
+) -> Result<Vec<(TemplateBuildTarget, V)>, Status> {
+    let mut passing = Vec::new();
+    let mut first_err = None;
+    for candidate in candidates {
+        match check(&candidate) {
+            Ok(value) => passing.push((candidate, value)),
+            Err(error) => {
+                first_err.get_or_insert(error);
+            }
+        }
+    }
+    if passing.is_empty() {
+        return Err(
+            first_err.unwrap_or_else(|| Status::internal("sandbox codec request names no parent"))
+        );
+    }
+    Ok(passing)
+}
+
+/// The candidate a receive uses: the one whose expected received UUID is the
+/// stream's parent, when the stream names one, else the first that passed.
+/// `FailedPrecondition` when the stream names a parent no candidate is.
+fn choose_stream_parent(
+    passing: Vec<(TemplateBuildTarget, ())>,
+    stream_parent: Option<uuid::Uuid>,
+) -> Result<TemplateBuildTarget, Status> {
+    let mut passing = passing.into_iter().map(|(candidate, ())| candidate);
+    match stream_parent {
+        Some(parent) => passing
+            .find(|candidate| candidate.received_uuid() == parent)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "no cached build on this node is the stream's parent (received_uuid={parent})"
+                ))
+            }),
+        None => passing
+            .next()
+            .ok_or_else(|| Status::internal("sandbox codec request names no parent")),
+    }
+}
+
+/// The first of `passing` that `accepts`, else the first.
+fn choose_parent_candidate<V>(
+    passing: Vec<(TemplateBuildTarget, V)>,
+    accepts: impl Fn(&V) -> bool,
+) -> Result<(TemplateBuildTarget, V), Status> {
+    let mut first = None;
+    for (candidate, value) in passing {
+        if accepts(&value) {
+            return Ok((candidate, value));
+        }
+        first.get_or_insert((candidate, value));
+    }
+    first.ok_or_else(|| Status::internal("sandbox codec request names no parent"))
+}
+
+/// `candidates` followed by the digest's other partitions that have a build
+/// directory under the template directory, in directory-name order, when the
+/// first candidate names a partition; unchanged when it's the legacy build.
+/// Only receive uses them: a stream encoded before this release, or on a node
+/// that held another partition, may name one, and receive matches the
+/// stream's parent by its received UUID. Encodes never take them, so no new
+/// stream names a parent outside the requested partition and the legacy
+/// build.
+fn with_cached_partitions(candidates: Vec<TemplateBuildTarget>) -> Vec<TemplateBuildTarget> {
+    if names_legacy_build(&candidates) {
+        return candidates;
+    }
+    let dir_names = candidates
+        .first()
+        .and_then(|first| std::fs::read_dir(first.digest_dir().parent()?).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok());
+    append_partitions(candidates, dir_names)
+}
+
+/// Whether the most specific candidate is the legacy build: the request
+/// carried no `environment_build`.
+fn names_legacy_build(candidates: &[TemplateBuildTarget]) -> bool {
+    candidates.first().is_none_or(|first| {
+        first.partition == pplx_space_common_core::types::TemplateCachePartition::Legacy
+    })
+}
+
+/// [`with_cached_partitions`] given the template directory's entry names.
+fn append_partitions(
+    mut candidates: Vec<TemplateBuildTarget>,
+    dir_names: impl IntoIterator<Item = String>,
+) -> Vec<TemplateBuildTarget> {
+    if names_legacy_build(&candidates) {
+        return candidates;
+    }
+    let Some(first) = candidates.first().cloned() else {
+        return candidates;
+    };
+    let mut others: Vec<TemplateBuildTarget> = dir_names
+        .into_iter()
+        .filter_map(|dir_name| {
+            let (content_hash, partition) =
+                pplx_space_common_core::types::TemplateCachePartition::parse_build_dir_name(
+                    &dir_name,
+                )?;
+            (content_hash == first.content_hash
+                && !candidates.iter().any(|known| known.partition == partition))
+            .then(|| TemplateBuildTarget {
+                name: first.name.clone(),
+                content_hash: first.content_hash.clone(),
+                partition,
+            })
+        })
+        .collect();
+    others.sort_by_key(TemplateBuildTarget::dir_name);
+    candidates.extend(others);
+    candidates
+}
+
+macro_rules! sandbox_codec_request {
+    ($($request:ty),+) => {$(
+        impl SandboxCodecRequest for $request {
+            fn parent_target(&self) -> Result<TemplateBuildTarget, Status> {
+                TemplateBuildTarget::for_sandbox_codec(
+                    &self.template_name,
+                    &self.content_hash,
+                    self.environment_build.as_ref(),
+                )
+            }
+
+            fn parent_candidates(&self) -> Result<Vec<TemplateBuildTarget>, Status> {
+                let primary = self.parent_target()?;
+                if primary.partition == pplx_space_common_core::types::TemplateCachePartition::Legacy {
+                    return Ok(vec![primary]);
+                }
+                let legacy = TemplateBuildTarget::parse(&self.template_name, &self.content_hash, None)?;
+                Ok(vec![primary, legacy])
+            }
+        }
+    )+};
+}
+
+sandbox_codec_request!(
+    BtrfsEncodeRootfsSendRequest,
+    BtrfsEncodeSnapshotRootfsSendRequest,
+    BtrfsReceiveInstanceRequest
+);
+
+/// The cache partition an [`EnvironmentTemplateBuild`] names, derived from
+/// its environment rather than trusted. Every request that carries one is
+/// checked here, so subvolume and codec requests follow one rule: the
+/// environment must parse and must not select the legacy partition, which
+/// legacy builds name with `content_hash` alone.
+fn environment_build_partition(
+    build: &EnvironmentTemplateBuild,
+) -> Result<pplx_space_common_core::types::TemplateCachePartition, Status> {
+    let environment = build
+        .environment
+        .parse::<pplx_space_common_core::types::EnvironmentReference>()
+        .map_err(|error| {
+            Status::invalid_argument(format!(
+                "invalid environment_build.environment '{}': {error}",
+                build.environment
+            ))
+        })?;
+    let partition =
+        pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment));
+    if partition == pplx_space_common_core::types::TemplateCachePartition::Legacy {
+        return Err(Status::invalid_argument(
+            "environment_build names the initial environment; use content_hash",
+        ));
+    }
+    Ok(partition)
+}
+
+impl TemplateBuildTarget {
+    /// The parent build a sandbox codec request names. A request from a
+    /// sandbox bound to an environment outside the legacy layout carries
+    /// `environment_build` beside the legacy `content_hash`, so a node-manager
+    /// that predates the field resolves the legacy build as before; here the
+    /// two hashes must agree, and the build is resolved in its partition. As
+    /// for the subvolume requests, an `environment_build` naming the initial
+    /// environment is rejected: a legacy-partition build sends none.
+    fn for_sandbox_codec(
+        name: &str,
+        content_hash: &str,
+        environment_build: Option<&EnvironmentTemplateBuild>,
+    ) -> Result<Self, Status> {
+        let Some(build) = environment_build else {
+            return Self::parse(name, content_hash, None);
+        };
+        if build.content_hash != content_hash {
+            return Err(Status::invalid_argument(
+                "environment_build.content_hash differs from content_hash",
+            ));
+        }
+        Self::parse(name, "", Some(build))
+    }
+
+    fn parse(
+        name: &str,
+        content_hash: &str,
+        environment_build: Option<&EnvironmentTemplateBuild>,
+    ) -> Result<Self, Status> {
+        validate_template_name(name)?;
+        let (content_hash, partition) = match environment_build {
+            None => (
+                content_hash,
+                pplx_space_common_core::types::TemplateCachePartition::Legacy,
+            ),
+            Some(build) => {
+                if !content_hash.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "set either content_hash or environment_build, not both",
+                    ));
+                }
+                (
+                    build.content_hash.as_str(),
+                    environment_build_partition(build)?,
+                )
+            }
+        };
+        validate_content_hash(content_hash)?;
+        Ok(Self {
+            name: name.to_string(),
+            content_hash: content_hash.to_string(),
+            partition,
+        })
+    }
+
+    fn dir_name(&self) -> String {
+        self.partition.build_dir_name(&self.content_hash)
+    }
+
+    fn digest_dir(&self) -> PathBuf {
+        PathBuf::from(
+            pplx_space_common_core::host::linux::paths::template_build_dir(
+                &self.name,
+                &self.content_hash,
+                self.partition,
+            ),
+        )
+    }
+
+    fn received_uuid(&self) -> uuid::Uuid {
+        pplx_space_common_core::host::btrfs::deterministic_template_received_uuid(
+            &self.name,
+            &self.dir_name(),
+        )
+    }
+}
+
+impl std::fmt::Display for TemplateBuildTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.name, self.dir_name())
+    }
+}
+
+fn sandbox_dir(sandbox_id: &str) -> PathBuf {
+    PathBuf::from(format!("{CACHE_DIR}/{sandbox_id}"))
+}
+
+fn instance_dir(sandbox_id: &str) -> PathBuf {
+    sandbox_dir(sandbox_id).join("instance")
+}
+
+fn snapshot_dir(sandbox_id: &str) -> PathBuf {
+    sandbox_dir(sandbox_id).join("snapshot")
+}
+
+fn named_snapshot_send_source(sandbox_id: &str, snapshot_name: &str) -> Result<PathBuf, Status> {
+    validate_sandbox_id(sandbox_id)?;
+    super::validation::validate_snapshot_name(snapshot_name)?;
+    Ok(sandbox_dir(sandbox_id)
+        .join("snapshots")
+        .join(snapshot_name))
+}
+
+fn named_snapshot_wire_source(artifact_dir: &Path) -> PathBuf {
+    instance_ro_in_snapshot_dir(artifact_dir)
+}
+
+/// Path the suspend codec writes its RO snapshot to (next to the
+/// other snapshot artifacts the FC `create_snapshot` step wrote).
+fn instance_ro_in_snapshot_dir(snapshot_dir: &Path) -> PathBuf {
+    snapshot_dir.join("instance.ro")
+}
+
+/// Where the suspend codec writes its btrfs-send stream (consumed
+/// later by the upload tail) and where the restore codec reads
+/// it from (placed by sbxmgr's S3 pull).
+fn rootfs_btrfs_send_path(snapshot_dir: &Path) -> PathBuf {
+    // Wire-format filename for the btrfs-send rootfs codec. Mirrors
+    // `crate::snapshot_upload::ROOTFS_BTRFS_SEND_FILENAME` in sbxmgr;
+    // not promoted to common_core yet so we duplicate the literal
+    // here. Both sides MUST agree.
+    snapshot_dir.join("rootfs.btrfs-send")
+}
+
+/// Where the Full-codec rootfs lives — superseded by btrfs-send
+/// stream on the suspend side, removed after a successful encode.
+fn rootfs_ext4_in_snapshot_dir(snapshot_dir: &Path) -> PathBuf {
+    snapshot_dir.join(pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE)
+}
+
+struct ValidatedSendParent {
+    path: PathBuf,
+    uuid: uuid::Uuid,
+}
+
+fn validated_send_parent(template: &TemplateBuildTarget) -> Result<ValidatedSendParent, Status> {
+    validated_send_parent_at(template.digest_dir(), template)
+}
+
+/// The suspend encode's send parent. Only suspend has a Full codec to fall
+/// back to, so only suspend maps an absent build to a lineage precondition;
+/// operation snapshots keep the walker's `NotFound`.
+fn validated_suspend_send_parent(
+    template: &TemplateBuildTarget,
+) -> Result<ValidatedSendParent, Status> {
+    validated_suspend_send_parent_at(template.digest_dir(), template)
+}
+
+fn validated_suspend_send_parent_at(
+    path: PathBuf,
+    template: &TemplateBuildTarget,
+) -> Result<ValidatedSendParent, Status> {
+    match validated_send_parent_at(path, template) {
+        // A build can leave the node while an instance still descends from
+        // it. Fetching it again cannot help: the new build is a different
+        // subvolume, so the instance's parent_uuid never matches it. Full is
+        // the only codec left for this sandbox. The template probe is the
+        // only `NotFound` the validator returns.
+        Err(status) if status.code() == tonic::Code::NotFound => {
+            tracing::warn!(
+                template = %template.name,
+                content_hash = %template.content_hash,
+                partition = %template.partition,
+                "btrfs-send parent template build is absent on this node"
+            );
+            Err(lineage_precondition(
+                LineageFallbackCause::TemplateMissing,
+                format!(
+                    "btrfs-send codec requires template {template} on this node, but its \
+                     build is absent; retry with format=full"
+                ),
+            ))
+        }
+        result => result,
+    }
+}
+
+fn validated_send_parent_at(
+    path: PathBuf,
+    template: &TemplateBuildTarget,
+) -> Result<ValidatedSendParent, Status> {
+    if !artifact_fs::is_subvolume(&path)? {
+        return Err(lineage_precondition(
+            LineageFallbackCause::TemplateNotSubvolume,
+            format!(
+                "btrfs-send codec requires template {template} to be a local \
+                 btrfs subvolume; this node still has the legacy directory-form template. \
+                 Retry with format=full or wait for tmplmgr to re-install this build."
+            ),
+        ));
+    }
+    let info = artifact_fs::info(&path).map_err(|error| {
+        Status::internal(format!(
+            "read template subvolume info {}: {error}",
+            path.display()
+        ))
+    })?;
+    let uuid = info.uuid.ok_or_else(|| {
+        Status::internal(format!(
+            "template subvolume at {} reports no UUID",
+            path.display()
+        ))
+    })?;
+    let expected_received = template.received_uuid();
+    if info.received_uuid != Some(expected_received) {
+        return Err(lineage_precondition(
+            LineageFallbackCause::TemplateReceivedUuidMismatch,
+            format!(
+                "btrfs-send codec requires template received_uuid={expected_received} for \
+                 cross-node stream portability; got {:?}. The template was likely installed \
+                 before received_uuid stamping shipped; force a re-install via tmplmgr or \
+                 retry with format=full.",
+                info.received_uuid,
+            ),
+        ));
+    }
+    Ok(ValidatedSendParent { path, uuid })
+}
+
+fn write_parented_btrfs_send(
+    parent: &Path,
+    source: &Path,
+    stream_path: &Path,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<u64, Status> {
+    let parent = trusted_paths::open_directory(parent)?;
+    let source = trusted_paths::open_directory(source)?;
+    let output = artifact_fs::write_atomic(stream_path, |output| {
+        artifact_fs::btrfs::send(&parent, &source, output).map_err(artifact_fs::error)?;
+        // The ioctl cannot be interrupted by dropping a future. Keep ownership
+        // through its return, then refuse publication for a cancelled caller.
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Err(Status::cancelled("btrfs stream transfer cancelled"));
+        }
+        trusted_paths::set_permissions(output, Some(gids::SPACE_CACHE_RW), 0o660)
+    })?;
+    output
+        .metadata()
+        .map(|m| m.len())
+        .map_err(artifact_fs::error)
+}
+
+struct ArtifactDirectoryGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl ArtifactDirectoryGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+fn create_snapshot_artifact_directory(
+    path: PathBuf,
+    reader_gid: u32,
+) -> Result<ArtifactDirectoryGuard, Status> {
+    let (parent, name) = artifact_fs::parent(&path)?;
+    nix::sys::stat::mkdirat(
+        &parent,
+        name,
+        nix::sys::stat::Mode::from_bits_truncate(0o700),
+    )
+    .map_err(|error| {
+        if error == nix::errno::Errno::EEXIST {
+            Status::already_exists("snapshot artifact destination exists")
+        } else {
+            artifact_fs::error(error)
+        }
+    })?;
+    let guard = ArtifactDirectoryGuard::new(path.clone());
+    let directory = artifact_fs::directory(&parent, name).map_err(artifact_fs::error)?;
+    trusted_paths::set_permissions(&directory, Some(reader_gid), 0o2770)?;
+    Ok(guard)
+}
+
+impl Drop for ArtifactDirectoryGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            log_best_effort_cleanup(
+                "remove incomplete snapshot artifact directory",
+                &self.path,
+                artifact_fs::delete(&self.path),
+            );
+        }
+    }
+}
+
+const LINEAGE_CAUSE_METADATA: &str = "x-space-btrfs-lineage-cause";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LineageFallbackCause {
+    InstanceNotSubvolume,
+    InstanceParentMismatch,
+    SnapshotNotSubvolume,
+    SnapshotParentMismatch,
+    TemplateMissing,
+    TemplateNotSubvolume,
+    TemplateReceivedUuidMismatch,
+}
+
+impl LineageFallbackCause {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InstanceNotSubvolume => "instance_not_subvolume",
+            Self::InstanceParentMismatch => "instance_parent_mismatch",
+            Self::SnapshotNotSubvolume => "snapshot_not_subvolume",
+            Self::SnapshotParentMismatch => "snapshot_parent_mismatch",
+            Self::TemplateMissing => "template_missing",
+            Self::TemplateNotSubvolume => "template_not_subvolume",
+            Self::TemplateReceivedUuidMismatch => "template_received_uuid_mismatch",
+        }
+    }
+}
+
+fn validate_named_snapshot_lineage(
+    template_uuid: uuid::Uuid,
+    instance: &pplx_space_common_core::host::btrfs::SubvolumeInfo,
+    snapshot: &pplx_space_common_core::host::btrfs::SubvolumeInfo,
+) -> Result<(), Status> {
+    if instance.parent_uuid != Some(template_uuid) {
+        return Err(lineage_precondition(
+            LineageFallbackCause::InstanceParentMismatch,
+            format!(
+                "instance.parent_uuid is {:?}, expected {template_uuid}",
+                instance.parent_uuid
+            ),
+        ));
+    }
+    let instance_uuid = instance.uuid.ok_or_else(|| {
+        lineage_precondition(
+            LineageFallbackCause::InstanceNotSubvolume,
+            "instance subvolume reports no UUID".to_string(),
+        )
+    })?;
+    if snapshot.parent_uuid != Some(instance_uuid) {
+        return Err(lineage_precondition(
+            LineageFallbackCause::SnapshotParentMismatch,
+            format!(
+                "snapshot.parent_uuid is {:?}, expected {instance_uuid}",
+                snapshot.parent_uuid
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn lineage_precondition(cause: LineageFallbackCause, message: String) -> Status {
+    let mut status = Status::failed_precondition(message);
+    status.metadata_mut().insert(
+        LINEAGE_CAUSE_METADATA,
+        tonic::metadata::MetadataValue::from_static(cause.as_str()),
+    );
+    status
+}
+
+/// Deletes `path` on drop unless disarmed. The drop path runs two `btrfs`
+/// subprocesses on the calling thread, so non-cancelled exits should prefer
+/// [`disarm`](Self::disarm) plus an offloaded delete; the blocking drop
+/// remains the backstop for RPC cancellation and early error returns.
+struct SubvolumeCleanupGuard {
+    path: PathBuf,
+    operation: &'static str,
+    armed: bool,
+}
+
+impl SubvolumeCleanupGuard {
+    fn new(path: PathBuf, operation: &'static str) -> Self {
+        Self {
+            path,
+            operation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SubvolumeCleanupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            log_best_effort_cleanup(self.operation, &self.path, artifact_fs::delete(&self.path));
+        }
+    }
+}
+
+impl NodeManagerService {
+    /// Returns the retained source identity and, for a deferred send, its
+    /// rootfs image length, read back through the same verification later
+    /// inspections use. A materialized send is sized by its stream file, so
+    /// it adds no read-back that could fail it.
+    async fn retain_send_source(
+        &self,
+        retain: bool,
+        defer: bool,
+        artifact: &Path,
+        parent: &Path,
+        source: &Path,
+    ) -> Result<Option<(uuid::Uuid, Option<u64>)>, Status> {
+        if !retain {
+            return Ok(None);
+        }
+        let (artifact, parent, source) =
+            (artifact.to_owned(), parent.to_owned(), source.to_owned());
+        self.off_runtime("retain immutable send source", move || {
+            let id = super::btrfs_send_source::capture(&artifact, &parent, &source)?;
+            if !defer {
+                return Ok(Some((id, None)));
+            }
+            // Not FailedPrecondition, which callers read as an ineligible
+            // source and answer with a Full fallback beside this bundle.
+            let rootfs_bytes =
+                super::btrfs_send_source::inspect(&artifact, id).map_err(|status| {
+                    Status::internal(format!("verify retained send source: {}", status.message()))
+                })?;
+            Ok(Some((id, Some(rootfs_bytes))))
+        })
+        .await
+    }
+
+    async fn encode_pinned_stream(
+        &self,
+        parent: &Path,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<u64, Status> {
+        let (parent, source, destination) =
+            (parent.to_owned(), source.to_owned(), destination.to_owned());
+        let owner = self.artifact_work.clone();
+        self.off_runtime("encode pinned btrfs stream", move || {
+            write_parented_btrfs_send(
+                &parent,
+                &source,
+                &destination,
+                owner.as_ref().map(|owner| &owner.cancel),
+            )
+        })
+        .await
+    }
+
+    pub(super) async fn btrfs_create_template_subvolume(
+        &self,
+        request: Request<BtrfsCreateTemplateSubvolumeRequest>,
+    ) -> Result<Response<BtrfsCreateTemplateSubvolumeResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "BtrfsCreateTemplateSubvolume",
+            ALLOW_NODEMGR_ADMIN_OR_TMPLMGR,
+        )?;
+        let req = request.get_ref();
+        let template = TemplateBuildTarget::parse(
+            &req.template_name,
+            &req.content_hash,
+            req.environment_build.as_ref(),
+        )?;
+
+        let digest_dir = template.digest_dir();
+        let digest_dir_for_section = digest_dir.clone();
+        self.off_runtime("create template subvolume", move || {
+            let digest_dir = digest_dir_for_section;
+            let parent = digest_dir
+                .parent()
+                .ok_or_else(|| artifact_fs::error("missing template parent"))?;
+            let parent_fd = trusted_paths::create_directory(parent)?;
+            trusted_paths::set_permissions(
+                &parent_fd,
+                Some(gids::SPACE_CACHE_RW),
+                TEMPLATE_CACHE_DIR_MODE,
+            )?;
+            let name = digest_dir
+                .file_name()
+                .ok_or_else(|| artifact_fs::error("missing template digest"))?;
+            artifact_fs::btrfs::create(&parent_fd, name).map_err(artifact_fs::error)?;
+            let digest = artifact_fs::directory(&parent_fd, name).map_err(artifact_fs::error)?;
+            nix::unistd::fchown(
+                &digest,
+                Some(nix::unistd::Uid::from_raw(users::SPACE_TMPLMGR.uid)),
+                Some(nix::unistd::Gid::from_raw(gids::SPACE_CACHE_RW)),
+            )
+            .map_err(artifact_fs::error)?;
+            trusted_paths::set_permissions(&digest, None, TEMPLATE_CACHE_DIR_MODE)?;
+            Ok(())
+        })
+        .await?;
+
+        Ok(Response::new(BtrfsCreateTemplateSubvolumeResponse {
+            digest_dir: digest_dir.to_string_lossy().into_owned(),
+        }))
+    }
+
+    pub(super) async fn btrfs_finalize_template_subvolume(
+        &self,
+        request: Request<BtrfsFinalizeTemplateSubvolumeRequest>,
+    ) -> Result<Response<BtrfsFinalizeTemplateSubvolumeResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "BtrfsFinalizeTemplateSubvolume",
+            ALLOW_NODEMGR_ADMIN_OR_TMPLMGR,
+        )?;
+        let req = request.get_ref();
+        let template = TemplateBuildTarget::parse(
+            &req.template_name,
+            &req.content_hash,
+            req.environment_build.as_ref(),
+        )?;
+
+        let digest_dir = template.digest_dir();
+        let received_uuid = template.received_uuid();
+        self.off_runtime("finalize template subvolume", move || {
+            let digest = trusted_paths::open_directory(&digest_dir)?;
+            let (_, info) = artifact_fs::btrfs::info(&digest).map_err(artifact_fs::error)?;
+            if info.received_uuid != Some(received_uuid) {
+                artifact_fs::btrfs::stamp(&digest, received_uuid).map_err(artifact_fs::error)?;
+            }
+            artifact_fs::btrfs::set_readonly(&digest, true).map_err(artifact_fs::error)
+        })
+        .await?;
+
+        Ok(Response::new(BtrfsFinalizeTemplateSubvolumeResponse {
+            received_uuid: received_uuid.to_string(),
+        }))
+    }
+
+    pub(super) async fn btrfs_delete_template_subvolume(
+        &self,
+        request: Request<BtrfsDeleteTemplateSubvolumeRequest>,
+    ) -> Result<Response<BtrfsDeleteTemplateSubvolumeResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "BtrfsDeleteTemplateSubvolume",
+            ALLOW_NODEMGR_ADMIN_OR_TMPLMGR,
+        )?;
+        let req = request.get_ref();
+        let template = TemplateBuildTarget::parse(
+            &req.template_name,
+            &req.content_hash,
+            req.environment_build.as_ref(),
+        )?;
+
+        let digest_dir = template.digest_dir();
+        self.off_runtime("delete template subvolume", move || {
+            delete_subvolume_or_dir(&digest_dir)
+        })
+        .await?;
+        Ok(Response::new(BtrfsDeleteTemplateSubvolumeResponse {}))
+    }
+
+    pub(super) async fn btrfs_encode_rootfs_send(
+        &self,
+        request: Request<BtrfsEncodeRootfsSendRequest>,
+    ) -> Result<Response<BtrfsEncodeRootfsSendResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "BtrfsEncodeRootfsSend",
+            ALLOW_NODEMGR_ADMIN_OR_SBXMGR,
+        )?;
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        self.run_artifact_mutation(&sandbox_id, |service| async move {
+            service.btrfs_encode_rootfs_send_inner(request).await
+        })
+        .await
+    }
+
+    async fn btrfs_encode_rootfs_send_inner(
+        &self,
+        request: Request<BtrfsEncodeRootfsSendRequest>,
+    ) -> Result<Response<BtrfsEncodeRootfsSendResponse>, Status> {
+        let req = request.get_ref();
+        validate_sandbox_id(&req.sandbox_id)?;
+        let _gate = self.lock_sandbox_cgroups(&req.sandbox_id).await;
+        self.check_filesystem_execution(&req.sandbox_id, req.execution_fence.as_ref())
+            .await?;
+        let snapshot_dir = match req.dest_dir.as_deref().filter(|path| !path.is_empty()) {
+            Some(path) => {
+                crate::runtime_paths::validate_create_snapshot_dest(&req.sandbox_id, path)?
+            }
+            None => snapshot_dir(&req.sandbox_id),
+        };
+        let candidates = req.parent_candidates()?;
+        let (template, send_parent) = {
+            let snapshot_dir = snapshot_dir.clone();
+            let instance_path = instance_dir(&req.sandbox_id);
+            self.off_runtime("validate suspend send parent", move || {
+                trusted_paths::create_directory(&snapshot_dir).map_err(|error| {
+                    Status::internal(format!(
+                        "create snapshot destination {}: {error}",
+                        snapshot_dir.display()
+                    ))
+                })?;
+                // The parent is the build the instance descends from; the
+                // lineage check below reports a mismatch.
+                // An encode takes the requested partition's build or the legacy one,
+                // never another partition's: a restoring node holds one of those two,
+                // but may not hold a third. A sandbox that descends from neither
+                // fails the lineage check, so a suspend encodes Full.
+                let instance_parent = artifact_fs::info(&instance_path)
+                    .ok()
+                    .and_then(|info| info.parent_uuid);
+                first_parent_candidate(candidates, validated_suspend_send_parent, |parent| {
+                    instance_parent == Some(parent.uuid)
+                })
+            })
+            .await?
+        };
+        let template_uuid = send_parent.uuid;
+
+        let instance_path = instance_dir(&req.sandbox_id);
+        let instance_probe = {
+            let instance_path = instance_path.clone();
+            self.off_runtime("probe suspend instance lineage", move || {
+                Ok(artifact_fs::info(&instance_path))
+            })
+            .await?
+        };
+        let lineage_failure = match instance_probe {
+            Ok(info) if info.parent_uuid == Some(template_uuid) => None,
+            Ok(info) => Some((
+                LineageFallbackCause::InstanceParentMismatch,
+                format!(
+                    "instance.parent_uuid is {:?}, expected {template_uuid}",
+                    info.parent_uuid
+                ),
+            )),
+            Err(error) => Some((
+                LineageFallbackCause::InstanceNotSubvolume,
+                format!("read instance subvolume info failed: {error}"),
+            )),
+        };
+
+        if let Some((cause, detail)) = lineage_failure {
+            return Err(lineage_precondition(
+                cause,
+                format!(
+                    "btrfs-send codec cannot use {}: {detail}; retry with format=full",
+                    instance_path.display()
+                ),
+            ));
+        }
+
+        let instance_ro_path = instance_ro_in_snapshot_dir(&snapshot_dir);
+        {
+            let instance_ro_path = instance_ro_path.clone();
+            let send_source = instance_path.clone();
+            self.off_runtime("snapshot suspend send source", move || {
+                // Defensive: a half-finished prior suspend might have left
+                // this around. Use the force variant so a stale RO subvolume
+                // doesn't block the snapshot below.
+                artifact_fs::delete(&instance_ro_path).map_err(|e| {
+                    Status::internal(format!("stale instance.ro cleanup failed: {e}"))
+                })?;
+                artifact_fs::snapshot(&send_source, &instance_ro_path, true)
+                    .map_err(|e| Status::internal(format!("btrfs ro snapshot of instance: {e}")))
+            })
+            .await?;
+        }
+
+        let retained = self
+            .retain_send_source(
+                req.retain_source,
+                req.defer_send,
+                &snapshot_dir,
+                &send_parent.path,
+                &instance_ro_path,
+            )
+            .await?;
+        let stream_path = rootfs_btrfs_send_path(&snapshot_dir);
+        let encode_result = if req.defer_send && retained.is_some() {
+            Ok(0)
+        } else {
+            self.encode_pinned_stream(&send_parent.path, &instance_ro_path, &stream_path)
+                .await
+        };
+        let stream_bytes = match encode_result {
+            Ok(stream_bytes) => stream_bytes,
+            Err(error) => {
+                let instance_ro_path = instance_ro_path.clone();
+                self.off_runtime_best_effort(move || {
+                    log_best_effort_cleanup(
+                        "delete temporary instance.ro subvolume",
+                        &instance_ro_path,
+                        artifact_fs::delete(&instance_ro_path),
+                    );
+                })
+                .await;
+                return Err(error);
+            }
+        };
+
+        {
+            let rootfs_ext4 = rootfs_ext4_in_snapshot_dir(&snapshot_dir);
+            let instance_ro_path = instance_ro_path.clone();
+            self.off_runtime_best_effort(move || {
+                // Drop rootfs.ext4 — the stream replaces it. Leaving both in
+                // the snapshot dir would confuse the per-format upload set
+                // and the restore-side codec dispatch.
+                log_best_effort_cleanup(
+                    "remove encoded ext4 rootfs",
+                    &rootfs_ext4,
+                    artifact_fs::unlink(&rootfs_ext4),
+                );
+                // Tear down the RO `instance.ro` snapshot now that the send
+                // has finished. Without this, the snapshot dir keeps a btrfs
+                // subvolume alive until the next suspend's stale-purge runs.
+                log_best_effort_cleanup(
+                    "delete encoded instance.ro subvolume",
+                    &instance_ro_path,
+                    artifact_fs::delete(&instance_ro_path),
+                );
+            })
+            .await;
+        }
+
+        tracing::info!(
+            sandbox_id = %req.sandbox_id,
+            template = %template.name,
+            content_hash = %template.content_hash,
+            partition = %template.partition,
+            stream = %stream_path.display(),
+            stream_bytes,
+            "btrfs-send codec: rootfs encoded as btrfs send -p stream"
+        );
+        Ok(Response::new(BtrfsEncodeRootfsSendResponse {
+            stream_bytes,
+            source_id: retained.map(|(id, _)| id.to_string()),
+            rootfs_bytes: retained.and_then(|(_, bytes)| bytes),
+        }))
+    }
+
+    pub(super) async fn btrfs_encode_snapshot_rootfs_send(
+        &self,
+        request: Request<BtrfsEncodeSnapshotRootfsSendRequest>,
+    ) -> Result<Response<BtrfsEncodeSnapshotRootfsSendResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "BtrfsEncodeSnapshotRootfsSend",
+            ALLOW_NODEMGR_ADMIN_OR_SBXMGR,
+        )?;
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        self.run_artifact_mutation(&sandbox_id, |service| async move {
+            service
+                .btrfs_encode_snapshot_rootfs_send_inner(request)
+                .await
+        })
+        .await
+    }
+
+    async fn btrfs_encode_snapshot_rootfs_send_inner(
+        &self,
+        request: Request<BtrfsEncodeSnapshotRootfsSendRequest>,
+    ) -> Result<Response<BtrfsEncodeSnapshotRootfsSendResponse>, Status> {
+        let req = request.get_ref();
+        let source = named_snapshot_send_source(&req.sandbox_id, &req.snapshot_name)?;
+        let candidates = req.parent_candidates()?;
+        let (template, send_parent) = {
+            let source = source.clone();
+            let instance_path = instance_dir(&req.sandbox_id);
+            self.off_runtime("validate named-snapshot send lineage", move || {
+                // An encode takes the requested partition's build or the legacy one,
+                // never another partition's: a restoring node holds one of those two,
+                // but may not hold a third. A sandbox that descends from neither
+                // fails the lineage check, so a suspend encodes Full.
+                if !artifact_fs::is_subvolume(&source)? {
+                    return Err(lineage_precondition(
+                        LineageFallbackCause::SnapshotNotSubvolume,
+                        format!(
+                            "named snapshot {} is not a btrfs subvolume",
+                            source.display()
+                        ),
+                    ));
+                }
+                // The parent is validated before the instance and snapshot are
+                // read, as before candidates existed, so a missing build keeps
+                // its terminal `NotFound`.
+                let passing = checked_parent_candidates(candidates, validated_send_parent)?;
+                let instance_info = artifact_fs::info(&instance_path).map_err(|error| {
+                    lineage_precondition(
+                        LineageFallbackCause::InstanceNotSubvolume,
+                        format!("read instance subvolume info failed: {error}"),
+                    )
+                })?;
+                let snapshot_info = artifact_fs::info(&source).map_err(|error| {
+                    lineage_precondition(
+                        LineageFallbackCause::SnapshotNotSubvolume,
+                        format!("read named snapshot subvolume info failed: {error}"),
+                    )
+                })?;
+                let (template, send_parent) = choose_parent_candidate(passing, |parent| {
+                    validate_named_snapshot_lineage(parent.uuid, &instance_info, &snapshot_info)
+                        .is_ok()
+                })?;
+                validate_named_snapshot_lineage(send_parent.uuid, &instance_info, &snapshot_info)?;
+                Ok((template, send_parent))
+            })
+            .await?
+        };
+        let destination =
+            crate::runtime_paths::validate_create_snapshot_dest(&req.sandbox_id, &req.dest_dir)?;
+        if destination == source
+            || destination.starts_with(&source)
+            || source.starts_with(&destination)
+        {
+            return Err(Status::invalid_argument(
+                "snapshot artifact destination must be separate from its immutable source",
+            ));
+        }
+        let mut destination_guard =
+            create_snapshot_artifact_directory(destination.clone(), gids::SPACE_CACHE_RW)?;
+        // Do not put the operation-specific named snapshot directly on the
+        // wire. Restore expects the received subvolume to be `instance.ro`,
+        // and a same-node receive cannot import a stream whose source identity
+        // is still present on that filesystem. A short-lived RO clone gives
+        // the stream its stable wire basename and a fresh identity while
+        // preserving the exact frozen bytes.
+        let wire_source = named_snapshot_wire_source(&destination);
+        {
+            let source = source.clone();
+            let wire_source = wire_source.clone();
+            self.off_runtime("clone named snapshot for send", move || {
+                artifact_fs::snapshot(&source, &wire_source, true).map_err(|error| {
+                    Status::internal(format!(
+                        "create named snapshot wire clone {}: {error}",
+                        wire_source.display()
+                    ))
+                })
+            })
+            .await?;
+        }
+        let mut wire_source_cleanup =
+            SubvolumeCleanupGuard::new(wire_source.clone(), "delete named snapshot wire clone");
+        let retained = self
+            .retain_send_source(
+                req.retain_source,
+                req.defer_send,
+                &destination,
+                &send_parent.path,
+                &wire_source,
+            )
+            .await?;
+        let stream_path = rootfs_btrfs_send_path(&destination);
+        let send_result = if req.defer_send && retained.is_some() {
+            Ok(0)
+        } else {
+            self.encode_pinned_stream(&send_parent.path, &wire_source, &stream_path)
+                .await
+        };
+        // Even on cancellation the send ioctl has returned before cleanup.
+        // The wire clone is dead weight on success and failure alike.
+        wire_source_cleanup.disarm();
+        self.off_runtime_best_effort(move || {
+            log_best_effort_cleanup(
+                "delete named snapshot wire clone",
+                &wire_source,
+                artifact_fs::delete(&wire_source),
+            );
+        })
+        .await;
+        let stream_bytes = send_result?;
+        destination_guard.disarm();
+
+        tracing::info!(
+            sandbox_id = %req.sandbox_id,
+            snapshot_name = %req.snapshot_name,
+            template = %template.name,
+            content_hash = %template.content_hash,
+            partition = %template.partition,
+            stream = %stream_path.display(),
+            stream_bytes,
+            "encoded immutable named snapshot as parent-relative btrfs stream"
+        );
+        Ok(Response::new(BtrfsEncodeSnapshotRootfsSendResponse {
+            stream_bytes,
+            source_id: retained.map(|(id, _)| id.to_string()),
+            rootfs_bytes: retained.and_then(|(_, bytes)| bytes),
+        }))
+    }
+
+    pub(super) async fn btrfs_receive_instance(
+        &self,
+        request: Request<BtrfsReceiveInstanceRequest>,
+    ) -> Result<Response<BtrfsReceiveInstanceResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "BtrfsReceiveInstance",
+            ALLOW_NODEMGR_ADMIN_OR_SBXMGR,
+        )?;
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        self.run_artifact_mutation(&sandbox_id, |service| async move {
+            service.btrfs_receive_instance_inner(request).await
+        })
+        .await
+    }
+
+    async fn btrfs_receive_instance_inner(
+        &self,
+        request: Request<BtrfsReceiveInstanceRequest>,
+    ) -> Result<Response<BtrfsReceiveInstanceResponse>, Status> {
+        let req = request.get_ref();
+        validate_sandbox_id(&req.sandbox_id)?;
+        let candidates = req.parent_candidates()?;
+        let target = req
+            .target
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("instance target is required"))?
+            .try_into()?;
+        let _gate = self.lock_sandbox_cgroups(&req.sandbox_id).await;
+        let sandbox_root = self.instance_target_root(&req.sandbox_id, target).await?;
+        self.btrfs_receive_instance_at(&req.sandbox_id, candidates, sandbox_root)
+            .await
+    }
+
+    async fn btrfs_receive_instance_at(
+        &self,
+        sandbox_id: &str,
+        candidates: Vec<TemplateBuildTarget>,
+        sandbox_root: PathBuf,
+    ) -> Result<Response<BtrfsReceiveInstanceResponse>, Status> {
+        let instance_path = sandbox_root.join("instance");
+        let stream_path = rootfs_btrfs_send_path(&sandbox_root.join("snapshot"));
+        let (template, stream_len) = {
+            let stream_path = stream_path.clone();
+            self.off_runtime("validate restore template", move || {
+                // These two precondition checks (template-is-a-subvolume and
+                // template-has-the-expected-`received_uuid`) match the encode
+                // side's checks in `BtrfsEncodeRootfsSend`. They surface as
+                // `FailedPrecondition` so the caller can detect "this codec
+                // can't proceed against this node's template" on the wire and
+                // fall back to the Full codec — distinct from `Internal`,
+                // which the caller treats as a real codec failure. Of the
+                // candidates that pass, the one whose received UUID is the
+                // stream's parent is used: `btrfs receive` finds the parent by
+                // that UUID, so any other candidate would fail it. With no such
+                // candidate the restore can't proceed on this node, which is a
+                // precondition failure too. A full stream, or one that can't be
+                // read here, takes the first candidate, as before.
+                let candidates = with_cached_partitions(candidates);
+                let passing = checked_parent_candidates(candidates, |template| {
+                    let template_dir = template.digest_dir();
+                    let template_path = template_dir.as_path();
+                    let template_info = artifact_fs::info(template_path).map_err(|e| {
+                        Status::failed_precondition(format!(
+                            "btrfs-send restore needs template {} as a btrfs subvolume on \
+                                 this node; read_subvolume_info({}) failed: {e}",
+                            template,
+                            template_path.display(),
+                        ))
+                    })?;
+                    let expected_received = template.received_uuid();
+                    if template_info.received_uuid != Some(expected_received) {
+                        return Err(Status::failed_precondition(format!(
+                            "btrfs-send restore needs template {} \
+                                 received_uuid={expected_received} on this node; got {:?}. The \
+                                 template was installed before the stamp landed; force a \
+                                 re-install via tmplmgr to recover.",
+                            template, template_info.received_uuid,
+                        )));
+                    }
+                    Ok(())
+                })?;
+                let stream_parent = std::fs::File::open(&stream_path)
+                    .ok()
+                    .and_then(|stream| {
+                        super::btrfs_send_stream::incremental_parent_uuid(&stream).ok()
+                    })
+                    .flatten();
+                let template = choose_stream_parent(passing, stream_parent)?;
+                Ok((
+                    template,
+                    std::fs::metadata(&stream_path)
+                        .ok()
+                        .map(|metadata| metadata.len()),
+                ))
+            })
+            .await?
+        };
+        let restore_reservation_bytes = stream_len.map(|len| {
+            len.saturating_add(self.disk_admission.config().allocation_reservation_bytes)
+        });
+        let disk_reservation = self.disk_admission.reserve(
+            crate::disk_admission::DiskAllocationOperation::BtrfsReceiveInstance,
+            restore_reservation_bytes,
+        )?;
+
+        let owner = self.artifact_work.clone();
+        let salvaged = self
+            .off_runtime("receive and publish btrfs stream", move || {
+                let receive = artifact_fs::receive::ReceiveRoot::open(&sandbox_root)?;
+                receive.receive_staged(owner.as_ref().map(|owner| &owner.cancel))
+            })
+            .await
+            .inspect_err(|status| {
+                if status.code() != tonic::Code::Cancelled {
+                    crate::metrics::node_manager::btrfs_receive_failed();
+                    tracing::warn!(
+                        sandbox_id,
+                        template = %template.name,
+                        content_hash = %template.content_hash,
+                        partition = %template.partition,
+                        code = ?status.code(),
+                        error = status.message(),
+                        "btrfs-send codec: restore receive failed, including any salvage of a send restarted mid-pipe"
+                    );
+                }
+            })?;
+        if let Some(offset) = salvaged {
+            crate::metrics::node_manager::btrfs_receive_stream_salvaged();
+            tracing::warn!(
+                sandbox_id,
+                template = %template.name,
+                content_hash = %template.content_hash,
+                partition = %template.partition,
+                complete_stream_offset = offset,
+                "btrfs-send codec: received the complete stream of a send restarted mid-pipe"
+            );
+        }
+
+        tracing::info!(
+            sandbox_id,
+            template = %template.name,
+            content_hash = %template.content_hash,
+            partition = %template.partition,
+            instance = %instance_path.display(),
+            "btrfs-send codec: instance reconstructed from btrfs receive"
+        );
+        self.disk_admission
+            .release_after_success(disk_reservation)
+            .await;
+        Ok(Response::new(BtrfsReceiveInstanceResponse {}))
+    }
+
+    pub(super) async fn btrfs_delete_sandbox_instance(
+        &self,
+        request: Request<BtrfsDeleteSandboxInstanceRequest>,
+    ) -> Result<Response<BtrfsDeleteSandboxInstanceResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "BtrfsDeleteSandboxInstance",
+            ALLOW_NODEMGR_ADMIN_OR_SBXMGR,
+        )?;
+        let req = request.get_ref();
+        validate_sandbox_id(&req.sandbox_id)?;
+        let sandbox_id = req.sandbox_id.clone();
+        let target = req
+            .target
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("instance target is required"))?
+            .try_into()?;
+        let guard = self.lock_sandbox_artifacts(&sandbox_id).await?;
+        let claim = self.claim_sandbox_mutation(&sandbox_id)?;
+        let gate = self.lock_sandbox_cgroups(&sandbox_id).await;
+        let sandbox_root = self.instance_target_root(&sandbox_id, target).await?;
+        self.off_runtime("delete instance artifacts", move || {
+            let _ownership = (guard, claim, gate);
+            delete_sandbox_instance_artifacts(&sandbox_id, sandbox_root)
+        })
+        .await
+    }
+}
+
+impl NodeManagerService {
+    pub(super) async fn btrfs_create_sandbox_instance(
+        &self,
+        request: Request<BtrfsCreateSandboxInstanceRequest>,
+    ) -> Result<Response<BtrfsCreateSandboxInstanceResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "BtrfsCreateSandboxInstance",
+            ALLOW_NODEMGR_ADMIN_OR_SBXMGR,
+        )?;
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        self.run_artifact_mutation(&sandbox_id, |service| async move {
+            service.btrfs_create_sandbox_instance_inner(request).await
+        })
+        .await
+    }
+
+    async fn btrfs_create_sandbox_instance_inner(
+        &self,
+        request: Request<BtrfsCreateSandboxInstanceRequest>,
+    ) -> Result<Response<BtrfsCreateSandboxInstanceResponse>, Status> {
+        let req = request.get_ref();
+        validate_sandbox_id(&req.sandbox_id)?;
+        let sandbox_id = req.sandbox_id.clone();
+        let target = req
+            .target
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("instance target is required"))?
+            .try_into()?;
+        let gate = self.lock_sandbox_cgroups(&sandbox_id).await;
+        let sandbox_root = self.instance_target_root(&sandbox_id, target).await?;
+        let subvolume = self
+            .off_runtime("create sandbox instance subvolume", move || {
+                let _gate = gate;
+                create_sandbox_instance_subvolume(&sandbox_root, InstanceOwners::node())
+            })
+            .await?;
+        tracing::info!(sandbox_id, subvolume, "prepared sandbox instance");
+        Ok(Response::new(BtrfsCreateSandboxInstanceResponse {
+            subvolume,
+        }))
+    }
+}
+
+/// What is already at a sandbox's `instance/` path when a restore asks for an
+/// empty subvolume there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingInstance {
+    Absent,
+    /// What this RPC creates (a subvolume, or on a filesystem that isn't
+    /// btrfs a plain directory), left by a call that died before handing it
+    /// over: still root's, and empty.
+    Unowned,
+    /// Any other subvolume, such as a retry's that was handed over.
+    Subvolume,
+    /// A plain directory, as every earlier Full-codec restore left behind.
+    PlainDirectory,
+    /// Anything else, which can't be opened as a directory.
+    Other,
+}
+
+/// What to do about the path. A restore staging in place over a plain
+/// directory keeps it, as the plain `mkdir` this RPC replaces did: refusing
+/// would fail every retry of that restore, and replacing it could discard a
+/// rootfs. A subvolume left by a create that died before its ownership change
+/// is finished. Only something that isn't a directory refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstanceAction {
+    Create,
+    HandOver,
+    Keep,
+}
+
+fn instance_action(existing: ExistingInstance) -> Result<InstanceAction, Status> {
+    match existing {
+        ExistingInstance::Absent => Ok(InstanceAction::Create),
+        ExistingInstance::Unowned => Ok(InstanceAction::HandOver),
+        ExistingInstance::Subvolume | ExistingInstance::PlainDirectory => Ok(InstanceAction::Keep),
+        ExistingInstance::Other => Err(Status::failed_precondition(
+            "sandbox instance path exists and is not a directory",
+        )),
+    }
+}
+
+/// Who a fresh `instance/` belongs to: the user node-manager creates it as,
+/// and the user and group it hands it to. On a node that's root and
+/// sandbox-manager; a test runs as neither, so it names its own.
+#[derive(Debug, Clone, Copy)]
+struct InstanceOwners {
+    creator: u32,
+    sandbox_manager: (u32, u32),
+}
+
+impl InstanceOwners {
+    fn node() -> Self {
+        Self {
+            creator: 0,
+            sandbox_manager: (
+                users::SPACE_SBXMGR.uid,
+                users::SPACE_SBXMGR.primary_group.gid,
+            ),
+        }
+    }
+}
+
+/// Whether `instance` is what only this RPC could have made: owned by its
+/// creator (root, on a node), with nothing in it, and on btrfs a subvolume
+/// root (elsewhere `create` makes a plain directory, and nothing can snapshot
+/// one there anyway). The parent is writable by the caller, so between the
+/// create and a reopen by name it could swap another directory in; ownership
+/// is handed over only to the fresh one.
+fn is_unowned_fresh_instance(
+    instance: &std::fs::File,
+    on_btrfs: bool,
+    creator: u32,
+) -> Result<bool, Status> {
+    use std::os::unix::fs::MetadataExt;
+    if on_btrfs && !artifact_fs::btrfs::is_subvolume(instance).map_err(artifact_fs::error)? {
+        return Ok(false);
+    }
+    let metadata = instance.metadata().map_err(artifact_fs::error)?;
+    Ok(metadata.uid() == creator && artifact_fs::entries(instance)?.is_empty())
+}
+
+/// Prepare `instance/` and report whether it is a btrfs subvolume.
+fn create_sandbox_instance_subvolume(
+    sandbox_root: &Path,
+    owners: InstanceOwners,
+) -> Result<bool, Status> {
+    let parent = trusted_paths::open_directory(sandbox_root)?;
+    let on_btrfs = artifact_fs::btrfs::is_on_btrfs(&parent).map_err(artifact_fs::error)?;
+    let name = std::ffi::OsStr::new("instance");
+    let existing = match artifact_fs::directory(&parent, name) {
+        Ok(instance) => {
+            if is_unowned_fresh_instance(&instance, on_btrfs, owners.creator)? {
+                ExistingInstance::Unowned
+            } else if artifact_fs::btrfs::is_subvolume(&instance).map_err(artifact_fs::error)? {
+                ExistingInstance::Subvolume
+            } else {
+                ExistingInstance::PlainDirectory
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ExistingInstance::Absent,
+        // Not a directory, or a symlink the no-follow open refuses.
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOTDIR) | Some(libc::ELOOP)
+            ) =>
+        {
+            ExistingInstance::Other
+        }
+        Err(error) => return Err(artifact_fs::error(error)),
+    };
+    match instance_action(existing)? {
+        InstanceAction::Keep => return Ok(existing == ExistingInstance::Subvolume),
+        InstanceAction::Create => {
+            artifact_fs::btrfs::create(&parent, name).map_err(artifact_fs::error)?;
+        }
+        InstanceAction::HandOver => {}
+    }
+    let instance = artifact_fs::directory(&parent, name).map_err(artifact_fs::error)?;
+    if !is_unowned_fresh_instance(&instance, on_btrfs, owners.creator)? {
+        return Err(Status::failed_precondition(
+            "sandbox instance changed between its creation and its ownership change",
+        ));
+    }
+    // Owned by sandbox-manager, which writes the rootfs into it next; the
+    // launch path sets the traversal permissions it needs later.
+    let (uid, gid) = owners.sandbox_manager;
+    nix::unistd::fchown(
+        &instance,
+        Some(nix::unistd::Uid::from_raw(uid)),
+        Some(nix::unistd::Gid::from_raw(gid)),
+    )
+    .map_err(artifact_fs::error)?;
+    trusted_paths::set_permissions(&instance, None, 0o755)?;
+    Ok(on_btrfs)
+}
+
+#[cfg(test)]
+#[path = "btrfs_delegation/create_instance_tests.rs"]
+mod create_instance_tests;
+
+fn delete_sandbox_instance_artifacts(
+    sandbox_id: &str,
+    sandbox_root: PathBuf,
+) -> Result<Response<BtrfsDeleteSandboxInstanceResponse>, Status> {
+    delete_sandbox_instance_artifacts_with(sandbox_id, sandbox_root, artifact_fs::delete)
+}
+
+fn delete_sandbox_instance_artifacts_with(
+    sandbox_id: &str,
+    sandbox_root: PathBuf,
+    mut delete: impl FnMut(&Path) -> Result<(), Status>,
+) -> Result<Response<BtrfsDeleteSandboxInstanceResponse>, Status> {
+    // Acknowledgement covers these instance targets only. Retained snapshots
+    // and other sandbox artifacts remain owned by their lifecycle operations.
+    let mut errors = Vec::new();
+    for path in [
+        sandbox_root.join("instance"),
+        sandbox_root.join("instance.ro"),
+        instance_ro_in_snapshot_dir(&sandbox_root.join("snapshot")),
+    ] {
+        // Independent targets can be reclaimed even while one remains busy.
+        if let Err(error) = delete(&path) {
+            errors.push((path, error));
+        }
+    }
+    if let Some((_, first)) = errors.first() {
+        return Err(Status::new(
+            first.code(),
+            errors
+                .iter()
+                .map(|(path, error)| format!("{}: {}", path.display(), error.message()))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    tracing::info!(
+        sandbox_id,
+        sandbox_root = %sandbox_root.display(),
+        "removed sandbox instance btrfs artifacts"
+    );
+    Ok(Response::new(BtrfsDeleteSandboxInstanceResponse {}))
+}
+
+#[cfg(test)]
+#[path = "btrfs_delegation/snapshot_send_tests.rs"]
+mod snapshot_send_tests;
+
+#[cfg(test)]
+mod validator_tests;
+
+/// Subvolume-aware delete with plain-dir fallback. Used by both
+/// `BtrfsDeleteTemplateSubvolume` and the pre-receive scrub in
+/// `BtrfsReceiveInstance`. Idempotent: returns Ok if the path
+/// doesn't exist.
+fn delete_subvolume_or_dir(path: &Path) -> Result<(), Status> {
+    artifact_fs::delete(path)
+}

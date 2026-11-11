@@ -94,6 +94,20 @@ test('a prefix is limited to what is safe in names and file names', () => {
   assert.equal(loadConfig(['--prefix', 'pr-12']).prefix, 'pr-12');
 });
 
+test('the Datadog logs link is configured when the variable is set and not blank', () => {
+  const saved = process.env.SPACE_UI_DATADOG_LOGS_URL;
+  try {
+    for (const [value, configured] of [[undefined, false], ['', false], ['  ', false], ['https://logs.example.test/logs', true]] as const) {
+      if (value === undefined) delete process.env.SPACE_UI_DATADOG_LOGS_URL;
+      else process.env.SPACE_UI_DATADOG_LOGS_URL = value;
+      assert.equal(loadConfig([]).datadogLogsConfigured, configured, `value ${JSON.stringify(value)}`);
+    }
+  } finally {
+    if (saved === undefined) delete process.env.SPACE_UI_DATADOG_LOGS_URL;
+    else process.env.SPACE_UI_DATADOG_LOGS_URL = saved;
+  }
+});
+
 test('upsertCreated keeps one entry per kind and name, the latest', () => {
   const state = { created: [] } as unknown as SeedState;
   upsertCreated(state, { kind: 'sandbox', name: 'loop-running', id: 'sbx_1' });

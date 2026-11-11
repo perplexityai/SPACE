@@ -658,13 +658,21 @@ fn crate_names_behaviours() {
             )],
         ),
     ];
-    for (name, base, entries, packages, expected) in cases {
-        let ws = crate_workspace(packages, &[("architecture-baseline.toml", tables(entries))]);
+    // Each row runs `cargo metadata` over its own workspace, so the rows run
+    // on threads of their own; a failed row fails the test when its thread
+    // is joined.
+    std::thread::scope(|scope| {
+        for (name, base, entries, packages, expected) in cases {
+            scope.spawn(move || {
+                let ws =
+                    crate_workspace(packages, &[("architecture-baseline.toml", tables(entries))]);
 
-        let found = crate_findings(&load(ws.path(), base.text().as_deref()));
+                let found = crate_findings(&load(ws.path(), base.text().as_deref()));
 
-        assert_findings(name, &found, expected);
-    }
+                assert_findings(name, &found, expected);
+            });
+        }
+    });
 }
 
 /// Cargo makes a path dependency inside the workspace a member, though the
@@ -5443,16 +5451,22 @@ fn layers_edge_checks() {
         ),
         ("Storage to a store listing it", &s_store, s_users, &[], &[]),
     ];
-    for (name, dependencies, tables, edges, expected) in cases {
-        let ws = Layered {
-            dependencies,
-            tables,
-            files: vec![("architecture-baseline.toml", layers_baseline(&[], edges))],
-            ..Layered::default()
+    // Each row runs `cargo metadata` over its own workspace, so the rows run
+    // on threads of their own.
+    std::thread::scope(|scope| {
+        for (name, dependencies, tables, edges, expected) in cases {
+            scope.spawn(move || {
+                let ws = Layered {
+                    dependencies,
+                    tables,
+                    files: vec![("architecture-baseline.toml", layers_baseline(&[], edges))],
+                    ..Layered::default()
+                }
+                .build();
+                assert_layer_findings(name, &layer_findings(&load(ws.path(), None)), expected);
+            });
         }
-        .build();
-        assert_layer_findings(name, &layer_findings(&load(ws.path(), None)), expected);
-    }
+    });
 }
 
 /// `[rules.layers]` entries that no longer apply are stale, each shown on its
@@ -5928,40 +5942,46 @@ fn layers_policy_changed() {
             )],
         ),
     ];
-    for (name, base, policy, expected) in &cases {
-        let ws = Layered {
-            files: vec![("ARCHITECTURE.toml", policy.clone())],
-            ..Layered::default()
+    // Each row runs `cargo metadata` over its own workspace, so the rows run
+    // on threads of their own.
+    std::thread::scope(|scope| {
+        for (name, base, policy, expected) in &cases {
+            scope.spawn(move || {
+                let ws = Layered {
+                    files: vec![("ARCHITECTURE.toml", policy.clone())],
+                    ..Layered::default()
+                }
+                .build();
+                let ctx = load_with(ws.path(), None, Some(base));
+                let found: Vec<_> = check(&ctx)
+                    .into_iter()
+                    .filter(|finding| finding.code() == "layers.policy_changed")
+                    .collect();
+                assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+                for (finding, (line, message)) in found.iter().zip(*expected) {
+                    // A mode is on the line after its table's header.
+                    let mut want = line_with(policy, line);
+                    if line.starts_with("[rules.layers.direction")
+                        || line.starts_with("[rules.layers.codec_features")
+                        || line.starts_with("[rules.layers.model_protocol")
+                    {
+                        want += 1;
+                    }
+                    assert_eq!(finding.message(), *message, "{name}");
+                    assert_eq!(finding.location.path, "ARCHITECTURE.toml", "{name}");
+                    assert_eq!(finding.location.line, want, "{name}");
+                    assert!(!finding.mode.is_required(), "{name}");
+                }
+                assert!(
+                    !skipped(&ctx)
+                        .iter()
+                        .any(|line| line.contains("layers.policy_changed")),
+                    "{name}: {:?}",
+                    skipped(&ctx)
+                );
+            });
         }
-        .build();
-        let ctx = load_with(ws.path(), None, Some(base));
-        let found: Vec<_> = check(&ctx)
-            .into_iter()
-            .filter(|finding| finding.code() == "layers.policy_changed")
-            .collect();
-        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
-        for (finding, (line, message)) in found.iter().zip(*expected) {
-            // A mode is on the line after its table's header.
-            let mut want = line_with(policy, line);
-            if line.starts_with("[rules.layers.direction")
-                || line.starts_with("[rules.layers.codec_features")
-                || line.starts_with("[rules.layers.model_protocol")
-            {
-                want += 1;
-            }
-            assert_eq!(finding.message(), *message, "{name}");
-            assert_eq!(finding.location.path, "ARCHITECTURE.toml", "{name}");
-            assert_eq!(finding.location.line, want, "{name}");
-            assert!(!finding.mode.is_required(), "{name}");
-        }
-        assert!(
-            !skipped(&ctx)
-                .iter()
-                .any(|line| line.contains("layers.policy_changed")),
-            "{name}: {:?}",
-            skipped(&ctx)
-        );
-    }
+    });
 
     // A crate whose unmoved entry is removed as it moves into another
     // layer's directory changes layer; one moving into its entry's layer

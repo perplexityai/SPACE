@@ -25,7 +25,7 @@ consumed by a service.
 {{/*
 SPACE_K8S_CONTROL_PLANE for `substrate`: "true" runs the KubernetesSubstrate,
 "false" the DirectSubstrate (Substrate::from_env_with_lifecycle in
-crates/libs/api/src/controllers/substrate/mod.rs; the flag is read by
+crates/l40_api/api/src/controllers/substrate/mod.rs; the flag is read by
 KubernetesState::try_from_env in substrate/kubernetes/mod.rs). Any other
 substrate fails the render.
 */}}

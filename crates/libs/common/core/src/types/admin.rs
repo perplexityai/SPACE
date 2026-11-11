@@ -1,9 +1,9 @@
 //! Wire types for the `/admin/api/v1` operator surface.
 //!
 //! These structs are the shared contract between the api-server
-//! (`crates/libs/api/src/routes/admin/`) and any client that speaks the
+//! (`crates/l40_api/api/src/routes/admin/`) and any client that speaks the
 //! admin HTTP API — currently the `space-admin-cli` operator CLI
-//! (`crates/apps/admin/cli/`). Keeping both ends pointed at one definition
+//! (`crates/l50_app/admin/cli/`). Keeping both ends pointed at one definition
 //! avoids the drift trap called out in the crate-level module docs:
 //! per-crate parallel types fragment the vocabulary and force lossy
 //! conversions at every boundary.
@@ -69,7 +69,7 @@ pub struct AdminNodeResponse {
     pub deleted_at: Option<String>,
     /// None on inventory-only responses; never interpret unknown as zero.
     /// Sandboxes still occupying placement on this node — anything that has
-    /// not terminated (`failed`/`cleanup_required`/`deleted`) and has not
+    /// not terminated (`failed`/`deleted`) and has not
     /// migrated off (`suspended`). This is the count the drain reconciler
     /// uses as the threshold for advancing `draining → drained`.
     pub sandboxes_active: Option<i64>,
@@ -99,7 +99,7 @@ pub struct AdminNodeResponse {
     /// `None` whenever `drainability` is.
     ///
     /// A `String` rather than the enum because that type lives in
-    /// `pplx-space-common-svc`, which this crate is a dependency *of*. The value
+    /// `pplx-space-sandbox-residency`, which this crate is a dependency *of*. The value
     /// is always that enum's own `as_str()`, never hand-written here.
     ///
     /// Load-bearing for interpreting the counts: under `lifecycle_only` — the

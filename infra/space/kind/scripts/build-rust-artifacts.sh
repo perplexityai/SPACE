@@ -245,14 +245,14 @@ build_health_probe_image() {
 
 # ── Docker mode ───────────────────────────────────────────────────────────────
 
-# The Dockerfile's build arguments for this build: the release lane empties
-# both test-hook feature lists and narrows the package selection.
+# The Dockerfile's build arguments for this build: SPACE_KIND_RUST_BUILD
+# selects the host build's test-hook features, and the release lane empties the
+# guest's list and narrows the package selection.
 rust_build_args() {
   BUILD_ARGS=(--build-arg "SPACE_KIND_RUST_BUILD=$RUST_BUILD"
     --build-arg "SPACE_CARGO_RELEASE_LTO=$RELEASE_LTO")
   if [[ "$RUST_BUILD" == release ]]; then
-    BUILD_ARGS+=(--build-arg SPACE_KIND_TEST_HOOK_FEATURES=
-      --build-arg SPACE_KIND_GUEST_TEST_HOOK_FEATURES=
+    BUILD_ARGS+=(--build-arg SPACE_KIND_GUEST_TEST_HOOK_FEATURES=
       --build-arg "SPACE_KIND_CARGO_EXCLUDE=$CARGO_EXCLUDE")
   fi
 }
@@ -293,7 +293,8 @@ build_docker() {
 # The build stage of docker/Dockerfile.rust-build-kind is the single source of
 # truth for what the artifact image contains. These readers pull the feature
 # list, the bin list, the runtime-supervisor invocation and the /artifacts
-# layout out of it, so a set change made there reaches this path unedited.
+# layout out of it, so a set change made there reaches this path unedited. The
+# host build's test-hook features come from the helper that stage runs.
 build_stage() {
   awk '/^FROM cook AS build$/ { s = 1; next } /^FROM / { s = 0 } s' "$KIND_DOCKERFILE"
 }
@@ -304,16 +305,22 @@ cargo_build_block() {
   build_stage | awk -v n="$1" '/^RUN cargo build/ { b++; on = b == n } on { print } on && /^$/ { on = 0 }'
 }
 
-# Its literal -F arguments; the test-hook list it expands is test_hook_features.
+# Its literal -F arguments; the test-hook list it expands is host_test_hook_features.
 main_build_features() {
   cargo_build_block 1 | grep -oE -- '-F [^ \\]+' | awk '$2 !~ /\$/ { print $2 }'
 }
 
-# One feature per line from the default of a test-hook ARG ($1), and nothing
-# for the release lane, which builds with the list empty.
-test_hook_features() {
+# One feature per line, as the build stage derives them from the synced
+# sources in the builder image (test-hook-features.sh); none for the release lane.
+host_test_hook_features() {
+  in_builder bash infra/space/kind/scripts/test-hook-features.sh "$RUST_BUILD" | tr ',' '\n' | awk 'NF'
+}
+
+# One feature per line from the default of the guest's test-hook ARG, and
+# nothing for the release lane, which builds with the list empty.
+guest_test_hook_features() {
   [[ "$RUST_BUILD" == test-hooks ]] || return 0
-  awk -F= -v name="ARG $1" '$1 == name && NF > 1 { print $2 }' "$KIND_DOCKERFILE" | tr ',' '\n'
+  awk -F= '$1 == "ARG SPACE_KIND_GUEST_TEST_HOOK_FEATURES" && NF > 1 { print $2 }' "$KIND_DOCKERFILE" | tr ',' '\n'
 }
 
 main_build_bins() {
@@ -507,8 +514,8 @@ assert_glibc_compatible() {
 }
 
 build_incremental() {
-  local release_dir host_release_dir features bins sup_features stamp
-  mapfile -t features < <(main_build_features; test_hook_features SPACE_KIND_TEST_HOOK_FEATURES)
+  local release_dir host_release_dir features hooks bins sup_features stamp
+  mapfile -t features < <(main_build_features)
   mapfile -t bins < <(main_build_bins)
   mapfile -t sup_features < <(supervisor_features)
   (( ${#features[@]} > 0 && ${#bins[@]} > 0 && ${#sup_features[@]} > 0 )) \
@@ -552,6 +559,8 @@ build_incremental() {
   log "builder image: $((SECONDS - phase_started))s"
   release_dir="/workspace/target/$(profile_dir)"
   host_release_dir="$TARGET_DIR/$(profile_dir)"
+  hooks="$(host_test_hook_features)" || die "could not derive the host build's test-hook features"
+  [[ -z "$hooks" ]] || mapfile -t -O "${#features[@]}" features <<<"$hooks"
 
   log "incremental mode: cargo $(cargo_profile_flag) ($RUST_BUILD, LTO $RELEASE_LTO) for ${#bins[@]} bins + runtime-supervisor inside $CHEF_IMAGE (target $TARGET_DIR)"
   local cargo_args=(cargo build --locked "$(cargo_profile_flag)" ${CARGO_SELECTION[@]+"${CARGO_SELECTION[@]}"})
@@ -567,7 +576,7 @@ build_incremental() {
     read -ra arg <<<"$arg"
     guest_args+=("${arg[@]}")
   done < <(guest_build_args)
-  while read -r f; do guest_args+=(-F "$f"); done < <(test_hook_features SPACE_KIND_GUEST_TEST_HOOK_FEATURES)
+  while read -r f; do guest_args+=(-F "$f"); done < <(guest_test_hook_features)
   (( ${#guest_args[@]} > 4 )) || die "could not read the guest build from $KIND_DOCKERFILE build stage"
   phase_started=$SECONDS
   in_builder "${guest_args[@]}"

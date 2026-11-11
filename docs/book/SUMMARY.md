@@ -13,6 +13,7 @@
   - [Configuration reference](configuration.md)
   - [Observability](observability.md)
   - [Troubleshooting](troubleshooting.md)
+  - [Upgrading spaced](spaced-upgrades.md)
   - [Warm pools](warm-pools.md)
   - [Base snapshots](base-snapshots.md)
   - [Internal RPC TLS](internal-rpc-tls.md)

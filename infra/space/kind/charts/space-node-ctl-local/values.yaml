@@ -13,8 +13,8 @@ telemetry: {}
 node: {}
 
 # node-ctl waits up to 25 s for its worker on SIGTERM, then exits holding its
-# service mutex if it overran (crates/libs/node/ctl/server/src/lib.rs); the
-# shared lifecycle default grace (crates/libs/service-lifecycle/src/lib.rs).
+# service mutex if it overran (crates/l40_api/node/ctl/server/src/lib.rs); the
+# shared lifecycle default grace (crates/l10_foundation/service/lifecycle/src/lib.rs).
 terminationGracePeriodSeconds: 60
 
 # Kind sizing: requests only (see space-node-manager-local/values.yaml).
@@ -43,6 +43,9 @@ nodeFence:
   allowedLabelKeyPrefixes:
     # TEMPLATE_BUILD_LABEL_KEY_PREFIX: one key per ready local template build.
     - space.pplx.net/template-build-
+    # ENVIRONMENT_LABEL_KEY_PREFIX: one key per environment the node's latest
+    # complete execution inventory lists as usable.
+    - space.pplx.net/env-
   allowedAnnotationKeys: []
   allowedAnnotationKeyPrefixes:
     # Template presence mirrors each build label with a same-key annotation

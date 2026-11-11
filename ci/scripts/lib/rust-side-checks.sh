@@ -111,9 +111,9 @@ run_feature_isolation_checks() {
     fi
     cat "${doctest_log}"
     if ! grep -qE \
-        '^test crates/libs/feature-flags/src/lib\.rs - \(line [0-9]+\) \.\.\. ok$' \
+        '^test crates/l10_foundation/feature/flags/src/lib\.rs - \(line [0-9]+\) \.\.\. ok$' \
         "${doctest_log}"; then
-        echo "no crate-level doctest in crates/libs/feature-flags/src/lib.rs ran to" \
+        echo "no crate-level doctest in crates/l10_foundation/feature/flags/src/lib.rs ran to" \
             "completion without the eppo feature; one is missing, ignored, or" \
             "fenced no_run" >&2
         return 1
@@ -125,9 +125,9 @@ run_feature_isolation_checks() {
     # crate-level example that is attributed or ignored, which holds however
     # many there are.
     if grep -qE \
-        '^test crates/libs/feature-flags/src/lib\.rs - \(line [0-9]+\)( - (compile|should panic) \.\.\. ok| \.\.\. ignored)$' \
+        '^test crates/l10_foundation/feature/flags/src/lib\.rs - \(line [0-9]+\)( - (compile|should panic) \.\.\. ok| \.\.\. ignored)$' \
         "${doctest_log}"; then
-        echo "a crate-level doctest in crates/libs/feature-flags/src/lib.rs is" \
+        echo "a crate-level doctest in crates/l10_foundation/feature/flags/src/lib.rs is" \
             "ignored or fenced so its body never executes; the SDK-free build's" \
             "runnable evidence has to actually run" >&2
         return 1
@@ -166,15 +166,15 @@ run_feature_isolation_checks() {
     # on zero dependency edges. Verified: it did.
     #
     # Listing them here also states the invariant. The day one of these becomes
-    # feature-gated — `crates/libs/feature-flags/Cargo.toml` discusses exactly
+    # feature-gated — `crates/l10_foundation/feature/flags/Cargo.toml` discusses exactly
     # that — this breaks loudly, which is the moment the check would otherwise
-    # lose its evidence base silently. `pplx-space-metrics` is on the list for
+    # lose its evidence base silently. `pplx-space-metrics-emit` is on the list for
     # that reason and not only as a control: an SDK-free deployment is the one
     # with no vendor console, so putting the flag counters back behind the
     # `eppo` feature would take away the only evidence it has that its flags
     # are inert on purpose.
     local required
-    for required in pplx-space-feature-flags pplx-space-metrics serde_json tracing; do
+    for required in pplx-space-feature-flags pplx-space-metrics-emit serde_json tracing; do
         if ! grep -qxF "${required}" <<<"${sdk_free_packages}"; then
             echo "the --no-default-features dependency graph for" \
                 "pplx-space-feature-flags is missing ${required}; it is not a" \

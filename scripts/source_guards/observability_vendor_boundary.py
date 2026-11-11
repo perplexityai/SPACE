@@ -14,7 +14,7 @@ import sys
 import tomllib
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-OWNER = pathlib.Path("crates/libs/observability/Cargo.toml")
+OWNER = pathlib.Path("crates/l10_foundation/observability/Cargo.toml")
 
 
 def is_vendor_sdk(package: str) -> bool:

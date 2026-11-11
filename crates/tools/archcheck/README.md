@@ -282,7 +282,7 @@ service: `sbx-mgr` beside `sbx-mgr-client` is at
 directories are listed by layer in `[rules.layers.unmoved]` until they move;
 a new crate goes in a layer directory, and a crate changes layer by moving
 into that layer's directory, not by editing its entry. `[rules.layers]
-legacy` names the crates being dissolved, such as `pplx-space-common-svc`,
+legacy` names the crates being dissolved, such as `pplx-space-common-core`,
 which predate the layers and mix SPACE-specific code in until they are split
 up: every check covers them like any other crate, with today's edges
 baselined.
@@ -314,7 +314,7 @@ drivers = ["sqlx", "rusqlite"]         # packages that reach a database or objec
 helpers = ["pplx-space-s3-http-client", "pplx-space-sqlite"]  # every storage helper
 
 [rules.layers]
-legacy = ["pplx-space-common-svc"]     # crates being dissolved; see Storage access below
+legacy = ["pplx-space-common-core"]    # crates being dissolved; see Storage access below
 protocols = ["pplx-space-events"]      # protocols without a *-protocol or *-proto name; see Domain
 
 [rules.layers.domain_fences]           # packages no Domain crate depends on, by family
@@ -562,7 +562,7 @@ behaviours above and a table keyed by package:
   crate turns on, so a crate that does I/O only behind a feature is listed,
   such as `pplx-space-observability` under `runtime`, whose `otel` feature
   brings tokio in, unless a required dependency fences it already, as
-  `pplx-space-metrics` fences `pplx-space-feature-flags`. A listed package
+  `pplx-space-metrics-emit` fences `pplx-space-feature-flags`. A listed package
   that is a driver or a storage helper is left to `storage_access`, which
   reports it from Domain already, and is a `stale_entries` finding, as is a
   listed Foundation crate that its own dependencies fence already. The
@@ -616,15 +616,15 @@ same name elsewhere. The manifest diff is where review sees it;
 `layers.policy_changed` does not.
 
 A store that must write a table another store owns, an approved exception
-such as placement claiming a sandbox, is its co-writer by a grant in
-`ARCHITECTURE.toml`, not in its own manifest, so that adding one is a policy
-change `layers.policy_changed` reports for review:
+such as the sandbox store orphaning a snapshot's storage location, is its
+co-writer by a grant in `ARCHITECTURE.toml`, not in its own manifest, so that
+adding one is a policy change `layers.policy_changed` reports for review:
 
 ```toml
 [rules.layers.state.co_writers.postgres]     # or .sqlite.<database>
-# Placement's commit puts a sandbox on its node. Temporary: the write folds
-# into sandbox-store.
-sandboxes = ["pplx-space-placement"]          # table = the stores granted it
+# Deleting a sandbox orphans its snapshots' storage locations for cleanup.
+# Temporary: the write folds into snapshot-store.
+snapshot_storage_locations = ["pplx-space-sandbox-store"]   # table = the stores granted it
 ```
 
 Each grant has a comment saying why the store writes another store's table
@@ -799,19 +799,18 @@ so a new table is declared by its owner before its migration lands (see
 ### Limits
 
 - The checks see direct dependencies only. An edge through a re-export, such
-  as `common-svc` re-exporting a store, is not seen until the legacy crates
-  that re-export go. Only `stale_entries` looks one crate further: a store
-  user that depends on a `legacy` crate depending on the store still uses
-  it, so its entry stays.
+  as a `legacy` crate's, is not seen. Only `stale_entries` looks one crate
+  further: a store user that depends on a `legacy` crate depending on the
+  store still uses it, so its entry stays.
 - A Foundation crate that gains a required driver dependency gets a
   `storage_access` finding until it is added to `helpers`, and is no helper
   before: its dependents get `storage_access` findings only once it is
   listed. Stores, other helpers, test support and tools, and
   `l10_foundation` crates whose dependency on it is optional are exempt.
 - `codec_features` reads the feature requests in each crate's own manifest,
-  not the features Cargo unifies for a build. `common-svc` enables
-  `common-core/sqlx`, so its dependents build against `common-core`'s `sqlx`
-  impls whatever they request; one that drops `"sqlx"` from its own
+  not the features Cargo unifies for a build. A crate that enables
+  `common-core/sqlx` makes its dependents build against `common-core`'s
+  `sqlx` impls whatever they request; one that drops `"sqlx"` from its own
   manifest loses its baseline entry, which `stale_entries` reports, but
   keeps the impls.
 - The drivers are a hand-kept list, and `cargo metadata` runs with

@@ -1,0 +1,88 @@
+[package]
+name = "pplx-space-node-mgr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+otel = ["pplx-space-observability/otel"]
+datadog = ["otel", "pplx-space-observability/datadog"]
+# Deprecated for one release; use otel and datadog.
+datadog-otel = ["otel", "datadog"]
+# Compiles in the test-only environment hooks; never enabled for release builds.
+test-hooks = ["pplx-space-common-core/test-hooks"]
+
+[dependencies]
+arc-swap = { workspace = true }
+crc = { workspace = true }
+dashmap = { workspace = true }
+h2 = { workspace = true }
+hyper = { workspace = true }
+jiff = { workspace = true }
+libc = { workspace = true }
+rustix = { workspace = true, features = ["fs", "mount", "process"] }
+nix = { workspace = true, features = ["dir", "fs", "mount", "sched", "process", "resource", "signal", "user"] }
+rusqlite = { workspace = true }
+socket2 = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "net", "process", "rt", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+tracing = { workspace = true }
+futures-util = { workspace = true }
+zeroize = { workspace = true }
+
+# internal
+pplx-space-common-core = { workspace = true }
+pplx-space-common-grpc = { workspace = true }
+pplx-space-common-io = { workspace = true, features = ["reflink"] }
+pplx-space-grpc-rate-limiter = { workspace = true }
+pplx-space-grpc-server = { workspace = true }
+pplx-space-local-health = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
+pplx-space-service-mutex = { workspace = true }
+pplx-space-sqlite = { workspace = true }
+pplx-space-credmgr-client = { workspace = true }
+pplx-space-events = { workspace = true }
+pplx-space-execution-common = { workspace = true }
+pplx-space-grpc-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
+pplx-space-net-common = { workspace = true }
+pplx-space-node-ctl-client = { workspace = true }
+pplx-space-node-mgr-client = { workspace = true }
+pplx-space-node-runtime-core = { workspace = true, features = ["artifact-store", "host-runtime"] }
+pplx-space-observability = { workspace = true, default-features = false }
+pplx-space-uds-peer-auth = { workspace = true }
+pplx-space-unix-socket-bind = { workspace = true }
+sqlx = { workspace = true, features = ["macros", "migrate"] }
+uuid = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = { workspace = true }
+
+[dev-dependencies]
+pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
+insta = { workspace = true, features = ["json"] }
+rstest = { workspace = true }
+# test-capture lets the encrypted-volume tests assert which BYOK counters a
+# code path emitted, so the attempted/failed pairing is enforced rather than
+# reviewed.
+pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+pplx-space-test-env = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+tower = { workspace = true }

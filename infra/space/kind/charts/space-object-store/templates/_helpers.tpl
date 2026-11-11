@@ -15,7 +15,7 @@ audience, as an EKS role trusts a service account's OIDC subject.
 {{/*
 The vend role's own policy, the ceiling of every session: the actions the
 authority's exact-object session policies grant
-(AuthorizedExchange::session_policy, crates/libs/credential/mgr/server/src/storage_exchange.rs),
+(AuthorizedExchange::session_policy, crates/l40_api/credmgr/server/src/storage_exchange.rs),
 on the two buckets' objects and listings.
 */}}
 {{- define "space-object-store.rolePolicy" -}}

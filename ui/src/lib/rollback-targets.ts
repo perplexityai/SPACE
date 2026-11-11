@@ -10,7 +10,7 @@ import type { DebugSnapshotInventory } from './sandbox-debug';
 
 // Directory names sbx-mgr keeps for itself and refuses to list or roll back
 // to (`is_internal_snapshot_name` in
-// `crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs`):
+// `crates/l40_api/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs`):
 // its current-instance and per-operation disk artifacts, and GC staging,
 // `.gc-pending-<uuid>` as the whole name or its end. The node already leaves
 // them out of its inventory; an older node might not.

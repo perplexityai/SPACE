@@ -54,11 +54,11 @@ test('the filter also offers every other status the loaded rows carry', () => {
 });
 
 test('the paged list sends only stored lifecycles', () => {
-  // Every lifecycle and both tombstones; node-only states and the no-status
-  // key are never stored.
+  // Every lifecycle and the tombstone; node-only states, which include the
+  // node's `cleanup_required`, and the no-status key are never stored.
   assert.deepEqual(storedLifecycles([...SANDBOX_LIFECYCLE_STATES]), [...SANDBOX_LIFECYCLE_STATES]);
   assert.deepEqual(storedLifecycles(['started', 'unknown', 'cleanup_failed', 'unspecified', 'deleted', 'cleanup_required']), [
-    'started', 'deleted', 'cleanup_required',
+    'started', 'deleted',
   ]);
 });
 

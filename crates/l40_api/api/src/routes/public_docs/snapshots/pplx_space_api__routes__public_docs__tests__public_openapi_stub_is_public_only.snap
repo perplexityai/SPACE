@@ -1,0 +1,179 @@
+---
+source: crates/l40_api/api/src/routes/public_docs/tests.rs
+assertion_line: 46
+expression: paths_by_method
+---
+{
+  "/credential-references": [
+    "post"
+  ],
+  "/credential-references/{credential_reference_id}": [
+    "delete"
+  ],
+  "/operations/{operation_id}": [
+    "get"
+  ],
+  "/operations/{operation_id}/events": [
+    "get"
+  ],
+  "/sandboxes": [
+    "get",
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}": [
+    "delete",
+    "get",
+    "patch"
+  ],
+  "/sandboxes/{sandbox_id}/commands": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/file-watch-sessions": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/files:changes_disable": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/files:changes_enable": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/files:list": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/files:mkdir": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/files:modified": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/files:read": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/files:remove": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/files:rename": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/files:stat": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/files:write": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/files:write_batch": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/lifecycle-events": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/metrics-stream": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/network-policy": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/port-sessions": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/ports": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/ports/{port}/close": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/ports/{port}/open": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/process-sessions": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/processes": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/processes/{process_id}": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/processes/{process_id}:kill": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/processes/{process_id}:signal": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/protocol-sessions": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/sessions": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/sessions/{session_id}": [
+    "delete",
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/snapshots": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/snapshots/{snapshot_id}": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/stats": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/terminal-sessions": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:checkpoint": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:disable_snapshots": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:enable_snapshots": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:kill": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:pause": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:restore": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:resume": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:rollback": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:set_timeout": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:start": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:stop": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:suspend": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:wake": [
+    "post"
+  ],
+  "/sessions/{session_id}/attach": [
+    "get"
+  ],
+  "/sessions/{session_id}/events": [
+    "get"
+  ],
+  "/sessions/{session_id}/proxy": [
+    "get"
+  ],
+  "/templates": [
+    "get"
+  ],
+  "/templates/{template_name}": [
+    "get"
+  ]
+}

@@ -1,0 +1,37 @@
+[package]
+name = "pplx-space-service-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+otel = ["pplx-space-observability/otel"]
+datadog = ["otel", "pplx-space-observability/datadog"]
+
+[dependencies]
+tracing = { workspace = true }
+
+# internal
+pplx-space-cluster-id = { workspace = true }
+pplx-space-common-grpc = { workspace = true }
+pplx-space-grpc-server = { workspace = true }
+pplx-space-observability = { workspace = true }
+pplx-space-rustls-provider = { workspace = true }
+pplx-space-systemd-watchdog = { workspace = true }
+
+[dev-dependencies]
+jiff = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
+tonic = { workspace = true }
+tracing-subscriber = { workspace = true }
+pplx-space-observability = { workspace = true, features = ["test-capture"] }

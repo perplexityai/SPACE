@@ -48,7 +48,7 @@ compatible with these requests and replies.
 
 The API records desired state in PostgreSQL. Controllers and worker services reconcile the running system with that state, so an accepted request is not a readiness signal.
 
-SPACE can manage workers directly or through Kubernetes. The [direct adapter](../crates/libs/api/src/controllers/substrate/direct.rs) calls worker services without creating Kubernetes sandbox pods. The [Kubernetes adapter](../crates/libs/api/src/controllers/substrate/kubernetes/mod.rs) is used by the local Kind installation in these guides.
+SPACE can manage workers directly or through Kubernetes. The [direct adapter](../crates/l40_api/api/src/controllers/substrate/direct.rs) calls worker services without creating Kubernetes sandbox pods. The [Kubernetes adapter](../crates/l40_api/api/src/controllers/substrate/kubernetes/mod.rs) is used by the local Kind installation in these guides.
 
 ### Local Kind topology
 
@@ -101,7 +101,7 @@ The separate command-stream path is **Application → Data plane ↔ Guest proce
 - **Execute:** The API creates a command session. The client attaches to the returned events endpoint, starting the guest process and receiving output.
 - **Finish:** The client checks the process exit result, then keeps the sandbox for another command or deletes it. A completed command does not itself delete the sandbox.
 
-An operation's `state` describes the lifecycle request; the sandbox's `state` describes the environment. Neither is the exit status of a command.
+An operation's `state` describes the lifecycle request; the sandbox's `state` describes the environment. Neither is the exit status of a command. A create, or a wake or start that leaves the sandbox `running`, succeeds once the sandbox's guest agent answers, so a command or file call sent after it does not wait for the guest to boot. On Kubernetes, a create whose guest does not answer within its readiness budget can still succeed with the sandbox `running`, and the first call then waits for the guest. A Native create's budget for that is 5 seconds. A create retried after an earlier attempt recorded its sandbox can also succeed before the guest answers.
 
 Native create, pause, suspend, wake, and delete operations have a 30-minute deadline from when they were requested. One that has started and is still retrying when it passes fails with `operation_failed` and the reason `operation_deadline_exceeded`. A create, pause, suspend, or wake that has not started by then, because it waited behind earlier work on its sandbox, for a free execution slot, or for the cluster controller to come back, ends `expired` with the same code and reason instead of starting late. Inspect the sandbox before requesting it again. A delete still runs however late it starts: expiring it would leave running a sandbox its owner asked to remove.
 
@@ -167,7 +167,7 @@ per-organization slot limit does not count inline claims, and the inline limit
 does not count dispatcher claims. Suspend, pause, stop, delete and kill always
 run on the dispatcher.
 
-In Kind, sandbox pods run in their own namespace, `sandboxes`, apart from the control plane in `space`. NetworkPolicies there admit only the API and cluster controller, on the port they dial, and limit sandbox egress to the public IPv4 internet and cluster DNS; the [Kind harness README](../infra/space/kind/README.md#sandbox-namespace-and-network-policy) lists each rule's source.
+In Kind, sandbox pods run in their own namespace, `sandboxes`, apart from the control plane in `space`. NetworkPolicies there admit only the API, the cluster controller and the data plane, on the port they dial, and limit sandbox egress to the public IPv4 internet and cluster DNS; the [Kind harness README](../infra/space/kind/README.md#sandbox-namespace-and-network-policy) lists each rule's source.
 
 ## Lifecycle and persistence
 
@@ -267,6 +267,18 @@ another execution or retarget a replacement generation. The reset is sent once:
 an ambiguous transport failure does not establish that repeating a clock reset
 is safe.
 
+### Native files on the data plane
+
+The data plane can also answer Native `files:*` requests (`SPACE_DATA_PLANE_NATIVE_FILES=serve`), under `/v1` and `/api/v1` as the API mounts them. A deployment routes those paths to it with its load balancer. The API keeps its own `files:*` routes, so any request that reaches it is still answered there. The data plane carries the request's bytes and the API makes every decision, through two RPCs on its activation listener ([native file access](../proto/node/api/v1/native_file_access.proto)):
+
+1. Before reading the body, the data plane asks the API to authorize the request from its headers. The API runs its public route's own credential check, owner scope and error rendering, so an unauthenticated request is refused before its body is read. A refusal keeps the status, body and headers the API rendered, except the hop-by-hop headers, `Content-Length` and `Transfer-Encoding`, which the data plane sets for its own connection.
+2. With Native upload admission on (`SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION`), a `files:write` or `files:write_batch` then reserves its declared `Content-Length` from the data plane's Native upload budgets before its body is read.
+3. The data plane reads and checks the body with the same rules as the API's handler. For write, write_batch, mkdir, remove and rename it computes the request's fingerprint.
+4. It asks the API to prepare the call. For those five operations the API binds the `Idempotency-Key` to the fingerprint, refusing a different request under it with 409 `idempotency_conflict`; `files:changes_enable` and `files:changes_disable` require a key but have no fingerprint, so nothing is bound for them. The API runs the drain gate and the admission charge, and wakes the sandbox if its policy allows. It answers with the runtime to call and a route token.
+5. The data plane calls the sandbox's runtime directly and maps a failure as the API does. A call whose connection to the runtime fails before the runtime answers gets the retryable 503 `service_unavailable` with `Retry-After`, from either server; a read-only call (`stat`, `list`, `read`, `modified`) is first sent once more over a new connection, since a connection kept to a sandbox endpoint can be dead when used. A mutation is not sent again, and one that nothing deduplicates is answered as not retryable, since it may have reached the runtime.
+
+Nothing is cached between calls, so a revoked credential is refused on its next request. A key that `files:write`, `files:write_batch`, `files:mkdir`, `files:remove` or `files:rename` bound through either server binds the same record, so a retry of those may land on either. A data-plane replica that is draining answers new files requests with the Native 503 `service_unavailable` and lets the ones it took finish. A request it took may first take as long as its client needs to send its body, then wait up to 135 s for its sandbox to wake, and then transfer its body, so size its drain deadline and the load balancer's deregistration delay to cover all three. If the API cannot be reached, or predates these RPCs, the data plane answers a retryable 503.
+
 ## Service responsibilities
 
 | Component | Responsibility |
@@ -274,7 +286,7 @@ is safe.
 | API and PostgreSQL | Authenticate and authorize requests; store control-plane records and desired state. |
 | Controllers and adapters | Coordinate sandbox lifecycle changes with worker services. In Kind, the Kubernetes adapter, cluster controller, and runtime shim create and manage sandbox pods. |
 | Worker services | Manage VMs, networking, volumes, templates, and credentials. btrfs copy-on-write supports root filesystem creation. |
-| Data plane | Connect clients to guest processes and forward events using scoped tokens. |
+| Data plane | Connect clients to guest processes and forward events using scoped tokens. Optionally carry Native `files:*` requests that the API authorizes and prepares. |
 | Builders and object storage | Build templates separately from user sandboxes and store template and snapshot artifacts. The Kind deployment uses Versity S3 Gateway (versitygw). |
 | Internal API and UI | Receive node state publication and template-release publication, and provide a browser interface. API clients do not require the UI. |
 
@@ -318,7 +330,7 @@ dependency rules CI enforces.
 
 Firecracker isolates guest execution. Host-side services still require privileges to manage VMs, storage, and networking.
 
-The API authorizes management requests with a user-session or service bearer token. The data plane authorizes command connections with session-scoped attachment tokens. Management and attachment tokens are not interchangeable.
+The API authorizes management requests with a user-session or service bearer token. The data plane authorizes command connections with session-scoped attachment tokens. Management and attachment tokens are not interchangeable. A Native `files:*` request that reaches the data plane carries a management token, which the data plane passes to the API to authorize; it never decides one itself.
 
 A data-plane replica that receives SIGTERM drains rather than dropping its
 streams. The listener closes, so new connections, readiness probes included,
@@ -374,6 +386,31 @@ the source and `ImportSandbox` / `ImportSnapshot` on the destination. That code
 must supply the destination RPC's existing import header and file chunks.
 Source lifecycle, encryption restrictions, and destination validation still
 apply. The node-api service account cannot invoke these local artifact methods.
+
+A transfer with `use_delta` sends the rootfs as a delta against the cached
+template build it was created from. A build directory alone says nothing about
+that rootfs: one can exist without a catalog row, as a transient recovery
+failure or an interrupted pull leaves it. So sandbox-manager takes the delta
+base, for sandbox and snapshot export and import, from a `GetTemplate` lookup
+with `cached_only` set. Template-manager answers it from a ready catalog row
+whose rootfs has the size its build declares and is a regular file, never
+pulls, and marks its answer as a `cached_only` one; sandbox-manager takes no
+base from an answer without that mark. Each lookup is bounded at 5 seconds.
+Exports, and a sandbox import's check before its body arrives, look the base up
+before taking the sandbox's locks. A delta import, sandbox or snapshot, looks
+it up again under the sandbox's locks just before it applies the diff, and once
+more after: it keeps the result only if the build still answers and its rootfs
+is the file the apply read, held open throughout, and is refused with a
+retryable `ABORTED` otherwise. A snapshot import makes only those two lookups,
+after its body. An export likewise looks the base up again after computing its
+diff and keeps the diff only for the file it read. Without a verified base an
+export sends the full rootfs. A delta import is refused with
+`FAILED_PRECONDITION` when template-manager answers that the node has no such
+build, holds one that can't serve as a base, or refuses the lookup, and with a
+retryable `UNAVAILABLE` when template-manager can't be reached, doesn't answer
+in time or fails transiently. A delta import of a sandbox that already exists,
+or whose cleanup is in progress, is refused with `ALREADY_EXISTS` or `ABORTED`
+before any lookup.
 
 ## TLS interception exemptions
 

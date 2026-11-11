@@ -10,8 +10,8 @@ unset GIT_ASKPASS SSH_ASKPASS GIT_SSH GIT_SSH_COMMAND GIT_CONFIG_PARAMETERS
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="${repo_root}/scripts/check-postgres-migrations-isolated.sh"
-bootstrap_roles_path="crates/libs/db/migrator/src/bootstrap_roles.rs"
-postgres_bootstrap_test_path="crates/libs/db/migrator/src/bootstrap_roles/tests/postgres_bootstrap_tests.rs"
+bootstrap_roles_path="crates/l30_storage/db/migrate/src/bootstrap_roles.rs"
+postgres_bootstrap_test_path="crates/l30_storage/db/migrate/src/bootstrap_roles/tests/postgres_bootstrap_tests.rs"
 postgres_bootstrap_test_with_credential_table="fn new_credential_table_is_fenced() {}"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
@@ -557,7 +557,7 @@ write_file "${work_repo}/db/postgres/20260623000021_add_credentials.up.sql" \
   "CREATE TABLE new_credential_table (id BIGINT PRIMARY KEY);"
 rewrite_credential_tables "${work_repo}/${bootstrap_roles_path}" add new_credential_table
 write_file \
-  "${work_repo}/crates/libs/db/migrator/src/bootstrap_roles/tests/other_postgres_test.rs" \
+  "${work_repo}/crates/l30_storage/db/migrate/src/bootstrap_roles/tests/other_postgres_test.rs" \
   "fn unrelated_test() {}"
 commit_scenario "${work_repo}" "migration plus sibling bootstrap test"
 expect_guard_failure "${work_repo}" "migration-plus-sibling-bootstrap-test"

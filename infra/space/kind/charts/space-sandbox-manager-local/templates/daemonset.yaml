@@ -1,7 +1,7 @@
 {{- $ctx := dict "ctx" . "component" "sandbox-manager" -}}
 {{- /*
 sandbox-manager forwards its OTLP endpoints to the net-gateway and spaced-host
-sidecars it launches (crates/libs/sbx/mgr/server/src/sidecar_env.rs), and those
+sidecars it launches (crates/l40_api/sbx/mgr/server/src/sidecar_env.rs), and those
 run on the Kind node in a sandbox network namespace, where cluster DNS does not
 resolve. Give it the node-reachable Collector addresses the shim and the
 runtime-supervisor use, the fixed ClusterIPs bring-up passes as
@@ -28,7 +28,7 @@ spec:
       {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
   # Surge: sandbox-manager holds /space/run/sandbox-manager/service.mutex; the
   # successor waits passively and the predecessor hands over its sockets after
-  # its pre-handoff drain (crates/libs/sbx/mgr/server/src/run.rs). Sandboxes
+  # its pre-handoff drain (crates/l40_api/sbx/mgr/server/src/run.rs). Sandboxes
   # keep running throughout: their VMs belong to the host runtime-supervisor.
   {{- include "space-node-service.updateStrategy" (dict "strategy" "surge") | nindent 2 }}
   template:
@@ -58,7 +58,7 @@ spec:
       hostPID: true
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
       # space-sbxmgr with SPACE_SANDBOX_MANAGER_GROUPS; btrfs work goes
-      # through node-manager (crates/libs/sbx/mgr/server/src/btrfs_via_nodemgr.rs).
+      # through node-manager (crates/l40_api/sbx/mgr/server/src/btrfs_via_nodemgr.rs).
       securityContext:
         {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_SBXMGR" "groups" "SPACE_SANDBOX_MANAGER_GROUPS") | nindent 8 }}
       containers:
@@ -77,7 +77,7 @@ spec:
             # unless SPACE_INTERNAL_TOKEN is set beside the endpoint, although
             # its ClusterApi client authenticates with the projected token
             # (reupload_precondition_for_cluster_api_env,
-            # crates/libs/sbx/mgr/server/src/service/grpc_lifecycle/artifact_backup.rs).
+            # crates/l40_api/sbx/mgr/server/src/service/grpc_lifecycle/artifact_backup.rs).
             {{- include "space-node-service.env.internalToken" . | nindent 12 }}
             {{- include "space-node-service.env.routeVerification" . | nindent 12 }}
             {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
@@ -179,7 +179,7 @@ spec:
             # The node's sandbox cgroup parent, whose per-VM jailer cgroups the
             # watchdog samples for a health transition's evidence
             # (SANDBOX_CGROUP_PARENT in
-            # crates/libs/sbx/mgr/server/src/watchdog/diagnostics.rs). The
+            # crates/l40_api/sbx/mgr/server/src/watchdog/diagnostics.rs). The
             # container's own /sys/fs/cgroup is its private cgroup namespace,
             # which holds only this pod's cgroup.
             - name: sandbox-cgroups

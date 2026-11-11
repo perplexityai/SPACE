@@ -1,0 +1,29 @@
+[package]
+name = "pplx-space-spaced-guest-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-lc-rs = { workspace = true }
+libc = { workspace = true }
+pplx-space-content-digest = { workspace = true }
+pplx-space-spaced-update = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+pplx-space-test-env = { workspace = true }
+pplx-space-cpu-arch = { workspace = true }
+tempfile = { workspace = true }
+semver = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_Security"] }

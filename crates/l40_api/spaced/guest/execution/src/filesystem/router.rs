@@ -1,0 +1,1591 @@
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
+
+use futures_util::{Stream, StreamExt};
+use pplx_space_common_core::types::GuestUserName;
+use pplx_space_spaced_guest_protocol::invalid_argument_status;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::filesystem_server::Filesystem;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+    CreateWatcherRequest, CreateWatcherResponse, DisableFileChangesRequest,
+    DisableFileChangesResponse, EnableFileChangesRequest, EnableFileChangesResponse,
+    GetModifiedFilesRequest, GetModifiedFilesResponse, GetWatcherEventsRequest,
+    GetWatcherEventsResponse, ListRequest, MkdirRequest, MkdirResponse, NormalizeWatchRootRequest,
+    NormalizeWatchRootResponse, ReadRequest, RemoveRequest, RemoveResponse, RemoveWatcherRequest,
+    RemoveWatcherResponse, RenameRequest, RenameResponse, StatRequest, StatResponse, WatchRequest,
+    WriteBatchRequest, WriteBatchResponse, WriteRequest, WriteResponse,
+};
+#[cfg(target_os = "linux")]
+use tokio::sync::Mutex;
+use tonic::{Request, Response, Status};
+
+use crate::{FilesystemExecutionMode, GuestFileChunkStream, GuestFileInfoStream};
+
+#[cfg(target_os = "linux")]
+use pplx_space_spaced_guest_protocol::proto::worker::worker_filesystem_client::WorkerFilesystemClient as FilesystemClient;
+
+use super::operations::{self, Kind, Lookup, Operations};
+use super::{FilesystemWorkerService, watch};
+use crate::idempotency::{optional_idempotency_key, require_idempotency_key};
+use pplx_space_spaced_guest_protocol::proto::worker::worker_filesystem_server::WorkerFilesystem;
+use pplx_space_spaced_guest_protocol::proto::worker::{self, mutation_result, write_frame};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+const MAX_GUEST_FILESYSTEM_EXECUTIONS: usize = 128;
+/// How long a cancelled dispatch may keep finishing before the router stops
+/// waiting, reaps its worker and publishes an unknown outcome. Cancelling an
+/// RPC cannot cancel a kernel operation the worker is already blocked in, so
+/// this is a real deadline rather than a poll interval.
+pub(crate) const DEFAULT_CANCELLATION_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+use pplx_space_common_grpc::{PreserveInputErrors, RequestAdmission, RequestPermit};
+use pplx_space_spaced_guest_protocol::filesystem_limits;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::filesystem_server::FilesystemServer as PublicFilesystemServer;
+
+#[derive(Clone)]
+enum Backend {
+    Direct(FilesystemWorkerService),
+    #[cfg(target_os = "linux")]
+    Workers(super::worker::WorkerPool),
+}
+
+enum Command {
+    Write {
+        input: tokio::sync::mpsc::Receiver<worker::WriteFrame>,
+        direct_owner: Option<GuestUserName>,
+    },
+    Batch(worker::BatchCommand),
+    Rename(worker::RenameCommand),
+}
+
+enum Executor {
+    Direct(FilesystemWorkerService),
+    #[cfg(target_os = "linux")]
+    Worker(super::worker::WorkerClient),
+}
+
+impl Executor {
+    async fn execute(&self, command: Command) -> Result<worker::MutationResult, Status> {
+        match self {
+            Self::Direct(service) => match command {
+                Command::Write {
+                    input,
+                    direct_owner,
+                } => {
+                    service
+                        .execute_write(
+                            tokio_stream::wrappers::ReceiverStream::new(input).map(Ok),
+                            direct_owner,
+                        )
+                        .await
+                }
+                Command::Batch(request) => service.write_batch(Request::new(request)).await,
+                Command::Rename(request) => service.rename(Request::new(request)).await,
+            },
+            #[cfg(target_os = "linux")]
+            Self::Worker(worker) => {
+                let mut client = worker.client.clone();
+                match command {
+                    Command::Write { input, .. } => {
+                        client
+                            .write(tokio_stream::wrappers::ReceiverStream::new(input))
+                            .await
+                    }
+                    Command::Batch(request) => client.write_batch(request).await,
+                    Command::Rename(request) => client.rename(request).await,
+                }
+            }
+        }
+        .map(Response::into_inner)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct LiveWatcherRoute {
+    slot: Arc<tokio::sync::OwnedSemaphorePermit>,
+    worker: super::worker::WorkerClient,
+    worker_watcher_id: String,
+    last_access: Instant,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+enum WatcherRoute {
+    Live(Box<LiveWatcherRoute>),
+    Reset {
+        expires_at: Instant,
+        _slot: Arc<tokio::sync::OwnedSemaphorePermit>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+const WATCHER_ROUTE_TTL: Duration = Duration::from_secs(10 * 60);
+#[cfg(target_os = "linux")]
+const MAX_WATCHER_ROUTES: usize = 2048;
+#[cfg(target_os = "linux")]
+const MAX_LEDGER_IDENTITIES: usize = 4096;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LedgerEvidence {
+    Tracking,
+    Lost,
+}
+
+/// Owned filesystem operations sharing the service's admission and worker state.
+///
+/// Obtain this handle from [`crate::ExecutionService::filesystem_service`]. It
+/// implements the generated `Filesystem` trait and accepts native uploads via
+/// [`Self::write_file`]. Clones share all capacity and lifecycle state.
+#[derive(Clone)]
+pub struct FilesystemHandle {
+    default_user: GuestUserName,
+    operations: Operations,
+    tasks: TaskTracker,
+    shutdown: CancellationToken,
+    pub(crate) lifecycle: crate::lifecycle::Lifecycle,
+    execution_slots: Arc<tokio::sync::Semaphore>,
+    payload_slots: Arc<tokio::sync::Semaphore>,
+    backend: Backend,
+    #[cfg(target_os = "linux")]
+    watcher_routes: Arc<Mutex<HashMap<String, WatcherRoute>>>,
+    #[cfg(target_os = "linux")]
+    watcher_slots: Arc<tokio::sync::Semaphore>,
+    #[cfg(target_os = "linux")]
+    ledger_evidence: Arc<Mutex<HashMap<GuestUserName, LedgerEvidence>>>,
+    cancellation_grace: std::time::Duration,
+    native_upload_idle_timeout: std::time::Duration,
+}
+
+impl std::fmt::Debug for FilesystemHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilesystemHandle").finish_non_exhaustive()
+    }
+}
+
+impl FilesystemHandle {
+    pub(crate) async fn has_update_obligations(&self) -> bool {
+        if self.operations.has_live_records() || !self.tasks.is_empty() {
+            return true;
+        }
+        match &self.backend {
+            // Updates are qualified only for the isolated Linux worker backend.
+            Backend::Direct(_) => true,
+            #[cfg(target_os = "linux")]
+            Backend::Workers(pool) => {
+                self.prune_watcher_routes().await;
+                !self.watcher_routes.lock().await.is_empty()
+                    || !self.ledger_evidence.lock().await.is_empty()
+                    || pool.has_update_obligations().await
+            }
+        }
+    }
+
+    pub(crate) fn with_native_upload_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.native_upload_idle_timeout = timeout;
+        self
+    }
+
+    /// Upload from a native stream, including borrowed and non-`Unpin` streams.
+    ///
+    /// Uses the same message limits, admission and supervised write path as gRPC.
+    /// Waiting for each input message (including `Open`) is bounded by
+    /// [`crate::ExecutionServiceConfig::native_upload_idle_timeout`]. Expiry
+    /// returns `DeadlineExceeded` and cancels the upload; it does not roll back
+    /// append effects or establish that a fresh-key retry is safe. Cleanup can
+    /// retain capacity after the response. Service backpressure is not input idle
+    /// time. Callers can separately bound the whole upload with a deadline.
+    pub async fn write_file<S>(
+        &self,
+        request: Request<S>,
+    ) -> Result<Response<WriteResponse>, Status>
+    where
+        S: Stream<Item = Result<WriteRequest, Status>> + Send,
+    {
+        let (metadata, extensions, incoming) = request.into_parts();
+        tokio::pin!(incoming);
+        let idle_timeout = self.native_upload_idle_timeout;
+        let bounded = futures_util::stream::unfold(Some(incoming.as_mut()), |input| async move {
+            let mut input = input?;
+            match tokio::time::timeout(idle_timeout, input.next()).await {
+                Ok(Some(message)) => Some((message, Some(input))),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(Status::deadline_exceeded(
+                        "native upload input idle timeout",
+                    )),
+                    None,
+                )),
+            }
+        });
+        self.write_from_stream(Request::from_parts(metadata, extensions, bounded))
+            .await
+    }
+
+    pub(crate) fn grpc_service(
+        &self,
+    ) -> RequestAdmission<PreserveInputErrors<PublicFilesystemServer<Self>>> {
+        RequestAdmission::new(
+            PreserveInputErrors::new(
+                PublicFilesystemServer::new(self.clone())
+                    .max_decoding_message_size(filesystem_limits::MAX_MESSAGE_BYTES),
+            ),
+            pplx_space_common_grpc::QueuedSlots::new(self.payload_slots.clone()),
+            filesystem_limits::PAYLOAD_METHODS,
+        )
+        .with_observation(pplx_space_grpc_metrics::payload::Budget::GuestFilesystem)
+    }
+
+    pub(crate) async fn drain(&self) {
+        self.lifecycle.close();
+        self.lifecycle.wait().await;
+        self.tasks.close();
+        self.tasks.wait().await;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service.tasks.close();
+                service.tasks.wait().await;
+                service.watch_manager.shutdown().await;
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(pool) => pool.drain().await,
+        }
+    }
+
+    async fn executor(&self, user: GuestUserName) -> Result<Executor, Status> {
+        crate::execution::require_running(&self.shutdown)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                let mut service = service.clone();
+                service.default_user = user;
+                Ok(Executor::Direct(service))
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => Ok(Executor::Worker(self.acquire_worker(user).await?)),
+        }
+    }
+
+    fn supervise(
+        &self,
+        executor: Executor,
+        reservation: operations::Reservation,
+        command: Command,
+        cancelled: CancellationToken,
+        permits: (tokio::sync::OwnedSemaphorePermit, RequestPermit),
+    ) -> tokio::task::JoinHandle<Result<worker::MutationResult, Status>> {
+        #[cfg(target_os = "linux")]
+        let router = self.clone();
+        let cancellation_grace = self.cancellation_grace;
+        self.tasks.spawn(async move {
+            // Input admission survives caller cancellation through all retained
+            // payloads, outstanding file I/O, and worker termination/reaping.
+            let _permits = permits;
+            if cancelled.is_cancelled() {
+                _permits.1.observe_cancellation();
+                return Err(Status::cancelled("filesystem dispatch cancelled before execution"));
+            }
+            let execution = reservation.dispatch();
+            let result = {
+                let call = executor.execute(command);
+                tokio::pin!(call);
+                tokio::select! {
+                    result = &mut call => result,
+                    _ = cancelled.cancelled() => {
+                        _permits.1.observe_cancellation();
+                        match tokio::time::timeout(cancellation_grace, &mut call).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                tracing::warn!("filesystem cancellation cleanup stalled");
+                                match &executor {
+                                    Executor::Direct(_) => call.await,
+                                    #[cfg(target_os = "linux")]
+                                    Executor::Worker(worker) => {
+                                        router.record_worker_failure(worker).await;
+                                        Err(operations::unknown_outcome())
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            let result = match result {
+                Ok(result) => Ok(result),
+                Err(status) => {
+                    // Operation errors and pre-execution refusals arrive as
+                    // typed replies. A bare status does not prove the worker
+                    // stopped effects, even if its code is not a transport code.
+                    tracing::warn!(code = ?status.code(), "filesystem dispatch ended without a terminal reply");
+                    #[cfg(target_os = "linux")]
+                    if let Executor::Worker(worker) = &executor {
+                        router.record_worker_failure(worker).await;
+                    }
+                    Err(operations::unknown_outcome())
+                }
+            };
+            execution.complete(result.clone());
+            result
+        })
+    }
+
+    fn execution_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        self.execution_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                crate::refused(Status::resource_exhausted(
+                    "too many guest filesystem executions",
+                ))
+            })
+    }
+
+    async fn mutate(
+        &self,
+        user: GuestUserName,
+        key: Option<pplx_space_common_core::types::IdempotencyKey>,
+        kind: Kind,
+        command: Command,
+        admission: RequestPermit,
+    ) -> Result<worker::MutationResult, Status> {
+        let reservation = match self.operations.reserve(user.clone(), key, kind).await? {
+            Lookup::Replay(result) => return result,
+            Lookup::New(reservation) => reservation,
+        };
+        let permit = self.execution_permit()?;
+        let executor = self.executor(user).await?;
+        let cancelled = self.shutdown.child_token();
+        let _on_drop = cancelled.clone().drop_guard();
+        let request_lifetime = admission.request_lifetime();
+        request_lifetime
+            .observe(self.supervise(
+                executor,
+                reservation,
+                command,
+                cancelled,
+                (permit, admission),
+            ))
+            .await
+            .map_err(|_| operations::unknown_outcome())?
+    }
+
+    pub(crate) async fn write_from_stream<S>(
+        &self,
+        mut request: Request<S>,
+    ) -> Result<Response<WriteResponse>, Status>
+    where
+        S: Stream<Item = Result<WriteRequest, Status>> + Send,
+    {
+        let _operation = self.lifecycle.admit()?;
+        let admission = crate::payload::acquire(
+            &self.payload_slots,
+            1,
+            pplx_space_grpc_metrics::payload::Budget::GuestFilesystem,
+            request.extensions_mut().remove::<RequestPermit>(),
+        )?;
+        let incoming = request.into_inner();
+        tokio::pin!(incoming);
+        admission
+            .request_lifetime()
+            .observe(self.write_stream(incoming.as_mut(), admission))
+            .await
+    }
+
+    async fn write_stream(
+        &self,
+        mut incoming: Pin<&mut (dyn Stream<Item = Result<WriteRequest, Status>> + Send)>,
+        admission: RequestPermit,
+    ) -> Result<Response<WriteResponse>, Status> {
+        use pplx_space_spaced_guest_protocol::proto::operations::write_request::Message;
+        let first = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => {
+                return Err(crate::refused(Status::unavailable("guest shutting down")));
+            }
+            first = incoming.next() => first,
+        }
+        .transpose()?
+        .ok_or_else(|| Status::invalid_argument("write requires open"))?;
+        crate::payload::check_message(&first, filesystem_limits::MAX_MESSAGE_BYTES)?;
+        let Some(Message::Open(open)) = first.message else {
+            return Err(Status::invalid_argument("first write message must be open"));
+        };
+        let direct_owner = open
+            .user
+            .clone()
+            .map(GuestUserName::parse)
+            .transpose()
+            .map_err(invalid_argument_status)?;
+        let user = self.effective_user(open.user)?;
+        let key = if open.append {
+            Some(require_idempotency_key(
+                open.idempotency_key,
+                "append write",
+            )?)
+        } else {
+            optional_idempotency_key(open.idempotency_key)?
+        };
+        let reservation = match self
+            .operations
+            .reserve(user.clone(), key, Kind::Write)
+            .await?
+        {
+            Lookup::Replay(result) => return Self::write_response(result?),
+            Lookup::New(reservation) => reservation,
+        };
+        let permit = self.execution_permit()?;
+        let executor = self.executor(user).await?;
+        let cancelled = self.shutdown.child_token();
+        let _on_drop = cancelled.clone().drop_guard();
+        let (tx, rx) = tokio::sync::mpsc::channel(filesystem_limits::WRITE_BUFFER_FRAMES);
+        tx.try_send(worker::WriteFrame {
+            frame: Some(write_frame::Frame::Open(worker::WriteStart {
+                execution_id: uuid::Uuid::now_v7().to_string(),
+                path: open.path,
+                append: open.append,
+            })),
+        })
+        .map_err(|_| Status::internal("new worker stream unavailable"))?;
+        let mut execution = self.supervise(
+            executor,
+            reservation,
+            Command::Write {
+                input: rx,
+                direct_owner,
+            },
+            cancelled.clone(),
+            (permit, admission),
+        );
+        // No detached pump: the outer future directly owns the input stream.
+        enum PumpExit {
+            Finished,
+            ExecutorClosed,
+        }
+        let pump = async move {
+            while let Some(message) = incoming.next().await {
+                let message = message?;
+                crate::payload::check_message(&message, filesystem_limits::MAX_MESSAGE_BYTES)?;
+                let Some(Message::Data(data)) = message.message else {
+                    return Err(Status::invalid_argument("write expects data"));
+                };
+                // Bound queued bytes as well as frame count, without rejecting
+                // clients that send larger (otherwise valid) protobuf messages.
+                // spaced-host already sends frames of at most this size, so
+                // those move through as they are. A larger one is split one
+                // chunk at a time, so at most one copy waits on the channel.
+                let send = |frame: Vec<u8>| {
+                    tx.send(worker::WriteFrame {
+                        frame: Some(write_frame::Frame::Data(frame)),
+                    })
+                };
+                if data.len() <= filesystem_limits::WRITE_CHUNK_BYTES {
+                    if send(data).await.is_err() {
+                        return Ok(PumpExit::ExecutorClosed);
+                    }
+                } else {
+                    for chunk in data.chunks(filesystem_limits::WRITE_CHUNK_BYTES) {
+                        if send(chunk.to_vec()).await.is_err() {
+                            return Ok(PumpExit::ExecutorClosed);
+                        }
+                    }
+                }
+            }
+            match tx
+                .send(worker::WriteFrame {
+                    frame: Some(write_frame::Frame::Finish(worker::Finish {})),
+                })
+                .await
+            {
+                Ok(()) => Ok(PumpExit::Finished),
+                Err(_) => Ok(PumpExit::ExecutorClosed),
+            }
+        };
+        tokio::pin!(pump);
+        tokio::select! {
+            result = &mut execution => Self::write_response(result.map_err(|_| operations::unknown_outcome())??),
+            result = &mut pump => {
+                match result {
+                    Err(error) => {
+                        cancelled.cancel();
+                        return Err(error);
+                    }
+                    Ok(PumpExit::ExecutorClosed) => {
+                        // A closed queue can mean an early known failure, not
+                        // lost execution. Preserve the authoritative result;
+                        // retain the cancellation grace if it never arrives.
+                        cancelled.cancel();
+                    }
+                    Ok(PumpExit::Finished) => {}
+                }
+                Self::write_response(execution.await.map_err(|_| operations::unknown_outcome())??)
+            }
+            _ = self.shutdown.cancelled() => Err(Status::unavailable("guest shutting down")),
+        }
+    }
+
+    fn write_response(result: worker::MutationResult) -> Result<Response<WriteResponse>, Status> {
+        match operations::checked_outcome(result)? {
+            mutation_result::Outcome::Write(response) => Ok(Response::new(response)),
+            _ => Err(operations::unknown_outcome()),
+        }
+    }
+
+    pub(crate) fn new(
+        execution: FilesystemExecutionMode,
+        #[cfg_attr(
+            not(target_os = "linux"),
+            expect(unused_variables, reason = "Linux-only workers")
+        )]
+        worker_executable: Option<crate::WorkerExecutable>,
+        #[cfg_attr(
+            not(target_os = "linux"),
+            expect(unused_variables, reason = "Linux-only workers")
+        )]
+        identity_policy: crate::IdentityPolicy,
+        default_user: GuestUserName,
+        shutdown: tokio_util::sync::CancellationToken,
+        cancellation_grace: std::time::Duration,
+        #[cfg_attr(
+            not(target_os = "linux"),
+            expect(unused_variables, reason = "Linux-only workers")
+        )]
+        guest_cgroups: Option<Arc<crate::ExecutionCgroups>>,
+    ) -> Result<Self, crate::CreateExecutionServiceError> {
+        let backend = match execution {
+            FilesystemExecutionMode::Direct => Backend::Direct(FilesystemWorkerService::new(
+                default_user.clone(),
+                shutdown.child_token(),
+            )),
+            #[cfg(target_os = "linux")]
+            FilesystemExecutionMode::IdentityWorkers => {
+                Backend::Workers(super::worker::WorkerPool::new(
+                    shutdown.child_token(),
+                    guest_cgroups,
+                    worker_executable
+                        .ok_or(crate::CreateExecutionServiceError::MissingWorkerExecutable)?,
+                    identity_policy,
+                ))
+            }
+            #[cfg(not(target_os = "linux"))]
+            FilesystemExecutionMode::IdentityWorkers => {
+                return Err(crate::CreateExecutionServiceError::UnsupportedIdentityWorkers);
+            }
+        };
+        Ok(Self {
+            default_user,
+            operations: Operations::new(),
+            tasks: TaskTracker::new(),
+            lifecycle: crate::lifecycle::Lifecycle::new(shutdown.clone()),
+            shutdown,
+            execution_slots: Arc::new(tokio::sync::Semaphore::new(MAX_GUEST_FILESYSTEM_EXECUTIONS)),
+            payload_slots: Arc::new(tokio::sync::Semaphore::new(
+                filesystem_limits::PAYLOAD_SLOTS,
+            )),
+            backend,
+            #[cfg(target_os = "linux")]
+            watcher_routes: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(target_os = "linux")]
+            watcher_slots: Arc::new(tokio::sync::Semaphore::new(MAX_WATCHER_ROUTES)),
+            #[cfg(target_os = "linux")]
+            ledger_evidence: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_grace,
+            native_upload_idle_timeout: crate::execution::DEFAULT_NATIVE_UPLOAD_IDLE_TIMEOUT,
+        })
+    }
+
+    fn effective_user(&self, requested_user: Option<String>) -> Result<GuestUserName, Status> {
+        crate::guest_path::effective_user(requested_user, &self.default_user)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn worker_pool(&self) -> Result<&super::worker::WorkerPool, Status> {
+        let Backend::Workers(pool) = &self.backend else {
+            return Err(Status::internal("filesystem worker backend is not enabled"));
+        };
+        Ok(pool)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn worker(
+        &self,
+        requested_user: Option<String>,
+    ) -> Result<super::worker::WorkerClient, Status> {
+        self.acquire_worker(self.effective_user(requested_user)?)
+            .await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn acquire_worker(
+        &self,
+        user: GuestUserName,
+    ) -> Result<super::worker::WorkerClient, Status> {
+        self.prune_watcher_routes().await;
+        let pool = self.worker_pool()?;
+        match pool.client_for(user.clone()).await {
+            Err(status) if status.code() == tonic::Code::ResourceExhausted => {
+                let deadline = tokio::time::Instant::now() + self.cancellation_grace;
+                for worker in pool.idle_ledgers().await {
+                    let Ok(permit) = worker.ledger_update_slot.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    let router = self.clone();
+                    // A cancelled acquisition cannot strand loss publication or
+                    // queue another probe for this generation while it settles.
+                    let probe = self.tasks.spawn(async move {
+                        let _permit = permit;
+                        let mut client = worker.client.clone();
+                        match tokio::time::timeout_at(
+                            deadline,
+                            client.get_modified_files(GetModifiedFilesRequest::default()),
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                if let Ok(response) =
+                                    router.observe_worker_result(&worker, result).await
+                                {
+                                    router
+                                        .observe_ledger_state(&worker, response.get_ref())
+                                        .await;
+                                }
+                            }
+                            Err(_) => router.record_worker_failure(&worker).await,
+                        }
+                    });
+                    if tokio::time::timeout_at(deadline, probe).await.is_err() {
+                        break;
+                    }
+                }
+                pool.client_for(user).await
+            }
+            result => result,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn stream<R, T: Send + 'static>(
+        &self,
+        user: Option<String>,
+        request: R,
+        stream_end: CancellationToken,
+        call: impl AsyncFnOnce(
+            &mut FilesystemClient<tonic::transport::Channel>,
+            R,
+        ) -> Result<Response<tonic::Streaming<T>>, Status>,
+    ) -> Result<Response<RoutedStream<T>>, Status> {
+        let worker = self.worker(user).await?;
+        let response = self
+            .observe_worker_result(&worker, call(&mut worker.client.clone(), request).await)
+            .await?;
+        Ok(Response::new(self.forward_stream(
+            response.into_inner(),
+            worker,
+            stream_end,
+        )))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn forward_stream<T: Send + 'static>(
+        &self,
+        incoming: impl Stream<Item = Result<T, Status>> + Send + 'static,
+        worker: super::worker::WorkerClient,
+        stream_end: CancellationToken,
+    ) -> RoutedStream<T> {
+        let router = self.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        // Keep cancellation outside the bounded data queue: a stalled reader
+        // must neither delay cleanup nor turn a truncated response into EOF.
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        self.tasks.spawn(async move {
+            tokio::pin!(incoming);
+            let failure = loop {
+                let message = tokio::select! {
+                    biased;
+                    _ = stream_end.cancelled() => break Some(Status::unavailable("filesystem stream cancelled")),
+                    _ = tx.closed() => break None,
+                    message = incoming.next() => message,
+                };
+                let Some(message) = message else {
+                    break None;
+                };
+                let failed = message.as_ref().is_err_and(is_worker_transport_failure);
+                if failed {
+                    let cleanup = router.clone();
+                    let failed_worker = worker.clone();
+                    router.tasks.spawn(async move {
+                        cleanup.record_worker_failure(&failed_worker).await;
+                    });
+                }
+                tokio::select! {
+                    biased;
+                    _ = stream_end.cancelled() => break Some(Status::unavailable("filesystem stream cancelled")),
+                    sent = tx.send(message) => if sent.is_err() { break None; },
+                }
+                if failed {
+                    break None;
+                }
+            };
+            let _ = completion_tx.send(failure.map_or(Ok(()), Err));
+        });
+        Box::pin(super::terminal::with_completion(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+            completion_rx,
+        )) as RoutedStream<T>
+    }
+
+    /// Read through a descriptor the user's worker opened: the worker checks
+    /// access as the user, and this process streams the bytes itself instead
+    /// of relaying every chunk from the worker. `None` falls back to the
+    /// relayed read: a worker without the call, or a descriptor this process
+    /// cannot duplicate.
+    #[cfg(target_os = "linux")]
+    async fn read_through_descriptor(
+        &self,
+        user: Option<String>,
+        request: ReadRequest,
+    ) -> Result<Option<GuestFileChunkStream>, Status> {
+        let worker = self.worker(user).await?;
+        let length = request.length;
+        let response = match worker.client.clone().open_read(request).await {
+            Err(status) if status.code() == tonic::Code::Unimplemented => return Ok(None),
+            result => self.observe_worker_result(&worker, result).await?,
+        };
+        let mut lease = response.into_inner();
+        let Some(opened) = self
+            .observe_worker_result(&worker, lease.message().await)
+            .await?
+        else {
+            return Err(Status::internal(
+                "filesystem worker ended an open without a descriptor",
+            ));
+        };
+        let Some(fd) = worker.duplicate_descriptor(opened.fd) else {
+            return Ok(None);
+        };
+        // The worker keeps its copy and its admission until this read ends,
+        // and the read ends with the worker: its admission is per worker, so
+        // a read outliving it would escape the replacement worker's limit.
+        // The worker sends nothing after the descriptor; its stream ends
+        // only when the worker does. A transport failure retires the worker,
+        // as it does on a relayed stream, without holding up the read's end.
+        let router = self.clone();
+        let leased = worker.clone();
+        let worker_ended = async move {
+            let ended = loop {
+                match lease.message().await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break None,
+                    Err(status) => break Some(status),
+                }
+            };
+            if ended.as_ref().is_some_and(is_worker_transport_failure) {
+                router.tasks.clone().spawn(async move {
+                    router.record_worker_failure(&leased).await;
+                });
+            }
+            Status::unavailable("filesystem worker ended during the read")
+        };
+        Ok(Some(super::read::stream_file(
+            std::fs::File::from(fd),
+            length,
+            worker,
+            worker_ended,
+            self.tasks.clone(),
+            self.shutdown.clone(),
+        )))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn observe_worker_result<T>(
+        &self,
+        worker: &super::worker::WorkerClient,
+        result: Result<T, Status>,
+    ) -> Result<T, Status> {
+        if result.as_ref().is_err_and(is_worker_transport_failure) {
+            self.record_worker_failure(worker).await;
+        }
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn record_worker_failure(&self, worker: &super::worker::WorkerClient) {
+        let router = self.clone();
+        let worker = worker.clone();
+        // Removal, reaping, and loss publication are one owned transition.
+        // A cancelled RPC observer must not erase an acknowledged ledger.
+        if let Err(error) = self
+            .tasks
+            .spawn(async move {
+                // Preserve evidence→pool lock order: no replacement may observe
+                // a clean disabled ledger between removal and loss publication.
+                let mut evidence = router.ledger_evidence.lock().await;
+                match router
+                    .worker_pool()
+                    .expect("identity worker backend")
+                    .remove(&worker)
+                    .await
+                {
+                    Some(true) => {
+                        if let Some(state) = evidence.get_mut(&worker.user) {
+                            *state = LedgerEvidence::Lost;
+                        }
+                    }
+                    Some(false)
+                        if evidence.get(&worker.user) == Some(&LedgerEvidence::Tracking) =>
+                    {
+                        evidence.remove(&worker.user);
+                    }
+                    _ => {}
+                }
+                drop(evidence);
+                router.reset_watcher_routes(&worker).await;
+                // Failure is visible before a slow reap; effect completion
+                // still waits until the old generation can no longer mutate.
+                worker.stop().await;
+            })
+            .await
+        {
+            tracing::error!(%error, "filesystem worker loss accounting failed");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn reset_watcher_routes(&self, worker: &super::worker::WorkerClient) {
+        let reset_expires_at = Instant::now() + WATCHER_ROUTE_TTL;
+        let mut routes = self.watcher_routes.lock().await;
+        for route in routes.values_mut() {
+            if let WatcherRoute::Live(live) = route
+                && live.worker.instance_id == worker.instance_id
+            {
+                *route = WatcherRoute::Reset {
+                    expires_at: reset_expires_at,
+                    _slot: live.slot.clone(),
+                };
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lost_ledger_response() -> Response<GetModifiedFilesResponse> {
+        Response::new(GetModifiedFilesResponse {
+            files: Vec::new(),
+            observed_since: None,
+            retained_since: None,
+            cursor: None,
+            monitoring_enabled: false,
+            overflowed: true,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn finish_enable_file_changes(
+        &self,
+        worker: &super::worker::WorkerClient,
+        user: &GuestUserName,
+    ) -> bool {
+        // Loss publication and acknowledgement share this lock before the pool
+        // lock. A late old-worker reply must not overwrite a replacement ledger.
+        let mut lost = self.ledger_evidence.lock().await;
+        let Some(evidence) = lost.get_mut(user) else {
+            return false;
+        };
+        let pool = self.worker_pool().expect("identity worker backend");
+        *evidence =
+            if pool.set_ledger_enabled(worker, true).await || pool.ledger_enabled(user).await {
+                LedgerEvidence::Tracking
+            } else {
+                LedgerEvidence::Lost
+            };
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn observe_ledger_state(
+        &self,
+        worker: &super::worker::WorkerClient,
+        response: &GetModifiedFilesResponse,
+    ) {
+        if !response.monitoring_enabled {
+            let mut evidence = self.ledger_evidence.lock().await;
+            if self
+                .worker_pool()
+                .expect("identity worker backend")
+                .set_ledger_enabled(worker, false)
+                .await
+            {
+                if response.overflowed {
+                    // Every enabled identity reserves its evidence slot before
+                    // dispatch, so worker loss cannot grow this map past its cap.
+                    if let Some(state) = evidence.get_mut(&worker.user) {
+                        *state = LedgerEvidence::Lost;
+                    }
+                } else if evidence.get(&worker.user) == Some(&LedgerEvidence::Tracking) {
+                    evidence.remove(&worker.user);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn update_ledger<T: Send + 'static>(
+        &self,
+        worker: super::worker::WorkerClient,
+        enabled: bool,
+        call: impl std::future::Future<Output = Result<Response<T>, Status>> + Send + 'static,
+    ) -> Result<Response<T>, Status> {
+        if self.shutdown.is_cancelled() {
+            return Err(crate::refused(Status::unavailable("guest shutting down")));
+        }
+        let permit = worker
+            .ledger_update_slot
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                crate::refused(Status::resource_exhausted(
+                    "file-change update in progress; retry with backoff",
+                ))
+            })?;
+        let new_identity = if enabled {
+            let mut evidence = self.ledger_evidence.lock().await;
+            if !self.worker_pool()?.contains(&worker).await {
+                return Err(Status::unavailable(
+                    "filesystem worker reset before ledger update",
+                ));
+            }
+            if !evidence.contains_key(&worker.user) {
+                if evidence.len() >= MAX_LEDGER_IDENTITIES {
+                    return Err(crate::refused(Status::resource_exhausted(
+                        "file-change identity capacity exhausted; reenable then disable an abandoned ledger",
+                    )));
+                }
+                evidence.insert(worker.user.clone(), LedgerEvidence::Tracking);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let router = self.clone();
+        // One service-owned update retains the worker and its admission through
+        // both the RPC and accounting. Dropping the caller cannot reorder replies.
+        let task = self.tasks.spawn(async move {
+            let _permit = permit;
+            let budget =
+                pplx_space_common_core::operation_budget::RuntimeOperationBudget::FilesystemMetadata
+                    .timeout();
+            let result = tokio::select! {
+                biased;
+                _ = router.shutdown.cancelled() => Err(Status::unavailable("guest shutting down")),
+                result = tokio::time::timeout(budget, call) => result.unwrap_or_else(|_| {
+                    Err(Status::deadline_exceeded("file-change update timed out"))
+                }),
+            };
+            if result.as_ref().is_err_and(|status| {
+                is_worker_transport_failure(status)
+                    || status.code() == tonic::Code::DeadlineExceeded
+            }) {
+                // A missing reply cannot establish the worker's ledger state.
+                tracing::warn!(
+                    worker = %worker.instance_id,
+                    error = ?result.as_ref().err(),
+                    "retiring filesystem worker after inconclusive file-change update"
+                );
+                router.record_worker_failure(&worker).await;
+            } else if result.is_ok() {
+                if enabled {
+                    if !router
+                        .finish_enable_file_changes(&worker, &worker.user)
+                        .await
+                    {
+                        return Err(Status::unavailable(
+                            "filesystem worker reset before ledger acknowledgement",
+                        ));
+                    }
+                } else {
+                    let mut evidence = router.ledger_evidence.lock().await;
+                    if router
+                        .worker_pool()?
+                        .set_ledger_enabled(&worker, false)
+                        .await
+                        && evidence.get(&worker.user) == Some(&LedgerEvidence::Tracking)
+                    {
+                        evidence.remove(&worker.user);
+                    }
+                }
+            }
+            if result.is_err() && new_identity {
+                let mut evidence = router.ledger_evidence.lock().await;
+                if evidence.get(&worker.user) == Some(&LedgerEvidence::Tracking)
+                    && router
+                        .worker_pool()?
+                        .set_ledger_enabled(&worker, false)
+                        .await
+                {
+                    evidence.remove(&worker.user);
+                }
+            }
+            result
+        });
+        task.await
+            .map_err(|error| Status::internal(format!("file-change update task failed: {error}")))?
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn prune_watcher_routes(&self) {
+        let now = Instant::now();
+        // Workers expire their own consumers. Drop routing leases before *any*
+        // worker acquisition so abandoned watches cannot prevent pool eviction.
+        self.watcher_routes
+            .lock()
+            .await
+            .retain(|_, route| match route {
+                WatcherRoute::Live(route) => {
+                    now.duration_since(route.last_access) <= WATCHER_ROUTE_TTL
+                }
+                WatcherRoute::Reset { expires_at, .. } => *expires_at > now,
+            });
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn watcher_route(&self, watcher_id: &str) -> Result<LiveWatcherRoute, Status> {
+        self.prune_watcher_routes().await;
+        let mut routes = self.watcher_routes.lock().await;
+        let route = routes
+            .get_mut(watcher_id)
+            .ok_or_else(|| Status::not_found("watcher not found"))?;
+        match route {
+            WatcherRoute::Live(route) => {
+                route.last_access = Instant::now();
+                Ok((**route).clone())
+            }
+            WatcherRoute::Reset { .. } => Err(Status::unavailable("watcher worker reset")),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_worker_transport_failure(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Cancelled | tonic::Code::Unavailable | tonic::Code::Unknown
+    )
+}
+
+#[cfg(target_os = "linux")]
+type RoutedStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl Filesystem for FilesystemHandle {
+    type ListInfoStream = GuestFileInfoStream;
+    // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_4: also requires MIN_HOST 0.1.4.
+    type ListStream = Pin<
+        Box<
+            dyn Stream<
+                    Item = Result<
+                        pplx_space_spaced_guest_protocol::proto::bridge_guest::LegacyDirEntry,
+                        Status,
+                    >,
+                > + Send,
+        >,
+    >;
+    async fn stat(
+        &self,
+        request: Request<StatRequest>,
+    ) -> Result<
+        Response<pplx_space_spaced_guest_protocol::proto::bridge_guest::LegacyStatResponse>,
+        Status,
+    > {
+        super::compat::stat(self.stat_info(request).await?)
+    }
+    async fn list(
+        &self,
+        request: Request<ListRequest>,
+    ) -> Result<Response<Self::ListStream>, Status> {
+        Ok(Response::new(Box::pin(
+            self.list_info(request)
+                .await?
+                .into_inner()
+                .map(|item| item.and_then(super::compat::entry)),
+        )))
+    }
+    type ReadStream = GuestFileChunkStream;
+    type WatchStream = watch::WatchStream;
+
+    async fn stat_info(
+        &self,
+        request: Request<StatRequest>,
+    ) -> Result<Response<StatResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.stat(request).await })
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let mut request = request.into_inner();
+                let worker = self.worker(request.user.take()).await?;
+                let mut client = worker.client.clone();
+                self.observe_worker_result(&worker, client.stat(request).await)
+                    .await
+            }
+        }
+    }
+
+    async fn list_info(
+        &self,
+        request: Request<ListRequest>,
+    ) -> Result<Response<Self::ListInfoStream>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.list(request).await })
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let mut request = request.into_inner();
+                self.stream(
+                    request.user.take(),
+                    request,
+                    self.shutdown.clone(),
+                    FilesystemClient::list,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn read(
+        &self,
+        request: Request<ReadRequest>,
+    ) -> Result<Response<Self::ReadStream>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.read(request).await })
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let mut request = request.into_inner();
+                let user = request.user.take();
+                if let Some(stream) = self
+                    .read_through_descriptor(user.clone(), request.clone())
+                    .await?
+                {
+                    return Ok(Response::new(stream));
+                }
+                self.stream(user, request, self.shutdown.clone(), FilesystemClient::read)
+                    .await
+            }
+        }
+    }
+
+    async fn write(
+        &self,
+        request: Request<tonic::Streaming<WriteRequest>>,
+    ) -> Result<Response<WriteResponse>, Status> {
+        self.write_from_stream(request).await
+    }
+
+    async fn write_batch(
+        &self,
+        mut request: Request<WriteBatchRequest>,
+    ) -> Result<Response<WriteBatchResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        let admission = crate::payload::admit(
+            &mut request,
+            &self.payload_slots,
+            filesystem_limits::BATCH_REQUEST_WEIGHT,
+            pplx_space_grpc_metrics::payload::Budget::GuestFilesystem,
+            filesystem_limits::MAX_MESSAGE_BYTES,
+        )?;
+        let request = request.into_inner();
+        if request.entries.len() > pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES {
+            return Err(Status::invalid_argument("too many write_batch entries"));
+        }
+        let user = self.effective_user(request.user)?;
+        let key = if request.entries.iter().any(|entry| entry.append) {
+            Some(require_idempotency_key(
+                request.idempotency_key,
+                "append write_batch",
+            )?)
+        } else {
+            optional_idempotency_key(request.idempotency_key)?
+        };
+        let command = Command::Batch(worker::BatchCommand {
+            execution_id: uuid::Uuid::now_v7().to_string(),
+            entries: request.entries,
+        });
+        match operations::checked_outcome(
+            self.mutate(user, key, Kind::Batch, command, admission)
+                .await?,
+        )? {
+            mutation_result::Outcome::Batch(response) => Ok(Response::new(response)),
+            _ => Err(operations::unknown_outcome()),
+        }
+    }
+
+    async fn mkdir(
+        &self,
+        request: Request<MkdirRequest>,
+    ) -> Result<Response<MkdirResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.mkdir(request).await })
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let mut request = request.into_inner();
+                let worker = self.worker(request.user.take()).await?;
+                let mut client = worker.client.clone();
+                self.observe_worker_result(&worker, client.mkdir(request).await)
+                    .await
+            }
+        }
+    }
+
+    async fn remove(
+        &self,
+        request: Request<RemoveRequest>,
+    ) -> Result<Response<RemoveResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.remove(request).await })
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let mut request = request.into_inner();
+                let worker = self.worker(request.user.take()).await?;
+                let mut client = worker.client.clone();
+                self.observe_worker_result(&worker, client.remove(request).await)
+                    .await
+            }
+        }
+    }
+
+    async fn rename(
+        &self,
+        mut request: Request<RenameRequest>,
+    ) -> Result<Response<RenameResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        let admission = crate::payload::admit(
+            &mut request,
+            &self.payload_slots,
+            1,
+            pplx_space_grpc_metrics::payload::Budget::GuestFilesystem,
+            filesystem_limits::MAX_MESSAGE_BYTES,
+        )?;
+        let request = request.into_inner();
+        let user = self.effective_user(request.user)?;
+        let key = Some(require_idempotency_key(request.idempotency_key, "rename")?);
+        let command = Command::Rename(worker::RenameCommand {
+            execution_id: uuid::Uuid::now_v7().to_string(),
+            old_path: request.old_path,
+            new_path: request.new_path,
+        });
+        match operations::checked_outcome(
+            self.mutate(user, key, Kind::Rename, command, admission)
+                .await?,
+        )? {
+            mutation_result::Outcome::Rename(response) => Ok(Response::new(response)),
+            _ => Err(operations::unknown_outcome()),
+        }
+    }
+
+    async fn normalize_watch_root(
+        &self,
+        request: Request<NormalizeWatchRootRequest>,
+    ) -> Result<Response<NormalizeWatchRootResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(
+                        move |service| async move { service.normalize_watch_root(request).await },
+                    )
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let mut request = request.into_inner();
+                let worker = self.worker(request.user.take()).await?;
+                let mut client = worker.client.clone();
+                self.observe_worker_result(&worker, client.normalize_watch_root(request).await)
+                    .await
+            }
+        }
+    }
+
+    async fn watch(
+        &self,
+        request: Request<WatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.watch(request).await })
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let mut request = request.into_inner();
+                self.stream(
+                    request.user.take(),
+                    request,
+                    self.lifecycle.closed(),
+                    FilesystemClient::watch,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn create_watcher(
+        &self,
+        request: Request<CreateWatcherRequest>,
+    ) -> Result<Response<CreateWatcherResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.create_watcher(request).await })
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                self.prune_watcher_routes().await;
+                let slot = self.watcher_slots.clone().try_acquire_owned()
+                    .map_err(|_| crate::refused(Status::resource_exhausted("watcher route capacity exhausted; remove a watcher or retry after expiry")))?;
+                let mut request = request.into_inner();
+                let worker = self.worker(request.user.take()).await?;
+                let mut client = worker.client.clone();
+                let mut response = self
+                    .observe_worker_result(&worker, client.create_watcher(request).await)
+                    .await?
+                    .into_inner();
+                let external_id = uuid::Uuid::now_v7().to_string();
+                self.prune_watcher_routes().await;
+                let mut routes = self.watcher_routes.lock().await;
+                routes.insert(
+                    external_id.clone(),
+                    WatcherRoute::Live(Box::new(LiveWatcherRoute {
+                        slot: Arc::new(slot),
+                        worker,
+                        worker_watcher_id: response.watcher_id,
+                        last_access: Instant::now(),
+                    })),
+                );
+                response.watcher_id = external_id;
+                Ok(Response::new(response))
+            }
+        }
+    }
+
+    async fn get_watcher_events(
+        &self,
+        request: Request<GetWatcherEventsRequest>,
+    ) -> Result<Response<GetWatcherEventsResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.get_watcher_events(request).await })
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let request = request.into_inner();
+                let route = self.watcher_route(&request.watcher_id).await?;
+                let mut client = route.worker.client.clone();
+                self.observe_worker_result(
+                    &route.worker,
+                    client
+                        .get_watcher_events(GetWatcherEventsRequest {
+                            watcher_id: route.worker_watcher_id,
+                        })
+                        .await,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn remove_watcher(
+        &self,
+        request: Request<RemoveWatcherRequest>,
+    ) -> Result<Response<RemoveWatcherResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.remove_watcher(request).await })
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let request = request.into_inner();
+                self.prune_watcher_routes().await;
+                let route = {
+                    let mut routes = self.watcher_routes.lock().await;
+                    match routes.get_mut(&request.watcher_id) {
+                        Some(WatcherRoute::Live(route)) => {
+                            route.last_access = Instant::now();
+                            (**route).clone()
+                        }
+                        Some(WatcherRoute::Reset { .. }) => {
+                            // Reset routes need only local cleanup; retaining them
+                            // would keep admission occupied until expiry.
+                            routes.remove(&request.watcher_id);
+                            return Ok(Response::new(RemoveWatcherResponse {}));
+                        }
+                        None => return Err(Status::not_found("watcher not found")),
+                    }
+                };
+                let mut client = route.worker.client.clone();
+                let response = self
+                    .observe_worker_result(
+                        &route.worker,
+                        client
+                            .remove_watcher(RemoveWatcherRequest {
+                                watcher_id: route.worker_watcher_id,
+                            })
+                            .await,
+                    )
+                    .await?;
+                self.watcher_routes.lock().await.remove(&request.watcher_id);
+                Ok(response)
+            }
+        }
+    }
+
+    async fn enable_file_changes(
+        &self,
+        request: Request<EnableFileChangesRequest>,
+    ) -> Result<Response<EnableFileChangesResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.enable_file_changes(request).await })
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let mut request = request.into_inner();
+                let user = self.effective_user(request.user.take())?;
+                let worker = self.acquire_worker(user).await?;
+                let mut client = worker.client.clone();
+                self.update_ledger(worker, true, async move {
+                    client.enable_file_changes(request).await
+                })
+                .await
+            }
+        }
+    }
+
+    async fn disable_file_changes(
+        &self,
+        request: Request<DisableFileChangesRequest>,
+    ) -> Result<Response<DisableFileChangesResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(
+                        move |service| async move { service.disable_file_changes(request).await },
+                    )
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let mut request = request.into_inner();
+                let worker = self.worker(request.user.take()).await?;
+                let mut client = worker.client.clone();
+                self.update_ledger(worker, false, async move {
+                    client.disable_file_changes(request).await
+                })
+                .await
+            }
+        }
+    }
+
+    async fn get_modified_files(
+        &self,
+        request: Request<GetModifiedFilesRequest>,
+    ) -> Result<Response<GetModifiedFilesResponse>, Status> {
+        let _operation = self.lifecycle.admit()?;
+        crate::payload::check_message(request.get_ref(), filesystem_limits::MAX_MESSAGE_BYTES)?;
+        match &self.backend {
+            Backend::Direct(service) => {
+                service
+                    .owned(move |service| async move { service.get_modified_files(request).await })
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let mut request = request.into_inner();
+                let user = self.effective_user(request.user.take())?;
+                if self.ledger_evidence.lock().await.get(&user) == Some(&LedgerEvidence::Lost) {
+                    return Ok(Self::lost_ledger_response());
+                }
+                let worker = self.acquire_worker(user.clone()).await?;
+                let _update = worker
+                    .ledger_update_slot
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        crate::refused(Status::resource_exhausted(
+                            "file-change update in progress; retry with backoff",
+                        ))
+                    })?;
+                let mut client = worker.client.clone();
+                let result = client.get_modified_files(request).await;
+                if result.as_ref().is_err_and(is_worker_transport_failure) {
+                    self.record_worker_failure(&worker).await;
+                    if self.ledger_evidence.lock().await.get(&user) == Some(&LedgerEvidence::Lost) {
+                        return Ok(Self::lost_ledger_response());
+                    }
+                }
+                if let Ok(response) = &result {
+                    self.observe_ledger_state(&worker, response.get_ref()).await;
+                }
+                result
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests;
+
+#[cfg(all(test, unix))]
+mod ingress_tests;

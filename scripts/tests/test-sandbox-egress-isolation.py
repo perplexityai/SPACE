@@ -137,7 +137,7 @@ PROBES: list[Probe] = [
 
     # MUST_FAIL — SPACE sandbox slot ranges (peer sandboxes on the same node).
     # See `PlatformEgressHardDenyCidr` entries `space-slots-a` (10.11.0.0/16)
-    # and `space-slots-b` (10.12.0.0/16) in crates/libs/net/common/src/lib.rs.
+    # and `space-slots-b` (10.12.0.0/16) in crates/l20_domain/net/common/src/lib.rs.
     # Reaching any address in these CIDRs from a guest implies cross-sandbox
     # isolation has broken on the node.
     Probe("SPACE slots-a 10.11.0.1:22 (peer sandbox, SSH banner)", "10.11.0.1", 22, "ssh_banner", "MUST_FAIL"),

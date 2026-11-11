@@ -107,7 +107,7 @@ local(["bash", "infra/space/kind/lib/substrate.sh", "check", KIND_CLUSTER], quie
 DIRECT = SUBSTRATE == "direct"
 # The exchange mode's credential-manager authority admits a node service by its
 # pod's Kubernetes node registration (`node_k8s`; check_node_registration in
-# crates/libs/credential/mgr/server/src/k8s_identity.rs), which a Direct node
+# crates/l40_api/credmgr/server/src/k8s_identity.rs), which a Direct node
 # does not have, so every template pull would be refused.
 if DIRECT and STORAGE_CREDENTIALS != "static":
     fail("SPACE_KIND_SUBSTRATE=direct needs SPACE_KIND_STORAGE_CREDENTIALS=static; see \"Direct substrate lane\" in infra/space/kind/README.md")
@@ -208,6 +208,7 @@ RUST_ARTIFACT_DEPS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo
                       "docker/Dockerfile.rust-build-kind",
                       "docker/Dockerfile.rust-artifacts-host",
                       "infra/space/kind/scripts/build-rust-artifacts.sh",
+                      "infra/space/kind/scripts/test-hook-features.sh",
                       "infra/space/kind/lib/rust-build.sh",
                       "scripts/build-runtime-supervisor.sh",
                       "infra/space/identity/node-identities.sh",
@@ -342,7 +343,7 @@ space_image(
         # multi-platform manifest list, which `kind load docker-image` cannot
         # ingest ("content digest ... not found").
         (image_build("space-worker") + " -t $SPACE_BUILD_REF " +
-         "--build-arg SPACE_RUST_BUILD_IMAGE={} --build-arg SPACE_GIT_SHA .").format(
+         "--build-arg SPACE_RUST_BUILD_IMAGE={} --build-arg SPACE_GIT_SHA --build-arg SPACE_BUILD_TIME .").format(
             RUST_ARTIFACT_IMAGE),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
@@ -506,7 +507,9 @@ deploy_yaml("infra/space/kind/manifests/runtimeclass.yaml")
 # sandbox pod carries (the chart cites the code behind each rule). The API
 # waits for them, so no sandbox pod runs before its namespace is confined.
 # internal-rpc-tls applies the Namespace manifest first.
-deploy_yaml(helm("infra/space/kind/charts/space-sandbox-network-policy", name = "space", namespace = NAMESPACE))
+# values-kind.yaml admits Kind's data plane, which serves Native files.
+deploy_yaml(helm("infra/space/kind/charts/space-sandbox-network-policy", name = "space", namespace = NAMESPACE,
+                 values = ["infra/space/kind/charts/space-sandbox-network-policy/values-kind.yaml"]))
 k8s_resource(
     new_name = "space-sandbox-network-policy",
     objects = [
@@ -607,10 +610,15 @@ local_resource(
 # cache that never comes. Every node-service release depends on it. It also
 # refuses nodes whose vendor tree, copied from the host tree on their first boot
 # and kept since, no longer matches that tree (check-node-vendor.sh).
+# allow_parallel: the check only reads the node containers, and Tilt runs a
+# serial local resource only while nothing else is building. Serial, it waited
+# out the first image builds, about 45 s, and held up the node services' image
+# build and the seed with it.
 local_resource(
     "check-kind-node-image",
     cmd = ("SPACE_KIND_CLUSTER={0} bash infra/space/kind/scripts/check-kind-node-image.sh && " +
            "SPACE_KIND_CLUSTER={0} bash infra/space/kind/scripts/check-node-vendor.sh").format(KIND_CLUSTER),
+    allow_parallel = True,
     deps = ["infra/space/kind/scripts/check-kind-node-image.sh",
             "infra/space/kind/scripts/check-node-vendor.sh",
             "infra/space/kind/scripts/kind-node-image.sh", "infra/space/kind/node",

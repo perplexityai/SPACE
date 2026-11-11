@@ -1,0 +1,88 @@
+[package]
+name = "pplx-space-net-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+test-support = []
+default = []
+otel = ["pplx-space-observability/otel"]
+datadog = ["otel", "pplx-space-observability/datadog"]
+# Deprecated for one release; use otel and datadog.
+datadog-otel = ["otel", "datadog"]
+
+[dependencies]
+zeroize = { workspace = true }
+arc-swap = { workspace = true }
+aws-lc-rs = { workspace = true }
+jiff = { workspace = true }
+rcgen = { workspace = true, features = ["aws_lc_rs", "x509-parser"] }
+time = { workspace = true }
+rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
+x509-parser = { workspace = true, features = ["verify-aws"] }
+bytes = { workspace = true }
+base64 = { workspace = true }
+futures-util = { workspace = true }
+hickory-resolver = { workspace = true }
+h2 = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "server", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["tokio", "server", "server-auto", "http1", "http2"] }
+libc = { workspace = true }
+lru = { workspace = true }
+metrics = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+socket2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "sync", "rt", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tokio-rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
+tokio-util = { workspace = true, features = ["codec"] }
+tonic = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+webpki-roots = { workspace = true }
+
+# internal
+pplx-space-api-route = { workspace = true }
+pplx-space-common-connection-admission = { workspace = true }
+pplx-space-common-core = { workspace = true }
+pplx-space-events = { workspace = true }
+pplx-space-grpc-rate-limiter = { workspace = true }
+pplx-space-grpc-server = { workspace = true }
+pplx-space-net-common = { workspace = true }
+pplx-space-common-grpc = { workspace = true }
+pplx-space-sandbox-grpc = { workspace = true }
+pplx-space-credmgr-client = { workspace = true }
+pplx-space-credential-injection-core = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
+pplx-space-sandbox-metrics = { workspace = true }
+pplx-space-observability = { workspace = true, default-features = false }
+pplx-space-net-gateway-client = { workspace = true }
+pplx-space-spaced-common = { workspace = true }
+pplx-space-uds-peer-auth = { workspace = true }
+pplx-space-unix-socket-bind = { workspace = true }
+
+[dev-dependencies]
+pplx-space-test-env.workspace = true
+prost = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+rcgen = { workspace = true, features = ["aws_lc_rs", "x509-parser", "pem"] }
+rstest = { workspace = true }
+tempfile = { workspace = true }
+insta = { workspace = true }
+nix = { workspace = true, features = ["net"] }
+pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
+pplx-space-observability = { workspace = true, features = ["test-capture"] }
+# Devbox validation (`#[ignore]`d): capture the proxy's real tracing output to
+# assert the SNI was extracted end-to-end through `tcp_proxy::run`.
+tracing-subscriber = { workspace = true }

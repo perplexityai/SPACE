@@ -30,6 +30,9 @@ log_init() {
 # fields and trace IDs as the node services' pod logs. The per-sandbox
 # net-gateway and spaced-host it launches share its journal stream and set
 # their own format. A SPACE_LOG_FORMAT in space.env still takes precedence.
+# The supervisor shares the node-critical pods' OOM score. Every sandbox
+# process it launches sets its own score to 1000 before exec, so the
+# supervisor's protection is never inherited by a VM or sidecar.
 render_runtime_supervisor_unit() {
   cat <<'EOF'
 [Unit]
@@ -46,6 +49,7 @@ ExecStart=/space/bin/space-runtime-supervisor-svc
 Restart=always
 RestartSec=1
 KillMode=process
+OOMScoreAdjust=-997
 Delegate=yes
 TasksMax=infinity
 CPUWeight=1000

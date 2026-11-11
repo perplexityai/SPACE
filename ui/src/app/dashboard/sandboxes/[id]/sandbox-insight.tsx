@@ -59,6 +59,9 @@ function SectionError({ error, what }: { error: string | null; what?: string }) 
 export interface DebugView {
   debug: SandboxDebug | null;
   error: string | null;
+  // The inventory generation the read that produced this view started in
+  // (`observePeriodic`), or null before the first.
+  generation: number | null;
 }
 
 function sectionState(view: DebugView, section: DebugSection<unknown> | undefined) {
@@ -334,7 +337,7 @@ export function QuarantineCard({ view, nowMs }: { view: DebugView; nowMs: number
 }
 
 // `LIMIT 200` in the debug route's timeline source
-// (`crates/libs/api/src/routes/debug/sources/timeline.rs`).
+// (`crates/l40_api/api/src/routes/debug/sources/timeline.rs`).
 const TIMELINE_CAP = 200;
 
 const TIMELINE_COLORS: Record<string, string> = {

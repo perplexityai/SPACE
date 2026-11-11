@@ -31,6 +31,10 @@ jobs:
       contents: read
       packages: read
       pull-requests: read
+    # Each check skips when the change touches nothing it reads
+    # (ci/check-scopes/README.md).
+    with:
+      scope_base: ${{ github.event.pull_request.base.sha }}
 
   common:
     if: github.repository == 'perplexityai/SPACE'
@@ -40,6 +44,7 @@ jobs:
       packages: read
     with:
       base_sha: ${{ github.event.pull_request.base.sha }}
+      scope_base: ${{ github.event.pull_request.base.sha }}
 
   # The Kind smoke runs only when the PR changes a path it exercises
   # (ci/kind-pull-paths.txt). Selecting it here rather than with a workflow

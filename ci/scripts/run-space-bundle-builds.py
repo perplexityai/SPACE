@@ -180,8 +180,8 @@ RUST_ARTIFACT_COMMON_INPUTS = (
     Path("docker/Dockerfile.rust-build-common"),
     Path("docker/run-cargo-with-sccache.sh"),
     Path("infra/space/identity/node-identities.sh"),
-    # Embedded under common-svc's migration-checksums feature, which feature
-    # unification across all members turns on in every lane.
+    # Embedded by pplx-space-migration-checksums, which pplx-space-sqlite and
+    # pplx-space-db-migrate depend on.
     Path("db/accepted-checksums.toml"),
 )
 RUST_ARTIFACT_TEMPLATE_RECIPES = (
@@ -1963,6 +1963,13 @@ class BundleBuilder:
                 rust_build_image = self.local_rust_build_image(feature)
             command.extend(["--build-arg", f"SPACE_RUST_BUILD_IMAGE={rust_build_image}"])
             command.extend(["--build-arg", f"SPACE_GIT_SHA={self.build_git_sha()}"])
+            if feature == "worker" and re.fullmatch(r"[0-9a-f]{40,64}", self.build_git_sha()):
+                source_epoch = run(
+                    ["git", "show", "-s", "--format=%ct", self.build_git_sha()],
+                    capture=True, cwd=REPO_ROOT,
+                ).stdout.strip()
+                source_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(source_epoch)))
+                command.extend(["--build-arg", f"SPACE_BUILD_TIME={source_time}"])
 
         self.maybe_append_cache_import(command, feature, "image")
         self.maybe_append_cache_export(command, feature, "image", targets=targets[:1])

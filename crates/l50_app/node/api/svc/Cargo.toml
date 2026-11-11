@@ -1,0 +1,44 @@
+[package]
+name = "pplx-space-node-api-svc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "space-node-api-svc"
+path = "src/main.rs"
+
+[features]
+default = []
+# Opt-in Kubernetes projected-token (TokenReview) auth, which pulls in the kube
+# stack. Off by default so the workspace builds without kube for non-k8s
+# deployments (dev box, UTM, self-deploy); prod image builds enable it. Forwards
+# to the server's `k8s` feature, which enables `rpc-auth`'s `k8s`.
+k8s = ["pplx-space-node-api-server/k8s"]
+otel = [
+    "pplx-space-service-host/otel",
+    "pplx-space-node-api-server/otel",
+]
+datadog = [
+    "otel",
+    "pplx-space-service-host/datadog",
+    "pplx-space-node-api-server/datadog",
+]
+# Deprecated for one release; use otel and datadog.
+datadog-otel = ["otel", "datadog"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+
+# internal
+pplx-space-node-api-server = { workspace = true }
+pplx-space-service-host = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
+pplx-space-tokio-runtime = { workspace = true }

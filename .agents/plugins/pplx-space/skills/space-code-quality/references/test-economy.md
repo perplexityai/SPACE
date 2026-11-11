@@ -126,14 +126,14 @@ Variant sweeps belong in **one** test, and the gold shape is the one the
 compiler enforces: an exhaustive `match` over the enum, so adding a variant
 fails the build until the test covers it. A hand-written cases table
 (`decision_table_covers_every_verdict` in
-`crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/classify/tests.rs`
+`crates/l40_api/cluster/controller/server/src/transient_lifecycle_sweeper/classify/tests.rs`
 is the in-tree shape) gets the one-test structure right but cannot falsify
 its own name — pair it with an exhaustive `match` or iterator over the
 variant set, or its coverage claim is aspirational. Either way, enumerate
 **all** of the enum — a hand-picked subset reads as coverage and isn't.
 Live example of the failure mode:
 `requested_create_reuses_only_stable_sandbox_states`
-(`crates/libs/sbx/mgr/server/src/service/tests.rs`), which as of 2026-08
+(`crates/l40_api/sbx/mgr/server/src/service/tests.rs`), which as of 2026-08
 covered 17 of 18 `SandboxState` variants; the missing `Quarantined` arm
 sat invisible for weeks precisely because the test looked exhaustive.
 

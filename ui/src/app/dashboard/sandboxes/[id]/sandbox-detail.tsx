@@ -19,6 +19,9 @@ import {
   theme,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
+import type { Terminal as XtermTerminal } from '@xterm/xterm';
+import type { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
 import {
   ArrowLeftOutlined,
   CameraOutlined,
@@ -35,7 +38,6 @@ import {
   RightOutlined,
   RollbackOutlined,
   SaveOutlined,
-  SendOutlined,
   StopOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
@@ -46,6 +48,23 @@ import {
   type TerminalConnection,
   type TerminalSessionEvent,
 } from '@/lib/data-plane-terminal';
+import {
+  binaryStringToBytes,
+  debounce,
+  isMacPlatform,
+  keepCurrentConnection,
+  shouldEndSessionOnDisable,
+  TERMINAL_ENV,
+  TERMINAL_RESIZE_DEBOUNCE_MS,
+  TERMINAL_SHELL_COMMAND,
+  TerminalInputGate,
+  terminalEventText,
+  terminalKeyAction,
+  terminalLinkUrl,
+  terminalNotice,
+  type TerminalInput,
+} from '@/lib/terminal-pane';
+import { terminalColors } from '@/lib/curiosity-theme';
 import { isHiddenOperationError } from '@/lib/hidden-operations';
 import {
   forceConsoleSandboxAction,
@@ -57,6 +76,7 @@ import {
   getSandboxOperations,
   type AdminOperationRecord,
   publicTemplateToConsoleTemplate,
+  SANDBOX_READ_TIMEOUT_MS,
   updateConsoleSandbox,
   waitForAdminOperation,
 } from '@/lib/public-api';
@@ -70,10 +90,15 @@ import type {
 import { tablePagination } from '@/lib/table-pagination';
 import { useAuth } from '@/lib/auth';
 import { isOwnOrg } from '@/lib/own-org';
+import { serialReads, withTimeout } from '@/lib/serial-reads';
 import { listsSnapshotsOn } from '@/lib/admin-fallback';
 import { RollbackButton, RollbackRefusalNote, useSnapshotRollback, type SnapshotRollback } from '@/components/snapshot-rollback';
 import { rollbackRoute, rollbackTargets, snapshotTimeMs, type RollbackTarget } from '@/lib/rollback-targets';
 import { formatAge, formatBytes, sectionData, sectionError, snapshotKey, snapshotStorageById, snapshotStorageLabel, type DebugSnapshot } from '@/lib/sandbox-debug';
+import {
+  CATALOG_NOTE, CATALOG_TITLE, NODE_NOTE, RECORDS_NOTE, catalogEmptyText, currentInventory, nodeEmptyText, nodeListing, observePeriodic,
+  type InventoryGeneration, type NodeListing,
+} from '@/lib/snapshot-catalog';
 import { OperationsCard, OrgLink, PlacementCard, QuarantineCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
 import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
@@ -127,7 +152,9 @@ function datadogTimeWindowParams(createdAt: string | null): DatadogTimeWindowPar
   };
 }
 
-function datadogLogsUrl(sandbox: Sandbox, timeWindowParams: DatadogTimeWindowParams): string {
+// The configured Datadog Logs explorer URL with the sandbox's query and time
+// window; the configured URL's other parameters are kept.
+function datadogLogsUrl(sandbox: Sandbox, timeWindowParams: DatadogTimeWindowParams, logsUrl: string): string {
   const sandboxUuid = sandboxUuidPart(sandbox.id);
   const sandboxPodName = `space-sbx-${sandboxIdWithoutDashes(sandbox.id)}-*`;
   const params = new URLSearchParams({
@@ -145,7 +172,9 @@ function datadogLogsUrl(sandbox: Sandbox, timeWindowParams: DatadogTimeWindowPar
     ...timeWindowParams,
   });
 
-  return `https://app.datadoghq.com/logs?${params.toString()}`;
+  const url = new URL(logsUrl);
+  params.forEach((value, key) => url.searchParams.set(key, value));
+  return url.toString();
 }
 
 function datadogDebugDashboardUrl(
@@ -345,11 +374,14 @@ function CollapsibleCard({
   extra,
   children,
   defaultOpen = true,
+  keepMounted = false,
 }: {
   title: React.ReactNode;
   extra?: React.ReactNode;
   children: React.ReactNode;
   defaultOpen?: boolean;
+  // Hide the collapsed body instead of unmounting it.
+  keepMounted?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
@@ -368,7 +400,7 @@ function CollapsibleCard({
       )}
       extra={extra}
     >
-      {open ? children : null}
+      {keepMounted ? <div hidden={!open}>{children}</div> : (open ? children : null)}
     </Card>
   );
 }
@@ -384,17 +416,19 @@ function snapshotCodec(type: string): { label: string; color: string } {
 
 // When no snapshot API serves the sandbox (snapshot operations not enabled for
 // the operator's organization, or another organization's sandbox on a release
-// without the admin snapshot list), list the catalog snapshots the admin debug
-// route reports.
+// without the admin snapshot list), list every snapshot record the admin
+// debug route reports, which the snapshot lists filter (`RECORDS_NOTE`).
 function AdminSnapshotsTable({
   snapshots,
   error,
   pending,
+  nodeListing,
   nowMs,
 }: {
   snapshots: DebugSnapshot[];
   error: string | null;
   pending: boolean;
+  nodeListing: NodeListing;
   nowMs: number;
 }) {
   const { token } = theme.useToken();
@@ -423,7 +457,7 @@ function AdminSnapshotsTable({
       size="small"
       pagination={tablePagination('snapshots', 10)}
       loading={pending}
-      locale={{ emptyText: error ? 'Could not load snapshots' : 'No snapshots' }}
+      locale={{ emptyText: catalogEmptyText(!!error, nodeListing, 'records') }}
       footer={() =>
         snapshots.length === 0 ? null : (
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: token.colorTextSecondary }}>
@@ -436,28 +470,28 @@ function AdminSnapshotsTable({
   );
 }
 
-// The snapshots the sandbox's node keeps, from the debug view the page
+// The snapshots the sandbox's node reports keeping, from the debug view the page
 // already reads on its cadence (no read of its own, and no audit event), with
 // Rollback: the node rolls back only to one of these names
 // (`rollbackTargets`). Each catalog row above is a `snap_` ID the node does
 // not know.
 function NodeSnapshotsTable({
   debugView,
-  sandboxStatus,
+  targets,
+  listing,
   route,
   rollback,
   nowMs,
 }: {
   debugView: DebugView;
-  sandboxStatus: string | null;
+  targets: RollbackTarget[];
+  listing: NodeListing;
   route: ReturnType<typeof rollbackRoute>;
   rollback: SnapshotRollback;
   nowMs: number;
 }) {
   const debug = debugView.debug;
-  const section = sectionData(debug?.snapshots);
   const error = debugView.error ?? (debug ? sectionError(debug.snapshots) : null);
-  const targets = rollbackTargets(section?.inventory ?? [], sandboxStatus);
   const columns: ColumnsType<RollbackTarget> = [
     { title: 'Name', key: 'name', ellipsis: true, render: (_, target) => <Text code copyable={{ text: target.snapshotName }}>{target.snapshotName}</Text> },
     {
@@ -488,7 +522,7 @@ function NodeSnapshotsTable({
       <Space size={8} wrap style={{ marginBottom: 8 }}>
         <Text strong>On the node</Text>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          Rollback restores one of the snapshots the sandbox&apos;s node keeps.
+          {NODE_NOTE}
         </Text>
         <RollbackRefusalNote state={rollback} />
       </Space>
@@ -502,7 +536,7 @@ function NodeSnapshotsTable({
         size="small"
         pagination={tablePagination('node-snapshots', 10)}
         loading={!debug && !debugView.error}
-        locale={{ emptyText: error ? "Could not load the node's snapshots" : 'The node keeps no snapshots for this sandbox' }}
+        locale={{ emptyText: nodeEmptyText(!!error, listing) }}
       />
     </div>
   );
@@ -512,6 +546,8 @@ function SnapshotsCard({
   sandboxId,
   orgId,
   sandboxStatus,
+  periodicSnapshots,
+  inventoryGeneration,
   ownOrg,
   debugView,
   onRollbackSettled,
@@ -521,6 +557,12 @@ function SnapshotsCard({
   sandboxId: string;
   orgId: string | null;
   sandboxStatus: string | null;
+  // Whether the node runs the sandbox with periodic snapshots on (its
+  // observed `snapshots_enabled`), or null when the API does not say.
+  periodicSnapshots: boolean | null;
+  // The inventory generation `periodicSnapshots` was observed in: a debug
+  // view read in an older one shows no node rows (`currentInventory`).
+  inventoryGeneration: number;
   // `isOwnOrg`: the operator's own organization lists through the public
   // routes; another lists through the admin list (see `listSnapshots`).
   ownOrg: boolean;
@@ -624,8 +666,22 @@ function SnapshotsCard({
   // listing is display-only.
   const route = rollbackRoute(ownOrg, adminList);
   const rollback = useSnapshotRollback({ sandboxId, orgId, via: route.via, onSettled: onRollbackSettled });
+  // The node's list, which the empty catalog points at. An inventory the
+  // debug view does not carry is unknown, not empty, and so is one read in an
+  // older generation than the periodic state shown; the page reads it again
+  // as soon as that state changes. An unknown inventory shows no rows, so it
+  // offers no Rollback either.
+  const inventory = currentInventory(sectionData(debug?.snapshots), debugView.generation, inventoryGeneration);
+  const targets = inventory ? rollbackTargets(inventory, sandboxStatus) : [];
+  const listing = nodeListing(inventory ? targets.length : null, periodicSnapshots);
   const nodeSnapshots = (
-    <NodeSnapshotsTable debugView={debugView} sandboxStatus={sandboxStatus} route={route} rollback={rollback} nowMs={nowMs} />
+    <NodeSnapshotsTable debugView={debugView} targets={targets} listing={listing} route={route} rollback={rollback} nowMs={nowMs} />
+  );
+  const catalogHeader = (note: string) => (
+    <Space size={8} wrap style={{ marginBottom: 8 }}>
+      <Text strong>{CATALOG_TITLE}</Text>
+      <Text type="secondary" style={{ fontSize: 12 }}>{note}</Text>
+    </Space>
   );
   // Refresh and Retry. In a view that showed the control plane's records
   // instead (no listing yet, or a release without the admin list), the
@@ -649,6 +705,7 @@ function SnapshotsCard({
         return <Tag color={codec.color}>{codec.label}</Tag>;
       },
     },
+    { title: 'State', dataIndex: 'state', width: 100, render: (v: string) => <Tag color={v === 'ready' ? 'green' : v === 'failed' ? 'red' : 'default'}>{v}</Tag> },
     { title: 'Timestamp', dataIndex: 'timestamp', width: 200, render: (v: string | null) => v ?? '—' },
     { title: 'Size', dataIndex: 'size_bytes', width: 100, render: (v: number) => formatBytes(v) },
     {
@@ -690,7 +747,8 @@ function SnapshotsCard({
         {adminError ? (
           <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not load the control plane's snapshot records: ${adminError}`} />
         ) : null}
-        <AdminSnapshotsTable snapshots={adminSnapshots} error={adminError} pending={!debug && !debugView.error} nowMs={nowMs} />
+        {catalogHeader(RECORDS_NOTE)}
+        <AdminSnapshotsTable snapshots={adminSnapshots} error={adminError} pending={!debug && !debugView.error} nodeListing={listing} nowMs={nowMs} />
         {nodeSnapshots}
       </Card>
     );
@@ -720,6 +778,7 @@ function SnapshotsCard({
           action={<Button size="small" onClick={relist}>Retry</Button>}
         />
       ) : null}
+      {catalogHeader(CATALOG_NOTE)}
       <Table
         columns={columns}
         dataSource={snapshots}
@@ -727,7 +786,7 @@ function SnapshotsCard({
         loading={loading}
         size="small"
         pagination={tablePagination('snapshots', 10)}
-        locale={{ emptyText: 'No snapshots' }}
+        locale={{ emptyText: catalogEmptyText(false, listing) }}
         footer={() =>
           snapshots.length === 0 ? null : (
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: token.colorTextSecondary }}>
@@ -855,111 +914,227 @@ function ExecCard({ sandbox }: { sandbox: Sandbox }) {
 
 type TerminalStatus = 'disconnected' | 'connecting' | 'attached' | 'closed' | 'error';
 
-type TerminalLine = {
-  id: number;
-  stream: 'stdout' | 'stderr' | 'system';
-  text: string;
+type TerminalView = {
+  term: XtermTerminal;
+  fit: FitAddon;
 };
+
+// Fits the terminal to its pane. A collapsed card's pane has no size, so the
+// terminal keeps its last one.
+function fitTerminal(view: TerminalView) {
+  const proposed = view.fit.proposeDimensions();
+  if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) return;
+  if (proposed.cols < 2 || proposed.rows < 1) return;
+  if (proposed.cols === view.term.cols && proposed.rows === view.term.rows) return;
+  view.term.resize(proposed.cols, proposed.rows);
+}
+
+// Without the async clipboard (an insecure origin, or a refusal), a copy
+// command carries the text instead.
+function copyText(text: string) {
+  const legacy = () => {
+    const onCopy = (event: ClipboardEvent) => {
+      event.clipboardData?.setData('text/plain', text);
+      event.preventDefault();
+    };
+    document.addEventListener('copy', onCopy, { capture: true, once: true });
+    try {
+      document.execCommand('copy');
+    } finally {
+      document.removeEventListener('copy', onCopy, { capture: true });
+    }
+  };
+  if (window.isSecureContext && navigator.clipboard) {
+    navigator.clipboard.writeText(text).catch(legacy);
+  } else {
+    legacy();
+  }
+}
+
+// Sandbox output is untrusted: only an http(s) link opens, in a new tab that
+// gets neither this page as its opener nor its URL as the referrer.
+function openTerminalLink(text: string) {
+  const url = terminalLinkUrl(text);
+  if (url) window.open(url, '_blank', 'noopener,noreferrer');
+}
 
 function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }) {
   const { token } = theme.useToken();
   const [status, setStatus] = useState<TerminalStatus>('disconnected');
-  const [input, setInput] = useState('');
-  const [lines, setLines] = useState<TerminalLine[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [view, setView] = useState<TerminalView | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const connectionRef = useRef<TerminalConnection | null>(null);
-  const lineIdRef = useRef(0);
-  const outputRef = useRef<HTMLPreElement | null>(null);
+  // The data plane takes input and resizes once the shell has started; what
+  // is typed before then is held and sent in order.
+  const gateRef = useRef(new TerminalInputGate());
+  // Each Connect starts a generation; a superseded session's late events and
+  // connection are dropped.
+  const generationRef = useRef(0);
+  const paneRef = useRef<HTMLDivElement | null>(null);
   const enabled = sandbox.status === 'started' || sandbox.status === 'running';
   const versionStatus = terminalVersionStatus(sandbox);
   const terminalEnabled = enabled && versionStatus.supported;
   const connecting = status === 'connecting';
-  const attached = status === 'attached';
-  const active = connecting || attached;
+  const active = connecting || status === 'attached';
 
-  const appendLine = (stream: TerminalLine['stream'], text: string) => {
-    if (!text) return;
-    lineIdRef.current += 1;
-    const line = { id: lineIdRef.current, stream, text };
-    setLines((current) => [...current.slice(-400), line]);
+  const endSession = () => {
+    generationRef.current += 1;
+    gateRef.current.close();
+    connectionRef.current?.close();
+    connectionRef.current = null;
   };
 
-  const handleTerminalEvent = (event: TerminalSessionEvent) => {
+  useEffect(() => {
+    const pane = paneRef.current;
+    if (!pane) return;
+    let disposed = false;
+    const disposers: Array<() => void> = [];
+    const disposeAll = () => {
+      for (const dispose of disposers.splice(0).reverse()) dispose();
+    };
+    void (async () => {
+      try {
+        // xterm touches the DOM as it loads, so it is imported in the browser only.
+        const [{ Terminal }, { FitAddon }, { WebLinksAddon }] = await Promise.all([
+          import('@xterm/xterm'),
+          import('@xterm/addon-fit'),
+          import('@xterm/addon-web-links'),
+        ]);
+        if (disposed) return;
+        const term = new Terminal({
+          cursorBlink: true,
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+          fontSize: 13,
+          scrollback: 5000,
+          theme: terminalColors,
+          // OSC 8 hyperlinks open as the addon's plain-text links do.
+          linkHandler: { activate: (_event, text) => openTerminalLink(text) },
+        });
+        disposers.push(() => term.dispose());
+        const fit = new FitAddon();
+        term.loadAddon(fit);
+        term.loadAddon(new WebLinksAddon((_event, uri) => openTerminalLink(uri)));
+        const mac = isMacPlatform(navigator.platform || navigator.userAgent);
+        term.attachCustomKeyEventHandler((event) => {
+          const action = terminalKeyAction(event, term.hasSelection(), mac);
+          if (action === 'terminal') return true;
+          if (event.type === 'keydown' && action !== 'paste') {
+            // A copy chord with nothing selected still must not reach the
+            // browser, where Ctrl+Shift+C opens the DevTools picker.
+            event.preventDefault();
+            if (action === 'copy') {
+              copyText(term.getSelection());
+              term.clearSelection();
+            }
+          }
+          return false;
+        });
+        term.open(pane);
+        const next = { term, fit };
+        fitTerminal(next);
+        term.write('\x1b[2mConnect to open an interactive shell.\x1b[22m\r\n');
+        const send = (input: TerminalInput) => {
+          const now = gateRef.current.write(input);
+          if (now === 'discarded') term.write(terminalNotice('input typed before the shell started was discarded'));
+          else if (now) connectionRef.current?.sendInput(now.data);
+        };
+        term.onData((data) => send({ kind: 'text', data }));
+        term.onBinary((data) => send({ kind: 'bytes', data: binaryStringToBytes(data) }));
+        term.onResize(({ cols, rows }) => {
+          if (gateRef.current.started) connectionRef.current?.resize(cols, rows);
+        });
+        const refit = debounce(() => fitTerminal(next), TERMINAL_RESIZE_DEBOUNCE_MS);
+        const observer = new ResizeObserver(() => refit.schedule());
+        observer.observe(pane);
+        disposers.push(() => refit.cancel(), () => observer.disconnect());
+        setView(next);
+      } catch (err: any) {
+        disposeAll();
+        pane.replaceChildren();
+        if (!disposed) setLoadError(err?.message || String(err));
+      }
+    })();
+    return () => {
+      disposed = true;
+      endSession();
+      disposeAll();
+    };
+  }, [loadAttempt]);
+
+  useEffect(() => {
+    if (shouldEndSessionOnDisable(terminalEnabled, connectionRef.current !== null, connecting)) {
+      endSession();
+      setStatus('closed');
+    }
+  }, [terminalEnabled]);
+
+  const handleTerminalEvent = (generation: number, event: TerminalSessionEvent) => {
+    if (generation !== generationRef.current || !view) return;
+    const text = terminalEventText(event);
+    if (text) view.term.write(text);
     switch (event.type) {
       case 'status':
-        setStatus(event.status === 'closed' ? 'closed' : event.status);
-        if (event.message) appendLine('system', `\n[${event.message}]\n`);
+        setStatus(event.status);
+        if (event.status === 'attached') view.term.focus();
+        if (event.status === 'closed') endSession();
         break;
       case 'started':
-        appendLine('system', `[process ${event.processId}${event.pid ? ` pid ${event.pid}` : ''}]\n`);
-        break;
-      case 'output':
-        appendLine(event.stream, event.text);
-        break;
-      case 'accepted':
+        // The pane may have changed size while the session opened.
+        fitTerminal(view);
+        connectionRef.current?.resize(view.term.cols, view.term.rows);
+        for (const input of gateRef.current.start()) connectionRef.current?.sendInput(input.data);
         break;
       case 'exited':
-        appendLine('system', `\n[process exited: ${event.status} ${event.exitCode}]\n`);
+        endSession();
         setStatus('closed');
-        connectionRef.current = null;
-        break;
-      case 'reconnecting':
-        appendLine('system', `\n[${event.message}]\n`);
         break;
       case 'error':
-        appendLine('system', `\n[error: ${event.message}]\n`);
         setStatus('error');
         break;
     }
   };
 
-  useEffect(() => {
-    outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight });
-  }, [lines]);
-
-  useEffect(() => {
-    if (!terminalEnabled && connectionRef.current) {
-      connectionRef.current.close();
-      connectionRef.current = null;
-      setStatus('closed');
-    }
-  }, [terminalEnabled]);
-
-  useEffect(() => () => {
-    connectionRef.current?.close();
-    connectionRef.current = null;
-  }, []);
-
   const connect = async () => {
-    if (!terminalEnabled || active) return;
+    if (!terminalEnabled || active || !view) return;
+    // A session left open by a retryable error is replaced, not leaked.
+    endSession();
+    const generation = generationRef.current;
+    gateRef.current.open();
     setStatus('connecting');
-    setLines([]);
     setSessionId(null);
+    view.term.reset();
+    fitTerminal(view);
+    view.term.focus();
     try {
-      const connection = await openSandboxTerminal(sandbox.id, handleTerminalEvent, {
-        cols: 100,
-        rows: 30,
-        ownOrg,
-      });
-      connectionRef.current = connection;
-      setSessionId(connection.sessionId);
+      const connection = await openSandboxTerminal(
+        sandbox.id,
+        (event) => handleTerminalEvent(generation, event),
+        {
+          cols: view.term.cols,
+          rows: view.term.rows,
+          command: TERMINAL_SHELL_COMMAND,
+          env: TERMINAL_ENV,
+          ownOrg,
+        },
+      );
+      const current = keepCurrentConnection(connection, generation, generationRef.current);
+      if (!current) return;
+      connectionRef.current = current;
+      setSessionId(current.sessionId);
     } catch (err: any) {
+      if (generation !== generationRef.current) return;
+      endSession();
       setStatus('error');
-      appendLine('system', `[error: ${err.message || 'failed to open terminal'}]\n`);
+      view.term.write(terminalNotice(`error: ${err.message || 'failed to open terminal'}`));
     }
   };
 
   const disconnect = () => {
-    connectionRef.current?.close();
-    connectionRef.current = null;
+    endSession();
     setStatus('closed');
-  };
-
-  const sendInput = () => {
-    const connection = connectionRef.current;
-    if (!connection || !input) return;
-    connection.sendInput(`${input}\n`);
-    setInput('');
+    view?.term.write(terminalNotice('disconnected'));
   };
 
   const shortSessionId = sessionId && sessionId.length > 24
@@ -973,6 +1148,8 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
 
   return (
     <CollapsibleCard
+      // The emulator and its session survive a collapse.
+      keepMounted
       title={<Space><DesktopOutlined /> Terminal</Space>}
       extra={(
         <Space>
@@ -980,8 +1157,11 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
           <Button
             size="small"
             icon={<ClearOutlined />}
-            onClick={() => setLines([])}
-            disabled={lines.length === 0}
+            onClick={() => {
+              view?.term.clear();
+              view?.term.focus();
+            }}
+            disabled={!view}
           >
             Clear
           </Button>
@@ -1000,7 +1180,7 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
               type="primary"
               icon={<PlayCircleOutlined />}
               onClick={connect}
-              disabled={!terminalEnabled}
+              disabled={!terminalEnabled || !view}
             >
               Connect
             </Button>
@@ -1023,61 +1203,34 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
               )}
             />
           ) : null}
-          <pre
-            ref={outputRef}
-            style={{
-              background: '#101418',
-              color: '#e6edf3',
-              border: '1px solid rgba(255,255,255,0.08)',
-              borderRadius: 4,
-              fontSize: 12,
-              lineHeight: 1.5,
-              minHeight: 260,
-              maxHeight: 420,
-              overflow: 'auto',
-              padding: 12,
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-word',
-            }}
-          >
-            {lines.length === 0 ? 'Connect to open an interactive shell.\n' : lines.map((line) => (
-              <span
-                key={line.id}
-                style={{
-                  color: line.stream === 'stderr'
-                    ? '#ffb4a8'
-                    : line.stream === 'system'
-                      ? '#8ab4f8'
-                      : '#e6edf3',
-                }}
-              >
-                {line.text}
-              </span>
-            ))}
-          </pre>
-          <Space.Compact block>
-            <Space.Addon>$</Space.Addon>
-            <Input
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onPressEnter={(event) => {
-                event.preventDefault();
-                sendInput();
-              }}
-              disabled={!attached || !terminalEnabled}
-              placeholder="Type shell input and press Enter"
-              suffix={(
+          {loadError ? (
+            <Alert
+              type="error"
+              showIcon
+              title={`The terminal could not load: ${loadError}`}
+              action={(
                 <Button
-                  type="text"
                   size="small"
-                  icon={<SendOutlined />}
-                  disabled={!attached || !terminalEnabled || !input}
-                  onClick={sendInput}
-                  aria-label="Send terminal input"
-                />
+                  onClick={() => {
+                    setLoadError(null);
+                    setLoadAttempt((attempt) => attempt + 1);
+                  }}
+                >
+                  Retry
+                </Button>
               )}
             />
-          </Space.Compact>
+          ) : null}
+          <div
+            style={{
+              background: terminalColors.background,
+              border: `1px solid ${token.colorBorder}`,
+              borderRadius: token.borderRadiusSM,
+              padding: 8,
+            }}
+          >
+            <div ref={paneRef} style={{ height: 420 }} />
+          </div>
         </Space>
         {!versionStatus.supported ? (
           <div
@@ -1206,7 +1359,7 @@ function ControlButtons({ sandbox, onAction, busy }: {
   );
 }
 
-export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: string | null }) {
+export default function SandboxDetailPage({ dashboardUrl, logsUrl }: { dashboardUrl: string | null; logsUrl: string | null }) {
   const { message } = App.useApp();
   const params = useParams<{ id: string }>();
   const router = useRouter();
@@ -1220,7 +1373,12 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const [editingNetwork, setEditingNetwork] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [errorStatus, setErrorStatus] = useState<number | null>(null);
-  const [debugView, setDebugView] = useState<DebugView>({ debug: null, error: null });
+  const [debugView, setDebugView] = useState<DebugView>({ debug: null, error: null, generation: null });
+  // The periodic state last observed and the node inventory's generation,
+  // which each change of that state bumps. The ref is what a debug read starts
+  // in; the state is what renders.
+  const periodicRef = useRef<InventoryGeneration | null>(null);
+  const [periodic, setPeriodic] = useState<InventoryGeneration | null>(null);
   const debug = debugView.debug;
   const [operations, setOperations] = useState<AdminOperationRecord[]>([]);
   const [operationsMore, setOperationsMore] = useState(false);
@@ -1230,6 +1388,9 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const [insightGeneration, setInsightGeneration] = useState(0);
   // Only the newest insight request may write its answers.
   const insightRequest = useRef(0);
+  // Sandbox reads run one at a time, so an older answer never lands after a
+  // newer one.
+  const sandboxReads = useRef(serialReads()).current;
   const [nowMs, setNowMs] = useState(() => Date.now());
   const sandboxRef = useRef<Sandbox | null>(null);
   sandboxRef.current = sandbox;
@@ -1244,11 +1405,12 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
     const target = safeDecodeURIComponent(id);
     setNowMs(Date.now());
     setInsightGeneration((n) => n + 1);
+    const generation = periodicRef.current?.generation ?? 0;
     await Promise.all([
       withDebug
         ? getSandboxDebug(target)
-            .then((loaded) => { if (current()) setDebugView({ debug: loaded, error: null }); })
-            .catch((err: any) => { if (current()) setDebugView({ debug: null, error: err.message || 'failed to load debug data' }); })
+            .then((loaded) => { if (current()) setDebugView({ debug: loaded, error: null, generation }); })
+            .catch((err: any) => { if (current()) setDebugView({ debug: null, error: err.message || 'failed to load debug data', generation }); })
         : null,
       getSandboxOperations(target, { orgId: sandboxRef.current?.org_id ?? null })
         .then(({ operations: ops, more }) => {
@@ -1269,15 +1431,24 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
     }
   };
 
-  const refresh = async (showSpinner = false): Promise<boolean> => {
-    if (showSpinner) setLoading(true);
+  // Reads the sandbox row and writes what it found; true when it found it.
+  const readSandbox = async (showSpinner: boolean): Promise<boolean> => {
     try {
-      const loaded = await getConsoleSandbox(safeDecodeURIComponent(id));
+      // A read with no answer fails, so it cannot hold the serialized reads.
+      const target = safeDecodeURIComponent(id);
+      const loaded = await withTimeout(SANDBOX_READ_TIMEOUT_MS, (signal) => getConsoleSandbox(target, signal));
       // The insight reads that follow use the org before the next render.
       sandboxRef.current = loaded;
       setSandbox(loaded);
       setError(null);
       setErrorStatus(null);
+      // A change of the periodic state makes the node inventory unknown until
+      // a debug read started after it lands, so start one now.
+      const prev = periodicRef.current;
+      const next = observePeriodic(prev, loaded.snapshots_enabled ?? null);
+      periodicRef.current = next;
+      setPeriodic(next);
+      if (prev && next !== prev) void loadInsight(true);
       return true;
     } catch (err: any) {
       const status = typeof err?.status === 'number' ? err.status : null;
@@ -1295,6 +1466,13 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
     } finally {
       if (showSpinner) setLoading(false);
     }
+  };
+
+  // Refresh, and the read after an action: once a pending read finishes, so
+  // it still sees what the action changed.
+  const refresh = (showSpinner = false): Promise<boolean> => {
+    if (showSpinner) setLoading(true);
+    return sandboxReads.next(() => readSandbox(showSpinner));
   };
 
   useEffect(() => {
@@ -1316,8 +1494,9 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
       if (typeof document !== 'undefined' && document.hidden) return;
       // A sandbox that was missing (still being created) loads its debug and
       // operations as soon as it appears, not at the next insight tick.
+      // A tick whose read would overlap a pending one skips it.
       const wasMissing = !sandboxRef.current;
-      void refresh(false).then((found) => {
+      void sandboxReads.poll(() => readSandbox(false))?.then((found) => {
         if (found && wasMissing) void loadInsight(true);
       });
       ticks += 1;
@@ -1477,7 +1656,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   if (!sandbox) return null;
 
   const datadogTimeWindow = datadogTimeWindowParams(sandbox.created_at);
-  const datadogLogsHref = datadogLogsUrl(sandbox, datadogTimeWindow);
+  const datadogLogsHref = logsUrl ? datadogLogsUrl(sandbox, datadogTimeWindow, logsUrl) : null;
   const datadogDashboardHref = dashboardUrl
     ? datadogDebugDashboardUrl(sandbox, datadogTimeWindow, dashboardUrl)
     : null;
@@ -1507,9 +1686,11 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
           ) : null}
           <div style={{ marginLeft: 'auto' }}>
             <Space>
-              <Button size="small" href={datadogLogsHref} target="_blank" rel="noreferrer">
-                Datadog logs
-              </Button>
+              {datadogLogsHref && (
+                <Button size="small" href={datadogLogsHref} target="_blank" rel="noreferrer">
+                  Datadog logs
+                </Button>
+              )}
               {datadogDashboardHref && (
                 <Button size="small" href={datadogDashboardHref} target="_blank" rel="noreferrer">
                   Debug Dashboard
@@ -1598,6 +1779,8 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
             sandboxId={sandbox.id}
             orgId={sandbox.org_id ?? null}
             sandboxStatus={sandbox.status}
+            periodicSnapshots={periodic?.periodic ?? null}
+            inventoryGeneration={periodic?.generation ?? 0}
             ownOrg={ownOrg}
             debugView={debugView}
             onRollbackSettled={() => { void Promise.all([refresh(false), loadInsight()]); }}

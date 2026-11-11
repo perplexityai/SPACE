@@ -1,0 +1,905 @@
+use pplx_space_common_core::types::SandboxId;
+
+use super::*;
+use pplx_space_common_core::sql;
+use pplx_space_net_common::NetworkPolicy;
+use pplx_space_sandbox_store as sandbox_store;
+
+use super::lifecycle::SandboxAction;
+
+fn proto_spaced_version(value: Option<&str>) -> Option<SemVer> {
+    let value = value?;
+    match SemVer::parse(value) {
+        Ok(version) => Some(version),
+        Err(error) => {
+            tracing::warn!(error = %error, "live sandbox info contained invalid spaced version");
+            None
+        }
+    }
+}
+
+const SANDBOX_COLUMNS: &str = "
+    s.id,
+    s.name,
+    s.user_id,
+    owner_user.email AS user_email,
+    s.org_id,
+    owner_user.owner_source AS owner_source,
+    owner_user.upstream_issuer AS upstream_issuer,
+    owner_org.upstream_org_id AS upstream_org_id,
+    owner_user.upstream_subject_id AS upstream_subject_id,
+    s.managed_by,
+    s.lifecycle,
+    s.placement,
+    COALESCE(direct_route.current_node_id, s.active_node_id) AS active_node_id,
+    COALESCE(active_direct.name, active_k8s.k8s_node_name) AS active_node_name,
+    active_node.role AS active_node_role,
+    host(active_node.address) AS active_node_address,
+    COALESCE(direct_route.substrate_kind, active_node.managed_by) AS active_node_managed_by,
+    COALESCE(active_execution.generation, direct_route.execution_generation)
+        AS active_execution_generation,
+    COALESCE(active_execution.pod_uid, direct_route.pod_uid) AS active_pod_uid,
+    COALESCE(active_execution.route_activation_id, direct_route.activation_attempt_id)
+        AS active_activation_attempt_id,
+    COALESCE(ecw_credential.epoch, 1) AS ecw_credential_epoch,
+    s.target_node_id,
+    s.placement_changed_at,
+    s.template_id,
+    s.content_hash,
+    s.vcpu,
+    s.memory_mib,
+    s.disk_mib,
+    s.disk_io_max_operations_per_sec,
+    s.disk_io_max_bandwidth_mib_per_sec,
+    s.env,
+    s.metadata,
+    s.auto_lifecycle_json AS auto_lifecycle,
+    s.auto_lifecycle_state_json AS auto_lifecycle_state,
+    s.network_policy_override_json AS network_policy,
+    s.network_policy_generation,
+    COALESCE(s.volume_encryption, FALSE) AS volume_encryption,
+    t.network_policy_json AS template_network_policy,
+    t.network_policy_generation AS template_network_policy_generation,
+    s.next_auto_event_at,
+    s.snapshots_enabled_desired,
+    s.command_ready_pending,
+    s.last_used_at,
+    s.last_access_at,
+    s.last_command_at,
+    s.created_at,
+    s.updated_at,
+    COALESCE(release_tags.tags, ARRAY[]::TEXT[]) AS release_tags
+";
+
+const SANDBOX_JOIN_TAIL: &str = "
+    JOIN users owner_user ON owner_user.id = s.user_id
+    JOIN organizations owner_org ON owner_org.id = s.org_id
+    LEFT JOIN templates t ON t.name = s.template_id
+    LEFT JOIN sandbox_direct_route_identities direct_route
+        ON direct_route.sandbox_id = s.id
+    LEFT JOIN nodes active_node
+        ON active_node.id = COALESCE(direct_route.current_node_id, s.active_node_id)
+    LEFT JOIN node_direct active_direct ON active_direct.node_id = active_node.id
+    LEFT JOIN node_k8s active_k8s ON active_k8s.node_id = active_node.id
+    LEFT JOIN sandbox_ecw_credential_epochs ecw_credential
+        ON ecw_credential.sandbox_id = s.id
+    LEFT JOIN LATERAL (
+        SELECT e.generation,
+               NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
+               e.route_activation_id
+        FROM sandbox_k8s_executions e
+        WHERE e.sandbox_id = s.id
+          AND e.active
+        ORDER BY e.generation DESC
+        LIMIT 1
+    ) active_execution ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT ARRAY_AGG(trt.tag ORDER BY trt.tag) AS tags
+        FROM template_releases tr
+        JOIN template_release_tags trt ON trt.template_release_id = tr.id
+        WHERE tr.template_name = s.template_id
+          AND tr.hash = s.content_hash
+    ) release_tags ON TRUE
+";
+
+const SANDBOX_FROM: &str = "
+    sandboxes s
+    {sandbox_join_tail}
+";
+
+fn format_age(epoch_str: &str) -> Option<String> {
+    let epoch: u64 = epoch_str.parse().ok()?;
+    Some(format_age_from_epoch(epoch))
+}
+
+fn format_age_from_epoch(epoch: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(epoch);
+    let secs = now.saturating_sub(epoch);
+
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
+fn format_age_from_time(value: time::OffsetDateTime) -> Option<String> {
+    let epoch = u64::try_from(value.unix_timestamp()).ok()?;
+    Some(format_age_from_epoch(epoch))
+}
+
+fn format_time(value: time::OffsetDateTime) -> String {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+fn epoch_time(epoch_str: &str) -> Option<time::OffsetDateTime> {
+    let epoch = epoch_str.parse().ok()?;
+    time::OffsetDateTime::from_unix_timestamp(epoch).ok()
+}
+
+fn observed_created_at(observed: &SandboxObservedState) -> Option<time::OffsetDateTime> {
+    observed
+        .observed_created_at
+        .as_deref()
+        .and_then(epoch_time)
+        .or(Some(observed.observed_at))
+}
+
+fn active_node_summary(sandbox: &Sandbox) -> Option<SandboxNodeSummary> {
+    sandbox.active_node_id.map(|id| SandboxNodeSummary {
+        id,
+        name: sandbox.active_node_name.clone(),
+        role: sandbox.active_node_role,
+        address: sandbox.active_node_address,
+        managed_by: sandbox.active_node_managed_by,
+    })
+}
+
+fn network_policy_source_name(source: i32) -> Option<String> {
+    match NetworkPolicySource::try_from(source).unwrap_or(NetworkPolicySource::Unspecified) {
+        NetworkPolicySource::Template => Some("template".to_string()),
+        NetworkPolicySource::Override => Some("override".to_string()),
+        NetworkPolicySource::Unspecified => None,
+    }
+}
+
+fn sandbox_policy_override(sandbox: &Sandbox) -> Option<NetworkPolicy> {
+    sandbox
+        .network_policy
+        .as_ref()
+        .map(|policy| policy.0.clone())
+}
+
+fn sandbox_template_policy(sandbox: &Sandbox) -> Option<NetworkPolicyV1> {
+    sandbox
+        .template_network_policy
+        .as_ref()
+        .map(|policy| policy.0.clone())
+}
+
+fn sandbox_effective_desired_policy(sandbox: &Sandbox) -> Option<NetworkPolicy> {
+    sandbox_policy_override(sandbox).or_else(|| sandbox_template_policy(sandbox))
+}
+
+fn i64_to_u64(value: i64) -> Option<u64> {
+    u64::try_from(value).ok()
+}
+
+fn sandbox_effective_network_policy_generation(sandbox: &Sandbox) -> Option<u64> {
+    if sandbox.network_policy.is_some() {
+        i64_to_u64(sandbox.network_policy_generation)
+    } else {
+        sandbox
+            .template_network_policy_generation
+            .and_then(i64_to_u64)
+            .or_else(|| i64_to_u64(sandbox.network_policy_generation))
+    }
+}
+
+fn sandbox_effective_network_policy_source(sandbox: &Sandbox) -> Option<&'static str> {
+    if sandbox.network_policy.is_some() {
+        Some("override")
+    } else if sandbox_effective_network_policy_generation(sandbox).is_some() {
+        Some("template")
+    } else {
+        None
+    }
+}
+
+pub(super) fn network_policy_status_for(
+    sandbox: Option<&Sandbox>,
+    observed: Option<&SandboxObservedState>,
+    live: Option<&SandboxInfo>,
+) -> Option<NetworkPolicyStatus> {
+    let desired_generation = sandbox.and_then(sandbox_effective_network_policy_generation);
+    let desired_source = sandbox.and_then(sandbox_effective_network_policy_source);
+    let observed_generation = observed
+        .and_then(|state| state.observed_network_policy_generation)
+        .and_then(i64_to_u64)
+        .or_else(|| {
+            live.map(|info| info.applied_network_policy_generation)
+                .filter(|generation| *generation != 0)
+        });
+    let observed_source = observed
+        .and_then(|state| state.observed_network_policy_source.clone())
+        .or_else(|| {
+            live.and_then(|info| network_policy_source_name(info.applied_network_policy_source))
+        });
+    let observed_authority = observed
+        .and_then(|state| state.observed_network_policy_authority.clone())
+        .or_else(|| {
+            live.and_then(|info| {
+                PolicyAuthority::from_optional_proto(info.network_policy_authority)
+                    .ok()
+                    .flatten()
+                    .map(|authority| authority.to_string())
+            })
+        });
+    let inherited_from_template = sandbox
+        .map(|sandbox| sandbox.network_policy.is_none())
+        .or_else(|| {
+            observed
+                .and_then(|state| state.observed_network_policy_source.as_deref())
+                .map(|source| source == "template")
+        });
+
+    if observed.is_none() && live.is_none() && desired_generation.is_none() {
+        return None;
+    }
+
+    let computed_condition = match (
+        desired_source,
+        desired_generation,
+        observed_source.as_deref(),
+        observed_generation,
+    ) {
+        (
+            Some(desired_source),
+            Some(desired_generation),
+            Some(observed_source),
+            Some(observed_generation),
+        ) if observed_source == desired_source && observed_generation == desired_generation => {
+            NetworkPolicyCondition {
+                condition_type: "Reconciled".to_string(),
+                status: "True".to_string(),
+                reason: Some("ObservedSourceAndGenerationMatch".to_string()),
+                ..NetworkPolicyCondition::default()
+            }
+        }
+        (Some(_), Some(_), Some(_), Some(_)) => NetworkPolicyCondition {
+            condition_type: "Stale".to_string(),
+            status: "True".to_string(),
+            reason: Some("ObservedSourceOrGenerationDiffers".to_string()),
+            ..NetworkPolicyCondition::default()
+        },
+        (Some(_), Some(_), None, Some(_)) => NetworkPolicyCondition {
+            condition_type: "Unknown".to_string(),
+            status: "True".to_string(),
+            reason: Some("NoObservedSource".to_string()),
+            ..NetworkPolicyCondition::default()
+        },
+        (Some(_), Some(_), _, None) => NetworkPolicyCondition {
+            condition_type: "Unknown".to_string(),
+            status: "True".to_string(),
+            reason: Some("NoObservedGeneration".to_string()),
+            ..NetworkPolicyCondition::default()
+        },
+        _ => NetworkPolicyCondition {
+            condition_type: "Unknown".to_string(),
+            status: "True".to_string(),
+            reason: Some("NoDesiredGeneration".to_string()),
+            ..NetworkPolicyCondition::default()
+        },
+    };
+    let mut conditions = vec![computed_condition];
+    if let Some(observed) = observed {
+        for condition in &observed.network_policy_conditions.0 {
+            if !conditions
+                .iter()
+                .any(|existing| existing.condition_type == condition.condition_type)
+            {
+                conditions.push(condition.clone());
+            }
+        }
+    }
+    conditions.sort_by(|left, right| left.condition_type.cmp(&right.condition_type));
+
+    Some(NetworkPolicyStatus {
+        observed_network_policy: observed
+            .and_then(|state| state.observed_network_policy.as_ref())
+            .map(|policy| policy.0.clone()),
+        observed_generation,
+        observed_source,
+        observed_authority,
+        observed_at: observed
+            .and_then(|state| state.observed_network_policy_at)
+            .map(format_time),
+        inherited_from_template,
+        source_template: sandbox.and_then(|sandbox| sandbox.template_id.clone()),
+        conditions,
+    })
+}
+
+/// Which start stamp this substrate needs. On a substrate whose start of a
+/// `suspended` row claims no `restoring` (Direct), a start of a `suspended`
+/// row cold-boots it on its node and leaves the row `suspended` until the
+/// stamp, and a Direct suspend writes no `suspending`, so every start there
+/// may write over `suspended` (see the `action_stamp` module docs). On
+/// Kubernetes a start of a `suspended` row delegates to the wake, which
+/// claims `restoring` and normally commits `started` itself, so a
+/// `suspended` the stamp finds is a newer suspend's.
+pub(super) fn start_substrate(
+    capabilities: crate::controllers::substrate::SubstrateCapabilities,
+) -> sandbox_store::action_stamp::StartSubstrate {
+    use sandbox_store::action_stamp::StartSubstrate;
+    if capabilities.start_of_suspended_claims_restoring {
+        StartSubstrate::ClaimsRestoring
+    } else {
+        StartSubstrate::LeavesSuspended
+    }
+}
+
+/// The stamp a successful run of `action` writes after its substrate call.
+/// `None` for the actions that write no result lifecycle there: start's arm
+/// already attempted its full stamp (`maybe_mark_started_after_start`), wake
+/// and restore run their own completion CAS, a suspend on a substrate whose
+/// suspend commits the lifecycle itself writes none (see
+/// `SubstrateCapabilities::suspend_commits_lifecycle`), and the rest leave
+/// the lifecycle alone.
+pub(super) fn post_action_stamp(
+    action: SandboxAction,
+    capabilities: crate::controllers::substrate::SubstrateCapabilities,
+) -> Option<sandbox_store::action_stamp::ActionStamp> {
+    use sandbox_store::action_stamp::ActionStamp;
+    match action {
+        SandboxAction::Resume => Some(ActionStamp::Resume),
+        SandboxAction::Pause => Some(ActionStamp::Pause),
+        SandboxAction::Stop | SandboxAction::Kill => Some(ActionStamp::Stop),
+        SandboxAction::Suspend => {
+            (!capabilities.suspend_commits_lifecycle).then_some(ActionStamp::Suspend)
+        }
+        SandboxAction::Start
+        | SandboxAction::Wake
+        | SandboxAction::ImplicitWake(_)
+        | SandboxAction::Restore
+        | SandboxAction::Checkpoint
+        | SandboxAction::EnableSnapshots
+        | SandboxAction::DisableSnapshots
+        | SandboxAction::Stats
+        | SandboxAction::OpenPort
+        | SandboxAction::Rollback
+        | SandboxAction::Spaced
+        | SandboxAction::Update => None,
+    }
+}
+
+/// Best-effort `sandboxes.lifecycle` write of an action's result. Called from
+/// the lifecycle action dispatcher after a substrate operation succeeds
+/// (e.g. `pause`, `stop`) to stamp the user-facing result lifecycle onto the
+/// row.
+///
+/// The stamp writes only while the row is still in one of its action's
+/// in-flight lifecycles (`ActionStamp::admits` in
+/// `pplx-space-sandbox-store`, whose `action_stamp` module docs say who owns
+/// the row when it refuses). That keeps the transient-lifecycle sweeper's
+/// `failed` (with the backing execution torn down, a stamp would resurrect
+/// the row as live while the pod is gone) and another intent's state: a
+/// delete, stop or suspend that began or finished while the substrate call
+/// was in flight, or another owner's restore claim. The `action_stamp`
+/// module docs list which stamp keeps which.
+///
+/// The `maybe_` prefix is preserved: the helper has always been
+/// best-effort (the original shape silently swallowed DB errors). A refusal
+/// is another writer winning, so it is logged and the action still succeeds
+/// rather than 5xx-ing. Long-running paths that *should* surface a CAS-loss
+/// (Restore, Wake) carry their own dedicated CAS upstream of this helper.
+pub(super) async fn maybe_update_sandbox_lifecycle(
+    pool: &PgPool,
+    id: SandboxId,
+    stamp: sandbox_store::action_stamp::ActionStamp,
+) {
+    match sandbox_store::action_stamp::stamp_action_lifecycle(pool, id, stamp).await {
+        Ok(true) => {}
+        Ok(false) => tracing::info!(
+            sandbox_id = %id,
+            lifecycle = %stamp.lifecycle(),
+            "sandbox lifecycle stamp refused: another writer owns the row"
+        ),
+        Err(err) => tracing::warn!(
+            sandbox_id = %id,
+            lifecycle = %stamp.lifecycle(),
+            error = %err,
+            "best-effort sandbox lifecycle update failed"
+        ),
+    }
+}
+
+/// Best-effort write of a successful start: `started`, `on_node`, under the
+/// same in-flight guard as [`maybe_update_sandbox_lifecycle`] with
+/// `ActionStamp::Start(substrate)`; see that function's doc.
+///
+/// It also drops a `disk` artifact pin. A disk pin names the bytes of a
+/// stopped rootfs, and a started guest can write past them, so once the start
+/// lands the pin describes nothing current; the node drops its own pin when a
+/// cold start completes (sandbox-manager's `mark_start_succeeded`). Left set,
+/// the cluster pin would outlive the next stop and make a later forced drain
+/// refuse the sandbox as an unattributable artifact on every tick. The pins
+/// this clears are the node drain's (`record_stopped_evacuation_artifact`),
+/// which a stopped re-placement's finalize keeps in place. A `full` pin is
+/// kept: this write also completes a start that restored a suspended sandbox,
+/// and the node keeps that pin across a restore (`mark_restore_succeeded`).
+pub(super) async fn maybe_mark_started_after_start(
+    pool: &PgPool,
+    id: SandboxId,
+    substrate: sandbox_store::action_stamp::StartSubstrate,
+) {
+    match sandbox_store::action_stamp::stamp_started_after_start(pool, id, substrate).await {
+        Ok(true) => {}
+        Ok(false) => tracing::info!(
+            sandbox_id = %id,
+            "post-start sandbox state stamp refused: another writer owns the row"
+        ),
+        Err(err) => tracing::warn!(
+            sandbox_id = %id,
+            error = %err,
+            "best-effort post-start sandbox state update failed"
+        ),
+    }
+}
+
+pub(super) async fn fetch_sandbox_observed_states(
+    pool: &PgPool,
+    ids: &[SandboxId],
+) -> Result<std::collections::HashMap<SandboxId, SandboxObservedState>, ControllerError> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, SandboxObservedState>(
+        sql!("SELECT sos.sandbox_id,
+                sos.node_id,
+                COALESCE(observed_direct.name, observed_k8s.k8s_node_name) AS node_name,
+                observed_node.role AS node_role,
+                observed_node.managed_by AS node_managed_by,
+                observed_direct.node_api_endpoint AS node_api_endpoint,
+                observed_k8s.k8s_node_name AS substrate_node_id,
+                COALESCE(sos.template, s.template_id, observed_template.template_name) AS template,
+                sos.status,
+                sos.spaced_version,
+                sos.pid,
+                sos.namespace,
+                sos.uptime,
+                sos.sandbox_owner,
+                sos.image_hash,
+                sos.snapshots_enabled,
+                sos.disk_usage_bytes,
+                sos.pool_template,
+                sos.failure_reason,
+                sos.observed_created_at,
+                sos.observed_at,
+                COALESCE(observed_release_tags.tags, ARRAY[]::TEXT[]) AS release_tags,
+                nfos.observed_payload AS observed_network_policy,
+                nfos.observed_generation AS observed_network_policy_generation,
+                nfos.applied_source AS observed_network_policy_source,
+                nfos.applied_authority AS observed_network_policy_authority,
+                nfos.observed_at AS observed_network_policy_at,
+                nfc.network_policy_conditions
+         FROM sandbox_observed_states sos
+         LEFT JOIN sandboxes s ON s.id = sos.sandbox_id
+         LEFT JOIN nodes observed_node ON observed_node.id = sos.node_id
+         LEFT JOIN node_direct observed_direct ON observed_direct.node_id = observed_node.id
+         LEFT JOIN node_k8s observed_k8s ON observed_k8s.node_id = observed_node.id
+         LEFT JOIN LATERAL (
+             SELECT nti.template_name
+             FROM node_template_inventory nti
+             WHERE nti.node_id = sos.node_id
+               AND sos.image_hash IS NOT NULL
+               AND nti.content_hash = sos.image_hash
+             ORDER BY nti.observed_at DESC, nti.template_name ASC
+             LIMIT 1
+         ) observed_template ON TRUE
+         LEFT JOIN LATERAL (
+             SELECT ARRAY_AGG(trt.tag ORDER BY trt.tag) AS tags
+             FROM template_releases tr
+             JOIN template_release_tags trt ON trt.template_release_id = tr.id
+             WHERE tr.template_name = COALESCE(sos.template, s.template_id, observed_template.template_name)
+               AND sos.image_hash IS NOT NULL
+               AND tr.hash = sos.image_hash
+         ) observed_release_tags ON TRUE
+         LEFT JOIN node_facet_observed_status nfos
+           ON nfos.node_id = sos.node_id
+          AND nfos.facet = $2
+          AND nfos.element = 'sandbox:' || sos.sandbox_id::text
+         LEFT JOIN LATERAL (
+             SELECT COALESCE(
+                 jsonb_agg(
+                     jsonb_build_object(
+                         'type', condition_type,
+                         'status', condition_status,
+                         'reason', reason,
+                         'message', message,
+                         'last_transition_at', last_transition_at
+                     )
+                     ORDER BY condition_type ASC
+                 ),
+                 '[]'::jsonb
+             ) AS network_policy_conditions
+             FROM node_facet_conditions
+             WHERE node_id = sos.node_id
+               AND facet = $2
+               AND element = 'sandbox:' || sos.sandbox_id::text
+         ) nfc ON TRUE
+         WHERE sos.sandbox_id = ANY($1)"),
+    )
+    .bind(ids)
+    .bind(ReconcileFacet::NetworkPolicy.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(|err| db_contention_error("query sandbox observed state", &err))?;
+    Ok(rows.into_iter().map(|row| (row.sandbox_id, row)).collect())
+}
+
+pub(super) async fn fetch_observed_only_sandboxes(
+    pool: &PgPool,
+    known_ids: &[SandboxId],
+) -> Result<Vec<SandboxObservedState>, ControllerError> {
+    sqlx::query_as::<_, SandboxObservedState>(
+        sql!("SELECT sos.sandbox_id,
+                sos.node_id,
+                COALESCE(observed_direct.name, observed_k8s.k8s_node_name) AS node_name,
+                observed_node.role AS node_role,
+                observed_node.managed_by AS node_managed_by,
+                observed_direct.node_api_endpoint AS node_api_endpoint,
+                observed_k8s.k8s_node_name AS substrate_node_id,
+                COALESCE(sos.template, s.template_id, observed_template.template_name) AS template,
+                sos.status,
+                sos.spaced_version,
+                sos.pid,
+                sos.namespace,
+                sos.uptime,
+                sos.sandbox_owner,
+                sos.image_hash,
+                sos.snapshots_enabled,
+                sos.disk_usage_bytes,
+                sos.pool_template,
+                sos.failure_reason,
+                sos.observed_created_at,
+                sos.observed_at,
+                COALESCE(observed_release_tags.tags, ARRAY[]::TEXT[]) AS release_tags,
+                nfos.observed_payload AS observed_network_policy,
+                nfos.observed_generation AS observed_network_policy_generation,
+                nfos.applied_source AS observed_network_policy_source,
+                nfos.applied_authority AS observed_network_policy_authority,
+                nfos.observed_at AS observed_network_policy_at,
+                nfc.network_policy_conditions
+         FROM sandbox_observed_states sos
+         LEFT JOIN sandboxes s ON s.id = sos.sandbox_id
+         LEFT JOIN nodes observed_node ON observed_node.id = sos.node_id
+         LEFT JOIN node_direct observed_direct ON observed_direct.node_id = observed_node.id
+         LEFT JOIN node_k8s observed_k8s ON observed_k8s.node_id = observed_node.id
+         LEFT JOIN LATERAL (
+             SELECT nti.template_name
+             FROM node_template_inventory nti
+             WHERE nti.node_id = sos.node_id
+               AND sos.image_hash IS NOT NULL
+               AND nti.content_hash = sos.image_hash
+             ORDER BY nti.observed_at DESC, nti.template_name ASC
+             LIMIT 1
+         ) observed_template ON TRUE
+         LEFT JOIN LATERAL (
+             SELECT ARRAY_AGG(trt.tag ORDER BY trt.tag) AS tags
+             FROM template_releases tr
+             JOIN template_release_tags trt ON trt.template_release_id = tr.id
+             WHERE tr.template_name = COALESCE(sos.template, s.template_id, observed_template.template_name)
+               AND sos.image_hash IS NOT NULL
+               AND tr.hash = sos.image_hash
+         ) observed_release_tags ON TRUE
+         LEFT JOIN node_facet_observed_status nfos
+           ON nfos.node_id = sos.node_id
+          AND nfos.facet = $2
+          AND nfos.element = 'sandbox:' || sos.sandbox_id::text
+         LEFT JOIN LATERAL (
+             SELECT COALESCE(
+                 jsonb_agg(
+                     jsonb_build_object(
+                         'type', condition_type,
+                         'status', condition_status,
+                         'reason', reason,
+                         'message', message,
+                         'last_transition_at', last_transition_at
+                     )
+                     ORDER BY condition_type ASC
+                 ),
+                 '[]'::jsonb
+             ) AS network_policy_conditions
+             FROM node_facet_conditions
+             WHERE node_id = sos.node_id
+               AND facet = $2
+               AND element = 'sandbox:' || sos.sandbox_id::text
+         ) nfc ON TRUE
+         WHERE s.id IS NULL
+           AND NOT (sos.sandbox_id = ANY($1))
+         ORDER BY sos.observed_at DESC"),
+    )
+    .bind(known_ids)
+    .bind(ReconcileFacet::NetworkPolicy.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(|err| db_contention_error("query observed-only sandboxes", &err))
+}
+
+pub(super) fn sandbox_to_cached_response(
+    sandbox: &Sandbox,
+    observed: Option<&SandboxObservedState>,
+) -> SandboxResponse {
+    let mut response = sandbox_to_response(sandbox, None);
+    if let Some(observed) = observed {
+        response.set_state(SandboxStateInput::observed_on(
+            sandbox.lifecycle.clone(),
+            sandbox.active_node_id,
+            observed.status.clone(),
+            observed.node_id,
+        ));
+        response.spaced_version = observed.spaced_version.clone();
+        response.pid = observed.pid.and_then(|value| u32::try_from(value).ok());
+        response.namespace = observed.namespace.clone();
+        response.uptime = observed.uptime.clone();
+        response.image_hash = observed.image_hash.clone();
+        if response.content_hash.is_none() {
+            response.content_hash = observed.image_hash.clone();
+        }
+        if response.release_tags.is_empty() {
+            response.release_tags.clone_from(&observed.release_tags);
+        }
+        if response.template.is_none() {
+            response.template = observed_template(observed);
+        }
+        response.snapshots_enabled = Some(observed.snapshots_enabled);
+        response.pool_template = observed.pool_template.clone();
+        response.disk_usage_bytes = observed_disk_usage_bytes(observed);
+        response.failure_reason = observed.failure_reason.clone();
+        response.age = observed.observed_created_at.as_deref().and_then(format_age);
+        response.network_policy_status =
+            network_policy_status_for(Some(sandbox), Some(observed), None);
+    }
+    response
+}
+
+fn observed_template(observed: &SandboxObservedState) -> Option<String> {
+    observed
+        .template
+        .clone()
+        .or_else(|| observed.pool_template.clone())
+}
+
+/// A sandbox a node reports with no sandbox row. It is a pool slot when the
+/// node says so (`pool_template`, which Direct nodes report) or when a
+/// warm-pool slot reserves its ID (`pool_id`, Kubernetes, whose nodes report
+/// no pool membership).
+pub(super) fn observed_only_sandbox_response(
+    observed: &SandboxObservedState,
+    pool_id: Option<uuid::Uuid>,
+) -> SandboxResponse {
+    let mut response = SandboxResponse {
+        id: observed.sandbox_id,
+        resource_type: if observed.pool_template.is_some() || pool_id.is_some() {
+            SandboxResourceType::PoolSlot
+        } else {
+            SandboxResourceType::ObservedLocal
+        },
+        pool_id,
+        placement: Some("observed".to_string()),
+        active_node_id: None,
+        active_node: None,
+        runtime: None,
+        spaced_version: observed.spaced_version.clone(),
+        pid: observed.pid.and_then(|value| u32::try_from(value).ok()),
+        namespace: observed.namespace.clone(),
+        uptime: observed.uptime.clone(),
+        user: observed.sandbox_owner.clone(),
+        content_hash: observed.image_hash.clone(),
+        release_tags: observed.release_tags.clone(),
+        image_hash: observed.image_hash.clone(),
+        snapshots_enabled: Some(observed.snapshots_enabled),
+        pool_template: observed.pool_template.clone(),
+        disk_usage_bytes: observed_disk_usage_bytes(observed),
+        failure_reason: observed.failure_reason.clone(),
+        created_at: observed_created_at(observed),
+        updated_at: Some(observed.observed_at),
+        last_used_at: None,
+        last_access_at: None,
+        last_command_at: None,
+        age: observed.observed_created_at.as_deref().and_then(format_age),
+        network_policy: None,
+        network_policy_override: None,
+        template_network_policy: None,
+        effective_desired_network_policy: None,
+        network_policy_generation: None,
+        network_policy_status: network_policy_status_for(None, Some(observed), None),
+        ..SandboxResponse::default()
+    };
+    response.template = observed_template(observed);
+    response.set_state(SandboxStateInput::new(None, observed.status.clone()));
+    response
+}
+
+pub(super) fn observed_disk_usage_bytes(observed: &SandboxObservedState) -> Option<u64> {
+    observed
+        .disk_usage_bytes
+        .and_then(|value| u64::try_from(value).ok())
+}
+
+pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> SandboxResponse {
+    let live_policy = live
+        .and_then(|info| info.auto_lifecycle.as_ref())
+        .and_then(|policy| policy_from_proto(policy).ok());
+    let live_status = live
+        .and_then(|info| info.auto_lifecycle_status.as_ref())
+        .and_then(|status| status_from_proto(status).ok());
+    let live_lifecycle = live.map(|info| {
+        info.observed_status()
+            .map(|state| state.label().to_string())
+            .unwrap_or_else(|_| "unknown".into())
+    });
+    let state_input = SandboxStateInput::new(Some(sandbox.lifecycle.clone()), live_lifecycle);
+
+    SandboxResponse {
+        id: sandbox.id,
+        resource_type: SandboxResourceType::Sandbox,
+        name: sandbox.name.clone(),
+        user_id: Some(sandbox.user_id),
+        user_email: match sandbox.owner_source {
+            pplx_space_common_core::types::SandboxOwnerSource::Local => sandbox.user_email.clone(),
+            pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity => None,
+        },
+        org_id: Some(sandbox.org_id),
+        lifecycle: state_input.reported_lifecycle(),
+        placement: Some(if live.is_some() {
+            "on_node".to_string()
+        } else {
+            sandbox.placement.clone()
+        }),
+        active_node_id: sandbox.active_node_id,
+        active_node: active_node_summary(sandbox),
+        metadata: sandbox.metadata.0.clone(),
+        created_at: Some(sandbox.created_at),
+        updated_at: Some(sandbox.updated_at),
+        last_used_at: sandbox.last_used_at,
+        last_access_at: sandbox.last_access_at,
+        last_command_at: sandbox.last_command_at,
+        auto_lifecycle: Some(live_policy.unwrap_or_else(|| sandbox.auto_lifecycle.0.clone())),
+        auto_lifecycle_status: Some(
+            live_status.unwrap_or_else(|| sandbox.auto_lifecycle_state.0.public_status()),
+        ),
+        network_policy: sandbox_policy_override(sandbox),
+        network_policy_override: sandbox_policy_override(sandbox),
+        template_network_policy: sandbox_template_policy(sandbox),
+        effective_desired_network_policy: sandbox_effective_desired_policy(sandbox),
+        network_policy_generation: sandbox_effective_network_policy_generation(sandbox),
+        network_policy_status: network_policy_status_for(Some(sandbox), None, live),
+        status: state_input.reported_lifecycle(),
+        state_input,
+        template: live
+            .and_then(|info| info.template.clone())
+            .or_else(|| sandbox.template_id.clone()),
+        content_hash: sandbox
+            .content_hash
+            .clone()
+            .or_else(|| live.and_then(|info| info.image_hash.clone())),
+        release_tags: sandbox.release_tags.clone(),
+        runtime: live.map(|info| info.runtime.clone().unwrap_or_else(|| "fc".to_string())),
+        spaced_version: live.and_then(|info| proto_spaced_version(info.spaced_version.as_deref())),
+        pid: live.and_then(|info| info.pid),
+        namespace: live.and_then(|info| info.namespace.clone()),
+        uptime: live.and_then(|info| info.uptime.clone()),
+        // Ownership is an immutable birth fact: the label derives from the
+        // cluster's sandbox row, never from what a node reports.
+        user: Some(
+            pplx_space_common_core::types::SandboxOwner::platform_user(sandbox.user_id).to_string(),
+        ),
+        image_hash: live.and_then(|info| info.image_hash.clone()),
+        snapshots_enabled: live.map(|info| info.snapshots_enabled),
+        snapshots_enabled_desired: sandbox.snapshots_enabled_desired,
+        pool_template: live.and_then(|info| info.pool_template.clone()),
+        pool_id: None,
+        disk_usage_bytes: None,
+        failure_reason: live.and_then(|info| info.failure_reason.clone()),
+        age: live
+            .and_then(|info| info.created_at.as_deref().and_then(format_age))
+            .or_else(|| format_age_from_time(sandbox.created_at)),
+        volume_encryption: sandbox.volume_encryption,
+    }
+}
+
+pub fn sandbox_query(sql: &str) -> String {
+    sql.replace("{sandbox_columns}", SANDBOX_COLUMNS)
+        .replace("{sandbox_from}", SANDBOX_FROM)
+        .replace("{sandbox_join_tail}", SANDBOX_JOIN_TAIL)
+}
+
+pub async fn fetch_sandbox(pool: &PgPool, id: SandboxId) -> Result<Option<Sandbox>, sqlx::Error> {
+    sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(sandbox_query(
+        "SELECT {sandbox_columns} FROM {sandbox_from} WHERE s.id = $1",
+    ))))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The lifecycles [`update_and_fetch_post_wake_sandbox`] may replace: a
+/// resume's decision. The pooled claim inserts the row `paused`, the wake
+/// resumes it, and a Kubernetes activation receipt can project `started`
+/// before this update. The pooled prepare claims and joins no restore on
+/// either substrate. So, as for a resume, it refuses `stopped` (a stop that
+/// completed while the wake was in flight; the wake did not begin from it)
+/// and `restoring` (another owner's restore claim). It also refuses
+/// `failed`, `quarantined` and the tombstones (the sweeper or a quarantine
+/// won), `deleting` (the delete owns the row), `suspending` and `suspended`
+/// (a suspend owns it), `stopping` (no control-plane writer sets it; node
+/// publication and the transient-lifecycle sweeper converge it), and any
+/// value outside the stored vocabulary. The `action_stamp` module of
+/// `pplx-space-sandbox-store` says who finishes each.
+const POOLED_POST_WAKE_FROM: sandbox_store::action_stamp::ActionStamp =
+    sandbox_store::action_stamp::ActionStamp::Resume;
+
+/// Marks a pooled sandbox as started/on-node after its wake completes and
+/// returns the freshly-joined response row in the same round-trip. The
+/// lifecycle guard ([`POOLED_POST_WAKE_FROM`]) refuses a row another writer
+/// moved while the wake was in flight: this helper must surface the CAS miss
+/// rather than resurrecting a failed row as started or overwriting a delete
+/// or suspend that began.
+pub async fn update_and_fetch_post_wake_sandbox(
+    pool: &PgPool,
+    id: SandboxId,
+    active_node_id: Option<NodeId>,
+) -> Result<Sandbox, ControllerError> {
+    let sql = sandbox_query(
+        "WITH updated AS (
+             UPDATE sandboxes
+             SET lifecycle = 'started',
+                 placement = 'on_node',
+                 active_node_id = $1,
+                 placement_changed_at = NOW()
+             WHERE id = $2
+               AND LOWER(TRIM(lifecycle)) = ANY($3::TEXT[])
+             RETURNING *
+         )
+         SELECT {sandbox_columns}
+         FROM updated s
+         {sandbox_join_tail}",
+    );
+    sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(sql.as_str())))
+        .bind(active_node_id)
+        .bind(id)
+        .bind(POOLED_POST_WAKE_FROM.admitted_values())
+        .fetch_optional(pool)
+        .await
+        // Not classified, deliberately, and for the same reason as the
+        // `fetch_sandbox` arm this shares an `if` with in
+        // `queries::try_create_from_pool`: by the time this runs the warm slot
+        // is claimed, bound, and prepared and the pod is running, with no
+        // rollback on this arm. `create` mints a fresh `SandboxId` per request
+        // with no idempotency key, so a retryable 503 here claims a second
+        // slot and starts a second sandbox while the first stays `started`
+        // under an id the caller never sees. See `db_contention_error`'s
+        // exception. This is the `wait_until_ready` arm — the one ECW create
+        // takes — so it is the more common of the two, not the edge case.
+        .map_err(|err| {
+            crate::controllers::internal_error("pooled sandbox post-wake update failed", err)
+        })?
+        .ok_or_else(|| {
+            ControllerError::internal(
+                "pooled sandbox wake lost the lifecycle CAS — another writer moved the row to a \
+                 terminal, deleting, stopped, restoring or suspend lifecycle while pooled wake was \
+                 in flight",
+            )
+        })
+}

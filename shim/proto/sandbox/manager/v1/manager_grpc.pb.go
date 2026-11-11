@@ -21,6 +21,9 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	SandboxManager_GuestUpdateStatus_FullMethodName                      = "/space.sandbox.manager.v1.SandboxManager/GuestUpdateStatus"
+	SandboxManager_ApplyGuestUpdate_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/ApplyGuestUpdate"
+	SandboxManager_RestartGuest_FullMethodName                           = "/space.sandbox.manager.v1.SandboxManager/RestartGuest"
 	SandboxManager_GetExecutionCapabilities_FullMethodName               = "/space.sandbox.manager.v1.SandboxManager/GetExecutionCapabilities"
 	SandboxManager_Create_FullMethodName                                 = "/space.sandbox.manager.v1.SandboxManager/Create"
 	SandboxManager_Start_FullMethodName                                  = "/space.sandbox.manager.v1.SandboxManager/Start"
@@ -47,6 +50,7 @@ const (
 	SandboxManager_EnqueueArtifactBackup_FullMethodName                  = "/space.sandbox.manager.v1.SandboxManager/EnqueueArtifactBackup"
 	SandboxManager_EvictClusterDeletedSandbox_FullMethodName             = "/space.sandbox.manager.v1.SandboxManager/EvictClusterDeletedSandbox"
 	SandboxManager_UpgradeRuntime_FullMethodName                         = "/space.sandbox.manager.v1.SandboxManager/UpgradeRuntime"
+	SandboxManager_GetRuntimeUpgrade_FullMethodName                      = "/space.sandbox.manager.v1.SandboxManager/GetRuntimeUpgrade"
 	SandboxManager_EnableSnapshots_FullMethodName                        = "/space.sandbox.manager.v1.SandboxManager/EnableSnapshots"
 	SandboxManager_DisableSnapshots_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/DisableSnapshots"
 	SandboxManager_ListSnapshots_FullMethodName                          = "/space.sandbox.manager.v1.SandboxManager/ListSnapshots"
@@ -107,6 +111,10 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type SandboxManagerClient interface {
+	// Node-local operator maintenance. Never wakes a dormant sandbox.
+	GuestUpdateStatus(ctx context.Context, in *GuestUpdateStatusRequest, opts ...grpc.CallOption) (*GuestUpdateOperation, error)
+	ApplyGuestUpdate(ctx context.Context, in *ApplyGuestUpdateRequest, opts ...grpc.CallOption) (*GuestUpdateOperation, error)
+	RestartGuest(ctx context.Context, in *RestartGuestRequest, opts ...grpc.CallOption) (*GuestUpdateOperation, error)
 	// Advisory readiness only. The environment input also fails closed on old readers.
 	GetExecutionCapabilities(ctx context.Context, in *GetExecutionCapabilitiesRequest, opts ...grpc.CallOption) (*GetExecutionCapabilitiesResponse, error)
 	// Create a new sandbox (allocate resources, prepare filesystem) without starting the VM.
@@ -188,8 +196,17 @@ type SandboxManagerClient interface {
 	// the old checkpoint. Files survive; memory and processes don't. A failed
 	// boot restores the old pair and releases the fence. Idempotent per
 	// `operation_id`: a retry resumes or settles the same upgrade. A rolled-back
-	// upgrade leaves no row behind, so a retry after it starts over.
+	// upgrade keeps only its outcome, so a retry after it starts over. A
+	// sandbox already on the target is activated in place for a STARTED
+	// target, and a suspended one absent from the node may be staged first;
+	// see `UpgradeRuntimeRequest.target_state` and `stage_from`, and
+	// `GetRuntimeUpgrade` for what the node records.
 	UpgradeRuntime(ctx context.Context, in *UpgradeRuntimeRequest, opts ...grpc.CallOption) (*UpgradeRuntimeResponse, error)
+	// Internal-only, read-only: where one `UpgradeRuntime` operation stands on
+	// this node, for a caller that can't see its response. A Kubernetes pod's
+	// shim runs the upgrade at container create, so the control plane reads the
+	// outcome here.
+	GetRuntimeUpgrade(ctx context.Context, in *GetRuntimeUpgradeRequest, opts ...grpc.CallOption) (*GetRuntimeUpgradeResponse, error)
 	// Enable rolling btrfs snapshots for a sandbox.
 	EnableSnapshots(ctx context.Context, in *EnableSnapshotsRequest, opts ...grpc.CallOption) (*EnableSnapshotsResponse, error)
 	// Disable rolling btrfs snapshots for a sandbox.
@@ -293,7 +310,7 @@ type SandboxManagerClient interface {
 	ServicePortIngress(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[v11.ServicePortIngressFrame, v11.ServicePortIngressFrame], error)
 	// Internal: find a paused pool sandbox, reassign to user, resume it.
 	AdoptPoolSandbox(ctx context.Context, in *AdoptPoolSandboxRequest, opts ...grpc.CallOption) (*AdoptPoolSandboxResponse, error)
-	// Wait for stopped, failed, cleanup_failed, suspended, or quarantined, or time out.
+	// Wait for stopped, failed, suspended, quarantined, or a failed cleanup, or time out.
 	// Quarantine completes the wait without implying that runtime or files were removed.
 	Wait(ctx context.Context, in *WaitRequest, opts ...grpc.CallOption) (*WaitResponse, error)
 	// Clone a paused donor sandbox to create a new sandbox (for pool cloning).
@@ -316,6 +333,36 @@ type sandboxManagerClient struct {
 
 func NewSandboxManagerClient(cc grpc.ClientConnInterface) SandboxManagerClient {
 	return &sandboxManagerClient{cc}
+}
+
+func (c *sandboxManagerClient) GuestUpdateStatus(ctx context.Context, in *GuestUpdateStatusRequest, opts ...grpc.CallOption) (*GuestUpdateOperation, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GuestUpdateOperation)
+	err := c.cc.Invoke(ctx, SandboxManager_GuestUpdateStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) ApplyGuestUpdate(ctx context.Context, in *ApplyGuestUpdateRequest, opts ...grpc.CallOption) (*GuestUpdateOperation, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GuestUpdateOperation)
+	err := c.cc.Invoke(ctx, SandboxManager_ApplyGuestUpdate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) RestartGuest(ctx context.Context, in *RestartGuestRequest, opts ...grpc.CallOption) (*GuestUpdateOperation, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GuestUpdateOperation)
+	err := c.cc.Invoke(ctx, SandboxManager_RestartGuest_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *sandboxManagerClient) GetExecutionCapabilities(ctx context.Context, in *GetExecutionCapabilitiesRequest, opts ...grpc.CallOption) (*GetExecutionCapabilitiesResponse, error) {
@@ -581,6 +628,16 @@ func (c *sandboxManagerClient) UpgradeRuntime(ctx context.Context, in *UpgradeRu
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(UpgradeRuntimeResponse)
 	err := c.cc.Invoke(ctx, SandboxManager_UpgradeRuntime_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) GetRuntimeUpgrade(ctx context.Context, in *GetRuntimeUpgradeRequest, opts ...grpc.CallOption) (*GetRuntimeUpgradeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetRuntimeUpgradeResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_GetRuntimeUpgrade_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1206,6 +1263,10 @@ func (c *sandboxManagerClient) ResolveSandboxMemory(ctx context.Context, in *Res
 // All implementations must embed UnimplementedSandboxManagerServer
 // for forward compatibility.
 type SandboxManagerServer interface {
+	// Node-local operator maintenance. Never wakes a dormant sandbox.
+	GuestUpdateStatus(context.Context, *GuestUpdateStatusRequest) (*GuestUpdateOperation, error)
+	ApplyGuestUpdate(context.Context, *ApplyGuestUpdateRequest) (*GuestUpdateOperation, error)
+	RestartGuest(context.Context, *RestartGuestRequest) (*GuestUpdateOperation, error)
 	// Advisory readiness only. The environment input also fails closed on old readers.
 	GetExecutionCapabilities(context.Context, *GetExecutionCapabilitiesRequest) (*GetExecutionCapabilitiesResponse, error)
 	// Create a new sandbox (allocate resources, prepare filesystem) without starting the VM.
@@ -1287,8 +1348,17 @@ type SandboxManagerServer interface {
 	// the old checkpoint. Files survive; memory and processes don't. A failed
 	// boot restores the old pair and releases the fence. Idempotent per
 	// `operation_id`: a retry resumes or settles the same upgrade. A rolled-back
-	// upgrade leaves no row behind, so a retry after it starts over.
+	// upgrade keeps only its outcome, so a retry after it starts over. A
+	// sandbox already on the target is activated in place for a STARTED
+	// target, and a suspended one absent from the node may be staged first;
+	// see `UpgradeRuntimeRequest.target_state` and `stage_from`, and
+	// `GetRuntimeUpgrade` for what the node records.
 	UpgradeRuntime(context.Context, *UpgradeRuntimeRequest) (*UpgradeRuntimeResponse, error)
+	// Internal-only, read-only: where one `UpgradeRuntime` operation stands on
+	// this node, for a caller that can't see its response. A Kubernetes pod's
+	// shim runs the upgrade at container create, so the control plane reads the
+	// outcome here.
+	GetRuntimeUpgrade(context.Context, *GetRuntimeUpgradeRequest) (*GetRuntimeUpgradeResponse, error)
 	// Enable rolling btrfs snapshots for a sandbox.
 	EnableSnapshots(context.Context, *EnableSnapshotsRequest) (*EnableSnapshotsResponse, error)
 	// Disable rolling btrfs snapshots for a sandbox.
@@ -1392,7 +1462,7 @@ type SandboxManagerServer interface {
 	ServicePortIngress(grpc.BidiStreamingServer[v11.ServicePortIngressFrame, v11.ServicePortIngressFrame]) error
 	// Internal: find a paused pool sandbox, reassign to user, resume it.
 	AdoptPoolSandbox(context.Context, *AdoptPoolSandboxRequest) (*AdoptPoolSandboxResponse, error)
-	// Wait for stopped, failed, cleanup_failed, suspended, or quarantined, or time out.
+	// Wait for stopped, failed, suspended, quarantined, or a failed cleanup, or time out.
 	// Quarantine completes the wait without implying that runtime or files were removed.
 	Wait(context.Context, *WaitRequest) (*WaitResponse, error)
 	// Clone a paused donor sandbox to create a new sandbox (for pool cloning).
@@ -1417,6 +1487,15 @@ type SandboxManagerServer interface {
 // pointer dereference when methods are called.
 type UnimplementedSandboxManagerServer struct{}
 
+func (UnimplementedSandboxManagerServer) GuestUpdateStatus(context.Context, *GuestUpdateStatusRequest) (*GuestUpdateOperation, error) {
+	return nil, status.Error(codes.Unimplemented, "method GuestUpdateStatus not implemented")
+}
+func (UnimplementedSandboxManagerServer) ApplyGuestUpdate(context.Context, *ApplyGuestUpdateRequest) (*GuestUpdateOperation, error) {
+	return nil, status.Error(codes.Unimplemented, "method ApplyGuestUpdate not implemented")
+}
+func (UnimplementedSandboxManagerServer) RestartGuest(context.Context, *RestartGuestRequest) (*GuestUpdateOperation, error) {
+	return nil, status.Error(codes.Unimplemented, "method RestartGuest not implemented")
+}
 func (UnimplementedSandboxManagerServer) GetExecutionCapabilities(context.Context, *GetExecutionCapabilitiesRequest) (*GetExecutionCapabilitiesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetExecutionCapabilities not implemented")
 }
@@ -1494,6 +1573,9 @@ func (UnimplementedSandboxManagerServer) EvictClusterDeletedSandbox(context.Cont
 }
 func (UnimplementedSandboxManagerServer) UpgradeRuntime(context.Context, *UpgradeRuntimeRequest) (*UpgradeRuntimeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpgradeRuntime not implemented")
+}
+func (UnimplementedSandboxManagerServer) GetRuntimeUpgrade(context.Context, *GetRuntimeUpgradeRequest) (*GetRuntimeUpgradeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRuntimeUpgrade not implemented")
 }
 func (UnimplementedSandboxManagerServer) EnableSnapshots(context.Context, *EnableSnapshotsRequest) (*EnableSnapshotsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method EnableSnapshots not implemented")
@@ -1676,6 +1758,60 @@ func RegisterSandboxManagerServer(s grpc.ServiceRegistrar, srv SandboxManagerSer
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&SandboxManager_ServiceDesc, srv)
+}
+
+func _SandboxManager_GuestUpdateStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GuestUpdateStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).GuestUpdateStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_GuestUpdateStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).GuestUpdateStatus(ctx, req.(*GuestUpdateStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_ApplyGuestUpdate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ApplyGuestUpdateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).ApplyGuestUpdate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_ApplyGuestUpdate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).ApplyGuestUpdate(ctx, req.(*ApplyGuestUpdateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_RestartGuest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestartGuestRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).RestartGuest(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_RestartGuest_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).RestartGuest(ctx, req.(*RestartGuestRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _SandboxManager_GetExecutionCapabilities_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -2135,6 +2271,24 @@ func _SandboxManager_UpgradeRuntime_Handler(srv interface{}, ctx context.Context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxManagerServer).UpgradeRuntime(ctx, req.(*UpgradeRuntimeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_GetRuntimeUpgrade_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRuntimeUpgradeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).GetRuntimeUpgrade(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_GetRuntimeUpgrade_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).GetRuntimeUpgrade(ctx, req.(*GetRuntimeUpgradeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3026,6 +3180,18 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*SandboxManagerServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
+			MethodName: "GuestUpdateStatus",
+			Handler:    _SandboxManager_GuestUpdateStatus_Handler,
+		},
+		{
+			MethodName: "ApplyGuestUpdate",
+			Handler:    _SandboxManager_ApplyGuestUpdate_Handler,
+		},
+		{
+			MethodName: "RestartGuest",
+			Handler:    _SandboxManager_RestartGuest_Handler,
+		},
+		{
 			MethodName: "GetExecutionCapabilities",
 			Handler:    _SandboxManager_GetExecutionCapabilities_Handler,
 		},
@@ -3124,6 +3290,10 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpgradeRuntime",
 			Handler:    _SandboxManager_UpgradeRuntime_Handler,
+		},
+		{
+			MethodName: "GetRuntimeUpgrade",
+			Handler:    _SandboxManager_GetRuntimeUpgrade_Handler,
 		},
 		{
 			MethodName: "EnableSnapshots",

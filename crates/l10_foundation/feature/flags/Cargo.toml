@@ -1,0 +1,59 @@
+[package]
+name = "pplx-space-feature-flags"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# `tracing` and `pplx-space-metrics-emit` are both unconditional. The client owns
+# the `feature_flags.evaluation` tally, and the deployment that needs it most is
+# the SDK-free one: it has no vendor console to look at, so the counter with
+# `outcome:no_provider` is its only evidence that flags are inert on purpose
+# rather than broken. A tally owned by the providers could not have said that —
+# a provider-free deployment emits no provider telemetry by construction.
+[features]
+default = ["eppo"]
+eppo = ["dep:eppo"]
+# The OpenFeature adapter is vendor-neutral: it takes any OpenFeature provider.
+# `flagd` adds the reference backend on top and is the one an OSS deployment
+# turns on; enabling it alone is enough, it pulls `openfeature` with it.
+openfeature = [
+    "dep:open-feature",
+    "dep:tokio",
+    "dep:thiserror",
+    "dep:pplx-space-env-vars",
+]
+flagd = ["openfeature", "dep:open-feature-flagd"]
+
+[dependencies]
+eppo = { workspace = true, optional = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+open-feature = { workspace = true, optional = true }
+open-feature-flagd = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+# `rt` builds the adapter's own current-thread runtime and `sync` carries
+# requests to it. No `macros`, no `rt-multi-thread`: the worker owns one thread.
+tokio = { workspace = true, optional = true, features = ["rt", "sync", "time"] }
+
+# internal
+# `env-vars` for the shared env-flag vocabulary the flagd switch is read
+# with.
+pplx-space-env-vars = { workspace = true, optional = true }
+
+pplx-space-metrics-emit = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
+pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
+pplx-space-test-env = { workspace = true }

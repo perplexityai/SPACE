@@ -12,7 +12,7 @@ this bounded Alloy restart scenario.
 ## Reproduce the process and transport checks
 
 Use a clean source checkout containing
-`crates/libs/common/svc/tests/logging_process.rs`. This chart can collect older JSON/text too; ingestion
+`crates/l40_api/service/host/tests/logging_process.rs`. This chart can collect older JSON/text too; ingestion
 alone does not establish which formatter an image contains. Record source and
 image IDs before interpreting a run. The build needs the repo's pinned Rust
 toolchain and native prerequisites, plus `jq`; validation needs Python 3.

@@ -83,37 +83,97 @@ This is not a mechanism for changing schema or data behavior: those
 changes still require a new migration. Rollbacks to versions predating a registry
 entry can reject a database created with the revised SQL.
 
-## Retired template-manager migration
+## Unbundled template-manager migrations
+
+A rollout can migrate template-manager's node-local database from an init
+container while the previous pod still serves, so a template-manager schema
+change must be readable by the release before it, and a rollback must need
+nothing beyond the image. A release can still find a migration recorded that it
+doesn't bundle: a withdrawn one, or the next release's after an image rollback.
+The runner keeps a list of those it can reverse, with each one's original up
+SQL (for its checksum) and down SQL under `db/template-manager/history/`. A new
+template-manager migration joins that list one release before the release that
+bundles it, so the image a rollback returns to can reverse it. Once a release
+lists a migration, the release that bundles it must ship the same up SQL byte
+for byte, comments included. The listing release compares the recorded
+checksum only with its own copy, so a changed file, even one registered as an
+accepted checksum, makes it refuse the database. A changed migration needs a
+new version.
+
+When a release migrates a database that records listed migrations it doesn't
+bundle, the runner first checks each one: its history row must hold the
+original checksum, and the migration's own check must find no data worth
+keeping that reversing would drop. Any failed check stops migration before any
+write. The runner then applies their down SQL newest first and removes their
+history rows, all in one transaction. History validation runs after that
+transaction commits and still refuses any other recorded version the release
+doesn't bundle, so such a database is reversed and then refused. Only `up` and
+template-manager's own startup reverse them; `space-db-migrator
+template-manager down` and `status` don't. A catalog that bundles a version
+applies it normally.
+
+`20261031050126_node_dirty_ref_revisions` adds a `revision` column to
+`node_dirty_refs`, the `node_dirty_ref_revision` counter and the triggers that
+stamp it. Reversing it drops only those and keeps every outbox row, so its
+check never refuses. It does give up what the revision is for: a release
+without the migration acknowledges rows by key, so, as before the migration, a
+re-enqueue made while a send is in flight can be lost, and re-applying the
+migration restarts every revision at 0. Where a rollout runs
+`space-db-migrator` in an init container beside a serving pod of the newer
+release, that pod still reads `revision` after the reversal: its outbox reads
+and acknowledgements fail, and its rows stay queued, until it exits or a
+migrator re-applies the migration. A send it started before the reversal and
+acknowledges after a re-apply can match a restarted revision and delete a
+re-enqueue made during that send. A release without the migration writes the
+outbox without naming `revision`, so it keeps serving while a migrator applies
+it.
+
+## Template cache partition migration
 
 Template-manager's `20261026220935_template_cache_partitions` was withdrawn
-after some nodes had applied it, so a release that doesn't bundle it can find
-it recorded. Its SQL is kept in `db/template-manager/history/`. When such a
-release migrates a database that records the migration with its original
-checksum and holds no environment-partition build, tag pin or unfinished
-environment `template_stamp` job, the runner applies the down SQL and removes
-the history row in one transaction. The down SQL also drops child rows whose
-build is gone and finished environment stamp jobs, which carry nothing to
-keep, so no rollback step beyond the image is needed for the database. Only
-`up` and template-manager's own startup reverse it; `space-db-migrator
-template-manager down` and `status` don't.
+after some nodes had applied it, and is bundled again with the same SQL.
+Releases from the withdrawn interval don't bundle it. Their writes succeed on either
+schema, so one can keep serving while a migrator applies the migration.
+When one finds the migration recorded with its original checksum, it applies
+the down SQL and removes the history row at startup, so rolling back to it
+needs no database step beyond the image. A release that bundles it keeps its entry in the runner's list
+of unbundled migrations, reading its SQL from the bundled catalog rather than
+`history/`; the runner skips a version its catalog bundles, so the entry never
+reverses it there.
 
-Where a rollout runs `space-db-migrator` in an init container beside the
-serving pod, that pod still names `cache_partition` after the reversal, so its
-reads and writes fail until it exits.
+The reversal counts rows only. A `{hash}@{environment}` build or snapshot
+directory left without a row stays on disk, and that release's startup
+recovery can register such a snapshot directory as a row. Remove those
+directories before rolling back, as `docs/execution-environments.md`
+describes.
 
-The check counts rows only. A `{hash}@{environment}` build or snapshot
-directory left without a row stays on disk, and the release's startup recovery
-can register a snapshot directory as a row; remove such directories first.
+That reversal refuses, before any write, a database holding an
+environment-partition build, tag pin or unfinished environment
+`template_stamp` job, since reversing would drop that row, and template-manager
+then fails to start. Keep running a release that bundles the migration on such
+a node. To check a node before rolling back, this read-only query counts the
+rows that block the reversal:
 
-A database holding an environment-partition build, tag pin or unfinished
-environment stamp job is refused before any write: reversing it would drop
-that row. Keep running a release that bundles the migration on that node.
+```sql
+SELECT (SELECT COUNT(*) FROM template_builds WHERE cache_partition != '')
+     + (SELECT COUNT(*) FROM template_pinned_tags WHERE cache_partition != '')
+     + (SELECT COUNT(*) FROM jobs
+        WHERE kind = 'template_stamp'
+          AND status IN ('pending', 'running', 'cancelling')
+          AND CASE
+                WHEN json_valid(payload) THEN json_extract(payload, '$.partition_environment')
+              END IS NOT NULL);
+```
 
-This release's template-manager writes succeed on either schema, so it can
-keep serving while a migrator re-applies the migration. That holds only for the
-original SQL: the same version and checksum, `cache_partition` defaulting to
-`''`, and no other unique constraint on the four tables. A catalog that bundles
-the version again applies it normally.
+Where a rollback runs `space-db-migrator` in an init container beside the
+serving pod, that pod still names `cache_partition` after the reversal, so its reads and writes fail
+until it exits.
+
+That reversal compares the recorded checksum with the original file's and
+has no registry of accepted revisions, so the migration's SQL must stay
+byte-identical: `partition_migration_keeps_the_checksum_releases_reverse` pins
+its checksum.
+Change the schema with a new migration, never by editing this one.
 
 ## Console password provisioning
 
@@ -266,7 +326,7 @@ maintenance can travel with migration-only PRs.
 The sole production-code exception is the credential fence required by a
 credential-table migration. That PR may change the canonical table-name entries
 inside the multiline `CREDENTIAL_TABLES` declaration in
-`crates/libs/db/migrator/src/bootstrap_roles.rs`; formatting-only changes and
+`crates/l30_storage/db/migrate/src/bootstrap_roles.rs`; formatting-only changes and
 changes outside that list remain blocked. Removing an entry also requires a
 matching standalone `DROP TABLE` statement in a changed Postgres up migration.
 
@@ -281,7 +341,7 @@ up migration. Each entry must stay on one line in the canonical
 `    ("table", &["column", ...]),` form.
 
 The exact Postgres bootstrap-role test file,
-`crates/libs/db/migrator/src/bootstrap_roles/tests/postgres_bootstrap_tests.rs`,
+`crates/l30_storage/db/migrate/src/bootstrap_roles/tests/postgres_bootstrap_tests.rs`,
 may append regression coverage in the same PR, but its existing cross-checks
 must remain byte-for-byte unchanged and appended code cannot shadow the fence
 constants. This is not a general exception for the bootstrap-role test tree;
@@ -314,7 +374,8 @@ writes, then applies common schema before service schema. Failed, modified,
 missing, or unbundled applied versions are rejected without recreating the
 database. A binary rollback therefore requires a catalog compatible with the
 complete applied history, even for an otherwise backward-compatible schema.
-Use expand/contract sequencing and retain verified backups.
+Use expand/contract sequencing and retain verified backups. Template-manager's
+exceptions are described under 'Unbundled template-manager migrations'.
 
 The migrator never adopts untracked schemas, repairs rejected history, or
 recreates a database after a migration failure. Baseline history conversion is
@@ -425,7 +486,7 @@ legitimately needs to wait.
 
 The bound converts lock waits into `55P03` (`lock_not_available`) errors, so
 every path that can block needs a disposition for it.
-`pplx_space_common_svc::sql::contention` is where the codes live for the
+`pplx_space_postgres_pool::contention` is where the codes live for the
 services: callers use `is_lock_contention` (`40001` / `40P01` / `55P03`),
 `is_lock_not_available` (`55P03` only) or `is_query_canceled` (`57014`) rather
 than open-coding a SQLSTATE list, because a hand-written
@@ -545,7 +606,7 @@ Two shapes need care when adding code:
 ### Application pools
 
 Long-running services connect only as the managed logins, with no selector
-and no fallback to the connecting admin. `pplx-space-common-svc::sql`
+and no fallback to the connecting admin. `pplx-space-postgres-pool`
 exposes three constructors: `connect_space_user_pool` (the service's
 general-purpose pool, as `space_user`), `CredentialsPool::connect` (the
 credential-fenced lane, as `space_creds`), and
@@ -598,7 +659,7 @@ Rules that follow from this model:
   a migration will fail on fresh databases. (`bootstrap-roles` pre-creates
   `space_credmgr`, so the guarded legacy migration that introduced it no-ops.)
 - **New credential-bearing tables must be added to `CREDENTIAL_TABLES`** in
-  `crates/libs/db/migrator/src/bootstrap_roles.rs`, in the same PR as the
+  `crates/l30_storage/db/migrate/src/bootstrap_roles.rs`, in the same PR as the
   migration that creates them. Until the next `bootstrap-roles` run, a new
   `space_migrator`-created table is accessible to `space_user` and `space_ro`
   through default privileges — the trailing bootstrap run is what enforces

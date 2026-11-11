@@ -523,6 +523,7 @@ fn test_common<'a>(
         content_hash: Some(TEST_CONTENT_HASH),
         env,
         traceparent: None,
+        environment: None,
     }
 }
 
@@ -608,6 +609,7 @@ fn build_sandbox_pod_direct_restore_keeps_artifact_kind_and_node_assignment() {
                 extra_tolerations: &[],
                 extra_required_affinity: None,
                 node_group_placement: None,
+                runtime_upgrade: None,
             },
         );
 
@@ -826,6 +828,7 @@ fn build_sandbox_pod_source_pinned_restore_skips_node_services_bias() {
             extra_required_affinity: None,
             fork_disk_restore: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -936,6 +939,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     let restore_portable = build_sandbox_pod(
@@ -960,6 +964,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     // Source-aware hard pin on: the same portable restore renders a required
@@ -991,6 +996,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     // Shortlist mode: ORed required terms for source + fallbacks, the
@@ -1024,6 +1030,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     let restore_storage_only = build_sandbox_pod(
@@ -1048,7 +1055,77 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
+    );
+    // Runtime upgrade pods: the shim calls `UpgradeRuntime` instead of
+    // `Start`. A stopped source upgraded in place on its node and left
+    // stopped, the same source upgraded as it starts, and a suspended source
+    // staged from its checkpoint elsewhere and upgraded as it resumes.
+    let upgrade_target =
+        crate::types::EnvironmentReference::new(crate::types::Digest::sha256([7; 32]));
+    let runtime_upgrade =
+        |target_state, checkpoint_local_artifact_id: Option<crate::types::LocalArtifactId>| {
+            PodRuntimeUpgrade {
+                operation_id: Uuid::from_u128(0x019f_8000_0000_7000_8000_0000_0000_0011),
+                target_environment: upgrade_target,
+                authorization_id: "environment-block-e0",
+                authorization_reason: "e0 runs a blocked runtime",
+                memory_loss: checkpoint_local_artifact_id.is_some(),
+                target_state,
+                checkpoint_local_artifact_id,
+            }
+        };
+    let restore_runtime_upgrade =
+        |name, generation, artifact_kind, storage_uri, source_node, upgrade| {
+            build_sandbox_pod(
+                &config,
+                SandboxPodRequest::Restore {
+                    stopped_materialization: None,
+                    artifact_kind,
+                    common: common(name, TEST_SANDBOX_ID, generation),
+                    runtime,
+                    suspend_restore_storage_uri: storage_uri,
+                    suspend_restore_source_node: source_node,
+                    fork_disk_restore: None,
+                    direct_node_name: source_node,
+                    preferred_node_name: None,
+                    restore_node_shortlist: Vec::new(),
+                    extra_tolerations: &[],
+                    extra_required_affinity: None,
+                    node_group_placement: None,
+                    runtime_upgrade: Some(Box::new(upgrade)),
+                },
+            )
+        };
+    let restore_runtime_upgrade_stopped = restore_runtime_upgrade(
+        "space-sbx-019de67463d77ef0a5888e106a878093-g21",
+        21,
+        crate::types::ArtifactKind::Disk,
+        None,
+        Some("worker-source"),
+        runtime_upgrade(PodRuntimeUpgradeTargetState::Stopped, None),
+    );
+    let restore_runtime_upgrade_started = restore_runtime_upgrade(
+        "space-sbx-019de67463d77ef0a5888e106a878093-g22",
+        22,
+        crate::types::ArtifactKind::Disk,
+        None,
+        Some("worker-source"),
+        runtime_upgrade(PodRuntimeUpgradeTargetState::Started, None),
+    );
+    let restore_runtime_upgrade_suspended = restore_runtime_upgrade(
+        "space-sbx-019de67463d77ef0a5888e106a878093-g23",
+        23,
+        crate::types::ArtifactKind::Full,
+        Some("s3://space-test/suspend-snapshots/current?region=us-east-1"),
+        None,
+        runtime_upgrade(
+            PodRuntimeUpgradeTargetState::Started,
+            Some(crate::types::LocalArtifactId::from_uuid(Uuid::from_u128(
+                0x019f_8000_0000_7000_8000_0000_0000_0012,
+            ))),
+        ),
     );
     // Evacuation pod with cohort placement: one Equal-operator toleration
     // and a matching required nodeAffinity term derived from the same
@@ -1084,6 +1161,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: std::slice::from_ref(&evacuation_toleration),
             extra_required_affinity: Some(("space.pplx.net/rollout-cohort", "test-2")),
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     let restore_fork_disk = build_sandbox_pod(
@@ -1112,6 +1190,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     // BYOK: an encrypted cold create renders the volume-encryption
@@ -1276,6 +1355,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             preferred_node_name: Some("space-worker-a"),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            runtime_upgrade: None,
         },
     );
     let pooled_placed = build_sandbox_pod(
@@ -1320,6 +1400,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             preferred_node_name: None,
             extra_tolerations: &[],
             extra_required_affinity: None,
+            runtime_upgrade: None,
         },
     );
     let mismatched_placement = NodeGroupPlacement::for_caller(
@@ -1358,6 +1439,18 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         ("sandbox_pod_restore_storage_only", restore_storage_only),
         ("sandbox_pod_restore_evacuation", restore_evacuation),
         ("sandbox_pod_restore_fork_disk", restore_fork_disk),
+        (
+            "sandbox_pod_restore_runtime_upgrade_stopped",
+            restore_runtime_upgrade_stopped,
+        ),
+        (
+            "sandbox_pod_restore_runtime_upgrade_started",
+            restore_runtime_upgrade_started,
+        ),
+        (
+            "sandbox_pod_restore_runtime_upgrade_suspended",
+            restore_runtime_upgrade_suspended,
+        ),
         (
             "sandbox_pod_on_demand_create_encrypted",
             on_demand_encrypted,
@@ -1488,6 +1581,7 @@ fn every_sandbox_pod_shape_requests_one_network_slot() {
                 extra_tolerations: &[],
                 extra_required_affinity: None,
                 node_group_placement: None,
+                runtime_upgrade: None,
             },
         ),
         build_sandbox_pod(
@@ -1619,6 +1713,7 @@ fn portable_restore_prefers_source_node_and_carries_remote_fallback() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -1761,6 +1856,7 @@ fn build_sandbox_pod_hard_pins_portable_restore_to_source_node() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -1835,6 +1931,7 @@ fn build_sandbox_pod_source_annotation_without_pin_renders_no_source_affinity() 
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -1900,6 +1997,7 @@ fn build_sandbox_pod_shortlist_renders_or_terms_with_preferred_source() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -1981,6 +2079,7 @@ fn build_sandbox_pod_hard_pin_without_ssd_affinity_omits_placement_block() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -2037,6 +2136,7 @@ fn restore_with_extra_tolerations_renders_pod_tolerations() {
             extra_tolerations: &tolerations,
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -2153,6 +2253,7 @@ fn extra_required_affinity_renders_into_required_node_selector_term() {
             extra_tolerations: std::slice::from_ref(&toleration),
             extra_required_affinity: Some(("space.pplx.net/rollout-cohort", "test-2")),
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     let spec = pod.spec.as_ref().unwrap();
@@ -2291,6 +2392,7 @@ fn node_group_placement_renders_boundary_affinity_and_dedicated_toleration() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2379,6 +2481,7 @@ fn shared_only_node_group_placement_renders_no_dedicated_toleration() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2438,6 +2541,7 @@ fn node_group_placement_and_drain_cohort_are_anded_in_one_term() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2455,6 +2559,7 @@ fn node_group_placement_and_drain_cohort_are_anded_in_one_term() {
             extra_required_affinity: Some(("space.pplx.net/rollout-cohort", "test-2")),
             fork_disk_restore: None,
             restore_node_shortlist: Vec::new(),
+            runtime_upgrade: None,
         },
     );
 
@@ -2499,6 +2604,7 @@ fn pooled_pod_renders_node_group_placement() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             pool: SandboxPoolPodMetadata {
                 slot_id: TEST_POOL_SLOT_ID,
@@ -2575,6 +2681,7 @@ fn local_only_restore_keeps_direct_node_assignment_under_placement() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2590,6 +2697,7 @@ fn local_only_restore_keeps_direct_node_assignment_under_placement() {
             preferred_node_name: None,
             extra_tolerations: &[],
             extra_required_affinity: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -2652,6 +2760,7 @@ fn dedicated_org_mismatch_renders_an_unsatisfiable_boundary() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2709,6 +2818,7 @@ fn placement_boundary_survives_with_every_soft_bias_disabled() {
                 content_hash: None,
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2756,6 +2866,7 @@ fn soft_pinned_restore_suppresses_the_dedicated_preference() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2773,6 +2884,7 @@ fn soft_pinned_restore_suppresses_the_dedicated_preference() {
             preferred_node_name: Some("space-worker-a"),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -2828,6 +2940,7 @@ fn pooled_pod_never_renders_dedicated_toleration_or_preference() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             pool: SandboxPoolPodMetadata {
                 slot_id: TEST_POOL_SLOT_ID,
@@ -2895,6 +3008,7 @@ fn dedicated_rendering_requires_matching_runtime_org() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2958,6 +3072,7 @@ fn restore_shortlist_suppresses_dedicated_preference_but_keeps_toleration() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2975,6 +3090,7 @@ fn restore_shortlist_suppresses_dedicated_preference_but_keeps_toleration() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             fork_disk_restore: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -3051,6 +3167,7 @@ fn dedicated_preference_is_gated_on_node_services_readiness() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3104,6 +3221,7 @@ fn dedicated_preference_is_ungated_when_readiness_bias_is_off() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3153,6 +3271,7 @@ fn all_shared_placement_for_another_org_fails_closed() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3218,6 +3337,7 @@ fn org_less_placement_on_an_org_owned_pod_fails_closed() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             // This runtime carries an org, which is what makes the pair a
             // mismatch — a pooled pod (the only org-less pod there is) renders
@@ -3275,6 +3395,7 @@ fn placement_for_a_different_template_fails_closed() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3338,6 +3459,7 @@ fn an_empty_preferred_node_name_does_not_drop_the_required_shortlist() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3358,6 +3480,7 @@ fn an_empty_preferred_node_name_does_not_drop_the_required_shortlist() {
             preferred_node_name: Some(""),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -3592,6 +3715,226 @@ fn render_stopped_re_placement(stopped_materialization: Option<StoppedMaterializ
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     )
+}
+
+fn environment_requirement(
+    reference: &crate::types::EnvironmentReference,
+) -> NodeSelectorRequirement {
+    NodeSelectorRequirement {
+        key: environment_label_key(reference),
+        operator: "In".to_string(),
+        values: Some(vec![ENVIRONMENT_USABLE_LABEL_VALUE.to_string()]),
+    }
+}
+
+fn bound_environment() -> crate::types::EnvironmentReference {
+    format!("sha256:{}", "e".repeat(64)).parse().unwrap()
+}
+
+#[test]
+fn a_bound_pod_requires_its_environment_label_and_an_unbound_one_does_not() {
+    let env = BTreeMap::new();
+    let auto_lifecycle_json = test_auto_lifecycle_json();
+    let network_policy_json = test_network_policy_json();
+    let sandbox_owner = test_sandbox_owner();
+    let render = |environment| {
+        build_sandbox_pod(
+            &test_pod_config(),
+            on_demand_request(
+                SandboxPodCommon {
+                    environment,
+                    ..test_common("space-sbx-env-g1", TEST_SANDBOX_ID, 1, &env)
+                },
+                test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json),
+            ),
+        )
+    };
+
+    let bound = render(Some(PodEnvironment {
+        reference: bound_environment(),
+        required: true,
+    }));
+    let terms = required_node_selector_terms(&bound);
+    assert_eq!(terms.len(), 1);
+    assert!(
+        terms[0]
+            .match_expressions
+            .as_ref()
+            .unwrap()
+            .contains(&environment_requirement(&bound_environment()))
+    );
+
+    let unbound = render(None);
+    assert!(
+        required_node_selector_terms(&unbound)
+            .iter()
+            .flat_map(|term| term.match_expressions.iter().flatten())
+            .all(|expression| !is_environment_label_key(&expression.key)),
+        "an unbound pod renders no environment term"
+    );
+}
+
+/// A restore pre-bound to its source node renders no other affinity: the
+/// scheduler is bypassed, so no scoring or exclusion term applies. Its
+/// environment requirement still has to render, since kubelet checks required
+/// node affinity at admission and refuses the pod on a node without the label.
+#[test]
+fn a_direct_assigned_restore_still_requires_its_environment() {
+    let env = BTreeMap::new();
+    let auto_lifecycle_json = test_auto_lifecycle_json();
+    let network_policy_json = test_network_policy_json();
+    let sandbox_owner = test_sandbox_owner();
+    let render = |environment| {
+        build_sandbox_pod(
+            &test_pod_config(),
+            SandboxPodRequest::Restore {
+                stopped_materialization: None,
+                artifact_kind: crate::types::ArtifactKind::Full,
+                common: SandboxPodCommon {
+                    environment,
+                    ..test_common("space-sbx-env-g3", TEST_SANDBOX_ID, 3, &env)
+                },
+                runtime: test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json),
+                suspend_restore_storage_uri: None,
+                suspend_restore_source_node: Some("node-a"),
+                fork_disk_restore: None,
+                direct_node_name: Some("node-a"),
+                preferred_node_name: None,
+                restore_node_shortlist: Vec::new(),
+                extra_tolerations: &[],
+                extra_required_affinity: None,
+                node_group_placement: None,
+                runtime_upgrade: None,
+            },
+        )
+    };
+
+    let unbound = render(None);
+    assert!(
+        unbound.spec.as_ref().unwrap().affinity.is_none(),
+        "the fixture renders no other affinity"
+    );
+    let bound = render(Some(PodEnvironment {
+        reference: bound_environment(),
+        required: true,
+    }));
+    let terms = required_node_selector_terms(&bound);
+    assert_eq!(terms.len(), 1);
+    assert_eq!(
+        terms[0].match_expressions.as_deref(),
+        Some([environment_requirement(&bound_environment())].as_slice())
+    );
+}
+
+#[test]
+fn every_shortlist_term_repeats_the_environment_requirement() {
+    let env = BTreeMap::new();
+    let auto_lifecycle_json = test_auto_lifecycle_json();
+    let network_policy_json = test_network_policy_json();
+    let sandbox_owner = test_sandbox_owner();
+    let pod = build_sandbox_pod(
+        &SandboxPodConfig {
+            restore_source_node_hard_pin: true,
+            ..test_pod_config()
+        },
+        SandboxPodRequest::Restore {
+            stopped_materialization: None,
+            artifact_kind: crate::types::ArtifactKind::Full,
+            common: SandboxPodCommon {
+                environment: Some(PodEnvironment {
+                    reference: bound_environment(),
+                    required: true,
+                }),
+                ..test_common("space-sbx-env-g2", TEST_SANDBOX_ID, 2, &env)
+            },
+            runtime: test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json),
+            suspend_restore_storage_uri: Some(
+                "s3://space-test/suspend-snapshots/current?region=us-east-1",
+            ),
+            suspend_restore_source_node: Some("node-a"),
+            direct_node_name: None,
+            preferred_node_name: Some("node-a"),
+            restore_node_shortlist: vec!["node-a".to_string(), "node-b".to_string()],
+            extra_tolerations: &[],
+            extra_required_affinity: None,
+            fork_disk_restore: None,
+            node_group_placement: None,
+            runtime_upgrade: None,
+        },
+    );
+
+    // Terms are ORed, so a term without the requirement would let the pod
+    // land on a node without the environment through it.
+    let terms = required_node_selector_terms(&pod);
+    assert_eq!(terms.len(), 2);
+    for term in terms {
+        assert!(
+            term.match_expressions
+                .unwrap_or_default()
+                .contains(&environment_requirement(&bound_environment()))
+        );
+    }
+}
+
+#[test]
+fn a_shadowed_pod_records_its_environment_without_requiring_it() {
+    let env = BTreeMap::new();
+    let auto_lifecycle_json = test_auto_lifecycle_json();
+    let network_policy_json = test_network_policy_json();
+    let sandbox_owner = test_sandbox_owner();
+    let render = |environment| {
+        build_sandbox_pod(
+            &test_pod_config(),
+            on_demand_request(
+                SandboxPodCommon {
+                    environment,
+                    ..test_common("space-sbx-env-g3", TEST_SANDBOX_ID, 1, &env)
+                },
+                test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json),
+            ),
+        )
+    };
+    let annotation = |pod: &Pod| {
+        pod.metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(SANDBOX_ENVIRONMENT_ANNOTATION))
+            .cloned()
+    };
+    let has_environment_term = |pod: &Pod| {
+        required_node_selector_terms(pod)
+            .iter()
+            .flat_map(|term| term.match_expressions.iter().flatten())
+            .any(|expression| is_environment_label_key(&expression.key))
+    };
+
+    for required in [false, true] {
+        let pod = render(Some(PodEnvironment {
+            reference: bound_environment(),
+            required,
+        }));
+        assert_eq!(annotation(&pod), Some(bound_environment().to_string()));
+        assert_eq!(has_environment_term(&pod), required, "required: {required}");
+    }
+    let unbound = render(None);
+    assert_eq!(annotation(&unbound), None);
+    assert!(!has_environment_term(&unbound));
+
+    // Shadow places exactly as off: the PodSpec is the same, and the
+    // metadata differs only by the recorded environment.
+    let mut shadowed = render(Some(PodEnvironment {
+        reference: bound_environment(),
+        required: false,
+    }));
+    assert_eq!(shadowed.spec, unbound.spec, "shadow renders off's PodSpec");
+    shadowed
+        .metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .remove(SANDBOX_ENVIRONMENT_ANNOTATION);
+    assert_eq!(shadowed.metadata, unbound.metadata);
 }

@@ -76,7 +76,10 @@ organizations (one nested), six users across roles and organizations, two API
 keys in the managing organization, and sandboxes that are running, paused,
 suspended and stopped, one in a tenant organization, and one created and
 deleted. Every name and organization display name carries the prefix, so
-runs under two prefixes can share a stack. Seeding sandboxes boots
+runs under two prefixes can share a stack. One `flows` step is the
+exception: `sandboxes-search-hex-name` needs a name of hex digits and dashes,
+which no prefix can start, so it names its sandbox `e2e-` and six random hex
+digits, records it in the state, and deletes it again. Seeding sandboxes boots
 Firecracker VMs and takes a minute or two; `--skip-sandboxes` leaves them out.
 
 The state is `out/seed-<prefix>.json`: the stack it was seeded on, the
@@ -132,11 +135,44 @@ once nothing is left in it.
 `--only` and `--skip` take comma-separated step names or tags, each matched
 exactly; a name that is neither is an error. The tags are `routes`, `orgs`,
 `users`, `api-keys`, `sandboxes`, `flows`, `lifecycle`, `templates`, `nodes`,
-`roles`. Sign-in always runs. Steps tagged `flows` create objects and delete
-them again; each records its object's ID as soon as the create is answered,
+`roles`, `terminal`. Sign-in always runs. Steps tagged `flows` create objects
+and delete them again; each records its object's ID as soon as the create is answered,
 so if one fails before deleting, `npm run clean` removes it. They need a seed
 state for the prefix, and the identity check above passes before any runs.
-`--no-mutate` skips them. The steps are in [`src/steps.ts`](src/steps.ts).
+`--no-mutate` skips them. The `terminal` steps open a shell in the seeded
+running sandbox and in the tenant organization's running sandbox, the second
+through the admin terminal route, and type into it. They create no objects,
+but they open terminal sessions, and the admin route records an admin audit
+row for each of the second's, so `--no-mutate` skips them too. The steps are in [`src/steps.ts`](src/steps.ts).
+
+Two `nodes` steps are `flows` that drain a node: `node-forced-drain-undrain`
+forced-drains a Kind worker through the node page and undrains it, and
+`node-terminate-refused` drains one, shows a terminate refusal the step
+answers itself (nothing is sent), then undrains the node while the terminate
+confirmation is open so the API refuses the terminate it sends; a route guard
+aborts that request unless the API reports the node undrained. Each drains
+only a Kubernetes worker that holds no sandboxes or local snapshots, while no
+node is in a drain phase and another worker exists, and records a failed check
+instead when there is none. The Kind stack's drained-node terminator deletes
+a drained node's Kubernetes Node unless it carries the
+`space.pplx.net/drain-keep` annotation, so each step sets it with `kubectl`
+through `--kube-context` (a `kind-*` context whose API server is on this host)
+before draining, and removes it once the node is undrained. Before either,
+each step cordons and uncordons the worker through the API and stops unless
+the cordon shows up on that Node, which shows the context and the API are one
+cluster. A step refuses a worker that already carries a
+`space.pplx.net/drain-keep` annotation, whatever its value, and leaves it in
+place; an interrupted run's own annotation (`console-loop-<run id>-<attempt>`) has to be
+removed by hand. Runs against one stack aren't meant to overlap, and because
+each run claims the annotation with its own run id through an annotate that
+fails when the key exists, two runs can't drain the same worker. A step stopped
+part-way can leave the node cordoned, drained or annotated. Undrain a drained
+node with `space-admin-cli undrain-node <node id>`, which also uncordons it;
+uncordon a node with no drain phase with Uncordon on its node page; and remove
+the annotation with
+`kubectl --context <context> annotate node <node> space.pplx.net/drain-keep-`,
+where `<context>` is the run's `--kube-context` or `CONSOLE_LOOP_KUBE_CONTEXT`
+(`kind-space-local` by default).
 
 Each run writes `out/runs/<time>[-<label>]/`:
 
@@ -158,6 +194,11 @@ Every setting is a flag or an environment variable:
 | `--out` | `CONSOLE_LOOP_OUT` | `./out` |
 | `--prefix` | `CONSOLE_LOOP_PREFIX` | `loop` |
 | `--template` (seed) | `CONSOLE_LOOP_TEMPLATE` | `seed:latest` |
+| `--kube-context` | `CONSOLE_LOOP_KUBE_CONTEXT` | `kind-space-local` |
+
+`SPACE_UI_DATADOG_LOGS_URL` has no flag: set it in the loop's environment to
+what the console under test has, and the detail step then requires the
+"Datadog logs" link (only whether it is set is read, not its value).
 
 A prefix is up to 32 lowercase letters, digits and dashes. `npm run seed`
 also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs`.

@@ -9,8 +9,8 @@ identifiers and wrapped key bytes as opaque.
 The wire contract is
 [`intermediate_key_broker.proto`](intermediate_key_broker.proto). Generated
 Rust client and server bindings live in
-`crates/libs/credential/provider/proto`; the SPACE-specific authenticated
-client lives in `crates/libs/credential/provider/client`.
+`crates/l20_domain/credential/provider/proto`; the SPACE-specific authenticated
+client lives in `crates/l40_api/credential/provider/client`.
 
 ## Request flow
 
@@ -190,6 +190,6 @@ Run a harness in this workspace with:
 cargo test -p <broker-test-package> broker_conforms -- --nocapture
 ```
 
-For local integration, `crates/apps/mock/branching-key-provider/svc` contains a
+For local integration, `crates/test_support/mock/branching/key/provider/svc` contains a
 small broker implementation. It is a connectivity fixture, not a conformance
 suite or production key authority.

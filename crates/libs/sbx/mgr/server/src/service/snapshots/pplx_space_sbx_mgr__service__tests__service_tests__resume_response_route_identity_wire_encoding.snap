@@ -1,5 +1,0 @@
----
-source: crates/libs/sbx/mgr/server/src/service/tests.rs
-expression: "hex::encode(ResumeResponse\n{ route_identity: Some(route_identity.clone()), }.encode_to_vec())"
----
-0a52082a122430313966383030302d303030302d373030302d383030302d30303030303030303030616118072a2430313966383030302d303030302d373030302d383030302d3030303030303030303062623001

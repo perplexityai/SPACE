@@ -335,3 +335,48 @@ def test_wait_fails_at_once_on_a_failure_that_cannot_heal(gh, answer, message):
     with pytest.raises(RuntimeError, match=message):
         handoff.wait(3600)
     assert clock.sleeps == []
+
+
+def producer_status(status):
+    job = {"name": "kind_smoke / " + handoff.PRODUCER, "status": status, "conclusion": None}
+    return (0, "", json.dumps([{"jobs": [job]}]))
+
+
+def test_started_returns_once_the_producer_has_a_runner(gh, capsys):
+    script, clock = gh
+    script.extend([producer_status("queued"), producer_status("queued"), producer_status("in_progress")])
+
+    handoff.started(240)
+
+    assert clock.sleeps == [handoff.STARTED_POLL_SECONDS] * 2
+    assert "requesting the shards' runners" in capsys.readouterr().out
+
+
+def test_started_returns_for_a_producer_that_already_finished(gh):
+    script, clock = gh
+    script.append(producer_jobs())
+
+    handoff.started(240)
+
+    assert clock.sleeps == []
+
+
+def test_started_gives_up_at_its_deadline_without_failing(gh, capsys):
+    script, clock = gh
+    script.extend([producer_status("queued")] * 10)
+
+    handoff.started(10)
+
+    assert "did not start within 10 s" in capsys.readouterr().out
+    assert sum(clock.sleeps) <= 10
+
+
+def test_started_does_not_fail_when_actions_read_is_refused(gh, capsys):
+    script, clock = gh
+    script.append((1, "gh: Resource not accessible by integration (HTTP 403)", ""))
+
+    handoff.started(240)
+
+    assert "Could not read the Rust producer's status" in capsys.readouterr().out
+    assert clock.sleeps == []
+

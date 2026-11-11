@@ -101,7 +101,7 @@ if TYPE_CHECKING:
     from space_smoke.fixtures import KindEcw
 
 # The timings `LeaderElectionConfig::from_environment` resolves
-# (crates/libs/cluster/controller/server/src/leader_election/mod.rs), which
+# (crates/l40_api/cluster/controller/server/src/leader_election/mod.rs), which
 # nothing but the Lease's `leaseDurationSeconds` exposes: the lease TTL, which
 # this run requests at MIN_LEASE_TTL through LEASE_TTL_TEST_ENV (checked
 # against the Lease), and the standby retry interval, DEFAULT_RETRY_INTERVAL
@@ -120,24 +120,23 @@ LIVENESS_BUDGET_SPREAD = 1 + 1 / 4
 # Past the first refused call plus the budget's ceiling and one retry interval
 # (the attempt that would cross it), how long until a contender whose
 # refusals spent its budget shows the restart: its exit runs only the metric
-# and trace providers' shutdowns (5 s each, crates/libs/observability); kubelet
+# and trace providers' shutdowns (5 s each, crates/l10_foundation/observability); kubelet
 # notices within a PLEG relist (1 s), restarts a first exit at once, and
 # reports the restart count within its status batch (10 s); the watch reads
 # every 5 s. That is 26 s; 30 s leaves room for a loaded node.
 REFUSAL_RESTART_SEEN_SECONDS = 30.0
-# The OTLP metric export interval (crates/libs/observability/src/sink/otlp.rs).
+# The OTLP metric export interval (crates/l10_foundation/observability/src/sink/otlp.rs).
 EXPORT_INTERVAL_SECONDS = 10.0
 # The loops that record the reconciler tick histogram in Kind, by the
-# controller setting that ticks each: started_sandbox_repair,
-# failed_restorable_repair, transient_lifecycle_sweeper and the
-# orphaned-restore-pod GC ship at 60 s, and the Kind bring-up ticks them every
-# 10 s (infra/space/kind/charts/space-cluster-controller-local/values-kind.yaml).
+# controller setting that ticks each: failed_restorable_repair,
+# transient_lifecycle_sweeper and the orphaned-restore-pod GC ship at 60 s,
+# and the Kind bring-up ticks them every 10 s
+# (infra/space/kind/charts/space-cluster-controller-local/values-kind.yaml).
 # The stuck-ContainerCreating GC, also at 60 s, is off on Kind. The warm
 # pool's 5 s loop records it only with its orphan GC on, which Kind leaves off.
 # The preflight reads these from the controller Deployment, so a bench that
 # still ticks at 60 s gets the windows a minute's ticks need.
 RECONCILER_TICK_ENV: dict[str, float] = {
-    "SPACE_STARTED_SANDBOX_REPAIR_TICK_SECS": 60.0,
     "SPACE_FAILED_RESTORABLE_REPAIR_TICK_SECS": 60.0,
     "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_TICK_SECS": 60.0,
     "SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS": 60.0,
@@ -169,7 +168,7 @@ def one_tick_window_seconds(slowest_tick: float) -> float:
 # `renewTime` it wrote; its reconcilers then drain within
 # SHUTDOWN_DRAIN_TIMEOUT (10 s), so they stop 2 s before expiry. Only bounded
 # steps follow: the release attempt (RELEASE_TIMEOUT, 5 s) and the metric and
-# trace providers' shutdowns (5 s each, crates/libs/observability). So the exit
+# trace providers' shutdowns (5 s each, crates/l10_foundation/observability). So the exit
 # is due by expiry + 13 s; a later exit is a holder that kept running.
 HOLDER_EXIT_AFTER_EXPIRY_SECONDS = -12.0 + 10.0 + 5.0 + 5.0 + 5.0
 # The apiserver stores the Lease's `renewTime` and `acquireTime`, and the pod

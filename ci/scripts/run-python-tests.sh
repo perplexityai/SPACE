@@ -103,6 +103,11 @@ else
     uv_lock_mode=--frozen
 fi
 
+# One worker per CPU (pytest-xdist): one at a time, the 1,978 tests took
+# 163 s. --dist loadfile keeps a file's tests on one worker, so tests that
+# share a module's state, or the Postgres database above
+# (test_prune_cluster_artifacts.py creates fixed table names), never run at
+# once. SPACE_PYTHON_TEST_WORKERS overrides the count; 0 runs in one process.
 echo "--- :python: Running every discovered Python test"
 "${uv_bin}" run \
     "${uv_lock_mode}" \
@@ -116,4 +121,6 @@ echo "--- :python: Running every discovered Python test"
         -ra \
         --strict-config \
         --strict-markers \
+        --numprocesses "${SPACE_PYTHON_TEST_WORKERS:-auto}" \
+        --dist loadfile \
         "${REPO_ROOT}"

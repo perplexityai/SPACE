@@ -1,0 +1,8 @@
+# Paths the Python tests do not read. They discover every test_*.py in the
+# repository (docs/site/test_build.py included) and their source guards read
+# crates/, docs/configuration.md and space_smoke/, so the list is short.
+
+# The Next.js console, built only by docker/Dockerfile.ui. A Python file
+# there would still be collected, as a test, a *_test.py or a conftest.py.
+ui/**
+!ui/*.py

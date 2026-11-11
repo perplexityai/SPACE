@@ -35,6 +35,11 @@ space-api-local:
   # URL that differs from space-cluster-controller-local's.
   redis:
     url: ""
+  # Only internal-api, as it ships: the data plane's Native files are off
+  # below, so its identity has no call to make here.
+  ingressActivation:
+    allowedServiceAccounts:
+      - space-internal-api
 
 space-cluster-controller-local:
   # Shares the API's cluster-activation bucket, so it names the same store.
@@ -57,6 +62,15 @@ space-data-plane-local:
   entry:
     type: ClusterIP
   ecwHosts: ""
+  # Kind serves Native files from the data plane, which needs the sandbox
+  # namespace's policy to admit it, the API's activation listener to admit its
+  # ServiceAccount, and a load balancer rule to route the files paths to it.
+  # Off here, as it ships, with neither admission: space-api answers them.
+  nativeFiles:
+    enabled: false
+
+space-sandbox-network-policy:
+  allowDataPlane: false
 
 # Kind gives every node its own root-owned /space/vendor (stage_vendor in
 # kind/node/space-kind-node.sh); a caller's node brings its own, which may be

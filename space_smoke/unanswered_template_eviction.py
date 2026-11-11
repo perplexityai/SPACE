@@ -6,7 +6,7 @@ sandbox left the worker, which the worker still reports holding, comes back
 in the answer's `released_templates` instead, and node-ctl records when it
 first did. After the wait, on a full sync, node-ctl asks about that template
 again and, still released, has template-manager delete it with
-`DeleteIdleTemplate` (crates/libs/node/ctl/server/src/facets/
+`DeleteIdleTemplate` (crates/l40_api/node/ctl/server/src/facets/
 unanswered_templates.rs).
 
 The wait is an hour and is read once at start, so the scenario scopes a

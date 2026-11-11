@@ -1,3 +1,4 @@
+use crate::metrics::{ResponseKind, ResponseOrigin};
 use axum::{
     Json,
     extract::Request,
@@ -5,7 +6,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api::{PublicErrorCode, PublicErrorDetail, PublicErrorEnvelope};
 use std::time::Duration;
 
@@ -410,7 +410,7 @@ impl IntoResponse for PublicApiError {
         let retry_after = self.retry_after;
         let origin = self.origin;
         let kind = self.kind;
-        pplx_space_metrics::response::public_api(origin, kind, status.as_u16());
+        crate::metrics::public_api(origin, kind, status.as_u16());
         tracing::Span::current().record("space.response_origin", origin.as_str());
         tracing::Span::current().record("space.response_kind", kind.as_str());
         let envelope = self.into_envelope();

@@ -1,0 +1,65 @@
+[package]
+name = "pplx-space-node-runtime-manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Read Firecracker release archives from GitHub releases.
+github = ["dep:reqwest"]
+otel = ["pplx-space-observability/otel"]
+datadog = ["otel", "pplx-space-observability/datadog"]
+# Deprecated for one release; use otel and datadog.
+datadog-otel = ["otel", "datadog"]
+
+[dependencies]
+async-trait = { workspace = true }
+aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio"] }
+bytes = { workspace = true }
+flate2 = { workspace = true }
+http = { workspace = true }
+futures-util = { workspace = true }
+jiff = { workspace = true }
+libc = { workspace = true }
+md-5 = { workspace = true }
+nix = { workspace = true, features = ["user"] }
+reqwest = { workspace = true, optional = true }
+rusqlite = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true, features = ["macros", "migrate"] }
+thiserror = { workspace = true }
+tar = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tonic = { workspace = true }
+tracing = { workspace = true }
+
+# internal
+pplx-space-common-core = { workspace = true, features = ["rusqlite", "serde"] }
+pplx-space-common-jobs = { workspace = true }
+pplx-space-grpc-server = { workspace = true }
+pplx-space-observability = { workspace = true }
+pplx-space-sqlite = { workspace = true }
+pplx-space-execution-common = { workspace = true }
+pplx-space-node-mgr-client = { workspace = true }
+pplx-space-node-runtime-core = { workspace = true, features = ["artifact-store"] }
+pplx-space-node-runtime-manager-client = { workspace = true }
+pplx-space-s3-http-client = { workspace = true }
+pplx-space-uds-peer-auth = { workspace = true }
+pplx-space-unix-socket-bind = { workspace = true }
+pplx-space-unix-socket-path = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

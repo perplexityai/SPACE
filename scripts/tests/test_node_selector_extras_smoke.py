@@ -55,15 +55,15 @@ def _stage(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _stage_real_shape(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The tree's actual shape: the call site in a library both apps link."""
-    _crate(tmp_path, "crates/libs/api", "pplx-space-api", call_site="substrate.rs")
+    _crate(tmp_path, "crates/l40_api/api", "pplx-space-api", call_site="substrate.rs")
     _crate(
-        tmp_path, "crates/apps/api/svc", "pplx-space-api-svc",
+        tmp_path, "crates/l50_app/api/svc", "pplx-space-api-svc",
         depends_on=("pplx-space-api",), binary=True,
     )
     _crate(
         tmp_path,
-        "crates/apps/cluster/controller/svc",
-        "pplx-space-cluster-controller",
+        "crates/l50_app/cluster/controller/svc",
+        "pplx-space-cluster-controller-svc",
         call_site="warm_pool.rs",
         depends_on=("pplx-space-api",),
         binary=True,
@@ -178,6 +178,17 @@ def test_an_unmapped_binary_reaching_the_constructor_fails_closed(
     _crate(tmp_path, "crates/apps/other/svc", "pplx-other", depends_on=("pplx-space-api",), binary=True)
     with pytest.raises(guard.GuardError, match="crates/apps/other/svc"):
         guard._renderer_deployments()
+
+
+def test_a_tools_binary_reaching_the_constructor_is_no_renderer(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stage_real_shape(tmp_path, monkeypatch)
+    _crate(
+        tmp_path, "crates/tools/metrics/workload", "pplx-tool",
+        depends_on=("pplx-space-api",), binary=True,
+    )
+    assert sorted(guard._renderer_deployments()) == ["space-api", "space-cluster-controller"]
 
 
 def test_a_test_module_call_site_does_not_widen_the_set(

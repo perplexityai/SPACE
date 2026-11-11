@@ -24,6 +24,7 @@ import (
 	"github.com/containerd/errdefs"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -2319,6 +2320,13 @@ func TestLegacyPodTeardownPreservesUserStoppedRootfs(t *testing.T) {
 		state sandboxStateResult
 	}{
 		{"stopped", sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED.Enum()}}}}},
+		// The guest can exit, and containerd tear its task down, before
+		// sbx-manager finishes the user's stop.
+		{"stopping", sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING.Enum()}}}}},
+		// A stop or suspend whose cleanup failed keeps its completion.
+		{"stop cleanup required", ownedCleanup(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_REQUIRED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED)},
+		{"stop cleanup failed", ownedCleanup(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED)},
+		{"suspend cleanup failed", ownedCleanup(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING, pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED)},
 		{"missing", sandboxStateResult{err: status.Error(codes.NotFound, "sandbox absent")}},
 		{"empty", sandboxStateResult{resp: &pb.StateResponse{}}},
 	} {
@@ -2327,7 +2335,7 @@ func TestLegacyPodTeardownPreservesUserStoppedRootfs(t *testing.T) {
 				client := &fakeSandboxManagerClient{results: []sandboxStateResult{tc.state}}
 				identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 7}
 
-				detached, err := releaseLegacyTaskTeardown(context.Background(), client, operation, identity)
+				detached, err := releaseLegacyTaskTeardown(context.Background(), client, operation, identity, nil)
 				if err != nil {
 					t.Fatalf("releaseLegacyTaskTeardown() error = %v", err)
 				}
@@ -2345,42 +2353,339 @@ func TestLegacyPodTeardownPreservesUserStoppedRootfs(t *testing.T) {
 	}
 }
 
+func cleanupState(lifecycle pb.SandboxLifecycleState, completion *pb.SandboxCleanupCompletion) sandboxStateResult {
+	sandbox := &pb.SandboxInfo{Lifecycle: lifecycle.Enum()}
+	if completion != nil {
+		sandbox.Cleanup = &pb.SandboxCleanup{Completion: *completion}
+	}
+	return sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{sandbox}}}
+}
+
+// ownedCleanup is a row the cleanup in state owns, published under the
+// teardown transition it is over.
+func ownedCleanup(lifecycle pb.SandboxLifecycleState, state pb.SandboxCleanupState, completion pb.SandboxCleanupCompletion) sandboxStateResult {
+	sandbox := &pb.SandboxInfo{Lifecycle: lifecycle.Enum(), Cleanup: &pb.SandboxCleanup{Completion: completion, State: state}}
+	return sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{sandbox}}}
+}
+
+// Without a cleanup state, a published completion can be an armed activation's
+// rollback target while the start runs. These are the shapes sbx-manager
+// publishes today, each with its lifecycle's answer spelled out.
+func TestLegacyTeardownKeepsTheLifecycleAnswerForArmedActivations(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		lifecycle  pb.SandboxLifecycleState
+		completion pb.SandboxCleanupCompletion
+		stopIssued bool
+		release    bool
+	}{
+		{"cold start from stopped", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTING, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED, false, false},
+		{"cold start from suspended", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTING, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED, false, false},
+		{"first start", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTING, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_CREATED, false, false},
+		{"create", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CREATING, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_DELETE_ROW, false, false},
+		{"create guard", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CREATED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_DELETE_ROW, false, false},
+		{"restore", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED, false, true},
+		{"restore after own stop", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED, true, true},
+		{"stopping with suspend target", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED, false, true},
+		{"stopping after own stop", pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED, true, false},
+	} {
+		for _, operation := range []string{"kill", "delete"} {
+			t.Run(tc.name+"/"+operation, func(t *testing.T) {
+				client := &fakeSandboxManagerClient{results: []sandboxStateResult{cleanupState(tc.lifecycle, tc.completion.Enum())}}
+				identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 1, legacyStopIssued: tc.stopIssued}
+				detached, err := releaseLegacyTaskTeardown(context.Background(), client, operation, identity, nil)
+				if err != nil {
+					t.Fatalf("releaseLegacyTaskTeardown() error = %v", err)
+				}
+				wantStop, wantDelete := 0, 0
+				if !tc.release && operation == "kill" {
+					wantStop = 1
+				}
+				if !tc.release && operation == "delete" {
+					wantDelete = 1
+				}
+				if detached != tc.release || client.stopCalls != wantStop || client.deleteCalls != wantDelete {
+					t.Fatalf("detached=%t stop:%d delete:%d, want detached=%t stop:%d delete:%d",
+						detached, client.stopCalls, client.deleteCalls, tc.release, wantStop, wantDelete)
+				}
+			})
+		}
+	}
+}
+
+// Without a cleanup state, every lifecycle gets the same answer with any
+// completion as with none, so a lifecycle or completion added later is covered
+// too.
+func TestLegacyTeardownIgnoresACompletionOutsideFailedCleanup(t *testing.T) {
+	type outcome struct {
+		detached         bool
+		code             codes.Code
+		stops, deletions int
+	}
+	run := func(lifecycle pb.SandboxLifecycleState, completion *pb.SandboxCleanupCompletion, operation string, stopIssued bool) outcome {
+		client := &fakeSandboxManagerClient{results: []sandboxStateResult{cleanupState(lifecycle, completion)}}
+		identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 1, legacyStopIssued: stopIssued}
+		detached, err := releaseLegacyTaskTeardown(context.Background(), client, operation, identity, nil)
+		return outcome{detached, status.Code(err), client.stopCalls, client.deleteCalls}
+	}
+	for lifecycleValue := range pb.SandboxLifecycleState_name {
+		lifecycle := pb.SandboxLifecycleState(lifecycleValue)
+		for completionValue := range pb.SandboxCleanupCompletion_name {
+			completion := pb.SandboxCleanupCompletion(completionValue)
+			for _, operation := range []string{"kill", "delete"} {
+				for _, stopIssued := range []bool{false, true} {
+					got := run(lifecycle, completion.Enum(), operation, stopIssued)
+					want := run(lifecycle, nil, operation, stopIssued)
+					if got != want {
+						t.Errorf("%s with %s, %s, stop_issued=%t: got %+v, want the no-cleanup answer %+v",
+							lifecycle, completion, operation, stopIssued, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+// A cleanup-owned row gets the same teardown answer whichever teardown
+// transition it is published under.
+func TestLegacyTeardownDecidesAnOwnedCleanupByItsCleanupStateNotItsLifecycle(t *testing.T) {
+	type outcome struct {
+		detached         bool
+		code             codes.Code
+		stops, deletions int
+	}
+	run := func(lifecycle pb.SandboxLifecycleState, cleanup *pb.SandboxCleanup, operation string, stopIssued bool) outcome {
+		sandbox := &pb.SandboxInfo{Lifecycle: lifecycle.Enum(), Cleanup: cleanup}
+		client := &fakeSandboxManagerClient{results: []sandboxStateResult{
+			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{sandbox}}},
+		}}
+		identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 1, legacyStopIssued: stopIssued}
+		detached, err := releaseLegacyTaskTeardown(context.Background(), client, operation, identity, nil)
+		return outcome{detached, status.Code(err), client.stopCalls, client.deleteCalls}
+	}
+	for _, owner := range []pb.SandboxCleanupState{pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_REQUIRED, pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED} {
+		for completionValue := range pb.SandboxCleanupCompletion_name {
+			cleanup := &pb.SandboxCleanup{Completion: pb.SandboxCleanupCompletion(completionValue), State: owner}
+			for _, operation := range []string{"kill", "delete"} {
+				for _, stopIssued := range []bool{false, true} {
+					want := run(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, cleanup, operation, stopIssued)
+					for _, lifecycle := range []pb.SandboxLifecycleState{
+						pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_DELETING,
+						pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING,
+					} {
+						if got := run(lifecycle, cleanup, operation, stopIssued); got != want {
+							t.Errorf("%s with %s %s, %s, stop_issued=%t: got %+v, want the STOPPING answer %+v",
+								lifecycle, owner, cleanup.Completion, operation, stopIssued, got, want)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// The one row the cleanup state flips from today's STOPPING answer: a
+	// handed-off suspend after this task's own stop is released, not torn down.
+	handedOff := &pb.SandboxCleanup{
+		Completion: pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED,
+		State:      pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_REQUIRED,
+	}
+	if got := run(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, handedOff, "kill", true); got != (outcome{detached: true}) {
+		t.Errorf("handed-off suspend after own stop: got %+v, want a release", got)
+	}
+
+	// A cleanup over a lifecycle no cleanup can be over authorizes nothing.
+	for _, lifecycle := range []pb.SandboxLifecycleState{
+		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED,
+		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED,
+		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDED,
+	} {
+		misplaced := &pb.SandboxCleanup{
+			Completion: pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED,
+			State:      pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED,
+		}
+		for _, operation := range []string{"kill", "delete"} {
+			if got := run(lifecycle, misplaced, operation, false); got != (outcome{code: codes.FailedPrecondition}) {
+				t.Errorf("%s with a cleanup, %s: got %+v, want FailedPrecondition", lifecycle, operation, got)
+			}
+		}
+	}
+
+	// A cleanup state this shim doesn't know authorizes nothing.
+	unknown := &pb.SandboxCleanup{State: pb.SandboxCleanupState(99)}
+	for _, lifecycle := range []pb.SandboxLifecycleState{
+		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING,
+		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_DELETING,
+	} {
+		for _, operation := range []string{"kill", "delete"} {
+			if got := run(lifecycle, unknown, operation, false); got != (outcome{code: codes.FailedPrecondition}) {
+				t.Errorf("%s with an unknown cleanup state, %s: got %+v, want FailedPrecondition", lifecycle, operation, got)
+			}
+		}
+	}
+}
+
+func TestStoppedRestartRefusesACleanupOwnedRowWhateverItsLifecycle(t *testing.T) {
+	for _, state := range []pb.SandboxCleanupState{
+		pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_REQUIRED,
+		pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED,
+		pb.SandboxCleanupState(99),
+	} {
+		for _, lifecycle := range []pb.SandboxLifecycleState{
+			pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING,
+			pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_DELETING,
+			pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING,
+		} {
+			sandbox := &pb.SandboxInfo{Lifecycle: lifecycle.Enum(), Cleanup: &pb.SandboxCleanup{State: state}}
+			client := &fakeSandboxManagerClient{results: []sandboxStateResult{
+				{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{sandbox}}},
+			}}
+			// A refusal answers at once; a missed one waits out this deadline.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			checkpoint, err := stoppedRestartCheckpoint(ctx, client, "sandbox", nil)
+			cancel()
+			if checkpoint != nil || status.Code(err) != codes.FailedPrecondition {
+				t.Errorf("%s with %s: stoppedRestartCheckpoint() = %v, %v; want FailedPrecondition without waiting", lifecycle, state, checkpoint, err)
+			}
+		}
+	}
+}
+
+// A failed cleanup that doesn't end in a stopped or suspended sandbox, or
+// whose completion this shim doesn't know, keeps the destructive teardown it
+// had before completions were reported.
+func TestLegacyTeardownStillTearsDownOtherFailedCleanups(t *testing.T) {
+	for _, completion := range []pb.SandboxCleanupCompletion{
+		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_DELETE_ROW,
+		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_DELETE_POOL_CLONE,
+		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_CREATED,
+		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_QUARANTINE,
+		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_UNSPECIFIED,
+		pb.SandboxCleanupCompletion(99),
+	} {
+		for _, owner := range []pb.SandboxCleanupState{pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_REQUIRED, pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED} {
+			for _, operation := range []string{"kill", "delete"} {
+				t.Run(fmt.Sprintf("%v/%s/%s", completion, owner, operation), func(t *testing.T) {
+					client := &fakeSandboxManagerClient{results: []sandboxStateResult{ownedCleanup(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, owner, completion)}}
+					identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 1}
+					detached, err := releaseLegacyTaskTeardown(context.Background(), client, operation, identity, nil)
+					if err != nil || detached {
+						t.Fatalf("releaseLegacyTaskTeardown() = %v, %v; want the destructive call", detached, err)
+					}
+					if client.stopCalls+client.deleteCalls != 1 {
+						t.Fatalf("calls = stop:%d delete:%d, want one destructive call", client.stopCalls, client.deleteCalls)
+					}
+				})
+			}
+		}
+	}
+}
+
+// A Stop that sbx-manager admits can still fail on the way back. The retried
+// Kill then sees its own stop as STOPPING and must not mistake it for a
+// user's, or the pod deletion leaves the sandbox behind. A Stop sbx-manager
+// refuses was never this task's, so a user STOP that follows stays kept,
+// including a refusal sbx-manager sends as Unavailable while shutting down
+// or draining for a restart.
+func TestLegacyKillOwnsOnlyAStopThatMayHaveBeenAdmitted(t *testing.T) {
+	notAdmitted := metadata.Pairs(stopNotAdmittedTrailer, "true")
+	for _, tc := range []struct {
+		name        string
+		stopError   error
+		stopTrailer metadata.MD
+		wantStops   int
+		wantDelete  int
+	}{
+		{"reply lost", status.Error(codes.DeadlineExceeded, "reply lost"), nil, 2, 1},
+		{"connection dropped", status.Error(codes.Unavailable, "transport is closing"), nil, 2, 1},
+		{"refused", status.Error(codes.FailedPrecondition, "stop refused"), nil, 1, 0},
+		{"refused while shutting down", status.Error(codes.Unavailable, "cleanup admission closed"), notAdmitted, 1, 0},
+		{"refused by the restart drain", status.Error(codes.Unavailable, "retry on successor"), metadata.Pairs(retryOnSuccessorTrailer, "true"), 1, 0},
+		// Only the value sbx-manager sends counts; any other is unmarked.
+		{"marked false", status.Error(codes.Unavailable, "transport is closing"), metadata.Pairs(stopNotAdmittedTrailer, "false"), 2, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			podTask := &task{id: "task", sandboxID: "sbx", status: tasktypes.Status_RUNNING}
+			client := &fakeSandboxManagerClient{
+				results: []sandboxStateResult{
+					cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED, nil),
+					cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, nil),
+					cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, nil),
+				},
+				stopErrors:   []error{tc.stopError},
+				stopTrailers: []metadata.MD{tc.stopTrailer},
+			}
+			service := &spaceTaskService{
+				tasks: map[string]*task{"task": podTask},
+				sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+					return client, fakeConn{}, nil
+				},
+			}
+
+			if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); status.Code(err) != status.Code(tc.stopError) {
+				t.Fatalf("first Kill() error = %v, want %v", err, status.Code(tc.stopError))
+			}
+			if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
+				t.Fatalf("retried Kill() error = %v", err)
+			}
+			if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err != nil {
+				t.Fatalf("Delete() error = %v", err)
+			}
+			if client.stopCalls != tc.wantStops || client.deleteCalls != tc.wantDelete {
+				t.Fatalf("legacy teardown calls = stop:%d delete:%d, want stop:%d delete:%d", client.stopCalls, client.deleteCalls, tc.wantStops, tc.wantDelete)
+			}
+		})
+	}
+}
+
 func TestLegacyKillThenDeleteStillCallsManagerDelete(t *testing.T) {
-	podTask := &task{
-		id:        "task",
-		sandboxID: "sbx",
-		status:    tasktypes.Status_RUNNING,
-	}
-	client := &fakeSandboxManagerClient{
-		results: []sandboxStateResult{
-			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}},
-			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED.Enum()}}}},
-		},
-	}
-	managerCalls := 0
-	service := &spaceTaskService{
-		tasks: map[string]*task{"task": podTask},
-		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
-			managerCalls++
-			return client, fakeConn{}, nil
-		},
-	}
+	// Kill's Stop does not block, so Delete can see the row still STOPPING,
+	// or its cleanup failed.
+	for _, tc := range []struct {
+		name      string
+		afterKill sandboxStateResult
+	}{
+		{"stopped", cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED, nil)},
+		{"stopping", cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, nil)},
+		{"stop cleanup failed", ownedCleanup(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			podTask := &task{
+				id:        "task",
+				sandboxID: "sbx",
+				status:    tasktypes.Status_RUNNING,
+			}
+			client := &fakeSandboxManagerClient{
+				results: []sandboxStateResult{
+					{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}},
+					tc.afterKill,
+				},
+			}
+			managerCalls := 0
+			service := &spaceTaskService{
+				tasks: map[string]*task{"task": podTask},
+				sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+					managerCalls++
+					return client, fakeConn{}, nil
+				},
+			}
 
-	if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
-		t.Fatalf("Kill() error = %v", err)
-	}
-	if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err != nil {
-		t.Fatalf("Delete() error = %v", err)
-	}
+			if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
+				t.Fatalf("Kill() error = %v", err)
+			}
+			if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err != nil {
+				t.Fatalf("Delete() error = %v", err)
+			}
 
-	if managerCalls != 2 {
-		t.Fatalf("sandbox manager connections = %d, want 2", managerCalls)
-	}
-	if client.stopCalls != 1 || client.deleteCalls != 1 {
-		t.Fatalf("legacy teardown calls = stop:%d delete:%d, want stop:1 delete:1", client.stopCalls, client.deleteCalls)
-	}
-	if _, ok := service.tasks["task"]; ok {
-		t.Fatal("Delete() left the legacy task in the task map")
+			if managerCalls != 2 {
+				t.Fatalf("sandbox manager connections = %d, want 2", managerCalls)
+			}
+			if client.stopCalls != 1 || client.deleteCalls != 1 {
+				t.Fatalf("legacy teardown calls = stop:%d delete:%d, want stop:1 delete:1", client.stopCalls, client.deleteCalls)
+			}
+			if _, ok := service.tasks["task"]; ok {
+				t.Fatal("Delete() left the legacy task in the task map")
+			}
+		})
 	}
 }
 
@@ -2645,6 +2950,8 @@ type fakeSandboxManagerClient struct {
 	teardownRequests []*pb.PrepareTeardownSuspendRequest
 	onTeardownCall   func()
 	stopCalls        int
+	stopErrors       []error
+	stopTrailers     []metadata.MD
 	deleteCalls      int
 	deleteError      error
 }
@@ -2855,6 +3162,20 @@ func (f *fakeSandboxManagerClient) PrepareTeardownSuspend(ctx context.Context, i
 
 func (f *fakeSandboxManagerClient) Stop(ctx context.Context, in *pb.StopRequest, opts ...grpc.CallOption) (*pb.StopResponse, error) {
 	f.stopCalls++
+	if len(f.stopTrailers) > 0 {
+		trailer := f.stopTrailers[0]
+		f.stopTrailers = f.stopTrailers[1:]
+		for _, opt := range opts {
+			if option, ok := opt.(grpc.TrailerCallOption); ok {
+				*option.TrailerAddr = trailer
+			}
+		}
+	}
+	if len(f.stopErrors) > 0 {
+		err := f.stopErrors[0]
+		f.stopErrors = f.stopErrors[1:]
+		return nil, err
+	}
 	return &pb.StopResponse{}, nil
 }
 

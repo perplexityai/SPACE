@@ -1,0 +1,5 @@
+# The admin console check installs, tests, type-checks and builds ui/ from
+# its own package.json and package-lock.json. Nothing under ui/ imports,
+# reads or generates from outside it, and the Node version it runs on is in
+# the workflow, which run-all.txt covers.
+ui/**

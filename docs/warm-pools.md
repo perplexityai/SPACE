@@ -25,14 +25,15 @@ A warm pool is for one **template release** and one VM size (vCPU and memory).
 ### In the UI
 
 1. Open the SPACE UI (`http://127.0.0.1:3000` on Kind) and sign in.
-2. Go to **Templates** and find the release in **Template Releases**.
-3. Choose **Create Pool**.
+2. Go to **Templates**, open the template, and choose its **Releases** tab.
+   (The **All releases** tab of **Templates** lists every template's releases.)
+3. Choose **Create Pool** on the release.
 4. Set **vCPU** and **Memory (MiB)** to the size your sandboxes use, and set
    **Target Ready Slots** to how many sandboxes to keep ready. Save.
 
 ### With `space-admin-cli`
 
-[Install and log in](../crates/apps/admin/cli/README.md), then run:
+[Install and log in](../crates/l50_app/admin/cli/README.md), then run:
 
 ```bash
 space-admin-cli warm-pool create \
@@ -133,6 +134,12 @@ curl -sS -X POST "$SPACE_API_URL/admin/api/v1/templates/my-template/builds" \
   }'
 ```
 
+To opt the new template into ballooning, add `build_config` to `recipe`, for
+example `"build_config": {"balloon": {"mode": "report", "stats_polling_interval_s": 1}}`.
+Omitting it preserves the existing no-balloon behavior. See
+[Template balloon device](configuration.md#template-balloon-device) for modes
+and snapshot behavior.
+
 The build returns a `job_id`. Poll
 `GET /admin/api/v1/templates/my-template/builds/{job_id}` until `state` is
 `succeeded`. The response then includes the new `content_hash`.
@@ -141,7 +148,8 @@ builds, newest first, with each one's state, `content_hash` on success and
 `error` on failure. A build its builder can no longer report lists with
 `state: null` and a `status_error`.
 
-The **Template Releases** table in the UI lists every release with its tags.
+In the UI, a template's **Releases** tab lists its releases with their tags,
+and its **Builds** tab its recent builds.
 Existing sandboxes and existing warm pools stay on their release when `latest`
 moves.
 
@@ -151,7 +159,8 @@ If you publish new releases often, use a rolling policy instead of creating a
 pool for each release. The policy keeps the newest releases of a template
 warm and drains pools for releases that are no longer used.
 
-Create one in the UI under **Templates** → **Rolling Warm Pool Policies**, or
+Create one in the UI under **Templates** → **Warm pool policies**, or from the
+template's **Warm pool** tab, or
 with the Admin API:
 
 ```bash
@@ -172,6 +181,37 @@ This keeps at least 5 ready sandboxes for each of the two newest releases,
 and up to 30 when demand is higher. A new release's pool fills a short time
 after the release is published.
 
+## Delete a template that has pools
+
+`DELETE /admin/api/v1/templates/{template}` answers 409, naming what is in the
+way, while an enabled pool config, an enabled rolling policy or a pool slot
+still uses the template. Each kind clears differently:
+
+- Disable its rolling policies (`PUT /admin/api/v1/warm-pool-policies` with
+  `"enabled": false`) and pool configs (`DELETE /admin/api/v1/warm-pools/{id}`
+  or `space-admin-cli warm-pool update ... --disabled`), then wait for their
+  open slots to drain. A slot claimed by a create still in flight counts as
+  open; it settles within minutes, when the create finishes or the stale claim
+  is swept.
+- A slot held by a sandbox created from the pool clears when that sandbox's
+  pod is retired, for example when the sandbox is deleted or suspended. The
+  409 names up to five of those sandboxes.
+
+Then delete the template again. The delete removes the disabled configs and
+policies left behind.
+
+A delete can also be accepted and then fail, when a use appeared after it was
+accepted. The template then stays `deleting`.
+
+- When the operation's own check finds the use, it fails with `conflict`.
+- The warm-pool reconciler still fills a pool config enabled after the delete
+  was accepted, and its pods keep the template on their nodes. The operation
+  then waits for those nodes and fails with `internal` once its retries run
+  out.
+
+Clear the use and delete again with a new `Idempotency-Key`: replaying the
+failed delete's key returns that failed operation and starts nothing.
+
 ## Native API creates
 
 On Kubernetes, native `POST /v1/sandboxes` creates cold-boot unless
@@ -186,7 +226,7 @@ Upgrade every `space-cluster-controller` replica before turning this on; see
 
 ## Learn more
 
-- [Operator CLI](../crates/apps/admin/cli/README.md): `warm-pool update`,
+- [Operator CLI](../crates/l50_app/admin/cli/README.md): `warm-pool update`,
   `get` and `--disabled`.
 - [Observability](observability.md): the `warm_pool.slots` and
   `warm_pool.create_path.duration_ms` metrics show pool size and hits.

@@ -32,6 +32,18 @@ pub use placement::{
 pub mod node_selector;
 pub use node_selector::SandboxNodeSelector;
 
+#[path = "k8s/runtime_upgrade.rs"]
+mod runtime_upgrade;
+pub use runtime_upgrade::*;
+
+#[path = "k8s/environment_labels.rs"]
+pub mod environment_labels;
+pub use environment_labels::{
+    ENVIRONMENT_LABEL_KEY_PREFIX, ENVIRONMENT_USABLE_LABEL_VALUE, PodEnvironment,
+    SANDBOX_ENVIRONMENT_ANNOTATION, environment_label_key, is_environment_label_key,
+    node_publishes_any_environment, node_publishes_environment,
+};
+
 pub const TEMPLATE_LABEL_DOMAIN: &str = "space.pplx.net";
 pub const TEMPLATE_PRESENT_LABEL_VALUE: &str = "true";
 pub const SANDBOX_MANAGED_BY_LABEL: &str = "space.pplx.net/managed-by";
@@ -264,7 +276,7 @@ pub const DEFAULT_SANDBOX_NODE_SERVICES_READY_AFFINITY: bool = false;
 /// emptiest nodes; collapsing the whole low-utilization range into a single
 /// tie-ing tier spreads them across the healthy fleet instead. Resolution is
 /// spent only in the high-usage danger zone, where the disk-gated reclaim loops
-/// (`crates/libs/sbx/mgr/server/src/disk_usage.rs`: snapshot reaper engages at
+/// (`crates/l40_api/sbx/mgr/server/src/disk_usage.rs`: snapshot reaper engages at
 /// `0.50` usage, cold-sandbox eviction at `0.55`) are already firing and the
 /// difference between a 90%- and a 96%-full node actually matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -498,6 +510,10 @@ pub struct SandboxPodCommon<'a> {
     pub content_hash: Option<&'a str>,
     pub env: &'a BTreeMap<String, String>,
     pub traceparent: Option<String>,
+    /// The environment the pod's work is bound to, while the environment
+    /// placement gate evaluates; see [`PodEnvironment`]. `None` for unbound
+    /// work and while the gate is off.
+    pub environment: Option<PodEnvironment>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -577,6 +593,11 @@ pub enum SandboxPodRequest<'a> {
         /// Set only on the drain's re-placement of an evacuated `stopped`
         /// sandbox; see [`StoppedMaterialization`].
         stopped_materialization: Option<StoppedMaterialization<'a>>,
+        /// Set only on a pod that boots the sandbox under another execution
+        /// environment; see [`PodRuntimeUpgrade`]. It excludes
+        /// `stopped_materialization` and `fork_disk_restore`, which name other
+        /// intents for the same checkpoint annotation.
+        runtime_upgrade: Option<Box<PodRuntimeUpgrade<'a>>>,
         /// Direct source-node assignment while no portable fallback exists.
         direct_node_name: Option<&'a str>,
         /// Source-node affinity preference once S3 fallback is available.
@@ -748,6 +769,12 @@ pub struct StoppedMaterialization<'a> {
 
 pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodRequest<'_>) -> Pod {
     let cold_create = matches!(&request, SandboxPodRequest::OnDemand { .. });
+    let runtime_upgrade = match &request {
+        SandboxPodRequest::Restore {
+            runtime_upgrade, ..
+        } => runtime_upgrade.as_deref().copied(),
+        SandboxPodRequest::OnDemand { .. } | SandboxPodRequest::Pooled { .. } => None,
+    };
     let empty_tolerations: &[PodToleration] = &[];
     let (
         common,
@@ -801,13 +828,21 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             suspend_restore_source_node,
             fork_disk_restore,
             stopped_materialization,
+            runtime_upgrade,
             direct_node_name,
             preferred_node_name,
             restore_node_shortlist,
             extra_tolerations,
             extra_required_affinity,
         } => {
-            let checkpoint =
+            debug_assert!(
+                runtime_upgrade.is_none()
+                    || (stopped_materialization.is_none() && fork_disk_restore.is_none()),
+                "a runtime upgrade pod names no other restore intent"
+            );
+            let checkpoint = if runtime_upgrade.is_some() {
+                Some(RUNTIME_UPGRADE_CHECKPOINT)
+            } else {
                 fork_disk_restore
                     .is_none()
                     .then_some(if stopped_materialization.is_some() {
@@ -817,7 +852,8 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
                             crate::types::ArtifactKind::Full => "suspend",
                             crate::types::ArtifactKind::Disk => "stopped",
                         }
-                    });
+                    })
+            };
             (
                 common,
                 Some(runtime),
@@ -871,6 +907,7 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
         content_hash,
         env,
         traceparent,
+        environment,
     } = common;
 
     let mut labels = BTreeMap::new();
@@ -963,6 +1000,42 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             materialization.artifact_id.to_string(),
         );
     }
+    if let Some(upgrade) = runtime_upgrade {
+        for (key, value) in [
+            (
+                SANDBOX_RUNTIME_UPGRADE_OPERATION_ID_ANNOTATION,
+                upgrade.operation_id.to_string(),
+            ),
+            (
+                SANDBOX_RUNTIME_UPGRADE_TARGET_ENVIRONMENT_ANNOTATION,
+                upgrade.target_environment.to_string(),
+            ),
+            (
+                SANDBOX_RUNTIME_UPGRADE_AUTHORIZATION_ID_ANNOTATION,
+                upgrade.authorization_id.to_string(),
+            ),
+            (
+                SANDBOX_RUNTIME_UPGRADE_AUTHORIZATION_REASON_ANNOTATION,
+                upgrade.authorization_reason.to_string(),
+            ),
+            (
+                SANDBOX_RUNTIME_UPGRADE_MEMORY_LOSS_ANNOTATION,
+                upgrade.memory_loss.to_string(),
+            ),
+            (
+                SANDBOX_RUNTIME_UPGRADE_TARGET_STATE_ANNOTATION,
+                upgrade.target_state.to_string(),
+            ),
+        ] {
+            annotations.insert(key.to_string(), value);
+        }
+        if let Some(artifact_id) = upgrade.checkpoint_local_artifact_id {
+            annotations.insert(
+                SANDBOX_RUNTIME_UPGRADE_CHECKPOINT_LOCAL_ARTIFACT_ID_ANNOTATION.to_string(),
+                artifact_id.to_string(),
+            );
+        }
+    }
     if let Some(fork_disk_restore) = fork_disk_restore {
         annotations.insert(
             SANDBOX_FORK_DISK_RESTORE_ANNOTATION.to_string(),
@@ -1035,6 +1108,12 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
     }
     if let Some(traceparent) = traceparent {
         annotations.insert(SANDBOX_TRACEPARENT_ANNOTATION.to_string(), traceparent);
+    }
+    if let Some(environment) = environment {
+        annotations.insert(
+            SANDBOX_ENVIRONMENT_ANNOTATION.to_string(),
+            environment.reference.to_string(),
+        );
     }
     if let Some(pool) = pool {
         let sandbox_owner = ROOT_SANDBOX_OWNER.as_str().to_string();
@@ -1373,6 +1452,11 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
                         }
                     })
                     .unwrap_or_default(),
+                required_environment: environment.filter(|environment| environment.required).map(
+                    |PodEnvironment { reference, .. }| {
+                        environment_labels::environment_requirement(&reference)
+                    },
+                ),
                 // Scoring term, suppressed whenever the pod already has a
                 // source-node preference of its own — a hard pin, a shortlist,
                 // *or* the legacy soft preference, which is the default
@@ -1495,6 +1579,8 @@ struct SandboxNodeAffinityInput<'a> {
     preferred_template_weight: i32,
     extra_required_label: Option<(&'a str, &'a str)>,
     required_node_group_expressions: Vec<NodeSelectorRequirement>,
+    /// The bound environment's node label, required in every term.
+    required_environment: Option<NodeSelectorRequirement>,
     preferred_dedicated_term: Option<PreferredSchedulingTerm>,
     ssd_placement_block: bool,
     ssd_headroom_tier_bias: bool,
@@ -1510,6 +1596,7 @@ fn sandbox_node_affinity(input: SandboxNodeAffinityInput<'_>) -> Option<Affinity
         preferred_template_weight,
         extra_required_label,
         required_node_group_expressions,
+        required_environment,
         preferred_dedicated_term,
         ssd_placement_block,
         ssd_headroom_tier_bias,
@@ -1534,6 +1621,7 @@ fn sandbox_node_affinity(input: SandboxNodeAffinityInput<'_>) -> Option<Affinity
         && preferred_template_label.is_none()
         && extra_required_label.is_none()
         && required_node_group_expressions.is_empty()
+        && required_environment.is_none()
         && preferred_dedicated_term.is_none()
         && !ssd_placement_block
         && !ssd_headroom_tier_bias
@@ -1562,6 +1650,7 @@ fn sandbox_node_affinity(input: SandboxNodeAffinityInput<'_>) -> Option<Affinity
         });
     }
     match_expressions.extend(required_node_group_expressions);
+    match_expressions.extend(required_environment);
     if ssd_placement_block {
         match_expressions.push(NodeSelectorRequirement {
             key: SSD_PLACEMENT_BLOCKED_LABEL.to_string(),

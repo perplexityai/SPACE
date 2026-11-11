@@ -27,7 +27,7 @@ tool changes an image, change its line there too.
 
 Rust CI checks are owned by `ci/scripts/run-rust-checks.sh` and its
 pipeline steps: formatting/error policy, workspace lint and compilation with
-all targets/features, and the common-svc feature-isolation check. The checks
+all targets/features, and the observability feature-isolation check. The checks
 that run beside nextest live in `ci/scripts/lib/rust-side-checks.sh`, which the
 Rust caches' keys do not hash.
 
@@ -37,17 +37,15 @@ workspace libraries one at a time, so a crate that uses a dependency feature
 it gets only through workspace feature unification fails. Its selection and
 lints live in `ci/scripts/lib/rust-isolated-crates.sh`, which the cache keys do
 not hash either. From `cargo metadata` it selects every library, other than
-`pplx-space-common-core` and `pplx-space-common-svc`, that reaches common-core
-at most directly: no other workspace member in its normal dependency graph may
-reach either of the two. Declared dependencies, optional ones included, decide
+`pplx-space-common-core`, that reaches common-core at most directly: no other
+workspace member in its normal dependency graph may reach it. Declared dependencies, optional ones included, decide
 first; a library they leave out is decided again from the graph `cargo tree`
 resolves for it with all of its features, so an optional dependency nothing
-enables does not count. Crates that reach common-core through another crate,
-such as everything built on `pplx-space-metrics`, are left out because each
-builds that crate's graph too. A short commented `ALSO` list adds crates whose
-only other path to common-core is `pplx-space-metrics`, such as
-`pplx-space-tokio-runtime`; the check fails on an entry that is not a
-workspace library or that the rule does not leave out for that reason. The log
+enables does not count. Crates that reach common-core through another crate
+are left out because each builds that crate's graph too. A commented `ALSO`
+list, empty today, adds such a crate when it builds quickly alone; the check
+fails on an entry that is not a workspace library or that the rule does not
+leave out for that reason. The log
 names the libraries left out. Each crate gets its own `cargo clippy` runs with
 `--no-default-features` and with `--all-features`, each once with
 `--all-targets` and once with `--lib`. The `--lib` runs catch a feature that
@@ -119,7 +117,7 @@ a target Cargo still builds.
 Postgres/Redis fixtures fail closed unless the run opts out with
 `SPACE_TEST_DEPS_OPTIONAL=1`. Every opted-out skip emits a `SPACE-TEST-DEP-SKIP:`
 stderr marker and appends to the file named by `SPACE_TEST_DEP_SKIP_LOG` when
-set (`crates/libs/db-test-fixtures/src/lib.rs`);
+set (`crates/test_support/db/test/fixtures/src/lib.rs`);
 `ci/scripts/run-rust-checks.sh` collects and reports the count on
 every run — zero proves no fail-open path was taken. A configured log is
 fail-closed: path and write errors fail the affected test so collection

@@ -17,8 +17,8 @@ assert SPEC is not None and SPEC.loader is not None
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 
-DISPATCHER = Path("crates/libs/cluster/controller/server/src/public_operation_dispatcher.rs")
-ENV_CONFIG = Path("crates/libs/cluster/controller/server/src/env_config.rs")
+DISPATCHER = Path("crates/l40_api/cluster/controller/server/src/public_operation_dispatcher.rs")
+ENV_CONFIG = Path("crates/l40_api/cluster/controller/server/src/env_config.rs")
 DOC_ROW = "| `SPACE_EXAMPLE_LIMIT` | 8 | |\n"
 LIB = "crates/libs/example/src/lib.rs"
 

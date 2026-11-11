@@ -1,0 +1,260 @@
+use super::*;
+
+#[test]
+fn uds_per_sandbox_limit_status_round_trips_through_metadata() {
+    let status =
+        uds_per_sandbox_limit_exceeded_status("SpacedStat UDS per-sandbox limiter exceeded");
+
+    assert_eq!(
+        UdsPerSandboxLimitExceeded::from_status(&status),
+        Some(UdsPerSandboxLimitExceeded)
+    );
+}
+
+#[test]
+fn uds_per_sandbox_limit_requires_metadata() {
+    let status = Status::resource_exhausted("SpacedStat UDS per-sandbox limiter exceeded");
+
+    assert_eq!(UdsPerSandboxLimitExceeded::from_status(&status), None);
+}
+
+#[test]
+fn guest_capability_unsupported_status_round_trips_through_metadata() {
+    let capability = GuestCapability::InteractiveProcessControl;
+    let status =
+        guest_capability_unsupported_status(capability, format!("{capability} is unsupported"));
+
+    assert_eq!(
+        GuestCapabilityUnsupported::from_status(&status),
+        Some(GuestCapabilityUnsupported { capability })
+    );
+}
+
+#[test]
+fn desired_state_apply_terminal_marker_round_trips_through_metadata() {
+    let status = mark_desired_state_apply_terminal(Status::failed_precondition(
+        "sandbox is failed; the guest is not reachable for loopback bridge operations",
+    ));
+    assert!(is_desired_state_apply_terminal(&status));
+    // The marker is what distinguishes terminal from transient; a bare
+    // FailedPrecondition (e.g. a still-initializing guest) is not terminal.
+    assert!(!is_desired_state_apply_terminal(
+        &Status::failed_precondition("guest_not_ready")
+    ));
+}
+
+#[test]
+fn guest_capability_parse_error_names_unsupported_value() {
+    let error = "missing_capability"
+        .parse::<GuestCapability>()
+        .expect_err("unknown capability should fail");
+
+    assert_eq!(
+        error.to_string(),
+        "unsupported guest capability \"missing_capability\""
+    );
+}
+
+#[test]
+fn guest_connect_refusal_is_an_application_precondition_only() {
+    for kind in [
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::Other,
+    ] {
+        // Identical text must not affect classification.
+        let status = guest_service_connect_status(&std::io::Error::new(kind, "connection refused"));
+        let refused = kind == std::io::ErrorKind::ConnectionRefused;
+        assert_eq!(
+            status.code(),
+            if refused {
+                Code::FailedPrecondition
+            } else {
+                Code::Unavailable
+            }
+        );
+        assert_eq!(
+            GuestServiceUnavailable::from_status(&status).is_some(),
+            refused
+        );
+        let decoded = Status::from_header_map(status.clone().into_http::<()>().headers()).unwrap();
+        assert_eq!(
+            GuestServiceUnavailable::from_status(&decoded).is_some(),
+            refused
+        );
+        assert!(!crate::should_reconnect_status(&status) || !refused);
+    }
+    for code in [Code::FailedPrecondition, Code::Unavailable, Code::Internal] {
+        assert_eq!(
+            GuestServiceUnavailable::from_status(&Status::new(
+                code,
+                "Sandbox service is not reachable"
+            )),
+            None
+        );
+        if code != Code::FailedPrecondition {
+            let marked = GuestServiceUnavailable.into_status();
+            let wrong_code =
+                Status::with_metadata(code, marked.message(), marked.metadata().clone());
+            assert_eq!(GuestServiceUnavailable::from_status(&wrong_code), None);
+        }
+    }
+}
+
+#[test]
+fn process_errors_require_guest_provenance_and_distinguish_storage_from_admission() {
+    for code in [
+        Code::NotFound,
+        Code::PermissionDenied,
+        Code::InvalidArgument,
+        Code::FailedPrecondition,
+        Code::Unavailable,
+        Code::DeadlineExceeded,
+        Code::ResourceExhausted,
+    ] {
+        let raw = Status::new(code, "synthetic failure");
+        assert!(!is_terminal_guest_process_error(&raw));
+        let mut raw = raw;
+        raw.metadata_mut()
+            .insert(GUEST_PROCESS_ERROR_METADATA, "terminal".parse().unwrap());
+        let marked = mark_guest_process_error(raw);
+        assert_eq!(
+            is_terminal_guest_process_error(&marked),
+            matches!(
+                code,
+                Code::NotFound
+                    | Code::PermissionDenied
+                    | Code::InvalidArgument
+                    | Code::FailedPrecondition
+            )
+        );
+    }
+    let mut full = Status::resource_exhausted("guest filesystem full");
+    full.metadata_mut().insert(
+        pplx_space_guest_status::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_status::GUEST_STORAGE_FULL.parse().unwrap(),
+    );
+    assert!(is_terminal_guest_process_error(&mark_guest_process_error(
+        full
+    )));
+}
+
+#[test]
+fn refused_before_start_round_trips_with_its_retry_hint() {
+    let status = refused_before_start(
+        Status::resource_exhausted("too many concurrent filesystem file operations"),
+        Duration::from_millis(1500),
+    );
+    assert!(is_refused_before_start(&status));
+    assert_eq!(retry_after(&status), Some(Duration::from_millis(1500)));
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert_eq!(
+        status.message(),
+        "too many concurrent filesystem file operations"
+    );
+    // The guest's storage-full reason shares the key but is not a refusal.
+    let mut full = Status::resource_exhausted("guest filesystem full");
+    full.metadata_mut().insert(
+        pplx_space_guest_status::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_status::GUEST_STORAGE_FULL.parse().unwrap(),
+    );
+    assert!(!is_refused_before_start(&full));
+    assert!(!is_refused_before_start(&Status::resource_exhausted(
+        "unmarked"
+    )));
+}
+
+#[test]
+fn uds_per_sandbox_limit_is_a_refusal_before_start() {
+    let status = uds_per_sandbox_limit_exceeded_status("per-sandbox limit");
+    assert!(is_refused_before_start(&status));
+    assert!(retry_after(&status).is_some());
+    assert_eq!(
+        UdsPerSandboxLimitExceeded::from_status(&status),
+        Some(UdsPerSandboxLimitExceeded)
+    );
+}
+
+// A refusal arrived over a working transport: neither a TCP failure to
+// retry nor a reason to redial.
+#[test]
+fn refusals_are_not_transport_failures() {
+    for code in [Code::Unavailable, Code::Unknown, Code::ResourceExhausted] {
+        let refused = refused_before_start(
+            Status::new(code, "guest shutting down"),
+            Duration::from_secs(1),
+        );
+        assert!(!crate::is_temporary_tcp_failure(&refused));
+        assert!(!crate::should_reconnect_status(&refused));
+    }
+    assert!(crate::is_temporary_tcp_failure(&Status::unavailable(
+        "transport closed"
+    )));
+    assert!(crate::should_reconnect_status(&Status::unavailable(
+        "transport closed"
+    )));
+}
+
+#[test]
+fn only_a_not_found_is_marked_as_a_missing_guest_path() {
+    let marked = mark_guest_path_not_found(Status::not_found("No such file or directory"));
+    assert!(is_guest_path_not_found(&marked));
+    assert_eq!(marked.code(), Code::NotFound);
+    assert_eq!(marked.message(), "No such file or directory");
+
+    // Every other outcome passes through unmarked, including a refusal that
+    // already carries a reason under the same key.
+    for status in [
+        Status::permission_denied("Permission denied"),
+        Status::failed_precondition("Not a directory"),
+        refused_before_start(
+            Status::unavailable("guest shutting down"),
+            Duration::from_secs(1),
+        ),
+    ] {
+        let code = status.code();
+        let passed = mark_guest_path_not_found(status);
+        assert_eq!(passed.code(), code);
+        assert!(!is_guest_path_not_found(&passed), "{code:?}");
+    }
+    assert!(is_refused_before_start(&mark_guest_path_not_found(
+        refused_before_start(
+            Status::unavailable("guest shutting down"),
+            Duration::from_secs(1)
+        )
+    )));
+    // An unmarked NOT_FOUND (a hop that does not know the sandbox) is not one.
+    assert!(!is_guest_path_not_found(&Status::not_found(
+        "sandbox not found"
+    )));
+}
+
+#[test]
+fn sandbox_not_running_round_trips_its_state_on_a_failed_precondition_only() {
+    let marked = mark_sandbox_not_running(Status::failed_precondition("not started"), "suspended");
+    assert_eq!(sandbox_not_running_state(&marked), Some("suspended"));
+    assert_eq!(
+        sandbox_not_running_state(&Status::failed_precondition("not started")),
+        None
+    );
+    let unavailable = mark_sandbox_not_running(Status::unavailable("gone"), "suspended");
+    assert_eq!(sandbox_not_running_state(&unavailable), None);
+}
+
+#[test]
+fn stripping_the_not_ready_mark_keeps_the_rest_of_the_status() {
+    let marked = with_retry_after(
+        RetryableNotReady.mark(Status::unavailable("not ready")),
+        Duration::from_millis(250),
+    );
+    assert_eq!(
+        RetryableNotReady::from_status(&marked),
+        Some(RetryableNotReady)
+    );
+    let relayed = RetryableNotReady::strip(marked);
+    assert_eq!(relayed.code(), Code::Unavailable);
+    assert_eq!(RetryableNotReady::from_status(&relayed), None);
+    assert_eq!(retry_after(&relayed), Some(Duration::from_millis(250)));
+}

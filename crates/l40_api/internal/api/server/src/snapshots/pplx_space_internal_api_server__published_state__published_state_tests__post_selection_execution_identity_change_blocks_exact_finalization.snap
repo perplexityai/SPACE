@@ -1,0 +1,7 @@
+---
+source: crates/l40_api/internal/api/server/src/published_state_tests.rs
+expression: "sandbox_execution_row(&db.pool, sandbox_id).await?"
+---
+lifecycle: suspending
+active: true
+state: running

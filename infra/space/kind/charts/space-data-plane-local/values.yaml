@@ -44,14 +44,65 @@ nodeApiTokenExpirationSeconds: 600
 # On SIGTERM the listener stops accepting and new streams are refused with a
 # retryable 503 (a native WebSocket that has not attached yet gets close 1012),
 # while streams that were already attached keep running; the process exits as
-# soon as none remain (serve_and_drain, crates/libs/data/plane/server/src/drain.rs).
+# soon as none remain (serve_and_drain, crates/l40_api/data/plane/server/src/drain.rs).
 # Streams still open after --shutdown-grace-secs are cancelled, each in the form
 # docs/architecture.md describes, and then get 5 s (STREAM_CANCEL_GRACE) before
-# the process exits regardless. Sized like the API's 150 s shutdown grace, for
-# the same clients' in-flight work. The chart always sets this deadline; the
-# binary's no-deadline mode is for deployments that rely on the termination
-# grace period alone.
-shutdownGraceSeconds: 150
+# the process exits regardless. Sized for a Native files request taken just
+# before SIGTERM (nativeFiles below: 25 + 135 + 15 s), which outlasts the API's
+# 150 s shutdown grace for the same clients' other in-flight work. The chart
+# always sets this deadline; the binary's no-deadline mode is for deployments
+# that rely on the termination grace period alone.
+shutdownGraceSeconds: 175
+
+# Native `files:*` (SPACE_DATA_PLANE_NATIVE_FILES); off leaves the routes
+# unmounted. On in Kind, where the smoke sends files calls to this origin
+# directly (127.0.0.1:8090, the entry NodePort below) as well as to the API's;
+# a deployment routes them here with its load balancer instead.
+nativeFiles:
+  enabled: true
+  # The API's activation listener, which decides each request
+  # (SPACE_INGRESS_ACTIVATION_ENDPOINT): the space-api Service's port 9801,
+  # whose TLS identity names that Service (space-api-local's deployment.yaml).
+  # The listener admits this release's ServiceAccount
+  # (ingressActivation.allowedServiceAccounts in space-api-local) with the
+  # projected space-cluster-api token below.
+  accessEndpoint: https://space-api:9801
+  # Native upload admission (SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION), sized
+  # for this pod's 512 MiB memory limit (resources below). A write's peak
+  # memory is about twice the bytes it reserves, its declared length
+  # (docs/configuration.md), so the replica's 128 MiB budget bounds Native
+  # writes at about 256 MiB and leaves the other half to the process, its ECW
+  # traffic and its streams. Unbounded, or at the binary's 1 GiB default, a
+  # dozen writes near the 22 MiB body limit at once would pass the pod's limit
+  # and restart it. An org's and a sandbox's shares are the whole budget: Kind runs
+  # few orgs, and 128 MiB still takes five full-size writes to one sandbox at
+  # once. Slots and the wait keep the binary's defaults.
+  uploadAdmission:
+    enabled: true
+    maxInFlightBytes: 134217728
+    maxInFlightBytesPerOrg: 134217728
+    maxInFlightBytesPerSandbox: 134217728
+  # A files request taken just before SIGTERM runs in three steps, and the
+  # drain deadline cuts whatever it has not finished, so with nativeFiles
+  # enabled the template refuses a shutdownGraceSeconds under
+  # uploadSeconds + 135 + transferSeconds.
+  #
+  # How long a request may take before it wakes its sandbox: its
+  # authorization and Native upload admission, then reading its whole body,
+  # which a write sends before the sandbox is asked. Sized for the largest
+  # write body (WRITE_FILE_BODY_LIMIT_BYTES, about 22 MiB for 16 MiB of data)
+  # at 1 MiB/s, a slow uplink, which takes 22 s, plus the admission's 2 s wait
+  # (SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION_WAIT_MS) and the authorization's
+  # round trip to the API. There is no body timeout: a slower upload still
+  # runs, and only a drain cuts it.
+  uploadSeconds: 25
+  # Then up to 135 s for its sandbox to wake (the API's blocking wait budget,
+  # NODE_RPC_BLOCKING_BUDGET in
+  # crates/l40_api/api/src/controllers/substrate/node_api_client.rs).
+  #
+  # Then how long it may still take once its sandbox is awake: the largest
+  # write's or read's transfer.
+  transferSeconds: 15
 
 # Seconds the pod keeps serving after it starts terminating, before SIGTERM,
 # so it leaves the entry Services' endpoints first: kube-proxy drops an
@@ -62,7 +113,7 @@ preStopSleepSeconds: 5
 # Covers the preStop delay, the shutdown grace, the 5 s the data plane gives
 # cancelled streams to close, and the telemetry flush and exit after it. The
 # template refuses a value that does not exceed the first three.
-terminationGracePeriodSeconds: 180
+terminationGracePeriodSeconds: 205
 
 # The boot budget. The listener binds only once ClusterApi answers: startup
 # retries it with backoff to 5 s, each attempt with a 5 s connect timeout

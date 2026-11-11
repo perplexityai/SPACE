@@ -5,6 +5,12 @@
 # the only ones allowed to dial a sandbox pod.
 sandboxNamespace: sandboxes
 
+# Whether sandbox pods accept the data plane's calls on 9800. Only a data plane
+# that serves Native files (SPACE_DATA_PLANE_NATIVE_FILES=serve) dials a
+# sandbox pod, so leave this off unless it does. The Kind bring-up turns it on
+# in values-kind.yaml.
+allowDataPlane: false
+
 # Sandbox egress is the guest's IPv4 internet and nothing local to the cluster
 # or the host. On Kind these cover the pod (10.244.0.0/16) and Service
 # (10.96.0.0/16) ranges, the nodes' Docker network (inside 172.16.0.0/12),

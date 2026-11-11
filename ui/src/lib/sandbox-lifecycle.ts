@@ -10,12 +10,12 @@ export const SANDBOX_LIFECYCLE_STATES = [
 
 // What the list's status filter offers. The list shows a node's reported
 // state when a node reports one (`sandbox_to_cached_response` in
-// crates/libs/api/src/controllers/sandbox/responses.rs), so it adds the
+// crates/l40_api/api/src/controllers/sandbox/responses.rs), so it adds the
 // node-only states (`SandboxLifecycleState` in
-// crates/libs/sbx/mgr/protocol/src/lifecycle.rs), and `deleted`. A delete
-// through the API removes the row (crates/libs/sandbox/teardown); a `deleted`
+// crates/l20_domain/sbx/mgr/protocol/src/lifecycle.rs), and `deleted`. A delete
+// through the API removes the row (crates/l30_storage/sandbox/teardown); a `deleted`
 // row is one a Direct node's complete census no longer includes
-// (crates/libs/internal/api/server/src/status.rs), kept for a retention
+// (crates/l40_api/internal/api/server/src/status.rs), kept for a retention
 // period, and the admin list, which does not filter by lifecycle, returns it.
 export const SANDBOX_STATUS_FILTER_STATES = [
   ...SANDBOX_LIFECYCLE_STATES, 'unspecified', 'cleanup_required', 'cleanup_failed', 'deleted',
@@ -23,11 +23,11 @@ export const SANDBOX_STATUS_FILTER_STATES = [
 
 // What the paged list's lifecycle filter offers and sends: the stored
 // lifecycle (`sandboxes.lifecycle`), every `SandboxLifecycle` state and the
-// two tombstones. It is not the State column, which shows the node's reported
+// `deleted` tombstone. It is not the State column, which shows the node's reported
 // state when there is one, so a row can match one lifecycle and show another
 // state. The node-only states above are never stored, and the server refuses
 // them.
-export const STORED_LIFECYCLE_FILTER_STATES = [...SANDBOX_LIFECYCLE_STATES, 'deleted', 'cleanup_required'] as const;
+export const STORED_LIFECYCLE_FILTER_STATES = [...SANDBOX_LIFECYCLE_STATES, 'deleted'] as const;
 
 const STORED_LIFECYCLES: ReadonlySet<string> = new Set(STORED_LIFECYCLE_FILTER_STATES);
 

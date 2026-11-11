@@ -11,6 +11,9 @@
   "dependencies": {
     "@ant-design/icons": "^6.1.1",
     "@ant-design/nextjs-registry": "^1.3.0",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-web-links": "0.12.0",
+    "@xterm/xterm": "6.0.0",
     "antd": "^6.3.5",
     "next": "^15.5.24",
     "react": "^19.1.0",

@@ -1,7 +1,21 @@
 experimental = ["setup-scripts"]
 
+# Each test's time, which ci/scripts/check-test-durations.py holds to
+# ci/test-duration-budget.toml in CI. nextest writes it under its store, in
+# the workspace's target/ whatever CARGO_TARGET_DIR says:
+# target/nextest/default/junit.xml.
+[store]
+dir = "target/nextest"
+
+[profile.default.junit]
+path = "junit.xml"
+
 [scripts.setup.postgres]
 command = "bash ci/scripts/setup-nextest-postgres.sh"
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[scripts.setup.bare-postgres]
+command = "bash ci/scripts/setup-nextest-postgres.sh --bare"
 slow-timeout = { period = "30s", terminate-after = 4 }
 
 [scripts.setup.redis]
@@ -21,18 +35,24 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # only cost them their own container and their own copy of the template. Its
 # postgres_baseline_tests take the raw fixture too, and without the shared
 # server they would need a Docker socket the default CI job does not have.
-# Spaced host tests use only local sockets; common-svc's dev dependency
-# otherwise pulls them into this transitive fixture selection.
 filter = '''
 (rdeps(pplx-space-db-test-fixtures)
- and not package(pplx-space-db-migrate)
- and not package(pplx-space-spaced-host-server))
+ and not package(pplx-space-db-migrate))
 or test(postgres_collision_repair_tests)
 or test(postgres_lock_retry_tests)
 or (package(pplx-space-db-migrate) and test(user_password::))
 or (package(pplx-space-db-migrate) and test(postgres_baseline_tests::))
 '''
 setup = "postgres"
+
+[[profile.default.scripts]]
+# The migrator's execution-record view pins provision the same cluster-global
+# roles as its bootstrap-role tests, but share one bare server: the first
+# bootstraps and migrates a template database on it, and each clones that.
+# Sharing is safe because every pin works in its own database and any pin
+# that converges the shared roles converges them to the same values.
+filter = "package(pplx-space-db-migrate) and test(/^bootstrap_roles::tests::execution_record_view_tests::/)"
+setup = "bare-postgres"
 
 [[profile.default.scripts]]
 # Publishes SPACE_TEST_REDIS_URL, which client_concurrency's and
@@ -72,6 +92,16 @@ priority = 10
 [test-groups.privileged]
 max-threads = 8
 
+# The state-render shards each write and read a few hundred rows through
+# every API surface on the run's shared Postgres server. Run together they
+# slowed each other to 2.5-4 s in CI, so at most two run at once.
+[test-groups.state-render]
+max-threads = 2
+
+[[profile.default.overrides]]
+filter = 'package(pplx-space-api) and test(/^routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::/)'
+test-group = "state-render"
+
 [[profile.default.overrides]]
 # Shared btrfs tests receive a disposable filesystem from the privileged CI
 # wrapper. Other opt-in tests keep their separate activation requirements.
@@ -80,7 +110,8 @@ max-threads = 8
 # and the spaced worker binaries switch between real service uids. The
 # router's descriptor reads use pidfd_getfd,
 # which Docker's default seccomp profile allows only with CAP_SYS_PTRACE. The
-# bootstrap-role tests each start a virgin Postgres container.
+# bootstrap-role tests each start a virgin Postgres container, and the
+# execution-record view pins share one.
 #
 # Root halves of split tests, whose unprivileged halves run outside the group:
 # encrypted_volumes reads the published copy as uid 65534; permission_tree
@@ -137,6 +168,8 @@ or (package(pplx-space-sbx-mgr) and test(=transfer_directory::tests::distinct_se
 or (package(pplx-space-credmgr) and test(=run::tests::volume_socket::real_peers_obey_volume_listener_policy))
 or (package(pplx-space-credmgr) and test(=run::volume_socket::tests::preflight_checks_real_permissions_without_replacing_live_socket))
 or binary_id(pplx-space-spaced-guest-server::worker_subprocess)
+or (package(pplx-space-spaced-guest-update) and test(streaming_stage_enforces_two_slots_and_does_not_unlink_an_open_previous_release))
+or (package(pplx-space-spaced-guest-server) and test(=platform::unix::update::tests::transfer_error_after_complete_payload_does_not_publish_staged_authority))
 or binary_id(pplx-space-spaced-guest-worker::embedding)
 or binary_id(pplx-space-spaced-guest-server::worker_telemetry)
 or (package(pplx-space-spaced-guest-execution) and test(=filesystem::router::tests::a_read_streams_from_the_workers_descriptor_without_relaying_through_it))
@@ -147,5 +180,6 @@ or (package(pplx-space-build-mgr) and test(/^oci::containerd::tests::real_contai
 or (package(pplx-space-net-gateway) and test(=tcp_proxy::tests::tls_interception::interception_exemptions_relay_original_tls_only_after_admission))
 or (package(pplx-space-net-gateway-client) and test(=tests::sandbox_connections_ignore_replaced_alias_and_reject_legacy_only_gateway))
 or (package(pplx-space-db-migrate) and test(/^bootstrap_roles::tests::postgres_bootstrap_tests::/))
+or (package(pplx-space-db-migrate) and test(/^bootstrap_roles::tests::execution_record_view_tests::/))
 '''
 test-group = "privileged"

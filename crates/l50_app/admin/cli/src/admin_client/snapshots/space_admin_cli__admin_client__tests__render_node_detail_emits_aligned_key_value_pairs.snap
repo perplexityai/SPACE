@@ -1,0 +1,23 @@
+---
+source: crates/l50_app/admin/cli/src/admin_client/tests.rs
+expression: out
+---
+ID                            11111111-1111-1111-1111-111111111111
+Name                          ip-192-0-2-125.ec2.internal
+Address                       192.0.2.125
+Role                          builder
+Managed By                    k8s
+State                         registered
+Scheduling Status             ready
+Scheduling Reason             enough ready slots
+Network Slots                 ready=298 min_ready=10 leased=2 total=300 degraded=1 quarantined=0 max=300
+K8s Node                      ip-192-0-2-125.ec2.internal
+Drain Phase                   draining
+Drain Mode                    -
+Drain Started                 2026-05-14T01:23:45Z
+Drain Last Error              cordon patch failed
+Terminate Decrement Capacity  false
+Active Sandboxes              2
+Local Snapshots               1
+Last Heartbeat                2026-05-07T18:34:01.282553Z
+Created At                    2026-05-14T00:00:00Z

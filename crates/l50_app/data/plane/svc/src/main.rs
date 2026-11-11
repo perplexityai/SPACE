@@ -1,0 +1,156 @@
+use std::time::Duration;
+
+use clap::Parser;
+use pplx_space_data_plane_server::{
+    DEFAULT_ATTACH_DEADLINE_MS, DEFAULT_BACKEND_CHANNEL_POOL_SIZE, DEFAULT_LISTEN,
+    DEFAULT_MAX_ATTACHED_STREAMS, DEFAULT_MAX_ATTACHED_STREAMS_PER_ORG,
+    DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX, DEFAULT_REVOCATION_CHECK_INTERVAL_MS,
+    DEFAULT_ROUTE_CACHE_TTL_MS, DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP, DataPlaneConfig,
+    MAX_REVOCATION_CHECK_INTERVAL_MS, MIN_SHUTDOWN_GRACE, NativeFilesMode,
+    NativeUploadAdmissionArgs, UploadAdmissionArgs,
+};
+
+// Same allocator choice as space-api-svc: glibc arenas keep the peak of an
+// upload burst resident after the traffic stops, so RSS tracks the largest
+// burst rather than live uploads. Static musl builds keep the target allocator.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Without background threads, jemalloc purges an arena's dirty pages only when
+// that arena next allocates or frees, so a replica that goes idle after a burst
+// keeps the burst resident just as glibc does. Background threads purge on the
+// decay timer instead. jemalloc defines `malloc_conf` as a weak symbol, so this
+// definition replaces it; `_RJEM_MALLOC_CONF` still overrides it at startup.
+// The symbol is a C `const char *`: a reference to a sized array is a thin
+// pointer with that layout, where `&[u8]` would be a (pointer, length) pair.
+// jemalloc reads the string before `main`, so the assertion keeps a dropped
+// terminator from becoming an out-of-bounds read that no test would observe.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const JEMALLOC_CONF: &[u8; 23] = b"background_thread:true\0";
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const _: () = assert!(matches!(JEMALLOC_CONF.last(), Some(0)));
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: &[u8; 23] = JEMALLOC_CONF;
+
+const SERVICE_NAME: &str = "space-data-plane";
+
+#[derive(Parser)]
+#[command(
+    name = "space-data-plane-svc",
+    about = "SPACE public data-plane stream gateway",
+    version,
+    disable_version_flag = true
+)]
+struct Cli {
+    /// Print version.
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    _version: (),
+
+    /// Listen address.
+    #[arg(long, default_value = DEFAULT_LISTEN)]
+    listen: String,
+
+    /// First-frame attach deadline for upgraded sockets without a header token.
+    #[arg(long, default_value_t = DEFAULT_ATTACH_DEADLINE_MS)]
+    attach_deadline_ms: u64,
+
+    /// Maximum unauthenticated upgraded sockets per source IP.
+    #[arg(long, default_value_t = DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP)]
+    unauthenticated_upgrade_cap_per_ip: usize,
+
+    /// Maximum authenticated attached native streams per replica.
+    #[arg(long, default_value_t = DEFAULT_MAX_ATTACHED_STREAMS)]
+    max_attached_streams: usize,
+
+    /// Maximum authenticated attached native streams per org on this replica.
+    #[arg(long, default_value_t = DEFAULT_MAX_ATTACHED_STREAMS_PER_ORG)]
+    max_attached_streams_per_org: usize,
+
+    /// Maximum authenticated attached native streams per sandbox on this replica.
+    #[arg(long, default_value_t = DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX)]
+    max_attached_streams_per_sandbox: usize,
+
+    /// HTTP/2 channels kept per backend node-api endpoint.
+    #[arg(long, default_value_t = DEFAULT_BACKEND_CHANNEL_POOL_SIZE)]
+    backend_channel_pool_size: usize,
+
+    /// Interval between revocation checks for long-lived attached streams; at
+    /// most 19000, so a failed check can keep the last confirmed verdict.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_REVOCATION_CHECK_INTERVAL_MS,
+        value_parser = clap::value_parser!(u64).range(..=MAX_REVOCATION_CHECK_INTERVAL_MS)
+    )]
+    revocation_check_interval_ms: u64,
+
+    /// Short-lived TTL for token-scoped route resolution cache entries.
+    #[arg(long, default_value_t = DEFAULT_ROUTE_CACHE_TTL_MS)]
+    route_cache_ttl_ms: u64,
+
+    #[command(flatten)]
+    upload: UploadAdmissionArgs,
+
+    /// Seconds live streams may keep running after SIGTERM before they are
+    /// cancelled; at least 8, the stream-open budget. Keep it plus 5 seconds,
+    /// which cancelled streams get to close, within the pod's termination grace
+    /// period minus its preStop delay. Unset, streams run until they end or the
+    /// termination grace period kills the process.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_SHUTDOWN_GRACE_SECS",
+        value_parser = clap::value_parser!(u64).range(MIN_SHUTDOWN_GRACE.as_secs()..)
+    )]
+    shutdown_grace_secs: Option<u64>,
+
+    /// `serve` to answer Native `files:*` under `/v1` and `/api/v1`, with
+    /// each request decided by the lifecycle API's activation listener at
+    /// `SPACE_INGRESS_ACTIVATION_ENDPOINT`; `off` leaves the routes unmounted.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_NATIVE_FILES",
+        value_enum,
+        default_value_t = NativeFilesMode::Off
+    )]
+    native_files: NativeFilesMode,
+
+    #[command(flatten)]
+    native_upload: NativeUploadAdmissionArgs,
+}
+
+impl From<Cli> for DataPlaneConfig {
+    fn from(cli: Cli) -> Self {
+        Self {
+            listen: cli.listen,
+            attach_deadline: Duration::from_millis(cli.attach_deadline_ms),
+            unauthenticated_upgrade_cap_per_ip: cli.unauthenticated_upgrade_cap_per_ip,
+            max_attached_streams: cli.max_attached_streams,
+            max_attached_streams_per_org: cli.max_attached_streams_per_org,
+            max_attached_streams_per_sandbox: cli.max_attached_streams_per_sandbox,
+            backend_channel_pool_size: cli.backend_channel_pool_size,
+            revocation_check_interval: Duration::from_millis(
+                cli.revocation_check_interval_ms.max(1),
+            ),
+            route_cache_ttl: Duration::from_millis(cli.route_cache_ttl_ms.max(1)),
+            upload_admission: cli.upload.config(),
+            shutdown_grace: cli.shutdown_grace_secs.map(Duration::from_secs),
+            native_files: cli.native_files,
+            native_upload_admission: cli.native_upload.config(),
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let telemetry = pplx_space_service_host::init_service(SERVICE_NAME)?;
+    let stop = pplx_space_service_lifecycle::shutdown::stop_tokens();
+
+    let result = pplx_space_data_plane_server::run(cli.into(), stop).await;
+    pplx_space_service_host::shutdown_telemetry(telemetry).await;
+    Ok(result?)
+}
+
+#[cfg(test)]
+mod tests;

@@ -1490,7 +1490,7 @@ class SandboxPodPlacement:
 @dataclass(frozen=True)
 class RestoreActivation:
     """One `runtime_activated` sandbox event: a documented contract
-    (`crates/libs/events/README.md`).
+    (`crates/l20_domain/events/README.md`).
 
     `restore_provenance` is sbx-manager's own classification of where the
     restored bytes came from (`local_only`, `remote_matches_local`,
@@ -2105,7 +2105,7 @@ class TransferJobView:
 @dataclass(frozen=True)
 class RestoreFailure:
     """One `snapshot_restore_failed` sandbox event: a documented contract
-    (`crates/libs/events/README.md`).
+    (`crates/l20_domain/events/README.md`).
 
     `reason` is the stage that failed (`ensure_template`, `pull_rootfs`, ...),
     `error_kind` the bounded name sbx-manager gives the failure
@@ -2919,6 +2919,14 @@ class ConsoleControl(Protocol):
 
     def console_url(self) -> str:
         """The console's origin on this bench."""
+        ...
+
+    def console_sandbox(self, sandbox_id: str) -> DurableLifecycleSandbox:
+        """Attach to an operator-owned sandbox without taking cleanup ownership."""
+        ...
+
+    def console_runtime_version(self, sandbox_id: str) -> str:
+        """Read the version of the running sandbox's actual runtime executable."""
         ...
 
     def console_operator_login(self) -> tuple[str, str]:

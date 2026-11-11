@@ -2,18 +2,24 @@
 
 The `ch-54.0-windows-uefi` environment is an explicit, x86-64-only development
 candidate. It is excluded from the default execution policy. It carries pinned
-EDK2 firmware and a cold-boot machine contract with Hyper-V enlightenments. It
-has no Linux kernel or initramfs and advertises no snapshot or device support.
+EDK2 firmware, Hyper-V enlightenments and the Cloud Hypervisor 54.0.1 snapshot
+format. It has no Linux kernel or initramfs. Images with the native spaced agent
+support resident pause/resume, persisted suspend/restore and automatic pause/suspend.
 
 The standalone path persists and validates the guest image contract,
-supplies slot-scoped DHCP, and waits for a declared TCP service instead
-of a guest agent. Stop requests ACPI shutdown and waits up to 120 seconds from
+supplies slot-scoped DHCP, and waits for either the native guest agent or a
+declared TCP service according to the image contract. Stop requests ACPI shutdown and waits up to 120 seconds from
 the durable cleanup job before forcing cleanup. Stop completion records the
 observed outcome in the existing sandbox event stream.
 
 This is a development environment, not a fleet default or a qualified Windows
-release. Export, cluster distribution, snapshots, warm pools and agent APIs are
-refused. Unexpected VMM-exit recovery remains a separate
+release. Export and cluster distribution remain refused. Automatic warm-pool
+refill prefers eligible Firecracker builds, then eligible CH builds. CH pool
+builds need a current bound environment and a native agent qualified for memory
+lifecycle. Agentless images remain cold-only.
+Agentless images refuse guest APIs; images provisioned with native spaced can
+use the standalone operator process/file path described below. Managed tenant
+API and ECW admission remain disabled. Unexpected VMM-exit recovery remains a separate
 [acceptance dependency](https://github.com/perplexityai/SPACE/issues/953).
 
 Before producing version-4 templates, deploy the reader guard that checks
@@ -177,7 +183,8 @@ Build with an explicit Cargo target and a matching cross-toolchain:
 
 ```sh
 cargo build --locked --release --target x86_64-pc-windows-gnu \
-  -p pplx-space-spaced-guest-svc --bin spaced-svc --no-default-features
+  -p pplx-space-spaced-guest-svc -p pplx-space-spaced-guest-cli \
+  --bin spaced-svc --bin spaced --no-default-features
 ```
 
 Use a MinGW-w64 linker for Windows GNU or a native Windows MSVC toolchain for
@@ -244,8 +251,15 @@ eight active filesystem workers and four uploads. Spaced-host file relays carry
 Windows metadata. Managed Windows admission and public API/ECW exposure remain
 separate work; these operator checks do not qualify those surfaces.
 
-Volume flush and UTC synchronization are deferred to separate qualification work. The image still uses ACPI shutdown; base snapshots,
-warm pools and automatic memory lifecycle remain refused. Do not publish an
+The native guest implements volume flush and UTC synchronization through the
+existing bridge RPCs for component qualification. Flush enumerates local fixed
+volumes, including those without drive letters, and retains its single worker
+permit across RPC cancellation until the OS call finishes. This flush is not
+VSS or application quiescence. UTC synchronization validates the host timestamp
+and reports a failed clock update explicitly. Flush and resume are advertised
+independently of the optional process/file account and admitted by the host's
+Windows profile. Stop continues to use ACPI shutdown. Agentless images refuse
+manual and automatic memory lifecycle before changing lifecycle state. Do not publish an
 evaluation disk or its provisioned credentials with this source.
 
 The `node.windows_agent_readiness` typed smoke checks the pinned image contract,
@@ -257,9 +271,67 @@ as `node.windows_sandbox_lifecycle`. It passed on an x86-64 Linux/KVM worker
 with Cloud Hypervisor 54 and a Windows Server 2025 evaluation image. This is
 readiness and cold-lifecycle evidence, not process/file or memory-restore evidence.
 
-Memory lifecycle remains unqualified: repeated VirtIO-socket reconnects stalled
-after a direct Cloud Hypervisor restore. Base snapshots and warm pools remain
-refused until restored connections pass without intervention.
+The native transport probes nonblocking accept, read and write after every bounded
+readiness wait, including timeout and `WSAEINVAL` from the readiness query:
+missed viosock notifications must not strand pending connections or buffered
+bytes. Without those progress checks, resume or
+repeated connections can stall until their deadlines. Component qualification exercised
+three pause/resume and three snapshot/restore cycles, each followed by 64 fresh
+connections, volume flush and UTC synchronization, while preserving a live
+process, its in-memory nonce and an advancing counter.
+
+`node.windows_memory_lifecycle` exercises manual and automatic dormancy through
+SPACE on an explicitly selected standalone worker. It checks resident execution
+identity, replacement execution after restore, live guest memory, network access
+and process/file APIs. The matrix passed on Linux/KVM with Cloud Hypervisor 54
+and Windows Server 2025: three resident cycles, three persisted cycles, and
+automatic pause/suspend followed by wake. Build its `windows_operations` probe from the same revision
+as the services. Install those service builds and rebuild the Windows template
+with the updated agent. The Windows environment reference changes when snapshot
+support is added; register the rebuilt image against that exact definition.
+Before replacing services, stop and retire Windows sandboxes and template
+builds recorded against the previous definition while the old services still
+support graceful ACPI shutdown. Do not relabel an older image's execution
+metadata. Disable pool refill during rolling upgrades; deploy node-manager,
+sandbox-manager and spaced-host before template-manager and re-enable pools
+only with current images and services. Before rollback, retire new Windows
+bindings that the older catalog cannot execute. Follow the CH Linux allowlist
+rollback instructions in [execution environments](../../../docs/execution-environments.md).
+
+Run the current `install-spaced.ps1` when updating the image. Copying only the
+executable does not apply the service dependency and failure-recovery settings.
+
+`node.windows_base_memory` builds a base snapshot and restores independent
+siblings, then fills and claims snapshot-seeded and cold-seeded pools. It checks
+live process continuity, separate guest-generated nonces, disk independence,
+and native process/file operations. Windows base preparation uses agent
+readiness and volume flushing; the Linux systemd app observer does not apply.
+
+Memory cloning retains the image's machine identity and provisioned local
+account, as cold creation from that image does. It does not provision a unique
+Windows account or generalize a domain-joined installation for each sandbox.
+Cloud Hypervisor provides a
+[VM Generation Counter on restore](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v54.0/docs/snapshot_restore.md#vm-generation-id); image
+qualification must include its Windows driver and application-specific clone
+requirements. The standalone evaluation-image tests do not qualify domain-joined
+workloads or application-owned random generators.
+
+Record both the `viosock.sys` driver and Winsock-provider versions when
+qualifying an image. The upstream
+[transmit-counter leak fix](https://github.com/virtio-win/kvm-guest-drivers-windows/pull/1627)
+addresses nonblocking sends becoming permanently unavailable after queued writes
+are cancelled or cleaned up. Check whether the tested driver contains it; this
+is separate from the missed readiness notifications addressed by spaced.
+
+For component diagnosis on a disposable Windows VM, the existing
+`windows_readiness <vsock-socket> <vmm-pid> <vmm-uid>` example opens 64 fresh
+connections and checks readiness and legacy-host refusal. Add `--lifecycle`
+to flush volumes and synchronize the guest clock on each connection. Run it
+before capture and after each restore with the current VMM identity. It verifies
+the peer before connecting and does not enable platform lifecycle admission.
+Repeated restore qualification must also verify a live process and memory marker,
+persisted file contents, guest time, and networking without restarting spaced or
+the VirtIO socket driver. A successful probe alone does not establish those facts.
 
 The `windows_operations` Rust example exercises the guest bridge directly or
 spaced-host (`--host` / `--sandbox`): regular identity, separate output streams,
@@ -277,3 +349,157 @@ path: current guest-image admission refuses these images on control-plane-manage
 nodes. The standalone operator probe does not qualify that path. Retain it until
 a public-API scenario has passed against an authorized Windows test deployment;
 do not remove the admission restriction merely to run the scenario.
+
+
+## Guest backend organization
+
+`pplx-space-spaced-guest-server` contains explicit Linux, Windows and macOS
+backends. Linux and macOS reuse Unix execution/service code; Windows owns its
+native SCM, Job Object and VirtIO implementations in the same crate. Cargo
+target dependencies keep Unix service dependencies out of Windows builds and
+Windows APIs out of Unix builds. The service entry point selects the current
+OS backend explicitly. macOS retains its development/test capabilities; it is
+not a qualified sandbox guest image.
+
+## Guest update recovery
+
+The experimental Windows backend implements the same manager-owned guest
+update RPCs, version ordering, execution fences and host SQLite receipts as
+Linux. It requires an explicitly qualified `windows-scm-two-slot-v1` image;
+legacy Windows services remain usable and refuse maintenance RPCs. Automatic
+rollout remains disabled. See [guest updates](../../../docs/spaced-upgrades.md)
+for policy, qualification and manager commands.
+
+Build the service and CLI together, then write their descriptor beside the two
+executables. Supply the clean source revision, actual build timestamp, workspace
+release and guest-update marker used for that build:
+
+```sh
+python3 scripts/build/agent-bundle.py "$BUNDLE_DIRECTORY" \
+  --platform windows --arch x86_64 \
+  --revision "$SOURCE_REVISION" --built-at "$BUILT_AT" \
+  --version "$WORKSPACE_VERSION" \
+  --guest-update-required-since "$GUEST_UPDATE_REQUIRED_SINCE"
+```
+
+`SOURCE_REVISION` is the full lowercase commit hash; `BUILT_AT` is a UTC RFC3339
+timestamp ending in `Z`; optional fractional seconds have at most nine digits
+and no trailing zeroes. Both version values are stable SemVer releases, and the
+marker cannot be newer than the workspace version. The logical service/CLI roles
+and schema-1 canonical hashing stay unchanged. Image
+preparation runs `install-spaced.ps1 -Bundle <directory> -EnableOperations` as
+Administrator, with `recover-spaced.ps1` beside the installer. `-EnableOperations`
+is required for update-capable images because the candidate self-test validates
+filesystem access through the provisioned workload account. The directory
+must contain `artifact.json`, `spaced-svc.exe` and `spaced.exe`. This is image
+assembly, not a way to reset update history in a running guest. Remove the
+assembly inputs before capturing the image. The qualified layout requires
+`C:\ProgramData` and `C:\Windows` on the system drive.
+
+The workload Job Object lives in a private namespace whose boundary and ACL
+require SYSTEM. A pre-existing job is refused rather than adopted. Tenant
+processes cannot squat on the service namespace or open its termination handle.
+
+Only slots A and B contain agent bundles. Selectors are bounded regular files
+under `C:\ProgramData\SPACE\agent`, protected by SYSTEM/Administrators ACLs.
+Journal writes precede selector replacement; NTFS rename uses write-through
+and successful transitions flush the local volume. Reparse points are refused.
+Inactive-slot replacement refuses mapped executables and open payload handles.
+The volume flush deliberately covers NTFS namespace durability as well as file
+contents. It runs under the journal lock, so heavy writes elsewhere on the guest
+volume can delay both transitions and queued status reads.
+
+SCM runs the selected `spaced-svc.exe` directly. Recovery reconciles its executable
+path with journal authority on each invocation, writing only when the complete
+command differs; a non-trial daemon refuses to
+serve unless its executable is the committed slot. There is no separate launcher
+binary and no permanently running old agent. Two SYSTEM scheduled tasks invoke
+the committed agent's short `--recover-update` mode:
+
+- `SPACE-Guest-Recovery` runs at boot and after an SCM failure. The service is
+  demand-started, so the selector runs before every boot start. Arm and restart
+  also request this task after persisting intent. Recovery can terminate the
+  outgoing daemon before its RPC response is flushed; the host reconciles the
+  durable receipt instead of assuming a lost response means the request failed.
+- `SPACE-Guest-Expiry` runs every minute with `--expired-only`, recovering armed
+  work, expired trials, stuck startup and stopped services. It retries failed
+  starts even after the journal has settled. For an administrative service stop
+  that must persist, disable both recovery tasks and SCM failure actions first.
+
+The template-owned PowerShell entry point pins the committed executable while
+holding the journal lock, releases that lock, invokes recovery and closes the
+pin. This closes the read-selector/slot-reuse race without retaining a third
+copy. Its CLI, paths and journal interpretation are permanent seed ABI, just
+as Linux's selector entry point is. Changes require qualification against the
+previous committed release; incompatible behavior requires a new contract.
+
+Recovery checks current durable authority under the same disk lock as Commit.
+A late task does not roll back a committed candidate. It terminates the old
+service and its nested workload Job Objects, waits for their processes to
+exit, selects once, updates SCM's executable path and starts the next daemon.
+Startup records bind a 30-second monotonic deadline to the PID and process
+creation identity, including administrative starts. Repeated observations and
+SCM checkpoint/wait-hint reports cannot extend it. If a process hangs before
+registering its start, recovery establishes the bound on its first observation;
+that exceptional path can add one expiry interval. SCM Running publication
+uses the journal lock too, so expiry cannot act on an earlier StartPending
+observation after readiness wins. Commit opens trial workload admission only
+after SCM readiness succeeds. Daemon journal operations retry lock contention
+for at most two seconds before returning Busy; only acquisition is retried, not
+trial adoption, self-test or commit side effects. Recovery retains its separate
+five-second lock-acquisition bound. A durable commit followed by a startup hang
+restarts the committed release. An uncommitted trial selects the fallback.
+
+The expiry cadence adds up to one minute before recovery begins. Each task has
+a 60-second execution limit and bounded retries; the manager retains its
+210-second activation budget, not a claimed 40-second Windows bound. A task
+execution limit alone does not kill a candidate: recovery explicitly terminates
+and reaps its workload job. Failures stay visible in Task Scheduler history and
+manager status. An unreadable journal is retried without replacing authority;
+malformed metadata on a stopped or startup-expired daemon falls back through
+the verified committed selector.
+
+The boot UUID lives in a volatile registry key and survives service restarts.
+The per-boot clock is `GetTickCount64`; recovery records the independent startup
+deadline before asking SCM to start. A cold boot creates a fresh UUID. CH memory
+restore retains guest kernel state, so the host's execution fence and restore
+configuration remain necessary. Qualification must cover pause, restore and
+fork; a successful native unit test does not establish those VM guarantees.
+
+The shared maintenance gate counts process/file RPCs, open streams, retained
+processes, live filesystem idempotency records and nested workload jobs. Force
+terminates them; it never replays interrupted work. Environment configuration
+uses Windows case-insensitive keys and accepts an empty map. Existing Windows
+image policy still governs customer-visible capabilities: guest update does not
+add PTYs, file watches or Linux loopback forwarding. Nonempty forwarding requests
+are explicitly refused instead of silently discarded.
+
+For image qualification, exercise committed crash recovery, failed candidate
+exec/self-test, missing and late confirmation, a fully hung candidate, durable
+commit before READY, boot interruption, force with descendants, two-slot reuse,
+and CH lifecycle restoration. Keep the template outside production admission
+until this matrix and the manager-driven canary pass.
+
+`node.windows_guest_update` is the manager-driven canary. Use the standalone
+node fixture above with `SPACE_SMOKE_NODE_RECOVERY=firmware-lifecycle`, a pinned
+updater-capable image, and an installed policy selecting a newer Windows bundle.
+It checks idle commit, repeated apply without restart, busy deferral, forced
+termination of a parent and its child, checkpoint admission, pause/resume,
+suspend/restore and cold-boot persistence. It creates and deletes its own VM.
+Recovery fault injection and explicit rollback/slot-reuse qualification remain
+additional checks; the canary does not replace them.
+
+`node.windows_guest_recovery` qualifies local failure recovery in a separate,
+newly created VM. It copies committed bytes into the inactive slot, injects a
+synthetic armed journal attempt, suspends all candidate threads, and checks that
+the installed periodic task rolls back and later restarts a stopped service with
+a settled journal. This is local recovery evidence, not manager authorization
+coverage. The scenario deletes its VM even on failure. Set
+`SPACE_SMOKE_WINDOWS_ADMIN_SSH_CONFIG` to a local SSH config with a
+`windows-recovery` entry specifying Administrator, its identity file, and the
+pinned template host key. The fixture supplies the proxy through the node's
+`guest-channel` API for its owned sandbox; it never copies the private key to
+the worker or guest. The ordinary manager canary does not require this access.
+Complete pending Windows servicing and reboots before capturing the test image.
+An OS-initiated reboot during a scenario invalidates its execution evidence and
+can replace the attested vsock endpoint; it is not an agent recovery result.

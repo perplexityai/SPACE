@@ -40,7 +40,7 @@ workflow registers more.
 
 ## Deploy-phase publishing
 
-Inspect `crates/apps/template/publish/` and the owning deployment's publish
+Inspect `crates/l50_app/template/publish/` and the owning deployment's publish
 configuration before changing release selection. A configured pin is a floor:
 if `latest` already resolves, the Job leaves it untouched. Do not turn it into an
 assignment that rolls back a newer release.

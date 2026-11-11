@@ -471,22 +471,61 @@ def test_apply_exits_1_on_what_it_cannot_do_exactly(
     assert message in result.stderr
 
 
-def test_apply_by_layer_resumes_after_a_rename(repo: Path) -> None:
+def test_apply_after_a_move_finds_renamed_crates_by_their_new_names(repo: Path) -> None:
     generated(repo)
-    first = tool(repo, "--apply", "--layer", "l40_api")
+    assert tool(repo, "--apply").returncode == 0
+    git(repo, "commit", "-qm", "move")
+
+    again = tool(repo, "--apply")
+
+    assert again.returncode == 0, again.stderr
+    assert "nothing to move" in again.stdout
+
+
+def test_apply_resumes_a_partial_move(repo: Path) -> None:
+    # The widget stays while the rest moves; its row then moves and renames it,
+    # and a second run moves only it.
+    reviewed(repo, REVIEWED.replace("[stale_paths]", '"pplx-space-widget" = { stay = "moves later" }\n\n[stale_paths]'))
+    assert tool(repo, "--generate").returncode == 0
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "mapping")
+    first = tool(repo, "--apply")
     assert first.returncode == 0, first.stderr
-    assert tool(repo, "--verify", "--skip-arch", "--layer", "l40_api").returncode == 0
-    everything = tool(repo, "--verify", "--skip-arch")
-    assert everything.returncode == 1
-    assert "pplx-space-widget is at crates/libs/model/widget, not crates/l20_domain/widget" in everything.stderr
-    git(repo, "commit", "-qm", "l40_api")
+    assert "crates/libs/model/widget ->" not in first.stdout
+    git(repo, "commit", "-qm", "move all but the widget")
+    mapping = repo / "scripts/move_crates.toml"
+    rows = tomllib.loads(mapping.read_text())
+    mapping.write_text(
+        mapping.read_text().replace(
+            '{ stay = "moves later" }', '{ to = "crates/l20_domain/widget/model", rename = "pplx-space-widget-model" }'
+        )
+    )
+    git(repo, "commit", "-qam", "move the widget")
+    base = git(repo, "rev-parse", "HEAD").strip()
 
-    rest = tool(repo, "--apply")
+    result = tool(repo, "--apply")
 
-    assert rest.returncode == 0, rest.stderr
-    assert "crates/libs/model/widget -> crates/l20_domain/widget" in rest.stdout
+    assert result.returncode == 0, result.stderr
+    # Only the widget moves: the renamed crate is found by its new name where
+    # it already is, and the family's files keep the rows that moved them.
+    assert "paths (1):\n  crates/libs/model/widget -> crates/l20_domain/widget/model\n" in result.stdout
+    assert "packages (1):\n  pplx-space-widget -> pplx-space-widget-model\n" in result.stdout
+    assert tomllib.loads(mapping.read_text())["files"] == rows["files"]
+    assert (repo / "crates/l40_api/gadget/AGENTS.md").read_text() == "# The gadget crates\n"
+    assert (repo / "crates/l40_api/gadgets/svc/src/lib.rs").is_file()
     check = cargo_check(repo)
     assert check.returncode == 0, check.stderr
+    assert 'pplx-space-widget-model = { path = "../../l20_domain/widget/model" }' in (
+        repo / "crates/libs/legacy/Cargo.toml"
+    ).read_text()
+    server = (repo / "crates/l40_api/gadget/server/src/lib.rs").read_text()
+    assert "pplx_space_gadgets_svc::NAME, pplx_space_widget_model::BLOB" in server
+    assert os.readlink(repo / "docs/widget-lib.rs") == "../crates/l20_domain/widget/model/src/lib.rs"
+
+    verify = tool(repo, "--verify", "--skip-arch", "--base", base)
+
+    assert verify.returncode == 0, verify.stderr
+    assert "paths (1):\n  crates/libs/model/widget -> crates/l20_domain/widget/model\n" in verify.stdout
 
 
 def test_verify_reports_old_paths_and_names(repo: Path) -> None:

@@ -14,3 +14,11 @@ k8s:
   # under 3 s and the slowest restore, a cold one that first pulls its parent
   # template, in about 4 s, so 45 s keeps a margin of ten times that.
   createDataPlaneReadyTimeoutSecs: "45"
+
+# Kind's data plane serves Native files (space-data-plane-local's nativeFiles),
+# deciding each request through the listener. Helm replaces a list, so this
+# names internal-api again.
+ingressActivation:
+  allowedServiceAccounts:
+    - space-internal-api
+    - space-data-plane

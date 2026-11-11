@@ -13,7 +13,7 @@ new worker. A later user `start` cold-starts there from the staged rootfs.
 
 The evacuation ships default-off behind three cluster-controller flags, and
 it is on only when all three are (`ReconcilerConfig::evacuates_stopped_residents`
-in `crates/libs/cluster/controller/server/src/node_drain/mod.rs`). The
+in `crates/l40_api/cluster/controller/server/src/node_drain/mod.rs`). The
 controller reads them once at startup, so the scenario overrides the
 controller Deployment's env for these three keys alone (closed key list,
 `true`/`false` only) under the controller-mutation Lease the retention and
@@ -76,7 +76,7 @@ RESTORE_STORAGE_URI_ANNOTATION = "space.pplx.net/suspend-restore-storage-uri"
 RESTORE_SOURCE_NODE_ANNOTATION = "space.pplx.net/suspend-restore-source-node"
 
 # `space-sbxmgr doctor` prints `Doctor: <short id>  (<lifecycle label>)` first
-# (crates/apps/sbx/mgr/cli/src/dispatch/diagnostics.rs).
+# (crates/l50_app/sbx/mgr/cli/src/dispatch/diagnostics.rs).
 _DOCTOR_LINE = re.compile(r"^Doctor: \S+\s+\(([a-z_]+)\)$", re.MULTILINE)
 _TERMINAL_POD_PHASES = frozenset({"Succeeded", "Failed"})
 
@@ -467,7 +467,7 @@ class StoppedReplacementAssertions:
         ordinarily stopped sandbox has. sandbox-manager's own lifecycle for the
         sandbox must be `stopped`, not `started` or `paused`, the two
         lifecycles `space-sbxmgr doctor` treats as running
-        (crates/apps/sbx/mgr/cli/src/dispatch/diagnostics.rs).
+        (crates/l50_app/sbx/mgr/cli/src/dispatch/diagnostics.rs).
         """
 
         destination = self._require_destination()

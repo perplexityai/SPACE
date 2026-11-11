@@ -1,7 +1,0 @@
----
-source: crates/libs/internal/api/server/tests/published_state.rs
-expression: "sandbox_execution_row(&db.pool, sandbox_id).await?"
----
-lifecycle: suspending
-active: true
-state: suspended

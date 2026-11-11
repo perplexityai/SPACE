@@ -1,0 +1,125 @@
+# Wall-time budget for each test in the Rust tests job, which
+# ci/scripts/check-test-durations.py checks against nextest's JUnit report
+# after every run (ci/scripts/run-rust-checks.sh).
+#
+# A test should take up to `limit_seconds`; CI reports each one over it as a
+# warning. The run fails when a test takes over `fail_seconds`. The gap is for
+# CI's run-to-run variance: on a loaded runner a test's slowest run is often
+# twice its median. A new test that needs longer than the limit does not get
+# an exception: make it faster, for example by testing the behaviour at a
+# smaller size or without real waits.
+limit_seconds = 2.0
+fail_seconds = 4.0
+
+# The tests that took 2 s or more in a recent CI Rust tests job, keyed by
+# `<nextest binary id> <test name>`, so a test already near the limit cannot
+# fail a pull request on a slow runner. Each ceiling is 1.5 times the test's
+# slowest time, rounded up and at least 5 s; the check refuses one at or
+# below `fail_seconds`. Some listed tests wait on something they cannot
+# shorten without proving less: a planner that needs production-scale
+# tables, an SDK's fixed stall window, their own Postgres container, or
+# per-test process setup. Make a listed test faster and delete its line;
+# never raise a ceiling.
+[exceptions]
+"pplx-space-api controllers::sandbox::lifecycle::characterization_tests::kubernetes::activations_and_suspend_wait_for_a_key_share_lock" = 7
+"pplx-space-api controllers::substrate::kubernetes::adapter_characterization_tests::create_readiness::create_readiness_failure_keeps_or_releases_only_what_its_arm_owns::case_3_slow_preserve_decision_tears_down" = 5
+"pplx-space-api controllers::substrate::kubernetes::tests::kubernetes_tests::concurrent_started_wake_returns_when_owner_publishes_running" = 6
+"pplx-space-api controllers::substrate::kubernetes::tests::kubernetes_tests::follower_losing_expiry_reclaim_keeps_original_budget_and_new_lease_hint" = 5
+"pplx-space-api controllers::substrate::kubernetes::tests::kubernetes_tests::missing_pod_observation_preserves_failed_started_recovery_claim_across_retries" = 5
+"pplx-space-api controllers::substrate::kubernetes::tests::kubernetes_tests::split_operation_capability_deadline_is_a_clean_no_send_failure" = 5
+"pplx-space-api public_operations::inline_org_limit_plan_tests::the_count_reads_only_the_orgs_running_operations" = 19
+"pplx-space-api public_operations::sandbox_quota::plan_tests::the_count_reads_only_the_orgs_rows_and_in_flight_operations" = 29
+"pplx-space-api public_operations::tests::an_admission_claim_is_stamped_when_taken_not_when_its_transaction_began" = 5
+"pplx-space-api routes::admin::node_store::pinned_local_only_plan_tests::enumeration_reads_only_the_nodes_pinned_rows" = 13
+"pplx-space-api routes::admin::node_store::pinned_local_only_plan_tests::inflight_check_runs_only_for_non_durable_rows" = 10
+"pplx-space-api routes::admin::node_store::pinned_local_only_plan_tests::page_is_the_lowest_ids_and_excludes_non_suspended_rows" = 6
+"pplx-space-api routes::admin::node_store::pinned_local_only_plan_tests::snapshot_scans_stay_within_the_nodes_snapshots" = 7
+"pplx-space-api routes::admin::node_store::pinned_local_only_plan_tests::the_composite_index_is_what_bounds_the_scan" = 13
+"pplx-space-api routes::admin::node_store::single_node_occupancy::tests::fleet_matches_legacy_occupancy_and_blockers" = 25
+"pplx-space-api routes::admin::node_store::single_node_occupancy::tests::postgres_fleet_occupancy_bounds_history_across_cached_plans" = 18
+"pplx-space-api routes::admin::node_store::single_node_occupancy::tests::single_matches_batched_durability_upload_and_residency_semantics" = 26
+"pplx-space-api routes::admin::nodes::tests::inventory_reads_skip_locked_sandbox_accounting_but_diagnostics_do_not" = 5
+"pplx-space-api routes::admin::nodes::tests::node_reads_survive_a_failed_read_state_read" = 5
+"pplx-space-api routes::admin::runtime_environments::tests::population::population_counts_each_sandbox_by_the_record_it_runs_from" = 5
+"pplx-space-api routes::admin::runtime_environments::tests::writes::blocking_needs_strand_while_work_may_be_bound_to_the_environment" = 5
+"pplx-space-api routes::admin::runtime_environments::tests::writes::only_releases_still_in_use_gate_a_block" = 5
+"pplx-space-api routes::admin::sandbox_list::tests::created_before_keeps_a_row_inside_its_microsecond" = 5
+"pplx-space-api routes::admin::sandbox_list::tests::malformed_list_parameters_answer_400" = 5
+"pplx-space-api routes::admin::sandbox_list::tests::the_list_and_the_count_require_a_managing_org_admin" = 5
+"pplx-space-api routes::admin::sandboxes::tests::cross_org_routes::an_operator_rolls_back_another_organizations_sandbox" = 5
+"pplx-space-api routes::admin::templates::tests::native_build::native_build_session_ownership::case_7_foreign_template::system_2_Some_SystemTemplate__Seed_" = 5
+"pplx-space-api routes::e2b::lifecycle::tests::delete::ecw_delete_joins_a_native_delete_waiting_on_an_upload" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_01_0" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_02_1" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_03_2" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_04_3" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_05_4" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_06_5" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_07_6" = 6
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_08_7" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_09_8" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_10_9" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_11_10" = 6
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_12_11" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_13_12" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_14_13" = 6
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_15_14" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_16_15" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_17_16" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_18_17" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_19_18" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_20_19" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_21_20" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_22_21" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_23_22" = 5
+"pplx-space-api routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::shard_24_23" = 5
+"pplx-space-api routes::e2b::tests::connect_route_preserves_missing_pod_while_suspend_snapshot_is_not_ready" = 5
+"pplx-space-api routes::e2b::tests::connect_route_recovers_missing_pod_after_current_suspend_snapshot" = 5
+"pplx-space-api routes::e2b::tests::connect_route_rejects_missing_restore_context_and_preserves_recovery_state" = 6
+"pplx-space-api routes::e2b::tests::grant_renewal_follows_the_lifecycle_checks" = 6
+"pplx-space-api routes::public::files::tests::batch_body_limits::file_write_batch_limits_bound_the_total_payload" = 5
+"pplx-space-api routes::public::files::tests::batch_body_limits::file_write_route_applies_its_body_limit" = 5
+"pplx-space-api routes::public::files::tests::write_chunks_decode_like_the_whole_payload" = 5
+"pplx-space-archcheck::repository repository_config_and_baseline_pass_every_required_rule" = 26
+"pplx-space-cluster-controller-server node_drain::store::lifecycle_writer_tests::restore_finalize::a_re_placement_that_succeeds_on_a_retry_releases_the_attempt_it_joined" = 5
+"pplx-space-cluster-controller-server public_operation_dispatcher::tests::capacity::a_claim_that_finds_its_work_held_back_waits_before_the_next" = 5
+"pplx-space-cluster-controller-server public_operation_dispatcher::tests::keyed_queue::one_sandboxs_operations_never_overlap_across_two_dispatchers" = 6
+"pplx-space-cluster-controller-server public_operation_dispatcher::tests::keyed_queue::stuck_sandboxes_hand_back_their_slots_and_never_starve_other_sandboxes" = 5
+"pplx-space-common-io fs::tests::interrupted_stream_reads_preserve_plaintext" = 5
+"pplx-space-common-io fs::tests::round_trips_multi_chunk_input" = 5
+"pplx-space-db-migrate bootstrap_roles::tests::postgres_bootstrap_tests::app_lock_timeout_converges_across_its_provisioning_lifecycle" = 6
+"pplx-space-db-migrate bootstrap_roles::tests::postgres_bootstrap_tests::bootstrap_adopts_routines_behind_admin_run_migrations" = 5
+"pplx-space-db-migrate bootstrap_roles::tests::postgres_bootstrap_tests::credential_references_enforce_triggers_and_grants" = 5
+"pplx-space-db-migrate bootstrap_roles::tests::postgres_bootstrap_tests::first_bootstrap_adopts_admin_owned_tables_routines_and_types" = 5
+"pplx-space-db-migrate bootstrap_roles::tests::postgres_bootstrap_tests::fresh_database_bootstraps_migrates_as_migrator_and_fences" = 11
+"pplx-space-db-migrate bootstrap_roles::tests::postgres_bootstrap_tests::missing_passwords_provision_nologin_roles" = 5
+"pplx-space-db-migrate bootstrap_roles::tests::postgres_bootstrap_tests::ro_reads_api_keys_without_key_hash" = 5
+"pplx-space-db-migrate bootstrap_roles::tests::postgres_bootstrap_tests::ro_reads_publication_grant_metadata_without_authorization_id" = 9
+"pplx-space-db-migrate bootstrap_roles::tests::postgres_bootstrap_tests::ro_reads_tenant_publication_grant_metadata_without_authorization_id" = 9
+"pplx-space-internal-api-server node_local_backup_pending::tests::the_delete_guard_resolves_through_indexes_not_a_history_scan" = 16
+"pplx-space-internal-api-server node_local_backup_pending::tests::the_publish_transaction_takes_no_nodes_row_lock" = 5
+"pplx-space-internal-api-server published_state::published_state_tests::lifecycle_writers::activation_rollback_receipt_converges_its_target_out_of_every_live_lifecycle::case_3_suspended" = 5
+"pplx-space-internal-api-server published_state::published_state_tests::lifecycle_writers::suspended_report_projects_only_out_of_running_and_restoring_lifecycles::case_1_k8s" = 5
+"pplx-space-net-gateway tcp_proxy::tls_http::tests::guest_http2_accepts_backpressured_small_frame_uploads" = 7
+"pplx-space-node-ctl-svc::handoff cooperative_handoff_moves_the_socket_to_the_passive_instance" = 5
+"pplx-space-node-ctl-svc::handoff exactly_one_contender_activates_when_the_holder_exits" = 5
+"pplx-space-node-ctl-svc::handoff successor_fails_visibly_behind_a_stuck_predecessor" = 5
+"pplx-space-node-mgr service::artifact_fs::receive::tests::receive_keeps_destination_identity_through_scrub_and_publication" = 8
+"pplx-space-node-mgr service::node_disk_metrics::tests::classify_disk_metric_targets_enumerates_nodes_past_4096_targets" = 5
+"pplx-space-node-runtime-manager installs::github::tests::every_compiled_release_pin_matches_its_published_checksum" = 7
+"pplx-space-object-store attempts::tests::stalled_upload_is_cut_and_retried" = 10
+"pplx-space-object-store content_md5::tests::every_multipart_part_sends_content_md5_of_its_range" = 6
+"pplx-space-object-store timeouts::tests::never_answered_operations_end_at_their_class_bound" = 7
+"pplx-space-object-store upload::tests::prefetch_keeps_producer_running_without_exceeding_upload_concurrency" = 5
+"pplx-space-object-store upload::tests::producer_failure_or_rejected_upload_never_publishes_and_awaits_abort" = 5
+"pplx-space-object-store upload::tests::reconstructs_empty_short_exact_and_multipart_objects_and_replays_parts" = 5
+"pplx-space-object-store upload::tests::shared_budget_backpressures_independent_stores_without_deadlocking_uploads" = 6
+"pplx-space-sandbox-store stuck::tests::census_reads_a_lifecycle_index_not_the_table" = 6
+"pplx-space-snapshot-retention tests::postgres::benchmark_postgres_reconciler_current_and_week_policy" = 41
+"pplx-space-snapshot-retention tests::postgres::claimed_recovery_reads_claims_not_the_table_under_stale_statistics" = 8
+"pplx-space-spaced-guest-worker::embedding embedding" = 8
+"pplx-space-volmgr executor::stream_push::tests::ordinary_and_luks_retry_from_staging_and_verify_actual_wire_size::artifact_1_SnapshotArtifact__Memory" = 5
+"pplx-space-volmgr executor::stream_push::tests::ordinary_and_luks_retry_from_staging_and_verify_actual_wire_size::artifact_2_SnapshotArtifact__Rootfs" = 5
+"pplx-space-volmgr executor::stream_push::tests::ordinary_and_luks_retry_from_staging_and_verify_actual_wire_size::artifact_3_SnapshotArtifact__RootfsBtrfsSend" = 5
+"pplx-space-volmgr executor::stream_push::tests::ordinary_and_luks_retry_from_staging_and_verify_actual_wire_size::artifact_4_SnapshotArtifact__EncryptedSnapshotVolume" = 5
+"pplx-space-volmgr executor::tests::encrypted_compressed_memory_restore_is_sparse" = 14

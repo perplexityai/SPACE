@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +42,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -493,6 +495,10 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 	if parseErr != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid sandbox start annotations: %v", parseErr)
 	}
+	runtimeUpgrade, parseErr := spec.sandboxRuntimeUpgrade()
+	if parseErr != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid sandbox runtime upgrade annotations: %v", parseErr)
+	}
 	if artifactRestore != nil {
 		artifactRestore.DiskIoMaxOperationsPerSec = sandboxDiskIOMaxOperationsPerSec
 		artifactRestore.DiskIoMaxBandwidthMibPerSec = sandboxDiskIOMaxBandwidthMiBPerSec
@@ -561,14 +567,25 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			}
 		}
 		var startResp *pb.StartResponse
+		upgradedStopped := runtimeUpgrade != nil && runtimeUpgrade.stopped()
+		startStep, startLabel := "sbxmgr_start", "sbx-manager Start"
+		if runtimeUpgrade != nil {
+			startStep, startLabel = "sbxmgr_upgrade_runtime", "sbx-manager UpgradeRuntime"
+		}
 		if sandboxAutoLifecycle != nil && sandboxAutoLifecycleAuthority == netpb.PolicyAuthority_POLICY_AUTHORITY_CLUSTER {
 			startRequest.ActivationAutoLifecycle = sandboxAutoLifecycle
 			err = requireActivationPolicySupport(startCtx, conn)
 		}
 		if err == nil {
-			if materializeStopped || (sandboxCheckpoint != nil && *sandboxCheckpoint == "stopped" && startRequest.Checkpoint != nil) {
+			switch {
+			case runtimeUpgrade != nil:
+				// The upgrade is the whole of this create: any refusal or
+				// failure fails it, and nothing here falls back to a Start,
+				// which would boot the environment the upgrade moves off.
+				startResp, err = upgradeRuntime(startCtx, client, startRequest, runtimeUpgrade)
+			case materializeStopped || (sandboxCheckpoint != nil && *sandboxCheckpoint == "stopped" && startRequest.Checkpoint != nil):
 				startResp, err = startStoppedCheckpoint(startCtx, client, startRequest)
-			} else {
+			default:
 				startResp, err = client.Start(startCtx, startRequest)
 			}
 		}
@@ -578,8 +595,8 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			if redirect.podIP != "" {
 				removeDataPlaneRedirect(netnsPath, sbxID)
 			}
-			emitShimStepError("create", "sbxmgr_start", "sbxmgr_start", err, metricTag("template", sandboxTemplate))
-			return nil, annotateStatus("sbx-manager Start", err)
+			emitShimStepError("create", startStep, startStep, err, metricTag("template", sandboxTemplate))
+			return nil, annotateStatus(startLabel, err)
 		}
 		if redirect.err != nil {
 			if redirect.podIP != "" {
@@ -588,15 +605,15 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			emitShimStepError("create", "dataplane_redirect", "dataplane_redirect", redirect.err, metricTag("template", sandboxTemplate))
 			return nil, status.Errorf(codes.Unavailable, "prepare data-plane redirect: %v", redirect.err)
 		}
-		emitShimStepLatency("create", "sbxmgr_start", startRPCStartedAt, shimMetricResultSuccess, metricTag("template", sandboxTemplate))
-		if materializeStopped {
-			// sbx-manager staged the disk and left the sandbox stopped. The
-			// data-plane redirect stays, so the control plane can confirm the
-			// materialization through it.
+		emitShimStepLatency("create", startStep, startRPCStartedAt, shimMetricResultSuccess, metricTag("template", sandboxTemplate))
+		if materializeStopped || upgradedStopped {
+			// sbx-manager staged the disk, or upgraded it and stopped it
+			// again, and left the sandbox stopped. The data-plane redirect
+			// stays, so the control plane can confirm the outcome through it.
 			markMaterializedStopped(t, sbxID, redirect.podIP, netnsPath)
 			s.tasks[r.ID] = t
 			createSucceeded = true
-			logShim("Create: materialized stopped sandbox %s without a VM (template=%s)", sbxID, sandboxTemplate)
+			logShim("Create: left sandbox %s stopped without a VM (template=%s restore_mode=%s)", sbxID, sandboxTemplate, restoreMode)
 			emitShimOperationLatency("create", createStartedAt, shimMetricResultSuccess, metricTag("template", sandboxTemplate))
 			return &taskAPI.CreateTaskResponse{Pid: uint32(t.pid)}, nil
 		}
@@ -921,6 +938,32 @@ func releaseTaskAfterGenerationTeardown(ctx context.Context, client pb.SandboxMa
 	}
 }
 
+// sbx-manager's markers for a Stop it answered before admitting it
+// (crates/l20_domain/sbx/mgr/protocol/src/lib.rs): STOP_NOT_ADMITTED_METADATA
+// from the Stop handler, and RESTART_RETRY_ON_SUCCESSOR_METADATA from the
+// restart drain, which refuses before any handler runs.
+const (
+	stopNotAdmittedTrailer  = "x-space-stop-not-admitted"
+	retryOnSuccessorTrailer = "x-space-retry-on-successor"
+)
+
+// stopRefused reports whether a failed Stop was certainly not admitted. A
+// Stop sbx-manager marks as not admitted was refused, whatever its code. An
+// unmarked call that ended on this side, or that failed with Unavailable,
+// may have been admitted unseen: a transport drop after admission reports
+// Unavailable too, as do refusals from an sbx-manager that predates the mark.
+// Any other answer is sbx-manager refusing the stop.
+func stopRefused(err error, trailer metadata.MD) bool {
+	if err == nil {
+		return false
+	}
+	if slices.Contains(trailer.Get(stopNotAdmittedTrailer), "true") ||
+		slices.Contains(trailer.Get(retryOnSuccessorTrailer), "true") {
+		return true
+	}
+	return !endedByContext(err) && status.Code(err) != codes.Unavailable
+}
+
 // endedByContext reports whether an RPC failed because its context ended
 // rather than because the server answered.
 func endedByContext(err error) bool {
@@ -1004,9 +1047,13 @@ func sandboxStateWithRetry(ctx context.Context, client pb.SandboxManagerClient, 
 // the durable-teardown marker was rolled out. Their controller first
 // stops and backs up retirements, so the shim must not invoke the new suspend
 // protocol against an already-stopped row. It returns true when the observed
-// lifecycle proves the sandbox is gone or this task belongs to a suspend/restore
-// handoff and must not issue a later destructive teardown against the sandbox.
-func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClient, operation string, identity taskTeardownIdentity) (bool, error) {
+// row shows the sandbox is gone, belongs to a stop this task didn't issue, or
+// belongs to a suspend/restore handoff, so the task must not issue a later
+// destructive teardown against the sandbox. recordStopIssued, when set,
+// records on the task whether this task's Kill owns a stop: true just before
+// Kill sends Stop, so a lost reply keeps the ownership, and the prior value
+// again when sbx-manager answers with a refusal.
+func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClient, operation string, identity taskTeardownIdentity, recordStopIssued func(bool)) (bool, error) {
 	if identity.sandboxDetached {
 		return true, nil
 	}
@@ -1025,23 +1072,56 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 	if err != nil {
 		return false, err
 	}
-	switch lifecycle {
-	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED:
-		// A user STOP parks the rootfs for a later START. Releasing its pod
-		// must not turn that intent into DELETE. A stop issued by this task's
-		// own Kill remains part of intentional legacy pod deletion.
-		if !identity.legacyStopIssued {
+	owned, err := cleanupOwned(sandbox, lifecycle)
+	if err != nil {
+		return false, err
+	}
+	stop := false
+	switch {
+	case owned:
+		// The recorded completion says what the cleanup returns the row to.
+		// MARK_SUSPENDED releases the task, and MARK_STOPPED does unless this
+		// task's own Kill issued the stop. Any other completion, or none,
+		// still falls through to the destructive call.
+		// Only cleanup-owned rows read it: on other rows a completion can be
+		// an armed activation's rollback target, published while the start
+		// runs.
+		switch sandbox.GetCleanup().GetCompletion() {
+		case pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED:
+			stop = true
+		case pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED:
 			return true, nil
 		}
-	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING,
-		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDED,
-		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING:
+	case lifecycle == pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED,
+		lifecycle == pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING:
+		stop = true
+	case lifecycle == pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING,
+		lifecycle == pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDED,
+		lifecycle == pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING:
+		return true, nil
+	}
+	// Any cleanup that returns the row to STOPPED (a user's STOP, an
+	// sbx-manager stop, a failed start of a stopped sandbox, or a recovery)
+	// keeps the rootfs for a later START. Releasing the pod must not turn that
+	// into DELETE, including when the guest exits before sbx-manager finishes
+	// the stop or when the stop's cleanup fails. A stop issued by this task's
+	// own Kill remains part of intentional legacy pod deletion.
+	if stop && !identity.legacyStopIssued {
 		return true, nil
 	}
 
 	switch operation {
 	case "kill":
-		_, err = client.Stop(ctx, &pb.StopRequest{SandboxId: identity.sandboxID})
+		if recordStopIssued != nil {
+			recordStopIssued(true)
+		}
+		var trailer metadata.MD
+		_, err = client.Stop(ctx, &pb.StopRequest{SandboxId: identity.sandboxID}, grpc.Trailer(&trailer))
+		// A Stop that may have been admitted keeps the ownership. Treating a
+		// refused Stop as this task's would turn a later user STOP into DELETE.
+		if stopRefused(err, trailer) && recordStopIssued != nil {
+			recordStopIssued(identity.legacyStopIssued)
+		}
 	case "delete":
 		_, err = client.Delete(ctx, &pb.DeleteRequest{SandboxId: identity.sandboxID})
 		// Durable deletion may finish after State observed the live sandbox.
@@ -1055,6 +1135,28 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 		return false, annotateStatus("sbx-manager legacy teardown", err)
 	}
 	return false, nil
+}
+
+// cleanupOwned reports whether a node-local cleanup owns the row, whatever
+// teardown transition its lifecycle names. A cleanup state this build doesn't
+// know, or a cleanup over a lifecycle no cleanup can be over, can't authorize
+// teardown, as an unknown lifecycle can't (observedSandboxLifecycle), so each
+// is an error.
+func cleanupOwned(sandbox *pb.SandboxInfo, lifecycle pb.SandboxLifecycleState) (bool, error) {
+	state := sandbox.GetCleanup().GetState()
+	if _, known := pb.SandboxCleanupState_name[int32(state)]; !known {
+		return false, status.Errorf(codes.FailedPrecondition, "unknown sandbox cleanup state value %d", state)
+	}
+	if state == pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_UNSPECIFIED {
+		return false, nil
+	}
+	switch lifecycle {
+	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING,
+		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_DELETING,
+		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING:
+		return true, nil
+	}
+	return false, status.Errorf(codes.FailedPrecondition, "sandbox cleanup %s over lifecycle %s, which no cleanup can be over", state, lifecycle)
 }
 
 func firstSandboxState(resp *pb.StateResponse) *pb.SandboxInfo {
@@ -1089,6 +1191,14 @@ func stoppedRestartCheckpoint(ctx context.Context, client pb.SandboxManagerClien
 		lifecycle, err := observedSandboxLifecycle(sandbox)
 		if err != nil {
 			return nil, err
+		}
+		owned, err := cleanupOwned(sandbox, lifecycle)
+		if err != nil {
+			return nil, err
+		}
+		if owned {
+			// A cleanup owns the row whatever transition it reports.
+			return nil, status.Errorf(codes.FailedPrecondition, "stopped restart cannot use local lifecycle %s under cleanup %s", lifecycle, sandbox.GetCleanup().GetState())
 		}
 		switch lifecycle {
 		case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED:
@@ -1190,7 +1300,16 @@ func (s *spaceTaskService) waitForTaskTeardownRelease(
 		err = releaseTaskAfterGenerationTeardown(ctx, client, identity)
 		detach = err == nil
 	} else {
-		detach, err = releaseLegacyTaskTeardown(ctx, client, operation, identity)
+		// A Stop whose reply is lost may still have been admitted, so the
+		// marker is recorded before the call rather than after it succeeds.
+		recordStopIssued := func(issued bool) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if current, ok := s.tasks[taskID]; ok && current == expected {
+				current.legacyStopIssued = issued
+			}
+		}
+		detach, err = releaseLegacyTaskTeardown(ctx, client, operation, identity, recordStopIssued)
 	}
 	// The task stays running until sbx-manager releases it, and each retry
 	// otherwise leaves only a metric; this line is what names the refusal
@@ -1291,9 +1410,6 @@ func (s *spaceTaskService) mutateTaskAfterTeardownRelease(
 	}
 	if detachSandbox {
 		current.sandboxDetached = true
-	}
-	if needsTeardown && operation == "kill" && !detachSandbox && !current.generationTeardown {
-		current.legacyStopIssued = true
 	}
 	mutate(current)
 	return true, nil
@@ -2245,7 +2361,8 @@ func (s *ociSpec) sandboxStoppedMaterializationArtifactID() string {
 const stoppedMaterializationCheckpoint = "stopped-materialization"
 
 // markMaterializedStopped makes t the task of a pod whose sandbox was
-// materialized stopped: no VM, so the task stands in on the shim's own pid,
+// materialized stopped, or upgraded to a stopped target: no VM, so the task
+// stands in on the shim's own pid,
 // and detached, so Kill and Delete never ask sbx-manager to release, suspend or
 // delete the sandbox the next start boots from. Unlike an ordinarily stopped
 // sandbox's task, this one is still running, so containerd would let an exec

@@ -15,7 +15,7 @@ spec:
   # Surge: node-manager holds /space/run/node-manager/service.mutex, and a
   # successor binds its health socket, reports ready while passive and takes
   # over when the predecessor releases the lock
-  # (crates/libs/node/mgr/server/src/run.rs). The runtime-supervisor upgrade
+  # (crates/l40_api/node/mgr/server/src/run.rs). The runtime-supervisor upgrade
   # is built around that overlap: the successor's init container stages the
   # new supervisor while the old node-manager still runs and defers the
   # restart, which the successor performs once it holds the mutex
@@ -35,14 +35,14 @@ spec:
       automountServiceAccountToken: false
       # Host network: node-manager builds each sandbox's veth/tap pair, routes
       # and nftables in the node's root network namespace and sets
-      # net.ipv4.ip_forward there (crates/libs/node/mgr/server/src/net.rs,
+      # net.ipv4.ip_forward there (crates/l40_api/node/mgr/server/src/net.rs,
       # firewall.rs). ClusterFirstWithHostNet keeps in-cluster DNS.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       # Host PID: node-manager opens pidfds on the Firecracker and sidecar
       # processes the host runtime-supervisor reports, and reads the
       # /proc/<pid> links it records under /space/run/firecracker/sandboxes
-      # (crates/libs/node/runtime/supervisor/src/inventory.rs). The init
+      # (crates/l40_api/node/runtime/supervisor/src/inventory.rs). The init
       # container's `nsenter --target 1` reaches the node's systemd through it
       # (scripts/k8s/node-manager-init.sh).
       hostPID: true
@@ -233,7 +233,7 @@ spec:
           # binds, btrfs on loop and device-mapper devices), creates loop and
           # device-mapper devices, unshares and bind-mounts network namespaces,
           # writes /sys/fs/cgroup/space, and programs nftables and links
-          # (crates/libs/node/mgr/server/src/{launch_prepare,snapshots,
+          # (crates/l40_api/node/mgr/server/src/{launch_prepare,snapshots,
           # loop_devices,rootfs_dmcrypt,net}.rs). Bidirectional mount
           # propagation below also requires it.
           securityContext:
@@ -255,12 +255,12 @@ spec:
             # Sandbox volume DEKs come straight from the authority, which
             # admits GetOrIssueSandboxVolumeDek only from node-manager, never
             # through the node agent
-            # (crates/libs/node/mgr/server/src/service/encrypted_volumes.rs,
-            # crates/libs/credential/mgr/server/src/service.rs).
+            # (crates/l40_api/node/mgr/server/src/service/encrypted_volumes.rs,
+            # crates/l40_api/credmgr/server/src/service.rs).
             {{- include "space-node-service.env.credmgrAuthority" . | nindent 12 }}
             # The successor activates a supervisor restart its init container
             # staged, once it holds the service mutex
-            # (crates/libs/node/mgr/server/src/run.rs).
+            # (crates/l40_api/node/mgr/server/src/run.rs).
             - name: SPACE_NODEMGR_ACTIVATE_RUNTIME_SUPERVISOR_ON_START
               value: "true"
             # Sandbox pods own their network namespaces (KubernetesSubstrate).
@@ -269,7 +269,7 @@ spec:
             # No warm network-slot pool, as deployed nodes run. Each slot is its
             # own network namespace, bridged to the sandbox pod's namespace or,
             # for an allocation without one, to the node's; claim_allocation
-            # (crates/libs/node/mgr/server/src/slot_pool.rs) serves only the
+            # (crates/l40_api/node/mgr/server/src/slot_pool.rs) serves only the
             # latter from the pool. Sandbox pods bring their own namespace
             # (KubernetesSubstrate), so their slots are set up on allocation
             # and torn down on release either way. The binary defaults also
@@ -281,7 +281,7 @@ spec:
             # up their slots on demand instead of leasing pooled ones. With no
             # ready minimum the pool reports healthy while empty (pool_status
             # in service/network_helpers.rs). Read at startup in
-            # crates/libs/node/mgr/server/src/run.rs.
+            # crates/l40_api/node/mgr/server/src/run.rs.
             - name: SPACE_NODEMGR_NETWORK_POOL_TARGET
               value: "0"
             - name: SPACE_NODEMGR_NETWORK_POOL_RETAIN_READY
@@ -301,14 +301,14 @@ spec:
             # node's. node-manager bind-mounts each instance's rootfs into its
             # jail before launch and the snapshot memory file after Firecracker
             # is already running on restore
-            # (crates/libs/node/mgr/server/src/service/snapshots.rs); those
+            # (crates/l40_api/node/mgr/server/src/service/snapshots.rs); those
             # mounts reach the jail only if they propagate from this pod to the
             # node's shared /space/cache. Without it Firecracker opens the
             # zero-byte bind target and restore fails ("Total sum of memory
             # regions exceeds largest possible file offset").
             {{- include "space-node-service.mount.cache" (dict "propagation" "Bidirectional") | nindent 12 }}
             # Bidirectional: node-manager bind-mounts each sandbox network
-            # namespace at /run/netns/<ns> (crates/libs/node/mgr/server/src/net/linux.rs);
+            # namespace at /run/netns/<ns> (crates/l40_api/node/mgr/server/src/net/linux.rs);
             # the host jailer (`--netns`) and the supervisor's sidecar launcher
             # (setns) open those paths on the node. Kubelet's CNI namespaces
             # for sandbox pods arrive the other way.
@@ -316,7 +316,7 @@ spec:
               mountPath: /var/run/netns
               mountPropagation: Bidirectional
             # The sandbox cgroup parent's cpu/memory/io limits and per-sandbox
-            # children (crates/libs/node/runtime/core/src/cgroup.rs).
+            # children (crates/l40_api/node/runtime/core/src/cgroup.rs).
             - name: cgroup
               mountPath: /sys/fs/cgroup
             # Includes the root-owned runtime tree used by the host supervisor.

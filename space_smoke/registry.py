@@ -66,6 +66,7 @@ class Scenario(Generic[Fixture]):
     required_tools: tuple[str, ...]
     api_surfaces: frozenset[str]
     timeout_minutes: int
+    cleanup_timeout_seconds: float | None
     backends: frozenset[str]
     substrates: frozenset[str]
     quarantined: str | None
@@ -116,6 +117,7 @@ def scenario(
     ignored: str | None = None,
     telemetry_mode: str | None = None,
     timeout_minutes: int | None = None,
+    cleanup_timeout_seconds: float | None = None,
     storage_credentials: str | None = None,
     test_hooks: str | None = None,
     substrates: Iterable[str] | None = None,
@@ -272,6 +274,8 @@ def scenario(
                 f"smoke {id} substrates may only narrow its fixture's "
                 f"{', '.join(sorted(fixture_substrates))}"
             )
+        if cleanup_timeout_seconds is not None and not 0 < cleanup_timeout_seconds < (timeout_minutes or fixture_type.timeout_minutes) * 60:
+            raise ValueError("cleanup reserve must be positive and smaller than the scenario timeout")
         return Scenario(
             id=id,
             category=id.split(".", 1)[0],
@@ -286,6 +290,7 @@ def scenario(
             required_tools=tool_names,
             api_surfaces=supported_surfaces,
             timeout_minutes=timeout_minutes or fixture_type.timeout_minutes,
+            cleanup_timeout_seconds=cleanup_timeout_seconds,
             backends=FIXTURE_BACKENDS[fixture_type],
             substrates=narrowed_substrates or fixture_substrates,
             quarantined=quarantined,

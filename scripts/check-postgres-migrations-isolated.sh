@@ -518,7 +518,7 @@ is_postgres_bootstrap_test_append() {
   local result=1
 
   if ! is_credential_tables_only_change \
-    "crates/libs/db/migrator/src/bootstrap_roles.rs"; then
+    "crates/l30_storage/db/migrate/src/bootstrap_roles.rs"; then
     echo "ERROR: ${file} is allowed only with a valid CREDENTIAL_TABLES change." >&2
     return 1
   fi
@@ -579,11 +579,11 @@ is_allowed_with_migrations() {
     db/postgres/*.sql|db/README.md)
       return 0
       ;;
-    crates/libs/db/migrator/src/bootstrap_roles.rs)
+    crates/l30_storage/db/migrate/src/bootstrap_roles.rs)
       is_credential_tables_only_change "${file}"
       return
       ;;
-    crates/libs/db/migrator/src/bootstrap_roles/tests/postgres_bootstrap_tests.rs)
+    crates/l30_storage/db/migrate/src/bootstrap_roles/tests/postgres_bootstrap_tests.rs)
       is_postgres_bootstrap_test_append "${file}"
       return
       ;;

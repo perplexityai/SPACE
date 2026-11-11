@@ -1,0 +1,22 @@
+-- no-transaction
+-- squawk-disable-assume-in-transaction
+-- Rebuilds idx_sandboxes_name_lower as 20261105161136_sandboxes_name_lower_index
+-- created it: the lowercased name's first 256 characters, COLLATE "C".
+--
+-- CONCURRENTLY because sandboxes takes writes on every lifecycle change: a
+-- plain build holds SHARE on the table and would stall them for its
+-- duration. That makes this a single-statement `-- no-transaction` migration.
+-- A failed build can leave an INVALID index behind while this migration stays
+-- recorded as applied. There is no IF NOT EXISTS so that a rerun fails on that
+-- index instead of skipping it and removing the history row. To recover, run
+-- this migration's up statement by hand and rerun the down.
+--
+-- The statement must be the file's only one, so it cannot set its own lock or
+-- statement timeout and runs under the session's (see db/README.md). Building
+-- concurrently takes SHARE UPDATE EXCLUSIVE, which does not block writers. It
+-- waits for every transaction in the database whose snapshot is older than its
+-- second scan, whatever tables that transaction reads, so a long-running one
+-- can hold the build past the session's lock timeout and leave an INVALID
+-- index.
+CREATE INDEX CONCURRENTLY idx_sandboxes_name_lower
+    ON public.sandboxes USING btree ((left(lower(name), 256) COLLATE "C"));

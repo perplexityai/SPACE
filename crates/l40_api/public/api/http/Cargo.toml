@@ -17,7 +17,7 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-public-api = { workspace = true, features = ["serde"] }
 pplx-space-request-id = { workspace = true }
 

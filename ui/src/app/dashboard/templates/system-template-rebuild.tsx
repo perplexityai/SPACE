@@ -54,6 +54,8 @@ import {
 } from '@/lib/system-template-rebuild';
 import { releaseViewRefreshLock, tryAcquireViewRefreshLock } from '@/lib/view-refresh';
 import { exclusiveWith, type BrowserLocks } from '@/lib/exclusive';
+import { READ_TIMEOUT_MS } from '@/lib/template-reads';
+import { templateHref } from './links';
 
 const { Text, Paragraph } = Typography;
 const TEMPLATES: SystemTemplate[] = ['seed', 'code-runtime'];
@@ -70,16 +72,29 @@ const exclusive = <T,>(name: string, work: () => T): Promise<T> => exclusiveWith
 
 const digest = (hash: string | null | undefined) => <code>{shortHash(hash, 'none')}</code>;
 
+// Where a build's outcome shows: the template's releases and its builds. The
+// builder creates a template's record when it starts the first build's job,
+// so a build still queued, or one whose outcome is unknown, can name a
+// template without a page yet: it is linked only once the template is listed.
+function ReleasesAndBuilds({ template, listed }: { template: SystemTemplate; listed: boolean }) {
+  if (!listed) return <>the {template} releases and builds, once the template is listed</>;
+  return (
+    <>
+      the <Link href={templateHref(template, 'releases')}>{template} releases</Link> and{' '}
+      <Link href={templateHref(template, 'builds')}>{template} builds</Link>
+    </>
+  );
+}
+
 // A build attempt "Start a new build" replaced, which may still publish a
 // release of its own. Later answers of its key are listed, never read as its
 // outcome.
-function RetiredAttempt({ template, attempt }: { template: SystemTemplate; attempt: RetiredBuild }) {
+function RetiredAttempt({ template, attempt, listed }: { template: SystemTemplate; attempt: RetiredBuild; listed: boolean }) {
   return (
     <Text type="warning">
       Earlier attempt {attempt.generation + 1}{attempt.jobId ? <>, job <Text code copyable>{attempt.jobId}</Text>,</> : null} has an
-      unknown outcome: it may still be running and publish a release of its own; see{' '}
-      <a href="#template-releases">Template Releases</a> below, and the {template} row&apos;s builds in the Templates table
-      above.{attempt.notes.length ? ` Since then, ${attempt.notes.join('; ')}.` : ''}
+      unknown outcome: it may still be running and publish a release of its own; see <ReleasesAndBuilds template={template} listed={listed} />.
+      {attempt.notes.length ? ` Since then, ${attempt.notes.join('; ')}.` : ''}
     </Text>
   );
 }
@@ -114,15 +129,17 @@ interface Props {
   // The releases have been read at least once (until then, a promotion's
   // state is not known).
   releasesLoaded: boolean;
-  // The Template Releases title, which this component's header row carries.
+  // The title this component's header row carries.
   title: ReactNode;
+  // The templates the console has a page for; others are named, not linked.
+  listedTemplates: ReadonlySet<string>;
 }
 
 // Rebuilding seed and code-runtime, one explicit step per click. The run is
 // stored per cluster and user, for at most a day, so a reload or another tab
 // can show it and keep polling its builds; nothing is sent from storage.
 // Whether a promotion is done is read from the tags, not stored.
-export default function SystemTemplateRebuild({ refreshReleases, releases, releasesLoaded, title }: Props) {
+export default function SystemTemplateRebuild({ refreshReleases, releases, releasesLoaded, title, listedTemplates }: Props) {
   const { message } = App.useApp();
   const { user, cluster } = useAuth();
   const key = user && cluster ? storageKey(cluster.id, user.id) : null;
@@ -146,6 +163,8 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
   // Bumped after every poll, so the next one is scheduled even when the
   // answer changed nothing.
   const [pollTick, setPollTick] = useState(0);
+  // The templates whose build status read is out: one read each at a time.
+  const statusReads = useRef(new Set<SystemTemplate>());
   const runRef = useRef<RebuildRun | null>(null);
   runRef.current = run;
 
@@ -287,9 +306,16 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
       if (!job || isTerminal(job)) continue;
       const failures = trouble[template]?.failures ?? 0;
       timers.push(setTimeout(async () => {
+        // The other template's poll re-runs this effect; a status read still
+        // out schedules the next poll when it ends.
+        if (statusReads.current.has(template)) return;
         if (!live(runId)) return;
+        statusReads.current.add(template);
         try {
-          const status = await adminApi.get<TemplateBuildStatus>(`/v1/templates/${template}/builds/${encodeURIComponent(job.job_id)}`);
+          const status = await adminApi.get<TemplateBuildStatus>(
+            `/v1/templates/${template}/builds/${encodeURIComponent(job.job_id)}`,
+            { signal: AbortSignal.timeout(READ_TIMEOUT_MS) },
+          );
           const next = await update(runId, (current) => applyStatus(current, runId, template, status));
           if (status.state === 'unspecified') {
             setTrouble((t) => ({ ...t, [template]: { failures: failures + 1, text: `The builder reports an unknown state for ${template}.` } }));
@@ -305,6 +331,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
           }
           setTrouble((t) => ({ ...t, [template]: { failures: failures + 1, text: `Could not read the ${template} build status: ${errorMessage(err)}` } }));
         } finally {
+          statusReads.current.delete(template);
           setPollTick((n) => n + 1);
         }
       }, failures === 0 && job.state === 'pending' ? 1_000 : pollDelayMs(failures)));
@@ -615,11 +642,10 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
           {closed ? (
             <Text type="secondary">
               {closed.jobId ? <>Job <Text code copyable>{closed.jobId}</Text>: </> : null}
-              see <a href="#template-releases">Template Releases</a> below, and the {template} row&apos;s builds in the
-              Templates table above.
+              see <ReleasesAndBuilds template={template} listed={listedTemplates.has(template)} />.
             </Text>
           ) : null}
-          {retiredBuilds(run, template).map((attempt) => <RetiredAttempt key={attempt.generation} template={template} attempt={attempt} />)}
+          {retiredBuilds(run, template).map((attempt) => <RetiredAttempt key={attempt.generation} template={template} attempt={attempt} listed={listedTemplates.has(template)} />)}
           {trouble[template] ? <Text type="warning">{trouble[template]!.text.replace(/\.$/, '')}. Retrying in {Math.round(pollDelayMs(trouble[template]!.failures) / 1000)} s.</Text> : null}
           {test ? (
             <Text>
@@ -840,7 +866,7 @@ function RollbackTargets({ promotion, expiresAt }: { promotion: Promotion; expir
       })}
       <Text type="secondary">
         Record these digests now. This browser keeps them only until {formatTime(expiresAt)}, and no other browser has
-        them. To roll back, assign latest to them with the tag button in Template Releases.
+        them. To roll back, assign latest to them with the tag button in each template's releases.
       </Text>
     </Space>
   );

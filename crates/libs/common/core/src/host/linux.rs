@@ -33,6 +33,38 @@ pub fn signal_pidfd(
 /// File-descriptor limit applied to Firecracker and sandbox sidecar processes.
 pub const SANDBOX_PROCESS_NOFILE_LIMIT: u64 = 4096;
 
+/// Mark the calling process as the host OOM killer's first choice by setting
+/// its `oom_score_adj` to the maximum, 1000. Firecracker and sandbox sidecars
+/// run with this score so host memory pressure kills sandboxes before node
+/// services. Raising the score needs no privilege.
+///
+/// Async-signal-safe: it calls only `open`, `write` and `close` on a static
+/// path and buffer, so it may run in a `pre_exec` hook.
+#[cfg(target_os = "linux")]
+pub fn prefer_for_oom_kill() -> std::io::Result<()> {
+    const SCORE: &[u8] = b"1000";
+    // SAFETY: the path is a static NUL-terminated string.
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self/oom_score_adj".as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is open and the buffer is a static slice.
+    let written = unsafe { libc::write(fd, SCORE.as_ptr().cast(), SCORE.len()) };
+    let result = match usize::try_from(written) {
+        Ok(len) if len == SCORE.len() => Ok(()),
+        Ok(_) => Err(std::io::ErrorKind::WriteZero.into()),
+        Err(_) => Err(std::io::Error::last_os_error()),
+    };
+    // SAFETY: `fd` is open and owned here; nothing uses it after close.
+    unsafe { libc::close(fd) };
+    result
+}
+
 /// SPACE node Linux filesystem paths.
 pub mod paths {
     use std::path::{Path, PathBuf};
@@ -165,7 +197,9 @@ pub mod paths {
     /// scripts in lockstep when the install surface changes.
     ///
     /// Used to configure
-    /// `pplx_space_common_svc::UdsPeerAccount::require_binary`.
+    /// `pplx_space_uds_peer_auth::UdsPeerAccount::require_binary`, with
+    /// [`SPACE_SYSTEMD_BIN_DIR`] and [`SPACE_SYSTEMD_APPS_DIR`] as the
+    /// authorizer's `ContentAddressedInstalls`.
     macro_rules! space_svc_binaries {
         ($($name:literal),+ $(,)?) => {
             &[$(
@@ -184,46 +218,6 @@ pub mod paths {
     pub const SPACE_SBXMGR_UID_BINARIES: &[&str] = space_svc_binaries!("space-sbxmgr-svc");
     pub const SPACE_VOLMGR_SVC_BINARIES: &[&str] = space_svc_binaries!("space-volmgr-svc");
     pub const SPACE_TMPLMGR_SVC_BINARIES: &[&str] = space_svc_binaries!("space-tmplmgr-svc");
-
-    /// Marker the kernel appends to a `/proc/<pid>/exe` readlink target
-    /// when the backing inode was unlinked while the process kept running.
-    const EXE_DELETED_MARKER: &str = " (deleted)";
-
-    /// Strip a trailing kernel ` (deleted)` marker from a `/proc/<pid>/exe`
-    /// readlink target. The systemd deploy never unlinks a running inode's
-    /// path (`deploy_binaries` uploads a fresh [`SPACE_SYSTEMD_APPS_DIR`]
-    /// digest file and repoints the [`SPACE_SYSTEMD_BIN_DIR`] symlink); the
-    /// marker's producers are in-place replacement under the Helm bin dir
-    /// and any future GC of old digest installs. Conservative: only the
-    /// literal trailing marker goes.
-    pub fn strip_exe_deleted_marker(path: &Path) -> PathBuf {
-        if let Some(s) = path.to_str()
-            && let Some(stripped) = s.strip_suffix(EXE_DELETED_MARKER)
-        {
-            return PathBuf::from(stripped);
-        }
-        path.to_path_buf()
-    }
-
-    /// Whether a raw `/proc/<pid>/exe` readlink target carries the kernel's
-    /// trailing ` (deleted)` marker — the backing inode was unlinked while
-    /// the process kept running.
-    pub fn exe_link_was_deleted(path: &Path) -> bool {
-        path.to_str()
-            .is_some_and(|s| s.ends_with(EXE_DELETED_MARKER))
-    }
-
-    /// True when `file_name` is `binary`'s content-addressed install name,
-    /// `<binary>-<sha256[:8]>` (exactly 8 lowercase hex).
-    pub fn is_content_addressed_binary_file_name(file_name: &str, binary: &str) -> bool {
-        let Some(digest) = file_name
-            .strip_prefix(binary)
-            .and_then(|rest| rest.strip_prefix('-'))
-        else {
-            return false;
-        };
-        digest.len() == 8 && digest.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
-    }
 
     pub const SPACED_HOST_SOCKET_DIR: &str = SPACE_RUN_DIR;
     pub const SPACED_HOST_SOCKET_FILE: &str = "spaced-host.sock";
@@ -385,24 +379,59 @@ pub mod paths {
         format!("{}/control.sock", isolated_net_gateway_run_dir(sandbox_id))
     }
 
-    /// Returns the build artifact directory for a template/content hash.
-    pub fn template_build_dir(template: &str, content_hash: &str) -> String {
-        format!("{TEMPLATE_DIR}/{template}/{content_hash}")
+    /// Returns the build artifact directory for a template build.
+    pub fn template_build_dir(
+        template: &str,
+        content_hash: &str,
+        partition: crate::types::TemplateCachePartition,
+    ) -> String {
+        let build = partition.build_dir_name(content_hash);
+        format!("{TEMPLATE_DIR}/{template}/{build}")
     }
 
-    /// Returns the snapshot directory for a template/content hash and compute shape.
+    /// Returns the snapshot directory for a template build and compute shape.
     pub fn template_snapshot_dir(
         template: &str,
         content_hash: &str,
+        partition: crate::types::TemplateCachePartition,
         vcpu: u32,
         memory_mib: u32,
     ) -> String {
-        format!("{TEMPLATE_DIR}/{template}/snapshots/{content_hash}/{vcpu}vcpu-{memory_mib}mib")
+        let build = partition.build_dir_name(content_hash);
+        format!("{TEMPLATE_DIR}/{template}/snapshots/{build}/{vcpu}vcpu-{memory_mib}mib")
     }
 
-    /// Returns the rootfs path for a template/content hash.
-    pub fn template_rootfs_path(template: &str, content_hash: &str) -> String {
-        format!("{}/rootfs.ext4", template_build_dir(template, content_hash))
+    /// Cache partitions holding a build dir for a template digest under
+    /// `template_root`, legacy first; none when the template dir doesn't
+    /// exist. A dir's presence says nothing about whether its build is
+    /// verified; only template-manager's catalog does. Any other read error
+    /// is returned rather than read as no dirs, since callers act on a
+    /// partition's absence: a delete would report success over it.
+    pub fn cached_template_partitions_in(
+        template_root: &std::path::Path,
+        template: &str,
+        content_hash: &str,
+    ) -> std::io::Result<Vec<crate::types::TemplateCachePartition>> {
+        let entries = match std::fs::read_dir(template_root.join(template)) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut partitions = Vec::new();
+        for entry in entries {
+            let name = entry?.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some((hash, partition)) =
+                crate::types::TemplateCachePartition::parse_build_dir_name(name)
+                && hash == content_hash
+            {
+                partitions.push(partition);
+            }
+        }
+        partitions.sort();
+        Ok(partitions)
     }
 
     /// Applies the shared SPACE template cache rwx bits to one path.

@@ -86,7 +86,7 @@ Not real, and deliberately:
 
 ## Guarding the harness itself
 
-Its Rust half has unit tests (`cargo test -p pplx-space-netgtw-bench`), including
+Its Rust half has unit tests (`cargo test -p pplx-space-net-gateway-bench`), including
 regression tests for each way it once measured wrongly: the upstream's byte
 accounting, its backlog depth against a burst nothing is accepting, the deny
 probe returning rather than waiting on the peer, and the report's noise-aware
@@ -134,7 +134,7 @@ target/release/netgtw-bench report --baseline before.json --candidate after.json
 | `topology.sh` | the three namespaces, the TPROXY rules, the policy routing |
 | `build-rev.sh` | one harness binary per git rev of the gateway library |
 | `run.sh` | sequences: build, topology, enforcement check, smoke, bench, compare |
-| `crates/apps/net/gateway/bench` | the harness itself — upstream, gateway, workloads, sampler, report |
+| `crates/tools/net/gateway/bench` | the harness itself — upstream, gateway, workloads, sampler, report |
 
 ```
 [client]  198.18.0.2 --veth-- 198.18.0.1  [gw]  198.18.1.1 --veth-- 198.18.1.2  [upstream]
@@ -156,7 +156,7 @@ reaching the destination directly.
 ## Registering a workload
 
 One function and one line. In
-[`crates/apps/net/gateway/bench/src/workload.rs`](../../../crates/apps/net/gateway/bench/src/workload.rs):
+[`crates/tools/net/gateway/bench/src/workload.rs`](../../../crates/tools/net/gateway/bench/src/workload.rs):
 
 ```rust
 async fn slow_start_download(env: &Env) -> Result<Measured, WorkloadError> {
@@ -197,8 +197,8 @@ Two rules make the registry worth trusting:
   open reads as a hang rather than as a failure. See `bytes_carried`.
 
 If the workload needs the upstream to behave in a new way, add an `Op` to
-[`wire.rs`](../../../crates/apps/net/gateway/bench/src/wire.rs) and a match arm
-in [`upstream.rs`](../../../crates/apps/net/gateway/bench/src/upstream.rs).
+[`wire.rs`](../../../crates/tools/net/gateway/bench/src/wire.rs) and a match arm
+in [`upstream.rs`](../../../crates/tools/net/gateway/bench/src/upstream.rs).
 Workloads whose first bytes are fixed — anything the ClientHello peek must see —
 dial `env.raw_echo` instead, which echoes without reading a header.
 

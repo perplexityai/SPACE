@@ -126,7 +126,7 @@ would reject or misroute, so a bad setting never reaches an install.
 {{- fail "global.observability.datadog.apmPort must be 8126 until all host producers support a configurable APM port" -}}
 {{- end -}}
 {{- /* The Rust metrics sink and the shim export OTLP over gRPC only
-       (crates/libs/observability/src/sink/otlp.rs, shim/otlp.go). */ -}}
+       (crates/l10_foundation/observability/src/sink/otlp.rs, shim/otlp.go). */ -}}
 {{- if ne (toString $o.otlp.protocol) "grpc" -}}
 {{- fail (printf "global.observability.otlp.protocol must be grpc (got %q)" (toString $o.otlp.protocol)) -}}
 {{- end -}}

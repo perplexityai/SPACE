@@ -3,7 +3,7 @@ name: DHCP fuzz CI
 on:
   pull_request:
     paths:
-      - crates/libs/net/common/src/slot_dhcp.rs
+      - crates/l20_domain/net/common/src/slot_dhcp.rs
       # The harness and its lock must stay buildable with `cargo fetch --locked`.
       - fuzz/**
 

@@ -49,7 +49,7 @@ class TracingFieldMerge(unittest.TestCase):
 
 class ReceivedUuidMirror(unittest.TestCase):
     def test_matches_the_vector_the_rust_side_pins(self) -> None:
-        # `crates/libs/btrfs/src/tests.rs` pins this pair; a
+        # `crates/l10_foundation/btrfs/src/tests.rs` pins this pair; a
         # drift in namespace, separator or hashing on the Python side shows
         # up here, and nowhere else.
         self.assertEqual(

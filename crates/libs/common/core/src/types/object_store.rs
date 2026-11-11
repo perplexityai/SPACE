@@ -27,21 +27,6 @@ use std::str::FromStr;
 
 use crate::types::template::{ContentHash, TemplateName};
 
-/// Default chunk size for S3 multipart uploads.
-///
-/// Sized for the SPACE suspend workload (compressed `memory` + `rootfs.ext4`
-/// in the 1–8 GiB range). 256 MiB keeps part counts low (32 parts for a
-/// 8 GiB file, 4 for a 1 GiB file) so a node-wide drain stays well under
-/// S3's per-prefix request budget without giving up multipart parallelism.
-pub const MULTIPART_PART_SIZE: usize = 256 * 1024 * 1024;
-
-/// Default concurrency for in-flight multipart parts.
-///
-/// A single TCP flow to S3 caps around 80–100 MB/s, so saturating a 25 Gbps
-/// NIC requires ~32 concurrent flows. Combined with the vol-mgr default
-/// `push_concurrency`, this gives `push × mp` ≈ that target.
-pub const MULTIPART_CONCURRENCY: usize = 16;
-
 /// Number of prefix shards under `suspend_snapshots/` in object storage.
 ///
 /// S3 auto-partitions a bucket per key prefix and rate-limits each

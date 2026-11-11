@@ -42,7 +42,7 @@
 # the rest, and the last pod to attach one crash-looped on an errno about a file
 # that exists.
 #
-# node-manager owns this at runtime — `crates/libs/node/mgr/server/src/loop_devices.rs`
+# node-manager owns this at runtime — `crates/l40_api/node/mgr/server/src/loop_devices.rs`
 # raises a node's capacity at startup, deriving a target from the slot budget
 # (4 devices/sandbox, clamped to [64, 10000]) and doing it in two halves:
 # `LOOP_CTL_ADD` for devices the kernel lacks, then `mknod` for devices with no

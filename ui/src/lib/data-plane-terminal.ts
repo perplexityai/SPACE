@@ -1,6 +1,7 @@
 import { adminApi, api } from '@/lib/api';
 import { isMissingRoute } from '@/lib/admin-fallback';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
+import { terminalInputFrames } from '@/lib/terminal-input';
 
 type DataPlaneAttachInfo = {
   url: string;
@@ -39,7 +40,9 @@ export type TerminalSessionEvent =
 
 export type TerminalConnection = {
   readonly sessionId: string;
-  sendInput: (input: string) => void;
+  // Text is sent UTF-8 encoded; bytes are sent as they are. Either is split
+  // into frames of at most TERMINAL_INPUT_CHUNK_BYTES.
+  sendInput: (input: string | Uint8Array) => void;
   resize: (cols: number, rows: number) => void;
   close: () => void;
 };
@@ -47,6 +50,10 @@ export type TerminalConnection = {
 type TerminalOptions = {
   cols: number;
   rows: number;
+  // The PTY's command and environment; an empty command is the data plane's
+  // default.
+  command: string[];
+  env: Record<string, string>;
   // The sandbox belongs to the signed-in operator's organization, which the
   // public route serves; any other organization's goes through the admin
   // route, which opens the session under the sandbox's own organization.
@@ -73,15 +80,6 @@ function toWebSocketUrl(rawUrl: string): string {
   return parsed.toString();
 }
 
-function encodeBase64(input: string): string {
-  const bytes = new TextEncoder().encode(input);
-  let binary = '';
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return window.btoa(binary);
-}
-
 function decodeBase64(input: string, decoder: TextDecoder): string {
   const raw = window.atob(input);
   const bytes = new Uint8Array(raw.length);
@@ -97,9 +95,9 @@ export async function openSandboxTerminal(
   options: TerminalOptions,
 ): Promise<TerminalConnection> {
   const body = {
-    command: [],
+    command: options.command,
     cwd: null,
-    env: {},
+    env: options.env,
     size: { cols: options.cols, rows: options.rows },
   };
   const headers = { 'Idempotency-Key': idempotencyKey() };
@@ -240,9 +238,8 @@ export async function openSandboxTerminal(
 
   return {
     sessionId: session.id,
-    sendInput(input: string) {
-      seq += 1;
-      sendJson({ type: 'input', seq, data_base64: encodeBase64(input) });
+    sendInput(input: string | Uint8Array) {
+      for (const frame of terminalInputFrames(input, () => (seq += 1))) sendJson(frame);
     },
     resize(cols: number, rows: number) {
       sendJson({ type: 'resize', cols, rows });

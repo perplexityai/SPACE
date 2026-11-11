@@ -1,7 +1,7 @@
 """The orphaned-restore-pod GC, proven live against real restores on kind.
 
 The cluster-controller reconciler `orphaned_restore_pod_gc`
-(crates/libs/cluster/controller/server/src/orphaned_restore_pod_gc/) deletes
+(crates/l40_api/cluster/controller/server/src/orphaned_restore_pod_gc/) deletes
 restore pods their owning `sandboxes` row has provably superseded: no row at
 all, or a resident row whose active execution generation is strictly higher
 than the pod's, or a `suspended`/`failed` row with no active execution whose

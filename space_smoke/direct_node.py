@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import shlex
 import textwrap
 import time
 import uuid
+from pathlib import Path
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -30,6 +32,7 @@ class DirectNodeConfig:
     crash_owned_runtime: bool = False
     firmware_lifecycle: bool = False
     windows_operations_probe: str | None = None
+    windows_admin_ssh_config: str | None = None
 
     @classmethod
     def from_environment(cls, values: Mapping[str, str]) -> DirectNodeConfig:
@@ -79,6 +82,7 @@ class DirectNodeConfig:
             fault == "crash-owned-runtime",
             values.get("SPACE_SMOKE_NODE_RECOVERY") == "firmware-lifecycle",
             values.get("SPACE_SMOKE_WINDOWS_OPERATIONS_PROBE"),
+            values.get("SPACE_SMOKE_WINDOWS_ADMIN_SSH_CONFIG"),
         )
 
 
@@ -89,6 +93,32 @@ class ExecutionObservation:
     pid: int
     slot: int
     start_ticks: int
+
+
+@dataclass(frozen=True)
+class MemoryObservation:
+    nonce: str
+    pid: int
+    counter: int
+
+
+@dataclass(frozen=True)
+class GuestMaintenanceObservation:
+    operation_id: str | None
+    phase: str
+    outcome: str | None
+    incarnation: str | None
+    version: str | None
+    committed_digest: str | None
+    admission_held: bool | None
+
+    @classmethod
+    def parse(cls, text: str) -> GuestMaintenanceObservation:
+        value = json.loads(text)
+        guest = value.get("guest") or {}
+        return cls(value.get("operation_id"), value["phase"], value.get("outcome"),
+                   guest.get("incarnation"), guest.get("version"), guest.get("committed_digest"),
+                   guest.get("admission_held"))
 
 
 class DirectNodeRecoveryFixture:
@@ -128,7 +158,7 @@ class DirectNodeRecoveryFixture:
             raise RuntimeError(f"node command {arguments[0]} failed: {result.detail()}")
         return result.stdout.strip()
 
-    def prepare(self, *, firmware: bool = False) -> None:
+    def prepare_node(self, *, firmware: bool = False) -> None:
         if firmware != self.config.firmware_lifecycle:
             raise SmokeConfigurationError("scenario does not match the explicit node operation opt-in")
         self.context.verify(
@@ -205,6 +235,9 @@ class DirectNodeRecoveryFixture:
             "supervisor restart would kill its executions",
         )
         self.context.record("machine_id", self.config.machine_id)
+
+    def prepare(self, *, firmware: bool = False, rootfs_size_mib: int | None = None) -> None:
+        self.prepare_node(firmware=firmware)
         self.context.scope.defer("remove recovery sandbox", self.cleanup, critical=True)
         self.create_directory = self.command(
             ["mktemp", "-d", "/tmp/space-smoke-create.XXXXXXXXXX"]
@@ -222,6 +255,8 @@ class DirectNodeRecoveryFixture:
             "deploy@local",
             "--auto-lifecycle-off",
         ]
+        if rootfs_size_mib is not None:
+            arguments.extend(["--rootfs-size-mb", str(rootfs_size_mib)])
         # Retain the response on the node before transmitting it over SSH, so
         # cleanup can recover the run's selector if that connection is lost.
         response = self.create_directory + "/response"
@@ -312,6 +347,132 @@ class DirectNodeRecoveryFixture:
         )
         return self.guest("cat /proc/sys/kernel/random/boot_id")
 
+    def verify_windows_recovery(self) -> None:
+        """Inject a hung trial only in this fixture's owned, disposable VM."""
+        config = self.config.windows_admin_ssh_config
+        if config is None or not Path(config).is_absolute() or not Path(config).is_file():
+            raise SmokeConfigurationError("set SPACE_SMOKE_WINDOWS_ADMIN_SSH_CONFIG to a pinned Administrator SSH config")
+        proxy = shlex.join(["ssh", "-o", "BatchMode=yes", self.config.host,
+                           "sudo", "-n", "/space/bin/space-nodemgr", "guest-channel",
+                           str(uuid.UUID(self.owned_selector())), "--port", "22"])
+        script = Path(__file__).with_name("guest").joinpath("windows_update_recovery.ps1").read_text()
+        # Parse stdin as one script, avoiding both cmd.exe's length limit and
+        # PowerShell's line-at-a-time stdin parser silently dropping a block.
+        bootstrap = "try { & ([ScriptBlock]::Create([Console]::In.ReadToEnd())) } catch { Write-Error $_; exit 1 }"
+        encoded = base64.b64encode(bootstrap.encode("utf-16le")).decode("ascii")
+        result = self.executor.run(
+            ["ssh", "-F", config, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+             "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ProxyCommand=" + proxy,
+             "windows-recovery", "powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            input_text=script, timeout=420,
+        )
+        if result.returncode:
+            raise RuntimeError(f"Windows recovery qualification failed: {result.detail()}")
+        try:
+            receipt = json.loads(result.stdout)
+            outcome = receipt["outcome"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise RuntimeError(f"Windows recovery receipt unreadable: {result.detail()}") from error
+        self.context.verify(outcome == "recovered", "guest did not complete recovery qualification")
+
+    def guest_maintenance_status(self, operation: str | None = None) -> GuestMaintenanceObservation:
+        arguments = ["space-sbxmgr", "guest-update", "status", self.owned_selector(), "--json"]
+        if operation is not None:
+            arguments.extend(["--operation", operation])
+        return GuestMaintenanceObservation.parse(self.command(arguments, timeout=20))
+
+    def guest_maintenance(self, *, update: bool, force: bool = False) -> str:
+        arguments = ["space-sbxmgr", "guest-update", "apply"] if update else ["space-sbxmgr", "guest-restart"]
+        arguments.extend([self.owned_selector(), "--json"])
+        if force:
+            arguments.append("--force")
+        receipt = GuestMaintenanceObservation.parse(self.command(arguments, timeout=20))
+        if receipt.operation_id is None:
+            raise RuntimeError("maintenance did not return an operation identity")
+        return receipt.operation_id
+
+    def await_guest_maintenance(self, operation: str) -> GuestMaintenanceObservation:
+        return self._await_guest_maintenance(operation, require_release=True)
+
+    def await_retired_guest_maintenance(self, operation: str) -> GuestMaintenanceObservation:
+        # The caller has completed stop; there is no live guest to observe.
+        return self._await_guest_maintenance(operation, require_release=False)
+
+    def _await_guest_maintenance(self, operation: str, *, require_release: bool) -> GuestMaintenanceObservation:
+        deadline = time.monotonic() + 720
+        while True:
+            receipt = self.guest_maintenance_status(operation)
+            # The generation observer may briefly own a separate configuration
+            # hold after maintenance releases its own. Await usable admission.
+            if receipt.phase == "GUEST_UPDATE_OPERATION_PHASE_COMPLETE" and (
+                not require_release or receipt.admission_held is False
+            ):
+                return receipt
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"maintenance did not settle: {receipt}")
+            self.context.wait(1)
+
+    def start_agent_workload(self) -> int:
+        child_file = rf"C:\Users\user\space-update-{self.marker}.child"
+        script = (
+            "$ErrorActionPreference = 'Stop'; "
+            "$child = Start-Process powershell.exe -ArgumentList "
+            "'-NoProfile -NonInteractive -Command Start-Sleep -Seconds 1200' -PassThru; "
+            f"$child.Id | Set-Content -LiteralPath '{child_file}.tmp'; "
+            f"Move-Item -LiteralPath '{child_file}.tmp' -Destination '{child_file}'; Start-Sleep -Seconds 1200"
+        )
+        program = (
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+             base64.b64encode(script.encode("utf-16le")).decode("ascii")]
+            if self.config.firmware_lifecycle else ["/usr/bin/gnusleep", "infinity"]
+        )
+        output = self._agent_run(["--background", "--", *program])
+        pid = re.search(r"\bpid=(\d+)\b", output)
+        if pid is None:
+            raise RuntimeError("process start did not return its guest PID")
+        return int(pid[1])
+
+    def windows_workload_descendant(self) -> int:
+        path = rf"C:\Users\user\space-update-{self.marker}.child"
+        output = self.agent_command(
+            f"$until = (Get-Date).AddSeconds(10); while (!(Test-Path -LiteralPath '{path}')) {{ "
+            "if ((Get-Date) -ge $until) { throw 'Descendant did not start' }; Start-Sleep -Milliseconds 100 }; "
+            f"Get-Content -LiteralPath '{path}'; Remove-Item -LiteralPath '{path}'"
+        )
+        return int(output)
+
+    def _agent_run(self, arguments: list[str]) -> str:
+        # The per-sandbox bridge socket is private to root and service users.
+        # This fixture already requires a privileged standalone-node operator.
+        command = ["sudo", "-n", "/space/bin/spaced-host", "--sandbox", self.owned_selector(), "run",
+                   "--idempotency-key", str(uuid.uuid4()), *arguments]
+        # A new generation can acquire its configuration hold between a status
+        # read and dispatch. Reuse the command key across bounded retries so an
+        # ambiguous response cannot duplicate an admitted process.
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                return self.command(command, timeout=45)
+            except ScenarioTimedOut:
+                raise
+            except RuntimeError:
+                if time.monotonic() >= deadline:
+                    raise
+                self.context.wait(0.5)
+
+    def agent_command(self, command: str) -> str:
+        if self.config.firmware_lifecycle:
+            script = "$ErrorActionPreference = 'Stop'; " + command
+            encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+            arguments = ["--", "powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
+        else:
+            arguments = ["--user", "root", "--", "/bin/sh", "-c", command]
+        output = self._agent_run(arguments)
+        lines = output.splitlines()
+        if not lines or not lines[0].startswith("started process_id=") or lines[-1] != "exit_code=0":
+            raise RuntimeError(f"agent command did not complete successfully: {output}")
+        return "\n".join(lines[1:-1])
+
     def restart_managers(self) -> None:
         if self.config.firmware_lifecycle:
             raise SmokeConfigurationError("firmware lifecycle opt-in does not authorize manager restarts")
@@ -323,6 +484,12 @@ class DirectNodeRecoveryFixture:
             try:
                 self.command(["systemctl", "is-active", *self.services])
                 self.command(["space-sbxmgr", "list"], timeout=15)
+                # systemd activation precedes node-manager's network-pool and
+                # authenticated artifact inventory recovery. Await both before
+                # issuing lifecycle calls with their shorter metadata budget.
+                self.command(["space-nodemgr", "status"], timeout=15)
+                self.command(["space-nodemgr", "environment", "--reference",
+                              self.config.environment], timeout=30)
                 return
             except (ScenarioTimedOut, SmokeConfigurationError):
                 raise
@@ -371,6 +538,85 @@ class DirectNodeRecoveryFixture:
         before = self.observe()
         self.command(["sudo", "-n", probe, "--sandbox", before.sandbox_id], timeout=150)
         self.context.verify(self.observe() == before, "execution changed during Windows operations")
+
+    def memory_marker(self, *, start: bool = False) -> MemoryObservation:
+        """A live guest process updates a nonce and counter across memory lifecycle."""
+        windows = self.config.firmware_lifecycle
+        path = (
+            rf"C:\Users\user\space-lifecycle-{self.marker}.json"
+            if windows else f"/root/space-lifecycle-{self.marker}.json"
+        )
+        host = ["sudo", "-n", "spaced-host", "--sandbox", self.owned_selector()]
+        if start:
+            if windows:
+                script = (
+                    "$ErrorActionPreference='Stop'; $nonce=[guid]::NewGuid().ToString(); $counter=0; "
+                    "while ($true) { $counter++; "
+                    "@{nonce=$nonce;pid=$PID;counter=$counter} | ConvertTo-Json -Compress | "
+                    f"Set-Content '{path}.tmp'; Move-Item '{path}.tmp' '{path}' -Force; "
+                    "Start-Sleep -Seconds 1 }"
+                )
+                arguments = ["run", "--background", "--", "powershell.exe", "-NoProfile",
+                             "-NonInteractive", "-Command", script]
+            else:
+                script = (
+                    "nonce=$(cat /proc/sys/kernel/random/uuid); counter=0; "
+                    "while :; do counter=$((counter + 1)); "
+                    "printf '{\"nonce\":\"%s\",\"pid\":%s,\"counter\":%s}' \"$nonce\" \"$$\" \"$counter\" "
+                    f"> {path}.tmp; mv {path}.tmp {path}; sleep 1; done"
+                )
+                arguments = ["run", "--background", "--user", "root", "--", "/bin/sh", "-c", script]
+            self.command(host + arguments)
+        deadline = time.monotonic() + 15
+        last_error: Exception | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("guest memory marker read timed out") from last_error
+            try:
+                arguments = host + ["read", path] + ([] if windows else ["--user", "root"])
+                value = json.loads(self.command(arguments, timeout=min(10, remaining)))
+                return MemoryObservation(str(value["nonce"]), int(value["pid"]), int(value["counter"]))
+            except ScenarioTimedOut:
+                raise
+            except (RuntimeError, json.JSONDecodeError) as error:
+                last_error = error
+                if time.monotonic() >= deadline:
+                    raise
+                self.context.wait(min(0.5, max(0, deadline - time.monotonic())))
+
+    def verify_memory(self, before: MemoryObservation) -> MemoryObservation:
+        baseline = self.memory_marker()
+        self.context.verify(baseline.nonce == before.nonce and baseline.pid == before.pid,
+                            "guest process or memory nonce changed across memory lifecycle")
+        self.context.verify(baseline.counter >= before.counter,
+                            "guest memory rewound across lifecycle")
+        deadline = time.monotonic() + 15
+        while True:
+            after = self.memory_marker()
+            self.context.verify(after.nonce == before.nonce and after.pid == before.pid,
+                                "guest process or memory nonce changed across memory lifecycle")
+            if after.counter > baseline.counter:
+                return after
+            self.context.verify(time.monotonic() < deadline, "restored guest process stopped progressing")
+            self.context.wait(0.5)
+
+    def memory_lifecycle(self, action: str) -> ExecutionObservation | None:
+        if action not in ("pause", "resume", "suspend", "restore", "wake"):
+            raise SmokeConfigurationError("unsupported memory lifecycle action")
+        self.command(["space-sbxmgr", action, self.owned_selector(), "--blocking"], timeout=240)
+        state = {"pause": "paused", "suspend": "suspended"}.get(action, "started")
+        self.await_lifecycle_state(state)
+        return None if state == "suspended" else self.observe()
+
+    def automatic_memory_lifecycle(self, action: str) -> None:
+        if action not in ("pause", "suspend"):
+            raise SmokeConfigurationError("unsupported automatic memory lifecycle action")
+        self.command(["space-sbxmgr", "update", self.owned_selector(),
+                      "--idle-policy", f"{action}@5s", "--wake-on", "access"])
+        self.await_lifecycle_state({"pause": "paused", "suspend": "suspended"}[action])
+        # Disarm before wake so verification itself cannot race another idle action.
+        self.command(["space-sbxmgr", "update", self.owned_selector(), "--auto-lifecycle-off"])
 
     def crash_runtime(self, execution: ExecutionObservation) -> None:
         self.require_crash_opt_in()
@@ -460,10 +706,10 @@ class DirectNodeRecoveryFixture:
             self.context.wait(1)
         self.context.verify(False, "owned node lease remains after sandbox cleanup")
 
-    def cleanup(self) -> None:
-        # The runner grants 90 seconds for this fixture. Share one smaller
-        # deadline across all cleanup calls, retaining time for its bookkeeping.
-        deadline = time.monotonic() + 80
+    def cleanup(self, *, deadline: float | None = None) -> None:
+        # Standalone callers share their scenario cleanup budget. A single
+        # fixture otherwise fits within the runner's default 90-second reserve.
+        deadline = min(deadline, time.monotonic() + 180) if deadline is not None else time.monotonic() + 80
 
         def remaining_budget() -> float:
             remaining = deadline - time.monotonic()

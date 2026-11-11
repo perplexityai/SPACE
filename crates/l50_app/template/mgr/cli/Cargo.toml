@@ -1,0 +1,29 @@
+[package]
+name = "pplx-space-template-mgr-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "space-tmplmgr"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+comfy-table = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# internal
+pplx-space-common-cli = { workspace = true }
+pplx-space-common-core = { workspace = true }
+pplx-space-net-common = { workspace = true }
+pplx-space-node-api-client = { workspace = true }
+pplx-space-sbx-mgr-client = { workspace = true }
+pplx-space-template-mgr-client = { workspace = true }

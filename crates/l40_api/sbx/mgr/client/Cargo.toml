@@ -1,0 +1,30 @@
+[package]
+name = "pplx-space-sbx-mgr-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Exposes `test_support`, the shared quarantine/recovery `SandboxInfo`
+# fixtures, to other crates' test suites. Unit tests in this crate get it
+# automatically under `cfg(test)`; external consumers (sbx-mgr, node-ctl) opt
+# in with this feature as a dev-dependency. Mirrors `pplx-space-rpc-auth`'s
+# `test-support`.
+test-support = []
+
+[dependencies]
+tokio = { workspace = true, features = ["time"] }
+thiserror = { workspace = true }
+tonic = { workspace = true }
+
+# internal
+pplx-space-common-core = { workspace = true }
+pplx-space-common-grpc = { workspace = true }
+pplx-space-sbx-mgr-protocol = { workspace = true }

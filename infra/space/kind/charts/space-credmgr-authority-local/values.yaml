@@ -23,7 +23,7 @@ nodeSelector:
   space.pplx.net/infra: "true"
 
 # TCP listener. The port is the binary's documented example
-# (`--tcp-listen 0.0.0.0:9810`, crates/apps/credential/mgr/svc/src/main.rs);
+# (`--tcp-listen 0.0.0.0:9810`, crates/l50_app/credmgr/svc/src/main.rs);
 # no public source fixes a production port.
 service:
   name: space-credmgr-authority
@@ -40,10 +40,10 @@ postgres:
   managedCredentialsPassword: space-dev-creds
 
 # Callers the authority admits, by ServiceAccount, as the client service each
-# one is (`account=service`, crates/libs/credential/mgr/server/src/k8s_identity.rs).
+# one is (`account=service`, crates/l40_api/credmgr/server/src/k8s_identity.rs).
 # Each node's credential-manager agent forwards its node services' calls;
 # node-manager fetches sandbox volume DEKs directly (GetOrIssueSandboxVolumeDek
-# admits only node-manager, crates/libs/credential/mgr/server/src/service.rs),
+# admits only node-manager, crates/l40_api/credmgr/server/src/service.rs),
 # and the builders' build-manager exchanges its storage credentials directly
 # (ALLOW_EXCHANGE_TOKEN_SERVICES, service.rs; space-build-manager-local).
 allowedServiceAccounts:
@@ -55,7 +55,7 @@ allowedServiceAccounts:
 
 # Credentials for the authority's own AWS integrations (AWS Secrets Manager
 # network-credential references, resolved only where the database pool lives,
-# crates/libs/credential/mgr/server/src/run.rs): the optional
+# crates/l40_api/credmgr/server/src/run.rs): the optional
 # `space-aws-creds` Secret Tilt creates from the AWS_* variables in its
 # environment (its `space-aws-creds` resource). Not used when
 # storage credentials are exchanged (below).
@@ -100,7 +100,7 @@ replicas: 2
 
 # The TCP-only authority has no service mutex or drain budget of its own: on
 # SIGTERM tonic's serve_with_shutdown stops accepting and finishes in-flight
-# unary RPCs (serve_tcp_until, crates/libs/credential/mgr/server/src/run.rs).
+# unary RPCs (serve_tcp_until, crates/l40_api/credmgr/server/src/run.rs).
 # The Kubernetes default grace covers that.
 terminationGracePeriodSeconds: 30
 

@@ -10,8 +10,8 @@ patterns = [
   '(?i)\bsandbox_direct_route_provenance\b',
 ]
 allow = [
-  "crates/libs/api/src/controllers/substrate/direct.rs",
-  "crates/libs/api/src/controllers/substrate/direct/**",
+  "crates/l40_api/api/src/controllers/substrate/direct.rs",
+  "crates/l40_api/api/src/controllers/substrate/direct/**",
 ]
 
 [rules.pattern_ratchet.direct_tables.no_crossing]       # only allowed and listed files may match
@@ -32,12 +32,12 @@ mode = "required"
 # Shared code reaches Kubernetes-only state through `Substrate::as_kubernetes()`,
 # binding and using the payload. A presence test on it, in any form, only asks
 # which substrate is running, which belongs in a `SubstrateCapabilities` field
-# (crates/libs/api/src/controllers/substrate/AGENTS.md). A line matcher cannot
+# (crates/l40_api/api/src/controllers/substrate/AGENTS.md). A line matcher cannot
 # tell the two apart, so every call outside the substrate module counts; the
 # baseline lists today's callers, and a new one fails.
 [rules.pattern_ratchet.kubernetes_access]
 patterns = ['\bas_kubernetes\s*\(']
-allow = ["crates/libs/api/src/controllers/substrate/**"]
+allow = ["crates/l40_api/api/src/controllers/substrate/**"]
 
 [rules.pattern_ratchet.kubernetes_access.no_crossing]
 mode = "required"
@@ -61,8 +61,8 @@ mode = "required"
 [rules.pattern_ratchet.capability_identity]
 patterns = ['\bSubstrateCapabilities\s*::\s*(?:DIRECT|KUBERNETES)\b']
 allow = [
-  "crates/libs/api/src/controllers/substrate/direct.rs",
-  "crates/libs/api/src/controllers/substrate/kubernetes/adapter/substrate_adapter.rs",
+  "crates/l40_api/api/src/controllers/substrate/direct.rs",
+  "crates/l40_api/api/src/controllers/substrate/kubernetes/adapter/substrate_adapter.rs",
 ]
 
 [rules.pattern_ratchet.capability_identity.no_crossing]
@@ -146,7 +146,7 @@ allow = [
   "**/test_fixtures.rs",
   "**/*_test_fixture.rs",
   "**/scripted_test_doubles.rs",
-  "crates/libs/db-test-fixtures/**",
+  "crates/test_support/db/test/fixtures/**",
 ]
 
 [rules.pattern_ratchet.substrate_literals.no_crossing]       # only allowed files may match
@@ -169,30 +169,20 @@ mode = "required"
 # production line that opens a statement writing the row (`UPDATE`,
 # `INSERT INTO`, `DELETE FROM`, `MERGE INTO` or `TRUNCATE` naming `sandboxes`,
 # in any case, schema-qualified or quoted, before any alias, including right
-# after a `\n`, `\r` or `\t` escape in a one-line string), and each call to
-# the sandbox-portability renderers that compose part of its SET list
-# (`sandbox_assignments()`, as a method or a path call, and the
-# `*_current_local_artifact_marker_assignments` functions, after punctuation,
-# a line start or `return`, `match`, `if`, `in`, `else` or `while`), so a file
-# with a composed `UPDATE sandboxes s SET {...}` counts the head and each
-# renderer call.
+# after a `\n`, `\r` or `\t` escape in a one-line string).
 # Not caught: a statement head split across lines (`UPDATE` and `sandboxes` on
 # different lines) or built at run time (`format!("UPDATE {table} ...")`); a
-# `COPY sandboxes FROM ...`; a statement in a non-`.rs` file, such as the
-# placement state machine's `include_str!` claim statements under
-# `postgres/sql/`; a head right after an escape other than `\n`, `\r` or
-# `\t` (`\0`, `\x0a`); a renderer called through an alias or a `use ... as`
-# rename, passed as a function value
-# (`.map(SuspendedK8sFinalizationSql::sandbox_assignments)`), or called
-# right after `break` or `yield`; database triggers; scripts and smoke
-# harnesses outside workspace members' `src/`.
+# `COPY sandboxes FROM ...`; a statement in a non-`.rs` file, such as one
+# loaded with `include_str!`; a head right after an escape other than `\n`,
+# `\r` or `\t` (`\0`, `\x0a`); database triggers; scripts and smoke harnesses
+# outside workspace members' `src/`.
 # False positives: the same text in a trailing `//` or `/* */` comment, in
 # `#[doc = "..."]`, in a SQL `--` comment or in an ordinary string such as an
 # error message ("failed to update sandboxes"); a statement on another
 # database's table of the same name.
 # sbx-mgr's node-local SQLite database also has a `sandboxes` table, a
 # different database on a different machine with its own stores
-# (`pplx-space-sbx-mgr-store` and `pplx-space-sbxmgr-migrations`;
+# (`pplx-space-sbx-mgr-store` and `pplx-space-sbx-mgr-migrations`;
 # `layers.storage_access` keeps database drivers out of sbx-mgr's other
 # crates), so its crates are allowed whole: `crates/l*/sbx/**` matches every
 # directory named `sbx` directly below `crates/libs` or an `l*` layer
@@ -204,22 +194,16 @@ mode = "required"
 # in a production file counts, so test-only writes go in a `*_tests` file.
 # A new writer outside the store fails, as does another write in a listed
 # file; so does splitting a listed file into modules, since `--renames` pairs
-# only whole-file renames and the new files' entries are new. Portability
-# calls its private `sandbox_assignments` helper bare; a path-qualified call to
-# it there (`Self::...`, `super::...`) matches and fails.
+# only whole-file renames and the new files' entries are new.
 [rules.pattern_ratchet.sandbox_writes]
 patterns = [
   # A statement head on the row's table
   '''(?i)(?:\\[nrt]|\b)(?:UPDATE|DELETE\s+FROM|INSERT\s+INTO|MERGE\s+INTO|TRUNCATE(?:\s+TABLE)?)\s+(?:ONLY\s+)?(?:\\?"?public\\?"?\s*\.\s*)?\\?"?sandboxes\b''',
-  # Calls to the portability renderers of the row's assignments
-  '''(?:\.|::)\s*sandbox_assignments\s*\(''',
-  '''(?:^|[^\w\s]|\b(?:return|match|if|in|else|while)\s)\s*(?:\w+\s*::\s*)*(?:clear|write|publish_clear_or_preserve)_current_local_artifact_marker_assignments\s*\(''',
 ]
 allow = [
-  "crates/libs/sandbox/store/**",
+  "crates/l30_storage/sandbox/store/**",
   # node-local sbx-mgr SQLite `sandboxes`: a different database
   "crates/l*/sbx/**",
-  "crates/apps/sbx/**",
   "**/*_tests/**",
   "**/test_support.rs",
   # a crate's test-support modules, not the whole test_support layer
@@ -228,7 +212,7 @@ allow = [
   "**/test_fixtures.rs",
   "**/*_test_fixture.rs",
   "**/scripted_test_doubles.rs",
-  "crates/libs/db-test-fixtures/**",
+  "crates/test_support/db/test/fixtures/**",
 ]
 
 [rules.pattern_ratchet.sandbox_writes.no_crossing]       # only allowed and listed files may match
@@ -258,7 +242,7 @@ patterns = [
   '\bfs\s*::\s*copy\s*\(',
   '\buse\s+(?:std|tokio)\s*::\s*fs\s*::[^;]*\bcopy\b',
 ]
-allow = ["crates/libs/common/io/src/reflink.rs"]
+allow = ["crates/l10_foundation/common/io/src/reflink.rs"]
 
 [rules.pattern_ratchet.rootfs_copy.no_crossing]
 mode = "required"
@@ -280,8 +264,8 @@ mode = "required"
 # spawn owner and the existing non-Linux fallback are capped in the baseline.
 [rules.pattern_ratchet.node_manager_commands]
 include = [
-  "crates/libs/node/mgr/server/src/**",
-  "crates/apps/node/mgr/svc/src/**",
+  "crates/l40_api/node/mgr/server/src/**",
+  "crates/l50_app/node/mgr/svc/src/**",
 ]
 patterns = [
   '\b(?:std\s*::\s*)?process\s*::\s*(?:Command\b|\{[^}]*\bCommand\b)',
@@ -323,15 +307,15 @@ mode = "required"
 # build-mgr-server) could open `SANDBOX_MANAGER_DB`.
 [rules.pattern_ratchet.sbxmgr_sqlite_schema]
 patterns = [
-  '\bpplx_space_sbxmgr_migrations\b',
+  '\bpplx_space_sbx_mgr_migrations\b',
   '\bSANDBOX_MANAGER_(?:DB|MIGRATOR)\b',
   '\bsqlite_sandbox_manager\b',
   '\bsbx-manager\.db\b',
   '\bdb/sandbox-manager\b',
 ]
 allow = [
-  "crates/libs/sbx/mgr/store/src/**",
-  "crates/libs/sbx/mgr/migrations/src/**",
+  "crates/l30_storage/sbx/mgr/store/src/**",
+  "crates/l30_storage/sbx/mgr/migrations/src/**",
   "crates/libs/common/core/src/host/linux.rs",
 ]
 
@@ -375,194 +359,15 @@ mode = "advisory"
 # (Layers).
 [rules.layers.unmoved]
 l10_foundation = [
-  "pplx-space-aws-client",
-  "pplx-space-bearer-token",
-  "pplx-space-btrfs",
-  "pplx-space-byte-size",
-  "pplx-space-common-cli",
-  "pplx-space-common-connection-admission",
-  "pplx-space-common-grpc",
-  "pplx-space-common-grpc-lb",
-  "pplx-space-common-io",
-  "pplx-space-common-jobs",
-  "pplx-space-common-lru-reaper",
-  "pplx-space-common-proto-build",
-  "pplx-space-common-svc",
-  "pplx-space-common-work-coalescer",
-  "pplx-space-content-digest",
-  "pplx-space-cpu-arch",
-  "pplx-space-dependency-drain",
-  "pplx-space-durations",
-  "pplx-space-env-vars",
-  "pplx-space-feature-flags",
-  "pplx-space-grpc-metrics",
-  "pplx-space-grpc-rate-limiter",
-  "pplx-space-http-server",
-  "pplx-space-k8s-ids",
-  "pplx-space-kube-client",
-  "pplx-space-linux-ids",
-  "pplx-space-metrics",
-  "pplx-space-metrics-emit",
-  "pplx-space-migration-checksums",
-  "pplx-space-object-store",
-  "pplx-space-observability",
-  "pplx-space-page-cache",
-  "pplx-space-pii",
-  "pplx-space-postgres-contention",
-  "pplx-space-request-id",
-  "pplx-space-rustls-provider",
-  "pplx-space-s3-http-client",
-  "pplx-space-semver",
-  "pplx-space-service-lifecycle",
-  "pplx-space-service-mutex",
-  "pplx-space-spaced-build",
-  "pplx-space-sql-locator",
-  "pplx-space-sqlite",
-  "pplx-space-stopwatch",
-  "pplx-space-systemd-watchdog",
-  "pplx-space-tokio-runtime",
-  "pplx-space-uds-peer-auth",
-  "pplx-space-unix-socket-bind",
-  "pplx-space-unix-socket-path",
-  "pplx-space-valkey",
 ]
 l20_domain = [
-  "pplx-space-accounts",
-  "pplx-space-api-route",
-  "pplx-space-auto-lifecycle",
-  "pplx-space-auto-lifecycle-receipt",
-  "pplx-space-cluster-id",
   "pplx-space-common-core",
-  "pplx-space-credential-injection-core",
-  "pplx-space-credential-provider-proto",
-  "pplx-space-db-identity",
-  "pplx-space-ecw-credential",
-  "pplx-space-events",
-  "pplx-space-execution-common",
-  "pplx-space-execution-spec",
-  "pplx-space-federated-identity",
-  "pplx-space-guest-process",
-  "pplx-space-k8s-node-id",
-  "pplx-space-net-common",
-  "pplx-space-net-gateway-protocol",
-  "pplx-space-network-roles",
-  "pplx-space-node-mgr-protocol",
-  "pplx-space-public-api",
-  "pplx-space-rpc-contracts",
-  "pplx-space-sbx-mgr-protocol",
-  "pplx-space-spaced-common",
-  "pplx-space-spaced-guest-protocol",
-  "pplx-space-state-reconciliation",
-]
-l30_storage = [
-  "pplx-space-cluster-pool",
-  "pplx-space-cluster-trigger-queue",
-  "pplx-space-credential-injection-store",
-  "pplx-space-db-migrate",
-  "pplx-space-federated-grant-store",
-  "pplx-space-node-registration-store",
-  "pplx-space-placement",
-  "pplx-space-runtime-environment-catalog-store",
-  "pplx-space-runtime-environment-policy-store",
-  "pplx-space-sandbox-portability",
-  "pplx-space-sandbox-quarantine-store",
-  "pplx-space-sandbox-routability",
-  "pplx-space-sandbox-store",
-  "pplx-space-sandbox-teardown",
-  "pplx-space-sbx-mgr-store",
-  "pplx-space-sbxmgr-migrations",
-  "pplx-space-snapshot-storage",
-  "pplx-space-snapshot-store",
-]
-l40_api = [
-  "pplx-space-api",
-  "pplx-space-build-mgr",
-  "pplx-space-build-mgr-client",
-  "pplx-space-build-mgr-server",
-  "pplx-space-cluster-controller-server",
-  "pplx-space-cluster-reconciler",
-  "pplx-space-credential-provider-client",
-  "pplx-space-credmgr",
-  "pplx-space-credmgr-client",
-  "pplx-space-data-plane-server",
-  "pplx-space-execution-catalog",
-  "pplx-space-ingress-admission",
-  "pplx-space-internal-api-server",
-  "pplx-space-net-gateway",
-  "pplx-space-net-gateway-client",
-  "pplx-space-node-api-client",
-  "pplx-space-node-api-server",
-  "pplx-space-node-ctl-client",
-  "pplx-space-node-ctl-server",
-  "pplx-space-node-mgr",
-  "pplx-space-node-mgr-client",
-  "pplx-space-node-runtime-core",
-  "pplx-space-node-runtime-manager",
-  "pplx-space-node-runtime-manager-client",
-  "pplx-space-node-runtime-supervisor",
-  "pplx-space-placement-executor",
-  "pplx-space-sbx-mgr",
-  "pplx-space-sbx-mgr-client",
-  "pplx-space-snapshot-retention",
-  "pplx-space-spaced-guest-client",
-  "pplx-space-spaced-guest-execution",
-  "pplx-space-spaced-guest-server",
-  "pplx-space-spaced-host-client",
-  "pplx-space-spaced-host-server",
-  "pplx-space-template-mgr",
-  "pplx-space-template-mgr-client",
-  "pplx-space-template-publisher",
-  "pplx-space-volmgr",
-  "pplx-space-volmgr-client",
-]
-l50_app = [
-  "pplx-space-admin-cli",
-  "pplx-space-api-svc",
-  "pplx-space-build-mgr-cli",
-  "pplx-space-build-mgr-svc",
-  "pplx-space-cluster-controller",
-  "pplx-space-credmgr-svc",
-  "pplx-space-data-plane-svc",
-  "pplx-space-db-migrator",
-  "pplx-space-internal-api-svc",
-  "pplx-space-net-gateway-svc",
-  "pplx-space-node-api-svc",
-  "pplx-space-node-ctl-cli",
-  "pplx-space-node-ctl-svc",
-  "pplx-space-node-mgr-cli",
-  "pplx-space-node-mgr-svc",
-  "pplx-space-runtime-manager-cli",
-  "pplx-space-runtime-manager-svc",
-  "pplx-space-runtime-supervisor-svc",
-  "pplx-space-sbx-mgr-cli",
-  "pplx-space-sbxmgr-svc",
-  "pplx-space-spaced-guest-cli",
-  "pplx-space-spaced-guest-svc",
-  "pplx-space-spaced-guest-worker",
-  "pplx-space-spaced-host-cli",
-  "pplx-space-spaced-host-svc",
-  "pplx-space-ssh-cli",
-  "pplx-space-template-publish",
-  "pplx-space-tmplmgr-cli",
-  "pplx-space-tmplmgr-svc",
-  "pplx-space-volmgr-cli",
-  "pplx-space-volmgr-svc",
-]
-test_support = [
-  "pplx-space-db-test-fixtures",
-  "pplx-space-mock-branching-key-provider-svc",
-  "pplx-space-node-api-sim",
-  "pplx-space-test-env",
-]
-tools = [
-  "pplx-space-netgtw-bench",
-  "pplx-space-spaced-loopback-test",
 ]
 
 
 # Each store's users: the l40_api and l30_storage crates that own its state
 # and use the store today, directly or through a legacy crate's re-exports
-# (see `legacy` below), such as common-svc's.
+# (see `legacy` below).
 [rules.layers.store_users]
 pplx-space-cluster-pool = [
   "pplx-space-api",
@@ -577,9 +382,18 @@ pplx-space-cluster-trigger-queue = [
 ]
 pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
-pplx-space-node-registration-store = ["pplx-space-credmgr"]
-pplx-space-placement = ["pplx-space-internal-api-server", "pplx-space-placement-executor"]
-pplx-space-runtime-environment-catalog-store = ["pplx-space-internal-api-server"]
+pplx-space-node-registration-store = ["pplx-space-api", "pplx-space-credmgr"]
+pplx-space-node-status-store = ["pplx-space-api"]
+pplx-space-postgres-pool = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-credmgr",
+  "pplx-space-internal-api-server",
+]
+pplx-space-runtime-environment-catalog-store = [
+  "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
+]
 pplx-space-runtime-environment-policy-store = [
   "pplx-space-api",
   "pplx-space-internal-api-server",
@@ -593,13 +407,16 @@ pplx-space-sandbox-portability = [
   "pplx-space-snapshot-store",
 ]
 pplx-space-sandbox-quarantine-store = [
-  "pplx-space-cluster-controller-server",
-  "pplx-space-internal-api-server",
-]
-pplx-space-sandbox-routability = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
+]
+pplx-space-sandbox-residency = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-sandbox-store",
+]
+pplx-space-sandbox-routability = [
   "pplx-space-sandbox-store",
 ]
 pplx-space-sandbox-store = [
@@ -613,8 +430,8 @@ pplx-space-sandbox-teardown = [
   "pplx-space-cluster-controller-server",
   "pplx-space-sandbox-store",
 ]
+pplx-space-sbx-mgr-migrations = ["pplx-space-sbx-mgr-store"]
 pplx-space-sbx-mgr-store = ["pplx-space-db-migrate", "pplx-space-sbx-mgr"]
-pplx-space-sbxmgr-migrations = ["pplx-space-sbx-mgr-store"]
 pplx-space-snapshot-storage = [
   "pplx-space-cluster-controller-server",
   "pplx-space-snapshot-retention",
@@ -672,7 +489,7 @@ helpers = [
 # The crates being dissolved: they predate the layers and mix SPACE-specific
 # code in until they are split up. Every check covers them, with today's edges
 # baselined.
-legacy = ["pplx-space-common-core", "pplx-space-common-svc", "pplx-space-metrics"]
+legacy = ["pplx-space-common-core"]
 
 # An l20_domain crate is a protocol (wire schemas and the conversions between
 # them and the models) if its name ends in -protocol or -proto, or `protocols`
@@ -697,13 +514,12 @@ protocols = [
 # aws-lc-rs and aws-lc-sys are cryptography, not cloud SDKs. The workspace's
 # own I/O crates need no entry: an l10_foundation crate, legacy or not, with
 # a required dependency on a fenced package is fenced under that package's
-# family, such as common-grpc (hyper-util), tokio-runtime (tokio) or
-# common-svc (axum). Only declared dependencies are
-# seen: tonic's transport brings tokio and hyper into every tonic user's
-# build regardless. Features are not followed, so observability, which brings
+# family, such as common-grpc (hyper-util) or tokio-runtime (tokio). Only
+# declared dependencies are seen: tonic's transport brings tokio and hyper
+# into every tonic user's build regardless. Features are not followed, so observability, which brings
 # tokio in only behind its otel feature, is listed; feature-flags, whose
 # openfeature feature does too, is fenced already by its required dependency
-# on metrics.
+# on metrics-emit.
 [rules.layers.domain_fences]
 runtime = [
   "async-std",
@@ -775,8 +591,8 @@ mode = "required"
 mode = "required"
 
 # Normal and build edges follow the dependency matrix; today's exceptions are
-# baselined in [layers.direction], most of them from common-svc and other
-# Foundation crates that still name SPACE types.
+# baselined in [layers.direction], most of them from Foundation crates that
+# still name SPACE types.
 [rules.layers.direction.no_crossing]
 mode = "required"
 
@@ -878,9 +694,6 @@ common = [
 # writes the table and whether that is permanent or temporary; a temporary
 # grant names the work that removes it.
 [rules.layers.state.co_writers.postgres]
-# Placement's commit puts a sandbox on its node. Temporary: the write folds
-# into sandbox-store.
-sandboxes = ["pplx-space-placement"]
 # Deleting a sandbox orphans its snapshots' storage locations for cleanup.
 # Temporary: the write folds into snapshot-store.
 snapshot_storage_locations = ["pplx-space-sandbox-store"]

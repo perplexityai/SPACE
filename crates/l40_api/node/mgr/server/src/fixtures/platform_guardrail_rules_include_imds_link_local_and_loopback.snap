@@ -1,0 +1,74 @@
+---
+source: crates/l40_api/node/mgr/server/src/firewall/tests.rs
+expression: rules
+---
+  { "add": { "rule": { "family": "inet", "table": "space", "chain": "forward",
+    "comment": "platform-egress-guardrail-ec2-imds",
+    "expr": [
+      { "match": { "left": { "meta": { "key": "iifname" } },
+                     "right": "sveth-*", "op": "==" } },
+      { "match": { "left": { "payload": { "protocol": "ip", "field": "daddr" } },
+                     "right": { "prefix": { "addr": "169.254.169.254", "len": 32 } },
+                     "op": "==" } },
+      { "drop": null }
+    ] } } },
+  { "add": { "rule": { "family": "inet", "table": "space", "chain": "forward",
+    "comment": "platform-egress-guardrail-link-local",
+    "expr": [
+      { "match": { "left": { "meta": { "key": "iifname" } },
+                     "right": "sveth-*", "op": "==" } },
+      { "match": { "left": { "payload": { "protocol": "ip", "field": "daddr" } },
+                     "right": { "prefix": { "addr": "169.254.0.0", "len": 16 } },
+                     "op": "==" } },
+      { "drop": null }
+    ] } } },
+  { "add": { "rule": { "family": "inet", "table": "space", "chain": "forward",
+    "comment": "platform-egress-guardrail-space-slots-a",
+    "expr": [
+      { "match": { "left": { "meta": { "key": "iifname" } },
+                     "right": "sveth-*", "op": "==" } },
+      { "match": { "left": { "payload": { "protocol": "ip", "field": "daddr" } },
+                     "right": { "prefix": { "addr": "10.11.0.0", "len": 16 } },
+                     "op": "==" } },
+      { "drop": null }
+    ] } } },
+  { "add": { "rule": { "family": "inet", "table": "space", "chain": "forward",
+    "comment": "platform-egress-guardrail-space-slots-b",
+    "expr": [
+      { "match": { "left": { "meta": { "key": "iifname" } },
+                     "right": "sveth-*", "op": "==" } },
+      { "match": { "left": { "payload": { "protocol": "ip", "field": "daddr" } },
+                     "right": { "prefix": { "addr": "10.12.0.0", "len": 16 } },
+                     "op": "==" } },
+      { "drop": null }
+    ] } } },
+  { "add": { "rule": { "family": "inet", "table": "space", "chain": "forward",
+    "comment": "platform-egress-guardrail-loopback",
+    "expr": [
+      { "match": { "left": { "meta": { "key": "iifname" } },
+                     "right": "sveth-*", "op": "==" } },
+      { "match": { "left": { "payload": { "protocol": "ip", "field": "daddr" } },
+                     "right": { "prefix": { "addr": "127.0.0.0", "len": 8 } },
+                     "op": "==" } },
+      { "drop": null }
+    ] } } },
+  { "add": { "rule": { "family": "inet", "table": "space", "chain": "forward",
+    "comment": "platform-egress-guardrail-ipv6-loopback",
+    "expr": [
+      { "match": { "left": { "meta": { "key": "iifname" } },
+                     "right": "sveth-*", "op": "==" } },
+      { "match": { "left": { "payload": { "protocol": "ip6", "field": "daddr" } },
+                     "right": { "prefix": { "addr": "::1", "len": 128 } },
+                     "op": "==" } },
+      { "drop": null }
+    ] } } },
+  { "add": { "rule": { "family": "inet", "table": "space", "chain": "forward",
+    "comment": "platform-egress-guardrail-ipv6-link-local",
+    "expr": [
+      { "match": { "left": { "meta": { "key": "iifname" } },
+                     "right": "sveth-*", "op": "==" } },
+      { "match": { "left": { "payload": { "protocol": "ip6", "field": "daddr" } },
+                     "right": { "prefix": { "addr": "fe80::", "len": 10 } },
+                     "op": "==" } },
+      { "drop": null }
+    ] } } }

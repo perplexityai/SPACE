@@ -34,7 +34,7 @@ bash templates/firecracker/seed/test-ext4-population.sh
 Install the CLI from the same source version as the deployment:
 
 ```bash
-cargo install --path crates/apps/admin/cli --locked
+cargo install --path crates/l50_app/admin/cli --locked
 ```
 
 Set `SPACE_API_URL` to the deployment's API origin, without `/admin/api/v1`,
@@ -54,9 +54,9 @@ session file is saved. Continue only after login succeeds, and keep shell tracin
 The deployment owns endpoint discovery, network access, and credentials; keep
 those values in private caller configuration. Direct API access needs no
 Kubernetes commands. If the admin service is not directly reachable, follow the
-[operator CLI port-forward instructions](../../../crates/apps/admin/cli/README.md#kubernetes-access-via-kubectl-port-forward)
+[operator CLI port-forward instructions](../../../crates/l50_app/admin/cli/README.md#kubernetes-access-via-kubectl-port-forward)
 first. For separate auth and admin endpoints, pass `--auth-url URL` to
-`space-admin-cli login`; see the [login examples](../../../crates/apps/admin/cli/README.md#logging-in).
+`space-admin-cli login`; see the [login examples](../../../crates/l50_app/admin/cli/README.md#logging-in).
 
 The builder must already have the guest binaries, containerd, configured
 artifact storage and cluster credentials, the pinned guest kernel, and the
@@ -432,7 +432,7 @@ binaries it packages, and the `spaced_compatibility_family` derived from it. For
 SemVer, `1.x.y` belongs to family `1`, `0.x.y` to `0.x`, and `0.0.y` to `0.0.y`.
 
 `space-sbxmgr-svc` admits guests whose version is in `SUPPORTED_SPACED_GUEST_VERSIONS`
-(`crates/libs/spaced/common/src/compatibility.rs`) and whose family agrees with that
+(`crates/l20_domain/spaced/common/src/compatibility.rs`) and whose family agrees with that
 version. The host's and the guest's compatibility families do not have to match. The
 [guest compatibility](../../../docs/versioning.md#guest-compatibility-in-08) section of
 the versioning policy is the full rule.

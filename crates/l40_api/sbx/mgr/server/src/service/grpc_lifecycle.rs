@@ -1,0 +1,483 @@
+use pplx_space_common_core::types::{JobId, LocalArtifactId};
+
+use super::activation_support::{
+    GuestActivityKind, IdentityFreeDirectActivationAuthority, WakeNetworkContext, WakeStartConfig,
+    grpc_timeout_budget, operation_activation_attempt_id_from_wire, sandbox_event_trigger,
+    space_api_route_identity_for_runtime_activation,
+    space_api_route_identity_from_wake_start_context, space_api_route_identity_to_wire,
+    wake_target_state_from_proto,
+};
+use super::cleanup::{
+    AsyncCleanupRequest, CleanupAdmission, CleanupDispatchDisposition, SynchronousCleanupRequest,
+};
+use super::cleanup_support::{CleanupCompletion, CleanupLockTryResult, OwnedCleanupFenceGuard};
+use super::create_support::SUSPEND_CHECKPOINT;
+use super::network_runtime::*;
+use super::recovery::SuspendSnapshotPublicationRecoveryOrigin;
+use super::suspend_snapshot_publication::{
+    RecordedPublicationError, SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
+    classify_suspend_snapshot_publication, commit_encrypted_capture_record,
+    prepare_encrypted_capture_record, publish_recorded_suspend_snapshot_dir,
+    read_encrypted_capture_record, recorded_encrypted_capture_to_seal,
+    remove_encrypted_capture_record, suspend_snapshot_staging_dir,
+    suspend_snapshot_staging_parent_dir,
+};
+use super::tail_support::*;
+use super::validation::optional_positive_or_default;
+use super::*;
+use crate::guest_filesystem_flush::{
+    GuestSnapshotPreparationBudget, prepare_guest_for_vm_snapshot_via_spaced_host,
+};
+use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, SandboxId};
+use pplx_space_events::{
+    SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger,
+    SandboxEventType, emit_sandbox_event,
+};
+
+mod artifact_backup;
+mod auto_lifecycle_policy;
+mod backup_submission;
+mod kill;
+mod pause_resume;
+mod sandbox_network_policy;
+mod suspend;
+mod suspend_snapshot;
+mod teardown_suspend;
+
+use self::artifact_backup::reupload_format_from_sidecar;
+#[cfg(test)]
+use self::artifact_backup::{
+    artifact_backup_format, artifact_backup_lookup_error, current_instance_backup_precondition,
+    require_artifact_backup_files,
+};
+#[cfg(test)]
+pub(super) use self::artifact_backup::{
+    reupload_precondition_for_cluster_api_env, reupload_resolution_to_config,
+};
+use self::backup_submission::suspend_artifact_metadata;
+pub(super) use self::backup_submission::suspend_snapshot_metadata;
+#[cfg(test)]
+use self::pause_resume::{PauseReconciliationOutcome, pause_reconciliation_outcome};
+use self::pause_resume::{pause_with_reconciliation, prepare_guest_for_pause};
+#[cfg(test)]
+pub(super) use self::suspend::classify_suspend_after_wake;
+use self::suspend::emit_suspend_failed_event;
+#[cfg(test)]
+use self::suspend::ensure_completed_suspend_retry_format;
+pub(super) use self::suspend::{suspend_superseded_by_wake, suspend_wake_arbitration_enabled};
+#[cfg(test)]
+pub(super) use self::suspend_snapshot::{
+    SuspendSnapshotStagingDisposition, failed_encrypted_capture_may_release_volume,
+};
+#[cfg(test)]
+use self::suspend_snapshot::{
+    btrfs_send_encode_falls_back_to_full, encrypted_snapshot_prepare_error_status,
+};
+#[cfg(test)]
+use self::teardown_suspend::teardown_artifact_backup_status;
+#[cfg(test)]
+pub(super) use self::teardown_suspend::{
+    KeyedUploadUse, SUSPEND_TRIGGER_METADATA, TerminalTeardownSuspend, teardown_keyed_upload_use,
+    teardown_suspend_event_trigger,
+};
+
+/// Outcome of [`SandboxManagerService::submit_artifact_backup`].
+/// `Enqueued` carries the durable-worker job id and the backup attempt id
+/// owned by that job. The attempt may differ from the caller's candidate when
+/// a deduplicated submission joins an existing job. `NoUploadConfig` is the
+/// silent fall-through when neither the request override nor the env-derived
+/// config is present (e.g. local dev without `SPACE_SNAPSHOT_BUCKET`).
+#[derive(Debug)]
+pub(super) enum SubmitSuspendSnapshotOutcome {
+    Enqueued {
+        job_id: JobId,
+        backup_attempt_id: String,
+    },
+    NoUploadConfig,
+}
+
+/// Outcome of resolving a sandbox's org-level snapshot upload override
+/// from the cluster-api. Callers distinguish "definitively no override"
+/// (env-default applies) from "lookup failed transiently" (retryable),
+/// because backup admission needs that distinction to avoid surfacing
+/// a transient cluster-api blip as a terminal `FailedPrecondition` that
+/// the drain reconciler would treat as mark-as-failed.
+pub(super) enum OrgSnapshotConfigResolution {
+    /// Override is present and parses to a valid upload config.
+    Resolved(crate::snapshot_upload::SnapshotUploadConfig),
+    /// Definitively no override: cluster-api isn't wired (local dev),
+    /// the org left it unset, or the returned URI is empty. Callers
+    /// fall back to the env-derived default with no logging.
+    Absent,
+    /// Lookup failed transiently or due to operator-fixable config
+    /// (cluster-api unreachable, RPC errored, bearer/endpoint invalid,
+    /// override URI didn't parse). Suspend collapses this to silent
+    /// fall-through; reupload surfaces it as `Internal` so the
+    /// reconciler retries instead of escalating to mark-as-failed.
+    LookupFailed(String),
+    /// `GetSandboxSnapshotStorageUri` returned `NotFound`: no sandbox row
+    /// exists at lookup time. This alone does not distinguish a create race
+    /// from deletion. Ordinary suspend permits the create race (the local
+    /// row can precede cluster commit); for reupload it indicates divergence,
+    /// because the sandbox must already have been suspended at least
+    /// once (and therefore registered with the cluster) before reupload
+    /// can be invoked. Suspend collapses this to silent fall-through;
+    /// reupload surfaces it as `FailedPrecondition` so the reconciler
+    /// stops issuing reupload work that the durable worker would
+    /// permanently fail at the `BeginArtifactBackup` step. Teardown combines
+    /// this absence with a permanent backup refusal for an owned execution
+    /// and artifact to close that attempt. It grants no runtime-release proof;
+    /// cluster-deleted eviction still independently verifies deletion.
+    ClusterRowMissing,
+}
+
+/// `SPACE_SUSPEND_DEFAULT_FORMAT=full` is the rollback lever that returns the
+/// suspend-codec default from `BtrfsSend` to `Full` for callers that don't
+/// supply an explicit `format`. Any other value keeps `BtrfsSend`. Resolved
+/// per-request so ops can flip it without restarting workers.
+fn env_default_is_full() -> bool {
+    matches!(
+        std::env::var("SPACE_SUSPEND_DEFAULT_FORMAT").as_deref(),
+        Ok("full"),
+    )
+}
+
+struct LocalArtifactStagingGuard {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl LocalArtifactStagingGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn cleanup(mut self, node_client: &mut NodeManagerGrpcClient) {
+        self.armed = false;
+        // An encode RPC error is not proof that its host writer has exited.
+        // Node-manager serializes deletion with that writer, including reap.
+        if let Err(error) = node_client
+            .delete_cache_artifact(
+                pplx_space_node_mgr_client::proto::DeleteCacheArtifactRequest {
+                    local_path: self.path.to_string_lossy().into_owned(),
+                },
+            )
+            .await
+        {
+            tracing::warn!(path = %self.path.display(), %error,
+                "failed to remove suspend staging; retained for inventory recovery or inspection");
+        }
+    }
+}
+
+impl Drop for LocalArtifactStagingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Abandonment is not proof that the remote capture stopped writing.
+            // Retain the evidence for recovery or operator inspection rather
+            // than performing blocking deletion in Drop.
+            tracing::warn!(path = %self.path.display(),
+                "suspend publication abandoned; staging retained for inventory inspection");
+        }
+    }
+}
+
+pub(super) struct SuspendSnapshotPublicationContext {
+    cleanup_fence: OwnedCleanupFenceGuard,
+    sandbox: crate::db::SandboxRow,
+    requested_format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    suspend_format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    create_codec: &'static str,
+    local_artifact_id: LocalArtifactId,
+    event_details: SandboxEventDetails,
+    started_at: std::time::Instant,
+    publish_node_state: bool,
+    durability: SuspendDurability,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SuspendDurability {
+    NodeLocal,
+    RemoteBeforeTeardown {
+        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+    },
+}
+
+impl SuspendDurability {
+    const fn is_remote_before_teardown(self) -> bool {
+        matches!(self, Self::RemoteBeforeTeardown { .. })
+    }
+
+    const fn execution_generation(
+        self,
+    ) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+        match self {
+            Self::NodeLocal => None,
+            Self::RemoteBeforeTeardown {
+                execution_generation,
+            } => Some(execution_generation),
+        }
+    }
+}
+
+pub(super) struct SuspendRequestContext {
+    sandbox_id: String,
+    blocking: bool,
+    requested_format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    suspend_format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    create_codec: &'static str,
+    publish_node_state: bool,
+    event_trigger: Option<SandboxEventTrigger>,
+    durability: SuspendDurability,
+}
+
+impl SuspendRequestContext {
+    fn guest_preparation_budget(&self) -> GuestSnapshotPreparationBudget {
+        if self.event_trigger == Some(SandboxEventTrigger::AutoLifecycle) {
+            GuestSnapshotPreparationBudget::AutoLifecycle
+        } else {
+            GuestSnapshotPreparationBudget::Standard
+        }
+    }
+
+    pub(super) fn new(
+        sandbox_id: String,
+        blocking: bool,
+        format: i32,
+        publish_node_state: bool,
+        event_trigger: Option<SandboxEventTrigger>,
+    ) -> Self {
+        // Per-request rootfs codec. `Unspecified` (the default existing
+        // API-substrate callers send) maps to `BtrfsSend`, or to `Full` when
+        // `SPACE_SUSPEND_DEFAULT_FORMAT=full` is set on this worker (the
+        // rollback lever). Explicit `BtrfsSend`/`Full` on the wire still
+        // overrides the default.
+        let requested_format =
+            pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::try_from(format)
+                .unwrap_or(pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::Unspecified);
+        let suspend_format = match requested_format {
+            pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::Unspecified => {
+                if env_default_is_full() {
+                    pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::Full
+                } else {
+                    pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::BtrfsSend
+                }
+            }
+            other => other,
+        };
+        // Codec tag for the `snapshot.create.*` metric family. Mirrors
+        // the closed vocabulary in `crate::metrics::snapshot`:
+        // `full` and `btrfs_send_v1` (note underscore for the tag value
+        // vs hyphen in the wire vocabulary).
+        let create_codec = match suspend_format {
+            pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::BtrfsSend => {
+                crate::metrics::snapshot::CODEC_BTRFS_SEND_V1
+            }
+            _ => crate::metrics::snapshot::CODEC_FULL,
+        };
+
+        Self {
+            sandbox_id,
+            blocking,
+            requested_format,
+            suspend_format,
+            create_codec,
+            publish_node_state,
+            event_trigger,
+            durability: SuspendDurability::NodeLocal,
+        }
+    }
+
+    pub(super) fn for_teardown(
+        sandbox_id: String,
+        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+    ) -> Self {
+        let mut context = Self::new(
+            sandbox_id,
+            true,
+            pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::Unspecified as i32,
+            true,
+            Some(SandboxEventTrigger::System),
+        );
+        context.durability = SuspendDurability::RemoteBeforeTeardown {
+            execution_generation,
+        };
+        context
+    }
+}
+
+struct ArtifactBackupSubmission<'a> {
+    local_artifact_id: LocalArtifactId,
+    artifact_kind: pplx_space_common_core::types::ArtifactKind,
+    artifact_origin: pplx_space_common_core::types::ArtifactOrigin,
+    snapshot_name: Option<&'a str>,
+    backup_attempt_id: pplx_space_common_core::types::BackupAttemptId,
+    snapshot_dir: &'a str,
+    request_override: Option<&'a crate::snapshot_upload::SnapshotUploadConfig>,
+    format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    handoff: ArtifactBackupHandoff,
+    /// The teardown suspend's execution, for `BeginArtifactBackup`'s fence.
+    execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    /// The caller holds evidence that `execution_generation` is the
+    /// capturing execution's: the capture was just taken by it, or an earlier
+    /// upload of the same bytes recorded it so. Without that, the capture's
+    /// own record can still show it (see `submit_artifact_backup`).
+    capture_vouched: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtifactBackupHandoff {
+    /// Persist the intent and let the durable worker perform remote work.
+    DurableWorker,
+    /// Stage immutable transfer handles and create the restore-visible cluster
+    /// row before returning, then let the durable worker poll and finalize.
+    RestoreVisible,
+    /// Stage and register the exact artifact before runtime teardown.
+    TeardownFence,
+}
+
+pub(super) const AUTO_LIFECYCLE_SUSPEND_BACKUP_FENCE_FAILED_METADATA: &str =
+    "x-space-auto-lifecycle-suspend-backup-fence-failed";
+
+#[derive(Debug, thiserror::Error)]
+enum ArtifactBackupSubmissionError {
+    #[error("{0}")]
+    Other(String),
+    /// `superseded_generation` is the generation the control plane named
+    /// when it refused the registration as superseded.
+    #[error("begin restore-visible snapshot backup: {error}")]
+    Begin {
+        #[source]
+        error: pplx_space_common_jobs::JobError,
+        superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    },
+    #[error(transparent)]
+    RetainedUpload(#[from] suspend_snapshot::RetainedUploadError),
+}
+
+impl From<String> for ArtifactBackupSubmissionError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+pub(super) fn artifact_backup_fence_status(error: String) -> Status {
+    let mut status = Status::internal(format!("artifact backup submission failed: {error}"));
+    status.metadata_mut().insert(
+        AUTO_LIFECYCLE_SUSPEND_BACKUP_FENCE_FAILED_METADATA,
+        tonic::metadata::MetadataValue::from_static("true"),
+    );
+    status
+}
+
+struct TeardownSuspendBackup<'a> {
+    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+    artifact: &'a crate::db::LocalArtifactRow,
+    format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    origin: TeardownBackupOrigin,
+}
+
+impl TeardownSuspendBackup<'_> {
+    /// The generation the backup registers under: only this execution's own
+    /// capture carries it to the control plane's fence.
+    fn registration_generation(
+        &self,
+    ) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+        match self.origin {
+            TeardownBackupOrigin::Captured => Some(self.execution_generation),
+            TeardownBackupOrigin::PreviouslySuspended => None,
+        }
+    }
+}
+
+/// The generation a node-local suspend of `sandbox` registers its backup
+/// under: the Kubernetes execution its runtime belongs to, so the control
+/// plane refuses the capture of a runtime it has superseded (an orphaned
+/// restore pod's VM idling into auto-suspend, say). A legitimate idle suspend
+/// runs while its execution is still the newest. A refusal rolls the suspend back and
+/// disarms auto-lifecycle, and the pod's teardown later releases the runtime.
+/// Runtimes outside Kubernetes have no execution to fence and register
+/// unfenced.
+fn node_local_registration_generation(
+    sandbox: &crate::db::SandboxRow,
+) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+    let route = &sandbox.space_api_route_identity;
+    (route.effective_substrate_kind()
+        == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes))
+    .then_some(route.execution_generation)
+    .flatten()
+}
+
+/// Where a teardown suspend's artifact came from, which decides whether its
+/// backup registration is fenced by the execution generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TeardownBackupOrigin {
+    /// This execution's teardown captured it from the resident runtime. The
+    /// control plane refuses it once the generation is superseded, and the
+    /// node releases the runtime.
+    Captured,
+    /// An earlier node-local suspend captured it, and the teardown only binds
+    /// the suspended row to this execution. That suspend registered its
+    /// backup synchronously before finalizing when an upload destination was
+    /// configured (a refusal would have rolled it back), and from an sbx-mgr
+    /// that predates the fence it registered without a generation; with no
+    /// destination configured it registered nothing. The teardown joins that
+    /// upload, whose registration replays unfenced. When it needs an attempt
+    /// of its own, after a failure a new attempt can fix or when the suspend
+    /// registered nothing, that attempt carries no generation, since the
+    /// capture may hold the sandbox's latest state and a refusal couldn't
+    /// release a row that isn't `suspending`.
+    ///
+    /// A row startup recovery marked `suspended` under this teardown looks
+    /// the same, but its capture is this execution's own: its capture record,
+    /// or the upload that registered it, names this generation. Such a
+    /// backup is treated as [`Self::Captured`], so every attempt registers
+    /// under the generation (see
+    /// [`SandboxManagerService::ensure_teardown_suspend_backup`]). A capture
+    /// taken before capture records existed, whose upload the job store has
+    /// since pruned, carries no such evidence and registers unfenced, as an
+    /// earlier suspend's capture would.
+    PreviouslySuspended,
+}
+
+/// The persisted retained-source identity of a full artifact, if any.
+pub(super) fn sidecar_rootfs_send_source_id(
+    snapshot_dir: &str,
+) -> Result<Option<uuid::Uuid>, Status> {
+    let path =
+        std::path::Path::new(snapshot_dir).join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Status::internal(format!(
+                "failed to read snapshot metadata at {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    serde_json::from_slice::<crate::snapshot_upload::SnapshotMeta>(&bytes)
+        .map(|meta| meta.rootfs_send_source_id)
+        .map_err(|error| {
+            Status::internal(format!(
+                "snapshot metadata present but unparseable at {}: {error}",
+                path.display()
+            ))
+        })
+}
+
+#[cfg(test)]
+mod backup_policy_tests;
+#[cfg(test)]
+mod retired_teardown_tests;
+#[cfg(test)]
+pub(super) use self::retired_teardown_tests::{answer, with_cluster_api};
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod teardown_backup_tests;

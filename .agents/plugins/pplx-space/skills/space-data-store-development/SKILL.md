@@ -16,7 +16,7 @@ one needs an API reused or extended. Prefer reuse; add a new API only when the
 question or the latency budget genuinely differs. Migrating the inline
 statements a PR touches onto the store is in scope for that PR.
 
-Exemplar: `crates/libs/sandbox/store` (`pplx-space-sandbox-store`, the
+Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
 `sandboxes` row — its crate docs carry the boundary rules). The shape it sets:
 
 - Named verbs with typed arguments and typed row structs; CRUD with filters
@@ -46,7 +46,26 @@ Exemplar: `crates/libs/sandbox/store` (`pplx-space-sandbox-store`, the
   re-spelling it: a second copy of that rule is how deletion paths and drain
   gates drift apart. Build the statement once (a `LazyLock<String>`), bind every
   value, and keep the rest of the statement whole at its query site.
-- The other is the column list of one row type read from one table: a shared
+- Another is a whole fragment from `pplx_space_sandbox_residency`
+  (`occupies_node_predicate`, `resident_lifecycle`,
+  `non_resident_lifecycle_exclusion` and its other gates), the single
+  definition of whether a sandbox row still occupies its node for node-release
+  decisions. Interpolate it as built rather than re-spelling its lifecycle
+  sets: a drain gate and the drained-node terminator that disagree park a node
+  in `drained`. Build the statement once, bind every value, and keep the rest
+  of the statement whole at its query site.
+- Another is a whole expression about node environment evidence:
+  `pplx_space_node_status_store`'s `environment_evidence` and
+  `environment_refusal`, the single definition of whether a node's published
+  environments count as evidence, and
+  `pplx_space_runtime_environment_catalog_store::node_certifies_upgrade`,
+  whether a node's own build certifies an upgrade edge, for the upgrade path
+  that will call it. Interpolate them
+  rather than re-spelling the freshness or certification rules: placement
+  and the upgrade decision have to agree on which nodes can run what. Build
+  the statement once, bind every value, and keep the rest of the statement
+  whole at its query site.
+- The last is the column list of one row type read from one table: a shared
   constant of that table's bare column names, with no expressions, aliases, or
   joined columns, matching one `FromRow` struct field for field. Interpolate it
   only as the entire `SELECT` list of a statement whose only `FROM` item is that
@@ -73,10 +92,13 @@ Not store verbs — leave these where they are:
   `delete::delete_with_dependents`. A write that is one step of such a
   transition stays in its module even when its own `WHERE` checks only the
   id, because the caller's locks and re-checks guard it (as with
-  `delete::mark_deleting`). Other unguarded writes of the row, such as its
-  desired-configuration columns, belong in ordinary verbs like
-  `update_desired_state`. The caller keeps its locks and transaction (see the
-  crate docs).
+  `delete::mark_deleting`). A step that writes a table another store owns can
+  instead be a verb of that store, run in the caller's transaction with its
+  guard whole, as `pplx-space-snapshot-store`'s
+  `lost::fail_quiet_full_uploads_from_node` is for the lost give-ups. Other
+  unguarded writes of the row, such as its desired-configuration columns,
+  belong in ordinary verbs like `update_desired_state`. The caller keeps its
+  locks and transaction (see the crate docs).
 - **`SELECT ... FOR UPDATE`**: a lock acquisition inside the caller's
   transaction. Converting it to a store read silently drops the lock.
 - **Predicates evaluated against the database clock** (`NOW()`-relative

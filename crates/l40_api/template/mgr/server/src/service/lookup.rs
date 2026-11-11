@@ -1,0 +1,1045 @@
+use pplx_space_common_core::types::OrgId;
+use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
+
+use super::*;
+
+/// Cache partition a request's `TemplateRef.environment` selects; `None`
+/// when the request names no environment.
+pub(super) fn requested_cache_partition(
+    environment: Option<&str>,
+) -> Result<Option<crate::db::TemplateCachePartition>, Status> {
+    environment
+        .map(|environment| {
+            environment
+                .parse::<pplx_space_common_core::types::EnvironmentReference>()
+                .map(|environment| {
+                    pplx_space_node_runtime_core::catalog::template_cache_partition(Some(
+                        environment,
+                    ))
+                })
+                .map_err(|error| {
+                    Status::invalid_argument(format!("invalid template environment: {error}"))
+                })
+        })
+        .transpose()
+}
+
+pub(super) const fn pull_failure_code(failure: crate::volume::PullFailure) -> tonic::Code {
+    match failure.class() {
+        crate::volume::PullFailureClass::Missing => tonic::Code::NotFound,
+        crate::volume::PullFailureClass::Retryable => tonic::Code::Unavailable,
+        crate::volume::PullFailureClass::InvalidInput => tonic::Code::InvalidArgument,
+        crate::volume::PullFailureClass::FailedPrecondition => tonic::Code::FailedPrecondition,
+        crate::volume::PullFailureClass::DataLoss => tonic::Code::DataLoss,
+    }
+}
+
+impl TemplateManagerService {
+    pub(super) async fn get_template(
+        &self,
+        request: Request<crate::proto::GetTemplateRequest>,
+    ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
+        let scope = TemplateLookupScope::from_request(&request)?;
+        if scope.is_none() {
+            pplx_space_template_mgr_client::lookup_scope::metrics::template_lookup_compatibility(
+                "missing_scope",
+            );
+        }
+        let mut response = self
+            .get_template_resolving(
+                request,
+                async |name, hash, tag, org| {
+                    crate::volume::find_release_in_scope(name, hash, tag, org, scope).await
+                },
+                async |spec, resolve_elapsed, release| {
+                    self.volume_puller
+                        .materialize_release(Arc::clone(&self.db), spec, resolve_elapsed, release)
+                        .await
+                },
+            )
+            .await?;
+        if let Some(scope) = scope {
+            scope.receipt(&mut response);
+        }
+        Ok(response)
+    }
+
+    pub(super) async fn get_template_resolving(
+        &self,
+        request: Request<crate::proto::GetTemplateRequest>,
+        resolve: impl AsyncFnOnce(
+            &str,
+            &str,
+            &str,
+            Option<OrgId>,
+        ) -> Result<
+            crate::volume::ResolvedRelease,
+            crate::volume::FindReleaseError,
+        >,
+        materialize: impl AsyncFnOnce(
+            crate::volume::PullSpec<'_>,
+            std::time::Duration,
+            crate::volume::ResolvedRelease,
+        ) -> crate::volume::PullOutcome,
+    ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
+        self.authorize_peer(&request, "GetTemplate", ALLOW_TEMPLATE_OBSERVER)?;
+        let scope = TemplateLookupScope::from_request(&request)?;
+        let req = request.get_ref();
+        let tmpl_ref = req
+            .template
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("template is required"))?;
+        let template_id = &tmpl_ref.name;
+        if template_id.is_empty() {
+            return Err(Status::invalid_argument("template name required"));
+        }
+
+        let req_hash = tmpl_ref.content_hash.clone().unwrap_or_default();
+        if !req_hash.is_empty() {
+            validate_content_hash(&req_hash)?;
+        }
+        let req_tag = tmpl_ref.tag.clone().unwrap_or_default();
+        let requested_partition = requested_cache_partition(tmpl_ref.environment.as_deref())?;
+        let caller_org = req
+            .caller_org_id
+            .as_deref()
+            .map(str::parse::<OrgId>)
+            .transpose()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if req.cached_only {
+            // A ready catalog row, or nothing: no release resolution, memory
+            // policy lookup, pull or snapshot reconcile. A build dir without
+            // a row, such as one a transient recovery failure left, is
+            // NOT_FOUND. This is the one authority on whether a build can be
+            // read in place as a delta base, so a ready row is still
+            // FAILED_PRECONDITION when its build records no rootfs size or its
+            // `rootfs.ext4` isn't a regular file.
+            //
+            // The LRU touch `resolve_template` makes on a hit isn't
+            // incidental: eviction plans made within the grace period after
+            // it skip the build while a transfer reads it, which is why a
+            // delta import looks its base up again just before applying.
+            // Keep it. It's best effort: a GC tick that planned the build's
+            // eviction before the touch can still remove it, and a transfer
+            // that then opens the missing file fails rather than reading a
+            // wrong base.
+            if req_hash.is_empty() || caller_org.is_some() {
+                return Err(Status::invalid_argument(
+                    "cached_only takes an exact content_hash and no caller_org_id",
+                ));
+            }
+            let mut response = build_get_template_response(
+                self.artifact_store.root.clone(),
+                Arc::clone(&self.db),
+                TemplateSelection {
+                    name: template_id.clone(),
+                    content_hash: req_hash,
+                    partition: requested_partition,
+                },
+                None,
+                None,
+            )
+            .await?;
+            let build_dir = PathBuf::from(&response.template_dir);
+            tokio::task::spawn_blocking(move || {
+                let recorded = crate::rootfs_cache::recorded_rootfs_bytes(&build_dir)
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                if recorded.is_none() {
+                    return Err(Status::failed_precondition(format!(
+                        "{} records no rootfs size to check it against",
+                        build_dir.display()
+                    )));
+                }
+                let rootfs = build_dir.join(pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE);
+                match std::fs::symlink_metadata(&rootfs) {
+                    Ok(metadata) if metadata.is_file() => Ok(()),
+                    Ok(_) => Err(Status::failed_precondition(format!(
+                        "{} is not a regular file",
+                        rootfs.display()
+                    ))),
+                    Err(error) => Err(Status::failed_precondition(format!(
+                        "inspect {}: {error}",
+                        rootfs.display()
+                    ))),
+                }
+            })
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))??;
+            response.cached_only = true;
+            return Ok(Response::new(response));
+        }
+        // Request metrics (cache, fetch-error, and pull) are tagged with the
+        // caller's selector, not the resolved hash that replaces `req_hash`
+        // below.
+        let requested_hash = req_hash.clone();
+        let resolve_started = std::time::Instant::now();
+        // Explicit tags need authoritative resolution even on cache hits. Trusted
+        // name-only policy refreshes and exact-digest reads can still work offline.
+        let release = if caller_org.is_some() || (req_hash.is_empty() && !req_tag.is_empty()) {
+            Some(
+                resolve(template_id, &req_hash, &req_tag, caller_org)
+                    .await
+                    .map_err(|error| match error {
+                        crate::volume::FindReleaseError::NotFound => {
+                            Status::not_found("template release not found")
+                        }
+                        crate::volume::FindReleaseError::Unavailable => {
+                            Status::unavailable("cluster metadata unavailable")
+                        }
+                        crate::volume::FindReleaseError::InvalidResponse => {
+                            Status::failed_precondition(
+                                "cluster did not return an authorized exact release",
+                            )
+                        }
+                        crate::volume::FindReleaseError::Status(status) => status,
+                    })?,
+            )
+        } else {
+            None
+        };
+        let resolve_elapsed = resolve_started.elapsed();
+        let req_hash = release
+            .as_ref()
+            .map(|release| release.hash.clone())
+            .unwrap_or(req_hash);
+        let snapshot_selector = optional_snapshot_dimensions(req.vcpu, req.memory_mib)?;
+        let policy_snapshot_memory_mib = if snapshot_selector.is_none() {
+            let desired_memory_mib = {
+                let db = Arc::clone(&self.db);
+                let template_id = template_id.clone();
+                let req_hash = req_hash.clone();
+                let preferred = requested_partition;
+                tokio::task::spawn_blocking(move || {
+                    let conn = db
+                        .lock()
+                        .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+                    // Resolve with the request's preference, so the build
+                    // whose LRU this touches is the one the request serves.
+                    let name = TemplateManagerService::resolve_template_build(
+                        &conn,
+                        &template_id,
+                        &req_hash,
+                        preferred,
+                    )?
+                    .name;
+                    let settings = crate::db::get_template_settings(&conn, &name)
+                        .map_err(|e| Status::internal(format!("db get_template_settings: {e}")))?;
+                    Ok::<_, Status>(
+                        settings
+                            .filter(|settings| settings.base_snapshot_policy_set_at.is_some())
+                            .map(|settings| settings.snapshot_memory_mib),
+                    )
+                })
+                .await
+            };
+            match desired_memory_mib {
+                Ok(Ok(Some(memory_mib))) => {
+                    match resolve_sandbox_memory(memory_mib, self.sbx_connect_retry_policy).await {
+                        Ok(resolved) => {
+                            if resolved.effective_memory_mib < resolved.requested_memory_mib {
+                                tracing::info!(
+                                    template = %template_id,
+                                    requested_snapshot_memory_mib = resolved.requested_memory_mib,
+                                    effective_snapshot_memory_mib = resolved.effective_memory_mib,
+                                    sandbox_guest_memory_max_mib = resolved.guest_memory_max_mib,
+                                    sandbox_cgroup_memory_mib = resolved.cgroup_memory_mib,
+                                    sandbox_cgroup_memory_max_mib = resolved.cgroup_memory_max_mib,
+                                    sandbox_memory_headroom_mib = resolved.memory_headroom_mib,
+                                    "clamped template snapshot lookup memory to sandbox policy"
+                                );
+                            }
+                            Some(resolved.effective_memory_mib)
+                        }
+                        Err(status) => {
+                            tracing::warn!(
+                                template = %template_id,
+                                code = ?status.code(),
+                                error = %status.message(),
+                                "could not resolve sandbox memory policy for template snapshot lookup"
+                            );
+                            None
+                        }
+                    }
+                }
+                Ok(Ok(None)) | Ok(Err(_)) => None,
+                Err(error) => {
+                    tracing::warn!(
+                        template = %template_id,
+                        %error,
+                        "could not read desired template snapshot policy for snapshot lookup"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let cache_tags = get_template_metric_tags(template_id, &requested_hash, &req_tag);
+
+        let selection = |content_hash: String| TemplateSelection {
+            name: template_id.clone(),
+            content_hash,
+            partition: requested_partition,
+        };
+
+        // First attempt: local-only lookup.
+        match build_get_template_response(
+            self.artifact_store.root.clone(),
+            Arc::clone(&self.db),
+            selection(req_hash.clone()),
+            snapshot_selector,
+            policy_snapshot_memory_mib,
+        )
+        .await
+        {
+            Ok(mut resp) => {
+                resp.authorized_org_id = caller_org.map(|org| org.to_string());
+                crate::metrics::get_cache_hit(&cache_tags);
+                if snapshot_selector.is_none() && resp.snapshot_dir.is_none() {
+                    self.spawn_desired_base_snapshot_reconcile(
+                        template_id.clone(),
+                        "get_template_snapshot_miss",
+                    );
+                }
+                return Ok(Response::new(resp));
+            }
+            Err(status) if status.code() != tonic::Code::NotFound => {
+                let reason = if status.code() == tonic::Code::FailedPrecondition {
+                    "template_rootfs_unavailable"
+                } else {
+                    "local_db_error"
+                };
+                record_fetch_error(template_id, &requested_hash, &req_tag, reason);
+                return Err(status);
+            }
+            Err(_) => {
+                crate::metrics::get_cache_miss(&cache_tags);
+            }
+        }
+
+        let outcome = match release {
+            Some(release) => {
+                let spec = crate::volume::PullSpec {
+                    name: template_id,
+                    req_hash: &requested_hash,
+                    req_tag: &req_tag,
+                    trigger: crate::volume::PullTrigger::OnDemand,
+                };
+                materialize(spec, resolve_elapsed, release).await
+            }
+            None => {
+                self.volume_puller
+                    .pull_in_scope(
+                        Arc::clone(&self.db),
+                        template_id,
+                        &req_hash,
+                        &req_tag,
+                        crate::volume::PullTrigger::OnDemand,
+                        scope,
+                    )
+                    .await
+            }
+        };
+        match outcome {
+            crate::volume::PullOutcome::Materialized => {
+                let template_id_owned = template_id.clone();
+                let req_hash_for_err = requested_hash.clone();
+                let req_tag_for_err = req_tag.clone();
+                build_get_template_response(
+                    self.artifact_store.root.clone(),
+                    Arc::clone(&self.db),
+                    selection(req_hash),
+                    snapshot_selector,
+                    policy_snapshot_memory_mib,
+                )
+                .await
+                .inspect(|resp| {
+                    if snapshot_selector.is_none() && resp.snapshot_dir.is_none() {
+                        self.spawn_desired_base_snapshot_reconcile(
+                            template_id_owned.clone(),
+                            "get_template_snapshot_miss",
+                        );
+                    }
+                })
+                .map(|mut response| {
+                    response.authorized_org_id = caller_org.map(|org| org.to_string());
+                    Response::new(response)
+                })
+                .inspect_err(|_| {
+                    record_fetch_error(
+                        &template_id_owned,
+                        &req_hash_for_err,
+                        &req_tag_for_err,
+                        "post_pull_local_lookup_failed",
+                    );
+                })
+            }
+            crate::volume::PullOutcome::ClassifiedFailure(failure) => {
+                record_fetch_error(
+                    template_id,
+                    &requested_hash,
+                    &req_tag,
+                    failure.metric_reason(),
+                );
+                let code = pull_failure_code(failure);
+                let lookup = describe_lookup(&req_hash, &req_tag);
+                let message = if code == tonic::Code::NotFound {
+                    format!("build not found: {template_id} ({lookup}): {failure}")
+                } else {
+                    format!("template pull failed for {template_id} ({lookup}): {failure}")
+                };
+                Err(Status::new(code, message))
+            }
+            crate::volume::PullOutcome::Retryable(status) => {
+                record_fetch_error(template_id, &requested_hash, &req_tag, "resource_exhausted");
+                Err(status)
+            }
+            crate::volume::PullOutcome::DownstreamFailure { failure, status } => {
+                record_fetch_error(
+                    template_id,
+                    &requested_hash,
+                    &req_tag,
+                    failure.metric_reason(),
+                );
+                Err(status)
+            }
+            crate::volume::PullOutcome::HashMismatch(status) => {
+                record_fetch_error(template_id, &requested_hash, &req_tag, "hash_mismatch");
+                Err(status)
+            }
+        }
+    }
+
+    pub(super) async fn update_template_settings(
+        &self,
+        request: Request<UpdateTemplateSettingsRequest>,
+    ) -> Result<Response<UpdateTemplateSettingsResponse>, Status> {
+        let req = request.get_ref();
+        let peer = self.authorize_peer(
+            &request,
+            "UpdateTemplateSettings",
+            update_template_settings_principals(req),
+        )?;
+        if req.template.trim().is_empty() {
+            return Err(Status::invalid_argument("template is required"));
+        }
+        let auto_lifecycle = req
+            .default_auto_lifecycle
+            .as_ref()
+            .map(proto_policy_to_common)
+            .transpose()?;
+        if let Some(policy) = auto_lifecycle.as_ref()
+            && policy.requires_memory_lifecycle()
+            && self
+                .template_guest_profile(&req.template)
+                .await?
+                .is_some_and(|image| !image.supports_memory_lifecycle())
+        {
+            return Err(Status::failed_precondition(
+                "guest profile is not qualified for automatic pause or suspend",
+            ));
+        }
+        let network_policy = req
+            .network_policy
+            .as_ref()
+            .map(proto_network_policy_to_common)
+            .transpose()?;
+        if auto_lifecycle.is_none() && network_policy.is_none() {
+            return Err(Status::invalid_argument(
+                "at least one template setting is required",
+            ));
+        }
+
+        let publish_node_state = !crate::node_state_sync::should_skip_node_publish(&request);
+        let auto_lifecycle_requested = auto_lifecycle.is_some();
+        let auto_lifecycle_authority =
+            crate::db::PolicyAuthority::try_from(req.auto_lifecycle_authority)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let network_policy_authority =
+            crate::db::PolicyAuthority::try_from(req.network_policy_authority)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if network_policy.is_some() {
+            pplx_space_uds_peer_auth::require_local_authority_peer(
+                peer.principal(),
+                network_policy_authority == crate::db::PolicyAuthority::Local,
+            )?;
+        }
+        if auto_lifecycle_requested {
+            pplx_space_uds_peer_auth::require_local_authority_peer(
+                peer.principal(),
+                auto_lifecycle_authority == crate::db::PolicyAuthority::Local,
+            )?;
+        }
+
+        let db = Arc::clone(&self.db);
+        let template = req.template.clone();
+        let network_policy_generation = req.network_policy_generation;
+        let update_outcome = tokio::task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+            crate::db::update_template_settings_with_outbox(
+                &conn,
+                crate::db::TemplateSettingsUpdate {
+                    template: &template,
+                    default_auto_lifecycle: auto_lifecycle.as_ref(),
+                    default_auto_lifecycle_authority: auto_lifecycle_authority,
+                    default_network_policy: network_policy.as_ref(),
+                    default_network_policy_generation: network_policy_generation,
+                    default_network_policy_authority: network_policy_authority,
+                    mark_dirty: publish_node_state,
+                },
+            )
+            .map_err(|e| match e {
+                crate::db::TemplateNetworkPolicyUpsertError::GenerationConflict => {
+                    Status::failed_precondition("template network policy generation conflict")
+                }
+                crate::db::TemplateNetworkPolicyUpsertError::Db(e) => {
+                    Status::internal(format!("db upsert_template_settings: {e}"))
+                }
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))??;
+        if publish_node_state && auto_lifecycle_requested && update_outcome.auto_lifecycle_applied {
+            crate::node_state_sync::mark_template_dirty(&self.db, &req.template);
+        }
+        Ok(Response::new(UpdateTemplateSettingsResponse {
+            network_policy_apply_decision: if req.network_policy.is_some() {
+                match update_outcome.network_policy {
+                    crate::db::TemplateNetworkPolicyUpdate::Apply => {
+                        NetworkPolicyApplyDecision::Apply as i32
+                    }
+                    crate::db::TemplateNetworkPolicyUpdate::Skip => {
+                        NetworkPolicyApplyDecision::Skip as i32
+                    }
+                    crate::db::TemplateNetworkPolicyUpdate::Repair => {
+                        NetworkPolicyApplyDecision::Repair as i32
+                    }
+                    crate::db::TemplateNetworkPolicyUpdate::Conflict => {
+                        NetworkPolicyApplyDecision::Conflict as i32
+                    }
+                    crate::db::TemplateNetworkPolicyUpdate::Unspecified => {
+                        NetworkPolicyApplyDecision::Unspecified as i32
+                    }
+                }
+            } else {
+                NetworkPolicyApplyDecision::Unspecified as i32
+            },
+        }))
+    }
+
+    pub(super) async fn update_template_snapshot_policy(
+        &self,
+        request: Request<UpdateTemplateSnapshotPolicyRequest>,
+    ) -> Result<Response<UpdateTemplateSnapshotPolicyResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "UpdateTemplateSnapshotPolicy",
+            ALLOW_TEMPLATE_SNAPSHOT_POLICY_OPERATOR,
+        )?;
+        let req = request.get_ref();
+        let template = req.template.trim().to_string();
+        validate_template_name(&template)?;
+        let ensure_base_snapshot = req.ensure_base_snapshot;
+        if ensure_base_snapshot
+            && self
+                .template_guest_profile(&template)
+                .await?
+                .is_some_and(|profile| !profile.supports_memory_lifecycle())
+        {
+            return Err(Status::failed_precondition(
+                "guest profile is not qualified for snapshots",
+            ));
+        }
+        let snapshot_vcpu = optional_positive_or_default("snapshot_vcpu", req.snapshot_vcpu, 2)?;
+        let snapshot_memory_mib =
+            optional_positive_or_default("snapshot_memory_mib", req.snapshot_memory_mib, 1024)?;
+
+        {
+            let db = Arc::clone(&self.db);
+            let template = template.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn = db
+                    .lock()
+                    .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+                crate::db::update_template_snapshot_policy(
+                    &conn,
+                    &template,
+                    ensure_base_snapshot,
+                    snapshot_vcpu,
+                    snapshot_memory_mib,
+                )
+                .map_err(|e| Status::internal(format!("db update_template_snapshot_policy: {e}")))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))??;
+        }
+
+        let outcome = self.reconcile_desired_base_snapshot(&template).await;
+        if outcome.reconciled {
+            crate::node_state_sync::mark_template_dirty(&self.db, &template);
+        }
+        Ok(Response::new(UpdateTemplateSnapshotPolicyResponse {
+            reconciled: outcome.reconciled,
+            snapshot_built: outcome.snapshot_built,
+            content_hash: outcome.content_hash,
+            error: outcome.error,
+            snapshot_deleted: outcome.snapshot_deleted,
+        }))
+    }
+
+    pub(super) async fn delete_template_build(
+        &self,
+        request: Request<crate::proto::DeleteTemplateBuildRequest>,
+    ) -> Result<Response<crate::proto::DeleteTemplateBuildResponse>, Status> {
+        self.authorize_peer(&request, "DeleteTemplateBuild", ALLOW_TEMPLATE_OPERATOR)?;
+        let skip_node_publish = crate::node_state_sync::should_skip_node_publish(&request);
+        let req = request.into_inner();
+        let tmpl_ref = req
+            .template
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("template is required"))?;
+        let name = tmpl_ref.name.clone();
+        let content_hash = tmpl_ref.content_hash.clone().unwrap_or_default();
+
+        if name.is_empty() || content_hash.is_empty() {
+            return Err(Status::invalid_argument(
+                "name and content_hash are required",
+            ));
+        }
+        if tmpl_ref.environment.is_some() {
+            return Err(Status::invalid_argument(
+                "DeleteTemplateBuild removes every cached build of the hash; environment is not accepted",
+            ));
+        }
+        validate_template_name(&name)?;
+        validate_content_hash(&content_hash)?;
+        // Held until the delete returns: no pull, import, registration or
+        // startup recovery's per-dir check or the GC tick's rowless check of
+        // the digest runs alongside it.
+        let _claim = self.claim_digest_for_delete(&name, &content_hash)?;
+
+        // Check that no pools or local sandboxes reference this build before
+        // deleting its master rootfs.
+        let db = Arc::clone(&self.db);
+        let root = self.artifact_store.root.clone();
+        let n = name.clone();
+        let h = content_hash.clone();
+        let builds = tokio::task::spawn_blocking(move || {
+            let builds = cached_builds_to_delete(&db, &root, &n, &h)?;
+            let conn = db
+                .lock()
+                .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+
+            // Check pools by template name
+            let pools = crate::db::get_all_pools(&conn)
+                .map_err(|e| Status::internal(format!("db: {e}")))?;
+
+            if pools.iter().any(|p| p.template == n) {
+                return Err(Status::failed_precondition(format!(
+                    "cannot delete build {n}@{h}: template is referenced by a pool"
+                )));
+            }
+
+            Ok::<_, Status>(builds)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+        .map_err(|e: Status| e)?;
+
+        // A digest whose only trace is a dir has no row to match sandboxes
+        // against; they're matched by the digest instead. Sandboxes report
+        // the digest they were created from, not its partition, so one
+        // dependent sandbox blocks the whole digest.
+        let target = if builds.is_empty() {
+            TemplateBuildDeleteTarget::Digest {
+                name: &name,
+                content_hash: &content_hash,
+            }
+        } else {
+            TemplateBuildDeleteTarget::Builds(builds.get(..1).unwrap_or_default())
+        };
+        ensure_no_dependent_sandboxes_for_template_builds(
+            TemplateBuildDeleteOperation::Build,
+            DependentSandboxScope::All,
+            target,
+        )
+        .await?;
+
+        self.delete_template_build_after_dependency_checks(&name, &content_hash)
+            .await?;
+        if !skip_node_publish {
+            crate::node_state_sync::mark_template_dirty(&self.db, &name);
+        }
+        Ok(Response::new(crate::proto::DeleteTemplateBuildResponse {}))
+    }
+
+    /// Claim a digest for `DeleteTemplateBuild`, so no pull, import,
+    /// registration, compression, other delete, startup recovery's per-dir
+    /// check or the GC tick's rowless check is writing a dir or row the delete
+    /// removes. Refuses retryably while one holds it; the claim goes
+    /// when dropped.
+    pub(super) fn claim_digest_for_delete(
+        &self,
+        name: &str,
+        content_hash: &str,
+    ) -> Result<crate::volume::DigestClaim, Status> {
+        self.volume_puller
+            .try_claim_digest(name, content_hash)
+            .ok_or_else(|| {
+                Status::aborted(format!(
+                    "{name}@{content_hash} is busy (a pull, import, registration, compression, \
+                     delete or recovery check holds it); retry the delete"
+                ))
+            })
+    }
+
+    /// Delete every cached partition of a digest: artifacts first, then rows.
+    /// A partition counts when it has a row, a build dir or a base-snapshot
+    /// dir, so neither a complete dir whose row an interrupted pull never
+    /// wrote nor a leftover snapshot dir outlives the delete.
+    pub(super) async fn delete_template_build_after_dependency_checks(
+        &self,
+        name: &str,
+        content_hash: &str,
+    ) -> Result<(), Status> {
+        let db = Arc::clone(&self.db);
+        let root = self.artifact_store.root.clone();
+        let n = name.to_string();
+        let h = content_hash.to_string();
+        let partitions = tokio::task::spawn_blocking(move || {
+            let builds = {
+                let conn = db
+                    .lock()
+                    .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+                crate::db::list_builds_for_hash(&conn, &n, &h)
+                    .map_err(|e| Status::internal(format!("db list_builds_for_hash: {e}")))?
+            };
+            let mut partitions: std::collections::BTreeSet<_> = builds
+                .into_iter()
+                .map(|build| build.cache_partition)
+                .collect();
+            // The dirs are read without the DB lock, as in
+            // `cached_builds_to_delete`.
+            partitions.extend(cached_partition_dirs(&root, &n, &h)?);
+            // A digest with neither still has its legacy dir cleaned, as before.
+            if partitions.is_empty() {
+                partitions.insert(crate::db::TemplateCachePartition::Legacy);
+            }
+            Ok::<_, Status>(partitions)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))??;
+
+        let nodemgr_deadline = tokio::time::Instant::now() + NODEMGR_SUBVOLUME_DELETE_TIMEOUT;
+        for partition in partitions {
+            self.remove_build_artifacts_subvolume_aware(
+                name,
+                &partition.build_dir_name(content_hash),
+                nodemgr_deadline,
+            )
+            .await?;
+
+            let db = Arc::clone(&self.db);
+            let n = name.to_string();
+            let h = content_hash.to_string();
+            tokio::task::spawn_blocking(move || {
+                let conn = db
+                    .lock()
+                    .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+                // Delete build and its snapshot rows from DB.
+                crate::db::delete_build(&conn, &n, &h, partition)
+                    .map_err(|e| Status::internal(format!("db delete_build: {e}")))?;
+
+                Ok::<_, Status>(())
+            })
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+            .map_err(|e: Status| e)?;
+        }
+
+        Ok(())
+    }
+
+    /// Remove a build's on-disk artifacts ahead of its DB cleanup,
+    /// handling the digest dir's two on-disk forms.
+    ///
+    /// Installed builds are read-only btrfs subvolumes
+    /// (`received_uuid`-stamped `btrfs send` parents), and tmplmgr runs
+    /// without `CAP_SYS_ADMIN` in production — plain
+    /// `std::fs::remove_dir_all` EROFSes on the first unlink inside the
+    /// read-only subvolume, so every RPC delete of an installed build
+    /// failed and template-cache disk was never reclaimed. Subvolume
+    /// digest dirs are deleted via node-mgr's privileged
+    /// `BtrfsDeleteTemplateSubvolume` like the eviction loop; the
+    /// per-`(vcpu, memory)` snapshot dirs are plain dirs and are removed
+    /// locally either way.
+    ///
+    /// The local fallback works without privilege because node-mgr
+    /// chowns digest subvolumes to the tmplmgr user at create time:
+    /// clearing the RO flag is an owner-permitted operation, subvolume
+    /// deletion needs only rmdir-equivalent permissions on current
+    /// kernels, and even where that ioctl is refused, `remove_dir_all`
+    /// completes — rmdir of an emptied subvolume root succeeds like a
+    /// plain directory. It does not depend on the
+    /// `user_subvol_rm_allowed` mount option.
+    ///
+    /// Unlike the eviction fallback's soft-success, a genuine
+    /// local-cleanup failure aborts before DB cleanup and the delete
+    /// stays retryable. What survives such a failure is not a usable
+    /// build: by the time the local cleanup can fail, the snapshot
+    /// dirs are gone, the subvolume's RO flag is cleared, and its
+    /// contents are wiped — at most an emptied subvolume root remains,
+    /// with the DB row still tracking it for the retry (and startup
+    /// recovery prunes rows whose artifacts are missing). Plain-dir
+    /// digest dirs (legacy installs, non-btrfs hosts) keep the
+    /// existing `remove_dir_all` path.
+    ///
+    /// Latency: the node-mgr RPC leg is bounded by `nodemgr_deadline`.
+    /// A single-build delete passes `now + NODEMGR_SUBVOLUME_DELETE_TIMEOUT`;
+    /// the template-level delete computes ONE deadline for its whole
+    /// serial loop, so N subvolumes cannot multiply the RPC budget to
+    /// N × 2 s — the callers of both delete RPCs budget ~10 s
+    /// end-to-end (the admin node-maintenance route and build-manager's
+    /// serial prune), and the node-mgr client's own connect retry
+    /// budget alone would consume all of it. Once the deadline is
+    /// exhausted, remaining legs skip straight to the local cleanup.
+    /// Abandoning the RPC at the deadline is safe: the delete is
+    /// idempotent, so a server-side completion racing the local
+    /// fallback is benign.
+    ///
+    /// `build_dir_name` is a directory under the template: a build dir
+    /// (`{content_hash}` or `{content_hash}@{environment}`) or a transient
+    /// sibling, whose name is used verbatim and which skips the RPC leg.
+    pub(super) async fn remove_build_artifacts_subvolume_aware(
+        &self,
+        name: &str,
+        build_dir_name: &str,
+        nodemgr_deadline: tokio::time::Instant,
+    ) -> Result<(), Status> {
+        let parsed_build = TemplateCachePartition::parse_build_dir_name(build_dir_name);
+        let (content_hash, partition) = parsed_build.unwrap_or((
+            build_dir_name,
+            // Legacy dir names are the bare name, so a transient sibling's
+            // paths compose unchanged.
+            TemplateCachePartition::Legacy,
+        ));
+        let build_dir =
+            build_artifacts_dir(&self.artifact_store.root, name, content_hash, partition);
+        let is_subvol = tokio::task::spawn_blocking({
+            let build_dir = build_dir.clone();
+            move || pplx_space_common_core::host::btrfs::is_subvolume(&build_dir)
+        })
+        .await
+        .map_err(|e| {
+            blocking_join_status("probe digest dir", &format!("{name}@{build_dir_name}"), e)
+        })?;
+
+        if !is_subvol {
+            let store = self.artifact_store.clone();
+            let n = name.to_string();
+            let h = content_hash.to_string();
+            return tokio::task::spawn_blocking(move || {
+                store.remove_build_artifacts(&n, &h, partition)
+            })
+            .await
+            .map_err(|e| {
+                blocking_join_status(
+                    "remove build artifacts",
+                    &format!("{name}@{build_dir_name}"),
+                    e,
+                )
+            })?
+            .map_err(|error| {
+                tracing::error!(
+                    template = name,
+                    content_hash,
+                    %error,
+                    "failed to remove template build artifacts before DB cleanup"
+                );
+                Status::internal(error.to_string())
+            });
+        }
+
+        // Snapshot dirs are plain dirs under
+        // `<root>/<name>/snapshots/<hash>/`, separate from the digest
+        // subvolume; remove them locally before touching the subvolume.
+        let snapshot_removal = tokio::task::spawn_blocking({
+            let store = self.artifact_store.clone();
+            let n = name.to_string();
+            let h = content_hash.to_string();
+            move || store.remove_snapshot_artifacts(&n, &h, partition)
+        })
+        .await
+        .map_err(|e| {
+            blocking_join_status(
+                "remove snapshot artifacts",
+                &format!("{name}@{build_dir_name}"),
+                e,
+            )
+        })?;
+        if let Err(error) = snapshot_removal {
+            tracing::error!(
+                template = name,
+                content_hash,
+                %error,
+                "failed to remove template snapshot artifacts before DB cleanup"
+            );
+            return Err(Status::internal(error.to_string()));
+        }
+
+        // Node-mgr derives the digest path from `(name, content_hash)`
+        // against the canonical TEMPLATE_DIR on its own side, so the
+        // RPC only means "delete *this* build" when the artifact store
+        // is rooted there. On a non-canonical root (dev/test
+        // environments) the RPC would target a different tree — skip
+        // straight to the local cleanup, which operates on the real
+        // `build_dir`.
+        //
+        // The RPC leg is also skipped when the dir is not a build dir:
+        // the template-level delete routes
+        // transient digest-sibling subvolumes (`….importing`,
+        // `….replaced.<uuid>`, `build.importing.<job>`) through here,
+        // and node-mgr rejects those names at its validation boundary,
+        // so firing the RPC would add one guaranteed error per
+        // transient dir to the gRPC error stream this path exists to
+        // quiet. The local cleanup deletes them fine.
+        let take_rpc_leg = self.artifact_store.root == Path::new(TEMPLATE_DIR)
+            && parsed_build.is_some()
+            && validate_content_hash(content_hash).is_ok();
+        if take_rpc_leg && nodemgr_deadline > tokio::time::Instant::now() {
+            match tokio::time::timeout_at(
+                nodemgr_deadline,
+                crate::btrfs_via_nodemgr::delete_template_subvolume(name, content_hash, partition),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(rpc_err)) => {
+                    tracing::warn!(
+                        template = name,
+                        content_hash,
+                        error = %rpc_err,
+                        "btrfs_via_nodemgr::delete_template_subvolume failed; \
+                         falling back to subvolume-aware local cleanup"
+                    );
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        template = name,
+                        content_hash,
+                        "btrfs_via_nodemgr::delete_template_subvolume hit the delete's \
+                         node-mgr deadline; falling back to subvolume-aware local cleanup"
+                    );
+                }
+            }
+        } else if take_rpc_leg {
+            tracing::warn!(
+                template = name,
+                content_hash,
+                "skipping node-mgr subvolume delete: the delete's node-mgr budget is \
+                 already exhausted; using subvolume-aware local cleanup"
+            );
+        }
+        // Always run the local subvolume-aware cleanup: it is a no-op
+        // when the node-mgr delete already removed the digest dir, and
+        // it is the deletion path when the RPC failed, timed out, or
+        // was skipped for a non-canonical root.
+        let cleanup_result = tokio::task::spawn_blocking({
+            let build_dir = build_dir.clone();
+            move || crate::volume::cleanup_digest_dir_sync(&build_dir)
+        })
+        .await
+        .map_err(|e| {
+            blocking_join_status("clean digest dir", &format!("{name}@{build_dir_name}"), e)
+        })?;
+        if let Err(error) = cleanup_result {
+            tracing::error!(
+                template = name,
+                content_hash,
+                %error,
+                dir = %build_dir.display(),
+                "failed to remove template build subvolume before DB cleanup"
+            );
+            return Err(Status::internal(format!(
+                "remove template build dir {}: {error}",
+                build_dir.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Cap on the node-mgr `BtrfsDeleteTemplateSubvolume` legs of a delete
+/// RPC — one shared budget per delete, not per subvolume, so a
+/// template with many builds cannot multiply it. Deliberately shorter
+/// than the node-mgr client's ~10 s connect retry budget: the callers
+/// of the delete RPCs budget ~10 s end-to-end, so letting the RPC legs
+/// retry that long would starve the local fallback entirely whenever
+/// node-manager is down or mid-rollout.
+pub(super) const NODEMGR_SUBVOLUME_DELETE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// Partitions of a digest with a build dir or a base-snapshot dir. A dir that
+/// can't be listed fails retryably, rather than reading as no dirs and letting
+/// a delete report success over a partition it never saw.
+pub(super) fn cached_partition_dirs(
+    root: &Path,
+    name: &str,
+    content_hash: &str,
+) -> Result<Vec<crate::db::TemplateCachePartition>, Status> {
+    let list = |dir: &Path, template: &str| {
+        pplx_space_common_core::host::linux::paths::cached_template_partitions_in(
+            dir,
+            template,
+            content_hash,
+        )
+        .map_err(|error| {
+            Status::unavailable(format!(
+                "list cached builds of {name}@{content_hash} under {}: {error}",
+                dir.join(template).display()
+            ))
+        })
+    };
+    let mut partitions = list(root, name)?;
+    // Base-snapshot dirs under `{name}/snapshots/` carry the same build dir
+    // names.
+    partitions.extend(list(&template_artifacts_dir(root, name), "snapshots")?);
+    Ok(partitions)
+}
+
+/// The rows of a digest `DeleteTemplateBuild` removes, failing `NOT_FOUND`
+/// when no partition has a row, a build dir or a base-snapshot dir. A build
+/// dir without a row counts, with no rows to return: pulls refuse such a dir until the GC
+/// tick verifies it, and this delete is the operator's way to clear it. So
+/// does a base-snapshot dir a removed build left behind. A dir whose
+/// presence can't be read fails retryably, rather than reading as absent
+/// and reporting a cached digest as not found.
+///
+/// The DB lock is held only for the row read: the dirs are read without it,
+/// so a stalled disk holds up this delete and not every DB user. The
+/// caller's digest claim keeps a row from appearing in between.
+pub(super) fn cached_builds_to_delete(
+    db: &Mutex<rusqlite::Connection>,
+    root: &Path,
+    name: &str,
+    content_hash: &str,
+) -> Result<Vec<crate::db::BuildRow>, Status> {
+    let builds: Vec<_> = {
+        let conn = db
+            .lock()
+            .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+        crate::db::list_builds_for_hash(&conn, name, content_hash)
+            .map_err(|e| Status::internal(format!("db: {e}")))?
+    };
+    if !builds.is_empty() {
+        return Ok(builds);
+    }
+    if cached_partition_dirs(root, name, content_hash)?.is_empty() {
+        return Err(Status::not_found(format!(
+            "build not found: {name}@{content_hash}"
+        )));
+    }
+    Ok(builds)
+}

@@ -52,7 +52,7 @@ TEMPLATE_BUCKET = "templates"
 SANDBOX_TEMPLATE = "seed"
 # Published template files small enough to read whole, which the authority
 # vends a template subject (validate_template_resource,
-# crates/libs/credential/mgr/server/src/storage_exchange.rs).
+# crates/l40_api/credmgr/server/src/storage_exchange.rs).
 TEMPLATE_PROBE_FILES = ("metadata.json", "manifest.json")
 # The template name in the authority refusal's key when no other template is
 # published. The authority refuses by the key's template name before any
@@ -66,7 +66,7 @@ REFUSED_WRITE_BODY = b"storage exchange scoping smoke: must not be written\n" * 
 SESSION_LIFETIME_SECONDS = 3600
 # The authority's answer when a subject asks for an object it does not own
 # (StorageExchangeError::UnauthorizedResource, mapped to PERMISSION_DENIED in
-# crates/libs/credential/mgr/server/src/service.rs), which the agent forwards.
+# crates/l40_api/credmgr/server/src/service.rs), which the agent forwards.
 RESOURCE_DENIED_STATUS = "PERMISSION_DENIED"
 RESOURCE_DENIED_DETAIL = "requested storage resource is not authorized for the subject"
 SNAPSHOT_READY_TIMEOUT_SECONDS = 300

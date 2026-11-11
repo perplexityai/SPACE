@@ -19,7 +19,9 @@ right tool for:
   controller, so attributing that one file to one Deployment would miss the
   others. Resolution walks the workspace dependency graph transitively, so a
   binary that reaches a call site through an intermediate crate is a renderer
-  too.
+  too. Binaries in the `tools` layer are the exception: they are never shipped
+  (`crates/tools/AGENTS.md`), so one that reaches a call site, such as a
+  hand-run validation workload, composes no deployed selector.
 
   The one thing it cannot see is a call reached under a different spelling — a
   `use … as` alias, or the constructor renamed. That is a real limit, not a
@@ -50,7 +52,7 @@ from collections.abc import Sequence
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCENARIO_MODULE = "space_smoke.node_selector_extras"
-ADMISSION = REPO_ROOT / "crates/libs/api/src/cluster_admission/mod.rs"
+ADMISSION = REPO_ROOT / "crates/l40_api/api/src/cluster_admission/mod.rs"
 CRATES = REPO_ROOT / "crates"
 
 # The Rust construction whose call sites are the renderers that must be
@@ -60,10 +62,15 @@ CONFIG_FROM_ENV = "SandboxPodConfigValues::from_env"
 # The Deployment each app crate ships as. Keyed by the crate directory, since
 # that is what a dependency edge resolves to.
 APP_DEPLOYMENTS = {
-    "crates/apps/api/svc": "space-api",
-    "crates/apps/internal/api/svc": "space-internal-api",
-    "crates/apps/cluster/controller/svc": "space-cluster-controller",
+    "crates/l50_app/api/svc": "space-api",
+    "crates/l50_app/internal/api/svc": "space-internal-api",
+    "crates/l50_app/cluster/controller/svc": "space-cluster-controller",
 }
+
+
+# Layer directories whose binaries are never deployed: repository tools run only
+# in development or CI (crates/tools/AGENTS.md), so they are no renderer.
+NEVER_DEPLOYED_DIRS = ("crates/tools/",)
 
 
 class GuardError(Exception):
@@ -245,6 +252,8 @@ def _renderer_deployments() -> dict[str, str]:
     for package, directory in sorted(directories.items()):
         relative_dir = directory.relative_to(CRATES.parent).as_posix()
         if not _declares_binary(directory / "Cargo.toml"):
+            continue
+        if relative_dir.startswith(NEVER_DEPLOYED_DIRS):
             continue
         via = reaches(package)
         if via is None:
