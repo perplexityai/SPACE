@@ -441,7 +441,7 @@ class DirectNodeRecoveryFixture:
         )
         return int(output)
 
-    def _agent_run(self, arguments: list[str]) -> str:
+    def _agent_run(self, arguments: list[str], *, retry: bool = True) -> str:
         # The per-sandbox bridge socket is private to root and service users.
         # This fixture already requires a privileged standalone-node operator.
         command = ["sudo", "-n", "/space/bin/spaced-host", "--sandbox", self.owned_selector(), "run",
@@ -449,6 +449,8 @@ class DirectNodeRecoveryFixture:
         # A new generation can acquire its configuration hold between a status
         # read and dispatch. Reuse the command key across bounded retries so an
         # ambiguous response cannot duplicate an admitted process.
+        if not retry:
+            return self.command(command, timeout=240)
         deadline = time.monotonic() + 15
         while True:
             try:
@@ -460,14 +462,14 @@ class DirectNodeRecoveryFixture:
                     raise
                 self.context.wait(0.5)
 
-    def agent_command(self, command: str) -> str:
+    def agent_command(self, command: str, *, retry: bool = True) -> str:
         if self.config.firmware_lifecycle:
             script = "$ErrorActionPreference = 'Stop'; " + command
             encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
             arguments = ["--", "powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
         else:
             arguments = ["--user", "root", "--", "/bin/sh", "-c", command]
-        output = self._agent_run(arguments)
+        output = self._agent_run(arguments, retry=retry)
         lines = output.splitlines()
         if not lines or not lines[0].startswith("started process_id=") or lines[-1] != "exit_code=0":
             raise RuntimeError(f"agent command did not complete successfully: {output}")
