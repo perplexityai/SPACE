@@ -614,6 +614,9 @@ impl SandboxManagerService {
                         StatePageError::PinnedArtifactCreatedAt(error) => Status::internal(
                             format!("load pinned artifact capture times: {error}"),
                         ),
+                        StatePageError::RuntimeUpgrades(error) => {
+                            Status::internal(format!("load runtime upgrade fences: {error}"))
+                        }
                         StatePageError::RecoveryObservations(error) => {
                             tracing::warn!(%error, "failed to load quarantine recovery observations");
                             Status::internal(format!("load quarantine recovery observations: {error}"))
@@ -649,7 +652,7 @@ impl SandboxManagerService {
                             if let Some(observation) = decoded.recovery_observation {
                                 recovery_observations.insert(id, observation);
                             }
-                            rows.push(decoded.row);
+                            rows.push((decoded.row, decoded.published_execution));
                         }
                         StatePageRow::StateOnly(row) => {
                             let crate::db::read::StateOnlyRow {
@@ -729,7 +732,8 @@ impl SandboxManagerService {
         })
         .await?;
         let mut route_identity_provenance = route_identity_provenance;
-        let sandbox_results = stream::iter(rows.into_iter().map(|sandbox| {
+        let sandbox_results = stream::iter(rows.into_iter().map(|row| {
+            let (sandbox, published_execution) = row;
             let sandbox_id = sandbox.id.clone();
             let status = (sandbox.state, sandbox.cleanup_completion);
             let metadata = publication_metadata.remove(&sandbox.id);
@@ -753,6 +757,7 @@ impl SandboxManagerService {
                 sandbox_id,
                 status,
                 sandbox,
+                published_execution,
                 metadata,
                 state_changed_at,
                 pinned_artifact_created_at,
@@ -766,6 +771,7 @@ impl SandboxManagerService {
                 sandbox_id,
                 status,
                 sandbox,
+                published_execution,
                 metadata,
                 state_changed_at,
                 pinned_artifact_created_at,
@@ -785,7 +791,14 @@ impl SandboxManagerService {
                         pinned_artifact_created_at,
                         recovery_observation,
                     )
-                    .await,
+                    .await
+                    // The State page names the execution to publish, which
+                    // differs from the saved one while an upgrade fences the
+                    // sandbox.
+                    .map(|mut info| {
+                        info.execution = published_execution.as_ref().map(Into::into);
+                        info
+                    }),
                 )
             },
         )

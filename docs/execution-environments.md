@@ -1516,7 +1516,17 @@ blocking cold `Start` to run, and whether the sandbox ends started or stopped.
    format may differ: a cold start loads no memory, and neither sandbox-manager's
    disk binding nor node-manager's cold-boot admission compares state formats.
    The target is saved as the sandbox's consumer in the same transaction that
-   moves the row to `booting`. The checkpoint's producer evidence isn't rewritten.
+   moves the row to `booting`. The boot is the ordinary cold start, which reads
+   the target from that saved consumer, so the target is saved before the boot
+   rather than when it's verified. The checkpoint's producer evidence isn't
+   rewritten.
+   From the fence until the boot is verified, the State RPC that node-ctl
+   publishes from reports the previous consumer instead (the one a rollback
+   restores, which for a sandbox with no saved consumer is its disk's
+   execution), or no execution if that doesn't decode: a failed boot's
+   cleanup stops the sandbox with the target still saved, and the control
+   plane reads a stopped sandbox published under the target as an upgrade
+   that reached it.
 4. **Boot.** The ordinary blocking cold start runs as the caller. It reads the
    saved consumer, and guest readiness verifies the boot: the transaction that
    marks the sandbox started also records the upgrade verified, so a later
@@ -1653,7 +1663,9 @@ artifact lock, before anything is captured; the teardown drive is deferred and
 asked again. Once the upgrade is verified, a stop ends the hold, whoever stops
 the sandbox: the upgrade never stops a later execution, so a later one
 suspends as usual even while the upgrade stays `verified`, and a checkpoint
-conflict that keeps it there still clears on that suspend.
+conflict that keeps it there still clears on that suspend. While an upgrade
+fences the sandbox, the State RPC publishes the execution a rollback restores,
+not the target.
 
 Only the control plane writes sandbox pods, and the annotations are the
 upgrade's authorization: a principal that can create a sandbox pod can request

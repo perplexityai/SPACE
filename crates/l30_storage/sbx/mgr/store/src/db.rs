@@ -360,6 +360,13 @@ fn describe_raw_error(error: &rusqlite::Error) -> String {
     }
 }
 
+/// `n` comma-separated positional placeholders (`?, ?, ?`) for an `IN` list
+/// of bound values. A caller whose list can be empty returns before building
+/// the query, since an empty list matches nothing.
+pub(crate) fn sql_placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ")
+}
+
 pub(crate) fn immediate_transaction(conn: &Connection) -> Result<Transaction<'_>> {
     Transaction::immediate(conn)
 }
