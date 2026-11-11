@@ -959,6 +959,9 @@ impl KubernetesSubstrate {
         let node_group_placement = self
             .resolve_node_group_placement_for_claim(&sandbox, &claim, &pod_create_context)
             .await?;
+        let environment = self
+            .resolve_pod_environment_for_claim(&sandbox, &claim, &pod_create_context)
+            .await?;
 
         let auto_lifecycle = match self
             .store
@@ -1052,6 +1055,7 @@ impl KubernetesSubstrate {
                     auto_lifecycle_json: &auto_lifecycle_json,
                     network_policy_json: &network_policy_json,
                     node_group_placement: node_group_placement.placement(),
+                    environment,
                 },
                 pod_create_context,
             ),

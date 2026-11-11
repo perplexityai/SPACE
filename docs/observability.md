@@ -1352,16 +1352,18 @@ is enabled, and it counts `deleting`, which the sweeper never ages out.
 
 ## Environment placement shadow
 
-While `SPACE_ENVIRONMENT_PLACEMENT_GATE` is `shadow`, Direct placement counts
+While `SPACE_ENVIRONMENT_PLACEMENT_GATE` is `shadow`, each substrate reports
 what `on` would refuse (see "Placing work by environment" in
 [execution-environments.md](execution-environments.md)). Nothing is emitted
 while it's `off`.
 
 | Metric | Tags | Value |
 | --- | --- | --- |
-| `environment_placement.would_refuse` | `path`, `reason` | One per candidate node a placement statement returned that `on` would leave out |
+| `environment_placement.would_refuse` | `path`, `reason` | Counter, Direct: one per candidate node a placement statement returned that `on` would leave out |
+| `environment_placement.running_pods` | `placement` | Gauge, Kubernetes: bound sandbox pods on a node, by how the node's labels compare with the environment they record |
+| `environment_placement.pending_pods` | `reason` | Gauge, Kubernetes: bound sandbox pods the gate, `on`, holds back, unschedulable because no node carries the environment label they require |
 
-`path` names the statement (`cached_create`, `last_known_create`,
+On Direct, `path` names the statement (`cached_create`, `last_known_create`,
 `pull_create`, `pool_adoption`, `restore_source` or `restore_remote`) and
 `reason` is `no_evidence`, `incomplete`, `stale` or
 `environment_not_usable`, except that a restore candidate whose evidence
@@ -1381,6 +1383,42 @@ refuses every ready holder. When shadow
 can't read a build's environment binding it logs `environment placement gate
 couldn't read the build's environment` at `warn` and places the work as
 unbound, as `off` does, so that work counts nothing.
+
+On Kubernetes the scheduler picks the node, so the cluster controller's
+elected leader compares, once a minute, the recorded environment of every
+bound pod on a node, running or still starting, with that node's environment
+labels, from its pod and Node
+reflectors. `placement` is `admitted`, `no_evidence` (the node has no
+environment label at all) or `environment_not_usable` (the node is labeled
+with other environments). Labels carry no receipt time, so a stale or
+incomplete node reads as whatever node-ctl last wrote. Every `placement` is
+emitted on every tick, zeros included, and a tick whose reflectors aren't
+ready emits nothing. The census also runs while the gate is `on`, which
+Kubernetes doesn't support yet (see "Not covered" in
+[execution-environments.md](execution-environments.md)); there, a non-zero
+value is a pod placed before the switch, or one whose node lost the
+label after it was placed: node affinity isn't checked once a pod runs.
+The census counts only pods that record an environment, so it leaves out
+pods created while the gate was `off`, which carry no annotation, pods whose
+node isn't in the controller's Node cache, and pods whose annotation doesn't
+parse, which it logs at `warn`. A zero during a shadow rollout therefore says
+nothing about pods created before the switch to `shadow`. Combine replicas with
+`max`, as for the transient-lifecycle census.
+
+The same tick counts `environment_placement.pending_pods`: bound pods built
+with the gate `on` that have no node, that the scheduler has ruled
+unschedulable, and whose environment label no node carries. `reason` is
+`no_evidence` when no node carries any environment label, as on a new cluster
+or after a fleet-wide node-manager rollout whose observation node-ctl can't
+decode, and `environment_not_usable` when nodes carry only other
+environments' labels. A pod whose label some node carries isn't counted, since
+something other than its environment keeps it off that node. Shadow pods
+require no label, so the gauge stays at zero until the gate is `on`. A
+non-zero `no_evidence` means `on` is holding back all bound work. Switching
+the gate to `shadow` lets new pods place without the label; a held pod keeps
+the requirement it was built with. A restore pinned to its source node that
+kubelet refuses fails, and the census counts no failed pod, so neither gauge
+shows it.
 
 ## Reserved DNS upstream connections
 

@@ -62,21 +62,6 @@ fn only_on_refuses_and_only_shadow_records() {
 }
 
 #[test]
-fn kubernetes_refuses_on_until_its_pods_are_gated() {
-    use EnvironmentPlacementGate::{Off, On, Shadow};
-    Off.check_kubernetes_support()
-        .expect("off is supported everywhere");
-    Shadow
-        .check_kubernetes_support()
-        .expect("shadow places as off");
-    assert!(matches!(
-        On.check_kubernetes_support(),
-        Err(crate::controllers::substrate::SubstrateError::Unsupported { message })
-            if message.contains(EnvironmentPlacementGate::ENV)
-    ));
-}
-
-#[test]
 fn a_restore_refused_for_want_of_cold_boot_evidence_has_its_own_label() {
     use crate::metrics::environment_placement::EnvironmentPlacementPath as Path;
     use pplx_space_node_status_store::EnvironmentRefusal as Refusal;
@@ -141,4 +126,21 @@ async fn shadow_reads_a_failed_binding_read_as_unbound_and_on_fails() {
         .expect("off reads nothing"),
         None
     );
+}
+
+/// Kubernetes runs off and shadow, but refuses on at startup until the worker
+/// boots the environment a pod requires.
+#[test]
+fn kubernetes_refuses_on_until_its_worker_boots_the_pods_environment() {
+    use EnvironmentPlacementGate::{Off, On, Shadow};
+    Off.check_kubernetes_support()
+        .expect("off is supported everywhere");
+    Shadow
+        .check_kubernetes_support()
+        .expect("shadow places as off");
+    assert!(matches!(
+        On.check_kubernetes_support(),
+        Err(crate::controllers::substrate::SubstrateError::Unsupported { message })
+            if message.contains(EnvironmentPlacementGate::ENV)
+    ));
 }

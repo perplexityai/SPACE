@@ -77,8 +77,9 @@ pub(crate) async fn resolve_template_release_by_digest(
 /// matches the way [`resolve_template_release_by_digest`] matches it.
 ///
 /// Placement reads it as the binding of Direct's create, pool and pull
-/// candidates whose own inventory row names none, and of pull candidates
-/// that hold nothing.
+/// candidates whose own inventory row names none, of pull candidates that
+/// hold nothing, and of a Kubernetes pod's template work, through
+/// `environment_placement::work_environment`.
 pub(crate) async fn release_environment(
     executor: impl PgExecutor<'_>,
     template_name: &str,

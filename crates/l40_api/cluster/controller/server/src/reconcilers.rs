@@ -406,6 +406,7 @@ pub async fn run_reconcilers(
         }
         Some(kube) => {
             let kube = Arc::new(kube.clone());
+            let environment_placement = substrate.environment_placement();
             let warm_pool_token = shutdown_token.child_token();
             let warm_pool_store = WarmPoolStore::new(pool.clone());
             let warm_pool_kube = kube.k8s.client.clone();
@@ -429,6 +430,20 @@ pub async fn run_reconcilers(
                     tracing::warn!(error = %err, "warm pool reconciler exited");
                 }
             }));
+
+            // Environment placement census: how many running bound pods sit
+            // on nodes the environment placement gate, on, would refuse. Off
+            // with the gate; read-only, from the shared reflectors.
+            let census_caches = crate::environment_placement_census::Caches {
+                pods: kube.sandbox_pod_store(),
+                pods_ready: kube.readiness(),
+                nodes: kube.k8s.caches.clone(),
+            };
+            handles.push(tokio::spawn(crate::environment_placement_census::run(
+                environment_placement,
+                census_caches,
+                shutdown_token.child_token(),
+            )));
 
             handles.push(tokio::spawn(orphaned_sandboxes::run(
                 pool.clone(),

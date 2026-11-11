@@ -26,11 +26,12 @@ use k8s_openapi::api::core::v1::{ContainerStatus, Pod, PodCondition};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::runtime::{reflector, watcher};
 use pplx_space_common_core::kubernetes::{
-    NODE_NAME_MATCH_FIELD, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION,
-    SANDBOX_ID_ANNOTATION, SANDBOX_MANAGED_BY_LABEL, SANDBOX_NETWORK_SLOTS_RESOURCE,
-    SANDBOX_POOL_CONFIG_ID_KEY, SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_SLOT_ID_KEY,
-    SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION, SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
-    SANDBOX_TRACEPARENT_ANNOTATION,
+    NODE_NAME_MATCH_FIELD, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_ENVIRONMENT_ANNOTATION,
+    SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION, SANDBOX_MANAGED_BY_LABEL,
+    SANDBOX_NETWORK_SLOTS_RESOURCE, SANDBOX_POOL_CONFIG_ID_KEY, SANDBOX_POOL_ROLE_KEY,
+    SANDBOX_POOL_SLOT_ID_KEY, SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
+    SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION, SANDBOX_TRACEPARENT_ANNOTATION,
+    is_environment_label_key,
 };
 
 /// Declares [`SandboxPodKey`] from one list, so a variant can't exist without
@@ -72,6 +73,7 @@ sandbox_pod_keys! {
     PoolRole => SANDBOX_POOL_ROLE_KEY,
     PoolConfigId => SANDBOX_POOL_CONFIG_ID_KEY,
     PoolSlotId => SANDBOX_POOL_SLOT_ID_KEY,
+    Environment => SANDBOX_ENVIRONMENT_ANNOTATION,
 }
 
 impl SandboxPodKey {
@@ -156,6 +158,7 @@ pub struct SandboxPodView {
     labels: RetainedKeys,
     node_name: Option<Box<str>>,
     required_source_pin: bool,
+    requires_environment_label: bool,
     network_slot_request: u64,
     phase: Option<Box<str>>,
     pod_ip: Option<Box<str>>,
@@ -234,6 +237,14 @@ impl SandboxPodView {
         self.required_source_pin
     }
 
+    /// Whether a required node-affinity term asks for an environment label
+    /// (`is_environment_label_key`): the pod was built with the environment
+    /// placement gate on, so a node without its environment's label can't
+    /// take it.
+    pub fn requires_environment_label(&self) -> bool {
+        self.requires_environment_label
+    }
+
     /// Sum of the containers' `space.pplx.net/network-slots` requests,
     /// regardless of phase or deletion.
     pub fn network_slot_request(&self) -> u64 {
@@ -289,7 +300,7 @@ impl From<Pod> for SandboxPodView {
             status,
         } = pod;
         let spec = spec.unwrap_or_default();
-        let required_source_pin = spec
+        let required_terms = spec
             .affinity
             .as_ref()
             .and_then(|affinity| affinity.node_affinity.as_ref())
@@ -298,15 +309,22 @@ impl From<Pod> for SandboxPodView {
                     .required_during_scheduling_ignored_during_execution
                     .as_ref()
             })
-            .is_some_and(|selector| {
-                selector.node_selector_terms.iter().any(|term| {
-                    term.match_fields.as_ref().is_some_and(|fields| {
-                        fields.iter().any(|field| {
-                            field.key == NODE_NAME_MATCH_FIELD && field.operator == "In"
-                        })
-                    })
-                })
-            });
+            .map(|selector| selector.node_selector_terms.as_slice())
+            .unwrap_or_default();
+        let required_source_pin = required_terms.iter().any(|term| {
+            term.match_fields.as_ref().is_some_and(|fields| {
+                fields
+                    .iter()
+                    .any(|field| field.key == NODE_NAME_MATCH_FIELD && field.operator == "In")
+            })
+        });
+        let requires_environment_label = required_terms.iter().any(|term| {
+            term.match_expressions.as_ref().is_some_and(|expressions| {
+                expressions
+                    .iter()
+                    .any(|expression| is_environment_label_key(&expression.key))
+            })
+        });
         let network_slot_request = spec
             .containers
             .iter()
@@ -335,6 +353,7 @@ impl From<Pod> for SandboxPodView {
             labels: retain_keys(metadata.labels),
             node_name: spec.node_name.map(Into::into),
             required_source_pin,
+            requires_environment_label,
             network_slot_request,
             phase: status.phase.map(Into::into),
             pod_ip: status.pod_ip.map(Into::into),

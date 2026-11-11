@@ -43,6 +43,9 @@ nodeFence:
   allowedLabelKeyPrefixes:
     # TEMPLATE_BUILD_LABEL_KEY_PREFIX: one key per ready local template build.
     - space.pplx.net/template-build-
+    # ENVIRONMENT_LABEL_KEY_PREFIX: one key per environment the node's latest
+    # complete execution inventory lists as usable.
+    - space.pplx.net/env-
   allowedAnnotationKeys: []
   allowedAnnotationKeyPrefixes:
     # Template presence mirrors each build label with a same-key annotation

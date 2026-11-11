@@ -296,7 +296,7 @@ impl KubernetesSubstrate {
     /// through here so the counter sees every attempt, including the ones
     /// that return before any placement sample is emitted.
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn redrive_unschedulable_restore_cross_node_recorded(
+    pub(in crate::controllers::substrate::kubernetes) async fn redrive_unschedulable_restore_cross_node_recorded(
         &self,
         path: crate::metrics::sandbox::restore::RedrivePath,
         sandbox: &Sandbox,
@@ -642,6 +642,9 @@ impl KubernetesSubstrate {
             let node_group_placement = self
                 .resolve_node_group_placement(sandbox, &cross_node_context)
                 .await?;
+            let environment = self
+                .resolve_pod_environment(sandbox, &cross_node_context)
+                .await?;
 
             let cross_node_pod = match create_sandbox_pod(
                 &self.k8s,
@@ -653,6 +656,7 @@ impl KubernetesSubstrate {
                         auto_lifecycle_json: &auto_lifecycle_json,
                         network_policy_json: &network_policy_json,
                         node_group_placement: node_group_placement.placement(),
+                        environment,
                     },
                     cross_node_context,
                 ),

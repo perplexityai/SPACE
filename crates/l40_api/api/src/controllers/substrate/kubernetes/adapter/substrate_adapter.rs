@@ -1,5 +1,6 @@
 //! `SubstrateAdapter` implementation for `KubernetesSubstrate`.
 
+use super::pooled::PooledPodEnvironment;
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
 use pplx_space_common_core::types::SubstrateKind;
@@ -283,10 +284,23 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         })
                 })
                 .transpose()?;
-            Ok::<_, SubstrateError>((cold_metadata, fork_restore))
+            // The pod boots the fork source's disk artifact, or else the
+            // requested template build.
+            let environment = match (&request.restore_from, request.template_ref.content_hash) {
+                (Some(restore), _) => self.fork_pod_environment(restore.snapshot_id).await?,
+                (None, Some(content_hash)) => {
+                    self.template_pod_environment(
+                        request.template_ref.template.as_str(),
+                        content_hash,
+                    )
+                    .await?
+                }
+                (None, None) => None,
+            };
+            Ok::<_, SubstrateError>((cold_metadata, fork_restore, environment))
         }
         .await;
-        let (cold_metadata, fork_restore) = match prepared {
+        let (cold_metadata, fork_restore, environment) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => {
                 cancel_guard.release_claim().await;
@@ -304,6 +318,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             content_hash: request.template_ref.content_hash,
             env: request.env,
             traceparent: pplx_space_observability::trace_propagation::current_traceparent(),
+            environment,
         };
         let runtime = cold_metadata.runtime_metadata(request.resources);
         let restore_source_sandbox_id: String;
@@ -1904,6 +1919,52 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 pool::invalidate_claimed_pool_slot(self.store.pool(), &claim).await?;
                 continue;
             }
+            // The environment gate, on, admits only a node that publishes
+            // the work's environment. A refused slot leaves the pool, so the
+            // reconciler replaces it with a pod that requires the label.
+            match self
+                .pooled_pod_environment(request.template, &claim.content_hash, pod.as_deref())
+                .await
+            {
+                Ok(PooledPodEnvironment::Admitted) => {}
+                Ok(PooledPodEnvironment::NotPublished) => {
+                    tracing::info!(
+                        claim_id = %claim.claim_id,
+                        sandbox_id = %claim.sandbox_id,
+                        pod_name = %claim.pod_name,
+                        attempt,
+                        "invalidating a warm-pool slot whose node doesn't publish the work's \
+                         environment"
+                    );
+                    pool::invalidate_claimed_pool_slot(self.store.pool(), &claim).await?;
+                    continue;
+                }
+                // Nothing shows the slot is unusable, so it goes back, as for
+                // a node group the cache can't answer.
+                unknown => {
+                    pool::release_claimed_pool_slot(self.store.pool(), &claim).await?;
+                    match unknown {
+                        Err(error) => tracing::warn!(
+                            claim_id = %claim.claim_id,
+                            pod_name = %claim.pod_name,
+                            attempt,
+                            %error,
+                            "failed to read the warm-pool pod's environment; released claim \
+                             and falling back"
+                        ),
+                        Ok(_) => tracing::info!(
+                            claim_id = %claim.claim_id,
+                            pod_name = %claim.pod_name,
+                            attempt,
+                            "could not read the claimed warm pod's node; released the claim \
+                             and falling back"
+                        ),
+                    }
+                    return Ok(PooledExecutionClaimAttempt::missed(
+                        claim_attempt.pool_shape,
+                    ));
+                }
+            }
 
             let resolved = match placement.as_ref() {
                 Some(resolved) => resolved,
@@ -2408,6 +2469,25 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     && self
                         .admitted_pool_pod_placement_admits(request, pod.as_deref())
                         .await
+                    && match self
+                        .pooled_pod_environment(
+                            request.template,
+                            &claim.content_hash,
+                            pod.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(environment) => environment == PooledPodEnvironment::Admitted,
+                        Err(error) => {
+                            tracing::warn!(
+                                claim_id = %claim.claim_id,
+                                %error,
+                                "failed to read the admitted warm-pool pod's environment; not \
+                                 adopting it"
+                            );
+                            false
+                        }
+                    }
             }
             Err(error) => {
                 tracing::warn!(

@@ -6,7 +6,7 @@
 //!
 //! | Refused or missing | Effect today | Owner | Removed by |
 //! |---|---|---|---|
-//! | Environment placement gate (`SPACE_ENVIRONMENT_PLACEMENT_GATE`) | `on` fails startup with `SubstrateError::Unsupported`: pods carry no environment label requirement. `shadow` places as `off`, counts nothing, and logs a warning at startup | the-gigi-pplx | node-ctl labeling its Node with its usable environments, and bound pods requiring their environment's label |
+//! | Environment placement gate `on` (`SPACE_ENVIRONMENT_PLACEMENT_GATE`) | `on` fails startup with `SubstrateError::Unsupported`. A Kubernetes create names no cache partition, so the worker boots the digest's legacy-partition build whatever environment the pod requires, and a runtime-upgrade activation's pod requires the recorded environment rather than the upgrade's target. `shadow` records, labels and counts, and places as `off` | the-gigi-pplx | the worker taking the pod's environment as its cache-partition preference, and activation pods recording an upgrade's target |
 
 use std::{
     fmt,
@@ -447,6 +447,10 @@ pub struct KubernetesState {
     /// Whether resume and start decide a runtime upgrade
     /// (`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED`, default off).
     pub runtime_upgrade_at_activation: super::runtime_upgrade::RuntimeUpgradeAtActivation,
+    /// How a bound sandbox pod renders its environment
+    /// (`SPACE_ENVIRONMENT_PLACEMENT_GATE`, default off): recorded in shadow
+    /// and on, and required as a node label only when it's on.
+    pub environment_placement: super::environment_placement::EnvironmentPlacementGate,
     pub caches: Arc<K8sCaches>,
 }
 
@@ -457,6 +461,10 @@ pub enum KubernetesStateInitError {
     Kube(#[from] KubeError),
     #[error(transparent)]
     NodeSelectorLabels(#[from] NodeSelectorLabelsParseError),
+    #[error(transparent)]
+    EnvironmentPlacementGate(
+        #[from] super::environment_placement::EnvironmentPlacementGateParseError,
+    ),
 }
 
 impl KubernetesState {
@@ -502,6 +510,10 @@ impl KubernetesState {
             abandoned_restore_retirement: super::AbandonedRestoreRetirement::from_env(),
             runtime_upgrade_at_activation:
                 super::runtime_upgrade::RuntimeUpgradeAtActivation::from_env(),
+            environment_placement:
+                super::environment_placement::EnvironmentPlacementGate::from_environment(
+                    &pplx_space_common_core::env::ProcessEnvironment,
+                )?,
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
             node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config: SandboxPodConfigValues::from_env()?,

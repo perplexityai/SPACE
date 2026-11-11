@@ -12,7 +12,9 @@ use crate::node_group_placement::{
     PlacementSubject, ResolvePath as NodeGroupResolvePath, ResolvedPlacement, RestoreSourceNode,
     check_local_restore_source,
 };
-use pplx_space_common_core::kubernetes::{EvacuationPlacement, NodeGroupPlacement, PodToleration};
+use pplx_space_common_core::kubernetes::{
+    EvacuationPlacement, NodeGroupPlacement, PodEnvironment, PodToleration,
+};
 use pplx_space_common_core::types::{
     ExecutionGeneration, NodeRole as SpaceNodeRole, PodUid, PolicyAuthority,
     SandboxActivationAttemptId, SandboxLifecycle, SandboxOwner, SandboxTransitionTargetState,
@@ -134,6 +136,10 @@ pub(super) struct SandboxPodRequestInputs<'a> {
     /// `None` renders no node-group constraints: the gate is off, or the
     /// cluster has no generic node group.
     pub(super) node_group_placement: Option<&'a NodeGroupPlacement>,
+    /// The environment the pod records, and requires while the gate is on
+    /// ([`KubernetesSubstrate::resolve_pod_environment`]): `None` for unbound
+    /// work, and while the environment placement gate is off.
+    pub(super) environment: Option<PodEnvironment>,
 }
 
 impl PodCreateContext<'_> {
