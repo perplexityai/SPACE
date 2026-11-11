@@ -113,9 +113,7 @@ RUN test "$(command -v btrfs)" = /usr/local/sbin/btrfs \
 COPY --from=aws-cli /usr/local/aws-cli /usr/local/aws-cli
 RUN ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws
 
-FROM runtime-deps AS guest-bundle
-RUN apt-get update && apt-get install -y --no-install-recommends python3 \
-    && rm -rf /var/lib/apt/lists/*
+FROM public.ecr.aws/docker/library/python:3.14-slim AS guest-bundle
 COPY --from=rust-build /artifacts/bin/spaced /guest/spaced
 COPY --from=rust-build /artifacts/bin/spaced-svc /guest/spaced-svc
 COPY scripts/build/agent-bundle.py /tmp/space-agent-bundle.py
