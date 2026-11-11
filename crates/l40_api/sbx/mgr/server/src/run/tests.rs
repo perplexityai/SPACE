@@ -58,6 +58,7 @@ async fn takeover_wait_keeps_liveness_and_withholds_readiness() {
         let shutdown = CancellationToken::new();
         let _guard = shutdown.clone().drop_guard();
         let config = SbxMgrRunConfig {
+            automatic_guest_updates: false,
             socket_path: root.path().join("production.sock"),
             host_control_socket_path: root.path().join("control.sock"),
             health_socket_path: Some(health_socket.clone()),

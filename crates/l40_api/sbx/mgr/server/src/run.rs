@@ -539,6 +539,8 @@ where
 /// code that reads it, so this carries only what the flags do.
 #[derive(Debug, Clone)]
 pub struct SbxMgrRunConfig {
+    /// Typed startup policy for optional admissions; receipt recovery is independent.
+    pub automatic_guest_updates: bool,
     /// Production sandbox-manager Unix socket, bound only after the service
     /// mutex is acquired.
     pub socket_path: PathBuf,
@@ -822,6 +824,7 @@ pub async fn run(
     let service = SandboxManagerService::new_with_config(
         conn,
         SandboxManagerServiceOptions {
+            automatic_guest_updates: config.automatic_guest_updates,
             host_control_socket_path: config.host_control_socket_path.clone(),
             shutdown_token: shutdown_token.clone(),
             task_tracker: task_tracker.clone(),
@@ -984,6 +987,7 @@ pub async fn run(
     service.start_sandbox_eviction(shutdown_token.child_token(), &task_tracker);
     service.start_snapshot_upload_maintenance(shutdown_token.child_token(), &task_tracker);
     service.start_runtime_upgrade_recovery(shutdown_token.child_token(), &task_tracker);
+    service.start_automatic_guest_updates(shutdown_token.child_token(), &task_tracker);
     service.start_guest_update_recovery(shutdown_token.child_token(), &task_tracker);
     service.start_guest_configuration_observation(shutdown_token.child_token(), &task_tracker);
     service.start_teardown_suspend_resumer(shutdown_token.child_token(), &task_tracker);
