@@ -89,6 +89,9 @@ pub enum ProcessStartDeliveryOutcome {
     Reattached,
     ReplayMiss,
     Backpressure,
+    /// The stream ended without delivering the process's exit to the client,
+    /// for a reason other than the client leaving or the drain deadline.
+    TerminalLost,
 }
 
 impl ProcessStartDeliveryOutcome {
@@ -99,6 +102,7 @@ impl ProcessStartDeliveryOutcome {
             Self::Reattached => "reattached",
             Self::ReplayMiss => "replay_miss",
             Self::Backpressure => "backpressure",
+            Self::TerminalLost => "terminal_lost",
         }
     }
 }

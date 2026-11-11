@@ -78,6 +78,8 @@ from space_smoke.capabilities import (
     EcwLifecycle,
     EcwPermissionDenied,
     EcwProcess,
+    EcwProcessStartStream,
+    EcwProcessStreamEvent,
     EcwPublicPort,
     EcwSandbox,
     EcwSandboxBusy,
@@ -558,6 +560,7 @@ NODE_TEMPLATE_MANAGER = "template-manager"
 NODE_VOLUME_MANAGER = "volume-manager"
 NODE_CTL = "node-ctl"
 NODE_API = "node-api"
+NODE_API_PORT = 9800
 # The worker node-ctl DaemonSet (release `space`) and the one env key the
 # unanswered-template scenario may set on it, read once at start
 # (`unanswered_template_evict_after` in node-ctl's facets/unanswered_templates.rs).
@@ -877,6 +880,29 @@ for d in /proc/[0-9]*; do
   esac
 done
 true
+"""
+# Aborts the data plane's connections to node-api through the kernel's socket
+# destroy (`ss -K`), then lists any of them still established: those would be
+# connections the kernel refused to destroy.
+_NODE_API_STREAM_CUT = r"""
+set -eu
+filter="( sport = :{port} ) and ( {peers} )"
+before=$(nsenter -t 1 -n ss -Htn state established "$filter" | awk '{{print $4, $5}}' | sort)
+[ -n "$before" ] || {{ echo 0; exit 0; }}
+nsenter -t 1 -n ss -K -Htn state established "$filter" >/dev/null
+after=$(nsenter -t 1 -n ss -Htn state established "$filter" | awk '{{print $4, $5}}' | sort)
+left=$(comm -12 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | grep -c . || true)
+[ "$left" -eq 0 ] || {{ echo "ss -K left $left connection(s) established" >&2; exit 1; }}
+printf '%s\n' "$before" | grep -c .
+"""
+_NODE_API_SIGNAL = r"""
+n=0
+for d in /proc/[0-9]*; do
+  if [ "$(cat "$d/comm" 2>/dev/null)" = space-node-api- ]; then
+    kill -{signal} "${{d#/proc/}}" && n=$((n + 1))
+  fi
+done
+echo $n
 """
 # The rootfs object each suspend codec publishes under the snapshot's storage
 # prefix (`SnapshotArtifact` in crates/libs/common/core/src/types/object_store.rs).
@@ -2575,6 +2601,60 @@ ON CONFLICT (key_hash) DO NOTHING;
             self._node_shell_exec(node_name, script, timeout=60),
             f"end the btrfs-send interrupter on {node_name}",
         )
+
+    # --- exec stream faults -------------------------------------------------
+
+    def cut_node_api_streams(self, node_name: str) -> int:
+        peers = sorted(set(self._data_plane_host_ips()))
+        if not peers:
+            raise SmokeConfigurationError("no data plane pod has a host IP")
+        script = _NODE_API_STREAM_CUT.format(
+            port=NODE_API_PORT, peers=" or ".join(f"dst {ipaddress.ip_address(peer)}" for peer in peers)
+        )
+        output = _require_ok(
+            self._node_shell_exec(node_name, script, timeout=30),
+            f"cut the data plane's node-api connections on {node_name}",
+        )
+        return int(output.strip().splitlines()[-1])
+
+    def stop_node_api(self, node_name: str) -> None:
+        self._signal_node_api(node_name, "STOP")
+
+    def continue_node_api(self, node_name: str) -> None:
+        self._signal_node_api(node_name, "CONT")
+
+    def _signal_node_api(self, node_name: str, signal: str) -> None:
+        output = _require_ok(
+            self._node_shell_exec(node_name, _NODE_API_SIGNAL.format(signal=signal), timeout=30),
+            f"send SIG{signal} to node-api on {node_name}",
+        )
+        if output.strip() != "1":
+            raise RuntimeError(f"SIG{signal} reached {output.strip()} node-api processes")
+
+    def replace_node_api(self, node_name: str, *, grace_seconds: int, timeout: float) -> str:
+        self._require_isolated_kind("node-api replacement")
+        old = self._node_service_pod(node_name, NODE_API)
+        _require_ok(
+            self.kubectl(
+                "delete", "pod", old, f"--grace-period={int(grace_seconds)}", "--wait=false",
+                timeout=30,
+            ),
+            f"delete {old}",
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ready = self.ready_node_service_pod(node_name, NODE_API)
+            if ready is not None and ready != old:
+                return ready
+            time.sleep(0.5)
+        raise RuntimeError(f"no replacement node-api pod was Ready on {node_name} in {timeout} s")
+
+    def _data_plane_host_ips(self) -> list[str]:
+        result = self.kubectl(
+            "get", "pods", "-l", "app.kubernetes.io/name=space-data-plane",
+            "-o", "jsonpath={.items[*].status.hostIP}", timeout=15,
+        )
+        return _require_ok(result, "list data plane host IPs").split()
 
     def sandbox_snapshot_dirs(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
         path = f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/snapshots"
@@ -8508,6 +8588,29 @@ class _SdkProtocolCompatibility:
             request_timeout=request_timeout,
         )
 
+    def open_process_start(
+        self,
+        command: str,
+        *,
+        timeout_ms: int,
+        idempotency_key: str | None = None,
+        request_timeout: float = 60,
+    ) -> EcwProcessStartStream:
+        sdk = self._sandbox._data_plane_sdk()
+        headers = dict(sdk.connection_config.sandbox_headers)
+        headers["Content-Type"] = "application/connect+json"
+        headers["Connect-Protocol-Version"] = "1"
+        headers["Connect-Timeout-Ms"] = str(timeout_ms)
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
+        request = {"process": {"cmd": "/bin/bash", "args": ["-l", "-c", command]}}
+        return _ConnectProcessStartStream.open(
+            f"{sdk.envd_api_url.rstrip('/')}/process.Process/Start",
+            headers,
+            _connect_envelope(0, json.dumps(request).encode()),
+            request_timeout=request_timeout,
+        )
+
     def _compatibility_request(
         self,
         path: str,
@@ -8545,6 +8648,87 @@ class _SdkProtocolCompatibility:
             ) from error
         except URLError as error:
             raise RuntimeError(f"ECW {method} {path} failed: {error.reason}") from error
+
+
+def _connect_envelope(flags: int, payload: bytes) -> bytes:
+    return bytes([flags]) + len(payload).to_bytes(4, "big") + payload
+
+
+class _ConnectProcessStartStream:
+    """A `Process.Start` Connect JSON stream read straight off its socket."""
+
+    def __init__(self, connection: Any, response: Any) -> None:
+        self._connection = connection
+        self._response = response
+
+    @classmethod
+    def open(
+        cls, url: str, headers: Mapping[str, str], body: bytes, *, request_timeout: float
+    ) -> _ConnectProcessStartStream:
+        import http.client
+
+        parts = urlsplit(url)
+        connection_type = (
+            http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+        )
+        connection = connection_type(parts.netloc, timeout=request_timeout)
+        connection.request("POST", parts.path, body=body, headers=dict(headers))
+        return cls(connection, connection.getresponse())
+
+    @property
+    def http_status(self) -> int:
+        return int(self._response.status)
+
+    def events(self) -> Iterator[EcwProcessStreamEvent]:
+        if self.http_status != 200:
+            detail = self._response.read(4_000).decode(errors="replace")
+            yield EcwProcessStreamEvent(
+                kind="error", at=time.monotonic(), error=f"HTTP {self.http_status}: {detail}"
+            )
+            return
+        while True:
+            try:
+                prefix = self._response.read(5)
+                if len(prefix) < 5:
+                    raise ValueError("stream closed before its end-stream message")
+                length = int.from_bytes(prefix[1:], "big")
+                payload = self._response.read(length)
+                if len(payload) < length:
+                    raise ValueError(f"message cut at {len(payload)} of {length} bytes")
+                message = json.loads(payload or b"{}")
+            except (OSError, HTTPException, ValueError) as error:
+                yield EcwProcessStreamEvent(
+                    kind="error", at=time.monotonic(), error=f"{type(error).__name__}: {error}"
+                )
+                return
+            at = time.monotonic()
+            if prefix[0] & 0x02:
+                error = message.get("error")
+                if error:
+                    yield EcwProcessStreamEvent(
+                        kind="error", at=at, error=f"{error.get('code')}: {error.get('message')}"
+                    )
+                return
+            event = message.get("event", {})
+            if "start" in event:
+                yield EcwProcessStreamEvent(kind="start", at=at, pid=int(event["start"]["pid"]))
+            elif "data" in event:
+                for kind, encoded in event["data"].items():
+                    yield EcwProcessStreamEvent(kind=kind, at=at, data=base64.b64decode(encoded))
+            elif "end" in event:
+                end = event["end"]
+                yield EcwProcessStreamEvent(
+                    kind="end",
+                    at=at,
+                    exit_code=int(end.get("exitCode", 0)),
+                    status=end.get("status"),
+                    error=end.get("error"),
+                )
+            else:
+                yield EcwProcessStreamEvent(kind="keepalive", at=at)
+
+    def close(self) -> None:
+        self._connection.close()
 
 
 class _SdkWatchHandle:

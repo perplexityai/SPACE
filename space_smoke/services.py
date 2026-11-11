@@ -412,6 +412,7 @@ class SmokeServices:
             fixture._telemetry_control = cast(Any, kind)
             fixture._leader_election_control = cast(Any, kind)
             fixture._sandbox_network_isolation_control = cast(Any, kind)
+            fixture._exec_stream_fault_control = cast(Any, kind)
             fixture._storage_exchange_control = cast(Any, kind)
             fixture._template_selector = template
             fixture._warm_pool_observer = cast(Any, kind)

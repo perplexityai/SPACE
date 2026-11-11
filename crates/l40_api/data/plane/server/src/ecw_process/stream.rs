@@ -259,11 +259,12 @@ where
                     Some(Err(status)) if is_recoverable_process_start_interruption(&status) => {
                         status
                     }
-                    Some(Err(status)) => {
+                    Some(Err(mut status)) => {
                         if state.replaying
                             && let Some(outcome) = process_start_delivery_failure(&status)
                         {
                             crate::metrics::process_start_delivery(outcome);
+                            mark_delivery_failure_counted(&mut status);
                         }
                         state.ended = true;
                         return Some((Err(status), state));
@@ -514,13 +515,30 @@ pub(super) fn process_start_reopen_status(
     error: EcwProxyError,
     resume: &ProcessStartResume,
 ) -> tonic::Status {
-    let status = error.into_tonic_status();
+    let mut status = error.into_tonic_status();
     if resume.is_connect()
         && let Some(outcome) = process_start_delivery_failure(&status)
     {
         crate::metrics::process_start_delivery(outcome);
+        mark_delivery_failure_counted(&mut status);
     }
     status
+}
+
+/// Metadata on a status whose delivery failure is already counted, so the
+/// client stream does not count it again as `terminal_lost`. Only the code and
+/// message reach the client.
+const DELIVERY_FAILURE_COUNTED: &str = "x-space-delivery-failure-counted";
+
+fn mark_delivery_failure_counted(status: &mut tonic::Status) {
+    status.metadata_mut().insert(
+        DELIVERY_FAILURE_COUNTED,
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+}
+
+pub(super) fn delivery_failure_counted(status: &tonic::Status) -> bool {
+    status.metadata().contains_key(DELIVERY_FAILURE_COUNTED)
 }
 
 pub(super) fn reset_process_start_stream_channel(state: &DataPlaneState, route: &EcwResolvedRoute) {
@@ -692,6 +710,7 @@ where
         shutdown: Box::pin(lease.shutdown_token.cancelled_owned()),
         flushed_after_shutdown: None,
         delivered_any: false,
+        terminal_accounted: false,
         keepalive_interval,
         keepalive_deadline: None,
         start_wait: None,
@@ -726,6 +745,10 @@ pub(super) struct ProcessConnectJsonStream<S> {
     /// Whether any message reached the client, so a start knows whether it
     /// has reported itself yet.
     delivered_any: bool,
+    /// Whether the stream's end is already accounted for: the process's exit
+    /// reached the client, or its delivery failure was counted as its own
+    /// outcome (replay miss or backpressure).
+    terminal_accounted: bool,
     // Response bytes reach HTTP intermediaries; backend keepalives do not.
     // This timer never renews the process lease or sandbox lifetime.
     keepalive_interval: Duration,
@@ -779,6 +802,14 @@ impl<S> ProcessConnectJsonStream<S> {
         }
         self.close_recorded = true;
         crate::metrics::stream_closed(ECW_PROCESS_STREAM_KIND, result);
+        // A start that ends without its exit lost it, including a stall: the
+        // stall deadline is past the command's own, so its exit is overdue.
+        // Not counted: a client that left (its drop skips this), a stream ended
+        // at the drain deadline (the client reconnects to a live data plane),
+        // and `Process.Connect` streams, whose process its start already counts.
+        if !self.connected_as_start && !self.terminal_accounted && result != "shutdown" {
+            crate::metrics::process_start_delivery(ProcessStartDeliveryOutcome::TerminalLost);
+        }
     }
 }
 
@@ -820,6 +851,10 @@ where
         loop {
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(event))) => {
+                    let exit = matches!(
+                        &event.event,
+                        Some(spaced_ops::process_event::Event::Exit(_))
+                    );
                     match &event.event {
                         Some(spaced_ops::process_event::Event::Started(_))
                         | Some(spaced_ops::process_event::Event::Connected(_)) => {
@@ -844,6 +879,7 @@ where
                             flushed.bytes += bytes.len();
                         }
                         this.delivered_any = true;
+                        this.terminal_accounted |= exit;
                         if let Some(deadline) = this.keepalive_deadline.as_mut() {
                             deadline
                                 .as_mut()
@@ -855,6 +891,7 @@ where
                 }
                 Poll::Ready(Some(Err(status))) => {
                     this.ended = true;
+                    this.terminal_accounted |= delivery_failure_counted(&status);
                     this.record_close("backend_status");
                     let bytes =
                         ecw_connect::connect_error_end_stream(status.code(), status.message());
