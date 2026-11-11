@@ -18,7 +18,7 @@ mod policy;
 // The candidate itself has only model::TRIAL_CONFIRMATION_WINDOW from
 // selection to commit. These larger bounds do not extend that trial or lifecycle clocks.
 const OPERATION_BUDGET: Duration = Duration::from_secs(420);
-const ACTIVATION_BUDGET: Duration = Duration::from_secs(210);
+use pplx_space_spaced_common::update::ACTIVATION_BUDGET;
 const LIFECYCLE_MARGIN: Duration = Duration::from_secs(30);
 const RPC_BUDGET: Duration = Duration::from_secs(5);
 
