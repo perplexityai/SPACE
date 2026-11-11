@@ -12,6 +12,7 @@ from space_smoke.node_selector_extras import ABSENT_EXTRA, SATISFIED_EXTRAS
 # ~65 s on the kind bench.
 @smoke.scenario(
     "local.node_selector_extras_render_and_enforce",
+    tier="main",
     sandbox=smoke.SandboxConfig(timeout=900),
 )
 def node_selector_extras_render_and_enforce(test: smoke.KindEcw) -> None:

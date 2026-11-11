@@ -1,6 +1,5 @@
 """With one inline permit per API pod, concurrent creates past it are queued, not lost."""
 
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 from space_smoke.native_inline import inline_execution, operation
@@ -9,15 +8,9 @@ from space_smoke.registry import scenario
 from space_smoke.runtime import InconclusiveSmoke
 
 CREATES = 4
-# How long the creates are watched with no dispatcher running. Admission
-# claims a create before it answers, so this only gives a claim admission
-# should not have made time to show.
-WATCH_SECONDS = 8
-# An inline create waits this long before it starts, holding its permit, so
-# the permit is still taken when the next create is admitted. Without it a
-# fast runner ends a create, and frees its permit, before the next request
-# arrives, and that one runs inline too. It far outlasts the admissions.
-PERMIT_HOLD_SECONDS = 30
+# Fail-safe deadline only: the run releases the held permits after reading
+# every admission's committed state, without waiting out this duration.
+PERMIT_HOLD_SECONDS = 120
 
 
 @scenario(
@@ -36,7 +29,7 @@ def inline_fallback_at_one_permit_loses_no_operation(fixture: KindNativeHardenin
 
     control = fixture.recovery
     with (
-        inline_execution(fixture, control, ("create_sandbox",), permits=1, hold=PERMIT_HOLD_SECONDS),
+        inline_execution(fixture, control, ("create_sandbox",), permits=1, hold=PERMIT_HOLD_SECONDS) as release_hold,
         control.owned_faults(),
     ):
         api_pods = control._captures["space-api"].replicas
@@ -48,11 +41,9 @@ def inline_fallback_at_one_permit_loses_no_operation(fixture: KindNativeHardenin
                 responses = list(pool.map(lambda _: fixture.create(), range(CREATES)))
             accepted = [expect_response(fixture, response, 202) for response in responses]
             operations = [body["operation_id"] for body in accepted]
-            started = set()
-            deadline = time.monotonic() + WATCH_SECONDS
-            while time.monotonic() < deadline:
-                started |= {op for op in operations if operation(fixture, op)["state"] != "queued"}
-                time.sleep(0.5)
+            # Admission commits its inline claim before answering, so every
+            # concurrent response is sufficient synchronization for this read.
+            started = {op for op in operations if operation(fixture, op)["state"] != "queued"}
             fixture.context.record("inline_started_while_stopped", len(started))
             fixture.context.verify(
                 bool(started),
@@ -66,6 +57,7 @@ def inline_fallback_at_one_permit_loses_no_operation(fixture: KindNativeHardenin
                 api_pods=api_pods,
             )
         with fixture.context.phase("restore the dispatcher and await every create"):
+            release_hold()
             control.restore_controller()
             for body in accepted:
                 fixture.wait_operation(body["operation_id"], timeout=300)

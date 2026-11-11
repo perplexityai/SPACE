@@ -264,6 +264,23 @@ inputs are the same (see [Smoke test](#smoke-test)). Each runner boots its own K
 and runs its assigned typed scenarios serially. Cluster-wide fault injection
 must never run concurrently on a shared stack. Every shard must pass.
 
+For a standalone full-suite run, provide the durable receipt directory that CI
+creates for cold-create and warm-pool fixture recovery:
+
+```bash
+export SPACE_SMOKE_KIND_COLD_RECEIPTS="${SPACE_TILT_STATE_DIR:-$HOME/.space-devbox/kind}/smoke-cold-receipts"
+install -d -m 0700 "$SPACE_SMOKE_KIND_COLD_RECEIPTS"
+```
+
+Keep that directory across retries so an interrupted fixture can restore its
+standing configuration. A named development cluster also needs an explicit
+identity pin before running privileged scenarios:
+
+```bash
+export SPACE_SMOKE_KIND_CLUSTER_UID="$(kubectl --context "kind-${KIND_CLUSTER:-space-local}" \
+  get namespace kube-system -o jsonpath='{.metadata.uid}')"
+```
+
 The shards prepare their node image, vendor mounts, cluster, and chart-image
 preloads while the Rust producer compiles or pulls the image, and build the UI
 image, which needs no Rust, so that Tilt's UI build is a cache hit
@@ -369,12 +386,11 @@ the Kind services with no crate's `test-hooks` feature enabled:
 
 | Skipped in the release lane | Hooks it needs | Why it cannot pass without them |
 |---|---|---|
-| `local.template_cache_lru_eviction_reclaims` | the chart's template GC interval and grace, and prefetch latest-N | release GC ticks every 300 s with an 1800 s grace, past the scenario's 900 s budget |
-| `local.snapshot_reaper_reclaims_backed_fork_snapshot` | the chart's `SPACE_SBX_GC_*` target, interval, grace and idle | a release candidate is idle for a day before the reaper takes it |
+| `local.garbage_collectors_reclaim_independent_resources` | the chart's template GC interval and grace, prefetch latest-N, and `SPACE_SBX_GC_*` target, interval, grace and idle | release template GC uses an 1800 s grace and the snapshot reaper requires a day of idle time, beyond the combined scenario's budget |
 | `local.retention_claim_finish_forward`, `local.retention_restore_source_guard` | the retention sweeper's dry-run, tick and minimum age, which they stage | a release sweeper ticks every 300 s and keeps snapshots younger than an hour |
 | `local.rate_limiters_enforce_and_fail_open` | `SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST`, which it shrinks to 2 | draining the release burst of 60 would take sixty real boots |
-| `local.leader_election_brownout_keeps_one_leader` | the cluster-controller's lease TTL and liveness budget, `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS` and `..._LEASE_FAILURE_GRACE_SECS` | at the release 60 s TTL and 600 s budget, a replica spends its budget long after the outage's bound |
-| `native_recovery.inline_wake_survives_api_pod_kill`, `native_recovery.inline_fallback_at_one_permit_loses_no_operation`, `native_recovery.inline_load_survives_leader_failover` | `SPACE_NATIVE_INLINE_TEST_HOLD_SECS`, which they set on the API for their run to hold each operation it claims inline `running`, its claim renewed, before it starts | a release wake or create the API runs inline can end before the scenario kills its API pod, admits its next create, or brings a dispatcher back |
+| `local.leader_election_brownout_keeps_one_leader`, `local.leader_election_refusal_does_not_restart` | the cluster-controller's lease TTL and liveness budget, `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS` and `..._LEASE_FAILURE_GRACE_SECS` | at the release 60 s TTL and 600 s budget, a replica spends its budget long after the outage's bound |
+| `native_recovery.inline_wake_survives_api_pod_kill`, `native_recovery.inline_fallback_at_one_permit_loses_no_operation`, `native_recovery.inline_load_survives_leader_failover` | `SPACE_NATIVE_INLINE_TEST_HOLD_SECS` and `SPACE_NATIVE_INLINE_TEST_RELEASE_FILE`, which hold each claimed inline operation `running`, renewing its claim, until the scenario releases it or the bounded hold expires | a release wake or create the API runs inline can end before the scenario kills its API pod, admits its next create, or brings a dispatcher back |
 
 The 40 GiB cache needs no replacement for the reservation hook: release
 binaries reserve 8 GiB per pending cache allocation
@@ -1107,6 +1123,22 @@ The three-state smoke specification, pinned inputs, measured results and
 guest/worker coverage limits are recorded with the run's evidence rather than
 in this repository.
 
+#### CI observability layout
+
+Both Kind CI lanes select `SPACE_KIND_OBSERVABILITY_LAYOUT=ci`. This keeps
+the OTLP metrics, traces and logs pipelines and their smoke scenarios, but
+omits Grafana and its port forward. Metrics and traces collectors, Prometheus,
+Tempo and Loki run on the existing `space.pplx.net/node-pool=infra` node;
+only that node receives their preloaded images. Alloy still runs on every
+node and its image is loaded everywhere. Backend ownership, reconciliation
+and readiness checks still run during setup and Tilt evaluation.
+
+The default `full` layout retains Grafana and unrestricted backend placement.
+Use the CI layout on a fresh cluster: it does not migrate or delete volumes
+already bound to another node. The layout can also be selected through the
+watched observability configuration file; it does not change the telemetry
+mode or exporter identity.
+
 ### SaaS experiments
 
 `saas` exports to a real Datadog organization, so it is deliberately harder to
@@ -1578,6 +1610,10 @@ api-server → per-sandbox pod IP at `:9800`. Node-scoped traffic (`NodeInfo`,
 
 ## Sandbox namespace and network policy
 
+The [smoke suite's known gaps](../../../space_smoke/scenarios/README.md#known-gaps)
+describe the current limits of live IMDS guardrail precedence coverage and
+the controlled-responder evidence needed to close them.
+
 Sandbox pods run in their own namespace, `sandboxes`, and everything else in
 `space`, as in a deployment that confines sandboxes with namespace-scoped
 policy. `k8s.sandboxNamespace` in the api, cluster-controller and
@@ -1653,14 +1689,17 @@ load-balanced entry, scaled on load.
   substrate: the Lease holder runs every reconciler and the other stands by,
   Ready, to take over.
   The typed scenario `local.leader_election_brownout_keeps_one_leader`
-  exercises the handoff. It needs `otel` mode. For its own run it lowers the
-  controller's lease TTL to its 18 s floor and the liveness budget to the
-  72 s floor at that TTL, through two test hooks that are inert unless the
-  `test-hooks` feature is compiled in, as the Kind build does. At the end it
-  removes the TTL hook and puts the budget's standing value back; it takes
-  about 8 minutes. Run it alone with
-  `uv run --frozen --python 3.11 -m space_smoke run
-  local.leader_election_brownout_keeps_one_leader`.
+  exercises outage recovery; `local.leader_election_refusal_does_not_restart`
+  verifies that a contender refused Lease access remains unready without
+  restarting. Both run by default and can occupy separate CI shards. Each
+  needs `otel` mode, lowers the controller's lease TTL to its 18 s floor and
+  the liveness budget to its 72 s floor, and restores the standing settings
+  afterward. These hooks require the `test-hooks` feature used by Kind.
+  Both change the budget only while owning the mutation Lease and restore
+  it before another scenario runs. Shards start with the standing chart
+  settings, so unrelated recovery tests do not inherit the shortened budget.
+  Run either alone with `uv run --frozen --python 3.11 -m space_smoke run`
+  followed by its scenario ID.
 - **internal-api** (ClusterApi) runs two replicas behind its ClusterIP
   Service and rolls one at a time. It needs no election: its state is in
   Postgres, written under row locks and claim tokens, its RPCs are unary, and
@@ -2356,6 +2395,23 @@ runs the baseline smoke, then runs one of fourteen duration-balanced partitions 
 the eligible ECW and native inventories. Scenarios remain serial within each
 shard because some mutate cluster-wide state. Every shard must pass for
 `space-ci` to pass.
+
+The baseline owns its sandbox as soon as create is admitted, including when
+the operation later fails. A successful round-trip also requires deletion to
+complete and the sandbox to answer 404. Its HTTP calls are bounded by
+`CURL_TIMEOUT_SECS` (30 seconds by default); the manual native REST suite uses
+`SPACE_SMOKE_HTTP_TIMEOUT` with the same default.
+
+The harness regression tests under `scripts/tests/test-kind-*.sh` and
+`scripts/tests/test_kind*.py` use synthetic processes, files and command
+responses; they need no running Kind cluster. Run them on Linux with Bash 5,
+GNU coreutils, Git, Python and Helm, as CI does. The artifact-key tests create
+their own small Git fixtures and do not require the developer checkout to use
+Git. On macOS, select Homebrew Bash and GNU coreutils on `PATH` before the
+Python tests; BSD `stat` and Bash 3 cannot run the Linux installer and array
+paths. The process-identity shell cases still need Linux `/proc` and must be
+validated there. Only the Datadog rendering cases fetch its pinned Helm
+subchart; pure policy checks do not need that dependency.
 
 The CI-only `SPACE_KIND_RUST_ARTIFACTS=prebuilt` mode checks
 `SPACE_KIND_PREBUILT_RUST_IMAGE_ID` against the loaded Docker image and

@@ -443,7 +443,7 @@ class OrphanedRestorePodGcAssertions:
 
     # --- verdicts ---------------------------------------------------------------
 
-    def expect_reaped(self, *orphans: PlantedOrphan) -> None:
+    def expect_reaped(self, *orphans: PlantedOrphan, protected: PlantedOrphan | None = None) -> None:
         """The loop deleted every plant, none of them before it reached the threshold.
 
         One loop polls every outstanding plant, so each is watched from its
@@ -460,7 +460,22 @@ class OrphanedRestorePodGcAssertions:
         last_present = {orphan.token: orphan.planted_at for orphan in orphans}
         outstanding = list(orphans)
         deadline = max(orphan.planted_at for orphan in orphans) + settings.reap_budget_seconds
-        while outstanding:
+        survival_deadline = time.monotonic() + settings.survival_window_seconds if protected else 0
+        while True:
+            if protected is not None:
+                document = self._control.restore_pod_document(protected.name)
+                metadata = (document or {}).get("metadata") or {}
+                self._fixture.verify(
+                    document is not None
+                    and metadata.get("uid") == protected.uid
+                    and not metadata.get("deletionTimestamp"),
+                    "the GC disturbed a protected orphan while its control aged",
+                    pod=protected.name,
+                    uid_before=protected.uid,
+                    uid_now=metadata.get("uid"),
+                    deleting=bool(metadata.get("deletionTimestamp")),
+                    failure_evidence=lambda: self._gc_evidence(protected.name),
+                )
             for orphan in list(outstanding):
                 polled_at = time.monotonic()
                 if self._control.restore_pod_document(orphan.name) is not None:
@@ -468,10 +483,16 @@ class OrphanedRestorePodGcAssertions:
                     continue
                 outstanding.remove(orphan)
                 self._judge_reap(orphan, last_present[orphan.token], polled_at, settings)
-            if not outstanding:
+                if protected is not None:
+                    # Keep observing after the control establishes a live GC,
+                    # including when that reap lands late in the age window.
+                    survival_deadline = max(
+                        survival_deadline, polled_at + 2 * settings.interval_seconds
+                    )
+            if not outstanding and time.monotonic() >= survival_deadline:
                 break
             self._fixture.verify(
-                time.monotonic() < deadline,
+                not outstanding or time.monotonic() < deadline,
                 "a planted orphan was not reaped within the budget",
                 pods=[orphan.name for orphan in outstanding],
                 reap_budget_seconds=settings.reap_budget_seconds,
@@ -479,8 +500,18 @@ class OrphanedRestorePodGcAssertions:
             )
             self._fixture.wait(settings.poll_seconds)
 
-    def expect_left_alone(self, orphan: PlantedOrphan) -> None:
-        """Through the survival window the plant keeps its uid and isn't deleted."""
+    def expect_left_alone(
+        self, orphan: PlantedOrphan, *, while_reaping: PlantedOrphan | None = None
+    ) -> None:
+        """Keep the same uid through a full survival window and optional control reap."""
+
+        if while_reaping is not None:
+            self.expect_reaped(while_reaping, protected=orphan)
+            self._fixture.record(
+                f"left_alone_g{orphan.generation}_{orphan.token}",
+                self._require_settings().survival_window_seconds,
+            )
+            return
 
         self._hold_through_window(
             orphan.name,

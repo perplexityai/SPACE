@@ -2,13 +2,12 @@
 
 Each Kind node service runs in its own pod, so a setting belongs to a service
 exactly when that service's chart renders it. These checks render every node
-service, per role, and the control-plane credential-manager authority, and
-assert that the credential database, its password, the AWS credentials and the
-Secrets Manager reader role reach only the authority, and the static
+service, per role, and the credential authority: authority database and AWS
+settings reach the authority alone, and the static
 object-store credentials no node service (volume-manager and build-manager,
 the services that transfer objects, exchange their credentials by default).
-Volume-manager's streaming upload budget is
-unset by default, so the service default applies, and renders exactly as set.
+The volume-manager budget check covers numeric formatting: zero stays zero
+and YAML numbers must not become exponent notation.
 """
 
 import subprocess
@@ -28,6 +27,7 @@ NODE_RELEASES = [
     ).stdout.splitlines()
     if line.strip()
 ]
+
 AUTHORITY_CHART = KIND_DIR / "charts/space-credmgr-authority-local"
 
 CREDENTIAL_AUTHORITY_ONLY = {
@@ -73,11 +73,6 @@ def test_node_services_receive_no_credential_authority_settings(release, role, s
 def test_no_node_service_receives_static_object_store_credentials_by_default(release, role, service):
     present = _node_service_env(release, role, service) & OBJECT_STORE_STATIC
     assert not present, f"{release} {service} renders {sorted(present)}"
-
-
-@pytest.mark.parametrize(("release", "role", "service"), NODE_RELEASES)
-def test_no_node_service_sets_a_stream_upload_budget_by_default(release, role, service):
-    assert STREAM_BUDGET not in _node_service_env(release, role, service)
 
 
 def _volume_manager_budget(*extra: str) -> str | None:

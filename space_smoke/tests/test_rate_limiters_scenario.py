@@ -153,11 +153,24 @@ class PerClientVerdict(unittest.TestCase):
         with self.assertRaisesRegex(InvariantViolation, "no 429"):
             self._assertions().expect_per_client_limited(outcomes, label="t")
 
-    def test_fail_open_ignores_non_limiter_statuses_but_not_limiter_429s(self) -> None:
+    def test_fail_open_requires_successful_admission_for_every_caller(self) -> None:
         assertions = self._assertions()
-        assertions.expect_fail_open([_outcome(201), _outcome(429, "placement", "2"), _outcome(500)])
-        with self.assertRaisesRegex(InvariantViolation, "fail open"):
-            assertions.expect_fail_open([_outcome(429, f"{SERVER_LIMIT_MESSAGE} x", "2")])
+        admitted = LimiterProbeOutcome(201, None, "", "sbx_a", 0.0)
+        assertions.expect_fail_open([admitted] * 4)
+        for rejected in (
+            [],
+            [_outcome(500)] * 4,
+            [admitted, _outcome(429, "placement", "2")],
+            [_outcome(429, f"{SERVER_LIMIT_MESSAGE} x", "2")],
+            [_outcome(429, f"{PER_CLIENT_LIMIT_MESSAGE} x", "2")],
+            [_outcome(0)],
+            [_outcome(201)],
+        ):
+            with (
+                self.subTest(outcomes=rejected),
+                self.assertRaisesRegex(InvariantViolation, "fail open"),
+            ):
+                assertions.expect_fail_open(rejected)
 
 
 class _ScriptedKubectl:

@@ -103,6 +103,15 @@ else
     uv_lock_mode=--frozen
 fi
 
+# Generated coverage documentation is part of the scenario declaration contract.
+echo "--- :python: Checking the generated smoke scenario index"
+"${uv_bin}" run \
+    "${uv_lock_mode}" \
+    --project "${REPO_ROOT}" \
+    --python 3.11 \
+    --group test \
+    python -m space_smoke.inventory --check
+
 # One worker per CPU (pytest-xdist): one at a time, the 1,978 tests took
 # 163 s. --dist loadfile keeps a file's tests on one worker, so tests that
 # share a module's state, or the Postgres database above

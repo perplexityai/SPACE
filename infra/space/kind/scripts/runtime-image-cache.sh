@@ -56,7 +56,7 @@ IMAGES="
 space-api docker/Dockerfile.api smoke-build runtime-deps
 space-data-plane docker/Dockerfile.data-plane runtime-deps
 space-cluster-controller docker/Dockerfile.cluster-controller runtime-deps
-space-worker docker/Dockerfile.worker runtime-deps
+space-worker docker/Dockerfile.worker runtime-deps guest-bundle-deps
 space-seed-publish docker/Dockerfile.seed-publish runtime-deps
 space-ui docker/Dockerfile.ui deps
 space-kind-key-broker docker/Dockerfile.kind-key-broker

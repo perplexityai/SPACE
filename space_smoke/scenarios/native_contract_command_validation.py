@@ -1,13 +1,34 @@
-"""Command input rejection without executing malformed commands."""
+"""Reject invalid resources and command inputs before admitting their work."""
 import json
 
-from space_smoke.registry import scenario
 from space_smoke.native_hardening import NativeHardeningFixture
+from space_smoke.registry import scenario
+
 
 @scenario("native_contract.command_validation", api_surfaces=("native",))
 def command_validation(test: NativeHardeningFixture) -> None:
-    """Malformed commands and a streamed pty fail admission; streamed stdin reads EOF."""
+    """Zero vCPUs, malformed commands and a streamed pty fail admission; streamed stdin reads EOF."""
     sid = test.create_ready()
+    # The ready sandbox proves the caller and template can create. The native
+    # fixture journals this probe too, so an unexpectedly accepted create is
+    # reconciled and deleted by its ordinary cleanup on every substrate.
+    with test.context.phase("reject zero-vCPU create before accepting work"):
+        response = test.create({"resources": {"vcpu": 0}})
+        error = response.body
+        test.context.record("zero_vcpu_admission", {
+            "status": response.status,
+            "error_code": error.get("code"),
+            "retryable": error.get("retryable"),
+            "operation_id": error.get("operation_id"),
+            "sandbox_id": error.get("sandbox_id"),
+        })
+        test.context.verify(
+            response.status in (400, 422)
+            and error.get("retryable") is False
+            and not error.get("operation_id")
+            and not error.get("sandbox_id"),
+            "zero-vCPU create must be rejected before an operation or sandbox is accepted",
+        )
     outcomes = []
     for label, body in (
         ("empty_argv", {"command": []}),

@@ -1383,4 +1383,4 @@ mod pinned_local_only_plan_tests;
 /// Postgres-backed, and each case also shows the pre-change guard disagreed —
 /// otherwise the agreement proves nothing.
 #[cfg(test)]
-mod terminate_gate_agreement_tests;
+pub(super) mod terminate_gate_agreement_tests;

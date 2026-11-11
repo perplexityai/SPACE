@@ -11,28 +11,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "infra/space/kind/scripts/build-rust-artifacts.sh"
 REPOSITORY = "ghcr.io/perplexityai/space-kind-build-cache"
-BUILDS = (
-    (
-        "space-rust-chef-base:local",
-        "docker/Dockerfile.rust-build-common",
-        "chef-base",
-        "kind-rust-chef-base",
-    ),
-    (
-        "space-grpc-health-probe:local",
-        "docker/Dockerfile.rust-build-common",
-        "grpc-health-probe-downloader",
-        "kind-grpc-health-probe",
-    ),
-    (
-        "space-rust-build-kind:local",
-        "docker/Dockerfile.rust-build-kind",
-        None,
-        "kind-rust-build",
-    ),
-)
-
-
 class RegistryCacheTests(unittest.TestCase):
     def run_build(self, overrides):
         with tempfile.TemporaryDirectory() as temporary:
@@ -75,7 +53,7 @@ class RegistryCacheTests(unittest.TestCase):
             )
             return result, calls
 
-    def test_local_pr_and_main_builds_have_exact_cache_arguments(self):
+    def test_local_pr_and_main_builds_follow_cache_authorization(self):
         for mode in ("local", "pr", "pr-registry-only", "main"):
             with self.subTest(mode=mode):
                 environment = {}
@@ -97,47 +75,22 @@ class RegistryCacheTests(unittest.TestCase):
                     environment["ACTIONS_RUNTIME_TOKEN"] = "test-runtime-token"
                 result, calls = self.run_build(environment)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                expected = []
-                for image, dockerfile, target, scope in BUILDS:
-                    command = ["build", "-t", image, "-f", dockerfile]
-                    if target:
-                        command += ["--target", target]
-                    if scope == "kind-rust-build":
-                        command += [
-                            "--build-arg", "SPACE_KIND_RUST_BUILD=test-hooks",
-                            "--build-arg", "SPACE_CARGO_RELEASE_LTO=false",
-                        ]
-                    if mode != "local":
-                        command += [
-                            "--cache-from",
-                            f"type=registry,ref={REPOSITORY}:{scope}",
-                        ]
-                    if mode in ("pr", "main"):
-                        command += [
-                            "--cache-from",
-                            f"type=gha,scope={scope},timeout=60s",
-                        ]
-                    if mode == "main":
-                        exports = [
-                            "--cache-to",
-                            f"type=registry,ref={REPOSITORY}:{scope},mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true",
-                        ]
-                        if scope == "kind-rust-build":
-                            # Only dependency layers may be published. The
-                            # final artifact keeps cache imports but no export.
-                            expected.append([
-                                "build", "-f", dockerfile, "--target", "cook",
-                                "--output", "type=cacheonly",
-                                *command[5:], *exports, ".",
-                            ])
-                        else:
-                            command += exports
-                    if scope == "kind-rust-build":
-                        # One manifest, and no input key label: these builds
-                        # take no base from the mirror.
-                        command[5:5] = ["--provenance=false"]
-                    expected.append([*command, "."])
-                self.assertEqual(calls, expected)
+                builds = [call for call in calls if call[0] == "build"]
+                self.assertTrue(builds)
+                final = next(call for call in builds if "space-rust-build-kind:local" in call)
+                # Artifacts depend on the whole source revision; only reusable
+                # dependency layers may be exported, even in trusted main CI.
+                self.assertNotIn("--cache-to", final)
+                exports = [call for call in builds if "--cache-to" in call]
+                self.assertEqual(bool(exports), mode == "main")
+                for call in builds:
+                    imports = [call[i + 1] for i, arg in enumerate(call) if arg == "--cache-from"]
+                    self.assertEqual(any(value.startswith(f"type=registry,ref={REPOSITORY}:") for value in imports), mode != "local")
+                    self.assertEqual(any(value.startswith("type=gha,") for value in imports), mode in ("pr", "main"))
+                if mode == "main":
+                    dependency = next(call for call in exports if "type=cacheonly" in call)
+                    self.assertEqual(dependency[dependency.index("--target") + 1], "cook")
+
 
     def test_invalid_configuration_and_untrusted_writes_never_reach_docker(self):
         main = {

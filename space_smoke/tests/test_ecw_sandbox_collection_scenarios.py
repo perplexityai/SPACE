@@ -15,7 +15,6 @@ from space_smoke.capabilities import (
 )
 from space_smoke.fixtures import CommandSandboxFixture, Ecw
 from space_smoke.runtime import InvariantViolation, ResourceScope, ScenarioContext
-from space_smoke.scenarios.ecw_sandbox_delete import sandbox_delete
 from space_smoke.scenarios.ecw_sandbox_list_pagination import (
     PAGE_SIZE,
     sandbox_list_pagination,
@@ -92,10 +91,9 @@ class EcwSandboxDeleteScenarioTests(unittest.TestCase):
     def test_delete_requires_public_absence(self) -> None:
         test, sandboxes, evidence = _fixture()
 
-        sandbox_delete.verify(test)
+        test.delete_sandbox()
+        test.wait_until_deleted()
 
-        self.assertIs(sandbox_delete.fixture_type, CommandSandboxFixture)
-        self.assertEqual(sandbox_delete.api_surfaces, {"ecw", "native"})
         self.assertTrue(sandboxes.sandboxes[0].deleted)
         self.assertEqual(evidence["deleted_sandbox_id"], "sandbox-1")
         self.assertEqual(evidence["observed_state"], "deleted")
@@ -108,7 +106,8 @@ class EcwSandboxDeleteScenarioTests(unittest.TestCase):
             mock.patch.object(Ecw, "lifecycle_transition_timeout", 0),
             self.assertRaisesRegex(InvariantViolation, "remained visible"),
         ):
-            sandbox_delete.verify(test)
+            test.delete_sandbox()
+            test.wait_until_deleted()
 
 
 class EcwSandboxListPaginationScenarioTests(unittest.TestCase):

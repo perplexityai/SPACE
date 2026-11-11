@@ -47,9 +47,17 @@ def run(tmp_path, monkeypatch):
     bin_dir.mkdir()
     (bin_dir / "docker").write_text(FAKE_DOCKER)
     (bin_dir / "docker").chmod(0o755)
-    head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-    ).strip()
+    # The GitHub context must compare the run SHA with a checkout's HEAD,
+    # but this fixture need not depend on the developer checkout's VCS.
+    head = "e" * 40
+    real_check_output = subprocess.check_output
+
+    def check_output(args, **kwargs):
+        if args == ["git", "rev-parse", "HEAD"]:
+            return head + "\n"
+        return real_check_output(args, **kwargs)
+
+    monkeypatch.setattr(handoff.subprocess, "check_output", check_output)
     for name, value in {
         "PATH": f"{bin_dir}:{handoff.os.environ['PATH']}",
         "FAKE_DOCKER_LOG": str(tmp_path / "docker.log"),

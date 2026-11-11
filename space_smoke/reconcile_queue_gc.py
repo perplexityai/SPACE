@@ -37,7 +37,7 @@ from space_smoke.capabilities import ReconcileQueueGcControl, ReconcileQueueRef
 from space_smoke.runtime import ResourceScope
 
 if TYPE_CHECKING:
-    from space_smoke.fixtures import KindEcw
+    from space_smoke.fixtures import KindAdmin
 
 GC_ENABLED_ENV = "SPACE_RECONCILE_QUEUE_GC_ENABLED"
 EC2_ENDPOINT_ENV = "AWS_ENDPOINT_URL_EC2"
@@ -94,7 +94,7 @@ def validate_node_name(name: str) -> str:
 class ReconcileQueueGcAssertions:
     """Seed one day-old queue for a live and a gone node, then judge one GC tick."""
 
-    def __init__(self, fixture: KindEcw, control: ReconcileQueueGcControl, scope: ResourceScope) -> None:
+    def __init__(self, fixture: KindAdmin, control: ReconcileQueueGcControl, scope: ResourceScope) -> None:
         self._fixture = fixture
         self._control = control
         self._scope = scope

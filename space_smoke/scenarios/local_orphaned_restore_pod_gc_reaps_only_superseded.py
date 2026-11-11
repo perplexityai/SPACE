@@ -105,14 +105,13 @@ def orphaned_restore_pod_gc_reaps_only_superseded(test: smoke.KindEcw) -> None:
             )
             own = gc.plant(sandbox_id=test.sandbox.sandbox_id, generation=retired)
             # A row-less control planted beside it shows the GC is acting
-            # while `own` ages: the control is reaped, then `own` must still
-            # be there through a further survival window.
+            # while `own` ages. Watch both from the start: the protected pod
+            # survives the full window and until the control is reaped.
             control = gc.plant(generation=1)
-            gc.expect_reaped(control)
             # A suspend retires its execution as `suspended`, not `replaced`,
             # and nothing newer has run, so the fence would admit the teardown
             # capture a reap of a bound pod starts: the GC must leave it alone.
-            gc.expect_left_alone(own)
+            gc.expect_left_alone(own, while_reaping=control)
             test.reconnect_by_id()
             test.expect_command(test.run_command_when_ready(f"cat {shlex.quote(PATH)}"), stdout=marker)
             # The restore's execution supersedes the plant. Its lingering-pod

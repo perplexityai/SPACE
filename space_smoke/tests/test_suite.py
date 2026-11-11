@@ -61,11 +61,11 @@ class SmokeSuiteTests(unittest.TestCase):
         services.browser_unavailable.return_value = None
         selected = tuple(
             scenario
-            for scenario in REGISTRY
+            for scenario in REGISTRY.select()
             if "ecw" in scenario.api_surfaces
             and "kind" in scenario.backends
             and scenario.quarantined is None
-            and scenario.ignored is None
+            and scenario.tier == "routine"
         )
         results = tuple(
             ScenarioProcessResult(scenario.id, 0, "", "") for scenario in selected
@@ -118,11 +118,11 @@ class SmokeSuiteTests(unittest.TestCase):
         services.browser_unavailable.return_value = None
         live = tuple(
             scenario
-            for scenario in REGISTRY
+            for scenario in REGISTRY.select()
             if "ecw" in scenario.api_surfaces
             and "kind" in scenario.backends
             and scenario.quarantined is None
-            and scenario.ignored is None
+            and scenario.tier == "routine"
         )
         held = dataclasses.replace(live[0], quarantined="tracked in #0000")
         registry = ScenarioRegistry((held, *live[1:]))
@@ -159,7 +159,7 @@ class SmokeSuiteTests(unittest.TestCase):
         services = mock.Mock()
         selected = tuple(
             scenario
-            for scenario in REGISTRY
+            for scenario in REGISTRY.select()
             if "ecw" in scenario.api_surfaces and "deployed" in scenario.backends
         )
         results = tuple(
@@ -338,9 +338,9 @@ class SmokeSuiteTests(unittest.TestCase):
         },
     )
     CRASHED = ScenarioProcessResult(
-        "ecw.sandbox_info", 2, "--- create sandbox\nSegmentation fault\n", ""
+        "ecw.filesystem_mutations", 2, "--- create sandbox\nSegmentation fault\n", ""
     )
-    PASSED = ScenarioProcessResult("ecw.sandbox_delete", 0, "", "", {"verdict": "pass"})
+    PASSED = ScenarioProcessResult("ecw.filesystem_ownership", 0, "", "", {"verdict": "pass"})
 
     def test_a_failed_run_ends_on_every_scenario_that_did_not_pass(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -371,12 +371,12 @@ class SmokeSuiteTests(unittest.TestCase):
                 "      ERROR: sandbox host mutation or reset is in progress; retry",
                 "    rerun: SPACE_SMOKE_BACKEND=kind uv run --frozen --python 3.11 "
                 "-m space_smoke run ecw.command_round_trip",
-                "  INFRA_ERROR ecw.sandbox_info: "
+                "  INFRA_ERROR ecw.filesystem_mutations: "
                 "scenario process exited 2 without a result",
                 "    | --- create sandbox",
                 "    | Segmentation fault",
                 "    rerun: SPACE_SMOKE_BACKEND=kind uv run --frozen --python 3.11 "
-                "-m space_smoke run ecw.sandbox_info",
+                "-m space_smoke run ecw.filesystem_mutations",
             ],
         )
         # The details file stays one line per scenario, with the multi-line
@@ -388,14 +388,14 @@ class SmokeSuiteTests(unittest.TestCase):
                 "passed; critical cleanup failed (sandbox_id=sandbox-123); cleanup "
                 "failures: kill sandbox: the delete failed: grpc_code=14 | ERROR: "
                 "sandbox host mutation or reset is in progress; retry",
-                "ecw.sandbox_info [infra_error]: scenario process exited 2 without "
+                "ecw.filesystem_mutations [infra_error]: scenario process exited 2 without "
                 "a result",
             ],
         )
 
     def test_github_actions_annotates_every_scenario_that_did_not_pass(self) -> None:
         warned = ScenarioProcessResult(
-            "ecw.sandbox_delete", 42, "", "", {"verdict": "warn", "summary": "slow"}
+            "ecw.filesystem_ownership", 42, "", "", {"verdict": "warn", "summary": "slow"}
         )
         _, stdout = self._run_all_with(
             (self.CLEANUP_FAILED, warned),
@@ -412,9 +412,9 @@ class SmokeSuiteTests(unittest.TestCase):
                 "kill sandbox: the delete failed: grpc_code=14 | ERROR: sandbox host "
                 "mutation or reset is in progress; retry%0Arerun: SPACE_SMOKE_BACKEND=kind "
                 "uv run --frozen --python 3.11 -m space_smoke run ecw.command_round_trip",
-                "::warning title=typed smoke (ecw)%3A ecw.sandbox_delete::"
-                "ecw.sandbox_delete [warn]: slow%0Arerun: SPACE_SMOKE_BACKEND=kind "
-                "uv run --frozen --python 3.11 -m space_smoke run ecw.sandbox_delete",
+                "::warning title=typed smoke (ecw)%3A ecw.filesystem_ownership::"
+                "ecw.filesystem_ownership [warn]: slow%0Arerun: SPACE_SMOKE_BACKEND=kind "
+                "uv run --frozen --python 3.11 -m space_smoke run ecw.filesystem_ownership",
             ],
         )
 
@@ -482,7 +482,7 @@ class SmokeSuiteTests(unittest.TestCase):
     def _failed_in(*phases: str) -> ScenarioProcessResult:
         evidence = {"phases": [{"name": phase} for phase in phases]}
         return ScenarioProcessResult(
-            "ecw.sandbox_info",
+            "ecw.filesystem_mutations",
             1,
             "",
             "",
@@ -495,7 +495,7 @@ class SmokeSuiteTests(unittest.TestCase):
         listing = (
             "# Direct lane\n"
             "\n"
-            "ecw.sandbox_info | verify node cleanup | cleanup needs the sandbox pod\n"
+            "ecw.filesystem_mutations | verify node cleanup | cleanup needs the sandbox pod\n"
             "ecw.command_round_trip | run marker command | volume keys need a node\n"
         )
         warned = dataclasses.replace(
@@ -526,7 +526,7 @@ class SmokeSuiteTests(unittest.TestCase):
             ),
             "listed warning in the listed phase": ((warned,), listing, 42, ["::warning"], 1),
             "listed scenario passed": (
-                (dataclasses.replace(self.PASSED, scenario_id="ecw.sandbox_info"),), listing, 0, ["::warning"], 0
+                (dataclasses.replace(self.PASSED, scenario_id="ecw.filesystem_mutations"),), listing, 0, ["::warning"], 0
             ),
             "unlisted failure": (
                 (in_listed_phase,),
@@ -537,7 +537,7 @@ class SmokeSuiteTests(unittest.TestCase):
             ),
             "unlisted infrastructure error": (
                 (in_listed_phase, self.CLEANUP_FAILED),
-                "ecw.sandbox_info | verify node cleanup | x\n",
+                "ecw.filesystem_mutations | verify node cleanup | x\n",
                 2,
                 ["::notice", "::error"],
                 0,
@@ -561,10 +561,10 @@ class SmokeSuiteTests(unittest.TestCase):
         self,
     ) -> None:
         listing = (
-            "ecw.sandbox_info | verify node cleanup | cleanup needs the sandbox pod\n"
+            "ecw.filesystem_mutations | verify node cleanup | cleanup needs the sandbox pod\n"
             "ecw.command_round_trip | verify marker | volume keys need a node registration\n"
-            "ecw.sandbox_delete | delete sandbox | the delete never settles\n"
-            "ecw.filesystem_round_trip | write file | listed but not run in this pass\n"
+            "ecw.filesystem_ownership | delete sandbox | the delete never settles\n"
+            "ecw.process_reattach | write file | listed but not run in this pass\n"
         )
         exit_code, stdout = self._run_with_known_failures(
             (
@@ -597,8 +597,8 @@ class SmokeSuiteTests(unittest.TestCase):
         self.assertEqual(
             [line for line in lines[header + 1 :] if not line.startswith("::")],
             [
-                "  KNOWN FAILURE ecw.sandbox_info: cleanup needs the sandbox pod",
-                "  UNEXPECTED PASS ecw.sandbox_delete: listed as \"the delete never "
+                "  KNOWN FAILURE ecw.filesystem_mutations: cleanup needs the sandbox pod",
+                "  UNEXPECTED PASS ecw.filesystem_ownership: listed as \"the delete never "
                 "settles\"; remove it from the list if it keeps passing",
             ],
         )
@@ -607,7 +607,7 @@ class SmokeSuiteTests(unittest.TestCase):
             [line.split(" ", 1)[0] for line in annotations],
             ["::notice", "::error", "::warning"],
         )
-        self.assertIn("typed smoke (ecw)%3A ecw.sandbox_delete", annotations[2])
+        self.assertIn("typed smoke (ecw)%3A ecw.filesystem_ownership", annotations[2])
         self.assertIn("unexpected pass", annotations[2])
 
     def test_a_known_failures_list_that_cannot_be_trusted_fails_before_bootstrap(
@@ -616,14 +616,14 @@ class SmokeSuiteTests(unittest.TestCase):
         # (listing, the line the error names)
         cases = {
             "unknown scenario": ("ecw.no_such_scenario | create sandbox | renamed\n", 1),
-            "no phase": ("# comment\necw.sandbox_info |  | no phase\n", 2),
-            "no phase field": ("ecw.sandbox_info  cleanup needs the sandbox pod\n", 1),
-            "no reason": ("\necw.sandbox_info | create sandbox |  \n", 2),
-            "no reason field": ("ecw.sandbox_info | create sandbox\n", 1),
+            "no phase": ("# comment\necw.filesystem_mutations |  | no phase\n", 2),
+            "no phase field": ("ecw.filesystem_mutations  cleanup needs the sandbox pod\n", 1),
+            "no reason": ("\necw.filesystem_mutations | create sandbox |  \n", 2),
+            "no reason field": ("ecw.filesystem_mutations | create sandbox\n", 1),
             "no scenario id": (" | create sandbox | reason\n", 1),
             "listed twice": (
-                "ecw.sandbox_info | create sandbox | one\n"
-                "ecw.sandbox_info | verify node cleanup | two\n",
+                "ecw.filesystem_mutations | create sandbox | one\n"
+                "ecw.filesystem_mutations | verify node cleanup | two\n",
                 2,
             ),
         }
@@ -672,7 +672,7 @@ class SmokeSuiteTests(unittest.TestCase):
                 registered = REGISTRY.get(scenario_id)
                 self.assertIn("direct", registered.substrates)
                 self.assertIsNone(registered.quarantined)
-                self.assertIsNone(registered.ignored)
+                self.assertEqual(registered.tier, "routine")
 
 
 class BenchSubstrateTests(unittest.TestCase):

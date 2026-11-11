@@ -9,7 +9,8 @@ from space_smoke.direct_node import DirectNodeRecoveryFixture
     sandbox=smoke.SandboxConfig(lifecycle=None),
     api_surfaces=("node",),
     required_tools=("ssh",),
-    ignored="requires a Windows updater template and an authorized newer Windows bundle",
+    tier="manual",
+    manual_reason="requires a Windows updater template and an authorized newer Windows bundle",
     rerun_environment=(
         "SPACE_SMOKE_NODE_RECOVERY", "SPACE_SMOKE_NODE_HOST", "SPACE_SMOKE_NODE_MACHINE_ID",
         "SPACE_SMOKE_NODE_CLIENT_ENV", "SPACE_SMOKE_NODE_TEMPLATE",

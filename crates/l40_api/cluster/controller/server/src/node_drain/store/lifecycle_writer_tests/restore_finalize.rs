@@ -401,7 +401,7 @@ async fn restore_finalize_moves_only_a_row_still_restoring(
 /// network namespace. And the node answering with no route identity, as a real
 /// stopped materialization does, must still count as success. The shim's half
 /// runs in neither double; its own tests and the kind scenario
-/// `native.forced_drain_re_places_stopped_sandbox` cover it.
+/// `native.forced_drain_re_drains_restarted_re_placed_stopped_sandbox` cover it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_released_stopped_evacuation_is_re_placed_stopped() -> TestResult {
     if !enter_node_api_client_process()? {

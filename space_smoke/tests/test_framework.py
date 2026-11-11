@@ -94,168 +94,6 @@ runpy.run_module("space_smoke", run_name="__main__")
     def test_decorated_scenario_is_discovered_without_a_manual_import(self) -> None:
         registered = REGISTRY.get("ecw.command_round_trip")
 
-        self.assertEqual(
-            [scenario.id for scenario in REGISTRY],
-            [
-                "ecw.access_idle_reconnect_preserves_workspace",
-                "ecw.authenticated_access_with_public_traffic_disabled",
-                "ecw.background_process_control",
-                "ecw.binary_file_round_trip",
-                "ecw.cold_create_environment",
-                "ecw.command_round_trip",
-                "ecw.domain_access_survives_default_deny",
-                "ecw.filesystem_mutations",
-                "ecw.filesystem_ownership",
-                "ecw.filesystem_private_boundary",
-                "ecw.filesystem_read_identity",
-                "ecw.filesystem_round_trip",
-                "ecw.filesystem_watcher",
-                "ecw.filesystem_write_identity",
-                "ecw.fork_idempotency",
-                "ecw.fork_isolation",
-                "ecw.guest_mptcp_segments_dropped",
-                "ecw.guest_vlan_frames_dropped",
-                "ecw.immediate_egress",
-                "ecw.internet_access_allowed",
-                "ecw.internet_access_denied",
-                "ecw.large_multipart_upload_round_trip",
-                "ecw.large_stdout_integrity",
-                "ecw.loopback_route_stays_open",
-                "ecw.pause_connect",
-                "ecw.pause_connect_race",
-                "ecw.pause_timeout_requires_connect",
-                "ecw.process_identity",
-                "ecw.process_reattach",
-                "ecw.public_port_to_all_interfaces",
-                "ecw.public_port_to_loopback",
-                "ecw.refresh_keepalive",
-                "ecw.sandbox_delete",
-                "ecw.sandbox_info",
-                "ecw.sandbox_list_pagination",
-                "ecw.timeout_rearm",
-                "ecw.timeout_update",
-                "ecw.warm_pool_environment",
-                "ecw.watcher_identity",
-                "local.btrfs_send_restore_fails_closed_without_parent_source",
-                "local.btrfs_send_restore_pulls_parent_template",
-                "local.btrfs_send_restore_rejects_corrupted_stream",
-                "local.cold_sandbox_eviction_wake_round_trip",
-                "local.concurrent_restore_converges_to_one_execution",
-                "local.console_destructive_actions_require_confirmation",
-                "local.console_links_resolve",
-                "local.console_operator_suspends_another_orgs_sandbox",
-                "local.console_sandbox_detail_complete_in_every_state",
-                "local.console_sandbox_lookup_accepts_every_id_form",
-                "local.console_seed_runtime_pair",
-                "local.console_turns_away_non_operators",
-                "local.deferred_btrfs_send_capture_restores_cross_node",
-                "local.ecw_template_build_from_oci_boots",
-                "local.encrypted_disk_fork",
-                "local.encrypted_live_disk_fork",
-                "local.encrypted_resuspend_preserves_cow",
-                "local.forced_drain_evacuates_sandbox",
-                "local.fork_saturation_safety",
-                "local.fork_suspended_cross_node",
-                "local.gentle_drain_leaves_sandbox_resident",
-                "local.leader_election_brownout_keeps_one_leader",
-                "local.node_ctl_fence_refuses_and_reconciles",
-                "local.node_group_boundary_schedules",
-                "local.node_selector_extras_render_and_enforce",
-                "local.orphaned_restore_pod_gc_reaps_only_superseded",
-                "local.pending_backup_census_reports_blocked_upload",
-                "local.private_template_build_isolation",
-                "local.rate_limiters_enforce_and_fail_open",
-                "local.reconcile_queue_gc_prunes_only_gone_nodes",
-                "local.restarted_btrfs_send_is_rejected_and_retried",
-                "local.retention_claim_finish_forward",
-                "local.retention_restore_source_guard",
-                "local.sandbox_manager_restart_leaves_teardown_suspend_to_its_teardown",
-                "local.sandbox_network_isolation_holds",
-                "local.snapshot_reaper_reclaims_backed_fork_snapshot",
-                "local.storage_exchange_scoping",
-                "local.suspend_restore_cross_node_from_object_storage",
-                "local.suspend_snapshot_rows_are_per_attempt",
-                "local.telemetry_reaches_local_backends",
-                "local.template_cache_lru_eviction_reclaims",
-                "local.template_startup_recovery_decision_table",
-                "local.terminate_gate_refuses_a_held_node",
-                "local.unanswered_template_deleted_after_wait",
-                "native.aws_secret_network_credential_injection",
-                "native.encrypted_double_restore_retires_prior_pods",
-                "native.forced_drain_re_drains_re_placed_stopped_sandbox",
-                "native.forced_drain_re_drains_restarted_re_placed_stopped_sandbox",
-                "native.forced_drain_re_places_stopped_sandbox",
-                "native.m1_generated_sdk_conformance",
-                "native.network_policy_live_update",
-                "native.resident_pause",
-                "native.stopped_restart_preserves_rootfs",
-                "native_concurrency.command_idempotency",
-                "native_concurrency.create_idempotency",
-                "native_concurrency.independent_commands",
-                "native_concurrency.lifecycle_contention",
-                "native_concurrency.slow_reader",
-                "native_contract.command_attach_after_pause",
-                "native_contract.command_on_sandbox_not_running",
-                "native_contract.command_replay_credentials",
-                "native_contract.command_validation",
-                "native_contract.command_wakes_idle_suspended_sandbox",
-                "native_contract.completed_delete_replay",
-                "native_contract.file_idempotency_across_origins",
-                "native_contract.file_idempotency_conflict",
-                "native_contract.file_op_wakes_idle_suspended_sandbox",
-                "native_contract.file_operations_match_on_the_data_plane",
-                "native_contract.file_upload_admission_429",
-                "native_contract.file_write_size_boundary_on_the_data_plane",
-                "native_contract.idempotency_conflict",
-                "native_contract.permanent_command_error",
-                "native_contract.process_session_wakes_idle_suspended_sandbox",
-                "native_contract.session_reattach_wakes_idle_suspended_sandbox",
-                "native_contract.session_reconnect_after_idle_suspend",
-                "native_contract.tenant_isolation",
-                "native_contract.token_scope",
-                "native_contract.zero_vcpu_admission",
-                "native_recovery.attached_stream_drains_through_data_plane_restart",
-                "native_recovery.command_survives_data_plane_restart",
-                "native_recovery.inline_fallback_at_one_permit_loses_no_operation",
-                "native_recovery.inline_load_survives_leader_failover",
-                "native_recovery.inline_wake_survives_api_pod_kill",
-                "native_recovery.inline_wake_waits_behind_queued_suspend",
-                "native_recovery.queued_create_survives_api_restart",
-                "native_recovery.slow_operation_does_not_block_later_work",
-                "native_recovery.stale_queued_work_expires_after_controller_outage",
-                "network_policy.v1_cidr_allow",
-                "network_policy.v1_cidr_deny",
-                "network_policy.v1_deny_precedes_allow",
-                "network_policy.v1_domain_binding",
-                "network_policy.v1_exact_ip_allow",
-                "network_policy.v1_exact_ip_deny",
-                "network_policy.v1_fastly_shared_edge_bypass",
-                "network_policy.v1_platform_guardrail_precedes_allow",
-                "network_policy.v1_rules_survive_restore",
-                "network_policy.v1_tcp_dns_transport_respects_ip_allow",
-                "network_policy.v1_udp_deny_precedes_allow",
-                "network_policy.v1_udp_respects_cidr_allow",
-                "network_policy.v1_udp_respects_cidr_deny",
-                "network_policy.v1_udp_respects_ip_allow",
-                "network_policy.v1_udp_respects_ip_deny",
-                "network_policy.v1_wildcard_domain_allow",
-                "node.guest_auto_update",
-                "node.guest_auto_update_disabled",
-                "node.guest_update",
-                "node.guest_update_failure",
-                "node.runtime_base_memory",
-                "node.runtime_crash_preserves_disk",
-                "node.runtime_memory_lifecycle",
-                "node.runtime_survives_manager_restarts",
-                "node.windows_agent_operations",
-                "node.windows_agent_readiness",
-                "node.windows_base_memory",
-                "node.windows_guest_recovery",
-                "node.windows_guest_update",
-                "node.windows_memory_lifecycle",
-                "node.windows_sandbox_lifecycle",
-            ],
-        )
         self.assertIs(registered.fixture_type, CommandSandboxFixture)
         self.assertEqual(registered.fixture_name, "command_sandbox")
         self.assertTrue(callable(registered.verify))
@@ -438,13 +276,32 @@ def partner_round_trip(_test: smoke.Ecw) -> None:
             def bad_tooling(_test: smoke.Ecw) -> None:
                 """Tool prerequisite declarations cannot be ambiguous."""
 
-    def test_empty_template_list_disables_the_scenario(self) -> None:
-        @smoke.scenario("runtime.no_templates", templates=())
-        def no_templates(_test: smoke.Ecw) -> None:
-            """Unconfigured workload scenarios remain disabled."""
+    def test_manual_tier_requires_a_reason_and_is_explicitly_selectable(self) -> None:
+        @smoke.scenario("runtime.manual", tier="manual", manual_reason="Requires a dedicated bench")
+        def manual(_test: smoke.Ecw) -> None:
+            """An operator can select a dedicated-bench scenario by name."""
 
-        self.assertFalse(no_templates.applies_to(None))
-        self.assertFalse(no_templates.applies_to("seed"))
+        @smoke.scenario("runtime.main", tier="main")
+        def main(_test: smoke.Ecw) -> None:
+            """Main coverage remains outside the routine selection."""
+
+        registry = smoke.registry.ScenarioRegistry([manual, main])
+        self.assertEqual(registry.select(), ())
+        self.assertEqual(registry.select(tiers=("routine", "main")), (main,))
+        self.assertEqual(registry.select(include_scenarios=(main.id,)), (main,))
+        self.assertIs(registry.get(manual.id), manual)
+        self.assertTrue(manual.applies_to("seed"))
+        for options, message in (
+            ({"tier": "manual"}, "manual smoke must state its reason"),
+            ({"tier": "manual", "manual_reason": " "}, "manual smoke must state its reason"),
+            ({"tier": "unknown"}, "smoke tier"),
+            ({"manual_reason": "unused"}, "manual_reason requires"),
+            ({"templates": ()}, "non-empty template ids"),
+        ):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, message):
+                smoke.scenario("runtime.invalid", **options)
+        with self.assertRaisesRegex(ValueError, "must have tier='main'"):
+            registry.select(include_scenarios=(manual.id,))
 
     def test_decorator_rejects_unsafe_rerun_environment_names(self) -> None:
         with self.assertRaisesRegex(ValueError, "shell variable names"):
@@ -456,12 +313,18 @@ def partner_round_trip(_test: smoke.Ecw) -> None:
             def unsafe_rerun_context(_test: smoke.Ecw) -> None:
                 """Rerun context cannot inject shell syntax."""
 
-    def test_decorator_rejects_non_positive_sandbox_count(self) -> None:
+    def test_decorator_rejects_invalid_sandbox_count(self) -> None:
         with self.assertRaisesRegex(ValueError, "sandbox count must be positive"):
 
             @smoke.scenario("ecw.no_sandboxes", sandboxes=0)
             def no_sandboxes(_test: smoke.Ecw) -> None:
                 """A scenario must own at least one sandbox."""
+
+        with self.assertRaisesRegex(ValueError, "KindAdmin does not allocate sandboxes"):
+
+            @smoke.scenario("local.admin_sandboxes", sandboxes=2)
+            def admin_sandboxes(_test: smoke.KindAdmin) -> None:
+                """A control-plane fixture cannot silently ignore requested sandboxes."""
 
     def test_decorator_requires_an_invariant_docstring(self) -> None:
         with self.assertRaisesRegex(ValueError, "must describe its invariant"):

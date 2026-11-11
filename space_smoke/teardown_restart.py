@@ -44,6 +44,7 @@ class TeardownRestartAssertions:
         self._fixture = fixture
         self._control = control
         self._uploads = uploads
+        self._replacement_ready = False
 
     def _row_state(self) -> str | None:
         return self._control.node_sandbox_state(
@@ -99,32 +100,29 @@ class TeardownRestartAssertions:
         pod = self._control.restart_node_service(
             self._uploads.node_name, SANDBOX_MANAGER, timeout=timeout
         )
+        self._replacement_ready = True
         self._fixture.record("sandbox_manager_pod_after", pod)
         self._fixture.record(
             "sandbox_manager_restart_seconds", round(time.monotonic() - started, 1)
         )
 
-    def expect_row_holds(self, state: str, *, seconds: float = 30, interval: float = 5) -> None:
-        """The row reads `state` on every poll for `seconds`.
+    def expect_teardown_owned_after_restart(self) -> None:
+        """The replacement's production CLI proves recovery left teardown ownership.
 
-        sandbox-manager runs startup recovery before it serves, so the first
-        read after the replacement is Ready already sees what recovery left;
-        the later reads cover cleanup it scheduled on the way up.
+        Ready alone can describe a passive replacement. A successful CLI read
+        reaches the production socket, bound only after startup cleanup discovery.
+        It persists `cleanup_required` before scheduling a cleanup target,
+        so the CLI's exact `suspending` state rejects takeover even when that
+        target has not run yet. The suspend operation's eventual success and
+        the following wake check that the original teardown can still finish.
         """
 
-        deadline = time.monotonic() + seconds
-        reads: list[str | None] = []
-        while True:
-            observed = self._row_state()
-            reads.append(observed)
-            self._fixture.verify(
-                observed == state,
-                f"the restart moved the worker's sandbox row off {state}",
-                node=self._uploads.node_name,
-                row_state=observed,
-                reads=reads,
-            )
-            if time.monotonic() >= deadline:
-                self._fixture.record("row_reads_after_restart", reads)
-                return
-            self._fixture.wait(interval)
+        if not self._replacement_ready:
+            raise RuntimeError("restart_sandbox_manager() must complete first")
+        observed = self._row_state()
+        self._fixture.verify(
+            observed == "suspending",
+            "startup recovery took the sandbox row away from its teardown",
+            node=self._uploads.node_name,
+            row_after_startup_recovery=observed,
+        )

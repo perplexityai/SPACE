@@ -60,7 +60,7 @@ async fn insert_node(pool: &PgPool) -> TestResult<Uuid> {
 
 /// A sandbox pinned to `node` by `target_node_id` with `active_node_id` NULL —
 /// the shape the guard's `active` half cannot see.
-async fn insert_target_pinned(
+pub(in crate::routes::admin) async fn insert_target_pinned(
     pool: &PgPool,
     node: Uuid,
     lifecycle: &str,

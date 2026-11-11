@@ -5,13 +5,8 @@ import space_smoke as smoke
 
 @smoke.scenario(
     "local.ecw_template_build_from_oci_boots",
-    # The fixture sandbox only seeds the run credential; the built template's
-    # sandbox is created by the scenario. Whole run ~50 s on the kind bench
-    # (build 33 s, boot + 13 guest checks 5 s, retire 5 s); build budget 600 s
-    # (a cold Docker Hub pull on a slow link is the margin).
-    sandbox=smoke.SandboxConfig(timeout=1200),
 )
-def ecw_template_build_from_oci_boots(test: smoke.KindEcw) -> None:
+def ecw_template_build_from_oci_boots(test: smoke.KindAdmin) -> None:
     """With the builder Service pinned to one of two builders, a Dockerfile built
     from a public OCI image through the public E2B SDK is accepted there and its
     prepared rootfs committed; with the Service moved to the other builder for

@@ -390,15 +390,14 @@ class ConcurrentRestoreAssertions:
         self._fixture.record(f"{label}_active_generation", active[0].generation)
         return active[0]
 
-    def wait_for_restore_in_flight(self, *, before: int, timeout: float = 60) -> ExecutionRow:
-        """Block until the callers have started claiming — the restore is in flight.
+    def wait_for_restore_claim(self, *, before: int, timeout: float = 60) -> ExecutionRow:
+        """Block until a caller has claimed a restore; it may already be retired.
 
         With the pod-count cap standing every claim's POST is refused and the
         claim is retired as `replaced` within milliseconds, then the caller
         re-claims; a poll for an *active* `creating` row never catches one
         (rev7 on the bench saw dozens of `replaced` rows and no active one).
-        Any new row after `before` is the signal: the callers are inside the
-        restore path. It doesn't mean they'll still be claiming when the cap
+        Any new row after `before` proves a caller entered the restore path. It doesn't mean they'll still be claiming when the cap
         lifts: each caller owns at most one refused claim before it returns
         500, so the re-claiming stops once every caller has had one.
         """

@@ -533,6 +533,7 @@ _LIVENESS_BUDGET_VALUE = re.compile(r"[1-9][0-9]{0,3}")
 # back, kubelets and the controller-manager take a minute or more to watch
 # new pods again, while a CRI exec needs neither.
 REFUSED_CONTENDER_NAME = "space-cluster-controller-refused"
+BUDGET_CONTENDER_NAME = "space-cluster-controller-budget"
 REFUSED_CONTENDER_SELECTOR = f"app.kubernetes.io/name={REFUSED_CONTENDER_NAME}"
 REFUSED_CONTENDER_SERVICE_ACCOUNT = "space-api"
 REFUSED_CONTENDER_GATE_CONTAINER = "space-smoke-gate"
@@ -1258,12 +1259,7 @@ class KindHarness:
             self._assert_retention_lease_owned()
 
         assert_lease()
-        if self.config.context != "kind-space-local" or urlsplit(
-            self.config.api_url
-        ).hostname not in {"localhost", "127.0.0.1"}:
-            raise SmokeConfigurationError(
-                "cold setup requires the isolated local Kind API"
-            )
+        self._require_isolated_kind("cold setup")
         token_file = self.environment.get("SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE")
         receipts = self.environment.get("SPACE_SMOKE_KIND_COLD_RECEIPTS")
         if not token_file or not receipts:
@@ -2733,60 +2729,6 @@ ON CONFLICT (key_hash) DO NOTHING;
             allocated_bytes=allocated_blocks * 512,
         )
 
-    def clear_completed_sandbox_pods(self, sandbox_id: str) -> tuple[str, ...]:
-        """Clear Kind pods stuck after a successful node-side suspend teardown."""
-
-        self._require_isolated_kind("completed sandbox pod cleanup")
-        canonical = _sql_uuid(sandbox_id)
-        deadline = time.monotonic() + 10
-        while True:
-            result = self.kubectl(
-                "get",
-                "pods",
-                "-l",
-                f"{SANDBOX_ID_LABEL}={canonical}",
-                "-o",
-                "json",
-                timeout=15,
-                namespace=KIND_SANDBOX_NAMESPACE,
-            )
-            payload = json.loads(_require_ok(result, "list completed sandbox pods"))
-            items = payload.get("items") if isinstance(payload, dict) else None
-            if not isinstance(items, list):
-                raise SmokeConfigurationError(
-                    "sandbox pod listing returned an invalid shape"
-                )
-
-            unsafe = [pod for pod in items if _completed_deleting_pod_name(pod) is None]
-            if not unsafe:
-                break
-            if time.monotonic() >= deadline:
-                raise SmokeConfigurationError(
-                    "refusing to force-clear sandbox pods that did not become deleting "
-                    "with every container terminated successfully"
-                )
-            time.sleep(0.25)
-
-        cleared: list[str] = []
-        for pod in items:
-            name = _completed_deleting_pod_name(pod)
-            assert name is not None
-            _require_ok(
-                self.kubectl(
-                    "delete",
-                    "pod",
-                    _kube_pod_name(name),
-                    "--grace-period=0",
-                    "--force",
-                    "--wait=false",
-                    timeout=15,
-                    namespace=KIND_SANDBOX_NAMESPACE,
-                ),
-                f"force-clear completed sandbox pod {name}",
-            )
-            cleared.append(name)
-        return tuple(cleared)
-
     def _require_isolated_kind(self, action: str) -> None:
         if urlsplit(self.config.api_url).hostname not in {"localhost", "127.0.0.1"}:
             raise SmokeConfigurationError(f"{action} require the isolated local Kind API")
@@ -2855,6 +2797,20 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return None
 
+    def template_rootfs_allocated_bytes(
+        self, node_name: str, template: str, content_hash: str
+    ) -> int:
+        name = _template_name(template)
+        digest = _template_digest(content_hash)
+        rootfs = shlex.quote(f"{TEMPLATE_CACHE_ROOT}/{name}/{digest}/rootfs.ext4")
+        output = _require_ok(
+            self._node_shell_exec(node_name, f"stat -c %b {rootfs}", timeout=30),
+            f"read allocated rootfs bytes for {name}@{digest}",
+        ).strip()
+        if not output.isdigit():
+            raise RuntimeError("rootfs allocation did not return a nonnegative block count")
+        return int(output) * 512
+
     def register_unpinned_template(
         self, node_name: str, template: str, size_bytes: int
     ) -> None:
@@ -2878,19 +2834,18 @@ ON CONFLICT (key_hash) DO NOTHING;
                 f"chown {TEMPLATE_CACHE_OWNER}:{TEMPLATE_CACHE_GROUP} {rootfs}",
                 f"chmod 0660 {rootfs}",
                 f"space-tmplmgr register --template {name}",
-                # `register` returns before the daemon's background job has
-                # written `rootfs.ext4.zst`, re-stat'd the rootfs, rewritten
-                # `manifest.json` and re-upserted the build row
-                # (`spawn_template_compressed_rootfs_generation`). Anything a
-                # scenario does to the plant before that lands — drop the row,
-                # truncate the rootfs — would be undone by it. The manifest
-                # listing the compressed sibling is the last file write; the
-                # row upsert follows within the same task, so give it a beat.
+                # The RPC's manifest comes from the committed build row.
+                # Seeing its compressed descriptor proves the compressor's
+                # final upsert, unlike the disk manifest written before it.
+                # This cached-only read still touches LRU and may initialize
+                # missing settings. It is setup only: callers establish their
+                # eviction grace or corrupt the plant after the final lookup.
                 f"d=$(ls -d {shlex.quote(directory)}/*:* | head -n1)",
                 "for _ in $(seq 1 360); do "
-                'if grep -q rootfs.ext4.zst "$d/manifest.json" 2>/dev/null; then sleep 2; exit 0; fi; '
+                f'if space-tmplmgr get --template {name} --content-hash "${{d##*/}}" --manifest '
+                '| grep -q rootfs.ext4.zst; then exit 0; fi; '
                 "sleep 0.5; done",
-                "echo 'register did not settle: manifest.json never listed rootfs.ext4.zst' >&2",
+                "echo 'register did not settle: committed manifest never listed rootfs.ext4.zst' >&2",
                 "exit 1",
             ]
         )
@@ -5170,6 +5125,25 @@ ON CONFLICT (key_hash) DO NOTHING;
         lifecycle, _, node = row.partition("|")
         return SandboxResidency(lifecycle=lifecycle.strip(), active_node_id=node.strip() or None)
 
+    def network_policy_state(self, sandbox_id: str) -> Mapping[str, str]:
+        node = self.sandbox_node_name(sandbox_id)
+        if node is None:
+            return {"error": "sandbox has no active node"}
+        result = self._node_shell_exec(
+            node,
+            f"timeout 10s space-sbxmgr network-state {shlex.quote(_sql_uuid(sandbox_id))}",
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return {"node": node, "error": result.stderr[-1000:], "exit_code": str(result.returncode)}
+        fields = dict(
+            (key.strip(), value.strip())
+            for line in result.stdout.splitlines()
+            for key, separator, value in [line.partition(":")]
+            if separator and key in {"state", "installed_policy_ref", "interception_readiness"}
+        )
+        return {"node": node, **fields}
+
     def sandbox_node_name(self, sandbox_id: str) -> str | None:
         sandbox = self._admin(
             "GET", f"sandboxes/sbx_{quote(_sql_uuid(sandbox_id), safe='')}", expect=(200,)
@@ -6090,8 +6064,12 @@ ON CONFLICT (key_hash) DO NOTHING;
             ]
         )
 
-    def controller_pods(self, *, refused_contender: bool = False) -> list[ControllerPod]:
+    def controller_pods(
+        self, *, refused_contender: bool = False, budget_contender: bool = False
+    ) -> list[ControllerPod]:
         selector = REFUSED_CONTENDER_SELECTOR if refused_contender else KIND_CONTROLLER_SELECTOR
+        if budget_contender:
+            selector = f"app.kubernetes.io/name={BUDGET_CONTENDER_NAME}"
         result = self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=15)
         pods = []
         for item in json.loads(_require_ok(result, "list cluster-controller pods") or "{}").get(
@@ -6106,7 +6084,10 @@ ON CONFLICT (key_hash) DO NOTHING;
                 ),
                 {},
             )
-            terminated = (container.get("lastState") or {}).get("terminated") or {}
+            terminated = (
+                (container.get("state") or {}).get("terminated")
+                or (container.get("lastState") or {}).get("terminated") or {}
+            )
             pods.append(
                 ControllerPod(
                     name=str(metadata.get("name", "")),
@@ -6126,6 +6107,48 @@ ON CONFLICT (key_hash) DO NOTHING;
                 )
             )
         return sorted(pods, key=lambda pod: pod.name)
+
+    def place_budget_contender(self) -> None:
+        """Run the same controller against an unreachable, pod-local API endpoint."""
+        self._require_isolated_kind("placing a leader-election budget control")
+        result = self.kubectl("get", "deploy", self._controller_deployment(), "-o", "json", timeout=15)
+        deployment = json.loads(_require_ok(result, "read the cluster-controller Deployment"))
+        nodes = sorted({pod.node for pod in self.controller_pods() if pod.node})
+        if not nodes:
+            raise SmokeConfigurationError("no controller node for the budget control")
+        document = refused_contender_pod(deployment, node=nodes[0])
+        document["metadata"]["name"] = BUDGET_CONTENDER_NAME
+        document["metadata"]["labels"]["app.kubernetes.io/name"] = BUDGET_CONTENDER_NAME
+        spec = document["spec"]
+        if spec.get("hostNetwork"):
+            raise SmokeConfigurationError("budget control requires a pod-local network namespace")
+        spec["restartPolicy"] = "Never"
+        spec["initContainers"] = [
+            container for container in spec["initContainers"]
+            if container["name"] != REFUSED_CONTENDER_GATE_CONTAINER
+        ]
+        spec["volumes"] = [volume for volume in spec["volumes"] if volume["name"] != REFUSED_CONTENDER_GATE_CONTAINER]
+        controller = next(container for container in spec["containers"] if container["name"] == CONTROLLER_CONTAINER)
+        # Config::infer builds its client lazily. The caches' bounded startup
+        # wait is shared with the refused contender; the election loop then
+        # classifies actual connection failures and must spend its budget.
+        overrides = {"KUBERNETES_SERVICE_HOST": "127.0.0.1", "KUBERNETES_SERVICE_PORT": "1"}
+        controller["env"] = [env for env in controller.get("env", []) if env["name"] not in overrides]
+        controller["env"].extend({"name": name, "value": value} for name, value in overrides.items())
+        self.remove_budget_contender(wait=True)
+        _require_ok(self.kubectl("create", "-f", "-", input_text=json.dumps(document), timeout=30),
+                    "create the leader-election budget control")
+
+    def remove_budget_contender(self, *, wait: bool = False) -> None:
+        _require_ok(self.kubectl("delete", "pod", BUDGET_CONTENDER_NAME,
+                                "--ignore-not-found", "--wait=false", timeout=CLEANUP_REQUEST_SECONDS),
+                    "delete the leader-election budget control")
+        if wait:
+            deadline = time.monotonic() + 120
+            while self.controller_pods(budget_contender=True):
+                if time.monotonic() >= deadline:
+                    raise SmokeConfigurationError("the old budget control outlived its deletion")
+                time.sleep(2)
 
     def place_refused_contender(self) -> None:
         self._require_isolated_kind("placing a refused leader-election contender")
@@ -7437,27 +7460,6 @@ def _ecw_sandbox_id(value: str) -> str:
     if not value or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", value):
         raise ValueError(f"refusing ECW sandbox id {value!r}")
     return value
-
-
-def _completed_deleting_pod_name(pod: object) -> str | None:
-    metadata = pod.get("metadata", {}) if isinstance(pod, dict) else {}
-    status = pod.get("status", {}) if isinstance(pod, dict) else {}
-    name = metadata.get("name")
-    statuses = status.get("containerStatuses")
-    completed = (
-        isinstance(name, str)
-        and bool(metadata.get("deletionTimestamp"))
-        and isinstance(statuses, list)
-        and bool(statuses)
-        and all(
-            isinstance(container, dict)
-            and isinstance(container.get("state"), dict)
-            and isinstance(container["state"].get("terminated"), dict)
-            and container["state"]["terminated"].get("exitCode") == 0
-            for container in statuses
-        )
-    )
-    return name if completed else None
 
 
 _PROBE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")

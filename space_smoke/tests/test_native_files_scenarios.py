@@ -155,7 +155,7 @@ def test_a_write_read_back_whole_passes(small_cap):
 def test_a_byte_changed_anywhere_it_reads_fails(small_cap, where, at):
     result = _run_boundary(_flip(at(small_cap)))
     assert result.verdict == Verdict.FAIL, result
-    assert result.summary == f"the {where} of the file at the cap is not what was written"
+    assert result.summary == "the file at the cap is not what was written"
 
 
 class _Connection:

@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stdout
 from io import StringIO
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -18,7 +19,7 @@ def _inventory(surface):
         if surface in scenario.api_surfaces
         and "kind" in scenario.backends
         and scenario.quarantined is None
-        and scenario.ignored is None
+        and scenario.tier == "routine"
         and scenario.applies_to(None)
     }
 
@@ -125,29 +126,26 @@ def test_empty_shard_does_not_bootstrap_or_report_green():
     bootstrap.assert_not_called()
 
 
-def test_the_joint_partition_is_lighter_than_balancing_each_surface_alone():
-    from space_smoke.sharding import _DURATION_SECONDS, select_shard
+def test_the_joint_partition_is_lighter_than_balancing_each_surface_alone(monkeypatch):
+    from space_smoke.sharding import select_shard
 
-    pools = {
-        surface: tuple(
-            sorted(
-                (s for s in REGISTRY if s.id in _inventory(surface)), key=lambda s: s.id
+    # Each surface has one heavy and one light case. Independent balancing
+    # stacks the heavy cases on shard one; joint balancing separates them.
+    weights = {surface: {f"{surface}.heavy": 100, f"{surface}.light": 10}
+               for surface in ("ecw", "native")}
+    monkeypatch.setattr("space_smoke.sharding._DURATION_SECONDS", weights)
+    pools = {surface: tuple(SimpleNamespace(id=name) for name in cases)
+             for surface, cases in weights.items()}
+
+    def loads(joint):
+        return [sum(
+            weights[surface][scenario.id]
+            for surface, scenarios in pools.items()
+            for scenario in select_shard(
+                scenarios, index=index, count=2, api_surface=surface,
+                inventories=pools if joint else None,
             )
-        )
-        for surface in ("ecw", "native")
-    }
+        ) for index in (1, 2)]
 
-    def heaviest(joint):
-        loads = []
-        for index in range(1, 9):
-            load = 0
-            for surface, scenarios in pools.items():
-                share = select_shard(
-                    scenarios, index=index, count=8, api_surface=surface,
-                    inventories=pools if joint else None,
-                )
-                load += sum(_DURATION_SECONDS[surface].get(s.id, 30) for s in share)
-            loads.append(load)
-        return max(loads)
-
-    assert heaviest(joint=True) < heaviest(joint=False)
+    assert loads(joint=False) == [200, 20]
+    assert loads(joint=True) == [110, 110]

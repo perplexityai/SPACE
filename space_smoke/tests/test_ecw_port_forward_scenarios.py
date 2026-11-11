@@ -42,12 +42,6 @@ from space_smoke.scenarios.ecw_public_port_to_all_interfaces import (
 from space_smoke.scenarios.ecw_public_port_to_all_interfaces import (
     public_port_to_all_interfaces,
 )
-from space_smoke.scenarios.ecw_public_port_to_loopback import (
-    EXPECTED_BODY as LOOPBACK_ONLY_BODY,
-)
-from space_smoke.scenarios.ecw_public_port_to_loopback import (
-    public_port_to_loopback,
-)
 
 
 class _Files:
@@ -271,7 +265,6 @@ class EcwPublicPortScenarioTests(unittest.TestCase):
     def test_every_port_scenario_requires_authenticated_ingress(self) -> None:
         for scenario in (
             public_port_to_all_interfaces,
-            public_port_to_loopback,
             loopback_route_stays_open,
         ):
             with self.subTest(scenario=scenario.id):
@@ -325,23 +318,6 @@ class EcwPublicPortScenarioTests(unittest.TestCase):
         self.assertNotIn("python3", guest_commands)
         self.assertIn("systemd-socket-activate", guest_commands)
 
-    def test_scenario_names_and_proves_the_loopback_path(self) -> None:
-        test, sandbox, context = _fixture()
-
-        with mock.patch.object(
-            EcwHttpService,
-            "request_from_public_port",
-            return_value=HttpResponse(200, LOOPBACK_ONLY_BODY, 1),
-        ):
-            public_port_to_loopback.verify(test)
-
-        self.assertEqual(context.scope.close(), ())
-
-        self.assertTrue(
-            any("--listen=127.0.0.1:8123" in item for item in sandbox.trace),
-            sandbox.trace,
-        )
-        self.assertEqual(sandbox.trace[-1], "process.kill")
 
     def test_long_lived_scenario_requires_every_delayed_chunk(self) -> None:
         test, sandbox, context = _fixture()

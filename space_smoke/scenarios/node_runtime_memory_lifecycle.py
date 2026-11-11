@@ -10,7 +10,8 @@ from space_smoke.memory_lifecycle import exercise_memory_lifecycle
     sandbox=smoke.SandboxConfig(lifecycle=None),
     api_surfaces=("node",),
     required_tools=("ssh",),
-    ignored="requires an explicitly selected standalone node and snapshot-capable environment",
+    tier="manual",
+    manual_reason="requires an explicitly selected standalone node and snapshot-capable environment",
     rerun_environment=(
         "SPACE_SMOKE_NODE_RECOVERY",
         "SPACE_SMOKE_NODE_HOST",

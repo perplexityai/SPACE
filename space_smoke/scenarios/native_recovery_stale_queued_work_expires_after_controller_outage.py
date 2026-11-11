@@ -9,10 +9,10 @@ from space_smoke.native_recovery import (
 )
 from space_smoke.registry import scenario
 
-DEADLINE_SECONDS = 20
+DEADLINE_SECONDS = 5
 # How far past the shortened deadline the outage lasts, so every queued
 # operation is over it when the controller comes back.
-OUTAGE_MARGIN_SECONDS = 10
+OUTAGE_MARGIN_SECONDS = 2
 
 
 @scenario(
