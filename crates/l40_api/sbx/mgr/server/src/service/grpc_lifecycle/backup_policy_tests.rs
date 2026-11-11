@@ -112,6 +112,7 @@ async fn artifact_backup_refuses_a_runtime_upgrade_and_its_internal_copy() {
         &conn,
         &id,
         execution.environment().unwrap(),
+        crate::db::RuntimeUpgradeTargetState::Started,
         None,
     )
     .operation_id;

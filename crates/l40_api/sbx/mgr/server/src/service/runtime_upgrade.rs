@@ -88,6 +88,25 @@ pub(super) fn refuse_unretired_runtime_upgrade_in(
     }
 }
 
+/// The runtime upgrade of `sandbox_id` that must leave it `stopped`, while
+/// its boot's execution may yet run it: a fencing one, or a verified one
+/// whose boot is the sandbox's current execution, while the sandbox is started
+/// or paused on it. Once verified, until the
+/// upgrade stops that execution, the sandbox runs unfenced; a suspend in that window
+/// would leave it `suspended`, which the upgrade never reports and the stopped
+/// disk backup that follows it refuses. Once the execution is gone, by the
+/// upgrade's stop or any other, the upgrade never stops a later one, so a
+/// later execution suspends as usual even while the upgrade stays unretired.
+pub(super) fn stay_stopped_upgrade_awaiting_its_stop(
+    db: &crate::db::Connection,
+    sandbox_id: &str,
+) -> Result<Option<RuntimeUpgradeOperationId>, Status> {
+    let read_failed =
+        |error: crate::db::Error| Status::unavailable(format!("read runtime upgrade: {error}"));
+    crate::db::read::stay_stopped_runtime_upgrade_awaiting_its_stop(db, sandbox_id)
+        .map_err(read_failed)
+}
+
 /// The status an activation returns when it can't claim the sandbox.
 pub(super) fn begin_activation_status(error: BeginActivationError, context: &str) -> Status {
     match error {
@@ -1115,6 +1134,27 @@ impl WakeRuntimeUpgrade {
 }
 
 impl super::SandboxManagerService {
+    /// Refuse a suspend of `sandbox_id`, retryably, while an upgrade that must
+    /// leave it `stopped` may run it on its boot's execution; see
+    /// [`stay_stopped_upgrade_awaiting_its_stop`]. Every suspend takes this
+    /// under its wake and artifact locks, before it captures anything.
+    pub(super) fn refuse_suspend_during_stay_stopped_upgrade(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<(), Status> {
+        let stay_stopped_upgrade = {
+            let db = self.db_conn()?;
+            stay_stopped_upgrade_awaiting_its_stop(&db, sandbox_id)?
+        };
+        match stay_stopped_upgrade {
+            Some(operation_id) => Err(Status::unavailable(format!(
+                "runtime upgrade {operation_id} must stop this sandbox first; retry the suspend \
+                 once it has"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Run the upgrade a Wake carries, booting `start`: the cold start the
     /// Wake built for this sandbox. The caller holds the Wake's lock.
     pub(super) async fn wake_runtime_upgrade(

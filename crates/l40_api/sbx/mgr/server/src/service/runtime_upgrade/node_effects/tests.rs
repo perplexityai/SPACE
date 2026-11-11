@@ -125,6 +125,7 @@ impl Fixture {
             &self.service.db.lock().unwrap(),
             &self.sandbox_id,
             self.target.environment().unwrap(),
+            crate::db::RuntimeUpgradeTargetState::Started,
             identity,
         )
     }
