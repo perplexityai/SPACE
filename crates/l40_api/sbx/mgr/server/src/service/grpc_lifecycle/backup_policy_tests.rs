@@ -1,19 +1,21 @@
 //! Characterization of the artifact-backup admission, network-policy, and
 //! `Kill` handler contracts that are reachable without host runtime state.
 //!
-//! Fixtures fail closed: no passing case reaches node-manager, vol-mgr, the
-//! template-manager socket, or a real cluster-api endpoint. The one exception
-//! under regression is `Kill`: if the restart drain stops refusing at cleanup
+//! Fixtures fail closed: no case reaches the host's node-manager, vol-mgr, the
+//! template-manager socket, or a real cluster-api endpoint; a test that
+//! scripts node-manager serves its own. Under regression, `Kill` is the
+//! exception: if the restart drain stops refusing at cleanup
 //! admission, a fatal signal to a started or paused row attempts its
 //! node-manager dispatch before the refusal bound fails the test.
 
 use super::{ArtifactBackupHandoff, ArtifactBackupSubmission, SubmitSuspendSnapshotOutcome};
 use crate::db::PolicyAuthority;
+use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::proto::enqueue_artifact_backup_request::Source;
-use crate::service::SandboxManagerService;
 use crate::service::activation_support::internal_request;
 use crate::service::network_policy::EffectiveNetworkPolicy;
 use crate::service::tests::service_tests::insert_test_sandbox;
+use crate::service::{SandboxManagerService, SandboxManagerServiceOptions};
 use crate::state::{SandboxState, SandboxStatus};
 use pplx_space_common_core::node_drain_signals::{
     REUPLOAD_ARTIFACT_MISSING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
@@ -343,6 +345,112 @@ async fn artifact_backup_admission_refuses_sources_it_cannot_back_up() {
             assert!(!error.message().contains(marker), "{case}: {error}");
         }
     }
+}
+
+/// A stopped sandbox's current-instance disk backup first snapshots its disk
+/// through node-manager, which refuses while another host mutation, such as
+/// the network-slot reset after its cleanup, holds the sandbox. That refusal,
+/// which carries node-manager's busy marker, stays retryable through the
+/// enqueue; any other failure is internal, an `Unavailable` without the
+/// marker and a transport `Unavailable` included.
+#[tokio::test]
+async fn stopped_disk_adoption_keeps_a_node_manager_refusal_retryable() {
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_path = token_dir.path().join("cluster-api.token");
+    if !pplx_space_test_env::enter_test_process(&cluster_api_env(
+        LOOPBACK_ENDPOINT,
+        STATIC_TOKEN,
+        &token_path,
+    )) {
+        return;
+    }
+    let refused = format!(
+        "sandbox host mutation or reset {}",
+        pplx_space_common_core::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER
+    );
+    for (refusal, expected) in [
+        (
+            tonic::Status::unavailable(refused),
+            tonic::Code::Unavailable,
+        ),
+        (
+            tonic::Status::unavailable("quiesce encrypted disk capture: resume failed"),
+            tonic::Code::Internal,
+        ),
+        (
+            tonic::Status::internal("btrfs snapshot failed"),
+            tonic::Code::Internal,
+        ),
+    ] {
+        let node_manager = FakeNodeManager::default()
+            .unary(
+                "CreateBtrfsSnapshot",
+                move |_: pplx_space_node_mgr_client::proto::CreateBtrfsSnapshotRequest| -> Result<
+                    pplx_space_node_mgr_client::proto::CreateBtrfsSnapshotResponse,
+                    tonic::Status,
+                > { Err(refusal.clone()) },
+            )
+            .serve();
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions {
+                node_manager: node_manager.connector(),
+                ..SandboxManagerServiceOptions::for_test()
+            },
+        );
+
+        let error = service
+            .enqueue_artifact_backup(artifact_backup_request(
+                &id,
+                crate::proto::ArtifactKind::Disk,
+                Some(Source::CurrentInstance(
+                    crate::proto::CurrentInstanceSource {},
+                )),
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), expected, "{error}");
+        assert_eq!(node_manager.calls(), ["CreateBtrfsSnapshot"]);
+        assert_eq!(snapshot_upload_jobs(&service, &id), 0);
+    }
+
+    // A transport failure reads `Unavailable` too, but carries no busy
+    // marker, so it isn't passed through as node-manager's refusal.
+    let sockets = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        SandboxManagerServiceOptions {
+            node_manager: crate::node_manager_transport::fake::unbound_on_call(
+                &sockets.path().join("node-manager.sock"),
+            ),
+            ..SandboxManagerServiceOptions::for_test()
+        },
+    );
+    let error = service
+        .enqueue_artifact_backup(artifact_backup_request(
+            &id,
+            crate::proto::ArtifactKind::Disk,
+            Some(Source::CurrentInstance(
+                crate::proto::CurrentInstanceSource {},
+            )),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal, "{error}");
+    assert!(
+        error
+            .message()
+            .contains("The service is currently unavailable"),
+        "{error}"
+    );
+    assert_eq!(snapshot_upload_jobs(&service, &id), 0);
 }
 
 /// Empty cluster-api wiring is retryable, operator-fixable configuration. It

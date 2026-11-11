@@ -622,7 +622,10 @@ impl NodeManagerService {
         self.pool
             .try_claim_sandbox_mutation(sandbox_id)
             .ok_or_else(|| {
-                Status::unavailable("sandbox host mutation or reset is in progress; retry")
+                Status::unavailable(format!(
+                    "sandbox host mutation or reset {}",
+                    pplx_space_common_core::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER
+                ))
             })
     }
 

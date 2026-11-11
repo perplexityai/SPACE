@@ -190,4 +190,15 @@ pub mod artifact_backup_signals {
     /// substring of the producer's historical wording.
     pub const CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER: &str =
         "current suspended instance publishes full";
+
+    /// Substring node-manager embeds in the `Unavailable` it answers when
+    /// it refuses a sandbox's artifact work before doing any: another
+    /// artifact operation or host mutation, such as the network-slot reset
+    /// after a cleanup, holds the sandbox. The on-node sbx-mgr passes a
+    /// stopped disk snapshot's refusal through as retryable only when its
+    /// message carries this marker; any other `Unavailable`, a transport
+    /// failure's included, stays internal. The phrase ends node-manager's
+    /// historical wording of both refusals, so already-deployed node-managers
+    /// carry it (no rollout-skew window).
+    pub const NODE_MANAGER_SANDBOX_BUSY_MARKER: &str = "is in progress; retry";
 }

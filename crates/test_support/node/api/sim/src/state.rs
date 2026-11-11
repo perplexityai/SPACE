@@ -121,6 +121,7 @@ pub struct SimState {
     inner: Arc<Mutex<HashMap<String, SandboxRecord>>>,
     transition_after_state_read: Arc<Mutex<HashMap<String, String>>>,
     failing_wakes: Arc<Mutex<HashSet<String>>>,
+    refused_artifact_backups: Arc<Mutex<HashMap<String, tonic::Code>>>,
     snapshot_dir: PathBuf,
     node_id: String,
     fs: crate::fs::SandboxFs,
@@ -164,6 +165,7 @@ impl SimState {
             inner: Arc::new(Mutex::new(HashMap::new())),
             transition_after_state_read: Default::default(),
             failing_wakes: Default::default(),
+            refused_artifact_backups: Default::default(),
             snapshot_dir,
             node_id,
             fs: crate::fs::SandboxFs::new(sandbox_fs_dir),
@@ -298,6 +300,25 @@ impl SimState {
 
     pub(crate) async fn take_wake_failure(&self, sandbox_id: &str) -> bool {
         self.failing_wakes.lock().await.remove(sandbox_id)
+    }
+
+    /// Refuse the next artifact backup enqueue for `sandbox_id` with `code`,
+    /// as sandbox-manager refuses one for a sandbox it can't back up yet.
+    pub async fn refuse_next_artifact_backup(&self, sandbox_id: String, code: tonic::Code) {
+        self.refused_artifact_backups
+            .lock()
+            .await
+            .insert(sandbox_id, code);
+    }
+
+    pub(crate) async fn take_artifact_backup_refusal(
+        &self,
+        sandbox_id: &str,
+    ) -> Option<tonic::Code> {
+        self.refused_artifact_backups
+            .lock()
+            .await
+            .remove(sandbox_id)
     }
 
     pub async fn state_of(&self, ids: &[String]) -> (Vec<SandboxRecord>, Vec<String>) {

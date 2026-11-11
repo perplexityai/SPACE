@@ -866,6 +866,19 @@ impl WorkerApi for SimWorkerApiService {
         request: Request<sbx::EnqueueArtifactBackupRequest>,
     ) -> Result<Response<sbx::EnqueueArtifactBackupResponse>, Status> {
         let request = request.into_inner();
+        if let Some(code) = self
+            .state
+            .take_artifact_backup_refusal(&request.sandbox_id)
+            .await
+        {
+            return Err(Status::new(
+                code,
+                format!(
+                    "sandbox {} isn't stopped or suspended yet",
+                    request.sandbox_id
+                ),
+            ));
+        }
         let local_artifact_id = match request.source {
             Some(sbx::enqueue_artifact_backup_request::Source::LocalArtifactId(value)) => value,
             _ => LocalArtifactId::new().to_string(),
