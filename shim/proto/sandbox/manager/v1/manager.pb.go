@@ -1871,15 +1871,18 @@ func (x *RestartGuestRequest) GetForce() bool {
 }
 
 type GuestUpdateOperation struct {
-	state         protoimpl.MessageState    `protogen:"open.v1"`
-	SandboxId     string                    `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
-	ExecutionId   string                    `protobuf:"bytes,2,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
-	OperationId   *string                   `protobuf:"bytes,3,opt,name=operation_id,json=operationId,proto3,oneof" json:"operation_id,omitempty"`
-	Phase         GuestUpdateOperationPhase `protobuf:"varint,4,opt,name=phase,proto3,enum=space.sandbox.manager.v1.GuestUpdateOperationPhase" json:"phase,omitempty"`
-	Outcome       *string                   `protobuf:"bytes,5,opt,name=outcome,proto3,oneof" json:"outcome,omitempty"`
-	Guest         *v1.Status                `protobuf:"bytes,6,opt,name=guest,proto3,oneof" json:"guest,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState    `protogen:"open.v1"`
+	SandboxId   string                    `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	ExecutionId string                    `protobuf:"bytes,2,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
+	OperationId *string                   `protobuf:"bytes,3,opt,name=operation_id,json=operationId,proto3,oneof" json:"operation_id,omitempty"`
+	Phase       GuestUpdateOperationPhase `protobuf:"varint,4,opt,name=phase,proto3,enum=space.sandbox.manager.v1.GuestUpdateOperationPhase" json:"phase,omitempty"`
+	Outcome     *string                   `protobuf:"bytes,5,opt,name=outcome,proto3,oneof" json:"outcome,omitempty"`
+	Guest       *v1.Status                `protobuf:"bytes,6,opt,name=guest,proto3,oneof" json:"guest,omitempty"`
+	// Ephemeral bare scheduler reason when no operation is active; not a durable
+	// outcome. Reason vocabulary is documented in docs/spaced-upgrades.md.
+	AutomaticDeferral *string `protobuf:"bytes,7,opt,name=automatic_deferral,json=automaticDeferral,proto3,oneof" json:"automatic_deferral,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *GuestUpdateOperation) Reset() {
@@ -1952,6 +1955,13 @@ func (x *GuestUpdateOperation) GetGuest() *v1.Status {
 		return x.Guest
 	}
 	return nil
+}
+
+func (x *GuestUpdateOperation) GetAutomaticDeferral() string {
+	if x != nil && x.AutomaticDeferral != nil {
+		return *x.AutomaticDeferral
+	}
+	return ""
 }
 
 type AutoLifecycleWakePolicy struct {
@@ -14040,7 +14050,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
 	"\foperation_id\x18\x02 \x01(\tR\voperationId\x122\n" +
 	"\x15expected_execution_id\x18\x03 \x01(\tR\x13expectedExecutionId\x12\x14\n" +
-	"\x05force\x18\x04 \x01(\bR\x05force\"\xcc\x02\n" +
+	"\x05force\x18\x04 \x01(\bR\x05force\"\x97\x03\n" +
 	"\x14GuestUpdateOperation\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
@@ -14048,11 +14058,13 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\foperation_id\x18\x03 \x01(\tH\x00R\voperationId\x88\x01\x01\x12I\n" +
 	"\x05phase\x18\x04 \x01(\x0e23.space.sandbox.manager.v1.GuestUpdateOperationPhaseR\x05phase\x12\x1d\n" +
 	"\aoutcome\x18\x05 \x01(\tH\x01R\aoutcome\x88\x01\x01\x129\n" +
-	"\x05guest\x18\x06 \x01(\v2\x1e.space.spaced.update.v1.StatusH\x02R\x05guest\x88\x01\x01B\x0f\n" +
+	"\x05guest\x18\x06 \x01(\v2\x1e.space.spaced.update.v1.StatusH\x02R\x05guest\x88\x01\x01\x122\n" +
+	"\x12automatic_deferral\x18\a \x01(\tH\x03R\x11automaticDeferral\x88\x01\x01B\x0f\n" +
 	"\r_operation_idB\n" +
 	"\n" +
 	"\b_outcomeB\b\n" +
-	"\x06_guest\"\\\n" +
+	"\x06_guestB\x15\n" +
+	"\x13_automatic_deferral\"\\\n" +
 	"\x17AutoLifecycleWakePolicy\x12A\n" +
 	"\x02on\x18\x01 \x03(\x0e21.space.sandbox.manager.v1.AutoLifecycleWakeSourceR\x02on\"\x9b\x03\n" +
 	"\x19AutoLifecycleConditionSet\x12E\n" +
