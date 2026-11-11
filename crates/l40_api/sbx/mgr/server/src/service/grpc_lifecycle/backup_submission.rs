@@ -465,16 +465,32 @@ impl SandboxManagerService {
             .get_job(job_id)
             .map_err(|error| format!("read snapshot-upload job {job_id}: {error}"))?
             .ok_or_else(|| format!("snapshot-upload job {job_id} disappeared"))?;
+        let mut payload = persisted
+            .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+            .map_err(|error| format!("decode snapshot-upload job {job_id}: {error}"))?;
         if persisted.is_terminal() && persisted.failure.is_some() {
+            // The worker can refuse registration before this caller reads
+            // the job. Its persisted error has no typed generation; recover
+            // the fence verdict without restarting the failed upload.
+            if payload.execution_generation.is_some()
+                && crate::snapshot_upload_jobs::prepared_upload_requires_begin(&payload)
+                && let crate::snapshot_upload_jobs::RegistrationProbe::Superseded(generation) =
+                    crate::snapshot_upload_jobs::prepared_begin_refused_as_superseded(&payload)
+                        .await
+            {
+                return Err(ArtifactBackupSubmissionError::Begin {
+                    error: pplx_space_common_jobs::JobError::permanent(
+                        persisted.error.as_deref().unwrap_or("unknown error"),
+                    ),
+                    superseded_generation: Some(generation),
+                });
+            }
             return Err(format!(
                 "snapshot-upload job {job_id} terminated before restore-visible handoff: {}",
                 persisted.error.as_deref().unwrap_or("unknown error")
             )
             .into());
         }
-        let mut payload = persisted
-            .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
-            .map_err(|error| format!("decode snapshot-upload job {job_id}: {error}"))?;
         if crate::snapshot_upload_jobs::prepared_upload_requires_begin(&payload) {
             crate::snapshot_upload_jobs::begin_prepared_upload_naming_supersession(&payload)
                 .await

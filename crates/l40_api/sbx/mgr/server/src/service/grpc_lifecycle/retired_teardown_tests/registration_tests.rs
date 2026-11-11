@@ -866,6 +866,54 @@ async fn first_request_of_a_staged_capture_carries_the_teardown_generation() {
     .await;
 }
 
+/// A worker can finish refusing the registration before its submitting
+/// caller reads the job. The handoff must still return the typed fence
+/// verdict, while an unrelated terminal failure stays failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_refusal_before_handoff_keeps_the_superseded_verdict() {
+    with_cluster_api(RETIRING, async || {
+        for carried in [Some(generation(GENERATION)), None] {
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new();
+            let staged =
+                insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation(GENERATION));
+            let mut payload = bound_upload_payload(staged);
+            payload.execution_generation = carried;
+            let job_id = insert_upload_job(
+                &conn,
+                &sandbox_id.to_string(),
+                staged,
+                &serde_json::to_string(&payload).unwrap(),
+            );
+            pplx_space_common_jobs::db::fail_job_permanent(
+                conn.raw(),
+                &job_id,
+                "registration failed before handoff",
+                None,
+            )
+            .unwrap();
+            let (service, _) = service_recording_cleanup(conn);
+            let error = service
+                .establish_restore_visible_artifact_backup(&job_id)
+                .await
+                .expect_err("a failed upload cannot establish a handoff");
+            let verdict = match &error {
+                super::super::ArtifactBackupSubmissionError::Begin {
+                    superseded_generation,
+                    ..
+                } => *superseded_generation,
+                _ => None,
+            };
+            assert_eq!(
+                verdict, carried,
+                "the handoff must retain the control plane's verdict: {error}"
+            );
+            drain(&service).await;
+        }
+    })
+    .await;
+}
+
 /// Write `refused`'s capture into `snapshot_dir` and point its local artifact
 /// row there. The capture records [`GENERATION`] when `recorded`, and its
 /// refused upload is pruned unless `upload_retained`.
