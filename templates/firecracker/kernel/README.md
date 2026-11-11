@@ -42,6 +42,31 @@ fallback. The default base build does not claim these additional capabilities.
 The fragment is mounted read-only during the Docker build. No private repository
 path or environment-specific input is required by this directory.
 
+## In-repository variants
+
+A variant is a named, reviewed change to the base config kept in `variants/`:
+
+```bash
+KERNEL_VARIANT=nft ./templates/firecracker/kernel/build.sh
+```
+
+Each variant has `<name>.config` (the fragment, built-in symbols only),
+`<name>.required` (lines the resolved config must contain verbatim, including
+symbols the fragment only selects) and `<name>.disabled` (symbols that must
+resolve to `is not set`). Every variant keeps `CONFIG_MODULES` disabled, and a
+resolved config with any `=m` line is rejected. An optional `<name>.boot-log`
+holds extended regular expressions that `smoke-boot.sh <kernel> <version>
+<name>` must find in a boot with `initcall_debug`. Output goes to
+`vmlinux-6.1.155-<name>/`. `KERNEL_VARIANT` and `CONFIG_FRAGMENT` are mutually
+exclusive, and an unknown variant is an error.
+
+The `nft` variant adds nf_tables with the iptables-nft compatibility layer,
+`inet` tables, `ct state`, `reject`, NAT/masquerade and `fib`, plus the legacy
+`raw` table and the `state` match, so that iptables 1.8 with its default
+nf_tables backend, nft rulesets and Docker's iptables rules work in the guest.
+ARP, netdev and bridge nf_tables families, flow offload, ipset, IPVS, conntrack
+netlink and nfqueue stay disabled.
+
 ## Other pinned versions
 
 Override all inputs together:
@@ -77,4 +102,5 @@ check without writing anything.
 `ci/scripts/run-guest-kernel-publish.sh` builds and validates the kernel before
 publishing immutable bundles. Non-PR main builds require a comma-separated list
 of destination buckets in `SPACE_GUEST_KERNEL_BUCKETS`. Pull-request and
-non-main builds validate without publishing.
+non-main builds validate without publishing. With `KERNEL_VARIANT` set, it
+builds, smoke-boots and publishes that variant as `vmlinux-<version>-<name>`.

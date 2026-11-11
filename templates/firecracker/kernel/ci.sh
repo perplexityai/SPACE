@@ -390,7 +390,7 @@ run() {
     # The default profile only: the hash does not cover the overrides.
     OUTPUT_ROOT="$(mktemp -d)"
     attempt "${BUILD_TIMEOUT_SECONDS}" "${options}" env -u ARCH -u KERNEL_VERSION -u FIRECRACKER_CI_VERSION \
-        -u KERNEL_SOURCE_COMMIT -u BASE_CONFIG_SHA256 -u CONFIG_FRAGMENT \
+        -u KERNEL_SOURCE_COMMIT -u BASE_CONFIG_SHA256 -u CONFIG_FRAGMENT -u KERNEL_VARIANT \
         OUTPUT_DIR="${OUTPUT_ROOT}" "${SCRIPT_DIR}/build.sh" || status=$?
     if [ "${status}" -eq 0 ]; then
         built=true

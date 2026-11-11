@@ -10,6 +10,9 @@ readonly KERNEL_SOURCE_COMMIT="${KERNEL_SOURCE_COMMIT:-069c93d2b7bddda87c472453c
 readonly BASE_CONFIG_SHA256="${BASE_CONFIG_SHA256:-024b2aae62fe7131f9a9ab80f27619c882c0a37265dd105adae01d2867bef7c3}"
 readonly OUTPUT_DIR="${OUTPUT_DIR:-${PWD}/output}"
 readonly CONFIG_FRAGMENT="${CONFIG_FRAGMENT:-}"
+# A variant names an in-repository profile under variants/: its fragment, the
+# lines its resolved config must contain, and the symbols it must leave unset.
+readonly KERNEL_VARIANT="${KERNEL_VARIANT:-}"
 # Further docker build options, such as a builder, base-image build contexts and
 # caches (ci.sh): whitespace-separated, none containing spaces.
 readonly KERNEL_DOCKER_BUILD_OPTIONS="${KERNEL_DOCKER_BUILD_OPTIONS:-}"
@@ -19,6 +22,28 @@ if [[ -n "$CONFIG_FRAGMENT" ]]; then
     echo 'ERROR: CONFIG_FRAGMENT must name an existing regular file in the kernel build directory' >&2
     exit 1
   fi
+fi
+
+if [[ -n "$KERNEL_VARIANT" ]]; then
+  if [[ -n "$CONFIG_FRAGMENT" ]]; then
+    echo 'ERROR: set KERNEL_VARIANT or CONFIG_FRAGMENT, not both' >&2
+    exit 1
+  fi
+  if [[ ! "$KERNEL_VARIANT" =~ ^[a-z][a-z0-9-]*$ || "$KERNEL_VARIANT" == bpf-modsig ]]; then
+    echo 'ERROR: KERNEL_VARIANT must be a lowercase name other than bpf-modsig' >&2
+    exit 1
+  fi
+  for suffix in config required disabled; do
+    if [[ ! -f "variants/${KERNEL_VARIANT}.${suffix}" || -L "variants/${KERNEL_VARIANT}.${suffix}" ]]; then
+      echo "ERROR: KERNEL_VARIANT ${KERNEL_VARIANT} has no variants/${KERNEL_VARIANT}.${suffix}" >&2
+      exit 1
+    fi
+  done
+fi
+if [[ -n "$KERNEL_VARIANT" ]]; then
+  readonly ARTIFACT_SUFFIX="-${KERNEL_VARIANT}"
+else
+  readonly ARTIFACT_SUFFIX="${CONFIG_FRAGMENT:+-bpf-modsig}"
 fi
 
 if [[ "$ARCH" != "x86_64" ]]; then
@@ -52,8 +77,9 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg "KERNEL_SOURCE_COMMIT=${KERNEL_SOURCE_COMMIT}" \
   --build-arg "BASE_CONFIG_SHA256=${BASE_CONFIG_SHA256}" \
   --build-arg "CONFIG_FRAGMENT=${CONFIG_FRAGMENT}" \
+  --build-arg "KERNEL_VARIANT=${KERNEL_VARIANT}" \
   --output "type=local,dest=${OUTPUT_DIR}" \
   $KERNEL_DOCKER_BUILD_OPTIONS \
   .
 
-echo "Guest kernel artifacts written to ${OUTPUT_DIR}/vmlinux-${KERNEL_VERSION}${CONFIG_FRAGMENT:+-bpf-modsig}"
+echo "Guest kernel artifacts written to ${OUTPUT_DIR}/vmlinux-${KERNEL_VERSION}${ARTIFACT_SUFFIX}"
