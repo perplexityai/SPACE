@@ -1405,8 +1405,9 @@ version = "4.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustix]]
-version = "1.1.4"
+version = "1.1.6"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption to the release fixing RUSTSEC-2026-0486. No imported audit covers this version; this is not an independent audit."
 
 [[exemptions.rustls]]
 version = "0.23.46"
@@ -2101,6 +2102,11 @@ criteria = "safe-to-deploy"
 [[exemptions.x509-parser]]
 version = "0.18.1"
 criteria = "safe-to-deploy"
+
+[[exemptions.xattr]]
+version = "1.7.0"
+criteria = "safe-to-deploy"
+notes = "Imported audits cover xattr through 1.6.1. 1.7.0 adapts to rustix 1.1.6, the release fixing RUSTSEC-2026-0486, with which 1.6.1 reads attribute values and name lists over 4 KiB as empty. No imported audit covers 1.7.0. Source diff from 1.6.1 reviewed for the exemption, not certified as an audit: src/sys/linux_macos.rs queries sizes with the new rustix *_query functions instead of an empty buffer, lib.rs drops one clippy allow, and no unsafe code is added."
 
 [[exemptions.xmlparser]]
 version = "0.13.6"
