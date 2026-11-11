@@ -54,12 +54,9 @@ logical payloads, slots and execution/boot fences; SQLite receipts remain
 host-owned. No SQL or protobuf replacement is required for Windows.
 Unknown installed contracts are unsupported. Host artifact selection matches
 the installed recovery ABI and architecture; it never tries the Linux installer
-on another OS. The policy selects one target bundle at a time, so a mixed-OS
-node must switch explicit policy authority when selecting a different platform.
-Drain that platform's unfinished receipts before switching: withdrawing policy
-cancels its in-flight work, and a consumed authorization cannot be reused. A
-single worker cannot concurrently authorize Linux and Windows target bundles.
-Use separate platform cohorts until policy supports multiple target authorities.
+on another OS. The catalog selects independent target bundles by recovery contract and
+architecture, so one node can authorize Linux and Windows simultaneously.
+Changing one entry does not withdraw another entry's authority.
 
 A release bundle carries the ordinary workspace version, source revision,
 diagnostic build time, binary hashes and `guest_update_required_since`. Normal
@@ -69,34 +66,85 @@ guest version. For example, target 0.8.145 with marker 0.8.143 leaves a guest at
 with a different digest are rejected. A build date is never an ordering key.
 See [versioning](versioning.md) for immutable release allocation prerequisites.
 
-An operator distributes verified artifacts into the root-owned directory
+Node installation distributes verified artifacts into the root-owned directory
 `/opt/space/guest-update/<artifact-digest>/` and installs root-owned
 `/etc/space/guest-update/policy.json`. All parent directories and files must be
-non-writable by group/other; the manager rejects symlinks. The policy selects:
+non-writable by group/other; the manager rejects symlinks. Use the installer as
+part of a direct service deployment (or `--root` for an offline image):
+
+```sh
+sudo python3 scripts/build/install-agent-bundle.py /path/to/verified-bundle
+```
+
+Repeat for another platform's bundle; the installer preserves other entries.
+For container deployments, bake **all** supported platform bundles and the
+complete catalog into the worker image with `--root`. The stock worker image
+contains Linux only. A host-side installation is not mounted into the container,
+and edits inside a running container do not survive replacement. Publish a
+custom worker image containing Windows too for mixed-platform container nodes;
+do not use ad-hoc installs into a running pod as deployment configuration.
+It verifies both payload identities, publishes the bundle before atomically
+replacing policy, and retains authorization when reinstalling the same selection.
+New authorization is a content-derived UUIDv8 over the complete promotion, so
+identical offline image rebuilds also retain receipt authority.
+The guest ceiling defaults to that exact target version and the host floor to
+the bundle's workspace version; `--minimum-host` requires compatibility review.
+Same-version replacement with different bytes is refused. The policy is keyed
+by installed recovery contract and architecture:
 
 ```json
 {
-  "authorization": "019b0000-0000-7000-8000-000000000001",
-  "promotion": {
-    "channel": "stable",
-    "target": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "target_version": "0.8.145",
-    "guest_update_required_since": "0.8.143",
-    "intent": "upgrade",
-    "minimum_host": "0.8.143",
-    "maximum_guest": "0.8.145"
-  },
-  "qualified_templates": ["blake3:0000000000000000000000000000000000000000000000000000000000000000"]
+  "targets": {
+    "linux-systemd-selector-v1": {
+      "x86_64": {
+        "authorization": "019b0000-0000-7000-8000-000000000001",
+        "promotion": {
+          "channel": "stable",
+          "target": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "target_version": "0.8.145",
+          "guest_update_required_since": "0.8.143",
+          "intent": "upgrade",
+          "minimum_host": "0.8.143",
+          "maximum_guest": "0.8.145"
+        }
+      }
+    }
+  }
 }
 ```
 
-These are illustrative identities, not installable values. Obtain real digests
-from the verified publication. The qualified template list is an explicit
-operator attestation of the installed selector/unit contract for those exact
-published templates, including OCI outputs. Never infer qualification from a
-guest-reported file. The ceiling must cover all permitted restore-placement and
-host-rollback targets. No field grants compatibility with an otherwise
-unsupported guest, architecture, or seed contract.
+These are illustrative identities, not installable values. The catalog selects
+host-authorized bundles by recovery contract and architecture; it has no template
+digest allowlist or publisher attestation. Manager-owned maintenance requires a
+committed guest version of at least 0.8.2 and a guest-reported recovery contract
+matching the trusted image profile. Local catalog authority is rechecked at Arm
+and Commit, without a template-manager lookup. Earlier guests keep serving work;
+use recreation or the separate manual procedure to reach this baseline.
+
+Eligibility deliberately trusts guest-reported capability. Preserve the installed
+recovery units/tasks and slots; broken supervision may require manual repair,
+regardless of the manager's bounded operation deadline.
+
+The ceiling must cover permitted placement/rollback hosts and does not bypass
+protocol or platform compatibility. Windows bundles occupy their own
+`windows-scm-two-slot-v1` entry, installed using the same command for direct
+services or baked into the complete worker image for container deployments.
+
+The CLI selects the appropriate entry using guest status; the manager
+independently checks trusted image identity. Install the manager, CLI and catalog
+as one node release. Replacing one platform entry never withdraws
+another platform's receipt authority. Drain unfinished operations before changing
+a target's authority. Malformed policy files are rejected before installation;
+after draining guest updates, remove the invalid file and reinstall each platform
+target to recreate the catalog. The installer does not translate other formats.
+
+For installer reauthorization, default authority is derived from promotion
+identity. Returning A → B → A or removing and reinstalling A reuses the original
+authority and consumed budget. After investigation, pass
+`--authorization <fresh-uuidv7>` to permit another bounded attempt, and retain
+that value in deployment inputs. Identical reinstalls preserve it. Do not use
+reauthorization as an automatic retry loop. Container deployments must bake the
+complete catalog into their worker image; direct-service installs may merge entries.
 
 The host socket retains its root-or-sandbox-manager UDS trust boundary. Root
 is a trusted node administrator and can invoke its maintenance primitives;
