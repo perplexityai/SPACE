@@ -36,6 +36,14 @@ pub use node_selector::SandboxNodeSelector;
 mod runtime_upgrade;
 pub use runtime_upgrade::*;
 
+#[path = "k8s/environment_labels.rs"]
+pub mod environment_labels;
+pub use environment_labels::{
+    ENVIRONMENT_LABEL_KEY_PREFIX, ENVIRONMENT_USABLE_LABEL_VALUE, PodEnvironment,
+    SANDBOX_ENVIRONMENT_ANNOTATION, environment_label_key, is_environment_label_key,
+    node_publishes_any_environment, node_publishes_environment,
+};
+
 pub const TEMPLATE_LABEL_DOMAIN: &str = "space.pplx.net";
 pub const TEMPLATE_PRESENT_LABEL_VALUE: &str = "true";
 pub const SANDBOX_MANAGED_BY_LABEL: &str = "space.pplx.net/managed-by";
@@ -502,6 +510,10 @@ pub struct SandboxPodCommon<'a> {
     pub content_hash: Option<&'a str>,
     pub env: &'a BTreeMap<String, String>,
     pub traceparent: Option<String>,
+    /// The environment the pod's work is bound to, while the environment
+    /// placement gate evaluates; see [`PodEnvironment`]. `None` for unbound
+    /// work and while the gate is off.
+    pub environment: Option<PodEnvironment>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -895,6 +907,7 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
         content_hash,
         env,
         traceparent,
+        environment,
     } = common;
 
     let mut labels = BTreeMap::new();
@@ -1095,6 +1108,12 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
     }
     if let Some(traceparent) = traceparent {
         annotations.insert(SANDBOX_TRACEPARENT_ANNOTATION.to_string(), traceparent);
+    }
+    if let Some(environment) = environment {
+        annotations.insert(
+            SANDBOX_ENVIRONMENT_ANNOTATION.to_string(),
+            environment.reference.to_string(),
+        );
     }
     if let Some(pool) = pool {
         let sandbox_owner = ROOT_SANDBOX_OWNER.as_str().to_string();
@@ -1433,6 +1452,11 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
                         }
                     })
                     .unwrap_or_default(),
+                required_environment: environment.filter(|environment| environment.required).map(
+                    |PodEnvironment { reference, .. }| {
+                        environment_labels::environment_requirement(&reference)
+                    },
+                ),
                 // Scoring term, suppressed whenever the pod already has a
                 // source-node preference of its own — a hard pin, a shortlist,
                 // *or* the legacy soft preference, which is the default
@@ -1555,6 +1579,8 @@ struct SandboxNodeAffinityInput<'a> {
     preferred_template_weight: i32,
     extra_required_label: Option<(&'a str, &'a str)>,
     required_node_group_expressions: Vec<NodeSelectorRequirement>,
+    /// The bound environment's node label, required in every term.
+    required_environment: Option<NodeSelectorRequirement>,
     preferred_dedicated_term: Option<PreferredSchedulingTerm>,
     ssd_placement_block: bool,
     ssd_headroom_tier_bias: bool,
@@ -1570,6 +1596,7 @@ fn sandbox_node_affinity(input: SandboxNodeAffinityInput<'_>) -> Option<Affinity
         preferred_template_weight,
         extra_required_label,
         required_node_group_expressions,
+        required_environment,
         preferred_dedicated_term,
         ssd_placement_block,
         ssd_headroom_tier_bias,
@@ -1594,6 +1621,7 @@ fn sandbox_node_affinity(input: SandboxNodeAffinityInput<'_>) -> Option<Affinity
         && preferred_template_label.is_none()
         && extra_required_label.is_none()
         && required_node_group_expressions.is_empty()
+        && required_environment.is_none()
         && preferred_dedicated_term.is_none()
         && !ssd_placement_block
         && !ssd_headroom_tier_bias
@@ -1622,6 +1650,7 @@ fn sandbox_node_affinity(input: SandboxNodeAffinityInput<'_>) -> Option<Affinity
         });
     }
     match_expressions.extend(required_node_group_expressions);
+    match_expressions.extend(required_environment);
     if ssd_placement_block {
         match_expressions.push(NodeSelectorRequirement {
             key: SSD_PLACEMENT_BLOCKED_LABEL.to_string(),

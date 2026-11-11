@@ -40,6 +40,21 @@
 //!   `stopped` and `restoring`, so a start or stop that races a restore lease
 //!   can make the lease's completion miss.
 //! - Warm-pool claims adopt node-side.
+//! - Create, pool-adoption and restore candidates evaluate the environment
+//!   placement gate (`environment_placement.rs`) for bound work, by mode:
+//!   off ignores it, shadow counts and logs the candidates it would refuse,
+//!   and on leaves them out and lets the environment match stand in for the
+//!   state-format major-version check, the legacy runtime and guest
+//!   projections, and for creates and pool adoption the legacy kernel check.
+//!   Those checks survive, for unbound work and while the gate isn't on: the
+//!   format check in the cached-ready and last-known create candidates and
+//!   the source and remote restore candidates, the projections in every
+//!   candidate statement, the kernel check in the two create statements and
+//!   the pool statement. Other recorded components are checked in every mode.
+//!   The two create statements are filtered in Rust, so when on refuses every
+//!   holder a create that may pull (it names a build and needs neither a base
+//!   snapshot nor a pool) goes on to pull-on-create; one no holder was refused
+//!   for fails as off.
 //! - Custom vCPU or memory uses separate create and start calls: only
 //!   `StartRequest` carries those fields. A readiness wait still blocks on
 //!   start. Default shapes and disk-only overrides can use one-shot create,
@@ -82,7 +97,7 @@
 
 use pplx_space_common_core::sql;
 use pplx_space_postgres_pool::contention;
-use std::{fmt, time::Duration};
+use std::{fmt, sync::LazyLock, time::Duration};
 
 use pplx_space_common_core::types::{
     ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, ExecutionGenerationParseError,
@@ -103,6 +118,7 @@ use tonic::{Code, transport::Endpoint};
 use tracing::Instrument;
 use uuid::Uuid;
 
+use super::environment_placement::{BindingScope, EnvironmentPlacementGate};
 use super::{
     ActivationCompletion, ActivationOptions, BuilderClient, CreateBootMode, CreateExecutionOutcome,
     CreateExecutionRequest, DbContext, ExecutionActivation, ExecutionActivityKind,
@@ -114,7 +130,9 @@ use super::{
 };
 use crate::controllers::auto_lifecycle::policy_to_proto;
 use crate::controllers::{ControllerError, db_contention_error};
+use crate::metrics::environment_placement::EnvironmentPlacementPath;
 use crate::models::Sandbox;
+use pplx_space_node_status_store::environment_refusal;
 
 fn network_policy_to_proto(policy: &NetworkPolicyV1) -> NetworkPolicyProto {
     NetworkPolicyProto::from(policy)
@@ -128,6 +146,25 @@ struct DirectNode {
     node_api_endpoint: String,
 }
 
+/// A candidate from a statement the environment gate evaluates, with what
+/// the gate would refuse it for (an `EnvironmentRefusal` wire value); NULL
+/// when there's nothing to refuse.
+#[derive(Debug, Clone, FromRow)]
+struct GatedDirectNode {
+    id: NodeId,
+    node_api_endpoint: String,
+    environment_refusal: Option<String>,
+}
+
+impl From<GatedDirectNode> for DirectNode {
+    fn from(row: GatedDirectNode) -> Self {
+        Self {
+            id: row.id,
+            node_api_endpoint: row.node_api_endpoint,
+        }
+    }
+}
+
 #[derive(Debug, Clone, FromRow)]
 struct DirectPoolCandidate {
     id: NodeId,
@@ -135,6 +172,8 @@ struct DirectPoolCandidate {
     content_hash: String,
     vcpu: Option<i32>,
     memory_mib: Option<i32>,
+    /// As [`GatedDirectNode::environment_refusal`].
+    environment_refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +210,8 @@ struct DirectRestoreCandidateRow {
     node_api_endpoint: String,
     storage_uri: Option<String>,
     source_node_id: Option<NodeId>,
+    /// As [`GatedDirectNode::environment_refusal`].
+    environment_refusal: Option<String>,
 }
 
 impl DirectRestoreCandidate {
@@ -199,11 +240,21 @@ impl DirectRestoreCandidate {
     }
 }
 
+/// One refusal shadow recorded: the statement, the reason label and the node.
+#[cfg(test)]
+type RecordedRefusal = (EnvironmentPlacementPath, &'static str, NodeId);
+
 #[derive(Clone)]
 pub struct DirectSubstrate {
     pool: PgPool,
     worker_channels: std::sync::Arc<super::worker_channels::WorkerChannels>,
     builder_connect_retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
+    /// Whether placement requires evidence for bound work.
+    environment_placement: EnvironmentPlacementGate,
+    /// Every refusal shadow recorded, so a test can compare what shadow
+    /// classifies with what on leaves out without reading telemetry.
+    #[cfg(test)]
+    recorded_refusals: std::sync::Arc<std::sync::Mutex<Vec<RecordedRefusal>>>,
 }
 
 const DIRECT_NODE_CREATE_FAILURE_TTL_SECS: i64 = 10;
@@ -945,7 +996,91 @@ impl DirectSubstrate {
             )),
             builder_connect_retry_policy:
                 pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+            environment_placement: EnvironmentPlacementGate::default(),
+            #[cfg(test)]
+            recorded_refusals: Default::default(),
         }
+    }
+
+    pub(super) fn environment_placement(&self) -> EnvironmentPlacementGate {
+        self.environment_placement
+    }
+
+    /// Place bound work under `gate`.
+    pub fn with_environment_placement_gate(mut self, gate: EnvironmentPlacementGate) -> Self {
+        self.environment_placement = gate;
+        self
+    }
+
+    /// [`record_refusals`](super::environment_placement::record_refusals)
+    /// under this substrate's gate.
+    fn record_environment_refusals<'a>(
+        &self,
+        path: EnvironmentPlacementPath,
+        candidates: impl IntoIterator<Item = (NodeId, Option<&'a str>)>,
+    ) {
+        let recorded = super::environment_placement::record_refusals(
+            self.environment_placement,
+            path,
+            candidates,
+        );
+        #[cfg(test)]
+        self.recorded_refusals
+            .lock()
+            .expect("recorded refusals")
+            .extend(
+                recorded
+                    .into_iter()
+                    .map(|(label, node)| (path, label, node)),
+            );
+        #[cfg(not(test))]
+        drop(recorded);
+    }
+
+    /// What [`Self::record_environment_refusals`] has recorded so far, as
+    /// (statement, reason label, node).
+    #[cfg(test)]
+    pub(crate) fn recorded_refusals(
+        &self,
+    ) -> Vec<(EnvironmentPlacementPath, &'static str, NodeId)> {
+        self.recorded_refusals
+            .lock()
+            .expect("recorded refusals")
+            .clone()
+    }
+
+    /// The `candidates` the environment gate admits on `path`, and whether
+    /// any has a refusal: on drops a refused candidate, and shadow records
+    /// it.
+    fn admit_environment_candidates(
+        &self,
+        path: EnvironmentPlacementPath,
+        candidates: Vec<GatedDirectNode>,
+    ) -> (Vec<DirectNode>, bool) {
+        let refuses = self.environment_placement.refuses();
+        let refused = candidates
+            .iter()
+            .any(|candidate| candidate.environment_refusal.is_some());
+        let candidates = candidates
+            .into_iter()
+            .filter(|candidate| !refuses || candidate.environment_refusal.is_none())
+            .collect();
+        (self.take_environment_refusals(path, candidates), refused)
+    }
+
+    /// [`Self::record_environment_refusals`] for plain node candidates.
+    fn take_environment_refusals(
+        &self,
+        path: EnvironmentPlacementPath,
+        candidates: Vec<GatedDirectNode>,
+    ) -> Vec<DirectNode> {
+        self.record_environment_refusals(
+            path,
+            candidates
+                .iter()
+                .map(|candidate| (candidate.id, candidate.environment_refusal.as_deref())),
+        );
+        candidates.into_iter().map(DirectNode::from).collect()
     }
 
     /// Dial builders under `policy`. A test whose builder refuses every
@@ -1783,6 +1918,9 @@ impl DirectSubstrate {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
+    /// The cached create candidates, or `Unavailable` when there are none,
+    /// whether or not the gate refused any: what tests of the statements read.
+    #[cfg(test)]
     async fn cached_worker_create_candidates(
         &self,
         template: &str,
@@ -1790,13 +1928,53 @@ impl DirectSubstrate {
         runtime: &str,
         boot_mode: CreateBootMode,
     ) -> Result<Vec<DirectNode>, SubstrateError> {
+        let (candidates, _) = self
+            .gated_cached_worker_create_candidates(template, content_hash, runtime, boot_mode)
+            .await?;
+        if candidates.is_empty() {
+            return Err(SubstrateError::Unavailable {
+                message: format!("no cached-ready worker node-api nodes host template {template}"),
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// The cached-ready create candidates, else the last-known fallback's.
+    /// With none, also whether the environment gate refused a holder. The
+    /// gate filters these two statements here rather than in their `WHERE`,
+    /// so a create can tell a template the gate kept off every holder from
+    /// one no worker holds. The last-known statement's answer is enough: it
+    /// differs from the cached-ready one only in what it asks of a node's
+    /// snapshot, so it returns every node that one does, with the same rows
+    /// when the create names a build.
+    async fn gated_cached_worker_create_candidates(
+        &self,
+        template: &str,
+        content_hash: Option<&str>,
+        runtime: &str,
+        boot_mode: CreateBootMode,
+    ) -> Result<(Vec<DirectNode>, bool), SubstrateError> {
         let require_base_snapshot = matches!(boot_mode, CreateBootMode::BaseSnapshot);
-        let cached_ready = sqlx::query_as::<_, DirectNode>(
-            sql!("SELECT n.id, nd.node_api_endpoint
+        let refuse = self.environment_placement.refuses();
+        let environment = self
+            .work_environment(template, content_hash, BindingScope::Release)
+            .await?;
+        // Binds: $1 template, $2 content hash, $3 runtime, $4 whether a base
+        // snapshot is required, $5 the substrate, $6 whether the environment
+        // gate refuses, $7 the release's environment (`work_environment`). A
+        // candidate is gated by its own inventory row's binding, the build a
+        // create with no environment preference runs when the node has a
+        // legacy-partition one, and by $7 when the row names none.
+        static CACHED_READY_WORKER_CREATE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
+            format!(
+                "SELECT n.id, nd.node_api_endpoint, environment_gate.refusal AS environment_refusal
              FROM nodes n
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_status_snapshots nss ON nss.node_id = n.id
              JOIN node_template_inventory nti ON nti.node_id = n.id
+             CROSS JOIN LATERAL (
+                 SELECT {refusal} AS refusal
+             ) environment_gate
              WHERE n.managed_by = $5
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
@@ -1804,7 +1982,8 @@ impl DirectSubstrate {
                AND nss.reachable IS TRUE
                AND nss.stale_after > NOW()
                AND nss.scheduling_status = 'ready'
-               AND ($3 = 'fc' OR (
+               AND (($6::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL)
+                    OR $3 = 'fc' OR (
                     nss.reachable IS TRUE
                     AND nss.scheduling_status = 'ready'
                     AND nss.stale_after > NOW()
@@ -1823,7 +2002,8 @@ impl DirectSubstrate {
                AND ($2::TEXT IS NULL OR nti.content_hash = $2)
                AND (($3 = 'fc' AND nti.runtime IS NULL) OR nti.runtime = $3)
                AND (
-                    ($3 = 'fc' AND NOT EXISTS (
+                    ($6::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL)
+                    OR ($3 = 'fc' AND NOT EXISTS (
                         SELECT 1 FROM node_runtime_installations inventory
                         WHERE inventory.node_id = n.id
                     ))
@@ -1835,6 +2015,10 @@ impl DirectSubstrate {
                )
                AND (
                     $4::BOOLEAN IS FALSE
+                    -- The environment gate's match replaces the format
+                    -- comparison for bound work on a node with evidence.
+                    OR ($6::BOOLEAN IS TRUE
+                        AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL)
                     OR ($3 = 'fc' AND (
                         nti.state_format_name IS NULL
                         OR NOT EXISTS (
@@ -1856,6 +2040,10 @@ impl DirectSubstrate {
                     SELECT 1
                     FROM node_template_components requested
                     WHERE requested.node_id = nti.node_id
+                      -- On, the environment match stands in for the kernel
+                      -- check for bound work: a node publishes a managed
+                      -- environment's kernel only in its evidence.
+                      AND NOT (($6::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL) AND requested.kind = 'kernel')
                       AND requested.template_name = nti.template_name
                       AND requested.content_hash = nti.content_hash
                       AND NOT EXISTS (
@@ -1875,34 +2063,52 @@ impl DirectSubstrate {
                       )
                )
                AND ($4::BOOLEAN IS FALSE OR nti.has_base_snapshot IS TRUE)
-             ORDER BY random()"),
-        )
+             ORDER BY random()",
+                refusal = environment_refusal("nss", "COALESCE(nti.execution_metadata->>'environment', $7::TEXT)"),
+            )
+        });
+        let cached_ready = sqlx::query_as::<_, GatedDirectNode>(sqlx::AssertSqlSafe(sql!(
+            CACHED_READY_WORKER_CREATE_CANDIDATES.as_str()
+        )))
         .bind(template)
         .bind(content_hash)
         .bind(runtime)
         .bind(require_base_snapshot)
         .bind(SubstrateKind::Space)
+        .bind(refuse)
+        .bind(environment.as_deref())
         .fetch_all(&self.pool)
         .await
         .db_context("failed to select cached-ready worker node")?;
+        let (cached_ready, _) =
+            self.admit_environment_candidates(EnvironmentPlacementPath::CachedCreate, cached_ready);
 
         if !cached_ready.is_empty() {
-            return Ok(cached_ready);
+            return Ok((cached_ready, false));
         }
 
-        let last_known = sqlx::query_as::<_, DirectNode>(
-            sql!("SELECT DISTINCT ON (n.id) n.id, nd.node_api_endpoint
+        // Tolerates a missing or stale snapshot (LEFT JOIN), with the same
+        // binds as the cached-ready statement. With the environment gate on,
+        // bound work still needs a snapshot that's evidence.
+        static LAST_KNOWN_WORKER_CREATE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
+            format!(
+                "SELECT DISTINCT ON (n.id) n.id, nd.node_api_endpoint,
+                    environment_gate.refusal AS environment_refusal
              FROM nodes n
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_template_inventory nti ON nti.node_id = n.id
              LEFT JOIN node_status_snapshots nss ON nss.node_id = n.id
+             CROSS JOIN LATERAL (
+                 SELECT {refusal} AS refusal
+             ) environment_gate
              WHERE n.managed_by = $5
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
                AND COALESCE(n.state, 'registered') = 'registered'
                AND COALESCE(nss.reachable, TRUE) IS TRUE
                AND COALESCE(nss.scheduling_status, 'ready') NOT IN ('full', 'draining', 'unavailable')
-               AND ($3 = 'fc' OR (
+               AND (($6::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL)
+                    OR $3 = 'fc' OR (
                     nss.reachable IS TRUE
                     AND nss.scheduling_status = 'ready'
                     AND nss.stale_after > NOW()
@@ -1921,7 +2127,8 @@ impl DirectSubstrate {
                AND ($2::TEXT IS NULL OR nti.content_hash = $2)
                AND (($3 = 'fc' AND nti.runtime IS NULL) OR nti.runtime = $3)
                AND (
-                    ($3 = 'fc' AND NOT EXISTS (
+                    ($6::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL)
+                    OR ($3 = 'fc' AND NOT EXISTS (
                         SELECT 1 FROM node_runtime_installations inventory
                         WHERE inventory.node_id = n.id
                     ))
@@ -1933,6 +2140,10 @@ impl DirectSubstrate {
                )
                AND (
                     $4::BOOLEAN IS FALSE
+                    -- The environment gate's match replaces the format
+                    -- comparison for bound work on a node with evidence.
+                    OR ($6::BOOLEAN IS TRUE
+                        AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL)
                     OR ($3 = 'fc' AND (
                         nti.state_format_name IS NULL
                         OR NOT EXISTS (
@@ -1954,6 +2165,10 @@ impl DirectSubstrate {
                     SELECT 1
                     FROM node_template_components requested
                     WHERE requested.node_id = nti.node_id
+                      -- On, the environment match stands in for the kernel
+                      -- check for bound work: a node publishes a managed
+                      -- environment's kernel only in its evidence.
+                      AND NOT (($6::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $7::TEXT) IS NOT NULL) AND requested.kind = 'kernel')
                       AND requested.template_name = nti.template_name
                       AND requested.content_hash = nti.content_hash
                       AND NOT EXISTS (
@@ -1973,16 +2188,25 @@ impl DirectSubstrate {
                       )
                )
                AND ($4::BOOLEAN IS FALSE OR nti.has_base_snapshot IS TRUE)
-             ORDER BY n.id, nti.observed_at DESC, nss.observed_at DESC NULLS LAST"),
-        )
+             ORDER BY n.id, nti.observed_at DESC, nss.observed_at DESC NULLS LAST",
+                refusal = environment_refusal("nss", "COALESCE(nti.execution_metadata->>'environment', $7::TEXT)"),
+            )
+        });
+        let last_known = sqlx::query_as::<_, GatedDirectNode>(sqlx::AssertSqlSafe(sql!(
+            LAST_KNOWN_WORKER_CREATE_CANDIDATES.as_str()
+        )))
         .bind(template)
         .bind(content_hash)
         .bind(runtime)
         .bind(require_base_snapshot)
         .bind(SubstrateKind::Space)
+        .bind(refuse)
+        .bind(environment.as_deref())
         .fetch_all(&self.pool)
         .await
         .db_context("failed to select last-known worker node")?;
+        let (last_known, refused_last_known) = self
+            .admit_environment_candidates(EnvironmentPlacementPath::LastKnownCreate, last_known);
 
         if !last_known.is_empty() {
             tracing::warn!(
@@ -1992,23 +2216,101 @@ impl DirectSubstrate {
                 candidate_count = last_known.len(),
                 "no cached-ready worker candidates; falling back to last-known worker inventory"
             );
-            return Ok(last_known);
+            return Ok((last_known, false));
         }
 
-        Err(SubstrateError::Unavailable {
-            message: format!("no cached-ready worker node-api nodes host template {template}"),
-        })
+        Ok((Vec::new(), refused_last_known))
     }
 
+    /// The cached candidates a create tries first. When the environment
+    /// placement gate refused every one, that's a cache miss rather than a
+    /// failure: a node with evidence could still pull the template. With no
+    /// candidate the gate refused, the error stands, as before the gate.
+    async fn create_candidates_from_cache(
+        &self,
+        template: &str,
+        content_hash: Option<&str>,
+        runtime: &str,
+        boot_mode: CreateBootMode,
+    ) -> Result<Vec<DirectNode>, SubstrateError> {
+        let (candidates, refused) = self
+            .gated_cached_worker_create_candidates(template, content_hash, runtime, boot_mode)
+            .await?;
+        if candidates.is_empty() && !refused {
+            return Err(SubstrateError::Unavailable {
+                message: format!("no cached-ready worker node-api nodes host template {template}"),
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// [`work_environment`](super::environment_placement::work_environment)
+    /// under this substrate's gate.
+    async fn work_environment(
+        &self,
+        template: &str,
+        content_hash: Option<&str>,
+        scope: BindingScope,
+    ) -> Result<Option<String>, SubstrateError> {
+        super::environment_placement::work_environment(
+            self.environment_placement,
+            &self.pool,
+            template,
+            content_hash,
+            scope,
+        )
+        .await
+        .db_context("failed to read the template build's environment")
+    }
+
+    /// Workers that can pull `template` at `content_hash` and create from it,
+    /// holders of the build included. A holder is gated as a cached candidate
+    /// is: by its own row's binding, else the release's. Any other candidate
+    /// is gated by the build's binding (`work_environment`): its release's,
+    /// or for a release recorded without one, the one every holder whose row
+    /// names a binding agrees on.
     async fn pull_on_create_worker_candidates(
         &self,
+        template: &str,
+        content_hash: Option<&str>,
         runtime: &str,
     ) -> Result<Vec<DirectNode>, SubstrateError> {
-        sqlx::query_as::<_, DirectNode>(sql!(
-            "SELECT n.id, nd.node_api_endpoint
+        let environment = self
+            .work_environment(template, content_hash, BindingScope::ReleaseOrHolders)
+            .await?;
+        let release_environment = self
+            .work_environment(template, content_hash, BindingScope::Release)
+            .await?;
+        // Binds: $1 runtime, $2 the substrate, $3 the build's environment for
+        // a candidate that doesn't hold it (`work_environment`), $4 whether
+        // the environment gate refuses, $5 template, $6 content hash, $7 the
+        // release's environment. A candidate holding the digest is gated as a
+        // cached one is: by its own row's binding, else by $7.
+        static PULL_ON_CREATE_WORKER_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
+            format!(
+                "SELECT n.id, nd.node_api_endpoint, environment_gate.refusal AS environment_refusal
              FROM nodes n
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_status_snapshots nss ON nss.node_id = n.id
+             -- A candidate that already holds the digest runs the build it
+             -- holds, so it's gated as a cached one is: by its own row's
+             -- binding, else the release's. A row that names a binding wins
+             -- over one that doesn't, then the exact spelling of the digest.
+             LEFT JOIN LATERAL (
+                 SELECT COALESCE(held.execution_metadata->>'environment', $7::TEXT)
+                            AS environment,
+                        TRUE AS holds
+                 FROM node_template_inventory held
+                 WHERE held.node_id = n.id
+                   AND held.template_name = $5
+                   AND held.content_hash IN ($6, replace($6, 'sha256:', ''))
+                 ORDER BY held.execution_metadata->>'environment' IS NULL,
+                          held.content_hash = $6 DESC
+                 LIMIT 1
+             ) held ON TRUE
+             CROSS JOIN LATERAL (
+                 SELECT {refusal} AS refusal
+             ) environment_gate
              WHERE n.managed_by = $2
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
@@ -2017,7 +2319,8 @@ impl DirectSubstrate {
                AND nss.stale_after > NOW()
                AND nss.scheduling_status = 'ready'
                AND (
-                    ($1 = 'fc' AND NOT EXISTS (
+                    ($4::BOOLEAN IS TRUE AND CASE WHEN held.holds THEN held.environment ELSE $3::TEXT END IS NOT NULL)
+                    OR ($1 = 'fc' AND NOT EXISTS (
                         SELECT 1 FROM node_runtime_installations inventory
                         WHERE inventory.node_id = n.id
                     ))
@@ -2027,7 +2330,8 @@ impl DirectSubstrate {
                           AND runtime.runtime = $1
                     )
                )
-               AND ($1 = 'fc' OR (
+               AND (($4::BOOLEAN IS TRUE AND CASE WHEN held.holds THEN held.environment ELSE $3::TEXT END IS NOT NULL)
+                    OR $1 = 'fc' OR (
                     nss.reachable IS TRUE
                     AND nss.scheduling_status = 'ready'
                     AND nss.stale_after > NOW()
@@ -2040,13 +2344,28 @@ impl DirectSubstrate {
                           AND guest.runtime = $1
                     )
                ))
-             ORDER BY random()"
-        ))
+               AND (
+                    $4::BOOLEAN IS FALSE
+                    OR environment_gate.refusal IS NULL
+               )
+             ORDER BY random()",
+                refusal = environment_refusal("nss", "CASE WHEN held.holds THEN held.environment ELSE $3::TEXT END"),
+            )
+        });
+        let candidates = sqlx::query_as::<_, GatedDirectNode>(sqlx::AssertSqlSafe(sql!(
+            PULL_ON_CREATE_WORKER_CANDIDATES.as_str()
+        )))
         .bind(runtime)
         .bind(SubstrateKind::Space)
+        .bind(environment)
+        .bind(self.environment_placement.refuses())
+        .bind(template)
+        .bind(content_hash)
+        .bind(release_environment.as_deref())
         .fetch_all(&self.pool)
         .await
-        .db_context("failed to select pull-on-create worker node")
+        .db_context("failed to select pull-on-create worker node")?;
+        Ok(self.take_environment_refusals(EnvironmentPlacementPath::PullCreate, candidates))
     }
 
     async fn pooled_worker_candidates(
@@ -2055,12 +2374,25 @@ impl DirectSubstrate {
         content_hash: Option<&str>,
         runtime: &str,
     ) -> Result<Vec<DirectPoolCandidate>, ControllerError> {
-        sqlx::query_as::<_, DirectPoolCandidate>(
-            sql!("SELECT n.id, nd.node_api_endpoint, nti.content_hash, nti.vcpu, nti.memory_mib
+        // Binds: $1 template, $2 content hash, $3 runtime, $4 the substrate,
+        // $5 whether the environment gate refuses, $6 the release's
+        // environment (`work_environment`). A candidate is gated by its own
+        // inventory row's binding, and by $6 when the row names none.
+        let environment = self
+            .work_environment(template, content_hash, BindingScope::Release)
+            .await
+            .map_err(ControllerError::from)?;
+        static POOLED_WORKER_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
+            format!(
+                "SELECT n.id, nd.node_api_endpoint, nti.content_hash, nti.vcpu, nti.memory_mib,
+                    environment_gate.refusal AS environment_refusal
              FROM nodes n
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_status_snapshots nss ON nss.node_id = n.id
              JOIN node_template_inventory nti ON nti.node_id = n.id
+             CROSS JOIN LATERAL (
+                 SELECT {refusal} AS refusal
+             ) environment_gate
              WHERE n.managed_by = $4
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
@@ -2068,7 +2400,8 @@ impl DirectSubstrate {
                AND nss.reachable IS TRUE
                AND nss.stale_after > NOW()
                AND nss.scheduling_status = 'ready'
-               AND ($3 = 'fc' OR (
+               AND (($5::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $6::TEXT) IS NOT NULL)
+                    OR $3 = 'fc' OR (
                     nss.reachable IS TRUE
                     AND nss.scheduling_status = 'ready'
                     AND nss.stale_after > NOW()
@@ -2087,7 +2420,8 @@ impl DirectSubstrate {
                AND ($2::TEXT IS NULL OR nti.content_hash = $2)
                AND (($3 = 'fc' AND nti.runtime IS NULL) OR nti.runtime = $3)
                AND (
-                    ($3 = 'fc' AND NOT EXISTS (
+                    ($5::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $6::TEXT) IS NOT NULL)
+                    OR ($3 = 'fc' AND NOT EXISTS (
                         SELECT 1 FROM node_runtime_installations inventory
                         WHERE inventory.node_id = n.id
                     ))
@@ -2101,6 +2435,10 @@ impl DirectSubstrate {
                     SELECT 1
                     FROM node_template_components requested
                     WHERE requested.node_id = nti.node_id
+                      -- On, the environment match stands in for the kernel
+                      -- check for bound work: a node publishes a managed
+                      -- environment's kernel only in its evidence.
+                      AND NOT (($5::BOOLEAN IS TRUE AND COALESCE(nti.execution_metadata->>'environment', $6::TEXT) IS NOT NULL) AND requested.kind = 'kernel')
                       AND requested.template_name = nti.template_name
                       AND requested.content_hash = nti.content_hash
                       AND NOT EXISTS (
@@ -2120,15 +2458,33 @@ impl DirectSubstrate {
                       )
                )
                AND nti.pool_current > 0
-             ORDER BY nti.pool_current DESC, random()"),
-        )
+               AND (
+                    $5::BOOLEAN IS FALSE
+                    OR environment_gate.refusal IS NULL
+               )
+             ORDER BY nti.pool_current DESC, random()",
+                refusal = environment_refusal("nss", "COALESCE(nti.execution_metadata->>'environment', $6::TEXT)"),
+            )
+        });
+        let candidates = sqlx::query_as::<_, DirectPoolCandidate>(sqlx::AssertSqlSafe(sql!(
+            POOLED_WORKER_CANDIDATES.as_str()
+        )))
         .bind(template)
         .bind(content_hash)
         .bind(runtime)
         .bind(SubstrateKind::Space)
+        .bind(self.environment_placement.refuses())
+        .bind(environment.as_deref())
         .fetch_all(&self.pool)
         .await
-        .map_err(|err| db_contention_error("failed to select direct pool candidates", &err))
+        .map_err(|err| db_contention_error("failed to select direct pool candidates", &err))?;
+        self.record_environment_refusals(
+            EnvironmentPlacementPath::PoolAdoption,
+            candidates
+                .iter()
+                .map(|candidate| (candidate.id, candidate.environment_refusal.as_deref())),
+        );
+        Ok(candidates)
     }
 
     fn pool_resource_value(
@@ -2435,7 +2791,8 @@ impl DirectSubstrate {
              SELECT n.id,
                     nd.node_api_endpoint,
                     NULL::TEXT AS storage_uri,
-                    COALESCE(s.target_node_id, s.active_node_id) AS source_node_id
+                    COALESCE(s.target_node_id, s.active_node_id) AS source_node_id,
+                    environment_gate.refusal AS environment_refusal
              FROM sandboxes s
              CROSS JOIN latest_snapshot
              JOIN sandbox_observed_states sos
@@ -2444,6 +2801,9 @@ impl DirectSubstrate {
              JOIN nodes n ON n.id = sos.node_id
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_status_snapshots nss ON nss.node_id = n.id
+             CROSS JOIN LATERAL (
+                 SELECT {refusal} AS refusal
+             ) environment_gate
              WHERE s.id = $1
                AND n.managed_by = $2
                AND n.role = 'worker'
@@ -2463,26 +2823,30 @@ impl DirectSubstrate {
                AND latest_snapshot.guest_arch IS NOT NULL
                AND latest_snapshot.state_format_name IS NOT NULL
                AND latest_snapshot.state_format_version IS NOT NULL
-               AND EXISTS (
+               AND (($3::BOOLEAN IS TRUE AND latest_snapshot.execution_metadata->>'environment' IS NOT NULL)
+                    OR EXISTS (
                     SELECT 1
                     FROM node_runtime_installations runtime
                     JOIN node_runtime_guests guest
                       ON guest.node_id = runtime.node_id
                      AND guest.runtime = runtime.runtime
                      AND guest.runtime_version = runtime.runtime_version
-                    JOIN node_runtime_state_formats state_format
-                      ON state_format.node_id = runtime.node_id
-                     AND state_format.runtime = runtime.runtime
-                     AND state_format.runtime_version = runtime.runtime_version
                     WHERE runtime.node_id = n.id
                       AND runtime.runtime = latest_snapshot.runtime
                       AND guest.guest_os = latest_snapshot.guest_os
                       AND guest.guest_arch = latest_snapshot.guest_arch
-                      AND state_format.state_format_name = latest_snapshot.state_format_name
-                      AND split_part(state_format.state_format_version, '.', 1)
-                          = split_part(latest_snapshot.state_format_version, '.', 1)
-                      AND state_format.can_load IS TRUE
-                   )
+                      AND EXISTS (
+                              SELECT 1
+                              FROM node_runtime_state_formats state_format
+                              WHERE state_format.node_id = runtime.node_id
+                                AND state_format.runtime = runtime.runtime
+                                AND state_format.runtime_version = runtime.runtime_version
+                                AND state_format.state_format_name = latest_snapshot.state_format_name
+                                AND split_part(state_format.state_format_version, '.', 1)
+                                    = split_part(latest_snapshot.state_format_version, '.', 1)
+                                AND state_format.can_load IS TRUE
+                          )
+                   ))
                    AND NOT EXISTS (
                     SELECT 1
                     FROM jsonb_to_recordset(
@@ -2507,16 +2871,28 @@ impl DirectSubstrate {
                             )
                       )
                )
-             LIMIT 1"
+               AND (
+                    $3::BOOLEAN IS FALSE
+                    OR environment_gate.refusal IS NULL
+               )
+             LIMIT 1",
+            refusal = environment_refusal("nss", "latest_snapshot.execution_metadata->>'environment'"),
         );
         let source_candidates = sqlx::query_as::<_, DirectRestoreCandidateRow>(
             sqlx::AssertSqlSafe(sql!(source_query.as_str())),
         )
         .bind(sandbox_id.as_uuid())
         .bind(SubstrateKind::Space)
+        .bind(self.environment_placement.refuses())
         .fetch_all(&self.pool)
         .await
         .db_context("failed to select direct source restore candidate")?;
+        self.record_environment_refusals(
+            EnvironmentPlacementPath::RestoreSource,
+            source_candidates
+                .iter()
+                .map(|row| (row.id, row.environment_refusal.as_deref())),
+        );
         candidates.extend(
             source_candidates
                 .into_iter()
@@ -2559,11 +2935,15 @@ impl DirectSubstrate {
              SELECT n.id,
                     nd.node_api_endpoint,
                     latest_snapshot.storage_uri,
-                    latest_snapshot.source_node_id
+                    latest_snapshot.source_node_id,
+                    environment_gate.refusal AS environment_refusal
              FROM latest_snapshot
              JOIN nodes n ON n.id IS DISTINCT FROM latest_snapshot.source_node_id
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_status_snapshots nss ON nss.node_id = n.id
+             CROSS JOIN LATERAL (
+                 SELECT {refusal} AS refusal
+             ) environment_gate
              WHERE n.managed_by = $3
                AND n.role = 'worker'
                AND nd.deleted_at IS NULL
@@ -2582,26 +2962,30 @@ impl DirectSubstrate {
                AND latest_snapshot.guest_arch IS NOT NULL
                AND latest_snapshot.state_format_name IS NOT NULL
                AND latest_snapshot.state_format_version IS NOT NULL
-               AND EXISTS (
+               AND (($4::BOOLEAN IS TRUE AND latest_snapshot.execution_metadata->>'environment' IS NOT NULL)
+                    OR EXISTS (
                     SELECT 1
                     FROM node_runtime_installations runtime
                     JOIN node_runtime_guests guest
                       ON guest.node_id = runtime.node_id
                      AND guest.runtime = runtime.runtime
                      AND guest.runtime_version = runtime.runtime_version
-                    JOIN node_runtime_state_formats state_format
-                      ON state_format.node_id = runtime.node_id
-                     AND state_format.runtime = runtime.runtime
-                     AND state_format.runtime_version = runtime.runtime_version
                     WHERE runtime.node_id = n.id
                       AND runtime.runtime = latest_snapshot.runtime
                       AND guest.guest_os = latest_snapshot.guest_os
                       AND guest.guest_arch = latest_snapshot.guest_arch
-                      AND state_format.state_format_name = latest_snapshot.state_format_name
-                      AND split_part(state_format.state_format_version, '.', 1)
-                          = split_part(latest_snapshot.state_format_version, '.', 1)
-                      AND state_format.can_load IS TRUE
-                   )
+                      AND EXISTS (
+                              SELECT 1
+                              FROM node_runtime_state_formats state_format
+                              WHERE state_format.node_id = runtime.node_id
+                                AND state_format.runtime = runtime.runtime
+                                AND state_format.runtime_version = runtime.runtime_version
+                                AND state_format.state_format_name = latest_snapshot.state_format_name
+                                AND split_part(state_format.state_format_version, '.', 1)
+                                    = split_part(latest_snapshot.state_format_version, '.', 1)
+                                AND state_format.can_load IS TRUE
+                          )
+                   ))
                    -- Component compatibility reads the components array of the
                    -- execution_metadata document written by BeginArtifactBackup.
                    -- Omitted optional keys surface as NULL
@@ -2637,8 +3021,13 @@ impl DirectSubstrate {
                             )
                       )
                )
+               AND (
+                    $4::BOOLEAN IS FALSE
+                    OR environment_gate.refusal IS NULL
+               )
              ORDER BY random()
              LIMIT $2",
+            refusal = environment_refusal("nss", "latest_snapshot.execution_metadata->>'environment'"),
         );
         let remote_candidates = sqlx::query_as::<_, DirectRestoreCandidateRow>(
             sqlx::AssertSqlSafe(sql!(remote_query.as_str())),
@@ -2646,9 +3035,16 @@ impl DirectSubstrate {
         .bind(sandbox_id.as_uuid())
         .bind(DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT)
         .bind(SubstrateKind::Space)
+        .bind(self.environment_placement.refuses())
         .fetch_all(&self.pool)
         .await
         .db_context("failed to select direct remote restore candidates")?;
+        self.record_environment_refusals(
+            EnvironmentPlacementPath::RestoreRemote,
+            remote_candidates
+                .iter()
+                .map(|row| (row.id, row.environment_refusal.as_deref())),
+        );
         candidates.extend(
             remote_candidates
                 .into_iter()
@@ -4209,7 +4605,7 @@ impl SubstrateAdapter for DirectSubstrate {
         );
         let sandbox_id = request.sandbox_id;
         let cached_candidates = self
-            .cached_worker_create_candidates(
+            .create_candidates_from_cache(
                 request.template_ref.template.as_str(),
                 request.template_ref.content_hash,
                 request.template_ref.runtime,
@@ -4240,7 +4636,11 @@ impl SubstrateAdapter for DirectSubstrate {
                 "no cached direct worker accepted create; trying pull-on-create candidates"
             );
             let pull_candidates = self
-                .pull_on_create_worker_candidates(request.template_ref.runtime)
+                .pull_on_create_worker_candidates(
+                    request.template_ref.template.as_str(),
+                    request.template_ref.content_hash,
+                    request.template_ref.runtime,
+                )
                 .await?;
             selected = self
                 .try_create_on_worker_candidates(

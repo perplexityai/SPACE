@@ -475,8 +475,8 @@ impl OutboundPublisher for ClusterApiPublisher {
 }
 
 /// The node's Kubernetes object reconciles: template-presence node metadata,
-/// network-slot status capacity, the SSD placement labels and the host-CPU
-/// label. They ride the template-inventory publication (see
+/// network-slot status capacity, the SSD placement labels, the host-CPU
+/// label and the environment labels. They ride the template-inventory publication (see
 /// `NodeCtlWorker::run_outbound_sync`). A trait so a test can stand in for the
 /// Kubernetes controller.
 #[tonic::async_trait]
@@ -514,6 +514,9 @@ impl NodeObjectReconciles for kubernetes_controller::Controller {
         }
         if let Err(error) = self.reconcile_host_cpu().await {
             tracing::warn!(%error, "local Kubernetes host-cpu reconcile failed");
+        }
+        if let Err(error) = self.reconcile_environment_labels().await {
+            tracing::warn!(%error, "local Kubernetes environment-label reconcile failed");
         }
     }
 }

@@ -80,6 +80,8 @@ bytes = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 insta = { workspace = true }
+# `serde` reads the E0 fixture document the environment-label tests build on.
+pplx-space-execution-common = { workspace = true, features = ["serde"] }
 pplx-space-sbx-mgr-client = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the facet

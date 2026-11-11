@@ -89,6 +89,7 @@ members = [
     "crates/l20_domain/execution/common",
     "crates/l40_api/execution/catalog",
     "crates/l30_storage/runtime/environment/catalog/store",
+    "crates/l30_storage/node/status/store",
     "crates/l30_storage/runtime/environment/policy/store",
     "crates/l20_domain/net/common",
     "crates/l40_api/net/gateway/client",
@@ -272,7 +273,7 @@ md-5 = "0.11"
 metrics = "0.24.1"
 multer = "3"
 nix = "0.31"
-rustix = "1.1.4"
+rustix = "1.1.6"
 notify = "8"
 oci-spec = { version = "0.10", default-features = false, features = ["distribution"] }
 object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
@@ -392,6 +393,7 @@ pplx-space-execution-catalog = { path = "crates/l40_api/execution/catalog" }
 pplx-space-execution-common = { path = "crates/l20_domain/execution/common" }
 pplx-space-runtime-environment-catalog-store = { path = "crates/l30_storage/runtime/environment/catalog/store" }
 pplx-space-runtime-environment-policy-store = { path = "crates/l30_storage/runtime/environment/policy/store" }
+pplx-space-node-status-store = { path = "crates/l30_storage/node/status/store" }
 pplx-space-feature-flags = { path = "crates/l10_foundation/feature/flags" }
 pplx-space-events = { path = "crates/l20_domain/events" }
 pplx-space-federated-grant-store = { path = "crates/l30_storage/federated/grant/store" }

@@ -235,6 +235,7 @@ fn direct_pool_candidate_shape_pairs_inventory_dimensions() {
         content_hash: "sha256:pooled".to_string(),
         vcpu: Some(4),
         memory_mib: Some(8192),
+        environment_refusal: None,
     };
 
     assert_eq!(
@@ -252,6 +253,7 @@ fn direct_pool_candidate_shape_rejects_half_populated_inventory() {
             content_hash: "sha256:pooled".to_string(),
             vcpu,
             memory_mib,
+            environment_refusal: None,
         };
 
         DirectSubstrate::pool_candidate_shape(&candidate)
@@ -4766,4 +4768,5 @@ async fn wake_keeps_generation_observed_during_resident_transition(
     Ok(())
 }
 
+mod environment_gate;
 mod runtime_evidence;

@@ -18,6 +18,8 @@ mod data_plane_session_retention;
 mod drained_node_terminator;
 mod env_config;
 mod environment_edge_recompute;
+#[cfg(feature = "kubernetes")]
+mod environment_placement_census;
 mod failed_restorable_repair;
 mod gone_node_write_off;
 mod kube_node_sync;

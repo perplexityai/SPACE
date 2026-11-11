@@ -71,6 +71,35 @@ pub(crate) async fn resolve_template_release_by_digest(
     Ok(release_id.map(|id| (id, hash)))
 }
 
+/// The execution environment the release of `template_name` at
+/// `content_hash` is bound to (its `execution_metadata.environment`), unparsed;
+/// `None` for an unbound release or no release. A legacy unprefixed hash
+/// matches the way [`resolve_template_release_by_digest`] matches it.
+///
+/// Placement reads it as the binding of Direct's create, pool and pull
+/// candidates whose own inventory row names none, of pull candidates that
+/// hold nothing, and of a Kubernetes pod's template work, through
+/// `environment_placement::work_environment`.
+pub(crate) async fn release_environment(
+    executor: impl PgExecutor<'_>,
+    template_name: &str,
+    content_hash: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, Option<String>>(sql!(
+        "SELECT r.execution_metadata->>'environment'
+         FROM template_releases r
+         WHERE r.template_name = $1
+           AND r.hash IN ($2, replace($2, 'sha256:', ''))
+         ORDER BY (r.hash = $2) DESC
+         LIMIT 1"
+    ))
+    .bind(template_name)
+    .bind(content_hash)
+    .fetch_optional(executor)
+    .await?
+    .flatten())
+}
+
 /// Whether the template has any release the caller may resolve, whatever its
 /// runtime and tags. Same visibility predicate as the lookups above.
 pub(crate) async fn template_has_visible_release(

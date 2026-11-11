@@ -134,6 +134,8 @@ pub(super) fn assemble_substrate(
             k8s_blocking_delete_timeout: TEST_BLOCKING_DELETE_TIMEOUT,
             abandoned_restore_retirement: AbandonedRestoreRetirement::Enabled,
             runtime_upgrade_at_activation: RuntimeUpgradeAtActivation::Disabled,
+            environment_placement:
+                crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::Off,
             caches,
         },
         restore_waiters: RestoreWaiters::with_max_poll_interval(

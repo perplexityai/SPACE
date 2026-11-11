@@ -114,6 +114,7 @@ pplx-space-common-work-coalescer = { workspace = true, optional = true }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-rpc-auth = { workspace = true }
+pplx-space-node-status-store = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-runtime-environment-policy-store = { workspace = true }
 pplx-space-sandbox-quarantine-store = { workspace = true }
@@ -140,6 +141,7 @@ pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
 pplx-space-node-api-sim = { workspace = true }
 pplx-space-rustls-provider = { workspace = true }
+pplx-space-node-status-store = { workspace = true, features = ["test-support"] }
 pplx-space-test-env = { workspace = true }
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
 rstest = { workspace = true }

@@ -523,6 +523,7 @@ fn test_common<'a>(
         content_hash: Some(TEST_CONTENT_HASH),
         env,
         traceparent: None,
+        environment: None,
     }
 }
 
@@ -2391,6 +2392,7 @@ fn node_group_placement_renders_boundary_affinity_and_dedicated_toleration() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2479,6 +2481,7 @@ fn shared_only_node_group_placement_renders_no_dedicated_toleration() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2538,6 +2541,7 @@ fn node_group_placement_and_drain_cohort_are_anded_in_one_term() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2600,6 +2604,7 @@ fn pooled_pod_renders_node_group_placement() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             pool: SandboxPoolPodMetadata {
                 slot_id: TEST_POOL_SLOT_ID,
@@ -2676,6 +2681,7 @@ fn local_only_restore_keeps_direct_node_assignment_under_placement() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2754,6 +2760,7 @@ fn dedicated_org_mismatch_renders_an_unsatisfiable_boundary() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2811,6 +2818,7 @@ fn placement_boundary_survives_with_every_soft_bias_disabled() {
                 content_hash: None,
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2858,6 +2866,7 @@ fn soft_pinned_restore_suppresses_the_dedicated_preference() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -2931,6 +2940,7 @@ fn pooled_pod_never_renders_dedicated_toleration_or_preference() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             pool: SandboxPoolPodMetadata {
                 slot_id: TEST_POOL_SLOT_ID,
@@ -2998,6 +3008,7 @@ fn dedicated_rendering_requires_matching_runtime_org() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3061,6 +3072,7 @@ fn restore_shortlist_suppresses_dedicated_preference_but_keeps_toleration() {
                 env: &env,
                 traceparent: None,
                 activation_attempt_id: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3155,6 +3167,7 @@ fn dedicated_preference_is_gated_on_node_services_readiness() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3208,6 +3221,7 @@ fn dedicated_preference_is_ungated_when_readiness_bias_is_off() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3257,6 +3271,7 @@ fn all_shared_placement_for_another_org_fails_closed() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3322,6 +3337,7 @@ fn org_less_placement_on_an_org_owned_pod_fails_closed() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             // This runtime carries an org, which is what makes the pair a
             // mismatch — a pooled pod (the only org-less pod there is) renders
@@ -3379,6 +3395,7 @@ fn placement_for_a_different_template_fails_closed() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3442,6 +3459,7 @@ fn an_empty_preferred_node_name_does_not_drop_the_required_shortlist() {
                 content_hash: Some(TEST_CONTENT_HASH),
                 env: &env,
                 traceparent: None,
+                environment: None,
             },
             runtime: placement_test_runtime(
                 &sandbox_owner,
@@ -3700,4 +3718,223 @@ fn render_stopped_re_placement(stopped_materialization: Option<StoppedMaterializ
             runtime_upgrade: None,
         },
     )
+}
+
+fn environment_requirement(
+    reference: &crate::types::EnvironmentReference,
+) -> NodeSelectorRequirement {
+    NodeSelectorRequirement {
+        key: environment_label_key(reference),
+        operator: "In".to_string(),
+        values: Some(vec![ENVIRONMENT_USABLE_LABEL_VALUE.to_string()]),
+    }
+}
+
+fn bound_environment() -> crate::types::EnvironmentReference {
+    format!("sha256:{}", "e".repeat(64)).parse().unwrap()
+}
+
+#[test]
+fn a_bound_pod_requires_its_environment_label_and_an_unbound_one_does_not() {
+    let env = BTreeMap::new();
+    let auto_lifecycle_json = test_auto_lifecycle_json();
+    let network_policy_json = test_network_policy_json();
+    let sandbox_owner = test_sandbox_owner();
+    let render = |environment| {
+        build_sandbox_pod(
+            &test_pod_config(),
+            on_demand_request(
+                SandboxPodCommon {
+                    environment,
+                    ..test_common("space-sbx-env-g1", TEST_SANDBOX_ID, 1, &env)
+                },
+                test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json),
+            ),
+        )
+    };
+
+    let bound = render(Some(PodEnvironment {
+        reference: bound_environment(),
+        required: true,
+    }));
+    let terms = required_node_selector_terms(&bound);
+    assert_eq!(terms.len(), 1);
+    assert!(
+        terms[0]
+            .match_expressions
+            .as_ref()
+            .unwrap()
+            .contains(&environment_requirement(&bound_environment()))
+    );
+
+    let unbound = render(None);
+    assert!(
+        required_node_selector_terms(&unbound)
+            .iter()
+            .flat_map(|term| term.match_expressions.iter().flatten())
+            .all(|expression| !is_environment_label_key(&expression.key)),
+        "an unbound pod renders no environment term"
+    );
+}
+
+/// A restore pre-bound to its source node renders no other affinity: the
+/// scheduler is bypassed, so no scoring or exclusion term applies. Its
+/// environment requirement still has to render, since kubelet checks required
+/// node affinity at admission and refuses the pod on a node without the label.
+#[test]
+fn a_direct_assigned_restore_still_requires_its_environment() {
+    let env = BTreeMap::new();
+    let auto_lifecycle_json = test_auto_lifecycle_json();
+    let network_policy_json = test_network_policy_json();
+    let sandbox_owner = test_sandbox_owner();
+    let render = |environment| {
+        build_sandbox_pod(
+            &test_pod_config(),
+            SandboxPodRequest::Restore {
+                stopped_materialization: None,
+                artifact_kind: crate::types::ArtifactKind::Full,
+                common: SandboxPodCommon {
+                    environment,
+                    ..test_common("space-sbx-env-g3", TEST_SANDBOX_ID, 3, &env)
+                },
+                runtime: test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json),
+                suspend_restore_storage_uri: None,
+                suspend_restore_source_node: Some("node-a"),
+                fork_disk_restore: None,
+                direct_node_name: Some("node-a"),
+                preferred_node_name: None,
+                restore_node_shortlist: Vec::new(),
+                extra_tolerations: &[],
+                extra_required_affinity: None,
+                node_group_placement: None,
+                runtime_upgrade: None,
+            },
+        )
+    };
+
+    let unbound = render(None);
+    assert!(
+        unbound.spec.as_ref().unwrap().affinity.is_none(),
+        "the fixture renders no other affinity"
+    );
+    let bound = render(Some(PodEnvironment {
+        reference: bound_environment(),
+        required: true,
+    }));
+    let terms = required_node_selector_terms(&bound);
+    assert_eq!(terms.len(), 1);
+    assert_eq!(
+        terms[0].match_expressions.as_deref(),
+        Some([environment_requirement(&bound_environment())].as_slice())
+    );
+}
+
+#[test]
+fn every_shortlist_term_repeats_the_environment_requirement() {
+    let env = BTreeMap::new();
+    let auto_lifecycle_json = test_auto_lifecycle_json();
+    let network_policy_json = test_network_policy_json();
+    let sandbox_owner = test_sandbox_owner();
+    let pod = build_sandbox_pod(
+        &SandboxPodConfig {
+            restore_source_node_hard_pin: true,
+            ..test_pod_config()
+        },
+        SandboxPodRequest::Restore {
+            stopped_materialization: None,
+            artifact_kind: crate::types::ArtifactKind::Full,
+            common: SandboxPodCommon {
+                environment: Some(PodEnvironment {
+                    reference: bound_environment(),
+                    required: true,
+                }),
+                ..test_common("space-sbx-env-g2", TEST_SANDBOX_ID, 2, &env)
+            },
+            runtime: test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json),
+            suspend_restore_storage_uri: Some(
+                "s3://space-test/suspend-snapshots/current?region=us-east-1",
+            ),
+            suspend_restore_source_node: Some("node-a"),
+            direct_node_name: None,
+            preferred_node_name: Some("node-a"),
+            restore_node_shortlist: vec!["node-a".to_string(), "node-b".to_string()],
+            extra_tolerations: &[],
+            extra_required_affinity: None,
+            fork_disk_restore: None,
+            node_group_placement: None,
+            runtime_upgrade: None,
+        },
+    );
+
+    // Terms are ORed, so a term without the requirement would let the pod
+    // land on a node without the environment through it.
+    let terms = required_node_selector_terms(&pod);
+    assert_eq!(terms.len(), 2);
+    for term in terms {
+        assert!(
+            term.match_expressions
+                .unwrap_or_default()
+                .contains(&environment_requirement(&bound_environment()))
+        );
+    }
+}
+
+#[test]
+fn a_shadowed_pod_records_its_environment_without_requiring_it() {
+    let env = BTreeMap::new();
+    let auto_lifecycle_json = test_auto_lifecycle_json();
+    let network_policy_json = test_network_policy_json();
+    let sandbox_owner = test_sandbox_owner();
+    let render = |environment| {
+        build_sandbox_pod(
+            &test_pod_config(),
+            on_demand_request(
+                SandboxPodCommon {
+                    environment,
+                    ..test_common("space-sbx-env-g3", TEST_SANDBOX_ID, 1, &env)
+                },
+                test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json),
+            ),
+        )
+    };
+    let annotation = |pod: &Pod| {
+        pod.metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(SANDBOX_ENVIRONMENT_ANNOTATION))
+            .cloned()
+    };
+    let has_environment_term = |pod: &Pod| {
+        required_node_selector_terms(pod)
+            .iter()
+            .flat_map(|term| term.match_expressions.iter().flatten())
+            .any(|expression| is_environment_label_key(&expression.key))
+    };
+
+    for required in [false, true] {
+        let pod = render(Some(PodEnvironment {
+            reference: bound_environment(),
+            required,
+        }));
+        assert_eq!(annotation(&pod), Some(bound_environment().to_string()));
+        assert_eq!(has_environment_term(&pod), required, "required: {required}");
+    }
+    let unbound = render(None);
+    assert_eq!(annotation(&unbound), None);
+    assert!(!has_environment_term(&unbound));
+
+    // Shadow places exactly as off: the PodSpec is the same, and the
+    // metadata differs only by the recorded environment.
+    let mut shadowed = render(Some(PodEnvironment {
+        reference: bound_environment(),
+        required: false,
+    }));
+    assert_eq!(shadowed.spec, unbound.spec, "shadow renders off's PodSpec");
+    shadowed
+        .metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .remove(SANDBOX_ENVIRONMENT_ANNOTATION);
+    assert_eq!(shadowed.metadata, unbound.metadata);
 }
