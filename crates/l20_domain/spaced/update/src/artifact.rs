@@ -193,7 +193,8 @@ pub(crate) fn valid_label(value: &str) -> bool {
 }
 
 /// Platform selected by an installed recovery contract, not a host OS default.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum RecoveryPlatform {
     Linux,
     Windows,
@@ -232,5 +233,17 @@ impl BundleDescriptor {
                 "ambiguous or unsupported recovery platform",
             )),
         }
+    }
+}
+
+impl TryFrom<String> for RecoveryPlatform {
+    type Error = DescriptorError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::from_contract(&value).ok_or(DescriptorError::Invalid("recovery contract"))
+    }
+}
+impl From<RecoveryPlatform> for String {
+    fn from(value: RecoveryPlatform) -> Self {
+        value.contract().to_owned()
     }
 }
