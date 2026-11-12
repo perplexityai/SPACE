@@ -3,7 +3,9 @@
 Scripts in this directory benchmark sandbox lifecycle operations on one SPACE
 worker node. Each `*.py` benchmark runs on the worker itself, or stages itself
 over SSH when given a `target` (`deploy@worker-1` or `worker-1` with
-`--ssh-user`). `--pull-results DIR` copies the compact results back.
+`--ssh-user`). `--pull-results DIR` copies the compact results back. The create-to-usable
+benchmark is the exception: it only calls the SPACE API, so it runs from any host
+that reaches the API.
 
 ## Balloon suspend/restore benchmark
 
@@ -211,6 +213,49 @@ cannot check that. Quiet runs are report-only.
 
 The harness does not yet collect the fio probe (F2), balloon statistics,
 per-VM memory, or disk and btrfs metrics.
+
+## Create-to-usable benchmark
+
+`bench-sbx-create-to-usable.py` measures how long a sandbox takes to run its
+first guest command through the public API. Each run creates one sandbox, waits
+until `true` exits 0 in the guest, suspends it, wakes it, waits for `true` again,
+and deletes it. Runs are sequential, so each sample is one sandbox on an
+otherwise idle cluster.
+
+| Field | Meaning |
+| --- | --- |
+| `cold_op_ms` | `POST /v1/sandboxes` until the create operation succeeds. |
+| `cold_usable_ms` | `POST /v1/sandboxes` until the first guest command exits 0. |
+| `warm_op_ms` | `:wake` on a suspended sandbox until the wake operation succeeds. |
+| `warm_usable_ms` | `:wake` until the first guest command exits 0. |
+
+The headline metrics are the p95 of `cold_usable_ms` and `warm_usable_ms`;
+lower is better. The guardrails are every run succeeding, every sandbox deleted,
+and no sandbox from the run left after it.
+
+```sh
+python3 scripts/benchmarks/bench-sbx-create-to-usable.py \
+  --api-url http://127.0.0.1:8080 --data-plane-url http://127.0.0.1:8090 \
+  --token-file "$TOKEN_FILE" --template seed --vcpu 2 --memory-mib 1024 \
+  --runs 20 --output-dir /tmp/create-to-usable
+```
+
+The token can also come from `SPACE_API_TOKEN`. `--no-warm` skips the
+suspend/wake half. The benchmark writes one row per run to `results.jsonl` and
+the arguments (without the token) plus count, p50, p95 and max per metric to
+`summary.json`. It exits non-zero when a run fails or a sandbox is left behind.
+
+Reference run on a local Kind cluster (three nodes, `seed` template with 2 vCPU
+and 1 GiB, no base snapshot or warm pool, 20 sequential runs):
+
+| Metric | p50 | p95 | max |
+| --- | --- | --- | --- |
+| `cold_usable_ms` | 1591 | 1815 | 1822 |
+| `warm_usable_ms` | 1070 | 1323 | 1331 |
+
+All 20 runs succeeded and were deleted, with no leftovers. Treat these numbers
+as a local reference only; compare changes by running the benchmark on the
+base and head of the same cluster.
 
 ## Runtime environment benchmark
 
