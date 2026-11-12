@@ -55,6 +55,19 @@ tokio::task_local! {
     pub(super) static GUEST_PREPARATION: GuestPreparation;
 }
 
+#[cfg(test)]
+pub(super) fn inherit_guest_preparation<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let prepare = GUEST_PREPARATION.try_with(Clone::clone).ok();
+    async move {
+        match prepare {
+            Some(prepare) => GUEST_PREPARATION.scope(prepare, future).await,
+            None => future.await,
+        }
+    }
+}
+
 pub(super) async fn prepare_guest_for_pause(
     sandbox_id: &str,
     budget: GuestSnapshotPreparationBudget,
