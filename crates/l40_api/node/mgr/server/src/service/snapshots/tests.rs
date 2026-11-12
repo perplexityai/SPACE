@@ -884,3 +884,124 @@ async fn instance_restore_accepts_only_internal_snapshots() {
         );
     }
 }
+
+/// Once the capture waiter is gone, sandbox-manager has rolled the sandbox
+/// back to paused. A queued encrypted capture must then not run at all, and a
+/// running one must finish its I/O but not stop the runtime it rolled back to.
+/// The control row keeps the waiter and shows the same capture does reach the
+/// runtime stop.
+#[tokio::test]
+async fn dropping_capture_handler_skips_queued_capture_and_keeps_running_vm() {
+    use crate::proto::CaptureVmStateRequest;
+    use crate::runtime_supervisor_client::tests::{SupervisorScript, scripted_in_process_client};
+    use crate::service::tests::service_tests::{
+        allocate_test_lease, bind_test_execution, root_request, service_for_unit_tests,
+    };
+    use std::future::{Future, poll_fn};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::Poll;
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Case {
+        Queued,
+        Running,
+        WaiterKept,
+    }
+
+    for case in [Case::Queued, Case::Running, Case::WaiterKept] {
+        let mut service = service_for_unit_tests().await;
+        let id = super::SandboxId::new().to_string();
+        let fence = bind_test_execution(&service, &id);
+        allocate_test_lease(&service, &id);
+        let captures = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let hold_capture = matches!(case, Case::Running);
+        service.encrypted_capture_io = Some(Arc::new({
+            let (captures, started, finish) = (captures.clone(), started.clone(), finish.clone());
+            move || {
+                let (captures, started, finish) =
+                    (captures.clone(), started.clone(), finish.clone());
+                Box::pin(async move {
+                    captures.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    if hold_capture {
+                        finish.notified().await;
+                    }
+                    Ok(())
+                })
+            }
+        }));
+        service.runtime_supervisor = scripted_in_process_client(SupervisorScript {
+            stop_runtime: Some(Arc::new({
+                let stops = stops.clone();
+                move |_| {
+                    stops.fetch_add(1, Ordering::SeqCst);
+                    // Refuse before any host bind-drain work.
+                    Err(tonic::Status::failed_precondition("test runtime stop"))
+                }
+            })),
+            ..Default::default()
+        });
+        let queued = match case {
+            Case::Queued => Some(service.lock_sandbox_vm_cgroup_launch(&id).await),
+            Case::Running | Case::WaiterKept => None,
+        };
+        let request = root_request(CaptureVmStateRequest {
+            sandbox_id: id.clone(),
+            execution_fence: Some(fence),
+            artifacts: [("machine-state", "vmstate"), ("memory", "memory")]
+                .map(|(name, relative_path)| crate::proto::VmStateArtifact {
+                    name: name.into(),
+                    relative_path: relative_path.into(),
+                })
+                .into(),
+            storage: Some(crate::proto::VmStateStorage {
+                encrypted_volume_mount: Some(snapshot_volume(&id)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut handler = Box::pin(service.capture_vm_state(request));
+        if let Case::WaiterKept = case {
+            let outcome = tokio::time::timeout(Duration::from_secs(5), handler)
+                .await
+                .expect("capture with a live waiter completes");
+            assert!(outcome.is_err(), "{case:?}: the scripted stop refuses");
+        } else {
+            poll_fn(|cx| {
+                assert!(handler.as_mut().poll(cx).is_pending(), "{case:?}");
+                Poll::Ready(())
+            })
+            .await;
+            if let Case::Running = case {
+                tokio::time::timeout(Duration::from_secs(5), started.notified())
+                    .await
+                    .expect("capture I/O starts");
+            }
+            drop(handler);
+        }
+        drop(queued);
+        finish.notify_one();
+        service.device_op_tasks.close();
+        tokio::time::timeout(Duration::from_secs(5), service.device_op_tasks.wait())
+            .await
+            .expect("owned capture work finishes");
+        let (want_captures, want_stops) = match case {
+            Case::Queued => (0, 0),
+            Case::Running => (1, 0),
+            Case::WaiterKept => (1, 1),
+        };
+        assert_eq!(
+            captures.load(Ordering::SeqCst),
+            want_captures,
+            "{case:?}: captures"
+        );
+        assert_eq!(stops.load(Ordering::SeqCst), want_stops, "{case:?}: stops");
+    }
+}
