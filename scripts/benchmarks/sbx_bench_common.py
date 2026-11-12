@@ -577,7 +577,10 @@ class SpaceApi:
             raise ApiError(f"{method} {path}: {error}") from error
         if not raw.strip():
             return {}
-        result = json.loads(raw)
+        try:
+            result = json.loads(raw)
+        except ValueError as error:
+            raise ApiError(f"{method} {path}: response is not valid JSON: {error}") from error
         if not isinstance(result, dict):
             raise ApiError(f"{method} {path}: expected a JSON object")
         return result
@@ -710,7 +713,10 @@ class SpaceApi:
                         continue
                     if not data:
                         continue
-                    frame = json.loads(b"\n".join(data))
+                    try:
+                        frame = json.loads(b"\n".join(data))
+                    except ValueError as error:
+                        raise ApiError(f"events: event frame is not valid JSON: {error}") from error
                     data = []
                     kind = frame.get("type") if isinstance(frame, dict) else None
                     if kind in ("stdout", "stderr"):

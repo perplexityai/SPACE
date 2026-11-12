@@ -75,13 +75,13 @@ def _fake_api(keep_deleted: bool):
     return server
 
 
-def _run(tmp_path, keep_deleted=False):
+def _run(tmp_path, keep_deleted=False, timeout="30"):
     server = _fake_api(keep_deleted)
     url = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         proc = subprocess.run(
             [sys.executable, str(SCRIPT), "--api-url", url, "--data-plane-url", url, "--runs", "3",
-             "--poll-secs", "0.01", "--output-dir", str(tmp_path)],
+             "--poll-secs", "0.01", "--timeout", timeout, "--output-dir", str(tmp_path)],
             env={"SPACE_API_TOKEN": "secret-token"}, capture_output=True, text=True, timeout=60,
         )
     finally:
@@ -102,6 +102,7 @@ def test_measures_cold_and_warm_until_usable(tmp_path):
 
 
 def test_fails_when_a_sandbox_is_left_behind(tmp_path):
-    proc, report = _run(tmp_path, keep_deleted=True)
+    proc, report = _run(tmp_path, keep_deleted=True, timeout="1")
     assert proc.returncode == 1
+    assert report["summary"]["deleted"] == 0
     assert len(report["summary"]["leftover_sandboxes"]) == 3

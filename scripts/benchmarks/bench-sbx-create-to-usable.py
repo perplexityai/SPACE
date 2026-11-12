@@ -7,7 +7,8 @@ is one sandbox on an otherwise idle cluster. Every sandbox is deleted after its
 run, and the summary reports whether any are still present.
 
 The benchmark only talks to the API, so it can run from any host that reaches
-the API and data-plane URLs.
+both the management API (create, lifecycle, delete) and the data plane (the
+command event stream used to probe usability).
 """
 
 from __future__ import annotations
@@ -16,11 +17,12 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
-from sbx_bench_common import ApiError, SpaceApi, stats, timestamp_for_path
+from sbx_bench_common import ApiError, SpaceApi, stats
 
 SCHEMA_VERSION = 1
 IDEMPOTENCY_PREFIX = "bench-create-to-usable"
@@ -33,24 +35,25 @@ def elapsed_ms(start: float) -> int:
 
 def wait_usable(api: SpaceApi, sandbox_id: str, deadline: float, poll_secs: float) -> None:
     """Return once `true` exits 0 in the guest; retry API errors until the deadline."""
-    last = ""
-    while True:
+    last = "deadline passed before the first probe"
+    while (remaining := deadline - time.monotonic()) > 0:
         try:
-            code, out = api.run(sandbox_id, ["true"], 30)
-            if code == 0:
+            code, out = api.run(sandbox_id, ["true"], min(30, remaining))
+            if code == 0 and time.monotonic() <= deadline:
                 return
-            last = f"exit {code}: {out[:200]}"
+            last = "probe finished after the deadline" if code == 0 else f"exit {code}: {out[:200]}"
         except ApiError as error:
             last = str(error)
         if time.monotonic() >= deadline:
-            raise ApiError(f"sandbox {sandbox_id} not usable: {last}")
+            break
         time.sleep(poll_secs)
+    raise ApiError(f"sandbox {sandbox_id} not usable: {last}")
 
 
 def run_one(api: SpaceApi, args: argparse.Namespace, index: int) -> dict[str, Any]:
     row: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "run": index, "ok": False}
     resources = {"vcpu": args.vcpu, "memory_mib": args.memory_mib}
-    sandbox_id = None
+    sandbox_id = operation_id = None
     try:
         start = time.monotonic()
         sandbox_id, operation_id = api.create(args.template, resources)
@@ -73,7 +76,8 @@ def run_one(api: SpaceApi, args: argparse.Namespace, index: int) -> dict[str, An
     finally:
         if sandbox_id:
             try:
-                api.delete(sandbox_id, args.timeout)
+                # Waits for the create to end and confirms the API no longer finds the sandbox.
+                api.delete_after_create(sandbox_id, operation_id, args.timeout)
                 row["deleted"] = True
             except ApiError as error:
                 row["deleted"] = False
@@ -140,8 +144,11 @@ def main() -> int:
     if not token:
         raise SystemExit("ERROR: pass --token-file or set SPACE_API_TOKEN")
     api = SpaceApi(args.api_url, args.data_plane_url, token, idempotency_prefix=IDEMPOTENCY_PREFIX)
-    output_dir = args.output_dir or Path(f"/tmp/space-sbx-create-to-usable-{timestamp_for_path()}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.output_dir:
+        output_dir = args.output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        output_dir = Path(tempfile.mkdtemp(prefix="space-sbx-create-to-usable-"))
 
     rows = []
     with (output_dir / "results.jsonl").open("w") as results:

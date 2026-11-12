@@ -5,7 +5,7 @@ worker node. Each `*.py` benchmark runs on the worker itself, or stages itself
 over SSH when given a `target` (`deploy@worker-1` or `worker-1` with
 `--ssh-user`). `--pull-results DIR` copies the compact results back. The create-to-usable
 benchmark is the exception: it only calls the SPACE API, so it runs from any host
-that reaches the API.
+that reaches both the management API and the data plane.
 
 ## Balloon suspend/restore benchmark
 
