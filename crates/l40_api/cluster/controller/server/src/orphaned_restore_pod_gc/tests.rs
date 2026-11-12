@@ -685,10 +685,12 @@ fn strictly_older_generation_is_orphaned() {
 #[test]
 fn current_generation_pod_is_skipped() {
     // Same generation as the active execution → the current execution's pod
-    // (materialized, or still materializing its UID) → skip.
+    // (materialized, or still materializing its UID) → skip. A `stopped` row's
+    // is the pod a runtime upgrade boots on while the row stays stopped.
     for lifecycle in [
         SandboxLifecycle::Started,
         SandboxLifecycle::Paused,
+        SandboxLifecycle::Stopped,
         SandboxLifecycle::Failed,
     ] {
         let s = state(lifecycle, Some(POD_GEN));

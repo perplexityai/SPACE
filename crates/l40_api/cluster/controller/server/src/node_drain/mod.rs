@@ -3745,6 +3745,43 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                      user's work"
                 );
             }
+            Ok(StoppedEvacuationOutcome::UpgradeAbandonRefused {
+                operation_id,
+                reason,
+                newly_refused,
+            }) => {
+                node_drain_metrics::stopped_evacuation(&node_label, "upgrade_abandon_refused");
+                // WARN on the tick the node refused, which is the one tick
+                // that called it; `debug` on the later ones, which answer from
+                // the sink's record of the refusal. The counter carries the
+                // standing hold, as for `unattributable_artifact`.
+                if newly_refused {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        sandbox_id = %sandbox_id,
+                        operation_id = %operation_id,
+                        reason = %reason,
+                        "node_drain: stopped resident's node refused to abandon its unfinished \
+                         runtime upgrade as invalid, so the evacuation can't capture its disk; \
+                         its node is held, neither drained nor terminated, while its only copy \
+                         is there. The node isn't asked again by this controller process: after \
+                         repairing the node's record of the operation, restart the cluster \
+                         controller (or move its leadership) so the drain asks again, or delete \
+                         the sandbox, which stops holding the node once its row reaches `deleted`"
+                    );
+                } else {
+                    tracing::debug!(
+                        node_id = %node_id,
+                        sandbox_id = %sandbox_id,
+                        operation_id = %operation_id,
+                        "node_drain: stopped resident's node refused its runtime upgrade \
+                         abandon earlier and isn't asked again by this controller process; \
+                         the node stays held until, after a repair of the node's record, a \
+                         restart or leadership move has the drain ask again, a new upgrade \
+                         operation does, or the sandbox's row reaches `deleted`"
+                    );
+                }
+            }
             Ok(StoppedEvacuationOutcome::Deferred { reason }) => {
                 node_drain_metrics::stopped_evacuation(&node_label, "deferred");
                 // `debug`, like the refusal: some deferrals repeat every tick

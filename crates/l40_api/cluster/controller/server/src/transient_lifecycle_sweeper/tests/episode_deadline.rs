@@ -126,7 +126,7 @@ fn sink(
         .with_restoring_episode_deadline(deadline))
 }
 
-async fn execution_active(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<bool> {
+pub(super) async fn execution_active(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<bool> {
     Ok(sqlx::query_scalar(sql!(
         "SELECT EXISTS (
              SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active

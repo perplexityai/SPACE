@@ -12,6 +12,11 @@ use pplx_space_common_core::types::{
 };
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
 
+use crate::lifecycle_writer_test_support::{
+    UnsettledUpgradePod, assert_left_for_retry, insert_unsettled_stopped_runtime_upgrade,
+    kubernetes_substrate, unsettled_upgrade_row,
+};
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -599,6 +604,87 @@ async fn split_operation_expired_stopped_row_has_no_orphan_owner_proof() -> Test
             list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 100).await?;
         assert!(candidates.iter().all(|row| row.sandbox_id != sandbox_id));
     }
+    Ok(())
+}
+
+/// A stopped sandbox's runtime upgrade boots its disk on an execution whose
+/// attempt targets `stopped`, while the row stays `stopped`. The scan never
+/// lists it: not while the upgrade's lease runs, and not once a failed
+/// attempt's lease expired, which a retry takes over.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stopped_runtime_upgrade_execution_is_never_an_orphan_candidate() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    // Seconds from now until the attempt's lease ends: live, then expired.
+    for lease_secs in [300_i64, -3600] {
+        let node_id = NodeId::new();
+        let sandbox_id = SandboxId::new();
+        insert_node(&db.pool, node_id).await?;
+        insert_started_sandbox_with_active_execution(&db.pool, sandbox_id, node_id).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        let attempt = Uuid::now_v7();
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_id = $2, route_activation_id = $2,
+                    activation_attempt_target_state = 'stopped',
+                    activation_attempt_expires_at = NOW() + make_interval(secs => $3::BIGINT),
+                    updated_at = NOW() - INTERVAL '1 hour'
+              WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(attempt)
+        .bind(lease_secs)
+        .execute(&db.pool)
+        .await?;
+
+        let candidates =
+            list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 100).await?;
+
+        assert!(
+            candidates.iter().all(|row| row.sandbox_id != sandbox_id),
+            "lease ending in {lease_secs}s"
+        );
+    }
+    Ok(())
+}
+
+/// An unsettled runtime upgrade of a stopped sandbox leaves an active
+/// execution, with its pod or with none, an expired claim and the recorded
+/// upgrade, for its retry to reuse. A live tick with no grace, whose presence
+/// reports the pod missing, leaves it alone: no quarantine, no recovery, no
+/// delete.
+#[rstest::rstest]
+#[case::with_its_pod(UnsettledUpgradePod::Running)]
+#[case::before_its_pod(UnsettledUpgradePod::NeverCreated)]
+#[tokio::test(flavor = "current_thread")]
+async fn an_unsettled_stopped_runtime_upgrade_row_is_left_for_its_retry(
+    #[case] pod: UnsettledUpgradePod,
+) -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let sandbox_id = insert_unsettled_stopped_runtime_upgrade(pool, pod).await?;
+    let before = unsettled_upgrade_row(pool, sandbox_id)
+        .await?
+        .ok_or("seeded row missing")?;
+    let sink = SubstrateActionSink::new(pool.clone(), Arc::new(kubernetes_substrate(pool)?));
+    let mut reconciler = Reconciler::new(config(0, 1000, false), FakePresence::default(), sink);
+
+    let report = reconciler.tick(Instant::now()).await;
+
+    assert_eq!(report, TickReport::default());
+    assert_left_for_retry(
+        &before,
+        unsettled_upgrade_row(pool, sandbox_id).await?.as_ref(),
+        "orphaned-sandbox tick",
+    );
     Ok(())
 }
 

@@ -397,6 +397,24 @@ pub fn sandbox_no_pod(node_id: &str, pre_lifecycle: &str, outcome: &str, reason:
 ///   repeats every tick; a responder finds the sandboxes by listing the node's
 ///   `stopped` residents.
 ///
+/// - `"upgrade_abandon_refused"` — the sandbox's unfinished stay-stopped
+///   runtime upgrade has to be abandoned on its node before its disk can be
+///   captured, and the node refused that as invalid (sandbox-manager records
+///   the operation for another sandbox, or can't parse its ids). It doesn't
+///   resolve on its own. The node is asked once per sandbox and operation per
+///   controller process; later ticks count this from the drain's record of
+///   the refusal. The sandbox stays `stopped` and placed on its node, so the
+///   node is held, neither drained nor terminated. **A repair of the node's
+///   record isn't enough by itself:** the node stays held until a controller
+///   restart or leader change, or a new upgrade operation on the sandbox, has
+///   the drain ask again. Deleting the sandbox stops it holding the node once
+///   its row reaches `deleted`. The tick that got the refusal logs it at
+///   `warn` with the node, the sandbox, the operation id and the node's
+///   reason; later ticks log at `debug`. Like `unattributable_artifact`, it
+///   doesn't appear on `node_drain.stopped_evacuation_stall_secs` when the
+///   refusal comes before the claim (step 0a), which writes the marker that
+///   series selects on.
+///
 /// A failed attempt is **not** here: it counts on `node_drain.failures` with
 /// `pre_lifecycle = "stopped"`, alongside every other evacuation failure.
 ///
