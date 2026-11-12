@@ -400,6 +400,7 @@ async fn every_pod_build_path_renders_the_environment() {
                 network_policy_json: "{}",
                 node_group_placement: None,
                 environment: required(E1),
+                client_id: None,
             },
             context,
         );
@@ -687,6 +688,7 @@ async fn a_cross_node_redrive_successor_requires_its_checkpoint_environment() ->
             SandboxLifecycle::Restoring,
             Some("source-node"),
             Some(URI),
+            None,
             None,
         )
         .await;

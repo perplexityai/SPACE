@@ -329,6 +329,7 @@ impl KubernetesSubstrate {
             network_policy_json,
             node_group_placement,
             environment,
+            client_id,
         } = inputs;
         let disk_io_limits = u64::try_from(sandbox.disk_io_max_operations_per_sec)
             .ok()
@@ -349,6 +350,7 @@ impl KubernetesSubstrate {
             sandbox_owner,
             user_id: sandbox.user_id,
             org_id: sandbox.org_id,
+            client_id,
             auto_lifecycle_json,
             auto_lifecycle_authority: PolicyAuthority::Cluster,
             network_policy_json,

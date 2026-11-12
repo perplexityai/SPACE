@@ -451,6 +451,9 @@ pub struct KubernetesState {
     /// (`SPACE_ENVIRONMENT_PLACEMENT_GATE`, default off): recorded in shadow
     /// and on, and required as a node label only when it's on.
     pub environment_placement: super::environment_placement::EnvironmentPlacementGate,
+    /// Whether pods are labeled and the record written
+    /// (`SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED`, default off).
+    pub activation_client_attribution: super::ActivationClientAttribution,
     pub caches: Arc<K8sCaches>,
 }
 
@@ -514,6 +517,7 @@ impl KubernetesState {
                 super::environment_placement::EnvironmentPlacementGate::from_environment(
                     &pplx_space_common_core::env::ProcessEnvironment,
                 )?,
+            activation_client_attribution: super::ActivationClientAttribution::from_env(),
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
             node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config: SandboxPodConfigValues::from_env()?,
@@ -936,7 +940,11 @@ impl KubernetesSubstrate {
             Ok(Some(k8s)) => {
                 let (pod_store, pod_network_slots, pod_events, pod_reflector_ready) =
                     pod_reflector::start(k8s.client.clone(), k8s.sandbox_namespace.clone());
-                let store = K8sStore::new(pool.clone(), k8s.sandbox_namespace.clone());
+                let store = K8sStore::new(
+                    pool.clone(),
+                    k8s.sandbox_namespace.clone(),
+                    k8s.activation_client_attribution,
+                );
                 // Read before `k8s` is moved into the struct below.
                 let node_group_placement = NodeGroupPlacementResolver::new(
                     pool.clone(),

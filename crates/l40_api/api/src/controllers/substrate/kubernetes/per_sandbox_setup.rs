@@ -32,7 +32,7 @@ use pplx_space_common_core::types::{OrgId, UserId};
 
 use pplx_space_common_core::kubernetes::SandboxRuntimePodMetadata;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, DiskIoLimits, EnvMap, PolicyAuthority, SandboxOwner,
+    AutoLifecyclePolicy, ClientId, DiskIoLimits, EnvMap, PolicyAuthority, SandboxOwner,
 };
 use pplx_space_net_common::NetworkPolicyV1;
 
@@ -86,11 +86,18 @@ pub(super) struct PerSandboxSetup {
     /// running plaintext pool VM cannot be encrypted at adoption).
     pub volume_encryption: bool,
     pub disk_io_limits: DiskIoLimits,
+    /// The create's client id, rendered as the cold pod's
+    /// `space.pplx.net/client-id` label. An adopted pool pod is labeled by
+    /// `label_adopted_execution`, before the adoption commits and before this
+    /// setup runs.
+    pub client_id: Option<ClientId>,
 }
 
 impl PerSandboxSetup {
     /// Resolve the setup intent from the inputs both create paths carry. This is
     /// the single place the intent is decided.
+    // One argument per setup input, so neither create path can omit one.
+    #[allow(clippy::too_many_arguments)]
     fn resolve(
         actor: &ActorRef,
         process_env: EnvMap,
@@ -99,6 +106,7 @@ impl PerSandboxSetup {
         template_network_policy: &NetworkPolicyV1,
         volume_encryption: bool,
         disk_io_limits: DiskIoLimits,
+        client_id: Option<ClientId>,
     ) -> Self {
         let effective_policy = network_policy_override
             .cloned()
@@ -117,6 +125,7 @@ impl PerSandboxSetup {
             node_fs: NodeFilesystemSetup::EnsureArtifactDirPermissions,
             volume_encryption,
             disk_io_limits,
+            client_id,
         }
     }
 
@@ -131,6 +140,7 @@ impl PerSandboxSetup {
             request.template_network_policy,
             request.volume_encryption,
             request.disk_io_limits,
+            request.client_id.cloned(),
         )
     }
 
@@ -157,6 +167,7 @@ impl PerSandboxSetup {
             // pool at the API before a claim is ever attempted.
             false,
             claim.disk_io_limits,
+            request.client_id.cloned(),
         )
     }
 
@@ -181,6 +192,7 @@ impl PerSandboxSetup {
             node_fs,
             volume_encryption,
             disk_io_limits,
+            client_id,
         } = self;
         // Cold create passes process env through the pod/shim create path, not
         // through pod runtime metadata.
@@ -216,6 +228,7 @@ impl PerSandboxSetup {
             authority,
             volume_encryption,
             disk_io_limits,
+            client_id,
         })
     }
 }
@@ -233,6 +246,7 @@ pub(super) struct ColdPodMetadata {
     authority: PolicyAuthority,
     volume_encryption: bool,
     disk_io_limits: DiskIoLimits,
+    client_id: Option<ClientId>,
 }
 
 impl ColdPodMetadata {
@@ -244,6 +258,7 @@ impl ColdPodMetadata {
             sandbox_owner: &self.sandbox_owner,
             user_id: self.user_id,
             org_id: self.org_id,
+            client_id: self.client_id.as_ref(),
             auto_lifecycle_json: &self.auto_lifecycle_json,
             auto_lifecycle_authority: self.authority,
             network_policy_json: &self.network_policy_json,

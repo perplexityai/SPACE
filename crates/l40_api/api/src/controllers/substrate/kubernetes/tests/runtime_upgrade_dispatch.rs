@@ -136,7 +136,7 @@ async fn restore(
                 blocking: true,
                 ready_timeout: Duration::from_secs(2),
             },
-            RecoveryCharge::Exempt,
+            RecoveryCharge::exempt_for_tests(),
         )
         .await
 }
@@ -338,7 +338,7 @@ async fn a_stopped_start_off_a_blocked_environment_wakes_by_the_upgrade(
                 blocking: true,
                 ready_timeout: Duration::from_secs(2),
             },
-            RecoveryCharge::Exempt,
+            RecoveryCharge::exempt_for_tests(),
         )
         .await;
 
