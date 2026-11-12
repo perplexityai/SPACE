@@ -221,7 +221,7 @@ pub(super) async fn json_body<T: DeserializeOwned>(
     axum::Json::<T>::from_request(request.with_body(body), &())
         .await
         .map(|axum::Json(value)| value)
-        .map_err(|rejection| normalize_public_error(rejection.into_response()).into())
+        .map_err(|rejection| PublicApiError::from(rejection).into())
 }
 
 /// The response that ends a files request early: a refusal the API rendered,
@@ -259,7 +259,7 @@ pub(super) async fn optional_json_body<T: DeserializeOwned>(
     )
     .await
     .map(|body| body.map(|axum::Json(value)| value))
-    .map_err(|rejection| normalize_public_error(rejection.into_response()).into())
+    .map_err(|rejection| PublicApiError::from(rejection).into())
 }
 
 /// The request's `Idempotency-Key`, checked as the API checks it. Its value

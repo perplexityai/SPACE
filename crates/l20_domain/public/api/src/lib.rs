@@ -2142,7 +2142,8 @@ pub struct PublicErrorEnvelope {
     /// with a `pty` carries `{"key": "field", "value": "pty"}`. An
     /// `invalid_request` for a sandbox create or update field outside its limit
     /// carries `{"key": "field", "value": "<field>"}`, such as `metadata` or
-    /// `resources.vcpu`.
+    /// `resources.vcpu`, and so does a 422 for a body value of the wrong
+    /// type, naming its path (`command[1]`, `env.NAME`).
     pub details: Vec<PublicErrorDetail>,
 }
 

@@ -508,7 +508,10 @@ async fn each_failure_answers_as_the_api_answers_it() {
                     .unwrap()
             },
             reply: None,
-            expected: invalid(400, "invalid request"),
+            expected: invalid(
+                400,
+                "request body is not valid JSON: EOF while parsing an object at line 1 column 1",
+            ),
             allow: None,
         },
         Row {
@@ -519,21 +522,37 @@ async fn each_failure_answers_as_the_api_answers_it() {
                     .unwrap()
             },
             reply: None,
-            expected: invalid(415, "invalid request"),
+            expected: invalid(415, "Content-Type must be application/json"),
             allow: None,
         },
         Row {
             name: "body misses a field",
             request: |harness| harness.post("stat", json!({})),
             reply: None,
-            expected: invalid(422, "invalid request"),
+            expected: invalid(
+                422,
+                "invalid request body: missing field `path` at line 1 column 2",
+            ),
+            allow: None,
+        },
+        Row {
+            name: "body has a field of the wrong type",
+            request: |harness| harness.post("stat", json!({"path": 5})),
+            reply: None,
+            expected: Expected {
+                details: json!([{"key": "field", "value": "path"}]),
+                ..invalid(
+                    422,
+                    "invalid request body: path: invalid type: integer `5`, expected a string at line 1 column 9",
+                )
+            },
             allow: None,
         },
         Row {
             name: "body over the 2 MiB default",
             request: |harness| harness.post("stat", json!({ "path": "a".repeat(2 * 1024 * 1024) })),
             reply: None,
-            expected: invalid(413, "invalid request"),
+            expected: invalid(413, "request body is too large"),
             allow: None,
         },
         Row {
@@ -765,7 +784,10 @@ async fn each_failure_answers_as_the_api_answers_it() {
             name: "key checked after the body",
             request: |harness| harness.post("rename", json!({"old_path": "/a"})),
             reply: None,
-            expected: invalid(422, "invalid request"),
+            expected: invalid(
+                422,
+                "invalid request body: missing field `new_path` at line 1 column 17",
+            ),
             allow: None,
         },
         Row {
