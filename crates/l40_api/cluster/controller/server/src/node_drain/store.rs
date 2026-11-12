@@ -3348,6 +3348,7 @@ impl NodeDrainSink for SubstrateSink {
             Err(
                 SubstrateError::Unavailable { message }
                 | SubstrateError::SandboxNoPod { message }
+                | SubstrateError::Unschedulable { message }
                 | SubstrateError::NotFound { message }
                 | SubstrateError::InvalidRequest { message }
                 | SubstrateError::Conflict { message }

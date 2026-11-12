@@ -288,6 +288,14 @@ spec:
               value: "0"
             - name: SPACE_NODEMGR_NETWORK_POOL_MIN_READY
               value: "0"
+            {{- $maxSlots := .Values.networkPoolMaxSlots }}
+            {{- if and (not (kindIs "invalid" $maxSlots)) (ne (toString $maxSlots) "") }}
+            # The node's network-slot count; null or empty keeps node-manager's
+            # default (values.yaml). A number read from a values file arrives
+            # as a float and is written out whole.
+            - name: SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS
+              value: {{ ternary (printf "%.0f" $maxSlots) (toString $maxSlots) (kindIs "float64" $maxSlots) | quote }}
+            {{- end }}
             {{- if and (ne (toString .Values.loopDeviceTarget) "") (eq (include "space-node-service.rustBuild" $) "test-hooks") }}
             - name: SPACE_LOOP_DEVICE_TARGET
               value: {{ .Values.loopDeviceTarget | quote }}

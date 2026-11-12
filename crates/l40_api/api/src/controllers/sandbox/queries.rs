@@ -1363,9 +1363,8 @@ impl SandboxController {
         )
         .await?;
 
-        let admission = self
-            .admit_cluster_activation(crate::cluster_admission::ClusterActivationClass::Cold)
-            .await;
+        // A warm-pool hit returned above, so this create builds a new pod.
+        let admission = self.admit_cluster_cold_create().await;
         // A fork's size comes from its source snapshot, not this request.
         if restore_from.is_none()
             && let Some(sample) = requested_size_metrics::admission(&admission)

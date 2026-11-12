@@ -36,6 +36,36 @@ pub(crate) const POD_IP: &str = "127.0.0.1";
 const PODS_PATH: &str = "/api/v1/namespaces/space/pods";
 
 /// The one place tests built on these fixtures construct a `Substrate`.
+/// Cluster admission with the slot check on, over one worker whose only
+/// network slot is held, so every cold create it admits is refused with
+/// `NoFreeSlot`. Its reads are cache reads; `pool` is never dialed by
+/// them.
+pub(crate) fn full_cluster_slot_check_admission(
+    pool: &PgPool,
+) -> crate::cluster_admission::ClusterSandboxAdmission {
+    use crate::controllers::substrate::kubernetes::tests::{
+        node_with_network_slots, sandbox_pod_on_node, substrate_with_inventory_caches_and_pool,
+    };
+    use pplx_space_common_core::kubernetes::SandboxPodConfigValues;
+    let labels = SandboxPodConfigValues::default()
+        .base_node_selector()
+        .into_labels();
+    let node = node_with_network_slots("full-node", labels, Some(1), None, true, false);
+    let pod = sandbox_pod_on_node("full-node-sbx", "full-node", 1, "Running");
+    crate::cluster_admission::ClusterSandboxAdmission::with_config(
+        kubernetes(substrate_with_inventory_caches_and_pool(
+            vec![(*pod).clone()],
+            vec![(*node).clone()],
+            pool.clone(),
+        )),
+        crate::cluster_admission::ClusterSandboxAdmissionConfig {
+            slot_check_enabled: true,
+            ..crate::test_support::enabled_config()
+        },
+        pplx_space_feature_flags::FeatureFlagClient::disabled(),
+    )
+}
+
 pub(crate) fn kubernetes(substrate: KubernetesSubstrate) -> Substrate {
     Substrate::from_kubernetes(substrate)
 }
