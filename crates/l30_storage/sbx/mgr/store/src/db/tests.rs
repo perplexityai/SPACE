@@ -10421,3 +10421,5 @@ fn cleanup_and_eviction_keep_the_capture_attempt_until_physical_work_settles() {
         SandboxEraseSafety::RetainedFilesystemOnlyCopy
     );
 }
+
+mod published_suspend;

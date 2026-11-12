@@ -343,6 +343,8 @@ pub(super) const AUTO_LIFECYCLE_SUSPEND_BACKUP_FENCE_FAILED_METADATA: &str =
 enum ArtifactBackupSubmissionError {
     #[error("{0}")]
     Other(String),
+    #[error("terminal backup handoff: {0}")]
+    TerminalHandoff(String),
     /// `superseded_generation` is the generation the control plane named
     /// when it refused the registration as superseded.
     #[error("begin restore-visible snapshot backup: {error}")]
@@ -353,6 +355,18 @@ enum ArtifactBackupSubmissionError {
     },
     #[error(transparent)]
     RetainedUpload(#[from] suspend_snapshot::RetainedUploadError),
+}
+
+impl ArtifactBackupSubmissionError {
+    fn handoff_is_terminal(&self) -> bool {
+        match self {
+            Self::TerminalHandoff(_) => true,
+            Self::Begin { error, .. } => {
+                error.kind() == pplx_space_common_jobs::JobFailureKind::Permanent
+            }
+            Self::Other(_) | Self::RetainedUpload(_) => false,
+        }
+    }
 }
 
 impl From<String> for ArtifactBackupSubmissionError {

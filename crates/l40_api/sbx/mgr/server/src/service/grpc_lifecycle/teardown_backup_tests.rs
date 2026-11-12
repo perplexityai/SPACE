@@ -627,9 +627,10 @@ async fn node_local_handoff(
             &sandbox,
             artifact_id,
             snapshot_dir.to_str().unwrap(),
-            SuspendSnapshotFormat::Full,
+            Some(SuspendSnapshotFormat::Full),
         )
-        .await;
+        .await
+        .map_err(|error| super::artifact_backup_fence_status(error.to_string()));
     NodeLocalHandoff {
         service,
         artifact_id,
@@ -1072,10 +1073,7 @@ async fn upload_after_refused_handoff(after: AfterRefusedHandoff) -> String {
     let id = sandbox_id.to_string();
     let runtime_live = !matches!(after, AfterRefusedHandoff::Quarantined);
     let NodeLocalHandoff {
-        service,
-        artifact_id,
-        handoff,
-        ..
+        service, handoff, ..
     } = node_local_handoff(
         sandbox_id,
         &volume_manager,
@@ -1088,16 +1086,26 @@ async fn upload_after_refused_handoff(after: AfterRefusedHandoff) -> String {
         Some(1),
     )
     .await;
-    if matches!(after, AfterRefusedHandoff::QuarantinedLive) {
-        // The quarantine the failure falls back to when the rollback's write
-        // fails; the test can't fail that write.
-        handoff.expect_err("vol-mgr refuses the handoff's pushes");
+    handoff.expect_err("vol-mgr refuses the handoff's pushes");
+    // Exercise historical/superseded lifecycle outcomes explicitly. Handoff
+    // refusal itself now preserves the publication owner for reconciliation.
+    {
         let db = service.db.lock().unwrap();
-        assert!(crate::db::mark_suspending_quarantined(&db, &id, "rollback failed").unwrap());
-    } else {
-        service
-            .require_node_local_backup_handoff(&id, artifact_id, handoff)
-            .expect_err("vol-mgr refuses the handoff's pushes");
+        match after {
+            AfterRefusedHandoff::Paused | AfterRefusedHandoff::Resuspends => {
+                assert!(crate::db::rollback_suspending_to_paused(&db, &id).unwrap());
+            }
+            AfterRefusedHandoff::Quarantined | AfterRefusedHandoff::QuarantinedLive => {
+                assert!(
+                    crate::db::mark_suspending_quarantined(
+                        &db,
+                        &id,
+                        "synthetic historical failure"
+                    )
+                    .unwrap()
+                );
+            }
+        }
     }
     let expected = match after {
         AfterRefusedHandoff::Paused => SandboxState::Paused,

@@ -105,6 +105,43 @@ pub(in crate::service) fn suspend_snapshot_metadata(
     })
 }
 
+fn suspend_upload_payload(
+    sandbox: &crate::db::SandboxRow,
+    local_artifact_id: LocalArtifactId,
+    job: &pplx_space_common_jobs::Job,
+) -> Result<crate::snapshot_upload::SnapshotUploadJobs, ArtifactBackupSubmissionError> {
+    let payload = job
+        .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+        .map_err(|error| ArtifactBackupSubmissionError::Other(error.to_string()))?;
+    // Older payloads may omit the execution fence after completing handoff.
+    // Exact immutable artifact identity plus staged metadata/transfers proves
+    // that existing handoff; it never authorizes a new unfenced registration.
+    let completed_legacy_handoff = payload.execution_generation.is_none()
+        && payload.includes_metadata_job
+        && !payload.job_ids.is_empty();
+    if payload.meta.local_artifact_id != Some(local_artifact_id)
+        || payload.meta.sandbox_id != sandbox.id
+        || (payload.execution_generation != node_local_registration_generation(sandbox)
+            && !completed_legacy_handoff)
+    {
+        return Err(ArtifactBackupSubmissionError::TerminalHandoff(
+            "persisted upload has a different capture owner".to_owned(),
+        ));
+    }
+    // Do not create another attempt on every cleanup tick. The cleanup
+    // owner retains the artifact and ends a terminal handoff explicitly.
+    if job.is_terminal()
+        && (job.status != pplx_space_common_jobs::JobStatus::Completed.as_str()
+            || job.failure.is_some())
+    {
+        return Err(ArtifactBackupSubmissionError::TerminalHandoff(format!(
+            "persisted suspend upload requires resolution: {}",
+            job.error.as_deref().unwrap_or("upload failed")
+        )));
+    }
+    Ok(payload)
+}
+
 #[cfg(test)]
 impl SandboxManagerService {
     pub(in crate::service) async fn submit_artifact_backup_for_test(
@@ -145,30 +182,152 @@ impl SandboxManagerService {
 }
 
 impl SandboxManagerService {
-    pub(in crate::service) fn require_node_local_backup_handoff(
+    /// Retry handoff for at most fifteen minutes from durable cleanup admission.
+    /// Each remote attempt has thirty seconds; neither retries nor restarts renew
+    /// the clock. Terminal failure retains the capture and finishes cleanup.
+    pub(in crate::service) async fn ensure_suspend_backup_before_cleanup(
         &self,
         sandbox_id: &str,
-        local_artifact_id: LocalArtifactId,
-        result: Result<SubmitSuspendSnapshotOutcome, Status>,
-    ) -> Result<(), Status> {
-        match result {
-            Ok(SubmitSuspendSnapshotOutcome::Enqueued { job_id, .. }) => {
-                tracing::info!(
-                    sandbox_id,
-                    local_artifact_id = %local_artifact_id,
-                    job_id = %job_id,
-                    "persisted suspend artifact backup before runtime teardown",
-                );
-                Ok(())
+        published: Option<&(LocalArtifactId, String)>,
+        job_id: Option<&JobId>,
+        now: impl Fn() -> jiff::Timestamp,
+    ) -> Result<Option<crate::db::cleanup_jobs::CleanupOutcome>, Status> {
+        let (row, artifact, path) = {
+            let db = self.db_conn()?;
+            let row = crate::db::read::sandbox(&db, sandbox_id)
+                .map_err(|error| {
+                    Status::internal(format!("read suspend cleanup evidence: {error}"))
+                })?
+                .ok_or_else(|| Status::aborted("suspend cleanup owner disappeared"))?;
+            // Restore retirement also uses MarkSuspended, but its persisted
+            // lifecycle is stopping. Only a newly published suspend owns handoff.
+            // Use durable state so rediscovery/restart preserves this distinction.
+            if row.state.lifecycle() != SandboxState::Suspending {
+                return Ok(None);
             }
-            Ok(SubmitSuspendSnapshotOutcome::NoUploadConfig) => Ok(()),
-            Err(status) => {
-                let reason =
-                    format!("persist suspend artifact backup before runtime teardown: {status}");
-                self.record_suspend_snapshot_publication_failure_after_begin(sandbox_id, &reason);
-                Err(status)
+            let artifact = match published {
+                Some(artifact) => Some(artifact.clone()),
+                None => match row.current_local_artifact_id {
+                    Some(id) => crate::db::read::local_artifact(
+                        &db,
+                        crate::db::read::LocalArtifactKey::Id(id),
+                    )
+                    .map_err(|error| {
+                        Status::internal(format!("read suspend cleanup evidence: {error}"))
+                    })?
+                    .map(|artifact| (artifact.local_artifact_id, artifact.local_path)),
+                    None => None,
+                },
+            };
+            // Missing publication is classified by the existing finalizer.
+            let Some((artifact, path)) = artifact else {
+                return Ok(None);
+            };
+            if let Some(status) = crate::db::read::sandbox_view(&db, sandbox_id)
+                .teardown()
+                .status()
+                .map_err(|error| {
+                    Status::internal(format!("read suspend cleanup evidence: {error}"))
+                })?
+            {
+                if status.backup_completed
+                    && status
+                        .artifact
+                        .as_ref()
+                        .is_some_and(|record| record.local_artifact_id == artifact)
+                {
+                    return Ok(None);
+                }
+                if status
+                    .operation
+                    .as_ref()
+                    .is_some_and(|operation| operation.status.is_active())
+                {
+                    return Err(Status::unavailable(
+                        "teardown suspend awaits remote durability",
+                    ));
+                }
+            }
+            (row, artifact, path)
+        };
+        let created = if let Some(job_id) = job_id {
+            let created = crate::db::read::cleanup_job_created_at(&*self.db_conn()?, job_id)
+                .map_err(|error| Status::internal(format!("read handoff admission time: {error}")))?
+                .ok_or_else(|| Status::aborted("suspend cleanup job disappeared"))?;
+            Some(created.get())
+        } else {
+            // Foreground-only probes cannot renew or replace a durable job.
+            None
+        };
+        let age_at = |now: jiff::Timestamp| {
+            created.map_or(0, |created| now.as_second().saturating_sub(created).max(0))
+        };
+        let age = age_at(now());
+        // Even an expired retry must accept an already persisted handoff: a
+        // restart or scheduling delay cannot invalidate completed ownership.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs((15 * 60 - age).clamp(1, 30).cast_unsigned()),
+            self.enqueue_node_local_suspend_backup(&row, artifact, &path, None),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(ArtifactBackupSubmissionError::Other(
+                "backup handoff attempt timed out".to_owned(),
+            ))
+        });
+        // Charge the awaited attempt against the same immutable admission.
+        let age = age_at(now());
+        match result {
+            Ok(_) => Ok(None),
+            Err(error) if error.handoff_is_terminal() || age >= 15 * 60 => {
+                let reason = format!(
+                    "suspend backup handoff ended at age {age}s; requires operator recovery: {error}"
+                );
+                self.settle_failed_suspend_handoff(&row, artifact, job_id, &reason)
+            }
+            Err(error) => {
+                if age >= 5 * 60 {
+                    tracing::error!(sandbox_id, %artifact, age_secs = age, %error,
+                        "suspend backup handoff pending over five minutes; capture retained for retry");
+                }
+                Err(artifact_backup_fence_status(error.to_string()))
             }
         }
+    }
+
+    pub(super) fn settle_failed_suspend_handoff(
+        &self,
+        row: &crate::db::SandboxRow,
+        artifact: LocalArtifactId,
+        job_id: Option<&JobId>,
+        reason: &str,
+    ) -> Result<Option<crate::db::cleanup_jobs::CleanupOutcome>, Status> {
+        use crate::db::cleanup_jobs::CleanupOutcome;
+        let applied = {
+            // The upload worker persists transfer IDs through this same mutex.
+            // Hold it from the final evidence read through quarantine so its
+            // successful handoff cannot land between those two decisions.
+            let db = self.db_conn()?;
+            if let Some(upload) = crate::db::read::local_artifact_upload(&db, artifact)
+                .map_err(|error| Status::internal(format!("re-read suspend handoff: {error}")))?
+                && let Ok(payload) = suspend_upload_payload(row, artifact, &upload)
+                && !payload.job_ids.is_empty()
+            {
+                return Ok(None);
+            }
+            crate::db::quarantine_refused_suspend_backup(&db, row, artifact, reason, job_id)
+                .map_err(|error| Status::internal(format!("settle suspend handoff: {error}")))?
+        };
+        if applied {
+            tracing::error!(sandbox_id = %row.id, %artifact, %reason,
+                "suspend backup handoff ended; capture retained");
+            mark_sandbox_dirty(&self.db, &row.id);
+        }
+        Ok(Some(if applied {
+            CleanupOutcome::Quarantined(reason.to_owned())
+        } else {
+            CleanupOutcome::Superseded
+        }))
     }
 
     /// Resolve the org-level S3 override for this sandbox. Returns one
@@ -566,15 +725,44 @@ impl SandboxManagerService {
     /// Hand a node-local suspend's capture to a durable upload, registered
     /// under the sandbox's Kubernetes execution (see
     /// [`node_local_registration_generation`]). Any failure, a refusal of a
-    /// superseded execution included, is a backup-fence failure, which rolls
-    /// the suspend back and disarms auto-lifecycle.
+    /// superseded execution included, is a backup-fence failure. The caller
+    /// preserves the published capture for publication/backup reconciliation.
     pub(super) async fn enqueue_node_local_suspend_backup(
         &self,
         sandbox: &crate::db::SandboxRow,
         local_artifact_id: LocalArtifactId,
         snapshot_dir: &str,
-        format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
-    ) -> Result<SubmitSuspendSnapshotOutcome, Status> {
+        format: Option<pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat>,
+    ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
+        if let Some(job) = self
+            .snapshot_upload_worker
+            .find_job_by_dedup_key(
+                crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                &crate::snapshot_upload_jobs::artifact_backup_dedup_key(local_artifact_id),
+            )
+            .map_err(|error| ArtifactBackupSubmissionError::Other(error.to_string()))?
+        {
+            let payload = suspend_upload_payload(sandbox, local_artifact_id, &job)?;
+            // Transfer IDs are the durable handoff; do not reintroduce a remote
+            // registration gate after they were persisted, including on restart.
+            let payload = if payload.job_ids.is_empty() {
+                self.establish_restore_visible_artifact_backup(&job.job_id)
+                    .await?
+            } else {
+                payload
+            };
+            return Ok(SubmitSuspendSnapshotOutcome::Enqueued {
+                job_id: job.job_id,
+                backup_attempt_id: payload.snapshot_id,
+            });
+        }
+        // Existing transfer ownership is independent of the local sidecar.
+        // Recovery reads its format only when it must create a new upload.
+        let format = match format {
+            Some(format) => format,
+            None => reupload_format_from_sidecar(snapshot_dir)
+                .map_err(|error| ArtifactBackupSubmissionError::Other(error.to_string()))?,
+        };
         self.enqueue_suspend_artifact_backup(
             sandbox,
             local_artifact_id,
@@ -585,7 +773,6 @@ impl SandboxManagerService {
             true,
         )
         .await
-        .map_err(|error| artifact_backup_fence_status(error.to_string()))
     }
 
     pub(super) async fn enqueue_suspend_artifact_backup(
