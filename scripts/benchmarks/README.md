@@ -291,3 +291,43 @@ binding. Compiled environment artifacts remain protected across restarts and
 deployment-mode changes; stopping benchmark submissions does not retire them.
 These measurements qualify cold boot and stop/start. Memory-state operations,
 production placement, and other VMMs require their own qualification.
+
+## Host overhead sampler
+
+`bench-sbx-host-overhead.py` attributes one worker node's CPU time to host
+overhead or guest work while some other driver runs the sandbox workload. It
+runs on the worker, needs only Python 3 and read access to `/proc` and the
+SPACE cgroup tree, and changes nothing.
+
+Every `--interval-secs` (default 5) it reads cumulative CPU time for four
+categories:
+
+| Category | Source | Counted as |
+| --- | --- | --- |
+| `guest_vcpu` | `fc_vcpu*` threads of each Firecracker process | guest |
+| `vmm_non_vcpu` | VMM cgroup `/space/<id>` `usage_usec` minus its vCPU threads | host |
+| `sidecar` | sidecar cgroup `/space/sbx-<id>` (net-gateway, spaced-host) | host |
+| `node_daemons` | processes outside sandbox cgroups whose name starts with `--daemon-prefix` (default `space-`) | host |
+
+Host CPU is the sum of the three host categories. A sandbox counts toward
+sandbox-minutes for each interval in which its VMM cgroup held a process at
+both ends, so the headline `host_cpu_s_per_sandbox_min` divides host CPU by
+running sandbox time. Memory is reported as peaks per category; the VMM cgroup
+charges guest RAM and VMM memory together, so it is not split.
+
+```bash
+# On the worker, while the workload runs; one JSON report per run.
+python3 scripts/benchmarks/bench-sbx-host-overhead.py \
+  --duration-secs 600 --window-secs 300 --output /tmp/host-overhead.json
+```
+
+`--window-secs` adds consecutive windows next to the total, which shows the
+spread within one run. On Kind, pipe the script into the worker container
+instead: `docker exec -i <worker> python3 - --duration-secs 600 < scripts/benchmarks/bench-sbx-host-overhead.py`.
+
+Limits: CPU of a process or sandbox that starts and exits between two samples
+is not counted, and an entity's first interval is counted only from its first
+sample, so lifecycle churn is undercounted by up to one interval per entity.
+Thread CPU has `CLK_TCK` (usually 10 ms) resolution. The sampler attributes
+everything on the node, so run it on a node with no unrelated sandbox work, or
+subtract an idle run taken the same way.
