@@ -18,8 +18,7 @@ def file_write_size_boundary_on_the_data_plane(test: NativeHardeningFixture) -> 
     files = FileCalls(test, sandbox_id, test.config.data_plane_url)
     at_cap = f"/tmp/{test.new_key('at-cap')}"
     above = f"/tmp/{test.new_key('above-cap')}"
-    # A printable pattern whose period does not divide the read below, so a
-    # truncated or shifted write cannot read back the same.
+    # Printable bytes permit exact comparisons through the text read adapter.
     payload = bytes(97 + index % 23 for index in range(CAP))
 
     with test.context.phase("write exactly 16 MiB"):
@@ -39,13 +38,14 @@ def file_write_size_boundary_on_the_data_plane(test: NativeHardeningFixture) -> 
         entry = stat.get("entry")
         size = entry.get("size_bytes") if isinstance(entry, dict) else None
         test.context.verify(size == CAP, "the file at the cap has the wrong size", size_bytes=size)
-        # The start, the middle and the end, so a chunk lost or reordered
-        # anywhere in the body reads back different.
-        for where, offset in (("start", 0), ("middle", CAP // 2), ("end", CAP - 1024)):
-            chunk = files.call("read", {"path": at_cap, "offset": offset, "length": 1024})
+        # Read the complete file in bounded responses: sampled offsets cannot
+        # establish that bytes elsewhere survived a chunk boundary intact.
+        chunk_size = 1024 * 1024
+        for offset in range(0, CAP, chunk_size):
+            chunk = files.call("read", {"path": at_cap, "offset": offset, "length": chunk_size})
             test.context.verify(
-                chunk.status == 200 and chunk.text == payload[offset:offset + 1024].decode(),
-                f"the {where} of the file at the cap is not what was written",
+                chunk.status == 200 and chunk.text == payload[offset:offset + chunk_size].decode(),
+                "the file at the cap is not what was written",
                 status=chunk.status, offset=offset,
             )
 

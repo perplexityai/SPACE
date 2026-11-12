@@ -1,0 +1,31 @@
+# Re-include the main-tier node-selector scenario in PR CI when its placement
+# contract can change. Read by the existing kind-pull-needed.sh selector; a
+# match also requires Kind when no routine path matched. Patterns cover both
+# renderers, shared selector parsing, eligibility and chart configuration.
+crates/libs/common/core/src/k8s.rs
+crates/libs/common/core/src/k8s/**
+crates/l40_api/api/src/controllers/substrate/**
+crates/l40_api/api/src/cluster_admission.rs
+crates/l40_api/api/src/cluster_admission/**
+crates/l40_api/cluster/controller/server/src/pod.rs
+crates/l40_api/cluster/controller/server/src/pod/**
+crates/l40_api/cluster/controller/server/src/warm_pool.rs
+crates/l40_api/cluster/controller/server/src/warm_pool/**
+crates/l40_api/cluster/controller/server/src/node_group*
+crates/l40_api/cluster/controller/server/src/node_group*/**
+crates/l40_api/cluster/controller/server/src/node_service_readiness.rs
+crates/l40_api/cluster/controller/server/src/node_service_readiness/**
+crates/l40_api/cluster/controller/server/src/public_operation_dispatcher.rs
+crates/l40_api/cluster/controller/server/src/public_operation_dispatcher/**
+crates/l50_app/cluster/controller/**
+infra/space/kind/charts/**
+Tiltfile
+space_smoke/node_selector_extras.py
+space_smoke/scenarios/local_node_selector_extras_render_and_enforce.py
+space_smoke/registry.py
+space_smoke/__main__.py
+.github/workflows/kind-ci.yml
+.github/workflows/pull-ci.yml
+.github/workflows/main-ci.yml
+ci/kind-placement-paths.txt
+ci/scripts/kind-pull-needed.sh

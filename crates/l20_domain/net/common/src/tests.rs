@@ -208,6 +208,17 @@ fn egress_decision_for_ip_preserves_precedence_and_dns_evidence() {
 
     let cases = [
         (
+            "platform guardrail precedes an explicit tenant metadata allow",
+            policy(
+                EgressDefaultAction::Deny,
+                vec![ip_rule("169.254.169.254")],
+                vec![],
+            ),
+            "169.254.169.254",
+            true,
+            EgressDecision::platform_guardrail("ec2-imds"),
+        ),
+        (
             "platform guardrail precedes every policy input",
             NetworkPolicyV1::allow_all(),
             "169.254.169.254",

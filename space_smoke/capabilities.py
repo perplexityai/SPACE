@@ -47,6 +47,12 @@ class ColdCreatePod:
     rejected_markers: tuple[str, ...]
 
 
+class NetworkPolicyObserver(Protocol):
+    def network_policy_state(self, sandbox_id: str) -> Mapping[str, str]:
+        """Read the resident gateway's installed policy through its node CLI."""
+        ...
+
+
 class ColdCreateObserver(Protocol):
     def cold_create_pod(self, sandbox_id: str) -> ColdCreatePod: ...
 
@@ -1310,7 +1316,13 @@ class EcwScenarioSandboxes(Protocol):
     @property
     def items(self) -> tuple[EcwSandbox, ...]: ...
 
-    def create(self, metadata: Mapping[str, str] | None = None) -> EcwSandbox: ...
+    def create(
+        self,
+        metadata: Mapping[str, str] | None = None,
+        *,
+        network: NetworkConfig | None = None,
+        allow_internet_access: bool | None = None,
+    ) -> EcwSandbox: ...
 
     def fork(
         self,
@@ -1721,10 +1733,6 @@ class EncryptedResuspendControl(RestoreStateRead, Protocol):
         """Read LUKS identity and sparse allocation from the sealed backing file."""
         ...
 
-    def clear_completed_sandbox_pods(self, sandbox_id: str) -> tuple[str, ...]:
-        """Force-clear only deleting pods whose containers all exited successfully."""
-        ...
-
     def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]:
         """The sandbox's execution pods by label, including terminating ones."""
         ...
@@ -1935,6 +1943,12 @@ class TemplateCacheControl(RestoreStateRead, Protocol):
         once at daemon start, and mid-rollout the spec describes a pod that
         does not exist yet on this node.
         """
+        ...
+
+    def template_rootfs_allocated_bytes(
+        self, node_name: str, template: str, content_hash: str
+    ) -> int:
+        """Allocated rootfs bytes, without resolving or touching the LRU clock."""
         ...
 
     def register_unpinned_template(
@@ -2680,8 +2694,18 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """Start watching the leadership Lease; every change it delivers is kept."""
         ...
 
-    def controller_pods(self, *, refused_contender: bool = False) -> list[ControllerPod]:
+    def controller_pods(
+        self, *, refused_contender: bool = False, budget_contender: bool = False
+    ) -> list[ControllerPod]:
         """The healthy Deployment's pods, or the refused contender's."""
+        ...
+
+    def place_budget_contender(self) -> None:
+        """Run the controller template with an unreachable pod-local API endpoint."""
+        ...
+
+    def remove_budget_contender(self, *, wait: bool = False) -> None:
+        """Delete this run's budget control without waiting for its teardown."""
         ...
 
     def place_refused_contender(self) -> None:

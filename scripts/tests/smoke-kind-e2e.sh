@@ -49,10 +49,10 @@ done
 # Idempotent kind+tilt bring-up.
 # shellcheck source=lib/bootstrap-kind-stack.sh
 # Shared public-API helpers. `OPERATION_POLL_ATTEMPTS` keeps this suite's
-# original 60-poll budget; `CURL_TIMEOUT_SECS` is deliberately unset, so
-# `api_curl` stays plain `api_curl` as it was here.
+# original 60-poll budget. Bound each request as well as the poll count.
 SPACE_OPS_PREFIX="smoke-kind-e2e"
 OPERATION_POLL_ATTEMPTS=60
+CURL_TIMEOUT_SECS="${CURL_TIMEOUT_SECS:-30}"
 . "$SCRIPT_DIR/lib/space-api-ops.sh"
 . "$SCRIPT_DIR/lib/bootstrap-kind-stack.sh"
 bootstrap_kind_stack
@@ -97,6 +97,18 @@ check_runtime_manager() {
 check_runtime_manager worker
 check_runtime_manager builder
 
+# Preserve the server's error body even when callers capture or discard stdout.
+api_request() {
+  local response rc
+  if response=$(api_curl --fail-with-body "$@"); then
+    printf '%s' "$response"
+  else
+    rc=$?
+    printf '%s\n' "$response" >&2
+    return "$rc"
+  fi
+}
+
 echo "[1/7] login as $EMAIL"
 TOKEN=$(api_curl -X POST "$API_URL/auth/v1/sessions" \
   -H 'content-type: application/json' \
@@ -116,7 +128,8 @@ CREATE_BODY=$(jq -nc --arg template "$TEMPLATE" '{
   metadata: {},
   resources: null
 }')
-CREATE=$(post_operation "/v1/sandboxes" "$CREATE_BODY")
+CREATE=$(api_request -X POST "$API_URL/v1/sandboxes" "${auth[@]}" \
+  -H 'content-type: application/json' -H "idempotency-key: $(idem_key)" -d "$CREATE_BODY")
 SANDBOX_ID=$(echo "$CREATE" | jq -r '.sandbox_id // empty')
 if [[ -z "$SANDBOX_ID" ]]; then
   echo "ERROR: create sandbox failed: $CREATE" >&2
@@ -126,20 +139,30 @@ echo "sandbox_id=$SANDBOX_ID"
 
 cleanup() {
   local rc=$?
+  trap - EXIT
   echo "cleanup: deleting sandbox $SANDBOX_ID"
-  delete_response=$(api_curl -X DELETE "$API_URL/v1/sandboxes/$SANDBOX_ID" \
-    "${auth[@]}" \
-    -H "idempotency-key: $(idem_key)" || true)
-  delete_operation_id=$(echo "$delete_response" | jq -r '.operation_id // empty' 2>/dev/null || true)
-  if [[ -n "$delete_operation_id" ]]; then
-    wait_operation "$delete_operation_id" || true
+  if ! delete_sandbox; then
+    echo "ERROR: cleanup failed for sandbox $SANDBOX_ID" >&2
+    [[ "$rc" != 0 ]] || rc=1
   fi
   exit $rc
 }
+
+delete_sandbox() {
+  local response operation_id code
+  response=$(api_request -X DELETE "$API_URL/v1/sandboxes/$SANDBOX_ID" \
+    "${auth[@]}" -H "idempotency-key: $(idem_key)") || return 1
+  operation_id=$(jq -r '.operation_id // empty' <<<"$response") || return 1
+  wait_operation "$operation_id" || return 1
+  code=$(api_curl "$API_URL/v1/sandboxes/$SANDBOX_ID" "${auth[@]}" \
+    -o /dev/null -w '%{http_code}') || return 1
+  [[ "$code" == 404 ]]
+}
+# Admission gives us the cleanup identity even if the create later fails.
 trap cleanup EXIT
 
-echo "[3/7] start sandbox"
-post_operation "/v1/sandboxes/$SANDBOX_ID:start" '{}' >/dev/null
+echo "[3/7] wait for create"
+wait_operation "$(jq -r '.operation_id // empty' <<<"$CREATE")"
 
 echo "[4/7] wait until file API is ready"
 ready=0
@@ -161,7 +184,7 @@ if [[ "$ready" != "1" ]]; then
 fi
 
 echo "[5/7] mkdir /home/user/data"
-api_curl -X POST "$API_URL/v1/sandboxes/$SANDBOX_ID/files:mkdir" \
+api_request -X POST "$API_URL/v1/sandboxes/$SANDBOX_ID/files:mkdir" \
   "${auth[@]}" \
   -H 'content-type: application/json' \
   -H "idempotency-key: $(idem_key)" \
@@ -176,14 +199,14 @@ WRITE_BODY=$(jq -nc --arg data "$PAYLOAD_B64" '{
   append: false,
   user: null
 }')
-api_curl -X POST "$API_URL/v1/sandboxes/$SANDBOX_ID/files:write" \
+api_request -X POST "$API_URL/v1/sandboxes/$SANDBOX_ID/files:write" \
   "${auth[@]}" \
   -H 'content-type: application/json' \
   -H "idempotency-key: $(idem_key)" \
   -d "$WRITE_BODY" \
   >/dev/null
 
-GOT=$(api_curl -X POST "$API_URL/v1/sandboxes/$SANDBOX_ID/files:read" \
+GOT=$(api_request -X POST "$API_URL/v1/sandboxes/$SANDBOX_ID/files:read" \
   "${auth[@]}" \
   -H 'content-type: application/json' \
   -d '{"path":"/home/user/data/hello.txt","offset":0,"length":16777216,"user":null}')

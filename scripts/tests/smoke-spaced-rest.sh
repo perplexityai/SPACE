@@ -13,6 +13,7 @@ SPACE_DATA_PLANE_URL="${SPACE_DATA_PLANE_URL:-}"
 SPACE_TEMPLATE="${SPACE_TEMPLATE:-seed:latest}"
 SPACE_RUNTIME="${SPACE_RUNTIME:-fc}"
 SPACE_READY_TIMEOUT_MS="${SPACE_READY_TIMEOUT_MS:-60000}"
+SPACE_SMOKE_HTTP_TIMEOUT="${SPACE_SMOKE_HTTP_TIMEOUT:-30}"
 # Set =1 to skip the interactive process / terminal session WebSocket
 # stages. Used when running the smoke against environments where the
 # data-plane WebSocket isn't routed (e.g. behind some kubectl
@@ -83,7 +84,7 @@ api_request() {
   local code
   if ((has_body)); then
     code="$(
-      curl -sS -o "$tmp" -w '%{http_code}' \
+      curl -sS --connect-timeout 5 --max-time "$SPACE_SMOKE_HTTP_TIMEOUT" -o "$tmp" -w '%{http_code}' \
         -X "$method" \
         -H "Authorization: Bearer $SPACE_API_TOKEN" \
         -H "Content-Type: application/json" \
@@ -92,7 +93,7 @@ api_request() {
     )"
   else
     code="$(
-      curl -sS -o "$tmp" -w '%{http_code}' \
+      curl -sS --connect-timeout 5 --max-time "$SPACE_SMOKE_HTTP_TIMEOUT" -o "$tmp" -w '%{http_code}' \
         -X "$method" \
         -H "Authorization: Bearer $SPACE_API_TOKEN" \
         "$(api_url "$path")"
@@ -124,7 +125,7 @@ api_request_idempotent() {
   local code
   if ((has_body)); then
     code="$(
-      curl -sS -o "$tmp" -w '%{http_code}' \
+      curl -sS --connect-timeout 5 --max-time "$SPACE_SMOKE_HTTP_TIMEOUT" -o "$tmp" -w '%{http_code}' \
         -X "$method" \
         -H "Authorization: Bearer $SPACE_API_TOKEN" \
         -H "Content-Type: application/json" \
@@ -134,7 +135,7 @@ api_request_idempotent() {
     )"
   else
     code="$(
-      curl -sS -o "$tmp" -w '%{http_code}' \
+      curl -sS --connect-timeout 5 --max-time "$SPACE_SMOKE_HTTP_TIMEOUT" -o "$tmp" -w '%{http_code}' \
         -X "$method" \
         -H "Authorization: Bearer $SPACE_API_TOKEN" \
         -H "Idempotency-Key: $(idem_key)" \
@@ -163,7 +164,7 @@ api_expect_status() {
   local code
   if [[ -n "$body" ]]; then
     code="$(
-      curl -sS -o "$tmp" -w '%{http_code}' \
+      curl -sS --connect-timeout 5 --max-time "$SPACE_SMOKE_HTTP_TIMEOUT" -o "$tmp" -w '%{http_code}' \
         -X "$method" \
         -H "Authorization: Bearer $SPACE_API_TOKEN" \
         -H "Content-Type: application/json" \
@@ -173,7 +174,7 @@ api_expect_status() {
     )"
   else
     code="$(
-      curl -sS -o "$tmp" -w '%{http_code}' \
+      curl -sS --connect-timeout 5 --max-time "$SPACE_SMOKE_HTTP_TIMEOUT" -o "$tmp" -w '%{http_code}' \
         -X "$method" \
         -H "Authorization: Bearer $SPACE_API_TOKEN" \
         -H "Idempotency-Key: $(idem_key)" \
@@ -297,7 +298,7 @@ wait_for_file_api() {
   local code
   while true; do
     code="$(
-      curl -sS -o /dev/null -w '%{http_code}' \
+      curl -sS --connect-timeout 5 --max-time "$SPACE_SMOKE_HTTP_TIMEOUT" -o /dev/null -w '%{http_code}' \
         -X POST \
         -H "Authorization: Bearer $SPACE_API_TOKEN" \
         -H "Content-Type: application/json" \
@@ -951,7 +952,7 @@ else
   delete_started=$SECONDS
   operation_request DELETE "/v1/sandboxes/$SANDBOX_ID" "" "$ready_timeout_secs" >/dev/null
   verify_code="$(
-    curl -sS -o /dev/null -w '%{http_code}' \
+    curl -sS --connect-timeout 5 --max-time "$SPACE_SMOKE_HTTP_TIMEOUT" -o /dev/null -w '%{http_code}' \
       -H "Authorization: Bearer $SPACE_API_TOKEN" \
       "$(api_url "/v1/sandboxes/$SANDBOX_ID")"
   )"

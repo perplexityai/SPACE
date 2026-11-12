@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # The Rust input key (build-rust-artifacts.sh --input-key) decides when Kind CI
 # reuses an artifact image main built from another commit, so a change the
-# build reads but the key misses would test stale binaries. On a scratch copy
-# of this checkout's tracked files, each case commits one change and compares
-# the key with the base commit's:
+# build reads but the key misses would test stale binaries. A small scratch
+# checkout keeps the real Dockerfiles and representative files in every copied
+# tree. Each case commits one change and compares the key with the base commit's:
 #
 #   1. Changes the Docker build never reads keep the key.
 #   2. Changes to what it reads (a crate, Cargo.lock, either Dockerfile, db/,
@@ -18,7 +18,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 repo="$work/repo"
 mkdir -p "$repo"
-git -C "$repo_root" ls-files -z | (cd "$repo_root" && tar --null -T - -cf -) | tar -xf - -C "$repo"
+python3 "$repo_root/scripts/tests/lib/kind-rust-fixture.py" "$repo_root" "$repo"
 git init -q -b main "$repo"
 git -C "$repo" config user.name test
 git -C "$repo" config user.email test@example.com
@@ -56,7 +56,13 @@ case_key() {
 append() { printf '\n# changed\n' >>"$1"; }
 # shellcheck disable=SC2329 # run through case_key
 bump_pin() {
-  sed -i -E "s|^($1[[:space:]]+sha256:)[a-f0-9]{64}|\\1$(printf '0123456789abcdef%.0s' 1 2 3 4)|" ci/mirrored-images.txt
+  sed -i.bak -E "s|^($1[[:space:]]+sha256:)[a-f0-9]{64}|\\1$(printf '0123456789abcdef%.0s' 1 2 3 4)|" ci/mirrored-images.txt
+  rm ci/mirrored-images.txt.bak
+}
+
+replace() {
+  sed -i.bak "$1" "$2"
+  rm "$2.bak"
 }
 
 # Smoke Python, charts, the Tiltfile, workflows, a runtime image's Dockerfile,
@@ -67,7 +73,7 @@ case_key same "the Tiltfile" append Tiltfile
 case_key same "the Kind workflow" append .github/workflows/kind-ci.yml
 case_key same "a runtime Dockerfile" append docker/Dockerfile.api
 case_key same "the artifact handoff" append infra/space/kind/scripts/rust-artifact-handoff.py
-case_key same "a test-only image pin" sed -i 's/postgres-16-alpine/postgres-16-alpine-moved/' ci/mirrored-images.txt
+case_key same "a test-only image pin" replace 's/postgres-16-alpine/postgres-16-alpine-moved/' ci/mirrored-images.txt
 
 case_key changed "a crate source file" append "$(first_file 'crates/*.rs')"
 case_key changed "a crate manifest" append "$(first_file 'crates/*/Cargo.toml')"
@@ -142,7 +148,8 @@ list="$work/mirrored-images.txt"
 cp "$repo/ci/mirrored-images.txt" "$list"
 [[ "$(SPACE_MIRRORED_IMAGES="$list" key)" == "$base_key" ]] \
   || { echo "FAIL: an override with the same pins changed the key" >&2; status=1; }
-sed -i -E "s|^(public.ecr.aws/docker/library/rust:1-bookworm[[:space:]]+sha256:)[a-f0-9]{64}|\\1$(printf 'f%.0s' {1..64})|" "$list"
+sed -i.bak -E "s|^(public.ecr.aws/docker/library/rust:1-bookworm[[:space:]]+sha256:)[a-f0-9]{64}|\\1$(printf 'f%.0s' {1..64})|" "$list"
+rm "$list.bak"
 [[ "$(SPACE_MIRRORED_IMAGES="$list" key)" != "$base_key" ]] \
   || { echo "FAIL: an override with another Rust base pin kept the key" >&2; status=1; }
 

@@ -426,7 +426,9 @@ kind_assert_live_cluster_mounts() {
     [[ -n "$node" ]] || continue
     while read -r dest src; do
       [[ -n "$dest" ]] || continue
-      printf '%s\n' "$declared_dests" | grep -qFx "$dest" || continue
+      # Consume the whole pipe: grep -q can close it after a match, making
+      # printf fail with SIGPIPE under pipefail and silently skip that mount.
+      printf '%s\n' "$declared_dests" | grep -Fx "$dest" >/dev/null || continue
       live_dests+="$dest"$'\n'
       case "$dest" in
         "$KIND_HOST_PATHS_VENDOR_MOUNT")

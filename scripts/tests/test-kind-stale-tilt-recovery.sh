@@ -168,6 +168,23 @@ TILT
         unset SPACE_KIND_STORAGE_CREDENTIALS SPACE_KIND_RUST_BUILD SPACE_KIND_SUBSTRATE
         source "$repo_root/scripts/tests/lib/bootstrap-kind-stack.sh"
 
+        # The CLI answers are immediate; advance the same clock used by the
+        # real deadline checks instead of sleeping through their retry budgets.
+        printf '0\n' >"$work/clock"
+        date() {
+            if [[ "${TEST_REAL_STOP:-0}" != 1 && "$*" == +%s ]]; then
+                cat "$work/clock"
+            else
+                command date "$@"
+            fi
+        }
+        sleep() {
+            if [[ "${TEST_REAL_STOP:-0}" == 1 ]]; then command sleep "$@"; return; fi
+            local seconds="${1%.*}"
+            [[ "$1" != *.* || "${1#*.}" =~ ^0*$ ]] || seconds=$((seconds + 1))
+            printf '%s\n' "$(( $(cat "$work/clock") + seconds ))" >"$work/clock"
+        }
+
         pgrep() { [[ -z "${TEST_PGREP_PIDS:-}" ]] || printf '%s\n' $TEST_PGREP_PIDS; return 0; }
         curl() { return 0; }
         lsof() { return 0; }
@@ -475,13 +492,12 @@ rm -rf "$work"
 # BOOTSTRAP_TIMEOUT is 600 s; the wait must give up within a few seconds and
 # only after seeing the failure twice (the check runs every 1 s here).
 work="$(mktemp -d)"
-started_at=$SECONDS
 if run_bring_up "$work" KIND_STACK_DETACH=0 TEST_TILT_EPOCH=3000 TEST_CLUSTER_EPOCH=2000 \
         TEST_API_REACHABLE=1 TEST_BOOTSTRAP_TIMEOUT=600 \
         TEST_UIRESOURCES='(Tiltfile) ok\nspace-api error\nspace-postgres ok\n'; then
     fail "a failed Tilt build must fail the bring-up" "$(cat "$work/result")"
 else
-    elapsed=$(( SECONDS - started_at ))
+    elapsed="$(cat "$work/clock")"
     (( elapsed < 60 )) \
         || fail "the failed build must end the wait well before BOOTSTRAP_TIMEOUT (took ${elapsed}s)"
     grep -q "Tilt reports failed builds" "$work/result" && grep -q "tilt logs space-api" "$work/result" \
@@ -510,12 +526,11 @@ rm -rf "$work"
 # update failed. On a warm stack the old pods keep every rollout green, so the
 # quiet wait must fail on the error itself, with the resource's log.
 work="$(mktemp -d)"
-started_at=$SECONDS
 if run_bring_up "$work" TEST_ENTRY=bootstrap_kind_stack__wait_for_tilt_quiet TEST_BOOTSTRAP_TIMEOUT=60 \
         TEST_UIRESOURCES='(Tiltfile) ok\nspace-ui error\nspace-api ok\n'; then
     fail "a settled Tilt with a failed resource must fail the bring-up" "$(cat "$work/result")"
 else
-    (( SECONDS - started_at < 30 )) \
+    (( $(cat "$work/clock") < 30 )) \
         || fail "the settled failure must end the wait well before BOOTSTRAP_TIMEOUT" "$(cat "$work/result")"
     grep -q "fake build log for space-ui" "$work/result" \
         || fail "the settled failure must print the failed resource's log tail" "$(cat "$work/result")"
@@ -544,12 +559,11 @@ rm -rf "$work"
 # Case 12b: the same Failed Job with space-db-migrate idle is the current one:
 # the wait ends on it, with its logs, long before the budget.
 work="$(mktemp -d)"
-started_at=$SECONDS
 run_bring_up "$work" TEST_ENTRY=bootstrap_kind_stack__wait_for_api TEST_BOOTSTRAP_TIMEOUT=600 \
         TEST_MIGRATE_JOB='uid-new Failed ' TEST_UIRESOURCES='space-db-migrate ok\nspace-api pending\n' || true
 grep -q "space-db-migrate Job failed" "$work/result" && grep -q "fake migration log" "$work/result" \
     || fail "a Failed Job Tilt has finished applying must end the bring-up with its logs" "$(cat "$work/result")"
-(( SECONDS - started_at < 60 )) \
+(( $(cat "$work/clock") < 60 )) \
     || fail "the current Job's failure must end the wait well before BOOTSTRAP_TIMEOUT" "$(cat "$work/result")"
 rm -rf "$work"
 
@@ -631,21 +645,19 @@ rm -rf "$work"
 # seed wait must end on the migration within seconds; a blocking wait reported
 # the seed at its timeout instead.
 work="$(mktemp -d)"
-started_at=$SECONDS
 run_bring_up "$work" TEST_REPO_ROOT="$shadow_root" TEST_TILT_EPOCH=3000 TEST_CLUSTER_EPOCH=2000 \
         TEST_API_REACHABLE=0 SEED_PUBLISH_COMPLETE_TIMEOUT=20 TEST_SEED_WAIT_SECS=20 \
         TEST_SEED_JOBS='uid-seed ' TEST_MIGRATE_JOB='uid-migrate Failed ' \
         TEST_UIRESOURCES='space-db-migrate ok\nspace-seed-publish ok\n' || true
 grep -q "space-db-migrate Job failed" "$work/result" && grep -q "fake migration log" "$work/result" \
     || fail "a migration failing during the seed wait must be diagnosed as such" "$(cat "$work/result")"
-(( SECONDS - started_at < 15 )) \
+(( $(cat "$work/clock") < 15 )) \
     || fail "the migration failure must end the seed wait in seconds, not at its timeout" "$(cat "$work/result")"
 rm -rf "$work"
 
 # Case 14c: the seed Job completes and provision-local-console has failed.
 # The bring-up must end on it, with its log, before the node-publication wait.
 work="$(mktemp -d)"
-started_at=$SECONDS
 if run_bring_up "$work" TEST_REPO_ROOT="$shadow_root" TEST_TILT_EPOCH=3000 TEST_CLUSTER_EPOCH=2000 \
         TEST_API_REACHABLE=0 SEED_PUBLISH_COMPLETE_TIMEOUT=4 TEST_SEED_JOBS='uid-seed Complete ' \
         TEST_UIRESOURCES='space-seed-publish ok\nspace-api ok\nprovision-local-console error\n'; then
@@ -655,7 +667,7 @@ else
         || fail "the console's failure must be reported with its log" "$(cat "$work/result")"
     ! grep -q "\[stub\] every SPACE node is published" "$work/result" \
         || fail "the console's failure must end the bring-up before the node-publication wait" "$(cat "$work/result")"
-    (( SECONDS - started_at < 15 )) \
+    (( $(cat "$work/clock") < 15 )) \
         || fail "the console's failure must end the bring-up in seconds" "$(cat "$work/result")"
 fi
 rm -rf "$work"

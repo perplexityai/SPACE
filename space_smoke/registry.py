@@ -12,7 +12,7 @@ from typing import Any, Generic, TypeVar, cast, get_type_hints
 from space_smoke.config import SandboxConfig
 from space_smoke.console import BROWSERS
 from space_smoke.direct_node import DirectNodeRecoveryFixture
-from space_smoke.fixtures import CommandSandboxFixture, Ecw, KindEcw
+from space_smoke.fixtures import CommandSandboxFixture, Ecw, KindAdmin, KindEcw, KindNetworkEcw
 from space_smoke.native_hardening import NativeHardeningFixture
 from space_smoke.native_recovery import KindNativeHardeningFixture
 from space_smoke.runtime import ScenarioContext, SmokeConfigurationError
@@ -26,15 +26,19 @@ FIXTURE_BACKENDS: dict[type[Any], frozenset[str]] = {
     KindNativeHardeningFixture: frozenset({"kind"}),
     CommandSandboxFixture: frozenset({"kind", "deployed"}),
     Ecw: frozenset({"kind", "deployed"}),
+    KindAdmin: frozenset({"kind"}),
     KindEcw: frozenset({"kind"}),
+    KindNetworkEcw: frozenset({"kind"}),
 }
 
 # The control-plane substrates a fixture can drive: the Kubernetes substrate
 # (pod per sandbox) and the Direct substrate (node-local VMs on registered
 # nodes, infra/space/kind/lib/substrate.sh). A fixture that needs no Kind-only
 # Kubernetes wiring (Ecw, CommandSandboxFixture, NativeHardeningFixture) serves
-# both; KindEcw and KindNativeHardeningFixture serve Kubernetes alone. A
-# scenario narrows its fixture's set (`substrates=`) where a substrate does not
+# both; KindAdmin, KindEcw and KindNativeHardeningFixture serve Kubernetes alone.
+# KindNetworkEcw observes the gateway through the Kind node shell on either
+# substrate without assuming Kubernetes sandbox pods. A scenario narrows its
+# fixture's set (`substrates=`) where a substrate does not
 # support what it asserts by contract: one that asserts sandbox pods, or forks,
 # narrows to kubernetes.
 FIXTURE_SUBSTRATES: dict[type[Any], frozenset[str]] = {
@@ -44,9 +48,12 @@ FIXTURE_SUBSTRATES: dict[type[Any], frozenset[str]] = {
     KindNativeHardeningFixture: frozenset({"kubernetes"}),
     CommandSandboxFixture: frozenset({"kubernetes", "direct"}),
     Ecw: frozenset({"kubernetes", "direct"}),
+    KindAdmin: frozenset({"kubernetes"}),
     KindEcw: frozenset({"kubernetes"}),
+    KindNetworkEcw: frozenset({"kubernetes", "direct"}),
 }
 SUBSTRATES = frozenset({"kubernetes", "direct"})
+TIERS = frozenset({"routine", "main", "manual"})
 
 Fixture = TypeVar("Fixture")
 
@@ -70,7 +77,8 @@ class Scenario(Generic[Fixture]):
     backends: frozenset[str]
     substrates: frozenset[str]
     quarantined: str | None
-    ignored: str | None
+    tier: str
+    manual_reason: str | None
     telemetry_mode: str | None
     storage_credentials: str | None
     test_hooks: str | None
@@ -97,7 +105,7 @@ class Scenario(Generic[Fixture]):
         )
 
     def applies_to(self, template: str | None) -> bool:
-        return self.templates != frozenset() and (
+        return (
             template is None
             or self.templates is None
             or template.split(":", 1)[0] in self.templates
@@ -114,7 +122,8 @@ def scenario(
     required_tools: Iterable[str] = (),
     api_surfaces: Iterable[str] = ("ecw",),
     quarantined: str | None = None,
-    ignored: str | None = None,
+    tier: str = "routine",
+    manual_reason: str | None = None,
     telemetry_mode: str | None = None,
     timeout_minutes: int | None = None,
     cleanup_timeout_seconds: float | None = None,
@@ -128,9 +137,9 @@ def scenario(
     `quarantined` names the reason (a PR or issue) a scenario is withheld from
     implicit selection (`--all`, `--category`). A quarantined scenario still
     runs when named explicitly, so it can be fixed and re-proven in place.
-    `ignored` withholds a proposed contract that is not yet agreed, or an
-    opt-in scenario too slow or too invasive for the per-merge set. It stays
-    explicitly runnable and visible in suite logs, outside the defect backlog.
+    `tier` selects routine PR coverage, additional main coverage, or a manual
+    scenario that runs only by name. Manual scenarios require `manual_reason`;
+    the reason describes the extra prerequisites or deferred contract.
     `telemetry_mode` names the Kind telemetry mode whose backends the scenario
     reads; implicit selection skips it, visibly, on a bench running another
     known mode that the runner did not ask for. `storage_credentials` does the
@@ -169,11 +178,10 @@ def scenario(
         if templates is not None
         else None
     )
-    # An empty list disables optional workload scenarios until templates are configured.
-    if supported_templates is not None and any(
-        not template for template in supported_templates
+    if supported_templates is not None and (
+        not supported_templates or any(not template for template in supported_templates)
     ):
-        raise ValueError("smoke templates must contain non-empty template ids")
+        raise ValueError("smoke templates must contain non-empty template ids; use tier='manual' for opt-in scenarios")
     rerun_names = tuple(rerun_environment)
     if len(set(rerun_names)) != len(rerun_names) or any(
         not _is_environment_name(name) for name in rerun_names
@@ -191,10 +199,12 @@ def scenario(
         )
     if quarantined is not None and not quarantined.strip():
         raise ValueError("smoke quarantine must state its reason")
-    if ignored is not None and not ignored.strip():
-        raise ValueError("ignored smoke must state its reason")
-    if ignored is not None and quarantined is not None:
-        raise ValueError("smoke cannot be both ignored and quarantined")
+    if tier not in TIERS:
+        raise ValueError(f"smoke tier must be one of {', '.join(sorted(TIERS))}")
+    if tier == "manual" and (manual_reason is None or not manual_reason.strip()):
+        raise ValueError("manual smoke must state its reason")
+    if tier != "manual" and manual_reason is not None:
+        raise ValueError("manual_reason requires tier='manual'")
     # Only otel installs backends a scenario can read.
     if telemetry_mode not in (None, "otel"):
         raise ValueError("smoke telemetry mode must be 'otel'")
@@ -232,6 +242,8 @@ def scenario(
                 f"smoke {id} fixture must be one of {supported}; got "
                 f"{getattr(fixture_type, '__name__', fixture_type)!r}"
             )
+        if fixture_type is KindAdmin and sandboxes != 1:
+            raise ValueError("KindAdmin does not allocate sandboxes; omit sandboxes")
         if (fixture_type is DirectNodeRecoveryFixture) != (
             "node" in supported_surfaces
         ):
@@ -255,8 +267,8 @@ def scenario(
             raise TypeError(
                 "NativeHardeningFixture requires only the native API surface"
             )
-        if telemetry_mode is not None and fixture_type is not KindEcw:
-            raise TypeError("a telemetry mode requires the KindEcw fixture")
+        if telemetry_mode is not None and fixture_type not in (KindEcw, KindAdmin):
+            raise TypeError("a telemetry mode requires a Kind control-plane fixture")
         if (
             timeout_minutes is not None
             and timeout_minutes < fixture_type.timeout_minutes
@@ -264,10 +276,10 @@ def scenario(
             raise ValueError(
                 f"smoke {id} may only raise its fixture's {fixture_type.timeout_minutes}-minute timeout"
             )
-        if storage_credentials is not None and fixture_type is not KindEcw:
-            raise TypeError("a storage credentials mode requires the KindEcw fixture")
-        if browser is not None and fixture_type is not KindEcw:
-            raise TypeError("a browser requires the KindEcw fixture")
+        if storage_credentials is not None and fixture_type not in (KindEcw, KindAdmin):
+            raise TypeError("a storage credentials mode requires a Kind control-plane fixture")
+        if browser is not None and fixture_type not in (KindEcw, KindAdmin):
+            raise TypeError("a browser requires a Kind control-plane fixture")
         fixture_substrates = FIXTURE_SUBSTRATES[fixture_type]
         if narrowed_substrates is not None and not narrowed_substrates < fixture_substrates:
             raise ValueError(
@@ -284,7 +296,7 @@ def scenario(
             fixture_name=fixture_type.fixture_name,
             fixture_type=cast(type[Fixture], fixture_type),
             sandbox=sandbox_config,
-            sandbox_count=sandboxes,
+            sandbox_count=0 if fixture_type is KindAdmin else sandboxes,
             templates=supported_templates,
             rerun_environment=rerun_names,
             required_tools=tool_names,
@@ -294,7 +306,8 @@ def scenario(
             backends=FIXTURE_BACKENDS[fixture_type],
             substrates=narrowed_substrates or fixture_substrates,
             quarantined=quarantined,
-            ignored=ignored,
+            tier=tier,
+            manual_reason=manual_reason,
             telemetry_mode=telemetry_mode,
             storage_credentials=storage_credentials,
             test_hooks=test_hooks,
@@ -370,8 +383,16 @@ class ScenarioRegistry:
         backend: str | None = None,
         substrate: str | None = None,
         include_quarantined: bool = False,
-        include_ignored: bool = False,
+        tiers: Iterable[str] = ("routine",),
+        include_scenarios: Iterable[str] = (),
     ) -> tuple[Scenario[Any], ...]:
+        selected_tiers = frozenset(tiers)
+        if not selected_tiers or not selected_tiers <= TIERS:
+            raise ValueError(f"smoke tiers must be a non-empty subset of {', '.join(sorted(TIERS))}")
+        included = frozenset(include_scenarios)
+        for scenario_id in included:
+            if self.get(scenario_id).tier != "main":
+                raise ValueError(f"additional scenario {scenario_id!r} must have tier='main'")
         return tuple(
             scenario
             for scenario in self
@@ -380,7 +401,7 @@ class ScenarioRegistry:
             and (backend is None or backend in scenario.backends)
             and (substrate is None or substrate in scenario.substrates)
             and (include_quarantined or scenario.quarantined is None)
-            and (include_ignored or scenario.ignored is None)
+            and (scenario.tier in selected_tiers or scenario.id in included)
         )
 
 

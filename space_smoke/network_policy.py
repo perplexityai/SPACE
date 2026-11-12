@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING
 
-from space_smoke.capabilities import EcwCreateAttempt
+from space_smoke.capabilities import EcwCreateAttempt, NetworkConfig
 from space_smoke.network_policy_dns import (
     verify_dns_transport as _verify_dns_transport,
 )
@@ -20,12 +21,32 @@ from space_smoke.network_policy_fastly import (
 if TYPE_CHECKING:
     from space_smoke.fixtures import Ecw
 
+_DENIAL_PROBE_TIMEOUT_SECONDS = 2
+
 
 @dataclass(frozen=True)
 class NetworkPolicyAssertions:
     """Reusable network-policy observations reached through an ECW sandbox."""
 
     _test: Ecw
+
+    @cached_property
+    def control(self) -> Ecw:
+        """An owned, unrestricted guest checks the very destinations we deny.
+
+        A timeout alone cannot distinguish a policy drop from a dead upstream.
+        Use the same template and guest transport, with cleanup registered by
+        the scenario collection, and reuse it across before/after restore probes.
+        """
+
+        from space_smoke.fixtures import Ecw
+
+        with self._test.phase("create an unrestricted egress control"):
+            sandbox = self._test.sandboxes.create(
+                allow_internet_access=True,
+                network=NetworkConfig(allow_public_traffic=False),
+            )
+        return Ecw(self._test._context, sandbox)
 
     def verify_egress(
         self,
@@ -46,14 +67,26 @@ class NetworkPolicyAssertions:
             checks.append({"expectation": "reachable", **observed.evidence()})
             self._test.expect_network_reachable(observed)
         for url in blocked:
+            control = self.control.wait_for_network_access(
+                url, timeout_seconds=15, probe_timeout_seconds=_DENIAL_PROBE_TIMEOUT_SECONDS
+            )
+            self.control.expect_network_reachable(control)
+            checks.append({"expectation": "control reachable before", **control.evidence()})
+            # Admission holds traffic until the create-time policy is installed.
+            # A fixed settling delay neither establishes readiness nor improves
+            # a denial whose destination has a working positive control.
+            # Both controls must respond within the denial probe's own bound;
+            # their overall retry budget still tolerates transient failures.
             observed = self._test.observe_https_access(
-                url,
-                after_seconds=5,
-                samples=3,
-                every_seconds=1,
+                url, probe_timeout_seconds=_DENIAL_PROBE_TIMEOUT_SECONDS
             )
             checks.append({"expectation": "blocked", **observed.evidence()})
             self._test.expect_https_blocked(observed)
+            control = self.control.wait_for_network_access(
+                url, timeout_seconds=15, probe_timeout_seconds=_DENIAL_PROBE_TIMEOUT_SECONDS
+            )
+            self.control.expect_network_reachable(control)
+            checks.append({"expectation": "control reachable after", **control.evidence()})
 
     def verify_dns_transport(
         self,
@@ -71,6 +104,7 @@ class NetworkPolicyAssertions:
             accepted=accepted,
             refused=refused,
             blocked=blocked,
+            control=self.control if blocked else None,
         )
 
     def verify_domain_binding(self) -> None:

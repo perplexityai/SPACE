@@ -68,7 +68,7 @@ def _install_header_digest_script(test: smoke.CommandSandboxFixture) -> None:
     # This scenario needs an explicitly provisioned AWS secret and selected
     # echo endpoint, so keep it out of implicit --all selection. Naming it
     # directly still runs it.
-    templates=(),
+    tier="manual", manual_reason='Requires an explicitly provisioned AWS secret and a selected echo endpoint.',
     rerun_environment=(
         "SPACE_SMOKE_SECRET_ARN",
         "SPACE_SMOKE_ECHO_URL",

@@ -154,7 +154,7 @@ ensure_build_foreign_org() {
   done
   local admin="${API_URL:-http://127.0.0.1:8080}/admin/api/v1"
   admin_call() {
-    local args=(-fsS -X "$1" "$admin/$2"
+    local args=(-fsS --connect-timeout 5 --max-time 30 -X "$1" "$admin/$2"
       -H "Authorization: Bearer $token"
       -H 'Content-Type: application/json'
       -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)")

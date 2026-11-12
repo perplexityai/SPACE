@@ -15,15 +15,19 @@ MARKER = "space-smoke-teardown-restart-ok"
 # as a native operation because the ECW pause answers only once durable. The
 # restart replaces only sandbox-manager's pod, so the VM keeps running under
 # the host runtime-supervisor, as in a sandbox-manager rollout. The store
-# returns once the restart's hold check is done, and the transfer's retry
-# ladder decides when the upload lands. Do not run concurrently with another
-# suspend-bearing smoke.
+# returns once the replacement's production CLI confirms ownership, and the
+# transfer's retry ladder decides when the upload lands. A slow replacement
+# can miss the 30 s retry and wait for the 120 s retry; the measured scheduling
+# hint is not an upper bound. Keep the restore wait's 600 s budget and do not
+# shorten the shared retries: that can exhaust the attempt budget during the
+# deliberate store outage. Do not run concurrently with another suspend-bearing
+# smoke.
 @smoke.scenario(
     "local.sandbox_manager_restart_leaves_teardown_suspend_to_its_teardown",
-    # The phases' worst cases add to 2610 s: the object store scale-down
+    # The phases' worst cases add to 2580 s: the object store scale-down
     # 120 s, the snapshot in flight 180 s, the row reaching `suspending`
     # 120 s, the restart 1200 s (the pod delete and its replacement's
-    # readiness are each bounded at 600 s), the hold 30 s, the object store's
+    # readiness are each bounded at 600 s), the object store's
     # rollout back 180 s, the upload's retry ladder 600 s and the row reaching
     # `suspended`, or its eviction once backed, 180 s. Create, the wake and
     # each poll's own read come on top.
@@ -61,7 +65,7 @@ def sandbox_manager_restart_leaves_teardown_suspend_to_its_teardown(test: smoke.
         restart.restart_sandbox_manager()
 
     with test.phase("the restart leaves the row to its teardown"):
-        restart.expect_row_holds("suspending")
+        restart.expect_teardown_owned_after_restart()
 
     with test.phase("restore uploads; the teardown finishes the suspend"):
         uploads.restore_uploads()

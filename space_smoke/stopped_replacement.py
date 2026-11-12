@@ -545,9 +545,9 @@ class StoppedReplacementAssertions:
 
     # --- the emptied node ---------------------------------------------------------
 
-    def expect_drained_and_held(self) -> None:
+    def expect_drained_node_present(self) -> None:
         self._read()
-        self.drain.expect_drained_and_held()
+        self.drain.expect_drained_node_present()
         self._read()
 
     def undrain(self) -> None:

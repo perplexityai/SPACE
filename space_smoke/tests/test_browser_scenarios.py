@@ -26,7 +26,7 @@ from space_smoke.suite import ScenarioProcessResult
 
 BROWSER_IDS = {
     scenario.id for scenario in REGISTRY
-    if scenario.browser is not None and scenario.ignored is None
+    if scenario.browser is not None and scenario.tier == "routine"
 }
 MISSING = "Playwright for Python is not installed (uv sync --frozen --python 3.11 --group console)"
 

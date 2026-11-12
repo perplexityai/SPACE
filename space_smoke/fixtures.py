@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass
 from enum import StrEnum
+from functools import cached_property
 from http.client import IncompleteRead
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, ClassVar, cast
@@ -59,6 +60,7 @@ from space_smoke.capabilities import (
     RestoreStateRead,
     SandboxPodPlacement,
     ColdCreateObserver,
+    NetworkPolicyObserver,
     CommandResult,
     CommandSandbox,
     DurableLifecycleSandbox,
@@ -306,6 +308,7 @@ class HttpsProbeSample:
     def blocked_by_network(self) -> bool:
         return (
             self.command_exit_code == 0
+            and not self.network_reachable
             and self.curl_exit_code in _CURL_NETWORK_FAILURE_EXIT_CODES
         )
 
@@ -617,7 +620,7 @@ set -eu
 while IFS= read -r header; do
   [ "$header" = "$(printf '\\r')" ] && break
 done
-content_length=$(wc -c < {quoted_body_path})
+content_length=$(wc -c < {quoted_body_path} | tr -d '[:space:]')
 printf 'HTTP/1.1 200 OK\\r\\nContent-Length: %s\\r\\nConnection: close\\r\\n\\r\\n' "$content_length"
 cat {quoted_body_path}
 """
@@ -844,10 +847,17 @@ class EcwSandboxCollection(SandboxCollection):
         self,
         *,
         metadata: Mapping[str, str] | None = None,
+        allow_internet_access: bool | None = None,
+        network: NetworkConfig | None = None,
     ) -> EcwSandbox:
         """Create another run-owned sandbox with critical cleanup pre-armed."""
 
-        return self._sandboxes.create(metadata)
+        options = {}
+        if allow_internet_access is not None:
+            options["allow_internet_access"] = allow_internet_access
+        if network is not None:
+            options["network"] = network
+        return self._sandboxes.create(metadata, **options)
 
     def attempt_create(
         self,
@@ -876,10 +886,58 @@ class EcwSandboxCollection(SandboxCollection):
 
 
 @dataclass(frozen=True)
-class CommandSandboxFixture:
-    """Shared scenario behavior over a command-capable sandbox."""
+class ScenarioFixture:
+    """Evidence and bounded waits shared by deployed scenario fixtures."""
 
     _context: ScenarioContext
+
+    def phase(self, name: str) -> AbstractContextManager[None]:
+        return self._context.phase(name)
+
+    def record(self, name: str, value: object) -> None:
+        """Attach a named fact to the scenario's evidence without asserting it."""
+        self._context.record(name, value)
+
+    def wait(self, seconds: float, *, reason: str | None = None) -> None:
+        if reason is None:
+            self._context.wait(seconds)
+            return
+        with self.phase(f"wait {reason}"):
+            self._context.wait(seconds)
+
+    def verify(
+        self,
+        condition: bool,
+        message: str,
+        *,
+        failure_evidence: Callable[[], Mapping[str, object]] | None = None,
+        **evidence: object,
+    ) -> None:
+        if not condition and failure_evidence is not None:
+            # Evidence must never replace the verdict it explains.
+            try:
+                evidence.update(failure_evidence())
+            except ScenarioTimedOut:
+                raise
+            except Exception as error:  # noqa: BLE001 - attached, the violation still raises
+                evidence["failure_evidence_error"] = f"{type(error).__name__}: {error}"[:500]
+        self._context.verify(condition, message, **evidence)
+
+    def warn(self, message: str, **evidence: object) -> None:
+        """End the scenario QUARANTINED: a known, narrowly classified failure.
+
+        The evidence is recorded and the run stays visible in the log without
+        turning the suite red. Callers must classify before calling — an
+        unclassified failure is a `verify` failure, never a warning.
+        """
+
+        self._context.warn(message, **evidence)
+
+
+@dataclass(frozen=True)
+class CommandSandboxFixture(ScenarioFixture):
+    """Shared scenario behavior over a command-capable sandbox."""
+
     sandbox: CommandSandbox
     _sandboxes: ScenarioSandboxes | None = None
     _durable_lifecycle: DurableLifecycleSandbox | None = None
@@ -933,48 +991,6 @@ class CommandSandboxFixture:
         return StoppedReplacementAssertions(
             self, self._stopped_replacement_control, self._context.scope
         )
-
-    def phase(self, name: str) -> AbstractContextManager[None]:
-        return self._context.phase(name)
-
-    def record(self, name: str, value: object) -> None:
-        """Attach a named fact to the scenario's evidence without asserting it."""
-        self._context.record(name, value)
-
-    def wait(self, seconds: float, *, reason: str | None = None) -> None:
-        if reason is None:
-            self._context.wait(seconds)
-            return
-        with self.phase(f"wait {reason}"):
-            self._context.wait(seconds)
-
-    def verify(
-        self,
-        condition: bool,
-        message: str,
-        *,
-        failure_evidence: Callable[[], Mapping[str, object]] | None = None,
-        **evidence: object,
-    ) -> None:
-        if not condition and failure_evidence is not None:
-            # Evidence must never replace the verdict it explains.
-            try:
-                evidence.update(failure_evidence())
-            except ScenarioTimedOut:
-                raise
-            except Exception as error:  # noqa: BLE001 - attached, the violation still raises
-                evidence["failure_evidence_error"] = f"{type(error).__name__}: {error}"[:500]
-        self._context.verify(condition, message, **evidence)
-
-    def warn(self, message: str, **evidence: object) -> None:
-        """End the scenario QUARANTINED: a known, narrowly classified failure.
-
-        The evidence is recorded and the run stays visible in the log without
-        turning the suite red. Callers must classify before calling — an
-        unclassified failure is a `verify` failure, never a warning.
-        """
-
-        self._context.warn(message, **evidence)
 
     def delete_sandbox(self, sandbox: CommandSandbox | None = None) -> int:
         """Delete a run-owned sandbox through the selected API adapter."""
@@ -1483,7 +1499,7 @@ class Ecw(CommandSandboxFixture):
 
         return EcwIdentityAssertions(self)
 
-    @property
+    @cached_property
     def network_policy(self) -> NetworkPolicyAssertions:
         """Assertions for ECW network-policy contracts."""
 
@@ -1826,6 +1842,7 @@ class Ecw(CommandSandboxFixture):
         *,
         timeout_seconds: float = 60,
         every_seconds: float = 2,
+        probe_timeout_seconds: int = _HTTPS_PROBE_CURL_TIMEOUT_SECONDS,
     ) -> HttpsAccessObservation:
         """Poll until any HTTP response proves the route is network-reachable."""
 
@@ -1833,11 +1850,13 @@ class Ecw(CommandSandboxFixture):
             raise ValueError("network access timeout must be positive")
         if every_seconds <= 0:
             raise ValueError("network access interval must be positive")
+        if probe_timeout_seconds <= 0:
+            raise ValueError("network probe timeout must be positive")
         deadline = time.monotonic() + timeout_seconds
         samples: list[HttpsProbeSample] = []
         with self.phase("wait for in-guest network access"):
             while True:
-                sample = self._probe_https(url)
+                sample = self._probe_https(url, timeout_seconds=probe_timeout_seconds)
                 samples.append(sample)
                 if sample.network_reachable or time.monotonic() >= deadline:
                     break
@@ -1853,6 +1872,7 @@ class Ecw(CommandSandboxFixture):
         after_seconds: float = 0,
         samples: int = 1,
         every_seconds: float = 2,
+        probe_timeout_seconds: int = _HTTPS_PROBE_CURL_TIMEOUT_SECONDS,
     ) -> HttpsAccessObservation:
         """Collect a fixed sample set after an optional policy settle window."""
 
@@ -1862,12 +1882,14 @@ class Ecw(CommandSandboxFixture):
             raise ValueError("HTTPS access sample count must be positive")
         if every_seconds <= 0:
             raise ValueError("HTTPS access interval must be positive")
+        if probe_timeout_seconds <= 0:
+            raise ValueError("HTTPS probe timeout must be positive")
         if after_seconds:
             self.wait(after_seconds, reason="for the network policy to settle")
         observed: list[HttpsProbeSample] = []
         with self.phase("sample in-guest HTTPS access"):
             for sample_number in range(samples):
-                observed.append(self._probe_https(url))
+                observed.append(self._probe_https(url, timeout_seconds=probe_timeout_seconds))
                 if sample_number + 1 < samples:
                     self._context.wait(every_seconds)
         return self._record_https_observation(url, observed)
@@ -1895,10 +1917,7 @@ class Ecw(CommandSandboxFixture):
     def expect_https_blocked(self, observed: HttpsAccessObservation) -> None:
         """Require every policy-settled sample to be rejected by curl."""
 
-        reached = any(
-            sample.command_exit_code == 0 and sample.curl_exit_code == 0
-            for sample in observed.samples
-        )
+        reached = any(sample.network_reachable for sample in observed.samples)
         self.verify(
             not reached,
             "sandbox unexpectedly reached an HTTPS endpoint that should be blocked",
@@ -1913,11 +1932,13 @@ class Ecw(CommandSandboxFixture):
             https_access=observed.evidence(),
         )
 
-    def _probe_https(self, url: str) -> HttpsProbeSample:
+    def _probe_https(
+        self, url: str, *, timeout_seconds: int = _HTTPS_PROBE_CURL_TIMEOUT_SECONDS
+    ) -> HttpsProbeSample:
         command = (
             "set +e; "
             "curl -fsS "
-            f"-m {_HTTPS_PROBE_CURL_TIMEOUT_SECONDS} "
+            f"-m {timeout_seconds} "
             f"-o /dev/null -w '%{{http_code}}' {shlex.quote(url)}; "
             "curl_rc=$?; printf '\\nrc=%s\\n' \"$curl_rc\""
         )
@@ -2141,6 +2162,7 @@ class Ecw(CommandSandboxFixture):
         reset_after: float,
         verify_after_reset: float,
         reset: Callable[[], None],
+        additional_resets: Sequence[tuple[EcwSandbox, Callable[[], None]]] = (),
     ) -> None:
         """Prove one action resets the configured sandbox idle deadline."""
 
@@ -2151,6 +2173,7 @@ class Ecw(CommandSandboxFixture):
             reset_after=reset_after,
             verify_after_reset=verify_after_reset,
             reset=reset,
+            additional_resets=additional_resets,
         )
 
     def expect_unavailable(
@@ -2640,17 +2663,16 @@ class RetentionAssertions:
         )
 
 
-class KindEcw(Ecw):
-    """[`Ecw`] plus narrow privileged control-plane operations.
+class KindAdmin(ScenarioFixture):
+    """Kind control-plane capabilities without provisioning an unused VM.
 
-    The fixture *type* is the privilege declaration: requesting it makes a
-    scenario kind-only, enforced at service construction — a deployed
-    backend refuses with a configuration error rather than mis-running a
-    white-box scenario against production.
+    Scenarios that create their own sandbox or only inspect the control plane
+    own those resources through their capability scopes.
     """
 
-    fixture_name: ClassVar[str] = "kind_ecw"
-    allow_committed_pause_not_running: ClassVar[bool] = True
+    fixture_name: ClassVar[str] = "kind_admin"
+    timeout_minutes: ClassVar[int] = 30
+    _template_selector: str | None = None
 
     _private_template_build_setup: Callable[[], PrivateTemplateBuildAssertions] | None = None
     _private_template_build_assertions: PrivateTemplateBuildAssertions | None = None
@@ -2662,6 +2684,147 @@ class KindEcw(Ecw):
         if self._private_template_build_assertions is None:
             self._private_template_build_assertions = self._private_template_build_setup()
         return self._private_template_build_assertions
+
+    _template_build_control: TemplateBuildControl | None = None
+    _template_builder: TemplateBuilder | None = None
+    _template_build_assertions: TemplateBuildAssertions | None = None
+
+    @property
+    def template_build(self) -> TemplateBuildAssertions:
+        """Privileged assertions for a public template build through the kind builders."""
+
+        if self._template_build_control is None or self._template_builder is None:
+            raise SmokeConfigurationError(
+                "template build control is only available on the kind backend"
+            )
+        if self._template_build_assertions is None:
+            self._template_build_assertions = TemplateBuildAssertions(
+                self, self._template_build_control, self._template_builder, self._context.scope
+            )
+        return self._template_build_assertions
+
+    _reconcile_queue_gc_control: ReconcileQueueGcControl | None = None
+    _reconcile_queue_gc_assertions: ReconcileQueueGcAssertions | None = None
+
+    @property
+    def reconcile_queue_gc(self) -> ReconcileQueueGcAssertions:
+        """Privileged assertions for the cluster-controller's reconcile-queue GC."""
+
+        if self._reconcile_queue_gc_control is None:
+            raise SmokeConfigurationError(
+                "reconcile-queue GC control is only available on the kind backend"
+            )
+        if self._reconcile_queue_gc_assertions is None:
+            self._reconcile_queue_gc_assertions = ReconcileQueueGcAssertions(
+                self, self._reconcile_queue_gc_control, self._context.scope
+            )
+        return self._reconcile_queue_gc_assertions
+
+    _leader_election_control: LeaderElectionControl | None = None
+    _leader_election_assertions: LeaderElectionAssertions | None = None
+
+    @property
+    def leader_election(self) -> LeaderElectionAssertions:
+        """Privileged faults and reads for the cluster-controller's leader election."""
+
+        if self._leader_election_control is None:
+            raise SmokeConfigurationError(
+                "leader-election control is only available on the kind backend"
+            )
+        if self._leader_election_assertions is None:
+            self._leader_election_assertions = LeaderElectionAssertions(
+                self, self._leader_election_control, self._context.scope
+            )
+        return self._leader_election_assertions
+
+    _drain_gate_control: DrainGateControl | None = None
+    _drain_gate_assertions: DrainGateAssertions | None = None
+
+    @property
+    def drain_gate(self) -> DrainGateAssertions:
+        """Privileged assertions for the admin `:terminate` occupancy guard."""
+
+        if self._drain_gate_control is None:
+            raise SmokeConfigurationError(
+                "drain gate control is only available on the kind backend"
+            )
+        if self._drain_gate_assertions is None:
+            self._drain_gate_assertions = DrainGateAssertions(
+                self, self._drain_gate_control, self._context.scope
+            )
+        return self._drain_gate_assertions
+
+    _console_control: ConsoleControl | None = None
+    _console_assertions: ConsoleAssertions | None = None
+
+    @property
+    def console(self) -> ConsoleAssertions:
+        """The admin console, driven through a browser and judged against the admin API."""
+
+        if self._console_control is None:
+            raise SmokeConfigurationError(
+                "admin console control is only available on the kind backend"
+            )
+        if self._console_assertions is None:
+            self._console_assertions = ConsoleAssertions(
+                self, self._console_control, self._context.scope
+            )
+        return self._console_assertions
+
+    def sandbox_template_name(self) -> str:
+        """The bare template name (no tag or digest) selected for this scenario."""
+
+        if not self._template_selector:
+            raise SmokeConfigurationError("the fixture template is unknown")
+        return self._template_selector.split("@", 1)[0].split(":", 1)[0]
+
+
+class KindNetworkEcw(Ecw):
+    """ECW plus live gateway observation on either Kind substrate.
+
+    This fixture observes the node's gateway without Kubernetes sandbox-pod
+    operations or the privileged teardown used by KindEcw.
+    """
+
+    fixture_name: ClassVar[str] = "kind_network_ecw"
+    _network_policy_observer: NetworkPolicyObserver | None = None
+
+    def expect_network_policy_installed(self) -> str:
+        """Require live gateway readiness, not a startup hold that drops traffic."""
+        if self._network_policy_observer is None:
+            raise SmokeConfigurationError("network-policy observation requires kind")
+        deadline = time.monotonic() + 30
+        observations = self._context.evidence.setdefault("installed_network_policy_checks", [])
+        assert isinstance(observations, list)
+        while True:
+            observed = self._network_policy_observer.network_policy_state(self.sandbox.sandbox_id)
+            observations.append(dict(observed))
+            reference = observed.get("installed_policy_ref", "")
+            if (
+                observed.get("state") == "ready"
+                and reference
+                and observed.get("interception_readiness") in {"ready", "not_required"}
+            ):
+                return reference
+            self.verify(
+                time.monotonic() < deadline,
+                "sandbox gateway did not install a ready network policy",
+                installed_network_policy_checks=observations,
+            )
+            self.wait(min(1, max(0, deadline - time.monotonic())))
+
+
+class KindEcw(Ecw, KindAdmin):
+    """[`Ecw`] plus narrow privileged control-plane operations.
+
+    The fixture *type* is the privilege declaration: requesting it makes a
+    scenario kind-only, enforced at service construction — a deployed
+    backend refuses with a configuration error rather than mis-running a
+    white-box scenario against production.
+    """
+
+    fixture_name: ClassVar[str] = "kind_ecw"
+    allow_committed_pause_not_running: ClassVar[bool] = True
 
     _cold_create_observer: ColdCreateObserver | None = None
     _warm_pool_observer: WarmPoolObserver | None = None
@@ -2732,9 +2895,30 @@ class KindEcw(Ecw):
 
     _template_cache_control: TemplateCacheControl | None = None
     _template_cache_assertions: TemplateCacheAssertions | None = None
-    # The template selector the fixture sandbox was created from, recorded by
-    # the service so privileged scenarios can name the pinned build.
-    _template_selector: str | None = None
+
+    def create_gc_sandbox(self) -> KindEcw:
+        """Bind GC assertions to another run-owned sandbox without sharing its state.
+
+        Cold eviction needs a suspended guest, snapshot reaping a live fork
+        source, and template eviction a live template pin. Their eligibility
+        clocks can overlap, but those roles must never share a sandbox or a
+        cached assertion object. Collection creation arms cleanup before the
+        request, including when preparation fails partway through.
+        The child receives only the template selector and these three GC
+        controls; it is not a general clone of the parent's privileged fixture.
+        """
+
+        fixture = KindEcw(
+            self._context,
+            self.sandboxes.create(),
+            self._sandboxes,
+            _sandbox_timeout=self._sandbox_timeout,
+        )
+        fixture._template_selector = self._template_selector
+        fixture._template_cache_control = self._template_cache_control
+        fixture._snapshot_reaper_control = self._snapshot_reaper_control
+        fixture._cold_eviction_control = self._cold_eviction_control
+        return fixture
 
     @property
     def template_cache(self) -> TemplateCacheAssertions:
@@ -2749,13 +2933,6 @@ class KindEcw(Ecw):
                 self, self._template_cache_control, self._context.scope
             )
         return self._template_cache_assertions
-
-    def sandbox_template_name(self) -> str:
-        """The bare template name (no tag or digest) this sandbox runs."""
-
-        if not self._template_selector:
-            raise SmokeConfigurationError("the fixture sandbox template is unknown")
-        return self._template_selector.split("@", 1)[0].split(":", 1)[0]
 
     _snapshot_reaper_control: SnapshotReaperControl | None = None
     _snapshot_reaper_assertions: SnapshotReaperAssertions | None = None
@@ -2878,24 +3055,6 @@ class KindEcw(Ecw):
             raise SmokeConfigurationError("admin org lookup is only available on the kind backend")
         return self._node_group_control.admin_org_id()
 
-    _template_build_control: TemplateBuildControl | None = None
-    _template_builder: TemplateBuilder | None = None
-    _template_build_assertions: TemplateBuildAssertions | None = None
-
-    @property
-    def template_build(self) -> TemplateBuildAssertions:
-        """Privileged assertions for a public template build through the kind builders."""
-
-        if self._template_build_control is None or self._template_builder is None:
-            raise SmokeConfigurationError(
-                "template build control is only available on the kind backend"
-            )
-        if self._template_build_assertions is None:
-            self._template_build_assertions = TemplateBuildAssertions(
-                self, self._template_build_control, self._template_builder, self._context.scope
-            )
-        return self._template_build_assertions
-
     _pending_backup_control: PendingBackupControl | None = None
     _pending_backup_assertions: PendingBackupAssertions | None = None
 
@@ -2963,23 +3122,6 @@ class KindEcw(Ecw):
                 self, self._unanswered_template_control, self._context.scope
             )
         return self._unanswered_template_assertions
-
-    _reconcile_queue_gc_control: ReconcileQueueGcControl | None = None
-    _reconcile_queue_gc_assertions: ReconcileQueueGcAssertions | None = None
-
-    @property
-    def reconcile_queue_gc(self) -> ReconcileQueueGcAssertions:
-        """Privileged assertions for the cluster-controller's reconcile-queue GC."""
-
-        if self._reconcile_queue_gc_control is None:
-            raise SmokeConfigurationError(
-                "reconcile-queue GC control is only available on the kind backend"
-            )
-        if self._reconcile_queue_gc_assertions is None:
-            self._reconcile_queue_gc_assertions = ReconcileQueueGcAssertions(
-                self, self._reconcile_queue_gc_control, self._context.scope
-            )
-        return self._reconcile_queue_gc_assertions
 
     _rate_limiter_control: RateLimiterControl | None = None
     _rate_limit_probe: RateLimitProbe | None = None
@@ -3098,57 +3240,6 @@ class KindEcw(Ecw):
             )
         return self._telemetry_assertions
 
-    _leader_election_control: LeaderElectionControl | None = None
-    _leader_election_assertions: LeaderElectionAssertions | None = None
-
-    @property
-    def leader_election(self) -> LeaderElectionAssertions:
-        """Privileged faults and reads for the cluster-controller's leader election."""
-
-        if self._leader_election_control is None:
-            raise SmokeConfigurationError(
-                "leader-election control is only available on the kind backend"
-            )
-        if self._leader_election_assertions is None:
-            self._leader_election_assertions = LeaderElectionAssertions(
-                self, self._leader_election_control, self._context.scope
-            )
-        return self._leader_election_assertions
-
-    _drain_gate_control: DrainGateControl | None = None
-    _drain_gate_assertions: DrainGateAssertions | None = None
-
-    @property
-    def drain_gate(self) -> DrainGateAssertions:
-        """Privileged assertions for the admin `:terminate` occupancy guard."""
-
-        if self._drain_gate_control is None:
-            raise SmokeConfigurationError(
-                "drain gate control is only available on the kind backend"
-            )
-        if self._drain_gate_assertions is None:
-            self._drain_gate_assertions = DrainGateAssertions(
-                self, self._drain_gate_control, self._context.scope
-            )
-        return self._drain_gate_assertions
-
-    _console_control: ConsoleControl | None = None
-    _console_assertions: ConsoleAssertions | None = None
-
-    @property
-    def console(self) -> ConsoleAssertions:
-        """The admin console, driven through a browser and judged against the admin API."""
-
-        if self._console_control is None:
-            raise SmokeConfigurationError(
-                "admin console control is only available on the kind backend"
-            )
-        if self._console_assertions is None:
-            self._console_assertions = ConsoleAssertions(
-                self, self._console_control, self._context.scope
-            )
-        return self._console_assertions
-
     _startup_recovery_control: StartupRecoveryControl | None = None
     _startup_recovery_assertions: StartupRecoveryAssertions | None = None
 
@@ -3218,13 +3309,6 @@ class EncryptedResuspendAssertions:
             },
         )
         return observation
-
-    def clear_completed_pods(self) -> tuple[str, ...]:
-        cleared = self._control.clear_completed_sandbox_pods(
-            self._sandbox_id
-        )
-        self._fixture.record("force_cleared_completed_pods", list(cleared))
-        return cleared
 
     def expect_base_reused(
         self,
@@ -3367,7 +3451,7 @@ class TemplateCacheAssertions:
         digests = self._control.template_digest_dirs(node_name, template)
         selector = self._fixture._template_selector
         if not selector:
-            raise SmokeConfigurationError("the fixture sandbox template is unknown")
+            raise SmokeConfigurationError("the fixture template is unknown")
         protected = self._control.protected_template_builds(
             node_name, self._fixture.sandbox.sandbox_id, selector
         )
@@ -3379,6 +3463,26 @@ class TemplateCacheAssertions:
             cached_digests=list(digests),
         )
         return protected
+
+    def over_budget_plant_bytes(
+        self, node_name: str, protected: str, digests: tuple[str, ...]
+    ) -> int:
+        """Fill only the deficit above bytes the live sandbox and seed pin keep.
+
+        Count rootfs allocation alone, a lower bound on the GC's full build
+        footprint. The compressed sibling and unprotected builds are extra
+        headroom, so their deletion cannot invalidate the pressure witness.
+        """
+        if self._config is None:
+            raise SmokeConfigurationError("require_smoke_sized_gc must run before sizing the plant")
+        protected_bytes = sum(
+            self._control.template_rootfs_allocated_bytes(node_name, protected, digest)
+            for digest in digests
+        )
+        size = max(4 * 1024**2, self._config.budget_bytes - protected_bytes + 1024**2)
+        self._fixture.record("protected_rootfs_allocated_bytes", protected_bytes)
+        self._fixture.record("lru_plant_bytes", size)
+        return size
 
     def plant_unpinned_build(self, node_name: str, *, size_bytes: int) -> str:
         """Register a throwaway build on the worker; returns its template name.
@@ -3863,16 +3967,6 @@ class SuspendCodecAssertions:
             entries=entries,
         )
         return entries
-
-    def require_btrfs_send_default(self, node_name: str) -> str:
-        """The worker resolves an omitted suspend format to the stream codec, or refuse.
-
-        Require `suspendDefaultFormat: btrfs-send`; otherwise the bench would
-        exercise Full and provide no stream-codec evidence. Read the running
-        pod, not the chart, and report a mismatch as a configuration error.
-        """
-
-        return "btrfs-send"
 
     def expect_suspend_codec(
         self, codec: str = BTRFS_SEND_V1, *, timeout: float = 300

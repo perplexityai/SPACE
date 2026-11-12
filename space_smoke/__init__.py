@@ -15,7 +15,9 @@ from space_smoke.fixtures import (
     LOOPBACK_ONLY,
     CommandSandboxFixture,
     Ecw,
+    KindAdmin,
     KindEcw,
+    KindNetworkEcw,
 )
 from space_smoke.registry import scenario
 
@@ -24,7 +26,9 @@ __all__ = [
     "LOOPBACK_ONLY",
     "CommandSandboxFixture",
     "Ecw",
+    "KindAdmin",
     "KindEcw",
+    "KindNetworkEcw",
     "KindWarmPoolConfig",
     "NetworkConfig",
     "SandboxConfig",

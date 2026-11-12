@@ -3,6 +3,12 @@ name: Kind CI
 on:
   workflow_call:
     inputs:
+      smoke_tiers:
+        type: string
+        default: routine
+      placement_scenarios:
+        type: boolean
+        default: false
       # test-hooks, every caller's default, or release: kind-release-ci.yml's
       # on-demand lane of binaries built without test hooks
       # (infra/space/kind/lib/rust-build.sh). Only the release lane sets
@@ -299,12 +305,9 @@ jobs:
       packages: read
     strategy:
       fail-fast: false
-      # Fourteen shards, balanced across both API surfaces together
-      # (space_smoke/sharding.py). The typed scenarios' medians sum to about
-      # 4060 s: twelve shards carried about 340 s each, more than the
-      # leader-election brownout's 297 s. At fourteen the brownout's shard
-      # holds it alone and is the slowest, so a fifteenth would not lower it.
-      # Keep the list, the job name and SMOKE_SHARD's count in step.
+      # Fourteen shards, balanced across both API surfaces together by
+      # space_smoke/sharding.py. Keep the list, the job name and SMOKE_SHARD's
+      # count in step; optimize scenario latency within this parallelism.
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     env:
@@ -325,7 +328,10 @@ jobs:
       # rather than inherited so a default change cannot alter the shards
       # silently.
       SPACE_KIND_TELEMETRY_MODE: otel
+      SPACE_KIND_OBSERVABILITY_LAYOUT: ci
       SPACE_SMOKE_BROWSER_SCENARIOS: ${{ inputs.console_scenarios && 'require' || 'withhold' }}
+      SPACE_SMOKE_TIERS: ${{ inputs.smoke_tiers }}
+      SPACE_SMOKE_INCLUDE_SCENARIOS: ${{ inputs.placement_scenarios && 'local.node_selector_extras_render_and_enforce' || '' }}
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 180
     steps:
@@ -528,7 +534,7 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      # Together the shards cover every ecw, network_policy, native, and local scenario.
+      # Together the shards cover the selected tiers on both API surfaces.
       # Each shard stays serial against the isolated stack its baseline proved. The suite
       # exits 1 on any failed scenario and 2 on an inconclusive one or a missing tool, so a
       # partial run cannot report green. A scenario declared `quarantined=` is withheld and
@@ -750,11 +756,13 @@ jobs:
       # The shards' telemetry profile, so both lanes run the same scenarios
       # and a failure leaves the same telemetry evidence.
       SPACE_KIND_TELEMETRY_MODE: otel
+      SPACE_KIND_OBSERVABILITY_LAYOUT: ci
       # The lane runs only with static storage credentials: the
       # credential-manager authority admits a node by its Kubernetes node
       # registration, which a Direct node does not have.
       SPACE_KIND_SUBSTRATE: direct
       SPACE_KIND_STORAGE_CREDENTIALS: static
+      SPACE_SMOKE_TIERS: ${{ inputs.smoke_tiers }}
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 180
     steps:

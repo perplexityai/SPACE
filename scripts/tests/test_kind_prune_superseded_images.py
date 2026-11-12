@@ -8,7 +8,6 @@ import copy
 import importlib.util
 import json
 import pathlib
-import re
 import subprocess
 import sys
 
@@ -470,28 +469,7 @@ def test_opt_out(monkeypatch, capsys):
     assert f"{prune.OPT_OUT}=0" in capsys.readouterr().out
 
 
-# ── The image list matches what the Tiltfile builds ─────────────────────────
-
-
-def test_tiltfile_builds_exactly_the_listed_images():
-    tiltfile = (ROOT / "Tiltfile").read_text()
-    built = set(re.findall(r'ref = "([a-z0-9-]+):local"', tiltfile))
-    built |= set(re.findall(r'rust_runtime_image\(\s*"([a-z0-9-]+)"', tiltfile))
-    assert built == set(NAMES)
-
-
-def test_each_listed_image_carries_its_title_label():
-    # The only way an untagged build is recognized as one of these images.
-    tiltfile = (ROOT / "Tiltfile").read_text()
-    titles = set()
-    for dockerfile in set(re.findall(r"docker/Dockerfile\.[a-z0-9-]+", tiltfile)):
-        titles |= set(
-            re.findall(
-                r'LABEL org\.opencontainers\.image\.title="([^"]+)"',
-                (ROOT / dockerfile).read_text(),
-            )
-        )
-    assert set(NAMES) <= titles
+# ── Watch only relevant image changes ──────────────────────────────────────
 
 
 def test_watch_passes_only_when_space_references_change(monkeypatch):

@@ -376,16 +376,36 @@ install_aws_cli() {
   esac
 }
 
+# These installers write distinct binaries and use their own extraction
+# directories. Join every child before checking versions or starting apt/AWS,
+# so a failed download cannot leave a successful-looking partial install.
+install_parallel_tools() {
+  local installers=(install_kind install_kubectl install_helm install_grpcurl install_tilt install_go)
+  local pids=() index status=0
+  for index in "${!installers[@]}"; do
+    (
+      started=$SECONDS
+      "${installers[$index]}"
+      log "${installers[$index]#install_} completed in $((SECONDS - started)) s"
+    ) &
+    pids+=("$!")
+  done
+  for index in "${!pids[@]}"; do
+    if ! wait "${pids[$index]}"; then
+      log "ERROR: ${installers[$index]#install_} installation failed"
+      status=1
+    fi
+  done
+  return "$status"
+}
+
 log "install dir: $INSTALL_DIR (override with INSTALL_DIR=…)"
 log "platform: $OS/$ARCH"
-install_kind
-install_kubectl
-install_helm
-install_grpcurl
-install_tilt
+install_parallel_tools
+# AWS needs the unzip package supplied by apt. Keep these in the parent so
+# the AWS installer's PATH update also reaches the final version report.
 install_apt_packages
 install_aws_cli
-install_go
 ensure_path
 # Report what will actually be used, resolved through PATH rather than assumed to
 # be under `$INSTALL_DIR`. `want_version` short-circuits when a tool is already

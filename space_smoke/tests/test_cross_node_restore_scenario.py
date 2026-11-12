@@ -24,8 +24,8 @@ from space_smoke.adapters import (
 from space_smoke.capabilities import ExecutionRow, RestoreActivation, SandboxPodPlacement
 from space_smoke.fixtures import CrossNodeRestoreAssertions
 from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
-from space_smoke.scenarios.local_suspend_restore_cross_node_from_object_storage import (
-    suspend_restore_cross_node_from_object_storage as scenario,
+from space_smoke.scenarios.local_deferred_btrfs_send_capture_restores_cross_node import (
+    deferred_btrfs_send_capture_restores_cross_node as scenario,
 )
 
 SANDBOX_ID = "01a0ac88-c99e-735a-b8fa-f13c948332fa"
@@ -172,6 +172,11 @@ class CordonChoreography(unittest.TestCase):
         fixture, assertions, _ = _assertions(control)
         test_double = cast(Any, fixture)
         test_double.cross_node_restore = assertions
+        test_double.suspend_codec = SimpleNamespace(
+            expect_retained_source_without_send_file=lambda _worker: None,
+            expect_suspend_codec=lambda: None,
+            expect_streamed_upload=lambda _worker: None,
+        )
 
         scenario.verify(test_double)
 

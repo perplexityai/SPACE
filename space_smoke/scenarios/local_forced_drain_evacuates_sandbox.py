@@ -10,14 +10,14 @@ MARKER = "space-smoke-forced-drain-ok"
 
 # The drain reconciler's evacuation (suspend the resident, restore it off the
 # draining node) is fake-backed in `node_drain/tests.rs`. The cross-node
-# restore is `local.suspend_restore_cross_node_from_object_storage`. This
+# restore is `local.deferred_btrfs_send_capture_restores_cross_node`. This
 # scenario is the seam between them: a `:drain` with `mode: forced` has to
 # drive a real suspend and a restore that lands on the other worker, which is
 # also the path `space-rollout-mng.py` selects by sending `forced`.
 # `local.gentle_drain_leaves_sandbox_resident` proves the opposite default.
 #
-# The drain-keep override is set before the drain, so the kind terminator (1 s
-# tick, `kube-delete` backend) never deletes the emptied node, and no tombstone
+# The drain-keep override is set before the drain, so the kind terminator's
+# `kube-delete` backend leaves the emptied node present, and no tombstone
 # or kubelet restart is left behind. `smoke-kind-node-drain.sh` let the node be
 # deleted instead; the terminator's contracts are crate tests
 # (`drained_node_terminator/tests.rs`, `node_drain/kube_delete/kube_delete_tests.rs`).
@@ -26,7 +26,7 @@ MARKER = "space-smoke-forced-drain-ok"
 @smoke.scenario(
     "local.forced_drain_evacuates_sandbox",
     # A suspend, a durable upload, and a restore pulled from object storage on
-    # a slow KVM bench, then the drained hold and the undrain.
+    # a slow KVM bench, then drained convergence and the undrain.
     sandbox=smoke.SandboxConfig(timeout=900),
 )
 def forced_drain_evacuates_sandbox(test: smoke.KindEcw) -> None:
@@ -34,7 +34,7 @@ def forced_drain_evacuates_sandbox(test: smoke.KindEcw) -> None:
     in forced mode and cordons it; the drain reconciler suspends the sandbox and
     restores it onto the other worker, from object storage, as `started`, with
     its filesystem intact and its data plane executing; the emptied node then
-    reaches `drained` on its own and the drain-keep override holds it there;
+    reaches `drained` on its own with the guarded Kubernetes node still present;
     `:undrain` returns it to schedulable with no drain phase."""
 
     marker = f"{MARKER}-{test.sandbox.sandbox_id}"
@@ -69,8 +69,8 @@ def forced_drain_evacuates_sandbox(test: smoke.KindEcw) -> None:
         observed = test.run_command_when_ready(f"cat {shlex.quote(PATH)}")
         test.expect_command(observed, stdout=marker)
 
-    with test.phase("the emptied node reaches drained and is held"):
-        drain.expect_drained_and_held()
+    with test.phase("the emptied node reaches drained with the Kubernetes node present"):
+        drain.expect_drained_node_present()
 
     with test.phase("undrain: schedulable again, no drain phase, no tombstone"):
         drain.undrain()

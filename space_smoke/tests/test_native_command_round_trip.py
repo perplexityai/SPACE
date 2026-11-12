@@ -34,8 +34,6 @@ from space_smoke.scenarios.ecw_pause_connect import (
     PATH as LIFECYCLE_PATH,
     pause_connect,
 )
-from space_smoke.scenarios.ecw_sandbox_delete import sandbox_delete
-from space_smoke.scenarios.ecw_sandbox_info import sandbox_info
 from space_smoke.scenarios.ecw_sandbox_list_pagination import (
     PAGE_SIZE,
     sandbox_list_pagination,
@@ -181,6 +179,13 @@ def _handler(script: _Script) -> type[BaseHTTPRequestHandler]:
                 command = body.get("command")
                 assert isinstance(command, list) and command[:2] == ["sh", "-c"]
                 shell_command = command[2]
+                # The resident-pause commands also pin and compare guest boot
+                # identity; the HTTP fixture models their marker output.
+                shell_command = shell_command.removeprefix(
+                    f"cat /proc/sys/kernel/random/boot_id > {RESIDENT_PATH}.boot-id && "
+                ).removeprefix(
+                    f"cmp /proc/sys/kernel/random/boot_id {RESIDENT_PATH}.boot-id && "
+                )
                 expected_timeout = (
                     "10s"
                     if shell_command == f"cat {PROCESS_READY_PREFIX}123"
@@ -647,11 +652,14 @@ class NativeCommandRoundTripTests(unittest.TestCase):
                 ("GET", f"/v1/sandboxes/{_SANDBOX_ID}"),
                 ("GET", f"/v1/sandboxes/{_SANDBOX_ID}"),
                 ("GET", f"/v1/sandboxes/{_SANDBOX_ID}/processes?limit=1"),
+                ("GET", f"/v1/sandboxes/{_SANDBOX_ID}"),
                 ("POST", f"/v1/sandboxes/{_SANDBOX_ID}/commands"),
                 ("GET", f"/v1/sessions/{_SESSION_ID}/events"),
                 ("DELETE", f"/v1/sandboxes/{_SANDBOX_ID}"),
                 ("GET", "/v1/operations/op-delete"),
                 ("GET", "/v1/operations/op-delete"),
+                ("GET", f"/v1/sandboxes/{_SANDBOX_ID}"),
+                ("DELETE", f"/v1/sandboxes/{_SANDBOX_ID}"),
             ],
         )
         mutation_keys = [
@@ -659,7 +667,7 @@ class NativeCommandRoundTripTests(unittest.TestCase):
             for request in script.requests
             if request.method in {"POST", "DELETE"}
         ]
-        self.assertEqual(len(set(mutation_keys)), 3)
+        self.assertEqual(len(set(mutation_keys)), 4)
         self.assertTrue(all(mutation_keys))
         self.assertTrue(
             all(
@@ -1099,40 +1107,6 @@ class NativeCommandRoundTripTests(unittest.TestCase):
                 self.assertEqual(result.evidence["actual"], (0, observed))
                 self.assert_cleaned_up(script)
 
-    def test_shared_sandbox_info_scenario_runs_one_explicit_native_read(self) -> None:
-        with _server(MARKER) as (base_url, script):
-            with (
-                mock.patch(
-                    "space_smoke.services.importlib.util.find_spec", return_value=None
-                ) as find_spec,
-                mock.patch("space_smoke.native.time.sleep"),
-            ):
-                native = _native_services(base_url, sandbox_info)
-                result = _run(native, scenario=sandbox_info)
-
-        self.assertEqual(result.verdict, Verdict.PASS)
-        find_spec.assert_not_called()
-        self.assertEqual(
-            [(request.method, request.path) for request in script.requests],
-            [
-                ("POST", "/v1/sandboxes"),
-                ("GET", "/v1/operations/op-create"),
-                ("GET", "/v1/operations/op-create"),
-                ("GET", f"/v1/sandboxes/{_SANDBOX_ID}"),
-                ("GET", f"/v1/sandboxes/{_SANDBOX_ID}"),
-                ("GET", f"/v1/sandboxes/{_SANDBOX_ID}/processes?limit=1"),
-                ("GET", f"/v1/sandboxes/{_SANDBOX_ID}"),
-                ("DELETE", f"/v1/sandboxes/{_SANDBOX_ID}"),
-                ("GET", "/v1/operations/op-delete"),
-                ("GET", "/v1/operations/op-delete"),
-            ],
-        )
-        self.assertTrue(
-            all(
-                request.authorization == "Bearer native-token"
-                for request in script.requests
-            )
-        )
 
     def test_shared_delete_waits_for_operation_then_requires_native_404(self) -> None:
         with _server(MARKER) as (base_url, script):
@@ -1142,8 +1116,8 @@ class NativeCommandRoundTripTests(unittest.TestCase):
                 ) as find_spec,
                 mock.patch("space_smoke.native.time.sleep"),
             ):
-                native = _native_services(base_url, sandbox_delete)
-                result = _run(native, scenario=sandbox_delete)
+                native = _native_services(base_url, command_round_trip)
+                result = _run(native, scenario=command_round_trip)
 
         self.assertEqual(result.verdict, Verdict.PASS)
         self.assertEqual(result.evidence["deleted_sandbox_id"], _SANDBOX_ID)
@@ -1168,7 +1142,7 @@ class NativeCommandRoundTripTests(unittest.TestCase):
         self.assertEqual(len(mutation_keys), len(set(mutation_keys)))
         self.assertNotIn(None, mutation_keys)
         self.assertEqual(
-            {request.authorization for request in script.requests},
+            {request.authorization for request in script.requests[-5:]},
             {"Bearer native-token"},
         )
 
@@ -1182,14 +1156,14 @@ class NativeCommandRoundTripTests(unittest.TestCase):
         for status, verdict, summary in cases:
             with self.subTest(status=status):
                 with _server(MARKER, post_delete_status=status) as (base_url, script):
-                    native = _native_services(base_url, sandbox_delete)
+                    native = _native_services(base_url, command_round_trip)
                     with (
                         mock.patch.object(
                             CommandSandboxFixture, "lifecycle_transition_timeout", 0
                         ),
                         mock.patch("space_smoke.native.time.sleep"),
                     ):
-                        result = _run(native, scenario=sandbox_delete)
+                        result = _run(native, scenario=command_round_trip)
 
                 self.assertEqual(result.verdict, verdict)
                 self.assertIn(summary, result.summary)
@@ -1201,9 +1175,9 @@ class NativeCommandRoundTripTests(unittest.TestCase):
 
     def test_wrong_native_info_id_fails_shared_assertion_and_cleans_up(self) -> None:
         with _server(MARKER, sandbox_info_id="sbx-wrong") as (base_url, script):
-            native = _native_services(base_url, sandbox_info)
+            native = _native_services(base_url, command_round_trip)
             with mock.patch("space_smoke.native.time.sleep"):
-                result = _run(native, scenario=sandbox_info)
+                result = _run(native, scenario=command_round_trip)
 
         self.assertEqual(result.verdict, Verdict.FAIL)
         self.assertEqual(result.summary, "sandbox information returned a different ID")
@@ -1352,7 +1326,7 @@ class NativeCommandRoundTripTests(unittest.TestCase):
         self.assertEqual(script.list_requests, 2)
 
     def test_unsupported_native_scenarios_are_rejected_before_setup(self) -> None:
-        unsupported = REGISTRY.get("ecw.binary_file_round_trip")
+        unsupported = REGISTRY.get("ecw.filesystem_mutations")
         with mock.patch("space_smoke.services.importlib.util.find_spec") as find_spec:
             with self.assertRaisesRegex(
                 SmokeConfigurationError, "does not support the 'native' API surface"
@@ -1394,8 +1368,6 @@ class NativeCommandRoundTripTests(unittest.TestCase):
             command_round_trip,
             pause_connect,
             background_process_control,
-            sandbox_info,
-            sandbox_delete,
             sandbox_list_pagination,
         ):
             with self.subTest(scenario=scenario.id):

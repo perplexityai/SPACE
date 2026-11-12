@@ -88,6 +88,11 @@ enum Commands {
     Get {
         #[arg(long)]
         template: String,
+        /// Print the cached manifest for an exact --content-hash, without pulling
+        /// or reconciling snapshots. A successful lookup refreshes LRU access
+        /// and initializes missing template settings, like other lookups.
+        #[arg(long)]
+        manifest: bool,
         #[arg(long, default_value = "")]
         tag: String,
         #[arg(long, default_value = "")]
@@ -294,15 +299,19 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Get {
             template,
+            manifest,
             tag,
             content_hash,
             vcpu,
             memory_mib,
         } => {
+            if manifest && content_hash.is_empty() {
+                anyhow::bail!("--manifest requires an exact --content-hash");
+            }
             let resp = client
                 .get_template(GetTemplateRequest {
                     caller_org_id: None,
-                    cached_only: false,
+                    cached_only: manifest,
                     template: Some(TemplateRef {
                         name: template,
                         content_hash: if content_hash.is_empty() {
@@ -318,6 +327,14 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?;
             let r = resp.into_inner();
+            if manifest {
+                anyhow::ensure!(
+                    r.cached_only,
+                    "template-manager did not confirm cached-only lookup; upgrade it before using --manifest"
+                );
+                println!("{}", r.manifest_json);
+                return Ok(());
+            }
             let tmpl = r.template.as_ref();
             println!("template_id:  {}", tmpl.map_or("", |t| t.name.as_str()));
             println!(

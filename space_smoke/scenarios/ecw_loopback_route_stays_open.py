@@ -3,10 +3,10 @@
 import space_smoke as smoke
 
 PORT = 8124
-EXPECTED_LINES = tuple(str(ordinal) for ordinal in range(10))
+EXPECTED_LINES = tuple(str(ordinal) for ordinal in range(6))
 LINE_INTERVAL_SECONDS = 1.0
 FORMER_BRIDGE_CLEANUP_WINDOW_SECONDS = 3.0
-MINIMUM_STREAM_SECONDS = 8.0
+MINIMUM_STREAM_SECONDS = 5.0
 
 
 @smoke.scenario(

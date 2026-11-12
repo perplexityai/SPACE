@@ -5,7 +5,7 @@ import space_smoke as smoke
 # The claim and teardown rules are Postgres-backed crate tests
 # (`node_drain/store/stopped_re_drain_tests.rs`); this scenario is the seam on
 # real workers. The first forced `:drain` re-places a `stopped` sandbox onto
-# the other worker, as `native.forced_drain_re_places_stopped_sandbox` does.
+# the other worker, as the restart-and-re-drain scenario does.
 # Then the destination is drained too, before any start. Its cluster row and its
 # node both pin the artifact the re-placement staged from, whose backup is
 # already durable, so the evacuation takes that pin and releases the node with

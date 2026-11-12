@@ -448,6 +448,42 @@ class NativeRecoveryControl:
         """The data plane's replica count, pinned while the faults run."""
         return self._captures["space-data-plane"].replicas
 
+    def release_inline_hold(self, path: str) -> None:
+        """Release only this run's test hold on the captured API Deployment."""
+        import re
+
+        if not re.fullmatch(r"/tmp/space-inline-[0-9a-f]{32}", path):
+            raise ValueError("invalid inline hold release path")
+        self._identity()
+        action = "release the API inline test hold"
+        ownership = self.harness._held_public_api_lease(action)
+        self.harness._assert_lease_owned(ownership, action, timeout=15)
+        pods = [
+            pod for pod in self._pods("space-api")
+            if not pod["metadata"].get("deletionTimestamp")
+        ]
+        if len(pods) != self._captures["space-api"].replicas:
+            raise SmokeConfigurationError("cannot release inline holds while API replicas are changing")
+        for pod in pods:
+            self.harness._assert_lease_owned(ownership, action, timeout=15)
+            containers = pod["spec"]["containers"]
+            matches = [
+                container for container in containers
+                if any(
+                    env.get("name") == "SPACE_NATIVE_INLINE_TEST_RELEASE_FILE"
+                    and env.get("value") == path
+                    for env in container.get("env", [])
+                )
+            ]
+            if len(matches) != 1:
+                raise SmokeConfigurationError("API pod does not carry this run's inline hold")
+            result = self.harness.kubectl(
+                "exec", pod["metadata"]["name"], "-c", matches[0]["name"],
+                "--", "touch", "--", path, timeout=15,
+            )
+            if result.returncode:
+                raise SmokeConfigurationError("could not release the API inline test hold")
+
     def restart(self, name: str) -> None:
         before = self.begin_restart(name)
         self._wait(name, self._captures[name].replicas, replaced=before)

@@ -51,7 +51,7 @@ from space_smoke.runtime import ResourceScope, SmokeConfigurationError
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, Locator, Page
 
-    from space_smoke.fixtures import KindEcw
+    from space_smoke.fixtures import KindAdmin
 
 BROWSER_CHROMIUM = "chromium"
 BROWSERS = frozenset({BROWSER_CHROMIUM})
@@ -258,7 +258,7 @@ class ConsoleSession:
 class ConsoleAssertions:
     """Drive the admin console and judge it against the admin API."""
 
-    def __init__(self, fixture: KindEcw, control: ConsoleControl, scope: ResourceScope) -> None:
+    def __init__(self, fixture: KindAdmin, control: ConsoleControl, scope: ResourceScope) -> None:
         self._fixture = fixture
         self._control = control
         self._scope = scope

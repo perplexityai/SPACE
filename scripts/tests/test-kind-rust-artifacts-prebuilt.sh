@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Exercise the CI handoff at the Docker boundary; never touch the host daemon.
-# The checkout is a committed scratch copy of this one's tracked files, so its
-# Rust input key exists whatever this worktree has uncommitted.
+# Commit a small fixture with the real Dockerfiles and representative inputs,
+# independent of this worktree's VCS and uncommitted files.
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 repo="$work/repo"
 mkdir -p "$repo" "$work/bin"
-git -C "$repo_root" ls-files -z | (cd "$repo_root" && tar --null -T - -cf -) | tar -xf - -C "$repo"
+python3 "$repo_root/scripts/tests/lib/kind-rust-fixture.py" "$repo_root" "$repo"
 git init -q -b main "$repo"
 git -C "$repo" config user.name test
 git -C "$repo" config user.email test@example.com

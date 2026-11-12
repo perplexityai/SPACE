@@ -5,7 +5,8 @@ from space_smoke.native_hardening import NativeHardeningFixture
 @scenario(
     "native_contract.command_replay_credentials",
     api_surfaces=("native",),
-    ignored=(
+    tier="manual",
+    manual_reason=(
         "Overlapping credential validity is not an agreed API guarantee; "
         "decision: docs/native-api-hardening.md#credential-replay-contract-deferred"
     ),

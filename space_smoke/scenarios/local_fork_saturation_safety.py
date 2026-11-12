@@ -16,7 +16,8 @@ PROBE_BUDGET_SECONDS = 10
 @smoke.scenario(
     "local.fork_saturation_safety",
     sandbox=smoke.SandboxConfig(timeout=900),
-    ignored="Explicit bounded fork-pressure run on a dedicated Kind bench",
+    tier="manual",
+    manual_reason="Explicit bounded fork-pressure run on a dedicated Kind bench",
 )
 def fork_saturation_safety(test: smoke.KindEcw) -> None:
     """Fork waves have distinct children with intact independent disks while a

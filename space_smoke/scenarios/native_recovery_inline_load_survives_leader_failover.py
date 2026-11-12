@@ -4,9 +4,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 from space_smoke.native_inline import (
     claims,
+    expect_ordered_wake,
     inline_execution,
     lifecycle,
     operation,
+    queue_suspend_then_wake,
     suspended_sandbox,
     terminal_events,
     wait_state,
@@ -19,8 +21,8 @@ WAKES = 2
 # Admission claims an inline operation before it answers; this bounds the
 # read that sees it running.
 INLINE_START_TIMEOUT = 15
-# Each inline create and wake waits this long before it starts, so its claim
-# is still live, and renewed, once the new leader's dispatcher has run the
+# Fail-safe bound if the run cannot release the hold. Each inline claim
+# stays live, and renewed, until the new leader's dispatcher has run the
 # suspend: a fast runner otherwise ends them before the controller is back,
 # and no dispatcher ever meets a live inline claim. The controller's return
 # and the suspend take seconds; this also covers a new leader that waits out
@@ -40,7 +42,8 @@ def inline_load_survives_leader_failover(fixture: KindNativeHardeningFixture) ->
     suspend queued behind them for the dispatcher, then a new controller
     leader elected, which runs the suspend while their claims are live: each
     create and wake is claimed once and ends once, and every operation
-    succeeds as requested.
+    succeeds as requested. On a separate sandbox, a wake admitted behind a
+    queued suspend stays queued and later leaves its guest running.
     """
 
     control = fixture.recovery
@@ -49,13 +52,18 @@ def inline_load_survives_leader_failover(fixture: KindNativeHardeningFixture) ->
     with fixture.context.phase("prepare suspended and running sandboxes"):
         suspended = [suspended_sandbox(fixture) for _ in range(WAKES)]
         running = fixture.create_ready(timeout=120)
+        ordering = fixture.create_ready(timeout=120)
     with (
-        inline_execution(fixture, control, ("create_sandbox", "wake_sandbox"), hold=INLINE_HOLD_SECONDS),
+        inline_execution(fixture, control, ("create_sandbox", "wake_sandbox"), hold=INLINE_HOLD_SECONDS) as release_hold,
         control.owned_faults(),
     ):
-        with fixture.context.phase("run creates and wakes inline with no controller running"):
+        with fixture.context.phase("stop the dispatcher"):
             control.stop_controller()
+        # No held work has consumed inline permits yet. Queueing here must
+        # follow the earlier suspend, not merely a full inline semaphore.
+        ordered_suspend, ordered_wake = queue_suspend_then_wake(fixture, ordering)
 
+        with fixture.context.phase("run creates and wakes inline with no controller running"):
             def submit(index: int) -> tuple[str, str]:
                 if index < CREATES:
                     body = expect_response(fixture, fixture.create(), 202)
@@ -93,6 +101,8 @@ def inline_load_survives_leader_failover(fixture: KindNativeHardeningFixture) ->
                 "every inline create and wake must still be running, its claim live, once the dispatcher has run",
                 inline_states_after_dispatch=live,
             )
+        release_hold()
+        expect_ordered_wake(fixture, ordering, ordered_suspend, ordered_wake)
         with fixture.context.phase("await every accepted operation"):
             for operation_id, sandbox_id in inline_work:
                 fixture.wait_operation(operation_id, timeout=INLINE_HOLD_SECONDS + 300)

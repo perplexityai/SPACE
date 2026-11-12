@@ -62,7 +62,7 @@ from space_smoke.capabilities import (
 from space_smoke.runtime import BackgroundWork, Compensation, ResourceScope, background
 
 if TYPE_CHECKING:
-    from space_smoke.fixtures import KindEcw
+    from space_smoke.fixtures import KindAdmin
 
 # Pinned to the tag's linux/amd64 image manifest, the platform of the x86_64
 # Kind builders, so a rebuild of the tag cannot change an unchanged run. The
@@ -308,7 +308,7 @@ class TemplateBuildAssertions:
 
     def __init__(
         self,
-        fixture: KindEcw,
+        fixture: KindAdmin,
         control: TemplateBuildControl,
         builder: TemplateBuilder,
         scope: ResourceScope,

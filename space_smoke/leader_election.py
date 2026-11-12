@@ -13,9 +13,12 @@ comes from state instead.
   lease TTL at 60 s. This run asks for the TTL's floor and the budget's floor
   at that TTL through the controller's test hooks, which every replica and the
   contender read at startup, records the Deployment's standing budget first
-  and puts both back in its last phase. The outage runs first: its
-  budget exit has to land within the requested budget's ceiling, so a binary
-  that ignored the hook fails there, before the refusal is judged against it.
+  and puts both back in its last phase. Each scenario qualifies its own
+  shortened budget with an actual budget exit. Alongside the refusal watch,
+  a second contender runs the same image and settings against an unreachable
+  pod-local API endpoint. It must report an unreachable Lease call, spend its
+  budget, and exit non-zero inside the requested bounds. A startup failure
+  or a binary that ignores the hook cannot satisfy that control.
 - **One leader, one runner.** Two healthy replicas, the Lease naming one of
   them with a fresh `renewTime`, and exactly one pod whose
   `space.cluster_reconciler.loop_latency_ms` tick count moves. Every
@@ -28,16 +31,15 @@ comes from state instead.
   `acquireTime`, so an older anchor would credit it with its predecessor's
   ticks. The window stays open for two of the slowest loop's ticks (10 s on
   Kind), so a second runner that starts late is still seen. That is judged once the
-  apiserver is back, with the refused contender already running, and opens at
-  the restore, so the outage's record checks run inside it. Before the outage
+  apiserver is back, and opens at the restore, so the outage's record checks
+  run inside it. The independent refusal scenario also watches the contender. Before the outage
   the window lasts one tick of every loop plus two exports, enough to show the
   holder ticking and no other process ticking throughout, which the outage's
   check that the holder's ticks stop relies on.
 - **A refused lease call is not a restart.** A third contender runs the
   controller's own pod template under a ServiceAccount with no `leases` grant.
-  It is placed before the outage, held by a gate container, and released once
-  the apiserver is back, so its controller's first lease call follows the
-  restore. The watch ends a budget ceiling, a retry interval and the time a
+  It is held by a gate container and released after a healthy holder renews
+  the Lease, so cluster connectivity is established before its first call. The watch ends a budget ceiling, a retry interval and the time a
   restart takes to show after its first refused call reaches Prometheus.
   Prometheus shows its `acquire_failed{reason="refused"}`; it stays NotReady
   with `restartCount` 0 for the whole liveness-budget ceiling counted from its
@@ -98,7 +100,7 @@ from space_smoke.capabilities import (
 from space_smoke.runtime import Compensation, ResourceScope, SmokeConfigurationError
 
 if TYPE_CHECKING:
-    from space_smoke.fixtures import KindEcw
+    from space_smoke.fixtures import KindAdmin
 
 # The timings `LeaderElectionConfig::from_environment` resolves
 # (crates/l40_api/cluster/controller/server/src/leader_election/mod.rs), which
@@ -211,7 +213,7 @@ class LeaderElectionAssertions:
     """Drive the two faults and judge the controllers from state."""
 
     def __init__(
-        self, fixture: KindEcw, control: LeaderElectionControl, scope: ResourceScope
+        self, fixture: KindAdmin, control: LeaderElectionControl, scope: ResourceScope
     ) -> None:
         self._fixture = fixture
         self._control = control
@@ -219,6 +221,8 @@ class LeaderElectionAssertions:
         self._control_plane = ""
         self._healthy: dict[str, ControllerPod] = {}
         self._contender: ControllerPod | None = None
+        self._budget_contender: ControllerPod | None = None
+        self._remove_budget_contender: Compensation | None = None
         self._remove_contender: Compensation | None = None
         self._restore_apiserver: Compensation | None = None
         self._restore_budget: Compensation | None = None
@@ -272,7 +276,7 @@ class LeaderElectionAssertions:
         self._fixture.record("control_plane_node", self._control_plane)
 
     def shrink_liveness_budget(self) -> None:
-        """Record the standing budget hook, request the floor and await the rollout."""
+        """Request the floor and capture the standing budget for restoration."""
 
         standing = self._control.controller_liveness_budget_env()
         self._standing_budget = standing
@@ -342,8 +346,8 @@ class LeaderElectionAssertions:
         """
 
         self._control.place_refused_contender()
-        # Cloned from the live Deployment, so it carries the same budget the
-        # outage is about to show that image honours.
+        # Cloned from the live Deployment; a concurrent unreachable contender
+        # independently qualifies this image's handling of the same budget.
         inherited = self._control.controller_liveness_budget_env(refused_contender=True)
         self._fixture.verify(
             inherited == str(LIVENESS_BUDGET_SECONDS),
@@ -352,28 +356,105 @@ class LeaderElectionAssertions:
             inherited=inherited,
         )
 
-    def start_refused_contender(self) -> None:
-        """Release the placed contender and wait for its controller container.
+    def start_budget_control(self) -> None:
+        """Qualify the shortened budget alongside the refused contender's watch."""
+        self._remove_budget_contender = self._scope.defer(
+            "remove the unreachable leader-election budget control",
+            self._control.remove_budget_contender,
+            critical=True,
+        )
+        self._control.place_budget_contender()
+        pods = self._poll(
+            "the unreachable budget control to start",
+            lambda: self._control.controller_pods(budget_contender=True),
+            lambda pods: len(pods) == 1 and pods[0].started_at is not None,
+            timeout=120,
+            tolerate_errors=True,
+        )
+        self._budget_contender = pods[0]
+        self._nodes[pods[0].name] = pods[0].node
 
-        Released only once a healthy replica has renewed the Lease since the
-        restore: the apiserver can answer on its host port a minute or more
-        before pods reach it through the cluster's Service, and the
-        contender's calls in that gap would be unreachable, which charges its
-        budget, rather than refused. A container that started before the
-        restore fails here.
+    def expect_budget_control_exited(self) -> None:
+        """An actual unreachable Lease call spends this image's effective budget."""
+        contender = self._budget_contender
+        assert contender is not None and contender.started_at is not None
+        first_failed = self._first_increment(
+            f'{ACQUIRE_FAILED}{{reason="unreachable", k8s_pod_name="{contender.name}"}}',
+            since=contender.started_at - KUBE_TIME_RESOLUTION_SECONDS,
+        )
+        self._fixture.verify(
+            first_failed is not None,
+            "the budget control never reported an unreachable Lease call",
+            failure_evidence=self._log_evidence,
+        )
+        assert first_failed is not None
+        # Export can lag the first failure by one interval. Both timestamps
+        # below are process observations; a startup failure cannot substitute
+        # for the election's own lease_unreachable counter and budget exit.
+        earliest = first_failed - EXPORT_INTERVAL_SECONDS - KUBE_TIME_RESOLUTION_SECONDS + LIVENESS_BUDGET_SECONDS
+        latest = first_failed + self._ceiling() + RETRY_INTERVAL_SECONDS + 10
+        pods = self._poll(
+            "the unreachable budget control to exit non-zero",
+            lambda: self._control.controller_pods(budget_contender=True),
+            lambda pods: len(pods) == 1 and pods[0].last_finished_at is not None,
+            timeout=max(1, latest + 15 - time.time()),
+            tolerate_errors=True,
+        )
+        ended = pods[0]
+        self._fixture.verify(
+            ended.uid == contender.uid
+            and ended.restart_count == 0
+            and ended.last_exit_code not in (None, 0)
+            and ended.last_finished_at is not None
+            and earliest <= ended.last_finished_at <= latest,
+            "the budget control did not exit within the shortened liveness budget",
+            first_unreachable_at=first_failed,
+            earliest_exit=earliest,
+            latest_exit=latest,
+            exit_code=ended.last_exit_code,
+            exited_at=ended.last_finished_at,
+            failure_evidence=self._log_evidence,
+        )
+        spent = self._poll(
+            "the budget control's lease_unreachable counter to reach Prometheus",
+            lambda: self._first_increment(
+                f'{LEASE_UNREACHABLE}{{identity="{contender.name}", reason="unreachable"}}',
+                since=contender.started_at - KUBE_TIME_RESOLUTION_SECONDS,
+            ),
+            lambda at: at is not None,
+            timeout=2 * EXPORT_INTERVAL_SECONDS,
+            tolerate_errors=True,
+        )
+        self._fixture.record("refusal_budget_control", {
+            "pod": contender.name, "first_unreachable_at": first_failed,
+            "budget_spent_at": spent, "exited_at": ended.last_finished_at,
+            "exit_code": ended.last_exit_code,
+        })
+        assert self._remove_budget_contender is not None
+        self._remove_budget_contender.release()
+        self._remove_budget_contender = None
+
+    def start_refused_contender(self) -> None:
+        """Release a refused contender after a healthy replica proves cluster access.
+
+        With an outage, require a renewal newer than the pre-outage lease.
+        Without one, use the initial holder's lease. A recent renewal proves
+        the Service path is up before refusals are observed, so connection
+        failures cannot consume the contender's liveness budget first.
         """
 
         before = self._lease_before_outage
-        assert before is not None
-        # Nothing renews the Lease while the apiserver is down, so a renewal
-        # newer than the outage's last one was written after the restore.
+        if before is None:
+            assert self._initial is not None
+            before = self._initial[0]
         self._poll(
-            "a healthy replica to renew the Lease through the cluster after the restore",
+            "a healthy replica to renew the Lease through the cluster",
             self._control.controller_lease,
             lambda lease: lease is not None and lease.renew_time > before.renew_time,
             timeout=300,
             tolerate_errors=True,
         )
+        released_at = time.time()
         self._control.release_refused_contender()
         pods = self._poll(
             "the refused contender's container to start",
@@ -386,10 +467,10 @@ class LeaderElectionAssertions:
         assert contender.started_at is not None
         self._fixture.verify(
             contender.restart_count == 0
-            and contender.started_at + KUBE_TIME_RESOLUTION_SECONDS >= self._restore_requested,
-            "the refused contender's controller started before the apiserver was restored",
+            and contender.started_at + KUBE_TIME_RESOLUTION_SECONDS >= released_at,
+            "the refused contender's controller started before its release",
             contender_started_at=contender.started_at,
-            restore_requested_at=self._restore_requested,
+            released_at=released_at,
             contender_restarts=contender.restart_count,
         )
         self._contender = contender
@@ -427,7 +508,7 @@ class LeaderElectionAssertions:
         )
         self._initial = (lease, since)
 
-    def expect_initial_runner(self) -> None:
+    def expect_initial_runner(self) -> str:
         """Before the outage, only the holder reconciles, for one tick of every loop.
 
         The outage's later checks that the holder's ticks stop are only as
@@ -439,6 +520,7 @@ class LeaderElectionAssertions:
         self._expect_only_runner(
             lease, label="initial", since=since, window=one_tick_window_seconds(self._slowest_tick)
         )
+        return lease.holder
 
     def expect_recovered_leader(self) -> str:
         """One fresh holder and one runner, judged from the restore on.
@@ -513,8 +595,9 @@ class LeaderElectionAssertions:
             (lease.acquire_time or 0.0) + KUBE_TIME_RESOLUTION_SECONDS,
         )
         closes = opened + window
-        # The candidates: both replicas, and the refused contender if it runs.
-        pods = sorted({*self._healthy, *([self._contender.name] if self._contender else [])})
+        # Neither fault control may become a second reconciler runner.
+        contenders = (self._contender, self._budget_contender)
+        pods = sorted({*self._healthy, *(pod.name for pod in contenders if pod is not None)})
         selector = f'{{k8s_pod_name=~"{"|".join(pods)}"}}'
         # A sample stamped before `opened` can arrive up to an export later.
         settled = opened + EXPORT_INTERVAL_SECONDS + POLL_SECONDS

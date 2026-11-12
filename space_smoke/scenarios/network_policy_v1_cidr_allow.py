@@ -3,7 +3,8 @@
 import space_smoke as smoke
 
 INSIDE = "https://1.0.0.1/"
-OUTSIDE = "http://208.67.222.222/"
+# Outside the allowed CIDR and the gateway's reserved DNS destinations.
+OUTSIDE = "http://1.1.1.2/"
 
 
 @smoke.scenario(
