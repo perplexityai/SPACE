@@ -299,15 +299,16 @@ overhead or guest work while some other driver runs the sandbox workload. It
 runs on the worker, needs only Python 3 and read access to `/proc` and the
 SPACE cgroup tree, and changes nothing.
 
-Every `--interval-secs` (default 5) it reads cumulative CPU time for four
-categories:
+Every `--interval-secs` (default 5) it reads cumulative CPU time and attributes
+each interval's increase to one category:
 
 | Category | Source | Counted as |
 | --- | --- | --- |
 | `guest_vcpu` | `fc_vcpu*` threads of each Firecracker process | guest |
-| `vmm_non_vcpu` | VMM cgroup `/space/<id>` `usage_usec` minus its vCPU threads | host |
+| `vmm_non_vcpu` | increase in VMM cgroup `/space/<id>` `usage_usec` minus the increase of its vCPU threads | host |
+| `unattributed` | VMM cgroup increase in an interval where one of its vCPU threads exited, so the split is unknown | neither |
 | `sidecar` | sidecar cgroup `/space/sbx-<id>` (net-gateway, spaced-host) | host |
-| `node_daemons` | processes outside sandbox cgroups whose name starts with `--daemon-prefix` (default `space-`) | host |
+| `node_daemons` | processes outside sandbox cgroups whose name starts with `--daemon-prefix` (default `space-`), including reaped helper processes they spawn (`cutime`/`cstime`) | host |
 
 Host CPU is the sum of the three host categories. A sandbox counts toward
 sandbox-minutes for each interval in which its VMM cgroup held a process at
@@ -325,9 +326,12 @@ python3 scripts/benchmarks/bench-sbx-host-overhead.py \
 spread within one run. On Kind, pipe the script into the worker container
 instead: `docker exec -i <worker> python3 - --duration-secs 600 < scripts/benchmarks/bench-sbx-host-overhead.py`.
 
-Limits: CPU of a process or sandbox that starts and exits between two samples
-is not counted, and an entity's first interval is counted only from its first
-sample, so lifecycle churn is undercounted by up to one interval per entity.
-Thread CPU has `CLK_TCK` (usually 10 ms) resolution. The sampler attributes
-everything on the node, so run it on a node with no unrelated sandbox work, or
-subtract an idle run taken the same way.
+Limits: an entity counts only between two samples that both see it. CPU a
+sandbox, sidecar or process uses before its first sample or after its last one
+is dropped, so lifecycle churn undercounts host CPU by at most one interval of
+each entity's CPU at each end. `unattributed` bounds the teardown interval
+that can't be split. Helper processes count only after their daemon reaps
+them, and kernel-thread work (dm and loop kworkers, softirq for guest
+networking) is not attributed. Thread CPU has `CLK_TCK` (usually 10 ms)
+resolution. The sampler attributes everything on the node, so run it on a node
+with no unrelated sandbox work, or subtract an idle run taken the same way.

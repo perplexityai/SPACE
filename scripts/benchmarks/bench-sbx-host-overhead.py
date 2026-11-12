@@ -18,7 +18,9 @@ from pathlib import Path
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-CATEGORIES = ("guest_vcpu", "vmm_non_vcpu", "sidecar", "node_daemons")
+# "unattributed" is VMM cgroup CPU from intervals in which a vCPU thread exited, so it
+# can't be split into guest and host; it is reported but counted as neither.
+CATEGORIES = ("guest_vcpu", "vmm_non_vcpu", "unattributed", "sidecar", "node_daemons")
 HOST_CATEGORIES = ("vmm_non_vcpu", "sidecar", "node_daemons")
 # The VMM cgroup charges guest RAM and VMM memory together, so memory has its own categories.
 MEMORY_CATEGORIES = ("vmm_cgroup", "sidecar", "node_daemons")
@@ -29,8 +31,10 @@ class Sample:
     """Cumulative CPU seconds and current memory at one instant."""
 
     at: float
-    # (category, key) -> cumulative CPU seconds. Keys identify one sandbox or daemon process.
+    # (category, key) -> cumulative CPU seconds for sidecar cgroups and daemon processes.
     cpu: dict[tuple[str, str], float] = field(default_factory=dict)
+    # VMM cgroup name -> (cumulative cgroup CPU seconds, {vCPU thread id: cumulative CPU seconds}).
+    vmm: dict[str, tuple[float, dict[str, float]]] = field(default_factory=dict)
     # category -> resident bytes now.
     memory: dict[str, int] = field(default_factory=dict)
     sandboxes: set[str] = field(default_factory=set)
@@ -43,15 +47,19 @@ def read_text(path: Path) -> str | None:
         return None
 
 
-def stat_cpu_and_rss(path: Path) -> tuple[str, float, int] | None:
-    """Return (comm, utime+stime seconds, rss bytes) from a /proc stat file."""
+def stat_cpu_and_rss(path: Path, children: bool = False) -> tuple[str, float, int] | None:
+    """Return (comm, CPU seconds, rss bytes) from a /proc stat file.
+
+    CPU is utime+stime, plus cutime+cstime of reaped children when children is set.
+    """
     raw = read_text(path)
     if raw is None:
         return None
     comm = raw[raw.find("(") + 1 : raw.rfind(")")]
     fields = raw[raw.rfind(")") + 2 :].split()
-    # Fields after comm start at state (field 3): utime is 14, stime 15, rss 24.
-    return comm, (int(fields[11]) + int(fields[12])) / CLK_TCK, int(fields[21]) * PAGE_SIZE
+    # Fields after comm start at state (field 3): utime is 14, stime 15, cutime 16, cstime 17, rss 24.
+    ticks = sum(int(value) for value in fields[11 : 15 if children else 13])
+    return comm, ticks / CLK_TCK, int(fields[21]) * PAGE_SIZE
 
 
 def cgroup_usage_secs(directory: Path) -> float | None:
@@ -75,20 +83,21 @@ def cgroup_pids(directory: Path) -> list[str]:
     return raw.split()
 
 
-def vcpu_secs(pid: str) -> float:
-    total = 0.0
+def vcpu_threads(proc_root: Path, pid: str) -> dict[str, float]:
+    """Return {thread id: utime+stime seconds} for the fc_vcpu threads of one process."""
+    threads: dict[str, float] = {}
     try:
-        tasks = list(Path(f"/proc/{pid}/task").iterdir())
+        tasks = list((proc_root / pid / "task").iterdir())
     except OSError:
-        return 0.0
+        return threads
     for task in tasks:
         parsed = stat_cpu_and_rss(task / "stat")
         if parsed and parsed[0].startswith("fc_vcpu"):
-            total += parsed[1]
-    return total
+            threads[task.name] = parsed[1]
+    return threads
 
 
-def take_sample(cgroup_root: Path, daemon_prefix: str) -> Sample:
+def take_sample(cgroup_root: Path, daemon_prefix: str, proc_root: Path = Path("/proc")) -> Sample:
     sample = Sample(at=time.monotonic(), memory={name: 0 for name in MEMORY_CATEGORIES})
     sandbox_pids: set[str] = set()
     try:
@@ -109,16 +118,18 @@ def take_sample(cgroup_root: Path, daemon_prefix: str) -> Sample:
             sample.memory["sidecar"] += cgroup_memory(child)
             continue
         # VMM cgroup: Firecracker vCPU threads are guest work, every other thread is host.
-        vcpu = sum(vcpu_secs(pid) for pid in pids)
-        sample.cpu[("guest_vcpu", child.name)] = vcpu
-        sample.cpu[("vmm_non_vcpu", child.name)] = max(0.0, usage - vcpu)
+        threads: dict[str, float] = {}
+        for pid in pids:
+            threads.update(vcpu_threads(proc_root, pid))
+        sample.vmm[child.name] = (usage, threads)
         sample.memory["vmm_cgroup"] += cgroup_memory(child)
         if pids:
             sample.sandboxes.add(child.name)
-    for proc in Path("/proc").iterdir():
+    for proc in proc_root.iterdir():
         if not proc.name.isdigit() or proc.name in sandbox_pids:
             continue
-        parsed = stat_cpu_and_rss(proc / "stat")
+        # Daemons run short-lived helpers (e2fsck, ip, nft, ...); reaped children count toward them.
+        parsed = stat_cpu_and_rss(proc / "stat", children=True)
         if parsed is None or not parsed[0].startswith(daemon_prefix):
             continue
         comm, cpu, rss = parsed
@@ -142,7 +153,20 @@ class Window:
         self.seconds += elapsed
         # A sandbox counts for an interval only when it ran at both ends of it.
         self.sandbox_secs += len(before.sandboxes & after.sandboxes) * elapsed
-        self.sandboxes_peak = max(self.sandboxes_peak, len(after.sandboxes))
+        self.sandboxes_peak = max(self.sandboxes_peak, len(before.sandboxes), len(after.sandboxes))
+        for name, (usage, threads) in after.vmm.items():
+            if name not in before.vmm:
+                continue
+            previous_usage, previous_threads = before.vmm[name]
+            delta = max(0.0, usage - previous_usage)
+            if previous_threads.keys() - threads.keys():
+                # A vCPU thread exited mid-interval, so its last CPU can't be separated from host work.
+                self.cpu["unattributed"] += delta
+                continue
+            # Threads that started inside the interval count from zero.
+            guest = sum(max(0.0, value - previous_threads.get(tid, 0.0)) for tid, value in threads.items())
+            self.cpu["guest_vcpu"] += min(guest, delta)
+            self.cpu["vmm_non_vcpu"] += max(0.0, delta - guest)
         for key, value in after.cpu.items():
             previous = before.cpu.get(key)
             if previous is None:
@@ -153,8 +177,8 @@ class Window:
             if category == "node_daemons":
                 daemon = name.rsplit(":", 1)[0]
                 self.daemons[daemon] = self.daemons.get(daemon, 0.0) + delta
-        for category, value in after.memory.items():
-            self.memory_peak[category] = max(self.memory_peak[category], value)
+        for category in MEMORY_CATEGORIES:
+            self.memory_peak[category] = max(self.memory_peak[category], before.memory.get(category, 0), after.memory.get(category, 0))
 
     def row(self, label: str) -> dict[str, object]:
         host = sum(self.cpu[name] for name in HOST_CATEGORIES)
@@ -179,11 +203,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-secs", type=float, default=0, help="Also report consecutive windows of this length; 0 reports only the total.")
     parser.add_argument("--interval-secs", type=float, default=5, help="Time between samples.")
     parser.add_argument("--cgroup-root", type=Path, default=Path("/sys/fs/cgroup/space"), help="Parent of the per-sandbox VMM and sbx-* sidecar cgroups.")
+    parser.add_argument("--proc-root", type=Path, default=Path("/proc"), help="procfs mount to read processes from.")
     parser.add_argument("--daemon-prefix", default="space-", help="Process-name prefix of node daemons outside sandbox cgroups.")
     parser.add_argument("--output", type=Path, default=None, help="Write the JSON report here as well as to stdout.")
     args = parser.parse_args()
     if args.interval_secs <= 0 or args.duration_secs < args.interval_secs:
         raise SystemExit("ERROR: need 0 < --interval-secs <= --duration-secs")
+    if args.window_secs != 0 and args.window_secs < args.interval_secs:
+        raise SystemExit("ERROR: --window-secs must be 0 or at least --interval-secs")
     return args
 
 
@@ -193,11 +220,11 @@ def main() -> int:
         raise SystemExit(f"ERROR: {args.cgroup_root} not found; run on a SPACE worker node")
     total = Window(started=time.monotonic())
     windows: list[Window] = []
-    previous = take_sample(args.cgroup_root, args.daemon_prefix)
+    previous = take_sample(args.cgroup_root, args.daemon_prefix, args.proc_root)
     deadline = previous.at + args.duration_secs
     while previous.at < deadline:
         time.sleep(max(0.0, min(args.interval_secs, deadline - previous.at)))
-        current = take_sample(args.cgroup_root, args.daemon_prefix)
+        current = take_sample(args.cgroup_root, args.daemon_prefix, args.proc_root)
         total.add(previous, current)
         if args.window_secs > 0:
             # Half an interval of slack keeps sleep jitter from splitting a window early.
