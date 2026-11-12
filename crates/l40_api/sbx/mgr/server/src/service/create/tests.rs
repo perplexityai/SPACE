@@ -376,9 +376,14 @@ async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation(
     )
     .unwrap();
     crate::db::upsert_sandbox_execution_metadata(&conn, &id.to_string(), &producer).unwrap();
-    let operation_id =
-        crate::db::test_fixtures::fence_runtime_upgrade(&conn, &id.to_string(), target, None)
-            .operation_id;
+    let operation_id = crate::db::test_fixtures::fence_runtime_upgrade(
+        &conn,
+        &id.to_string(),
+        target,
+        crate::db::RuntimeUpgradeTargetState::Started,
+        None,
+    )
+    .operation_id;
     let instance = cache.join(id.to_string()).join("instance");
     let snapshot = cache.join(id.to_string()).join("snapshot");
     std::fs::create_dir_all(&instance).unwrap();

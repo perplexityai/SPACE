@@ -157,6 +157,121 @@ fn begin_fences_a_stopped_sandbox_without_memory_loss_consent() {
     assert_eq!(record.checkpoint_artifact_id, None);
 }
 
+/// A stay-stopped upgrade awaits its stop from its fence, whatever the
+/// sandbox's state, and once verified only while its boot's execution is the
+/// sandbox's current one and runs: a stop, which keeps the execution's id but
+/// retires it, ends it. An older unretired upgrade of the sandbox to another
+/// target state never hides it.
+#[test]
+fn a_stay_stopped_upgrade_awaits_its_stop_only_while_its_boot_runs() {
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let stay_stopped = fenced(begin(&conn, operation(), &id, envs.target_reference, false));
+    let operation_id = stay_stopped.operation_id;
+    let boot = uuid::Uuid::now_v7().to_string();
+    // Created at the same instant, so the operation id breaks the tie and
+    // the smallest one is the oldest.
+    let older = RuntimeUpgradeOperationId::from_uuid(uuid::Uuid::from_u128(1));
+    conn.execute_batch(&format!(
+        "CREATE TEMP TABLE older_upgrade AS
+             SELECT * FROM sandbox_runtime_upgrades WHERE operation_id = '{operation_id}';
+         UPDATE older_upgrade
+            SET operation_id = '{older}', target_state = 'started', phase = 'verified',
+                boot_execution_id = '{boot}';
+         INSERT INTO sandbox_runtime_upgrades SELECT * FROM older_upgrade;
+         DROP TABLE older_upgrade;",
+    ))
+    .unwrap();
+    let awaiting = |conn: &Connection| {
+        crate::db::read::stay_stopped_runtime_upgrade_awaiting_its_stop(conn, &id).unwrap()
+    };
+    let set = |conn: &Connection, sql: &str| conn.execute_batch(sql).unwrap();
+    assert_eq!(
+        crate::db::read::unretired_runtime_upgrade(&conn, &id).unwrap(),
+        Some(older),
+        "the older upgrade is the sandbox's oldest unretired one"
+    );
+
+    for phase in ["fenced", "preserved", "booting"] {
+        set(
+            &conn,
+            &format!(
+                "UPDATE sandbox_runtime_upgrades SET phase = '{phase}'
+                  WHERE operation_id = '{operation_id}'"
+            ),
+        );
+        assert_eq!(
+            awaiting(&conn),
+            Some(operation_id),
+            "{phase}: its boot may start before a suspend's capture"
+        );
+    }
+
+    // The boot started and verified: its execution runs the sandbox.
+    set(
+        &conn,
+        &format!(
+            "UPDATE sandbox_runtime_upgrades SET phase = 'verified', boot_execution_id = '{boot}'
+              WHERE operation_id = '{operation_id}';
+             UPDATE sandboxes SET state = 'started', node_execution_id = '{boot}',
+                                  node_execution_retired = 0
+              WHERE id = '{id}';"
+        ),
+    );
+    assert_eq!(awaiting(&conn), Some(operation_id));
+    set(
+        &conn,
+        &format!("UPDATE sandboxes SET state = 'paused' WHERE id = '{id}'"),
+    );
+    assert_eq!(
+        awaiting(&conn),
+        Some(operation_id),
+        "a paused boot is still the upgrade's to stop"
+    );
+
+    set(
+        &conn,
+        &format!(
+            "UPDATE sandbox_runtime_upgrades SET phase = 'retired'
+              WHERE operation_id = '{operation_id}'"
+        ),
+    );
+    assert_eq!(awaiting(&conn), None, "a retired upgrade owes nothing");
+    set(
+        &conn,
+        &format!(
+            "UPDATE sandbox_runtime_upgrades SET phase = 'verified'
+              WHERE operation_id = '{operation_id}'"
+        ),
+    );
+
+    // A later execution runs the sandbox.
+    set(
+        &conn,
+        &format!(
+            "UPDATE sandboxes SET state = 'started', node_execution_id = '{later}' WHERE id = '{id}'",
+            later = uuid::Uuid::now_v7(),
+        ),
+    );
+    assert_eq!(
+        awaiting(&conn),
+        None,
+        "a later execution is never the upgrade's to stop"
+    );
+
+    // A stop keeps the boot's execution id and retires it.
+    set(
+        &conn,
+        &format!(
+            "UPDATE sandboxes SET state = 'stopped', node_execution_id = '{boot}',
+                                  node_execution_retired = 1
+              WHERE id = '{id}'"
+        ),
+    );
+    assert_eq!(awaiting(&conn), None, "a stopped boot owes no stop");
+}
+
 #[test]
 fn begin_refuses_everything_that_already_owns_the_sandbox() {
     let envs = environments();

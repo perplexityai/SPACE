@@ -391,6 +391,47 @@ db_private_outside_tests! {
 }
 
 db_private_outside_tests! {
+    /// The upgrade of `sandbox_id` that must leave it `stopped` and hasn't
+    /// stopped its boot yet, if any: a fencing one, whatever the sandbox's
+    /// state, since its boot may be about to start and verify, or a verified
+    /// one whose boot's execution still runs: the sandbox's current execution,
+    /// on a started or paused row, as `boot_activity` in the service reads it.
+    /// A stop keeps the execution's id, so the state decides. Once that
+    /// execution is gone, by a stop or anything else, the upgrade never stops
+    /// a later one, so only this window counts. A suspend that holds the
+    /// artifact lock, which a fence takes, sees every upgrade that could boot
+    /// before its capture.
+    fn stay_stopped_runtime_upgrade_awaiting_its_stop(
+        conn: &Connection,
+        sandbox_id: &str,
+    ) -> Result<Option<RuntimeUpgradeOperationId>> {
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT upgrade.operation_id
+                   FROM sandbox_runtime_upgrades AS upgrade
+                   JOIN sandboxes AS sandbox ON sandbox.id = upgrade.sandbox_id
+                  WHERE upgrade.sandbox_id = ?1
+                    AND upgrade.target_state = ?2
+                    AND (upgrade.phase IN ('fenced', 'preserved', 'booting')
+                         OR (upgrade.phase = 'verified'
+                             AND sandbox.unowned_state IN ('started', 'paused')
+                             AND upgrade.boot_execution_id = sandbox.node_execution_id))
+                  ORDER BY upgrade.created_at, upgrade.operation_id
+                  LIMIT 1",
+                params![sandbox_id, RuntimeUpgradeTargetState::Stopped.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        row.map(|operation_id| {
+            operation_id
+                .parse()
+                .map_err(|error| conversion_error(0, Type::Text, error).into())
+        })
+        .transpose()
+    }
+}
+
+db_private_outside_tests! {
     /// Every upgrade that still owes work: everything but `retired`. A row
     /// that doesn't decode is skipped with a warning, so it can't keep
     /// recovery from the others; its fence stays in place.

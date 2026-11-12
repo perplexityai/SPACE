@@ -422,6 +422,29 @@ impl SandboxManagerService {
             )?;
             return Ok(());
         };
+        // A runtime upgrade that must leave the sandbox stopped fences it, then
+        // runs it on its boot's execution until it stops it; a suspend there
+        // would leave it suspended. Held like the non-actionable stage below,
+        // so the suspend is reconsidered once the fence lifts and that
+        // execution is gone. The suspend itself checks again under its locks.
+        // Bound first, so the connection's guard is dropped before the body
+        // takes the connection again.
+        let stay_stopped_upgrade = if action == AutoLifecycleIdleAction::Suspend {
+            let db = self.db_conn()?;
+            super::runtime_upgrade::stay_stopped_upgrade_awaiting_its_stop(&db, &sandbox.id)?
+        } else {
+            None
+        };
+        if let Some(operation_id) = stay_stopped_upgrade {
+            tracing::debug!(
+                sandbox_id = %sandbox.id,
+                %operation_id,
+                "holding a due auto-suspend while a runtime upgrade that ends stopped \
+                 hasn't stopped its boot; nothing recorded"
+            );
+            self.defer_gated_auto_lifecycle_row(&sandbox.id, now)?;
+            return Ok(());
+        }
         // A stage whose action can neither act on this state nor count it
         // as satisfied — a Suspend due on a mid-transition row, or on a
         // failed cross-node restore's retained `restoring` row — is left

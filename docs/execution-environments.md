@@ -1520,7 +1520,11 @@ blocking cold `Start` to run, and whether the sandbox ends started or stopped.
 4. **Boot.** The ordinary blocking cold start runs as the caller. It reads the
    saved consumer, and guest readiness verifies the boot: the transaction that
    marks the sandbox started also records the upgrade verified, so a later
-   stop or suspend can never make a verified boot look interrupted.
+   stop or suspend can never make a verified boot look interrupted. On
+   Kubernetes the boot's route identity, a new execution in the upgrade's pod,
+   replaces the teardown proof the sandbox's stop kept (the old execution's
+   generation and pod UID), as any cold start's does, provided it's a newer
+   execution.
 5. **Settle.** After a verified boot, the old checkpoint is retired and the
    preserved copy deleted. Then a request to end stopped stops the execution the
    boot started, never a later one, and only while it's started or paused: the
@@ -1538,7 +1542,10 @@ blocking cold `Start` to run, and whether the sandbox ends started or stopped.
    Bytes several rows claim are left, as the reaper leaves them, and the upgrade
    stays `verified`, refusing warm start and restore, until the conflict
    clears: the sandbox's next suspend replaces every older suspend row, or an
-   operator resolves it. Moving the bytes off the checkpoint path is the
+   operator resolves it. A request to end stopped retires before it stops, so
+   its boot keeps running, and the suspend holds below refuse its suspend: the
+   conflict then clears once the boot's execution ends, by a `Stop` or
+   otherwise, and a later execution suspends, or an operator resolves it. Moving the bytes off the checkpoint path is the
    durable retirement: a catalogued checkpoint goes to the snapshot reaper's GC
    staging, an uncatalogued one to the suspend-garbage lane, and each lane's
    sweep deletes what the immediate reclaim leaves. An encrypted sandbox's next suspend writes a fresh suspend
@@ -1635,6 +1642,18 @@ doesn't render it yet.
   progress (with its phase), upgraded, rolled back (with its failure) or
   already on target. Node-api forwards it on `WorkerApiInternal` only for a
   caller with the control-plane authority a policy write needs.
+
+After a verified boot to a `stopped` target, the sandbox runs the boot's
+execution unfenced until the upgrade stops it, and a suspend there would
+leave it suspended. So while such an upgrade fences the sandbox, or is
+verified with its boot's execution still running, a due auto-suspend is held
+like a non-actionable stage, and a user's `Suspend` and a teardown suspend
+(`PrepareTeardownSuspend`'s drive) answer a retryable `UNAVAILABLE` under the
+artifact lock, before anything is captured; the teardown drive is deferred and
+asked again. Once the upgrade is verified, a stop ends the hold, whoever stops
+the sandbox: the upgrade never stops a later execution, so a later one
+suspends as usual even while the upgrade stays `verified`, and a checkpoint
+conflict that keeps it there still clears on that suspend.
 
 Only the control plane writes sandbox pods, and the annotations are the
 upgrade's authorization: a principal that can create a sandbox pod can request

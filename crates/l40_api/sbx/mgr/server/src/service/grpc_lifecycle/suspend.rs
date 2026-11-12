@@ -291,6 +291,13 @@ impl SandboxManagerService {
                 "sandbox cleanup is active; retry suspend",
             ));
         };
+        // A runtime upgrade that must leave the sandbox stopped runs it on its
+        // boot's execution until it stops it: suspended there, it would never
+        // reach the state it reports. Checked under the artifact lock every
+        // suspend holds here, which a runtime upgrade's fence takes too: an
+        // upgrade whose boot could start before the capture already fences
+        // the sandbox, and the check holds the suspend for it.
+        self.refuse_suspend_during_stay_stopped_upgrade(&context.sandbox_id)?;
         let sandbox = self.lookup_sandbox(&context.sandbox_id)?;
         self.ensure_memory_state_supported(&sandbox, "suspend")?;
         self.ensure_not_pool_sandbox_for_snapshots(&sandbox, "suspend")?;

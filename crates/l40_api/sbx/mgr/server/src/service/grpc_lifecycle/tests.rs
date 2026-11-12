@@ -2970,3 +2970,77 @@ async fn teardown_suspend_without_a_capture_quarantines_as_an_only_copy() {
         crate::db::TeardownSuspendOperationStatus::Failed
     );
 }
+
+/// A teardown suspend of a sandbox that an unretired runtime upgrade to a
+/// `stopped` target runs is refused retryably, as a user's Suspend is: the
+/// upgrade stops the sandbox itself, and a suspend in between would leave it
+/// suspended. The drive fails `Unavailable` before it captures anything, the
+/// sandbox stays started and its suspend job stays running for a later
+/// drive.
+#[tokio::test]
+async fn teardown_suspend_waits_while_a_stay_stopped_upgrade_runs() {
+    use crate::service::tests::service_tests::insert_test_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    let execution = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+        pplx_space_common_core::types::Arch::X86_64,
+    )
+    .unwrap()
+    .first()
+    .unwrap()
+    .definition()
+    .execution_requirements()
+    .unwrap();
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    crate::db::upsert_sandbox_execution_metadata(&conn, &id, &execution).unwrap();
+    let operation_id = crate::db::test_fixtures::fence_runtime_upgrade(
+        &conn,
+        &id,
+        execution.environment().unwrap(),
+        crate::db::RuntimeUpgradeTargetState::Stopped,
+        None,
+    )
+    .operation_id;
+    // The boot's execution runs the sandbox: the upgrade still owes its stop.
+    let boot = uuid::Uuid::now_v7().to_string();
+    conn.execute(
+        "UPDATE sandbox_runtime_upgrades SET phase = 'verified', boot_execution_id = ?2
+          WHERE operation_id = ?1",
+        crate::db::fixture::params![operation_id.to_string(), boot],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sandboxes SET state = 'started', node_execution_id = ?2 WHERE id = ?1",
+        crate::db::fixture::params![id, boot],
+    )
+    .unwrap();
+    let generation = ExecutionGeneration::new(7).unwrap();
+    crate::db::begin_teardown_suspend_operation(&conn, &id, generation).unwrap();
+    let service = SandboxManagerService::for_test(conn);
+
+    let error = service
+        .drive_teardown_suspend(sandbox_id, generation, SandboxEventTrigger::System)
+        .await
+        .expect_err("the teardown suspend waits for the upgrade");
+
+    assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
+    assert!(
+        error.message().contains("must stop this sandbox first"),
+        "{error}"
+    );
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxStatus::from(SandboxState::Started)
+    );
+    let db = service.db.lock().unwrap();
+    assert_eq!(
+        crate::db::latest_teardown_suspend_operation(&db, &id)
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::db::TeardownSuspendOperationStatus::Running,
+        "the job stays for a later drive"
+    );
+}

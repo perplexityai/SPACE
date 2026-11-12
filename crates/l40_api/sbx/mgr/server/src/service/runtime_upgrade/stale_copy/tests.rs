@@ -447,6 +447,7 @@ async fn a_copy_another_upgrade_owns_is_left_to_it() {
                 &f.service.db.lock().unwrap(),
                 &f.sandbox_id,
                 f.target.environment().unwrap(),
+                crate::db::RuntimeUpgradeTargetState::Started,
                 None,
             );
             if let Some(phase) = phase {

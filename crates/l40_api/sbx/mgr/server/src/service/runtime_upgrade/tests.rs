@@ -841,6 +841,7 @@ async fn an_upgrade_interrupted_before_its_boot_rolls_back_on_settle() {
             &h.db.lock().unwrap(),
             &h.sandbox_id,
             reference(&h.envs.target),
+            crate::db::RuntimeUpgradeTargetState::Started,
             None,
         )
         .operation_id;
@@ -1354,6 +1355,7 @@ async fn a_second_upgrade_of_a_fenced_sandbox_is_refused() {
         &h.db.lock().unwrap(),
         &h.sandbox_id,
         reference(&h.envs.target),
+        crate::db::RuntimeUpgradeTargetState::Started,
         None,
     )
     .operation_id;
@@ -1641,6 +1643,7 @@ mod service {
             &conn,
             &sandbox_id,
             reference(&envs.target),
+            crate::db::RuntimeUpgradeTargetState::Started,
             None,
         )
         .operation_id;
