@@ -5,7 +5,8 @@ const TEST_SANDBOX_ID: &str = "019e31d9-79a6-7132-b90f-007f1c62ddea";
 #[test]
 fn publication_replaces_the_complete_snapshot_and_preserves_runtime_siblings() {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let sandbox_dir = tmp.path();
+    let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+    let sandbox_dir = sandbox_root.as_path();
     let snapshot_dir = canonical_suspend_snapshot_dir(sandbox_dir);
     let staging_dir = sandbox_dir.join("publish-source");
     let instance_dir = sandbox_dir.join("instance");
@@ -52,7 +53,8 @@ fn publication_replaces_the_complete_snapshot_and_preserves_runtime_siblings() {
 #[test]
 fn publication_makes_a_new_snapshot_visible_only_at_publish_time() {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let sandbox_dir = tmp.path();
+    let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+    let sandbox_dir = sandbox_root.as_path();
     let snapshot_dir = canonical_suspend_snapshot_dir(sandbox_dir);
     let staging_dir = sandbox_dir.join("publish-source");
     let local_artifact_id = LocalArtifactId::new();
@@ -81,7 +83,8 @@ fn publication_makes_a_new_snapshot_visible_only_at_publish_time() {
 #[test]
 fn publication_is_idempotent_when_canonical_already_matches_artifact() {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let sandbox_dir = tmp.path();
+    let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+    let sandbox_dir = sandbox_root.as_path();
     let snapshot_dir = canonical_suspend_snapshot_dir(sandbox_dir);
     let staging_dir = sandbox_dir.join("publish-source");
     let local_artifact_id = LocalArtifactId::new();
@@ -110,7 +113,8 @@ fn publication_is_idempotent_when_canonical_already_matches_artifact() {
 #[test]
 fn classifier_prefers_complete_staging_over_unpinned_canonical_artifact() {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let sandbox_dir = tmp.path();
+    let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+    let sandbox_dir = sandbox_root.as_path();
     let old_artifact_id = LocalArtifactId::new();
     let new_artifact_id = LocalArtifactId::new();
     write_full_suspend_artifact(
@@ -143,7 +147,8 @@ fn classifier_prefers_complete_staging_over_unpinned_canonical_artifact() {
 #[test]
 fn classifier_refuses_mismatched_canonical_when_expected_artifact_is_known() {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let sandbox_dir = tmp.path();
+    let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+    let sandbox_dir = sandbox_root.as_path();
     let expected_artifact_id = LocalArtifactId::new();
     let stale_artifact_id = LocalArtifactId::new();
     write_full_suspend_artifact(
@@ -171,7 +176,8 @@ fn classifier_refuses_mismatched_canonical_when_expected_artifact_is_known() {
 #[test]
 fn classifier_treats_runtime_live_as_source_of_truth() {
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let sandbox_dir = tmp.path();
+    let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+    let sandbox_dir = sandbox_root.as_path();
     let local_artifact_id = LocalArtifactId::new();
     let staging_dir = suspend_snapshot_staging_dir(sandbox_dir, local_artifact_id);
     write_full_suspend_artifact(
@@ -287,7 +293,8 @@ fn deferred_artifact_completeness_follows_node_manager_verdicts() {
 #[test]
 fn classification_waits_for_an_unverified_retained_source() {
     let tmp = tempfile::tempdir().unwrap();
-    let sandbox_dir = tmp.path();
+    let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+    let sandbox_dir = sandbox_root.as_path();
     let snapshot_dir = canonical_suspend_snapshot_dir(sandbox_dir);
     let local_artifact_id = LocalArtifactId::new();
     let source_id = uuid::Uuid::now_v7();
@@ -359,7 +366,8 @@ fn classification_waits_for_an_unverified_retained_source() {
 #[test]
 fn retained_sources_are_discovered_from_canonical_and_staged_metadata() {
     let tmp = tempfile::tempdir().unwrap();
-    let sandbox_dir = tmp.path();
+    let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+    let sandbox_dir = sandbox_root.as_path();
     let canonical = canonical_suspend_snapshot_dir(sandbox_dir);
     let staged = suspend_snapshot_staging_dir(sandbox_dir, LocalArtifactId::new());
     let full = suspend_snapshot_staging_dir(sandbox_dir, LocalArtifactId::new());
@@ -409,7 +417,8 @@ fn retired_entries(sandbox_dir: &Path) -> Vec<LocalArtifactId> {
 #[test]
 fn publication_retires_the_superseded_snapshot_for_the_staging_sweep() {
     let tmp = tempfile::tempdir().unwrap();
-    let sandbox_dir = tmp.path();
+    let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+    let sandbox_dir = sandbox_root.as_path();
     let snapshot_dir = canonical_suspend_snapshot_dir(sandbox_dir);
     let old_id = LocalArtifactId::new();
     let new_id = LocalArtifactId::new();
@@ -452,7 +461,8 @@ fn publication_retires_the_superseded_snapshot_for_the_staging_sweep() {
 #[test]
 fn publication_resumes_an_interrupted_replacement_from_its_hold() {
     let tmp = tempfile::tempdir().unwrap();
-    let sandbox_dir = tmp.path();
+    let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+    let sandbox_dir = sandbox_root.as_path();
     let snapshot_dir = canonical_suspend_snapshot_dir(sandbox_dir);
     let (old_id, new_id) = (LocalArtifactId::new(), LocalArtifactId::new());
     let hold = retired_suspend_snapshot_dir(sandbox_dir, new_id);
@@ -490,7 +500,8 @@ fn publication_resumes_an_interrupted_replacement_from_its_hold() {
 #[test]
 fn discovery_names_only_the_sources_validation_needs() {
     let tmp = tempfile::tempdir().unwrap();
-    let sandbox_dir = tmp.path();
+    let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+    let sandbox_dir = sandbox_root.as_path();
     let canonical = canonical_suspend_snapshot_dir(sandbox_dir);
     let source_id = uuid::Uuid::now_v7();
     let _bundle = write_deferred_suspend_artifact(
@@ -564,7 +575,8 @@ fn an_absent_verdict_counts_as_missing_only_once_the_bundle_is_gone() {
 #[test]
 fn publication_with_a_hold_waits_for_an_unverified_canonical() {
     let tmp = tempfile::tempdir().unwrap();
-    let sandbox_dir = tmp.path();
+    let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+    let sandbox_dir = sandbox_root.as_path();
     let canonical = canonical_suspend_snapshot_dir(sandbox_dir);
     let id = LocalArtifactId::new();
     let source_id = uuid::Uuid::now_v7();
@@ -630,9 +642,10 @@ fn a_retained_artifact_stays_complete_across_stream_reclaim() {
 fn a_recovered_publication_records_a_generation_that_fences_but_orders_nothing() {
     let generation = ExecutionGeneration::new(7).unwrap();
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let snapshot_dir = canonical_suspend_snapshot_dir(tmp.path());
+    let sandbox_dir = tmp.path().join(TEST_SANDBOX_ID);
+    let snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir);
     let local_artifact_id = LocalArtifactId::new();
-    let staging_dir = suspend_snapshot_staging_dir(tmp.path(), local_artifact_id);
+    let staging_dir = suspend_snapshot_staging_dir(&sandbox_dir, local_artifact_id);
     write_full_suspend_artifact(&staging_dir, TEST_SANDBOX_ID, local_artifact_id, b"capture");
 
     publish_recovered_suspend_snapshot_dir(
@@ -667,7 +680,8 @@ fn a_teardown_capture_publishes_only_with_its_execution_record() {
         ("a record that can't be written", Some(generation), true),
     ] {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let sandbox_dir = tmp.path();
+        let sandbox_root = tmp.path().join(TEST_SANDBOX_ID);
+        let sandbox_dir = sandbox_root.as_path();
         let snapshot_dir = canonical_suspend_snapshot_dir(sandbox_dir);
         let local_artifact_id = LocalArtifactId::new();
         let staging_dir = suspend_snapshot_staging_dir(sandbox_dir, local_artifact_id);
@@ -716,6 +730,335 @@ fn a_teardown_capture_publishes_only_with_its_execution_record() {
                 execution_generation,
                 "{case}: the capturing teardown's own record orders captures"
             );
+        }
+    }
+}
+
+#[test]
+fn current_attempt_evidence_precedes_liveness_and_never_adopts_stale_artifacts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(TEST_SANDBOX_ID);
+    let stale = LocalArtifactId::new();
+    let current = LocalArtifactId::new();
+    write_full_suspend_artifact(
+        &suspend_snapshot_staging_dir(&root, stale),
+        TEST_SANDBOX_ID,
+        stale,
+        b"stale",
+    );
+    let fresh = crate::db::read::SuspendAttempt {
+        artifact_id: current,
+        started_at: jiff::Timestamp::now().as_second(),
+    };
+    let verdicts = RetainedSourceVerdicts::default();
+    let classify = |attempt, live: bool| {
+        classify_suspend_attempt(&root, None, attempt, true, live.into(), &verdicts)
+    };
+    for live in [false, true] {
+        assert!(
+            classify(Some(fresh), live).unwrap_err().is_pending(),
+            "no file yet is still an admitted operation"
+        );
+        assert!(matches!(
+            classify(None, live).unwrap(),
+            SuspendSnapshotPublicationDecision::BlockedAttempt(_)
+        ));
+    }
+    let ahead_of_clock = crate::db::read::SuspendAttempt {
+        started_at: fresh.started_at + 60,
+        ..fresh
+    };
+    for live in [false, true] {
+        assert!(
+            matches!(
+                classify(Some(ahead_of_clock), live).unwrap_err(),
+                SuspendSnapshotPublicationError::CaptureOwnershipUnresolved { .. }
+            ),
+            "clock skew requires attention without removing automatic receipt recovery"
+        );
+    }
+    assert!(suspend_attempt_retry_open_at(fresh, fresh.started_at - 1));
+    let near_expiry = crate::db::read::SuspendAttempt {
+        started_at: fresh.started_at - 6 * 3600 + 60,
+        ..fresh
+    };
+    let expired = crate::db::read::SuspendAttempt {
+        started_at: fresh.started_at - 6 * 3600,
+        ..fresh
+    };
+    for live in [false, true] {
+        assert!(matches!(
+            classify(Some(near_expiry), live).unwrap_err(),
+            SuspendSnapshotPublicationError::CaptureOwnershipUnresolved { .. }
+        ));
+        assert!(matches!(
+            classify(Some(expired), live).unwrap(),
+            SuspendSnapshotPublicationDecision::BlockedAttempt(_)
+        ));
+    }
+    // A sidecar IO error must not suppress ownership escalation. A directory
+    // at the sidecar path makes the read fail even when tests run as root.
+    let canonical = canonical_suspend_snapshot_dir(&root);
+    let unreadable = canonical.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+    std::fs::create_dir_all(&unreadable).unwrap();
+    assert!(matches!(
+        classify(Some(fresh), false).unwrap_err(),
+        SuspendSnapshotPublicationError::Validation(
+            SuspendSnapshotValidationError::ReadMetadata { .. }
+        )
+    ));
+    assert!(matches!(
+        classify(Some(near_expiry), false).unwrap_err(),
+        SuspendSnapshotPublicationError::CaptureOwnershipUnresolved { .. }
+    ));
+    std::fs::remove_dir(&unreadable).unwrap();
+    std::fs::remove_dir(&canonical).unwrap();
+    // A restart supplies the same persisted admission, not a new wait budget.
+    assert!(suspend_attempt_retry_open_at(
+        near_expiry,
+        fresh.started_at + 59
+    ));
+    assert!(!suspend_attempt_retry_open_at(
+        near_expiry,
+        fresh.started_at + 60
+    ));
+    let staging = suspend_snapshot_staging_dir(&root, current);
+    std::fs::create_dir_all(&staging).unwrap();
+    let mut metadata: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(
+        &std::fs::read(
+            suspend_snapshot_staging_dir(&root, stale)
+                .join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    metadata.local_artifact_id = Some(current);
+    metadata.encrypted = true;
+    prepare_encrypted_capture_record(&staging, &metadata).unwrap();
+    for live in [false, true] {
+        assert!(classify(Some(fresh), live).unwrap_err().is_pending());
+    }
+    commit_encrypted_capture_record(&staging).unwrap();
+    assert!(
+        matches!(
+            classify(Some(near_expiry), false).unwrap_err(),
+            SuspendSnapshotPublicationError::CapturePending { .. }
+        ),
+        "confirmed stopped capture uses the seal budget after ownership escalation"
+    );
+    assert!(
+        classify(Some(fresh), true).unwrap_err().is_pending(),
+        "receipt plus live runtime is contradictory"
+    );
+    for live in [false, true] {
+        // A late matching receipt can still recover before the original
+        // deadline; its fresh mtime cannot reset that deadline.
+        assert!(classify(Some(near_expiry), live).unwrap_err().is_pending());
+        assert!(
+            matches!(
+                classify(Some(expired), live).unwrap(),
+                SuspendSnapshotPublicationDecision::BlockedAttempt(_)
+            ),
+            "fresh receipt mtime must not renew admission"
+        );
+    }
+    write_full_suspend_artifact(&staging, TEST_SANDBOX_ID, current, b"current");
+    assert!(
+        matches!(
+            classify(Some(fresh), false).unwrap(),
+            SuspendSnapshotPublicationDecision::BlockedAttempt(_)
+        ),
+        "plaintext bytes cannot satisfy an encrypted attempt"
+    );
+    assert!(classify(Some(fresh), true).unwrap_err().is_pending());
+    // Plaintext capture does not stop its VM: a valid published artifact must
+    // survive a backup-handoff failure even while that runtime is resident.
+    assert!(
+        matches!(classify_suspend_attempt(&root, None, Some(fresh), false, true.into(), &verdicts).unwrap(), SuspendSnapshotPublicationDecision::StagedComplete(a) if a.local_artifact_id == current)
+    );
+    // File-shape validation only; the transport test exercises the seal RPC.
+    std::fs::write(staging.join("snapshot.luks"), b"sealed snapshot").unwrap();
+    std::fs::write(staging.join("cow.luks"), b"sealed cow").unwrap();
+    metadata.size_bytes = (b"sealed snapshot".len() + b"sealed cow".len()) as u64;
+    std::fs::write(
+        staging.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
+    // Time cannot turn unreadable producer evidence into permission to publish.
+    for receipt in [
+        pplx_space_node_mgr_client::capture_receipt::FAILED,
+        pplx_space_node_mgr_client::capture_receipt::REFUSED,
+        ENCRYPTED_CAPTURE_RECORD,
+    ] {
+        std::fs::write(staging.join(receipt), b"{").unwrap();
+        classify(Some(fresh), false).expect_err("unreadable evidence must remain unresolved");
+        assert!(matches!(
+            classify(Some(expired), false).unwrap(),
+            SuspendSnapshotPublicationDecision::BlockedAttempt(_)
+        ));
+        if receipt == ENCRYPTED_CAPTURE_RECORD {
+            std::fs::write(
+                staging.join(receipt),
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
+        } else {
+            std::fs::remove_file(staging.join(receipt)).unwrap();
+        }
+    }
+    // A complete artifact cannot erase contradictory producer identity.
+    for field in ["local_artifact_id", "sandbox_id"] {
+        let mut mismatched = metadata.clone();
+        if field == "local_artifact_id" {
+            mismatched.local_artifact_id = Some(stale);
+        } else {
+            mismatched.sandbox_id = SandboxId::new().to_string();
+        }
+        std::fs::write(
+            staging.join(ENCRYPTED_CAPTURE_RECORD),
+            serde_json::to_vec(&mismatched).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                classify(Some(fresh), false).unwrap(),
+                SuspendSnapshotPublicationDecision::BlockedAttempt(_)
+            ),
+            "{field}"
+        );
+    }
+    std::fs::write(
+        staging.join(ENCRYPTED_CAPTURE_RECORD),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
+    for canonical in [false, true] {
+        if canonical {
+            std::fs::rename(&staging, canonical_suspend_snapshot_dir(&root)).unwrap();
+        }
+        for row_encrypted in [false, true] {
+            let decision = classify_suspend_attempt(
+                &root,
+                None,
+                Some(fresh),
+                row_encrypted,
+                RuntimeObservation::Gone,
+                &verdicts,
+            )
+            .unwrap();
+            match (row_encrypted, canonical, decision) {
+                (false, _, SuspendSnapshotPublicationDecision::BlockedAttempt(_)) => {}
+                (true, false, SuspendSnapshotPublicationDecision::StagedComplete(a)) => {
+                    assert_eq!(a.local_artifact_id, current)
+                }
+                (true, true, SuspendSnapshotPublicationDecision::CanonicalReady(a)) => {
+                    assert_eq!(a.local_artifact_id, current)
+                }
+                (_, _, other) => panic!("unexpected encryption/slot verdict: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn admitted_plaintext_capture_ignores_an_unrelated_pending_canonical_source() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join(TEST_SANDBOX_ID);
+    let stale = LocalArtifactId::new();
+    let current = LocalArtifactId::new();
+    let canonical = canonical_suspend_snapshot_dir(&root);
+    let _bundle = write_deferred_suspend_artifact(
+        &canonical,
+        TEST_SANDBOX_ID,
+        stale,
+        uuid::Uuid::now_v7(),
+        8,
+    );
+    let staging = suspend_snapshot_staging_dir(&root, current);
+    write_full_suspend_artifact(&staging, TEST_SANDBOX_ID, current, b"admitted capture");
+    let attempt = crate::db::read::SuspendAttempt {
+        artifact_id: current,
+        started_at: jiff::Timestamp::now().as_second(),
+    };
+    let verdicts = RetainedSourceVerdicts::default();
+    for runtime in [RuntimeObservation::Live, RuntimeObservation::Gone] {
+        let recovered =
+            classify_suspend_attempt(&root, None, Some(attempt), false, runtime, &verdicts)
+                .unwrap();
+        assert!(
+            matches!(recovered, SuspendSnapshotPublicationDecision::StagedComplete(a) if a.local_artifact_id == current)
+        );
+    }
+    // Pending evidence for the admitted artifact itself must still defer.
+    let admitted = crate::db::read::SuspendAttempt {
+        artifact_id: stale,
+        ..attempt
+    };
+    assert!(
+        classify_suspend_attempt(
+            &root,
+            None,
+            Some(admitted),
+            false,
+            RuntimeObservation::Gone,
+            &verdicts
+        )
+        .unwrap_err()
+        .is_pending()
+    );
+}
+
+#[test]
+fn admitted_artifact_cannot_publish_another_sandbox_metadata() {
+    for encrypted in [false, true] {
+        for canonical in [false, true] {
+            let scratch = tempfile::tempdir().unwrap();
+            let root = scratch.path().join(TEST_SANDBOX_ID);
+            let id = LocalArtifactId::new();
+            let attempt = crate::db::read::SuspendAttempt {
+                artifact_id: id,
+                started_at: jiff::Timestamp::now().as_second(),
+            };
+            let staging = suspend_snapshot_staging_dir(&root, id);
+            let snapshot = canonical_suspend_snapshot_dir(&root);
+            let path = if canonical { &snapshot } else { &staging };
+            write_full_suspend_artifact(
+                path,
+                &SandboxId::new().to_string(),
+                id,
+                b"another sandbox",
+            );
+            let metadata_path = path.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+            let mut metadata: crate::snapshot_upload::SnapshotMeta =
+                serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+            if encrypted {
+                metadata.encrypted = true;
+                std::fs::write(path.join("snapshot.luks"), b"snapshot").unwrap();
+                std::fs::write(path.join("cow.luks"), b"cow").unwrap();
+                metadata.size_bytes = 11;
+                std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+            }
+            let result = classify_suspend_attempt(
+                &root,
+                None,
+                Some(attempt),
+                encrypted,
+                RuntimeObservation::Gone,
+                &Default::default(),
+            );
+            assert!(
+                !matches!(
+                    result,
+                    Ok(SuspendSnapshotPublicationDecision::StagedComplete(_)
+                        | SuspendSnapshotPublicationDecision::CanonicalReady(_))
+                ),
+                "encrypted={encrypted} canonical={canonical}: {result:?}"
+            );
+            publish_suspend_snapshot_dir(&staging, &snapshot, id, &Default::default())
+                .expect_err("publication must reject another sandbox's metadata");
+            assert_eq!(snapshot.exists(), canonical);
+            assert!(path.exists());
         }
     }
 }

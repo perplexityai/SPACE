@@ -61,6 +61,7 @@ impl SandboxManagerServiceOptions {
         let run_dir = scratch.to_owned();
         Self {
             automatic_guest_updates: false,
+            capture_runtime_probe: None,
             host_control_socket_path: scratch.join("absent-host-control.sock"),
             credential_manager_socket_path: scratch.join("absent-credential-manager.sock"),
             sandbox_runtime_live: Arc::new(move |id| {

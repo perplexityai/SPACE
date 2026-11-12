@@ -18,6 +18,68 @@ static ALL_MIGRATORS: &[(&str, &Migrator)] = &[
 ];
 
 #[tokio::test]
+async fn suspend_attempt_rollback_preserves_ownership_and_migration_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.sqlite");
+    let database = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
+    migrate_sqlite_up(database, &path).await.unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO sandboxes (id, uuid8, state, template, created_at, updated_at,
+             suspend_attempt_artifact_id, suspend_attempt_started_at)
+         VALUES ('sandbox', 'sandbox', 'suspending', 'template', '1', '1', 'attempt', 1)",
+        [],
+    )
+    .unwrap();
+    let history = || {
+        conn.query_row(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 20261112160000",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(history(), 1);
+    assert!(
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .is_err()
+    );
+    assert_eq!(history(), 1, "refused rollback must retain applied history");
+    assert_eq!(
+        conn.query_row(
+            "SELECT suspend_attempt_artifact_id FROM sandboxes WHERE id = 'sandbox'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "attempt"
+    );
+
+    conn.execute(
+        "UPDATE sandboxes SET state = 'paused' WHERE id = 'sandbox'",
+        [],
+    )
+    .unwrap();
+    rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+        .await
+        .unwrap();
+    assert_eq!(history(), 0);
+    migrate_sqlite_up(database, &path).await.unwrap();
+    assert_eq!(history(), 1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT suspend_attempt_artifact_id FROM sandboxes WHERE id = 'sandbox'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap(),
+        None,
+        "re-upgrade must not invent an admission identity"
+    );
+}
+
+#[tokio::test]
 async fn sandbox_baseline_refuses_down_without_changing_shared_jobs_or_history() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sandbox.sqlite");

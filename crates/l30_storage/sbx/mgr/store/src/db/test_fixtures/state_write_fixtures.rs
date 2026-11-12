@@ -753,7 +753,7 @@ pub fn begin_cold_start(conn: &Connection, id: &str) -> CleanupEpisode {
 /// A `suspended` row pinning its published suspend artifact.
 pub fn insert_suspended_with_artifact(conn: &Connection) -> (String, LocalArtifactId) {
     let id = insert_row(conn, SandboxState::Paused);
-    assert!(begin_suspend(conn, &id).unwrap());
+    assert!(begin_suspend(conn, &id, LocalArtifactId::new()).unwrap());
     let artifact = LocalArtifactId::new();
     complete_row_intent_cleanup_for_job(
         conn,

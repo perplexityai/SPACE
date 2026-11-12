@@ -353,6 +353,11 @@ fn the_migration_round_trips_every_cleanup_shape_and_keeps_historical_labels() {
             .collect()
     };
 
+    // Reverse dependent migrations before dropping the generated column.
+    conn.execute_batch(include_str!(
+        "../../../../../../../../db/sandbox-manager/20261112160000_suspend_attempt.down.sql"
+    ))
+    .unwrap();
     conn.execute_batch(LEGACY_DROP_DOWN).unwrap();
     conn.execute_batch(UNOWNED_DOWN).unwrap();
     conn.execute_batch(MIGRATION_DOWN).unwrap();
@@ -372,6 +377,10 @@ fn the_migration_round_trips_every_cleanup_shape_and_keeps_historical_labels() {
     conn.execute_batch(MIGRATION_UP).unwrap();
     conn.execute_batch(UNOWNED_UP).unwrap();
     conn.execute_batch(LEGACY_DROP_UP).unwrap();
+    conn.execute_batch(include_str!(
+        "../../../../../../../../db/sandbox-manager/20261112160000_suspend_attempt.up.sql"
+    ))
+    .unwrap();
     // A migration can't tell a handed-off suspend from a restore rollback, so
     // `c` comes back `stopping`; its combined status is unchanged.
     for (id, expected) in [

@@ -454,6 +454,7 @@ pub struct SandboxManagerService {
     /// reattach path without a real `fc.pid` symlink on disk. Production uses
     /// [`is_sandbox_running`].
     sandbox_runtime_live: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    capture_runtime_probe: Option<RuntimeLivenessProbe>,
     /// Probe for "is this sandbox's rootfs on this node's disk". The stopped
     /// materialization boundary checks it before vouching for a row, so a row
     /// whose bytes are gone is refused rather than reported as placed; an
@@ -1032,12 +1033,17 @@ fn install_authoritative_route_epoch(
     }
 }
 
+pub type RuntimeLivenessProbe = Arc<dyn Fn(&str) -> std::io::Result<bool> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct SandboxManagerServiceOptions {
     pub automatic_guest_updates: bool,
     pub host_control_socket_path: PathBuf,
     pub credential_manager_socket_path: PathBuf,
     pub sandbox_runtime_live: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Preserve unknown filesystem evidence for encrypted capture recovery.
+    /// None delegates to the injected boolean probe used by legacy callers.
+    pub capture_runtime_probe: Option<RuntimeLivenessProbe>,
     pub sandbox_rootfs_present: RootfsPresenceProbe,
     pub shutdown_token: CancellationToken,
     pub task_tracker: TaskTracker,
@@ -1085,6 +1091,9 @@ impl Default for SandboxManagerServiceOptions {
                 pplx_space_credmgr_client::CREDMGR_SOCKET,
             ),
             sandbox_runtime_live: Arc::new(is_sandbox_running),
+            capture_runtime_probe: Some(Arc::new(|id| {
+                Path::new(RUN_DIR).join(id).join("fc.pid").try_exists()
+            })),
             sandbox_rootfs_present: Arc::new(|id: &str| {
                 create_support::sandbox_rootfs_exists_in(std::path::Path::new(CACHE_DIR), id)
             }),
@@ -1876,6 +1885,7 @@ impl SandboxManagerService {
             },
             snapshot_upload_worker,
             sandbox_runtime_live: options.sandbox_runtime_live,
+            capture_runtime_probe: options.capture_runtime_probe,
             sandbox_rootfs_present: options.sandbox_rootfs_present,
             retained_source_inspector: Arc::new(
                 crate::retained_source::NodeManagerSourceInspector(options.node_manager.clone()),

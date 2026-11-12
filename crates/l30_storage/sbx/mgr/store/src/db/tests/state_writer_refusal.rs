@@ -167,7 +167,7 @@ fn insert_with_episode(
 /// A `suspended` row pinning a published suspend artifact.
 fn insert_suspended_with_artifact(conn: &Connection) -> (String, LocalArtifactId) {
     let id = insert_row(conn, SandboxState::Paused);
-    assert!(begin_suspend(conn, &id).unwrap());
+    assert!(begin_suspend(conn, &id, LocalArtifactId::new()).unwrap());
     let artifact = LocalArtifactId::new();
     complete_row_intent_cleanup(
         conn,
@@ -467,7 +467,7 @@ fn teardown_suspend_begins_only_from_paused_and_a_refusal_enqueues_nothing() {
         let id = insert_row(&conn, state);
         let before = database_rows(&conn);
         assert_no_rows(
-            begin_teardown_suspend(&conn, &id, generation).map(|_| ()),
+            begin_teardown_suspend(&conn, &id, generation, LocalArtifactId::new()).map(|_| ()),
             state.legacy_label(),
         );
         assert_unchanged(&conn, &before, state.legacy_label());
@@ -475,7 +475,7 @@ fn teardown_suspend_begins_only_from_paused_and_a_refusal_enqueues_nothing() {
 
     let id = insert_row(&conn, SandboxState::Paused);
     let before = database_rows(&conn);
-    begin_teardown_suspend(&conn, &id, generation).unwrap();
+    begin_teardown_suspend(&conn, &id, generation, LocalArtifactId::new()).unwrap();
     assert_eq!(
         row(&conn, &id).state,
         SandboxStatus::from(SandboxState::Suspending)
@@ -484,7 +484,7 @@ fn teardown_suspend_begins_only_from_paused_and_a_refusal_enqueues_nothing() {
 
     let before = database_rows(&conn);
     assert_no_rows(
-        begin_teardown_suspend(&conn, &id, generation).map(|_| ()),
+        begin_teardown_suspend(&conn, &id, generation, LocalArtifactId::new()).map(|_| ()),
         "already suspending",
     );
     assert_unchanged(&conn, &before, "already suspending");
@@ -497,7 +497,7 @@ fn suspend_rollback_returns_only_a_suspending_row_to_paused() {
     let predecessor = set_suspend_pin(&conn, &resuspend);
     let first_suspend = insert_row(&conn, SandboxState::Paused);
     for (id, restored) in [(&resuspend, Some(predecessor)), (&first_suspend, None)] {
-        assert!(begin_suspend(&conn, id).unwrap());
+        assert!(begin_suspend(&conn, id, LocalArtifactId::new()).unwrap());
         assert_eq!(row(&conn, id).current_local_artifact_id, None);
         assert!(rollback_suspending_to_paused(&conn, id).unwrap());
         let paused = row(&conn, id);
@@ -734,7 +734,7 @@ fn suspended_cleanup_pin_requires_a_suspending_row_and_a_refusal_keeps_prior_art
     assert!(get_local_artifact(&conn, prior).unwrap().is_some());
 
     let id = insert_row(&conn, SandboxState::Paused);
-    assert!(begin_suspend(&conn, &id).unwrap());
+    assert!(begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
     let artifact = LocalArtifactId::new();
     pin_suspended_artifact_for_cleanup(&conn, &id, artifact, &snapshot_path(&id)).unwrap();
     let pinned = row(&conn, &id);

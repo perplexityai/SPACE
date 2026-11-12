@@ -475,7 +475,8 @@ fn an_earlier_upload_vouches_only_for_the_generation_it_marked() {
     assert!(!vouches(None, Some(generation(GENERATION))));
 }
 
-/// A teardown that crashed before publishing its capture leaves the
+/// A legacy plaintext teardown without an admission identity crashed before
+/// publishing its capture and leaves the
 /// canonical directory holding the previous capture, A, which an earlier
 /// execution took. Startup recovery adopts A as the teardown's capture and
 /// records the teardown's generation for it, so its backup stays fenced under
@@ -484,7 +485,7 @@ fn an_earlier_upload_vouches_only_for_the_generation_it_marked() {
 /// own, so cluster-api records no capture generation for it and A can't order
 /// as newer than a capture taken between the two executions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_capture_recovery_adopts_after_a_crash_before_publish_orders_nothing() {
+async fn legacy_capture_recovery_adopts_without_inventing_capture_order() {
     with_cluster_api(
         RetiringClusterApi {
             supersession_lapsed: true,
@@ -521,7 +522,22 @@ async fn a_capture_recovery_adopts_after_a_crash_before_publish_orders_nothing()
             .unwrap();
             // This execution's teardown began, then the node went down before
             // its capture was published.
-            crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation(GENERATION)).unwrap();
+            crate::db::begin_teardown_suspend(
+                &conn,
+                &sandbox_id,
+                generation(GENERATION),
+                pplx_space_common_core::types::LocalArtifactId::new(),
+            )
+            .unwrap();
+            // Only legacy plaintext recovery may adopt an unrelated capture.
+            // New admissions bind an exact artifact; the classifier matrix
+            // covers their refusal to choose the old canonical directory.
+            conn.execute(
+                "UPDATE sandboxes SET suspend_attempt_artifact_id = NULL,
+                     suspend_attempt_started_at = NULL WHERE id = ?1",
+                [&sandbox_id],
+            )
+            .unwrap();
             let (service, _dispatched) = service_recording_cleanup(conn);
             service
                 .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
