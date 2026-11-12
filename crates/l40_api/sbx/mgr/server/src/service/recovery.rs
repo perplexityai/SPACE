@@ -778,16 +778,6 @@ impl SandboxManagerService {
         if !row.volume_encryption {
             return;
         }
-        match suspend_snapshot_publication::recorded_encrypted_capture_to_seal(
-            &cache_dir.join(&row.id),
-        ) {
-            Ok(Some(_)) => {}
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!(sandbox_id = %row.id, %error, "cannot select an unsealed encrypted capture; will retry");
-                return;
-            }
-        }
         let (Ok(wake), Ok(artifact)) = (
             self.auto_lifecycle.wake_lock(&row.id).try_lock_owned(),
             self.auto_lifecycle.artifact_lock(&row.id).try_lock_owned(),
@@ -926,11 +916,21 @@ impl SandboxManagerService {
             });
         }
         let sandbox_dir = cache_dir.join(&row.id);
-        let runtime_live = (self.sandbox_runtime_live)(&row.id);
-        let decision = suspend_snapshot_publication::classify_suspend_snapshot_publication(
+        let runtime = if row.volume_encryption {
+            self.capture_runtime_observation(&row.id)
+        } else {
+            (self.sandbox_runtime_live)(&row.id).into()
+        };
+        let attempt = {
+            let db = self.startup_recovery_db()?;
+            crate::db::read::suspend_attempt(&db, &row.id)?
+        };
+        let decision = suspend_snapshot_publication::classify_suspend_attempt(
             &sandbox_dir,
             row.current_local_artifact_id,
-            runtime_live,
+            attempt,
+            row.volume_encryption,
+            runtime,
             verdicts,
         )?;
         self.apply_suspend_snapshot_publication_recovery_decision(
@@ -952,6 +952,14 @@ impl SandboxManagerService {
         teardown_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
         verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError> {
+        let refused = matches!(decision, SuspendSnapshotPublicationDecision::CaptureRefused);
+        let blocked_reason = match &decision {
+            SuspendSnapshotPublicationDecision::BlockedAttempt(reason) => {
+                tracing::warn!(sandbox_id = %row.id, reason, "retaining unresolved encrypted capture");
+                crate::db::SUSPEND_CAPTURE_UNRESOLVED
+            }
+            _ => crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE,
+        };
         match decision {
             SuspendSnapshotPublicationDecision::CanonicalReady(artifact) => {
                 if let Some(execution_generation) = teardown_generation {
@@ -1073,10 +1081,31 @@ impl SandboxManagerService {
                     )
                 }
             }
-            SuspendSnapshotPublicationDecision::RuntimeLiveWithoutUsableArtifact => {
+            SuspendSnapshotPublicationDecision::RuntimeLiveWithoutUsableArtifact
+            | SuspendSnapshotPublicationDecision::CaptureRefused => {
                 let db = self.startup_recovery_db()?;
                 if crate::db::rollback_suspending_to_paused(&db, &row.id)? {
                     drop(db);
+                    if refused {
+                        let service = self.clone();
+                        let id = row.id.clone();
+                        self.task_tracker.spawn(async move {
+                            // Serialize with a new suspend: a delayed re-arm
+                            // must not follow its monitoring unsubscribe.
+                            let _wake = tokio::select! {
+                                biased;
+                                _ = service.shutdown_token.cancelled() => return,
+                                guard = service.auto_lifecycle.wake_lock(&id).lock_owned() => guard,
+                            };
+                            if service
+                                .lookup_sandbox(&id)
+                                .is_ok_and(|row| row.state.is_unowned(SandboxState::Paused))
+                                && (service.sandbox_runtime_live)(&id)
+                            {
+                                service.watchdog.rearm_sandbox_from_db(&id).await;
+                            }
+                        });
+                    }
                     // Staging is rediscovered independently of this transition
                     // by the inventory loop, including after restart or a failed
                     // deletion. A rollback is not evidence that a writer exited.
@@ -1110,13 +1139,11 @@ impl SandboxManagerService {
                     outcome: crate::db::StartupRecoveryOutcome::Deferred,
                 })
             }
-            SuspendSnapshotPublicationDecision::RuntimeGoneWithoutUsableArtifact => {
+            SuspendSnapshotPublicationDecision::RuntimeGoneWithoutUsableArtifact
+            | SuspendSnapshotPublicationDecision::BlockedAttempt(_) => {
                 let db = self.startup_recovery_db()?;
-                let quarantined = crate::db::mark_suspending_quarantined(
-                    &db,
-                    &row.id,
-                    crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE,
-                )?;
+                let quarantined =
+                    crate::db::mark_suspending_quarantined(&db, &row.id, blocked_reason)?;
                 drop(db);
                 if !quarantined {
                     crate::metrics::snapshot::create_recovery(
@@ -1139,7 +1166,7 @@ impl SandboxManagerService {
                     SandboxEventSource::SbxManager,
                     SandboxEventDetails::default()
                         .trigger(SandboxEventTrigger::System)
-                        .reason(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
+                        .reason(blocked_reason)
                         .with_from_status(row.state)
                         .with_to_status(SandboxState::Quarantined),
                 );

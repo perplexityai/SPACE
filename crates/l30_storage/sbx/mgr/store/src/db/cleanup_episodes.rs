@@ -10,6 +10,16 @@ pub struct QuarantineRecoveryFence {
 
 pub const SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE: &str =
     "suspend_publish_failed_no_artifact_runtime_gone";
+/// An admitted capture has no conclusive completion evidence. Its runtime may
+/// still be live; deleting its files is not a safe recovery action.
+pub const SUSPEND_CAPTURE_UNRESOLVED: &str = "suspend_capture_unresolved";
+
+fn suspend_evidence_requires_retention(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some(SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE | SUSPEND_CAPTURE_UNRESOLVED)
+    )
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompleteCleanupEpisodeError {
@@ -1136,7 +1146,7 @@ db_private_outside_tests! {
             state.unowned(),
             Some(SandboxState::Failed | SandboxState::Quarantined)
         )
-            && failure_reason == Some(SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
+            && suspend_evidence_requires_retention(failure_reason)
         {
             SandboxEraseSafety::RetainedFilesystemOnlyCopy
         } else {
@@ -1368,7 +1378,7 @@ pub fn complete_row_intent_cleanup_for_job(
     let quarantine_reason = if orphan_cleanup {
         SandboxQuarantineReasonCode::OrphanedSandboxRowMissing
     } else if missing_suspend_artifact
-        || row.failure_reason.as_deref() == Some(SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
+        || suspend_evidence_requires_retention(row.failure_reason.as_deref())
     {
         SandboxQuarantineReasonCode::SuspendSnapshotPublicationFailed
     } else {

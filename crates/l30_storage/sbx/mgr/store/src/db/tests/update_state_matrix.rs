@@ -10,6 +10,7 @@
 //! writes the guards admit, including edges the state machine forbids.
 
 use crate::db::{Connection, Transaction};
+use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_common_core::types::{
     SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode,
 };
@@ -279,7 +280,7 @@ pub(super) fn seed(
     receipt: SandboxState,
 ) -> String {
     let id = insert_row(conn, SandboxState::Paused);
-    begin_teardown_suspend(conn, &id, generation(7)).unwrap();
+    begin_teardown_suspend(conn, &id, generation(7), LocalArtifactId::new()).unwrap();
     shape.install(conn, &id);
     force_state(conn, &id, from);
     set_failure_reason(conn, &id, "seeded failure");
@@ -307,6 +308,24 @@ pub(super) fn applied_diff(
         cells.push(("restore_origin", NULL));
         cells.push(("restore_phase", NULL));
         cells.push(("restore_storage_uri", NULL));
+    }
+    if !matches!(
+        from.lifecycle(),
+        SandboxState::Started
+            | SandboxState::Paused
+            | SandboxState::Stopped
+            | SandboxState::Suspended
+            | SandboxState::Failed
+    ) && matches!(
+        to,
+        SandboxState::Started
+            | SandboxState::Paused
+            | SandboxState::Stopped
+            | SandboxState::Suspended
+            | SandboxState::Failed
+    ) {
+        cells.push(("suspend_attempt_artifact_id", NULL));
+        cells.push(("suspend_attempt_started_at", NULL));
     }
     if receipt != to {
         cells.extend(receipt_cleared(receipt));
@@ -454,7 +473,7 @@ pub(super) fn sweep_quarantine_episode_and_missing_row(writer: Writer) {
         let case = format!("quarantine episode: quarantined -> {to}");
         let conn = test_conn();
         let id = insert_row(&conn, SandboxState::Paused);
-        begin_teardown_suspend(&conn, &id, generation(7)).unwrap();
+        begin_teardown_suspend(&conn, &id, generation(7), LocalArtifactId::new()).unwrap();
         assert!(mark_suspending_quarantined(&conn, &id, "suspend publication failed").unwrap());
         backdate(&conn, &id);
         // Entering quarantine already failed the teardown job, so a deletion

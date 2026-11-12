@@ -1194,8 +1194,8 @@ async fn restore_consumer_cannot_observe_suspend_staging_before_publication() {
     let artifact_lock = coordinator.artifact_lock(sandbox_id);
     let publication_guard = artifact_lock.lock().await;
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let snapshot_dir = tmp.path().join("snapshot");
-    let staging_dir = tmp.path().join("staging");
+    let snapshot_dir = tmp.path().join(sandbox_id).join("snapshot");
+    let staging_dir = tmp.path().join(sandbox_id).join("staging");
     let local_artifact_id = LocalArtifactId::new();
     write_full_suspend_artifact(
         &staging_dir,
@@ -1908,22 +1908,19 @@ async fn teardown_suspend_registration_failure_closes_only_the_requested_generat
             crate::db::TeardownSuspendOperationStatus::Running
         );
     }
-    {
-        let db = service.db.lock().unwrap();
-        crate::db::stage_teardown_suspend_artifact(
-            &db,
-            &sandbox_id.to_string(),
-            generation,
-            LocalArtifactId::new(),
-            "/synthetic/replacement",
-        )
-        .unwrap();
-    }
+    // A late failure for another artifact cannot close this admitted attempt.
+    let stale_missing = teardown_artifact_backup_status(
+        ArtifactBackupSubmissionError::Begin {
+            error: pplx_space_common_jobs::JobError::permanent("registration refused"),
+            superseded_generation: None,
+        },
+        LocalArtifactId::new(),
+    );
     service
         .record_teardown_suspend_driver_failure(
             sandbox_id,
             generation,
-            &missing,
+            &stale_missing,
             Some(&OrgSnapshotConfigResolution::ClusterRowMissing),
         )
         .unwrap();
@@ -1944,14 +1941,6 @@ async fn teardown_suspend_registration_failure_closes_only_the_requested_generat
             status.operation.unwrap().status,
             crate::db::TeardownSuspendOperationStatus::Running
         );
-        crate::db::stage_teardown_suspend_artifact(
-            &db,
-            &sandbox_id.to_string(),
-            generation,
-            failed_artifact,
-            "/synthetic/original",
-        )
-        .unwrap();
         db.execute_batch(
             "CREATE TRIGGER reject_terminal_job BEFORE UPDATE ON jobs
              WHEN NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END",
@@ -2524,7 +2513,7 @@ async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
             crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
         )
         .unwrap();
-        assert!(crate::db::begin_suspend(&conn, &id).unwrap());
+        assert!(crate::db::begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
         let mut captured = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
         match supersession {
             Supersession::CleanupActive => {}
@@ -2553,7 +2542,7 @@ async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
                     crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
                 )
                 .unwrap();
-                assert!(crate::db::begin_suspend(&conn, &id).unwrap());
+                assert!(crate::db::begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
             }
         }
         let before = crate::db::get_sandbox(&conn, &id).unwrap();
@@ -2765,13 +2754,13 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
             None,
         ),
         (
-            "unlistable staging is quarantined",
+            "unreadable staging defers classification",
             false,
             Row::At(SandboxState::Suspending),
             Disk::UnlistableStaging,
             false,
-            Disposition::Cleanup,
-            Some(SandboxState::Quarantined),
+            Disposition::Preserve,
+            Some(SandboxState::Suspending),
         ),
         (
             "no usable artifact is quarantined",
@@ -2888,7 +2877,7 @@ async fn teardown_suspend_driver_completes_a_generation_whose_artifact_is_alread
     let snapshot_dir = snapshot_dir.to_string_lossy();
     let local_artifact_id = LocalArtifactId::new();
     insert_test_sandbox(&conn, &id, SandboxState::Paused);
-    crate::db::begin_teardown_suspend(&conn, &id, generation).unwrap();
+    crate::db::begin_teardown_suspend(&conn, &id, generation, local_artifact_id).unwrap();
     crate::db::stage_teardown_suspend_artifact(
         &conn,
         &id,

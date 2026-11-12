@@ -98,9 +98,12 @@ impl SandboxManagerService {
             } else {
                 Ok(None)
             };
-            let may_retire = match eligible {
-                Ok(Some(row))
-                    if matches!(
+            let stable = eligible
+                .as_ref()
+                .ok()
+                .and_then(|r| r.as_ref())
+                .is_some_and(|row| {
+                    matches!(
                         row.state.unowned(),
                         Some(
                             SandboxState::Started
@@ -108,14 +111,35 @@ impl SandboxManagerService {
                                 | SandboxState::Stopped
                                 | SandboxState::Suspended
                         )
-                    ) =>
-                {
-                    true
+                    )
+                });
+            let (may_retire, protected) = match eligible {
+                Ok(Some(row)) => {
+                    let ownership = self.startup_recovery_db().and_then(|db| {
+                        let attempt = crate::db::read::suspend_attempt(&db, &id)?;
+                        let mut pins = crate::db::read::suspend_staging_pins(&db, &id)?;
+                        if let Some(attempt) = attempt {
+                            pins.push(attempt.artifact_id);
+                        }
+                        Ok((attempt, pins))
+                    });
+                    match ownership {
+                        Ok((attempt, pins)) => (
+                            stable
+                                || (row.state.is_unowned(SandboxState::Suspending)
+                                    && attempt.is_some()),
+                            pins,
+                        ),
+                        Err(error) => {
+                            tracing::warn!(sandbox_id = %id, %error, "cannot establish staging attempt; retaining files");
+                            (false, Vec::new())
+                        }
+                    }
                 }
-                Ok(_) => false,
+                Ok(None) => (false, Vec::new()),
                 Err(error) => {
                     tracing::warn!(sandbox_id = %id, %error, "cannot establish suspend staging owner; retaining files");
-                    false
+                    (false, Vec::new())
                 }
             };
             while remaining > 0 && paths.len() < DELETE_BATCH {
@@ -157,7 +181,7 @@ impl SandboxManagerService {
                     };
                     let canonical =
                         suspend_snapshot_publication::canonical_suspend_snapshot_dir(&sandbox_dir);
-                    match self.hold_disposition(&id, &entry.path(), &canonical, may_retire) {
+                    match self.hold_disposition(&id, &entry.path(), &canonical, stable) {
                         Ok(HoldDisposition::Release) => {
                             match suspend_snapshot_publication::release_retired_suspend_snapshot(
                                 &sandbox_dir,
@@ -194,6 +218,9 @@ impl SandboxManagerService {
                         .strip_prefix(suspend_snapshot_publication::SUSPEND_STAGING_PREFIX)
                         .and_then(|id| id.parse::<LocalArtifactId>().ok())
                 {
+                    if protected.contains(&artifact) {
+                        continue;
+                    }
                     let retired = entry
                         .path()
                         .with_file_name(format!("{RETIRED_PREFIX}{artifact}"));

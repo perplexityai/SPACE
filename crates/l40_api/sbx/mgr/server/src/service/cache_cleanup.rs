@@ -223,7 +223,8 @@ pub(super) fn is_sandbox_running(sandbox_id: &str) -> bool {
 
 pub(super) fn is_sandbox_running_in(run_dir: &Path, sandbox_id: &str) -> bool {
     let link_path = run_dir.join(sandbox_id).join("fc.pid");
-    // Path::exists() follows the symlink — returns true only if /proc/{pid} exists
+    // Follow the runtime's /proc link. Capture recovery uses its own fallible
+    // probe because it must distinguish an unreadable path from confirmed exit.
     link_path.exists()
 }
 

@@ -269,39 +269,6 @@ fn rejects_traversal_and_degenerate_components() {
     assert!(validate_cache_artifact_path("/other/root/foo").is_err());
 }
 
-/// A timed-out RPC must not release the capture's ownership before its actual
-/// work completes. This uses the same wait boundary as capture_runtime_state.
-#[tokio::test(start_paused = true)]
-async fn detached_capture_finishes_its_cleanup_after_the_caller_cancels() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-    let mounts = Arc::new(AtomicUsize::new(0));
-    let tracker = tokio_util::task::TaskTracker::new();
-    let (release, pending) = tokio::sync::oneshot::channel();
-    let observed = mounts.clone();
-    let body = super::run_detached(tracker.clone(), "test capture", async move {
-        observed.fetch_add(1, Ordering::SeqCst);
-        pending.await.unwrap();
-        observed.fetch_sub(1, Ordering::SeqCst);
-        Ok::<_, tonic::Status>(())
-    });
-    let error = super::wait_for_capture(async { body.await? })
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
-    assert_eq!(
-        mounts.load(Ordering::SeqCst),
-        1,
-        "capture lost its owner at the caller deadline"
-    );
-    release.send(()).unwrap();
-    tracker.close();
-    tracker.wait().await;
-    assert_eq!(mounts.load(Ordering::SeqCst), 0);
-}
-
 #[test]
 fn snapshot_dispatch_uses_the_recorded_boot_contract() {
     use pplx_space_common_core::types::Arch;
@@ -574,7 +541,7 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
             "path does not belong to this sandbox",
         ),
         (
-            "encrypted capture without a lease",
+            "encrypted capture without its required staging directory",
             CaptureVmStateRequest {
                 storage: Some(crate::proto::VmStateStorage {
                     encrypted_volume_mount: Some(snapshot_volume(&fixture.unallocated_id)),
@@ -582,8 +549,8 @@ async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
                 }),
                 ..unallocated.clone()
             },
-            Code::Unavailable,
-            "snapshot lease is no longer active",
+            Code::InvalidArgument,
+            "encrypted capture requires its staging directory",
         ),
     ];
     let mut mismatches = Vec::new();
@@ -883,4 +850,273 @@ async fn instance_restore_accepts_only_internal_snapshots() {
             "{name}: {error}"
         );
     }
+}
+
+#[tokio::test]
+async fn abandoned_capture_handler_finishes_queued_running_and_stopping_attempts() {
+    use crate::runtime_supervisor_client::tests::{SupervisorScript, scripted_in_process_client};
+    use crate::service::tests::service_tests::{
+        allocate_test_lease, bind_test_execution, root_request,
+    };
+    use pplx_space_common_core::types::LocalArtifactId;
+    use pplx_space_node_mgr_client::capture_receipt::{COMMITTED, INTENT, STAGING_PREFIX};
+    use std::{
+        future::{Future, poll_fn},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::Poll,
+        time::Duration,
+    };
+
+    for phase in [
+        "queued",
+        "capturing",
+        "stopping",
+        "stop_failed",
+        "capture_failed",
+        "fence_refused",
+        "lease_refused",
+    ] {
+        let mut service = crate::service::tests::service_tests::service_for_unit_tests().await;
+        let id = super::SandboxId::new().to_string();
+        let mut fence = bind_test_execution(&service, &id);
+        if phase != "lease_refused" {
+            allocate_test_lease(&service, &id);
+        }
+        if phase == "fence_refused" {
+            fence.execution_id = uuid::Uuid::now_v7().to_string();
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let artifact = LocalArtifactId::new();
+        let staging = cache
+            .path()
+            .join(&id)
+            .join("snapshots")
+            .join(format!("{STAGING_PREFIX}{artifact}"));
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join(INTENT),
+            serde_json::to_vec(
+                &serde_json::json!({"sandbox_id": id, "local_artifact_id": artifact}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let drains = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let stopping = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        service.encrypted_capture_io = Some(super::EncryptedCaptureTestIo {
+            cache: cache.path().to_owned(),
+            drain: Arc::new({
+                let (drains, staging) = (drains.clone(), staging.clone());
+                move || {
+                    assert!(
+                        staging.join(COMMITTED).exists(),
+                        "bind drain follows durable completion"
+                    );
+                    drains.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(()) })
+                }
+            }),
+            capture: Arc::new({
+                let (captures, started, finish) =
+                    (captures.clone(), started.clone(), finish.clone());
+                move || {
+                    let (captures, started, finish) =
+                        (captures.clone(), started.clone(), finish.clone());
+                    Box::pin(async move {
+                        captures.fetch_add(1, Ordering::SeqCst);
+                        if phase == "capture_failed" {
+                            return Err(tonic::Status::internal(
+                                "synthetic in-place capture failure",
+                            ));
+                        }
+                        started.notify_one();
+                        if phase == "capturing" {
+                            finish.notified().await;
+                        }
+                        Ok(())
+                    })
+                }
+            }),
+        });
+        service.runtime_supervisor = scripted_in_process_client(SupervisorScript {
+            stop_runtime: Some(Arc::new({
+                let (stops, stopping, staging) = (stops.clone(), stopping.clone(), staging.clone());
+                move |_| {
+                    assert!(
+                        !staging.join(COMMITTED).exists(),
+                        "receipt must follow confirmed stop"
+                    );
+                    let n = stops.fetch_add(1, Ordering::SeqCst);
+                    stopping.notify_one();
+                    if phase == "stop_failed" {
+                        return Err(tonic::Status::failed_precondition("synthetic stop failure"));
+                    }
+                    if phase == "stopping" && n == 0 {
+                        return Err(tonic::Status::unavailable("still stopping"));
+                    }
+                    Ok(Default::default())
+                }
+            })),
+            ..Default::default()
+        });
+        let queued = if phase == "queued" {
+            Some(service.lock_sandbox_vm_cgroup_launch(&id).await)
+        } else {
+            None
+        };
+        let request = root_request(crate::proto::CaptureVmStateRequest {
+            sandbox_id: id.clone(),
+            execution_fence: Some(fence),
+            artifacts: crate::snapshot_request::tests::artifacts(
+                "/vmstate".into(),
+                "/memory".into(),
+            ),
+            storage: Some(crate::proto::VmStateStorage {
+                directory: Some(staging.to_string_lossy().into_owned()),
+                encrypted_volume_mount: Some(snapshot_volume(&id)),
+            }),
+            ..Default::default()
+        });
+        let mut handler = Box::pin(service.capture_vm_state(request));
+        poll_fn(|cx| {
+            assert!(handler.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        if phase == "capturing" {
+            tokio::time::timeout(Duration::from_secs(5), started.notified())
+                .await
+                .unwrap();
+        }
+        if phase == "stopping" {
+            tokio::time::timeout(Duration::from_secs(5), stopping.notified())
+                .await
+                .unwrap();
+        }
+        drop(handler);
+        drop(queued);
+        finish.notify_one();
+        service.device_op_tasks.close();
+        tokio::time::timeout(Duration::from_secs(10), service.device_op_tasks.wait())
+            .await
+            .unwrap();
+        let refused = matches!(phase, "fence_refused" | "lease_refused");
+        let completed = !refused && !matches!(phase, "capture_failed" | "stop_failed");
+        assert_eq!(
+            captures.load(Ordering::SeqCst),
+            usize::from(!refused),
+            "{phase}"
+        );
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            if refused || phase == "capture_failed" {
+                0
+            } else if phase == "stopping" {
+                2
+            } else {
+                1
+            },
+            "{phase}"
+        );
+        assert_eq!(
+            drains.load(Ordering::SeqCst),
+            usize::from(completed),
+            "{phase}"
+        );
+        assert_eq!(staging.join(COMMITTED).exists(), completed, "{phase}");
+        assert!(
+            !staging.join(INTENT).exists(),
+            "{phase}: the owner durably settled"
+        );
+        assert_eq!(
+            staging
+                .join(pplx_space_node_mgr_client::capture_receipt::FAILED)
+                .exists(),
+            !refused && !completed,
+            "{phase}"
+        );
+        assert_eq!(
+            staging
+                .join(pplx_space_node_mgr_client::capture_receipt::REFUSED)
+                .exists(),
+            refused,
+            "{phase}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cloud_hypervisor_pre_capture_refusal_never_stops_the_runtime() {
+    use crate::runtime_supervisor_client::tests::{SupervisorScript, scripted_in_process_client};
+    use crate::service::tests::service_tests::{bind_test_execution, service_for_unit_tests};
+    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_node_mgr_client::capture_receipt::{INTENT, REFUSED, STAGING_PREFIX};
+    let mut service = service_for_unit_tests().await;
+    let sandbox = SandboxId::new();
+    let artifact = pplx_space_common_core::types::LocalArtifactId::new();
+    let root = tempfile::tempdir().unwrap();
+    let staging = root
+        .path()
+        .join(sandbox.to_string())
+        .join("snapshots")
+        .join(format!("{STAGING_PREFIX}{artifact}"));
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(
+        staging.join(INTENT),
+        serde_json::to_vec(&serde_json::json!({
+            "sandbox_id": sandbox.to_string(), "local_artifact_id": artifact
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let receipt =
+        super::capture_receipt::CaptureReceipt::open_under(root.path(), sandbox, &staging).unwrap();
+    service.runtime_supervisor = scripted_in_process_client(SupervisorScript {
+        stop_runtime: Some(std::sync::Arc::new(|_| {
+            panic!("a refusal must not stop the runtime")
+        })),
+        ..Default::default()
+    });
+    let request =
+        crate::snapshot_request::StateCapture::try_from(crate::proto::CaptureVmStateRequest {
+            sandbox_id: sandbox.to_string(),
+            execution_fence: Some(bind_test_execution(&service, &sandbox.to_string())),
+            storage: Some(crate::proto::VmStateStorage {
+                directory: Some(staging.to_string_lossy().into_owned()),
+                encrypted_volume_mount: Some(snapshot_volume(&sandbox.to_string())),
+            }),
+            artifacts: crate::snapshot_request::tests::artifacts(
+                "/vmstate".into(),
+                "/memory".into(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut destination = super::CaptureDestination::Encrypted(
+        pplx_space_common_core::types::NodeSpacePath::parse(snapshot_volume(&sandbox.to_string()))
+            .unwrap(),
+        receipt,
+    );
+    let result = service
+        .capture_cloud_hypervisor_state(
+            tonic::Request::new(request),
+            &mut destination,
+            pplx_space_node_runtime_core::boot::BootSource::LinuxDirect,
+        )
+        .await;
+    assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+    let super::CaptureDestination::Encrypted(_, receipt) = destination else {
+        unreachable!();
+    };
+    assert!(!receipt.capture_started());
+    receipt.settle_error().await.unwrap();
+    assert!(staging.join(REFUSED).exists());
+    assert!(!staging.join(INTENT).exists());
 }

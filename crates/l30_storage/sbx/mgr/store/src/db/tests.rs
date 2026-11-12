@@ -302,7 +302,7 @@ fn cleanup_intent_cannot_be_replaced_by_suspend_or_resident_completion() {
                     refusal: StateWriteRefusal::Guard(StateWriteGuard::CleanupOwned),
                 }
             );
-            assert!(!begin_suspend(&conn, &id).unwrap());
+            assert!(!begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
             let row = get_sandbox(&conn, &id).unwrap().unwrap();
             assert_eq!(row.state, expected);
             assert_eq!(row.cleanup_completion, Some(CleanupCompletion::DeleteRow));
@@ -313,8 +313,8 @@ fn cleanup_intent_cannot_be_replaced_by_suspend_or_resident_completion() {
         &conn,
         TestSandboxInsert::new(&id, "sandbox2", SandboxState::Paused),
     );
-    assert!(begin_suspend(&conn, &id).unwrap());
-    assert!(!begin_suspend(&conn, &id).unwrap());
+    assert!(begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
+    assert!(!begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
 }
 
 #[test]
@@ -1991,7 +1991,7 @@ fn suspend_snapshot_publication_exposes_identity_only_with_terminal_state() {
         crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
     )
     .unwrap();
-    begin_suspend(&conn, &sandbox_id).unwrap();
+    begin_suspend(&conn, &sandbox_id, LocalArtifactId::new()).unwrap();
     let accepted = get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
     assert_eq!(
         accepted.state,
@@ -2053,7 +2053,27 @@ fn teardown_suspend_keeps_the_runtime_until_the_staged_artifact_is_durable() {
     let local_artifact_id = LocalArtifactId::new();
     let generation = ExecutionGeneration::new(1).unwrap();
 
-    begin_teardown_suspend(&conn, "sandbox-1", generation).unwrap();
+    begin_teardown_suspend(&conn, "sandbox-1", generation, local_artifact_id).unwrap();
+    let wrong = LocalArtifactId::new();
+    let before = get_sandbox(&conn, "sandbox-1").unwrap().unwrap();
+    assert!(
+        stage_teardown_suspend_artifact(
+            &conn,
+            "sandbox-1",
+            generation,
+            wrong,
+            "/cache/sandbox-1/wrong",
+        )
+        .is_err()
+    );
+    let after = get_sandbox(&conn, "sandbox-1").unwrap().unwrap();
+    assert_eq!(after.state, before.state);
+    assert_eq!(
+        after.current_local_artifact_id,
+        before.current_local_artifact_id
+    );
+    assert_eq!(after.updated_at, before.updated_at);
+    assert!(get_local_artifact(&conn, wrong).unwrap().is_none());
     stage_teardown_suspend_artifact(
         &conn,
         "sandbox-1",
@@ -2130,7 +2150,7 @@ fn retried_suspend_cleanup_retains_publication_identity_for_pinned_artifact() {
     )
     .unwrap();
     let local_artifact_id = LocalArtifactId::new();
-    begin_teardown_suspend(&conn, &sandbox_id, generation).unwrap();
+    begin_teardown_suspend(&conn, &sandbox_id, generation, local_artifact_id).unwrap();
     stage_teardown_suspend_artifact(
         &conn,
         &sandbox_id,
@@ -2163,7 +2183,13 @@ fn teardown_suspend_journal_persists_the_local_execution_lease() {
         &conn,
         TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Paused),
     );
-    begin_teardown_suspend(&conn, "sandbox-1", ExecutionGeneration::new(7).unwrap()).unwrap();
+    begin_teardown_suspend(
+        &conn,
+        "sandbox-1",
+        ExecutionGeneration::new(7).unwrap(),
+        LocalArtifactId::new(),
+    )
+    .unwrap();
 
     let (payload, dedup_key): (String, String) = conn
         .query_row(
@@ -2293,7 +2319,7 @@ fn restaging_the_same_teardown_artifact_preserves_its_durability_marker() {
     let local_artifact_id = LocalArtifactId::new();
     let generation = ExecutionGeneration::new(1).unwrap();
 
-    begin_teardown_suspend(&conn, "sandbox-1", generation).unwrap();
+    begin_teardown_suspend(&conn, "sandbox-1", generation, local_artifact_id).unwrap();
     stage_teardown_suspend_artifact(
         &conn,
         "sandbox-1",
@@ -2346,7 +2372,7 @@ fn suspended_cleanup_completion_dedupes_prior_suspend_row() {
     );
 
     // First suspend: Paused -> Suspending -> Suspended pinned on A1.
-    begin_suspend(&conn, "sandbox-1").unwrap();
+    begin_suspend(&conn, "sandbox-1", LocalArtifactId::new()).unwrap();
     let a1 = LocalArtifactId::new();
     complete_row_intent_cleanup(
         &conn,
@@ -2359,7 +2385,7 @@ fn suspended_cleanup_completion_dedupes_prior_suspend_row() {
 
     // Simulate a wake-and-resuspend cycle, including its stable paused state.
     state_write_fixtures::force_state(&conn, "sandbox-1", SandboxState::Paused);
-    assert!(begin_suspend(&conn, "sandbox-1").unwrap());
+    assert!(begin_suspend(&conn, "sandbox-1", LocalArtifactId::new()).unwrap());
     let a2 = LocalArtifactId::new();
     complete_row_intent_cleanup(
         &conn,
@@ -2416,7 +2442,7 @@ fn publish_restored_suspended_artifact_dedupes_prior_suspend_row() {
         &conn,
         TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Paused),
     );
-    begin_suspend(&conn, "sandbox-1").unwrap();
+    begin_suspend(&conn, "sandbox-1", LocalArtifactId::new()).unwrap();
     let a1 = LocalArtifactId::new();
     complete_row_intent_cleanup(
         &conn,
@@ -10293,4 +10319,105 @@ fn an_unknown_previous_status_is_reported_as_stored() {
     );
     assert_eq!(details.from_state.as_deref(), Some("stopping"));
     assert_eq!(details.from_cleanup_state.as_deref(), Some("failed"));
+}
+
+#[test]
+fn suspend_attempt_is_atomic_immutable_and_cleared_only_on_resolution() {
+    let conn = test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new(&id, "attempt1", SandboxState::Paused),
+    );
+    assert!(read::suspend_attempt(&conn, &id).unwrap().is_none());
+    let artifact = LocalArtifactId::new();
+    assert!(begin_suspend(&conn, &id, artifact).unwrap());
+    let attempt = read::suspend_attempt(&conn, &id).unwrap().unwrap();
+    assert_eq!(attempt.artifact_id, artifact);
+    assert!(!begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
+    conn.execute(
+        "UPDATE sandboxes SET updated_at = updated_at + 3600 WHERE id = ?1",
+        [&id],
+    )
+    .unwrap();
+    assert_eq!(read::suspend_attempt(&conn, &id).unwrap(), Some(attempt));
+    let down = include_str!(
+        "../../../../../../../db/sandbox-manager/20261112160000_suspend_attempt.down.sql"
+    );
+    // A rollback cannot silently discard unresolved ownership.
+    assert!(conn.execute_batch(down).is_err());
+    conn.execute_batch("DROP TABLE IF EXISTS temp.suspend_attempt_rollback_guard")
+        .unwrap();
+    assert!(rollback_suspending_to_paused(&conn, &id).unwrap());
+    assert!(read::suspend_attempt(&conn, &id).unwrap().is_none());
+    assert!(begin_suspend(&conn, &id, artifact).unwrap());
+    pin_suspended_artifact_for_cleanup(&conn, &id, artifact, "/synthetic/snapshot").unwrap();
+    assert!(
+        read::suspend_attempt(&conn, &id).unwrap().is_some(),
+        "cleanup retains the attempt"
+    );
+}
+
+#[test]
+fn cleanup_and_eviction_keep_the_capture_attempt_until_physical_work_settles() {
+    for completion in [
+        CleanupCompletion::DeleteRow,
+        CleanupCompletion::MarkStopped,
+        CleanupCompletion::MarkSuspended,
+    ] {
+        let conn = test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(
+            &conn,
+            TestSandboxInsert::new(&id, "cleanup1", SandboxState::Paused),
+        );
+        assert!(begin_suspend(&conn, &id, LocalArtifactId::new()).unwrap());
+        let attempt = read::suspend_attempt(&conn, &id).unwrap();
+        mark_cleanup_required(
+            &conn,
+            &id,
+            true,
+            completion,
+            "synthetic interrupted cleanup",
+        )
+        .unwrap();
+        assert_eq!(
+            read::suspend_attempt(&conn, &id).unwrap(),
+            attempt,
+            "{completion:?}"
+        );
+    }
+    let conn = test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new(&id, "evict001", SandboxState::Paused),
+    );
+    let generation = ExecutionGeneration::new(1).unwrap();
+    let artifact = LocalArtifactId::new();
+    begin_teardown_suspend(&conn, &id, generation, artifact).unwrap();
+    let attempt = read::suspend_attempt(&conn, &id).unwrap();
+    stage_teardown_suspend_artifact(&conn, &id, generation, artifact, "/synthetic/snapshot")
+        .unwrap();
+    fail_teardown_suspend_backup_operation(&conn, &id, generation, artifact).unwrap();
+    let changed_at: String = conn
+        .query_row(
+            "SELECT state_changed_at FROM sandboxes WHERE id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        claim_teardown_suspend_failed_sandbox_for_eviction(&conn, &id, artifact, &changed_at)
+            .unwrap()
+    );
+    assert_eq!(read::suspend_attempt(&conn, &id).unwrap(), attempt);
+    assert_eq!(
+        sandbox_erase_safety(
+            SandboxState::Quarantined,
+            None,
+            Some(SUSPEND_CAPTURE_UNRESOLVED)
+        ),
+        SandboxEraseSafety::RetainedFilesystemOnlyCopy
+    );
 }

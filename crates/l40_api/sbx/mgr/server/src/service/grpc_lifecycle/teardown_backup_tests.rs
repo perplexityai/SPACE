@@ -267,6 +267,7 @@ async fn teardown_retry_seals_publishes_backs_up_and_completes_the_same_capture(
         let cache = tempfile::tempdir().unwrap();
         let (capture, _) =
             record_encrypted_capture_in(cache.path(), &id, std::time::Duration::ZERO, true);
+        conn.execute("UPDATE sandboxes SET suspend_attempt_artifact_id = ?1, suspend_attempt_started_at = ?2 WHERE id = ?3", crate::db::fixture::params![capture.to_string(), jiff::Timestamp::now().as_second(), &id]).unwrap();
         let node_manager = sealing_node_manager_builder(1)
             .unary("CleanupSandbox", |_: CleanupSandboxRequest| {
                 Ok(CleanupSandboxResponse::default())
@@ -594,7 +595,14 @@ async fn node_local_handoff(
     fields.space_api_route_identity.substrate_kind =
         Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
     crate::db::update_runtime_fields(&conn, sandbox_id, fields).unwrap();
-    assert!(crate::db::begin_suspend(&conn, &id).unwrap());
+    assert!(
+        crate::db::begin_suspend(
+            &conn,
+            &id,
+            pplx_space_common_core::types::LocalArtifactId::new()
+        )
+        .unwrap()
+    );
     let mut options = SandboxManagerServiceOptions {
         volume_manager_socket_path: volume_manager.socket.clone(),
         ..SandboxManagerServiceOptions::for_test_in(scratch)
@@ -1095,7 +1103,14 @@ async fn upload_after_refused_handoff(after: AfterRefusedHandoff) -> String {
         AfterRefusedHandoff::Paused => SandboxState::Paused,
         AfterRefusedHandoff::Resuspends => {
             let db = service.db.lock().unwrap();
-            assert!(crate::db::begin_suspend(&db, &id).unwrap());
+            assert!(
+                crate::db::begin_suspend(
+                    &db,
+                    &id,
+                    pplx_space_common_core::types::LocalArtifactId::new()
+                )
+                .unwrap()
+            );
             SandboxState::Suspending
         }
         AfterRefusedHandoff::Quarantined | AfterRefusedHandoff::QuarantinedLive => {

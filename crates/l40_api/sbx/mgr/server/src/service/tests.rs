@@ -8392,8 +8392,14 @@ pub(crate) mod service_tests {
             crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
         )
         .unwrap();
-        crate::db::begin_teardown_suspend(conn, &sandbox_id_string, execution_generation).unwrap();
         let local_artifact_id = LocalArtifactId::new();
+        crate::db::begin_teardown_suspend(
+            conn,
+            &sandbox_id_string,
+            execution_generation,
+            local_artifact_id,
+        )
+        .unwrap();
         crate::db::stage_teardown_suspend_artifact(
             conn,
             &sandbox_id_string,
@@ -9963,7 +9969,8 @@ pub(crate) mod service_tests {
 
         {
             let conn = service.db_conn().unwrap();
-            crate::db::begin_suspend(&conn, &sandbox_id.to_string()).unwrap();
+            crate::db::begin_suspend(&conn, &sandbox_id.to_string(), LocalArtifactId::new())
+                .unwrap();
             crate::db::complete_row_intent_cleanup(
                 &conn,
                 &sandbox_id.to_string(),
@@ -12272,7 +12279,8 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
         let local_artifact_id = LocalArtifactId::new();
         let generation = teardown_generation();
-        crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation).unwrap();
+        crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation, local_artifact_id)
+            .unwrap();
         crate::db::stage_teardown_suspend_artifact(
             &conn,
             &sandbox_id,
@@ -12993,8 +13001,13 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
         let local_artifact_id = LocalArtifactId::new();
-        crate::db::begin_teardown_suspend(&conn, &sandbox_id, ExecutionGeneration::new(2).unwrap())
-            .unwrap();
+        crate::db::begin_teardown_suspend(
+            &conn,
+            &sandbox_id,
+            ExecutionGeneration::new(2).unwrap(),
+            local_artifact_id,
+        )
+        .unwrap();
         crate::db::stage_teardown_suspend_artifact(
             &conn,
             &sandbox_id,
@@ -13047,6 +13060,7 @@ pub(crate) mod service_tests {
             &conn,
             &sandbox_id.to_string(),
             ExecutionGeneration::new(1).unwrap(),
+            LocalArtifactId::new(),
         )
         .unwrap();
         crate::db::test_fixtures::state_write_fixtures::apply_edge(
@@ -13274,7 +13288,8 @@ pub(crate) mod service_tests {
             runtime_fields(generation, 7),
         )
         .unwrap();
-        crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation).unwrap();
+        crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation, LocalArtifactId::new())
+            .unwrap();
         let service = service_for_teardown_test(conn);
 
         let response = service
@@ -13315,8 +13330,13 @@ pub(crate) mod service_tests {
             runtime_fields(teardown_generation(), 7),
         )
         .unwrap();
-        crate::db::begin_teardown_suspend(&conn, &sandbox_id.to_string(), teardown_generation())
-            .unwrap();
+        crate::db::begin_teardown_suspend(
+            &conn,
+            &sandbox_id.to_string(),
+            teardown_generation(),
+            LocalArtifactId::new(),
+        )
+        .unwrap();
         let service = service_for_teardown_test(conn);
         let wake_lock = service.auto_lifecycle.wake_lock(&sandbox_id.to_string());
         let wake_guard = wake_lock.lock_owned().await;
@@ -13503,7 +13523,7 @@ pub(crate) mod service_tests {
             crate::db::fixture::params![predecessor.to_string(), id],
         )
         .unwrap();
-        assert!(crate::db::begin_suspend(conn, id).unwrap());
+        assert!(crate::db::begin_suspend(conn, id, LocalArtifactId::new()).unwrap());
         predecessor
     }
 
@@ -13564,12 +13584,6 @@ pub(crate) mod service_tests {
             crate::snapshot_encryption::capture_volume_is_fresh(&started),
             "a successful cold start must not reuse an older suspend memory image"
         );
-    }
-
-    #[test]
-    fn failed_encrypted_capture_keeps_live_memory_base_mounted() {
-        assert!(!super::grpc_lifecycle::failed_encrypted_capture_may_release_volume(true));
-        assert!(super::grpc_lifecycle::failed_encrypted_capture_may_release_volume(false));
     }
 
     #[tokio::test]
@@ -15788,7 +15802,10 @@ pub(crate) mod service_tests {
         let id = SandboxId::new().to_string();
         insert_suspending_resuspend(&conn, &id);
         let cache = tempfile::tempdir().unwrap();
-        let artifact_id = LocalArtifactId::new();
+        let artifact_id = crate::db::read::suspend_attempt(&conn, &id)
+            .unwrap()
+            .unwrap()
+            .artifact_id;
         let staging = suspend_snapshot_staging_dir(&cache.path().join(&id), artifact_id);
         write_full_suspend_artifact(&staging, &id, artifact_id, b"retained-capture");
         let service = service_with_runtime_probe(conn, false);
@@ -15881,7 +15898,10 @@ pub(crate) mod service_tests {
         insert_suspending_resuspend(&conn, &id);
         let cache = tempfile::tempdir().unwrap();
         let sandbox_dir = cache.path().join(&id);
-        let artifact_id = LocalArtifactId::new();
+        let artifact_id = crate::db::read::suspend_attempt(&conn, &id)
+            .unwrap()
+            .unwrap()
+            .artifact_id;
         let staging = suspend_snapshot_staging_dir(&sandbox_dir, artifact_id);
         let _bundle =
             write_deferred_suspend_artifact(&staging, &id, artifact_id, uuid::Uuid::now_v7(), 64);
@@ -15927,7 +15947,10 @@ pub(crate) mod service_tests {
             let id = SandboxId::new().to_string();
             insert_suspending_resuspend(&conn, &id);
             let cache = tempfile::tempdir().unwrap();
-            let artifact_id = LocalArtifactId::new();
+            let artifact_id = crate::db::read::suspend_attempt(&conn, &id)
+                .unwrap()
+                .unwrap()
+                .artifact_id;
             let source_id = uuid::Uuid::now_v7();
             let staging = suspend_snapshot_staging_dir(&cache.path().join(&id), artifact_id);
             let bundle = write_deferred_suspend_artifact(&staging, &id, artifact_id, source_id, 64);
@@ -16279,10 +16302,11 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
         let generation = teardown_generation();
-        crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation).unwrap();
+        let local_artifact_id = LocalArtifactId::new();
+        crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation, local_artifact_id)
+            .unwrap();
 
         let cache_dir = tempfile::tempdir().unwrap();
-        let local_artifact_id = LocalArtifactId::new();
         let snapshot_dir = canonical_suspend_snapshot_dir(&cache_dir.path().join(&sandbox_id));
         write_full_suspend_artifact(
             &snapshot_dir,
@@ -16327,10 +16351,16 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
-            crate::db::begin_teardown_suspend(&conn, &sandbox_id, teardown_generation()).unwrap();
+            let local_artifact_id = LocalArtifactId::new();
+            crate::db::begin_teardown_suspend(
+                &conn,
+                &sandbox_id,
+                teardown_generation(),
+                local_artifact_id,
+            )
+            .unwrap();
 
             let cache_dir = tempfile::tempdir().unwrap();
-            let local_artifact_id = LocalArtifactId::new();
             let sandbox_dir = cache_dir.path().join(&sandbox_id);
             let snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir);
             let written_dir = if staged {
@@ -16408,7 +16438,10 @@ pub(crate) mod service_tests {
         assert!(admitted.current_local_artifact_id.is_none());
 
         let cache_dir = tempfile::tempdir().unwrap();
-        let local_artifact_id = LocalArtifactId::new();
+        let local_artifact_id = crate::db::read::suspend_attempt(&conn, &sandbox_id)
+            .unwrap()
+            .unwrap()
+            .artifact_id;
         let sandbox_dir = cache_dir.path().join(&sandbox_id);
         let snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir);
         write_full_suspend_artifact(
@@ -17397,7 +17430,7 @@ pub(crate) mod service_tests {
             }
             {
                 let db = service.db_conn().unwrap();
-                crate::db::begin_suspend(&db, &id.to_string()).unwrap();
+                crate::db::begin_suspend(&db, &id.to_string(), LocalArtifactId::new()).unwrap();
                 crate::db::complete_row_intent_cleanup(
                     &db,
                     &id.to_string(),
@@ -17683,7 +17716,7 @@ pub(crate) mod service_tests {
             {
                 // Teardown retires the route binding; only the end state differs.
                 let db = service.db_conn().unwrap();
-                crate::db::begin_suspend(&db, &id.to_string()).unwrap();
+                crate::db::begin_suspend(&db, &id.to_string(), LocalArtifactId::new()).unwrap();
                 crate::db::complete_row_intent_cleanup(
                     &db,
                     &id.to_string(),
@@ -19046,9 +19079,7 @@ pub(crate) mod service_tests {
                 blocking: true,
                 start_context: Some(pplx_space_sbx_mgr_client::proto::WakeStartContext {
                     netns_path: Some("/var/run/netns/test".to_string()),
-                    expected_local_artifact_id: Some(
-                        pplx_space_common_core::types::LocalArtifactId::new().to_string(),
-                    ),
+                    expected_local_artifact_id: Some(LocalArtifactId::new().to_string()),
                     suspend_restore_storage_uri: Some(format!(
                         "s3://snapshots/suspend/{sandbox_id}/{}?region=us-east-1",
                         Uuid::now_v7()
@@ -19321,9 +19352,7 @@ pub(crate) mod service_tests {
                 blocking: true,
                 start_context: Some(pplx_space_sbx_mgr_client::proto::WakeStartContext {
                     netns_path: Some("/var/run/netns/test".to_string()),
-                    expected_local_artifact_id: Some(
-                        pplx_space_common_core::types::LocalArtifactId::new().to_string(),
-                    ),
+                    expected_local_artifact_id: Some(LocalArtifactId::new().to_string()),
                     suspend_restore_storage_uri: Some(format!(
                         "s3://snapshots/suspend/{sandbox_id}/{}?region=us-east-1",
                         Uuid::now_v7()

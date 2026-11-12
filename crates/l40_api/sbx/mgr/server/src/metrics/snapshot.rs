@@ -226,7 +226,9 @@ pub fn create_bytes(kind: &str, codec: &str, encrypted: bool, artifact: &str, by
     counter("snapshot.create.bytes", bytes, &tags);
 }
 
-/// Startup recovery outcome for an interrupted snapshot-create publication.
+/// Recovery observations for interrupted snapshot publication. The
+/// `receipt_runtime_live` outcome counts blocked observations, not attempts;
+/// it reports contradictory producer evidence without renewing the retry clock.
 pub fn create_recovery(kind: &str, outcome: &str) {
     counter(
         "snapshot.create.recovery",

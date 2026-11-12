@@ -701,3 +701,45 @@ async fn immediate_reclaim_backlog_uses_each_entrys_own_node_manager() {
         [first, second, drainer].map(|path| vec![path.to_string_lossy().into_owned()])
     );
 }
+
+#[tokio::test]
+async fn newer_attempt_does_not_let_stale_intent_block_recovery_forever() {
+    let cache = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Paused);
+    let a = LocalArtifactId::new();
+    let b = LocalArtifactId::new();
+    let root = cache.path().join(&id);
+    let stale = suspend_snapshot_publication::suspend_snapshot_staging_dir(&root, a);
+    let current = suspend_snapshot_publication::suspend_snapshot_staging_dir(&root, b);
+    assert!(crate::db::begin_suspend(&conn, &id, a).unwrap());
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(
+        stale.join(pplx_space_node_mgr_client::capture_receipt::INTENT),
+        b"A",
+    )
+    .unwrap();
+    assert!(crate::db::rollback_suspending_to_paused(&conn, &id).unwrap());
+    // A pre-submission failure rolled back; its staging cleanup failed.
+    assert!(crate::db::begin_suspend(&conn, &id, b).unwrap());
+    std::fs::create_dir_all(&current).unwrap();
+    let service = SandboxManagerService::for_test(conn);
+    let guard = service
+        .auto_lifecycle
+        .artifact_lock(&id)
+        .lock_for_capture()
+        .await;
+    assert!(sweep(&service, cache.path()).is_empty());
+    drop(guard);
+    let retired = stale.with_file_name(format!("{RETIRED_PREFIX}{a}"));
+    assert_eq!(
+        sweep(&service, cache.path()),
+        HashSet::from([retired.clone()])
+    );
+    assert!(current.exists());
+    assert!(!stale.exists());
+    // A failed unlink is rediscovered. The GC namespace is not publication
+    // evidence; it does not reintroduce an ambiguous capture candidate.
+    assert_eq!(sweep(&service, cache.path()), HashSet::from([retired]));
+}

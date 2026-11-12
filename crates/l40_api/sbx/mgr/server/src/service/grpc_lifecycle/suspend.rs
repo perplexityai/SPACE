@@ -533,7 +533,7 @@ impl SandboxManagerService {
             let db = self.db_conn()?;
             match context.durability {
                 SuspendDurability::NodeLocal => {
-                    let applied = crate::db::begin_suspend(&db, &sandbox.id)
+                    let applied = crate::db::begin_suspend(&db, &sandbox.id, local_artifact_id)
                         .map_err(|e| Status::internal(format!("db error: {e}")))?;
                     if !applied {
                         return Err(Status::aborted("suspend admission superseded"));
@@ -542,8 +542,13 @@ impl SandboxManagerService {
                 }
                 SuspendDurability::RemoteBeforeTeardown {
                     execution_generation,
-                } => crate::db::begin_teardown_suspend(&db, &sandbox.id, execution_generation)
-                    .map(|_| ()),
+                } => crate::db::begin_teardown_suspend(
+                    &db,
+                    &sandbox.id,
+                    execution_generation,
+                    local_artifact_id,
+                )
+                .map(|_| ()),
             }
             .map_err(|e| Status::internal(format!("db error: {e}")))?;
         }

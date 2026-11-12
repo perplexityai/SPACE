@@ -14,7 +14,7 @@ use crate::state::SandboxState;
 
 pub(super) const LOCAL_SNAPSHOT_DIR: &str = "snapshot";
 const SUSPEND_STAGING_PARENT_DIR: &str = "snapshots";
-pub(super) const SUSPEND_STAGING_PREFIX: &str = ".suspend-publish-";
+pub(super) use pplx_space_node_mgr_client::capture_receipt::STAGING_PREFIX as SUSPEND_STAGING_PREFIX;
 
 pub(super) fn canonical_suspend_snapshot_dir(sandbox_dir: &Path) -> PathBuf {
     sandbox_dir.join(LOCAL_SNAPSHOT_DIR)
@@ -36,7 +36,7 @@ pub(super) fn suspend_snapshot_staging_dir(
 /// completed, before its volume is sealed. It carries the sidecar metadata of
 /// that capture, so a later seal publishes exactly it after the runtime is
 /// gone. Its absence means the staging holds no finished encrypted capture.
-pub(super) const ENCRYPTED_CAPTURE_RECORD: &str = "encrypted-capture.json";
+pub(super) use pplx_space_node_mgr_client::capture_receipt::COMMITTED as ENCRYPTED_CAPTURE_RECORD;
 
 /// How long recovery keeps retrying an unsealed encrypted capture. After it,
 /// the staging directory is treated as incomplete and the row quarantines as
@@ -44,10 +44,23 @@ pub(super) const ENCRYPTED_CAPTURE_RECORD: &str = "encrypted-capture.json";
 pub(super) const ENCRYPTED_SEAL_RETRY_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(6 * 60 * 60);
 
+/// Total automatic-recovery grace from durable suspend admission, including
+/// uncertain capture ownership and sealing. This is an availability policy,
+/// not a capture timeout or proof that an absent producer has stopped. Keep
+/// it separate from the legacy receipt-based seal budget: tuning one must not
+/// silently change the other. Expiry retains evidence for operator recovery.
+pub(super) const SUSPEND_ATTEMPT_RECOVERY_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Escalate unresolved producer ownership after the capture RPC's sixteen-minute
+/// wait budget plus four minutes of scheduling grace. This only asks for
+/// operator attention; automatic receipt recovery keeps its independent bound.
+pub(super) const SUSPEND_CAPTURE_OWNERSHIP_ESCALATION_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(20 * 60);
+
 /// The record, written durably before the capture under a name recovery
-/// ignores. [`commit_encrypted_capture_record`] gives it the record's name
-/// once the capture has finished.
-const ENCRYPTED_CAPTURE_INTENT: &str = ".encrypted-capture.json.intent";
+/// ignores. Node-manager renames it after capture and confirmed runtime stop.
+use pplx_space_node_mgr_client::capture_receipt::INTENT as ENCRYPTED_CAPTURE_INTENT;
 
 /// Write the capture's record before the capture, while a failure can still
 /// roll back to paused. Nothing treats it as a record until it is committed,
@@ -77,6 +90,7 @@ pub(super) fn prepare_encrypted_capture_record(
 /// Mark the capture finished: a same-directory rename of the already
 /// durable record, then a directory sync. It writes no data, so it can fail
 /// only if the staging filesystem itself is failing.
+#[cfg(test)]
 pub(super) fn commit_encrypted_capture_record(staging_dir: &Path) -> std::io::Result<()> {
     std::fs::rename(
         staging_dir.join(ENCRYPTED_CAPTURE_INTENT),
@@ -88,11 +102,36 @@ pub(super) fn commit_encrypted_capture_record(staging_dir: &Path) -> std::io::Re
 pub(super) fn read_encrypted_capture_record(
     staging_dir: &Path,
 ) -> Result<Option<crate::snapshot_upload::SnapshotMeta>, SuspendSnapshotPublicationError> {
+    read_capture_record(staging_dir, ENCRYPTED_CAPTURE_RECORD)
+}
+
+pub(super) fn read_capture_refusal(
+    staging_dir: &Path,
+) -> Result<Option<crate::snapshot_upload::SnapshotMeta>, SuspendSnapshotPublicationError> {
+    read_capture_record(
+        staging_dir,
+        pplx_space_node_mgr_client::capture_receipt::REFUSED,
+    )
+}
+
+pub(super) fn read_capture_failure(
+    staging_dir: &Path,
+) -> Result<Option<crate::snapshot_upload::SnapshotMeta>, SuspendSnapshotPublicationError> {
+    read_capture_record(
+        staging_dir,
+        pplx_space_node_mgr_client::capture_receipt::FAILED,
+    )
+}
+
+fn read_capture_record(
+    staging_dir: &Path,
+    filename: &str,
+) -> Result<Option<crate::snapshot_upload::SnapshotMeta>, SuspendSnapshotPublicationError> {
     let error = |source| SuspendSnapshotPublicationError::EncryptedCaptureRecord {
         staging_dir: path_label(staging_dir),
         source,
     };
-    match std::fs::read(staging_dir.join(ENCRYPTED_CAPTURE_RECORD)) {
+    match std::fs::read(staging_dir.join(filename)) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(|source| error(std::io::Error::other(source))),
@@ -108,61 +147,6 @@ pub(super) fn remove_encrypted_capture_record(staging_dir: &Path) -> std::io::Re
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
-}
-
-/// Staging directories of `sandbox_dir` holding a finished encrypted capture
-/// whose volume has not sealed yet and may still be sealed, in name order.
-/// Every seal retry selects through this, so a record past its retry window is
-/// never sealed: classification quarantines it instead.
-pub(super) fn encrypted_captures_awaiting_seal(
-    sandbox_dir: &Path,
-) -> Result<Vec<StagedSuspendSnapshotArtifact>, SuspendSnapshotPublicationError> {
-    let staging_parent = suspend_snapshot_staging_parent_dir(sandbox_dir);
-    let entries = match std::fs::read_dir(&staging_parent) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(SuspendSnapshotPublicationError::ListStagingParent {
-                staging_parent: path_label(&staging_parent),
-                source,
-            });
-        }
-    };
-    let now = std::time::SystemTime::now();
-    let mut pending = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter_map(|path| {
-            let local_artifact_id = path
-                .file_name()?
-                .to_str()?
-                .strip_prefix(SUSPEND_STAGING_PREFIX)?
-                .parse()
-                .ok()?;
-            encrypted_seal_pending(&path, now).then_some(StagedSuspendSnapshotArtifact {
-                local_artifact_id,
-                staging_dir: path,
-            })
-        })
-        .collect::<Vec<_>>();
-    pending.sort_by(|left, right| left.staging_dir.cmp(&right.staging_dir));
-    Ok(pending)
-}
-
-/// The capture a seal retry should seal: the newest pending record, unless a
-/// complete staged capture already awaits publication, which classification
-/// publishes without a seal.
-pub(super) fn recorded_encrypted_capture_to_seal(
-    sandbox_dir: &Path,
-) -> Result<Option<StagedSuspendSnapshotArtifact>, SuspendSnapshotPublicationError> {
-    match find_complete_suspend_snapshot_staging_dir(
-        sandbox_dir,
-        &RetainedSourceVerdicts::default(),
-    ) {
-        Ok(Some(_)) => return Ok(None),
-        Ok(None) | Err(SuspendSnapshotPublicationError::EncryptedSealPending { .. }) => {}
-        Err(error) => return Err(error),
-    }
-    Ok(encrypted_captures_awaiting_seal(sandbox_dir)?.pop())
 }
 
 /// An unsealed capture is pending evidence while recovery may still seal it.
@@ -277,7 +261,9 @@ pub(super) enum SuspendSnapshotPublicationDecision {
     CanonicalReady(CanonicalSuspendSnapshotArtifact),
     StagedComplete(StagedSuspendSnapshotArtifact),
     RuntimeLiveWithoutUsableArtifact,
+    CaptureRefused,
     RuntimeGoneWithoutUsableArtifact,
+    BlockedAttempt(&'static str),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -423,6 +409,20 @@ impl SuspendSnapshotValidationError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SuspendSnapshotPublicationError {
+    #[error("sandbox directory {sandbox_dir} does not name a sandbox UUID")]
+    InvalidSandboxDirectory { sandbox_dir: String },
+    #[error(
+        "capture attempt in {staging_dir} remains pending at age {age_secs}s within its {retry_window_secs}s admission recovery window; evidence retained"
+    )]
+    CapturePending {
+        staging_dir: String,
+        age_secs: i64,
+        retry_window_secs: u64,
+    },
+    #[error(
+        "capture ownership in {staging_dir} is unresolved at age {age_secs}s; operator attention required; evidence retained and automatic recovery continues"
+    )]
+    CaptureOwnershipUnresolved { staging_dir: String, age_secs: i64 },
     #[error(transparent)]
     Validation(#[from] SuspendSnapshotValidationError),
     #[error("snapshot directory {snapshot_dir} has no parent")]
@@ -483,7 +483,9 @@ impl SuspendSnapshotPublicationError {
     /// The artifact exists but a step owned elsewhere has not finished.
     pub(super) fn is_pending(&self) -> bool {
         match self {
-            Self::EncryptedSealPending { .. } => true,
+            Self::EncryptedSealPending { .. }
+            | Self::CapturePending { .. }
+            | Self::CaptureOwnershipUnresolved { .. } => true,
             Self::Validation(error) => error.is_pending(),
             _ => false,
         }
@@ -512,6 +514,20 @@ impl CanonicalSuspendSnapshotRecoveryError {
 
 fn path_label(path: &Path) -> String {
     path.display().to_string()
+}
+
+fn publication_sandbox_id(
+    sandbox_dir: &Path,
+) -> Result<SandboxId, SuspendSnapshotPublicationError> {
+    sandbox_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.parse().ok())
+        .ok_or_else(
+            || SuspendSnapshotPublicationError::InvalidSandboxDirectory {
+                sandbox_dir: path_label(sandbox_dir),
+            },
+        )
 }
 
 fn suspended_snapshot_dir_metadata(
@@ -1018,8 +1034,17 @@ pub(super) fn publish_suspend_snapshot_dir(
     local_artifact_id: LocalArtifactId,
     verdicts: &RetainedSourceVerdicts,
 ) -> Result<Vec<PathBuf>, SuspendSnapshotPublicationError> {
-    // A seal interrupted after its sidecar leaves the record behind; it is
-    // not part of the artifact.
+    let parent =
+        snapshot_dir
+            .parent()
+            .ok_or_else(|| SuspendSnapshotPublicationError::MissingParent {
+                snapshot_dir: path_label(snapshot_dir),
+            })?;
+    let expected_sandbox_id = publication_sandbox_id(parent)?;
+    if staging_dir.exists() {
+        validate_suspend_snapshot_metadata(staging_dir, Some(expected_sandbox_id))?;
+    }
+    // Validate identity before removing recovery evidence or renaming bytes.
     remove_encrypted_capture_record(staging_dir).map_err(|source| {
         SuspendSnapshotPublicationError::EncryptedCaptureRecord {
             staging_dir: path_label(staging_dir),
@@ -1027,12 +1052,6 @@ pub(super) fn publish_suspend_snapshot_dir(
         }
     })?;
     let mut garbage = Vec::new();
-    let parent =
-        snapshot_dir
-            .parent()
-            .ok_or_else(|| SuspendSnapshotPublicationError::MissingParent {
-                snapshot_dir: path_label(snapshot_dir),
-            })?;
     let staging_parent = suspend_snapshot_staging_parent_dir(parent);
     std::fs::create_dir_all(&staging_parent).map_err(|source| {
         SuspendSnapshotPublicationError::CreateParent {
@@ -1072,6 +1091,7 @@ pub(super) fn publish_suspend_snapshot_dir(
     if snapshot_dir.exists() {
         match validate_complete_suspend_snapshot_dir(snapshot_dir, verdicts) {
             Ok(existing_artifact_id) if existing_artifact_id == local_artifact_id => {
+                validate_suspend_snapshot_metadata(snapshot_dir, Some(expected_sandbox_id))?;
                 garbage.extend(release_retired_suspend_snapshot(parent, &hold).map_err(
                     |source| SuspendSnapshotPublicationError::RetireExisting {
                         snapshot_dir: path_label(&hold),
@@ -1235,6 +1255,255 @@ pub(super) fn find_suspend_snapshot_staging_residue(
         }
     }
     Ok(None)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RuntimeObservation {
+    Live,
+    Gone,
+    Unknown,
+}
+
+impl From<bool> for RuntimeObservation {
+    fn from(live: bool) -> Self {
+        if live { Self::Live } else { Self::Gone }
+    }
+}
+
+impl super::SandboxManagerService {
+    pub(super) fn capture_runtime_observation(&self, id: &str) -> RuntimeObservation {
+        let Some(probe) = &self.capture_runtime_probe else {
+            return (self.sandbox_runtime_live)(id).into();
+        };
+        match probe(id) {
+            Ok(live) => live.into(),
+            Err(error) => {
+                tracing::warn!(sandbox_id = id, %error, "capture runtime liveness is unknown");
+                RuntimeObservation::Unknown
+            }
+        }
+    }
+}
+
+pub(super) fn report_live_capture_receipt(sandbox_id: &str) {
+    tracing::warn!(
+        sandbox_id,
+        "committed capture receipt contradicts a live runtime; recovery blocked"
+    );
+    crate::metrics::snapshot::create_recovery("suspend", "receipt_runtime_live");
+}
+
+/// Recovery uses the admitted identity, not the newest directory. Even a
+/// missing intent is ambiguous: admission may have survived a process crash
+/// before the first file write. The immutable row clock bounds that case too.
+pub(super) fn classify_suspend_attempt(
+    sandbox_dir: &Path,
+    pinned: Option<LocalArtifactId>,
+    attempt: Option<crate::db::read::SuspendAttempt>,
+    encrypted: bool,
+    runtime: RuntimeObservation,
+    verdicts: &RetainedSourceVerdicts,
+) -> Result<SuspendSnapshotPublicationDecision, SuspendSnapshotPublicationError> {
+    let expected_sandbox_id = publication_sandbox_id(sandbox_dir)?;
+    let runtime_live = runtime == RuntimeObservation::Live;
+    let Some(attempt) = attempt else {
+        return if encrypted {
+            Ok(SuspendSnapshotPublicationDecision::BlockedAttempt(
+                "encrypted suspend has no admitted attempt identity; operator recovery required",
+            ))
+        } else {
+            classify_suspend_snapshot_publication(sandbox_dir, pinned, runtime_live, verdicts)
+        };
+    };
+    let canonical = canonical_suspend_snapshot_dir(sandbox_dir);
+    let staging = suspend_snapshot_staging_dir(sandbox_dir, attempt.artifact_id);
+    let mut capture_confirmed = false;
+    if encrypted {
+        let refused = read_capture_refusal(&staging);
+        let committed = read_encrypted_capture_record(&staging);
+        let failed = read_capture_failure(&staging);
+        match (refused, committed, failed) {
+            (_, _, Ok(Some(failure))) => {
+                return Ok(SuspendSnapshotPublicationDecision::BlockedAttempt(
+                    if failure.local_artifact_id == Some(attempt.artifact_id)
+                        && failure.sandbox_id == expected_sandbox_id.to_string()
+                    {
+                        "capture producer finished with an error; retain runtime and artifacts for operator recovery"
+                    } else {
+                        "capture failure evidence contradicts the admitted attempt"
+                    },
+                ));
+            }
+            (Ok(Some(refusal)), Ok(completion), Ok(None)) => {
+                if completion.is_some()
+                    || refusal.local_artifact_id != Some(attempt.artifact_id)
+                    || sandbox_dir.file_name().and_then(|name| name.to_str())
+                        != Some(refusal.sandbox_id.as_str())
+                {
+                    return Ok(SuspendSnapshotPublicationDecision::BlockedAttempt(
+                        "contradictory capture refusal evidence",
+                    ));
+                }
+                match runtime {
+                    RuntimeObservation::Live => {
+                        return Ok(SuspendSnapshotPublicationDecision::CaptureRefused);
+                    }
+                    RuntimeObservation::Gone => {
+                        return Ok(SuspendSnapshotPublicationDecision::BlockedAttempt(
+                            "capture refused but runtime is gone",
+                        ));
+                    }
+                    RuntimeObservation::Unknown => {}
+                }
+            }
+            (Ok(None), Ok(Some(_)), Ok(None)) if runtime_live => {
+                report_live_capture_receipt(
+                    sandbox_dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown"),
+                );
+            }
+            (Ok(None), Ok(Some(record)), Ok(None)) if runtime == RuntimeObservation::Gone => {
+                if record.local_artifact_id != Some(attempt.artifact_id)
+                    || record.sandbox_id != expected_sandbox_id.to_string()
+                {
+                    return Ok(SuspendSnapshotPublicationDecision::BlockedAttempt(
+                        "committed capture receipt contradicts the admitted attempt",
+                    ));
+                }
+                capture_confirmed = true;
+            }
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                if !suspend_attempt_retry_open(attempt) {
+                    return Ok(SuspendSnapshotPublicationDecision::BlockedAttempt(
+                        "capture outcome remains unreadable after its recovery window; retain evidence",
+                    ));
+                }
+                if let Some(escalation) = report_capture_ownership_escalation(&staging, attempt) {
+                    tracing::warn!(%error, "capture evidence remains unreadable after ownership escalation");
+                    return Err(escalation);
+                }
+                return Err(error);
+            }
+            _ => {}
+        }
+    }
+    if runtime == RuntimeObservation::Gone || !encrypted {
+        for (path, is_canonical) in [(&canonical, true), (&staging, false)] {
+            // A predecessor's pending retained source cannot block this attempt.
+            // Validate files only after the candidate's own metadata names it.
+            let candidate = match validate_suspend_snapshot_metadata(path, None) {
+                Ok(metadata) if metadata.local_artifact_id != attempt.artifact_id => continue,
+                Ok(metadata) if metadata.metadata.sandbox_id != expected_sandbox_id.to_string() => {
+                    return Ok(SuspendSnapshotPublicationDecision::BlockedAttempt(
+                        "admitted artifact belongs to another sandbox",
+                    ));
+                }
+                Ok(metadata) if metadata.metadata.encrypted != encrypted => {
+                    return Ok(SuspendSnapshotPublicationDecision::BlockedAttempt(
+                        "admitted artifact encryption mode differs from its sandbox",
+                    ));
+                }
+                Ok(metadata) => metadata
+                    .validate_artifact_files(verdicts)
+                    .map(|()| metadata.local_artifact_id),
+                Err(error) => Err(error),
+            };
+            match candidate {
+                Ok(id) => {
+                    return Ok(if is_canonical {
+                        SuspendSnapshotPublicationDecision::CanonicalReady(
+                            CanonicalSuspendSnapshotArtifact {
+                                local_artifact_id: id,
+                                path: canonical.clone(),
+                            },
+                        )
+                    } else {
+                        SuspendSnapshotPublicationDecision::StagedComplete(
+                            StagedSuspendSnapshotArtifact {
+                                local_artifact_id: id,
+                                staging_dir: staging.clone(),
+                            },
+                        )
+                    });
+                }
+                Err(error)
+                    if error.is_inconclusive()
+                        && (!encrypted || suspend_attempt_retry_open(attempt)) =>
+                {
+                    if encrypted
+                        && !capture_confirmed
+                        && let Some(escalation) =
+                            report_capture_ownership_escalation(&staging, attempt)
+                    {
+                        return Err(escalation);
+                    }
+                    return Err(error.into());
+                }
+                _ => {}
+            }
+        }
+    }
+    if !encrypted {
+        return Ok(if runtime_live {
+            SuspendSnapshotPublicationDecision::RuntimeLiveWithoutUsableArtifact
+        } else {
+            SuspendSnapshotPublicationDecision::RuntimeGoneWithoutUsableArtifact
+        });
+    }
+    if suspend_attempt_retry_open(attempt) {
+        if !capture_confirmed
+            && let Some(error) = report_capture_ownership_escalation(&staging, attempt)
+        {
+            return Err(error);
+        }
+        return Err(SuspendSnapshotPublicationError::CapturePending {
+            staging_dir: path_label(&staging),
+            age_secs: jiff::Timestamp::now()
+                .as_second()
+                .saturating_sub(attempt.started_at),
+            retry_window_secs: SUSPEND_ATTEMPT_RECOVERY_WINDOW.as_secs(),
+        });
+    }
+    Ok(SuspendSnapshotPublicationDecision::BlockedAttempt(
+        "encrypted capture did not converge within its admission retry window; retain evidence for operator recovery",
+    ))
+}
+
+fn report_capture_ownership_escalation(
+    staging: &Path,
+    attempt: crate::db::read::SuspendAttempt,
+) -> Option<SuspendSnapshotPublicationError> {
+    let age_secs = jiff::Timestamp::now()
+        .as_second()
+        .saturating_sub(attempt.started_at);
+    if (0..SUSPEND_CAPTURE_OWNERSHIP_ESCALATION_AFTER.as_secs() as i64).contains(&age_secs) {
+        return None;
+    }
+    tracing::error!(
+        staging_dir = %staging.display(), artifact_id = %attempt.artifact_id,
+        age_secs, clock_skew = age_secs < 0,
+        escalation_after_secs = SUSPEND_CAPTURE_OWNERSHIP_ESCALATION_AFTER.as_secs(),
+        "capture ownership requires operator attention; preserve evidence and keep reconciling late receipts"
+    );
+    Some(
+        SuspendSnapshotPublicationError::CaptureOwnershipUnresolved {
+            staging_dir: path_label(staging),
+            age_secs,
+        },
+    )
+}
+
+pub(super) fn suspend_attempt_retry_open(attempt: crate::db::read::SuspendAttempt) -> bool {
+    suspend_attempt_retry_open_at(attempt, jiff::Timestamp::now().as_second())
+}
+
+fn suspend_attempt_retry_open_at(attempt: crate::db::read::SuspendAttempt, now: i64) -> bool {
+    let age = now.saturating_sub(attempt.started_at);
+    // Backward clock correction is uncertainty, not expiry. Keep the original
+    // admission and receipt recovery; unresolved skew escalates for attention.
+    age < SUSPEND_ATTEMPT_RECOVERY_WINDOW.as_secs() as i64
 }
 
 /// An inconclusive validation is an error, not a decision: the caller retries

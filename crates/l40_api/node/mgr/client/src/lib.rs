@@ -392,3 +392,5 @@ pub fn lazy_unshared() -> NodeManagerGrpcClient {
 
 #[cfg(test)]
 mod tests;
+
+pub use pplx_space_node_mgr_protocol::capture_receipt;

@@ -858,7 +858,7 @@ fn row_intent_completion_applies_the_owned_intent() {
     );
 
     let suspending = insert_row(&conn, SandboxState::Paused);
-    assert!(begin_suspend(&conn, &suspending).unwrap());
+    assert!(begin_suspend(&conn, &suspending, LocalArtifactId::new()).unwrap());
     seed_runtime(&conn, &suspending);
     conn.execute(
         "UPDATE sandboxes SET suspend_predecessor_artifact_id = ?2 WHERE id = ?1",
@@ -869,6 +869,8 @@ fn row_intent_completion_applies_the_owned_intent() {
     let artifact = LocalArtifactId::new();
     let mut cells = vec![
         ("state", text("suspended")),
+        ("suspend_attempt_artifact_id", NULL),
+        ("suspend_attempt_started_at", NULL),
         ("failure_reason", NULL),
         ("current_local_artifact_id", text(artifact.to_string())),
         ("current_local_artifact_kind", text("full")),
@@ -901,7 +903,7 @@ fn row_intent_completion_applies_the_owned_intent() {
     // Without a published or registered artifact the suspend cannot settle:
     // the row is quarantined instead.
     let lost = insert_row(&conn, SandboxState::Paused);
-    assert!(begin_suspend(&conn, &lost).unwrap());
+    assert!(begin_suspend(&conn, &lost, LocalArtifactId::new()).unwrap());
     seed_runtime(&conn, &lost);
     decorate(&conn, &lost, SandboxState::Suspended);
     let lost_reason = crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE;

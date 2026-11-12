@@ -130,6 +130,8 @@ pub use pplx_space_common_core::types::QuarantineRecoveryNoProgressReason;
 /// the node-wide counts. Each keeps the decoder, missing-row rule and
 /// tolerance of the reader it consolidates.
 pub mod read {
+    mod suspend_attempt;
+    pub use suspend_attempt::*;
     mod guest_update;
     pub use guest_update::*;
     mod cleanup_job;
