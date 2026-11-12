@@ -44,12 +44,12 @@ pub struct PrunedDeletedSandboxes {
 ///
 /// A sandbox's snapshots go with its row, named ones (`artifact_origin =
 /// 'snapshot'`) included, as on every other path that deletes the row. For a
-/// census tombstone, they stay listed for the tombstone retention
-/// ([`crate::DELETED_SANDBOX_RETENTION`], 7 days from the row's last update),
-/// the only window in which their objects can be kept by hand. Once this prune
-/// detaches them, the sweeper deletes their objects after its one-hour grace,
-/// except for locations in another bucket or with an encrypted sidecar, which
-/// it leaves in place.
+/// census tombstone, this prune leaves them in place for the tombstone
+/// retention ([`crate::DELETED_SANDBOX_RETENTION`], 7 days from the row's last
+/// update); ordinary snapshot retention still applies to them meanwhile. Once
+/// this prune detaches them, the sweeper deletes their objects after its
+/// one-hour grace, except for locations in another bucket or with an
+/// encrypted sidecar, which it leaves in place.
 pub async fn prune_deleted_sandboxes(
     executor: impl sqlx::PgExecutor<'_>,
     retention_secs: i64,
