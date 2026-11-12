@@ -6,7 +6,11 @@
 //! moves the active execution row to a different pod, which sets the record
 //! to that pod's `space.pplx.net/client-id` label. The caller owns the locks
 //! (`sandboxes`, then the execution row) and re-checks the generation and pod
-//! itself, so this statement touches `sandboxes` alone.
+//! itself, so this statement touches `sandboxes` alone. On Direct, which has
+//! no execution row, it's the transaction that commits a start, wake or owned
+//! restore receipt: the statement runs before that transaction's route
+//! identity rows, or under the restore's `sandboxes` row lock, so `sandboxes`
+//! is locked first either way.
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{ClientId, SandboxId, SandboxLifecycle};
