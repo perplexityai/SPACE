@@ -2,7 +2,8 @@
 //! sandbox.
 
 use crate::db::{
-    Connection, Result, RuntimeUpgradeOperationId, RuntimeUpgradeRecord, RuntimeUpgradeReport,
+    Connection, Result, RuntimeUpgradeAttemptOutcome, RuntimeUpgradeOperationId,
+    RuntimeUpgradeRecord, RuntimeUpgradeRefusedAttempt, RuntimeUpgradeReport,
     RuntimeUpgradeRequestIdentity,
 };
 
@@ -59,4 +60,25 @@ pub fn recorded_runtime_upgrade_request(
     operation_id: RuntimeUpgradeOperationId,
 ) -> Result<Option<RuntimeUpgradeRequestIdentity>> {
     crate::db::recorded_runtime_upgrade_request(conn, operation_id)
+}
+
+/// The attempt `attempt_id` the operation refused after reaching its
+/// target, `None` when it refused no such attempt.
+pub fn runtime_upgrade_refused_attempt(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    attempt_id: &str,
+) -> Result<Option<RuntimeUpgradeRefusedAttempt>> {
+    crate::db::runtime_upgrade_refused_attempt(conn, operation_id, attempt_id)
+}
+
+/// The rollback or refusal final for the attempt `attempt_id` under
+/// `operation_id`, whatever later attempts recorded since; `None`
+/// without one.
+pub fn runtime_upgrade_attempt_outcome(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    attempt_id: &str,
+) -> Result<Option<RuntimeUpgradeAttemptOutcome>> {
+    crate::db::runtime_upgrade_attempt_outcome(conn, operation_id, attempt_id)
 }

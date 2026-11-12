@@ -439,6 +439,7 @@ fn retire(
             },
             checkpoint_dir_identity: None,
             previous_execution: &f.source,
+            attempt_id: &crate::db::new_runtime_upgrade_attempt_id(),
         },
     )
     .unwrap();
@@ -1094,6 +1095,7 @@ async fn an_activated_upgrade_never_starts_its_sandbox_again() {
                         target_state: crate::db::RuntimeUpgradeTargetState::Started,
                         authorization_id: authorization().authorization_id,
                     },
+                    &crate::db::new_runtime_upgrade_attempt_id(),
                 )
                 .unwrap()
             );

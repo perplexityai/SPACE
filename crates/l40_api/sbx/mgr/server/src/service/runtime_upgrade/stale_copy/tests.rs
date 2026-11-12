@@ -500,6 +500,7 @@ async fn a_copy_after_this_operations_outcome_is_left_to_the_upgrade() {
                     target_state: crate::db::RuntimeUpgradeTargetState::Started,
                     authorization_id: authorization().authorization_id,
                 },
+                &crate::db::new_runtime_upgrade_attempt_id(),
             )
             .unwrap()
         );

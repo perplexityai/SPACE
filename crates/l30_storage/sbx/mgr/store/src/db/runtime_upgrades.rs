@@ -182,6 +182,12 @@ pub struct RuntimeUpgradeRecord {
     pub boot_execution_id: Option<SandboxActivationAttemptId>,
     pub phase: RuntimeUpgradePhase,
     pub failure: Option<String>,
+    /// The attempt the upgrade runs as: the opaque attempt id of the
+    /// `UpgradeRuntime` request that began it, or the one the node generated
+    /// for a request that named none (see [`new_runtime_upgrade_attempt_id`]).
+    /// Its rollback is recorded for that attempt. `None` only for a row
+    /// written before the node recorded attempts.
+    pub attempt_id: Option<String>,
 }
 
 impl RuntimeUpgradeRecord {
@@ -211,6 +217,15 @@ pub struct NewRuntimeUpgrade<'a> {
     /// The consumer a rollback restores; see
     /// [`RuntimeUpgradeRecord::previous_execution`].
     pub previous_execution: &'a ExecutionMetadata,
+    /// See [`RuntimeUpgradeRecord::attempt_id`].
+    pub attempt_id: &'a str,
+}
+
+/// A fresh attempt id, for an `UpgradeRuntime` request that named none: the
+/// node generates it and records it with the attempt. A UUIDv7: time-ordered
+/// with random bits, so ids the node generates don't collide in practice.
+pub fn new_runtime_upgrade_attempt_id() -> String {
+    uuid::Uuid::now_v7().to_string()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -267,6 +282,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeUpgradeRe
     let checkpoint: Option<String> = row.get(9)?;
     let phase: String = row.get(11)?;
     let boot_execution: Option<String> = row.get(13)?;
+    let attempt_id: Option<String> = row.get(14)?;
     Ok(RuntimeUpgradeRecord {
         operation_id: operation_id
             .parse()
@@ -301,6 +317,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeUpgradeRe
             .map(|id| id.parse())
             .transpose()
             .map_err(|error| conversion_error(13, Type::Text, error))?,
+        attempt_id,
     })
 }
 
@@ -309,7 +326,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeUpgradeRe
 const RECORD_COLUMNS: &str = "operation_id, sandbox_id, target_environment, target_state, \
     authorization_id, authorization_reason, memory_loss_authorized, source_state, \
     previous_execution_metadata_json, checkpoint_artifact_id, checkpoint_dir_identity, \
-    phase, failure, boot_execution_id";
+    phase, failure, boot_execution_id, attempt_id";
 
 db_private_outside_tests! {
     fn runtime_upgrade(
@@ -635,8 +652,8 @@ pub fn begin_runtime_upgrade(
              operation_id, sandbox_id, target_environment, target_state,
              authorization_id, authorization_reason, memory_loss_authorized,
              source_state, previous_execution_metadata_json, checkpoint_artifact_id,
-             checkpoint_dir_identity, phase, failure, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'fenced', NULL, ?12, ?12)",
+             checkpoint_dir_identity, phase, failure, created_at, updated_at, attempt_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'fenced', NULL, ?12, ?12, ?13)",
         params![
             new.operation_id.to_string(),
             new.sandbox_id,
@@ -650,6 +667,7 @@ pub fn begin_runtime_upgrade(
             checkpoint_artifact_id.map(|id| id.to_string()),
             new.checkpoint_dir_identity,
             now,
+            new.attempt_id,
         ],
     )?;
     let record = runtime_upgrade(&tx, new.operation_id)?.ok_or_else(Error::no_rows)?;
@@ -783,7 +801,10 @@ pub(super) fn verify_booting_runtime_upgrade(conn: &Connection, sandbox_id: &str
 }
 
 /// Delete a `rolled_back` row once its preserved disk is gone, keeping its
-/// failure as the operation's [`RecordedRuntimeUpgradeOutcome::RolledBack`] outcome.
+/// failure and its attempt as the operation's
+/// [`RecordedRuntimeUpgradeOutcome::RolledBack`] outcome, and in the history
+/// of the attempt it ran as (see [`runtime_upgrade_attempt_outcome`]); a row
+/// written before attempts were recorded adds no history.
 pub fn finish_runtime_upgrade_rollback(
     conn: &Connection,
     operation_id: RuntimeUpgradeOperationId,
@@ -792,18 +813,37 @@ pub fn finish_runtime_upgrade_rollback(
     tx.execute(
         "INSERT INTO sandbox_runtime_upgrade_outcomes (
              operation_id, sandbox_id, outcome, target_environment, target_state,
-             authorization_id, failure, recorded_at
+             authorization_id, failure, recorded_at, attempt_id
          )
          SELECT operation_id, sandbox_id, ?2, target_environment, target_state,
-                authorization_id, failure, ?3
+                authorization_id, failure, ?3, attempt_id
            FROM sandbox_runtime_upgrades
           WHERE operation_id = ?1
             AND phase = 'rolled_back'
          ON CONFLICT (operation_id) DO UPDATE
             SET outcome = excluded.outcome,
                 failure = excluded.failure,
-                recorded_at = excluded.recorded_at
+                recorded_at = excluded.recorded_at,
+                attempt_id = excluded.attempt_id
           WHERE sandbox_id = excluded.sandbox_id",
+        params![
+            operation_id.to_string(),
+            RecordedRuntimeUpgradeOutcome::RolledBack.as_str(),
+            now()?
+        ],
+    )?;
+    // The attempt's own history: a later attempt's outcome replaces this one
+    // above, but never this attempt's finality.
+    tx.execute(
+        "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes (
+             operation_id, attempt_id, sandbox_id, outcome, failure, recorded_at
+         )
+         SELECT operation_id, attempt_id, sandbox_id, ?2, failure, ?3
+           FROM sandbox_runtime_upgrades
+          WHERE operation_id = ?1
+            AND phase = 'rolled_back'
+            AND attempt_id IS NOT NULL
+         ON CONFLICT (operation_id, attempt_id) DO NOTHING",
         params![
             operation_id.to_string(),
             RecordedRuntimeUpgradeOutcome::RolledBack.as_str(),
@@ -835,7 +875,8 @@ pub struct RuntimeUpgradeRequestIdentity {
 }
 
 /// Record that the operation `request` names found its sandbox already on
-/// its target and fenced nothing. False, recording nothing, when the node
+/// its target and fenced nothing, as the attempt `attempt_id`. False,
+/// recording nothing, when the node
 /// already recorded the operation, as an outcome or a live upgrade, for
 /// another sandbox, or as an outcome for another target, target state or
 /// authorization.
@@ -845,13 +886,14 @@ pub struct RuntimeUpgradeRequestIdentity {
 pub fn record_runtime_upgrade_already_on_target(
     conn: &Connection,
     request: &RuntimeUpgradeRequestIdentity,
+    attempt_id: &str,
 ) -> Result<bool> {
     let changed = conn.execute(
         "INSERT INTO sandbox_runtime_upgrade_outcomes (
              operation_id, sandbox_id, outcome, target_environment, target_state,
-             authorization_id, failure, recorded_at
+             authorization_id, failure, recorded_at, attempt_id
          )
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8
           WHERE NOT EXISTS (
                 SELECT 1
                   FROM sandbox_runtime_upgrades
@@ -861,7 +903,8 @@ pub fn record_runtime_upgrade_already_on_target(
          ON CONFLICT (operation_id) DO UPDATE
             SET outcome = excluded.outcome,
                 failure = NULL,
-                recorded_at = excluded.recorded_at
+                recorded_at = excluded.recorded_at,
+                attempt_id = excluded.attempt_id
           WHERE sandbox_id = excluded.sandbox_id
             AND target_environment = excluded.target_environment
             AND target_state = excluded.target_state
@@ -873,10 +916,129 @@ pub fn record_runtime_upgrade_already_on_target(
             request.target_environment.to_string(),
             request.target_state.as_str(),
             request.authorization_id,
-            now()?
+            now()?,
+            attempt_id,
         ],
     )?;
     Ok(changed == 1)
+}
+
+/// Record that the operation `request` names was refused for the attempt
+/// `attempt_id` before it fenced anything, with `failure` as the reason, so the
+/// refusal is final for that attempt as a rollback is: it becomes the
+/// operation's outcome and joins the attempt's history (see
+/// [`runtime_upgrade_attempt_outcome`]). The caller records only a refusal a
+/// retry can't change, and only for an attempt without a rollback or refusal
+/// of its own: the attempt's history keeps its first. False, recording nothing,
+/// when the sandbox is gone from the node, a live upgrade row exists for the
+/// operation, or its recorded outcome names another request or is one a
+/// refusal may not replace: an already-on-target outcome keeps the operation
+/// from ever booting, and its activation claim with it.
+pub fn record_runtime_upgrade_refusal(
+    conn: &Connection,
+    request: &RuntimeUpgradeRequestIdentity,
+    attempt_id: &str,
+    failure: &str,
+) -> Result<bool> {
+    let tx = immediate_transaction(conn)?;
+    let recorded_at = now()?;
+    let changed = tx.execute(
+        "INSERT INTO sandbox_runtime_upgrade_outcomes (
+             operation_id, sandbox_id, outcome, target_environment, target_state,
+             authorization_id, failure, recorded_at, attempt_id
+         )
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+          WHERE EXISTS (SELECT 1 FROM sandboxes WHERE id = ?2)
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM sandbox_runtime_upgrades
+                 WHERE operation_id = ?1
+          )
+         ON CONFLICT (operation_id) DO UPDATE
+            SET outcome = excluded.outcome,
+                failure = excluded.failure,
+                recorded_at = excluded.recorded_at,
+                attempt_id = excluded.attempt_id
+          WHERE sandbox_id = excluded.sandbox_id
+            AND target_environment = excluded.target_environment
+            AND target_state = excluded.target_state
+            AND authorization_id = excluded.authorization_id
+            AND outcome IN (?3, ?10)",
+        params![
+            request.operation_id.to_string(),
+            request.sandbox_id,
+            RecordedRuntimeUpgradeOutcome::Refused.as_str(),
+            request.target_environment.to_string(),
+            request.target_state.as_str(),
+            request.authorization_id,
+            failure,
+            recorded_at,
+            attempt_id,
+            RecordedRuntimeUpgradeOutcome::RolledBack.as_str(),
+        ],
+    )?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes (
+             operation_id, attempt_id, sandbox_id, outcome, failure, recorded_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (operation_id, attempt_id) DO NOTHING",
+        params![
+            request.operation_id.to_string(),
+            attempt_id,
+            request.sandbox_id,
+            RecordedRuntimeUpgradeOutcome::Refused.as_str(),
+            failure,
+            recorded_at,
+        ],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// The rollback or refusal the operation recorded for the attempt
+/// `attempt_id` (see [`finish_runtime_upgrade_rollback`] and
+/// [`record_runtime_upgrade_refusal`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeUpgradeAttemptOutcome {
+    /// [`RecordedRuntimeUpgradeOutcome::RolledBack`] or
+    /// [`RecordedRuntimeUpgradeOutcome::Refused`].
+    pub outcome: RecordedRuntimeUpgradeOutcome,
+    pub failure: Option<String>,
+}
+
+db_private_outside_tests! {
+    /// The rollback or refusal final for the attempt `attempt_id` under
+    /// `operation_id`, `None` when none was recorded for it. Unlike the
+    /// operation's report, which keeps only its latest outcome, this is the
+    /// attempt's own, whatever later attempts recorded since.
+    fn runtime_upgrade_attempt_outcome(
+        conn: &Connection,
+        operation_id: RuntimeUpgradeOperationId,
+        attempt_id: &str,
+    ) -> Result<Option<RuntimeUpgradeAttemptOutcome>> {
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT outcome, failure
+                   FROM sandbox_runtime_upgrade_attempt_outcomes
+                  WHERE operation_id = ?1
+                    AND attempt_id = ?2",
+                params![operation_id.to_string(), attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(outcome, failure)| {
+            Ok(RuntimeUpgradeAttemptOutcome {
+                outcome: outcome
+                    .parse()
+                    .map_err(|error| conversion_error(0, Type::Text, error))?,
+                failure,
+            })
+        })
+        .transpose()
+    }
 }
 
 db_private_outside_tests! {
@@ -910,6 +1072,112 @@ db_private_outside_tests! {
         })
         .transpose()
     }
+}
+
+/// Record that the operation `operation_id` refused the attempt `attempt_id`
+/// after it reached its target for `sandbox_id`: the node upgraded the
+/// sandbox (the live row is retired), or found it there already (no live
+/// row, an already-on-target outcome), but the attempt's `UpgradeRuntime` for
+/// a started target failed, so the sandbox doesn't run for that attempt. The
+/// refusal is final for that attempt; `failure` says why. False, recording
+/// nothing, when the operation hasn't reached its target for that sandbox:
+/// its rollback or refusal is what the attempt's report says then. False too,
+/// keeping the recorded one, when the attempt's refusal is already recorded: a
+/// row is never rewritten, so recording order is insertion order (see
+/// [`latest_refused_attempt`]). The check and the write are one statement.
+pub fn record_runtime_upgrade_refused_attempt(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    sandbox_id: &str,
+    attempt_id: &str,
+    failure: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "INSERT INTO sandbox_runtime_upgrade_refused_attempts (
+             operation_id, attempt_id, sandbox_id, failure, recorded_at
+         )
+         SELECT ?1, ?2, ?3, ?4, ?5
+          WHERE EXISTS (
+                SELECT 1
+                  FROM sandbox_runtime_upgrades
+                 WHERE operation_id = ?1
+                   AND sandbox_id = ?3
+                   AND phase = 'retired'
+          )
+             OR (
+                NOT EXISTS (
+                    SELECT 1 FROM sandbox_runtime_upgrades WHERE operation_id = ?1
+                )
+                AND EXISTS (
+                    SELECT 1
+                      FROM sandbox_runtime_upgrade_outcomes
+                     WHERE operation_id = ?1
+                       AND sandbox_id = ?3
+                       AND outcome = ?6
+                )
+          )
+         ON CONFLICT (operation_id, attempt_id) DO NOTHING",
+        params![
+            operation_id.to_string(),
+            attempt_id,
+            sandbox_id,
+            failure,
+            now()?,
+            RecordedRuntimeUpgradeOutcome::AlreadyOnTarget.as_str(),
+        ],
+    )?;
+    Ok(changed == 1)
+}
+
+db_private_outside_tests! {
+    /// The attempt `attempt_id` the operation refused after reaching its
+    /// target (see [`record_runtime_upgrade_refused_attempt`]), `None` when it
+    /// refused no such attempt.
+    fn runtime_upgrade_refused_attempt(
+        conn: &Connection,
+        operation_id: RuntimeUpgradeOperationId,
+        attempt_id: &str,
+    ) -> Result<Option<RuntimeUpgradeRefusedAttempt>> {
+        conn.query_row(
+            "SELECT attempt_id, failure
+               FROM sandbox_runtime_upgrade_refused_attempts
+              WHERE operation_id = ?1
+                AND attempt_id = ?2",
+            params![operation_id.to_string(), attempt_id],
+            refused_attempt_from_row,
+        )
+        .optional()
+    }
+}
+
+/// The latest attempt the operation refused after reaching its target,
+/// `None` without one. A row is never rewritten, and is deleted only
+/// with its sandbox, which takes every row of the operation with it, so the
+/// newest rowid is the latest recorded, however coarse or unsteady the clock
+/// that stamped `recorded_at`.
+fn latest_refused_attempt(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+) -> Result<Option<RuntimeUpgradeRefusedAttempt>> {
+    conn.query_row(
+        "SELECT attempt_id, failure
+           FROM sandbox_runtime_upgrade_refused_attempts
+          WHERE operation_id = ?1
+          ORDER BY rowid DESC
+          LIMIT 1",
+        params![operation_id.to_string()],
+        refused_attempt_from_row,
+    )
+    .optional()
+}
+
+fn refused_attempt_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RuntimeUpgradeRefusedAttempt> {
+    Ok(RuntimeUpgradeRefusedAttempt {
+        attempt_id: row.get(0)?,
+        failure: row.get(1)?,
+    })
 }
 
 /// Record how `sandbox_id`'s already-on-target upgrade claims its
@@ -954,6 +1222,9 @@ pub enum RecordedRuntimeUpgradeOutcome {
     RolledBack,
     /// The sandbox was already on the target; nothing was fenced or booted.
     AlreadyOnTarget,
+    /// The request was refused before it fenced anything, for a reason no
+    /// retry changes.
+    Refused,
 }
 
 impl RecordedRuntimeUpgradeOutcome {
@@ -961,6 +1232,7 @@ impl RecordedRuntimeUpgradeOutcome {
         match self {
             Self::RolledBack => "rolled_back",
             Self::AlreadyOnTarget => "already_on_target",
+            Self::Refused => "refused",
         }
     }
 }
@@ -982,6 +1254,7 @@ impl FromStr for RecordedRuntimeUpgradeOutcome {
         match value {
             "rolled_back" => Ok(Self::RolledBack),
             "already_on_target" => Ok(Self::AlreadyOnTarget),
+            "refused" => Ok(Self::Refused),
             other => Err(RecordedRuntimeUpgradeOutcomeParseError(other.to_string())),
         }
     }
@@ -993,6 +1266,22 @@ impl FromStr for RecordedRuntimeUpgradeOutcome {
 pub struct RuntimeUpgradeReport {
     pub sandbox_id: String,
     pub status: RuntimeUpgradeStatus,
+    /// The attempt the reported outcome ran as, as its live row or recorded
+    /// outcome names it; `None` for a row written before the node recorded
+    /// attempts.
+    pub attempt_id: Option<String>,
+    /// The latest attempt the operation refused after it reached its target,
+    /// so the sandbox doesn't run for that attempt; see
+    /// [`record_runtime_upgrade_refused_attempt`]. Only an upgraded or
+    /// already-on-target operation refuses one.
+    pub refused_attempt: Option<RuntimeUpgradeRefusedAttempt>,
+}
+
+/// An attempt an operation refused after it reached its target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeUpgradeRefusedAttempt {
+    pub attempt_id: String,
+    pub failure: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1004,6 +1293,8 @@ pub enum RuntimeUpgradeStatus {
     Upgraded,
     /// The old pair is back. The preserved copy may still await deletion.
     RolledBack { failure: Option<String> },
+    /// The request was refused before it fenced anything; `failure` says why.
+    Refused { failure: Option<String> },
     /// Nothing was fenced or booted. `activation` once the upgrade claimed
     /// its activation for a started target; a claimed start may still have
     /// failed.
@@ -1042,7 +1333,8 @@ impl RuntimeUpgradeActivationClaim {
 db_private_outside_tests! {
     /// The report for `operation_id`, `None` when the node holds no record of
     /// it. The live row, when there is one, wins over a recorded outcome: a
-    /// retry after a rollback starts over under the same operation.
+    /// new attempt after a rollback or a refusal starts over under the same
+    /// operation.
     fn runtime_upgrade_report(
         conn: &Connection,
         operation_id: RuntimeUpgradeOperationId,
@@ -1058,20 +1350,38 @@ db_private_outside_tests! {
             return Ok(Some(RuntimeUpgradeReport {
                 sandbox_id: record.sandbox_id,
                 status,
+                attempt_id: record.attempt_id,
+                refused_attempt: latest_refused_attempt(conn, operation_id)?,
             }));
         }
-        type OutcomeRow = (String, String, Option<String>, Option<String>, Option<String>);
+        type OutcomeRow = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
         let row: Option<OutcomeRow> = conn
             .query_row(
                 "SELECT sandbox_id, outcome, failure, activation_claim_kind,
-                        activation_claimed_execution_id
+                        activation_claimed_execution_id, attempt_id
                    FROM sandbox_runtime_upgrade_outcomes
                   WHERE operation_id = ?1",
                 params![operation_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        row.map(|(sandbox_id, outcome, failure, claim_kind, claimed_execution)| {
+        row.map(|(sandbox_id, outcome, failure, claim_kind, claimed_execution, attempt_id)| {
             let from_execution = claimed_execution
                 .map(|id| id.parse())
                 .transpose()
@@ -1094,11 +1404,17 @@ db_private_outside_tests! {
                 .map_err(|error| conversion_error(1, Type::Text, error))?
             {
                 RecordedRuntimeUpgradeOutcome::RolledBack => RuntimeUpgradeStatus::RolledBack { failure },
+                RecordedRuntimeUpgradeOutcome::Refused => RuntimeUpgradeStatus::Refused { failure },
                 RecordedRuntimeUpgradeOutcome::AlreadyOnTarget => {
                     RuntimeUpgradeStatus::AlreadyOnTarget { activation }
                 }
             };
-            Ok(RuntimeUpgradeReport { sandbox_id, status })
+            Ok(RuntimeUpgradeReport {
+                sandbox_id,
+                status,
+                attempt_id,
+                refused_attempt: latest_refused_attempt(conn, operation_id)?,
+            })
         })
         .transpose()
     }
