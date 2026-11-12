@@ -275,6 +275,36 @@ async fn managing_org_id(
     })
 }
 
+/// The organization an admin template build runs as: the one the request
+/// names, which must exist, or else the cluster's managing org.
+///
+/// Ownership of an existing template is still checked downstream, so naming
+/// an org cannot move a template that another org already owns.
+async fn build_org_id(
+    pool: &sqlx::PgPool,
+    requested: Option<OrgId>,
+) -> Result<OrgId, ApiErrorResponse> {
+    let Some(org_id) = requested else {
+        return managing_org_id(pool, "failed to load managing org for template build").await;
+    };
+    let exists: bool = sqlx::query_scalar(sql!(
+        "SELECT EXISTS (SELECT 1 FROM organizations WHERE id = $1)"
+    ))
+    .bind(org_id.as_uuid())
+    .fetch_one(pool)
+    .await
+    .map_err(|error| {
+        contention_response(ContentionScope::ReadOnly, &error).unwrap_or_else(|| {
+            tracing::error!(%error, %org_id, "failed to load template build org");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+        })
+    })?;
+    if !exists {
+        return Err(api_error(StatusCode::NOT_FOUND, "Organization not found"));
+    }
+    Ok(org_id)
+}
+
 /// `api_error`'s envelope with `retryable` forced on.
 ///
 /// `api_error` derives that flag from the status, and 409 is absent from its
@@ -1627,6 +1657,7 @@ pub async fn start_template_build(
         publish_tags,
         request.client,
         None,
+        request.org_id,
     )
     .await
 }
@@ -2103,6 +2134,10 @@ fn system_template_recipe(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the build request's fields plus its target; bundling them only moves the list"
+)]
 async fn submit_admin_template_build(
     state: AppState,
     target: TemplateBuildTarget,
@@ -2111,13 +2146,9 @@ async fn submit_admin_template_build(
     publish_tags: Vec<String>,
     client: Option<TemplateBuildClientContext>,
     environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    requested_org_id: Option<OrgId>,
 ) -> axum::response::Response {
-    let managing_org_id = match managing_org_id(
-        &state.pool,
-        "failed to load managing org for template build",
-    )
-    .await
-    {
+    let org_id = match build_org_id(&state.pool, requested_org_id).await {
         Ok(org_id) => org_id,
         Err(response) => return response.into_response(),
     };
@@ -2125,7 +2156,7 @@ async fn submit_admin_template_build(
         &state,
         TemplateBuildSubmission {
             environment,
-            org_id: managing_org_id,
+            org_id,
             target,
             client_build_id: None,
             recipe,

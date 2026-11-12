@@ -583,6 +583,156 @@ async fn native_build_session_ownership(
     Ok(())
 }
 
+/// A native build that names an organization runs as it: the builder is told
+/// that org, the job is recorded under it, and its private bases resolve
+/// while the managing org's do not, exactly as an E2B build with that org's
+/// key would. An unknown org is refused before dispatch, even for a template
+/// another org owns, and naming an org cannot take over a template another
+/// org already owns.
+#[rstest]
+#[case::named_org(Target::Seed, None, None, StatusCode::ACCEPTED)]
+#[case::unknown_org(Target::Unknown, None, None, StatusCode::NOT_FOUND)]
+#[case::unknown_org_for_owned_template(
+    Target::Unknown,
+    Some(Owner::Managing),
+    None,
+    StatusCode::NOT_FOUND
+)]
+#[case::template_owned_by_managing_org(
+    Target::Seed,
+    Some(Owner::Managing),
+    None,
+    StatusCode::CONFLICT
+)]
+#[case::template_owned_by_named_org(Target::Seed, Some(Owner::Seed), None, StatusCode::ACCEPTED)]
+#[case::named_org_private_base(Target::Seed, None, Some(Owner::Seed), StatusCode::ACCEPTED)]
+#[case::managing_org_private_base(Target::Seed, None, Some(Owner::Managing), StatusCode::NOT_FOUND)]
+#[tokio::test]
+async fn native_build_runs_as_the_named_org(
+    #[future] native_build_fixture: TestResult<NativeBuildFixture>,
+    #[case] target: Target,
+    #[case] existing_owner: Option<Owner>,
+    #[case] private_base_owner: Option<Owner>,
+    #[case] expected_status: StatusCode,
+) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let mut fixture = native_build_fixture.await?;
+    let template = "native-named-org-build";
+    let seed_org = OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID);
+    let target_org = match target {
+        Target::Seed => seed_org,
+        Target::Unknown => OrgId::new(),
+    };
+    if let Some(owner) = existing_owner {
+        sqlx::query(sql!(
+            "INSERT INTO templates (id, name, org_id) VALUES ($1, $2, $3)"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(template)
+        .bind(match owner {
+            Owner::Managing => fixture.org_id,
+            Owner::Seed => seed_org,
+        })
+        .execute(&fixture.db.pool)
+        .await?;
+    }
+    let base_name = "native-named-org-base";
+    let base_hash = "sha256:00000000000000000000000000000000000000000000000000000000000000b1";
+    if let Some(owner) = private_base_owner {
+        sqlx::query(sql!(
+            "INSERT INTO templates (id, name, org_id, visibility)
+             VALUES ($1, $2, $3, 'org_specific')"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(base_name)
+        .bind(match owner {
+            Owner::Managing => fixture.org_id,
+            Owner::Seed => seed_org,
+        })
+        .execute(&fixture.db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO template_releases (template_name, type, hash) VALUES ($1, 'fc', $2)"
+        ))
+        .bind(base_name)
+        .bind(base_hash)
+        .execute(&fixture.db.pool)
+        .await?;
+    }
+    let token = build_admin_token(&fixture).await?;
+    let mut body = scratch_template_build_request_json(KERNEL_VERSION, KERNEL_DIGEST);
+    body["org_id"] = serde_json::json!(target_org.to_string());
+    if private_base_owner.is_some() {
+        body["recipe"]["origin"] =
+            serde_json::json!({"from_template": {"base": format!("{base_name}@{base_hash}")}});
+    }
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post(format!("/admin/api/v1/templates/{template}/builds"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    assert_eq!(
+        status,
+        expected_status,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let build = fixture.builds.try_recv().ok();
+    let jobs: Vec<(Option<OrgId>, String)> = sqlx::query_as(sql!(
+        "SELECT org_id, build_id FROM template_build_jobs WHERE template_id = $1"
+    ))
+    .bind(template)
+    .fetch_all(&fixture.db.pool)
+    .await?;
+    if expected_status == StatusCode::ACCEPTED {
+        let request = build.expect("accepted build must reach the builder");
+        assert_eq!(request.org_id, Some(seed_org.to_string()));
+        if private_base_owner.is_some() {
+            let origin = request
+                .recipe
+                .and_then(|recipe| recipe.origin)
+                .and_then(|o| o.kind);
+            let Some(build_proto::recipe::origin::Kind::FromTemplate(base)) = origin else {
+                panic!("private-base build must reach the builder from that base: {origin:?}");
+            };
+            assert_eq!(base.base, format!("{base_name}@{base_hash}"));
+        }
+        assert_eq!(jobs, vec![(Some(seed_org), fixture.job_id.to_string())]);
+    } else {
+        assert!(
+            build.is_none(),
+            "rejected builds must not reach the builder"
+        );
+        assert!(jobs.is_empty(), "rejected builds must not create job rows");
+    }
+    fixture.shutdown.cancel();
+    fixture.tasks.close();
+    fixture.tasks.wait().await;
+    fixture.db.pool.close().await;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    Seed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Owner {
+    Managing,
+    Seed,
+}
+
 /// A replayed system build with the same `Idempotency-Key` and body returns
 /// the original job without reaching the builder again; the same key with a
 /// different body is refused. The key is committed before dispatch, so neither
