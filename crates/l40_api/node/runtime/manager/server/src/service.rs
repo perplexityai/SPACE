@@ -158,7 +158,7 @@ fn parse_line(runtime: RuntimeKind, value: &str) -> Result<RuntimeLine, Status> 
 /// The release a runtime request names. The runtime must be named.
 fn parse_release(runtime_kind: i32, version: &str) -> Result<RuntimeIdentity, Status> {
     let kind = parse_runtime(runtime_kind, None)?;
-    let version = RuntimeVersion::parse(version.strip_prefix('v').unwrap_or(version))
+    let version = RuntimeVersion::parse(version.trim_prefix('v'))
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     Ok(RuntimeIdentity { kind, version })
 }

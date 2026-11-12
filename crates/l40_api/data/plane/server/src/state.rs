@@ -488,9 +488,7 @@ pub(super) async fn build_backend_channels(
         endpoint,
     )
     .await?;
-    Ok((0..pool_size)
-        .map(|_| endpoint.clone().connect_lazy())
-        .collect())
+    Ok(Vec::from_fn(pool_size, |_| endpoint.clone().connect_lazy()))
 }
 
 fn normalize_backend_endpoint(endpoint: &str) -> Result<String, tonic::transport::Error> {

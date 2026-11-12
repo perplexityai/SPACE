@@ -101,18 +101,17 @@ paths_to_restamp() {
     done
 }
 
-# Uplifted copies are links Cargo recreates on every build of a target; the
-# hashed originals under deps/, examples/ and build/ are what it tracks.
+# Cargo 1.100 keeps intermediates and fingerprints under build/<crate>/<hash>.
+# Top-level outputs and examples are uplifted copies it recreates on every build.
 delete_path_readable_outputs() {
     local target_dir="$1"
     local profile
     rm -rf "${target_dir}/tmp"
     for profile in "${target_dir}"/*/; do
-        [ -d "${profile}.fingerprint" ] || continue
+        [ -d "${profile}build" ] || continue
         find "${profile}" -maxdepth 1 \( -type f -o -type l \) -delete
         if [ -d "${profile}examples" ]; then
-            find "${profile}examples" -maxdepth 1 -regextype posix-extended \
-                \( -type f -o -type l \) ! -regex '.*-[0-9a-f]{16}(\.[^/]*)?' -delete
+            find "${profile}examples" -maxdepth 1 \( -type f -o -type l \) -delete
         fi
     done
 }

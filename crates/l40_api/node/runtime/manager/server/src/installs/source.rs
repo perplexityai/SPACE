@@ -55,7 +55,7 @@ impl FromStr for ReleaseLine {
         let invalid = || ReleaseLineParseError(value.to_string());
         let digits =
             |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
-        let unprefixed = value.strip_prefix('v').unwrap_or(value);
+        let unprefixed = value.trim_prefix('v');
         let mut parts = unprefixed.split('.');
         let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
             return Err(invalid());
@@ -158,8 +158,7 @@ impl FromStr for KernelVersion {
             None => (value, None),
         };
         let numeric_parts = release
-            .strip_suffix('+')
-            .unwrap_or(release)
+            .trim_suffix('+')
             .split('.')
             .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
         let plain_variant = variant.is_none_or(|variant| {

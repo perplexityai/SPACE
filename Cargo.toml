@@ -202,7 +202,7 @@ edition = "2024"
 # on): that is the minimum we can prove green. Raise both together when bumping.
 # Edition 2024 independently requires >=1.85. Members inherit via
 # `rust-version.workspace = true`.
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 authors = ["Perplexity AI"]
 license = "Apache-2.0"
 publish = false
@@ -436,7 +436,6 @@ pplx-space-reconcile-metrics = { path = "crates/l10_foundation/reconcile/metrics
 pplx-space-sandbox-metrics = { path = "crates/l40_api/sandbox/metrics" }
 pplx-space-observability = { path = "crates/l10_foundation/observability", default-features = false }
 pplx-space-internal-api-server = { path = "crates/l40_api/internal/api/server" }
-pplx-space-internal-api-svc = { path = "crates/l50_app/internal/api/svc" }
 pplx-space-k8s-ids = { path = "crates/l10_foundation/k8s/ids" }
 pplx-space-kube-client = { path = "crates/l10_foundation/kube/client" }
 pplx-space-cluster-id = { path = "crates/l20_domain/cluster/id" }
@@ -501,13 +500,11 @@ pplx-space-spaced-host-client = { path = "crates/l40_api/spaced/host/client" }
 pplx-space-spaced-host-server = { path = "crates/l40_api/spaced/host/server" }
 pplx-space-template-mgr = { path = "crates/l40_api/template/mgr/server" }
 pplx-space-template-mgr-client = { path = "crates/l40_api/template/mgr/client" }
-pplx-space-template-mgr-store = { path = "crates/l30_storage/template/mgr/store" }
 pplx-space-template-publisher = { path = "crates/l40_api/template/publisher" }
 pplx-space-test-env = { path = "crates/test_support/test/env" }
 pplx-space-unix-socket-path = { path = "crates/l10_foundation/unix/socket/path" }
 pplx-space-uds-peer-auth = { path = "crates/l10_foundation/uds/peer/auth" }
 pplx-space-unix-socket-bind = { path = "crates/l10_foundation/unix/socket/bind" }
-pplx-space-valkey = { path = "crates/l10_foundation/valkey" }
 pplx-space-grpc-rate-limiter = { path = "crates/l10_foundation/grpc/rate/limiter" }
 pplx-space-tokio-runtime = { path = "crates/l10_foundation/tokio/runtime" }
 [profile.release]

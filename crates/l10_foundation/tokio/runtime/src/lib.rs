@@ -94,12 +94,10 @@ impl RuntimeSnapshot {
             sampled_at: Instant::now(),
             num_alive_tasks: metrics.num_alive_tasks(),
             global_queue_depth: metrics.global_queue_depth(),
-            workers: (0..num_workers)
-                .map(|worker| WorkerSnapshot {
-                    total_busy_duration: metrics.worker_total_busy_duration(worker),
-                    park_count: metrics.worker_park_count(worker),
-                })
-                .collect(),
+            workers: Vec::from_fn(num_workers, |worker| WorkerSnapshot {
+                total_busy_duration: metrics.worker_total_busy_duration(worker),
+                park_count: metrics.worker_park_count(worker),
+            }),
         }
     }
 }

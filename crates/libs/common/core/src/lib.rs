@@ -96,7 +96,7 @@ pub mod ids {
     /// assert_eq!(sandbox_label_or_id("bad id"), "bad id");
     /// ```
     pub fn sandbox_label_or_id(sandbox_id: &str) -> String {
-        let display_id = sandbox_id.strip_prefix("sbx_").unwrap_or(sandbox_id);
+        let display_id = sandbox_id.trim_prefix("sbx_");
         sandbox_label(display_id).unwrap_or_else(|_| sandbox_id.to_string())
     }
 

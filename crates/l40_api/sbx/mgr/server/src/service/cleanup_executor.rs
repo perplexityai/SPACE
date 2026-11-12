@@ -491,7 +491,7 @@ impl SandboxManagerService {
             } else {
                 [(0, background), (1, foreground)]
             };
-            foreground_first = !foreground_first;
+            foreground_first.toggle();
             let jobs = self
                 .storage(move |db| {
                     let tx = crate::db::Transaction::deferred(db).map_err(storage_status)?;

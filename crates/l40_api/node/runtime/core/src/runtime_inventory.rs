@@ -1409,7 +1409,7 @@ fn component_metadata_identity(
 fn version_from_dir(path: &Path) -> Option<RuntimeVersion> {
     path.file_name()
         .and_then(|value| value.to_str())
-        .and_then(|value| RuntimeVersion::parse(value.strip_prefix('v').unwrap_or(value)).ok())
+        .and_then(|value| RuntimeVersion::parse(value.trim_prefix('v')).ok())
 }
 
 /// Architecture of the host running execution inventory and launch admission.

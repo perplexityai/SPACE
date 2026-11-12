@@ -389,7 +389,7 @@ pub fn is_test_directory(name: &OsStr) -> bool {
 /// so a CR-only file is one line. A leading byte order mark is not part of the
 /// first line.
 pub fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let text = text.trim_prefix('\u{feff}');
     text.lines()
         .enumerate()
         .map(|(index, line)| (index + 1, line))
@@ -700,7 +700,7 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), LoadErro
 }
 
 fn relative_path(root: &Path, path: &Path) -> Result<String, LoadError> {
-    let relative = path.strip_prefix(root).unwrap_or(path);
+    let relative = path.trim_prefix(root);
     let parts: Option<Vec<&str>> = relative
         .components()
         .map(|component| component.as_os_str().to_str())
