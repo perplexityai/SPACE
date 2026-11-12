@@ -1126,7 +1126,9 @@ async fn terminate_of_a_v2_node_needs_a_done_report_for_its_epoch() -> TestResul
 
 /// A drain of an undrained v2 node whose cancel hasn't reached the node is
 /// refused unless it runs under v2, which starts a new epoch; a default
-/// `:drain` would inherit the old epoch and its cancel.
+/// `:drain` would inherit the old epoch and its cancel. The new drain takes
+/// over the slot an admitted drain's cancel holds, starting admitted, and
+/// waits for one when the cancelled drain was still waiting.
 #[tokio::test(flavor = "current_thread")]
 async fn a_drain_over_a_pending_v2_cancel_runs_under_v2_only() -> TestResult {
     if !enter_direct_test_process() {
@@ -1138,42 +1140,53 @@ async fn a_drain_over_a_pending_v2_cancel_runs_under_v2_only() -> TestResult {
     let mut state = kubernetes_state(&db.pool).await?;
     state.drain_v2_enabled = true;
     let actor = managing_org_admin(&db.pool).await?;
-    let cancelled = || serde_json::json!({"epoch": 42, "cancel": true});
 
-    let node_id = insert_k8s_node(&db.pool, None, Some("v2"), Some(cancelled())).await?;
-    let before = v2_columns(&db.pool, node_id).await?;
-    let answer = post_drain(
-        &state,
-        &actor,
-        node_id,
-        DrainAction::Drain,
-        DrainRequest {
-            engine: None,
-            ..v2_request(NodeDrainMode::Forced)
-        },
-    )
-    .await;
-    assert_eq!(answer, StatusCode::CONFLICT);
-    assert_eq!(v2_columns(&db.pool, node_id).await?, before, "wrote");
+    for (cancelled, waiting) in [
+        (serde_json::json!({"epoch": 42, "cancel": true}), false),
+        (
+            serde_json::json!({"epoch": 42, "cancel": true, "waiting": false}),
+            false,
+        ),
+        (
+            serde_json::json!({"epoch": 42, "cancel": true, "waiting": true}),
+            true,
+        ),
+    ] {
+        let node_id = insert_k8s_node(&db.pool, None, Some("v2"), Some(cancelled.clone())).await?;
+        let before = v2_columns(&db.pool, node_id).await?;
+        let answer = post_drain(
+            &state,
+            &actor,
+            node_id,
+            DrainAction::Drain,
+            DrainRequest {
+                engine: None,
+                ..v2_request(NodeDrainMode::Forced)
+            },
+        )
+        .await;
+        assert_eq!(answer, StatusCode::CONFLICT);
+        assert_eq!(v2_columns(&db.pool, node_id).await?, before, "wrote");
 
-    post_drain(
-        &state,
-        &actor,
-        node_id,
-        DrainAction::Drain,
-        v2_request(NodeDrainMode::Forced),
-    )
-    .await;
-    let (phase, engine, status, started_us) = v2_columns(&db.pool, node_id).await?;
-    assert_eq!(
-        (phase.as_deref(), engine.as_deref()),
-        (Some("draining"), Some("v2"))
-    );
-    assert_eq!(
-        status,
-        started_us.map(|epoch| serde_json::json!({"epoch": epoch, "waiting": true})),
-        "a new epoch, waiting for its slot, without the old cancel"
-    );
+        post_drain(
+            &state,
+            &actor,
+            node_id,
+            DrainAction::Drain,
+            v2_request(NodeDrainMode::Forced),
+        )
+        .await;
+        let (phase, engine, status, started_us) = v2_columns(&db.pool, node_id).await?;
+        assert_eq!(
+            (phase.as_deref(), engine.as_deref()),
+            (Some("draining"), Some("v2"))
+        );
+        assert_eq!(
+            status,
+            started_us.map(|epoch| serde_json::json!({"epoch": epoch, "waiting": waiting})),
+            "a new epoch without the old cancel, over {cancelled}"
+        );
+    }
     Ok(())
 }
 

@@ -236,6 +236,140 @@ async fn waiting_drains_are_admitted_oldest_first_up_to_the_cap() {
     }
 }
 
+/// A node holds an evacuation slot from its admission until it leaves v2:
+/// while it evacuates, and while it is undrained with its cancel not yet
+/// finished, letting its running suspends and uploads finish. A waiting
+/// drain, cancelled or not, a drained or terminating node, and a row gone,
+/// its cancel finished or the row deleted, hold none, so the oldest waiting
+/// drain beside it is admitted to the one slot.
+#[tokio::test]
+async fn a_node_holds_its_slot_until_it_leaves_v2() {
+    let waiting = |phase: Option<&str>, cancel: bool| V2Node {
+        waiting: true,
+        ..node(phase, Some(5), cancel)
+    };
+    for (case, other, holds) in [
+        (
+            "evacuating",
+            Some(node(Some("draining"), Some(5), false)),
+            true,
+        ),
+        ("cancelling", Some(node(None, Some(5), true)), true),
+        ("waiting", Some(waiting(Some("draining"), false)), false),
+        ("cancelled while waiting", Some(waiting(None, true)), false),
+        (
+            "drained",
+            Some(node(Some("drained"), Some(5), false)),
+            false,
+        ),
+        (
+            "terminating",
+            Some(V2Node {
+                terminated: true,
+                ..node(Some("terminating"), Some(5), false)
+            }),
+            false,
+        ),
+        ("left v2", None, false),
+    ] {
+        // The oldest drain, so a waiting one beside it comes second.
+        let next = V2Node {
+            epoch: Some(1),
+            ..waiting(Some("draining"), false)
+        };
+        let nodes: Vec<V2Node> = other.iter().cloned().chain([next.clone()]).collect();
+        let sink = FakeSink {
+            responses: nodes
+                .iter()
+                .flat_map(|node| {
+                    // A cancel still handing back what it evacuated.
+                    let mut answer = response(None, false, &[]);
+                    answer
+                        .pending
+                        .push(pplx_space_sbx_mgr_client::proto::DrainPending {
+                            sandbox_id: "a".into(),
+                            action: "suspend".into(),
+                        });
+                    [
+                        ((node.id, false), Ok(response(node.epoch, false, &[]))),
+                        ((node.id, true), Ok(answer)),
+                    ]
+                })
+                .collect(),
+            nodes,
+            ..FakeSink::default()
+        };
+        let report = tick(&sink, &FakeTerminator::ok(), 1).await;
+        let admitted: &[NodeId] = if holds { &[] } else { &[next.id] };
+        assert_eq!(report.admitted, admitted, "{case}");
+        assert_eq!(
+            sink.calls()
+                .iter()
+                .any(|call| call.starts_with(&format!("drain_node {}", next.id))),
+            !holds,
+            "{case}: {:?}",
+            sink.calls()
+        );
+    }
+}
+
+/// A drain cancelled while it still waited for a slot was never sealed or
+/// called: one cancel call, which the node answers with nothing to hand
+/// back, finishes it in the tick, with no cordon, admission or drain call,
+/// and it keeps no other drain from its slot.
+#[tokio::test]
+async fn a_waiting_drains_cancel_finishes_at_once() {
+    let cancelled = V2Node {
+        waiting: true,
+        ..node(None, Some(10), true)
+    };
+    let next = V2Node {
+        waiting: true,
+        ..node(Some("draining"), Some(20), false)
+    };
+    let sink = FakeSink {
+        nodes: vec![cancelled.clone(), next.clone()],
+        responses: HashMap::from([
+            ((cancelled.id, true), Ok(response(None, false, &[]))),
+            ((next.id, false), Ok(response(Some(20), false, &[]))),
+        ]),
+        ..FakeSink::default()
+    };
+    let report = tick(&sink, &FakeTerminator::ok(), 1).await;
+    assert_eq!(report.cancelled, [cancelled.id]);
+    assert_eq!(report.admitted, [next.id]);
+    let calls: Vec<_> = sink
+        .calls()
+        .into_iter()
+        .filter(|call| call.contains(&cancelled.id.to_string()))
+        .collect();
+    assert_eq!(
+        calls.first().map(String::as_str),
+        Some(format!("drain_node {} 10 cancel=true", cancelled.id).as_str()),
+        "{calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("drain_node"))
+            .count(),
+        1,
+        "{calls:?}"
+    );
+    assert!(
+        calls
+            .last()
+            .is_some_and(|call| call.starts_with("finish_cancel")),
+        "{calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("cordon") || call.starts_with("admit")),
+        "{calls:?}"
+    );
+}
+
 /// A tick calls its nodes at once: two nodes whose `DrainNode` calls each
 /// wait for the other both answer.
 #[tokio::test]

@@ -9,10 +9,11 @@
 //!
 //! - **`draining`, waiting**: the admin route starts every v2 drain waiting
 //!   for one of the cluster's evacuation slots (`drain_status.waiting`).
-//!   At most [`DEFAULT_MAX_EVACUATING_NODES`] nodes evacuate at once (sealed
-//!   and not yet `drained`); a waiting node is admitted, oldest drain first,
-//!   once one frees. Until then it stays cordoned and gets no `DrainNode`
-//!   call, so it isn't sealed and the drain gate refuses no user call on it.
+//!   At most [`DEFAULT_MAX_EVACUATING_NODES`] nodes evacuate at once
+//!   (admitted and not yet `drained`, or undrained with their cancel not yet
+//!   finished); a waiting node is admitted, oldest drain first, once one
+//!   frees. Until then it stays cordoned and gets no `DrainNode` call, so it
+//!   isn't sealed and the drain gate refuses no user call on it.
 //! - **`draining` and `drained`**: reconcile the cordon, call `DrainNode`
 //!   under the epoch, and for each sandbox the node reports evacuated,
 //!   enqueue the drain restore operation that brings a suspended one back to
@@ -34,7 +35,11 @@
 //!   sandbox the drain suspended, the loop records it as a drain records it
 //!   (enqueueing the restore to its prior lifecycle, which may land on the
 //!   node again), and the node forgets the ones recorded. Once the node is
-//!   unsealed with nothing left to hand back, clear the v2 columns.
+//!   unsealed with nothing left to hand back, clear the v2 columns. Until
+//!   then the node keeps its evacuation slot, as its running suspends and
+//!   uploads finish; a drain that never left waiting holds none, and its
+//!   cancel finishes on the first call the node answers with nothing to hand
+//!   back.
 //!
 //! An evacuation the loop can't record for [`UNRECORDED_BOUND`] is reported
 //! `blocked`, as the node reports work that doesn't settle.
@@ -91,9 +96,18 @@ pub struct V2Node {
 }
 
 impl V2Node {
-    /// Sealed, or about to be, under its epoch and not yet `drained`.
+    /// Holding an evacuation slot: admitted and not yet `drained`, or
+    /// undrained after its admission with its cancel not yet finished, which
+    /// lets the node's running suspends and uploads finish. The slot frees
+    /// once the node leaves v2: its cancel finished, or its row deleted.
     fn evacuating(&self) -> bool {
-        self.epoch.is_some() && self.phase.as_deref() == Some("draining") && !self.waiting
+        self.epoch.is_some()
+            && !self.waiting
+            && match self.phase.as_deref() {
+                Some("draining") => true,
+                None => self.cancel,
+                Some(_) => false,
+            }
     }
 
     fn awaiting_slot(&self) -> bool {

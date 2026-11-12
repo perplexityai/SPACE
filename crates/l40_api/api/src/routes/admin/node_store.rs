@@ -1464,7 +1464,11 @@ pub(super) async fn drain_v2_columns(
 /// later, so its epoch is larger: the node takes epochs only forward. The
 /// drain starts waiting for one of the cluster's evacuation slots
 /// (`waiting`), which the controller's v2 loop admits it to before it seals
-/// the node; until then the drain gate leaves the node's sandboxes open.
+/// the node; until then the drain gate leaves the node's sandboxes open. A
+/// drain started over the cancel of an admitted one that hasn't finished
+/// starts admitted instead, in the slot that cancel holds: the node may
+/// still be sealed under the cancelled epoch, finishing its suspends, and
+/// this drain's first call takes over the seal and what it evacuated.
 pub(super) async fn start_v2_drain(
     tx: &mut Transaction<'_, Postgres>,
     node_id: NodeId,
@@ -1474,7 +1478,12 @@ pub(super) async fn start_v2_drain(
             SET drain_engine = 'v2',
                 drain_status = jsonb_build_object(
                     'epoch', (EXTRACT(EPOCH FROM drain_started_at) * 1000000)::BIGINT,
-                    'waiting', TRUE
+                    'waiting', NOT COALESCE(
+                        drain_engine = 'v2'
+                            AND (drain_status->>'cancel')::BOOLEAN
+                            AND NOT COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE),
+                        FALSE
+                    )
                 )
           WHERE id = $1 AND drain_phase = 'draining' AND drain_started_at IS NOT NULL"
     ))
