@@ -308,7 +308,7 @@ each interval's increase to one category:
 | `vmm_non_vcpu` | increase in VMM cgroup `/space/<id>` `usage_usec` minus the increase of its vCPU threads | host |
 | `unattributed` | VMM cgroup increase in an interval where one of its vCPU threads exited, so the split is unknown | neither |
 | `sidecar` | sidecar cgroup `/space/sbx-<id>` (net-gateway, spaced-host) | host |
-| `node_daemons` | `usage_usec` of the cgroup of each process outside sandbox cgroups whose name starts with `--daemon-prefix` (default `space-`); this includes helper processes the daemon runs (e2fsck, ip, nft) but not sidecars it launches, which move to `sbx-*` cgroups | host |
+| `node_daemons` | `usage_usec` of the cgroup of each process outside sandbox cgroups whose name starts with `--daemon-prefix` (default `space-`); this includes helper processes the daemon runs (e2fsck, ip, nft) and exec probes run in its container, but not sidecars it launches, which move to `sbx-*` cgroups | host |
 
 Host CPU is the sum of the three host categories. A sandbox counts toward
 sandbox-minutes for each interval in which its VMM cgroup held a process at
