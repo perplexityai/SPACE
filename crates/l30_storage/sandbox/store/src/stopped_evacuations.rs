@@ -25,6 +25,11 @@ pub struct StoppedEvacuationRow {
     pub marked: bool,
     /// A `creating` snapshot of the pinned artifact exists.
     pub upload_in_flight: bool,
+    /// The row is still a `stopped` resident of the source node, and that
+    /// node is still force-draining: `claim_holds` without the marker
+    /// conjunct, for a step that acts on a row before any claim re-checks the
+    /// drain.
+    pub resident: bool,
 }
 
 /// `$1` = sandbox id, `$2` = source node id.
@@ -59,7 +64,18 @@ static STATE: LazyLock<String> = LazyLock::new(|| {
                   WHERE sn.sandbox_id = s.id
                     AND {pinned}
                     AND sn.state = 'creating'
-             ) AS upload_in_flight
+             ) AS upload_in_flight,
+             COALESCE((
+                 s.lifecycle = 'stopped'
+                 AND s.active_node_id = $2
+                 AND EXISTS (
+                SELECT 1
+                  FROM nodes n_fd
+                 WHERE n_fd.id = $2
+                   AND n_fd.drain_phase = 'draining'
+                   AND n_fd.drain_mode = 'forced'
+            )
+             ), FALSE) AS resident
              FROM sandboxes s
              WHERE s.id = $1"
     ))
