@@ -2496,8 +2496,10 @@ ordering are unchanged.
 To measure a failure rate, run a versioned suite from `space_smoke/suites.py`
 repeatedly: `SPACE_SMOKE_API_SURFACE=native python -m space_smoke run --suite
 lifecycle-faults --repeat 20`. Each pass runs the whole suite in order, and the
-run ends with failures per 1,000 scenario runs, counting a pass that left
-cleanup failures as a failure. A suite runs only whole: if any listed scenario
+run ends with failures per 1,000 conclusive scenario runs: a fail, or a pass or
+warning that left cleanup failures. Inconclusive runs and infrastructure errors
+are reported separately and left out of the rate. A repeated run labels each
+result that did not pass with its pass number. A suite runs only whole: if any listed scenario
 would be skipped, quarantined or withheld, the run stops before any scenario
 runs. A released version's list never changes; compare rates only within one
 `NAME@VERSION`. `--repeat` also works with `--all` and `--category`.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import shlex
@@ -205,9 +206,17 @@ def _one_line(text: str) -> str:
     return " | ".join(line.strip() for line in text.splitlines() if line.strip())
 
 
+def _labelled_id(result: ScenarioProcessResult) -> str:
+    """The scenario id, with its pass number when the run repeated."""
+
+    if result.pass_number is None:
+        return result.scenario_id
+    return f"{result.scenario_id} (pass {result.pass_number})"
+
+
 def _failure_detail(result: ScenarioProcessResult) -> str:
     verdict, summary = _verdict_and_summary(result)
-    detail = f"{result.scenario_id} [{verdict}]: {_one_line(summary)}"
+    detail = f"{_labelled_id(result)} [{verdict}]: {_one_line(summary)}"
     evidence = (result.report or {}).get("evidence")
     if isinstance(evidence, dict) and evidence.get("sandbox_id"):
         detail += f" (sandbox_id={evidence['sandbox_id']})"
@@ -244,7 +253,7 @@ def _print_not_passed(
     print(f"\nNOT PASSED on the {api_surface} API surface ({len(not_passed)}):")
     for result in not_passed:
         verdict, summary = _verdict_and_summary(result)
-        print(f"  {verdict.upper()} {result.scenario_id}: {summary}")
+        print(f"  {verdict.upper()} {_labelled_id(result)}: {summary}")
         evidence = (result.report or {}).get("evidence")
         if result.last_phase is not None:
             print(f"    last phase: {result.last_phase}")
@@ -607,13 +616,18 @@ def _run_all(
     for number in range(1, repeat + 1):
         if repeat > 1:
             print(f"\n=== PASS {number}/{repeat} ===", flush=True)
-        results += run_scenarios(
+        passed_through = run_scenarios(
             scenarios,
             environment=environment,
             on_start=_print_started,
             line_sink=_print_line,
             on_result=_print_finished,
         )
+        if repeat > 1:
+            passed_through = tuple(
+                dataclasses.replace(result, pass_number=number) for result in passed_through
+            )
+        results += passed_through
     _write_failure_details(results)
 
     passed = sum(result.exit_code == 0 for result in results)
@@ -663,26 +677,36 @@ def _suite_incomplete(suite: Suite, scenarios: tuple[Scenario[Any], ...]) -> str
 
 
 def _failure_rate_failed(result: ScenarioProcessResult) -> bool:
-    """A run that did not pass, or passed and left cleanup failures behind."""
+    """A run that failed, or passed or warned and left cleanup failures behind."""
 
-    return result.exit_code != 0 or bool(_cleanup_failures(result))
+    return result.exit_code == 1 or bool(_cleanup_failures(result))
 
 
 def _print_failure_rate(results: tuple[ScenarioProcessResult, ...], label: str) -> None:
-    """Failures per 1,000 scenario runs, overall and per scenario.
+    """Failures per 1,000 conclusive scenario runs, overall and per scenario.
 
-    Every result counts, known failures included: the list excuses a result
-    from the exit code, not from the rate.
+    An inconclusive run or infrastructure error says nothing about the
+    lifecycle under test, so it is reported on its own and left out of the
+    denominator. Known failures count: the list excuses a result from the
+    exit code, not from the rate.
     """
 
-    failed = sum(map(_failure_rate_failed, results))
+    conclusive = tuple(result for result in results if result.exit_code in (0, 1, 42))
+    excluded = len(results) - len(conclusive)
+    if not conclusive:
+        print(f"FAILURE RATE {label}: withheld; no conclusive scenario runs ({excluded} excluded)")
+        return
+    failed = sum(map(_failure_rate_failed, conclusive))
     print(
-        f"FAILURE RATE {label}: {failed} of {len(results)} scenario runs failed "
-        f"or left cleanup failures ({1000 * failed / len(results):.1f} per 1,000)"
+        f"FAILURE RATE {label}: {failed} of {len(conclusive)} conclusive scenario runs "
+        f"failed or left cleanup failures ({1000 * failed / len(conclusive):.1f} per 1,000); "
+        f"{excluded} inconclusive or infrastructure errors excluded"
     )
     for scenario_id in dict.fromkeys(result.scenario_id for result in results):
-        runs = [result for result in results if result.scenario_id == scenario_id]
-        print(f"  {scenario_id}: {sum(map(_failure_rate_failed, runs))}/{len(runs)}")
+        runs = [result for result in conclusive if result.scenario_id == scenario_id]
+        skipped = sum(result.scenario_id == scenario_id for result in results) - len(runs)
+        line = f"  {scenario_id}: {sum(map(_failure_rate_failed, runs))}/{len(runs)}"
+        print(line + (f" ({skipped} excluded)" if skipped else ""))
     sys.stdout.flush()
 
 
