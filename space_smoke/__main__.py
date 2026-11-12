@@ -133,6 +133,7 @@ def _run(scenario_id: str) -> int:
         result.summary,
         result.evidence,
         result.cleanup_failures,
+        result.promoted_from.value if result.promoted_from else None,
     )
     return result.exit_code
 
@@ -143,17 +144,21 @@ def _print_result(
     summary: str,
     evidence: Mapping[str, Any],
     cleanup_failures: Sequence[str],
+    promoted_from: str | None = None,
 ) -> None:
+    report = {
+        "scenario_id": scenario_id,
+        "verdict": verdict,
+        "summary": summary,
+        "evidence": evidence,
+        "cleanup_failures": list(cleanup_failures),
+    }
+    if promoted_from is not None:
+        report["promoted_from"] = promoted_from
     print(
         RESULT_PREFIX
         + json.dumps(
-            {
-                "scenario_id": scenario_id,
-                "verdict": verdict,
-                "summary": summary,
-                "evidence": evidence,
-                "cleanup_failures": list(cleanup_failures),
-            },
+            report,
             sort_keys=True,
         ),
         flush=True,
@@ -695,6 +700,19 @@ def _suite_incomplete(suite: Suite, scenarios: tuple[Scenario[Any], ...]) -> str
     )
 
 
+def _failure_rate_conclusive(result: ScenarioProcessResult) -> bool:
+    """A run whose body reached a verdict on the lifecycle under test.
+
+    A pass or warning that a critical cleanup failure turned into an
+    infrastructure error still counts, as a failure.
+    """
+
+    report = result.report or {}
+    if report.get("promoted_from") in (Verdict.PASS.value, Verdict.WARN.value):
+        return True
+    return result.exit_code in (0, 1, 42) and report.get("verdict") != Verdict.INFRA_ERROR.value
+
+
 def _failure_rate_failed(result: ScenarioProcessResult) -> bool:
     """A run that failed, or passed or warned and left cleanup failures behind."""
 
@@ -710,12 +728,7 @@ def _print_failure_rate(results: tuple[ScenarioProcessResult, ...], label: str) 
     exit code, not from the rate.
     """
 
-    conclusive = tuple(
-        result
-        for result in results
-        if result.exit_code in (0, 1, 42)
-        and (result.report or {}).get("verdict") != Verdict.INFRA_ERROR.value
-    )
+    conclusive = tuple(result for result in results if _failure_rate_conclusive(result))
     excluded = len(results) - len(conclusive)
     if not conclusive:
         print(f"FAILURE RATE {label}: withheld; no conclusive scenario runs ({excluded} excluded)")

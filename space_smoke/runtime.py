@@ -541,6 +541,7 @@ def execute_scenario(
             result.evidence,
             details,
             result.diagnostics,
+            promoted_from=result.verdict,
         )
     return ScenarioResult(
         result.verdict,
