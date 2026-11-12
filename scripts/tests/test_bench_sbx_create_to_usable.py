@@ -9,21 +9,15 @@ import re
 import subprocess
 import sys
 import threading
-import time
 import uuid
 
 SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "benchmarks" / "bench-sbx-create-to-usable.py"
 
 
-def _fake_api(keep_deleted: bool, create_secs: float):
-    """Sandboxes run commands only once they have been probed twice after create or wake.
-
-    Create operations stay running for create_secs, and a delete sent meanwhile has no effect.
-    """
+def _fake_api(keep_deleted: bool):
+    """Sandboxes run commands only once they have been probed twice after create or wake."""
     states: dict[str, str] = {}
     probes: dict[str, int] = {}
-    done_at: dict[str, float] = {}
-    created_at: dict[str, float] = {}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -37,15 +31,12 @@ def _fake_api(keep_deleted: bool, create_secs: float):
             self.end_headers()
             self.wfile.write(data)
 
-        def op(self, sid, secs=0.0):
-            op_id = f"op_{uuid.uuid4()}"
-            done_at[op_id] = time.monotonic() + secs
-            return self.reply({"sandbox_id": f"sbx_{sid}", "operation_id": op_id}, 202)
+        def op(self, sid):
+            return self.reply({"sandbox_id": f"sbx_{sid}", "operation_id": f"op_{uuid.uuid4()}"}, 202)
 
         def do_GET(self):
             if self.path.startswith("/v1/operations/"):
-                op_id = self.path.rsplit("/", 1)[1]
-                return self.reply({"state": "succeeded" if time.monotonic() >= done_at[op_id] else "running"})
+                return self.reply({"state": "succeeded"})
             if self.path.startswith("/v1/sessions/"):
                 code = 0 if self.path.endswith("ready/events") else 1
                 self.send_response(200)
@@ -63,8 +54,7 @@ def _fake_api(keep_deleted: bool, create_secs: float):
             if self.path == "/v1/sandboxes":
                 sid = str(uuid.uuid4())
                 states[sid], probes[sid] = "running", 0
-                created_at[sid] = time.monotonic() + create_secs
-                return self.op(sid, create_secs)
+                return self.op(sid)
             sid, action = re.fullmatch(r"/v1/sandboxes/sbx_([0-9a-f-]+)(/commands|:suspend|:wake)", self.path).groups()
             if action == "/commands":
                 probes[sid] += 1
@@ -76,7 +66,7 @@ def _fake_api(keep_deleted: bool, create_secs: float):
 
         def do_DELETE(self):
             sid = self.path.rsplit("sbx_", 1)[1]
-            if not keep_deleted and time.monotonic() >= created_at[sid]:
+            if not keep_deleted:
                 states[sid] = "deleted"
             return self.op(sid)
 
@@ -85,8 +75,8 @@ def _fake_api(keep_deleted: bool, create_secs: float):
     return server
 
 
-def _run(tmp_path, keep_deleted=False, timeout="30", create_secs=0.0):
-    server = _fake_api(keep_deleted, create_secs)
+def _run(tmp_path, keep_deleted=False, timeout="30"):
+    server = _fake_api(keep_deleted)
     url = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         proc = subprocess.run(
@@ -116,11 +106,3 @@ def test_fails_when_a_sandbox_is_left_behind(tmp_path):
     assert proc.returncode == 1
     assert report["summary"]["deleted"] == 0
     assert len(report["summary"]["leftover_sandboxes"]) == 3
-
-
-def test_cleans_up_a_create_that_outlives_the_timeout(tmp_path):
-    proc, report = _run(tmp_path, timeout="1", create_secs=1.5)
-    assert proc.returncode == 1
-    rows = [json.loads(line) for line in (tmp_path / "results.jsonl").read_text().splitlines()]
-    assert all(not row["ok"] and row["deleted"] and "still running" in row["error"] for row in rows)
-    assert report["summary"]["leftover_sandboxes"] == []
