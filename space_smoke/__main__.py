@@ -8,9 +8,11 @@ import json
 import os
 import shlex
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from space_smoke.model import Verdict
 from space_smoke.registry import SUBSTRATES, TIERS, Scenario
 from space_smoke.runtime import SmokeConfigurationError, execute_scenario
 from space_smoke.scenarios import REGISTRY
@@ -21,7 +23,6 @@ from space_smoke.services import (
     repair_orphaned_kind_faults,
 )
 from space_smoke.sharding import JOINT_SURFACES, select_shard
-from space_smoke.suites import Suite, resolve_suite
 from space_smoke.suite import (
     KNOWN_FAILURES_ENV,
     RESULT_PREFIX,
@@ -32,6 +33,7 @@ from space_smoke.suite import (
     run_scenarios,
     suite_exit_code,
 )
+from space_smoke.suites import Suite, resolve_suite
 
 
 def _describe(scenario_id: str) -> int:
@@ -101,6 +103,7 @@ def _run(scenario_id: str) -> int:
         services = SmokeServices.from_environment(scenario)
     except MissingToolError as error:
         print(f"ERROR: {error}", file=sys.stderr)
+        _print_result(scenario_id, Verdict.INFRA_ERROR.value, str(error), {}, [])
         return 1
     except SmokeConfigurationError as error:
         print(f"ERROR: {error}", file=sys.stderr)
@@ -124,21 +127,37 @@ def _run(scenario_id: str) -> int:
         print(diagnostic, file=sys.stderr, end="", flush=True)
     if result.exit_code != 0:
         print(f"RERUN: {_rerun_command(scenario)}", flush=True)
+    _print_result(
+        scenario_id,
+        result.verdict.value,
+        result.summary,
+        result.evidence,
+        result.cleanup_failures,
+    )
+    return result.exit_code
+
+
+def _print_result(
+    scenario_id: str,
+    verdict: str,
+    summary: str,
+    evidence: Mapping[str, Any],
+    cleanup_failures: Sequence[str],
+) -> None:
     print(
         RESULT_PREFIX
         + json.dumps(
             {
                 "scenario_id": scenario_id,
-                "verdict": result.verdict.value,
-                "summary": result.summary,
-                "evidence": result.evidence,
-                "cleanup_failures": result.cleanup_failures,
+                "verdict": verdict,
+                "summary": summary,
+                "evidence": evidence,
+                "cleanup_failures": list(cleanup_failures),
             },
             sort_keys=True,
         ),
         flush=True,
     )
-    return result.exit_code
 
 
 def _rerun_command(scenario: Scenario[Any]) -> str:
@@ -691,7 +710,12 @@ def _print_failure_rate(results: tuple[ScenarioProcessResult, ...], label: str) 
     exit code, not from the rate.
     """
 
-    conclusive = tuple(result for result in results if result.exit_code in (0, 1, 42))
+    conclusive = tuple(
+        result
+        for result in results
+        if result.exit_code in (0, 1, 42)
+        and (result.report or {}).get("verdict") != Verdict.INFRA_ERROR.value
+    )
     excluded = len(results) - len(conclusive)
     if not conclusive:
         print(f"FAILURE RATE {label}: withheld; no conclusive scenario runs ({excluded} excluded)")
