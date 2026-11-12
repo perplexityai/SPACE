@@ -557,14 +557,23 @@ class SpaceApi:
         self.poll_secs = poll_secs
         self.idempotency_prefix = idempotency_prefix
 
-    def request(self, method: str, path: str, body: Any = None, *, idempotent: bool = False, timeout: float = 30) -> dict[str, Any]:
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        *,
+        idempotent: bool = False,
+        idempotency_key: str | None = None,
+        timeout: float = 30,
+    ) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
         data = None
         if body is not None:
             headers["Content-Type"] = "application/json"
             data = json.dumps(body).encode()
-        if idempotent:
-            headers["Idempotency-Key"] = f"{self.idempotency_prefix}-{uuid.uuid4().hex}"
+        if idempotency_key or idempotent:
+            headers["Idempotency-Key"] = idempotency_key or f"{self.idempotency_prefix}-{uuid.uuid4().hex}"
         req = urllib.request.Request(self.api_url + path, data=data, headers=headers, method=method)
         try:
             with _HTTP.open(req, timeout=timeout) as response:
@@ -614,9 +623,19 @@ class SpaceApi:
         self.request("GET", f"/v1/sandboxes/{sandbox_id}/processes?limit=1", timeout=min(timeout, 180))
 
     def create(self, template: str, resources: dict[str, int]) -> tuple[str, str]:
-        """POST the create and return (sandbox_id, operation_id) without waiting."""
+        """POST the create and return (sandbox_id, operation_id) without waiting.
+
+        A transport error can hide a create the server accepted, so the POST is
+        retried once with the same idempotency key to recover its sandbox ID.
+        """
         body = {"template": template, "runtime": "fc", "resources": resources}
-        result = self.request("POST", "/v1/sandboxes", body, idempotent=True)
+        key = f"{self.idempotency_prefix}-{uuid.uuid4().hex}"
+        try:
+            result = self.request("POST", "/v1/sandboxes", body, idempotency_key=key)
+        except ApiError as error:
+            if error.status is not None:
+                raise
+            result = self.request("POST", "/v1/sandboxes", body, idempotency_key=key)
         sandbox_id, operation_id = result.get("sandbox_id"), result.get("operation_id")
         if not isinstance(sandbox_id, str) or not sandbox_id.startswith("sbx_") or not isinstance(operation_id, str):
             raise ApiError(f"create returned no sandbox_id or operation_id: {result}")

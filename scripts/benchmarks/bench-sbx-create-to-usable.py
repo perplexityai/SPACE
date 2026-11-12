@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -50,8 +51,8 @@ def wait_usable(api: SpaceApi, sandbox_id: str, deadline: float, poll_secs: floa
     raise ApiError(f"sandbox {sandbox_id} not usable: {last}")
 
 
-def run_one(api: SpaceApi, args: argparse.Namespace, index: int) -> dict[str, Any]:
-    row: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "run": index, "ok": False}
+def run_one(api: SpaceApi, args: argparse.Namespace, row: dict[str, Any]) -> None:
+    """Fill in row in place, so an interrupted run still records its sandbox."""
     resources = {"vcpu": args.vcpu, "memory_mib": args.memory_mib}
     sandbox_id = operation_id = None
     try:
@@ -82,7 +83,6 @@ def run_one(api: SpaceApi, args: argparse.Namespace, index: int) -> dict[str, An
             except ApiError as error:
                 row["deleted"] = False
                 row["delete_error"] = str(error)[:300]
-    return row
 
 
 def leftovers(api: SpaceApi, rows: list[dict[str, Any]]) -> list[str]:
@@ -119,6 +119,11 @@ def print_table(summary: dict[str, Any]) -> None:
     )
 
 
+def interrupt(signum: int, frame: object) -> None:
+    """Unwind SIGTERM (e.g. a CI timeout) like Ctrl-C so cleanup and the summary still run."""
+    raise KeyboardInterrupt
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--api-url", default=os.environ.get("SPACE_API_URL", "http://127.0.0.1:8080"))
@@ -143,29 +148,44 @@ def main() -> int:
     token = args.token_file.read_text().strip() if args.token_file else os.environ.get("SPACE_API_TOKEN", "")
     if not token:
         raise SystemExit("ERROR: pass --token-file or set SPACE_API_TOKEN")
-    api = SpaceApi(args.api_url, args.data_plane_url, token, idempotency_prefix=IDEMPOTENCY_PREFIX)
+    # Operation polls share --poll-secs so op completion adds at most one interval to each sample.
+    api = SpaceApi(
+        args.api_url, args.data_plane_url, token, poll_secs=args.poll_secs, idempotency_prefix=IDEMPOTENCY_PREFIX
+    )
     if args.output_dir:
         output_dir = args.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
     else:
         output_dir = Path(tempfile.mkdtemp(prefix="space-sbx-create-to-usable-"))
 
-    rows = []
+    signal.signal(signal.SIGTERM, interrupt)
+    rows: list[dict[str, Any]] = []
+    interrupted = False
     with (output_dir / "results.jsonl").open("w") as results:
         for index in range(args.runs):
-            row = run_one(api, args, index)
+            row: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "run": index, "ok": False}
             rows.append(row)
-            results.write(json.dumps(row) + "\n")
-            results.flush()
-            print(json.dumps(row), file=sys.stderr, flush=True)
+            try:
+                run_one(api, args, row)
+            except KeyboardInterrupt:
+                interrupted = True
+                row["error"] = "interrupted"
+            finally:
+                results.write(json.dumps(row) + "\n")
+                results.flush()
+                print(json.dumps(row), file=sys.stderr, flush=True)
+            if interrupted:
+                print("interrupted; checking for leftovers", file=sys.stderr)
+                break
 
     summary = summarize(rows, leftovers(api, rows))
+    summary["interrupted"] = interrupted
     run = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k != "token_file"}
     (output_dir / "summary.json").write_text(json.dumps({"args": run, "summary": summary}, indent=2) + "\n")
     print_table(summary)
     print(f"results: {output_dir}")
     clean = summary["succeeded"] == summary["deleted"] == len(rows) and not summary["leftover_sandboxes"]
-    return 0 if clean else 1
+    return 130 if interrupted else 0 if clean else 1
 
 
 if __name__ == "__main__":

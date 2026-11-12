@@ -222,6 +222,14 @@ until `true` exits 0 in the guest, suspends it, wakes it, waits for `true` again
 and deletes it. Runs are sequential, so each sample is one sandbox on an
 otherwise idle cluster.
 
+`bench-sbx-lifecycle.sh` also times cold create (`create_cold`, `e2e_cold`) and
+`restore`, but through node-local `space-sbxmgr --blocking`, stopping at the
+guest's ReadyNotification. This benchmark's `cold_usable_ms` and
+`warm_usable_ms` instead cover the public API path, ReadyNotification and the
+first guest command, so they run higher. Use `bench-sbx-lifecycle.sh` to isolate
+node-side lifecycle cost. Use this benchmark for what an API client sees, or
+where route tokens refuse node-local exec.
+
 | Field | Meaning |
 | --- | --- |
 | `cold_op_ms` | `POST /v1/sandboxes` until the create operation succeeds. |
@@ -250,12 +258,23 @@ and 1 GiB, no base snapshot or warm pool, 20 sequential runs):
 
 | Metric | p50 | p95 | max |
 | --- | --- | --- | --- |
-| `cold_usable_ms` | 1591 | 1815 | 1822 |
-| `warm_usable_ms` | 1070 | 1323 | 1331 |
+| `cold_usable_ms` | 1587 | 1775 | 1824 |
+| `warm_usable_ms` | 1110 | 1166 | 1170 |
 
 All 20 runs succeeded and were deleted, with no leftovers. Treat these numbers
-as a local reference only; compare changes by running the benchmark on the
-base and head of the same cluster.
+as a local reference only.
+
+At n=20, p95 is the 19th sample, so one slow wake moves it. Three n=20 runs on
+the same cluster and unchanged product code measured warm p95 between 1166 ms
+and 2078 ms, because most wakes land on a step of about 1 s or about 2 s. Before
+treating a p95 delta as signal, run base and head on the same cluster,
+interleaved (base, head, base, head), and use n of at least 50 or several
+repeats per side. Check that the delta exceeds the spread between repeats of
+the same side.
+
+Operation polls use `--poll-secs` (default 0.05 s), so each `*_op_ms` sample
+and the start of each usability probe lag the server by at most one interval
+plus one request.
 
 ## Runtime environment benchmark
 
