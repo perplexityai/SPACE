@@ -2698,13 +2698,16 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
     }
     for (case, runtime_live, row, disk, unreadable_journal, expected, final_state) in [
         (
-            "a live runtime rolls back to paused",
+            "a complete capture wins over a live runtime",
             true,
             Row::At(SandboxState::Suspending),
             Disk::CompleteCurrentStaging,
             false,
             Disposition::Cleanup,
-            Some(SandboxState::Paused),
+            Some(SandboxStatus::owned(
+                crate::state::Teardown::Suspending,
+                crate::state::CleanupState::Required,
+            )),
         ),
         (
             "another transition already moved the row",
@@ -2713,7 +2716,7 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
             Disk::CompleteCurrentStaging,
             false,
             Disposition::Cleanup,
-            Some(SandboxState::Paused),
+            Some(SandboxStatus::from(SandboxState::Paused)),
         ),
         (
             "the sandbox was deleted",
@@ -2749,7 +2752,7 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
             Disk::UnlistableStaging,
             false,
             Disposition::Cleanup,
-            Some(SandboxState::Quarantined),
+            Some(SandboxStatus::from(SandboxState::Quarantined)),
         ),
         (
             "no usable artifact is quarantined",
@@ -2758,7 +2761,7 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
             Disk::Empty,
             false,
             Disposition::Cleanup,
-            Some(SandboxState::Quarantined),
+            Some(SandboxStatus::from(SandboxState::Quarantined)),
         ),
         (
             "an unprovable durability mode keeps the complete capture",
@@ -2767,7 +2770,7 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
             Disk::CompleteCurrentStaging,
             true,
             Disposition::Preserve,
-            Some(SandboxState::Suspending),
+            Some(SandboxStatus::from(SandboxState::Suspending)),
         ),
     ] {
         let conn = crate::db::test_conn();
@@ -2840,13 +2843,28 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
         } else {
             assert_eq!(
                 stored_sandbox(&service, &id).map(|row| row.state),
-                final_state.map(SandboxStatus::from),
+                final_state,
                 "{case}"
             );
         }
         if matches!(disk, Disk::CompleteCurrentStaging) {
-            // Removal is the caller's job, on a Cleanup disposition.
-            assert!(staging_dir.exists(), "{case}");
+            if final_state
+                == Some(SandboxStatus::owned(
+                    crate::state::Teardown::Suspending,
+                    crate::state::CleanupState::Required,
+                ))
+            {
+                assert!(
+                    crate::service::suspend_snapshot_publication::canonical_suspend_snapshot_dir(
+                        &sandbox_dir,
+                    )
+                    .exists(),
+                    "{case}"
+                );
+            } else {
+                // Removal is the caller's job, on a Cleanup disposition.
+                assert!(staging_dir.exists(), "{case}");
+            }
         }
         drain_service_tasks(&service).await;
     }

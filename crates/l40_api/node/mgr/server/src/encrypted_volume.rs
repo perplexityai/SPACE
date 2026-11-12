@@ -787,8 +787,12 @@ pub async fn prepare(params: PrepareParams<'_>) -> Result<PreparedEncryptedVolum
         let identity = mapper_identity(&mapper).await;
         let mount_num = mount_device_numbers_of(&mount_dir).await?;
         match idempotent_arm(&identity, mount_num) {
-            // Accept ONLY on positive proof the mount is present and ours.
-            IdempotentArm::Accept => return Ok(PreparedEncryptedVolume { mount_dir }),
+            // Accept ONLY on positive proof the mount is present and ours. A
+            // staged volume was left read-only; the next capture writes it.
+            IdempotentArm::Accept => {
+                remount_read_write(&mount_dir).await?;
+                return Ok(PreparedEncryptedVolume { mount_dir });
+            }
             // Unknown (probe error, or the mount vanished mid-check): never
             // accept an unverified mount, never destroy — fail retryably.
             IdempotentArm::Retry => {
@@ -813,8 +817,10 @@ pub async fn prepare(params: PrepareParams<'_>) -> Result<PreparedEncryptedVolum
     // btrfs mount while leaving this healthy mapper (and Firecracker's jail
     // bind) alive. If the mapper still points at the exact canonical backing,
     // re-mount it instead of attempting a second `cryptsetup open`. Never use
-    // this recovery for a fresh format or while a restore source still needs
-    // staging; either case could overwrite a live volume.
+    // while a restore source still needs staging. A fresh operation can reach
+    // this arm only after it already opened its canonical backing and lost its
+    // reply before mount; remounting that exact mapper avoids formatting it a
+    // second time.
     match mapper_identity(&mapper).await {
         MapperIdentity::Present(_) => {
             let path = backing_path.clone();
@@ -822,8 +828,19 @@ pub async fn prepare(params: PrepareParams<'_>) -> Result<PreparedEncryptedVolum
             let reconciled =
                 reconcile_stale_mapper(&mapper, backing.as_ref().map(|b| &b.file)).await?;
             if !reconciled {
-                if !fresh && restore_source.is_none() {
-                    mount_mapper(&mapper, &mount_dir).await?;
+                if restore_source.is_none() {
+                    if let Err(error) = mount_mapper(&mapper, &mount_dir).await {
+                        if !fresh {
+                            return Err(error);
+                        }
+                        // A fresh operation may have lost the process after
+                        // cryptsetup open but before mkfs. No Diff base exists,
+                        // so finishing the format is safe and makes the retry
+                        // converge instead of pinning an unusable mapper.
+                        let mapper_dev = format!("/dev/mapper/{mapper}");
+                        run("mkfs.btrfs", &["-q", &mapper_dev]).await?;
+                        mount_mapper(&mapper, &mount_dir).await?;
+                    }
                     return Ok(PreparedEncryptedVolume { mount_dir });
                 }
                 return Err(DmCryptError::Command {
@@ -937,6 +954,58 @@ async fn build_volume(
     }
 
     mount_mapper(mapper, mount_dir).await
+}
+
+/// Make a mounted volume's contents immutable while it stays open, so its
+/// backing file can be copied for publication: flush the filesystem through
+/// dm-crypt and the loop device to the backing, then remount it read-only. Ok
+/// only once the mount is positively this volume's and its superblock is
+/// read-only; an open writer refuses the remount and fails the call.
+/// [`remount_read_write`] undoes it.
+pub async fn make_read_only(
+    sandbox_id: &SandboxId,
+    volume_name: &str,
+    mount_dir: &Path,
+) -> Result<(), DmCryptError> {
+    let mapper = mapper_name(sandbox_id, volume_name);
+    let unproven = |stderr: &str| DmCryptError::Command {
+        cmd: format!("make {mapper} read-only"),
+        stderr: stderr.to_string(),
+    };
+    if !is_mounted(mount_dir).await? {
+        return Err(unproven("volume is not mounted"));
+    }
+    let identity = mapper_identity(&mapper).await;
+    let mount_num = mount_device_numbers_of(mount_dir).await?;
+    if idempotent_arm(&identity, mount_num) != IdempotentArm::Accept {
+        return Err(match identity {
+            MapperIdentity::Error(error) => error,
+            _ => unproven("mount is not on the volume's mapper"),
+        });
+    }
+    let point = mount_dir.to_string_lossy();
+    run("sync", &["-f", &point]).await?;
+    if !remount_read_only(&point).await {
+        return Err(unproven("filesystem did not become read-only"));
+    }
+    Ok(())
+}
+
+/// Undo [`make_read_only`]: once the backing has been copied, and on a volume
+/// a new capture is about to write. A no-op for a writable mount.
+pub async fn remount_read_write(mount_dir: &Path) -> Result<(), DmCryptError> {
+    let point = mount_dir.to_string_lossy();
+    if !superblock_read_only(&read_mountinfo().await?, &point) {
+        return Ok(());
+    }
+    run("mount", &["-o", "remount,rw", &point]).await?;
+    if superblock_read_only(&read_mountinfo().await?, &point) {
+        return Err(DmCryptError::Command {
+            cmd: format!("mount -o remount,rw {point}"),
+            stderr: "superblock is still read-only".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// `mount -o remount,ro` the filesystem mounted at `point`, and confirm its
