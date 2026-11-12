@@ -2,13 +2,16 @@
 
 A rate is comparable only between runs of the same suite version. A released
 version's scenario list never changes; adding, removing or replacing a
-scenario is a new version, so a rate cannot improve by dropping coverage.
+scenario is a new version, so a rate cannot improve by dropping coverage. Each
+version records the digest of its list, and resolving a version whose list no
+longer matches its digest fails.
 `space_smoke run --suite NAME` runs the latest version and `NAME@VERSION` a
 named one; the run refuses to start unless every listed scenario will run.
 """
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 
@@ -17,6 +20,7 @@ class Suite:
     name: str
     version: int
     scenarios: tuple[str, ...]
+    digest: str
 
     @property
     def label(self) -> str:
@@ -40,6 +44,7 @@ SUITES: tuple[Suite, ...] = (
             "native_recovery.stale_queued_work_expires_after_controller_outage",
             "native.forced_drain_re_drains_re_placed_stopped_sandbox",
         ),
+        "10f0f0b67328f0a2ec3860aeddb09badc24635fed8c7265cba5e2b1eb0407bb4",
     ),
 )
 
@@ -53,9 +58,22 @@ def resolve_suite(value: str) -> Suite:
         known = ", ".join(sorted({suite.name for suite in SUITES}))
         raise ValueError(f"no suite is named {name!r}; suites: {known}")
     if not version:
-        return max(versions, key=lambda suite: suite.version)
+        return _released(max(versions, key=lambda suite: suite.version))
     for suite in versions:
         if str(suite.version) == version:
-            return suite
+            return _released(suite)
     released = ", ".join(str(suite.version) for suite in versions)
     raise ValueError(f"suite {name!r} has no version {version!r}; versions: {released}")
+
+
+def scenarios_digest(scenarios: tuple[str, ...]) -> str:
+    return hashlib.sha256("\n".join(scenarios).encode()).hexdigest()
+
+
+def _released(suite: Suite) -> Suite:
+    if scenarios_digest(suite.scenarios) != suite.digest:
+        raise ValueError(
+            f"suite {suite.label}'s scenario list no longer matches its released digest; "
+            "a changed list is a new version"
+        )
+    return suite
