@@ -70,7 +70,8 @@ class SampleTests(unittest.TestCase):
                 (cgroups / name / "memory.current").write_text("4096\n")
                 (cgroups / name / "cgroup.procs").write_text(pids)
             tick = overhead.CLK_TCK
-            write_stat(proc / "100", "100", "firecracker", tick, 0)
+            # Named like a daemon so only sandbox-cgroup membership keeps it out of node_daemons.
+            write_stat(proc / "100", "100", "space-fc", tick, 0)
             write_stat(proc / "100" / "task" / "101", "101", "fc_vcpu 0", tick, 0)
             write_stat(proc / "100" / "task" / "102", "102", "fc_api", tick // 2, 0)
             # Reaped helpers (cutime/cstime) count toward the daemon that spawned them.
@@ -82,7 +83,7 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(result.cpu[("sidecar", "abc")], 0.25)
         self.assertEqual(result.cpu[("node_daemons", "space-volmgr-sv:200")], 4.0)
         self.assertEqual(result.cpu[("node_daemons", "space-x (y):300")], 1.0)
-        self.assertNotIn(("node_daemons", "firecracker:100"), result.cpu)
+        self.assertNotIn(("node_daemons", "space-fc:100"), result.cpu)
 
 
 if __name__ == "__main__":
