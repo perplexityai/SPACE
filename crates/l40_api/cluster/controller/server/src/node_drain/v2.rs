@@ -259,7 +259,7 @@ impl Recording {
 
 /// The JSON `drain_status.report` holds: the node's answer and what the loop
 /// recorded of it. An evacuation unrecorded past [`UNRECORDED_BOUND`] is
-/// `blocked` as well.
+/// `blocked` as well, unless the node already reports its sandbox blocked.
 pub fn report_json(response: &DrainNodeResponse, recording: &Recording) -> serde_json::Value {
     let prior = |value: i32| match DrainPrior::try_from(value) {
         Ok(DrainPrior::Started) => "started",
@@ -282,7 +282,7 @@ pub fn report_json(response: &DrainNodeResponse, recording: &Recording) -> serde
         "blocked": response.blocked.iter().map(|entry| serde_json::json!({
             "sandbox_id": entry.sandbox_id,
             "reason": entry.reason,
-        })).chain(recording.overdue().into_iter().map(|(sandbox_id, reason)| serde_json::json!({
+        })).chain(overdue_unblocked(response, recording).map(|(sandbox_id, reason)| serde_json::json!({
             "sandbox_id": sandbox_id,
             "reason": reason,
         }))).collect::<Vec<_>>(),
@@ -336,16 +336,57 @@ async fn record_evacuations<S: DrainV2Sink>(
     recording
 }
 
-/// Publish what `response` and the loop's `recording` of it leave to do:
-/// an evacuation unrecorded past the bound is blocked, one within it pending.
+/// The evacuations unrecorded past the bound whose sandbox the node doesn't
+/// already report blocked, with why.
+fn overdue_unblocked<'a>(
+    response: &'a DrainNodeResponse,
+    recording: &'a Recording,
+) -> impl Iterator<Item = (&'a str, String)> {
+    recording.overdue().into_iter().filter(|(sandbox_id, _)| {
+        !response
+            .blocked
+            .iter()
+            .any(|entry| entry.sandbox_id.as_deref() == Some(*sandbox_id))
+    })
+}
+
+/// How many of the node's rows `response` and the loop's `recording` of it
+/// leave blocked and pending, each row counted once: blocked when the node
+/// reports it blocked or its evacuation is unrecorded past the bound, else
+/// pending when the node reports it pending, its window's `queued` and
+/// `disk` among the reasons, or its evacuation is unrecorded within the
+/// bound. A blocked entry that names no sandbox counts on its own.
+fn outstanding_rows(response: &DrainNodeResponse, recording: &Recording) -> (u64, u64) {
+    use std::collections::BTreeSet;
+    let mut blocked: BTreeSet<&str> = recording
+        .overdue()
+        .into_iter()
+        .map(|(sandbox_id, _)| sandbox_id)
+        .collect();
+    let mut unnamed = 0_u64;
+    for entry in &response.blocked {
+        match entry.sandbox_id.as_deref() {
+            Some(sandbox_id) => {
+                blocked.insert(sandbox_id);
+            }
+            None => unnamed += 1,
+        }
+    }
+    let pending: BTreeSet<&str> = response
+        .pending
+        .iter()
+        .map(|entry| entry.sandbox_id.as_str())
+        .chain(recording.unrecorded().map(|(sandbox_id, _, _)| sandbox_id))
+        .filter(|sandbox_id| !blocked.contains(sandbox_id))
+        .collect();
+    (blocked.len() as u64 + unnamed, pending.len() as u64)
+}
+
+/// Publish what `response` and the loop's `recording` of it leave to do,
+/// as [`outstanding_rows`] counts it.
 fn publish_report(node: &V2Node, response: &DrainNodeResponse, recording: &Recording) {
-    let unrecorded = recording.unrecorded().count();
-    let overdue = recording.overdue().len();
-    crate::metrics::node_drain::v2_report(
-        &node.id.to_string(),
-        (response.blocked.len() + overdue) as u64,
-        (response.pending.len() + unrecorded - overdue) as u64,
-    );
+    let (blocked, pending) = outstanding_rows(response, recording);
+    crate::metrics::node_drain::v2_report(&node.id.to_string(), blocked, pending);
 }
 
 /// How many v2 nodes one tick calls at once: each call waits on its node,

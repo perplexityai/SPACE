@@ -8,11 +8,12 @@ use pplx_space_common_core::types::NodeDrainMode;
 
 use pplx_space_metrics_emit::{counter, elapsed_ms, gauge, tag, timing_ms};
 
-/// What a v2 drain's node reported on the loop's last call: residents it
-/// can't make durable (`blocked`, which keeps the drain from ending and is
-/// what to page on) and work still under way (`pending`, evacuations not yet
-/// recorded included). `unanswered` is 1 while the node didn't answer, which
-/// keeps the drain from ending just as `blocked` does.
+/// What a v2 drain's node reported on the loop's last call, each resident
+/// counted once: residents it can't make durable (`blocked`, which keeps the
+/// drain from ending and is what to page on) and the rest with work still
+/// under way (`pending`, evacuations not yet recorded included).
+/// `unanswered` is 1 while the node didn't answer, which keeps the drain from
+/// ending just as `blocked` does.
 pub fn v2_report(node_id: &str, blocked: u64, pending: u64) {
     gauge("node_drain.v2.unanswered", 0.0, &[tag("node", node_id)]);
     gauge(

@@ -850,6 +850,67 @@ async fn an_evacuation_unrecorded_past_the_bound_is_blocked() {
     }
 }
 
+/// The gauges count each row once, and the report blocks an overdue
+/// evacuation only when the node doesn't block its sandbox already: a row
+/// the node reports twice pending (an activation and the window's `queued`)
+/// is one pending row, a row the node blocks whose evacuation is also
+/// overdue is one blocked row with the node's reason alone, and a row both
+/// pending and blocked counts as blocked. The controls: a row only
+/// unrecorded past the bound, one within it, one the window holds for disk,
+/// and a blocked entry without a sandbox.
+#[test]
+fn a_row_is_reported_once_however_many_reasons_name_it() {
+    use pplx_space_sbx_mgr_client::proto::{DrainBlocked, DrainPending};
+    let pending = |sandbox_id: &str, action: &str| DrainPending {
+        sandbox_id: sandbox_id.into(),
+        action: action.into(),
+    };
+    let blocked = |sandbox_id: Option<&str>, reason: &str| DrainBlocked {
+        sandbox_id: sandbox_id.map(str::to_owned),
+        reason: reason.into(),
+    };
+    let answer = DrainNodeResponse {
+        pending: vec![
+            pending("queued", "activation"),
+            pending("queued", "queued"),
+            pending("disk", "disk"),
+            pending("both", "upload"),
+        ],
+        blocked: vec![
+            blocked(Some("both"), "upload failed 3 times: denied"),
+            blocked(Some("blocked"), "the cache disk hasn't had room"),
+            blocked(None, "orphan inventory scan failed"),
+        ],
+        ..response(Some(5), false, &["blocked", "late", "fresh"])
+    };
+    let bound = i64::try_from(UNRECORDED_BOUND.as_secs()).unwrap();
+    let not_yet = || EvacuationRecord::NotYet("not projected yet".into());
+    let recording = Recording {
+        records: vec![
+            ("blocked".into(), not_yet()),
+            ("late".into(), not_yet()),
+            ("fresh".into(), not_yet()),
+        ],
+        since: BTreeMap::from([
+            ("blocked".into(), 0),
+            ("late".into(), 0),
+            ("fresh".into(), bound),
+        ]),
+        now: bound + 60,
+    };
+
+    assert_eq!(outstanding_rows(&answer, &recording), (4, 3));
+    let json = report_json(&answer, &recording);
+    let named: Vec<_> = json["blocked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["sandbox_id"].as_str().unwrap_or("-").to_owned())
+        .collect();
+    assert_eq!(named, ["both", "blocked", "-", "late"]);
+    assert_eq!(json["unrecorded"].as_array().unwrap().len(), 3);
+}
+
 /// A terminate that fails counts on `node_drain.v2.terminate_failures`; one
 /// the terminator answers with a stale identity counts nothing, writes no
 /// error, and is logged at warn.
