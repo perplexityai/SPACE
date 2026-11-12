@@ -1018,6 +1018,31 @@ async fn a_read_that_fails_mid_stream_aborts_its_body() {
     response.into_body().collect().await.unwrap_err();
 }
 
+// A read the sandbox refuses before its first chunk, as a guest refuses a
+// directory, answers with the refusal instead of a 200 and an aborted body.
+#[tokio::test]
+async fn a_read_refused_before_its_first_chunk_answers_with_the_refusal() {
+    if !test_process() {
+        return;
+    }
+    let harness = Harness::start().await;
+    harness
+        .worker
+        .reply(Reply::Read(Ok(vec![Err(Status::failed_precondition(
+            "Is a directory (os error 21)",
+        ))])));
+    let (status, _, body) = read_body(
+        harness
+            .send(harness.post("read", json!({"path": "/a", "length": 100})))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["code"], "failed_precondition");
+    assert_eq!(body["message"], "Is a directory (os error 21)");
+}
+
 #[tokio::test]
 async fn an_api_that_cannot_answer_is_a_retryable_503() {
     if !test_process() {

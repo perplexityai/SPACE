@@ -32,6 +32,20 @@ pub(crate) fn map_io_error(error: std::io::Error) -> Status {
             // telemetry. Retry behavior is unchanged: no layer retries
             // Internal or DataLoss.
             libc::EBADMSG => return Status::data_loss(error.to_string()),
+            // A path that cannot be read as a file: opening a socket (ENXIO),
+            // or seeking a FIFO or terminal (ESPIPE). The path's kind refuses
+            // the request, as a directory's does; the reason tells it from a
+            // hop's refusal with the same code.
+            libc::ENXIO | libc::ESPIPE => {
+                let mut status = Status::failed_precondition(error.to_string());
+                status.metadata_mut().insert(
+                    pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+                    tonic::metadata::MetadataValue::from_static(
+                        pplx_space_common_core::spaced::GUEST_PATH_REFUSED,
+                    ),
+                );
+                return status;
+            }
             _ => {}
         }
     }

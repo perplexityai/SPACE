@@ -11,7 +11,7 @@ use axum::{
 use futures_util::StreamExt as _;
 use pplx_space_native_files::{
     FileOperation, admit_list_entry, list_depth, list_request, parse_guest_path, parse_guest_user,
-    public_file_info, read_request, stat_request, validate_read_length,
+    public_file_info, read_request, start_read, stat_request, validate_read_length,
 };
 use pplx_space_node_api_client::NodeApiOperationBudget;
 use pplx_space_public_api::{
@@ -130,6 +130,14 @@ async fn read(state: &DataPlaneState, request: Request<Body>) -> Result<Response
         )
         .await
         .map_err(|failure| failure.into_refusal(OPERATION))?;
+    let stream = start_read(
+        stream,
+        NodeApiOperationBudget::FilesystemTransferOpen.timeout(),
+    )
+    .await
+    .map_err(|status| {
+        CallFailure::Worker(WorkerCallError::Status(status)).into_refusal(OPERATION)
+    })?;
     let stream = stream.map(|chunk| {
         chunk.map(|chunk| chunk.data).map_err(|status| {
             // The 200 and part of the body are already sent, so only the
