@@ -424,7 +424,7 @@ fn a_cancel_hands_back_what_the_drain_suspended() {
         ..PlanInputs::default()
     };
 
-    let (plan, forget) = plan_cancel(&rows, &inputs);
+    let (plan, forget) = plan_cancel(&rows, &inputs, &[]);
 
     assert_eq!(
         plan.evacuated,
@@ -457,6 +457,162 @@ fn a_cancel_hands_back_what_the_drain_suspended() {
         )]
     );
     assert_eq!(forget, ["failed", "gone", "resumed", "stopped"]);
+}
+
+/// A cancel of a drain evacuating under its window starts no suspend, the
+/// ones it queued included, however much room the window has; the suspend
+/// still running finishes and is handed back once its snapshot is durable.
+/// The control: the drain under the same window starts the queued suspend
+/// once the running one is done.
+#[test]
+fn a_cancel_under_the_window_starts_no_suspend_and_hands_back_the_running_one() {
+    use SandboxState as S;
+    let durable = DrainRow {
+        pin: Some((FULL_ARTIFACT.to_owned(), ArtifactKind::Full)),
+        ..row("running", S::Suspended)
+    };
+    let before = [
+        row("running", S::Started),
+        row("queued", S::Started),
+        row("stopped", S::Stopped),
+    ];
+    let after = [
+        durable,
+        row("queued", S::Started),
+        row("stopped", S::Stopped),
+    ];
+    let inputs = |window: usize, running: bool| PlanInputs {
+        window,
+        evacuations: [evacuation("running", DrainPrior::Started)].into(),
+        running: if running {
+            BTreeMap::from([("running".to_owned(), DrainAction::Suspend)])
+        } else {
+            BTreeMap::new()
+        },
+        ..PlanInputs::default()
+    };
+
+    let drain = plan(&before, &inputs(1, true));
+    assert!(drain.actions.is_empty(), "{drain:?}");
+    assert_eq!(
+        drain.pending,
+        [
+            ("running".to_owned(), "suspend".to_owned()),
+            ("queued".to_owned(), "queued".to_owned()),
+            ("stopped".to_owned(), "queued".to_owned()),
+        ]
+    );
+
+    for window in [1, 9] {
+        let (cancel, forget) = plan_cancel(&before, &inputs(window, true), &[]);
+        assert!(cancel.actions.is_empty(), "window {window}: {cancel:?}");
+        assert_eq!(
+            cancel.pending,
+            [("running".to_owned(), "suspend".to_owned())],
+            "window {window}"
+        );
+        assert_eq!(forget, Vec::<String>::new(), "window {window}");
+
+        let (cancel, forget) = plan_cancel(&after, &inputs(window, false), &[]);
+        assert!(cancel.actions.is_empty(), "window {window}: {cancel:?}");
+        assert_eq!(
+            cancel.evacuated,
+            [(
+                "running".to_owned(),
+                DrainPrior::Started,
+                FULL_ARTIFACT.to_owned()
+            )],
+            "window {window}"
+        );
+        assert!(cancel.pending.is_empty(), "window {window}: {cancel:?}");
+        assert_eq!(forget, Vec::<String>::new(), "window {window}");
+    }
+
+    let drain = plan(&after, &inputs(1, false));
+    assert_eq!(drain.actions, [suspend("queued")]);
+}
+
+/// A cancel keeps a sandbox's record, and reports it, while the window
+/// counts it in flight: a suspend or disk publication running, or its pinned
+/// snapshot still uploading. That holds whatever the row's lifecycle, and
+/// when the control plane names it to forget; a sandbox with nothing in
+/// flight is forgotten when named, or when nothing is left to hand back.
+#[test]
+fn a_cancel_forgets_a_record_only_once_the_window_counts_nothing_for_it() {
+    use SandboxState as S;
+    #[derive(Clone, Copy, Debug)]
+    enum InFlight {
+        Nothing,
+        Running(DrainAction),
+        Uploading,
+        UploadBlocked,
+    }
+    let states = [
+        InFlight::Nothing,
+        InFlight::Running(DrainAction::Suspend),
+        InFlight::Running(DrainAction::PublishDisk),
+        InFlight::Running(DrainAction::Upload),
+        InFlight::Uploading,
+        InFlight::UploadBlocked,
+    ];
+    for lifecycle in [S::Started, S::Paused, S::Stopped, S::Failed, S::Suspended] {
+        for in_flight in states {
+            for named in [false, true] {
+                let case = format!("{lifecycle} {in_flight:?} named={named}");
+                let id = "sbx";
+                let subject = DrainRow {
+                    pin: Some((FULL_ARTIFACT.to_owned(), ArtifactKind::Full)),
+                    ..row(id, lifecycle)
+                };
+                let mut inputs = PlanInputs {
+                    evacuations: [
+                        evacuation(id, DrainPrior::Started),
+                        evacuation("control", DrainPrior::Started),
+                    ]
+                    .into(),
+                    ..PlanInputs::default()
+                };
+                match in_flight {
+                    InFlight::Nothing => {}
+                    InFlight::Running(action) => {
+                        inputs.running.insert(id.to_owned(), action);
+                    }
+                    InFlight::Uploading => {
+                        inputs.pending_backups = pending(id, FULL_ARTIFACT);
+                    }
+                    InFlight::UploadBlocked => {
+                        inputs.pending_backups = pending(id, FULL_ARTIFACT);
+                        inputs.failures.insert(
+                            (id.to_owned(), DrainAction::Upload),
+                            (MAX_ACTION_FAILURES, "denied".to_owned()),
+                        );
+                    }
+                }
+                let rows = [subject, row("control", S::Started)];
+                let counted = inputs.window_in_flight(&rows) > 0;
+                let names = if named {
+                    vec![id.to_owned()]
+                } else {
+                    Vec::new()
+                };
+                let (plan, forget) = plan_cancel(&rows, &inputs, &names);
+                let forgotten = forget.contains(&id.to_owned());
+                let reported_pending = plan.pending.iter().any(|(sandbox, _)| sandbox == id);
+                if counted {
+                    assert!(
+                        !forgotten && reported_pending,
+                        "{case}: {plan:?} {forget:?}"
+                    );
+                }
+                let expect_forgotten = match in_flight {
+                    InFlight::Nothing => named || lifecycle != S::Suspended,
+                    _ => false,
+                };
+                assert_eq!(forgotten, expect_forgotten, "{case}: {plan:?} {forget:?}");
+                assert!(forget.contains(&"control".to_owned()), "{case}");
+            }
+        }
+    }
 }
 
 /// A cancel keeps the drain's record and reports the sandbox evacuated, call

@@ -430,28 +430,36 @@ impl PlanInputs {
             .is_some_and(|(failures, _)| *failures >= MAX_ACTION_FAILURES)
     }
 
+    /// The row's pinned artifact, while it is still without a durable copy.
+    fn pending_pin(
+        &self,
+        row: &DrainRow,
+    ) -> Option<(String, pplx_space_common_core::types::ArtifactKind)> {
+        row.pin.clone().filter(|(artifact, _)| {
+            self.pending_backups
+                .get(&row.sandbox_id)
+                .is_some_and(|pending| pending.contains(artifact))
+        })
+    }
+
+    /// Whether the row's pinned artifact is still uploading as the window
+    /// counts it: without a durable copy, nothing running for the row, and
+    /// its upload not blocked on its failures.
+    fn uploading(&self, row: &DrainRow) -> bool {
+        !self.running.contains_key(&row.sandbox_id)
+            && self.pending_pin(row).is_some()
+            && !self.failed_too_often(&row.sandbox_id, DrainAction::Upload)
+    }
+
     /// How much of the window is taken: the suspends and disk publications
-    /// running, and the rows whose pinned artifact is still uploading, short
-    /// of one blocked on its failures.
+    /// running, and the rows whose pinned artifact is still uploading.
     fn window_in_flight(&self, rows: &[DrainRow]) -> usize {
         let running = self
             .running
             .values()
             .filter(|action| matches!(action, DrainAction::Suspend | DrainAction::PublishDisk))
             .count();
-        let uploading = rows
-            .iter()
-            .filter(|row| {
-                !self.running.contains_key(&row.sandbox_id)
-                    && row.pin.as_ref().is_some_and(|(artifact, _)| {
-                        self.pending_backups
-                            .get(&row.sandbox_id)
-                            .is_some_and(|pending| pending.contains(artifact))
-                    })
-                    && !self.failed_too_often(&row.sandbox_id, DrainAction::Upload)
-            })
-            .count();
-        running + uploading
+        running + rows.iter().filter(|row| self.uploading(row)).count()
     }
 }
 
@@ -750,10 +758,17 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
 /// What a call under a cancelled epoch decides, from the rows it read: the
 /// drain starts no suspend, and hands back each sandbox it suspended,
 /// `evacuated` once its snapshot is durable, its upload driven until then.
-/// Work still running on one is waited for. The records with nothing left to
-/// hand back, their sandbox running again, stopped, failed or gone, are
-/// returned to be forgotten.
-pub(super) fn plan_cancel(rows: &[DrainRow], inputs: &PlanInputs) -> (DrainPlan, Vec<String>) {
+/// Work still running on one is waited for, and an upload driven, whatever
+/// its row's lifecycle, so a record is kept while the window would count its
+/// sandbox in flight. The records with nothing left to hand back, their
+/// sandbox running again, stopped, failed or gone, and the ones the control
+/// plane names in `named` once nothing is in flight for them, are returned
+/// to be forgotten.
+pub(super) fn plan_cancel(
+    rows: &[DrainRow],
+    inputs: &PlanInputs,
+    named: &[String],
+) -> (DrainPlan, Vec<String>) {
     use pplx_space_common_core::types::ArtifactKind;
     let mut plan = DrainPlan::default();
     let mut forget = Vec::new();
@@ -766,23 +781,27 @@ pub(super) fn plan_cancel(rows: &[DrainRow], inputs: &PlanInputs) -> (DrainPlan,
             plan.wait_for(inputs, id, *action);
             continue;
         }
-        let pending_pin = row.pin.clone().filter(|(artifact, _)| {
-            inputs
-                .pending_backups
-                .get(id)
-                .is_some_and(|pending| pending.contains(artifact))
-        });
+        // A row being deleted takes its artifacts with it; it settles below.
+        if row.lifecycle != SandboxState::Deleting
+            && let Some((artifact_id, kind)) = inputs.pending_pin(row)
+        {
+            plan.drive(
+                inputs,
+                PlannedAction::Upload {
+                    sandbox_id: id.clone(),
+                    artifact_id,
+                    kind,
+                },
+            );
+            continue;
+        }
+        if named.contains(id) {
+            forget.push(id.clone());
+            continue;
+        }
         match row.lifecycle {
-            SandboxState::Suspended => match (&row.pin, pending_pin) {
-                (_, Some((artifact_id, kind))) => plan.drive(
-                    inputs,
-                    PlannedAction::Upload {
-                        sandbox_id: id.clone(),
-                        artifact_id,
-                        kind,
-                    },
-                ),
-                (Some((artifact, ArtifactKind::Full)), None) => {
+            SandboxState::Suspended => match &row.pin {
+                Some((artifact, ArtifactKind::Full)) => {
                     plan.evacuated
                         .push((id.clone(), evacuation.prior, artifact.clone()));
                 }
@@ -906,8 +925,7 @@ impl SandboxManagerService {
         }
         if cancel {
             self.activation_seal.unseal(&self.db, epoch)?;
-            self.forget_drain_suspends(&forget)?;
-            return Ok(Response::new(self.finish_cancel(epoch)));
+            return Ok(Response::new(self.finish_cancel(epoch, &forget)));
         }
         self.activation_seal.seal(&self.db, epoch)?;
         let first = self.activation_seal.status();
@@ -973,12 +991,13 @@ impl SandboxManagerService {
     }
 
     /// Under a cancelled `epoch`: forget the records with nothing left to
-    /// hand back, start the uploads the hand-back waits for, and report.
-    /// `done` once nothing is left to hand back.
-    pub(super) fn finish_cancel(&self, epoch: u64) -> DrainNodeResponse {
+    /// hand back and the ones the control plane names in `named` that
+    /// nothing is in flight for, start the uploads the hand-back waits for,
+    /// and report. `done` once nothing is left to hand back.
+    pub(super) fn finish_cancel(&self, epoch: u64, named: &[String]) -> DrainNodeResponse {
         let mut plan = match self.read_plan_inputs(epoch, None, tokio::time::Instant::now()) {
             Ok((rows, inputs)) => {
-                let (plan, stale) = plan_cancel(&rows, &inputs);
+                let (plan, stale) = plan_cancel(&rows, &inputs, named);
                 match self.forget_drain_suspends(&stale) {
                     Ok(()) => plan,
                     Err(status) => DrainPlan {
