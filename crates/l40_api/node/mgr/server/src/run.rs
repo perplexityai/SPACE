@@ -33,6 +33,10 @@ use crate::slot_pool::{
 /// rate-limit surfaces with, and binds its production socket under.
 pub const SERVICE_NAME: &str = "space-node-manager";
 
+const CAPTURE_VM_STATE_PATH: &str = "/space.node.v1.NodeManager/CaptureVmState";
+const CAPTURE_VM_STATE_RPC_BUDGET: Duration =
+    pplx_space_node_mgr_client::MEMORY_CAPTURE_WAIT_TIMEOUT.saturating_add(Duration::from_secs(30));
+
 /// Group name that controls who can connect to the node-manager socket.
 const SOCKET_GROUP: &str = group_names::SPACE_NODECLIENTS;
 /// Where the binary looks for the node-manager TOML config by default.
@@ -897,7 +901,16 @@ pub async fn run(
             async move { token.cancelled().await }
         };
         let server_handle = tokio::spawn(
-            pplx_space_grpc_server::grpc_server_builder()
+            pplx_space_grpc_server::grpc_server_builder_with_request_timeout(
+                CAPTURE_VM_STATE_RPC_BUDGET,
+            )
+                .layer(pplx_space_grpc_server::MethodTimeoutLayer(|path| {
+                    if path == CAPTURE_VM_STATE_PATH {
+                        CAPTURE_VM_STATE_RPC_BUDGET
+                    } else {
+                        pplx_space_grpc_server::GRPC_REQUEST_TIMEOUT
+                    }
+                }))
                 .http2_max_pending_accept_reset_streams(Some(MAX_PENDING_ACCEPT_RESET_STREAMS))
                 .layer(pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
                 .layer(pplx_space_grpc_server::grpc_trace_layer())

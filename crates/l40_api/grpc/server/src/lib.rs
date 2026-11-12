@@ -19,9 +19,11 @@ use pplx_space_request_id::request_id_from_headers;
 
 mod grpc_request_params;
 mod grpc_trace;
+mod method_timeout;
 
 pub use grpc_request_params::*;
 pub use grpc_trace::*;
+pub use method_timeout::MethodTimeoutLayer;
 
 pub const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub const GRPC_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);

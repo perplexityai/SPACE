@@ -203,46 +203,68 @@ impl SandboxManagerService {
         {
             return Ok(Response::new(response));
         }
-        let (blocking_local_artifact_id, publication) = self
-            .prepare_suspend_snapshot_publication_after_locks(
-                &context,
-                &wake_guard,
-                &artifact_guard,
-            )
-            .await?;
-        if !context.blocking {
-            let service = self.clone();
-            let background_sandbox_id = publication.sandbox.id.clone();
-            let span_sandbox_id = background_sandbox_id.clone();
-            self.spawn_detached_state_writer("SuspendPublication", &span_sandbox_id, async move {
-                let _wake_guard = wake_guard;
-                let _artifact_guard = artifact_guard;
-                if let Err(error) = service
-                    .complete_suspend_snapshot_publication(publication)
-                    .await
-                {
-                    tracing::warn!(
-                        sandbox_id = %background_sandbox_id,
-                        code = %error.code(),
-                        error = %error.message(),
-                        "asynchronous suspend publication failed"
-                    );
-                    super::super::drain::record_detached_failure(error.message());
+        // Waiting for lifecycle locks belongs to the request. Once acquired,
+        // preparation and publication share one tracked owner, including when
+        // either caller or server deadline drops the response waiter.
+        let blocking = context.blocking;
+        let service = self.clone();
+        let task_sandbox_id = context.sandbox_id.clone();
+        let (admitted, admission) = tokio::sync::oneshot::channel();
+        let work = async move {
+            let prepared = service
+                .prepare_suspend_snapshot_publication_after_locks(
+                    &context,
+                    &wake_guard,
+                    &artifact_guard,
+                )
+                .await;
+            let (local_artifact_id, publication) = match prepared {
+                Ok(prepared) => {
+                    let _ = admitted.send(Ok(()));
+                    prepared
                 }
-            })?;
+                Err(error) => {
+                    super::super::drain::record_detached_failure(error.message());
+                    if admitted.send(Err(error.clone())).is_err() {
+                        tracing::warn!(sandbox_id = %context.sandbox_id,
+                            code = %error.code(), error = %error.message(),
+                            "owned suspend preparation failed without a waiting caller");
+                    }
+                    return Err(error);
+                }
+            };
+            let result = service
+                .complete_suspend_snapshot_publication(publication)
+                .await;
+            // Keep both guards through completion, not just preparation.
+            drop(artifact_guard);
+            drop(wake_guard);
+            if let Err(error) = &result {
+                tracing::warn!(sandbox_id = %context.sandbox_id,
+                        code = %error.code(), error = %error.message(),
+                        "owned suspend publication failed");
+                super::super::drain::record_detached_failure(error.message());
+            }
+            result.map(|()| local_artifact_id)
+        };
+        #[cfg(test)]
+        let work = super::pause_resume::inherit_guest_preparation(work);
+        let publication =
+            self.spawn_detached_state_writer("SuspendPublication", &task_sandbox_id, work)?;
+        if !blocking {
+            admission
+                .await
+                .map_err(|_| Status::internal("suspend preparation task ended"))??;
             return Ok(Response::new(SuspendResponse {
                 published_artifact: None,
             }));
         }
-
-        self.complete_suspend_snapshot_publication(publication)
-            .await?;
-        drop(artifact_guard);
-        drop(wake_guard);
-
+        let local_artifact_id = publication.await.map_err(|error| {
+            Status::internal(format!("suspend publication task ended: {error}"))
+        })??;
         Ok(Response::new(SuspendResponse {
             published_artifact: Some(crate::proto::PublishedArtifact {
-                local_artifact_id: blocking_local_artifact_id,
+                local_artifact_id,
                 artifact_kind: crate::proto::ArtifactKind::Full as i32,
                 origin: crate::proto::ArtifactOrigin::Suspend as i32,
                 snapshot_name: None,

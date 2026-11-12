@@ -15,6 +15,8 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tonic = { workspace = true }
 tonic-health = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tower = { workspace = true }
 tower-http = { workspace = true, features = ["trace"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
@@ -26,7 +28,7 @@ pplx-space-request-id = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "time", "test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic-prost = { workspace = true }
 tower = { workspace = true }
