@@ -1151,19 +1151,13 @@ impl SandboxManagerService {
             // the runtime intact and makes this suspend retryable.
             let upload_queue_started_at = std::time::Instant::now();
             if durability == SuspendDurability::NodeLocal {
-                let enqueue_result = self
-                    .enqueue_node_local_suspend_backup(
-                        &sandbox,
-                        local_artifact_id,
-                        &snapshot_dir_string,
-                        published_format,
-                    )
-                    .await;
-                self.require_node_local_backup_handoff(
-                    &sandbox.id,
+                self.prepare_node_local_suspend_cleanup(
+                    &sandbox,
                     local_artifact_id,
-                    enqueue_result,
-                )?;
+                    &snapshot_dir_string,
+                    published_format,
+                )
+                .await?;
             }
             crate::metrics::snapshot::create_step(
                 create_kind,
@@ -1236,6 +1230,55 @@ impl SandboxManagerService {
             }
         }
         result
+    }
+
+    /// Publication is already validated under wake, artifact and cleanup fences.
+    /// A live plaintext VM can roll back, but must keep the newly published
+    /// artifact: publication retired its predecessor. Otherwise cleanup owns
+    /// handoff retries and the bounded terminal decision.
+    pub(super) async fn prepare_node_local_suspend_cleanup(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        artifact: LocalArtifactId,
+        path: &str,
+        format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    ) -> Result<(), Status> {
+        if !sandbox.volume_encryption
+            && (self.sandbox_runtime_live)(&sandbox.id)
+            && let Err(error) = tokio::time::timeout(
+                Duration::from_secs(30),
+                self.enqueue_node_local_suspend_backup(sandbox, artifact, path, Some(format)),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(ArtifactBackupSubmissionError::Other(
+                    "backup handoff attempt timed out".to_owned(),
+                ))
+            })
+            && (self.sandbox_runtime_live)(&sandbox.id)
+        {
+            let applied = crate::db::rollback_published_suspend_to_paused(
+                &*self.db_conn()?,
+                sandbox,
+                artifact,
+                path,
+            )
+            .map_err(|error| {
+                Status::internal(format!("retain published suspend on rollback: {error}"))
+            })?;
+            if !applied {
+                return Err(Status::aborted("published suspend rollback superseded"));
+            }
+            mark_sandbox_dirty(&self.db, &sandbox.id);
+            return Err(artifact_backup_fence_status(error.to_string()));
+        }
+        crate::db::pin_suspended_artifact_for_cleanup(
+            &*self.db_conn()?,
+            &sandbox.id,
+            artifact,
+            path,
+        )
+        .map_err(|error| Status::internal(format!("persist published suspend cleanup: {error}")))
     }
 
     pub(super) async fn finalize_suspended_runtime(

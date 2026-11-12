@@ -2612,6 +2612,15 @@ impl SandboxManagerService {
             if completion == CleanupCompletion::DeletePoolClone {
                 admit_prepared_clone_disposal_attempt(&self.db, sandbox_id, job_id)?;
             }
+            // Restore compensation retains its entry artifact; it must not
+            // submit that older capture under the interrupted execution.
+            if completion == CleanupCompletion::MarkSuspended && cleanup_id.is_none()
+                && let Some(outcome) = self.ensure_suspend_backup_before_cleanup(
+                    sandbox_id, published_artifact.as_ref(), job_id, jiff::Timestamp::now,
+                ).await?
+            {
+                return Ok(outcome);
+            }
             let dispatch_target = prepare_dispatch().await?;
 
             let dispatch = Self::dispatch_cleanup_if_generation_current(

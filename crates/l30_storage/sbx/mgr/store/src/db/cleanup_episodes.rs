@@ -1571,6 +1571,100 @@ pub fn quarantine_cleanup_episode_for_job(
     Ok(changed == 1)
 }
 
+/// Retain a terminal or expired suspend handoff as quarantine and finish its
+/// cleanup job atomically. Refused execution/artifact owners change no rows.
+pub fn quarantine_refused_suspend_backup(
+    conn: &Connection,
+    expected: &SandboxRow,
+    artifact: LocalArtifactId,
+    reason: &str,
+    job_id: Option<&JobId>,
+) -> std::result::Result<bool, MarkQuarantinedError> {
+    let tx = immediate_transaction(conn)?;
+    if let Some(id) = job_id {
+        let Some(job) = cleanup_jobs::get_job(&tx, id)? else {
+            return Ok(false);
+        };
+        let work = cleanup_jobs::decode(&job.payload).map_err(Error::to_sql_conversion)?;
+        if job.kind != cleanup_jobs::KIND
+            || job.status != pplx_space_common_jobs::JobStatus::Running.as_str()
+            || work.sandbox_id.to_string() != expected.id
+            || work.uuid8 != expected.uuid8
+            || work.execution_generation != expected.space_api_route_identity.execution_generation
+            || work.cleanup_id.is_some()
+            || work.completion != CleanupCompletion::MarkSuspended
+            || !work.keep_filesystem
+            || work
+                .published_artifact
+                .as_ref()
+                .is_some_and(|(id, _)| *id != artifact)
+        {
+            return Ok(false);
+        }
+    }
+    let timestamp = now()?;
+    let changed = tx.execute(
+        "UPDATE sandboxes
+         SET state = 'quarantined', cleanup_state = NULL, failure_reason = ?1,
+             cleanup_completion = NULL, cleanup_keep_filesystem = NULL,
+             suspend_predecessor_artifact_id = NULL,
+             state_changed_at = ?2, updated_at = ?2
+         WHERE id = ?3 AND state = 'suspending'
+           AND cleanup_state IN ('required', 'failed')
+           AND (suspend_attempt_artifact_id IS NULL OR suspend_attempt_artifact_id = ?7)
+           AND uuid8 = ?4 AND node_execution_id IS ?5
+           AND space_api_route_execution_generation IS ?6
+           AND current_local_artifact_id = ?7
+           AND current_local_artifact_kind = 'full'
+           AND current_local_artifact_origin = 'suspend'
+           AND cleanup_completion = 'mark_suspended'
+           AND cleanup_keep_filesystem = TRUE
+           AND NOT EXISTS (SELECT 1 FROM sandbox_cleanup_episodes WHERE sandbox_id = ?3)",
+        params![
+            reason,
+            timestamp,
+            expected.id,
+            expected.uuid8.as_str(),
+            expected.node_execution_id.map(|id| id.to_string()),
+            expected
+                .space_api_route_identity
+                .execution_generation
+                .map(|g| g.get()),
+            artifact.to_string()
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    route_activation_claims::close_claim(&tx, &expected.id)?;
+    insert_new_quarantine_episode(
+        &tx,
+        &QuarantineEpisode {
+            sandbox_id: &expected.id,
+            entered_from_state: Some(expected.state.legacy_label()),
+            source: SandboxQuarantineSource::SbxManager,
+            reason_code: SandboxQuarantineReasonCode::SuspendSnapshotPublicationFailed,
+            reason_message: Some(reason),
+            next_action: SandboxQuarantineNextAction::RequiresOperatorAttention,
+            timestamp: &timestamp,
+        },
+    )?;
+    cleanup_jobs::finish_in_transaction(
+        &tx,
+        job_id,
+        &cleanup_jobs::CleanupOutcome::Quarantined(reason.to_owned()),
+    )?;
+    tx.commit()?;
+    emit_sandbox_quarantined_event(
+        &expected.id,
+        Some(Ok(expected.state)),
+        SandboxQuarantineReasonCode::SuspendSnapshotPublicationFailed,
+        "quarantine_refused_suspend_backup",
+        Some(reason),
+    );
+    Ok(true)
+}
+
 pub fn mark_cleanup_required(
     conn: &Connection,
     id: &str,

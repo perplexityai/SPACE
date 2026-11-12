@@ -52,3 +52,16 @@ pub fn local_artifact_unowned(
 ) -> Result<bool> {
     crate::db::local_artifact_leases::gc_staging_is_unowned(conn, &local_artifact_id.to_string())
 }
+
+/// The newest upload of this immutable artifact, using the caller's held
+/// connection so handoff evidence and a cleanup decision can share one lock.
+pub fn local_artifact_upload(
+    conn: &Connection,
+    artifact: LocalArtifactId,
+) -> Result<Option<pplx_space_common_jobs::Job>> {
+    Ok(pplx_space_common_jobs::db::find_job_by_dedup_key(
+        conn.raw(),
+        crate::db::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+        &crate::db::snapshot_upload_jobs::artifact_backup_dedup_key(artifact),
+    )?)
+}

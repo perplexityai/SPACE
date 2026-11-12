@@ -103,6 +103,59 @@ pub fn pin_suspended_artifact_for_cleanup(
     Ok(())
 }
 
+/// Roll back only the admitted published capture and its execution. The caller
+/// holds wake, artifact and cleanup fences and has confirmed a live plaintext VM.
+/// Publication retired the predecessor; the new artifact must remain pinned.
+pub fn rollback_published_suspend_to_paused(
+    conn: &Connection,
+    expected: &SandboxRow,
+    artifact: LocalArtifactId,
+    path: &str,
+) -> Result<bool> {
+    let tx = immediate_transaction(conn)?;
+    let changed = tx.execute(
+        "UPDATE sandboxes
+         SET state = 'paused',
+             current_local_artifact_id = ?1,
+             current_local_artifact_kind = 'full',
+             current_local_artifact_origin = 'suspend',
+             suspend_predecessor_artifact_id = NULL,
+             failure_reason = NULL,
+             state_changed_at = ?2, updated_at = ?2
+         WHERE id = ?3 AND unowned_state = 'suspending'
+           AND suspend_attempt_artifact_id = ?1
+           AND uuid8 = ?4 AND node_execution_id IS ?5
+           AND space_api_route_execution_generation IS ?6
+           AND current_local_artifact_id IS NULL
+           AND suspend_predecessor_artifact_id IS ?7
+           AND cleanup_completion IS NULL AND cleanup_keep_filesystem IS NULL",
+        params![
+            artifact.to_string(),
+            now()?,
+            expected.id,
+            expected.uuid8.as_str(),
+            expected.node_execution_id.map(|id| id.to_string()),
+            expected
+                .space_api_route_identity
+                .execution_generation
+                .map(|g| g.get()),
+            expected
+                .current_local_artifact_id
+                .filter(|_| {
+                    expected.current_local_artifact_kind == Some(ArtifactKind::Full)
+                        && expected.current_local_artifact_origin == Some(ArtifactOrigin::Suspend)
+                })
+                .map(|id| id.to_string())
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    upsert_suspend_local_artifact(&tx, &expected.id, artifact, path)?;
+    tx.commit()?;
+    Ok(true)
+}
+
 pub fn adopt_suspended_local_artifact(
     conn: &Connection,
     id: &str,
