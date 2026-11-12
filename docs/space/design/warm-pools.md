@@ -142,6 +142,7 @@ sequenceDiagram
         alt no ready slot
             API->>K8S: cold create
         else hit
+            API->>K8S: with attribution on, patch the adopter's<br/>client-id label, fenced by the pod UID
             API->>PG: bind: sandbox rows on the reserved ID,<br/>slot bound
             API->>K8S: patch pod annotations
             API->>Node: adopt: apply env, owner and lifecycle,<br/>wake the paused VM
@@ -179,6 +180,44 @@ Bind is a separate transaction. It inserts the sandbox rows and the
 generation-1 `sandbox_k8s_executions` row on the slot's reserved sandbox ID,
 and marks the slot `bound` in the same transaction. A `claimed` row older than
 the claim timeout is therefore a handoff that died before bind.
+
+With `SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED` on, before bind, the API
+patches the adopter's `space.pplx.net/client-id` label onto the claimed pod,
+retrying while the apiserver throttles, all within 5 seconds
+(`ADOPTION_LABEL_TIMEOUT`). The patch carries the claimed pod UID, so a pod
+recreated under the same name is rejected rather than labeled. No `ready`
+slot's pod carries the label.
+
+A transient failure (throttling that outlasts those retries, a 408 or 5xx, a
+dropped connection, no answer within the bound) says nothing about the pod, so
+the create fails with a retryable 503 rather than building cold. Under
+throttling, a cold build would add apiserver writes while the apiserver
+struggles; after a 5xx or a lost answer a plain create's slot is spent instead,
+and the pool replaces its pod. What happens to the slot depends
+on whether the patch could have landed. A throttled request is rejected before
+it runs, so after throttling the slot goes back to `ready` unlabeled. A 408 or
+5xx (the apiserver may still commit a write it timed out), a dropped connection,
+or a request abandoned at the bound may land, even after a later write, and the
+UID can't fence that because it stays the same across claims. So that slot is
+invalidated, never released, and the create removes the label best-effort,
+under the same UID fence and bound. A create whose slot was claimed at admission
+keeps its claim, and the label if it landed, and gets a retryable 503; its retry
+adopts the same slot, and an abandoned claim's pod is deleted by the stale-claim
+sweep.
+
+When the bind fails after the label is written, the create invalidates the slot
+and removes the label. A label whose removal fails stays on the pod until the
+stale-claim sweep deletes it.
+
+A permanent refusal (a replaced pod, a missing `patch` permission, a missing
+pod UID) means the pod can't be labeled, so it isn't adopted: its slot
+is invalidated for cleanup, never returned to `ready`, and the create falls
+back as after a pool miss: a cold build, or a 503 for a pool-only create. A
+create whose slot was claimed at admission gets a retryable 503 and builds cold
+under the same ID once the pool collects the slot. Returning a permanently
+failed slot would put it first in claim order for every later create, so one
+refusal that repeats would take every claim. The API needs `patch` on pods in
+the sandbox namespace for this.
 
 After bind, the API patches the pod's annotations and calls node-local
 adoption. Adoption applies the owner, environment and final auto-lifecycle

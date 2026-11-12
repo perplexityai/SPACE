@@ -39,7 +39,8 @@
 //!   stays `suspended` until the stamp. A start and a stop also write over
 //!   `stopped` and `restoring`, so a start or stop that races a restore lease
 //!   can make the lease's completion miss.
-//! - Warm-pool claims adopt node-side.
+//! - Warm-pool claims adopt node-side, so `label_adopted_execution` has no
+//!   pod to label and answers `Labeled`.
 //! - Create, pool-adoption and restore candidates evaluate the environment
 //!   placement gate (`environment_placement.rs`) for bound work, by mode:
 //!   off ignores it, shadow counts and logs the candidates it would refuse,
@@ -55,6 +56,11 @@
 //!   holder a create that may pull (it names a build and needs neither a base
 //!   snapshot nor a pool) goes on to pull-on-create; one no holder was refused
 //!   for fails as off.
+//! - With `SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED` on
+//!   ([`super::ActivationClientAttribution`], read in
+//!   `Substrate::from_env_with_lifecycle`), a create records its activating
+//!   client in `sandboxes.activating_client_id` when it inserts the row. Off,
+//!   the default, nothing records it.
 //! - Custom vCPU or memory uses separate create and start calls: only
 //!   `StartRequest` carries those fields. A readiness wait still blocks on
 //!   start. Default shapes and disk-only overrides can use one-shot create,
@@ -77,6 +83,7 @@
 //! | Stopped-disk backup on retire | `retire_execution` enqueues none; the stopped disk stays on the node (see below) | ac-pplx | A retried Direct retire (next row), then the enqueue |
 //! | Retire retry | Nothing retries a failed Direct retire (see below) | ac-pplx | The sweeper's failed-cleanup retry running for both substrates |
 //! | Drain and evacuation | [`SubstrateCapabilities::supports_node_drain`] is false. Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and `:force-upload-local-snapshots` return 501 before reading or writing the node. `:undrain` clears a `draining` or `drained` phase an earlier drain left, without a substrate call | ac-pplx | Core drain and evacuation for both substrates over a Direct `set_node_schedulability` |
+//! | Activation attribution | Only a create records the activating client; a later start, restore or wake doesn't re-attribute `sandboxes.activating_client_id`, so it keeps the creating client | the-gigi-pplx | Recording the activating client on Direct's start and restore receipts |
 //! | Drain, orphan, failed-row repair and node-sync loops | Not started on Direct (below) | ac-pplx | Those loops running for both substrates through the adapter |
 //! | Network-slot headroom (`Substrate::network_slot_headroom`) | Reads `Unknown(Unsupported)`, so the activation limiter's slot check (`SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED`) admits every Direct cold create | ac-pplx | Slot capacity of registered nodes, read by an admission check that runs for both substrates |
 //!
@@ -256,6 +263,8 @@ pub struct DirectSubstrate {
     /// classifies with what on leaves out without reading telemetry.
     #[cfg(test)]
     recorded_refusals: std::sync::Arc<std::sync::Mutex<Vec<RecordedRefusal>>>,
+    /// Whether creates record their activating client; off unless set.
+    activation_client_attribution: super::ActivationClientAttribution,
 }
 
 const DIRECT_NODE_CREATE_FAILURE_TTL_SECS: i64 = 10;
@@ -1000,6 +1009,7 @@ impl DirectSubstrate {
             environment_placement: EnvironmentPlacementGate::default(),
             #[cfg(test)]
             recorded_refusals: Default::default(),
+            activation_client_attribution: super::ActivationClientAttribution::Disabled,
         }
     }
 
@@ -1094,6 +1104,18 @@ impl DirectSubstrate {
     ) -> Self {
         self.builder_connect_retry_policy = policy;
         self
+    }
+
+    pub fn with_activation_client_attribution(
+        mut self,
+        attribution: super::ActivationClientAttribution,
+    ) -> Self {
+        self.activation_client_attribution = attribution;
+        self
+    }
+
+    pub(super) fn activation_client_attribution(&self) -> super::ActivationClientAttribution {
+        self.activation_client_attribution
     }
 
     async fn persist_route_identity_receipt(
@@ -4544,6 +4566,16 @@ impl SubstrateAdapter for DirectSubstrate {
         Ok(())
     }
 
+    /// Direct adopts node-side and has no pod to label.
+    async fn label_adopted_execution(
+        &self,
+        _claim: &PooledExecutionClaim,
+        _client_id: Option<&pplx_space_common_core::types::ClientId>,
+        _on_transient: crate::controllers::substrate::AdoptionLabelTransient,
+    ) -> Result<crate::controllers::substrate::AdoptionLabelOutcome, ControllerError> {
+        Ok(crate::controllers::substrate::AdoptionLabelOutcome::Labeled)
+    }
+
     async fn rollback_pooled_execution_claim(
         &self,
         claim: &PooledExecutionClaim,
@@ -5287,7 +5319,7 @@ impl SubstrateAdapter for DirectSubstrate {
         sandbox: &Sandbox,
         activity: ExecutionActivityKind,
         timeout: Duration,
-        _charge: crate::controllers::substrate::RecoveryCharge,
+        charge: crate::controllers::substrate::RecoveryCharge,
     ) -> Result<RuntimeClient, ControllerError> {
         if matches!(
             sandbox.lifecycle.parse::<SandboxLifecycle>(),
@@ -5311,7 +5343,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 sandbox,
                 timeout,
                 Some(activity),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                charge.after_charge(),
             )
             .await
             .map_err(ControllerError::from)?;

@@ -19,6 +19,7 @@ mod materialization_record_tests;
 mod node_registration_tests;
 mod owned_restore_completion_tests;
 mod restore_revert_tests;
+mod runtime_attribution_tests;
 mod runtime_upgrade_evidence_tests;
 mod started_recovery_observation_tests;
 mod stopped_evacuation_claim_tests;
@@ -150,7 +151,11 @@ async fn postgres_store_with_max_connections(max_connections: u32) -> TestResult
     let db = pg_test_db_with_max_connections(max_connections).await?;
     let pool = db.pool.clone();
     Ok(PostgresStore {
-        store: K8sStore::new(pool.clone(), "space".to_string()),
+        store: K8sStore::new(
+            pool.clone(),
+            "space".to_string(),
+            crate::controllers::substrate::ActivationClientAttribution::Enabled,
+        ),
         pool,
         _db: db,
     })
@@ -1238,6 +1243,7 @@ async fn split_operation_stopped_start_retry_preserves_route_proof() -> TestResu
             claim.row.generation,
             Some("pod-proof"),
             Some("100.64.0.7"),
+            None,
         )
         .await?;
     // Caller abandonment does not complete a stopped->started lifecycle; ownership
@@ -2367,6 +2373,7 @@ async fn ensure_active_execution_row_is_idempotent(fixture: &PostgresStore) -> T
             first.row.generation,
             Some("pod-uid"),
             Some("10.90.0.7"),
+            None,
         )
         .await?;
     let (state, pod_ip): (String, Option<String>) = sqlx::query_as(sql!(
@@ -2395,6 +2402,7 @@ async fn pod_materialization_claim_publishes_fresh_lease(fixture: &PostgresStore
             claim.row.generation,
             Some("stale-pod-uid"),
             Some("10.90.0.8"),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -2465,7 +2473,13 @@ async fn started_recovery_claim_is_bounded_and_preserves_its_marker(
 
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("pod-uid"), Some("10.90.0.8"))
+        .persist_pod_metadata(
+            sandbox_id,
+            generation,
+            Some("pod-uid"),
+            Some("10.90.0.8"),
+            None,
+        )
         .await?;
     let state: String = sqlx::query_scalar(sql!(
         "SELECT state FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
@@ -2508,7 +2522,13 @@ async fn started_recovery_claim_is_bounded_and_preserves_its_marker(
     );
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("pod-uid"), Some("10.90.0.8"))
+        .persist_pod_metadata(
+            sandbox_id,
+            generation,
+            Some("pod-uid"),
+            Some("10.90.0.8"),
+            None,
+        )
         .await?;
     let state: String = sqlx::query_scalar(sql!(
         "SELECT state FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
@@ -2541,6 +2561,7 @@ async fn started_recovery_claim_is_bounded_and_preserves_its_marker(
             generation,
             Some("replacement-pod-uid"),
             Some("10.90.0.8"),
+            None,
         )
         .await?;
     assert_eq!(
@@ -2640,6 +2661,7 @@ async fn failed_started_recovery_converges_unplaced_sandbox_with_current_snapsho
                 generation,
                 Some("late-pod-uid"),
                 Some("10.90.0.9"),
+                None,
             )
             .await?,
         None,
@@ -2705,7 +2727,7 @@ async fn failed_started_recovery_converges_after_authoritative_pod_absence(
     };
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("failed-pod-uid"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("failed-pod-uid"), None, None)
         .await?;
     fixture
         .store
@@ -2805,7 +2827,7 @@ async fn failed_started_recovery_after_pod_absence_refuses_stale_snapshot(
     };
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("failed-pod-uid"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("failed-pod-uid"), None, None)
         .await?;
     fixture
         .store
@@ -2931,7 +2953,7 @@ async fn failed_started_recovery_pod_absence_is_fenced_against_late_materializat
     };
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("observed-pod-uid"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("observed-pod-uid"), None, None)
         .await?;
     fixture
         .store
@@ -3300,7 +3322,7 @@ async fn failed_started_recovery_with_materialized_pod_stays_started(
     };
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("pending-pod-uid"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("pending-pod-uid"), None, None)
         .await?;
 
     fixture
@@ -3401,6 +3423,7 @@ async fn failed_started_recovery_with_routable_pod_stays_started(
             generation,
             Some("routable-pod-uid"),
             Some("10.90.0.8"),
+            None,
         )
         .await?;
 
@@ -3491,6 +3514,7 @@ async fn started_recovery_follows_superseding_execution(fixture: &PostgresStore)
             replacement.row.generation,
             Some("replacement-pod-uid"),
             Some("10.90.0.9"),
+            None,
         )
         .await?;
 
@@ -3656,6 +3680,7 @@ async fn abandon_created_unmaterialized_create_claim_preserves_observed_or_mater
             materialized.row.generation,
             Some("materialized-pod-uid"),
             None,
+            None,
         )
         .await?;
 
@@ -3766,6 +3791,7 @@ async fn abandon_unmaterialized_create_claim_retires_foreign_creating_claim(
             materialized_sandbox_id,
             materialized.row.generation,
             Some("redrive-materialized-pod-uid"),
+            None,
             None,
         )
         .await?;
@@ -3882,7 +3908,7 @@ async fn reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim(
     // the row to `created`.
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("pinned-pod-uid"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("pinned-pod-uid"), None, None)
         .await?;
     let state: String = sqlx::query_scalar(sql!(
         "SELECT state FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
@@ -3916,7 +3942,7 @@ async fn reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim(
     assert!(
         fixture
             .store
-            .reset_active_execution_to_creating_if_generation(sandbox_id, generation, None, None,)
+            .reset_active_execution_to_creating_if_generation(sandbox_id, generation, None, None)
             .await?
     );
     assert!(
@@ -3955,7 +3981,13 @@ async fn reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim(
     .await?;
     fixture
         .store
-        .persist_pod_metadata(fenced_id, fenced_generation, Some("pinned-pod-uid"), None)
+        .persist_pod_metadata(
+            fenced_id,
+            fenced_generation,
+            Some("pinned-pod-uid"),
+            None,
+            None,
+        )
         .await?;
     assert!(
         !fixture
@@ -4770,6 +4802,7 @@ async fn stale_generation_pod_metadata_does_not_update_new_active_execution(
             stale.row.generation,
             Some("stale-pod-uid"),
             Some("10.90.0.7"),
+            None,
         )
         .await?;
     assert!(
@@ -4794,6 +4827,7 @@ async fn stale_generation_pod_metadata_does_not_update_new_active_execution(
             active.row.generation,
             Some("active-pod-uid"),
             Some("10.90.0.8"),
+            None,
         )
         .await?;
     assert_eq!(
@@ -4907,6 +4941,7 @@ async fn persist_pod_metadata_reports_recovering_state_unchanged(
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.13"),
+            None,
         )
         .await?;
     assert_eq!(
@@ -4959,11 +4994,21 @@ async fn persist_pod_metadata_reports_noop_when_retirement_commits_mid_write(
     .await?;
 
     // Conn B: the persist, which must block behind A's row lock.
-    let store = K8sStore::new(fixture.pool.clone(), "space".to_string());
+    let store = K8sStore::new(
+        fixture.pool.clone(),
+        "space".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
     let generation = execution.generation;
     let persist = tokio::spawn(async move {
         store
-            .persist_pod_metadata(sandbox_id, generation, Some("pod-uid"), Some("10.90.0.12"))
+            .persist_pod_metadata(
+                sandbox_id,
+                generation,
+                Some("pod-uid"),
+                Some("10.90.0.12"),
+                None,
+            )
             .await
     });
     // Once the persist is blocked on the locked row, commit the retirement
@@ -5012,6 +5057,7 @@ async fn persist_pod_metadata_normalizes_blank_pod_uid_to_null(
             execution.generation,
             Some("   "),
             Some("10.90.0.8"),
+            None,
         )
         .await?;
 
@@ -5683,6 +5729,7 @@ async fn unchanged_pod_metadata_does_not_touch_execution_row(
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.7"),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -5700,6 +5747,7 @@ async fn unchanged_pod_metadata_does_not_touch_execution_row(
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.7"),
+            None,
         )
         .await?;
 
@@ -5720,6 +5768,7 @@ async fn unchanged_pod_metadata_does_not_touch_execution_row(
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.8"),
+            None,
         )
         .await?;
     let (state, execution_ip, execution_touched): (String, Option<String>, bool) =
@@ -6115,7 +6164,13 @@ async fn finish_suspended_execution_rejects_uncommitted_running_execution(
     let pod_uid = PodUid::parse(Uuid::now_v7().to_string())?;
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, claim.generation, Some(pod_uid.as_str()), None)
+        .persist_pod_metadata(
+            sandbox_id,
+            claim.generation,
+            Some(pod_uid.as_str()),
+            None,
+            None,
+        )
         .await?;
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
@@ -6165,7 +6220,13 @@ async fn suspend_commit_rejects_artifact_claimed_for_prune(fixture: &PostgresSto
     let pod_uid = PodUid::parse(Uuid::now_v7().to_string())?;
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, claim.generation, Some(pod_uid.as_str()), None)
+        .persist_pod_metadata(
+            sandbox_id,
+            claim.generation,
+            Some(pod_uid.as_str()),
+            None,
+            None,
+        )
         .await?;
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
@@ -6242,7 +6303,13 @@ async fn finish_suspended_execution_rejects_mismatched_artifact(
     let pod_uid = PodUid::parse(Uuid::now_v7().to_string())?;
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, claim.generation, Some(pod_uid.as_str()), None)
+        .persist_pod_metadata(
+            sandbox_id,
+            claim.generation,
+            Some(pod_uid.as_str()),
+            None,
+            None,
+        )
         .await?;
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
@@ -6500,6 +6567,7 @@ async fn seed_bound_claimed_pool_slot(
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.9"),
+            None,
         )
         .await?;
 
@@ -6599,6 +6667,7 @@ async fn suspend_commit_finishes_after_exact_execution_is_forgotten(
             execution.generation,
             Some(pod_uid.as_str()),
             Some("100.64.101.40"),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -6733,6 +6802,7 @@ async fn durable_suspend_snapshot_artifact_requires_this_suspends_snapshot(
                 execution.generation,
                 Some(pod_uid.as_str()),
                 Some("100.64.101.30"),
+                None,
             )
             .await?;
         let snapshot_id = Uuid::now_v7();
@@ -6858,6 +6928,7 @@ async fn committed_suspend_artifact_belongs_to_the_active_execution(
             prior_execution.generation,
             Some("prior-pod-uid"),
             Some("100.64.101.20"),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -6894,6 +6965,7 @@ async fn committed_suspend_artifact_belongs_to_the_active_execution(
             current_execution.generation,
             Some(current_pod_uid.as_str()),
             Some("100.64.101.21"),
+            None,
         )
         .await?;
 
@@ -6950,6 +7022,7 @@ async fn stale_worker_suspend_result_cannot_retire_replacement() -> TestResult {
             stale_execution.generation,
             Some(stale_pod_uid.as_str()),
             Some("100.64.101.30"),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -6974,6 +7047,7 @@ async fn stale_worker_suspend_result_cannot_retire_replacement() -> TestResult {
             replacement_execution.generation,
             Some(replacement_pod_uid.as_str()),
             Some("100.64.101.31"),
+            None,
         )
         .await?;
 
@@ -7515,6 +7589,7 @@ async fn forget_pod_tracking_preserves_execution_history(fixture: &PostgresStore
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.9"),
+            None,
         )
         .await?;
     fixture
@@ -7609,6 +7684,7 @@ async fn forget_pod_tracking_recovers_started_with_current_suspend_backup(
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.9"),
+            None,
         )
         .await?;
     insert_ready_full_snapshot_relative_to_lifecycle(
@@ -7703,6 +7779,7 @@ async fn forget_pod_tracking_clears_stale_marker_for_newest_current_suspend_back
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.9"),
+            None,
         )
         .await?;
     insert_ready_full_snapshot_relative_to_lifecycle(
@@ -7766,6 +7843,7 @@ async fn forget_pod_tracking_keeps_started_when_suspend_backup_is_unsafe(
             stale_activity_execution.generation,
             Some("pod-uid"),
             Some("10.90.0.9"),
+            None,
         )
         .await?;
     insert_ready_full_snapshot_relative_to_lifecycle(
@@ -7799,6 +7877,7 @@ async fn forget_pod_tracking_keeps_started_when_suspend_backup_is_unsafe(
             newer_non_suspend_execution.generation,
             Some("pod-uid"),
             Some("10.90.0.10"),
+            None,
         )
         .await?;
     insert_ready_full_snapshot_relative_to_lifecycle(
@@ -7900,7 +7979,7 @@ async fn forget_pod_tracking_preserve_keeps_markerless_snapshot_selectable(
         .await?;
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, 1, Some("pod-uid"), Some("10.90.0.9"))
+        .persist_pod_metadata(sandbox_id, 1, Some("pod-uid"), Some("10.90.0.9"), None)
         .await?;
 
     let fresh_query = format!(
@@ -8949,6 +9028,7 @@ async fn restored_generation_accepts_late_pod_metadata(fixture: &PostgresStore) 
             restored.generation,
             Some("restore-pod-uid"),
             Some("100.64.101.240"),
+            None,
         )
         .await?;
 
@@ -9597,7 +9677,11 @@ async fn a_contended_execution_guard_answers_retryable_not_failed() -> TestResul
         })
         .connect(&db.database_url)
         .await?;
-    let store = K8sStore::new(store_pool, "space".to_string());
+    let store = K8sStore::new(
+        store_pool,
+        "space".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
     let typed = sandbox_id;
 
     let mut blocker = db.pool.begin().await?;
@@ -9739,7 +9823,11 @@ async fn placement_retryability_follows_the_operation_not_the_statement() -> Tes
         })
         .connect(&db.database_url)
         .await?;
-    let store = K8sStore::new(store_pool, "space".to_string());
+    let store = K8sStore::new(
+        store_pool,
+        "space".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
     let node_id = NodeId::new();
 
     // Hold the row `lock_sandbox_for_execution_mutation_in` takes.

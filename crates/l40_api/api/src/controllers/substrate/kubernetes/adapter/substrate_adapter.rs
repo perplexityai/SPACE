@@ -448,6 +448,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 execution.generation,
                 pod_uid.as_deref(),
                 pod_ip_string.as_deref(),
+                pod.client_id().as_ref(),
             )
             .await
         {
@@ -1004,6 +1005,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             SandboxTransitionTargetState::Started,
+            charge.attribution().key().clone(),
         );
         let wait = async {
             // Boxed: `ensure_pod_exists` is a large future, and inlining it in
@@ -1673,7 +1675,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     sandbox,
                     timeout,
                     metric_identity,
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    // The access entrypoint already charged it.
+                    charge.after_charge(),
                 )
                 .await;
         }
@@ -2551,14 +2554,99 @@ impl SubstrateAdapter for KubernetesSubstrate {
         &self,
         claim: &PooledExecutionClaim,
     ) -> Result<(), ControllerError> {
-        pool::invalidate_claimed_pool_slot(self.store.pool(), claim)
+        // A label this adoption wrote must not outlive it, so the pod loses it
+        // once the slot is out of the inventory. A slot this call didn't take
+        // out (already bound, say, after a commit that reported failure but
+        // landed) keeps its pod's label.
+        if self.invalidate_pooled_execution_claim(claim).await? {
+            self.clear_adoption_label(claim).await;
+        }
+        Ok(())
+    }
+
+    /// Patch the adopter's `space.pplx.net/client-id` label onto the pool pod,
+    /// synchronously and before the adoption commits, so the label exists
+    /// before the client can use the sandbox. No `ready` slot's pod carries
+    /// the label: a pod that can't be labeled isn't adopted, a slot goes back
+    /// to the pool only when the write never ran, and an abandoned slot's
+    /// label is removed best-effort.
+    async fn label_adopted_execution(
+        &self,
+        claim: &PooledExecutionClaim,
+        client_id: Option<&pplx_space_common_core::types::ClientId>,
+        on_transient: crate::controllers::substrate::AdoptionLabelTransient,
+    ) -> Result<crate::controllers::substrate::AdoptionLabelOutcome, ControllerError> {
+        use super::pooled::AdoptionLabelWrite;
+        use crate::controllers::substrate::{AdoptionLabelOutcome, AdoptionLabelTransient};
+
+        let Some(client_id) = self.k8s.activation_client_attribution.gate(client_id) else {
+            return Ok(AdoptionLabelOutcome::Labeled);
+        };
+        // Without the claimed UID the patch can't be fenced to the claimed
+        // pod, so a pod that can't be identified isn't adopted.
+        let Some(pod_uid) = &claim.pod_uid else {
+            tracing::warn!(
+                sandbox_id = %claim.sandbox_id,
+                pod_name = %claim.pod_name,
+                "adopted pool pod has no recorded UID; abandoning the adoption"
+            );
+            self.invalidate_pooled_execution_claim(claim).await?;
+            return Ok(AdoptionLabelOutcome::Invalidated);
+        };
+        match self
+            .write_adoption_label(claim, pod_uid.as_str(), Some(client_id))
             .await
-            .map_err(|error| {
-                ControllerError::internal(format!(
-                    "pool claim leaked for pod {}: failed to invalidate claimed pool slot: {error}",
-                    claim.pod_name
-                ))
-            })
+        {
+            AdoptionLabelWrite::Applied => Ok(AdoptionLabelOutcome::Labeled),
+            // Throttling says nothing about the pod, and a throttled write
+            // never ran, so the slot goes back unlabeled.
+            AdoptionLabelWrite::Throttled(error) => {
+                tracing::warn!(
+                    sandbox_id = %claim.sandbox_id,
+                    pod_name = %claim.pod_name,
+                    %error,
+                    ?on_transient,
+                    "adopted pool pod label throttled; not adopting it now"
+                );
+                if on_transient == AdoptionLabelTransient::ReleaseSlot {
+                    pool::release_claimed_pool_slot(self.store.pool(), claim).await?;
+                }
+                Ok(AdoptionLabelOutcome::Transient)
+            }
+            // Nor does a 5xx or a lost answer, but that write may land, even
+            // after a later one, so the slot can't go back to the pool: a
+            // `ready` pod, or the next adopter's, would carry this label.
+            AdoptionLabelWrite::Transient(error) => {
+                tracing::warn!(
+                    sandbox_id = %claim.sandbox_id,
+                    pod_name = %claim.pod_name,
+                    %error,
+                    ?on_transient,
+                    "adopted pool pod label failed transiently; not adopting it now"
+                );
+                if on_transient == AdoptionLabelTransient::ReleaseSlot {
+                    self.rollback_pooled_execution_claim(claim).await?;
+                }
+                Ok(AdoptionLabelOutcome::Transient)
+            }
+            AdoptionLabelWrite::Refused(error) => {
+                tracing::warn!(
+                    sandbox_id = %claim.sandbox_id,
+                    pod_name = %claim.pod_name,
+                    %error,
+                    "failed to label the adopted pool pod; abandoning the adoption"
+                );
+                // A refusal the apiserver answered didn't land, and a removal
+                // would be refused the same way. Any other error may follow a
+                // write that landed, such as a response that didn't decode.
+                if matches!(error, kube::Error::Api(_)) {
+                    self.invalidate_pooled_execution_claim(claim).await?;
+                } else {
+                    self.rollback_pooled_execution_claim(claim).await?;
+                }
+                Ok(AdoptionLabelOutcome::Invalidated)
+            }
+        }
     }
 
     async fn cleanup_failed_pooled_prepare(

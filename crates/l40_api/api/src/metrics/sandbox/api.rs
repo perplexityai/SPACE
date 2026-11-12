@@ -1157,8 +1157,8 @@ fn dormant_activation_tags(
 }
 
 /// Metrics for the space-api per-client concurrency limiter, which caps how
-/// many sandbox create/reconnect operations a single client (identified by the
-/// `X-Client-ID` header) may have in flight at once.
+/// many sandbox create, fork, reconnect and resume operations a single client
+/// (identified by the `X-Client-ID` header) may have in flight at once.
 pub mod client_limit {
     use super::ClientIdTag;
     use pplx_space_metrics_emit::{counter, gauge, tag};
@@ -1169,6 +1169,8 @@ pub mod client_limit {
         Create,
         Fork,
         Reconnect,
+        /// ECW resume: a restore of a paused (SPACE-suspended) sandbox.
+        Resume,
     }
 
     impl Operation {
@@ -1177,6 +1179,7 @@ pub mod client_limit {
                 Self::Create => "create",
                 Self::Fork => "fork",
                 Self::Reconnect => "reconnect",
+                Self::Resume => "resume",
             }
         }
     }

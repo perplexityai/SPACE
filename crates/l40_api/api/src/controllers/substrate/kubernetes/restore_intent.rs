@@ -4,7 +4,7 @@
 
 use super::RestoreSnapshotChoice;
 use super::execution::WakeTarget;
-use crate::controllers::substrate::RecoveryCharge;
+use crate::controllers::substrate::{ActivationAttribution, CapPolicy, RecoveryCharge};
 use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::types::SandboxLifecycle;
 
@@ -86,8 +86,8 @@ pub(super) struct RestoreIntent {
     /// environment.
     pub(super) allows_runtime_upgrade: bool,
     /// What the claim winner pays, and what a re-driven started recovery
-    /// pays. A preclaimed wake's drive runs exempt: its caller paid for the
-    /// claim.
+    /// pays. A preclaimed wake's drive runs as already paid: its caller paid
+    /// for the claim.
     pub(super) charge: RecoveryCharge,
     /// Whether a wake that has yet to claim a `suspended` or `restoring` row
     /// goes through the pod-local wake coalescer, so pod-local contenders
@@ -126,7 +126,8 @@ impl RestoreIntent {
     }
 
     /// The node drain's evacuation restore toward `target`, placed in
-    /// `cohort` when a node-group rollout is active. Exempt from the charge.
+    /// `cohort` when a node-group rollout is active. Exempt from the charge;
+    /// the restored pod is labeled from the sandbox's record.
     pub(super) fn drain(cohort: Option<EvacuationPlacement>, target: SandboxLifecycle) -> Self {
         Self {
             target: WakeTarget::Explicit(target),
@@ -134,7 +135,10 @@ impl RestoreIntent {
             snapshot: RestoreSnapshotChoice::NewestRemote,
             pod_placement: RestorePodPlacement::Evacuation { cohort },
             allows_runtime_upgrade: false,
-            charge: RecoveryCharge::Exempt,
+            charge: RecoveryCharge::exempt(
+                CapPolicy::Skip,
+                ActivationAttribution::inherit_unresolved(),
+            ),
             coalesces: false,
             owner_commits_started: false,
             redrives_started_recovery: false,

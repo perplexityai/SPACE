@@ -1430,6 +1430,7 @@ mod response_tests {
             last_command_at: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            activating_client_id: None,
         }
     }
 

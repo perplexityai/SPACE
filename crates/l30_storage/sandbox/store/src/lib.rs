@@ -110,6 +110,7 @@ use uuid::Uuid;
 pub mod action_stamp;
 pub mod admin_occupancy;
 pub mod artifact_marker;
+pub mod attribute_runtime;
 pub mod create;
 pub mod delete;
 pub mod direct;

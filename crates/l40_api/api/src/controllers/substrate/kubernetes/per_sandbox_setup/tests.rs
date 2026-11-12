@@ -62,6 +62,7 @@ fn assert_cold_matches_adoption(
         command_ready_wait: None,
         volume_encryption: false,
         node_pool: None,
+        client_id: None,
     };
 
     let pooled = PooledExecutionClaimRequest {
@@ -80,6 +81,7 @@ fn assert_cold_matches_adoption(
         template_network_policy,
         template_network_policy_generation: 7,
         volume_encryption: false,
+        client_id: None,
     };
     let claim = PooledExecutionClaim {
         claim_id: Uuid::now_v7(),
@@ -136,6 +138,7 @@ fn setup_captures_owner_and_effective_policy() {
         &template_policy,
         true,
         Default::default(),
+        None,
     );
     assert!(setup.volume_encryption);
     assert_eq!(setup.sandbox_owner, actor.sandbox_owner);

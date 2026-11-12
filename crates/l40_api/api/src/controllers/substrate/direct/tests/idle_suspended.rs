@@ -147,7 +147,7 @@ async fn wake_restores_an_idle_suspended_sandbox_on_its_artifact_node(
         &sandbox,
         Duration::from_secs(5),
         wake_activity,
-        crate::controllers::substrate::RecoveryCharge::Exempt,
+        crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
     ))
     .await?;
 
@@ -234,7 +234,7 @@ async fn implicit_wake_of_an_idle_suspended_sandbox_honors_the_local_override() 
             &sandbox,
             Duration::from_secs(5),
             Some(ExecutionActivityKind::Command),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         ))
         .await;
 
@@ -349,7 +349,7 @@ async fn implicit_access_wake_of_a_target_only_row_honors_the_local_override() -
             &sandbox,
             ExecutionActivityKind::Access,
             Duration::from_secs(5),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         ))
         .await;
 
@@ -690,7 +690,7 @@ async fn wake_adopts_a_live_record_on_its_artifact_node(#[case] case: Case) -> T
         &sandbox,
         Duration::from_secs(5),
         None,
-        crate::controllers::substrate::RecoveryCharge::Exempt,
+        crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
     ))
     .await;
 
@@ -887,7 +887,7 @@ async fn wake_adopts_a_started_record_only_at_its_route_identity() -> TestResult
                         &sandbox,
                         Duration::from_secs(5),
                         None,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                     ))
                     .await
                     .map(drop)
@@ -897,7 +897,7 @@ async fn wake_adopts_a_started_record_only_at_its_route_identity() -> TestResult
                         &sandbox,
                         ExecutionActivityKind::Access,
                         Duration::from_secs(5),
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                     ))
                     .await
                     .map(drop)
@@ -1031,7 +1031,7 @@ async fn lookup_of_a_started_row_without_an_active_node_adopts_its_live_record()
 
         let result = Box::pin(fixture.substrate.runtime_client(
             sandbox_id,
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         ))
         .await;
 
@@ -1089,7 +1089,7 @@ async fn wake_of_a_placed_suspended_sandbox_still_asks_its_worker() -> TestResul
         &sandbox,
         Duration::from_secs(5),
         None,
-        crate::controllers::substrate::RecoveryCharge::Exempt,
+        crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
     ))
     .await?;
 

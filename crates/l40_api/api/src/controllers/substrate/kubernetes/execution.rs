@@ -481,7 +481,7 @@ impl KubernetesSubstrate {
                     .await
             }
             // Unreachable as written: only the evacuation claim produces this
-            // variant, and evacuation restores are `RecoveryCharge::Exempt`,
+            // variant, and evacuation restores are exempt,
             // so no deferred charge can reject one. If it ever is, leaving
             // the row `restoring` is the release, for the reason
             // `RestoreClaim::FreshFromStopped` gives.
@@ -880,7 +880,7 @@ impl KubernetesSubstrate {
             &sandbox,
             remaining_ready_window(join_deadline),
             metric_identity,
-            &RestoreIntent::user(RecoveryCharge::Exempt, WakeTarget::started(None)),
+            &RestoreIntent::user(charge.after_charge(), WakeTarget::started(None)),
             RestoreClaimHandling::preclaimed_with_cleanup(restore_claim),
         )
         .await
@@ -1058,6 +1058,7 @@ impl KubernetesSubstrate {
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             SandboxTransitionTargetState::Started,
+            charge.attribution().key().clone(),
         );
         let wait = async {
             // Boxed: `ensure_pod_exists` is a large future; inlining it here
@@ -1189,7 +1190,7 @@ impl KubernetesSubstrate {
                     Some(generation),
                     join_deadline,
                     metric_identity,
-                    RecoveryCharge::Exempt,
+                    charge.after_charge(),
                 )
                 .await;
         }
@@ -1729,9 +1730,9 @@ impl KubernetesSubstrate {
         let substrate = self.clone();
         let mut intent = intent.clone();
         // A preclaimed caller paid for its claim itself, so the drive must not
-        // charge this activation again.
+        // charge this activation again; it still acts for the same client.
         if restore_claim_handling.preclaimed.is_some() {
-            intent.charge = RecoveryCharge::Exempt;
+            intent.charge = intent.charge.after_charge();
         }
         let cleanup_on_failure = restore_claim_handling.cleanup_on_failure;
         let shutdown_token = self.shutdown_token.clone();
@@ -1861,6 +1862,7 @@ impl KubernetesSubstrate {
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             restore_transition_target_state(target_state)?,
+            intent.charge.attribution().key().clone(),
         );
         // Error variants alone cannot prove whether runtime work exists. Keep
         // dispatch evidence outside the timed future so outer cancellation,
