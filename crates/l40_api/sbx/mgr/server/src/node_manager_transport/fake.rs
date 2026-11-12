@@ -151,6 +151,13 @@ pub(crate) fn unbound(socket: &Path) -> NodeManagerConnector {
     NodeManagerConnector::new(Arc::new(Unbound(socket.to_owned())))
 }
 
+/// A connector whose clients dial `socket`, a path nothing binds, only when
+/// called: `connect` succeeds and every call then fails in the transport with
+/// `Unavailable`, as when node-manager goes away between the dial and a call.
+pub(crate) fn unbound_on_call(socket: &Path) -> NodeManagerConnector {
+    fixed_client(lazy_client(socket))
+}
+
 /// [`unbound`] on a socket in a fresh directory that nothing creates, for
 /// tests that build a subsystem context rather than a service.
 pub(crate) fn unbound_in_absent_dir() -> NodeManagerConnector {

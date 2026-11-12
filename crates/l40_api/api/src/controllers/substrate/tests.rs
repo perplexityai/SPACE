@@ -1026,3 +1026,93 @@ fn the_node_answer_is_never_a_false_all_clear() {
          the one shape an evacuation may open on"
     );
 }
+
+/// What a refused `EnqueueArtifactBackup` answers on both enqueue paths.
+/// `Aborted`, a sandbox not yet stopped or suspended, is the `Conflict`
+/// `FailedPrecondition` is: the retire and the drain's promotion key on
+/// `Conflict` and its markers. `Unavailable`, node-manager's busy refusal
+/// that sandbox-manager passes through, stays retryable.
+#[test]
+fn a_not_yet_stopped_backup_refusal_is_the_conflict_it_was() {
+    let sandbox_id = SandboxId::new();
+    for (code, expected) in [
+        (tonic::Code::FailedPrecondition, "conflict"),
+        (tonic::Code::Aborted, "conflict"),
+        (tonic::Code::Unavailable, "unavailable"),
+        (tonic::Code::Internal, "failed"),
+    ] {
+        let error = artifact_backup_refusal(
+            &tonic::Status::new(code, "sandbox is started"),
+            sandbox_id,
+            "node-a",
+        );
+        let answered = match &error {
+            SubstrateError::Conflict { message } if message.contains("sandbox is started") => {
+                "conflict"
+            }
+            SubstrateError::Unavailable { .. } => "unavailable",
+            SubstrateError::Failed { .. } => "failed",
+            _ => "other",
+        };
+        assert_eq!(answered, expected, "{code:?}: {error:?}");
+    }
+}
+
+/// The same refusal, sent by a node over gRPC, through the two enqueue paths
+/// the api's callers take: the teardown retire's (a worker client) and the
+/// admin upload's (the retrying node-api client the adapter builds). Both
+/// answer `Conflict` for `Aborted` as for `FailedPrecondition`.
+#[tokio::test]
+async fn a_not_yet_stopped_backup_refusal_is_a_conflict_on_each_api_path()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let server = SimWorkerHarness::builder("not-yet-stopped-backup-node")
+        .start()
+        .await?;
+    for code in [tonic::Code::FailedPrecondition, tonic::Code::Aborted] {
+        let sandbox_id = SandboxId::new();
+        server
+            .state()
+            .refuse_next_artifact_backup(sandbox_id.to_string(), code)
+            .await;
+        let channel = node_api_endpoint(
+            server.endpoint(),
+            Duration::from_secs(3),
+            Duration::from_secs(10),
+        )?
+        .connect()
+        .await?;
+        let mut client = RuntimeClient::new(channel, server.endpoint());
+        let retire = enqueue_artifact_backup_with_client(
+            &mut client,
+            server.endpoint(),
+            sandbox_id,
+            ArtifactKind::Disk,
+            BackupSource::CurrentInstance,
+        )
+        .await;
+        assert!(
+            matches!(&retire, Err(SubstrateError::Conflict { message }) if message.contains("isn't stopped")),
+            "{code:?}: {retire:?}"
+        );
+
+        server
+            .state()
+            .refuse_next_artifact_backup(sandbox_id.to_string(), code)
+            .await;
+        let upload = enqueue_artifact_backup_via_retrying_node_api(
+            server.endpoint(),
+            sandbox_id,
+            ArtifactKind::Full,
+            BackupSource::CurrentInstance,
+        )
+        .await;
+        assert!(
+            matches!(&upload, Err(SubstrateError::Conflict { message }) if message.contains("isn't stopped")),
+            "{code:?}: {upload:?}"
+        );
+    }
+    Ok(())
+}

@@ -71,7 +71,12 @@ impl NodeManagerService {
             .sandbox_artifact_lock(sandbox_id)
             .await?
             .try_lock_owned()
-            .map_err(|_| Status::unavailable("sandbox artifact work is in progress; retry"))?;
+            .map_err(|_| {
+                Status::unavailable(format!(
+                    "sandbox artifact work {}",
+                    pplx_space_common_core::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER
+                ))
+            })?;
         let claim = self.claim_sandbox_mutation(sandbox_id)?;
         let owner = Arc::new(ArtifactWork {
             cancel,

@@ -2087,19 +2087,38 @@ pub async fn enqueue_artifact_backup_with_client(
             },
         )
         .await
-        .map_err(|err| match err.code() {
-            tonic::Code::NotFound => SubstrateError::NotFound {
-                message: format!("sandbox {sandbox_id} not present on node-api at {endpoint_addr}"),
-            },
-            tonic::Code::FailedPrecondition => SubstrateError::Conflict {
-                message: format!("node-api refused artifact backup: {}", err.message()),
-            },
-            _ => SubstrateError::Failed {
-                message: format!("node-api artifact backup error: {err}"),
-            },
-        })?
+        .map_err(|err| artifact_backup_refusal(&err, sandbox_id, endpoint_addr))?
         .into_inner();
     parse_enqueued_artifact_backup(response, expected_kind)
+}
+
+/// The [`SubstrateError`] a refused `EnqueueArtifactBackup` answers with, on
+/// both enqueue paths: [`enqueue_artifact_backup_with_client`] and
+/// [`enqueue_artifact_backup_with_node_api`].
+fn artifact_backup_refusal(
+    err: &tonic::Status,
+    sandbox_id: SandboxId,
+    endpoint_addr: &str,
+) -> SubstrateError {
+    match err.code() {
+        tonic::Code::NotFound => SubstrateError::NotFound {
+            message: format!("sandbox {sandbox_id} not present on node-api at {endpoint_addr}"),
+        },
+        // `Aborted` is a sandbox not yet stopped or suspended, which may
+        // still get there; callers treat it like `FailedPrecondition`.
+        tonic::Code::FailedPrecondition | tonic::Code::Aborted => SubstrateError::Conflict {
+            message: format!("node-api refused artifact backup: {}", err.message()),
+        },
+        // The node or its connection can't take the backup now, for one
+        // while another host mutation holds the sandbox's disk; a caller may
+        // retry.
+        tonic::Code::Unavailable => SubstrateError::Unavailable {
+            message: format!("node-api artifact backup unavailable: {err}"),
+        },
+        _ => SubstrateError::Failed {
+            message: format!("node-api artifact backup error: {err}"),
+        },
+    }
 }
 
 fn parse_enqueued_artifact_backup(
@@ -2197,17 +2216,7 @@ pub async fn enqueue_artifact_backup_with_node_api(
             Duration::from_secs(30),
         )
         .await
-        .map_err(|err| match err.code() {
-            tonic::Code::NotFound => SubstrateError::NotFound {
-                message: format!("sandbox {sandbox_id} not present on node-api at {endpoint_addr}"),
-            },
-            tonic::Code::FailedPrecondition => SubstrateError::Conflict {
-                message: format!("node-api refused artifact backup: {}", err.message()),
-            },
-            _ => SubstrateError::Failed {
-                message: format!("node-api artifact backup error: {err}"),
-            },
-        })?
+        .map_err(|err| artifact_backup_refusal(&err, sandbox_id, endpoint_addr))?
         .into_inner();
     parse_enqueued_artifact_backup(response, expected_kind)
 }

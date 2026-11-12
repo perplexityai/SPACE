@@ -972,8 +972,8 @@ pub(super) fn retire_can_skip_backup_enqueue_error(err: &SubstrateError) -> bool
         // No sbx-mgr sandbox row: there is no node-local source left to
         // salvage, so the backup is moot.
         SubstrateError::NotFound { .. } => true,
-        // sbx-mgr's `FailedPrecondition` surfaces as `Conflict` with the
-        // message passed through. Two refusals are terminal for retire's
+        // sbx-mgr's `FailedPrecondition` and `Aborted` surface as `Conflict`
+        // with the message passed through. Two refusals are terminal for retire's
         // fixed current-instance/disk request and can never resolve by
         // retrying: a `failed` local state (nothing moves it to
         // stopped/suspended without external action) and a suspended
@@ -983,8 +983,8 @@ pub(super) fn retire_can_skip_backup_enqueue_error(err: &SubstrateError) -> bool
         // while the leftover pod keeps feeding kubelet CreatePodSandbox
         // retries; node-local state stays salvageable either way because
         // retire never sends the sbx-mgr delete. Any other `Conflict`
-        // (e.g. a still-stopping row that can converge to a backupable
-        // state) keeps the execution tracked for retry.
+        // (e.g. a still-stopping row, which sbx-mgr answers `Aborted`)
+        // keeps the execution tracked for retry.
         SubstrateError::Conflict { message } => {
             use pplx_space_common_core::artifact_backup_signals::{
                 CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER,
