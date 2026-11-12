@@ -20,6 +20,7 @@ from space_smoke.services import (
     repair_orphaned_kind_faults,
 )
 from space_smoke.sharding import JOINT_SURFACES, select_shard
+from space_smoke.suites import Suite, resolve_suite
 from space_smoke.suite import (
     KNOWN_FAILURES_ENV,
     RESULT_PREFIX,
@@ -357,6 +358,8 @@ def _run_all(
     category: str | None = None,
     shard: tuple[int, int] | None = None,
     tiers: tuple[str, ...] | None = None,
+    suite: Suite | None = None,
+    repeat: int = 1,
 ) -> int:
     template = os.environ.get("E2B_TEMPLATE") or None
     backend = os.environ.get("SPACE_SMOKE_BACKEND", "kind")
@@ -392,6 +395,12 @@ def _run_all(
             category=category, template=template, tiers=selected_tiers,
             include_scenarios=included,
         )
+        if suite is not None:
+            registered = {scenario.id for scenario in REGISTRY}
+            unknown = [scenario_id for scenario_id in suite.scenarios if scenario_id not in registered]
+            if unknown:
+                raise ValueError(f"suite {suite.label} lists unregistered scenarios: {', '.join(unknown)}")
+            eligible = tuple(scenario for scenario in eligible if scenario.id in suite.scenarios)
     except (ValueError, KeyError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
@@ -402,6 +411,8 @@ def _run_all(
     for held in REGISTRY.select(
         category=category, template=template, include_quarantined=True, tiers=TIERS,
     ):
+        if suite is not None and held.id not in suite.scenarios:
+            continue
         if held.quarantined is not None:
             print(f"QUARANTINED {held.id}: {held.quarantined}")
         elif held.tier == "manual":
@@ -409,7 +420,7 @@ def _run_all(
         elif held.tier not in selected_tiers and held.id not in included:
             print(f"SKIPPED {held.id}: tier {held.tier} is not selected")
     api_surface = os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw")
-    if category is None:
+    if category is None and suite is None:
         eligible = tuple(
             scenario for scenario in eligible if api_surface in scenario.api_surfaces
         )
@@ -512,6 +523,11 @@ def _run_all(
                 )
                 return 0
     selection = f"category {category!r}" if category is not None else "this run"
+    if suite is not None:
+        selection = f"suite {suite.label}"
+        if (error := _suite_incomplete(suite, scenarios)) is not None:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 2
     if not scenarios:
         print(
             f"ERROR: no smoke scenarios apply to {selection} on the "
@@ -565,6 +581,9 @@ def _run_all(
     telemetry_error = telemetry_error or browser_error
     if not scenarios:
         return _mode_emptied(selection, "browser state", shard, telemetry_error)
+    if suite is not None and (error := _suite_incomplete(suite, scenarios)) is not None:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
 
     environment = dict(os.environ)
     if environment.get("SPACE_SMOKE_BACKEND", "kind") == "kind":
@@ -580,14 +599,21 @@ def _run_all(
                 "each scenario runs the full bootstrap"
             )
     label = f" {category}" if category is not None else ""
-    print(f"Running {len(scenarios)}{label} smoke scenarios sequentially.")
-    results = run_scenarios(
-        scenarios,
-        environment=environment,
-        on_start=_print_started,
-        line_sink=_print_line,
-        on_result=_print_finished,
-    )
+    if suite is not None:
+        label = f" {suite.label}"
+    passes = f", {repeat} times" if repeat > 1 else ""
+    print(f"Running {len(scenarios)}{label} smoke scenarios sequentially{passes}.")
+    results: tuple[ScenarioProcessResult, ...] = ()
+    for number in range(1, repeat + 1):
+        if repeat > 1:
+            print(f"\n=== PASS {number}/{repeat} ===", flush=True)
+        results += run_scenarios(
+            scenarios,
+            environment=environment,
+            on_start=_print_started,
+            line_sink=_print_line,
+            on_result=_print_finished,
+        )
     _write_failure_details(results)
 
     passed = sum(result.exit_code == 0 for result in results)
@@ -598,6 +624,8 @@ def _run_all(
         f"SUITE: {passed} passed, {warned} warned, {failed} failed, "
         f"{incomplete} inconclusive or infrastructure errors"
     )
+    if suite is not None or repeat > 1:
+        _print_failure_rate(results, label.strip() or "this run")
     _print_not_passed(
         results,
         scenarios,
@@ -619,6 +647,43 @@ def _run_all(
         if exit_code in (0, 42):
             exit_code = 2
     return exit_code
+
+
+def _suite_incomplete(suite: Suite, scenarios: tuple[Scenario[Any], ...]) -> str | None:
+    """Why this run cannot report the suite's rate, or None when it runs all of it."""
+
+    selected = {scenario.id for scenario in scenarios}
+    missing = [scenario_id for scenario_id in suite.scenarios if scenario_id not in selected]
+    if not missing:
+        return None
+    return (
+        f"suite {suite.label} runs only whole; this run withholds "
+        f"{', '.join(missing)} (see the SKIPPED, QUARANTINED or MANUAL lines above)"
+    )
+
+
+def _failure_rate_failed(result: ScenarioProcessResult) -> bool:
+    """A run that did not pass, or passed and left cleanup failures behind."""
+
+    return result.exit_code != 0 or bool(_cleanup_failures(result))
+
+
+def _print_failure_rate(results: tuple[ScenarioProcessResult, ...], label: str) -> None:
+    """Failures per 1,000 scenario runs, overall and per scenario.
+
+    Every result counts, known failures included: the list excuses a result
+    from the exit code, not from the rate.
+    """
+
+    failed = sum(map(_failure_rate_failed, results))
+    print(
+        f"FAILURE RATE {label}: {failed} of {len(results)} scenario runs failed "
+        f"or left cleanup failures ({1000 * failed / len(results):.1f} per 1,000)"
+    )
+    for scenario_id in dict.fromkeys(result.scenario_id for result in results):
+        runs = [result for result in results if result.scenario_id == scenario_id]
+        print(f"  {scenario_id}: {sum(map(_failure_rate_failed, runs))}/{len(runs)}")
+    sys.stdout.flush()
 
 
 def _mode_emptied(
@@ -893,6 +958,23 @@ def _parse_shard(value: str) -> tuple[int, int]:
     )
 
 
+def _parse_suite(value: str) -> Suite:
+    try:
+        return resolve_suite(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def _parse_repeat(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError:
+        count = 0
+    if count < 1:
+        raise argparse.ArgumentTypeError("repeat must be a positive integer")
+    return count
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -914,6 +996,19 @@ def main() -> int:
         metavar="INDEX/COUNT",
         help="run one duration-balanced partition on an isolated backend (1-based)",
     )
+    run.add_argument(
+        "--suite",
+        type=_parse_suite,
+        metavar="NAME[@VERSION]",
+        help="run a versioned suite manifest (space_smoke/suites.py) and report its failure rate",
+    )
+    run.add_argument(
+        "--repeat",
+        type=_parse_repeat,
+        default=1,
+        metavar="N",
+        help="run the selection N times in sequence and report failures per 1,000 scenario runs",
+    )
     args = parser.parse_args()
 
     if args.command == "list":
@@ -928,15 +1023,22 @@ def main() -> int:
             args.scenario is not None,
             args.run_all,
             args.category is not None,
+            args.suite is not None,
         )
     )
     if selectors != 1:
-        parser.error("run requires exactly one scenario, --all, or --category")
-    if args.shard is not None and args.scenario is not None:
+        parser.error("run requires exactly one scenario, --all, --category, or --suite")
+    if args.shard is not None and (args.scenario is not None or args.suite is not None):
         parser.error("--shard requires --all or --category")
+    if args.repeat > 1 and args.scenario is not None:
+        parser.error("--repeat requires --all, --category, or --suite")
     if args.tier is not None and args.scenario is not None:
         parser.error("--tier requires --all or --category; a named scenario runs regardless of tier")
-    selection = {"tiers": tuple(args.tier)} if args.tier is not None else {}
+    selection: dict[str, Any] = {"repeat": args.repeat} if args.repeat > 1 else {}
+    if args.tier is not None:
+        selection["tiers"] = tuple(args.tier)
+    if args.suite is not None:
+        return _run_all(suite=args.suite, **selection)
     if args.run_all:
         return _run_all(shard=args.shard, **selection)
     if args.category is not None:
