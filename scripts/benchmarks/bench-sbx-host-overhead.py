@@ -31,8 +31,10 @@ class Sample:
     """Cumulative CPU seconds and current memory at one instant."""
 
     at: float
-    # (category, key) -> cumulative CPU seconds for sidecar cgroups and daemon processes.
+    # (category, key) -> cumulative CPU seconds for sidecar cgroups and daemon cgroups.
     cpu: dict[tuple[str, str], float] = field(default_factory=dict)
+    # node_daemons key -> daemon process name, for the per-daemon breakdown.
+    daemon_names: dict[str, str] = field(default_factory=dict)
     # VMM cgroup name -> (cumulative cgroup CPU seconds, {vCPU thread id: cumulative CPU seconds}).
     vmm: dict[str, tuple[float, dict[str, float]]] = field(default_factory=dict)
     # category -> resident bytes now.
@@ -47,18 +49,15 @@ def read_text(path: Path) -> str | None:
         return None
 
 
-def stat_cpu_and_rss(path: Path, children: bool = False) -> tuple[str, float, int] | None:
-    """Return (comm, CPU seconds, rss bytes) from a /proc stat file.
-
-    CPU is utime+stime, plus cutime+cstime of reaped children when children is set.
-    """
+def stat_cpu_and_rss(path: Path) -> tuple[str, float, int] | None:
+    """Return (comm, utime+stime seconds, rss bytes) from a /proc stat file."""
     raw = read_text(path)
     if raw is None:
         return None
     comm = raw[raw.find("(") + 1 : raw.rfind(")")]
     fields = raw[raw.rfind(")") + 2 :].split()
-    # Fields after comm start at state (field 3): utime is 14, stime 15, cutime 16, cstime 17, rss 24.
-    ticks = sum(int(value) for value in fields[11 : 15 if children else 13])
+    # Fields after comm start at state (field 3): utime is 14, stime 15, rss 24.
+    ticks = int(fields[11]) + int(fields[12])
     return comm, ticks / CLK_TCK, int(fields[21]) * PAGE_SIZE
 
 
@@ -97,7 +96,20 @@ def vcpu_threads(proc_root: Path, pid: str) -> dict[str, float]:
     return threads
 
 
-def take_sample(cgroup_root: Path, daemon_prefix: str, proc_root: Path = Path("/proc")) -> Sample:
+def process_cgroup(proc: Path, cgroup_mount: Path) -> Path | None:
+    """Return the cgroup v2 directory of a process, or None for the root or an unreadable entry."""
+    for line in (read_text(proc / "cgroup") or "").splitlines():
+        if line.startswith("0::/") and line.strip() != "0::/":
+            return cgroup_mount / line.strip()[4:]
+    return None
+
+
+def take_sample(
+    cgroup_root: Path,
+    daemon_prefix: str,
+    proc_root: Path = Path("/proc"),
+    cgroup_mount: Path = Path("/sys/fs/cgroup"),
+) -> Sample:
     sample = Sample(at=time.monotonic(), memory={name: 0 for name in MEMORY_CATEGORIES})
     sandbox_pids: set[str] = set()
     try:
@@ -128,13 +140,22 @@ def take_sample(cgroup_root: Path, daemon_prefix: str, proc_root: Path = Path("/
     for proc in proc_root.iterdir():
         if not proc.name.isdigit() or proc.name in sandbox_pids:
             continue
-        # Daemons run short-lived helpers (e2fsck, ip, nft, ...); reaped children count toward them.
-        parsed = stat_cpu_and_rss(proc / "stat", children=True)
+        parsed = stat_cpu_and_rss(proc / "stat")
         if parsed is None or not parsed[0].startswith(daemon_prefix):
             continue
         comm, cpu, rss = parsed
-        sample.cpu[("node_daemons", f"{comm}:{proc.name}")] = cpu
         sample.memory["node_daemons"] += rss
+        # A daemon's own cgroup charges the short-lived helpers it runs (e2fsck, ip, nft, ...)
+        # but not sidecars it launches, which move into sbx-* cgroups. Reaped-child times
+        # (cutime) would count a reaped sidecar's lifetime CPU a second time.
+        cgroup = process_cgroup(proc, cgroup_mount)
+        usage = cgroup_usage_secs(cgroup) if cgroup else None
+        if usage is not None:
+            key = str(cgroup)
+        else:
+            key, usage = f"pid:{proc.name}", cpu
+        sample.cpu[("node_daemons", key)] = usage
+        sample.daemon_names[key] = comm
     return sample
 
 
@@ -175,7 +196,7 @@ class Window:
             category, name = key
             self.cpu[category] += delta
             if category == "node_daemons":
-                daemon = name.rsplit(":", 1)[0]
+                daemon = after.daemon_names[name]
                 self.daemons[daemon] = self.daemons.get(daemon, 0.0) + delta
         for category in MEMORY_CATEGORIES:
             self.memory_peak[category] = max(self.memory_peak[category], before.memory.get(category, 0), after.memory.get(category, 0))
@@ -204,6 +225,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interval-secs", type=float, default=5, help="Time between samples.")
     parser.add_argument("--cgroup-root", type=Path, default=Path("/sys/fs/cgroup/space"), help="Parent of the per-sandbox VMM and sbx-* sidecar cgroups.")
     parser.add_argument("--proc-root", type=Path, default=Path("/proc"), help="procfs mount to read processes from.")
+    parser.add_argument("--cgroup-mount", type=Path, default=Path("/sys/fs/cgroup"), help="cgroup v2 mount that /proc/<pid>/cgroup paths are relative to.")
     parser.add_argument("--daemon-prefix", default="space-", help="Process-name prefix of node daemons outside sandbox cgroups.")
     parser.add_argument("--output", type=Path, default=None, help="Write the JSON report here as well as to stdout.")
     args = parser.parse_args()
@@ -220,11 +242,11 @@ def main() -> int:
         raise SystemExit(f"ERROR: {args.cgroup_root} not found; run on a SPACE worker node")
     total = Window(started=time.monotonic())
     windows: list[Window] = []
-    previous = take_sample(args.cgroup_root, args.daemon_prefix, args.proc_root)
+    previous = take_sample(args.cgroup_root, args.daemon_prefix, args.proc_root, args.cgroup_mount)
     deadline = previous.at + args.duration_secs
     while previous.at < deadline:
         time.sleep(max(0.0, min(args.interval_secs, deadline - previous.at)))
-        current = take_sample(args.cgroup_root, args.daemon_prefix, args.proc_root)
+        current = take_sample(args.cgroup_root, args.daemon_prefix, args.proc_root, args.cgroup_mount)
         total.add(previous, current)
         if args.window_secs > 0:
             # Half an interval of slack keeps sleep jitter from splitting a window early.

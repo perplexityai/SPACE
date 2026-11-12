@@ -308,7 +308,7 @@ each interval's increase to one category:
 | `vmm_non_vcpu` | increase in VMM cgroup `/space/<id>` `usage_usec` minus the increase of its vCPU threads | host |
 | `unattributed` | VMM cgroup increase in an interval where one of its vCPU threads exited, so the split is unknown | neither |
 | `sidecar` | sidecar cgroup `/space/sbx-<id>` (net-gateway, spaced-host) | host |
-| `node_daemons` | processes outside sandbox cgroups whose name starts with `--daemon-prefix` (default `space-`), including reaped helper processes they spawn (`cutime`/`cstime`) | host |
+| `node_daemons` | `usage_usec` of the cgroup of each process outside sandbox cgroups whose name starts with `--daemon-prefix` (default `space-`); this includes helper processes the daemon runs (e2fsck, ip, nft) but not sidecars it launches, which move to `sbx-*` cgroups | host |
 
 Host CPU is the sum of the three host categories. A sandbox counts toward
 sandbox-minutes for each interval in which its VMM cgroup held a process at
@@ -330,8 +330,11 @@ Limits: an entity counts only between two samples that both see it. CPU a
 sandbox, sidecar or process uses before its first sample or after its last one
 is dropped, so lifecycle churn undercounts host CPU by at most one interval of
 each entity's CPU at each end. `unattributed` bounds the teardown interval
-that can't be split. Helper processes count only after their daemon reaps
-them, and kernel-thread work (dm and loop kworkers, softirq for guest
-networking) is not attributed. Thread CPU has `CLK_TCK` (usually 10 ms)
+that can't be split. A daemon cgroup counts every process in it, so daemons
+should run in their own cgroups (systemd services or pod containers); a daemon
+in the root cgroup counts only its own threads, without helpers. Reaped-child
+times (`cutime`) are not used: they would count a sidecar's lifetime CPU again
+when its launching daemon reaps it. Kernel-thread work (dm and loop kworkers,
+softirq for guest networking) is not attributed. Thread CPU has `CLK_TCK` (usually 10 ms)
 resolution. The sampler attributes everything on the node, so run it on a node
 with no unrelated sandbox work, or subtract an idle run taken the same way.
