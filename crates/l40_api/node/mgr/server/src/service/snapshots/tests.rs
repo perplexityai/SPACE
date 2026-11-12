@@ -1,3 +1,7 @@
+use super::encrypted_suspend::{
+    EncryptedSuspendCapturePhase, encrypted_suspend_capture_phase,
+    transition_encrypted_suspend_capture,
+};
 use super::{
     ENC_SNAPSHOT_JAIL_SUBDIR, ENC_SNAPSHOT_MEMORY_NAME, ENC_SNAPSHOT_VMSTATE_NAME,
     pin_encrypted_snapshot_bind, reown_encrypted_snapshot_inputs, restore_instance_snapshot_in,
@@ -5,6 +9,53 @@ use super::{
 };
 use crate::proto::node_manager_server::NodeManager as _;
 use std::os::unix::fs::PermissionsExt;
+
+#[test]
+fn encrypted_suspend_progress_has_one_durable_phase() {
+    use pplx_space_common_core::host::linux::paths::{
+        ENCRYPTED_SUSPEND_CAPTURE_INTENT, ENCRYPTED_SUSPEND_CAPTURE_RECORD,
+        ENCRYPTED_SUSPEND_CAPTURE_STARTED,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let intent = root.join(ENCRYPTED_SUSPEND_CAPTURE_INTENT);
+    let started = root.join(ENCRYPTED_SUSPEND_CAPTURE_STARTED);
+    let captured = root.join(ENCRYPTED_SUSPEND_CAPTURE_RECORD);
+    std::fs::write(&intent, br#"{"encrypted_capture_base":"fresh"}"#).unwrap();
+    assert_eq!(
+        encrypted_suspend_capture_phase(&root).unwrap(),
+        EncryptedSuspendCapturePhase::Prepared { fresh: true }
+    );
+
+    transition_encrypted_suspend_capture(
+        &root,
+        ENCRYPTED_SUSPEND_CAPTURE_INTENT,
+        ENCRYPTED_SUSPEND_CAPTURE_STARTED,
+    )
+    .unwrap();
+    assert!(!intent.exists());
+    assert_eq!(
+        encrypted_suspend_capture_phase(&root).unwrap(),
+        EncryptedSuspendCapturePhase::Ambiguous
+    );
+
+    transition_encrypted_suspend_capture(
+        &root,
+        ENCRYPTED_SUSPEND_CAPTURE_STARTED,
+        ENCRYPTED_SUSPEND_CAPTURE_RECORD,
+    )
+    .unwrap();
+    assert!(!started.exists());
+    assert_eq!(
+        encrypted_suspend_capture_phase(&root).unwrap(),
+        EncryptedSuspendCapturePhase::Captured
+    );
+    assert_eq!(
+        std::fs::read(captured).unwrap(),
+        br#"{"encrypted_capture_base":"fresh"}"#
+    );
+}
 
 #[test]
 fn snapshot_identity_inventory_survives_failed_or_exhausted_measurements() {

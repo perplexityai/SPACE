@@ -16,10 +16,10 @@ use super::network_runtime::*;
 use super::recovery::SuspendSnapshotPublicationRecoveryOrigin;
 use super::suspend_snapshot_publication::{
     RecordedPublicationError, SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
-    classify_suspend_snapshot_publication, commit_encrypted_capture_record,
-    prepare_encrypted_capture_record, publish_recorded_suspend_snapshot_dir,
-    read_encrypted_capture_record, recorded_encrypted_capture_to_seal,
-    remove_encrypted_capture_record, suspend_snapshot_staging_dir,
+    classify_suspend_snapshot_publication, discard_encrypted_capture_markers,
+    encrypted_capture_to_complete, prepare_encrypted_capture_record,
+    publish_recorded_suspend_snapshot_dir, read_encrypted_capture_fresh,
+    read_encrypted_capture_metadata, read_encrypted_capture_record, suspend_snapshot_staging_dir,
     suspend_snapshot_staging_parent_dir,
 };
 use super::tail_support::*;
@@ -66,9 +66,7 @@ use self::suspend::emit_suspend_failed_event;
 use self::suspend::ensure_completed_suspend_retry_format;
 pub(super) use self::suspend::{suspend_superseded_by_wake, suspend_wake_arbitration_enabled};
 #[cfg(test)]
-pub(super) use self::suspend_snapshot::{
-    SuspendSnapshotStagingDisposition, failed_encrypted_capture_may_release_volume,
-};
+pub(super) use self::suspend_snapshot::SuspendSnapshotStagingDisposition;
 #[cfg(test)]
 use self::suspend_snapshot::{
     btrfs_send_encode_falls_back_to_full, encrypted_snapshot_prepare_error_status,
