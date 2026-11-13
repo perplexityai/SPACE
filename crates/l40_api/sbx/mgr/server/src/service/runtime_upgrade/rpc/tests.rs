@@ -67,6 +67,7 @@ pub(in crate::service::runtime_upgrade) fn pod_upgrade(
         target_state: target_state as i32,
         stage_from: None,
         checkpoint_local_artifact_id: None,
+        attempt_id: None,
     }
 }
 
@@ -133,6 +134,7 @@ fn report(
         .get_runtime_upgrade(&internal_request(GetRuntimeUpgradeRequest {
             sandbox_id: sandbox_id.to_string(),
             operation_id: operation_id.to_string(),
+            attempt_id: None,
         }))
         .unwrap()
 }
@@ -301,6 +303,7 @@ async fn an_upgrade_already_on_its_target_is_recorded_and_replays_the_same() {
         .get_runtime_upgrade(&internal_request(GetRuntimeUpgradeRequest {
             sandbox_id: other,
             operation_id: operation_id.to_string(),
+            attempt_id: None,
         }))
         .unwrap_err();
     assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused}");
@@ -1593,6 +1596,7 @@ async fn the_runtime_upgrade_report_is_read_only_by_the_upgrades_principals() {
         let mut request = tonic::Request::new(GetRuntimeUpgradeRequest {
             sandbox_id: SandboxId::new().to_string(),
             operation_id: operation().to_string(),
+            attempt_id: None,
         });
         request
             .extensions_mut()

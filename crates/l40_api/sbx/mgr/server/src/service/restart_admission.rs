@@ -240,6 +240,7 @@ restart_rpcs! {
     SandboxEvictClusterDeletedSandbox => ("/space.sandbox.manager.v1.SandboxManager/EvictClusterDeletedSandbox", StateWriter),
     SandboxUpgradeRuntime => ("/space.sandbox.manager.v1.SandboxManager/UpgradeRuntime", StateWriter),
     SandboxGetRuntimeUpgrade => ("/space.sandbox.manager.v1.SandboxManager/GetRuntimeUpgrade", ReadOnly),
+    SandboxAbandonRuntimeUpgrade => ("/space.sandbox.manager.v1.SandboxManager/AbandonRuntimeUpgrade", StateWriter),
     SandboxEnableSnapshots => ("/space.sandbox.manager.v1.SandboxManager/EnableSnapshots", StateWriter),
     SandboxDisableSnapshots => ("/space.sandbox.manager.v1.SandboxManager/DisableSnapshots", StateWriter),
     SandboxListSnapshots => ("/space.sandbox.manager.v1.SandboxManager/ListSnapshots", ReadOnly),
