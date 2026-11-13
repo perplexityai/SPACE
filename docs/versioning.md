@@ -94,9 +94,8 @@ validate the live guest identity. The manager also checks identities reported by
 older host sidecars that survive a rolling upgrade. A restore whose final state
 is paused defers its live check until resume; it never thaws the VM merely to
 query its version.
-Running restores have a restore-specific 45-second guest readiness budget before
-the existing network readiness gate; the default cold-start budget remains 30
-seconds. Resident resumes check readiness even when the caller
+Running restores have a 30-second guest readiness budget before the existing
+network readiness gate. Resident resumes check readiness even when the caller
 omits a blocking readiness wait; a failed check uses the existing pause rollback
 path. Unsupported identity returns `FailedPrecondition`, rather than retrying
 until it appears to be a timeout. Missing connectivity remains bounded by the
