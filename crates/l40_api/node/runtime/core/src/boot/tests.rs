@@ -138,6 +138,7 @@ fn firecracker_retains_balloon_network_and_console_configuration() {
         let args = config["boot-source"]["boot_args"].as_str().unwrap();
         assert!(args.contains("8250.nr_uarts=1 console=ttyS0"));
         assert!(args.contains("clocksource=kvm-clock"));
+        assert!(args.contains("pci=off i8042.noaux i8042.nomux i8042.dumbkbd"));
         assert!(args.contains(pplx_space_template_runtime::TEMPLATE_RUNTIME_BUILD_MASK));
         assert_eq!(config["machine-config"]["huge_pages"], "2M");
         assert_eq!(
@@ -157,6 +158,17 @@ fn firecracker_retains_balloon_network_and_console_configuration() {
             config["drives"][0]["rate_limiter"]
         );
     }
+}
+
+#[test]
+fn firecracker_adds_i8042_boot_args_only_on_x86_64() {
+    let mut boot = input();
+    boot.guest.architecture = Arch::Aarch64;
+    let config: Value =
+        serde_json::from_str(&configuration(RuntimeKind::Firecracker, &boot).unwrap()).unwrap();
+    let args = config["boot-source"]["boot_args"].as_str().unwrap();
+    assert!(args.contains("pci=off"));
+    assert!(!args.contains("i8042"));
 }
 
 #[test]
