@@ -66,6 +66,12 @@ spec:
       # events for shim/scheduling failure detection; throttled events
       # silently drop those signals. Events TTL ~1h so etcd stays bounded.
       eventRecordQPS: 0
+%{ if length(cluster_dns_ips) > 0 ~}
+      clusterDNS:
+%{ for cluster_dns_ip in cluster_dns_ips ~}
+        - ${cluster_dns_ip}
+%{ endfor ~}
+%{ endif ~}
   containerd:
     config: |
       [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.space]
