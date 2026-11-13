@@ -175,6 +175,25 @@ byte-identical: `partition_migration_keeps_the_checksum_releases_reverse` pins
 its checksum.
 Change the schema with a new migration, never by editing this one.
 
+## Sandbox-manager runtime upgrade attempts
+
+Sandbox-manager's `20261113200001_sandbox_runtime_upgrade_attempt_id` and
+`20261113200002_sandbox_runtime_upgrade_attempt_outcomes` record each runtime
+upgrade attempt's final outcome. Their downs refuse, before they change the
+schema, while a row they'd lose is recorded: `20261113200002`'s while any attempt outcome is,
+and `20261113200001`'s while an operation's outcome is `refused`, which an
+older release can't parse. Every rollback of an upgrade begun under these
+migrations records its attempt's outcome, and those rows go only with their
+sandbox, so once a node has rolled back such an upgrade, its schema is
+forward-only until that sandbox is deleted.
+Keep running a release that bundles the migrations on such a node. This
+read-only query counts the rows that block the reversal:
+
+```sql
+SELECT (SELECT COUNT(*) FROM sandbox_runtime_upgrade_attempt_outcomes)
+     + (SELECT COUNT(*) FROM sandbox_runtime_upgrade_outcomes WHERE outcome = 'refused');
+```
+
 ## Console password provisioning
 
 The password hash marker `!` locks console password login and rejects existing

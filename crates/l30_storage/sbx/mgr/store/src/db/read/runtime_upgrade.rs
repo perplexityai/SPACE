@@ -2,8 +2,8 @@
 //! sandbox.
 
 use crate::db::{
-    Connection, Result, RuntimeUpgradeOperationId, RuntimeUpgradeRecord, RuntimeUpgradeReport,
-    RuntimeUpgradeRequestIdentity,
+    Connection, Result, RuntimeUpgradeAttemptOutcome, RuntimeUpgradeOperationId,
+    RuntimeUpgradeRecord, RuntimeUpgradeReport, RuntimeUpgradeRequestIdentity,
 };
 
 /// The upgrade row, `None` without one; a row that does not decode fails the
@@ -59,4 +59,16 @@ pub fn recorded_runtime_upgrade_request(
     operation_id: RuntimeUpgradeOperationId,
 ) -> Result<Option<RuntimeUpgradeRequestIdentity>> {
     crate::db::recorded_runtime_upgrade_request(conn, operation_id)
+}
+
+/// The final outcome of the attempt `attempt_id` under `operation_id` (a
+/// rollback, a refusal before the fence, or a refusal after the operation
+/// reached its target), whatever later attempts recorded since; `None`
+/// without one.
+pub fn runtime_upgrade_attempt_outcome(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    attempt_id: &str,
+) -> Result<Option<RuntimeUpgradeAttemptOutcome>> {
+    crate::db::runtime_upgrade_attempt_outcome(conn, operation_id, attempt_id)
 }
