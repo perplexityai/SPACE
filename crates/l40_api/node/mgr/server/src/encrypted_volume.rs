@@ -779,10 +779,11 @@ pub async fn prepare(params: PrepareParams<'_>) -> Result<PreparedEncryptedVolum
     }
 
     let mapper = mapper_name(&sandbox_id, &volume_name);
-    // Snapshot reads already pass through the inner btrfs page cache. Request
-    // bypass of the backing cache for eligible I/O, without changing other volumes.
+    // Keep fresh capture writes buffered. Existing snapshot reads already pass
+    // through the inner btrfs page cache, so request backing-cache bypass on
+    // reopen; that loop keeps its mode through any later re-suspend writes.
     let loop_io = match volume_name.as_str() {
-        "snapshot" => LoopIoMode::Direct,
+        "snapshot" if !fresh => LoopIoMode::Direct,
         _ => LoopIoMode::Buffered,
     };
 

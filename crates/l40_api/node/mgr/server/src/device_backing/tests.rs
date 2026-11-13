@@ -314,7 +314,7 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
         b"unformatted retained data"
     );
 
-    for (name, mode) in [
+    for (name, reopen_mode) in [
         ("test", LoopIoMode::Buffered),
         ("snapshot", LoopIoMode::Direct),
     ] {
@@ -333,7 +333,7 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
         let mut memory = vec![42; 8193];
         let published = root.join("published-snapshot.luks");
         let mut published_digest = None;
-        for fresh in [true, false] {
+        for (fresh, mode) in [(true, LoopIoMode::Buffered), (false, reopen_mode)] {
             encrypted_volume::prepare(params(fresh)).await.unwrap();
             let backing = Backing::open(&volume_backing, false).unwrap().unwrap();
             let devices = attached_loops(&backing);
@@ -356,17 +356,9 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
                         .unwrap();
                 }
             }
-            if fresh && mode == LoopIoMode::Direct {
-                use std::os::fd::AsRawFd;
-                // Model a pre-upgrade buffered loop. Mounted re-entry and
-                // recovery of an existing mapper must not switch live I/O.
-                assert_eq!(
-                    // SAFETY: the test owns this loop and submits no concurrent I/O.
-                    unsafe {
-                        libc::ioctl(devices[0]._device.as_raw_fd(), 0x4c08, 0 as libc::c_ulong)
-                    },
-                    0
-                );
+            if fresh && reopen_mode == LoopIoMode::Direct {
+                // Re-entry and mapper recovery retain the fresh capture's
+                // buffered loop even though a new reopen would request direct I/O.
                 for mounted in [true, false] {
                     if !mounted {
                         nix::mount::umount(&mount).unwrap();
@@ -391,7 +383,7 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
                 assert!(attached_loops(&backing).is_empty());
                 assert!(!mount.join("memory").exists());
             }
-            if mode == LoopIoMode::Direct {
+            if reopen_mode == LoopIoMode::Direct {
                 if fresh {
                     // Published snapshot extents must survive later direct
                     // writes through the canonical backing's reopened loop.
@@ -426,7 +418,7 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
                 }
             }
         }
-        if mode == LoopIoMode::Direct {
+        if reopen_mode == LoopIoMode::Direct {
             encrypted_volume::prepare(params(false)).await.unwrap();
             assert_eq!(std::fs::read(mount.join("memory")).unwrap(), memory);
             let backing = Backing::open(&volume_backing, false).unwrap().unwrap();
