@@ -72,6 +72,9 @@ pub struct AppState {
     /// [`public::hidden_operations`].
     pub native_hidden_operations: public::hidden_operations::HiddenOperationsGate,
     pub ecw_credential_keyring: std::sync::Arc<pplx_space_ecw_credential::EcwCredentialKeyring>,
+    /// Whether the admin surface mounts the stopped-runtime-upgrade trigger;
+    /// see [`debug::RuntimeUpgradeTestHook`].
+    pub(in crate::routes) runtime_upgrade_test_hook: debug::RuntimeUpgradeTestHook,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -186,6 +189,7 @@ impl AppState {
         let native_hidden_operations = public::hidden_operations::HiddenOperationsGate::from_env()?;
         let client_classification = crate::client_classification::ClientClassification::from_env()?;
         let native_sandbox_limits = crate::native_sandbox_limits::NativeSandboxLimits::from_env()?;
+        let runtime_upgrade_test_hook = debug::RuntimeUpgradeTestHook::from_env();
         // Cloned into the substrate, which consumes both, so the limiter
         // heartbeats below can still be spawned from the originals.
         let substrate = crate::controllers::substrate::Substrate::from_env_with_lifecycle(
@@ -273,6 +277,7 @@ impl AppState {
             feature_flags,
             native_hidden_operations,
             ecw_credential_keyring,
+            runtime_upgrade_test_hook,
         })
     }
 

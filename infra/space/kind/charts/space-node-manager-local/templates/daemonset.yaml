@@ -300,6 +300,14 @@ spec:
             - name: SPACE_LOOP_DEVICE_TARGET
               value: {{ .Values.loopDeviceTarget | quote }}
             {{- end }}
+            {{- if ne (toString .Values.allowedExecutionEnvironments) "" }}
+            - name: SPACE_ALLOWED_EXECUTION_ENVIRONMENTS
+              value: {{ .Values.allowedExecutionEnvironments | quote }}
+            {{- end }}
+            {{- if ne (toString .Values.defaultExecutionEnvironment) "" }}
+            - name: SPACE_DEFAULT_EXECUTION_ENVIRONMENT
+              value: {{ .Values.defaultExecutionEnvironment | quote }}
+            {{- end }}
           {{- include "space-node-service.probes" $ctx | nindent 10 }}
           volumeMounts:
             {{- include "space-node-service.mount.run" . | nindent 12 }}
