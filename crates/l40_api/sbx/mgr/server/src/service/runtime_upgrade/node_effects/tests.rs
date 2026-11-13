@@ -236,7 +236,9 @@ async fn inspection_refuses_a_sandbox_without_its_local_disk() {
     // A cold start without the rootfs would boot a fresh template clone.
     let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
     std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4")).unwrap();
-    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    let Refusal::Final(error) = f.effects().inspect_local_disk(&f.row()).await.unwrap_err() else {
+        panic!("a missing rootfs is final for the pod");
+    };
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("rootfs"), "{error}");
 
@@ -244,9 +246,56 @@ async fn inspection_refuses_a_sandbox_without_its_local_disk() {
     let f = fixture(SandboxState::Suspended, true, FakeNodeManager::default());
     f.effects().inspect_local_disk(&f.row()).await.unwrap();
     std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/cow.luks")).unwrap();
-    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    let Refusal::Final(error) = f.effects().inspect_local_disk(&f.row()).await.unwrap_err() else {
+        panic!("a missing COW is final for the pod");
+    };
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("COW"), "{error}");
+}
+
+/// A required file whose path can't be checked, here because a file sits
+/// where its parent directory belongs, may be checkable on a retry, so the
+/// refusal is a retry; one that's absent is final.
+#[test]
+fn a_required_file_that_cant_be_checked_is_a_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let not_a_directory = directory.path().join("instance");
+    std::fs::write(&not_a_directory, b"").unwrap();
+    let Refusal::Retry(error) =
+        required_file(&not_a_directory.join("rootfs.ext4"), "rootfs").unwrap_err()
+    else {
+        panic!("a path that can't be checked is not final for the pod");
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+
+    let Refusal::Final(_) =
+        required_file(&directory.path().join("rootfs.ext4"), "rootfs").unwrap_err()
+    else {
+        panic!("an absent file is final for the pod");
+    };
+}
+
+/// Runtime metadata that can't be read, here a directory where the file
+/// belongs, may be readable on a retry, so its refusal is a retry; metadata
+/// that reads but doesn't parse answers every retry the same way and is
+/// final. Both answer `FAILED_PRECONDITION`.
+#[tokio::test]
+async fn inspection_retries_metadata_it_cant_read_and_refuses_metadata_it_cant_parse() {
+    let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+    let metadata = f.cache.join(&f.sandbox_id).join("metadata.json");
+    let _ = std::fs::remove_file(&metadata);
+    std::fs::create_dir(&metadata).unwrap();
+    let Refusal::Retry(error) = f.effects().inspect_local_disk(&f.row()).await.unwrap_err() else {
+        panic!("unreadable metadata is not final for the pod");
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+
+    std::fs::remove_dir(&metadata).unwrap();
+    std::fs::write(&metadata, b"not json").unwrap();
+    let Refusal::Final(error) = f.effects().inspect_local_disk(&f.row()).await.unwrap_err() else {
+        panic!("unparseable metadata is final for the pod");
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
 }
 
 #[tokio::test]

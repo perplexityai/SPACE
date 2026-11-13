@@ -130,6 +130,10 @@ func (s *ociSpec) sandboxRuntimeUpgrade() (*runtimeUpgradeIntent, error) {
 // readiness verifies. A suspended source (one that names its checkpoint)
 // carries the restore's storage URI and source node as where the node stages
 // a sandbox absent from it; a stopped one must be on this node already.
+// The pod UID is the attempt id: kubelet retries a failed create under the
+// same pod UID, so its retries are one attempt, and sbx-manager answers them
+// with that attempt's rollback or refusal once it's final rather than
+// fencing and booting again.
 func runtimeUpgradeRequest(start *pb.StartRequest, intent *runtimeUpgradeIntent) *pb.UpgradeRuntimeRequest {
 	var stageFrom *pb.RuntimeUpgradeStageFrom
 	if intent.checkpointLocalArtifactID != nil && start.SuspendRestoreStorageUri != nil {
@@ -154,7 +158,19 @@ func runtimeUpgradeRequest(start *pb.StartRequest, intent *runtimeUpgradeIntent)
 		TargetState:               intent.targetState,
 		StageFrom:                 stageFrom,
 		CheckpointLocalArtifactId: intent.checkpointLocalArtifactID,
+		AttemptId:                 runtimeUpgradeAttemptID(start),
 	}
+}
+
+// runtimeUpgradeAttemptID is the attempt a runtime upgrade pod's create runs
+// as: its pod UID, or none (a fresh attempt the node names) when the start
+// carries no pod UID. An empty id is never sent; sbx-manager refuses one.
+func runtimeUpgradeAttemptID(start *pb.StartRequest) *string {
+	podUID := start.GetRouteIdentity().GetPodUid()
+	if podUID == "" {
+		return nil
+	}
+	return &podUID
 }
 
 // stopped reports whether the upgrade leaves the sandbox stopped, so the pod

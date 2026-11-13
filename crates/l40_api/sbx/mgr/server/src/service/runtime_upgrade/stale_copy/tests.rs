@@ -17,7 +17,7 @@ use pplx_space_node_api_client::proto::{
 use tonic::Status;
 
 use super::super::node_effects::tests::{Fixture, certified_target, fixture, remote_upgrade_wake};
-use super::super::rpc::tests::{authorization, operation, pod_upgrade, upgrade};
+use super::super::rpc::tests::{authorization, operation, pod_upgrade, report, upgrade};
 use crate::db::RuntimeUpgradeOperationId;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::proto::{RuntimeUpgradeStageFrom, UpgradeRuntimeRequest, WakeTargetState};
@@ -381,16 +381,25 @@ async fn a_direct_wake_upgrade_keeps_refusing_a_stale_copy() {
 /// A copy nothing proves backed up may be the only copy of something: it is
 /// refused before any node work. The stub backs the
 /// decided checkpoint, so only a proof of the copy's own pin counts. An
-/// unpinned copy has no artifact to prove.
+/// unpinned copy has no artifact to prove. Nothing is recorded for the
+/// operation, since the copy may be backed up later and an outcome on record
+/// would stop a later pod's eviction of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unproven_stale_copy_is_refused_before_any_node_work() {
     with_cluster_api(BACKS_ONLY_DECIDED, async || {
         for pin in [Some(STALE), None] {
             let (f, cleanups) = stale_copy(false, pin);
-            let refused = f.pod_upgrade_error(operation()).await;
+            let operation_id = operation();
+            let refused = f.pod_upgrade_error(operation_id).await;
             assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{refused}");
             assert!(refused.message().contains("backed up"), "{refused}");
             f.assert_copy_untouched(pin, &cleanups);
+            let reported = report(&f.service, &f.sandbox_id, operation_id);
+            assert_eq!(
+                reported.status,
+                crate::proto::RuntimeUpgradeStatus::Absent as i32,
+                "{reported:?}"
+            );
         }
     })
     .await;
@@ -510,6 +519,39 @@ async fn a_copy_after_this_operations_outcome_is_left_to_the_upgrade() {
         assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{refused}");
         assert!(refused.message().contains("decided from"), "{refused}");
         f.assert_copy_untouched(Some(STALE), &cleanups);
+    })
+    .await;
+}
+
+/// An operation that was only refused before it fenced anything, for another
+/// attempt, never touched the copy: a later attempt's upgrade still replaces a
+/// backed-up stale copy rather than being refused by the earlier refusal's
+/// record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_operation_still_lets_a_later_attempt_replace_the_copy() {
+    with_cluster_api(BackupReadiness::backs(STALE), async || {
+        let (f, cleanups) = stale_copy(false, Some(STALE));
+        let operation_id = operation();
+        assert!(
+            crate::db::record_runtime_upgrade_refusal(
+                &f.service.db.lock().unwrap(),
+                &crate::db::RuntimeUpgradeRequestIdentity {
+                    operation_id,
+                    sandbox_id: f.sandbox_id.clone(),
+                    target_environment: f.target_environment().environment().unwrap(),
+                    target_state: crate::db::RuntimeUpgradeTargetState::Started,
+                    authorization_id: authorization().authorization_id,
+                },
+                "an-earlier-pod",
+                "the checkpoint isn't the one the upgrade was decided from",
+            )
+            .unwrap()
+        );
+
+        let error = f.pod_upgrade_error(operation_id).await;
+
+        assert!(!error.message().contains("decided from"), "{error}");
+        f.assert_copy_evicted(&cleanups);
     })
     .await;
 }

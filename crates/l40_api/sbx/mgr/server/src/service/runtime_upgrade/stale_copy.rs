@@ -106,7 +106,20 @@ impl crate::service::SandboxManagerService {
             }
             let recorded = crate::db::read::runtime_upgrade_report(&db, operation_id)
                 .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?;
-            if recorded.is_some() {
+            // An operation whose latest outcome ran here (upgraded, rolled
+            // back, or found its target) leaves the copy to its own record.
+            // One whose latest outcome is a refusal before the fence goes
+            // ahead, even when an earlier attempt rolled back here: that
+            // refusal replaced the rollback as the operation's outcome, and
+            // the fence check below still holds back an unfinished upgrade.
+            // A refused attempt's own retries are answered with its refusal
+            // before they reach this.
+            if recorded.is_some_and(|report| {
+                !matches!(
+                    report.status,
+                    crate::db::RuntimeUpgradeStatus::Refused { .. }
+                )
+            }) {
                 return Ok(());
             }
             // An interrupted upgrade's preserved disk, or a checkpoint whose
