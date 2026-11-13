@@ -40,12 +40,17 @@ def encrypted_resuspend_preserves_cow(test: smoke.KindEcw) -> None:
         raise SmokeConfigurationError(f"{WORKING_SET_ENV} must be between 1 and 8192")
     # Two incompressible generations plus metadata must still remain sparse.
     allocation_bound = max(encrypted.MAX_DIFF_ALLOCATION_BYTES, memory_mib * 3 * 1024**2)
+    # Full-payload checks may fault and rewrite every restored RAM page.
+    # This bound is independent of the platform's data-plane readiness budget.
+    payload_timeout = max(20, (memory_mib + 31) // 32)
+    test.record("snapshot_guest_request_timeout_seconds", payload_timeout)
     identity: tuple[object, ...] | None = None
 
     def observe(generation: int, *, mutate: bool = False) -> None:
         nonlocal identity
         result = test.run_command_when_ready(
-            f"python3 {PROBE} {'mutate' if mutate else 'read'}"
+            f"python3 {PROBE} {'mutate' if mutate else 'read'} {payload_timeout}",
+            timeout=max(60, payload_timeout + 5),
         )
         test.verify(result.exit_code == 0, "live snapshot-state process did not answer",
                     command_stderr=result.stderr)

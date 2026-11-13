@@ -65,8 +65,8 @@ def serve(memory_mib: int) -> None:
                 }).encode())
 
 
-def request(operation: str) -> None:
-    deadline = time.monotonic() + 20
+def request(operation: str, timeout_seconds: int) -> None:
+    deadline = time.monotonic() + timeout_seconds
     with socket.socket(socket.AF_UNIX) as connection:
         while True:
             try:
@@ -76,7 +76,7 @@ def request(operation: str) -> None:
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(0.05)
-        connection.settimeout(20)
+        connection.settimeout(timeout_seconds)
         connection.sendall(operation.encode())
         output = bytearray()
         while data := connection.recv(4096):
@@ -88,4 +88,4 @@ if __name__ == "__main__":
     if sys.argv[1] == "serve":
         serve(int(sys.argv[2]))
     else:
-        request(sys.argv[1])
+        request(sys.argv[1], int(sys.argv[2]))

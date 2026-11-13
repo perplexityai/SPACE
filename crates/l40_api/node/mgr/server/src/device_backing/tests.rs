@@ -330,7 +330,9 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
             dek: &dek,
             fresh,
         };
-        let memory = vec![42; 8193];
+        let mut memory = vec![42; 8193];
+        let published = root.join("published-snapshot.luks");
+        let mut published_digest = None;
         for fresh in [true, false] {
             encrypted_volume::prepare(params(fresh)).await.unwrap();
             let backing = Backing::open(&volume_backing, false).unwrap().unwrap();
@@ -345,6 +347,14 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
                     .unwrap();
             } else {
                 assert_eq!(std::fs::read(mount.join("memory")).unwrap(), memory);
+                if mode == LoopIoMode::Direct {
+                    memory.fill(77);
+                    std::fs::write(mount.join("memory"), &memory).unwrap();
+                    File::open(mount.join("memory"))
+                        .unwrap()
+                        .sync_all()
+                        .unwrap();
+                }
             }
             if fresh && mode == LoopIoMode::Direct {
                 use std::os::fd::AsRawFd;
@@ -381,6 +391,53 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
                 assert!(attached_loops(&backing).is_empty());
                 assert!(!mount.join("memory").exists());
             }
+            if mode == LoopIoMode::Direct {
+                if fresh {
+                    // Published snapshot extents must survive later direct
+                    // writes through the canonical backing's reopened loop.
+                    let source = volume_backing.clone();
+                    let target = published.clone();
+                    blocking(move || pplx_space_file_io::reflink::reflink_file(&source, &target))
+                        .await
+                        .unwrap();
+                    published_digest = Some(
+                        rootfs_dmcrypt::run("sha256sum", &[published.to_str().unwrap()])
+                            .await
+                            .unwrap(),
+                    );
+                } else {
+                    let old = File::open(&published).unwrap();
+                    old.sync_all().unwrap();
+                    nix::fcntl::posix_fadvise(
+                        &old,
+                        0,
+                        0,
+                        nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+                    )
+                    .unwrap();
+                    let digest = rootfs_dmcrypt::run("sha256sum", &[published.to_str().unwrap()])
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        Some(digest),
+                        published_digest,
+                        "direct writes changed an already published snapshot"
+                    );
+                }
+            }
+        }
+        if mode == LoopIoMode::Direct {
+            encrypted_volume::prepare(params(false)).await.unwrap();
+            assert_eq!(std::fs::read(mount.join("memory")).unwrap(), memory);
+            let backing = Backing::open(&volume_backing, false).unwrap().unwrap();
+            let devices = attached_loops(&backing);
+            assert_eq!(devices.len(), 1);
+            assert_loop_mode(&devices[0], LoopIoMode::Direct);
+            drop(devices);
+            encrypted_volume::release(&sandbox_id, name, &volume_backing, &mount)
+                .await
+                .unwrap();
+            assert!(attached_loops(&backing).is_empty());
         }
     }
 }
