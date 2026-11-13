@@ -93,6 +93,23 @@ fn assert_loop_mode(device: &LoopDevice, expected: LoopIoMode) {
 }
 
 #[cfg(target_os = "linux")]
+struct MountedFilesystem(PathBuf);
+
+#[cfg(target_os = "linux")]
+impl Drop for MountedFilesystem {
+    fn drop(&mut self) {
+        if let Err(error) = nix::mount::umount(&self.0) {
+            let detached = nix::mount::umount2(&self.0, nix::mount::MntFlags::MNT_DETACH);
+            if std::thread::panicking() {
+                eprintln!("unmount disposable fixture: {error}; lazy detach: {detached:?}");
+            } else {
+                panic!("unmount disposable fixture: {error}; lazy detach: {detached:?}");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires root, loop/dm-crypt and an explicitly supplied disposable btrfs fixture directory"]
 async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
@@ -129,6 +146,75 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
         assert!(attached_loops(&backing).is_empty());
     }
 
+    // A 512-byte loop cannot use direct I/O through a 4 KiB-sector backing
+    // device. Unlike filesystem-name assumptions, this forces the unsupported
+    // configuration while leaving the production loop's block size unchanged.
+    {
+        use std::os::fd::AsRawFd;
+        let block_size = |device: &LoopDevice| {
+            std::fs::read_to_string(
+                Path::new("/sys/block")
+                    .join(device.path().file_name().unwrap())
+                    .join("queue/logical_block_size"),
+            )
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap()
+        };
+        let image = Backing::create(&root.join("sector-4k.img")).unwrap();
+        image.resize(64 * 1024 * 1024).unwrap();
+        let parent = LoopDevice::attach(&image, false, LoopIoMode::Buffered).unwrap();
+        assert_eq!(
+            // SAFETY: SET_BLOCK_SIZE takes an integer and this task-owned loop
+            // fd stays live until its disposable filesystem is unmounted.
+            unsafe { libc::ioctl(parent._device.as_raw_fd(), 0x4c09, 4096 as libc::c_ulong) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(block_size(&parent), 4096);
+        let formatted = std::process::Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-b", "4096"])
+            .arg(parent.path())
+            .output()
+            .unwrap();
+        assert!(
+            formatted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&formatted.stderr)
+        );
+        let mountpoint = root.join("sector-4k");
+        std::fs::create_dir(&mountpoint).unwrap();
+        nix::mount::mount(
+            Some(parent.path()),
+            &mountpoint,
+            Some("ext4"),
+            nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NODEV,
+            None::<&str>,
+        )
+        .unwrap();
+        let mounted = MountedFilesystem(mountpoint.clone());
+        {
+            let backing = Backing::create(&mountpoint.join("buffered")).unwrap();
+            backing.file.set_len(1024 * 1024).unwrap();
+            let device = LoopDevice::attach(&backing, false, LoopIoMode::Direct).unwrap();
+            assert_eq!(block_size(&device), 512);
+            assert_loop_mode(&device, LoopIoMode::Buffered);
+            let file = File::options().write(true).open(device.path()).unwrap();
+            file.write_all_at(b"buffered", 4096).unwrap();
+            file.sync_all().unwrap();
+            backing.file.read_exact_at(&mut bytes, 4096).unwrap();
+            assert_eq!(&bytes, b"buffered");
+            drop(file);
+            drop(device);
+            assert!(attached_loops(&backing).is_empty());
+        }
+        drop(mounted);
+        drop(parent);
+        assert!(attached_loops(&image).is_empty());
+    }
+
     let sandbox_id = SandboxId::new();
     let origin = root.join("rootfs.ext4");
     let origin_file = Backing::create(&origin).unwrap();
@@ -142,12 +228,6 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
     // filesystem rather than filling the host cache to exercise real low-space
     // admission, then retry the same name on the underlying btrfs filesystem.
     {
-        struct SmallFilesystem(PathBuf);
-        impl Drop for SmallFilesystem {
-            fn drop(&mut self) {
-                nix::mount::umount(&self.0).expect("unmount disposable low-space fixture");
-            }
-        }
         nix::mount::mount(
             Some("tmpfs"),
             &cow_dir,
@@ -156,23 +236,7 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
             Some("size=64m"),
         )
         .unwrap();
-        let mounted = SmallFilesystem(cow_dir.clone());
-        {
-            // tmpfs has no direct-I/O implementation. The optimization must
-            // not reject otherwise usable storage or claim that it is direct.
-            let backing = Backing::create(&cow_dir.join("buffered")).unwrap();
-            backing.file.set_len(1024 * 1024).unwrap();
-            let device = LoopDevice::attach(&backing, false, LoopIoMode::Direct).unwrap();
-            assert_loop_mode(&device, LoopIoMode::Buffered);
-            let file = File::options().write(true).open(device.path()).unwrap();
-            file.write_all_at(b"buffered", 4096).unwrap();
-            file.sync_all().unwrap();
-            backing.file.read_exact_at(&mut bytes, 4096).unwrap();
-            assert_eq!(&bytes, b"buffered");
-            drop(file);
-            drop(device);
-            assert!(attached_loops(&backing).is_empty());
-        }
+        let mounted = MountedFilesystem(cow_dir.clone());
         let result = rootfs_dmcrypt::prepare(rootfs_dmcrypt::PrepareParams {
             sandbox_id,
             origin_path: origin.clone(),
