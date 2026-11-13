@@ -62,6 +62,37 @@ fn backing_rejects_links_and_retains_the_opened_inode() {
 }
 
 #[cfg(target_os = "linux")]
+fn attached_loops(backing: &Backing) -> Vec<LoopDevice> {
+    std::fs::read_dir("/sys/block")
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("loop"))
+        .filter_map(|entry| {
+            match LoopDevice::matching(&Path::new("/dev").join(entry.file_name()), &backing.file) {
+                Ok(device) => device,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => panic!("read loop identity: {error}"),
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn assert_loop_mode(device: &LoopDevice, expected: LoopIoMode) {
+    let dio = Path::new("/sys/block")
+        .join(device.path().file_name().unwrap())
+        .join("loop/dio");
+    assert_eq!(
+        std::fs::read_to_string(dio).unwrap().trim(),
+        match expected {
+            LoopIoMode::Buffered => "0",
+            LoopIoMode::Direct => "1",
+        }
+    );
+    assert_eq!(device.io_mode(), expected);
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires root, loop/dm-crypt and an explicitly supplied disposable btrfs fixture directory"]
 async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
@@ -82,17 +113,21 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
     backing.file.write_all_at(b"original", 0).unwrap();
     std::fs::rename(&path, root.join("original")).unwrap();
     std::fs::write(&path, b"replacement").unwrap();
-    let device = LoopDevice::attach(&backing, true).unwrap();
-    assert!(matches_loop(device.path(), &backing.file).unwrap());
     let replacement = Backing::open(&path, false).unwrap().unwrap();
-    assert!(!matches_loop(device.path(), &replacement.file).unwrap());
     let mut bytes = [0; 8];
-    File::open(device.path())
-        .unwrap()
-        .read_exact_at(&mut bytes, 0)
-        .unwrap();
-    assert_eq!(&bytes, b"original");
-    drop(device);
+    for mode in [LoopIoMode::Buffered, LoopIoMode::Direct] {
+        let device = LoopDevice::attach(&backing, true, mode).unwrap();
+        assert_loop_mode(&device, mode);
+        assert!(matches_loop(device.path(), &backing.file).unwrap());
+        assert!(!matches_loop(device.path(), &replacement.file).unwrap());
+        File::open(device.path())
+            .unwrap()
+            .read_exact_at(&mut bytes, 0)
+            .unwrap();
+        assert_eq!(&bytes, b"original");
+        drop(device);
+        assert!(attached_loops(&backing).is_empty());
+    }
 
     let sandbox_id = SandboxId::new();
     let origin = root.join("rootfs.ext4");
@@ -122,6 +157,22 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
         )
         .unwrap();
         let mounted = SmallFilesystem(cow_dir.clone());
+        {
+            // tmpfs has no direct-I/O implementation. The optimization must
+            // not reject otherwise usable storage or claim that it is direct.
+            let backing = Backing::create(&cow_dir.join("buffered")).unwrap();
+            backing.file.set_len(1024 * 1024).unwrap();
+            let device = LoopDevice::attach(&backing, false, LoopIoMode::Direct).unwrap();
+            assert_loop_mode(&device, LoopIoMode::Buffered);
+            let file = File::options().write(true).open(device.path()).unwrap();
+            file.write_all_at(b"buffered", 4096).unwrap();
+            file.sync_all().unwrap();
+            backing.file.read_exact_at(&mut bytes, 4096).unwrap();
+            assert_eq!(&bytes, b"buffered");
+            drop(file);
+            drop(device);
+            assert!(attached_loops(&backing).is_empty());
+        }
         let result = rootfs_dmcrypt::prepare(rootfs_dmcrypt::PrepareParams {
             sandbox_id,
             origin_path: origin.clone(),
@@ -150,6 +201,12 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
         })
         .await
         .unwrap();
+        for path in [&origin, &cow] {
+            let backing = Backing::open(path, false).unwrap().unwrap();
+            let devices = attached_loops(&backing);
+            assert_eq!(devices.len(), 1);
+            assert_loop_mode(&devices[0], LoopIoMode::Buffered);
+        }
         let composite = File::options()
             .read(true)
             .write(true)
@@ -193,31 +250,73 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
         b"unformatted retained data"
     );
 
-    let volume_backing = root.join("snapshot.luks");
-    let mount = root.join("snapshot-vol");
-    for fresh in [true, false] {
-        encrypted_volume::prepare(encrypted_volume::PrepareParams {
+    for (name, mode) in [
+        ("test", LoopIoMode::Buffered),
+        ("snapshot", LoopIoMode::Direct),
+    ] {
+        let volume_backing = root.join(format!("{name}.luks"));
+        let mount = root.join(format!("{name}-vol"));
+        let params = |fresh| encrypted_volume::PrepareParams {
             sandbox_id,
-            volume_name: "test".into(),
+            volume_name: name.into(),
             backing_path: volume_backing.clone(),
             restore_source: None,
             mount_dir: mount.clone(),
             size_bytes: 1,
             dek: &dek,
             fresh,
-        })
-        .await
-        .unwrap();
-        if fresh {
-            std::fs::write(mount.join("memory"), b"encrypted snapshot").unwrap();
-        } else {
-            assert_eq!(
-                std::fs::read(mount.join("memory")).unwrap(),
-                b"encrypted snapshot"
-            );
+        };
+        let memory = vec![42; 8193];
+        for fresh in [true, false] {
+            encrypted_volume::prepare(params(fresh)).await.unwrap();
+            let backing = Backing::open(&volume_backing, false).unwrap().unwrap();
+            let devices = attached_loops(&backing);
+            assert_eq!(devices.len(), 1);
+            assert_loop_mode(&devices[0], mode);
+            if fresh {
+                std::fs::write(mount.join("memory"), &memory).unwrap();
+                File::open(mount.join("memory"))
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+            } else {
+                assert_eq!(std::fs::read(mount.join("memory")).unwrap(), memory);
+            }
+            if fresh && mode == LoopIoMode::Direct {
+                use std::os::fd::AsRawFd;
+                // Model a pre-upgrade buffered loop. Mounted re-entry and
+                // recovery of an existing mapper must not switch live I/O.
+                assert_eq!(
+                    // SAFETY: the test owns this loop and submits no concurrent I/O.
+                    unsafe {
+                        libc::ioctl(devices[0]._device.as_raw_fd(), 0x4c08, 0 as libc::c_ulong)
+                    },
+                    0
+                );
+                for mounted in [true, false] {
+                    if !mounted {
+                        nix::mount::umount(&mount).unwrap();
+                    }
+                    encrypted_volume::prepare(params(false)).await.unwrap();
+                    let reused = attached_loops(&backing);
+                    assert_eq!(reused.len(), 1);
+                    assert_eq!(reused[0].path(), devices[0].path());
+                    assert_loop_mode(&reused[0], LoopIoMode::Buffered);
+                    assert_eq!(std::fs::read(mount.join("memory")).unwrap(), memory);
+                }
+            }
+            drop(devices);
+            encrypted_volume::release(&sandbox_id, name, &volume_backing, &mount)
+                .await
+                .unwrap();
+            assert!(attached_loops(&backing).is_empty());
+            if fresh {
+                let mut rejected = params(false);
+                rejected.dek = b"wrong key";
+                encrypted_volume::prepare(rejected).await.unwrap_err();
+                assert!(attached_loops(&backing).is_empty());
+                assert!(!mount.join("memory").exists());
+            }
         }
-        encrypted_volume::release(&sandbox_id, "test", &volume_backing, &mount)
-            .await
-            .unwrap();
     }
 }

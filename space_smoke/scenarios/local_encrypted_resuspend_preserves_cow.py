@@ -1,69 +1,104 @@
 """An encrypted restore can be suspended again without losing its memory base."""
 
-import shlex
+import hashlib
+import json
+import os
+from importlib.resources import files
 
 import space_smoke as smoke
+from space_smoke.runtime import SmokeConfigurationError
 
-PATH = "/dev/shm/space-smoke-encrypted-resuspend.txt"
-MARKER = "space-smoke-encrypted-resuspend-ok"
-BOOT_ID_COMMAND = "tr -d '\\n' < /proc/sys/kernel/random/boot_id"
+PROBE = "/tmp/space-smoke-snapshot-state.py"
+WORKING_SET_ENV = "SPACE_SMOKE_SNAPSHOT_MEMORY_MIB"
 
 
-# The fixture enrolls a disposable BYOK organization before sandbox creation.
-# Its first sealed `snapshot.luks` is the base Firecracker loads; the second suspend must update that same sparse LUKS volume. Reformatting
-# it makes a Diff snapshot with no base, which resumes into broken userspace and
-# surfaces later as an unreachable vsock bridge.
+def expected_digest(kind: str, generation: int, mib: int) -> str:
+    digest = hashlib.sha256()
+    for index in range(mib):
+        digest.update(hashlib.shake_256(f"{kind}:{generation}:{index}".encode()).digest(1024**2))
+    return digest.hexdigest()
+
+
+# The first sealed volume is the base Firecracker loads. Reformatting on the
+# second suspend makes a Diff snapshot without its base, breaking userspace.
 @smoke.scenario(
     "local.encrypted_resuspend_preserves_cow",
     sandbox=smoke.SandboxConfig(timeout=900, template="seed", kind_byok=True),
+    rerun_environment=(WORKING_SET_ENV,),
 )
 def encrypted_resuspend_preserves_cow(test: smoke.KindEcw) -> None:
-    """A BYOK sandbox survives suspend, restore, re-suspend, and a second
-    restore with one stable sparse LUKS memory base and intact guest state."""
+    """A BYOK sandbox restores its live process and full RAM/disk contents
+    from object storage, mutates them, and re-suspends into its sparse base."""
 
     encrypted = test.encrypted_resuspend
-    marker = f"{MARKER}-{test.sandbox.sandbox_id}"
+    restore = test.cross_node_restore
+    try:
+        memory_mib = int(os.environ.get(WORKING_SET_ENV, "32"))
+    except ValueError as error:
+        raise SmokeConfigurationError(f"{WORKING_SET_ENV} must be an integer") from error
+    if not 1 <= memory_mib <= 8192:
+        raise SmokeConfigurationError(f"{WORKING_SET_ENV} must be between 1 and 8192")
+    # Two incompressible generations plus metadata must still remain sparse.
+    allocation_bound = max(encrypted.MAX_DIFF_ALLOCATION_BYTES, memory_mib * 3 * 1024**2)
+    identity: tuple[object, ...] | None = None
 
-    with test.phase("write memory-only guest state before the first suspend"):
-        boot_id_result = test.run_command_when_ready(BOOT_ID_COMMAND)
+    def observe(generation: int, *, mutate: bool = False) -> None:
+        nonlocal identity
+        result = test.run_command_when_ready(
+            f"python3 {PROBE} {'mutate' if mutate else 'read'}"
+        )
+        test.verify(result.exit_code == 0, "live snapshot-state process did not answer",
+                    command_stderr=result.stderr)
+        observed = json.loads(result.stdout)
+        current_identity = tuple(observed[key] for key in ("pid", "nonce", "boot_id"))
+        if identity is None:
+            identity = current_identity
         test.verify(
-            boot_id_result.exit_code == 0 and bool(boot_id_result.stdout),
-            "failed to read guest boot identity before encrypted suspend",
-            command_stderr=boot_id_result.stderr,
+            current_identity == identity
+            and observed["generation"] == generation
+            and observed["memory_mib"] == memory_mib
+            and observed["memory_sha256"] == expected_digest("ram", generation, memory_mib)
+            and observed["disk_sha256"] == expected_digest("disk", generation, 8),
+            "restore changed the process identity or full RAM/disk contents",
+            snapshot_guest_state=observed,
         )
-        boot_id = boot_id_result.stdout
-        written = test.run_command_when_ready(
-            f"printf %s {shlex.quote(marker)} > {shlex.quote(PATH)}"
+        test.record(f"snapshot_guest_generation_{generation}", observed)
+
+    with test.phase("start a process holding independently checked RAM and disk bytes"):
+        source = files("space_smoke.guest").joinpath("snapshot_state.py").read_text()
+        test.sandbox.files.write(PROBE, source)
+        process = test.sandbox.start_background(
+            f"python3 {PROBE} serve {memory_mib}", timeout=900,
         )
-        test.verify(
-            written.exit_code == 0,
-            "failed to write guest state before encrypted suspend",
-            command_stderr=written.stderr,
-        )
+        process.disconnect()
+        # Sandbox teardown owns the process even if suspend or a read fails.
+        observe(0)
 
     with test.phase("seal the first encrypted snapshot volume"):
-        first_node = encrypted.current_node()
+        source_placement = restore.current_placement()
         test.pause()
-        first = encrypted.sealed_snapshot(first_node)
+        first = encrypted.sealed_snapshot(
+            source_placement.node_name, max_allocation_bytes=allocation_bound,
+        )
+        restore.wait_until_restore_portable()
 
-    with test.phase("restore from the first encrypted snapshot"):
-        test.reconnect_by_id()
-        observed = test.run_command_when_ready(f"cat {shlex.quote(PATH)}")
-        test.expect_command(observed, stdout=marker)
-        restored_boot_id = test.run_command_when_ready(BOOT_ID_COMMAND)
-        test.expect_command(restored_boot_id, stdout=boot_id)
-        encrypted.expect_prior_executions_retired()
+    with restore.cordoned(source_placement.node_name):
+        with test.phase("restore published encrypted bytes onto another worker"):
+            test.reconnect_by_id()
+            restore.expect_restored_from_object_storage(
+                source=source_placement, landed=restore.current_placement(),
+            )
+            observe(0)
+            encrypted.expect_prior_executions_retired()
 
     with test.phase("re-suspend into the existing sparse encrypted base"):
+        observe(1, mutate=True)
         second_node = encrypted.current_node()
         test.pause()
-        second = encrypted.sealed_snapshot(second_node)
+        second = encrypted.sealed_snapshot(second_node, max_allocation_bytes=allocation_bound)
         encrypted.expect_base_reused(first, second)
 
     with test.phase("restore the re-suspended guest through the vsock bridge"):
         test.reconnect_by_id()
-        observed = test.run_command_when_ready(f"cat {shlex.quote(PATH)}")
-        test.expect_command(observed, stdout=marker)
-        restored_boot_id = test.run_command_when_ready(BOOT_ID_COMMAND)
-        test.expect_command(restored_boot_id, stdout=boot_id)
+        observe(1)
         encrypted.expect_prior_executions_retired()

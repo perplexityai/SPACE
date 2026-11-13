@@ -69,7 +69,7 @@
 use crate::host_command::Command;
 use std::path::{Path, PathBuf};
 
-use crate::device_backing::{self, Backing, LoopDevice};
+use crate::device_backing::{self, Backing, LoopDevice, LoopIoMode};
 use pplx_space_common_core::types::SandboxId;
 
 pub(crate) mod fork;
@@ -660,7 +660,9 @@ async fn build_stack(
     // overflow no matter how a caller computed the size (the guest can't
     // address past the device, and dm-snapshot stores one exception per
     // chunk, so total COW use is bounded by the device size).
-    let origin_loop = device_backing::blocking(move || LoopDevice::attach(&origin, true)).await?;
+    let origin_loop =
+        device_backing::blocking(move || LoopDevice::attach(&origin, true, LoopIoMode::Buffered))
+            .await?;
     let origin_sectors = blockdev_sectors(origin_loop.path()).await?;
     let origin_bytes = origin_sectors.saturating_mul(SECTOR_BYTES);
     pplx_space_common_core::sandbox_storage::validate_rootfs_bytes(origin_bytes)
@@ -689,7 +691,7 @@ async fn build_stack(
         if fresh {
             cow_backing.resize(cow_backing_size_bytes(origin_bytes))?;
         }
-        let cow_loop = LoopDevice::attach(&cow_backing, false)?;
+        let cow_loop = LoopDevice::attach(&cow_backing, false, LoopIoMode::Buffered)?;
         Ok((cow_backing, cow_loop, fresh))
     })
     .await?;
@@ -973,14 +975,16 @@ async fn build_plaintext_stack(
 ) -> Result<(), DmCryptError> {
     let composite = composite_name(sandbox_id);
 
-    let origin_loop = device_backing::blocking(move || LoopDevice::attach(&origin, true)).await?;
+    let origin_loop =
+        device_backing::blocking(move || LoopDevice::attach(&origin, true, LoopIoMode::Buffered))
+            .await?;
     let origin_sectors = blockdev_sectors(origin_loop.path()).await?;
     let origin_bytes = origin_sectors.saturating_mul(SECTOR_BYTES);
     let cow_loop = device_backing::blocking(move || {
         if fresh {
             cow.resize(cow_backing_size_bytes(origin_bytes))?;
         }
-        LoopDevice::attach(&cow, false)
+        LoopDevice::attach(&cow, false, LoopIoMode::Buffered)
     })
     .await?;
 
