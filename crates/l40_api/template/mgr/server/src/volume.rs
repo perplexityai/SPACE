@@ -1464,7 +1464,8 @@ const NODE_MANAGER_RETRY_MAX: Duration = Duration::from_secs(2);
 /// OK, so any failure it reports is a fault (unreachable mid-restart, EROFS
 /// while its mounts are torn down, EACCES): it is retried for
 /// [`NODE_MANAGER_RESTART_GRACE`], then fails the pull retryably without
-/// creating the dir.
+/// creating the dir. An attempt node-manager never answers counts as a
+/// fault once the window runs out.
 async fn create_build_dir<F, Fut>(
     name: &str,
     content_hash: &str,
@@ -1482,7 +1483,21 @@ where
     let deadline = tokio::time::Instant::now() + NODE_MANAGER_RESTART_GRACE;
     let mut backoff = NODE_MANAGER_RETRY_INITIAL;
     loop {
-        let err = match create_subvolume().await {
+        // node-manager can accept the socket and never answer; bound each
+        // attempt so the restart window holds. A late success on its side is
+        // adopted by the next attempt.
+        let attempt_timeout = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .max(NODE_MANAGER_RETRY_MAX);
+        let result = tokio::time::timeout(attempt_timeout, create_subvolume())
+            .await
+            .unwrap_or_else(|_| {
+                Err(BtrfsViaNodemgrError::Rpc {
+                    rpc: "BtrfsCreateTemplateSubvolume",
+                    status: Status::deadline_exceeded("node-manager did not answer"),
+                })
+            });
+        let err = match result {
             Ok(_path) => {
                 tracing::debug!(
                     template = name,

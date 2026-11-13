@@ -1633,3 +1633,22 @@ async fn build_dir_never_falls_back_on_a_node_manager_refusal() {
     );
     assert!(!dir.exists(), "no plain-directory build was minted");
 }
+
+/// node-manager accepts the socket but never answers: the pull still ends
+/// retryably at the restart window instead of hanging, with no build dir.
+#[tokio::test(start_paused = true)]
+async fn build_dir_does_not_hang_on_a_silent_node_manager() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("sha256:abc");
+
+    let result = create_build_dir("base", "sha256:abc", dir.to_str().unwrap(), || {
+        std::future::pending::<Result<PathBuf, crate::btrfs_via_nodemgr::BtrfsViaNodemgrError>>()
+    })
+    .await;
+
+    assert!(
+        matches!(result, Err(PullError::Retryable(ref status)) if status.code() == tonic::Code::Unavailable),
+        "expected a retryable failure, got {result:?}"
+    );
+    assert!(!dir.exists(), "no plain-directory build was minted");
+}
