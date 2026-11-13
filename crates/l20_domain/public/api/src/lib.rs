@@ -2139,7 +2139,10 @@ pub struct PublicErrorEnvelope {
     /// refusing a command because the sandbox is not running carries `reason`
     /// (`sandbox_not_running`), `state` (the sandbox's lifecycle state) and,
     /// unless the sandbox is deleting or failed, `wake` (the request that
-    /// returns it to running). An `invalid_request` for a command streamed
+    /// returns it to running). An `invalid_request` for a command the sandbox
+    /// could not start carries `reason` (`command_not_started`) and, when the
+    /// sandbox says which, `field` (`command`, `cwd` or `user`). An
+    /// `invalid_request` for a command streamed
     /// with a `pty` carries `{"key": "field", "value": "pty"}`. An
     /// `invalid_request` for a sandbox create or update field outside its limit
     /// carries `{"key": "field", "value": "<field>"}`, such as `metadata` or
@@ -2215,8 +2218,42 @@ pub const INVALID_REQUEST_FIELD_DETAIL_KEY: &str = "field";
 /// command created with `Accept: text/event-stream` and a `pty`.
 pub const INVALID_REQUEST_FIELD_PTY: &str = "pty";
 
-/// [`PublicErrorDetail::key`] naming why a `conflict` was refused.
+/// [`PublicErrorDetail::key`] naming why a `conflict`, or an
+/// `invalid_request` such as [`INVALID_REQUEST_REASON_COMMAND_NOT_STARTED`],
+/// was refused.
 pub const CONFLICT_REASON_DETAIL_KEY: &str = "reason";
+
+/// [`CONFLICT_REASON_DETAIL_KEY`] value of an `invalid_request` for a
+/// command the sandbox could not start: its executable, working directory
+/// or user cannot be used. [`INVALID_REQUEST_FIELD_DETAIL_KEY`] names which
+/// when the sandbox says ([`CommandStartField`]); guests from older
+/// templates do not.
+pub const INVALID_REQUEST_REASON_COMMAND_NOT_STARTED: &str = "command_not_started";
+
+/// The request field a command could not be started with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandStartField {
+    Command,
+    Cwd,
+    User,
+}
+
+impl CommandStartField {
+    /// The field's name in the command and session create requests.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Cwd => "cwd",
+            Self::User => "user",
+        }
+    }
+}
+
+impl fmt::Display for CommandStartField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 /// [`CONFLICT_REASON_DETAIL_KEY`] value of a `conflict` for replaying a
 /// session create whose session was revoked, has expired or is no longer
@@ -2248,6 +2285,9 @@ pub struct DataPlaneHttpError {
     /// Bounded typed details, as on [`PublicErrorEnvelope::details`]; omitted
     /// when there are none. A `conflict` refusing to start a command because
     /// the sandbox is not running carries the same details as `createCommand`.
+    /// An `invalid_request` for a command the sandbox could not start carries
+    /// `reason` (`command_not_started`) and, when the sandbox says which,
+    /// `field` (`command`, `cwd` or `user`).
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")

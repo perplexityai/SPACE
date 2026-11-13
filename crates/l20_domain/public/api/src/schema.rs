@@ -290,7 +290,7 @@ pub(crate) fn optional_guest_path(generator: &mut SchemaGenerator) -> Schema {
                 MAX_UTF8_BYTES_EXTENSION: MAX_GUEST_PATH_BYTES,
                 "pattern": "^[^\\p{Cc}]+$",
                 "not": { "pattern": "^([A-Za-z]:|//|\\\\\\\\)" },
-                "description": "Non-empty Linux guest path. Windows drive-letter and UNC paths are rejected."
+                "description": "Non-empty Linux guest path. A relative path resolves against the user's home directory. Windows drive-letter and UNC paths are rejected."
             },
             { "type": "null" }
         ]

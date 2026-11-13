@@ -130,7 +130,7 @@ pub(super) fn insert_command_event_stream_schema(spec: &mut Value) {
         "responses".to_string(),
         json!({
             "200": response,
-            "400": data_plane_error_response("Invalid session id, session kind, token transport, or Last-Event-ID, or a pty process session that has not started"),
+            "400": data_plane_error_response("Invalid session id, session kind, token transport, or Last-Event-ID, a pty process session that has not started, or a command the sandbox could not start: `details` carry `reason` (`command_not_started`) and, from current templates, `field` (`command`, `cwd` or `user`). Over WebSocket the same refusal is an `error` frame with code `backend_stream_error` and the same `details`"),
             "401": data_plane_error_response("Missing, invalid, or expired data-plane token"),
             "403": data_plane_error_response("Token does not authorize this session"),
             "404": data_plane_error_response("Session not found"),

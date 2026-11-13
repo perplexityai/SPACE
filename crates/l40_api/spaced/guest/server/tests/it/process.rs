@@ -394,22 +394,76 @@ async fn bridge_guest_process_login_environment_and_relative_cwd() {
     fixture.stop().await;
 }
 
+/// A start that cannot run names the request field to fix in its error
+/// reason, which the data plane turns into the error's `field` detail.
 #[tokio::test]
-async fn bridge_guest_process_start_rejects_unknown_user() {
+async fn bridge_guest_process_start_names_the_field_it_could_not_start_with() {
+    use pplx_space_common_core::spaced::{
+        ERROR_REASON_METADATA_KEY, PROCESS_START_COMMAND, PROCESS_START_CWD, PROCESS_START_USER,
+    };
     let temp_dir = tempfile::tempdir().expect("temp dir created");
     let fixture = GuestFixture::start(temp_dir.path()).await;
     let mut client = bridge_guest::process_client::ProcessClient::new(fixture.channel.clone());
+    let file = temp_dir.path().join("not-a-directory");
+    std::fs::write(&file, b"").expect("plain file written");
+    let file = file.to_str().expect("utf-8 temp path").to_string();
+    let missing = temp_dir.path().join("missing");
+    let missing = missing.to_str().expect("utf-8 temp path").to_string();
 
-    let error = client
-        .start(bridge_guest::StartRequest {
-            command: vec!["/bin/sh".into(), "-c".into(), "true".into()],
-            user: Some("__space_missing_user__".into()),
-            idempotency_key: Some("unknown-user".into()),
-            ..Default::default()
-        })
-        .await
-        .expect_err("unknown user rejected");
-    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    for (label, command, cwd, user, code, reason) in [
+        (
+            "unknown user",
+            "/bin/true",
+            None,
+            Some("__space_missing_user__"),
+            tonic::Code::InvalidArgument,
+            PROCESS_START_USER,
+        ),
+        (
+            "missing executable",
+            missing.as_str(),
+            None,
+            None,
+            tonic::Code::NotFound,
+            PROCESS_START_COMMAND,
+        ),
+        (
+            "missing working directory",
+            "/bin/true",
+            Some(missing.as_str()),
+            None,
+            tonic::Code::NotFound,
+            PROCESS_START_CWD,
+        ),
+        (
+            "working directory is a file",
+            "/bin/true",
+            Some(file.as_str()),
+            None,
+            tonic::Code::FailedPrecondition,
+            PROCESS_START_CWD,
+        ),
+    ] {
+        let error = client
+            .start(bridge_guest::StartRequest {
+                command: vec![command.into()],
+                cwd: cwd.map(Into::into),
+                user: user.map(Into::into),
+                idempotency_key: Some(format!("start-failure-{label}")),
+                ..Default::default()
+            })
+            .await
+            .expect_err(label);
+        assert_eq!(error.code(), code, "{label}: {error:?}");
+        assert_eq!(
+            error
+                .metadata()
+                .get(ERROR_REASON_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some(reason),
+            "{label}: {error:?}"
+        );
+    }
 
     fixture.stop().await;
 }

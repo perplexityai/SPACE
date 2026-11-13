@@ -8,11 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 async fn process_start_http_errors_preserve_permanent_guest_failures() {
     use http_body_util::BodyExt;
 
+    // A guest's refusal is the caller's request to fix whatever its code, and
+    // not retryable; see `a_command_the_guest_cannot_start_names_the_cause_and_field`
+    // for what it says.
     for (code, guest, expected_status, retryable, websocket_retryable) in [
         (
             tonic::Code::NotFound,
             true,
-            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST,
             false,
             false,
         ),
@@ -26,7 +29,7 @@ async fn process_start_http_errors_preserve_permanent_guest_failures() {
         (
             tonic::Code::PermissionDenied,
             true,
-            StatusCode::FORBIDDEN,
+            StatusCode::BAD_REQUEST,
             false,
             false,
         ),
@@ -108,7 +111,9 @@ async fn process_start_http_errors_preserve_permanent_guest_failures() {
             actual_websocket_retryable, websocket_retryable,
             "WebSocket opening errors retain the established stream retry contract"
         );
-        assert_eq!(message, STREAM_OPEN_FAILED, "{code:?}");
+        if !guest {
+            assert_eq!(message, STREAM_OPEN_FAILED, "{code:?}");
+        }
     }
 }
 
@@ -416,6 +421,123 @@ async fn full_guest_storage_is_named_and_not_retryable() {
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["error"]["message"], "sandbox storage is full");
     assert_eq!(body["error"]["retryable"], false);
+}
+
+// A command the guest refused to start for good is the caller's to fix: an
+// `invalid_request` naming the cause and, when the guest tags it, the request
+// field, never a `not_found` that reads as the session or a `forbidden` that
+// reads as the token. Guests from older templates send no tag, and get the
+// cause their status code allows. WebSocket answers with the same details.
+#[tokio::test]
+async fn a_command_the_guest_cannot_start_names_the_cause_and_field() {
+    use http_body_util::BodyExt;
+    use pplx_space_common_core::spaced::{
+        ERROR_REASON_METADATA_KEY, PROCESS_START_COMMAND, PROCESS_START_CWD, PROCESS_START_USER,
+    };
+
+    for (code, tag, cause, field) in [
+        (
+            tonic::Code::NotFound,
+            Some(PROCESS_START_COMMAND),
+            "the executable was not found",
+            Some("command"),
+        ),
+        (
+            tonic::Code::PermissionDenied,
+            Some(PROCESS_START_COMMAND),
+            "the executable cannot be run",
+            Some("command"),
+        ),
+        (
+            tonic::Code::NotFound,
+            Some(PROCESS_START_CWD),
+            "the working directory does not exist or is not a directory",
+            Some("cwd"),
+        ),
+        (
+            tonic::Code::InvalidArgument,
+            Some(PROCESS_START_USER),
+            "the user does not exist",
+            Some("user"),
+        ),
+        (
+            tonic::Code::NotFound,
+            None,
+            "the executable or working directory was not found",
+            None,
+        ),
+        (
+            tonic::Code::PermissionDenied,
+            None,
+            "permission denied",
+            None,
+        ),
+        (
+            tonic::Code::FailedPrecondition,
+            None,
+            "the executable or working directory cannot be used",
+            None,
+        ),
+        (
+            tonic::Code::InvalidArgument,
+            None,
+            "the command, user, working directory or environment is invalid",
+            None,
+        ),
+    ] {
+        let mut status = tonic::Status::new(code, "guest wording");
+        if let Some(tag) = tag {
+            status
+                .metadata_mut()
+                .insert(ERROR_REASON_METADATA_KEY, tag.parse().unwrap());
+        }
+        let error = StreamBridgeError::BackendStatus(
+            pplx_space_common_grpc::mark_guest_process_error(status),
+        );
+        let message = format!("command could not be started: {cause}");
+        let mut details =
+            vec![serde_json::json!({"key": "reason", "value": "command_not_started"})];
+        if let Some(field) = field {
+            details.push(serde_json::json!({"key": "field", "value": field}));
+        }
+
+        let response = process_stream_start_http_error(&error, SandboxId::new());
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{code:?} {tag:?}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"error": {
+                "code": "invalid_request",
+                "message": message,
+                "retryable": false,
+                "details": details,
+            }}),
+            "{code:?} {tag:?}"
+        );
+
+        let DataPlaneServerFrame::Error {
+            code: frame_code,
+            message: frame_message,
+            retryable,
+            details: frame_details,
+        } = stream_start_error_frame(&error, SandboxId::new())
+        else {
+            panic!("expected an error frame")
+        };
+        assert_eq!(frame_code, DataPlaneErrorCode::BackendStreamError);
+        assert_eq!(frame_message, message, "{code:?} {tag:?}");
+        assert!(!retryable, "{code:?} {tag:?}");
+        assert_eq!(
+            serde_json::to_value(frame_details).unwrap(),
+            serde_json::Value::Array(details),
+            "{code:?} {tag:?}"
+        );
+    }
 }
 
 // Reattaching to a session whose process the guest no longer retains names
