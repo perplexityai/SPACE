@@ -296,11 +296,22 @@ async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed()
     assert_eq!(row.state, SandboxStatus::from(SandboxState::Suspending));
     assert!(staging.join(publication::ENCRYPTED_CAPTURE_RECORD).exists());
 
-    // Once the holder exits, the next pass seals it. That pass's own
-    // classification skips the row while the seal task holds its locks, but
-    // can run after a fast seal finishes and publish the capture at once;
-    // otherwise the pass after it does.
-    recover_batch(&service, cache.path(), &id).await;
+    // Once the holder exits, the next pass seals it. Classification can skip
+    // the row while the seal task holds its locks, including on a later pass
+    // whose seal task finds nothing left to do. Drive periodic recovery until
+    // publication rather than assuming a fixed number of passes.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while service
+            .lookup_sandbox(&id)
+            .unwrap()
+            .current_local_artifact_id
+            != Some(capture)
+        {
+            recover_batch(&service, cache.path(), &id).await;
+        }
+    })
+    .await
+    .expect("the sealed capture must be published by periodic recovery");
     assert_eq!(
         node_manager.calls(),
         ["ReleaseEncryptedVolume", "ReleaseEncryptedVolume"]
