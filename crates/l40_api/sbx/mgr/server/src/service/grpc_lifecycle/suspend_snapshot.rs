@@ -1096,6 +1096,9 @@ impl SandboxManagerService {
             );
 
             let snapshot_dir_string = snapshot_dir.to_string_lossy().into_owned();
+            // Sized before the backup handoff: once it's queued, an uploaded
+            // rootfs stream can be reclaimed from the directory.
+            let published_bytes = published_snapshot_bytes(&snapshot_dir).await;
             if let SuspendDurability::RemoteBeforeTeardown {
                 execution_generation,
             } = durability
@@ -1212,6 +1215,7 @@ impl SandboxManagerService {
                 create_kind,
                 create_codec,
                 sandbox.volume_encryption,
+                published_bytes,
                 create_started_at,
             );
             Ok(())
@@ -1484,4 +1488,19 @@ pub(in crate::service) enum RetainedUploadError {
         retained: crate::retained_source::RetainedSource,
         check: crate::retained_source::RetainedSourceCheck,
     },
+}
+
+/// Apparent size of the files a published snapshot directory holds, for the
+/// create metrics' size bucket. The directory is flat: each artifact is a
+/// top-level file. `None` when the directory can't be read.
+async fn published_snapshot_bytes(dir: &std::path::Path) -> Option<u64> {
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    let mut total = 0u64;
+    while let Some(entry) = entries.next_entry().await.ok()? {
+        let metadata = entry.metadata().await.ok()?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Some(total)
 }
