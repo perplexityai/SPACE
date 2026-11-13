@@ -442,6 +442,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     slot: None,
                     template: None,
                     execution_only: false,
+                    cgroup_only: false,
                 })
                 .await
                 .map_err(|e| format!("ERROR: {e}"))?

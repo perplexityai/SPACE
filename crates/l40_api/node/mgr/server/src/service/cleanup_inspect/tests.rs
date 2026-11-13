@@ -913,3 +913,63 @@ async fn cleanup_proceeds_once_the_claim_holder_releases_it() {
         node.stop().await;
     }
 }
+
+#[test]
+fn sandbox_cgroup_reads_either_cgroup_name_and_reports_an_absent_one() {
+    let root = tempfile::tempdir().unwrap();
+    let id = SandboxId::new().to_string();
+    assert_eq!(
+        SandboxCgroup::read(root.path(), &id),
+        SandboxCgroup::default()
+    );
+
+    for name in [id.clone(), format!("sbx-{id}")] {
+        let dir = root.path().join(&name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("memory.current"), format!("{}\n", name.len())).unwrap();
+        std::fs::write(dir.join("cpu.stat"), "usage_usec 7\n").unwrap();
+        // The prefixed name wins once it exists; absent files read as empty.
+        assert_eq!(
+            SandboxCgroup::read(root.path(), &id),
+            SandboxCgroup {
+                exists: true,
+                memory_current: name.len().to_string(),
+                cpu_stat: "usage_usec 7".to_string(),
+                ..Default::default()
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn cgroup_only_inspect_answers_without_host_probes() {
+    let service = crate::service::tests::service_tests::service_for_unit_tests().await;
+    let id = SandboxId::new();
+    let mut request = Request::new(InspectSandboxRequest {
+        sandbox_id: id.to_string(),
+        uuid8: id.label().to_string(),
+        uid: Some(10_000),
+        slot: Some(7),
+        cgroup_only: true,
+        ..Default::default()
+    });
+    request
+        .extensions_mut()
+        .insert(pplx_space_uds_peer_auth::PeerIdentity::new(
+            pplx_space_host_layout::identities::users::SPACE_SBXMGR.uid,
+            pplx_space_host_layout::identities::users::SPACE_SBXMGR
+                .primary_group
+                .gid,
+            None,
+        ));
+    let inspection = service.inspect_sandbox(request).await.unwrap().into_inner();
+    // Only identity and cgroup figures: no slot, process, network or
+    // filesystem probe ran, so none is reported.
+    assert_eq!(
+        inspection,
+        InspectSandboxResponse {
+            sandbox_id: id.to_string(),
+            ..Default::default()
+        }
+    );
+}
