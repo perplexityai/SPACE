@@ -1973,7 +1973,31 @@ impl KubernetesSubstrate {
                     same_target: true,
                     owner_attempt_id,
                     ..
-                }) => (requested_attempt_id, Some(owner_attempt_id)),
+                }) => {
+                    // A stopped sandbox's runtime upgrade also claims a
+                    // `stopped` target, and its pod is a placeholder that
+                    // boots the upgrade, not this re-placement. It records
+                    // its upgrade in the claim's own transaction, so a claim
+                    // with a record is never the drain's to join.
+                    if target_state == SandboxLifecycle::Stopped
+                        && self
+                            .store
+                            .stopped_runtime_upgrade_claim(sandbox_id)
+                            .await?
+                            .is_some_and(|claim| {
+                                claim.activation_attempt_id == owner_attempt_id
+                                    && claim.upgrade.is_some()
+                            })
+                    {
+                        return Err(SubstrateError::Unavailable {
+                            message: format!(
+                                "a runtime upgrade owns stopped sandbox {sandbox_id}'s execution; \
+                                 retry its re-placement once the upgrade is done"
+                            ),
+                        });
+                    }
+                    (requested_attempt_id, Some(owner_attempt_id))
+                }
                 Err(error) => {
                     // The materialization may have failed after a pod
                     // carrying the upgrade was created, or kept: its shim may
@@ -2102,9 +2126,10 @@ impl KubernetesSubstrate {
             // whichever attempt it ran under. A re-drive after a timed-out wait
             // joins the earlier attempt, still inside its lease, rather than
             // taking one. A join needs the owner's attempt to have the same
-            // target, and only this path assigns a `stopped` one, which the
-            // guard above limits to the drain, so the joined attempt is the
-            // drain's own. Left set,
+            // target. Besides this path, which the guard above limits to the
+            // drain, only a stopped sandbox's runtime upgrade assigns a
+            // `stopped` one, and the join above refuses its attempt, so the
+            // joined attempt is the drain's own. Left set,
             // it keeps the materialization pod from being released and refuses
             // the owner's next `start` until its lease expires.
             let owned_attempt = if target_state == SandboxLifecycle::Stopped {

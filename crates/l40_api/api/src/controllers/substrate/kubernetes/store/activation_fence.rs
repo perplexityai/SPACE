@@ -2,6 +2,7 @@
 //! activation attempts, route identity publication, and fence reconciliation.
 
 use super::*;
+use pplx_space_sandbox_store::restore_source;
 
 impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn begin_activation_execution_row(
@@ -26,6 +27,8 @@ impl K8sStore {
                 &mut tx,
                 sandbox_id,
                 Some((activation_attempt_id, target_state)),
+                None,
+                None,
             )
             .await?;
         tx.commit()
@@ -42,23 +45,97 @@ impl K8sStore {
         activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
         target_state: SandboxTransitionTargetState,
     ) -> Result<pplx_space_common_core::types::SandboxActivationAttemptId, SubstrateError> {
+        self.assign_activation_attempt_guarded(
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+            target_state,
+            AssignmentGuard::Any,
+        )
+        .await
+    }
+
+    /// Assign `activation_attempt_id` to the active execution under the
+    /// sandbox's row lock, once `guard` holds under that lock.
+    async fn assign_activation_attempt_guarded(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        target_state: SandboxTransitionTargetState,
+        guard: AssignmentGuard,
+    ) -> Result<pplx_space_common_core::types::SandboxActivationAttemptId, SubstrateError> {
         let mut tx = self
             .pool
             .begin()
             .await
             .db_context("failed to start activation-attempt transaction")?;
-        if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
-            return Err(SubstrateError::NotFound {
-                message: format!("sandbox not found: {sandbox_id}"),
-            });
-        }
-        let row = self
-            .active_execution_row(&mut tx, sandbox_id)
-            .await?
-            .ok_or_else(|| SubstrateError::Conflict {
-                message: "execution changed before activation attempt assignment".to_string(),
-            })?;
+        let not_found = || SubstrateError::NotFound {
+            message: format!("sandbox not found: {sandbox_id}"),
+        };
+        let left_by = match guard {
+            AssignmentGuard::Any => {
+                if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
+                    return Err(not_found());
+                }
+                None
+            }
+            AssignmentGuard::StoppedLeftBy(left_by) => {
+                match Self::lock_sandbox_execution_lifecycle_in(&mut tx, sandbox_id).await? {
+                    // A drain's stopped evacuation took the execution over
+                    // when it opened, and its teardown retires it.
+                    Some(SandboxLifecycle::Stopped)
+                        if Self::stopped_evacuation_marked_in(&mut tx, sandbox_id).await? =>
+                    {
+                        return Err(evacuation_refusal(sandbox_id));
+                    }
+                    Some(SandboxLifecycle::Stopped) => Some(left_by),
+                    // Another activation took the execution: retry once it's
+                    // done, as for a live claim.
+                    Some(lifecycle) => {
+                        return Err(SubstrateError::Unavailable {
+                            message: format!(
+                                "sandbox {sandbox_id} is {lifecycle}, so its runtime upgrade's \
+                                 execution belongs to another activation; retry"
+                            ),
+                        });
+                    }
+                    None => return Err(not_found()),
+                }
+            }
+        };
+        let row = match (
+            self.active_execution_row(&mut tx, sandbox_id).await?,
+            left_by,
+        ) {
+            (Some(row), None) => row,
+            // The generation is checked here too: a replacement can carry the
+            // earlier attempt to a new generation, and the assignment below,
+            // keyed by generation, would then find no row.
+            (Some(row), Some(left_by))
+                if row.activation_attempt_id == Some(left_by) && row.generation == generation =>
+            {
+                row
+            }
+            (_, Some(_)) => {
+                return Err(SubstrateError::Unavailable {
+                    message: format!(
+                        "another activation took stopped sandbox {sandbox_id}'s runtime upgrade \
+                         execution; retry"
+                    ),
+                });
+            }
+            (None, None) => {
+                return Err(SubstrateError::Conflict {
+                    message: "execution changed before activation attempt assignment".to_string(),
+                });
+            }
+        };
         let route_publication = classify_activation_route_publication(&row, false)?;
+        // Neither caller (a pooled sandbox's activation, a stopped sandbox's
+        // runtime upgrade taking its own execution over) clears an upgrade's
+        // record: a pooled sandbox's execution never carries one, and the
+        // upgrade's own claim keeps it.
         let activation_attempt_id = Self::assign_activation_attempt_in(
             &mut tx,
             sandbox_id,
@@ -66,6 +143,7 @@ impl K8sStore {
             activation_attempt_id,
             target_state,
             route_publication,
+            None,
         )
         .await?;
         tx.commit()
@@ -278,28 +356,316 @@ impl K8sStore {
         generation: i64,
         activation_attempt_id: SandboxActivationAttemptId,
     ) {
-        if let Err(error) = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-                SET activation_attempt_id = NULL,
-                    activation_attempt_expires_at = LEAST(activation_attempt_expires_at, NOW()),
-                    activation_attempt_target_state = NULL
-              WHERE sandbox_id = $1 AND generation = $2 AND active
-                AND activation_attempt_id = $3"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation)
-        .bind(activation_attempt_id)
-        .execute(&self.pool)
-        .await
+        self.end_activation_attempt_best_effort(
+            sql!(
+                "UPDATE sandbox_k8s_executions
+                    SET activation_attempt_id = NULL,
+                        activation_attempt_expires_at = LEAST(activation_attempt_expires_at, NOW()),
+                        activation_attempt_target_state = NULL
+                  WHERE sandbox_id = $1 AND generation = $2 AND active
+                    AND activation_attempt_id = $3"
+            ),
+            "give up",
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+        )
+        .await;
+    }
+
+    /// Run `statement`, which ends the lease of `activation_attempt_id` on
+    /// the active execution of `generation` (bound as `$1` sandbox, `$2`
+    /// generation, `$3` attempt), and only warn when it fails: the lease's
+    /// expiry recovers the execution either way.
+    async fn end_activation_attempt_best_effort(
+        &self,
+        statement: &'static str,
+        action: &'static str,
+        sandbox_id: SandboxId,
+        generation: i64,
+        activation_attempt_id: SandboxActivationAttemptId,
+    ) {
+        if let Err(error) = sqlx::query(statement)
+            .bind(sandbox_id.as_uuid())
+            .bind(generation)
+            .bind(activation_attempt_id)
+            .execute(&self.pool)
+            .await
         {
             tracing::warn!(
                 sandbox_id = %sandbox_id,
                 generation,
                 %activation_attempt_id,
+                action,
                 %error,
-                "failed to give up unfinished activation; lease expiry will allow recovery"
+                "failed to end unfinished activation; lease expiry will allow recovery"
             );
         }
+    }
+
+    /// Take over the execution an earlier runtime upgrade of the stopped
+    /// sandbox left, with `activation_attempt_id` targeting `stopped`. The
+    /// lifecycle and the earlier attempt, `left_by`, are checked under the
+    /// sandbox's row lock with the assignment, so a start that moved the
+    /// sandbox or claimed the execution meanwhile keeps it.
+    pub(in crate::controllers::substrate::kubernetes) async fn take_over_stopped_runtime_upgrade(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        left_by: SandboxActivationAttemptId,
+        activation_attempt_id: SandboxActivationAttemptId,
+    ) -> Result<SandboxActivationAttemptId, SubstrateError> {
+        self.assign_activation_attempt_guarded(
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+            SandboxTransitionTargetState::Stopped,
+            AssignmentGuard::StoppedLeftBy(left_by),
+        )
+        .await
+    }
+
+    /// End an unfinished stopped runtime upgrade's lease now. An attempt that
+    /// recorded its upgrade keeps its id and target: unlike
+    /// [`Self::give_up_activation_attempt_best_effort`], the claim still says
+    /// what it was for, which is how a retry finds the execution
+    /// ([`Self::stopped_runtime_upgrade_claim`]). One that recorded nothing
+    /// placed no pod with the upgrade, so it gives the claim up instead, as
+    /// that method does: a claim with nothing recorded isn't the upgrade's to
+    /// take over. Either way any activation may take the execution at once.
+    pub(in crate::controllers::substrate::kubernetes) async fn expire_activation_attempt_best_effort(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        activation_attempt_id: SandboxActivationAttemptId,
+    ) {
+        self.end_activation_attempt_best_effort(
+            sql!(
+                "UPDATE sandbox_k8s_executions
+                    SET activation_attempt_expires_at = LEAST(activation_attempt_expires_at, NOW()),
+                        activation_attempt_id = CASE
+                            WHEN runtime_upgrade_operation_id IS NULL THEN NULL
+                            ELSE activation_attempt_id
+                        END,
+                        activation_attempt_target_state = CASE
+                            WHEN runtime_upgrade_operation_id IS NULL THEN NULL
+                            ELSE activation_attempt_target_state
+                        END,
+                        updated_at = NOW()
+                  WHERE sandbox_id = $1 AND generation = $2 AND active
+                    AND activation_attempt_id = $3"
+            ),
+            "expire",
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+        )
+        .await;
+    }
+
+    /// The active execution claimed by an attempt targeting `stopped`: a
+    /// runtime upgrade of the stopped sandbox `sandbox_id`, or a drain's
+    /// re-placement, which claims it on a `restoring` row and may leave the
+    /// claim behind once the row is `stopped` again. Only a claim with a
+    /// recorded upgrade is the upgrade's: every other activation's claim
+    /// clears the record (`assign_activation_attempt_in`).
+    pub(in crate::controllers::substrate::kubernetes) async fn stopped_runtime_upgrade_claim(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<StoppedRuntimeUpgradeClaim>, SubstrateError> {
+        type ClaimRow = (
+            i64,
+            SandboxActivationAttemptId,
+            String,
+            Option<String>,
+            bool,
+            Option<Uuid>,
+            Option<String>,
+            Option<String>,
+        );
+        let row: Option<ClaimRow> = sqlx::query_as(sql!(
+            "SELECT execution.generation, execution.activation_attempt_id, execution.pod_name,
+                    execution.k8s_node_name,
+                    COALESCE(execution.activation_attempt_expires_at > NOW(), TRUE),
+                    execution.runtime_upgrade_operation_id,
+                    execution.runtime_upgrade_target_environment_ref,
+                    execution.runtime_upgrade_authorization_id
+               FROM sandbox_k8s_executions execution
+              WHERE execution.sandbox_id = $1
+                AND execution.active
+                AND execution.activation_attempt_id IS NOT NULL
+                AND execution.activation_attempt_target_state = $2"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(SandboxTransitionTargetState::Stopped.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to read a stopped sandbox's runtime upgrade claim")?;
+        row.map(
+            |(
+                generation,
+                activation_attempt_id,
+                pod_name,
+                node_name,
+                live,
+                operation_id,
+                target,
+                authorization_id,
+            )| {
+                let upgrade = match (operation_id, target, authorization_id) {
+                    (Some(operation_id), Some(target), Some(authorization_id)) => {
+                        Some(RecordedRuntimeUpgrade {
+                            operation_id,
+                            target: target.parse().map_err(|error| SubstrateError::Failed {
+                                message: format!(
+                                    "execution records an invalid runtime upgrade target {target}: \
+                                     {error}"
+                                ),
+                            })?,
+                            authorization_id,
+                        })
+                    }
+                    _ => None,
+                };
+                Ok(StoppedRuntimeUpgradeClaim {
+                    generation,
+                    activation_attempt_id,
+                    pod_name,
+                    node_name,
+                    live,
+                    upgrade,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    /// Record on the execution `activation_attempt_id` just claimed, in the
+    /// claim's own transaction, the upgrade its pod is about to carry, so a
+    /// retry that finds the execution places exactly that upgrade again. In
+    /// the claim's transaction, no claim targeting `stopped` commits without
+    /// its record: one that did, left by an attempt that ended in between,
+    /// would read as a drain's claim to every retry
+    /// ([`Self::stopped_runtime_upgrade_claim`]).
+    ///
+    /// Refused unless the sandbox is still stopped and the attempt still owns
+    /// the execution: a drain's re-placement moves the row to `restoring`
+    /// before it claims, so it either sees this record and refuses to join
+    /// the attempt, or this record fails. That needs the sandbox row locked
+    /// (taken again here, a no-op when the claim already holds it): under READ
+    /// COMMITTED a plain read of the lifecycle sees the statement's snapshot,
+    /// so a drain committing `restoring` after it could claim the execution,
+    /// join this attempt and miss the record. Holding the lock until the claim
+    /// commits makes the drain's lifecycle write wait for it. A refusal is a
+    /// retryable error, which rolls the claim back with the record.
+    ///
+    /// Under the same lock it refuses retryably while a drain's stopped
+    /// evacuation has claimed the sandbox (its marker is set): the
+    /// evacuation's teardown releases the node only while the node still pins
+    /// the artifact the evacuation minted, and an upgrade boot drops that
+    /// pin. The evacuation claims under this lock too
+    /// (`open_stopped_evacuation`), and waits while an upgrade's lease runs,
+    /// so one of the two waits for the other. The marker outlasts an
+    /// `:undrain` until the sandbox's lifecycle next changes, and the
+    /// upgrade waits that long too: a later forced drain resumes the claim
+    /// on the artifact it minted.
+    ///
+    /// Under the same lock it checks that the disk is still where the
+    /// operation checked it before claiming: `record.disk_node` is still the
+    /// node [`Self::restore_source_plan`] names and the registered node the
+    /// placement pins the disk to (`restore_source::disk_pin_node_name`), and
+    /// no stopped evacuation has left the sandbox unplaced. A drain that released or re-placed the
+    /// sandbox in between leaves the row `stopped`, so the lifecycle alone
+    /// doesn't see it, and a pod pinned to the old node would boot a released
+    /// or stale copy. That refusal is retryable too: a retry checks the disk
+    /// node again.
+    ///
+    /// The record never replaces another operation's: an execution whose
+    /// claim expired may still carry the record of an upgrade that owes its
+    /// disk backup, and overwriting it would lose that debt. The claim is
+    /// refused retryably instead, and the retry takes that upgrade over.
+    pub(super) async fn record_stopped_runtime_upgrade_in(
+        conn: &mut PgConnection,
+        sandbox_id: SandboxId,
+        generation: i64,
+        activation_attempt_id: SandboxActivationAttemptId,
+        record: &StoppedUpgradeRecord,
+    ) -> Result<(), SubstrateError> {
+        let upgrade = &record.upgrade;
+        let changed_hands = || SubstrateError::Unavailable {
+            message: format!(
+                "stopped sandbox {sandbox_id}'s execution changed hands before its runtime \
+                 upgrade was recorded; retry"
+            ),
+        };
+        if Self::lock_sandbox_execution_lifecycle_in(&mut *conn, sandbox_id).await?
+            != Some(SandboxLifecycle::Stopped)
+        {
+            return Err(changed_hands());
+        }
+        if Self::stopped_evacuation_marked_in(&mut *conn, sandbox_id).await? {
+            return Err(evacuation_refusal(sandbox_id));
+        }
+        let source = Self::restore_source_plan_in(&mut *conn, sandbox_id).await?;
+        let pin = restore_source::disk_pin_node_name(&mut *conn, sandbox_id)
+            .await
+            .db_context("failed to read a stopped sandbox's disk pin")?;
+        if source.stopped_evacuation_unplaced
+            || source.node_name.as_deref() != Some(record.disk_node.as_str())
+            || pin.as_deref() != Some(record.disk_node.as_str())
+        {
+            return Err(SubstrateError::Unavailable {
+                message: format!(
+                    "stopped sandbox {sandbox_id}'s disk moved off node {} before its runtime \
+                     upgrade was claimed; retry",
+                    record.disk_node
+                ),
+            });
+        }
+        let recorded = sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET runtime_upgrade_operation_id = $4,
+                    runtime_upgrade_target_environment_ref = $5,
+                    runtime_upgrade_authorization_id = $6,
+                    updated_at = NOW()
+              WHERE sandbox_id = $1 AND generation = $2 AND active
+                AND activation_attempt_id = $3
+                -- Another operation's record may still owe its disk backup:
+                -- never overwrite it. Its own retry takes it over instead.
+                AND (runtime_upgrade_operation_id IS NULL
+                     OR runtime_upgrade_operation_id = $4)"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(generation)
+        .bind(activation_attempt_id)
+        .bind(upgrade.operation_id)
+        .bind(upgrade.target.to_string())
+        .bind(&upgrade.authorization_id)
+        .execute(&mut *conn)
+        .await
+        .db_context("failed to record a stopped sandbox's runtime upgrade")?
+        .rows_affected();
+        if recorded != 1 {
+            return Err(changed_hands());
+        }
+        // The upgrade's boot may rewrite the disk, and a rollback's cleanup
+        // drops the node's pin too, so a control-plane pin captured before it
+        // (an earlier drain's, say) describes the disk on no outcome. Nothing
+        // projects a stopped sandbox's node pin up, so left set it would make
+        // a drain refuse the sandbox on every tick and a restart with no known
+        // source node select pre-upgrade bytes. Cleared here, under the row
+        // lock and in the claim's own transaction, as a start's boot clears
+        // it, every outcome starts without one; a drain then takes the node's
+        // own pin.
+        pplx_space_sandbox_store::artifact_marker::set_current_local_artifact(
+            &mut *conn,
+            sandbox_id,
+            None,
+            pplx_space_common_core::types::ArtifactOrigin::Stop,
+        )
+        .await
+        .db_context("failed to clear a stopped sandbox's disk pin for its runtime upgrade")?;
+        Ok(())
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn abandon_activation_attempt_superseded_by_suspend(
@@ -354,6 +720,22 @@ impl K8sStore {
         }
     }
 
+    /// Assign `requested_attempt_id` (or the next one after the current
+    /// owner) to the active execution of `generation`, under its row lock.
+    /// The caller holds the sandbox row's lock.
+    ///
+    /// An activation other than a stopped sandbox's runtime upgrade clears the
+    /// upgrade's record from the execution. An upgrade that recorded itself
+    /// and wasn't retired may have changed the disk, whether or not the node
+    /// has published its result yet, and may still owe the disk backup that
+    /// retiring the execution would have enqueued; the record is its only
+    /// trace. So the claim is refused unless the caller enqueued that backup
+    /// for the recorded operation (`owed_backup_enqueued`), which it does
+    /// outside this transaction (`enqueue_backup_owed_by_stopped_upgrade`,
+    /// which answers the refusals no retry changes), retryably: the retry
+    /// enqueues it first. Deciding it here,
+    /// under the locks, means a lease that expires after the caller's check
+    /// can't let a claim clear the record without the backup.
     pub(super) async fn assign_activation_attempt_in(
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
@@ -361,27 +743,43 @@ impl K8sStore {
         requested_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
         target_state: SandboxTransitionTargetState,
         route_publication: ActivationRoutePublication,
+        owed_backup_enqueued: Option<Uuid>,
     ) -> Result<pplx_space_common_core::types::SandboxActivationAttemptId, SubstrateError> {
-        let current_attempt =
-            sqlx::query_as::<_, (Option<Uuid>, Option<String>, f64, Option<Uuid>)>(sql!(
-                "SELECT activation_attempt_id,
+        type CurrentAttempt = (
+            Option<Uuid>,
+            Option<String>,
+            f64,
+            Option<Uuid>,
+            Option<Uuid>,
+            Option<String>,
+        );
+        let current_attempt = sqlx::query_as::<_, CurrentAttempt>(sql!(
+            "SELECT activation_attempt_id,
                     activation_attempt_target_state,
                     GREATEST(
                         EXTRACT(EPOCH FROM (activation_attempt_expires_at - NOW())),
                         0.0
                     )::float8,
-                    route_activation_id
+                    route_activation_id,
+                    runtime_upgrade_operation_id,
+                    runtime_upgrade_target_environment_ref
                FROM sandbox_k8s_executions
               WHERE sandbox_id = $1 AND generation = $2 AND active
               FOR UPDATE"
-            ))
-            .bind(sandbox_id.as_uuid())
-            .bind(generation)
-            .fetch_optional(&mut *conn)
-            .await
-            .db_context("failed to inspect activation attempt owner")?;
-        let Some((current_attempt_id, current_target, lease_remaining_secs, route_owner)) =
-            current_attempt
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(generation)
+        .fetch_optional(&mut *conn)
+        .await
+        .db_context("failed to inspect activation attempt owner")?;
+        let Some((
+            current_attempt_id,
+            current_target,
+            lease_remaining_secs,
+            route_owner,
+            recorded_upgrade,
+            recorded_target,
+        )) = current_attempt
         else {
             return Err(SubstrateError::Conflict {
                 message: "execution changed before activation attempt assignment".to_string(),
@@ -412,6 +810,41 @@ impl K8sStore {
             return Err(SubstrateError::Conflict {
                 message: "resident execution has no published route identity; refusing activation assignment"
                     .to_string(),
+            });
+        }
+        // The recorded runtime upgrade belongs to the stopped sandbox's
+        // upgrade that claimed the execution (`record_stopped_runtime_upgrade_in`).
+        // Any other activation that takes the execution owns it from now on,
+        // and nothing it does carries that upgrade, so the record goes. Only
+        // the upgrade claims a `stopped` target on a `stopped` row: a drain's
+        // re-placement claims it on a `restoring` one.
+        let clears_upgrade_record = match recorded_upgrade {
+            None => None,
+            Some(operation_id) => {
+                let upgrade_claims = target_state == SandboxTransitionTargetState::Stopped
+                    && sqlx::query_scalar::<_, bool>(sql!(
+                        "SELECT EXISTS (
+                             SELECT 1 FROM sandboxes WHERE id = $1 AND lifecycle = $2
+                         )"
+                    ))
+                    .bind(sandbox_id.as_uuid())
+                    .bind(SandboxLifecycle::Stopped.as_str())
+                    .fetch_one(&mut *conn)
+                    .await
+                    .db_context("failed to read the sandbox's lifecycle")?;
+                (!upgrade_claims).then_some(operation_id)
+            }
+        };
+        if let Some(operation_id) = clears_upgrade_record
+            && owed_backup_enqueued != Some(operation_id)
+        {
+            let target = recorded_target.as_deref().unwrap_or("its target");
+            return Err(SubstrateError::Unavailable {
+                message: format!(
+                    "stopped sandbox {sandbox_id}'s runtime upgrade {operation_id} to {target} \
+                     may have changed its disk, and the disk backup it owes isn't enqueued; \
+                     retry, which enqueues it first"
+                ),
             });
         }
 
@@ -526,6 +959,22 @@ impl K8sStore {
             }
             .to_string(),
         })?;
+        if clears_upgrade_record.is_some() {
+            sqlx::query(sql!(
+                "UPDATE sandbox_k8s_executions
+                    SET runtime_upgrade_operation_id = NULL,
+                        runtime_upgrade_target_environment_ref = NULL,
+                        runtime_upgrade_authorization_id = NULL
+                  WHERE sandbox_id = $1
+                    AND generation = $2
+                    AND active"
+            ))
+            .bind(sandbox_id.as_uuid())
+            .bind(generation)
+            .execute(&mut *conn)
+            .await
+            .db_context("failed to clear another activation's runtime upgrade record")?;
+        }
         Ok(pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(assigned))
     }
 
@@ -617,4 +1066,68 @@ impl K8sStore {
             ownership,
         })
     }
+}
+
+/// The retryable refusal of a stopped sandbox's runtime upgrade while a
+/// drain's stopped evacuation has claimed the sandbox.
+fn evacuation_refusal(sandbox_id: SandboxId) -> SubstrateError {
+    SubstrateError::Unavailable {
+        message: format!(
+            "a drain is evacuating stopped sandbox {sandbox_id}; retry its runtime upgrade once \
+             it's placed again"
+        ),
+    }
+}
+
+/// See [`K8sStore::stopped_runtime_upgrade_claim`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::controllers::substrate::kubernetes) struct StoppedRuntimeUpgradeClaim {
+    pub(in crate::controllers::substrate::kubernetes) generation: i64,
+    pub(in crate::controllers::substrate::kubernetes) activation_attempt_id:
+        SandboxActivationAttemptId,
+    /// The execution's pod name, which its generation fixes.
+    pub(in crate::controllers::substrate::kubernetes) pod_name: String,
+    /// The node the execution names, the one holding the disk its pod is
+    /// pinned to; `None` before any pod was placed.
+    pub(in crate::controllers::substrate::kubernetes) node_name: Option<String>,
+    /// Whether its lease still runs: an upgrade may still own the execution.
+    pub(in crate::controllers::substrate::kubernetes) live: bool,
+    /// The upgrade the claiming attempt recorded before its pod; `None` when
+    /// it never got that far, so no pod carried it.
+    pub(in crate::controllers::substrate::kubernetes) upgrade: Option<RecordedRuntimeUpgrade>,
+}
+
+/// What a stopped sandbox's runtime upgrade records on the execution it
+/// claims, and the node holding the disk its pod is pinned to, which the
+/// claim checks again under the sandbox row's lock
+/// ([`K8sStore::record_stopped_runtime_upgrade_in`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::controllers::substrate::kubernetes) struct StoppedUpgradeRecord {
+    pub(in crate::controllers::substrate::kubernetes) upgrade: RecordedRuntimeUpgrade,
+    pub(in crate::controllers::substrate::kubernetes) disk_node: String,
+}
+
+/// What a stopped sandbox's runtime upgrade sends sandbox-manager, as far as
+/// a retry must repeat it: sandbox-manager refuses an operation that names
+/// another target or authorization than the one it recorded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::controllers::substrate::kubernetes) struct RecordedRuntimeUpgrade {
+    pub(in crate::controllers::substrate::kubernetes) operation_id: Uuid,
+    pub(in crate::controllers::substrate::kubernetes) target:
+        pplx_space_common_core::types::EnvironmentReference,
+    pub(in crate::controllers::substrate::kubernetes) authorization_id: String,
+}
+
+/// What [`K8sStore::assign_activation_attempt_guarded`] checks under the
+/// sandbox's row lock before it assigns.
+#[derive(Clone, Copy)]
+enum AssignmentGuard {
+    /// The sandbox exists.
+    Any,
+    /// The sandbox is still stopped, no drain's stopped evacuation has
+    /// claimed it, and the active execution's attempt is still the one an
+    /// earlier runtime upgrade left, so a start that moved the sandbox or
+    /// claimed the execution meanwhile keeps it, as does an evacuation that
+    /// took the execution over. Each refusal is a retryable `Unavailable`.
+    StoppedLeftBy(SandboxActivationAttemptId),
 }

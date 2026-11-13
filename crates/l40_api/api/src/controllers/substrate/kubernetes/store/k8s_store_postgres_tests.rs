@@ -1185,6 +1185,8 @@ async fn materialization_claim_defers_when_suspend_commits_after_refresh() -> Te
                 SandboxLifecycle::Started,
                 None,
                 None,
+                None,
+                None,
             )
             .await
     });
@@ -1234,6 +1236,8 @@ async fn split_operation_stopped_start_retry_preserves_route_proof() -> TestResu
             SandboxLifecycle::Stopped,
             None,
             Some((route_a, SandboxTransitionTargetState::Started)),
+            None,
+            None,
         )
         .await?;
     fixture
@@ -1765,7 +1769,9 @@ async fn concurrent_claim_loses_to_cleanup_recovery(lifecycle: SandboxLifecycle)
     let claim_store = fixture.store.clone();
     let claim = tokio::spawn(async move {
         claim_store
-            .ensure_active_execution_claim_for_lifecycle(sandbox_id, lifecycle, None, None)
+            .ensure_active_execution_claim_for_lifecycle(
+                sandbox_id, lifecycle, None, None, None, None,
+            )
             .await
     });
     wait_for_blocked_query(
@@ -3069,7 +3075,13 @@ async fn stale_failed_started_recovery_does_not_converge_newer_execution(
     };
     let successor = fixture
         .store
-        .replace_active_execution_claim_if_generation(typed, stale_generation, "replaced", None)
+        .replace_active_execution_claim_if_generation(
+            typed,
+            stale_generation,
+            "replaced",
+            None,
+            None,
+        )
         .await?
         .expect("active recovery generation should be replaced");
 
@@ -3146,6 +3158,8 @@ async fn failed_started_recovery_follows_owned_successor_generation(
             SandboxLifecycle::Started,
             None,
             Some((activation_attempt_id, SandboxTransitionTargetState::Started)),
+            None,
+            None,
         )
         .await?;
     assert_eq!(materialization.row.generation, initial_generation);
@@ -3266,6 +3280,8 @@ async fn failed_started_recovery_without_attempt_does_not_steal_owned_generation
             SandboxLifecycle::Started,
             None,
             Some((activation_attempt_id, SandboxTransitionTargetState::Started)),
+            None,
+            None,
         )
         .await?;
     assert_eq!(materialization.row.generation, generation);
@@ -3496,7 +3512,13 @@ async fn started_recovery_follows_superseding_execution(fixture: &PostgresStore)
     };
     let replacement = fixture
         .store
-        .replace_active_execution_claim_if_generation(typed, first_generation, "replaced", None)
+        .replace_active_execution_claim_if_generation(
+            typed,
+            first_generation,
+            "replaced",
+            None,
+            None,
+        )
         .await?
         .expect("active recovery generation should be replaced");
 
@@ -3569,7 +3591,13 @@ async fn transient_create_dodge_handoff_yields_fresh_claim(fixture: &PostgresSto
     // so a later claim attempt dedupes against it instead of inserting.
     let replaced = fixture
         .store
-        .replace_active_execution_claim_if_generation(typed, first.row.generation, "replaced", None)
+        .replace_active_execution_claim_if_generation(
+            typed,
+            first.row.generation,
+            "replaced",
+            None,
+            None,
+        )
         .await?
         .expect("replacement claim");
     let reacquired = fixture.store.ensure_active_execution_claim(typed).await?;
@@ -4069,6 +4097,8 @@ async fn concurrent_handler_does_not_claim_g7_while_g6_create_is_in_flight(
             SandboxLifecycle::Started,
             None,
             Some((attempt_a, SandboxTransitionTargetState::Started)),
+            None,
+            None,
         )
         .await?;
     assert_eq!(
@@ -4714,6 +4744,7 @@ async fn replacement_handler_claims_g7_after_lagging_g6_is_replaced(
             handler_a_claim.row.generation,
             "replaced",
             Some((replacement_attempt, SandboxTransitionTargetState::Started)),
+            None,
         )
         .await?
         .expect("handler B should replace the stale generation");
@@ -4748,6 +4779,7 @@ async fn replacement_handler_claims_g7_after_lagging_g6_is_replaced(
             sandbox_id,
             handler_a_claim.row.generation,
             "replaced",
+            None,
             None,
         )
         .await?;
@@ -4891,6 +4923,8 @@ async fn blank_pod_uid_decodes_as_absent_for_active_execution(
             SandboxLifecycle::Started,
             None,
             Some((attempt, SandboxTransitionTargetState::Started)),
+            None,
+            None,
         )
         .await?;
     assert_eq!(initialized.row.activation_attempt_id, Some(attempt));

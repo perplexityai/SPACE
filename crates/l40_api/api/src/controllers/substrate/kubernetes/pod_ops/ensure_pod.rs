@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::controllers::substrate::kubernetes::pod_runtime_upgrade::PodUpgrade;
+use crate::controllers::substrate::kubernetes::store::StoppedUpgradeRecord;
 use pplx_space_common_core::kubernetes::PodRuntimeUpgradeTargetState;
 
 /// Derive the per-restore placement decision a [`PodCreateContext`] renders,
@@ -290,6 +291,24 @@ impl KubernetesSubstrate {
                 err,
             ));
         }
+        // A stopped sandbox's upgrade may owe a disk backup that only its
+        // execution's record carries, so that execution is kept, not retired,
+        // and this attempt stops here: the node's outcome for the operation is
+        // read again by the upgrade's retry, or the owed backup is enqueued by
+        // the next activation, never inferred from the pod this deleted.
+        if self
+            .store
+            .keep_recorded_upgrade_after_stale_pod(sandbox.id, claim.row.generation)
+            .await?
+        {
+            return Err(SubstrateError::Unavailable {
+                message: format!(
+                    "sandbox {}'s runtime upgrade pod {} was stale after its create's answer was \
+                     lost and is deleted; its execution keeps the upgrade's record; retry",
+                    sandbox.id, claim.row.pod_name
+                ),
+            });
+        }
         let _ = self
             .store
             .cleanup_replaced_pod_tracking_if_generation(sandbox.id, claim.row.generation)
@@ -416,6 +435,47 @@ impl KubernetesSubstrate {
             self.sweep_lingering_prior_generation_pods(sandbox_id, generation)
                 .await?;
         }
+        // A stopped sandbox's upgrade (target state `stopped`) is recorded on
+        // every execution claimed for it, in the claim's own transaction and
+        // before any pod is created or reused for it: the pod carries this
+        // upgrade, so a retry that finds the execution must render exactly it
+        // again. Its pod is pinned to the disk node the caller checked, which
+        // the claim checks again under the sandbox's lock.
+        let stopped_upgrade_record = match runtime_upgrade.as_ref() {
+            Some(upgrade) if upgrade.target_state == PodRuntimeUpgradeTargetState::Stopped => {
+                let Some(disk_node) = suspend_restore_source_node else {
+                    return Err(SubstrateError::Failed {
+                        message: format!(
+                            "stopped sandbox {sandbox_id}'s runtime upgrade names no disk node to \
+                             pin its pod to"
+                        ),
+                    });
+                };
+                Some(StoppedUpgradeRecord {
+                    upgrade: upgrade.recorded(),
+                    disk_node: disk_node.to_string(),
+                })
+            }
+            _ => None,
+        };
+        // Any other activation of a stopped sandbox, or a drain's
+        // re-placement of one, may be about to take over an execution a
+        // stopped sandbox's runtime upgrade left after reaching its target:
+        // its claim clears the upgrade's record, so the disk backup the
+        // upgrade may still owe is enqueued first. The claim checks again
+        // under the sandbox's lock and refuses retryably if the upgrade still
+        // owes it, with none enqueued here (a lease that ended after this
+        // read).
+        let owed_backup_enqueued = if stopped_upgrade_record.is_none()
+            && matches!(
+                materialization_lifecycle,
+                SandboxLifecycle::Stopped | SandboxLifecycle::Restoring
+            ) {
+            self.enqueue_backup_owed_by_stopped_upgrade(sandbox_id)
+                .await?
+        } else {
+            None
+        };
         let mut claim = self
             .store
             .ensure_active_execution_claim_for_lifecycle(
@@ -425,6 +485,8 @@ impl KubernetesSubstrate {
                 activation_attempt
                     .as_ref()
                     .map(ActivationAttemptAssignment::request),
+                stopped_upgrade_record.as_ref(),
+                owed_backup_enqueued,
             )
             .await?;
         if let Some(activation_attempt) = activation_attempt.as_ref()
@@ -756,14 +818,19 @@ impl KubernetesSubstrate {
             // materialization renders is this execution's: an earlier attempt
             // of the same operation created it and ended between its POST and
             // its persist. Hydrate it rather than answering create-in-flight.
-            // The reflector may not have seen a pod an
+            // A stopped sandbox's upgrade has no restore source for the
+            // hydration above to run on, and a `stopped` claim never ages into
+            // a stale create, so without this its placement, which the stop's
+            // teardown cleared, would never come back, and the node's
+            // publication, accepted only from the node the sandbox is placed
+            // on, would never land. The reflector may not have seen a pod an
             // attempt on another replica created, so a cache miss is
             // confirmed with one GET.
             //
             // With no pod there, the attempt that claimed the execution ended
             // before its create was sent, and a create still in flight is
-            // only one this call's claim superseded: every claim refreshes
-            // the execution, so it never ages
+            // only one this call's claim superseded: every claim, takeover,
+            // expiry and record refreshes the execution, so it never ages
             // into a stale create while an upgrade's retries keep coming, and
             // answering create-in-flight would leave each retry without a pod
             // to read. So the attempt holding the claim creates it, at the
@@ -796,8 +863,8 @@ impl KubernetesSubstrate {
                 // No pod at the claim's name: this attempt holds the claim
                 // (assigned under the claim's row lock, refused while another
                 // lease runs), so it creates the pod rather than waiting on a
-                // create no attempt is making, for a start's or resume's
-                // upgrade alike. A create
+                // create no attempt is making. This covers a start's or
+                // resume's upgrade as well as the stopped upgrade's. A create
                 // still in flight lands at the same name and meets the
                 // conflict path, which reuses the pod carrying the operation.
                 None => {
@@ -931,6 +998,7 @@ impl KubernetesSubstrate {
                     activation_attempt
                         .as_ref()
                         .map(ActivationAttemptAssignment::request),
+                    stopped_upgrade_record.as_ref(),
                 )
                 .await?
             else {
@@ -1072,6 +1140,7 @@ impl KubernetesSubstrate {
                                 activation_attempt
                                     .as_ref()
                                     .map(ActivationAttemptAssignment::request),
+                                stopped_upgrade_record.as_ref(),
                             )
                             .await?
                         else {

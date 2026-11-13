@@ -141,9 +141,12 @@ impl DecidedUpgrade {
     /// `target_state`. A `started` target derives its operation from what is
     /// booted, so every retry names the same operation under the same
     /// authorization. A `stopped` target names a fresh one on every
-    /// decision, which keeps it apart from a start's operation, since a node
-    /// refuses to reuse an operation for another target state. Activations
-    /// render only `started` targets.
+    /// decision: its claim records the operation on the execution, in the
+    /// same transaction and before any pod carries it, and every retry
+    /// reads it back from there. A fresh id also keeps it apart from a
+    /// start's operation, which a node refuses to reuse for another target
+    /// state, and from one the control plane abandoned on the node
+    /// (`AbandonRuntimeUpgrade`), which the node refuses for good.
     pub(super) fn pod_upgrade(
         &self,
         sandbox_id: SandboxId,

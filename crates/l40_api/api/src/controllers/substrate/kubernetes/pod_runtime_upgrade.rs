@@ -78,6 +78,7 @@ use super::KubernetesSubstrate;
 use super::pod_ops::pod_matches_execution_generation;
 use super::sandbox_pod_view::SandboxPodView;
 use super::store::ActiveExecutionStatusRow;
+use super::store::RecordedRuntimeUpgrade;
 use super::support::execution_pod_create_in_flight;
 use crate::controllers::substrate::SubstrateError;
 
@@ -96,7 +97,9 @@ const OUTCOME_POLL: Duration = Duration::from_millis(200);
 /// inside it. The observation is otherwise bounded by the time left to the
 /// deadline, not the API server's, the database pool's or the node-RPC
 /// channel's timeouts, so a hung read, dial or call overshoots the deadline
-/// by at most this.
+/// by at most this. A stopped sandbox's upgrade bounds each read of the
+/// node's publication the same way, after the outcome's wait, so a read of
+/// each that hangs near the deadline can hold it up to twice this past it.
 pub(super) const NODE_READ_FLOOR: Duration = Duration::from_secs(1);
 
 /// A runtime upgrade as the control plane renders it on a sandbox pod; see
@@ -160,6 +163,16 @@ impl PodUpgrade {
             memory_loss: self.memory_loss,
             target_state: self.target_state,
             checkpoint_local_artifact_id: self.checkpoint_local_artifact_id,
+        }
+    }
+
+    /// What a stopped sandbox's upgrade records on its execution before its
+    /// pod exists, so a retry renders this same upgrade again.
+    pub(super) fn recorded(&self) -> RecordedRuntimeUpgrade {
+        RecordedRuntimeUpgrade {
+            operation_id: self.operation_id,
+            target: self.target,
+            authorization_id: self.authorization_id.clone(),
         }
     }
 }

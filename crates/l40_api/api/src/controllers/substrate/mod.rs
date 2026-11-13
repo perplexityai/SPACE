@@ -1448,6 +1448,31 @@ pub trait SubstrateAdapter: Send + Sync {
         charge: RecoveryCharge,
     ) -> Result<ExecutionActivation, SubstrateError>;
 
+    /// Upgrade a stopped sandbox's runtime to the cluster default without
+    /// starting it: decide the move as a start would, boot the disk under the
+    /// default on a short-lived execution and stop it again. The sandbox's
+    /// row stays `stopped` throughout. A rollback, or a boot refused before
+    /// it began, leaves it on its old environment and answers retryably: the
+    /// node deletes a rolled-back upgrade, so a retry under the same
+    /// operation boots it again and may succeed. Any other failure may come
+    /// after the node reached the default and published it there: say the
+    /// backup enqueue or the execution's retire failed. That leaves the
+    /// sandbox stopped on the default on its node, with the durable copy not
+    /// yet replaced, and keeps the execution and its pod for a retry, which
+    /// names the same operation, behind a retryable error (`Failed` only for
+    /// an execution whose pod name doesn't parse, which no retry can retire).
+    /// Nothing in this decision reads the at-activation setting: the caller
+    /// decides when to run it. `timeout` bounds the boot and its outcome
+    /// wait; the backup enqueue, pod delete and execution update that follow
+    /// a settled boot run after it, each under its own RPC or database
+    /// bound, so the call can return later than `timeout` by their duration.
+    /// Direct answers `Unsupported` (the gap row in `direct.rs`).
+    async fn upgrade_stopped_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        timeout: Duration,
+    ) -> Result<runtime_upgrade::StoppedRuntimeUpgrade, SubstrateError>;
+
     /// Restore a suspended sandbox through the active execution object.
     ///
     /// This is separate from `start_execution` because restore may use
@@ -2145,6 +2170,36 @@ pub async fn enqueue_artifact_backup_with_client(
     expected_kind: ArtifactKind,
     source: BackupSource,
 ) -> Result<EnqueuedArtifactBackup, SubstrateError> {
+    enqueue_artifact_backup_status_with_client(client, sandbox_id, expected_kind, source)
+        .await
+        .map_err(|status| match status {
+            EnqueueArtifactBackupFailure::Refused(status) => {
+                artifact_backup_refusal(&status, sandbox_id, endpoint_addr)
+            }
+            EnqueueArtifactBackupFailure::Response(error) => error,
+        })
+}
+
+/// Why [`enqueue_artifact_backup_status_with_client`] enqueued nothing.
+#[derive(Debug)]
+pub enum EnqueueArtifactBackupFailure {
+    /// Sandbox-manager, or the transport to it, refused the call with this
+    /// status, as it came.
+    Refused(tonic::Status),
+    /// Sandbox-manager answered with a response that doesn't describe the
+    /// backup asked for.
+    Response(SubstrateError),
+}
+
+/// [`enqueue_artifact_backup_with_client`], with a refusal's status as
+/// sandbox-manager answered it, for a caller that tells a refusal no retry
+/// changes from one that may clear.
+pub async fn enqueue_artifact_backup_status_with_client(
+    client: &mut RuntimeClient,
+    sandbox_id: SandboxId,
+    expected_kind: ArtifactKind,
+    source: BackupSource,
+) -> Result<EnqueuedArtifactBackup, EnqueueArtifactBackupFailure> {
     let source = backup_source_to_proto(source);
     let response = client
         .enqueue_sandbox_artifact_backup(
@@ -2162,9 +2217,10 @@ pub async fn enqueue_artifact_backup_with_client(
             },
         )
         .await
-        .map_err(|err| artifact_backup_refusal(&err, sandbox_id, endpoint_addr))?
+        .map_err(EnqueueArtifactBackupFailure::Refused)?
         .into_inner();
     parse_enqueued_artifact_backup(response, expected_kind)
+        .map_err(EnqueueArtifactBackupFailure::Response)
 }
 
 /// The [`SubstrateError`] a refused `EnqueueArtifactBackup` answers with, on
@@ -2180,7 +2236,9 @@ fn artifact_backup_refusal(
             message: format!("sandbox {sandbox_id} not present on node-api at {endpoint_addr}"),
         },
         // `Aborted` is a sandbox not yet stopped or suspended, which may
-        // still get there; callers treat it like `FailedPrecondition`.
+        // still get there; callers treat it like `FailedPrecondition`. A
+        // caller that tells the two apart reads the status itself
+        // ([`enqueue_artifact_backup_status_with_client`]).
         tonic::Code::FailedPrecondition | tonic::Code::Aborted => SubstrateError::Conflict {
             message: format!("node-api refused artifact backup: {}", err.message()),
         },
@@ -2715,6 +2773,22 @@ impl SubstrateAdapter for Substrate {
                 substrate
                     .start_execution(metric_identity, sandbox_id, options, charge)
                     .await
+            }
+        }
+    }
+
+    async fn upgrade_stopped_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        timeout: Duration,
+    ) -> Result<runtime_upgrade::StoppedRuntimeUpgrade, SubstrateError> {
+        match &self.inner {
+            Inner::Direct(substrate) => {
+                substrate.upgrade_stopped_runtime(sandbox_id, timeout).await
+            }
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => {
+                substrate.upgrade_stopped_runtime(sandbox_id, timeout).await
             }
         }
     }
