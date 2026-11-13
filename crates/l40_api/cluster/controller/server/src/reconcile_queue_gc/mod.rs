@@ -71,10 +71,10 @@ impl ReconcilerConfig {
     /// EC2-detector instance config, read from `SPACE_RECONCILE_QUEUE_GC_*`.
     /// Owns the dead-letter pass.
     pub fn from_env_ec2() -> Self {
-        Self::from_environment_ec2(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment_ec2(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment_ec2(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment_ec2(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         Self {
             enabled: config.truthy_default("SPACE_RECONCILE_QUEUE_GC_ENABLED", false),
@@ -95,12 +95,10 @@ impl ReconcilerConfig {
     /// `SPACE_GONE_NODE_QUEUE_GC_*`. Does not run the dead-letter pass (the EC2
     /// instance owns it).
     pub fn from_env_kube() -> Self {
-        Self::from_environment_kube(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment_kube(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment_kube(
-        env: &dyn pplx_space_common_core::env::Environment,
-    ) -> Self {
+    pub(crate) fn from_environment_kube(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         Self {
             enabled: config.destructive_gate("SPACE_GONE_NODE_QUEUE_GC_ENABLED"),

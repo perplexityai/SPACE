@@ -93,10 +93,10 @@ impl ReconcilerConfig {
     /// Read config from env vars. Helm renders this under
     /// `clusterController.reconcilers.failedRestorableRepair.*`.
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         Self {
             // Ships enabled and writes, so a malformed value must disable it
             // rather than leave it running.

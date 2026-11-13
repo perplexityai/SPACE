@@ -73,7 +73,8 @@ pplx-space-spaced-update = { workspace = true }
 
 [dev-dependencies]
 futures-util = { workspace = true }
-pplx-space-common-core = { workspace = true, features = ["serde", "test-hooks"] }
+pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 prost-types = { workspace = true }
 rstest = { workspace = true }
 rusqlite = { workspace = true, features = ["serialize"] }

@@ -582,8 +582,8 @@ async fn initialize_authority_service(
         };
 
     let platform_kek_provider = pplx_space_common_core::types::platform_default_kek_provider();
-    let in_memory_enabled = pplx_space_common_core::env::env_flag(
-        pplx_space_common_core::env::test_hook_var(IN_MEMORY_KEK_ENABLED_ENV).as_deref(),
+    let in_memory_enabled = pplx_space_env_vars::env_flag(
+        pplx_space_test_hooks::test_hook_var(IN_MEMORY_KEK_ENABLED_ENV).as_deref(),
         false,
     );
     let mut composite = CompositeKeyWrapper::new();
@@ -608,7 +608,7 @@ async fn initialize_authority_service(
         let pool = pool
             .as_ref()
             .ok_or(RunCredmgrError::InMemoryPlatformKekMissingDatabase)?;
-        let identifier = pplx_space_common_core::env::test_hook_var(PLATFORM_KEK_IDENTIFIER_ENV)
+        let identifier = pplx_space_test_hooks::test_hook_var(PLATFORM_KEK_IDENTIFIER_ENV)
             .filter(|value| !value.is_empty())
             .ok_or(RunCredmgrError::MissingPlatformKekIdentifier)?;
         let identifier = MasterKeyIdentifier::parse(identifier)

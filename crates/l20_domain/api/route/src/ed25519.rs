@@ -349,18 +349,18 @@ pub struct SpaceApiRouteEd25519Authority {
 
 impl SpaceApiRouteEd25519Authority {
     pub fn load_from_env() -> Result<Option<Self>, SpaceApiRouteEd25519Error> {
-        Self::load_from_environment_impl(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::load_from_environment_impl(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn load_from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Option<Self>, SpaceApiRouteEd25519Error> {
         Self::load_from_environment_impl(env)
     }
 
     fn load_from_environment_impl(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Option<Self>, SpaceApiRouteEd25519Error> {
         let key_path = env.var_os(SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV);
         let encoded_key = env.var(SPACE_API_ROUTE_ED25519_SIGNING_KEY_ENV).ok();
@@ -397,18 +397,18 @@ impl SpaceApiRouteEd25519Authority {
     }
 
     pub fn load_required_from_env() -> Result<Self, SpaceApiRouteEd25519Error> {
-        Self::load_required_from_environment_impl(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::load_required_from_environment_impl(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn load_required_from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Self, SpaceApiRouteEd25519Error> {
         Self::load_required_from_environment_impl(env)
     }
 
     fn load_required_from_environment_impl(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Self, SpaceApiRouteEd25519Error> {
         Self::load_from_environment_impl(env)?
             .ok_or(SpaceApiRouteEd25519Error::MissingSigningConfiguration)

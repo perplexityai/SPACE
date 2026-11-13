@@ -19,8 +19,8 @@ k8s = ["dep:k8s-openapi", "dep:kube", "dep:pplx-space-kube-client"]
 # get them under `cfg(test)`; external test suites opt in through a
 # dev-dependency.
 test-support = ["dep:axum", "dep:jiff", "dep:tokio-util"]
-# Enables the test-only environment overrides (see `pplx_space_common_core::env::test_hook`).
-test-hooks = ["pplx-space-common-core/test-hooks"]
+# Enables the test-only environment overrides (see `pplx_space_test_hooks::test_hook`).
+test-hooks = ["pplx-space-test-hooks/test-hooks"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
@@ -45,8 +45,10 @@ tracing = { workspace = true }
 pplx-space-api-route = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true }
+pplx-space-env-vars = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-metrics-emit = { workspace = true }
+pplx-space-test-hooks = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 
 [dev-dependencies]
@@ -60,5 +62,5 @@ tonic-health = { workspace = true }
 tonic-prost = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
-pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 pplx-space-test-env = { workspace = true }
+pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }

@@ -73,7 +73,7 @@ impl RuntimeUpgradeAtActivation {
     }
 
     pub fn from_env() -> Self {
-        Self::from_enabled(pplx_space_common_core::env::env_flag_var(Self::ENV, false))
+        Self::from_enabled(pplx_space_env_vars::env_flag_var(Self::ENV, false))
     }
 
     pub fn is_enabled(self) -> bool {

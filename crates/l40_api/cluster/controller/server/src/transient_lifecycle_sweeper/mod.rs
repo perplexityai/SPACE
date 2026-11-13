@@ -891,10 +891,10 @@ impl ReconcilerConfig {
     /// Read config from env vars. Helm renders these under
     /// `clusterController.reconcilers.transientLifecycleSweeper.*`.
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         let default = Self::default();
         Self {
@@ -991,10 +991,7 @@ impl ReconcilerConfig {
 /// positive integer -> [`LifecycleAge::Override`]; unset or unparseable ->
 /// [`LifecycleAge::UseDefault`] (so a typo doesn't silently disable a
 /// lifecycle).
-fn env_lifecycle_age(
-    env: &dyn pplx_space_common_core::env::Environment,
-    var: &str,
-) -> LifecycleAge {
+fn env_lifecycle_age(env: &dyn pplx_space_env_vars::Environment, var: &str) -> LifecycleAge {
     match env.var(var).ok().and_then(|raw| raw.parse::<u64>().ok()) {
         Some(0) => LifecycleAge::Disabled,
         Some(n) => PositiveDuration::new(Duration::from_secs(n))

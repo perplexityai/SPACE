@@ -57,6 +57,7 @@ pplx-space-api-route = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
+pplx-space-env-vars = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-feature-flags = { workspace = true }
 pplx-space-guest-process = { workspace = true }

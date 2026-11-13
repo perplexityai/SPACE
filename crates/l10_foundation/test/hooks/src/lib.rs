@@ -1,19 +1,7 @@
-//! SPACE-specific environment settings and test-only overrides.
-//!
-//! The generic parsing (the shared flag vocabulary, the positive-`f64`
-//! helpers and the [`Environment`] source) lives in `pplx-space-env-vars`,
-//! which has no SPACE dependencies; it is re-exported here by name so the
-//! `env::` paths keep resolving.
+//! Test-only environment overrides, compiled in only with the `test-hooks`
+//! feature; see [`test_hook`].
 
-pub use pplx_space_env_vars::{
-    Environment, ProcessEnvironment, env_destructive_gate, env_destructive_gate_var, env_flag,
-    env_flag_var, parse_env_flag, parse_positive_f64_env, valid_positive_f64,
-};
-
-/// Admission gate for create-time sandbox node-pool placement.
-pub const SANDBOX_ALLOW_PLACEMENT_ENV: &str = "SPACE_ALLOW_SANDBOX_PLACEMENT";
-/// Placement is operator-only and remains disabled unless explicitly enabled.
-pub const DEFAULT_SANDBOX_ALLOW_PLACEMENT: bool = false;
+use pplx_space_env_vars::{Environment, ProcessEnvironment};
 
 /// Read a test-only override.
 ///

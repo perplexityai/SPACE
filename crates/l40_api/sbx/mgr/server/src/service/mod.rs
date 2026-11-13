@@ -1886,7 +1886,7 @@ impl SandboxManagerService {
             host_control_socket_path: options.host_control_socket_path,
             credential_manager_endpoint,
             credential_manager_client,
-            network_credentials_enabled: pplx_space_common_core::env::env_flag(
+            network_credentials_enabled: pplx_space_env_vars::env_flag(
                 std::env::var(NETWORK_CREDENTIALS_ENABLED_ENV)
                     .ok()
                     .as_deref(),

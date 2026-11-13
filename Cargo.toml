@@ -138,6 +138,7 @@ members = [
     "crates/l10_foundation/aws/client",
     "crates/l10_foundation/s3/http/client",
     "crates/l10_foundation/env/vars",
+    "crates/l10_foundation/test/hooks",
     "crates/l10_foundation/feature/flags",
     "crates/l20_domain/events",
     "crates/l30_storage/federated/grant/store",
@@ -393,6 +394,7 @@ pplx-space-db-test-fixtures = { path = "crates/test_support/db/test/fixtures" }
 pplx-space-dependency-drain = { path = "crates/l10_foundation/dependency/drain" }
 pplx-space-ecw-credential = { path = "crates/l20_domain/ecw/credential" }
 pplx-space-env-vars = { path = "crates/l10_foundation/env/vars" }
+pplx-space-test-hooks = { path = "crates/l10_foundation/test/hooks" }
 pplx-space-migration-checksums = { path = "crates/l10_foundation/migration/checksums" }
 pplx-space-execution-catalog = { path = "crates/l40_api/execution/catalog" }
 pplx-space-execution-common = { path = "crates/l20_domain/execution/common" }

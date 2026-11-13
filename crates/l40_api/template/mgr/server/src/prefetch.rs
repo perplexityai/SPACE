@@ -319,7 +319,7 @@ const CONCURRENCY: usize = 2;
 /// LRU eviction lands.
 const DEFAULT_LATEST_N: u32 = 5;
 /// Test-hook name overriding the latest-N count (see
-/// `pplx_space_common_core::env::test_hook`); release builds never read it.
+/// `pplx_space_test_hooks::test_hook`); release builds never read it.
 const LATEST_N_TEST_HOOK: &str = "SPACE_TEMPLATE_PREFETCH_LATEST_N";
 
 /// Single jitter knob, applied as a fraction of the configured
@@ -386,15 +386,14 @@ impl PrefetchConfig {
     pub fn from_env() -> Self {
         // Fail-open: prefetch is best-effort and won't disrupt on-demand
         // traffic if it errors, so an unrecognized value leaves it enabled.
-        let enabled =
-            pplx_space_common_core::env::env_flag_var("SPACE_TEMPLATE_PREFETCH_ENABLED", true);
+        let enabled = pplx_space_env_vars::env_flag_var("SPACE_TEMPLATE_PREFETCH_ENABLED", true);
         // Latest-N: parsed permissively. `0` is a meaningful value
         // (disable the pass), so unset → DEFAULT_LATEST_N, but an
         // explicit `0` is respected. The cluster-side handler caps at
         // 50; clamp here defensively so a misconfigured operator
         // doesn't spam the cluster API with a validation error every
         // tick.
-        let latest_n = match pplx_space_common_core::env::test_hook_var(LATEST_N_TEST_HOOK) {
+        let latest_n = match pplx_space_test_hooks::test_hook_var(LATEST_N_TEST_HOOK) {
             Some(s) => s.parse::<u32>().unwrap_or(DEFAULT_LATEST_N).min(50),
             None => DEFAULT_LATEST_N,
         };

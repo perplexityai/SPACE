@@ -86,7 +86,7 @@ const ENV_SUSPEND_WAKE_ARBITRATION: &str = "SPACE_SUSPEND_WAKE_ARBITRATION";
 /// values fail toward the fixed behavior; only an explicit falsy value
 /// disables it.
 pub(in crate::service) fn suspend_wake_arbitration_enabled() -> bool {
-    pplx_space_common_core::env::env_flag_var(ENV_SUSPEND_WAKE_ARBITRATION, true)
+    pplx_space_env_vars::env_flag_var(ENV_SUSPEND_WAKE_ARBITRATION, true)
 }
 
 /// A suspend is superseded when its request arrived at this process before

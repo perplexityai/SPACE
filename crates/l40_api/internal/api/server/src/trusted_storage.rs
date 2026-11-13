@@ -2,8 +2,8 @@
 
 use std::collections::BTreeSet;
 
-use pplx_space_common_core::env::{Environment, ProcessEnvironment};
 use pplx_space_common_core::types::StorageUri;
+use pplx_space_env_vars::{Environment, ProcessEnvironment};
 
 pub(super) const TRUSTED_BUCKETS_ENV: &str = "SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS";
 

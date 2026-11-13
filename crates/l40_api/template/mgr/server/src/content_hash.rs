@@ -42,7 +42,7 @@ const PRODUCTION_ALGORITHM_ENV: &str = "SPACE_TEMPLATE_HASH_ALGORITHM";
 pub struct TemplateHashConfigError;
 
 pub(crate) fn production_algorithm_from_environment(
-    environment: &dyn pplx_space_common_core::env::Environment,
+    environment: &dyn pplx_space_env_vars::Environment,
 ) -> Result<HashAlg, TemplateHashConfigError> {
     match environment.var(PRODUCTION_ALGORITHM_ENV) {
         Ok(value) => value.parse().map_err(|_| TemplateHashConfigError),

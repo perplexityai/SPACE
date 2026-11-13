@@ -1037,7 +1037,7 @@ pub struct GcConfig {
 
 impl GcConfig {
     pub(crate) const ENV_BUDGET: &'static str = "SPACE_TEMPLATE_CACHE_BUDGET_BYTES";
-    /// Test hooks (`pplx_space_common_core::env::test_hook`): compiled in only
+    /// Test hooks (`pplx_space_test_hooks::test_hook`): compiled in only
     /// with the `test-hooks` feature, so release binaries cannot shrink the
     /// GC timers. Smoke benches use them to make eviction observable.
     pub(crate) const ENV_INTERVAL_SECS: &'static str = "SPACE_TEMPLATE_GC_INTERVAL_SECS";
@@ -1066,10 +1066,10 @@ impl GcConfig {
     const HEADROOM_FRACTION: f64 = 0.9;
 
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let budget = match env.var(Self::ENV_BUDGET).ok() {
             None => Some(Self::DEFAULT_BUDGET_BYTES),
             Some(raw) => match raw.trim().parse::<u64>() {
@@ -1089,11 +1089,11 @@ impl GcConfig {
             },
         };
         let enabled = budget.is_some();
-        let interval_secs = pplx_space_common_core::env::test_hook(env, Self::ENV_INTERVAL_SECS)
+        let interval_secs = pplx_space_test_hooks::test_hook(env, Self::ENV_INTERVAL_SECS)
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(Self::DEFAULT_INTERVAL_SECS);
-        let grace_secs = pplx_space_common_core::env::test_hook(env, Self::ENV_GRACE_SECS)
+        let grace_secs = pplx_space_test_hooks::test_hook(env, Self::ENV_GRACE_SECS)
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(Self::DEFAULT_GRACE_SECS);
         if enabled && grace_secs < Self::SAFETY_GRACE_FLOOR_SECS {

@@ -123,10 +123,10 @@ mod tests;
 mod otlp_tests;
 
 pub fn net_gateway_env() -> HashMap<String, String> {
-    net_gateway_env_from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    net_gateway_env_from_environment(&pplx_space_env_vars::ProcessEnvironment)
 }
 fn net_gateway_env_from_environment(
-    source: &dyn pplx_space_common_core::env::Environment,
+    source: &dyn pplx_space_env_vars::Environment,
 ) -> HashMap<String, String> {
     let mut env = telemetry_env_for_service("space-net-gateway");
     insert_non_empty_env_values(&mut env, ROUTE_TOKEN_ENV_KEYS, |key| source.var(key).ok());
