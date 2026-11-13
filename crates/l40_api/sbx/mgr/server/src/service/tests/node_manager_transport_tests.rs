@@ -296,10 +296,8 @@ async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed()
     assert_eq!(row.state, SandboxStatus::from(SandboxState::Suspending));
     assert!(staging.join(publication::ENCRYPTED_CAPTURE_RECORD).exists());
 
-    // Once the holder exits, the next pass seals it. That pass's own
-    // classification skips the row while the seal task holds its locks, but
-    // can run after a fast seal finishes and publish the capture at once;
-    // otherwise the pass after it does.
+    // Once the holder exits, the next pass seals it. The following pass
+    // publishes the capture before dispatching another seal attempt.
     recover_batch(&service, cache.path(), &id).await;
     assert_eq!(
         node_manager.calls(),
@@ -385,7 +383,24 @@ async fn complete_staged_capture_publishes_past_an_older_unsealed_record() {
             .unwrap(),
         Some(newer),
     );
-    recover_batch(&service, cache.path(), &id).await;
+    // Keep spawned Tokio seal tasks unpolled while blocking classification
+    // runs. An already sealed capture must publish without a redundant seal
+    // task first releasing the row's lifecycle fences.
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                runtime.block_on(service.recover_deferred_suspend_publication_batch(
+                    cache.path(),
+                    vec![service.lookup_sandbox(&id).unwrap()],
+                    &CancellationToken::new(),
+                    &mut Default::default(),
+                    (),
+                ))
+            })
+            .join()
+            .unwrap();
+    });
 
     assert_eq!(
         node_manager.calls().len(),

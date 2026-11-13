@@ -731,12 +731,6 @@ impl SandboxManagerService {
         schedule: &mut crate::retained_source::InspectionSchedule,
         hold: impl Send + 'static,
     ) -> crate::retained_source::RetainedSourceVerdicts {
-        for row in rows.iter().filter(|row| unowned_publication(row)) {
-            if shutdown.is_cancelled() {
-                break;
-            }
-            self.spawn_encrypted_capture_seal(cache_dir, row);
-        }
         let verdicts = self
             .inspect_retained_sources_in(
                 rows.iter()
@@ -746,22 +740,39 @@ impl SandboxManagerService {
                 schedule,
             )
             .await;
-        let (service, cache_dir, shutdown) =
+        let (service, recovery_cache_dir, recovery_shutdown) =
             (self.clone(), cache_dir.to_path_buf(), shutdown.clone());
+        let recovery_rows = rows.clone();
         let recovered = tokio::task::spawn_blocking(move || {
             let _hold = hold;
-            if let Err(error) = service
-                .recover_deferred_suspend_publications_in(&cache_dir, rows, &shutdown, &verdicts)
-            {
+            if let Err(error) = service.recover_deferred_suspend_publications_in(
+                &recovery_cache_dir,
+                recovery_rows,
+                &recovery_shutdown,
+                &verdicts,
+            ) {
                 tracing::warn!(%error, "periodic suspend publication recovery failed; will retry");
             }
             verdicts
         })
         .await;
-        recovered.unwrap_or_else(|error| {
-            tracing::warn!(%error, "periodic suspend publication recovery task failed");
-            Default::default()
-        })
+        let verdicts = match recovered {
+            Ok(verdicts) => verdicts,
+            Err(error) => {
+                tracing::warn!(%error, "periodic suspend publication recovery task failed");
+                return Default::default();
+            }
+        };
+        // Classify completed captures before seal retries take their fences.
+        // Otherwise a no-op seal can exclude publication on every pass, even
+        // after the previous pass sealed the capture successfully.
+        for row in rows.iter().filter(|row| unowned_publication(row)) {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            self.spawn_encrypted_capture_seal(cache_dir, row);
+        }
+        verdicts
     }
 
     /// Retry, in its own task, the seal of an encrypted capture that a suspend
