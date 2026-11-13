@@ -1652,3 +1652,21 @@ async fn build_dir_does_not_hang_on_a_silent_node_manager() {
     );
     assert!(!dir.exists(), "no plain-directory build was minted");
 }
+
+/// node-manager accepts the delete and never answers: cleanup falls through
+/// to the local removal instead of holding the pull's digest forever.
+#[tokio::test(start_paused = true)]
+async fn build_dir_cleanup_does_not_hang_on_a_silent_node_manager() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("sha256:abc");
+    std::fs::create_dir(&dir).unwrap();
+
+    remove_build_dir_with(
+        &dir,
+        "pull_failed",
+        std::future::pending::<Result<(), String>>(),
+    )
+    .await;
+
+    assert!(!dir.exists(), "the local fallback removed the build dir");
+}

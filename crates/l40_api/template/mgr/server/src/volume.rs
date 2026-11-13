@@ -2419,7 +2419,28 @@ async fn delete_digest_dir_via_nodemgr(
 /// A subvolume root it can't remove stays without a row, and pulls refuse
 /// it until the GC tick's rowless check removes it.
 async fn remove_build_dir(name: &str, content_hash: &str, dir: &Path, reason: &'static str) {
-    match delete_digest_dir_via_nodemgr(name, content_hash, dir).await {
+    remove_build_dir_with(
+        dir,
+        reason,
+        delete_digest_dir_via_nodemgr(name, content_hash, dir),
+    )
+    .await;
+}
+
+/// How long build-dir cleanup waits on node-manager's delete before falling
+/// through to the local removal. node-manager can accept the socket and
+/// never answer, and the pull holds its digest until cleanup finishes.
+const NODE_MANAGER_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn remove_build_dir_with(
+    dir: &Path,
+    reason: &'static str,
+    nodemgr_delete: impl std::future::Future<Output = Result<(), String>>,
+) {
+    let deleted = tokio::time::timeout(NODE_MANAGER_DELETE_TIMEOUT, nodemgr_delete)
+        .await
+        .unwrap_or_else(|_| Err("node-manager did not answer".to_string()));
+    match deleted {
         Ok(()) => {
             info!(dir = %dir.display(), reason, "removed digest dir (via nodemgr)");
             return;
