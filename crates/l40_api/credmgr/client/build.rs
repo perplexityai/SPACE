@@ -53,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         ])
         .extern_path(
             ".space.credential.manager.v1.ResolvedNetworkCredential",
-            "::pplx_space_credential_injection_core::proto::ResolvedNetworkCredential",
+            "::pplx_space_credential_injection::proto::ResolvedNetworkCredential",
         );
     pplx_space_common_proto_build::compile_protos(builder, &[cred_file], &[proto_root])?;
 

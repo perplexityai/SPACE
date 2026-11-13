@@ -4883,8 +4883,7 @@ dependencies = [
  "pplx-space-cluster-trigger-queue",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-work-coalescer",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-credential-injection-store",
  "pplx-space-credmgr-client",
  "pplx-space-db-test-fixtures",
@@ -4929,6 +4928,7 @@ dependencies = [
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
+ "pplx-space-work-coalescer",
  "prost",
  "prost-types",
  "rand 0.10.2",
@@ -5366,20 +5366,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-common-connection-admission"
-version = "0.8.2"
-dependencies = [
- "libc",
- "thiserror 2.0.20",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-health",
- "tracing",
-]
-
-[[package]]
 name = "pplx-space-common-core"
 version = "0.8.2"
 dependencies = [
@@ -5457,40 +5443,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-common-grpc-lb"
-version = "0.8.2"
-dependencies = [
- "futures-util",
- "http 1.5.0",
- "k8s-openapi",
- "kube",
- "pplx-space-grpc-metrics",
- "pplx-space-observability",
- "thiserror 2.0.20",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "pplx-space-common-io"
-version = "0.8.2"
-dependencies = [
- "aead-stream",
- "aes-gcm",
- "libc",
- "pplx-space-stopwatch",
- "rand 0.10.2",
- "rustix",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "zstd",
-]
-
-[[package]]
 name = "pplx-space-common-jobs"
 version = "0.8.2"
 dependencies = [
@@ -5512,10 +5464,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-common-lru-reaper"
-version = "0.8.2"
-
-[[package]]
 name = "pplx-space-common-proto-build"
 version = "0.8.2"
 dependencies = [
@@ -5526,15 +5474,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-common-work-coalescer"
+name = "pplx-space-connection-admission"
 version = "0.8.2"
 dependencies = [
- "dashmap",
+ "libc",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-stream",
  "tokio-util",
+ "tonic",
+ "tonic-health",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -5554,7 +5504,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-credential-injection-core"
+name = "pplx-space-credential-injection"
 version = "0.8.2"
 dependencies = [
  "anyhow",
@@ -5571,7 +5521,7 @@ name = "pplx-space-credential-injection-store"
 version = "0.8.2"
 dependencies = [
  "pplx-space-common-core",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-db-test-fixtures",
  "pplx-space-net-common",
  "serde",
@@ -5641,7 +5591,7 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-credential-injection-store",
  "pplx-space-credential-provider-client",
  "pplx-space-credmgr-client",
@@ -5699,7 +5649,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-rustls-provider",
  "pplx-space-test-env",
  "prost",
@@ -5988,6 +5938,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-file-io"
+version = "0.8.2"
+dependencies = [
+ "aead-stream",
+ "aes-gcm",
+ "libc",
+ "pplx-space-stopwatch",
+ "rand 0.10.2",
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "pplx-space-grpc-lb"
+version = "0.8.2"
+dependencies = [
+ "futures-util",
+ "http 1.5.0",
+ "k8s-openapi",
+ "kube",
+ "pplx-space-grpc-metrics",
+ "pplx-space-observability",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "pplx-space-grpc-metrics"
 version = "0.8.2"
 dependencies = [
@@ -6231,6 +6215,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-lru-reaper"
+version = "0.8.2"
+
+[[package]]
 name = "pplx-space-metrics-emit"
 version = "0.8.2"
 dependencies = [
@@ -6341,10 +6329,10 @@ dependencies = [
  "nix 0.31.3",
  "parking_lot",
  "pplx-space-api-route",
- "pplx-space-common-connection-admission",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-credential-injection-core",
+ "pplx-space-connection-admission",
+ "pplx-space-credential-injection",
  "pplx-space-credmgr-client",
  "pplx-space-events",
  "pplx-space-grpc-rate-limiter",
@@ -6391,7 +6379,7 @@ dependencies = [
  "jiff",
  "pplx-space-api-route",
  "pplx-space-common-core",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-net-common",
  "pplx-space-net-gateway",
  "pplx-space-net-gateway-client",
@@ -6475,9 +6463,9 @@ dependencies = [
  "pplx-space-build-mgr-client",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-grpc-lb",
  "pplx-space-common-proto-build",
  "pplx-space-execution-common",
+ "pplx-space-grpc-lb",
  "pplx-space-net-common",
  "pplx-space-net-gateway-client",
  "pplx-space-node-mgr-client",
@@ -6723,10 +6711,10 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-io",
  "pplx-space-credmgr-client",
  "pplx-space-events",
  "pplx-space-execution-common",
+ "pplx-space-file-io",
  "pplx-space-grpc-metrics",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
@@ -6846,10 +6834,10 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-io",
  "pplx-space-common-proto-build",
  "pplx-space-execution-catalog",
  "pplx-space-execution-common",
+ "pplx-space-file-io",
  "pplx-space-metrics-emit",
  "pplx-space-test-env",
  "pplx-space-transparent-proxy-socket",
@@ -7362,10 +7350,8 @@ dependencies = [
  "pplx-space-bearer-token",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-io",
  "pplx-space-common-jobs",
- "pplx-space-common-lru-reaper",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-credmgr",
  "pplx-space-credmgr-client",
  "pplx-space-dependency-drain",
@@ -7373,12 +7359,14 @@ dependencies = [
  "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-feature-flags",
+ "pplx-space-file-io",
  "pplx-space-grpc-metrics",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
  "pplx-space-ingress-admission",
  "pplx-space-k8s-node-id",
  "pplx-space-local-health",
+ "pplx-space-lru-reaper",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-net-gateway",
@@ -7663,7 +7651,7 @@ dependencies = [
  "hyper-util",
  "pplx-space-common-core",
  "pplx-space-common-proto-build",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-net-common",
  "pplx-space-spaced-build",
  "pplx-space-spaced-guest-protocol",
@@ -7778,9 +7766,9 @@ dependencies = [
  "libc",
  "nix 0.31.3",
  "opentelemetry-proto",
- "pplx-space-common-connection-admission",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
+ "pplx-space-connection-admission",
  "pplx-space-grpc-metrics",
  "pplx-space-guest-capability",
  "pplx-space-guest-process",
@@ -7908,9 +7896,9 @@ dependencies = [
  "anyhow",
  "futures-util",
  "http-body 1.1.0",
- "pplx-space-common-connection-admission",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
+ "pplx-space-connection-admission",
  "pplx-space-grpc-metrics",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
@@ -8044,17 +8032,17 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-io",
  "pplx-space-common-jobs",
- "pplx-space-common-lru-reaper",
  "pplx-space-db-test-fixtures",
  "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-feature-flags",
+ "pplx-space-file-io",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
  "pplx-space-internal-api-server",
  "pplx-space-local-health",
+ "pplx-space-lru-reaper",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
@@ -8264,9 +8252,9 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-io",
  "pplx-space-common-jobs",
  "pplx-space-credmgr-client",
+ "pplx-space-file-io",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
  "pplx-space-local-health",
@@ -8353,6 +8341,18 @@ dependencies = [
  "tonic",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "pplx-space-work-coalescer"
+version = "0.8.2"
+dependencies = [
+ "dashmap",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

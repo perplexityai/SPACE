@@ -13,20 +13,18 @@
 "pplx-space-btrfs" = { to = "crates/l10_foundation/btrfs" }
 "pplx-space-byte-size" = { to = "crates/l10_foundation/byte/size" }
 "pplx-space-common-cli" = { to = "crates/l10_foundation/common/cli" }
-"pplx-space-common-connection-admission" = { to = "crates/l10_foundation/common/connection/admission" }
-"pplx-space-common-grpc-lb" = { to = "crates/l10_foundation/common/grpc/lb" }
-"pplx-space-common-grpc" = { to = "crates/l10_foundation/common/grpc/transport" }  # leaf: pplx-space-common-grpc-lb nest in l10_foundation/common/grpc
-"pplx-space-common-io" = { to = "crates/l10_foundation/common/io" }
+"pplx-space-common-grpc" = { to = "crates/l10_foundation/common/grpc/transport" }  # leaf
 "pplx-space-common-jobs" = { to = "crates/l10_foundation/common/jobs" }
-"pplx-space-common-lru-reaper" = { to = "crates/l10_foundation/common/lru/reaper" }
 "pplx-space-common-proto-build" = { to = "crates/l10_foundation/common/proto/build" }
-"pplx-space-common-work-coalescer" = { to = "crates/l10_foundation/common/work/coalescer" }
+"pplx-space-common-connection-admission" = { to = "crates/l10_foundation/connection/admission", rename = "pplx-space-connection-admission" }  # renamed
 "pplx-space-content-digest" = { to = "crates/l10_foundation/content/digest" }
 "pplx-space-cpu-arch" = { to = "crates/l10_foundation/cpu/arch" }
 "pplx-space-dependency-drain" = { to = "crates/l10_foundation/dependency/drain" }
 "pplx-space-durations" = { to = "crates/l10_foundation/durations" }
 "pplx-space-env-vars" = { to = "crates/l10_foundation/env/vars" }
 "pplx-space-feature-flags" = { to = "crates/l10_foundation/feature/flags" }
+"pplx-space-common-io" = { to = "crates/l10_foundation/file/io", rename = "pplx-space-file-io" }  # renamed
+"pplx-space-common-grpc-lb" = { to = "crates/l10_foundation/grpc/lb", rename = "pplx-space-grpc-lb" }  # renamed
 "pplx-space-grpc-metrics" = { to = "crates/l10_foundation/grpc/metrics" }
 "pplx-space-grpc-rate-limiter" = { to = "crates/l10_foundation/grpc/rate/limiter" }
 "pplx-space-guest-capability" = { to = "crates/l10_foundation/guest/capability" }
@@ -34,6 +32,7 @@
 "pplx-space-k8s-ids" = { to = "crates/l10_foundation/k8s/ids" }
 "pplx-space-kube-client" = { to = "crates/l10_foundation/kube/client" }
 "pplx-space-linux-ids" = { to = "crates/l10_foundation/linux/ids" }
+"pplx-space-common-lru-reaper" = { to = "crates/l10_foundation/lru/reaper", rename = "pplx-space-lru-reaper" }  # renamed
 "pplx-space-metrics-emit" = { to = "crates/l10_foundation/metrics/emit" }
 "pplx-space-migration-checksums" = { to = "crates/l10_foundation/migration/checksums" }
 "pplx-space-object-store" = { to = "crates/l10_foundation/object/store" }
@@ -57,13 +56,14 @@
 "pplx-space-unix-socket-bind" = { to = "crates/l10_foundation/unix/socket/bind" }
 "pplx-space-unix-socket-path" = { to = "crates/l10_foundation/unix/socket/path" }
 "pplx-space-valkey" = { to = "crates/l10_foundation/valkey" }
+"pplx-space-common-work-coalescer" = { to = "crates/l10_foundation/work/coalescer", rename = "pplx-space-work-coalescer" }  # renamed
 # l20_domain (25)
 "pplx-space-accounts" = { to = "crates/l20_domain/accounts" }
 "pplx-space-api-route" = { to = "crates/l20_domain/api/route" }
 "pplx-space-auto-lifecycle" = { to = "crates/l20_domain/auto/lifecycle/policy" }  # leaf: pplx-space-auto-lifecycle-receipt nest in l20_domain/auto/lifecycle
 "pplx-space-auto-lifecycle-receipt" = { to = "crates/l20_domain/auto/lifecycle/receipt" }
 "pplx-space-cluster-id" = { to = "crates/l20_domain/cluster/id" }
-"pplx-space-credential-injection-core" = { to = "crates/l20_domain/credential/injection/core" }
+"pplx-space-credential-injection-core" = { to = "crates/l20_domain/credential/injection", rename = "pplx-space-credential-injection" }  # renamed
 "pplx-space-credential-provider-proto" = { to = "crates/l20_domain/credential/provider/proto" }
 "pplx-space-db-identity" = { to = "crates/l20_domain/db/identity" }
 "pplx-space-ecw-credential" = { to = "crates/l20_domain/ecw/credential" }

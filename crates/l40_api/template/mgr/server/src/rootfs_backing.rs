@@ -55,7 +55,7 @@ impl RootfsBackingPolicy {
     pub(crate) fn prepare_empty(self, file: &File) -> io::Result<()> {
         match self {
             Self::Inherit => Ok(()),
-            Self::NoCow => pplx_space_common_io::reflink::set_nocow_on_empty(file),
+            Self::NoCow => pplx_space_file_io::reflink::set_nocow_on_empty(file),
         }
     }
 
@@ -65,7 +65,7 @@ impl RootfsBackingPolicy {
         match self {
             Self::Inherit => Ok(()),
             Self::NoCow => {
-                pplx_space_common_io::reflink::validate_nocow_filesystem(&File::open(root)?)
+                pplx_space_file_io::reflink::validate_nocow_filesystem(&File::open(root)?)
             }
         }
     }
@@ -77,7 +77,7 @@ impl RootfsBackingPolicy {
             return Ok(());
         }
         let mut source = File::open(path)?;
-        pplx_space_common_io::reflink::validate_nocow_filesystem(&source)?;
+        pplx_space_file_io::reflink::validate_nocow_filesystem(&source)?;
         #[cfg(target_os = "linux")]
         if rustix::fs::ioctl_getflags(&source)?.contains(rustix::fs::IFlags::NOCOW) {
             return Ok(());
@@ -90,7 +90,7 @@ impl RootfsBackingPolicy {
         })?;
         let temporary = tempfile::NamedTempFile::new_in(parent)?;
         self.prepare_empty(temporary.as_file())?;
-        let mut writer = pplx_space_common_io::sparse::SparseFileWriter::new(
+        let mut writer = pplx_space_file_io::sparse::SparseFileWriter::new(
             temporary.as_file().try_clone()?,
             64 * 1024,
         )?;

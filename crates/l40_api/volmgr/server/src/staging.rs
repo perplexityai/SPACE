@@ -164,7 +164,7 @@ async fn reflink_copy(src: &Path, dst: &Path) -> Result<StagingMode, String> {
     {
         let src = src.to_path_buf();
         let dst = dst.to_path_buf();
-        tokio::task::spawn_blocking(move || pplx_space_common_io::reflink::copy_file(&src, &dst))
+        tokio::task::spawn_blocking(move || pplx_space_file_io::reflink::copy_file(&src, &dst))
             .await
             .map_err(|error| format!("join staged copy: {error}"))?
             .map(|cloned| {
@@ -215,7 +215,7 @@ pub(crate) async fn reflink_only(src: &Path, dst: &Path) -> Result<(), String> {
     {
         let src = src.to_path_buf();
         let dst = dst.to_path_buf();
-        tokio::task::spawn_blocking(move || pplx_space_common_io::reflink::reflink_file(&src, &dst))
+        tokio::task::spawn_blocking(move || pplx_space_file_io::reflink::reflink_file(&src, &dst))
             .await
             .map_err(|error| format!("join shadow reflink: {error}"))?
             .map_err(|error| format!("shadow reflink: {error}"))

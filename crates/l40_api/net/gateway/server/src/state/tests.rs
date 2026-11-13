@@ -216,7 +216,7 @@ async fn changed_tls_policy_applies_to_subsequent_admissions() {
 
 #[tokio::test]
 async fn network_credentials_are_bound_to_the_exact_installed_policy_generation() {
-    use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
+    use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
     use pplx_space_net_common::{
         CredentialHeaderBindingV1, NetworkCredentialDestinationV1, NetworkCredentialHttpMethodV1,
         NetworkCredentialRuleV1, TlsInterception,
@@ -584,7 +584,7 @@ async fn refresh_short_circuits_when_ready_with_matching_ref() {
 
 #[tokio::test]
 async fn matching_policy_ref_reloads_the_complete_network_credential_snapshot() {
-    use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
+    use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
     use pplx_space_net_common::{
         CredentialHeaderBindingV1, NetworkCredentialDestinationV1, NetworkCredentialHttpMethodV1,
         NetworkCredentialRuleV1,

@@ -21,7 +21,7 @@ zeroize = { workspace = true }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-credential-injection-core = { workspace = true }
+pplx-space-credential-injection = { workspace = true }
 pplx-space-rustls-provider = { workspace = true }
 
 [dev-dependencies]

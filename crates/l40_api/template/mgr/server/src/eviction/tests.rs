@@ -49,7 +49,7 @@ fn cfg(budget: u64, headroom: f64, grace_secs: u64, now: u64) -> EvictionConfig 
 }
 
 // Pure-planner tests (ordering, protected-set, grace, headroom)
-// live in `pplx-space-common-lru-reaper`. This module keeps the
+// live in `pplx-space-lru-reaper`. This module keeps the
 // template-specific wrapper coverage: the per-build adapter shape,
 // the `plan_from_db` → SQL UNION integration, and the
 // `execute_one*` race-recheck transactions.

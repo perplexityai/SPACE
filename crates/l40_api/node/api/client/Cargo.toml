@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = []
-kubernetes = ["dep:pplx-space-common-grpc-lb", "pplx-space-common-grpc-lb/k8s"]
+kubernetes = ["dep:pplx-space-grpc-lb", "pplx-space-grpc-lb/k8s"]
 
 [dependencies]
 hyper-util = { workspace = true, features = ["tokio"] }
@@ -32,7 +32,7 @@ pplx-space-bearer-token = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
-pplx-space-common-grpc-lb = { workspace = true, optional = true }
+pplx-space-grpc-lb = { workspace = true, optional = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-net-gateway-client = { workspace = true }

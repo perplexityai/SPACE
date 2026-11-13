@@ -11,11 +11,11 @@ use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::types::{
     SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
 };
-use pplx_space_common_work_coalescer::{
-    JoinError as CoalesceJoinError, Role as CoalesceRole, WorkOutcome,
-};
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
+};
+use pplx_space_work_coalescer::{
+    JoinError as CoalesceJoinError, Role as CoalesceRole, WorkOutcome,
 };
 use std::{
     future::Future,

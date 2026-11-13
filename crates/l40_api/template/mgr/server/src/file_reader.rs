@@ -3,8 +3,8 @@
 use std::fs::File;
 use std::io::{self, Read};
 
-use pplx_space_common_io::sparse::SparseFileReader;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_TEMPLATE_SPARSE_AWARE_READS_FLAG};
+use pplx_space_file_io::sparse::SparseFileReader;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TemplateReadMode {

@@ -42,7 +42,7 @@
 //!
 //! ```
 //! use std::sync::Arc;
-//! use pplx_space_common_work_coalescer::{WorkCoalescer, WorkOutcome};
+//! use pplx_space_work_coalescer::{WorkCoalescer, WorkOutcome};
 //!
 //! # tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
 //! let coalescer: Arc<WorkCoalescer<&'static str, u32, std::io::Error>> =

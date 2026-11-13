@@ -20,7 +20,7 @@ use pplx_space_common_core::{
     types::CredentialReferenceId, types::ExecutionGeneration, types::K8sNodeUid, types::NodeId,
     types::SandboxId,
 };
-use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
+use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 use pplx_space_credential_injection_store::references::ReferenceState;
 use pplx_space_net_common::EffectiveNetworkPolicyRef;
 
