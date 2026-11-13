@@ -98,6 +98,13 @@ and delete through the SPACE API instead. Put the bearer token in
 `SPACE_API_TOKEN` or a file named by `--api-token-file`, and give each variant
 an API template reference such as `baseline=bench-balloon-baseline:bench`.
 
+Both API-mode scripts send the token only over HTTPS, or over plain HTTP to
+`localhost` or a loopback, private or shared (100.64.0.0/10) IP literal. Plain
+HTTP to a DNS name, including a cluster service name such as
+`space-api.space.svc.cluster.local`, is refused. Use its ClusterIP, a
+port-forward, or HTTPS. The same rule applies to an absolute `events_url`
+returned by the API when `--data-plane-url` is not set.
+
 API mode still reads Firecracker statistics and snapshot sizes from the host,
 so run it on the worker the sandboxes land on and keep every other worker
 cordoned. A create that lands elsewhere is deleted and recorded as an error,
@@ -311,8 +318,10 @@ python3 scripts/benchmarks/bench-sbx-create-to-usable.py \
 records `cold_op_ms` and `warm_op_ms` (the create or wake operation) and
 `cold_usable_ms` and `warm_usable_ms` (until `true` exits 0 in the guest,
 probed every `--poll-secs`). `summary.json` holds p50/p95 per metric and the
-sandboxes the API still finds. The script exits non-zero when a run fails or a
-sandbox is left behind.
+sandboxes the API still finds. A malformed API response fails that run without
+skipping cleanup. If a create is interrupted before its reply arrives, the script
+replays it with the same idempotency key to find the sandbox and delete it. The
+script exits non-zero when a run fails or a sandbox is left behind.
 
 To compare two revisions, alternate them in blocks on the same cluster rather
 than measuring one after the other.

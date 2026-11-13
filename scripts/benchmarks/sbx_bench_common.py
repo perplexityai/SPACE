@@ -528,6 +528,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 _TERMINAL_FAILED = {"failed", "canceled", "cancelled", "expired"}
 _SANDBOX_GONE = {"failed", "deleted", "deleting", "stopped"}
+# RFC 6598 shared address space, used for pod and service IPs on some clusters.
+_SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
 
 
 class ApiError(RuntimeError):
@@ -539,9 +541,11 @@ class ApiError(RuntimeError):
 def require_token_safe_url(url: str) -> str:
     """Return url if a bearer token may be sent to it, else raise ValueError.
 
-    HTTPS is always allowed. Plain HTTP is allowed only to a loopback name or a
-    private or loopback IP literal (for example a port-forward or a ClusterIP),
-    so the token never crosses a public network in cleartext.
+    HTTPS is always allowed. Plain HTTP is allowed only to localhost or a
+    loopback, private or shared (100.64.0.0/10) IP literal, for example a
+    port-forward or a ClusterIP, so the token never crosses a public network in
+    cleartext. Plain HTTP to any other DNS name, including a cluster service
+    name, is refused because its resolution is not checked.
     """
     parts = urllib.parse.urlsplit(url)
     if parts.scheme == "https" and parts.hostname:
@@ -553,9 +557,9 @@ def require_token_safe_url(url: str) -> str:
             address = ipaddress.ip_address(parts.hostname)
         except ValueError:
             address = None
-        if address is not None and (address.is_loopback or address.is_private):
+        if address is not None and (address.is_loopback or address.is_private or address in _SHARED_ADDRESS_SPACE):
             return url
-    raise ValueError(f"refusing to send the API token to {url!r}; use https, or http to a loopback or private IP")
+    raise ValueError(f"refusing to send the API token to {url!r}; use https, or http to localhost or a loopback, private or shared IP")
 
 
 class SpaceApi:
@@ -646,14 +650,18 @@ class SpaceApi:
         self.wait_state(sandbox_id, "running", timeout)
         self.request("GET", f"/v1/sandboxes/{sandbox_id}/processes?limit=1", timeout=min(timeout, 180))
 
-    def create(self, template: str, resources: dict[str, int]) -> tuple[str, str]:
+    def new_idempotency_key(self) -> str:
+        return f"{self.idempotency_prefix}-{uuid.uuid4().hex}"
+
+    def create(self, template: str, resources: dict[str, int], idempotency_key: str | None = None) -> tuple[str, str]:
         """POST the create and return (sandbox_id, operation_id) without waiting.
 
         A transport error can hide a create the server accepted, so the POST is
         retried once with the same idempotency key to recover its sandbox ID.
+        Passing the key in lets a caller replay the create the same way later.
         """
         body = {"template": template, "runtime": "fc", "resources": resources}
-        key = f"{self.idempotency_prefix}-{uuid.uuid4().hex}"
+        key = idempotency_key or self.new_idempotency_key()
         try:
             result = self.request("POST", "/v1/sandboxes", body, idempotency_key=key)
         except ApiError as error:

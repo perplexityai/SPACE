@@ -56,10 +56,11 @@ def wait_usable(api: SpaceApi, sandbox_id: str, deadline: float, poll_secs: floa
 def run_one(api: SpaceApi, args: argparse.Namespace, row: dict[str, Any]) -> None:
     """Fill in row in place, so an interrupted run still records its sandbox."""
     resources = {"vcpu": args.vcpu, "memory_mib": args.memory_mib}
+    key = api.new_idempotency_key()
     sandbox_id = operation_id = None
     try:
         start = time.monotonic()
-        sandbox_id, operation_id = api.create(args.template, resources)
+        sandbox_id, operation_id = api.create(args.template, resources, idempotency_key=key)
         row["sandbox_id"] = sandbox_id
         api.wait_operation(operation_id, args.timeout)
         row["cold_op_ms"] = elapsed_ms(start)
@@ -76,7 +77,20 @@ def run_one(api: SpaceApi, args: argparse.Namespace, row: dict[str, Any]) -> Non
         row["ok"] = True
     except ApiError as error:
         row["error"] = str(error)[:300]
+    except Exception as error:
+        # A malformed response is a failed sample, not a reason to skip cleanup and the summary.
+        row["error"] = f"{type(error).__name__}: {error}"[:300]
     finally:
+        if not sandbox_id:
+            # The create may have been accepted without its reply arriving, for example on an
+            # interrupt. Replaying the same idempotency key returns that sandbox so it can be
+            # deleted; if the first POST never landed, the replay creates one that is deleted too.
+            try:
+                sandbox_id, operation_id = api.create(args.template, resources, idempotency_key=key)
+                row["sandbox_id"] = sandbox_id
+            except ApiError as error:
+                if error.status is None or error.status >= 500:
+                    row["create_recovery_error"] = str(error)[:300]
         if sandbox_id:
             try:
                 # Waits for the create to end and confirms the API no longer finds the sandbox.

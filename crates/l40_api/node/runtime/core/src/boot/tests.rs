@@ -161,6 +161,17 @@ fn firecracker_retains_balloon_network_and_console_configuration() {
 }
 
 #[test]
+fn firecracker_adds_i8042_boot_args_only_on_x86_64() {
+    let mut boot = input();
+    boot.guest.architecture = Arch::Aarch64;
+    let config: Value =
+        serde_json::from_str(&configuration(RuntimeKind::Firecracker, &boot).unwrap()).unwrap();
+    let args = config["boot-source"]["boot_args"].as_str().unwrap();
+    assert!(args.contains("pci=off"));
+    assert!(!args.contains("i8042"));
+}
+
+#[test]
 fn standalone_admission_rejects_extra_devices_and_host_paths() {
     let text = configuration(RuntimeKind::CloudHypervisor, &input()).unwrap();
     validate_standalone(RuntimeKind::CloudHypervisor, &text, BootSource::LinuxDirect).unwrap();
