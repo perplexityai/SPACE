@@ -745,6 +745,53 @@ SELECT state FROM snapshots WHERE sandbox_id = '{sandbox_id}'::uuid AND type = '
 """
 KIND_REDIS_POD_SELECTOR = "app.kubernetes.io/name=space-redis"
 SANDBOX_ID_LABEL = "space.pplx.net/sandbox-id"
+# The label the activating client's id is carried on, and the column it is
+# recorded in. Both are read-only here: the smoke asserts what the API wrote,
+# and writing either from the harness would be asserting its own value back.
+ACTIVATION_CLIENT_LABEL = "space.pplx.net/client-id"
+# The selector the API's own pod reflector watches. The live cap counts from
+# that reflector, so a count taken here has to carry this label too: the
+# client-id label alone would also match a pod the API does not manage, and the
+# whole point of the count is to be the one the cap is working from.
+SANDBOX_MANAGED_BY_SELECTOR = "space.pplx.net/managed-by=space-api"
+# The sandbox placement pool and the extended resource every sandbox pod
+# requests one of. Read with `-o json` and parsed here rather than through a
+# jsonpath: the resource key carries dots and a slash, and kubectl answers a
+# malformed jsonpath with empty output instead of an error -- which would read
+# as "no capacity" and make a slot verdict pass over nothing.
+SANDBOX_NODE_POOL_SELECTOR = "space.pplx.net/node-pool=sandbox"
+SANDBOX_NETWORK_SLOTS_RESOURCE = "space.pplx.net/network-slots"
+# Built once, and pinned by a unit test. A dotted label key has to be escaped
+# for jsonpath, and kubectl answers a malformed expression with empty output
+# rather than an error -- which would turn "every pod carries the label" into a
+# verdict over an empty list. The expression is assembled here rather than
+# f-string-interpolated at the call site because the braces jsonpath needs are
+# exactly the ones an f-string eats.
+ACTIVATION_CLIENT_JSONPATH = (
+    "jsonpath={range .items[*]}{.metadata.labels['"
+    + ACTIVATION_CLIENT_LABEL.replace(".", "\\.")
+    + "']}"
+    + '{"\\n"}'
+    + "{end}"
+)
+# Whether this build records the activating client at all. The column is the
+# one sound build fingerprint the three stacked capabilities leave behind --
+# it ships as a migration, so a build either has it or does not, and no
+# behavioral probe is needed to tell "absent" from "broken".
+ACTIVATION_ATTRIBUTION_COLUMN_SQL = """
+SELECT count(*)
+  FROM information_schema.columns
+ WHERE table_name = 'sandboxes'
+   AND column_name = 'activating_client_id';
+"""
+SANDBOX_ACTIVATING_CLIENT_SQL = """
+SELECT coalesce(activating_client_id, '')
+  FROM sandboxes
+ WHERE id = '{sandbox_id}';
+"""
+# Selects the pods the live cap counts: the reflector reads the same label, so
+# this counts what the cap counts rather than a parallel notion of "live".
+LIVE_CLIENT_PODS_JSONPATH = "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}"
 CHECKPOINT_ANNOTATION = "space.pplx.net/checkpoint"
 RESTORE_SOURCE_NODE_ANNOTATION = "space.pplx.net/suspend-restore-source-node"
 RESTORE_STORAGE_URI_ANNOTATION = "space.pplx.net/suspend-restore-storage-uri"
@@ -1045,8 +1092,17 @@ _RETENTION_BOOLEAN_ENV_VALUES = {
 }
 _RETENTION_ENV_VALUE = re.compile(r"[a-z0-9]{1,16}")
 # Limiter values: booleans, small numbers, a redis:// URL, a client id, and
-# a comma-separated list (SPACE_NATIVE_INLINE_KINDS).
-_LIMITER_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/@,-]{1,64}")
+# comma-separated lists — `SPACE_NATIVE_INLINE_KINDS`, and
+# `SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS`, which is an allowlist by the
+# limiter's own grammar, so any value naming more than one client needs the
+# comma. One class covers every limiter key, so this admits a comma in the
+# others too; that is safe rather than intended — `_apply_public_api_env`
+# hands each value to `kubectl set env` as one `key=value` argv element, and
+# kubectl splits that on the first `=` and never on a comma, with no shell in
+# between. Everything this guard exists to refuse — whitespace, quotes, `$`,
+# backticks, newlines — stays out.
+LIMITER_ENV_VALUE_MAX = 64
+_LIMITER_ENV_VALUE = re.compile(rf"[A-Za-z0-9._:/@,-]{{1,{LIMITER_ENV_VALUE_MAX}}}")
 _UNSIGNED_INTEGER = re.compile(r"\+?[0-9]+")
 
 
@@ -4815,6 +4871,124 @@ ON CONFLICT (key_hash) DO NOTHING;
             if time.monotonic() > deadline:
                 raise RuntimeError(f"the public API did not report /readyz=200 within {timeout:g}s")
             time.sleep(1)
+
+    def activation_attribution_available(self) -> bool:
+        """Whether this build records the activating client on the sandbox row.
+
+        Reads `information_schema`, so it answers for the schema the running
+        API is actually against rather than for the source tree the bench was
+        built from -- the two can differ when a rollout is stale.
+        """
+
+        count = self._psql(
+            ACTIVATION_ATTRIBUTION_COLUMN_SQL,
+            action="probe for the activating-client column",
+        )
+        return count.strip() == "1"
+
+    def sandbox_activating_client(self, sandbox_id: str) -> str:
+        """The activating client recorded on the sandbox row, empty when unset."""
+
+        return self._psql(
+            SANDBOX_ACTIVATING_CLIENT_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="read the sandbox's activating client",
+        ).strip()
+
+    def sandbox_pod_client_ids(self, sandbox_id: str) -> list[str]:
+        """The activating-client label of each of the sandbox's pods.
+
+        A pod carrying no such label contributes an empty string rather than
+        being dropped, so a caller can tell "no pod" from "a pod the API never
+        labelled" -- the second is the defect, and silently filtering it out
+        would make the verdict pass by having nothing to judge.
+        """
+
+        result = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            f"{SANDBOX_ID_LABEL}={_sql_uuid(sandbox_id)}",
+            "-o",
+            ACTIVATION_CLIENT_JSONPATH,
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(result, "read the sandbox pods' activating-client label")
+        return [line.strip() for line in (result.stdout or "").splitlines()]
+
+    def live_client_sandbox_pods(self, client_id: str) -> list[str]:
+        """Names of the sandbox pods currently labelled for this client.
+
+        What the live cap counts from the substrate side, read the same way
+        its reflector reads it. Terminating pods are included exactly as the
+        apiserver lists them: the cap's own count comes from a reflector of
+        the same objects, so filtering here would measure something the cap
+        does not.
+        """
+
+        result = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            f"{SANDBOX_MANAGED_BY_SELECTOR},{ACTIVATION_CLIENT_LABEL}={client_id}",
+            "-o",
+            LIVE_CLIENT_PODS_JSONPATH,
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(result, "count the client's live sandbox pods")
+        return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+    def sandbox_node_slots(self) -> dict[str, dict[str, int]]:
+        """Per sandbox-pool node: advertised network slots and sandbox pods on it.
+
+        `capacity` is read from `status.allocatable`, which is what both
+        kube-scheduler and the activation limiter's slot check consult --
+        node-ctl writes `status.capacity` and the kubelet derives allocatable
+        from it, so reading capacity here would be reading the input rather
+        than the value in force.
+
+        `used` counts non-terminating sandbox pods bound to the node, and
+        `terminating` counts the rest. The split matters and the two are not
+        interchangeable: kube-scheduler charges a terminating pod's slot
+        request until the pod is actually gone, so a caller waiting for room
+        to place something must read `used + terminating`, while a caller
+        asking how full the cluster has been made reads `used`. Collapsing
+        them lets a release look complete while the scheduler still refuses.
+        """
+
+        nodes = self.kubectl(
+            "get", "nodes", "-l", SANDBOX_NODE_POOL_SELECTOR, "-o", "json", timeout=15
+        )
+        _require_ok(nodes, "read the sandbox nodes' network-slot capacity")
+        slots: dict[str, dict[str, int]] = {}
+        for node in json.loads(nodes.stdout or "{}").get("items", []):
+            name = (node.get("metadata") or {}).get("name") or ""
+            allocatable = (node.get("status") or {}).get("allocatable") or {}
+            raw = str(allocatable.get(SANDBOX_NETWORK_SLOTS_RESOURCE, "0"))
+            slots[name] = {
+                "capacity": int(raw) if raw.isdigit() else 0,
+                "used": 0,
+                "terminating": 0,
+            }
+        pods = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            SANDBOX_MANAGED_BY_SELECTOR,
+            "-o",
+            "json",
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(pods, "count the sandbox pods holding network slots")
+        for pod in json.loads(pods.stdout or "{}").get("items", []):
+            node_name = (pod.get("spec") or {}).get("nodeName") or ""
+            if node_name not in slots:
+                continue
+            terminating = bool((pod.get("metadata") or {}).get("deletionTimestamp"))
+            slots[node_name]["terminating" if terminating else "used"] += 1
+        return slots
 
     def redis_replicas(self) -> int:
         previous = _require_ok(

@@ -533,6 +533,26 @@ class RateLimiterControl(Protocol):
 
     def wait_public_api_ready(self, *, timeout: float) -> None: ...
 
+    def sandbox_node_slots(self) -> dict[str, dict[str, int]]:
+        """Per sandbox-pool node: advertised network slots and sandbox pods on it."""
+        ...
+
+    def activation_attribution_available(self) -> bool:
+        """Whether this build records the activating client on the sandbox row.
+
+        The capability probe for the attribution phase. Reads the live
+        schema, so it answers for the API the bench is actually running.
+        """
+        ...
+
+    def sandbox_activating_client(self, sandbox_id: str) -> str:
+        """The activating client recorded on the sandbox row, empty when unset."""
+        ...
+
+    def sandbox_pod_client_ids(self, sandbox_id: str) -> list[str]:
+        """Each of the sandbox's pods' activating-client label, empty when absent."""
+        ...
+
     def redis_replicas(self) -> int:
         """The Redis Deployment's current `.spec.replicas`, read without writing."""
         ...
