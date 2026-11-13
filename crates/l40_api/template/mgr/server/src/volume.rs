@@ -1445,6 +1445,98 @@ fn finish_pull_failures(classified: PullFailure, downstream_status: Option<Statu
         .unwrap_or(PullError::Failure(classified))
 }
 
+/// How long a pull keeps asking an unreachable node-manager to create its
+/// build dir. A rolling deploy leaves node-manager's socket unbound for
+/// tens of seconds while the old process drains; a pull in that gap must
+/// wait it out (or fail retryably), never settle for a plain directory.
+const NODE_MANAGER_RESTART_GRACE: Duration = Duration::from_secs(60);
+const NODE_MANAGER_RETRY_INITIAL: Duration = Duration::from_millis(250);
+const NODE_MANAGER_RETRY_MAX: Duration = Duration::from_secs(2);
+
+/// Create a pull's digest dir as a btrfs subvolume via node-manager.
+/// The ioctl requires CAP_SYS_ADMIN, so delegate to privileged
+/// node-manager.
+///
+/// A plain directory is a permanent install: nothing converts it later, and
+/// a btrfs-send restore can never use it as its parent. So the fallback is
+/// taken only when node-manager predates the RPC (`Unimplemented`). On a
+/// non-btrfs cache node-manager itself makes a plain directory and answers
+/// OK, so any failure it reports is a fault (unreachable mid-restart, EROFS
+/// while its mounts are torn down, EACCES): it is retried for
+/// [`NODE_MANAGER_RESTART_GRACE`], then fails the pull retryably without
+/// creating the dir.
+async fn create_build_dir<F, Fut>(
+    name: &str,
+    content_hash: &str,
+    digest_dir: &str,
+    mut create_subvolume: F,
+) -> Result<(), PullError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+            Output = Result<PathBuf, crate::btrfs_via_nodemgr::BtrfsViaNodemgrError>,
+        >,
+{
+    use crate::btrfs_via_nodemgr::BtrfsViaNodemgrError;
+
+    let deadline = tokio::time::Instant::now() + NODE_MANAGER_RESTART_GRACE;
+    let mut backoff = NODE_MANAGER_RETRY_INITIAL;
+    loop {
+        let err = match create_subvolume().await {
+            Ok(_path) => {
+                tracing::debug!(
+                    template = name,
+                    content_hash,
+                    dir = %digest_dir,
+                    "on-demand pull: digest dir created as btrfs subvolume (via nodemgr)"
+                );
+                return Ok(());
+            }
+            Err(err) => err,
+        };
+        let unsupported = matches!(
+            &err,
+            BtrfsViaNodemgrError::Rpc { status, .. } if status.code() == tonic::Code::Unimplemented
+        );
+        if unsupported {
+            tracing::info!(
+                template = name,
+                content_hash,
+                dir = %digest_dir,
+                error = %err,
+                "on-demand pull: node-manager lacks the subvolume RPC; falling back to plain directory"
+            );
+            if let Err(err) = tokio::fs::create_dir_all(digest_dir).await {
+                warn!(error = %err, template = name, content_hash, dir = %digest_dir, "create digest dir failed; falling through");
+                return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+            }
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            warn!(
+                template = name,
+                content_hash,
+                dir = %digest_dir,
+                error = %err,
+                "on-demand pull: node-manager could not create the build subvolume; failing the pull retryably"
+            );
+            return Err(PullError::Retryable(Status::unavailable(format!(
+                "node-manager could not create template build subvolume: {err}"
+            ))));
+        }
+        tracing::info!(
+            template = name,
+            content_hash,
+            dir = %digest_dir,
+            error = %err,
+            "on-demand pull: nodemgr btrfs subvolume create failed; retrying"
+        );
+        tokio::time::sleep(backoff.min(deadline - now)).await;
+        backoff = (backoff * 2).min(NODE_MANAGER_RETRY_MAX);
+    }
+}
+
 async fn do_pull(
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     name: &str,
@@ -1807,34 +1899,10 @@ async fn try_pull_from(
     // Disarmed below right before the final `Ok(())` once the sqlite upsert
     // has committed.
     let cleanup_guard = PullCleanupGuard::new(name, content_hash, &digest_dir, cleanup);
-    // Create the digest dir as a btrfs subvolume via node-manager.
-    // The ioctl requires CAP_SYS_ADMIN, so delegate to privileged
-    // node-manager. An unprivileged direct call would return EPERM and
-    // fall back to a plain directory, breaking btrfs-send's subvolume
-    // precondition. Non-btrfs hosts still fall back to plain mkdir.
-    match crate::btrfs_via_nodemgr::create_template_subvolume(name, content_hash, partition).await {
-        Ok(_path) => {
-            tracing::debug!(
-                template = name,
-                content_hash,
-                dir = %digest_dir,
-                "on-demand pull: digest dir created as btrfs subvolume (via nodemgr)"
-            );
-        }
-        Err(err) => {
-            tracing::info!(
-                template = name,
-                content_hash,
-                dir = %digest_dir,
-                error = %err,
-                "on-demand pull: nodemgr btrfs subvolume create failed; falling back to plain directory"
-            );
-            if let Err(err) = tokio::fs::create_dir_all(&digest_dir).await {
-                warn!(error = %err, template = name, content_hash, dir = %digest_dir, "create digest dir failed; falling through");
-                return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
-            }
-        }
-    }
+    create_build_dir(name, content_hash, &digest_dir, || {
+        crate::btrfs_via_nodemgr::create_template_subvolume(name, content_hash, partition)
+    })
+    .await?;
     if let Err(err) =
         set_template_cache_permissions(Path::new(&digest_dir), TEMPLATE_CACHE_DIR_MODE)
     {
@@ -2116,7 +2184,8 @@ async fn try_pull_from(
     //
     // FailedPrecondition from nodemgr (`needs subvolume`) is a
     // benign skip — the digest dir was installed as a plain dir
-    // (non-btrfs host, or a future create_subvolume fallback path);
+    // (non-btrfs host or a node-manager without the create RPC; see
+    // `create_build_dir`);
     // those templates remain usable via the legacy create-and-
     // reflink + Full-codec paths, just without btrfs-send
     // portability. Any other status surfaces as a warn — the
