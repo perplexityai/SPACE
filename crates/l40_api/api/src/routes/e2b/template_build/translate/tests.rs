@@ -274,12 +274,14 @@ async fn public_oci_build_preserves_the_image_and_dockerfile_execution_context(
             other => panic!("expected RUN step, got {other:?}"),
         })
         .collect();
+    let create_root = create_workdir_command("/", "root");
+    let create_home = create_workdir_command("/home/user", "user");
     assert_eq!(
         runs,
         [
-            ("mkdir -p '/'", Some("root")),
+            (create_root.as_str(), Some("root")),
             ("cd '/' && {\ntrue\n}", Some("root")),
-            ("mkdir -p '/home/user'", Some("root")),
+            (create_home.as_str(), Some("root")),
             ("cd '/home/user' && {\npwd\n}", Some("user")),
         ]
     );
@@ -599,4 +601,98 @@ fn runtime_translation_owns_intent_only_and_validates_readiness() {
     runtime_step(&req).unwrap_err();
     req.ready_cmd = None;
     assert!(runtime_step(&req).unwrap().is_none());
+}
+
+async fn workdir_recipe_steps(
+    from_image: Option<&str>,
+    from_template: Option<&str>,
+    steps: &[(&str, &[&str])],
+) -> Vec<build_proto::recipe::Run> {
+    let state = template_build_state();
+    let req = TemplateBuildStartV2 {
+        from_image: from_image.map(str::to_string),
+        from_template: from_template.map(str::to_string),
+        steps: steps
+            .iter()
+            .map(|(kind, args)| TemplateStep {
+                kind: (*kind).to_string(),
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                files_hash: None,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let recipe = build_recipe(
+        TEST_ORG,
+        &TemplateName::parse("custom-template").unwrap(),
+        &req,
+        state.as_ref(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    recipe
+        .steps
+        .into_iter()
+        .filter_map(|step| match step.body {
+            Some(build_proto::recipe::step::Body::Run(run)) => Some(run),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn workdir_created_for_non_root_user_is_owned_by_that_user() {
+    // e2b's WORKDIR chowns the directories it creates to the current user
+    // (packages/orchestrator/pkg/template/build/commands/workdir.go), so a
+    // following RUN as `user` can write there.
+    let runs = workdir_recipe_steps(
+        None,
+        Some("code-interpreter-v1"),
+        &[("WORKDIR", &["/home/user/app"]), ("RUN", &["touch x", ""])],
+    )
+    .await;
+
+    let (last, before) = runs.split_last().expect("recipe has run steps");
+    assert_eq!(last.user.as_deref(), Some("user"));
+    assert_eq!(last.command, "cd '/home/user/app' && {\ntouch x\n}");
+    assert!(
+        before.iter().any(|run| run.user.as_deref() == Some("root")
+            && run.command.contains("/home/user/app")
+            && run.command.contains("chown")
+            && run.command.contains("user:user")),
+        "expected a root step that chowns the new workdir to user:user, got {before:#?}"
+    );
+}
+
+#[tokio::test]
+async fn relative_workdir_resolves_against_previous_workdir() {
+    // e2b joins a relative WORKDIR onto the previous workdir (or `/`),
+    // matching Docker. `data` after `/srv` must mean `/srv/data`, not a
+    // path relative to the SSH login user's home.
+    let runs = workdir_recipe_steps(
+        Some("docker.io/library/python:3.12-slim-bookworm"),
+        Some(""),
+        &[
+            ("WORKDIR", &["/srv"]),
+            ("WORKDIR", &["data"]),
+            ("RUN", &["pwd", ""]),
+        ],
+    )
+    .await;
+
+    let last = runs.last().expect("recipe has run steps");
+    assert_eq!(last.command, "cd '/srv/data' && {\npwd\n}");
+}
+
+#[test]
+fn relative_workdir_without_previous_workdir_resolves_against_root() {
+    assert_eq!(resolve_workdir(None, "app"), "/app");
+    assert_eq!(
+        resolve_workdir(Some("/srv/data"), "../logs/./x"),
+        "/srv/logs/x"
+    );
+    assert_eq!(resolve_workdir(Some("/srv"), "/abs"), "/abs");
 }
