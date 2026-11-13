@@ -94,6 +94,7 @@
 //! | Stopped-disk backup on retire | `retire_execution` enqueues none; the stopped disk stays on the node (see below) | ac-pplx | A retried Direct retire (next row), then the enqueue |
 //! | Retire retry | Nothing retries a failed Direct retire (see below) | ac-pplx | The sweeper's failed-cleanup retry running for both substrates |
 //! | Drain and evacuation | [`SubstrateCapabilities::supports_node_drain`] is false. Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and `:force-upload-local-snapshots` return 501 before reading or writing the node. `:undrain` clears a `draining` or `drained` phase an earlier drain left, without a substrate call | ac-pplx | Core drain and evacuation for both substrates over a Direct `set_node_schedulability` |
+//! | Per-client live cap | `DirectSubstrate::live_sandboxes_for_client` answers `Unknown(Unsupported)`: Direct keeps no per-client inventory, so the cap admits every activation (reason `unsupported` while attribution is on). Direct also has no point that reserves for a `ReserveAtClaim` charge or checks a `Check` one, so a restore of a suspended sandbox, and a start or restore that reserved nothing at entry, go uncapped either way | the-gigi-pplx | A per-client count of Direct's live executions from its node records, plus reserving for `ReserveAtClaim` at Direct's restore entry and checking `Check` where Direct launches an execution, with `RecoveryCharge`'s live-cap methods built without the `kubernetes` feature |
 //! | Drain, orphan, failed-row repair and node-sync loops | Not started on Direct (below) | ac-pplx | Those loops running for both substrates through the adapter |
 //! | Network-slot headroom (`Substrate::network_slot_headroom`) | Reads `Unknown(Unsupported)`, so the activation limiter's slot check (`SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED`) admits every Direct cold create | ac-pplx | Slot capacity of registered nodes, read by an admission check that runs for both substrates |
 //!
@@ -1191,6 +1192,12 @@ impl DirectSubstrate {
     ) -> Self {
         self.activation_client_attribution = attribution;
         self
+    }
+
+    /// Direct keeps no per-client inventory of live executions, so it can't
+    /// count a client's live sandboxes (see the gap table above).
+    pub(super) fn live_sandboxes_for_client(&self) -> super::LiveSandboxCount {
+        super::LiveSandboxCount::Unknown(super::LiveSandboxCountUnknown::Unsupported)
     }
 
     pub(super) fn activation_client_attribution(&self) -> super::ActivationClientAttribution {

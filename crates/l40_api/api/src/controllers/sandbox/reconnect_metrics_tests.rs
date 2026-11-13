@@ -261,6 +261,7 @@ fn reconnect_tags_classify_deferred_restore_admission_rejection() {
             message: "cluster activation admission rejected".to_string(),
             retry_after: Some(std::time::Duration::from_secs(1)),
             kind,
+            live_cap: false,
         };
         let (outcome, terminal_phase, reason) = reconnect_error_outcome("suspended", &err);
         assert_eq!(
@@ -307,6 +308,7 @@ fn reconnect_tags_classify_a_lost_database_lock_race() {
         message: "cluster activation admission rejected".to_string(),
         retry_after: Some(std::time::Duration::from_secs(1)),
         kind: ActivationRejectionKind::RateLimited,
+        live_cap: false,
     };
     let (admission_outcome, _, admission_reason) = reconnect_error_outcome("suspended", &admission);
     assert_eq!(admission_outcome.as_str(), outcome.as_str());
@@ -357,4 +359,40 @@ fn reconnect_controller_tags_classify_a_lost_database_lock_race() {
     let (fleet_outcome, _, fleet_reason) = reconnect_controller_error_outcome("suspended", &fleet);
     assert_eq!(fleet_outcome.as_str(), "wake_failed");
     assert_eq!(fleet_reason.as_str(), "unavailable");
+}
+
+#[test]
+fn a_live_cap_refusal_is_its_own_error_kind_apart_from_cluster_admission() {
+    // A refusal at the client's live cap carries its own kind, so the
+    // reconnect classifier and request metrics never read it as a cluster
+    // admission refusal, which a bare 429 with a Retry-After would be.
+    let refused = ControllerError::live_cap_refused(
+        "client at its live sandbox cap",
+        Some(std::time::Duration::from_secs(5)),
+    );
+    assert!(refused.is_live_cap_refusal());
+    assert!(!refused.is_cluster_admission_rejection());
+    let saturated = crate::controllers::substrate::ActivationRejectionKind::EmptyCluster
+        .controller_error(
+            "no eligible node".into(),
+            Some(std::time::Duration::from_secs(5)),
+        );
+    assert!(saturated.is_cluster_admission_rejection());
+    assert!(!saturated.is_live_cap_refusal());
+}
+
+#[test]
+fn a_substrate_live_cap_refusal_converts_to_the_live_cap_error_kind() {
+    // The pod-create check's refusal reaches the controller as a substrate
+    // error and converts to the same kind as the entry check's.
+    let refused = SubstrateError::AdmissionRejected {
+        message: "client at its live sandbox cap".to_string(),
+        retry_after: Some(std::time::Duration::from_secs(5)),
+        kind: crate::controllers::substrate::ActivationRejectionKind::LiveCap,
+        live_cap: true,
+    };
+    let converted = ControllerError::from(refused);
+    assert!(converted.is_live_cap_refusal());
+    assert!(!converted.is_cluster_admission_rejection());
+    assert_eq!(converted.retry_after_cause(), None);
 }

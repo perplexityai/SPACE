@@ -1,6 +1,7 @@
 use pplx_space_common_core::types::SandboxId;
 
 use super::*;
+use crate::client_live_cap::{LiveHandoff, LiveReservation};
 use crate::controllers::db_contention_error;
 use crate::controllers::substrate::{
     ActivationAttribution, ActivationClient, CapPolicy, RecoveryCharge,
@@ -716,15 +717,21 @@ fn implicit_activation_class(
 
 /// The substrate charge for an implicit activation of `sandbox` (an access,
 /// opening a port, a rollback, the spaced control path): it acts for the
-/// sandbox's recorded client. A dormant sandbox gets a new runtime for
-/// certain, so its live cap would be reserved up front; a live one creates a
-/// pod only if its running pod is gone, so the cap would be checked there.
+/// sandbox's recorded client. Its live cap counts as `Reserved` only when this
+/// request holds a reservation for a dormant sandbox (`live`), which the
+/// charge carries so a detached wake can take it over; otherwise it's checked
+/// where a pod gets created. A live sandbox creates a pod only if its running
+/// pod is gone, and a request that skipped the entry reservation (a
+/// mid-stream reconnect) may still rebuild one.
 pub(super) fn implicit_activation_charge(
     admission: Option<&std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
     sandbox: &Sandbox,
+    live: &LiveHandoff,
 ) -> RecoveryCharge {
     let cap = match sandbox.lifecycle.parse::<SandboxLifecycle>() {
-        Ok(lifecycle) if implicit_activation_class(lifecycle).is_some() => CapPolicy::Reserved,
+        Ok(lifecycle) if live.is_held() && implicit_activation_class(lifecycle).is_some() => {
+            CapPolicy::Reserved
+        }
         _ => CapPolicy::Check,
     };
     RecoveryCharge::enforce(
@@ -732,6 +739,52 @@ pub(super) fn implicit_activation_charge(
         cap,
         ActivationAttribution::inherit(sandbox.activating_client_id.as_ref()),
     )
+    .with_live(live)
+}
+
+/// Reserve the live slot of an activation of `sandbox_id` charged before the
+/// substrate runs (`CapPolicy::Reserved`). `Ok(None)` when no limiter is
+/// configured, the activation has no client id, or no cap applies.
+pub(super) async fn reserve_live_cap(
+    admission: Option<&std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
+    sandbox_id: SandboxId,
+    attribution: &ActivationAttribution,
+) -> Result<Option<LiveReservation>, ControllerError> {
+    let (Some(admission), Some(client)) = (admission, attribution.key().pod_label(None)) else {
+        return Ok(None);
+    };
+    // Boxed: the callers' futures are already large, and tests build them
+    // unoptimized.
+    Box::pin(admission.live_cap().reserve(&client, sandbox_id))
+        .await
+        .map_err(live_cap_controller_error)
+}
+
+/// A client at its live cap: a `429` with the jittered `Retry-After`, and no
+/// cluster-backpressure cause, so the async dispatcher retries it against its
+/// attempt budget.
+pub(super) fn live_cap_controller_error(
+    refusal: crate::client_live_cap::LiveCapRefusal,
+) -> ControllerError {
+    ControllerError::live_cap_refused(refusal.message, Some(refusal.retry_after))
+}
+
+/// The activation is admitted and its substrate call comes next, which may
+/// create a pod even if it then fails: any later drop lets the member lapse.
+fn substrate_may_create(mut live: Option<LiveReservation>) -> Option<LiveReservation> {
+    if let Some(live) = live.as_mut() {
+        live.pod_may_exist();
+    }
+    live
+}
+
+/// A pod exists or may exist (the activation succeeded, joined one that did,
+/// or got past its runtime's creation): let its pending member lapse within
+/// one TTL.
+pub(super) fn keep_live(live: Option<LiveReservation>) {
+    if let Some(live) = live {
+        live.keep();
+    }
 }
 
 /// Charge cluster activation admission for a sandbox about to be implicitly
@@ -739,23 +792,35 @@ pub(super) fn implicit_activation_charge(
 /// is a no-op, and an unparseable lifecycle fails open (no charge) — the
 /// substrate remains the correctness gate. Fail-open on Redis errors is
 /// inherited from [`crate::cluster_admission::ClusterSandboxAdmission::admit_activation`].
+///
+/// A dormant sandbox gets a new runtime for certain, so its live slot is
+/// reserved first (`CapPolicy::Reserved`), before any token is spent. Hold the
+/// returned reservation until the wake ends, and keep it if the wake succeeds.
 async fn charge_implicit_activation(
     admission: Option<&std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
-    lifecycle: &str,
-) -> Result<(), ControllerError> {
-    let Some(admission) = admission else {
-        return Ok(());
+    sandbox: &Sandbox,
+) -> Result<Option<LiveReservation>, ControllerError> {
+    let Some(cluster_admission) = admission else {
+        return Ok(None);
     };
-    let Ok(lifecycle) = lifecycle.parse::<SandboxLifecycle>() else {
-        return Ok(());
+    let Ok(lifecycle) = sandbox.lifecycle.parse::<SandboxLifecycle>() else {
+        return Ok(None);
     };
     let Some(class) = implicit_activation_class(lifecycle) else {
-        return Ok(());
+        return Ok(None);
     };
-    admission
+    let live = reserve_live_cap(
+        admission,
+        sandbox.id,
+        &ActivationAttribution::inherit(sandbox.activating_client_id.as_ref()),
+    )
+    .await?;
+
+    cluster_admission
         .admit_activation(class)
         .await
-        .map_err(ControllerError::from)
+        .map_err(ControllerError::from)?;
+    Ok(substrate_may_create(live))
 }
 
 /// Access-path admission charge. The substrate honors the sandbox's auto-wake
@@ -765,11 +830,11 @@ pub(super) async fn charge_implicit_access_activation(
     admission: Option<&std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
     sandbox: &Sandbox,
     activity: ExecutionActivityKind,
-) -> Result<(), ControllerError> {
+) -> Result<Option<LiveReservation>, ControllerError> {
     if !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
-        return Ok(());
+        return Ok(None);
     }
-    charge_implicit_activation(admission, &sandbox.lifecycle).await
+    charge_implicit_activation(admission, sandbox).await
 }
 
 /// Control-plane wake admission charge for `control_runtime_client`. Its
@@ -778,8 +843,8 @@ pub(super) async fn charge_implicit_access_activation(
 pub(super) async fn charge_control_wake_activation(
     admission: Option<&std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
     sandbox: &Sandbox,
-) -> Result<(), ControllerError> {
-    charge_implicit_activation(admission, &sandbox.lifecycle).await
+) -> Result<Option<LiveReservation>, ControllerError> {
+    charge_implicit_activation(admission, sandbox).await
 }
 
 impl SandboxController {
@@ -859,15 +924,52 @@ impl SandboxController {
             .map_err(ControllerError::from)
     }
 
+    /// Admit an explicit action charged at entry: reserve its live slot
+    /// first, so a client at its cap is refused before it spends a cluster
+    /// token, then charge the cluster bucket. The reservation is `None` when
+    /// the action isn't charged here or no cap applies; hold it until the
+    /// action ends, and keep it if the action succeeds.
     async fn admit_action_cluster_activation(
         &self,
         action: SandboxAction,
         lifecycle: Option<SandboxLifecycle>,
-    ) -> Result<(), ControllerError> {
+        sandbox_id: SandboxId,
+        attribution: &ActivationAttribution,
+    ) -> Result<Option<LiveReservation>, ControllerError> {
         let Some(class) = action.activation_class(lifecycle) else {
-            return Ok(());
+            return Ok(None);
         };
-        self.admit_cluster_activation(class).await
+        let live =
+            reserve_live_cap(self.cluster_admission.as_ref(), sandbox_id, attribution).await?;
+        self.admit_cluster_activation(class).await?;
+        Ok(substrate_may_create(live))
+    }
+
+    /// Snapshot `sandbox_id`'s pending live-cap entries before a teardown's
+    /// substrate call, for [`Self::forget_live_sandbox`] once it confirms.
+    pub(super) async fn live_teardown(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Option<crate::client_live_cap::LiveTeardown> {
+        match self.cluster_admission.as_ref() {
+            Some(admission) => {
+                Some(Box::pin(admission.live_cap().teardown_snapshot(sandbox_id)).await)
+            }
+            None => None,
+        }
+    }
+
+    /// Stop counting the entries `teardown` snapshotted once the sandbox's
+    /// pods are deleted, so a client that tears sandboxes down doesn't stay
+    /// counted for them until they lapse. An entry a later activation added
+    /// isn't in the snapshot, so it keeps counting.
+    pub(super) async fn forget_live_sandbox(
+        &self,
+        teardown: Option<crate::client_live_cap::LiveTeardown>,
+    ) {
+        if let (Some(admission), Some(teardown)) = (self.cluster_admission.as_ref(), teardown) {
+            Box::pin(admission.live_cap().forget(teardown)).await;
+        }
     }
 
     /// Deferred activation charge for lease-claiming wakes/restores. When
@@ -903,9 +1005,17 @@ impl SandboxController {
                 attribution.clone(),
             )
         } else if action.activation_class(lifecycle).is_some() {
-            RecoveryCharge::paid(CapPolicy::Reserved, attribution.clone())
+            RecoveryCharge::paid(
+                self.cluster_admission.as_ref(),
+                CapPolicy::Reserved,
+                attribution.clone(),
+            )
         } else {
-            RecoveryCharge::exempt(CapPolicy::Check, attribution.clone())
+            RecoveryCharge::exempt(
+                self.cluster_admission.as_ref(),
+                CapPolicy::Check,
+                attribution.clone(),
+            )
         }
     }
 }
@@ -1278,11 +1388,25 @@ impl SandboxController {
         id: SandboxId,
         sandbox: Option<&Sandbox>,
     ) -> Result<(), ControllerError> {
+        // Snapshotted before the teardown, so only entries that predate it
+        // are forgotten.
+        let teardown = self.live_teardown(id).await;
         if sandbox.is_none() {
-            return self.delete_observed_sandbox(pool, id).await;
+            let deleted = self.delete_observed_sandbox(pool, id).await;
+            if deleted.is_ok() {
+                self.forget_live_sandbox(teardown).await;
+            }
+            return deleted;
         }
 
-        if let Err(err) = self.substrate.delete_execution(id).await {
+        let deleted = self.substrate.delete_execution(id).await;
+        // Only a confirmed teardown, or a node that had no such sandbox,
+        // uncounts it: after a failed one its pod may still exist, so its
+        // pending member stays to lapse.
+        if matches!(deleted, Ok(()) | Err(SubstrateError::NotFound { .. })) {
+            self.forget_live_sandbox(teardown).await;
+        }
+        if let Err(err) = deleted {
             if cluster_delete_must_defer_control_plane(&err) {
                 return Err(ControllerError::from(err));
             }
@@ -1551,15 +1675,22 @@ impl SandboxController {
             // not a consistency guard for races with other lifecycle writers. For
             // Wake the terminal-lifecycle check runs first — a Wake the guard
             // rejects must not spend a shared token or draw a 429 either.
-            match action {
+            let live = match action {
                 SandboxAction::Start | SandboxAction::Restore => {
                     let lifecycle = sandbox.lifecycle.parse::<SandboxLifecycle>().ok();
                     // Restore-shaped starts defer admission to the restore-lease
                     // claim-winner too. Direct has no lease and spends the same
                     // policy at its substrate entry.
-                    if !Self::defers_to_restore_claim(lifecycle) {
-                        self.admit_action_cluster_activation(action, lifecycle)
-                            .await?;
+                    if Self::defers_to_restore_claim(lifecycle) {
+                        None
+                    } else {
+                        self.admit_action_cluster_activation(
+                            action,
+                            lifecycle,
+                            typed_id,
+                            &attribution,
+                        )
+                        .await?
                     }
                 }
                 SandboxAction::Wake | SandboxAction::ImplicitWake(_) => {
@@ -1596,26 +1727,43 @@ impl SandboxController {
                     // error classifier maps the retry-after to exhausted/wait_budget)
                     // before returning — otherwise a storm throttled by the cluster
                     // limiter is invisible to the monitor.
-                    if !Self::defers_to_restore_claim(Some(lifecycle))
-                        && let Err(err) = self
-                            .admit_action_cluster_activation(action, Some(lifecycle))
+                    if Self::defers_to_restore_claim(Some(lifecycle)) {
+                        None
+                    } else {
+                        match self
+                            .admit_action_cluster_activation(
+                                action,
+                                Some(lifecycle),
+                                typed_id,
+                                &attribution,
+                            )
                             .await
-                    {
-                        let (outcome, terminal_phase, reason) =
-                            reconnect_controller_error_outcome(sandbox.lifecycle.as_str(), &err);
-                        record_reconnect_attempt(
-                            metric_identity,
-                            sandbox.lifecycle.as_str(),
-                            outcome,
-                            terminal_phase,
-                            reason,
-                            reconnect_started_at,
-                        );
-                        return Err(err);
+                        {
+                            Ok(live) => live,
+                            Err(err) => {
+                                let (outcome, terminal_phase, reason) =
+                                    reconnect_controller_error_outcome(
+                                        sandbox.lifecycle.as_str(),
+                                        &err,
+                                    );
+                                record_reconnect_attempt(
+                                    metric_identity,
+                                    sandbox.lifecycle.as_str(),
+                                    outcome,
+                                    terminal_phase,
+                                    reason,
+                                    reconnect_started_at,
+                                );
+                                return Err(err);
+                            }
+                        }
                     }
                 }
-                _ => {}
-            }
+                _ => None,
+            };
+            // The substrate charge carries it, so a wake that goes on after
+            // this request ends (a detached restore leader) takes it over.
+            let live = LiveHandoff::new(live);
 
             let id_str = id.to_string();
             let body =
@@ -1628,6 +1776,10 @@ impl SandboxController {
                     .lifecycle_state(sandbox.lifecycle.as_str())
                     .placement(sandbox.placement.as_str()),
             );
+            // A suspend snapshots the entries it may forget before its
+            // substrate call, so a wake that reserves once it commits keeps
+            // counting.
+            let mut suspend_teardown = None;
             let result: Result<
                 (Option<SandboxLifecycleStatus>, serde_json::Value),
                 ControllerError,
@@ -1644,7 +1796,8 @@ impl SandboxController {
                                 action,
                                 sandbox.lifecycle.parse::<SandboxLifecycle>().ok(),
                                 &attribution,
-                            ),
+                            )
+                            .with_live(&live),
                         )
                         .await
                     {
@@ -1667,6 +1820,9 @@ impl SandboxController {
                         }
                     };
                     if !execution.completion.should_finalize_lifecycle() {
+                        // Joined an activation that's already finishing: its
+                        // pod exists, so this member lapses as on success.
+                        live.keep();
                         requested_kind = None;
                         return Ok(body);
                     }
@@ -1721,7 +1877,8 @@ impl SandboxController {
                                 action,
                                 sandbox.lifecycle.parse::<SandboxLifecycle>().ok(),
                                 &attribution,
-                            ),
+                            )
+                            .with_live(&live),
                         )
                         .await
                     {
@@ -1754,6 +1911,8 @@ impl SandboxController {
                         }
                     };
                     if !execution.completion.should_finalize_lifecycle() {
+                        // As for Start: a joined activation's pod exists.
+                        live.keep();
                         completion_guard.defuse();
                         requested_kind = None;
                         record_reconnect_attempt(
@@ -1891,7 +2050,8 @@ impl SandboxController {
                                 action,
                                 sandbox.lifecycle.parse::<SandboxLifecycle>().ok(),
                                 &attribution,
-                            ),
+                            )
+                            .with_live(&live),
                         )
                         .await
                     {
@@ -2001,6 +2161,7 @@ impl SandboxController {
                     Ok((None, body))
                 }
                 SandboxAction::Suspend => {
+                    suspend_teardown = self.live_teardown(typed_id).await;
                     match self.substrate.suspend_execution(typed_id).await {
                         Ok(_) => {}
                         Err(err) => {
@@ -2092,6 +2253,7 @@ impl SandboxController {
                                 // A rebuild as a side effect of a stop acts
                                 // for the sandbox's recorded client.
                                 RecoveryCharge::exempt(
+                                    self.cluster_admission.as_ref(),
                                     CapPolicy::Skip,
                                     ActivationAttribution::inherit(
                                         sandbox.activating_client_id.as_ref(),
@@ -2199,6 +2361,16 @@ impl SandboxController {
                     return Err(err);
                 }
             };
+            // The activation succeeded, so its pod exists: the member lapses
+            // within one TTL, covering the reflectors' watch delay.
+            live.keep();
+            // A suspend deletes the pod, so the sandbox stops counting. A stop's
+            // pod ends with its VM; its pending member is left to lapse within
+            // one TTL, covering the reflectors' watch delay until the pod reads
+            // as ended.
+            if status == Some(SandboxLifecycleStatus::Suspended) {
+                self.forget_live_sandbox(suspend_teardown).await;
+            }
             if let Some(status) = status {
                 if let Some(stamp) = post_action_stamp(action, self.substrate.capabilities()) {
                     maybe_update_sandbox_lifecycle(pool, id, stamp).await;
@@ -2247,16 +2419,32 @@ impl SandboxController {
         let status = match action {
             SandboxAction::Start => {
                 let activation = resolve_activation_options(activation.as_ref(), true)?;
-                self.admit_action_cluster_activation(action, None).await?;
+                let live = LiveHandoff::new(
+                    self.admit_action_cluster_activation(action, None, typed_id, &attribution)
+                        .await?,
+                );
+                // No row was loaded, so an inheriting action reserved nothing
+                // at entry: its cap is then checked where the pod is created.
+                let cap = if live.is_held() {
+                    CapPolicy::Reserved
+                } else {
+                    CapPolicy::Check
+                };
                 self.substrate
                     .start_execution(
                         metric_identity,
                         typed_id,
                         activation,
-                        RecoveryCharge::paid(CapPolicy::Reserved, attribution.clone()),
+                        RecoveryCharge::paid(
+                            self.cluster_admission.as_ref(),
+                            cap,
+                            attribution.clone(),
+                        )
+                        .with_live(&live),
                     )
                     .await
                     .map_err(ControllerError::from)?;
+                live.keep();
                 SandboxLifecycleStatus::Started
             }
             SandboxAction::Wake | SandboxAction::ImplicitWake(_) => {
@@ -2265,7 +2453,11 @@ impl SandboxController {
                 self.substrate
                     .runtime_client(
                         typed_id,
-                        RecoveryCharge::exempt(CapPolicy::Check, attribution.clone()),
+                        RecoveryCharge::exempt(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Check,
+                            attribution.clone(),
+                        ),
                     )
                     .await?
                     .internal_client()
@@ -2284,16 +2476,30 @@ impl SandboxController {
             }
             SandboxAction::Restore => {
                 let activation = resolve_activation_options(activation.as_ref(), true)?;
-                self.admit_action_cluster_activation(action, None).await?;
+                let live = LiveHandoff::new(
+                    self.admit_action_cluster_activation(action, None, typed_id, &attribution)
+                        .await?,
+                );
+                let cap = if live.is_held() {
+                    CapPolicy::Reserved
+                } else {
+                    CapPolicy::Check
+                };
                 self.substrate
                     .restore_execution(
                         metric_identity,
                         typed_id,
                         activation,
-                        RecoveryCharge::paid(CapPolicy::Reserved, attribution.clone()),
+                        RecoveryCharge::paid(
+                            self.cluster_admission.as_ref(),
+                            cap,
+                            attribution.clone(),
+                        )
+                        .with_live(&live),
                     )
                     .await
                     .map_err(ControllerError::from)?;
+                live.keep();
                 SandboxLifecycleStatus::Started
             }
             SandboxAction::Suspend => {
@@ -2308,7 +2514,11 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        RecoveryCharge::exempt(CapPolicy::Skip, attribution.clone()),
+                        RecoveryCharge::exempt(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Skip,
+                            attribution.clone(),
+                        ),
                     )
                     .await?;
                 client
@@ -2326,7 +2536,11 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        RecoveryCharge::exempt(CapPolicy::Skip, attribution.clone()),
+                        RecoveryCharge::exempt(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Skip,
+                            attribution.clone(),
+                        ),
                     )
                     .await?;
                 client
@@ -2341,7 +2555,11 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        RecoveryCharge::exempt(CapPolicy::Check, attribution.clone()),
+                        RecoveryCharge::exempt(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Check,
+                            attribution.clone(),
+                        ),
                     )
                     .await?;
                 let activation = resolve_activation_options(activation.as_ref(), true)?;
@@ -2361,7 +2579,11 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        RecoveryCharge::exempt(CapPolicy::Skip, attribution.clone()),
+                        RecoveryCharge::exempt(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Skip,
+                            attribution.clone(),
+                        ),
                     )
                     .await?;
                 client
@@ -2378,7 +2600,11 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        RecoveryCharge::exempt(CapPolicy::Skip, attribution.clone()),
+                        RecoveryCharge::exempt(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Skip,
+                            attribution.clone(),
+                        ),
                     )
                     .await?;
                 client

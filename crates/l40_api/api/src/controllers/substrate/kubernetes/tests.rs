@@ -565,9 +565,9 @@ mod kubernetes_tests {
 
     /// The per-node slot index the reflector would build from `pods`.
     fn network_slots_for(pods: &[Arc<Pod>]) -> NodeNetworkSlots {
-        let (_, network_slots, _) =
+        let (_, indexes, _) =
             sandbox_pod_view::seeded_sandbox_pod_cache(pods.iter().map(|pod| (**pod).clone()));
-        network_slots
+        indexes.network_slots
     }
 
     #[test]
@@ -1943,7 +1943,7 @@ mod kubernetes_tests {
         nodes: Vec<Node>,
     ) -> KubernetesSubstrate {
         let (node_api_pod_store, mut node_api_pod_writer) = reflector::store::<Pod>();
-        let (pod_store, pod_network_slots, mut pod_writer) = sandbox_pod_view::sandbox_pod_cache();
+        let (pod_store, pod_indexes, mut pod_writer) = sandbox_pod_view::sandbox_pod_cache();
         if !pods.is_empty() {
             use kube::runtime::watcher::Event;
             node_api_pod_writer.apply_watcher_event(&Event::Init);
@@ -1969,7 +1969,7 @@ mod kubernetes_tests {
             sandbox_proxy_port,
             SandboxPodConfigValues::default(),
             caches,
-            (pod_store, pod_network_slots),
+            (pod_store, pod_indexes),
         )
     }
 
@@ -6021,6 +6021,271 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// Admits every charge and decides only the live cap, through a real cap.
+    struct LiveCapOnly(crate::client_live_cap::ClientLiveCap);
+
+    fn live_cap_rejection(
+        refusal: crate::client_live_cap::LiveCapRefusal,
+    ) -> crate::controllers::substrate::ActivationAdmissionRejection {
+        crate::controllers::substrate::ActivationAdmissionRejection::new(
+            refusal.message,
+            Some(refusal.retry_after),
+            crate::controllers::substrate::ActivationRejectionKind::LiveCap,
+        )
+    }
+
+    impl crate::controllers::substrate::ActivationAdmission for LiveCapOnly {
+        fn admit(
+            &self,
+            _class: crate::controllers::substrate::ActivationAdmissionClass,
+        ) -> crate::controllers::substrate::ActivationAdmissionFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn reserve_live(
+            &self,
+            client: pplx_space_common_core::types::ClientId,
+            sandbox: SandboxId,
+        ) -> crate::controllers::substrate::LiveCapFuture<'_> {
+            Box::pin(async move {
+                self.0
+                    .reserve(&client, sandbox)
+                    .await
+                    .map_err(live_cap_rejection)
+            })
+        }
+
+        fn precheck_live(
+            &self,
+            client: pplx_space_common_core::types::ClientId,
+            sandbox: SandboxId,
+        ) -> crate::controllers::substrate::ActivationAdmissionFuture<'_> {
+            Box::pin(async move {
+                self.0
+                    .precheck(&client, sandbox)
+                    .await
+                    .map_err(live_cap_rejection)
+            })
+        }
+
+        fn live_cap_configured(&self) -> bool {
+            true
+        }
+    }
+
+    /// A restore's live-cap reservation moves into its detached leader, so a
+    /// caller that disconnects while the pod is still being created doesn't
+    /// stop its renewal: past the member's TTL the restore still counts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_disconnected_restore_keeps_its_live_cap_reservation() -> Result<(), BoxError> {
+        let Some((_node, redis_url)) = crate::client_concurrency::tests::try_redis_url().await?
+        else {
+            return Ok(());
+        };
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
+        insert_ready_full_snapshot_relative_to_lifecycle(
+            &pool,
+            sandbox_id,
+            "s3://space-test/suspend-snapshots/disconnected-reservation?region=us-east-1",
+            0,
+            Uuid::now_v7(),
+        )
+        .await?;
+        let request_started = Arc::new(Semaphore::new(0));
+        let release_request = Arc::new(Semaphore::new(0));
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            blocking_failed_pod_create_kubernetes_client(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::clone(&request_started),
+                Arc::clone(&release_request),
+            ),
+        );
+        let leader_tasks = substrate.task_tracker.clone();
+        let ttl = Duration::from_secs(1);
+        let cap = crate::client_live_cap::ClientLiveCap::for_tests(
+            Substrate::from_kubernetes(KubernetesSubstrate::with_seeded_caches(
+                pool.clone(),
+                inert_kubernetes_client(),
+                1,
+                Vec::new(),
+            )),
+            &redis_url,
+            "alpha",
+            std::num::NonZeroU64::new(1).expect("nonzero"),
+            ttl,
+        );
+        let admission = Arc::new(LiveCapOnly(cap.clone()));
+        let alpha = pplx_space_common_core::types::ClientId::parse("alpha")?;
+        let charge = crate::controllers::substrate::RecoveryCharge::enforce(
+            Some(&admission),
+            crate::controllers::substrate::CapPolicy::ReserveAtClaim,
+            crate::controllers::substrate::ActivationAttribution::resolve(
+                crate::controllers::substrate::ActivationClient::Client(alpha.clone()),
+                None,
+            ),
+        );
+
+        let handler = tokio::spawn(async move {
+            substrate
+                .restore_execution_inner(
+                    SandboxApiMetricIdentity::ecw("resume"),
+                    sandbox_id,
+                    ActivationOptions {
+                        blocking: true,
+                        ready_timeout: Duration::from_secs(5),
+                    },
+                    super::super::restore_intent::RestoreIntent::user(
+                        charge,
+                        super::super::execution::WakeTarget::Explicit(SandboxLifecycle::Started),
+                    ),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), request_started.acquire())
+            .await
+            .expect("the restore must reach its pod create")?
+            .forget();
+        handler.abort();
+        assert!(
+            handler
+                .await
+                .expect_err("handler must be cancelled")
+                .is_cancelled()
+        );
+        tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+        cap.precheck(&alpha, SandboxId::new())
+            .await
+            .expect_err("the detached restore still holds its slot past the TTL");
+
+        release_request.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !leader_tasks.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached restore leader must finish");
+        Ok(())
+    }
+
+    /// A reservation a request took at entry rides in its charge, so a wake
+    /// that goes on in a detached task after the request disconnects (the
+    /// implicit wake's leader, or a coalesced run) keeps it renewed: past the
+    /// member's TTL the wake still counts.
+    #[rstest::rstest]
+    #[case::implicit_wake(Some(ExecutionActivityKind::Access))]
+    #[case::coalesced_wake(None)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_disconnected_wake_keeps_the_reservation_its_request_took(
+        #[case] activity: Option<ExecutionActivityKind>,
+    ) -> Result<(), BoxError> {
+        let Some((_node, redis_url)) = crate::client_concurrency::tests::try_redis_url().await?
+        else {
+            return Ok(());
+        };
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
+        insert_ready_full_snapshot_relative_to_lifecycle(
+            &pool,
+            sandbox_id,
+            "s3://space-test/suspend-snapshots/disconnected-wake-reservation?region=us-east-1",
+            0,
+            Uuid::now_v7(),
+        )
+        .await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        let request_started = Arc::new(Semaphore::new(0));
+        let release_request = Arc::new(Semaphore::new(0));
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            blocking_failed_pod_create_kubernetes_client(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::clone(&request_started),
+                Arc::clone(&release_request),
+            ),
+        );
+        let leader_tasks = substrate.task_tracker.clone();
+        let ttl = Duration::from_secs(1);
+        let cap = crate::client_live_cap::ClientLiveCap::for_tests(
+            Substrate::from_kubernetes(KubernetesSubstrate::with_seeded_caches(
+                pool.clone(),
+                inert_kubernetes_client(),
+                1,
+                Vec::new(),
+            )),
+            &redis_url,
+            "alpha",
+            std::num::NonZeroU64::new(1).expect("nonzero"),
+            ttl,
+        );
+        let admission = Arc::new(LiveCapOnly(cap.clone()));
+        let alpha = pplx_space_common_core::types::ClientId::parse("alpha")?;
+        // As an entry site does: reserve, mark that the substrate call comes
+        // next, and hand the reservation to the charge.
+        let mut entry = cap
+            .reserve(&alpha, sandbox_id)
+            .await?
+            .expect("admitted under the cap");
+        entry.pod_may_exist();
+        let live = crate::client_live_cap::LiveHandoff::new(Some(entry));
+        let charge = crate::controllers::substrate::RecoveryCharge::enforce(
+            Some(&admission),
+            crate::controllers::substrate::CapPolicy::Reserved,
+            crate::controllers::substrate::ActivationAttribution::resolve(
+                crate::controllers::substrate::ActivationClient::Client(alpha.clone()),
+                None,
+            ),
+        )
+        .with_live(&live);
+
+        let handler = tokio::spawn(async move {
+            // The request's own handle goes with it when it's cancelled.
+            let _live = live;
+            substrate
+                .wake_execution_with_metric_identity_and_activity(
+                    &sandbox,
+                    Duration::from_secs(5),
+                    SandboxApiMetricIdentity::ecw("connect"),
+                    charge,
+                    activity,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), request_started.acquire())
+            .await
+            .expect("the wake must reach its pod create")?
+            .forget();
+        handler.abort();
+        assert!(
+            handler
+                .await
+                .expect_err("handler must be cancelled")
+                .is_cancelled()
+        );
+        tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+        cap.precheck(&alpha, SandboxId::new())
+            .await
+            .expect_err("the detached wake still holds its slot past the TTL");
+
+        release_request.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !leader_tasks.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the detached wake must finish");
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn joined_restore_does_not_resurrect_concurrent_delete() -> Result<(), BoxError> {
         // Arrange: the caller holds a stale restoring snapshot after the owner
@@ -9492,7 +9757,7 @@ mod kubernetes_tests {
         node_writer.apply_watcher_event(&Event::InitDone);
 
         let (node_api_pod_store, _) = reflector::store::<Pod>();
-        let (pod_store, pod_network_slots, _) = sandbox_pod_view::sandbox_pod_cache();
+        let (pod_store, pod_indexes, _) = sandbox_pod_view::sandbox_pod_cache();
         let caches = Arc::new(K8sCaches::for_test(
             node_api_pod_store,
             node_store,
@@ -9509,7 +9774,7 @@ mod kubernetes_tests {
             DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config,
             caches,
-            (pod_store, pod_network_slots),
+            (pod_store, pod_indexes),
         )
     }
 

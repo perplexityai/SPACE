@@ -626,6 +626,13 @@ fn reconnect_error_outcome(
         // wait_budget) so restore-path and direct-wake admission rejections land
         // on one outcome/reason series instead of being split across
         // `rejected/unavailable` vs `exhausted/wait_budget`.
+        // A client at its live cap is a per-client refusal, recorded like the
+        // concurrency limiter's rather than as cluster saturation.
+        SubstrateError::AdmissionRejected { live_cap: true, .. } => (
+            ReconnectOutcome::Rejected,
+            ReconnectTerminalPhase::Api,
+            ReconnectReason::RateLimited,
+        ),
         SubstrateError::AdmissionRejected { .. } => (
             ReconnectOutcome::Exhausted,
             ReconnectTerminalPhase::Api,
@@ -701,6 +708,16 @@ fn reconnect_controller_error_outcome(
             ReconnectOutcome::Exhausted,
             initial_lifecycle_terminal_phase(initial_lifecycle),
             ReconnectReason::LockContention,
+        );
+    }
+    // A client at its live cap is a per-client refusal, recorded like the
+    // concurrency limiter's. Without this its bare 429 and `Retry-After` read
+    // as `wait_budget`, the cluster-saturation tag.
+    if err.is_live_cap_refusal() {
+        return (
+            ReconnectOutcome::Rejected,
+            ReconnectTerminalPhase::Api,
+            ReconnectReason::RateLimited,
         );
     }
     if let Some(cause) = err.retry_after_cause() {

@@ -4,7 +4,7 @@
 
 use super::RestoreSnapshotChoice;
 use super::execution::WakeTarget;
-use crate::controllers::substrate::{ActivationAttribution, CapPolicy, RecoveryCharge};
+use crate::controllers::substrate::{ActivationAttribution, ChargeState, RecoveryCharge};
 use pplx_space_common_core::types::SandboxLifecycle;
 use pplx_space_sandbox_pod::EvacuationPlacement;
 
@@ -135,8 +135,8 @@ impl RestoreIntent {
             snapshot: RestoreSnapshotChoice::NewestRemote,
             pod_placement: RestorePodPlacement::Evacuation { cohort },
             allows_runtime_upgrade: false,
-            charge: RecoveryCharge::exempt(
-                CapPolicy::Skip,
+            charge: RecoveryCharge::uncapped(
+                ChargeState::Exempt,
                 ActivationAttribution::inherit_unresolved(),
             ),
             coalesces: false,

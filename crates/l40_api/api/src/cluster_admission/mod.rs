@@ -24,11 +24,13 @@ use pplx_space_sandbox_metrics::admission::{
 use rand::RngExt as _;
 use tokio_util::sync::CancellationToken;
 
+use crate::client_live_cap::{ClientLiveCap, ClientLiveCapConfig, LiveCapRefusal};
 use crate::controllers::substrate::{
     ActivationAdmission, ActivationAdmissionClass, ActivationAdmissionFuture,
-    ActivationAdmissionRejection, ActivationRejectionKind, GATEWAY_RETRY_AFTER,
+    ActivationAdmissionRejection, ActivationRejectionKind, GATEWAY_RETRY_AFTER, LiveCapFuture,
     NetworkSlotHeadroom, Substrate,
 };
+use pplx_space_common_core::types::{ClientId, SandboxId};
 
 mod redis_bucket;
 #[cfg(test)]
@@ -161,6 +163,9 @@ pub struct ClusterSandboxAdmission {
     bucket: Option<RedisTokenBucket>,
     config: ClusterSandboxAdmissionConfig,
     feature_flags: FeatureFlagClient,
+    /// The per-client live cap, which runs on its own switch: the cluster
+    /// bucket being off doesn't turn it off.
+    live_cap: ClientLiveCap,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -266,12 +271,28 @@ impl From<ClusterAdmissionError> for crate::controllers::ControllerError {
 }
 
 impl ClusterSandboxAdmission {
+    /// The cluster limiter and the live cap, both configured from the
+    /// environment.
     pub fn new(substrate: Substrate, feature_flags: FeatureFlagClient) -> Self {
+        let live_cap = ClientLiveCap::new(substrate.clone(), feature_flags.clone());
         Self::with_config(
             substrate,
             ClusterSandboxAdmissionConfig::from_env(),
             feature_flags,
         )
+        .with_live_cap(live_cap)
+    }
+
+    /// Replace the live cap, which [`Self::with_config`] leaves capping
+    /// nothing.
+    pub fn with_live_cap(mut self, live_cap: ClientLiveCap) -> Self {
+        self.live_cap = live_cap;
+        self
+    }
+
+    /// The per-client live cap this admission runs.
+    pub fn live_cap(&self) -> &ClientLiveCap {
+        &self.live_cap
     }
 
     pub fn with_config(
@@ -282,11 +303,17 @@ impl ClusterSandboxAdmission {
         // Borrow the URL to build the bucket before the config is moved into
         // sanitize_config; env parsing already happened in from_env.
         let bucket = build_bucket(config.redis_url.as_deref());
+        let live_cap = ClientLiveCap::with_config(
+            substrate.clone(),
+            ClientLiveCapConfig::default(),
+            feature_flags.clone(),
+        );
         Self {
             substrate,
             bucket,
             config: sanitize_config(config),
             feature_flags,
+            live_cap,
         }
     }
 
@@ -472,6 +499,36 @@ impl ActivationAdmission for ClusterSandboxAdmission {
                 })
         })
     }
+
+    fn reserve_live(&self, client: ClientId, sandbox: SandboxId) -> LiveCapFuture<'_> {
+        Box::pin(async move {
+            self.live_cap
+                .reserve(&client, sandbox)
+                .await
+                .map_err(live_cap_rejection)
+        })
+    }
+
+    fn precheck_live(&self, client: ClientId, sandbox: SandboxId) -> ActivationAdmissionFuture<'_> {
+        Box::pin(async move {
+            self.live_cap
+                .precheck(&client, sandbox)
+                .await
+                .map_err(live_cap_rejection)
+        })
+    }
+
+    fn live_cap_configured(&self) -> bool {
+        self.live_cap.is_configured()
+    }
+}
+
+fn live_cap_rejection(refusal: LiveCapRefusal) -> ActivationAdmissionRejection {
+    ActivationAdmissionRejection::new(
+        refusal.message,
+        Some(refusal.retry_after),
+        ActivationRejectionKind::LiveCap,
+    )
 }
 
 fn build_bucket(url: Option<&str>) -> Option<RedisTokenBucket> {
@@ -684,7 +741,7 @@ pub(crate) fn capacity_retry_after() -> Duration {
 /// Sampled independently per rejection rather than per caller, so a client that
 /// retries and is shed again draws a fresh offset instead of staying in the
 /// cohort it first landed in.
-fn jittered_retry_after(earliest: Duration) -> Duration {
+pub(crate) fn jittered_retry_after(earliest: Duration) -> Duration {
     let offset = rand::rng().random_range(0..=RETRY_AFTER_JITTER.as_secs());
     retry_after_with_jitter(earliest, Duration::from_secs(offset))
 }

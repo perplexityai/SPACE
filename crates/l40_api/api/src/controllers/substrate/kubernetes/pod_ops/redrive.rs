@@ -84,6 +84,15 @@ pub(super) enum PreconditionReread {
     Indeterminate,
 }
 
+/// Whether a re-drive leaves `pod` in place: it has bound, or it lacks the
+/// required pin because a concurrent re-drive already replaced it.
+pub(super) fn redrive_retains(pod: &SandboxPodView) -> bool {
+    matches!(
+        scheduling_outcome_of(pod),
+        Some(SchedulingOutcome::Scheduled { .. })
+    ) || !pod.has_required_source_pin()
+}
+
 pub(super) fn classify_precondition_reread(
     now_live: Option<&SandboxPodView>,
     caller_source_node: Option<&str>,
@@ -382,12 +391,7 @@ impl KubernetesSubstrate {
         // (a concurrent re-drive already replaced it with a same-name
         // successor) is left alone.
         let live_identity = match live.as_ref() {
-            Some(pod)
-                if matches!(
-                    scheduling_outcome_of(pod),
-                    Some(SchedulingOutcome::Scheduled { .. })
-                ) || !pod.has_required_source_pin() =>
-            {
+            Some(pod) if redrive_retains(pod) => {
                 tracing::info!(
                     sandbox_id = %sandbox.id,
                     pod_name = %pod_name,
