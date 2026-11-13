@@ -246,8 +246,8 @@ pub enum RunNodeCtlError {
     EmptyNodeId { path: PathBuf },
     #[error("unsupported node role {role:?}; expected cluster, worker, or builder")]
     UnsupportedNodeRole { role: String },
-    #[error("failed to bind the node-ctl health socket: {0}")]
-    HealthSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
+    #[error("failed to start the node-ctl health server: {0}")]
+    HealthSocket(#[source] pplx_space_local_health::LocalHealthServerError),
     #[error("failed to acquire the node-ctl service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to migrate node-ctl's SQLite database: {0}")]

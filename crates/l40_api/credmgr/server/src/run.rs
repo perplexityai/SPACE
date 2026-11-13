@@ -214,8 +214,8 @@ pub enum RunCredmgrError {
          non-empty SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_URL"
     )]
     MissingIntermediateKeyBrokerPlatformConfig,
-    #[error("failed to bind the credential-manager health socket: {0}")]
-    HealthSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
+    #[error("failed to start the credential-manager health server: {0}")]
+    HealthSocket(#[source] pplx_space_local_health::LocalHealthServerError),
     #[error("failed to acquire the credential-manager service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to bind the credential-manager socket: {0}")]

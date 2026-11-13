@@ -191,8 +191,8 @@ pub enum RunNodeMgrError {
     AwsImdsClient(String),
     #[error("failed to resolve sandbox disk I/O capacity profile: {0}")]
     ResolveDiskIoCapacityProfile(String),
-    #[error("failed to bind the node-manager health socket: {0}")]
-    HealthSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
+    #[error("failed to start the node-manager health server: {0}")]
+    HealthSocket(#[source] pplx_space_local_health::LocalHealthServerError),
     #[error("failed to acquire the node-manager service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to apply sandbox parent CPU limit: {0}")]
