@@ -1816,6 +1816,217 @@ fn the_unretired_phase_list_is_the_fencing_phases_and_verified() {
     assert_eq!(listed, expected);
 }
 
+/// An operation abandoned before the node ever saw it (its call still on its
+/// way) never fences afterwards, from any pod; abandoning it again changes
+/// nothing. Another operation of the same sandbox is untouched.
+#[test]
+fn an_abandoned_operation_never_fences_afterwards() {
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let abandoned = operation();
+
+    assert_eq!(
+        abandon_runtime_upgrade(&conn, &id, abandoned).unwrap(),
+        AbandonRuntimeUpgrade::Abandoned
+    );
+    assert_eq!(
+        abandon_runtime_upgrade(&conn, &id, abandoned).unwrap(),
+        AbandonRuntimeUpgrade::Abandoned
+    );
+    assert!(crate::db::read::runtime_upgrade_abandoned(&conn, abandoned).unwrap());
+    let other_sandbox = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    assert_eq!(
+        abandon_runtime_upgrade(&conn, &other_sandbox, abandoned).unwrap(),
+        AbandonRuntimeUpgrade::OperationNamesAnother
+    );
+
+    for attempt_id in ["late-attempt", "new-attempt", "another-attempt"] {
+        assert!(matches!(
+            begin_for_attempt(
+                &conn,
+                abandoned,
+                &id,
+                envs.target_reference,
+                false,
+                attempt_id
+            ),
+            BeginRuntimeUpgrade::Abandoned
+        ));
+    }
+    assert_eq!(runtime_upgrade(&conn, abandoned).unwrap(), None);
+    assert_eq!(
+        crate::db::read::runtime_upgrade_fence(&conn, &id).unwrap(),
+        None
+    );
+
+    let other = operation();
+    assert!(!crate::db::read::runtime_upgrade_abandoned(&conn, other).unwrap());
+    fenced(begin(&conn, other, &id, envs.target_reference, false));
+}
+
+/// An operation that hasn't settled isn't abandoned: one that fences the
+/// sandbox may still change its disk, and a verified boot still owes its
+/// stop. One rolled back since is: a new pod's retry of it would
+/// otherwise fence and boot again. An id the node recorded for another
+/// sandbox is refused, and a sandbox the node doesn't hold has nothing to
+/// fence.
+#[test]
+fn only_a_settled_operation_is_abandoned() {
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let operation_id = operation();
+    fenced(begin(
+        &conn,
+        operation_id,
+        &id,
+        envs.target_reference,
+        false,
+    ));
+
+    assert_eq!(
+        abandon_runtime_upgrade(&conn, &id, operation_id).unwrap(),
+        AbandonRuntimeUpgrade::Unsettled
+    );
+    assert!(!crate::db::read::runtime_upgrade_abandoned(&conn, operation_id).unwrap());
+    // A verified boot still owes its stop and retirement, which only a retry
+    // of it finishes, so it isn't abandoned either.
+    conn.execute(
+        "UPDATE sandbox_runtime_upgrades SET phase = 'verified' WHERE operation_id = ?1",
+        params![operation_id.to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        abandon_runtime_upgrade(&conn, &id, operation_id).unwrap(),
+        AbandonRuntimeUpgrade::Unsettled
+    );
+    conn.execute(
+        "UPDATE sandbox_runtime_upgrades SET phase = 'booting' WHERE operation_id = ?1",
+        params![operation_id.to_string()],
+    )
+    .unwrap();
+
+    let other_sandbox = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    assert_eq!(
+        abandon_runtime_upgrade(&conn, &other_sandbox, operation_id).unwrap(),
+        AbandonRuntimeUpgrade::OperationNamesAnother
+    );
+
+    assert!(roll_back_runtime_upgrade(&conn, operation_id, "boot failed").unwrap());
+    assert!(finish_runtime_upgrade_rollback(&conn, operation_id).unwrap());
+    // The settled operation's row is gone, but its recorded outcome still
+    // names the sandbox.
+    assert_eq!(
+        abandon_runtime_upgrade(&conn, &other_sandbox, operation_id).unwrap(),
+        AbandonRuntimeUpgrade::OperationNamesAnother
+    );
+    assert_eq!(
+        abandon_runtime_upgrade(&conn, &id, operation_id).unwrap(),
+        AbandonRuntimeUpgrade::Abandoned
+    );
+    assert!(matches!(
+        begin_for_attempt(
+            &conn,
+            operation_id,
+            &id,
+            envs.target_reference,
+            false,
+            "new-attempt"
+        ),
+        BeginRuntimeUpgrade::Abandoned
+    ));
+
+    // A sandbox the node doesn't hold: a call carrying `stage_from` could
+    // still stage it, so the operation is recorded all the same.
+    let absent = operation();
+    assert_eq!(
+        abandon_runtime_upgrade(&conn, &SandboxId::new().to_string(), absent).unwrap(),
+        AbandonRuntimeUpgrade::Abandoned
+    );
+    assert!(crate::db::read::runtime_upgrade_abandoned(&conn, absent).unwrap());
+}
+
+/// A call for an abandoned operation that names another sandbox takes
+/// another lock than the abandon, so it can pass its own check first. The
+/// writes it can still reach refuse the operation too, so it never records an
+/// outcome the abandonment contradicts.
+#[test]
+fn an_abandoned_operation_records_no_outcome_for_another_sandbox() {
+    let conn = test_conn();
+    let envs = environments();
+    let abandoned_for = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let other = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let operation_id = operation();
+    abandon_runtime_upgrade(&conn, &abandoned_for, operation_id).unwrap();
+
+    assert!(
+        !record_runtime_upgrade_already_on_target(
+            &conn,
+            &on_target(operation_id, &other),
+            "attempt-a"
+        )
+        .unwrap()
+    );
+    assert!(
+        !record_runtime_upgrade_refusal(
+            &conn,
+            &on_target(operation_id, &other),
+            "attempt-a",
+            "busy"
+        )
+        .unwrap()
+    );
+    assert!(
+        crate::db::read::runtime_upgrade_report(&conn, operation_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A rolled-back row still owes deleting its preserved copy, which never
+/// touches the sandbox, so it's done with the sandbox and abandoned as it
+/// stands; recovery deletes the copy afterwards.
+#[test]
+fn a_rolled_back_operation_is_abandoned_as_it_stands() {
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let operation_id = operation();
+    fenced(begin(
+        &conn,
+        operation_id,
+        &id,
+        envs.target_reference,
+        false,
+    ));
+    assert!(roll_back_runtime_upgrade(&conn, operation_id, "boot failed").unwrap());
+
+    assert_eq!(
+        abandon_runtime_upgrade(&conn, &id, operation_id).unwrap(),
+        AbandonRuntimeUpgrade::Abandoned
+    );
+    assert_eq!(
+        runtime_upgrade(&conn, operation_id)
+            .unwrap()
+            .map(|record| record.phase),
+        Some(RuntimeUpgradePhase::RolledBack)
+    );
+}
+
+#[test]
+fn deleting_the_sandbox_keeps_its_abandoned_operations() {
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let operation_id = operation();
+    abandon_runtime_upgrade(&conn, &id, operation_id).unwrap();
+
+    delete_sandbox(&conn, &id).unwrap();
+
+    assert!(crate::db::read::runtime_upgrade_abandoned(&conn, operation_id).unwrap());
+}
+
 /// A fencing upgrade's retained execution, which the State page publishes in
 /// place of the target the boot saved, is charged to the page's byte budget
 /// whether or not it decodes: one larger than the whole budget fails the page

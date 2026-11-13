@@ -56,6 +56,18 @@ struct SucceedingWake {
 
 #[tonic::async_trait]
 impl WorkerApiInternal for SucceedingWake {
+    async fn abandon_runtime_upgrade(
+        &self,
+        _request: tonic::Request<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<
+        tonic::Response<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "a restore runs no runtime upgrade",
+        ))
+    }
+
     async fn get_runtime_upgrade(
         &self,
         _request: tonic::Request<pplx_space_sbx_mgr_client::proto::GetRuntimeUpgradeRequest>,
@@ -121,6 +133,18 @@ struct StoppedWake {
 
 #[tonic::async_trait]
 impl WorkerApiInternal for StoppedWake {
+    async fn abandon_runtime_upgrade(
+        &self,
+        _request: tonic::Request<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<
+        tonic::Response<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "a restore runs no runtime upgrade",
+        ))
+    }
+
     async fn get_runtime_upgrade(
         &self,
         _request: tonic::Request<pplx_space_sbx_mgr_client::proto::GetRuntimeUpgradeRequest>,

@@ -1906,6 +1906,15 @@ impl SimWorkerApiInternalService {
 
 #[tonic::async_trait]
 impl WorkerApiInternal for SimWorkerApiInternalService {
+    async fn abandon_runtime_upgrade(
+        &self,
+        _request: tonic::Request<sbx::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<tonic::Response<sbx::AbandonRuntimeUpgradeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "the simulator runs no runtime upgrades",
+        ))
+    }
+
     async fn get_runtime_upgrade(
         &self,
         _request: Request<sbx::GetRuntimeUpgradeRequest>,

@@ -1703,7 +1703,68 @@ doesn't render it yet.
   attempt's, and its own refused activation, never another attempt's, so a
   later attempt never changes what the caller waiting on one reads. Node-api
   forwards it on `WorkerApiInternal` only for a caller with the control-plane
-  authority a policy write needs.
+  authority a policy write needs. It also reports `abandoned` once
+  the operation is abandoned (below).
+- **`AbandonRuntimeUpgrade`.** A pod that's gone doesn't prove its shim's
+  `UpgradeRuntime` call is: one force-deleted mid-create can still have the
+  call on its way to the node. So a caller that's about to capture the
+  sandbox's disk first abandons the operation. Sandbox-manager takes the
+  sandbox's upgrade lock, which an `UpgradeRuntime` holds for its whole call,
+  so an upgrade running there finishes first. If the lock stays held for 5 s
+  (`LOCK_WAIT`), the abandon answers `UNAVAILABLE` and the caller asks again.
+  An unsettled operation whose target is `stopped` is settled first, as a
+  retry of it would be: an interrupted one rolls back, and a verified boot
+  retires what it superseded and then stops the sandbox. A rolled-back
+  operation is already done with the sandbox for either target: its disk is
+  restored, so it's abandoned as it stands, and the preserved copy it still
+  owes deleting is left to recovery. A settling that fails answers its error
+  and records nothing. An unsettled operation whose
+  target is `started` answers `ABORTED`: it's left to its own retry or to the
+  recovery loop, which runs every 60 s (`RECOVERY_INTERVAL`), and the caller
+  asks again. Then the operation is recorded
+  abandoned in `sandbox_runtime_upgrade_abandoned`, and every later
+  `UpgradeRuntime` for it, from any pod, is refused before it stages, fences
+  or boots, under any attempt id. The refusal is `FAILED_PRECONDITION`, or
+  `INVALID_ARGUMENT` for one that names another sandbox, target or
+  authorization than the operation's upgrade row or outcome, or another
+  sandbox than the abandonment's. A call naming another sandbox than the
+  abandonment's takes its own sandbox's lock, so it can pass its own check
+  before the abandon lands. The writes it can still reach refuse the
+  operation in the same statement or transaction, so it never fences, starts
+  or records an outcome, though such a call may be answered with the first
+  refusal it reaches rather than `INVALID_ARGUMENT`, and one carrying
+  `stage_from` may still evict a stale copy of its own sandbox and stage it
+  first.
+
+  A Wake carrying an abandoned operation is refused with the same codes
+  where the Wake would run the upgrade: before the
+  upgrade of a stopped or suspended sandbox, including one already on the
+  upgrade's target. A Wake for an absent sandbox checks before staging it
+  too, but outside the upgrade lock, so one already past that check when the
+  abandon lands still stages the checkpoint, and is then refused before the
+  upgrade. A Wake that doesn't reach the upgrade (the sandbox is already
+  started, paused or created) wakes it as a Wake without the upgrade would,
+  which abandonment doesn't bar. Nor does abandonment wait for a Wake
+  already past its check: once the upgrade answers that it found the sandbox
+  on its target, or that the operation's upgrade had already retired, the
+  Wake starts or restores the sandbox after the upgrade lock is released.
+  None of this reaches a Kubernetes sandbox, which never takes an upgrade on
+  a Wake, and abandonment is for a Kubernetes pod's operation.
+
+  Abandoning an operation already abandoned, settled or never seen succeeds,
+  and so does one for a sandbox the node doesn't hold, since a late call
+  carrying `stage_from` would stage it; the record outlives the sandbox's
+  row, and nothing prunes it. One recorded for another sandbox answers
+  `INVALID_ARGUMENT`, to an abandon and to a `GetRuntimeUpgrade` alike.
+  Node-api forwards it on `WorkerApiInternal` under the same authority as
+  `GetRuntimeUpgrade`.
+
+  Abandonment bars one operation, so a caller that issued several for the
+  sandbox, as a retry under a new operation id does, abandons each before it
+  captures the disk. An abandon bars later calls; it doesn't stop what the
+  operation already started. A `started` target's retired boot keeps running
+  the sandbox on the new runtime, so a caller captures the disk only once the
+  sandbox is at rest.
 
 A failed upgrade fails the pod's sandbox create, so the pod stays pending in
 `ContainerCreating`, with no container ever ending, while kubelet retries the
@@ -1747,15 +1808,16 @@ execution, and the shim fails the create.
 
 A sandbox-manager from this release applies the
 `sandbox_runtime_upgrade_outcomes`, `sandbox_runtime_upgrade_attempt_id`,
-`sandbox_runtime_upgrade_refused_attempts` and
-`sandbox_runtime_upgrade_attempt_outcomes` migrations at startup, and an
+`sandbox_runtime_upgrade_refused_attempts`,
+`sandbox_runtime_upgrade_attempt_outcomes` and
+`sandbox_runtime_upgrade_abandoned` migrations at startup, and an
 older one refuses a database whose migration history holds a version it
 doesn't bundle. So a rollback build reverts the code but keeps those
 migrations, their files under `db/sandbox-manager/` and their entries in the
 store's migration list, as `db/README.md` requires of any binary rollback. A
 binary rollback keeps the schema, so the down migrations' guards don't
 protect it. The older code never reads the new tables or columns, so it
-ignores per-attempt finality and refused activations, and it can't parse a
+ignores per-attempt finality, refused activations and abandonment, and it can't parse a
 `refused` outcome: for an operation that recorded one, `GetRuntimeUpgrade`
 answers `INTERNAL`, and so does an `UpgradeRuntime` once it reads the
 operation's outcome. The attempt id columns are nullable, and every row
@@ -1767,13 +1829,20 @@ recorded, since an older release would let that attempt's retry activate the
 sandbox. The attempt-outcomes migration's down migration refuses while any
 attempt's outcome is recorded, since an older release reads only the
 operation's latest outcome and would let a delayed retry of an earlier
-attempt fence the sandbox again.
+attempt fence the sandbox again. The abandoned
+migration's down migration refuses while an abandoned operation is recorded,
+since an older release would let a late call for it change a disk the
+control plane has already captured. Nothing prunes those records, so once a
+node has abandoned an operation, that down migration refuses until an
+operator deletes them.
 
-A sandbox-manager that predates these fields returns no `attempt_id` or
-`refused_attempt_id`, and ignores a request's `attempt_id`, answering the
-latest outcome. A caller has to treat a report that doesn't name its attempt
-as an outcome it can't confirm, so deploy sandbox-manager before any control
-plane that relies on them.
+A sandbox-manager that predates these fields returns no `attempt_id`,
+`refused_attempt_id` or `abandoned`, and ignores a request's `attempt_id`,
+answering the latest outcome. One that predates `AbandonRuntimeUpgrade`, or
+sits behind a node-api that does, answers it `UNIMPLEMENTED`. A caller has to
+treat a report that doesn't name its attempt, and an abandon that isn't OK,
+as an outcome it can't confirm, so deploy sandbox-manager and node-api before
+any control plane that relies on them.
 
 ### Upgrading at resume and start
 

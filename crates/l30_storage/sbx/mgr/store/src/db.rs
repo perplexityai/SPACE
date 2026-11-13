@@ -580,6 +580,9 @@ fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
         "DELETE FROM sandbox_runtime_upgrade_attempt_outcomes WHERE sandbox_id = ?1",
         params![id],
     )?;
+    // `sandbox_runtime_upgrade_abandoned` is kept: a late call for an
+    // abandoned operation can stage the sandbox again, and must still be
+    // refused.
     Ok(())
 }
 

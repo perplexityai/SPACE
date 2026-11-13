@@ -2694,3 +2694,77 @@ async fn a_refusal_of_the_sandboxs_state_is_not_final_for_its_attempt() {
         .unwrap();
     assert_eq!(h.boots(), 1);
 }
+
+/// A call that reaches the fence for an abandoned operation, as one does when
+/// an abandon naming another sandbox, under that sandbox's lock, lands after
+/// the call's own check, is refused there and records nothing: the operation
+/// reports its abandonment, not a refused create. It's `FAILED_PRECONDITION`
+/// for the abandonment's sandbox and `INVALID_ARGUMENT` for another.
+#[tokio::test]
+async fn an_abandoned_operation_refused_at_the_fence_records_nothing() {
+    for (for_this_sandbox, code) in [
+        (true, tonic::Code::FailedPrecondition),
+        (false, tonic::Code::InvalidArgument),
+    ] {
+        let h = harness(SandboxState::Stopped);
+        let operation_id = operation();
+        let abandoned_for = if for_this_sandbox {
+            h.sandbox_id.clone()
+        } else {
+            SandboxId::new().to_string()
+        };
+        assert_eq!(
+            crate::db::abandon_runtime_upgrade(&h.db.lock().unwrap(), &abandoned_for, operation_id)
+                .unwrap(),
+            crate::db::AbandonRuntimeUpgrade::Abandoned
+        );
+
+        let refusal = h
+            .upgrader
+            .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(refusal.code(), code, "{refusal}");
+        assert!(refusal.message().contains("abandoned"), "{refusal}");
+        assert!(h.report_status(operation_id).is_none(), "nothing recorded");
+        assert_eq!(h.boots(), 0);
+    }
+}
+
+/// The same race on a sandbox already on its target: the abandon naming
+/// another sandbox lands after the call's check, and the call's
+/// already-on-target outcome is refused in the same write. The call is
+/// answered as one naming another sandbox than the abandonment's, and nothing
+/// is recorded or started.
+#[tokio::test]
+async fn an_abandoned_operation_already_on_its_target_records_nothing() {
+    let h = harness(SandboxState::Stopped);
+    crate::db::upsert_sandbox_execution_metadata(
+        &h.db.lock().unwrap(),
+        &h.sandbox_id,
+        &h.envs.target,
+    )
+    .unwrap();
+    let operation_id = operation();
+    assert_eq!(
+        crate::db::abandon_runtime_upgrade(
+            &h.db.lock().unwrap(),
+            &SandboxId::new().to_string(),
+            operation_id
+        )
+        .unwrap(),
+        crate::db::AbandonRuntimeUpgrade::Abandoned
+    );
+
+    let refusal = h
+        .upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(refusal.code(), tonic::Code::InvalidArgument, "{refusal}");
+    assert!(refusal.message().contains("abandoned"), "{refusal}");
+    assert!(h.report_status(operation_id).is_none(), "nothing recorded");
+    assert_eq!(h.boots(), 0);
+}

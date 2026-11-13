@@ -226,15 +226,20 @@ async fn capture_time_marker_round_trips_and_reupgrades_as_not_comparable() {
     );
 }
 
-/// The three runtime-upgrade migrations: the attempt id, refused attempts and
-/// attempt outcomes.
-const RUNTIME_UPGRADE_MIGRATIONS: [i64; 3] = [20261112170001, 20261112170002, 20261112170003];
+/// The four runtime-upgrade migrations: the attempt id, refused attempts,
+/// attempt outcomes and abandoned operations.
+const RUNTIME_UPGRADE_MIGRATIONS: [i64; 4] = [
+    20261112170001,
+    20261112170002,
+    20261112170003,
+    20261112170004,
+];
 /// The newest sandbox-manager migration that shipped before them.
 const BEFORE_RUNTIME_UPGRADE_MIGRATIONS: i64 = 20261112160000;
 
 /// The runtime-upgrade migrations come after every migration that shipped
 /// before them, next to each other, so a database at that earlier head takes
-/// them as its next three and a `down` reverts them, newest first, before it
+/// them as its next four and a `down` reverts them, newest first, before it
 /// reaches any earlier migration. Up, down and up again round-trip; newer
 /// migrations are rolled back first.
 #[tokio::test]
@@ -298,7 +303,8 @@ async fn runtime_upgrade_migrations_follow_their_predecessors_and_round_trip() {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
                      'sandbox_runtime_upgrade_refused_attempts',
-                     'sandbox_runtime_upgrade_attempt_outcomes'
+                     'sandbox_runtime_upgrade_attempt_outcomes',
+                     'sandbox_runtime_upgrade_abandoned'
                  )",
                 [],
                 |row| row.get(0),
@@ -332,7 +338,7 @@ async fn runtime_upgrade_downs_refuse_while_a_row_an_older_release_misreads_is_r
         .iter()
         .filter(|migration| {
             migration.migration_type.is_up_migration()
-                && migration.version > RUNTIME_UPGRADE_MIGRATIONS[2]
+                && migration.version > RUNTIME_UPGRADE_MIGRATIONS[3]
         })
         .count();
     let applied = || async {
@@ -354,6 +360,13 @@ async fn runtime_upgrade_downs_refuse_while_a_row_an_older_release_misreads_is_r
     }
     // Newest first: each down's guarded row, and the statement that clears it.
     let guarded = [
+        (
+            RUNTIME_UPGRADE_MIGRATIONS[3],
+            "INSERT INTO sandbox_runtime_upgrade_abandoned
+                 (operation_id, sandbox_id, recorded_at)
+             VALUES ('op', 'sandbox', '0')",
+            "DELETE FROM sandbox_runtime_upgrade_abandoned",
+        ),
         (
             RUNTIME_UPGRADE_MIGRATIONS[2],
             "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes

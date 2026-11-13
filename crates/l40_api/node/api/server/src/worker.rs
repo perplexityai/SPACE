@@ -400,6 +400,7 @@ sandbox_scoped_requests!(
     pplx_space_sbx_mgr_client::proto::ResumeRequest,
     pplx_space_sbx_mgr_client::proto::WakeRequest,
     pplx_space_sbx_mgr_client::proto::GetRuntimeUpgradeRequest,
+    pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeRequest,
     pplx_space_sbx_mgr_client::proto::CreateSnapshotRequest,
     pplx_space_sbx_mgr_client::proto::SuspendRequest,
     pplx_space_sbx_mgr_client::proto::PrepareTeardownSuspendRequest,
@@ -1311,6 +1312,18 @@ impl WorkerApiInternal for WorkerApiService {
         record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
         require_policy_mutation_authority(&r)?;
         fwd_sbx!(self, "GetRuntimeUpgrade", get_runtime_upgrade, r)
+    }
+
+    async fn abandon_runtime_upgrade(
+        &self,
+        r: Request<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::AbandonRuntimeUpgradeResponse>, Status>
+    {
+        // Only the control plane drives runtime upgrades, so it takes the
+        // authority a Wake carrying one does.
+        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
+        require_policy_mutation_authority(&r)?;
+        fwd_sbx!(self, "AbandonRuntimeUpgrade", abandon_runtime_upgrade, r)
     }
 }
 

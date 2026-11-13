@@ -339,3 +339,33 @@ async fn the_internal_runtime_upgrade_report_is_forwarded_only_for_the_control_p
         .unwrap_err();
     assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
 }
+
+/// Abandoning an upgrade refuses every later call for it, so only the control
+/// plane that requested the upgrade may abandon it.
+#[tokio::test]
+async fn the_internal_runtime_upgrade_abandon_is_forwarded_only_for_the_control_plane() {
+    use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
+    let service =
+        service_with_limiter(UdsPerSandboxLimiter::for_tests_with_reserved(1, 1, 8)).await;
+    let abandon = || {
+        Request::new(proto::AbandonRuntimeUpgradeRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            operation_id: uuid::Uuid::now_v7().to_string(),
+        })
+    };
+
+    let mut unprivileged = abandon();
+    unprivileged
+        .extensions_mut()
+        .insert(pplx_space_rpc_auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test());
+    let denied = WorkerApiInternal::abandon_runtime_upgrade(&service, unprivileged)
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied, "{denied}");
+
+    // The fake sandbox-manager answers whatever reaches it with Unimplemented.
+    let forwarded = WorkerApiInternal::abandon_runtime_upgrade(&service, abandon())
+        .await
+        .unwrap_err();
+    assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
+}
