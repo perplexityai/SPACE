@@ -251,4 +251,11 @@ fn firewall_setup_classifier_preserves_transient_and_permanent_sources() {
         },)
         .is_transient()
     );
+    let malformed = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+    assert!(
+        !classify_firewall_setup_error(crate::firewall::FirewallError::PackagedPolicy(
+            crate::firewall::PackagedPolicyError(malformed),
+        ))
+        .is_transient()
+    );
 }

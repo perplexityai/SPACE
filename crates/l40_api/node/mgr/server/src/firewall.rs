@@ -13,6 +13,7 @@ use std::process::Output;
 pub mod config_version;
 mod host_cache;
 
+use config_version::{ConfigPart, PartHash};
 #[cfg(test)]
 pub(crate) use tests::packaged_pre_tproxy_guardrails_policy as packaged_pre_tproxy_guardrails_policy_for_test;
 
@@ -64,6 +65,11 @@ const PRE_TPROXY_GUARDRAILS_POLICY_PATH: &str =
 /// Validation still reads the result back as JSON, plus the native listing
 /// for the device binding, which the JSON output omits.
 fn guest_l2_ingress_policy_script() -> String {
+    guest_l2_ingress_rules_script() + &config_version::l2_ingress_marker_script()
+}
+
+/// The L2 ingress policy's rules, without the marker that records them.
+fn guest_l2_ingress_rules_script() -> String {
     let tap = crate::net::TAP_DEVICE;
     format!(
         "add table netdev {SANDBOX_L2_TABLE}
@@ -124,6 +130,10 @@ pub enum FirewallError {
         #[source]
         source: std::io::Error,
     },
+    #[error(transparent)]
+    PackagedPolicy(#[from] PackagedPolicyError),
+    #[error("a firewall builder rendered invalid nft JSON: {0}")]
+    RenderedRuleset(#[source] serde_json::Error),
     #[error("nft exec failed: {0}")]
     Exec(#[source] std::io::Error),
     #[error("nft apply failed: {stderr}\ninput: {input}")]
@@ -263,14 +273,47 @@ pub fn setup_namespace_rules(
     guest_ip: &str,
 ) -> FirewallResult<()> {
     let pre_tproxy_guardrail_rules = load_pre_tproxy_guardrail_rules()?;
+    install_namespace_rules(ns, vpeer, vpeer_ip, guest_ip, &pre_tproxy_guardrail_rules)
+}
+
+fn install_namespace_rules(
+    ns: &str,
+    vpeer: &str,
+    vpeer_ip: &str,
+    guest_ip: &str,
+    pre_tproxy_guardrail_rules: &str,
+) -> FirewallResult<()> {
+    // The policy text is spliced into the transaction, so check it before
+    // anything is applied: text that is not nft JSON commands fails here, as
+    // the host fault it is, rather than inside the ruleset.
+    let sandbox_base = PartHash::sandbox_base(pre_tproxy_guardrail_rules)?;
+    let markers = config_version::marker_commands(ConfigPart::SandboxBase, sandbox_base);
+    let ruleset = with_commands(
+        &namespace_rules_json(vpeer, vpeer_ip, guest_ip, pre_tproxy_guardrail_rules),
+        markers,
+    )
+    .map_err(PackagedPolicyError)?;
     // Guest L2 filtering first, so the TAP drops VLAN frames before the
     // namespace's routing and NAT rules exist.
     apply_nft_script(&guest_l2_ingress_policy_script(), Some(ns))?;
-    apply_nft_json(
-        &namespace_rules_json(vpeer, vpeer_ip, guest_ip, &pre_tproxy_guardrail_rules),
-        Some(ns),
-    )?;
+    apply_nft_json(&ruleset, Some(ns))?;
     ensure_namespace_forward_drop_rules(ns, vpeer)
+}
+
+/// An nft JSON ruleset as the builders render it.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct NftRuleset {
+    nftables: Vec<serde_json::Value>,
+}
+
+/// Append commands to an nft JSON ruleset so they share its transaction.
+fn with_commands(
+    ruleset: &str,
+    commands: impl IntoIterator<Item = serde_json::Value>,
+) -> Result<String, serde_json::Error> {
+    let mut ruleset: NftRuleset = serde_json::from_str(ruleset)?;
+    ruleset.nftables.extend(commands);
+    serde_json::to_string(&ruleset)
 }
 
 fn namespace_rules_json(
@@ -576,7 +619,15 @@ pub fn setup_netgtw_tproxy_rules(
     dhcp: bool,
 ) -> FirewallResult<()> {
     ensure_namespace_forward_drop_rules(ns, vpeer)?;
-    apply_nft_json(&netgtw_tproxy_rules_json(uid, dhcp), Some(ns))
+    let hash = ConfigPart::Proxy
+        .builtin_hash()
+        .expect("proxy is hashed from this binary's builder");
+    let ruleset = with_commands(
+        &netgtw_tproxy_rules_json(uid, dhcp),
+        config_version::marker_commands(ConfigPart::Proxy, hash),
+    )
+    .map_err(FirewallError::RenderedRuleset)?;
+    apply_nft_json(&ruleset, Some(ns))
 }
 
 fn netgtw_tproxy_rules_json(uid: u32, dhcp: bool) -> String {
@@ -1416,6 +1467,18 @@ fn ensure_namespace_forward_drop_rules(ns: &str, vpeer: &str) -> FirewallResult<
         nftables.push(add_chain);
     }
     nftables.extend(rules);
+    // Only creating the chain installs the part in full; a repair of an
+    // existing chain leaves its marker, or its absence, as it was.
+    if !chain_exists {
+        let hash = ConfigPart::Forward
+            .builtin_hash()
+            .expect("forward is hashed from this binary's builder");
+        nftables.extend(
+            config_version::marker_commands(ConfigPart::Forward, hash)
+                .iter()
+                .map(serde_json::Value::to_string),
+        );
+    }
     let json = format!(
         r#"{{ "nftables": [
 {}

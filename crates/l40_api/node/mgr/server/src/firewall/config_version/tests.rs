@@ -73,7 +73,7 @@ fn hashes_ignore_formatting_and_key_order() {
         assert_eq!(PartHash::sandbox_base(&respelled).unwrap(), installed);
     }
 
-    let script = super::super::guest_l2_ingress_policy_script();
+    let script = super::super::guest_l2_ingress_rules_script();
     let respaced = script
         .lines()
         .map(|line| format!("\t{}  ", line.replace(' ', "   ")))
@@ -136,7 +136,9 @@ fn hashes_change_with_every_meaningful_rule_change() {
         crate::net::GUEST_IP,
         FIXTURE_POLICY,
     );
-    let commands = serde_json::from_str::<Ruleset>(&rendered).unwrap().nftables;
+    let commands = serde_json::from_str::<super::super::NftRuleset>(&rendered)
+        .unwrap()
+        .nftables;
     assert_eq!(
         PartHash::of_commands(ConfigPart::SandboxBase, &commands),
         installed
@@ -273,35 +275,201 @@ fn markers_round_trip_and_parse_strictly() {
 }
 
 #[test]
-fn installed_hash_requires_exactly_one_marker_for_its_part() {
+fn read_marker_requires_exactly_one_marker_for_its_part() {
     let part = ConfigPart::SandboxBase;
     let hash = PartHash::sandbox_base(FIXTURE_POLICY).unwrap();
     let marker = hash.marker(part);
     let other = ConfigPart::Forward.builtin_hash().unwrap();
+    let read_comments = |comments: &[Option<&str>]| {
+        let rules: Vec<_> = comments
+            .iter()
+            .map(|comment| {
+                let mut rule = serde_json::json!({
+                    "family": "ip", "table": "sandbox", "chain": "space_cfg_sandbox_base",
+                    "expr": [{"continue": null}]
+                });
+                if let Some(comment) = comment {
+                    rule["comment"] = (*comment).into();
+                }
+                serde_json::json!({"rule": rule})
+            })
+            .collect();
+        read_marker(part, &serde_json::json!({"nftables": rules}))
+    };
 
-    assert_eq!(installed_hash(part, []), Ok(None));
-    assert_eq!(
-        installed_hash(part, [Some(marker.as_str())]),
-        Ok(Some(hash))
-    );
+    assert_eq!(read_comments(&[]), Ok(None));
+    assert_eq!(read_comments(&[Some(marker.as_str())]), Ok(Some(hash)));
     // A second marker is ambiguous even when it repeats the first.
     assert_eq!(
-        installed_hash(part, [Some(marker.as_str()), Some(marker.as_str())]),
+        read_comments(&[Some(marker.as_str()), Some(marker.as_str())]),
         Err(MarkerError::Duplicate(part))
     );
     assert_eq!(
-        installed_hash(part, [Some(marker.as_str()), None]),
+        read_comments(&[Some(marker.as_str()), None]),
         Err(MarkerError::Uncommented(part))
     );
     assert_eq!(
-        installed_hash(part, [Some(marker.as_str()), Some("space-cfg-note")]),
+        read_comments(&[Some(marker.as_str()), Some("space-cfg-note")]),
         Err(MarkerError::Malformed("space-cfg-note".into()))
     );
     assert_eq!(
-        installed_hash(part, [Some(other.marker(ConfigPart::Forward).as_str())]),
+        read_comments(&[Some(other.marker(ConfigPart::Forward).as_str())]),
         Err(MarkerError::WrongPart {
             expected: part,
             found: ConfigPart::Forward
+        })
+    );
+}
+
+/// `nft -j list ruleset` of a namespace after every full installation, from
+/// each supported nftables version: `nft --version` in amazonlinux:2023
+/// (1.0.4), ubuntu:24.04 (1.0.9) and debian:trixie (1.1.3). The rules must
+/// match this binary's builders and the image's packaged policy, so
+/// regenerate them after changing either: run the ignored
+/// `firewall::tests::linux::print_stamped_namespace_listing` as root with
+/// `SPACE_PRINT_NFT_FIXTURE=1` under each version, for example by running the test binary in a container with
+/// `--cap-add NET_ADMIN --cap-add SYS_ADMIN`, and pipe its output through
+/// `python3 -m json.tool --indent 2`.
+fn stamped_listings() -> [serde_json::Value; 3] {
+    [
+        include_str!("../../fixtures/stamped_namespace_nft_1_0_4.json"),
+        include_str!("../../fixtures/stamped_namespace_nft_1_0_9.json"),
+        include_str!("../../fixtures/stamped_namespace_nft_1_1_3.json"),
+    ]
+    .map(|listing| serde_json::from_str(listing).unwrap())
+}
+
+#[test]
+fn markers_read_back_from_each_supported_nft_version() {
+    for listing in stamped_listings() {
+        let version = &listing["nftables"][0]["metainfo"]["version"];
+        for part in ConfigPart::ALL {
+            let expected = part.builtin_hash().unwrap_or_else(|| {
+                PartHash::sandbox_base(
+                    super::super::packaged_pre_tproxy_guardrails_policy_for_test(),
+                )
+                .unwrap()
+            });
+            assert_eq!(
+                read_marker(part, &listing),
+                Ok(Some(expected)),
+                "nft {version} {part}"
+            );
+        }
+    }
+    // Namespaces installed before markers existed read as unmarked.
+    for legacy in [
+        include_str!("../../fixtures/live_pre_tproxy_guardrails_chain.json"),
+        include_str!("../../fixtures/live_inbound_reply_chain.json"),
+        include_str!("../../fixtures/guest_l2_ingress_nft_1_0_4.json"),
+    ] {
+        let legacy: serde_json::Value = serde_json::from_str(legacy).unwrap();
+        for part in ConfigPart::ALL {
+            assert_eq!(read_marker(part, &legacy), Ok(None), "{part}");
+        }
+    }
+    // Per-component stamps do not establish a complete base installation.
+    let old_components =
+        ["pre_tproxy", "packaged_policy", "egress_guardrails", "nat"].map(|part| {
+            serde_json::json!({"rule": {
+                "family": "ip", "table": "sandbox", "chain": format!("space_cfg_{part}"),
+                "comment": format!("space-cfg:{part}=r1.{}", "0".repeat(32)),
+                "expr": [{"continue": null}]
+            }})
+        });
+    let listing = serde_json::json!({"nftables": old_components});
+    assert_eq!(read_marker(ConfigPart::SandboxBase, &listing), Ok(None));
+}
+
+#[test]
+fn only_inert_well_formed_markers_are_read() {
+    let [listing, ..] = stamped_listings();
+    let find = |predicate: &dyn Fn(&serde_json::Value) -> bool| {
+        listing["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(predicate)
+            .unwrap()
+    };
+    let base_marker = find(&|entry| entry["rule"]["chain"] == "space_cfg_sandbox_base");
+    let base_chain = find(&|entry| entry["chain"]["name"] == "space_cfg_sandbox_base");
+    let proxy_marker = find(&|entry| {
+        entry["rule"]["table"] == "proxy"
+            && entry["rule"]["comment"]
+                .as_str()
+                .is_some_and(|comment| comment.starts_with(MARKER_PREFIX))
+    });
+    let edit = |change: &dyn Fn(&mut Vec<serde_json::Value>)| {
+        let mut changed = listing.clone();
+        change(changed["nftables"].as_array_mut().unwrap());
+        changed
+    };
+
+    // A marker that is not an inert continue is not a marker, in a dedicated
+    // chain or in the shared proxy chain. Comment parsing, duplicates and
+    // missing comments are covered above.
+    for (part, index) in [
+        (ConfigPart::SandboxBase, base_marker),
+        (ConfigPart::Proxy, proxy_marker),
+    ] {
+        let verdict = edit(&|entries| {
+            entries[index]["rule"]["expr"] = serde_json::json!([{ "accept": null }]);
+        });
+        assert_eq!(
+            read_marker(part, &verdict),
+            Err(MarkerError::NotInert(part))
+        );
+    }
+    // A dedicated chain holds nothing but its marker, and nothing evaluates it.
+    let extra_rule = edit(&|entries| {
+        let mut extra = entries[base_marker].clone();
+        extra["rule"]["comment"] = "drop-everything".into();
+        entries.push(extra);
+    });
+    assert_eq!(
+        read_marker(ConfigPart::SandboxBase, &extra_rule),
+        Err(MarkerError::Malformed("drop-everything".into()))
+    );
+    // An earlier malformed comment takes precedence over a later bad expression.
+    let mixed_errors = edit(&|entries| {
+        entries[base_marker]["rule"]["comment"] = "space-cfg:invalid".into();
+        let mut extra = entries[base_marker].clone();
+        extra["rule"]["expr"] = serde_json::json!([{"accept": null}]);
+        entries.push(extra);
+    });
+    assert_eq!(
+        read_marker(ConfigPart::SandboxBase, &mixed_errors),
+        Err(MarkerError::Malformed("space-cfg:invalid".into()))
+    );
+    let hooked = edit(&|entries| {
+        entries[base_chain]["chain"]["hook"] = "prerouting".into();
+    });
+    assert_eq!(
+        read_marker(ConfigPart::SandboxBase, &hooked),
+        Err(MarkerError::HookedChain(ConfigPart::SandboxBase))
+    );
+    // Proxy rules without the marker prefix belong to the part, not its marker.
+    let unmarked_proxy = edit(&|entries| {
+        entries.remove(proxy_marker);
+    });
+    assert_eq!(read_marker(ConfigPart::Proxy, &unmarked_proxy), Ok(None));
+    // A marker at another part's location is evidence of neither part.
+    let moved = edit(&|entries| {
+        let forward_marker = entries
+            .iter()
+            .position(|entry| entry["rule"]["chain"] == "space_cfg_forward")
+            .unwrap();
+        entries[forward_marker]["rule"]["comment"] =
+            entries[base_marker]["rule"]["comment"].clone();
+        entries.remove(base_marker);
+    });
+    assert_eq!(read_marker(ConfigPart::SandboxBase, &moved), Ok(None));
+    assert_eq!(
+        read_marker(ConfigPart::Forward, &moved),
+        Err(MarkerError::WrongPart {
+            expected: ConfigPart::Forward,
+            found: ConfigPart::SandboxBase
         })
     );
 }

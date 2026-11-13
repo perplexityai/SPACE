@@ -8,8 +8,8 @@
 //! rule order and values. [`HASH_REVISION`] versions this format; markers use
 //! `space-cfg:<part>=r<revision>.<digest>`.
 //!
-//! Reset teardown is best effort. Sandbox table installation uses `create`,
-//! so a surviving table fails the transaction and triggers a namespace rebuild.
+//! Markers commit atomically with their installation. They record its identity,
+//! not proof that the rules have remained unchanged.
 
 use serde::de::Error as _;
 use sha2::Digest;
@@ -70,7 +70,7 @@ impl ConfigPart {
             Self::L2Ingress => {
                 return Some(PartHash::of_native_script(
                     self,
-                    &super::guest_l2_ingress_policy_script(),
+                    &super::guest_l2_ingress_rules_script(),
                 ));
             }
             Self::SandboxBase => return None,
@@ -81,7 +81,7 @@ impl ConfigPart {
                 .into_iter()
                 .flat_map(|dhcp| {
                     let rendered = super::netgtw_tproxy_rules_json(SLOT_GATEWAY_UID, dhcp);
-                    serde_json::from_str::<Ruleset>(&rendered)
+                    serde_json::from_str::<super::NftRuleset>(&rendered)
                         .expect("the TPROXY builder renders an nftables JSON ruleset")
                         .nftables
                 })
@@ -146,7 +146,8 @@ impl PartHash {
         }
         let rendered =
             super::namespace_rules_json(SLOT_VPEER, SLOT_VPEER_IP, crate::net::GUEST_IP, policy);
-        let ruleset: Ruleset = serde_json::from_str(&rendered).map_err(PackagedPolicyError)?;
+        let ruleset: super::NftRuleset =
+            serde_json::from_str(&rendered).map_err(PackagedPolicyError)?;
         Ok(Self::of_commands(
             ConfigPart::SandboxBase,
             &ruleset.nftables,
@@ -204,6 +205,10 @@ pub enum MarkerError {
     Malformed(String),
     #[error("a rule at the {0} marker location has no comment")]
     Uncommented(ConfigPart),
+    #[error("a rule at the {0} marker location is not an inert continue")]
+    NotInert(ConfigPart),
+    #[error("the {0} marker chain is a base chain")]
+    HookedChain(ConfigPart),
     #[error("marker {0:?} names an unknown configuration part")]
     UnknownPart(String),
     #[error("marker {0:?} uses an unsupported hash revision")]
@@ -219,7 +224,7 @@ pub enum MarkerError {
 
 /// Parse a marker comment strictly: exactly `space-cfg:<part>=r1.<digest>`,
 /// with a known part and 32 lowercase hex digits.
-pub fn parse_marker(comment: &str) -> Result<(ConfigPart, PartHash), MarkerError> {
+fn parse_marker(comment: &str) -> Result<(ConfigPart, PartHash), MarkerError> {
     let malformed = || MarkerError::Malformed(comment.to_string());
     let (part, hash) = comment
         .strip_prefix(MARKER_PREFIX)
@@ -254,14 +259,139 @@ pub fn parse_marker(comment: &str) -> Result<(ConfigPart, PartHash), MarkerError
     Ok((part, PartHash(bytes)))
 }
 
-/// Read one marker at `part`'s location, or `None` for an unmarked namespace.
-/// Reject missing comments, malformed or wrong-part markers, and duplicates.
-pub fn installed_hash<'a>(
+/// Where a part's marker lives. A dedicated chain holds nothing else; in a
+/// shared chain, only rules with the marker prefix are markers.
+///
+/// Sandbox and L2 markers use unhooked, unreferenced chains, keeping them out
+/// of rule validators. Recreating their table removes them; L2 containment
+/// flushes and rewrites its marker alongside the policy. The proxy marker
+/// follows the readiness rule's `return` in `prerouting`, which every gateway
+/// launch flushes, including launches by older binaries.
+///
+/// Two pre-marker rollback paths can leave a marker behind:
+/// - Reset appends to a sandbox table that teardown failed to delete. Its
+///   surviving marker describes only the original installation; appended rules
+///   can affect fall-through traffic. A marker-aware reset uses `create`,
+///   rejects the leftover table, and rebuilds the namespace instead.
+/// - Startup containment rewrites L2 rules without clearing their marker.
+///   On roll forward, containment reinstalls both the rules and their marker.
+struct MarkerLocation {
+    family: &'static str,
+    table: &'static str,
+    chain: &'static str,
+    dedicated: bool,
+}
+
+impl ConfigPart {
+    const fn marker_location(self) -> MarkerLocation {
+        let (family, table, chain, dedicated) = match self {
+            Self::L2Ingress => (
+                "netdev",
+                super::SANDBOX_L2_TABLE,
+                "space_cfg_l2_ingress",
+                true,
+            ),
+            Self::SandboxBase => ("ip", super::SANDBOX_TABLE, "space_cfg_sandbox_base", true),
+            Self::Forward => ("ip", super::SANDBOX_TABLE, "space_cfg_forward", true),
+            Self::Proxy => ("ip", super::PROXY_TABLE, "prerouting", false),
+        };
+        MarkerLocation {
+            family,
+            table,
+            chain,
+            dedicated,
+        }
+    }
+}
+
+/// The nft JSON commands that record `hash` for `part`. Add them to the
+/// transaction that installs the part, after the rules.
+pub(super) fn marker_commands(part: ConfigPart, hash: PartHash) -> Vec<serde_json::Value> {
+    let location = part.marker_location();
+    let rule = serde_json::json!({ "add": { "rule": {
+        "family": location.family, "table": location.table, "chain": location.chain,
+        "comment": hash.marker(part),
+        "expr": [{ "continue": null }]
+    } } });
+    if !location.dedicated {
+        return vec![rule];
+    }
+    let chain = serde_json::json!({
+        "family": location.family, "table": location.table, "name": location.chain
+    });
+    vec![
+        serde_json::json!({ "add": { "chain": chain } }),
+        serde_json::json!({ "flush": { "chain": chain } }),
+        rule,
+    ]
+}
+
+/// [`marker_commands`] for this binary's `l2_ingress` hash in nft's native
+/// syntax, which the L2 policy transaction uses.
+pub(super) fn l2_ingress_marker_script() -> String {
+    let part = ConfigPart::L2Ingress;
+    let hash = part
+        .builtin_hash()
+        .expect("l2_ingress is hashed from this binary's builder");
+    let MarkerLocation {
+        family,
+        table,
+        chain,
+        ..
+    } = part.marker_location();
+    format!(
+        "add chain {family} {table} {chain}
+flush chain {family} {table} {chain}
+add rule {family} {table} {chain} continue comment \"{}\"
+",
+        hash.marker(part)
+    )
+}
+
+/// The hash a namespace's markers record for `part`, read from an `nft -j`
+/// listing of the ruleset or of the marker's chain. `None` means no marker,
+/// as in a namespace installed before markers existed or a part not
+/// installed. A marker must be exactly an inert `continue` rule. Dedicated
+/// marker chains must be unhooked and contain only that marker; shared chains
+/// may contain other rules, but any rule with the marker prefix must have the
+/// marker's form. After checking chain metadata, report the first invalid
+/// rule in listing order.
+pub fn read_marker(
     part: ConfigPart,
-    comments: impl IntoIterator<Item = Option<&'a str>>,
+    listing: &serde_json::Value,
 ) -> Result<Option<PartHash>, MarkerError> {
+    let location = part.marker_location();
+    let at_location = |object: &serde_json::Value, name_key: &str| {
+        object["family"] == location.family
+            && object["table"] == location.table
+            && object[name_key] == location.chain
+    };
+    let entries = listing["nftables"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if location.dedicated
+        && entries
+            .iter()
+            .filter_map(|entry| entry.get("chain"))
+            .any(|chain| at_location(chain, "name") && chain.get("hook").is_some())
+    {
+        return Err(MarkerError::HookedChain(part));
+    }
     let mut installed = None;
-    for comment in comments {
+    for rule in entries
+        .iter()
+        .filter_map(|entry| entry.get("rule"))
+        .filter(|rule| at_location(rule, "chain"))
+    {
+        let comment = rule["comment"].as_str();
+        let marked = comment.is_some_and(|comment| comment.starts_with(MARKER_PREFIX));
+        if !location.dedicated && !marked {
+            continue;
+        }
+        if rule["expr"] != serde_json::json!([{ "continue": null }]) {
+            return Err(MarkerError::NotInert(part));
+        }
         let comment = comment.ok_or(MarkerError::Uncommented(part))?;
         let (found, hash) = parse_marker(comment)?;
         if found != part {
@@ -275,11 +405,6 @@ pub fn installed_hash<'a>(
         }
     }
     Ok(installed)
-}
-
-#[derive(serde::Deserialize)]
-struct Ruleset {
-    nftables: Vec<serde_json::Value>,
 }
 
 fn builder_commands(fragment: &str) -> Vec<serde_json::Value> {

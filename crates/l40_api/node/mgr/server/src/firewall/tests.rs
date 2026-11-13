@@ -697,15 +697,24 @@ fn guest_l2_ingress_validator_requires_both_drop_forms() {
 // 1.0.4 fixtures below are that script's result read back from 1.0.4.
 #[test]
 fn guest_l2_ingress_policy_is_one_native_transaction_bound_to_the_tap() {
+    let marker = config_version::ConfigPart::L2Ingress
+        .builtin_hash()
+        .unwrap()
+        .marker(config_version::ConfigPart::L2Ingress);
     assert_eq!(
         guest_l2_ingress_policy_script(),
-        r#"add table netdev sandbox_l2
-add chain netdev sandbox_l2 ingress { type filter hook ingress device "tap0" priority -500; }
+        format!(
+            r#"add table netdev sandbox_l2
+add chain netdev sandbox_l2 ingress {{ type filter hook ingress device "tap0" priority -500; }}
 flush chain netdev sandbox_l2 ingress
-add rule netdev sandbox_l2 ingress meta protocol { 0x8100, 0x88a8 } counter drop comment "drop-guest-vlan"
-add rule netdev sandbox_l2 ingress ether type { 0x8100, 0x88a8 } counter drop comment "drop-guest-vlan"
-add rule netdev sandbox_l2 ingress meta protocol { 0x0800, 0x0806 } meta pkttype other counter meta pkttype set host comment "accept-stale-gateway-mac"
+add rule netdev sandbox_l2 ingress meta protocol {{ 0x8100, 0x88a8 }} counter drop comment "drop-guest-vlan"
+add rule netdev sandbox_l2 ingress ether type {{ 0x8100, 0x88a8 }} counter drop comment "drop-guest-vlan"
+add rule netdev sandbox_l2 ingress meta protocol {{ 0x0800, 0x0806 }} meta pkttype other counter meta pkttype set host comment "accept-stale-gateway-mac"
+add chain netdev sandbox_l2 space_cfg_l2_ingress
+flush chain netdev sandbox_l2 space_cfg_l2_ingress
+add rule netdev sandbox_l2 space_cfg_l2_ingress continue comment "{marker}"
 "#
+        )
     );
 }
 
@@ -921,6 +930,54 @@ fn malformed_packaged_policy_is_a_typed_host_fault_that_keeps_its_source() {
             .contains("sandbox-pre-tproxy-guardrails.json"),
         "the message must name the file an operator has to fix: {error}"
     );
+}
+
+/// The reply-path repair is unchanged from releases before markers, so this
+/// also shows an older binary leaves the trailing proxy marker alone.
+#[test]
+fn proxy_reply_repair_ignores_the_proxy_marker() {
+    let listing: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/stamped_namespace_nft_1_1_3.json")).unwrap();
+    let prerouting: Vec<_> = listing["nftables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            entry["rule"]["table"] == PROXY_TABLE && entry["rule"]["chain"] == "prerouting"
+        })
+        .cloned()
+        .collect();
+    assert!(
+        prerouting.last().unwrap()["rule"]["comment"]
+            .as_str()
+            .unwrap()
+            .starts_with(config_version::MARKER_PREFIX)
+    );
+    let chain = serde_json::json!({ "nftables": prerouting });
+    assert_eq!(
+        local_service_reply_rule_updates(Some(&chain)).unwrap(),
+        Vec::<serde_json::Value>::new()
+    );
+}
+
+#[test]
+fn unusable_packaged_policy_fails_installation_before_nft_runs() {
+    // The namespace does not exist, so reaching nft would fail otherwise. An
+    // empty policy is well-formed but splices into an invalid ruleset.
+    for policy in ["", "{ \"add\": "] {
+        let error = install_namespace_rules(
+            "space-test-never-created",
+            "vpeer-000001",
+            "10.12.0.1",
+            crate::net::GUEST_IP,
+            policy,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, FirewallError::PackagedPolicy(_)),
+            "{policy:?}: {error}"
+        );
+    }
 }
 
 #[test]

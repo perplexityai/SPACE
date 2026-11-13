@@ -342,6 +342,13 @@ fn classify_firewall_setup_error(error: crate::firewall::FirewallError) -> Netwo
         crate::firewall::FirewallError::ListJson(error) => {
             NetworkOpError::permanent(error.to_string())
         }
+        error @ crate::firewall::FirewallError::RenderedRuleset(_) => {
+            NetworkOpError::permanent(error.to_string())
+        }
+        // Every namespace on the node fails alike until the image is fixed.
+        crate::firewall::FirewallError::PackagedPolicy(error) => {
+            NetworkOpError::permanent(format!("{error}: {}", error.0))
+        }
     }
 }
 
