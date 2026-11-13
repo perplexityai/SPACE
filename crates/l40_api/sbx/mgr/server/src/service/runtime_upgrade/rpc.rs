@@ -458,6 +458,10 @@ impl crate::service::SandboxManagerService {
                 response.failure = failure;
                 Wire::RolledBack
             }
+            RuntimeUpgradeStatus::Refused { failure } => {
+                response.failure = failure;
+                Wire::Refused
+            }
             RuntimeUpgradeStatus::AlreadyOnTarget { activation } => {
                 response.activation_claimed = activation.is_some();
                 Wire::AlreadyOnTarget

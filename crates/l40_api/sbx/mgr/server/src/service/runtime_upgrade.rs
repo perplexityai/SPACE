@@ -183,6 +183,10 @@ pub(super) struct RuntimeUpgradeRequest {
     /// For a suspended sandbox, the checkpoint the upgrade was decided from;
     /// see [`require_decided_checkpoint`].
     pub(super) checkpoint_local_artifact_id: Option<LocalArtifactId>,
+    /// The attempt this call runs as: the request's `attempt_id`, or one the
+    /// node generated for a request that named none. The store records
+    /// outcomes per `(operation_id, attempt_id)`.
+    pub(super) attempt_id: String,
 }
 
 impl RuntimeUpgradeRequest {
@@ -541,6 +545,7 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                     .execution_metadata
                     .as_ref()
                     .unwrap_or(&disk.execution),
+                attempt_id: &request.attempt_id,
             },
         )
         .map_err(|error| Status::internal(format!("fence runtime upgrade: {error}")))?;
@@ -595,11 +600,12 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
     ) -> Result<RuntimeUpgradeOutcome, Status> {
         // Recorded only if no other request reused the operation id first;
         // the per-sandbox upgrade lock doesn't serialize two sandboxes.
-        let recorded =
-            crate::db::record_runtime_upgrade_already_on_target(&*self.db()?, &request.identity())
-                .map_err(|error| {
-                    Status::internal(format!("record runtime upgrade outcome: {error}"))
-                })?;
+        let recorded = crate::db::record_runtime_upgrade_already_on_target(
+            &*self.db()?,
+            &request.identity(),
+            &request.attempt_id,
+        )
+        .map_err(|error| Status::internal(format!("record runtime upgrade outcome: {error}")))?;
         if !recorded {
             return Err(request.names_another());
         }
@@ -1086,7 +1092,29 @@ fn parse_request(
         checkpoint_local_artifact_id: parse_checkpoint_local_artifact_id(
             request.checkpoint_local_artifact_id.as_deref(),
         )?,
+        attempt_id: parse_attempt_id(request.attempt_id)?,
     })
+}
+
+/// The longest attempt id the node records. The id is stored with each of
+/// the attempt's records, so a caller-chosen one is bounded; a Kubernetes
+/// pod UID or a UUID fits many times over.
+const MAX_ATTEMPT_ID_BYTES: usize = 256;
+
+/// The attempt an `UpgradeRuntime` request runs as: the id it names, or a
+/// fresh one the node generates when it names none. An empty id names no
+/// attempt a caller could reuse, so it's refused rather than read as omitted.
+fn parse_attempt_id(attempt_id: Option<String>) -> Result<String, Status> {
+    match attempt_id {
+        None => Ok(crate::db::new_runtime_upgrade_attempt_id()),
+        Some(id) if id.trim().is_empty() => Err(Status::invalid_argument(
+            "a runtime upgrade's attempt_id is empty; omit it for a fresh attempt",
+        )),
+        Some(id) if id.len() > MAX_ATTEMPT_ID_BYTES => Err(Status::invalid_argument(format!(
+            "a runtime upgrade's attempt_id is longer than {MAX_ATTEMPT_ID_BYTES} bytes"
+        ))),
+        Some(id) => Ok(id),
+    }
 }
 
 /// The upgrade a Wake carries (`WakeRequest.runtime_upgrade`), parsed before
@@ -1175,6 +1203,8 @@ impl super::SandboxManagerService {
                 authorization: upgrade.authorization.clone(),
                 start,
                 checkpoint_local_artifact_id: upgrade.checkpoint_local_artifact_id,
+                // A Wake names no attempt, so its upgrade is a fresh one.
+                attempt_id: crate::db::new_runtime_upgrade_attempt_id(),
             },
         )
         .await
