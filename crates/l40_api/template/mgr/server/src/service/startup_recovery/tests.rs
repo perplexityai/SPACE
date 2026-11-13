@@ -1107,11 +1107,14 @@ async fn the_gc_tick_enqueues_the_inventory_of_a_build_it_restores() {
         TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
             .unwrap();
     let dirty = || {
-        crate::db::list_node_dirty_refs(&service.db.lock().unwrap(), 100)
-            .unwrap()
-            .into_iter()
-            .map(|row| row.element_value)
-            .collect::<Vec<_>>()
+        pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs(
+            &service.db.lock().unwrap(),
+            100,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.element_value)
+        .collect::<Vec<_>>()
     };
     assert!(!dirty().contains(&"seed".to_string()));
 
@@ -1438,9 +1441,12 @@ async fn the_gc_tick_skips_a_dir_removed_after_its_scan() {
     );
 
     assert!(
-        crate::db::list_node_dirty_refs(&service.db.lock().unwrap(), 100)
-            .unwrap()
-            .is_empty()
+        pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs(
+            &service.db.lock().unwrap(),
+            100
+        )
+        .unwrap()
+        .is_empty()
     );
 }
 
@@ -2190,11 +2196,14 @@ async fn a_restored_build_s_snapshots_that_fail_to_register_are_retried() {
         hashes
     };
     let dirty = || {
-        crate::db::list_node_dirty_refs(&service.db.lock().unwrap(), 100)
-            .unwrap()
-            .into_iter()
-            .map(|row| row.element_value)
-            .collect::<Vec<_>>()
+        pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs(
+            &service.db.lock().unwrap(),
+            100,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.element_value)
+        .collect::<Vec<_>>()
     };
 
     assert_eq!(service.reconcile_rowless_build_dirs(4, CHECK_WAIT).await, 1);
@@ -2202,7 +2211,9 @@ async fn a_restored_build_s_snapshots_that_fail_to_register_are_retried() {
     assert_eq!(snapshots(), ["sibling-hash"]);
     {
         let conn = service.db.lock().unwrap();
-        let published = crate::db::list_node_dirty_refs(&conn, 100).unwrap();
+        let published =
+            pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs(&conn, 100)
+                .unwrap();
         crate::db::delete_node_dirty_refs(&conn, &published).unwrap();
     }
 
@@ -2419,11 +2430,14 @@ async fn a_partial_snapshot_repair_is_published() {
     service.reconcile_rowless_build_dirs(4, CHECK_WAIT).await;
 
     assert_eq!(snapshot_count(&service, "seed", &hashes[0]), 1);
-    let dirty: Vec<_> = crate::db::list_node_dirty_refs(&service.db.lock().unwrap(), 100)
-        .unwrap()
-        .into_iter()
-        .map(|row| row.element_value)
-        .collect();
+    let dirty: Vec<_> = pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs(
+        &service.db.lock().unwrap(),
+        100,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|row| row.element_value)
+    .collect();
     assert!(dirty.contains(&"seed".to_string()), "{dirty:?}");
 }
 

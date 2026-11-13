@@ -8415,6 +8415,7 @@ dependencies = [
  "pplx-space-template-cache-permissions",
  "pplx-space-template-manifest",
  "pplx-space-template-mgr-client",
+ "pplx-space-template-mgr-store",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "pplx-space-uds-peer-auth",
@@ -8485,6 +8486,10 @@ dependencies = [
 [[package]]
 name = "pplx-space-template-mgr-store"
 version = "0.8.2"
+dependencies = [
+ "pplx-space-sql-locator",
+ "rusqlite",
+]
 
 [[package]]
 name = "pplx-space-template-mgr-svc"
