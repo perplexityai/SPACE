@@ -5,7 +5,16 @@ use pplx_space_node_runtime_core::cgroup;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
 
-const CGROUP_TERMINATION_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a stop keeps polling a killed sandbox cgroup before it reports
+/// UNAVAILABLE and the durable cleanup job retries the whole attempt. After
+/// `cgroup.kill`, the last firecracker thread still has to free its guest
+/// memory. On a healthy host that takes well under a second. When the /space
+/// memcg is at its limit, freeing a large guest under reclaim can take several
+/// seconds. A miss redoes the full cleanup attempt after a retry delay, which
+/// adds work to the hosts least able to absorb it. The wait holds no
+/// blocking-work permit between polls, and it stays inside sbx-mgr's Stop
+/// confirmation budget.
+const CGROUP_TERMINATION_TIMEOUT: Duration = Duration::from_secs(15);
 const CGROUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) async fn apply_firecracker_cgroup_fixups(
