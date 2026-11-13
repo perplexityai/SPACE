@@ -45,6 +45,7 @@ from space_smoke.capabilities import (
     SandboxInfo,
     SandboxPages,
     StoppableLifecycleSandbox,
+    RuntimeUpgradeControl,
     StoppedReplacementControl,
     WarmPoolCandidate,
 )
@@ -587,6 +588,9 @@ class SmokeServices:
             ),
             _stopped_replacement_control=(
                 cast(StoppedReplacementControl, kind) if kind is not None else None
+            ),
+            _runtime_upgrade_control=(
+                cast(RuntimeUpgradeControl, kind) if kind is not None else None
             ),
             _drain_v2_control=(cast(DrainV2Control, kind) if kind is not None else None),
             _create_sandbox=create_owned_sandbox,
