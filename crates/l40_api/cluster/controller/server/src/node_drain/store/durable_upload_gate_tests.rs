@@ -2591,3 +2591,71 @@ async fn gone_node_inflight_snapshot_flip_unblocks_drain_gate() -> TestResult {
     );
     Ok(())
 }
+
+/// Both adopt give-ups unpin the row, and an unpinned row whose history is
+/// unordered (a capture without a generation registered after one with a generation) refuses
+/// to restore. So neither adopts a pinned row with that history: it stays
+/// pinned and blocking. Once a later execution's capture orders the history,
+/// both adopt it.
+#[tokio::test(flavor = "current_thread")]
+async fn adopt_refuses_to_unpin_an_unordered_history() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    for gone_node in [false, true] {
+        let node = NodeId::new();
+        if gone_node {
+            insert_draining_node(pool, node).await?;
+            insert_node_k8s(pool, node, Some("uid-1")).await?;
+        }
+        let sandbox = SandboxId::new();
+        insert_sandbox(pool, sandbox, "suspended", Some(node)).await?;
+        age_lifecycle(pool, sandbox, 3600).await?;
+        insert_snapshot(pool, sandbox, "ready", node).await?;
+        let pinned = Uuid::now_v7();
+        sqlx::query(sql!(
+            "UPDATE snapshots
+                SET generation = 5, local_artifact_id = $2, artifact_kind = 'full',
+                    artifact_origin = 'suspend', timestamp = NOW() - INTERVAL '1 minute'
+              WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox)
+        .bind(pinned)
+        .execute(pool)
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET current_local_artifact_id = $2, current_local_artifact_kind = 'full',
+                    current_local_artifact_origin = 'suspend'
+              WHERE id = $1"
+        ))
+        .bind(sandbox)
+        .bind(pinned)
+        .execute(pool)
+        .await?;
+        insert_snapshot(pool, sandbox, "ready", node).await?;
+        let adopt = async || -> TestResult<u64> {
+            if gone_node {
+                adopt_on_gone_node(pool, sandbox, node, Some("uid-1"), 600).await
+            } else {
+                adopt_remote_snapshot(pool, sandbox, node, 60).await
+            }
+        };
+        assert_eq!(adopt().await?, 0, "gone node {gone_node}");
+        assert_eq!(give_up_columns(pool, sandbox).await?.1, Some(pinned));
+
+        insert_snapshot(pool, sandbox, "ready", node).await?;
+        sqlx::query(sql!(
+            "UPDATE snapshots
+                SET generation = 6, timestamp = NOW() + INTERVAL '1 minute'
+              WHERE sandbox_id = $1 AND generation IS NULL
+                AND timestamp = (SELECT MAX(timestamp) FROM snapshots WHERE sandbox_id = $1)"
+        ))
+        .bind(sandbox)
+        .execute(pool)
+        .await?;
+        assert_eq!(adopt().await?, 1, "gone node {gone_node}, ordered");
+    }
+    Ok(())
+}

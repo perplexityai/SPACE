@@ -313,6 +313,10 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             "/sandboxes/{spec}/snapshots",
             get(sandboxes::list_snapshots),
         )
+        .route(
+            "/sandboxes/{spec}/restore-pin",
+            get(sandboxes::get_restore_pin).post(sandboxes::pin_restore_source),
+        )
         .merge(debug::admin_v1_debug_router())
         .layer(middleware::from_fn_with_state(state, require_admin_auth))
 }

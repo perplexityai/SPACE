@@ -27,9 +27,8 @@ use pplx_space_events::{
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_sandbox_portability::{
-    fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
-    restore_retry_source_snapshot_is_current, restore_retry_suspended_revert_snapshot_exists,
-    snapshot_is_current_local_artifact,
+    missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
+    restore_retry_suspended_revert_snapshot_exists, snapshot_is_current_local_artifact,
 };
 use pplx_space_state_reconciliation::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_LOCAL_SUSPEND_KEY};
 use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, postgres::PgRow};

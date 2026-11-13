@@ -6320,21 +6320,37 @@ async fn begin_artifact_backup_accepts_unnamed_fork_disk_artifacts() -> TestResu
     Ok(())
 }
 
+/// A node's suspend lookup returns the capture the control plane restores: a
+/// pinned sandbox's pinned artifact, not a full artifact of another origin
+/// registered after it.
 #[tokio::test(flavor = "current_thread")]
-async fn legacy_suspend_lookup_ignores_newer_non_suspend_full_artifacts() -> TestResult {
+async fn suspend_lookup_returns_the_pinned_capture_over_newer_full_artifacts() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
     };
     let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
-    let suspend_snapshot_id = SnapshotId::new();
-
-    seed_suspend_snapshot(&fixture.service, sandbox_id, suspend_snapshot_id).await?;
-    finalize(
+    let suspend_artifact = LocalArtifactId::new();
+    let suspend_attempt = Uuid::now_v7();
+    begin_artifact_backup(
         &fixture.service,
-        suspend_snapshot_id,
-        SuspendSnapshotTerminalState::Ready,
-        123,
+        sandbox_id,
+        suspend_artifact,
+        SnapshotId::from_uuid(suspend_attempt),
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
     )
+    .await?;
+    finalize_artifact_backup(&fixture.service, SnapshotId::from_uuid(suspend_attempt)).await?;
+    sqlx::query(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend'
+          WHERE id = $1",
+    )
+    .bind(sandbox_id)
+    .bind(suspend_artifact.as_uuid())
+    .execute(&fixture.service.pool)
     .await?;
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -6354,9 +6370,78 @@ async fn legacy_suspend_lookup_ignores_newer_non_suspend_full_artifacts() -> Tes
     let location = get_location(&fixture.service, sandbox_id).await?;
     assert_eq!(
         location.snapshot_id,
-        suspend_snapshot_id.to_string(),
-        "legacy suspend lookup must not return stop/snapshot-origin full artifacts"
+        suspend_attempt.to_string(),
+        "the lookup must return the pinned capture"
     );
+    Ok(())
+}
+
+/// A node's lookup for an unpinned sandbox whose history is unordered, a
+/// capture without a generation registered after one with a generation, is
+/// refused with
+/// `FAILED_PRECONDITION`, which sbx-mgr treats as terminal, never as a
+/// missing snapshot or a retryable failure. A pin restores its capture.
+#[tokio::test(flavor = "current_thread")]
+async fn get_location_refuses_an_unordered_history_unless_pinned() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let sandbox_id = seed_sandbox(pool).await?;
+    let with_generation = SnapshotId::new();
+    seed_suspend_snapshot(&fixture.service, sandbox_id, with_generation).await?;
+    finalize(
+        &fixture.service,
+        with_generation,
+        SuspendSnapshotTerminalState::Ready,
+        1,
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE snapshots
+            SET generation = 5, local_artifact_id = $2, artifact_kind = 'full',
+                artifact_origin = 'suspend'
+          WHERE id = $1",
+    )
+    .bind(with_generation)
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let without_generation = SnapshotId::new();
+    seed_suspend_snapshot(&fixture.service, sandbox_id, without_generation).await?;
+    finalize(
+        &fixture.service,
+        without_generation,
+        SuspendSnapshotTerminalState::Ready,
+        1,
+    )
+    .await?;
+
+    let error = get_location(&fixture.service, sandbox_id)
+        .await
+        .expect_err("an unordered history has no restore source");
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error:?}");
+    assert!(
+        error.message().contains("can't be ordered"),
+        "{}",
+        error.message()
+    );
+
+    sqlx::query(
+        "UPDATE sandboxes s
+            SET current_local_artifact_id = sn.local_artifact_id,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend'
+           FROM snapshots sn
+          WHERE s.id = $1 AND sn.id = $2",
+    )
+    .bind(sandbox_id)
+    .bind(with_generation)
+    .execute(pool)
+    .await?;
+    let location = get_location(&fixture.service, sandbox_id).await?;
+    assert_eq!(location.snapshot_id, with_generation.to_string());
     Ok(())
 }
 

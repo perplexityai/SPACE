@@ -486,7 +486,7 @@ mod backup_policy_tests;
 #[cfg(test)]
 mod retired_teardown_tests;
 #[cfg(test)]
-pub(super) use self::retired_teardown_tests::{answer, with_cluster_api};
+pub(crate) use self::retired_teardown_tests::{answer, with_cluster_api};
 #[cfg(test)]
 mod tests;
 

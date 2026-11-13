@@ -28,7 +28,7 @@ pub(super) use cluster_api_stub_tests::{
 use cluster_api_stub_tests::{
     RETIRING, RetiringClusterApi, admitted_registrations, bound_upload_payload,
 };
-pub(in crate::service) use cluster_api_stub_tests::{answer, with_cluster_api};
+pub(crate) use cluster_api_stub_tests::{answer, with_cluster_api};
 
 const GENERATION: i64 = 7;
 

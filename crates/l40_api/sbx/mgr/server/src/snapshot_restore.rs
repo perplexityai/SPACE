@@ -138,6 +138,17 @@ pub enum RestoreError {
     /// caller should surface this as a normal `NotFound`.
     #[error("no suspend snapshot registered for sandbox {0}")]
     SnapshotNotRegistered(String),
+    /// Cluster API refused to choose a suspend snapshot for this sandbox
+    /// (`FAILED_PRECONDITION`): a capture without a generation registered
+    /// after one with a generation, so capture order can't say which is the
+    /// latest. Terminal:
+    /// a retry asks the same question until an operator pins a capture.
+    #[error(
+        "refusing to restore sandbox {0}: its captures can't be ordered, so the control plane \
+         won't guess which is the latest; an operator can pin one through the admin restore-pin \
+         route"
+    )]
+    RestoreSourceUnordered(String),
     /// Restore lock admission or volume-manager refused new work.
     #[error("{0}")]
     AdmissionRejected(#[source] tonic::Status),
@@ -365,6 +376,7 @@ impl RestoreError {
             Self::ReplaceInstance { .. } => Kind::Filesystem,
             Self::ClusterApiUnconfigured(_)
             | Self::SnapshotNotRegistered(_)
+            | Self::RestoreSourceUnordered(_)
             | Self::AdmissionRejected(_)
             | Self::RootfsPolicy(_)
             | Self::CanonicalRootConflict { .. }
@@ -450,6 +462,7 @@ impl RestoreError {
             // Nothing here holds a string supplied by a caller, a peer, or
             // downloaded metadata.
             Self::SnapshotNotRegistered(..)
+            | Self::RestoreSourceUnordered(..)
             | Self::RootfsPolicy(..)
             | Self::RestoreOperationBusy { .. }
             | Self::MissingSandboxOwnershipMetadata
@@ -486,6 +499,7 @@ impl RestoreError {
         match self {
             Self::ClusterApiUnconfigured(..) => "cluster_api_unconfigured",
             Self::SnapshotNotRegistered(..) => "snapshot_not_registered",
+            Self::RestoreSourceUnordered(..) => "restore_source_unordered",
             Self::AdmissionRejected(..) => "admission_rejected",
             Self::RestoreOperationBusy { .. } => "restore_operation_busy",
             Self::SnapshotIdentityMismatch { .. } => "snapshot_identity_mismatch",
@@ -1449,15 +1463,25 @@ async fn get_suspend_snapshot_location(
             },
         )
         .await
-        .map_err(|status| match status.code() {
-            tonic::Code::NotFound => RestoreError::SnapshotNotRegistered(sandbox_id.to_string()),
-            _ => RestoreError::Other(format!(
-                "cluster-api GetSuspendSnapshotLocation ({:?}): {}",
-                status.code(),
-                status.message()
-            )),
-        })
+        .map_err(|status| suspend_snapshot_location_error(sandbox_id, &status))
         .map(tonic::Response::into_inner)
+}
+
+/// What a `GetSuspendSnapshotLocation` refusal means: `NOT_FOUND` that no
+/// snapshot is registered, `FAILED_PRECONDITION` that the control plane
+/// refuses to choose one, both terminal; anything else is retryable.
+fn suspend_snapshot_location_error(sandbox_id: &str, status: &tonic::Status) -> RestoreError {
+    match status.code() {
+        tonic::Code::NotFound => RestoreError::SnapshotNotRegistered(sandbox_id.to_string()),
+        tonic::Code::FailedPrecondition => {
+            RestoreError::RestoreSourceUnordered(sandbox_id.to_string())
+        }
+        _ => RestoreError::Other(format!(
+            "cluster-api GetSuspendSnapshotLocation ({:?}): {}",
+            status.code(),
+            status.message()
+        )),
+    }
 }
 
 pub(crate) enum QuarantineRecoveryPlanResolution {

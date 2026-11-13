@@ -1908,3 +1908,26 @@ fn only_a_bootable_instance_falls_back_to_a_plain_directory() {
             .expect_err("a stopped re-placement must not proceed without a snapshottable instance");
     }
 }
+
+/// The control plane's two terminal refusals stay terminal: `NOT_FOUND` is
+/// an unregistered snapshot and `FAILED_PRECONDITION` an ambiguous restore
+/// source. Anything else is retryable `Other`.
+#[test]
+fn suspend_snapshot_location_refusals_keep_their_meaning() {
+    let sandbox = "sbx-location-refusal";
+    assert!(matches!(
+        suspend_snapshot_location_error(sandbox, &tonic::Status::not_found("none")),
+        RestoreError::SnapshotNotRegistered(id) if id == sandbox
+    ));
+    let unordered =
+        suspend_snapshot_location_error(sandbox, &tonic::Status::failed_precondition("ambiguous"));
+    assert!(matches!(
+        &unordered,
+        RestoreError::RestoreSourceUnordered(id) if id == sandbox
+    ));
+    assert_eq!(unordered.kind_label(), "restore_source_unordered");
+    assert!(matches!(
+        suspend_snapshot_location_error(sandbox, &tonic::Status::unavailable("blip")),
+        RestoreError::Other(_)
+    ));
+}

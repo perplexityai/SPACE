@@ -17,8 +17,8 @@ use std::sync::LazyLock;
 
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
-    failed_repair_revert_eligibility, restore_retry_suspended_revert_snapshot_exists,
-    started_suspend_revert_eligibility,
+    failed_repair_revert_eligibility, restore_order_unordered,
+    restore_retry_suspended_revert_snapshot_exists, started_suspend_revert_eligibility,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -79,7 +79,10 @@ pub async fn unplace_after_pod_teardown_preserving_placement_clock(
 /// abandoned).
 ///
 /// Guarded on `restoring`, no evacuation marker, no active execution, and
-/// [`restore_retry_suspended_revert_snapshot_exists`]. The caller holds the
+/// [`restore_retry_suspended_revert_snapshot_exists`]. A pinned row whose
+/// history is unordered ([`restore_order_unordered`]) isn't reverted: clearing
+/// its pin would leave a restore that refuses where the pin restores. It stays
+/// `restoring` until the sweeper's revert, which keeps the pin. The caller holds the
 /// sandbox row lock, which execution creation also takes, so no successor
 /// execution can appear between this proof and commit. Callers retire the
 /// execution, or confirm that none is active, earlier in this transaction.
@@ -88,6 +91,7 @@ pub async fn recover_markerless_restoring_after_execution_cleanup(
     sandbox_id: SandboxId,
 ) -> Result<(), sqlx::Error> {
     let safe_revert_snapshot = restore_retry_suspended_revert_snapshot_exists("s");
+    let unordered = restore_order_unordered("s");
     let query = format!(
         "UPDATE sandboxes s
                 SET lifecycle = 'suspended',
@@ -110,7 +114,8 @@ pub async fn recover_markerless_restoring_after_execution_cleanup(
                      WHERE e.sandbox_id = s.id
                        AND e.active
                 )
-                AND {safe_revert_snapshot}"
+                AND {safe_revert_snapshot}
+                AND (s.current_local_artifact_id IS NULL OR NOT {unordered})"
     );
     sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(sandbox_id)

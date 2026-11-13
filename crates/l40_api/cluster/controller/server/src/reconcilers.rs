@@ -391,6 +391,15 @@ pub async fn run_reconcilers(
         ),
     ));
 
+    // Restore-pin repair: a post-deploy backfill that pins unpinned
+    // suspended rows to the artifact their node holds, for both substrates.
+    // Default off, `SPACE_RESTORE_PIN_REPAIR_ENABLED=true`.
+    handles.push(tokio::spawn(crate::restore_pin_repair::run(
+        crate::restore_pin_repair::ReconcilerConfig::from_env(),
+        crate::restore_pin_repair::PoolSink::new(pool.clone(), substrate.clone()),
+        shutdown_token.child_token(),
+    )));
+
     // Transient-lifecycle census: gauges of how many sandboxes sit in each
     // transient lifecycle, by age, and the oldest one's age. Read-only and
     // always on, for both substrates and whatever the sweeper above is set

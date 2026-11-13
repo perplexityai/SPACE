@@ -796,6 +796,11 @@ where
                 )));
             }
             Err(RestoreError::AdmissionRejected(status)) => return Err(status),
+            Err(error @ RestoreError::RestoreSourceUnordered(..)) => {
+                return Err(pplx_space_sbx_mgr_client::restore_source_unordered_status(
+                    error.to_string(),
+                ));
+            }
             Err(error @ RestoreError::RootfsPolicy(..)) => {
                 return Err(Status::failed_precondition(error.to_string()));
             }
@@ -1235,6 +1240,23 @@ impl SandboxManagerService {
                     cross_node_started_at,
                 );
                 Err(Status::failed_precondition(error.to_string()))
+            }
+            Err(error @ crate::snapshot_restore::RestoreError::RestoreSourceUnordered(..)) => {
+                tracing::warn!(sandbox_id, %error, "cross-node restore refused");
+                let observed_encrypted =
+                    super::recovery_cross_node::encrypted_from_staged_sidecar(sandbox_id);
+                cross_node_start.emit(observed_encrypted);
+                crate::metrics::snapshot::restore_failed(
+                    "cross_node",
+                    cross_node_codec_at_start,
+                    observed_encrypted,
+                    "cluster_lookup",
+                    error.kind_label(),
+                    cross_node_started_at,
+                );
+                Err(pplx_space_sbx_mgr_client::restore_source_unordered_status(
+                    error.to_string(),
+                ))
             }
             Err(error) => {
                 tracing::warn!(

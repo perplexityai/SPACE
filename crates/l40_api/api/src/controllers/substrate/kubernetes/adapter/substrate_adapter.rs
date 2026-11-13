@@ -3018,6 +3018,30 @@ impl SubstrateAdapter for KubernetesSubstrate {
         }
     }
 
+    async fn node_api_target(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<OwnedNodeApiTarget>, SubstrateError> {
+        let row: Option<(SpaceNodeRole, Option<String>)> = sqlx::query_as(sql!(
+            "SELECT n.role, nk.k8s_node_name
+               FROM nodes n
+               LEFT JOIN node_k8s nk ON nk.node_id = n.id
+              WHERE n.id = $1
+                AND n.managed_by = $2"
+        ))
+        .bind(node_id)
+        .bind(SubstrateKind::Kubernetes)
+        .fetch_optional(self.store.pool())
+        .await
+        .db_context("failed to look up Kubernetes node-api target")?;
+        Ok(row.map(|(role, substrate_node_id)| OwnedNodeApiTarget {
+            managed_by: pplx_space_common_core::types::NodeManagedBy::Kubernetes,
+            role,
+            direct_endpoint: None,
+            substrate_node_id,
+        }))
+    }
+
     async fn select_ready_worker_node_api_target(
         &self,
     ) -> Result<OwnedNodeApiTarget, SubstrateError> {

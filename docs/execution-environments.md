@@ -1802,7 +1802,10 @@ is stranded.
    own: the running execution just took the capture, the record the
    capturing teardown published with it names it, or an earlier upload of
    the same bytes recorded it so
-   (`BeginArtifactBackupRequest.execution_generation_names_capture`). A
+   (`BeginArtifactBackupRequest.execution_generation_names_capture`). Once
+   one backup of an artifact records a generation, every later backup of it
+   inherits that one, whatever its own registration says, so a re-upload
+   keeps its capture's place. A
    generation the node only infers fences the registration but records
    nothing: one from a teardown still running when it re-uploads an
    unrecorded capture, or one startup recovery recorded. A teardown that

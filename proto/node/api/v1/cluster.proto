@@ -189,14 +189,30 @@ service ClusterApi {
   // (e.g. an env-derived bucket). The URI is returned unparsed.
   rpc GetSandboxSnapshotStorageUri(GetSandboxSnapshotStorageUriRequest) returns (GetSandboxSnapshotStorageUriResponse);
 
-  // Look up the most recent ready suspend-snapshot storage location for a
-  // sandbox. Returns the `s3://…` connection string of the latest row with
-  // `state='ready'` (selected via
-  // `ORDER BY timestamp DESC LIMIT 1`), so partial uploads and failed
-  // attempts are invisible. Used by on-node sbx-mgr to restore a sandbox
-  // whose local snapshot files are absent (e.g. cross-node restore or
-  // restore after a node-local cache wipe). Returns `NOT_FOUND` if no
-  // ready suspend snapshot exists for the sandbox.
+  // Look up the storage location of the ready snapshot a sandbox restores
+  // from: the capture the control plane's own restores select. For a
+  // `restoring` sandbox that's the latest capture registered before the
+  // restore claimed it, its pinned artifact if that's among them, or a
+  // backup of that capture's artifact. Otherwise it's the pinned artifact of
+  // a pinned sandbox, or the latest capture by capture rank, then by the
+  // capture's first registration, of an unpinned one. An unpinned sandbox
+  // restores only from suspend captures: a named snapshot's or a stop's
+  // backup is never returned for it.
+  // Partial uploads and failed attempts are never returned. Used by on-node
+  // sbx-mgr to restore a sandbox whose local snapshot files are absent (e.g.
+  // cross-node restore or restore after a node-local cache wipe). Returns
+  // `NOT_FOUND` if no such snapshot exists, or the sandbox isn't placed on
+  // the caller's node. For an unpinned sandbox that includes while, or
+  // after, a later execution's capture is uploading or has failed to, and
+  // for a `restoring` one, while an upload registered before the claim isn't
+  // ready. Returns `FAILED_PRECONDITION`, which the caller must not retry,
+  // when an unpinned sandbox's captures can't be ordered: a capture without
+  // a generation registered after one with a generation, with no later
+  // execution's capture after it. That holds until the sandbox is pinned
+  // (the restore-pin repair, or an operator's admin pin). Sandbox-manager
+  // passes the refusal on as `FAILED_PRECONDITION` with metadata
+  // `x-space-restore-refusal: source-unordered`, which its callers treat as
+  // terminal.
   // TODO: [legacy] Remove once all restore callers look up exact artifact
   // backups with `GetArtifactBackupLocation`.
   rpc GetSuspendSnapshotLocation(GetSuspendSnapshotLocationRequest) returns (GetSuspendSnapshotLocationResponse);
@@ -1334,7 +1350,7 @@ message GetExecutionCurrencyResponse {
 }
 
 message GetSuspendSnapshotLocationRequest {
-  // Sandbox whose latest suspend snapshot location should be returned.
+  // Sandbox whose restore source location should be returned.
   string sandbox_id = 1;
 }
 

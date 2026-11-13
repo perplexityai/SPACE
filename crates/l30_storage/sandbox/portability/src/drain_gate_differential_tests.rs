@@ -100,8 +100,10 @@ async fn batched_blocker_count_matches_the_single_node_predicate_per_node() -> T
     // `(durable_source, this)` and report a node that is free to terminate as
     // permanently blocked.
     let durable = insert_target_pinned(pool, target, "suspended", None).await?;
-    insert_ready_snapshot(pool, durable, target, None).await?;
+    // The remnant registered before the ready capture, so the ready one is
+    // still the newest suspend capture.
     insert_creating_snapshot(pool, durable, durable_source).await?;
+    insert_ready_snapshot(pool, durable, target, None).await?;
 
     // Artifact-pinned, with a ready snapshot for a *different* artifact. The two
     // arms of `artifact_identity_or_legacy` disagree about this row — the exact
@@ -393,12 +395,12 @@ async fn source_release_join_preserves_snapshot_selection() -> TestResult {
     }
     assert_source_release(pool, &sandboxes, &[true, true, true, true, false, false]).await?;
 
-    // A newer unfinished upload blocks legacy evacuation, but not a backup of
-    // the exact pinned artifact; ordinary legacy suspend still uses freshness.
+    // A newer unfinished upload blocks a legacy row, evacuation-marked or not,
+    // but not a backup of the exact pinned artifact.
     for sandbox in &sandboxes {
         insert_creating_snapshot_at(pool, *sandbox, node, "NOW() + INTERVAL '1 hour'").await?;
     }
-    assert_source_release(pool, &sandboxes, &[true, false, true, true, false, false]).await?;
+    assert_source_release(pool, &sandboxes, &[false, false, true, true, false, false]).await?;
 
     sqlx::query(sql!(
         "UPDATE snapshots SET timestamp = NOW() - INTERVAL '2 hours' WHERE state = 'ready'"
@@ -410,7 +412,24 @@ async fn source_release_join_preserves_snapshot_selection() -> TestResult {
     sqlx::query(sql!("UPDATE sandboxes SET placement_changed_at = NULL"))
         .execute(pool)
         .await?;
+    assert_source_release(pool, &sandboxes, &[false, false, true, true, false, false]).await?;
+
+    // Once the newer upload fails, it no longer holds an unmarked row's
+    // source: nothing retries it there, so the hold would never end and the
+    // drain would park for good. An evacuation-marked row stays held, since
+    // the evacuating drain re-uploads it, or fails the row.
+    sqlx::query(sql!(
+        "UPDATE snapshots SET state = 'failed' WHERE state = 'creating'"
+    ))
+    .execute(pool)
+    .await?;
     assert_source_release(pool, &sandboxes, &[true, false, true, true, false, false]).await?;
+
+    // With the newer upload gone, freshness decides for an unmarked row.
+    sqlx::query(sql!("DELETE FROM snapshots WHERE state = 'failed'"))
+        .execute(pool)
+        .await?;
+    assert_source_release(pool, &sandboxes, &[true, true, true, true, false, false]).await?;
 
     sqlx::query(sql!(
         "UPDATE snapshots SET state = 'failed' WHERE state = 'ready'"
@@ -450,7 +469,20 @@ async fn assert_source_release(
     let query = format!(
         "SELECT s.id, {bulk},
                 ((s.evacuation_restore_target IS NOT NULL AND {latest})
-                 OR (s.evacuation_restore_target IS NULL AND {fresh}))
+                 OR (s.evacuation_restore_target IS NULL AND {fresh}
+                     AND (s.current_local_artifact_id IS NOT NULL OR NOT EXISTS (
+                         SELECT 1
+                           FROM snapshots inflight
+                          WHERE inflight.sandbox_id = s.id
+                            AND inflight.type = 'full'
+                            AND inflight.state = 'creating'
+                            AND inflight.timestamp > (
+                                SELECT MAX(ready.timestamp)
+                                  FROM snapshots ready
+                                 WHERE ready.sandbox_id = s.id
+                                   AND ready.state = 'ready'
+                            )
+                     ))))
            FROM sandboxes s WHERE s.id = ANY($1)"
     );
     let rows: Vec<(SandboxId, bool, bool)> =

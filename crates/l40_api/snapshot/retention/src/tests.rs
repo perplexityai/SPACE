@@ -2571,6 +2571,570 @@ mod postgres {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn p14_markerless_latest_capture_is_shielded_from_later_re_uploads() -> TestResult {
+        // An unpinned suspended sandbox restores its latest capture by
+        // generation, but the rank counts registration order. Two re-uploads
+        // of an older capture (generation 3), registered after the first two
+        // rows, push those out of a keep-set of two; pruning the restore's
+        // pick would leave it older bytes. Each case lists the snapshots
+        // oldest first and which of the first two may still be pruned.
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let pool = &db.pool;
+        type Row = (Option<i64>, &'static str);
+        let cases: [(&str, &str, [Row; 5], [bool; 2]); 5] = [
+            // The latest capture, generation 5, is kept; generation 4 prunes.
+            (
+                "re-upload",
+                "suspended",
+                [
+                    (Some(4), "ready"),
+                    (Some(5), "ready"),
+                    (None, "skip"),
+                    (Some(3), "ready"),
+                    (Some(3), "ready"),
+                ],
+                [true, false],
+            ),
+            // A node recovering a started sandbox's runtime restores the
+            // same capture.
+            (
+                "started",
+                "started",
+                [
+                    (Some(4), "ready"),
+                    (Some(5), "ready"),
+                    (None, "skip"),
+                    (Some(3), "ready"),
+                    (Some(3), "ready"),
+                ],
+                [true, false],
+            ),
+            // The row without a generation registered after generation 5 and no later
+            // execution's capture followed it, so the history is unordered
+            // and the restore refuses it: both sides are kept for an
+            // operator to choose between.
+            (
+                "mixed",
+                "suspended",
+                [
+                    (Some(5), "ready"),
+                    (None, "ready"),
+                    (None, "skip"),
+                    (Some(3), "ready"),
+                    (Some(3), "ready"),
+                ],
+                [false, false],
+            ),
+            // A failed upload of generation 6 can't be restored, so the
+            // placement-fresh rule still loads generation 5.
+            (
+                "failed-later-upload",
+                "suspended",
+                [
+                    (Some(4), "ready"),
+                    (Some(5), "ready"),
+                    (Some(6), "failed"),
+                    (Some(3), "ready"),
+                    (Some(3), "ready"),
+                ],
+                [true, false],
+            ),
+            // No generation anywhere: the restore loads the latest capture,
+            // which the rank keeps too.
+            (
+                "no-generation",
+                "suspended",
+                [
+                    (None, "ready"),
+                    (None, "ready"),
+                    (None, "skip"),
+                    (None, "ready"),
+                    (None, "ready"),
+                ],
+                [true, true],
+            ),
+        ];
+        let store = SnapshotRetentionDbStore::new(pool.clone());
+        for (case, lifecycle, rows, prunable) in cases {
+            let sandbox = insert_sandbox(pool).await?;
+            sqlx::query("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1")
+                .bind(sandbox)
+                .bind(lifecycle)
+                .execute(pool)
+                .await?;
+            let mut ids = Vec::new();
+            for (age, (generation, state)) in [600, 500, 450, 400, 300].into_iter().zip(rows) {
+                if state == "skip" {
+                    continue;
+                }
+                let id =
+                    insert_artifact_snapshot(pool, sandbox, age, Uuid::now_v7(), "full").await?;
+                sqlx::query("UPDATE snapshots SET generation = $2, state = $3 WHERE id = $1")
+                    .bind(id)
+                    .bind(generation)
+                    .bind(state)
+                    .execute(pool)
+                    .await?;
+                ids.push(id);
+            }
+            let candidates: Vec<SnapshotId> = store
+                .list_candidates(2, 100, None, None)
+                .await?
+                .candidates
+                .iter()
+                .map(|c| c.snapshot_id)
+                .collect();
+            for (id, prunable) in ids[..2].iter().zip(prunable) {
+                assert_eq!(
+                    candidates.contains(id),
+                    prunable,
+                    "{case}: snapshot {id} prunable"
+                );
+                if !prunable {
+                    assert_eq!(
+                        store.claim_prune(*id, 2).await?,
+                        ClaimOutcome::Refused(ClaimRefusalReason::ProtectedRestoreSource),
+                        "{case}: snapshot {id} must not be claimed for deletion"
+                    );
+                }
+            }
+        }
+
+        // With no generation anywhere, two re-uploads of capture A's artifact
+        // registered after capture B push B out of the keep-set. The restore
+        // still loads B, by its capture's first registration, so B is kept.
+        // So is A's first backup, which anchors that registration: pruned,
+        // A's re-uploads would sort as a capture newer than B.
+        let sandbox = insert_sandbox(pool).await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1")
+            .bind(sandbox)
+            .execute(pool)
+            .await?;
+        let a = Uuid::now_v7();
+        let a_first = insert_artifact_snapshot(pool, sandbox, 600, a, "full").await?;
+        let b = insert_artifact_snapshot(pool, sandbox, 500, Uuid::now_v7(), "full").await?;
+        insert_artifact_snapshot(pool, sandbox, 400, a, "full").await?;
+        insert_artifact_snapshot(pool, sandbox, 300, a, "full").await?;
+        let candidates: Vec<SnapshotId> = store
+            .list_candidates(2, 100, None, None)
+            .await?
+            .candidates
+            .iter()
+            .map(|c| c.snapshot_id)
+            .collect();
+        assert!(!candidates.contains(&a_first), "{candidates:?}");
+        assert!(!candidates.contains(&b), "{candidates:?}");
+        assert_eq!(
+            store.claim_prune(b, 2).await?,
+            ClaimOutcome::Refused(ClaimRefusalReason::ProtectedRestoreSource),
+        );
+
+        // Two captures registered at the same instant tie, and the restore
+        // breaks the tie on the higher id, so that one is kept and the other
+        // prunes like any outranked capture.
+        let sandbox = insert_sandbox(pool).await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1")
+            .bind(sandbox)
+            .execute(pool)
+            .await?;
+        let a = Uuid::now_v7();
+        insert_artifact_snapshot(pool, sandbox, 600, a, "full").await?;
+        let mut tied = [
+            insert_artifact_snapshot(pool, sandbox, 500, Uuid::now_v7(), "full").await?,
+            insert_artifact_snapshot(pool, sandbox, 500, Uuid::now_v7(), "full").await?,
+        ];
+        sqlx::query(
+            "UPDATE snapshots SET timestamp = (SELECT timestamp FROM snapshots WHERE id = $1)
+              WHERE id = $2",
+        )
+        .bind(tied[0])
+        .bind(tied[1])
+        .execute(pool)
+        .await?;
+        tied.sort();
+        insert_artifact_snapshot(pool, sandbox, 300, a, "full").await?;
+        let candidates: Vec<SnapshotId> = store
+            .list_candidates(1, 100, None, None)
+            .await?
+            .candidates
+            .iter()
+            .map(|c| c.snapshot_id)
+            .collect();
+        assert!(candidates.contains(&tied[0]), "{candidates:?}");
+        assert!(!candidates.contains(&tied[1]), "{candidates:?}");
+
+        // Capture A's first backup records no generation and a later one
+        // records 3, which the first ranks by. Re-uploads of capture B push
+        // both out of the keep-set; the one with a generation stays while the first
+        // remains, or the first would rank as unordered against B and refuse
+        // the restore. B outranks A, so the first prunes, and then the
+        // one with a generation can.
+        let sandbox = insert_sandbox(pool).await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1")
+            .bind(sandbox)
+            .execute(pool)
+            .await?;
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let (mut a_first, mut a_with_generation) = (None, None);
+        for (age, artifact, generation) in [
+            (600, b, Some(5_i64)),
+            (500, a, None),
+            (400, a, Some(3)),
+            (300, b, Some(5)),
+            (200, b, Some(5)),
+        ] {
+            let id = insert_artifact_snapshot(pool, sandbox, age, artifact, "full").await?;
+            sqlx::query("UPDATE snapshots SET generation = $2 WHERE id = $1")
+                .bind(id)
+                .bind(generation)
+                .execute(pool)
+                .await?;
+            match age {
+                500 => a_first = Some(id),
+                400 => a_with_generation = Some(id),
+                _ => {}
+            }
+        }
+        let a_with_generation = a_with_generation.expect("A's backup with a generation");
+        let candidates: Vec<SnapshotId> = store
+            .list_candidates(2, 100, None, None)
+            .await?
+            .candidates
+            .iter()
+            .map(|c| c.snapshot_id)
+            .collect();
+        assert!(!candidates.contains(&a_with_generation), "{candidates:?}");
+        assert!(
+            candidates.contains(&a_first.expect("A's first backup")),
+            "{candidates:?}"
+        );
+
+        // Captures A and B of one generation order by first registration, so
+        // A's first backup stays while its re-uploads push it out of the
+        // keep-set: pruned, they'd sort A after B and restore it.
+        let sandbox = insert_sandbox(pool).await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1")
+            .bind(sandbox)
+            .execute(pool)
+            .await?;
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let mut ids = Vec::new();
+        for (age, artifact) in [(600, a), (500, b), (400, a), (300, a)] {
+            let id = insert_artifact_snapshot(pool, sandbox, age, artifact, "full").await?;
+            sqlx::query("UPDATE snapshots SET generation = 5 WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await?;
+            ids.push(id);
+        }
+        let candidates: Vec<SnapshotId> = store
+            .list_candidates(2, 100, None, None)
+            .await?
+            .candidates
+            .iter()
+            .map(|c| c.snapshot_id)
+            .collect();
+        assert!(!candidates.contains(&ids[0]), "A's anchor: {candidates:?}");
+        assert!(!candidates.contains(&ids[1]), "B: {candidates:?}");
+
+        // A capture A without a generation ranks below a later execution's capture B by
+        // its first registration. A's first backup stays while A's re-uploads
+        // remain, though B outranks A: pruned, A would register after B and
+        // the history would turn unordered.
+        let sandbox = insert_sandbox(pool).await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1")
+            .bind(sandbox)
+            .execute(pool)
+            .await?;
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let mut ids = Vec::new();
+        for (age, artifact, generation) in [
+            (600, a, None),
+            (500, b, Some(5_i64)),
+            (400, a, None),
+            (300, a, None),
+        ] {
+            let id = insert_artifact_snapshot(pool, sandbox, age, artifact, "full").await?;
+            sqlx::query("UPDATE snapshots SET generation = $2 WHERE id = $1")
+                .bind(id)
+                .bind(generation)
+                .execute(pool)
+                .await?;
+            ids.push(id);
+        }
+        let candidates: Vec<SnapshotId> = store
+            .list_candidates(2, 100, None, None)
+            .await?
+            .candidates
+            .iter()
+            .map(|c| c.snapshot_id)
+            .collect();
+        assert!(!candidates.contains(&ids[0]), "A's anchor: {candidates:?}");
+        assert!(!candidates.contains(&ids[1]), "B: {candidates:?}");
+
+        // A named snapshot isn't a restore source for an unpinned row, so it
+        // doesn't shadow the suspend capture it registered after, though it
+        // has the same generation and the newer registration.
+        let sandbox = insert_sandbox(pool).await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1")
+            .bind(sandbox)
+            .execute(pool)
+            .await?;
+        let suspend = insert_typed_artifact_snapshot(
+            pool,
+            sandbox,
+            "full",
+            600,
+            Uuid::now_v7(),
+            ("full", "suspend"),
+        )
+        .await?;
+        let named = insert_snapshot(pool, sandbox, "full", "ready", 500).await?;
+        sqlx::query(
+            "UPDATE snapshots
+                SET local_artifact_id = $2, artifact_kind = 'full', artifact_origin = 'snapshot',
+                    artifact_snapshot_name = 'named'
+              WHERE id = $1",
+        )
+        .bind(named)
+        .bind(Uuid::now_v7())
+        .execute(pool)
+        .await?;
+        sqlx::query("UPDATE snapshots SET generation = 5 WHERE sandbox_id = $1")
+            .bind(sandbox)
+            .execute(pool)
+            .await?;
+        let found: Vec<SnapshotId> = store
+            .list_candidates(1, 100, None, None)
+            .await?
+            .candidates
+            .iter()
+            .map(|c| c.snapshot_id)
+            .collect();
+        assert!(!found.contains(&suspend), "the suspend capture: {found:?}");
+
+        // B without a generation ranks below C because C's execution started
+        // after B's first backup registered. That first backup stays while
+        // B's re-upload remains, though C outranks B: pruned, B's capture
+        // would register at the re-upload, after C's execution started, and
+        // the history would turn unordered.
+        let sandbox = insert_sandbox(pool).await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1")
+            .bind(sandbox)
+            .execute(pool)
+            .await?;
+        let b = Uuid::now_v7();
+        let mut ids = Vec::new();
+        for (age, artifact, generation) in [
+            (600, b, None),
+            (500, Uuid::now_v7(), Some(6_i64)),
+            (300, b, None),
+        ] {
+            let id = insert_artifact_snapshot(pool, sandbox, age, artifact, "full").await?;
+            sqlx::query("UPDATE snapshots SET generation = $2 WHERE id = $1")
+                .bind(id)
+                .bind(generation)
+                .execute(pool)
+                .await?;
+            ids.push(id);
+        }
+        sqlx::query(
+            "INSERT INTO sandbox_k8s_executions (
+                 sandbox_id, generation, pod_name, pod_namespace, state, active, created_at
+             )
+             VALUES ($1, 6, 'space-sbx-retention-g6', 'sandboxes', 'suspended', FALSE,
+                     NOW() - INTERVAL '550 seconds')",
+        )
+        .bind(sandbox)
+        .execute(pool)
+        .await?;
+        let found: Vec<SnapshotId> = store
+            .list_candidates(1, 100, None, None)
+            .await?
+            .candidates
+            .iter()
+            .map(|c| c.snapshot_id)
+            .collect();
+        assert!(!found.contains(&ids[0]), "B's anchor: {found:?}");
+
+        // A with a generation 5, then B without one, then D, E and F with
+        // generation 5: B can't be ordered against them, and the restore
+        // refuses. Pruning A would leave B first registered before every
+        // capture with a generation, ordered below them, and the restore would
+        // choose. So nothing registered up to B prunes, pinned or not, since a
+        // pin can be cleared later; D, a capture registered after B that F
+        // follows, prunes by rank.
+        let sandbox = insert_sandbox(pool).await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1")
+            .bind(sandbox)
+            .execute(pool)
+            .await?;
+        let f = Uuid::now_v7();
+        let mut ids = Vec::new();
+        for (age, artifact, generation) in [
+            (600, Uuid::now_v7(), Some(5_i64)),
+            (500, Uuid::now_v7(), None),
+            (400, Uuid::now_v7(), Some(5)),
+            (300, Uuid::now_v7(), Some(5)),
+            (200, f, Some(5)),
+        ] {
+            let id = insert_artifact_snapshot(pool, sandbox, age, artifact, "full").await?;
+            sqlx::query("UPDATE snapshots SET generation = $2 WHERE id = $1")
+                .bind(id)
+                .bind(generation)
+                .execute(pool)
+                .await?;
+            ids.push(id);
+        }
+        let found: Vec<SnapshotId> = store
+            .list_candidates(2, 100, None, None)
+            .await?
+            .candidates
+            .iter()
+            .map(|c| c.snapshot_id)
+            .collect();
+        assert!(!found.contains(&ids[0]), "A: {found:?}");
+        assert!(!found.contains(&ids[1]), "B: {found:?}");
+        assert!(found.contains(&ids[2]), "D: {found:?}");
+        sqlx::query(
+            "UPDATE sandboxes SET current_local_artifact_id = $2, current_local_artifact_kind = 'full',
+                    current_local_artifact_origin = 'suspend'
+              WHERE id = $1",
+        )
+        .bind(sandbox)
+        .bind(f)
+        .execute(pool)
+        .await?;
+        let found: Vec<SnapshotId> = store
+            .list_candidates(2, 100, None, None)
+            .await?
+            .candidates
+            .iter()
+            .map(|c| c.snapshot_id)
+            .collect();
+        assert!(!found.contains(&ids[0]), "pinned, A: {found:?}");
+        assert!(!found.contains(&ids[1]), "pinned, B: {found:?}");
+        assert!(found.contains(&ids[2]), "pinned, D: {found:?}");
+
+        // Ordered: a later execution's capture C (generation 6) follows B, so B
+        // ranks below it, and nothing is held for B's order. A and B, both
+        // outranked, prune by rank, pinned or not.
+        for pinned in [false, true] {
+            let sandbox = insert_sandbox(pool).await?;
+            sqlx::query("UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1")
+                .bind(sandbox)
+                .execute(pool)
+                .await?;
+            let c = Uuid::now_v7();
+            let mut ids = Vec::new();
+            for (age, artifact, generation) in [
+                (600, Uuid::now_v7(), Some(5_i64)),
+                (500, Uuid::now_v7(), None),
+                (300, c, Some(6)),
+                (200, c, Some(6)),
+            ] {
+                let id = insert_artifact_snapshot(pool, sandbox, age, artifact, "full").await?;
+                sqlx::query("UPDATE snapshots SET generation = $2 WHERE id = $1")
+                    .bind(id)
+                    .bind(generation)
+                    .execute(pool)
+                    .await?;
+                ids.push(id);
+            }
+            if pinned {
+                sqlx::query(
+                    "UPDATE sandboxes SET current_local_artifact_id = $2,
+                            current_local_artifact_kind = 'full',
+                            current_local_artifact_origin = 'suspend'
+                      WHERE id = $1",
+                )
+                .bind(sandbox)
+                .bind(c)
+                .execute(pool)
+                .await?;
+            }
+            let found: Vec<SnapshotId> = store
+                .list_candidates(2, 100, None, None)
+                .await?
+                .candidates
+                .iter()
+                .map(|c| c.snapshot_id)
+                .collect();
+            assert!(
+                found.contains(&ids[0]),
+                "ordered, pinned {pinned}, A: {found:?}"
+            );
+            assert!(
+                found.contains(&ids[1]),
+                "ordered, pinned {pinned}, B: {found:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p15_restoring_source_re_upload_is_shielded_from_pruning() -> TestResult {
+        // The claim's source upload failed and its artifact was backed up
+        // again after the claim, outside the retry window. A node asking where
+        // to restore from gets that backup, so later failed-branch artifacts
+        // must not push it out of the keep-set.
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let pool = &db.pool;
+        let sandbox = insert_sandbox(pool).await?;
+        let source = Uuid::now_v7();
+        let failed_upload = insert_artifact_snapshot(pool, sandbox, 5000, source, "full").await?;
+        sqlx::query("UPDATE snapshots SET state = 'failed' WHERE id = $1")
+            .bind(failed_upload)
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "UPDATE sandboxes
+                SET lifecycle = 'restoring',
+                    current_local_artifact_id = $2,
+                    current_local_artifact_kind = 'full',
+                    current_local_artifact_origin = 'suspend'
+              WHERE id = $1",
+        )
+        .bind(sandbox)
+        .bind(Uuid::now_v7())
+        .execute(pool)
+        .await?;
+        // Backdated in a second update, as in p11: the lifecycle trigger
+        // stamps NOW() on the lifecycle change itself.
+        sqlx::query(
+            "UPDATE sandboxes
+                SET lifecycle_changed_at = NOW() - make_interval(secs => 4000)
+              WHERE id = $1",
+        )
+        .bind(sandbox)
+        .execute(pool)
+        .await?;
+        let reupload = insert_artifact_snapshot(pool, sandbox, 1000, source, "full").await?;
+        for age in [900, 800] {
+            insert_artifact_snapshot(pool, sandbox, age, Uuid::now_v7(), "full").await?;
+        }
+
+        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let got: Vec<SnapshotId> = store
+            .list_candidates(2, 100, None, None)
+            .await?
+            .candidates
+            .iter()
+            .map(|c| c.snapshot_id)
+            .collect();
+        assert!(!got.contains(&reupload), "got {got:?}");
+        assert_eq!(
+            store.claim_prune(reupload, 2).await?,
+            ClaimOutcome::Refused(ClaimRefusalReason::ProtectedRestoreSource),
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn p13_marker_on_a_restoring_row_is_not_a_breach() -> TestResult {
         // A `restoring` row's selector deliberately ignores the marker and
         // reads the pre-restore window instead, so the marker is not that

@@ -146,7 +146,7 @@ pub async fn list_snapshots(
 
 /// The sandbox `spec` names, in any organization and any form
 /// [`AdminSandboxTarget::parse`] accepts, with its canonical `sbx_` ID.
-async fn resolve_sandbox(
+pub(super) async fn resolve_sandbox(
     state: &AppState,
     spec: &str,
 ) -> Result<(PublicSandboxId, Sandbox), PublicApiError> {
@@ -168,7 +168,7 @@ async fn resolve_sandbox(
 
 /// A handler's answer, success or refusal, carrying the resolved `target` for
 /// the audit event.
-fn with_target(
+pub(super) fn with_target(
     target: AdminAuditTarget,
     result: Result<impl IntoResponse, PublicApiError>,
 ) -> Response {

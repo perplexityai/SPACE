@@ -10936,6 +10936,164 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// A Kubernetes node's target names its Kubernetes node, which the
+    /// substrate resolves its node-api endpoint from. An unregistered node, or
+    /// another substrate's, has no target.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_kubernetes_node_target_names_its_node() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let node_id = NodeId::new();
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, '10.0.0.12', 'worker', 'k8s', 'ready')",
+        )
+        .bind(node_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query("INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, 'worker-a')")
+            .bind(node_id)
+            .execute(&pool)
+            .await?;
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            mock_kubernetes_client(Arc::new(Mutex::new(Vec::new()))),
+        );
+        let target = substrate
+            .node_api_target(node_id)
+            .await?
+            .expect("registered node");
+        assert_eq!(target.substrate_node_id.as_deref(), Some("worker-a"));
+        assert!(substrate.node_api_target(NodeId::new()).await?.is_none());
+        // Another substrate's node isn't this one's.
+        let foreign = NodeId::new();
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, '10.0.0.14', 'worker', 'space', 'ready')",
+        )
+        .bind(foreign)
+        .execute(&pool)
+        .await?;
+        assert!(substrate.node_api_target(foreign).await?.is_none());
+        Ok(())
+    }
+
+    /// An unpinned sandbox whose history is unordered (a capture without a
+    /// generation registered after one with a generation) gets no remote
+    /// source. A restore on
+    /// its own node goes to that node without a URI, to load the local copy
+    /// it suspended with there, while that node is ready; while it's
+    /// registered but not ready, the restore is retryable. An evacuation, or
+    /// a restore with no source node, is refused with the reason: 412, never
+    /// a retryable wait.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unordered_history_restores_only_on_its_source_node() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let node_id = NodeId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, '10.0.0.11', 'worker', 'k8s', 'ready')",
+        )
+        .bind(node_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query("INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, 'source-node')")
+            .bind(node_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("UPDATE sandboxes SET target_node_id = $2 WHERE id = $1")
+            .bind(sandbox_id)
+            .bind(node_id)
+            .execute(&pool)
+            .await?;
+        let with_generation = "s3://space-test/suspend-snapshots/with-generation?region=us-east-1";
+        insert_ready_full_snapshot_relative_to_lifecycle(
+            &pool,
+            sandbox_id,
+            with_generation,
+            60,
+            Uuid::now_v7(),
+        )
+        .await?;
+        insert_ready_full_snapshot_relative_to_lifecycle(
+            &pool,
+            sandbox_id,
+            "s3://space-test/suspend-snapshots/no-generation?region=us-east-1",
+            120,
+            Uuid::now_v7(),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE snapshots sn SET generation = 5
+               FROM snapshot_storage_locations ssl
+              WHERE ssl.snapshot_id = sn.id AND ssl.storage_connection_string = $1",
+        )
+        .bind(with_generation)
+        .execute(&pool)
+        .await?;
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            mock_kubernetes_client(Arc::new(Mutex::new(Vec::new()))),
+        );
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+
+        let plan = substrate
+            .suspend_restore_plan(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
+            .await?;
+        assert_eq!(plan.source_node_name.as_deref(), Some("source-node"));
+        assert_eq!(plan.storage_uri, None);
+
+        // The source node is registered but not ready: a node-only pod there
+        // wouldn't come up now, and it may come back, so it's retryable.
+        sqlx::query("UPDATE nodes SET state = 'registered' WHERE id = $1")
+            .bind(node_id)
+            .execute(&pool)
+            .await?;
+        assert!(matches!(
+            substrate
+                .suspend_restore_plan(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
+                .await,
+            Err(SubstrateError::Unavailable { message }) if message.contains("can't be ordered")
+        ));
+        sqlx::query("UPDATE nodes SET state = 'ready' WHERE id = $1")
+            .bind(node_id)
+            .execute(&pool)
+            .await?;
+
+        let refused = |result: Result<_, SubstrateError>| {
+            matches!(
+                result,
+                Err(SubstrateError::RestoreContextUnavailable { message })
+                    if message.contains("can't be ordered")
+            )
+        };
+        assert!(refused(
+            substrate
+                .suspend_restore_plan(&sandbox, RestoreSnapshotChoice::NewestRemote)
+                .await
+        ));
+        sqlx::query(
+            "UPDATE sandboxes SET target_node_id = NULL, active_node_id = NULL WHERE id = $1",
+        )
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        let unplaced = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        assert!(refused(
+            substrate
+                .suspend_restore_plan(&unplaced, RestoreSnapshotChoice::SourceNodeOrFresh)
+                .await
+        ));
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn expired_restore_redrive_with_vanished_source_uses_remote_snapshot_without_hard_pin()
     -> Result<(), BoxError> {

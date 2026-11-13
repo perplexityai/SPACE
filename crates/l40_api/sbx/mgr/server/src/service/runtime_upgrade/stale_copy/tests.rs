@@ -96,6 +96,8 @@ impl BackupReadiness {
             return Err(Status::not_found("no backup of that artifact"));
         }
         let ready = match request.readiness.and_then(|query| query.artifact) {
+            // The cluster restores the sandbox without its local copy.
+            Some(Artifact::DurablyRestorable(true)) => true,
             Some(Artifact::LocalArtifact(identity)) => identity.local_artifact_id == backed,
             Some(Artifact::CapturedAfter(order)) => {
                 let id = |identity: Option<LocalArtifactBackupIdentity>| {

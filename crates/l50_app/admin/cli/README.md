@@ -309,6 +309,54 @@ What doesn't help:
 - `terminate-node` is accepted only from `drained` and returns 409 while the
   node has active residents or drain blockers. It has no override.
 
+### Restore refused: captures can't be ordered
+
+An unpinned sandbox whose captures can't be ordered refuses to restore off
+its node. That's a capture with no recorded capture generation that
+registered after one with a generation, with no later execution's capture
+after it: either could hold the sandbox's latest state, so the control plane
+won't guess. The message says `its captures can't be ordered`:
+
+- `412` when nothing can restore it: an evacuation, a sandbox with no source
+  node, or a source node that's gone or deregistered;
+- `503` while its source node is still registered but can't take the restore
+  now: on Direct, a node that isn't a restore candidate, and on Kubernetes, a
+  node that isn't ready. It restores there once the node can;
+- `FAILED_PRECONDITION` to a node asking where to restore from.
+
+The drain and drained-node terminator keep the sandbox `suspended` rather
+than failing it. A restore on the node that still holds the sandbox works.
+With `SPACE_RESTORE_PIN_REPAIR_ENABLED`, the controller pins such a row from
+that node's answer on its own, but only while the node's capture is still the
+latest the control plane knows of: no full snapshot records a higher
+generation, and no capture of another artifact registered at or after it.
+Otherwise the repair logs the reason and leaves the row unpinned.
+
+When the repair leaves the row unpinned, or the node no longer holds the
+sandbox, pin a capture by hand, as a managing-organization admin:
+
+1. `GET /admin/api/v1/sandboxes/sbx_<uuid>/restore-pin` returns the
+   sandbox's `lifecycle`, `lifecycle_changed_at`, `unordered`, and the
+   `captures` a pin accepts: in an unordered history, the latest capture of
+   each side, with its `local_artifact_id`, `generation` (none for the side
+   without one), `first_registered_at` and `source_node_id`.
+2. Decide which capture holds the latest state. Only evidence outside these
+   rows can tell: the owner's account of what they last did, or the node
+   each capture came from and when the sandbox ran there.
+3. `POST /admin/api/v1/sandboxes/sbx_<uuid>/restore-pin` with
+   `{"local_artifact_id": "<uuid>", "lifecycle_changed_at": "<as read>"}`.
+   It pins only a `suspended`, unpinned sandbox that hasn't changed lifecycle
+   since the read, to a listed capture, and answers `409` otherwise; read
+   again and retry. It first asks the sandbox's node what it holds: a node
+   still holding the sandbox suspended restores its own local copy whatever
+   the pin names, so while it holds another capture, or a copy with no
+   recorded capture, the pin is refused with `409`, and while the node can't
+   be asked, `503`. On success it returns the new state, and the next restore
+   loads exactly that capture.
+
+A pin is the operator's word: picking the older side restores the older
+state, and nothing afterwards can tell.
+
 ## Warm pools
 
 `warm-pool create` creates or updates a cluster warm-pool config through

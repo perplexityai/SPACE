@@ -2,7 +2,7 @@ use super::{
     GetSnapshotError, InsertOutcome, InsertSnapshotError, NewSnapshot, RecordArtifactDigestsError,
     SnapshotArtifact, SnapshotArtifactDigest, artifact_captured_after, artifact_digests,
     artifact_registered_by_another_attempt, delete_snapshot_catalog, get, insert,
-    record_artifact_digests,
+    is_latest_ready_suspend, record_artifact_digests,
 };
 use jiff::Timestamp;
 use pplx_space_accounts::{NodeId, OrgId};
@@ -592,6 +592,78 @@ async fn captures_order_by_the_generation_that_took_them() -> TestResult {
     Ok(())
 }
 
+/// Every backup attempt of one artifact records the capture generation its
+/// first attempt with a generation recorded: a re-upload the node can no longer vouch
+/// for inherits it, and one that vouches for another generation can't move
+/// it. An artifact that never recorded one takes the first that's given.
+#[tokio::test(flavor = "current_thread")]
+async fn backup_attempts_of_an_artifact_keep_its_capture_generation() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    insert_placed_sandbox(&db.pool, sandbox_id, "suspended", None, None, None).await?;
+    let generation = |value| ExecutionGeneration::new(value).expect("valid generation");
+    let register = |artifact: LocalArtifactId, recorded: Option<i64>| {
+        let pool = db.pool.clone();
+        async move {
+            let snapshot_id = SnapshotId::new();
+            let snapshot = NewSnapshot::new(
+                snapshot_id,
+                sandbox_id,
+                SnapshotKind::Full,
+                SnapshotState::Creating,
+                OrgId::from_uuid(SEEDED_ORG_ID),
+                ExactStorageUri::parse(&format!(
+                    "s3://test-bucket/snapshots/{sandbox_id}/{snapshot_id}?region=us-east-1"
+                ))?,
+            )
+            .with_artifact(SnapshotArtifact::new(
+                Some(artifact),
+                ArtifactKind::Full,
+                ArtifactOrigin::Suspend,
+                None,
+            )?)
+            .with_generation(recorded.map(generation));
+            let mut tx = pool.begin().await?;
+            let (inserted, outcome) = insert(&mut tx, &snapshot).await?;
+            tx.commit().await?;
+            assert_eq!(outcome, InsertOutcome::Created);
+            TestResult::Ok(inserted.generation())
+        }
+    };
+
+    let with_generation = LocalArtifactId::new();
+    assert_eq!(
+        register(with_generation, Some(4)).await?,
+        Some(generation(4))
+    );
+    assert_eq!(
+        register(with_generation, None).await?,
+        Some(generation(4)),
+        "an unvouched re-upload inherits the capture's generation"
+    );
+    assert_eq!(
+        register(with_generation, Some(9)).await?,
+        Some(generation(4)),
+        "a later registration can't move the capture's generation"
+    );
+
+    let without_generation = LocalArtifactId::new();
+    assert_eq!(register(without_generation, None).await?, None);
+    assert_eq!(
+        register(without_generation, Some(6)).await?,
+        Some(generation(6)),
+        "an artifact that never recorded a generation takes the first given"
+    );
+    assert_eq!(
+        register(LocalArtifactId::new(), None).await?,
+        None,
+        "another artifact's generation isn't inherited"
+    );
+    Ok(())
+}
+
 /// A catalog snapshot is in the object store only when it is `ready` with a
 /// live location, and node-local only when it is the current local artifact
 /// of a sandbox settled in `suspended` or `stopped` on the node it uploaded
@@ -814,4 +886,83 @@ async fn insert_snapshot(
         .await?;
     }
     Ok(snapshot_id)
+}
+
+/// The unpinned eviction proof refuses a sandbox whose history is unordered,
+/// a ready capture without a generation registered after one with a
+/// generation, even for its newest ready attempt: its restore refuses off its
+/// node, so the node's copy may be its only restore path. Ordered, or
+/// pinned, the newest ready attempt proves it.
+#[tokio::test(flavor = "current_thread")]
+async fn the_unpinned_eviction_proof_refuses_an_unordered_history() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    // (case, generation of the newest attempt, pinned, proven)
+    for (case, newest_generation, pinned, proven) in [
+        ("unordered", None, false, false),
+        ("ordered", Some(6_i64), false, true),
+        ("unordered, pinned", None, true, true),
+    ] {
+        let sandbox_id = SandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, network_policy_generation)
+             VALUES ($1, $2::UUID, $3::UUID, 'suspended', 1)"
+        ))
+        .bind(sandbox_id)
+        .bind(SEEDED_USER_ID)
+        .bind(SEEDED_ORG_ID)
+        .execute(pool)
+        .await?;
+        let mut newest = SnapshotId::new();
+        for (generation, minutes_ago) in [(Some(5_i64), 20), (newest_generation, 10)] {
+            let snapshot_id = SnapshotId::new();
+            newest = snapshot_id;
+            sqlx::query(sql!(
+                "INSERT INTO snapshots (
+                     id, sandbox_id, type, state, timestamp, local_artifact_id, artifact_kind,
+                     artifact_origin, generation, org_id
+                 )
+                 VALUES ($1, $2, 'full', 'ready', NOW() - make_interval(mins => $3::INT), $4,
+                         'full', 'suspend', $5, $6)"
+            ))
+            .bind(snapshot_id)
+            .bind(sandbox_id)
+            .bind(minutes_ago)
+            .bind(Uuid::now_v7())
+            .bind(generation)
+            .bind(SEEDED_ORG_ID)
+            .execute(pool)
+            .await?;
+            sqlx::query(sql!(
+                "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string, org_id)
+                 VALUES ($1, 's3://test/latest-ready?region=us-east-1', $2)"
+            ))
+            .bind(snapshot_id)
+            .bind(SEEDED_ORG_ID)
+            .execute(pool)
+            .await?;
+        }
+        if pinned {
+            sqlx::query(sql!(
+                "UPDATE sandboxes s
+                    SET current_local_artifact_id = sn.local_artifact_id,
+                        current_local_artifact_kind = 'full',
+                        current_local_artifact_origin = 'suspend'
+                   FROM snapshots sn
+                  WHERE s.id = $1 AND sn.id = $2"
+            ))
+            .bind(sandbox_id)
+            .bind(newest)
+            .execute(pool)
+            .await?;
+        }
+        assert_eq!(
+            is_latest_ready_suspend(pool, sandbox_id, newest).await?,
+            proven,
+            "{case}"
+        );
+    }
+    Ok(())
 }

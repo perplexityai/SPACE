@@ -43,6 +43,7 @@ use pplx_space_net_common::{
     NetworkPolicyV1,
     proto::{NetworkPolicySource, NetworkPolicyV1 as NetworkPolicyProto},
 };
+use pplx_space_sandbox_store::restore_source;
 use pplx_space_snapshot_store as snapshot_store;
 use sqlx::FromRow;
 use sqlx::types::Json;
@@ -1010,6 +1011,10 @@ impl ClusterApiService {
             .map(ExecutionGeneration::new)
             .transpose()
             .map_err(|e| Status::invalid_argument(format!("invalid execution_generation: {e}")))?;
+        // Orders captures only when the node vouches that the generation is
+        // the capturing execution's; it fences either way.
+        let capture_generation =
+            execution_generation.filter(|_| req.execution_generation_names_capture);
         let sandbox = self.lookup_snapshot_sandbox(sandbox_id).await?;
         let snapshot = sandbox
             .new_snapshot(
@@ -1021,11 +1026,7 @@ impl ClusterApiService {
             )?
             .with_artifact(artifact)
             .with_execution_metadata(execution_metadata)
-            // Orders captures only when the node vouches that the generation
-            // is the capturing execution's; it fences either way.
-            .with_generation(
-                execution_generation.filter(|_| req.execution_generation_names_capture),
-            );
+            .with_generation(capture_generation);
         let mut tx = self
             .pool
             .begin()
@@ -1035,6 +1036,22 @@ impl ClusterApiService {
         let (persisted, outcome) = snapshot_store::insert(&mut tx, &snapshot)
             .await
             .map_err(snapshot_insert_status)?;
+        // An earlier backup of these bytes fixed their capture generation,
+        // and the row inherits it. A node vouching for another one holds
+        // wrong evidence for one of the two registrations.
+        if outcome == snapshot_store::InsertOutcome::Created
+            && let Some(vouched) = capture_generation
+            && persisted.generation() != Some(vouched)
+        {
+            tracing::warn!(
+                %sandbox_id,
+                %local_artifact_id,
+                vouched_generation = vouched.get(),
+                recorded_generation = persisted.generation().map(ExecutionGeneration::get),
+                "backup registration vouches for a capture generation other than the one \
+                 an earlier backup of the artifact recorded; keeping the recorded one"
+            );
+        }
         // Only a capture's first registration is fenced. Refusing a replay
         // would fail an upload the API's own suspend may be waiting on. A
         // fresh attempt for bytes an earlier attempt already registered is a
@@ -1355,18 +1372,35 @@ impl ClusterApiService {
 
         let mut tx = self.begin_restore_lookup().await?;
 
+        // The same capture the control plane would restore the sandbox from.
+        // The node asks on behalf of a restore the control plane already
+        // started, a claimed restore or the recovery of a `started` sandbox,
+        // so a `restoring` row selects from the claim's source window.
         // TODO: [legacy] Remove once all restore callers look up exact artifact
         // backups with `GetArtifactBackupLocation`.
-        let row = snapshot_store::latest_ready_suspend_location_placed_on(
-            &mut *tx, sandbox_id, &node_ids,
+        let row = restore_source::select_restore_source(
+            &mut *tx,
+            sandbox_id,
+            restore_source::RestoreSourceMode::NodeLookup,
+            restore_source::RestoreSourcePlacement::PlacedOn(&node_ids),
         )
         .await
-        .map_err(|e| Status::internal(format!("snapshot lookup: {e}")))?
-        .ok_or_else(|| {
-            Status::not_found(format!(
-                "no suspend snapshot registered for sandbox {sandbox_id}"
-            ))
-        })?;
+        .map_err(|e| Status::internal(format!("snapshot lookup: {e}")))?;
+        // `FAILED_PRECONDITION` is this RPC's terminal refusal: sbx-mgr reads
+        // the code as `RestoreError::RestoreSourceUnordered`, never retried.
+        let row = match row {
+            restore_source::RestoreSourceSelection::Selected(row) => row,
+            restore_source::RestoreSourceSelection::Unavailable => {
+                return Err(Status::not_found(format!(
+                    "no suspend snapshot registered for sandbox {sandbox_id}"
+                )));
+            }
+            restore_source::RestoreSourceSelection::Unordered => {
+                return Err(Status::failed_precondition(
+                    restore_source::unordered_restore_source_message(sandbox_id),
+                ));
+            }
+        };
 
         let artifact_digests = Self::artifact_digests_for_restore(&mut tx, row.snapshot_id).await?;
         tx.commit()

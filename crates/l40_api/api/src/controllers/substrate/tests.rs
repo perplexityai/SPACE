@@ -814,6 +814,64 @@ fn a_reported_pin_is_pinless_only_when_genuinely_absent() {
     );
 }
 
+/// A node reports the sandbox suspended only when its status is `Suspended`
+/// with no cleanup owning the row. A cleanup still pending or failed, reported
+/// beside the lifecycle or as the lifecycle itself, isn't a sandbox held
+/// suspended, and neither is a cleanup state this build doesn't know.
+#[test]
+fn a_cleanup_pending_row_is_never_reported_suspended() {
+    use pplx_space_sbx_mgr_client::proto::{
+        SandboxCleanup, SandboxCleanupState, SandboxInfo, SandboxLifecycleState,
+    };
+    let sandbox_id = SandboxId::from_uuid(Uuid::now_v7());
+    let reported = |lifecycle: SandboxLifecycleState, cleanup: Option<i32>| {
+        node_reported_artifact_from_info(
+            SandboxInfo {
+                sandbox_id: sandbox_id.to_string(),
+                lifecycle: Some(lifecycle as i32),
+                cleanup: cleanup.map(|state| SandboxCleanup {
+                    state,
+                    ..SandboxCleanup::default()
+                }),
+                ..SandboxInfo::default()
+            },
+            sandbox_id,
+        )
+        .reports_suspended
+    };
+    assert!(reported(SandboxLifecycleState::Suspended, None));
+    assert!(reported(
+        SandboxLifecycleState::Suspended,
+        Some(SandboxCleanupState::Unspecified as i32)
+    ));
+    for (case, lifecycle, cleanup) in [
+        (
+            "cleanup required beside",
+            SandboxLifecycleState::Suspended,
+            Some(SandboxCleanupState::Required as i32),
+        ),
+        (
+            "cleanup failed beside",
+            SandboxLifecycleState::Suspended,
+            Some(SandboxCleanupState::Failed as i32),
+        ),
+        (
+            "unknown cleanup state",
+            SandboxLifecycleState::Suspended,
+            Some(99),
+        ),
+        (
+            "cleanup required",
+            SandboxLifecycleState::CleanupRequired,
+            None,
+        ),
+        ("cleanup failed", SandboxLifecycleState::CleanupFailed, None),
+        ("stopped", SandboxLifecycleState::Stopped, None),
+    ] {
+        assert!(!reported(lifecycle, cleanup), "{case}");
+    }
+}
+
 /// The node's capture time travels with its pin and never without one: a
 /// readable pin carries it, while a time beside no pin or beside an unreadable
 /// one is dropped, so a time can't be attributed to an artifact nobody can name.

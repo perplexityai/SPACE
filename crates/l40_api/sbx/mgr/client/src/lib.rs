@@ -62,6 +62,36 @@ pub enum ConnectError {
 
 pub use pplx_space_common_grpc::GrpcRetryPolicy;
 
+/// Metadata key on a sandbox-manager `FAILED_PRECONDITION` that names why a
+/// restore was refused, for a caller that must tell the refusals apart.
+pub const RESTORE_REFUSAL_METADATA_KEY: &str = "x-space-restore-refusal";
+
+/// [`RESTORE_REFUSAL_METADATA_KEY`] value: the control plane refused to choose
+/// the sandbox's restore source, since its captures can't be ordered. Terminal:
+/// every node asks the same question.
+pub const RESTORE_REFUSAL_SOURCE_UNORDERED: &str = "source-unordered";
+
+/// The `FAILED_PRECONDITION` a restore answers when the control plane refused
+/// to choose its source ([`RESTORE_REFUSAL_SOURCE_UNORDERED`]).
+pub fn restore_source_unordered_status(message: impl Into<String>) -> tonic::Status {
+    let mut status = tonic::Status::failed_precondition(message);
+    status.metadata_mut().insert(
+        RESTORE_REFUSAL_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(RESTORE_REFUSAL_SOURCE_UNORDERED),
+    );
+    status
+}
+
+/// Whether `status` is [`restore_source_unordered_status`]'s refusal.
+pub fn status_is_restore_source_unordered(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status
+            .metadata()
+            .get(RESTORE_REFUSAL_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            == Some(RESTORE_REFUSAL_SOURCE_UNORDERED)
+}
+
 /// The connect budget [`connect`] spends.
 ///
 /// Re-exported so a caller that carries the budget in its own configuration

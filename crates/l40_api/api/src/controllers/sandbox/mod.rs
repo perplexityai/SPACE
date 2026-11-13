@@ -1202,6 +1202,42 @@ impl SandboxController {
         self.substrate.capabilities()
     }
 
+    /// What node `node_id` reports holding for `sandbox_id`, as the
+    /// restore-pin repair asks it: `None` when no node of this substrate has
+    /// that id. A Direct node with no node-api endpoint, deregistered but
+    /// still recorded, is `Unavailable`: it can't be asked, and if it comes
+    /// back it restores whatever local copy it still holds.
+    pub async fn node_reported_artifact(
+        &self,
+        node_id: NodeId,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<super::substrate::NodeReportedArtifact>, super::substrate::SubstrateError>
+    {
+        use super::substrate::SubstrateAdapter as _;
+        let Some(node) = self.substrate.node_api_target(node_id).await? else {
+            return Ok(None);
+        };
+        if node.managed_by == pplx_space_common_core::types::NodeManagedBy::Space
+            && node.direct_endpoint.is_none()
+        {
+            return Err(super::substrate::SubstrateError::Unavailable {
+                message: format!(
+                    "node {node_id} is recorded without a node-api endpoint, so whether it holds \
+                     a local copy can't be checked"
+                ),
+            });
+        }
+        let (addr, mut client) = super::substrate::connect_retrying_node_api_client_for_target(
+            &self.substrate,
+            &node.as_target(),
+            Duration::from_secs(30),
+        )
+        .await?;
+        super::substrate::sandbox_state_with_node_api(&mut client, &addr, sandbox_id)
+            .await
+            .map(Some)
+    }
+
     /// Whether this deployment records activating clients (see
     /// [`super::substrate::ActivationClientAttribution`]).
     pub fn activation_client_attribution(&self) -> super::substrate::ActivationClientAttribution {

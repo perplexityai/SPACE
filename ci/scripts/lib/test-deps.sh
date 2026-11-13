@@ -106,7 +106,10 @@ space_pull_docker_image() {
 # is a tmpfs: each test's database is a copy of the template's files, created
 # and deleted a file at a time, and that is cheaper in memory than on the
 # runner's disk. CI runs 30 tests at once. Most hold two or three connections,
-# but a few hold eight or ten, so the default limit of 100 is raised.
+# but a few hold eight or ten, so the default limit of 100 is raised. JIT is
+# off, as the service pools set it for their sessions: the restore-source and
+# retention predicates plan above jit_above_cost, and compiling them on every
+# statement of 30 concurrent tests saturates the runner.
 space_start_test_postgres() {
     local docker_options=()
     while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
@@ -125,6 +128,7 @@ space_start_test_postgres() {
         -c synchronous_commit=off \
         -c full_page_writes=off \
         -c max_connections=200 \
+        -c jit=off \
         "$@"
 }
 
