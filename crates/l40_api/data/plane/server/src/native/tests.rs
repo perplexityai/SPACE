@@ -3634,10 +3634,12 @@ async fn already_started_process_is_resumed_exactly() {
     );
 }
 
-/// A `Last-Event-ID` too close to the end of the id space to number a later
-/// frame above is refused before anything is opened.
+/// A `Last-Event-ID` too high for any id to follow, up to the schema's
+/// maximum, was never sent: like any id that does not resume exactly, it
+/// replays the output from its start behind `resync_required`, and a resume
+/// from the ids that replay sends is exact.
 #[tokio::test]
-async fn last_event_id_without_room_after_it_is_rejected() {
+async fn last_event_id_without_room_after_it_replays_behind_a_resync() {
     if !binding_fake_test_process() {
         return;
     }
@@ -3648,26 +3650,21 @@ async fn last_event_id_without_room_after_it_is_rejected() {
         Arc::new(|_, open| journal_replay(&JOURNAL, open)),
     )
     .await;
-    let mut state = crate::tests::test_data_plane_state().await;
-    state.cluster_api = ClusterApiClients::service_only(
-        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
-            .await
-            .unwrap(),
-    );
-    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
-    let response = tower::ServiceExt::oneshot(
-        router(state),
-        Request::get(format!("/v1/sessions/{session_id}/events"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header("last-event-id", MAX_LAST_EVENT_ID.to_string())
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await
-    .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(fake.opens.lock().unwrap().is_empty());
+    let frames = process_events_to_close(&fake.endpoint, session_id, Some(MAX_LAST_EVENT_ID)).await;
+
+    assert_eq!(resync_reasons(&frames), ["cursor_replay_unavailable"]);
+    assert_eq!(stdout_text(&frames), JOURNAL.concat());
+    let after_two: Vec<_> = frames
+        .iter()
+        .take_while(|(_, frame)| frame["seq"] != 3)
+        .cloned()
+        .collect();
+    let resumed =
+        process_events_to_close(&fake.endpoint, session_id, Some(last_id(&after_two))).await;
+    assert_eq!(stdout_text(&resumed), "three\nfour\n");
+    assert_eq!(resync_reasons(&resumed), Vec::<String>::new());
+    assert_eq!(*fake.opens.lock().unwrap(), connects(&[Some(0), Some(2)]));
 }
 
 #[tokio::test]
