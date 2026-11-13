@@ -114,8 +114,8 @@ def take_sample(
     sandbox_pids: set[str] = set()
     try:
         children = sorted(cgroup_root.iterdir())
-    except OSError:
-        children = []
+    except OSError as error:
+        raise SystemExit(f"ERROR: cannot list {cgroup_root}: {error}") from error
     for child in children:
         if not child.is_dir():
             continue
@@ -245,7 +245,8 @@ def main() -> int:
     previous = take_sample(args.cgroup_root, args.daemon_prefix, args.proc_root, args.cgroup_mount)
     deadline = previous.at + args.duration_secs
     while previous.at < deadline:
-        time.sleep(max(0.0, min(args.interval_secs, deadline - previous.at)))
+        # previous.at is taken before the scan, so the scan's own time doesn't stretch the interval.
+        time.sleep(max(0.0, min(previous.at + args.interval_secs, deadline) - time.monotonic()))
         current = take_sample(args.cgroup_root, args.daemon_prefix, args.proc_root, args.cgroup_mount)
         total.add(previous, current)
         if args.window_secs > 0:
