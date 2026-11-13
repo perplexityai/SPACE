@@ -20,8 +20,9 @@ use pplx_space_common_core::kubernetes::{
 };
 use pplx_space_common_core::types::{
     ContentHash, Digest, MemorySize, NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy,
-    PolicyAuthority, SandboxOwner, TemplateCompatSpec, TemplateName, TemplateVisibility, VcpuCount,
+    SandboxOwner, TemplateCompatSpec, TemplateName, TemplateVisibility, VcpuCount,
 };
+use pplx_space_policy_authority::PolicyAuthority;
 use time::OffsetDateTime;
 
 use super::*;

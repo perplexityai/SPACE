@@ -2151,9 +2151,8 @@ async fn refresh_register_existing_expanded_build_preserves_rootfs_bytes(
 
 #[tokio::test]
 async fn register_refresh_cannot_add_remove_or_replace_a_retained_binding() {
-    use pplx_space_common_core::types::{
-        Arch, Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest, TemplateMetadata,
-    };
+    use pplx_space_common_core::types::{Arch, Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_template_manifest::{TemplateManifest, TemplateMetadata};
     let first = EnvironmentReference::new(Digest::sha256([1; 32]));
     let second = EnvironmentReference::new(Digest::sha256([2; 32]));
     for (retained, incoming, accepted) in [
@@ -2813,7 +2812,8 @@ async fn register_template_uses_producer_algorithm(
     // environment's cache partition.
     let mut partition = crate::db::TemplateCachePartition::Legacy;
     if cloud_hypervisor {
-        use pplx_space_common_core::types::{Arch, TemplateMetadata};
+        use pplx_space_common_core::types::Arch;
+        use pplx_space_template_manifest::TemplateMetadata;
         let environments =
             pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
                 Arch::X86_64,
@@ -2887,7 +2887,7 @@ async fn register_template_uses_producer_algorithm(
         std::fs::read(published.join(TEMPLATE_ROOTFS_FILE)).unwrap(),
         bytes
     );
-    let manifest: pplx_space_common_core::types::TemplateManifest =
+    let manifest: pplx_space_template_manifest::TemplateManifest =
         serde_json::from_slice(&std::fs::read(published.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest.content_hash, expected);
     let build = crate::db::get_build(&service.db.lock().unwrap(), name, &expected, partition)
@@ -2917,7 +2917,7 @@ async fn firmware_template_refuses_pool_and_snapshot_intent_before_persisting() 
         "readiness":{"kind":"tcp_service", "port":3389}
     }))
     .unwrap();
-    let mut manifest = pplx_space_common_core::types::TemplateManifest {
+    let mut manifest = pplx_space_template_manifest::TemplateManifest {
         guest_image: Some(image),
         ..Default::default()
     };
@@ -2979,7 +2979,7 @@ async fn firmware_template_refuses_pool_and_snapshot_intent_before_persisting() 
 async fn legacy_guest_policy_does_not_require_a_retired_execution_environment() {
     let root = tempfile::tempdir().unwrap();
     let conn = crate::db::test_conn();
-    let mut manifest = pplx_space_common_core::types::TemplateManifest::default();
+    let mut manifest = pplx_space_template_manifest::TemplateManifest::default();
     manifest.set_execution_metadata(
         serde_json::from_value(serde_json::json!({
             "environment": format!("sha256:{}", "a".repeat(64)),

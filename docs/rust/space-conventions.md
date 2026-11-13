@@ -321,7 +321,7 @@ why this is a mechanical move rather than a refactor:
 
 Whatever gated the inline module gates the declaration, character for character.
 The workspace has `#[cfg(all(test, feature = "serde"))]`
-(`crates/libs/common/core/src/types/template/metadata.rs`),
+(`crates/l20_domain/execution/spec/src/balloon.rs`),
 `#[cfg(all(test, target_os = "linux"))]`, `#[cfg(all(test, unix))]`, and
 `#[cfg(all(test, feature = "kubernetes"))]`. **Never** simplify one of these to
 a plain `#[cfg(test)]` while moving it — that silently compiles a test module
@@ -359,7 +359,7 @@ A top-level `crates/<crate>/tests/*.rs` file is **not** the default home for
 unit tests. Use one only when the test genuinely wants integration semantics:
 
 - It deliberately exercises **only the public API**, and the inability to reach
-  private helpers is the point. `crates/libs/common/core/tests/template_manifest_api.rs:1-9`
+  private helpers is the point. `crates/l20_domain/template/manifest/tests/template_manifest_api.rs:1-9`
   states that rationale in its own module doc: the file "acts as a guard against
   accidentally relying on a private helper."
 - It **spawns the built binary** via `CARGO_BIN_EXE_*`.

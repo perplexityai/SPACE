@@ -3,8 +3,9 @@
 
 use pplx_space_common_core::types::{
     Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
-    Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest,
+    Digest, EnvironmentReference, ExecutionMetadata,
 };
+use pplx_space_template_manifest::TemplateManifest;
 use rusqlite::Connection;
 
 use super::*;

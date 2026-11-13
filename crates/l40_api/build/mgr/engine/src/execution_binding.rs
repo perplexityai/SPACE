@@ -3,7 +3,7 @@
 use pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION as DEFINITION_SCHEMA;
 use std::path::Path;
 
-use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata, TemplateMetadata};
+use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata};
 use pplx_space_execution_common::{
     ExecutionProtoError,
     environment::{EnvironmentBindingError, EnvironmentDecodeError, EnvironmentDefinition},
@@ -11,6 +11,7 @@ use pplx_space_execution_common::{
 use pplx_space_node_mgr_client::proto::{
     ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
 };
+use pplx_space_template_manifest::TemplateMetadata;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BuildExecutionBindingError {
@@ -55,7 +56,7 @@ pub enum BuildExecutionBindingError {
     #[error("invalid template metadata JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid template metadata schema: {0}")]
-    Schema(#[from] pplx_space_common_core::types::TemplateMetadataSchemaError),
+    Schema(#[from] pplx_space_template_manifest::TemplateMetadataSchemaError),
 }
 
 #[derive(Debug)]

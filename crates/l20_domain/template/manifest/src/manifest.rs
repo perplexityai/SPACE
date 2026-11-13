@@ -1,7 +1,7 @@
 //! Typed `manifest.json` shape for template builds.
 //!
 //! The manifest is the artifact-side description of a template build —
-//! the "table of contents" companion to [`super::TemplateMetadata`]'s
+//! the "table of contents" companion to [`crate::TemplateMetadata`]'s
 //! "blueprint". It travels with the build (on disk in the digest dir,
 //! in S3 alongside the artifacts, and as the `manifest_json` column in
 //! template-manager's SQLite), and downstream code uses it to answer
@@ -56,7 +56,6 @@
 
 use std::collections::BTreeMap;
 
-#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// Unbound template `manifest.json` schema version.
@@ -83,88 +82,77 @@ pub enum TemplateManifestSchemaError {
 }
 
 /// Typed view of `manifest.json` carried with every template build.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct TemplateManifest {
     /// Absent for the legacy version-1 shape.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u32>,
 
     /// Exact execution environment selected for this template build.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
-    pub execution: Option<crate::types::ExecutionMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<pplx_space_execution_spec::ExecutionMetadata>,
 
     /// Omitted for legacy Linux images. Version 4 prevents old readers from
     /// applying ext4 tools or waiting for an absent guest agent.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_image: Option<pplx_space_execution_spec::guest_image::GuestImageContract>,
 
     /// Template name (matches the directory under `/space/cache/templates/`).
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub name: String,
 
     /// Content-addressed digest of the build (matches the digest dir name).
     /// Empty when the manifest was just written by the upstream builder
     /// and template-manager hasn't normalized it yet.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub content_hash: String,
 
     /// Timestamp the build was completed (ISO-8601). Sourced from the
     /// `metadata.json`'s `built_at` during build, preserved through
     /// normalize.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub build_date: String,
 
     /// VM runtime kind alias (`"fc"` for Firecracker today). Defaults
     /// to `"fc"` if absent on the wire — see
-    /// `pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS`.
-    #[cfg_attr(feature = "serde", serde(default))]
+    /// `pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS`.
+    #[serde(default)]
     pub runtime: String,
 
     /// CPU architecture identifier (`"aarch64"`, `"x86_64"`). Empty
     /// when the producer didn't write it; consumers fall back to
     /// metadata's `arch` and ultimately to `"aarch64"` (see the
     /// `template_arch` helper in template-manager).
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub arch: String,
 
     /// Template-specific runtime configuration carried opaquely. Today
     /// template-manager never inspects this; it's serialized through
     /// to consumers (e.g. sandbox creation) that have their own
     /// strongly-typed view of what goes in here.
-    #[cfg_attr(feature = "serde", serde(default = "default_config"))]
+    #[serde(default = "default_config")]
     pub config: serde_json::Value,
 
     /// Relative filename of the file that should be booted as the VM
     /// rootfs. In practice always `"rootfs.ext4"` today.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub bootable_artifact: String,
 
     /// Files that travel with the build, keyed by filename relative to
     /// the digest dir. `BTreeMap` keeps the serialized order stable so
     /// the manifest is bit-identical across writers that use the same
     /// inputs.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub files: BTreeMap<String, TemplateManifestFile>,
 }
 
 /// Per-file entry inside [`TemplateManifest::files`].
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct TemplateManifestFile {
     /// Content-addressed digest of the file's bytes as they sit on
     /// disk (post-decompress for the rootfs; raw bytes for the
     /// compressed sibling).
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub digest: String,
 
     /// Size in bytes as the file sits on disk. `Option<u64>` so the
@@ -172,25 +160,18 @@ pub struct TemplateManifestFile {
     /// "size is zero" (`Some(0)`) survives the round-trip — some
     /// readers fall back to `fs::metadata().len()` for the former
     /// while accepting the latter literally.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
 
     /// Compression descriptor for sibling artifacts that ship in a
     /// compressed form (e.g. `rootfs.ext4.zst`). `None` when the file
     /// is stored as-is.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<TemplateManifestCompression>,
 }
 
 /// Compression metadata for a manifest file entry.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct TemplateManifestCompression {
     /// Codec name (`"zstd"` today).
     pub codec: String,
@@ -227,7 +208,10 @@ impl TemplateManifestFile {
 }
 
 impl TemplateManifest {
-    pub fn set_execution_metadata(&mut self, execution: crate::types::ExecutionMetadata) {
+    pub fn set_execution_metadata(
+        &mut self,
+        execution: pplx_space_execution_spec::ExecutionMetadata,
+    ) {
         self.execution = Some(execution);
         self.refresh_schema_version();
     }
@@ -254,7 +238,8 @@ impl TemplateManifest {
 
     pub fn execution_metadata(
         &self,
-    ) -> Result<Option<&crate::types::ExecutionMetadata>, TemplateManifestSchemaError> {
+    ) -> Result<Option<&pplx_space_execution_spec::ExecutionMetadata>, TemplateManifestSchemaError>
+    {
         if self.guest_image.is_some()
             != (self.schema_version == Some(GUEST_TEMPLATE_MANIFEST_SCHEMA_VERSION))
         {
@@ -292,7 +277,8 @@ impl TemplateManifest {
     /// `None` for unbound documents.
     pub fn environment(
         &self,
-    ) -> Result<Option<crate::types::EnvironmentReference>, TemplateManifestSchemaError> {
+    ) -> Result<Option<pplx_space_execution_spec::EnvironmentReference>, TemplateManifestSchemaError>
+    {
         Ok(self
             .execution_metadata()?
             .and_then(|execution| execution.environment()))
@@ -384,10 +370,9 @@ fn validate_manifest_filename(name: &str) -> Result<(), TemplateManifestFilename
     })
 }
 
-#[cfg(feature = "serde")]
 fn default_config() -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
 }
 
-#[cfg(all(test, feature = "serde"))]
+#[cfg(test)]
 mod tests;

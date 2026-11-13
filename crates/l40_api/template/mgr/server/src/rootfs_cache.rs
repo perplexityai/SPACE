@@ -39,9 +39,9 @@ pub(crate) enum ExpandedRootfsError {
         actual_bytes: u64,
     },
     #[error("invalid template metadata schema: {0}")]
-    Schema(#[from] pplx_space_common_core::types::TemplateMetadataSchemaError),
+    Schema(#[from] pplx_space_template_manifest::TemplateMetadataSchemaError),
     #[error("invalid template manifest schema: {0}")]
-    ManifestSchema(#[from] pplx_space_common_core::types::TemplateManifestSchemaError),
+    ManifestSchema(#[from] pplx_space_template_manifest::TemplateManifestSchemaError),
     #[error("template metadata and manifest guest image contracts disagree")]
     GuestImageMismatch,
     #[error("invalid guest profile: {0}")]
@@ -65,8 +65,9 @@ impl ExpandedRootfsError {
     }
 }
 
-use pplx_space_common_core::types::{TEMPLATE_ROOTFS_FILE, TemplateManifest, TemplateMetadata};
+use pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE;
 use pplx_space_page_cache as page_cache;
+use pplx_space_template_manifest::{TemplateManifest, TemplateMetadata};
 
 /// Expand the template rootfs to the size declared in `metadata.json`.
 /// Returns `Some((path, final_size_bytes))` when metadata declares a size,

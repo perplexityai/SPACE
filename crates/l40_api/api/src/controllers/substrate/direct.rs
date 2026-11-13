@@ -119,11 +119,12 @@ use std::{fmt, sync::LazyLock, time::Duration};
 
 use pplx_space_common_core::types::{
     ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, ExecutionGenerationParseError,
-    NodeId, NodeManagedBy, NodeRole as SpaceNodeRole, PodUid, PodUidParseError, PolicyAuthority,
-    RouteGeneration, RouteGenerationParseError, SandboxActivationAttemptId, SandboxId,
-    SandboxLifecycle, SandboxRouteIdentity, SandboxRouteIdentityInvariantError, SubstrateKind,
+    NodeId, NodeManagedBy, NodeRole as SpaceNodeRole, PodUid, PodUidParseError, RouteGeneration,
+    RouteGenerationParseError, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
+    SandboxRouteIdentity, SandboxRouteIdentityInvariantError, SubstrateKind,
 };
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyV1 as NetworkPolicyProto};
+use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_portability::{
     no_newer_full_snapshot, restore_retry_source_snapshot_is_current,
 };

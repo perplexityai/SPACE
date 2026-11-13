@@ -9,7 +9,6 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-pub use pplx_space_common_core::types::PolicyAuthority;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
     ExecutionGeneration, ExecutionMetadata, LocalArtifactId, NodeManagedBy, ORPHANED_SANDBOX_OWNER,
@@ -27,6 +26,7 @@ use pplx_space_events::{
 #[cfg(test)]
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::{NetworkPolicy, proto::NetworkPolicySource};
+pub use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sqlite::SqliteU64;
 use rusqlite::types::Type;
 

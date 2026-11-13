@@ -67,7 +67,7 @@ fn parses_versioned_execution_metadata() {
     let execution = metadata.execution_metadata().unwrap().unwrap();
     assert_eq!(
         execution.runtime().kind,
-        crate::types::RuntimeKind::Firecracker
+        pplx_space_execution_spec::RuntimeKind::Firecracker
     );
     assert_eq!(execution.runtime().version.to_string(), "1.15.1");
 }
@@ -155,7 +155,10 @@ fn always_serialized_string_fields_preserve_pre_typing_wire() {
 
 #[test]
 fn bound_template_documents_cannot_be_downgraded_or_lose_the_reference() {
-    use crate::types::{Arch, Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest};
+    use crate::TemplateManifest;
+    use pplx_space_content_digest::Digest;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
     let reference = EnvironmentReference::new(Digest::sha256([1; 32]));
     for bound in [false, true] {
         let execution = ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]);
@@ -200,8 +203,8 @@ fn balloon_is_omitted_when_absent_and_rejected_when_invalid() {
         serde_json::from_str(r#"{"memory_mib":8192,"balloon":{"mode":"report"}}"#).unwrap();
     assert_eq!(
         m.balloon,
-        Some(crate::types::BalloonConfig::new(
-            crate::types::BalloonDevice::FreePageReporting,
+        Some(pplx_space_execution_spec::BalloonConfig::new(
+            pplx_space_execution_spec::BalloonDevice::FreePageReporting,
             0
         ))
     );
@@ -212,7 +215,9 @@ fn balloon_is_omitted_when_absent_and_rejected_when_invalid() {
 
 #[test]
 fn guest_image_contract_requires_a_new_schema_and_an_exact_environment() {
-    use crate::types::guest_image::{GuestDiskLayout, GuestImageContract, GuestReadiness};
+    use pplx_space_execution_spec::guest_image::{
+        GuestDiskLayout, GuestImageContract, GuestReadiness,
+    };
     let mut metadata = TemplateMetadata {
         guest_image: Some(
             GuestImageContract::new(
@@ -228,14 +233,14 @@ fn guest_image_contract_requires_a_new_schema_and_an_exact_environment() {
         ..Default::default()
     };
     metadata.execution_metadata().unwrap_err();
-    let execution = crate::types::ExecutionMetadata::new(
-        crate::types::RuntimeIdentity {
-            kind: crate::types::RuntimeKind::CloudHypervisor,
+    let execution = pplx_space_execution_spec::ExecutionMetadata::new(
+        pplx_space_execution_spec::RuntimeIdentity {
+            kind: pplx_space_execution_spec::RuntimeKind::CloudHypervisor,
             version: "54.0".parse().unwrap(),
         },
-        crate::types::GuestPlatform {
-            os: crate::types::GuestOperatingSystem::Windows,
-            architecture: crate::types::Arch::X86_64,
+        pplx_space_execution_spec::GuestPlatform {
+            os: pplx_space_execution_spec::GuestOperatingSystem::Windows,
+            architecture: pplx_space_cpu_arch::Arch::X86_64,
         },
         None,
         Vec::new(),

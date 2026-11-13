@@ -480,7 +480,7 @@ fn template_runtime_defaults(
         return TemplateRuntimeDefaults::default();
     };
     let Ok(metadata) =
-        serde_json::from_str::<pplx_space_common_core::types::TemplateMetadata>(&metadata_json)
+        serde_json::from_str::<pplx_space_template_manifest::TemplateMetadata>(&metadata_json)
     else {
         return TemplateRuntimeDefaults::default();
     };
@@ -715,7 +715,7 @@ fn snapshot_cache_size_bytes(
 }
 
 fn rootfs_artifact_size_from_manifest(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
 ) -> Option<u64> {
     // Pre-typing this read returned `None` when `size` was absent from
     // the JSON and `Some(0)` when it was an explicit zero. Callers use
@@ -772,9 +772,9 @@ fn write_template_manifest_atomic(
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum NormalizeTemplateManifestError {
     #[error("invalid template metadata execution schema: {0}")]
-    Metadata(#[from] pplx_space_common_core::types::TemplateMetadataSchemaError),
+    Metadata(#[from] pplx_space_template_manifest::TemplateMetadataSchemaError),
     #[error("invalid template manifest execution schema: {0}")]
-    Manifest(#[from] pplx_space_common_core::types::TemplateManifestSchemaError),
+    Manifest(#[from] pplx_space_template_manifest::TemplateManifestSchemaError),
     #[error("template metadata and manifest execution metadata disagree")]
     ExecutionMismatch,
     #[error("template metadata and manifest guest image contracts disagree")]
@@ -784,8 +784,8 @@ pub(crate) enum NormalizeTemplateManifestError {
 /// Register keeps the digest-addressed manifest. Metadata refresh cannot change
 /// its environment binding, including an upgrade from an unbound release.
 fn validate_retained_environment_binding(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
 ) -> Result<(), Status> {
     let retained = manifest
         .execution_metadata()
@@ -805,8 +805,8 @@ fn validate_retained_environment_binding(
 
 /// Cache partition of the environment a build's manifest binds.
 pub(crate) fn manifest_cache_partition(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
 ) -> Result<TemplateCachePartition, Status> {
     let environment = effective_environment(manifest, metadata).map_err(Status::data_loss)?;
     Ok(pplx_space_node_runtime_core::catalog::template_cache_partition(environment))
@@ -818,8 +818,8 @@ pub(crate) fn manifest_cache_partition(
 /// Every reader that picks a build's partition goes through this, so it
 /// agrees with the binding `db::upsert_build` checks.
 pub(crate) fn effective_environment(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
 ) -> Result<Option<pplx_space_common_core::types::EnvironmentReference>, String> {
     match manifest
         .execution_metadata()
@@ -832,7 +832,7 @@ pub(crate) fn effective_environment(
 
 /// Cache partition of the environment registration metadata binds.
 pub(crate) fn metadata_cache_partition(
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
 ) -> Result<TemplateCachePartition, Status> {
     let environment = metadata
         .environment()
@@ -853,9 +853,9 @@ pub(crate) struct BuildRowManifest {
 }
 
 pub(crate) fn build_row_manifest(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
     manifest_json: String,
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
 ) -> BuildRowManifest {
     let manifest_execution = manifest.execution_metadata().ok().flatten().cloned();
     let metadata_execution = match metadata.execution_metadata() {
@@ -882,14 +882,14 @@ pub(crate) fn build_row_manifest(
 }
 
 pub(crate) fn normalize_template_manifest(
-    mut manifest: pplx_space_common_core::types::TemplateManifest,
+    mut manifest: pplx_space_template_manifest::TemplateManifest,
     name: &str,
     content_hash: &str,
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
     rootfs_size: u64,
     compressed_rootfs: Option<(&str, u64)>,
-) -> Result<pplx_space_common_core::types::TemplateManifest, NormalizeTemplateManifestError> {
-    use pplx_space_common_core::types::{TemplateManifestCompression, TemplateManifestFile};
+) -> Result<pplx_space_template_manifest::TemplateManifest, NormalizeTemplateManifestError> {
+    use pplx_space_template_manifest::{TemplateManifestCompression, TemplateManifestFile};
 
     manifest.name = name.to_string();
     manifest.content_hash = content_hash.to_string();
@@ -956,7 +956,7 @@ pub(crate) fn normalize_template_manifest(
 }
 
 fn manifest_has_compressed_rootfs_entry(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
 ) -> bool {
     // Pre-typing this required `size` to be a present u64 (any value,
     // including 0). Match exactly: `entry.size.is_some()` not `> 0`.
@@ -2239,7 +2239,7 @@ impl TemplateManagerService {
         let manifest_path = digest_path.join("manifest.json");
         let compressed_rootfs_path = digest_path.join(TEMPLATE_ROOTFS_ZSTD_FILE);
         let manifest_json = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-        let manifest: pplx_space_common_core::types::TemplateManifest =
+        let manifest: pplx_space_template_manifest::TemplateManifest =
             serde_json::from_str(&manifest_json).unwrap_or_default();
 
         let generated_stats = if !compressed_rootfs_path.exists() {
@@ -2286,7 +2286,7 @@ impl TemplateManagerService {
         };
         let metadata_json =
             std::fs::read_to_string(digest_path.join("metadata.json")).unwrap_or_default();
-        let metadata: pplx_space_common_core::types::TemplateMetadata =
+        let metadata: pplx_space_template_manifest::TemplateMetadata =
             serde_json::from_str(&metadata_json).unwrap_or_default();
         let manifest = normalize_template_manifest(
             manifest,
@@ -2343,9 +2343,9 @@ impl TemplateManagerService {
             Status::internal(format!("read manifest {}: {e}", manifest_path.display()))
         })?;
         let metadata_json = std::fs::read_to_string(&metadata_path).unwrap_or_default();
-        let manifest: pplx_space_common_core::types::TemplateManifest =
+        let manifest: pplx_space_template_manifest::TemplateManifest =
             serde_json::from_str(&manifest_json).unwrap_or_default();
-        let metadata: pplx_space_common_core::types::TemplateMetadata =
+        let metadata: pplx_space_template_manifest::TemplateMetadata =
             serde_json::from_str(&metadata_json).unwrap_or_default();
         let build_date = manifest.build_date.clone();
         let BuildRowManifest {
@@ -2665,7 +2665,7 @@ impl TemplateManagerService {
 
         let manifest_json =
             std::fs::read_to_string(digest_path.join("manifest.json")).unwrap_or_default();
-        let manifest: pplx_space_common_core::types::TemplateManifest =
+        let manifest: pplx_space_template_manifest::TemplateManifest =
             serde_json::from_str(&manifest_json).unwrap_or_default();
         let compressed_rootfs_needs_refresh = !digest_path.join(TEMPLATE_ROOTFS_ZSTD_FILE).exists()
             || !manifest_has_compressed_rootfs_entry(&manifest);
@@ -2763,8 +2763,8 @@ use support::*;
 pub(crate) fn validate_guest_documents(
     metadata_bytes: &[u8],
     manifest_bytes: &[u8],
-) -> Result<pplx_space_common_core::types::TemplateMetadata, Status> {
-    let metadata: pplx_space_common_core::types::TemplateMetadata = if metadata_bytes.is_empty() {
+) -> Result<pplx_space_template_manifest::TemplateMetadata, Status> {
+    let metadata: pplx_space_template_manifest::TemplateMetadata = if metadata_bytes.is_empty() {
         Default::default()
     } else {
         serde_json::from_slice(metadata_bytes).map_err(|error| {
@@ -2782,7 +2782,7 @@ pub(crate) fn validate_guest_documents(
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
     }
     if !manifest_bytes.is_empty() {
-        let manifest: pplx_space_common_core::types::TemplateManifest =
+        let manifest: pplx_space_template_manifest::TemplateManifest =
             serde_json::from_slice(manifest_bytes).map_err(|error| {
                 Status::invalid_argument(format!("invalid template manifest: {error}"))
             })?;
@@ -2815,7 +2815,7 @@ impl TemplateManagerService {
                 Err(error) if error.code() == tonic::Code::NotFound => return Ok(None),
                 Err(error) => return Err(error),
             };
-            let manifest: pplx_space_common_core::types::TemplateManifest =
+            let manifest: pplx_space_template_manifest::TemplateManifest =
                 serde_json::from_str(&build.manifest_json).map_err(|error| {
                     Status::failed_precondition(format!("invalid template manifest: {error}"))
                 })?;

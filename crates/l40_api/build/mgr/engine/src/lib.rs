@@ -30,7 +30,7 @@ use pplx_space_common_core::{
     host::linux::identities::group_names,
     types::{
         BUILDER_SANDBOX_OWNER, ContentHash, DEFAULT_GUEST_USER, DEFAULT_TEMPLATE_TAG,
-        PolicyAuthority, TemplateBuildId,
+        TemplateBuildId,
     },
 };
 pub use pplx_space_net_common::NetworkPolicyV1;
@@ -39,6 +39,7 @@ use pplx_space_node_mgr_client::proto::{
     CompletePreparedRootfsRequest, PreparedRootfsDisposition, ReservePreparedRootfsRequest,
 };
 use pplx_space_page_cache as page_cache;
+use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sbx_mgr_client::SandboxManagerGrpcClient;
 use pplx_space_sbx_mgr_client::proto::{CreateRequest, DeleteRequest, StartRequest, StopRequest};
 use pplx_space_template_mgr_client::proto::{
@@ -84,7 +85,7 @@ const BUNDLED_BUILD_SEED_SCRIPT: &str = include_str!("../scripts/build-seed.sh")
 const BUNDLED_ROOTFS_BUILDER_SCRIPT: &str =
     include_str!("../../../../../../templates/firecracker/seed/rootfs-builder.sh");
 
-use pplx_space_common_core::types::TemplateMetadata;
+use pplx_space_template_manifest::TemplateMetadata;
 
 pub struct TemplateBuilder {
     caller_org: Option<OrgId>,

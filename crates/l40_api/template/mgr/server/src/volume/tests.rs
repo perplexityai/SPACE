@@ -525,7 +525,7 @@ async fn populate_orphaned_digest_dir(digest_dir: &Path) {
 
 #[test]
 fn build_manifest_pull_plan_dedups_zst_pair() {
-    use pplx_space_common_core::types::{
+    use pplx_space_template_manifest::{
         TemplateManifest, TemplateManifestCompression, TemplateManifestFile,
     };
 
@@ -601,7 +601,7 @@ fn build_manifest_pull_plan_handles_multiple_files_and_pairs() {
     // rootfs, the pull plan must (a) include every standalone file
     // and (b) apply the dedup rule to every `(X, X.zst)` pair, not
     // just the rootfs pair.
-    use pplx_space_common_core::types::{
+    use pplx_space_template_manifest::{
         TemplateManifest, TemplateManifestCompression, TemplateManifestFile,
     };
 
@@ -698,7 +698,7 @@ fn build_decompress_targets_pairs_every_zst_with_its_sibling() {
     // Symmetric to `build_manifest_pull_plan_handles_multiple_files_and_pairs`:
     // every `.zst` whose sibling is in the manifest becomes one
     // decompress target, regardless of whether it's the rootfs.
-    use pplx_space_common_core::types::{
+    use pplx_space_template_manifest::{
         TemplateManifest, TemplateManifestCompression, TemplateManifestFile,
     };
 
@@ -859,11 +859,11 @@ fn recovery_normalizes_manifest_before_db_commit() {
     // `bootable_artifact`, `files["rootfs.ext4"]`). The fix re-runs
     // normalization on recovery so the DB row carries the same shape
     // a fresh pull would have committed.
-    let raw_manifest = pplx_space_common_core::types::TemplateManifest {
+    let raw_manifest = pplx_space_template_manifest::TemplateManifest {
         runtime: "fc".to_string(),
         ..Default::default()
     };
-    let metadata = pplx_space_common_core::types::TemplateMetadata {
+    let metadata = pplx_space_template_manifest::TemplateMetadata {
         arch: Some("aarch64".to_string()),
         ..Default::default()
     };
@@ -927,11 +927,11 @@ fn normalize_patches_explicit_null_config_to_empty_object() {
     // `Value::Null`; without the null→{} patch the round-trip would
     // re-emit `"config": null` and the seed-register on-disk shape
     // would drift from the pre-typing one.
-    let raw_manifest = pplx_space_common_core::types::TemplateManifest {
+    let raw_manifest = pplx_space_template_manifest::TemplateManifest {
         config: serde_json::Value::Null,
         ..Default::default()
     };
-    let metadata = pplx_space_common_core::types::TemplateMetadata::default();
+    let metadata = pplx_space_template_manifest::TemplateMetadata::default();
     let normalized = crate::service::normalize_template_manifest(
         raw_manifest,
         "seed",
@@ -969,10 +969,10 @@ fn normalize_rejects_conflicting_execution_metadata() {
         vec![],
     )
     .unwrap();
-    let mut raw_manifest = pplx_space_common_core::types::TemplateManifest::default();
+    let mut raw_manifest = pplx_space_template_manifest::TemplateManifest::default();
     raw_manifest.set_execution_metadata(manifest_execution);
-    let metadata = pplx_space_common_core::types::TemplateMetadata {
-        schema_version: Some(pplx_space_common_core::types::TEMPLATE_METADATA_SCHEMA_VERSION),
+    let metadata = pplx_space_template_manifest::TemplateMetadata {
+        schema_version: Some(pplx_space_template_manifest::TEMPLATE_METADATA_SCHEMA_VERSION),
         execution: Some(metadata_execution),
         arch: Some("aarch64".to_string()),
         ..Default::default()
@@ -1073,7 +1073,8 @@ async fn assert_untouched(dir: &Path) {
 /// The manifest of a release bound to `partition`'s environment, or an
 /// unbound one for the legacy partition, as the partition probe reads it.
 fn probed_manifest(partition: &TemplateCachePartition) -> Vec<u8> {
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata, TemplateManifest};
+    use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+    use pplx_space_template_manifest::TemplateManifest;
     let mut manifest = TemplateManifest::default();
     if let Some(environment) = partition.environment() {
         manifest.set_execution_metadata(
@@ -1154,7 +1155,7 @@ async fn a_rowless_dir_in_another_partition_does_not_block_a_pull() {
 async fn materialize_rootfs_rejects_decoded_bytes_that_disagree_with_the_release_hash(
     #[case] algorithm: pplx_space_common_core::types::HashAlg,
 ) {
-    use pplx_space_common_core::types::{
+    use pplx_space_template_manifest::{
         TemplateManifest, TemplateManifestCompression, TemplateManifestFile,
     };
 
@@ -1234,7 +1235,7 @@ async fn materialize_rootfs_rejects_decoded_bytes_that_disagree_with_the_release
 #[case::compressed(true)]
 #[tokio::test]
 async fn materialize_blake3_release(#[case] compressed: bool) {
-    use pplx_space_common_core::types::{TemplateManifest, TemplateManifestFile, TemplateMetadata};
+    use pplx_space_template_manifest::{TemplateManifest, TemplateManifestFile, TemplateMetadata};
     let directory = tempfile::tempdir().unwrap();
     let rootfs = directory.path().join(TEMPLATE_ROOTFS_FILE);
     std::fs::write(&rootfs, b"abc").unwrap();
@@ -1406,9 +1407,8 @@ fn partition_probe_dirs_are_reaped_staging_dirs_not_builds() {
 /// one its metadata carries, as registration does.
 #[test]
 fn release_partition_reads_the_manifest_then_the_metadata_binding() {
-    use pplx_space_common_core::types::{
-        Arch, Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest, TemplateMetadata,
-    };
+    use pplx_space_common_core::types::{Arch, Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_template_manifest::{TemplateManifest, TemplateMetadata};
     let environment = EnvironmentReference::new(Digest::sha256([2; 32]));
     let twin = TemplateCachePartition::Environment(environment);
     let bound =

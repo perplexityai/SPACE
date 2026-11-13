@@ -39,8 +39,8 @@ use std::str::FromStr;
 
 use pplx_space_common_core::types::{
     ContentHash, DEFAULT_TEMPLATE_TAG, RUNTIME_FIRECRACKER_ALIAS, StorageUri, TemplateArtifact,
-    TemplateManifest, TemplateName, TemplateReference, TemplateReferenceParseError,
-    TemplateSelector, template_object_key, template_object_prefix,
+    TemplateName, TemplateReference, TemplateReferenceParseError, TemplateSelector,
+    template_object_key, template_object_prefix,
 };
 use pplx_space_execution_common::proto::ExecutionMetadata;
 use pplx_space_node_api_client::cluster::{
@@ -54,6 +54,7 @@ use pplx_space_object_store::{
     ObjectCredentials, ObjectCredentialsError, ObjectStore, ObjectStoreError, ObjectTarget,
     S3ObjectStore,
 };
+use pplx_space_template_manifest::TemplateManifest;
 use tokio::sync::OnceCell;
 use tonic::Code;
 use tracing::{info, warn};

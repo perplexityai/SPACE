@@ -1,12 +1,12 @@
 use clap::Parser;
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
 
-use pplx_space_common_core::types::PolicyAuthority;
 use pplx_space_net_common::proto::{
     EgressDefaultAction as NetworkPolicyAction, NetworkPolicyV1 as NetworkPolicyProto,
     NetworkPolicyVersion,
 };
 use pplx_space_node_api_client::proto::GetControllerStateRequest;
+use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_template_mgr_client::proto::{
     CreatePoolRequest, DeletePoolRequest, DeleteTemplateBuildRequest, DeleteTemplateRequest,
     GetTemplateRequest, ListTemplatesRequest, PoolStatusRequest, RegisterTemplateRequest,

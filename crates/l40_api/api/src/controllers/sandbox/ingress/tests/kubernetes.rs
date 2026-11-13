@@ -65,7 +65,7 @@ async fn stored_ingress_access_resumes_paused_execution_before_reporting_ready()
         );
         // The worker regression pins Local authority against cluster replay;
         // this fixture models the resulting effective policy at the RPC boundary.
-        record.auto_lifecycle_authority = pplx_space_common_core::types::PolicyAuthority::Local;
+        record.auto_lifecycle_authority = pplx_space_policy_authority::PolicyAuthority::Local;
         let mut effective_policy = AutoLifecyclePolicy::disabled();
         if worker_allows_access {
             effective_policy
