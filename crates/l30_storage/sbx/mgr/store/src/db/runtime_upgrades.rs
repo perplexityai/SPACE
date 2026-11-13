@@ -53,6 +53,16 @@ pub enum RuntimeUpgradePhase {
     Retired,
 }
 
+/// The phases in which a row refuses other activations of its sandbox.
+/// `fencing_runtime_upgrade` and `fenced_runtime_upgrade_publications` bind
+/// these. Other phase lists spell them out; a test holds
+/// [`UNRETIRED_UPGRADE_PHASES_SQL`] to exactly these and `verified`.
+const FENCING_PHASES: [RuntimeUpgradePhase; 3] = [
+    RuntimeUpgradePhase::Fenced,
+    RuntimeUpgradePhase::Preserved,
+    RuntimeUpgradePhase::Booting,
+];
+
 impl RuntimeUpgradePhase {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -66,8 +76,8 @@ impl RuntimeUpgradePhase {
     }
 
     /// Whether a row in this phase refuses other activations of its sandbox.
-    pub const fn fences_activation(self) -> bool {
-        matches!(self, Self::Fenced | Self::Preserved | Self::Booting)
+    pub fn fences_activation(self) -> bool {
+        FENCING_PHASES.contains(&self)
     }
 
     const fn can_advance_to(self, next: Self) -> bool {
@@ -321,23 +331,29 @@ db_private_outside_tests! {
 }
 
 db_private_outside_tests! {
-    /// The upgrade that fences `sandbox_id`'s activations, if any. The phases
-    /// listed are those [`RuntimeUpgradePhase::fences_activation`] names.
+    /// The upgrade that fences `sandbox_id`'s activations, if any: one in a
+    /// phase of [`FENCING_PHASES`].
     fn fencing_runtime_upgrade(
         conn: &Connection,
         sandbox_id: &str,
     ) -> Result<Option<(RuntimeUpgradeOperationId, RuntimeUpgradePhase)>> {
-        let row: Option<(String, String)> = conn
-            .query_row(
+        static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            format!(
                 "SELECT operation_id, phase
                    FROM sandbox_runtime_upgrades
-                  WHERE sandbox_id = ?1
-                    AND phase IN ('fenced', 'preserved', 'booting')
+                  WHERE sandbox_id = ?
+                    AND phase IN ({})
                   ORDER BY created_at, operation_id
                   LIMIT 1",
-                params![sandbox_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                crate::db::sql_placeholders(FENCING_PHASES.len())
             )
+        });
+        let params = std::iter::once(sandbox_id)
+            .chain(FENCING_PHASES.map(RuntimeUpgradePhase::as_str));
+        let row: Option<(String, String)> = conn
+            .query_row(QUERY.as_str(), rusqlite::params_from_iter(params), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .optional()?;
         row.map(|(operation_id, phase)| {
             Ok((
@@ -358,6 +374,70 @@ db_private_outside_tests! {
 /// eviction and its candidate scan hold off a sandbox in these too.
 pub(crate) const UNRETIRED_UPGRADE_PHASES_SQL: &str =
     "('fenced', 'preserved', 'booting', 'verified')";
+
+db_private_outside_tests! {
+    /// The execution each of `sandbox_ids` publishes while a runtime upgrade
+    /// fences it: the one the upgrade restores on a rollback
+    /// ([`RuntimeUpgradeRecord::previous_execution`]). Sandboxes no upgrade
+    /// fences are absent. The boot saves the target as the sandbox's
+    /// consumer before it runs, and a failed boot's cleanup stops the
+    /// sandbox with it still saved, so until the boot is verified the saved
+    /// consumer isn't what the sandbox runs under; the rollback's restore
+    /// commits with the end of the fence.
+    fn fenced_runtime_upgrade_publications(
+        conn: &Connection,
+        sandbox_ids: &[String],
+        budget: &mut pplx_space_common_core::inventory::InventoryBudget,
+    ) -> std::result::Result<
+        HashMap<String, Result<ExecutionMetadata>>,
+        crate::db::inventory_read::InventoryReadError,
+    > {
+        if sandbox_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // At most one upgrade fences a sandbox. Should that ever not hold,
+        // the earliest wins, as it does in `fencing_runtime_upgrade`.
+        let query = format!(
+            "SELECT sandbox_id, previous_execution_metadata_json
+               FROM sandbox_runtime_upgrades
+              WHERE sandbox_id IN ({})
+                AND phase IN ({})
+              ORDER BY sandbox_id, created_at, operation_id",
+            crate::db::sql_placeholders(sandbox_ids.len()),
+            crate::db::sql_placeholders(FENCING_PHASES.len())
+        );
+        let params = sandbox_ids
+            .iter()
+            .map(String::as_str)
+            .chain(FENCING_PHASES.map(RuntimeUpgradePhase::as_str));
+        let mut statement = conn.prepare(&query)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(params))?;
+        let mut publications = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let sandbox_id: String = row.get(0)?;
+            if publications.contains_key(&sandbox_id) {
+                continue;
+            }
+            // Charged from SQLite's own buffer before it's copied or decoded,
+            // as the State page charges each sandbox row it reads.
+            let previous = row.get_ref(1)?;
+            budget.charge_bytes(crate::db::inventory_read::value_raw_bytes(previous))?;
+            // One that isn't text or doesn't decode is that sandbox's own
+            // failure, which the State page publishes without an execution;
+            // the rest of the page stands.
+            let previous = previous
+                .as_str()
+                .map_err(|error| conversion_error(1, Type::Text, error))
+                .and_then(|previous| {
+                    serde_json::from_str::<ExecutionMetadata>(previous)
+                        .map_err(|error| conversion_error(1, Type::Text, error))
+                })
+                .map_err(crate::db::Error::from);
+            publications.insert(sandbox_id, previous);
+        }
+        Ok(publications)
+    }
+}
 
 db_private_outside_tests! {
     /// The upgrade of `sandbox_id` that hasn't retired the checkpoint it

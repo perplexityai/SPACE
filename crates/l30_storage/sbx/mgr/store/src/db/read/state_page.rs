@@ -2,6 +2,7 @@
 //! fields around it, every field with its own result.
 
 use pplx_space_common_core::inventory::InventoryBudget;
+use pplx_space_execution_spec::ExecutionMetadata;
 
 use crate::db::inventory_read::InventoryReadError;
 use crate::db::timestamps::EpochSeconds;
@@ -14,7 +15,8 @@ use crate::db::{
 ///
 /// `metadata` is charged first, for each id's auxiliary State columns, so
 /// oversized metadata fails the batch before any row is decoded. `raw` is
-/// charged with each row's whole-row bytes as it is read.
+/// charged with each row's whole-row bytes as it is read, then, for each
+/// decoded row a runtime upgrade fences, with the execution it retains.
 pub struct StateBudgets {
     pub raw: InventoryBudget,
     pub metadata: InventoryBudget,
@@ -31,7 +33,15 @@ pub enum StatePageRow {
 }
 
 pub struct DecodedStateRow {
+    /// The stored row.
     pub row: SandboxRow,
+    /// The execution the State RPC publishes for the sandbox: its saved one,
+    /// except while a runtime upgrade fences it, when it's the execution the
+    /// upgrade restores on a rollback, or none when that doesn't decode (see
+    /// `fenced_runtime_upgrade_publications`). The boot saves the target
+    /// before it runs, so the saved one isn't what the sandbox runs under
+    /// until the boot is verified.
+    pub published_execution: Option<ExecutionMetadata>,
     /// `None` when the batch read no provenance for this id.
     pub route_provenance: Option<Result<ActivationRouteProvenance>>,
     /// `None` unless the row is quarantined or carries a transition receipt.
@@ -62,7 +72,8 @@ pub enum StatePageError {
     Metadata(InventoryReadError),
     #[error("load route identity provenance: {0}")]
     RouteProvenance(Error),
-    /// A row exceeded [`StateBudgets::raw`].
+    /// A row, or the execution a fencing runtime upgrade retains for it,
+    /// exceeded [`StateBudgets::raw`].
     #[error(transparent)]
     Row(InventoryReadError),
     #[error("read raw sandbox state for {sandbox_id}: {error}")]
@@ -75,6 +86,8 @@ pub enum StatePageError {
     PinnedArtifactCreatedAt(Error),
     #[error("load quarantine recovery observations: {0}")]
     RecoveryObservations(Error),
+    #[error("load runtime upgrade fences: {0}")]
+    RuntimeUpgrades(Error),
 }
 
 /// Read one batch of `ids` for the State RPC, charging `budgets`.
@@ -149,20 +162,50 @@ pub fn state_page(
             .map_err(StatePageError::PinnedArtifactCreatedAt)?;
     let mut recovery_observations = crate::db::quarantine_recovery_observations(conn, &row_ids)
         .map_err(StatePageError::RecoveryObservations)?;
-    Ok(page
-        .into_iter()
-        .map(|entry| match entry {
-            PageEntry::Done(row) => *row,
-            PageEntry::Row(row) => StatePageRow::Decoded(Box::new(DecodedStateRow {
-                route_provenance: route_provenance.remove(&row.id),
-                publication: publications.remove(&row.id),
-                state_changed_at: state_changed_at.remove(&row.id),
-                pinned_artifact_created_at: pinned_artifact_created_at.remove(&row.id),
-                recovery_observation: recovery_observations.remove(&row.id),
-                row: *row,
-            })),
-        })
-        .collect())
+    let mut fenced_publications =
+        crate::db::fenced_runtime_upgrade_publications(conn, &row_ids, &mut budgets.raw).map_err(
+            |error| match error {
+                InventoryReadError::Database(error) => StatePageError::RuntimeUpgrades(error),
+                error => StatePageError::Row(error),
+            },
+        )?;
+    let mut rows = Vec::with_capacity(page.len());
+    for entry in page {
+        let row = match entry {
+            PageEntry::Done(row) => {
+                rows.push(*row);
+                continue;
+            }
+            PageEntry::Row(row) => row,
+        };
+        let published_execution = match fenced_publications.remove(&row.id) {
+            Some(Ok(previous)) => Some(previous),
+            // The execution a fencing upgrade retains for the sandbox isn't
+            // text or didn't decode: the sandbox is published without an
+            // execution, as one whose own saved execution isn't valid JSON
+            // is, never under the target the boot saved.
+            Some(Err(error)) => {
+                tracing::warn!(
+                    sandbox_id = %row.id,
+                    %error,
+                    "fencing runtime upgrade's retained execution didn't decode; omitting \
+                     execution metadata from state"
+                );
+                None
+            }
+            None => row.execution_metadata.clone(),
+        };
+        rows.push(StatePageRow::Decoded(Box::new(DecodedStateRow {
+            route_provenance: route_provenance.remove(&row.id),
+            publication: publications.remove(&row.id),
+            state_changed_at: state_changed_at.remove(&row.id),
+            pinned_artifact_created_at: pinned_artifact_created_at.remove(&row.id),
+            recovery_observation: recovery_observations.remove(&row.id),
+            published_execution,
+            row: *row,
+        })));
+    }
+    Ok(rows)
 }
 
 /// A decoded row waits for the batch-wide reads keyed by the decoded ids;
