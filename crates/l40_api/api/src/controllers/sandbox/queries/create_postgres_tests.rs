@@ -677,6 +677,7 @@ fn pooled_create_input<'a>(
         federated_service_grant: None,
         volume_encryption: false,
         client_id: None,
+        live_cap: None,
     }
 }
 

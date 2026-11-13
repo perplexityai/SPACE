@@ -85,6 +85,7 @@ use crate::models::{ClusterPoolConfigRequest, ClusterPoolConfigResponse, Sandbox
 use sqlx::{PgPool, Postgres, Transaction};
 
 mod execution_fence;
+mod live_count;
 mod local_artifact;
 pub(crate) mod native_access;
 mod node_api_client;
@@ -95,6 +96,7 @@ mod sandbox_state_probe;
 mod slot_headroom;
 
 pub use execution_fence::*;
+pub use live_count::*;
 pub use local_artifact::*;
 pub use node_api_client::*;
 pub use pool_claims::*;
@@ -709,6 +711,9 @@ pub enum SubstrateError {
         /// Decides the status and whether the async dispatcher waits it out
         /// as backpressure or retries it against a bounded budget.
         kind: ActivationRejectionKind,
+        /// The client's live-sandbox cap refused the activation, not cluster
+        /// admission: a per-client refusal, never `rate_limited`.
+        live_cap: bool,
     },
     #[error("{message}")]
     Cancelled { message: String },
@@ -1013,7 +1018,14 @@ impl From<SubstrateError> for ControllerError {
             SubstrateError::AdmissionRejected {
                 message,
                 retry_after,
+                live_cap: true,
+                ..
+            } => ControllerError::live_cap_refused(message, retry_after),
+            SubstrateError::AdmissionRejected {
+                message,
+                retry_after,
                 kind,
+                live_cap: false,
             } => kind.controller_error(message, retry_after),
             SubstrateError::Cancelled { message } => ControllerError::service_unavailable(message),
             SubstrateError::Unsupported { message } => {
@@ -2054,6 +2066,35 @@ impl Substrate {
             Inner::Direct(_) => ReflectorReady::always_ready(),
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.readiness(),
+        }
+    }
+
+    /// How many sandboxes with a live runtime the client ids `ids` select
+    /// hold, other than `activating` and the sandboxes in `already_pending`.
+    /// A synchronous cache read: Kubernetes counts from the sandbox-pod
+    /// reflector, and Direct, with no in-memory inventory, answers
+    /// [`LiveSandboxCountUnknown::Unsupported`], so the live cap admits.
+    /// Without the `kubernetes` feature only Direct is built, so the
+    /// parameters go unread.
+    #[cfg_attr(
+        not(feature = "kubernetes"),
+        expect(
+            unused_variables,
+            reason = "Direct keeps no pod inventory; only the Kubernetes arm reads the parameters"
+        )
+    )]
+    pub fn live_sandboxes_for_client(
+        &self,
+        ids: &CountedIds,
+        activating: Option<SandboxId>,
+        already_pending: &std::collections::HashSet<SandboxId>,
+    ) -> LiveSandboxCount {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.live_sandboxes_for_client(),
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => {
+                substrate.live_sandboxes_for_client(ids, activating, already_pending)
+            }
         }
     }
 

@@ -149,9 +149,9 @@ fn requested_size_kind_classifies_by_action_and_entry_lifecycle() {
 /// Admission refusals at request entry and those the substrate charges later
 /// share one constructor, [`ActivationRejectionKind::controller_error`], which
 /// marks them as admission refusals. Only a rate-limited refusal carries the
-/// backpressure cause the async dispatcher re-queues behind; an empty cluster
-/// and a cluster with no free slot keep their bounded retry, and only the
-/// slot refusal is a 503.
+/// backpressure cause the async dispatcher re-queues behind; an empty cluster,
+/// a cluster with no free slot and a client at its live cap keep their
+/// bounded retry, and only the slot refusal is a 503.
 #[test]
 fn admission_refusals_keep_their_dispatcher_retry_causes() {
     use crate::controllers::substrate::ActivationRejectionKind;
@@ -173,6 +173,11 @@ fn admission_refusals_keep_their_dispatcher_retry_causes() {
             StatusCode::SERVICE_UNAVAILABLE,
             None,
         ),
+        (
+            ActivationRejectionKind::LiveCap,
+            StatusCode::TOO_MANY_REQUESTS,
+            None,
+        ),
     ];
     for (kind, status, cause) in kinds {
         let cases = [
@@ -187,6 +192,7 @@ fn admission_refusals_keep_their_dispatcher_retry_causes() {
                     message: "refused".into(),
                     retry_after: None,
                     kind,
+                    live_cap: false,
                 }),
                 None,
             ),

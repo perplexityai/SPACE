@@ -86,7 +86,7 @@ fn only_a_resolved_client_id_is_written() {
             ReceiptRecord::Unchanged,
         ),
     ] {
-        let charge = RecoveryCharge::paid(CapPolicy::Skip, attribution);
+        let charge = RecoveryCharge::paid(None::<&Arc<AdmitAll>>, CapPolicy::Skip, attribution);
         assert_eq!(ReceiptRecord::for_runtime(&charge), expected, "{label}");
     }
 }
@@ -101,6 +101,26 @@ impl crate::controllers::substrate::ActivationAdmission for AdmitAll {
     ) -> crate::controllers::substrate::ActivationAdmissionFuture<'_> {
         Box::pin(async { Ok(()) })
     }
+
+    fn reserve_live(
+        &self,
+        _client: pplx_space_common_core::types::ClientId,
+        _sandbox: SandboxId,
+    ) -> crate::controllers::substrate::LiveCapFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn precheck_live(
+        &self,
+        _client: pplx_space_common_core::types::ClientId,
+        _sandbox: SandboxId,
+    ) -> crate::controllers::substrate::ActivationAdmissionFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn live_cap_configured(&self) -> bool {
+        false
+    }
 }
 
 fn start_charge(state: ChargeState) -> RecoveryCharge {
@@ -109,8 +129,12 @@ fn start_charge(state: ChargeState) -> RecoveryCharge {
         ChargeState::Enforce => {
             RecoveryCharge::enforce(Some(&Arc::new(AdmitAll)), CapPolicy::Check, attribution)
         }
-        ChargeState::Paid => RecoveryCharge::paid(CapPolicy::Reserved, attribution),
-        ChargeState::Exempt => RecoveryCharge::exempt(CapPolicy::Skip, attribution),
+        ChargeState::Paid => {
+            RecoveryCharge::paid(None::<&Arc<AdmitAll>>, CapPolicy::Reserved, attribution)
+        }
+        ChargeState::Exempt => {
+            RecoveryCharge::exempt(None::<&Arc<AdmitAll>>, CapPolicy::Skip, attribution)
+        }
     }
 }
 
@@ -218,6 +242,7 @@ async fn a_wake_that_restores_records_its_client() -> TestResult {
             ExecutionActivityKind::Access,
             Duration::from_secs(5),
             RecoveryCharge::paid(
+                None::<&Arc<AdmitAll>>,
                 CapPolicy::Check,
                 ActivationAttribution::client(client(ACTIVATING)),
             ),

@@ -253,6 +253,7 @@ async fn actions_and_implicit_wakes_are_not_slot_checked() -> TestResult {
         ),
         crate::test_support::kubernetes::full_cluster_slot_check_admission(&pool),
     );
+    let attribution = crate::controllers::substrate::ActivationAttribution::native();
     for action in [SandboxAction::Start, SandboxAction::Wake] {
         for lifecycle in [
             None,
@@ -261,15 +262,72 @@ async fn actions_and_implicit_wakes_are_not_slot_checked() -> TestResult {
             Some(SandboxLifecycle::Suspended),
         ] {
             controller
-                .admit_action_cluster_activation(action, lifecycle)
+                .admit_action_cluster_activation(action, lifecycle, SandboxId::new(), &attribution)
                 .await
                 .unwrap_or_else(|error| panic!("{action:?} from {lifecycle:?}: {error:?}"));
         }
     }
     for lifecycle in ["created", "stopped", "suspended"] {
-        super::charge_implicit_activation(Some(&admission), lifecycle)
+        let sandbox = crate::controllers::substrate::kubernetes::tests::test_sandbox_with_lifecycle(
+            lifecycle,
+        );
+        super::charge_implicit_activation(Some(&admission), &sandbox)
             .await
             .unwrap_or_else(|error| panic!("implicit wake from {lifecycle}: {error:?}"));
     }
+    Ok(())
+}
+
+/// A create rolled back after a confirmed teardown stops counting against
+/// its client's live cap at once, as a deleted sandbox does, rather than
+/// holding the slot until its pending member lapses.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rolled_back_create_stops_counting_against_the_live_cap() -> TestResult {
+    use crate::controllers::substrate::kubernetes::tests::{
+        inert_kubernetes_client, substrate_with_store,
+    };
+    let Some((_node, redis_url)) = crate::client_concurrency::tests::try_redis_url().await? else {
+        return Ok(());
+    };
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let pool = db.pool.clone();
+    let cap = crate::client_live_cap::ClientLiveCap::for_tests(
+        Substrate::from_kubernetes(
+            crate::controllers::substrate::kubernetes::KubernetesSubstrate::with_seeded_caches(
+                pool.clone(),
+                inert_kubernetes_client(),
+                1,
+                Vec::new(),
+            ),
+        ),
+        &redis_url,
+        "alpha",
+        std::num::NonZeroU64::new(1).expect("nonzero"),
+        std::time::Duration::from_secs(30),
+    );
+    let controller = SandboxController::with_cluster_admission(
+        kubernetes(substrate_with_store(pool.clone())),
+        crate::cluster_admission::ClusterSandboxAdmission::with_config(
+            kubernetes(substrate_with_store(pool.clone())),
+            crate::test_support::enabled_config(),
+            pplx_space_feature_flags::FeatureFlagClient::disabled(),
+        )
+        .with_live_cap(cap.clone()),
+    );
+    let alpha = pplx_space_common_core::types::ClientId::parse("alpha")?;
+    let created = SandboxId::new();
+    cap.reserve(&alpha, created)
+        .await
+        .map_err(|refusal| refusal.message)?
+        .expect("admitted under the cap")
+        .keep();
+    cap.precheck(&alpha, SandboxId::new())
+        .await
+        .expect_err("the created sandbox counts");
+
+    controller.rollback_created_sandbox(&pool, created).await;
+    cap.precheck(&alpha, SandboxId::new())
+        .await
+        .expect("the rolled-back create no longer counts");
     Ok(())
 }

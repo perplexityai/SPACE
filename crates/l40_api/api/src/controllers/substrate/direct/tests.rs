@@ -4142,8 +4142,8 @@ async fn cross_node_restore_handles_candidate_failures(
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::exempt(
-                crate::controllers::substrate::CapPolicy::Skip,
+            crate::controllers::substrate::RecoveryCharge::uncapped(
+                crate::controllers::substrate::ChargeState::Exempt,
                 crate::controllers::substrate::ActivationAttribution::client(
                     pplx_space_common_core::types::ClientId::parse("restore-client")?,
                 ),

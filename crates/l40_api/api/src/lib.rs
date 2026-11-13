@@ -11,6 +11,7 @@ pub mod api_surface;
 pub mod auth;
 pub mod client_classification;
 pub mod client_concurrency;
+pub mod client_live_cap;
 pub mod cluster_admission;
 pub mod command_stream;
 pub mod controllers;

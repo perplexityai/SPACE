@@ -1,6 +1,7 @@
 //! Activation admission and the recovery charge a cold or restored activation pays.
 
 use super::*;
+use crate::client_live_cap::LiveReservation;
 use pplx_space_common_core::types::ClientId;
 
 /// Capacity classes understood by the substrate admission boundary.
@@ -25,6 +26,10 @@ pub enum ActivationRejectionKind {
     /// No start-eligible node has a free network slot: a 503, since it isn't
     /// the client's doing, retried against the same bounded budget.
     NoFreeSlot,
+    /// The client is at its live-sandbox cap: a 429 retried against the
+    /// bounded budget, since the cap lifts when the client releases a
+    /// sandbox, not with time.
+    LiveCap,
 }
 
 impl ActivationRejectionKind {
@@ -39,7 +44,7 @@ impl ActivationRejectionKind {
         let mut error = match self {
             Self::RateLimited => ControllerError::rate_limited(message)
                 .with_retry_after_cause(ControllerRetryAfterCause::ClusterActivationAdmission),
-            Self::EmptyCluster => ControllerError::rate_limited(message),
+            Self::EmptyCluster | Self::LiveCap => ControllerError::rate_limited(message),
             Self::NoFreeSlot => ControllerError::service_unavailable(message),
         };
         if let Some(retry_after) = retry_after {
@@ -76,10 +81,33 @@ impl ActivationAdmissionRejection {
 pub type ActivationAdmissionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), ActivationAdmissionRejection>> + Send + 'a>>;
 
+/// Boxed live-cap reservation future used by [`ActivationAdmission`]:
+/// `Ok(None)` admits without holding anything (no cap applies, or the check
+/// failed open).
+pub type LiveCapFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Option<LiveReservation>, ActivationAdmissionRejection>>
+            + Send
+            + 'a,
+    >,
+>;
+
 /// Capacity admission capability supplied to substrate adapters.
 pub trait ActivationAdmission: Send + Sync {
     /// Admit or reject one capacity-spending activation.
     fn admit(&self, class: ActivationAdmissionClass) -> ActivationAdmissionFuture<'_>;
+
+    /// Reserve a per-client live slot for `client` activating `sandbox`.
+    /// Hold the reservation until the activation ends.
+    fn reserve_live(&self, client: ClientId, sandbox: SandboxId) -> LiveCapFuture<'_>;
+
+    /// Refuse when `client` is already at its live cap, reserving nothing:
+    /// the pre-check before a deferred charge.
+    fn precheck_live(&self, client: ClientId, sandbox: SandboxId) -> ActivationAdmissionFuture<'_>;
+
+    /// Whether any live cap is configured, so callers can skip the work they
+    /// do only to feed a check (a pod-store scan, a record read).
+    fn live_cap_configured(&self) -> bool;
 }
 
 /// The kind of client an activation is for (RFC "Per-client admission
@@ -194,8 +222,7 @@ pub enum ChargeState {
     Exempt,
 }
 
-/// Where a per-client live cap would decide this activation. Nothing reads it
-/// yet; each path states it so the cap can be added without revisiting them.
+/// Where the per-client live cap decides this activation (RFC Decision 6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapPolicy {
     /// Reserved upstream, before any token was spent.
@@ -229,6 +256,20 @@ pub struct RecoveryCharge {
     /// `None` when the process has no limiter configured; charging is then a
     /// no-op.
     admission: Option<Arc<dyn ActivationAdmission>>,
+    /// The live-cap reservation the request took at entry, shared by every
+    /// clone of this charge, so a detached wake leader can take it over.
+    live: crate::client_live_cap::LiveHandoff,
+}
+
+impl std::fmt::Debug for RecoveryCharge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryCharge")
+            .field("state", &self.state)
+            .field("cap", &self.cap)
+            .field("attribution", &self.attribution)
+            .field("admission", &self.admission.is_some())
+            .finish()
+    }
 }
 
 impl RecoveryCharge {
@@ -247,26 +288,60 @@ impl RecoveryCharge {
             attribution,
             admission: admission
                 .map(|admission| Arc::clone(admission) as Arc<dyn ActivationAdmission>),
+            live: Default::default(),
         }
     }
 
-    /// The activation was charged upstream and admitted.
-    pub(crate) fn paid(cap: CapPolicy, attribution: ActivationAttribution) -> Self {
+    /// The activation was charged upstream and admitted. `admission` is
+    /// still needed when `cap` is [`CapPolicy::Check`]: the cap runs where a
+    /// pod gets created.
+    pub(crate) fn paid<T>(
+        admission: Option<&Arc<T>>,
+        cap: CapPolicy,
+        attribution: ActivationAttribution,
+    ) -> Self
+    where
+        T: ActivationAdmission + 'static,
+    {
         Self {
             state: ChargeState::Paid,
             cap,
             attribution,
-            admission: None,
+            admission: admission
+                .map(|admission| Arc::clone(admission) as Arc<dyn ActivationAdmission>),
+            live: Default::default(),
         }
     }
 
-    /// Nobody charges the activation.
-    pub(crate) fn exempt(cap: CapPolicy, attribution: ActivationAttribution) -> Self {
+    /// Nobody charges the activation. `admission` is still needed when `cap`
+    /// is [`CapPolicy::Check`].
+    pub(crate) fn exempt<T>(
+        admission: Option<&Arc<T>>,
+        cap: CapPolicy,
+        attribution: ActivationAttribution,
+    ) -> Self
+    where
+        T: ActivationAdmission + 'static,
+    {
         Self {
             state: ChargeState::Exempt,
             cap,
             attribution,
+            admission: admission
+                .map(|admission| Arc::clone(admission) as Arc<dyn ActivationAdmission>),
+            live: Default::default(),
+        }
+    }
+
+    /// A charge with no admission handle: nothing is charged or capped.
+    #[cfg(any(test, feature = "kubernetes"))]
+    pub(crate) fn uncapped(state: ChargeState, attribution: ActivationAttribution) -> Self {
+        Self {
+            state,
+            cap: CapPolicy::Skip,
+            attribution,
             admission: None,
+            live: Default::default(),
         }
     }
 
@@ -281,7 +356,35 @@ impl RecoveryCharge {
             state,
             cap: self.cap,
             attribution: self.attribution.clone(),
-            admission: None,
+            admission: self.admission.clone(),
+            live: self.live.clone(),
+        }
+    }
+
+    /// This activation carrying `live`, the reservation the request took at
+    /// entry, so the substrate work it starts can take it over.
+    pub(crate) fn with_live(mut self, live: &crate::client_live_cap::LiveHandoff) -> Self {
+        self.live = live.clone();
+        self
+    }
+
+    /// Take the entry reservation this charge carries, if no one has yet.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn take_live(&self) -> Option<LiveReservation> {
+        self.live.take()
+    }
+
+    /// This activation with its cap decided as `cap`: a lease winner turns
+    /// [`CapPolicy::ReserveAtClaim`] into `Reserved` once it has reserved, or
+    /// into `Check` when it may reuse a pod.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn with_cap(&self, cap: CapPolicy) -> Self {
+        Self {
+            state: self.state,
+            cap,
+            attribution: self.attribution.clone(),
+            admission: self.admission.clone(),
+            live: self.live.clone(),
         }
     }
 
@@ -297,6 +400,56 @@ impl RecoveryCharge {
         &self.attribution
     }
 
+    /// Reserve this activation's live slot for `sandbox`, whose record is
+    /// `record`. `Ok(None)` when no cap applies: no admission handle, or an
+    /// activation with no client id (an inheriting one whose record is
+    /// `NULL`).
+    #[cfg(any(test, feature = "kubernetes"))]
+    pub(crate) async fn reserve_live_cap(
+        &self,
+        sandbox: SandboxId,
+        record: Option<&ClientId>,
+    ) -> Result<Option<LiveReservation>, SubstrateError> {
+        let Some(admission) = self.admission.as_ref() else {
+            return Ok(None);
+        };
+        let Some(client) = self.attribution.key().pod_label(record) else {
+            return Ok(None);
+        };
+        admission
+            .reserve_live(client, sandbox)
+            .await
+            .map_err(live_cap_rejection)
+    }
+
+    /// Whether a live cap could apply to this activation at all: a limiter is
+    /// attached and it has a cap configured.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn live_cap_configured(&self) -> bool {
+        self.admission
+            .as_ref()
+            .is_some_and(|admission| admission.live_cap_configured())
+    }
+
+    /// The read-only pre-check of this activation's live cap.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) async fn precheck_live_cap(
+        &self,
+        sandbox: SandboxId,
+        record: Option<&ClientId>,
+    ) -> Result<(), SubstrateError> {
+        let Some(admission) = self.admission.as_ref() else {
+            return Ok(());
+        };
+        let Some(client) = self.attribution.key().pod_label(record) else {
+            return Ok(());
+        };
+        admission
+            .precheck_live(client, sandbox)
+            .await
+            .map_err(live_cap_rejection)
+    }
+
     pub(super) async fn charge(
         &self,
         class: ActivationAdmissionClass,
@@ -310,6 +463,7 @@ impl RecoveryCharge {
             .map_err(|error| SubstrateError::AdmissionRejected {
                 retry_after: error.retry_after,
                 kind: error.kind,
+                live_cap: false,
                 message: error.to_string(),
             })
     }
@@ -332,12 +486,29 @@ impl RecoveryCharge {
     }
 }
 
+/// A live-cap refusal is a refused charge: a `429` without the cluster
+/// limiter's backpressure cause, so the async dispatcher retries it against
+/// its attempt budget. A cap lifts when the client releases a sandbox, not
+/// with time.
+#[cfg(any(test, feature = "kubernetes"))]
+fn live_cap_rejection(error: ActivationAdmissionRejection) -> SubstrateError {
+    SubstrateError::AdmissionRejected {
+        message: error.to_string(),
+        retry_after: error.retry_after,
+        kind: ActivationRejectionKind::LiveCap,
+        live_cap: true,
+    }
+}
+
 #[cfg(test)]
 impl RecoveryCharge {
     /// An exempt, uncapped charge acting for the sandbox's record, for tests
     /// that don't exercise attribution or caps.
     pub(crate) fn exempt_for_tests() -> Self {
-        Self::exempt(CapPolicy::Skip, ActivationAttribution::inherit_unresolved())
+        Self::uncapped(
+            ChargeState::Exempt,
+            ActivationAttribution::inherit_unresolved(),
+        )
     }
 
     /// An enforcing charge acting for the sandbox's record, for tests that

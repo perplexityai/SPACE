@@ -1139,7 +1139,18 @@ impl SandboxController {
         // higher (see `ALB_IDLE_TIMEOUT_SECS`). Cancelling a slow delete would
         // leak the backing instance (on direct, with no orphan GC, a running VM
         // invisibly), so the unbounded delete is the safe choice.
-        if let Err(err) = self.substrate.delete_execution(sandbox_id).await {
+        let teardown = self.live_teardown(sandbox_id).await;
+        let deleted = self.substrate.delete_execution(sandbox_id).await;
+        // As for a delete: only a confirmed teardown, or a node that had no
+        // such sandbox, uncounts it; after a failed one its pod may still
+        // exist, so its pending member stays to lapse.
+        if matches!(
+            deleted,
+            Ok(()) | Err(crate::controllers::substrate::SubstrateError::NotFound { .. })
+        ) {
+            self.forget_live_sandbox(teardown).await;
+        }
+        if let Err(err) = deleted {
             tracing::warn!(
                 sandbox_id = %sandbox_id,
                 error = %err,
