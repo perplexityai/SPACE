@@ -902,6 +902,10 @@ struct PreparedPty {
 #[cfg(not(target_os = "linux"))]
 static PTY_INHERITANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The environment a pty-backed process starts with unless the sandbox or the
+/// request sets these: the values E2B-compatible terminal clients send.
+const PTY_DEFAULT_ENV: [(&str, &str); 2] = [("TERM", "xterm-256color"), ("LANG", "C.UTF-8")];
+
 fn spawn_child(command: &mut Command) -> io::Result<tokio::process::Child> {
     #[cfg(not(target_os = "linux"))]
     let _inheritance_guard = PTY_INHERITANCE_LOCK
@@ -2333,6 +2337,14 @@ impl Process for ExecutionService {
         command.env("USER", account.name().as_str());
         command.env("LOGNAME", account.name().as_str());
         command.env("SHELL", account.shell());
+        // A terminal needs a terminal type and a character set, as an
+        // interactive login has. The sandbox's environment and the request's,
+        // applied below, override them.
+        if pty_config.is_some() {
+            for (key, value) in PTY_DEFAULT_ENV {
+                command.env(key, value);
+            }
+        }
         if !clean_env {
             let process_env = self.inner.process_env.read().await.clone();
             if !process_env.as_map().is_empty() {
