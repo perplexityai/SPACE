@@ -1177,8 +1177,12 @@ fn resize_guest_disk(
     }
     // These tools must see the pinned inode too, not a cache pathname which
     // could be replaced after set_len. The loop detaches when this scope ends.
-    let device = crate::device_backing::LoopDevice::attach(&backing, false)
-        .map_err(super::artifact_fs::error)?;
+    let device = crate::device_backing::LoopDevice::attach(
+        &backing,
+        false,
+        crate::device_backing::LoopIoMode::Buffered,
+    )
+    .map_err(super::artifact_fs::error)?;
 
     let mut fsck = crate::host_command::Command::new("e2fsck");
     fsck.arg("-fy").arg(device.path());

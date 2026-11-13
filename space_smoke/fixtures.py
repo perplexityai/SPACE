@@ -3286,19 +3286,21 @@ class EncryptedResuspendAssertions:
         assert placement is not None
         return placement.node_name
 
-    def sealed_snapshot(self, node_name: str) -> EncryptedSnapshotObservation:
+    def sealed_snapshot(
+        self, node_name: str, *, max_allocation_bytes: int = MAX_DIFF_ALLOCATION_BYTES,
+    ) -> EncryptedSnapshotObservation:
         observation = self._control.encrypted_snapshot_observation(
             self._sandbox_id, node_name
         )
         self._fixture.verify(
             observation.allocated_bytes < observation.logical_bytes
-            and observation.allocated_bytes < self.MAX_DIFF_ALLOCATION_BYTES,
+            and observation.allocated_bytes < max_allocation_bytes,
             "encrypted snapshot volume lost its sparse Diff/CoW allocation",
             snapshot_node=observation.node_name,
             snapshot_luks_uuid=observation.luks_uuid,
             snapshot_logical_bytes=observation.logical_bytes,
             snapshot_allocated_bytes=observation.allocated_bytes,
-            max_diff_allocation_bytes=self.MAX_DIFF_ALLOCATION_BYTES,
+            max_diff_allocation_bytes=max_allocation_bytes,
         )
         self._fixture.record(
             "encrypted_snapshot_allocation",

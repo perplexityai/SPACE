@@ -50,7 +50,7 @@ use crate::rootfs_dmcrypt::{
     run_with_stdin, verify_kernel_support,
 };
 
-use crate::device_backing::{self, Backing, LoopDevice};
+use crate::device_backing::{self, Backing, LoopDevice, LoopIoMode};
 
 mod busy_holders;
 #[cfg(any(target_os = "linux", test))]
@@ -779,8 +779,16 @@ pub async fn prepare(params: PrepareParams<'_>) -> Result<PreparedEncryptedVolum
     }
 
     let mapper = mapper_name(&sandbox_id, &volume_name);
+    // Keep fresh capture writes buffered. Existing snapshot reads already pass
+    // through the inner btrfs page cache, so request backing-cache bypass on
+    // reopen; that loop keeps its mode through any later re-suspend writes.
+    let loop_io = match volume_name.as_str() {
+        "snapshot" if !fresh => LoopIoMode::Direct,
+        _ => LoopIoMode::Buffered,
+    };
 
     // Idempotent re-entry, keyed on device identity (not path spelling).
+    // Keep an existing loop's I/O mode until its natural detach and reopen.
     // Ordered before the restore staging so a retried prepare can never
     // overwrite the backing file under a live volume.
     if is_mounted(&mount_dir).await? {
@@ -873,7 +881,17 @@ pub async fn prepare(params: PrepareParams<'_>) -> Result<PreparedEncryptedVolum
 
     verify_kernel_support().await?;
 
-    match build_volume(&mapper, &backing_path, &mount_dir, size_bytes, dek, fresh).await {
+    match build_volume(
+        &mapper,
+        &backing_path,
+        &mount_dir,
+        size_bytes,
+        dek,
+        fresh,
+        loop_io,
+    )
+    .await
+    {
         Ok(()) => Ok(PreparedEncryptedVolume { mount_dir }),
         Err(e) => {
             let _ = release(&sandbox_id, &volume_name, &backing_path, &mount_dir).await;
@@ -891,6 +909,7 @@ async fn build_volume(
     size_bytes: u64,
     dek: &[u8],
     fresh: bool,
+    loop_io: LoopIoMode,
 ) -> Result<(), DmCryptError> {
     let path = backing_path.to_owned();
     let (backing, loop_device) = device_backing::blocking(move || {
@@ -901,10 +920,16 @@ async fn build_volume(
         } else {
             Backing::require(Backing::open(&path, true)?)?
         };
-        let device = LoopDevice::attach(&backing, false)?;
+        let device = LoopDevice::attach(&backing, false, loop_io)?;
         Ok((backing, device))
     })
     .await?;
+    tracing::debug!(
+        mapper,
+        requested_io = ?loop_io,
+        effective_io = ?loop_device.io_mode(),
+        "attached encrypted-volume loop"
+    );
     let loop_path = loop_device.path().to_string_lossy();
     if fresh {
         run_with_stdin("cryptsetup", &luks_format_args(&loop_path), dek).await?;
