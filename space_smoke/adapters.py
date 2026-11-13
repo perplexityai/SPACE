@@ -4390,7 +4390,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         self, node_name: str, component: str, identity: NodeServiceIdentity
     ) -> None:
         self._require_isolated_kind("node-service thaw")
-        self._require_node_service_identity(node_name, component, identity)
+        # Compensation must release the owned cgroup even if its pod was replaced.
         script = _node_service_cgroup_script(component, identity) + (
             'echo 0 > "$cg/cgroup.freeze"\n'
         )
