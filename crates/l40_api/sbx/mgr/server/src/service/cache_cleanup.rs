@@ -87,6 +87,7 @@ fn durable_inventory_reason(
     }
 }
 
+#[tracing::instrument(name = "sbxmgr.cache.ensure_root", skip_all, err)]
 pub(super) fn ensure_sandbox_cache_root_in(
     cache_dir: &Path,
     sandbox_id: &str,
