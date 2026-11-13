@@ -219,6 +219,7 @@ impl crate::service::SandboxManagerService {
         Ok(UpgradeRuntimeResponse {
             outcome: wire_outcome as i32,
             start,
+            attempt_id: None,
         })
     }
 
