@@ -1459,11 +1459,10 @@ const NODE_MANAGER_RETRY_MAX: Duration = Duration::from_secs(2);
 ///
 /// A plain directory is a permanent install: nothing converts it later, and
 /// a btrfs-send restore can never use it as its parent. So the fallback is
-/// taken only when a subvolume genuinely cannot exist here: node-manager
-/// predates the RPC (`Unimplemented`), or refuses it (`FailedPrecondition`)
-/// on a cache that `cache_is_btrfs` reports is not btrfs. Any other failure
-/// (node-manager unreachable mid-restart, or refusing on a btrfs cache,
-/// e.g. EROFS while its mounts are torn down) is retried for
+/// taken only when node-manager predates the RPC (`Unimplemented`). On a
+/// non-btrfs cache node-manager itself makes a plain directory and answers
+/// OK, so any failure it reports is a fault (unreachable mid-restart, EROFS
+/// while its mounts are torn down, EACCES): it is retried for
 /// [`NODE_MANAGER_RESTART_GRACE`], then fails the pull retryably without
 /// creating the dir.
 async fn create_build_dir<F, Fut>(
@@ -1471,7 +1470,6 @@ async fn create_build_dir<F, Fut>(
     content_hash: &str,
     digest_dir: &str,
     mut create_subvolume: F,
-    cache_is_btrfs: impl FnOnce() -> bool,
 ) -> Result<(), PullError>
 where
     F: FnMut() -> Fut,
@@ -1483,8 +1481,6 @@ where
 
     let deadline = tokio::time::Instant::now() + NODE_MANAGER_RESTART_GRACE;
     let mut backoff = NODE_MANAGER_RETRY_INITIAL;
-    let mut cache_is_btrfs = Some(cache_is_btrfs);
-    let mut on_btrfs = None;
     loop {
         let err = match create_subvolume().await {
             Ok(_path) => {
@@ -1498,22 +1494,17 @@ where
             }
             Err(err) => err,
         };
-        let unsupported = match &err {
-            BtrfsViaNodemgrError::Rpc { status, .. } => match status.code() {
-                tonic::Code::Unimplemented => true,
-                tonic::Code::FailedPrecondition => !*on_btrfs
-                    .get_or_insert_with(|| cache_is_btrfs.take().is_some_and(|probe| probe())),
-                _ => false,
-            },
-            _ => false,
-        };
+        let unsupported = matches!(
+            &err,
+            BtrfsViaNodemgrError::Rpc { status, .. } if status.code() == tonic::Code::Unimplemented
+        );
         if unsupported {
             tracing::info!(
                 template = name,
                 content_hash,
                 dir = %digest_dir,
                 error = %err,
-                "on-demand pull: btrfs subvolumes unsupported here; falling back to plain directory"
+                "on-demand pull: node-manager lacks the subvolume RPC; falling back to plain directory"
             );
             if let Err(err) = tokio::fs::create_dir_all(digest_dir).await {
                 warn!(error = %err, template = name, content_hash, dir = %digest_dir, "create digest dir failed; falling through");
@@ -1544,17 +1535,6 @@ where
         tokio::time::sleep(backoff.min(deadline - now)).await;
         backoff = (backoff * 2).min(NODE_MANAGER_RETRY_MAX);
     }
-}
-
-/// Whether the template cache holding `digest_dir` is btrfs, judged from
-/// its nearest existing ancestor (node-manager creates the parent).
-fn template_cache_is_btrfs(digest_dir: &str) -> bool {
-    const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
-    Path::new(digest_dir)
-        .ancestors()
-        .skip(1)
-        .find_map(|dir| rustix::fs::statfs(dir).ok())
-        .is_some_and(|fs| fs.f_type.cast_unsigned() == BTRFS_SUPER_MAGIC)
 }
 
 async fn do_pull(
@@ -1919,13 +1899,9 @@ async fn try_pull_from(
     // Disarmed below right before the final `Ok(())` once the sqlite upsert
     // has committed.
     let cleanup_guard = PullCleanupGuard::new(name, content_hash, &digest_dir, cleanup);
-    create_build_dir(
-        name,
-        content_hash,
-        &digest_dir,
-        || crate::btrfs_via_nodemgr::create_template_subvolume(name, content_hash, partition),
-        || template_cache_is_btrfs(&digest_dir),
-    )
+    create_build_dir(name, content_hash, &digest_dir, || {
+        crate::btrfs_via_nodemgr::create_template_subvolume(name, content_hash, partition)
+    })
     .await?;
     if let Err(err) =
         set_template_cache_permissions(Path::new(&digest_dir), TEMPLATE_CACHE_DIR_MODE)

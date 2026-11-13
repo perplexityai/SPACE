@@ -1551,15 +1551,9 @@ async fn build_dir_waits_out_a_node_manager_restart() {
         std::iter::repeat_with(node_manager_unreachable).take(3),
     );
 
-    create_build_dir(
-        "base",
-        "sha256:abc",
-        dir.to_str().unwrap(),
-        || fake.call(),
-        || false,
-    )
-    .await
-    .unwrap();
+    create_build_dir("base", "sha256:abc", dir.to_str().unwrap(), || fake.call())
+        .await
+        .unwrap();
 
     assert_eq!(fake.calls, 4, "the pull retries until node-manager answers");
     assert!(
@@ -1579,14 +1573,8 @@ async fn build_dir_fails_retryably_while_node_manager_stays_down() {
         std::iter::repeat_with(node_manager_unreachable).take(10_000),
     );
 
-    let result = create_build_dir(
-        "base",
-        "sha256:abc",
-        dir.to_str().unwrap(),
-        || fake.call(),
-        || false,
-    )
-    .await;
+    let result =
+        create_build_dir("base", "sha256:abc", dir.to_str().unwrap(), || fake.call()).await;
 
     assert!(
         matches!(result, Err(PullError::Retryable(ref status)) if status.code() == tonic::Code::Unavailable),
@@ -1595,42 +1583,34 @@ async fn build_dir_fails_retryably_while_node_manager_stays_down() {
     assert!(!dir.exists(), "no plain-directory build was minted");
 }
 
-/// Node-manager's own verdict that this filesystem can't hold a subvolume
-/// (non-btrfs host) still falls back to a plain directory.
+/// A node-manager that predates the subvolume RPC still gets a plain
+/// directory.
 #[tokio::test(start_paused = true)]
-async fn build_dir_falls_back_to_plain_directory_when_subvolumes_are_unsupported() {
+async fn build_dir_falls_back_to_plain_directory_without_the_rpc() {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("sha256:abc");
     let mut fake = FakeSubvolumeCreate::new(
         dir.clone(),
         [crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc {
             rpc: "BtrfsCreateTemplateSubvolume",
-            status: Status::failed_precondition(
-                "artifact filesystem operation: Inappropriate ioctl for device",
-            ),
+            status: Status::unimplemented("BtrfsCreateTemplateSubvolume"),
         }],
     );
 
-    create_build_dir(
-        "base",
-        "sha256:abc",
-        dir.to_str().unwrap(),
-        || fake.call(),
-        || false,
-    )
-    .await
-    .unwrap();
+    create_build_dir("base", "sha256:abc", dir.to_str().unwrap(), || fake.call())
+        .await
+        .unwrap();
 
     assert_eq!(fake.calls, 1);
     assert!(dir.is_dir());
     assert!(!dir.join(FAKE_SUBVOLUME_MARKER).exists());
 }
 
-/// node-manager refusing the create on a btrfs cache (EROFS while its mounts
-/// are torn down on shutdown) is not "subvolumes unsupported": no plain
-/// directory is minted.
+/// node-manager refusing the create (EROFS while its mounts are torn down on
+/// shutdown) is a fault, not "subvolumes unsupported": no plain directory is
+/// minted.
 #[tokio::test(start_paused = true)]
-async fn build_dir_never_falls_back_on_a_btrfs_cache() {
+async fn build_dir_never_falls_back_on_a_node_manager_refusal() {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("sha256:abc");
     let mut fake = FakeSubvolumeCreate::new(
@@ -1644,14 +1624,8 @@ async fn build_dir_never_falls_back_on_a_btrfs_cache() {
         .take(10_000),
     );
 
-    let result = create_build_dir(
-        "base",
-        "sha256:abc",
-        dir.to_str().unwrap(),
-        || fake.call(),
-        || true,
-    )
-    .await;
+    let result =
+        create_build_dir("base", "sha256:abc", dir.to_str().unwrap(), || fake.call()).await;
 
     assert!(
         matches!(result, Err(PullError::Retryable(_))),
