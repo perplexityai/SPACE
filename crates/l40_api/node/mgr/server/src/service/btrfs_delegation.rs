@@ -811,7 +811,7 @@ impl NodeManagerService {
             let name = digest_dir
                 .file_name()
                 .ok_or_else(|| artifact_fs::error("missing template digest"))?;
-            create_template_digest(&parent_fd, name)?;
+            artifact_fs::btrfs::create(&parent_fd, name).map_err(artifact_fs::error)?;
             let digest = artifact_fs::directory(&parent_fd, name).map_err(artifact_fs::error)?;
             nix::unistd::fchown(
                 &digest,
@@ -1575,29 +1575,6 @@ fn create_sandbox_instance_subvolume(
     .map_err(artifact_fs::error)?;
     trusted_paths::set_permissions(&instance, None, 0o755)?;
     Ok(on_btrfs)
-}
-
-/// Create a template digest dir under `parent`, or accept the one a prior
-/// attempt of this RPC made. A retry whose first reply was lost finds the dir
-/// already there; the caller re-applies its owner and mode either way. On
-/// btrfs only an existing subvolume is accepted: a plain directory there can
-/// never parent a btrfs-send restore.
-fn create_template_digest(parent: &std::fs::File, name: &std::ffi::OsStr) -> Result<(), Status> {
-    match artifact_fs::btrfs::create(parent, name) {
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = artifact_fs::directory(parent, name).map_err(artifact_fs::error)?;
-            let on_btrfs = artifact_fs::btrfs::is_on_btrfs(parent).map_err(artifact_fs::error)?;
-            if on_btrfs
-                && !artifact_fs::btrfs::is_subvolume(&existing).map_err(artifact_fs::error)?
-            {
-                return Err(artifact_fs::error(
-                    "template digest exists as a plain directory, not a btrfs subvolume",
-                ));
-            }
-            Ok(())
-        }
-        result => result.map_err(artifact_fs::error),
-    }
 }
 
 #[cfg(test)]

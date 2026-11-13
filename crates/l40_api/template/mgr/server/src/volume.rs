@@ -1464,8 +1464,7 @@ const NODE_MANAGER_RETRY_MAX: Duration = Duration::from_secs(2);
 /// OK, so any failure it reports is a fault (unreachable mid-restart, EROFS
 /// while its mounts are torn down, EACCES): it is retried for
 /// [`NODE_MANAGER_RESTART_GRACE`], then fails the pull retryably without
-/// creating the dir. An attempt node-manager never answers counts as a
-/// fault once the window runs out.
+/// creating the dir.
 async fn create_build_dir<F, Fut>(
     name: &str,
     content_hash: &str,
@@ -1483,21 +1482,7 @@ where
     let deadline = tokio::time::Instant::now() + NODE_MANAGER_RESTART_GRACE;
     let mut backoff = NODE_MANAGER_RETRY_INITIAL;
     loop {
-        // node-manager can accept the socket and never answer; bound each
-        // attempt so the restart window holds. A late success on its side is
-        // adopted by the next attempt.
-        let attempt_timeout = deadline
-            .saturating_duration_since(tokio::time::Instant::now())
-            .max(NODE_MANAGER_RETRY_MAX);
-        let result = tokio::time::timeout(attempt_timeout, create_subvolume())
-            .await
-            .unwrap_or_else(|_| {
-                Err(BtrfsViaNodemgrError::Rpc {
-                    rpc: "BtrfsCreateTemplateSubvolume",
-                    status: Status::deadline_exceeded("node-manager did not answer"),
-                })
-            });
-        let err = match result {
+        let err = match create_subvolume().await {
             Ok(_path) => {
                 tracing::debug!(
                     template = name,
@@ -2419,28 +2404,7 @@ async fn delete_digest_dir_via_nodemgr(
 /// A subvolume root it can't remove stays without a row, and pulls refuse
 /// it until the GC tick's rowless check removes it.
 async fn remove_build_dir(name: &str, content_hash: &str, dir: &Path, reason: &'static str) {
-    remove_build_dir_with(
-        dir,
-        reason,
-        delete_digest_dir_via_nodemgr(name, content_hash, dir),
-    )
-    .await;
-}
-
-/// How long build-dir cleanup waits on node-manager's delete before falling
-/// through to the local removal. node-manager can accept the socket and
-/// never answer, and the pull holds its digest until cleanup finishes.
-const NODE_MANAGER_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
-
-async fn remove_build_dir_with(
-    dir: &Path,
-    reason: &'static str,
-    nodemgr_delete: impl std::future::Future<Output = Result<(), String>>,
-) {
-    let deleted = tokio::time::timeout(NODE_MANAGER_DELETE_TIMEOUT, nodemgr_delete)
-        .await
-        .unwrap_or_else(|_| Err("node-manager did not answer".to_string()));
-    match deleted {
+    match delete_digest_dir_via_nodemgr(name, content_hash, dir).await {
         Ok(()) => {
             info!(dir = %dir.display(), reason, "removed digest dir (via nodemgr)");
             return;

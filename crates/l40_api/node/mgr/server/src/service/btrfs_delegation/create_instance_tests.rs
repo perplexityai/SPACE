@@ -220,21 +220,3 @@ fn the_instance_is_created_finished_or_kept_and_only_a_non_directory_refuses() {
         tonic::Code::FailedPrecondition
     );
 }
-
-/// A template-subvolume create retried after its reply was lost finds the
-/// digest dir it made and accepts it, keeping what was written there.
-#[test]
-fn a_retried_template_digest_create_accepts_the_dir_it_made() {
-    let root = tempfile::tempdir().unwrap();
-    let parent = std::fs::File::open(root.path()).unwrap();
-    let name = std::ffi::OsStr::new("sha256:digest");
-
-    create_template_digest(&parent, name).unwrap();
-    fs::write(root.path().join("sha256:digest/marker"), b"kept").unwrap();
-    create_template_digest(&parent, name).unwrap();
-
-    assert_eq!(
-        fs::read(root.path().join("sha256:digest/marker")).unwrap(),
-        b"kept"
-    );
-}
