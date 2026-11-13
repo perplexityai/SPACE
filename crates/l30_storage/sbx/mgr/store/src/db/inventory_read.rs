@@ -35,15 +35,19 @@ impl InventoryReadError {
     }
 }
 
+/// The bytes one column value costs an inventory budget, whatever its type.
+pub(in crate::db) fn value_raw_bytes(value: ValueRef<'_>) -> usize {
+    match value {
+        ValueRef::Text(value) | ValueRef::Blob(value) => value.len(),
+        ValueRef::Null => 0,
+        ValueRef::Integer(_) | ValueRef::Real(_) => 8,
+    }
+}
+
 fn row_raw_bytes(row: &Row<'_>) -> rusqlite::Result<usize> {
     let mut bytes = 0usize;
     for index in 0..row.as_ref().column_count() {
-        let size = match row.get_ref(index)? {
-            ValueRef::Text(value) | ValueRef::Blob(value) => value.len(),
-            ValueRef::Null => 0,
-            ValueRef::Integer(_) | ValueRef::Real(_) => 8,
-        };
-        bytes = bytes.saturating_add(size);
+        bytes = bytes.saturating_add(value_raw_bytes(row.get_ref(index)?));
     }
     Ok(bytes)
 }

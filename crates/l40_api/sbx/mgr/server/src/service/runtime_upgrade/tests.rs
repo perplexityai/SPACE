@@ -751,6 +751,92 @@ async fn a_failed_restore_keeps_the_fence_for_a_later_rollback() {
     h.assert_old_pair_restorable(SandboxState::Stopped);
 }
 
+impl Harness {
+    /// The execution the node publishes for the sandbox: the one the State
+    /// RPC reads.
+    fn published_execution(&self) -> Option<ExecutionMetadata> {
+        use pplx_space_common_core::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+        let mut budgets = crate::db::read::StateBudgets {
+            raw: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+            metadata: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+        };
+        let page = crate::db::read::state_page(
+            &self.db.lock().unwrap(),
+            std::slice::from_ref(&self.sandbox_id),
+            &mut budgets,
+        )
+        .unwrap();
+        match page.into_iter().next() {
+            Some(crate::db::read::StatePageRow::Decoded(decoded)) => decoded.published_execution,
+            _ => panic!("the sandbox's row didn't decode"),
+        }
+    }
+}
+
+/// A failed boot's cleanup stops the sandbox with the target still saved as
+/// its consumer, and the rollback restores the old one only once its disk is
+/// back. The node never publishes the sandbox under the target meanwhile,
+/// nor after the rollback: the control plane reads a stopped publication
+/// under the target as an upgrade that reached it.
+#[tokio::test]
+async fn a_rolled_back_upgrade_is_never_published_under_its_target() {
+    let h = harness(SandboxState::Stopped);
+    *h.fake.boot.lock().unwrap() = Boot::FailAfterWriting;
+    h.fake.fail_restore.store(true, Ordering::SeqCst);
+    let operation_id = operation();
+
+    h.upgrader
+        .upgrade(h.request(operation_id, RuntimeUpgradeTargetState::Stopped))
+        .await
+        .unwrap_err();
+
+    let row = h.row();
+    assert_eq!(
+        row.state,
+        crate::state::SandboxStatus::from(SandboxState::Stopped)
+    );
+    assert_eq!(row.execution_metadata, Some(h.envs.target.clone()));
+    assert_eq!(h.published_execution(), Some(h.envs.source.clone()));
+
+    h.fake.fail_restore.store(false, Ordering::SeqCst);
+    let record = h.record(operation_id).unwrap();
+    assert_eq!(
+        h.upgrader.settle(&record, false).await.unwrap(),
+        Settled::RolledBack
+    );
+    assert_eq!(h.published_execution(), Some(h.envs.source.clone()));
+}
+
+/// Once the boot is verified the sandbox runs under the target, and that's
+/// what the node publishes: while the upgrade waits in `verified` for its
+/// retirement, and after it retires.
+#[tokio::test]
+async fn a_verified_upgrade_is_published_under_its_target() {
+    let h = harness(SandboxState::Stopped);
+    h.fake.fail_retire.store(true, Ordering::SeqCst);
+    let operation_id = operation();
+
+    h.upgrader
+        .upgrade(h.request(operation_id, RuntimeUpgradeTargetState::Stopped))
+        .await
+        .unwrap_err();
+
+    let record = h.record(operation_id).unwrap();
+    assert_eq!(record.phase, RuntimeUpgradePhase::Verified);
+    assert_eq!(h.published_execution(), Some(h.envs.target.clone()));
+
+    h.fake.fail_retire.store(false, Ordering::SeqCst);
+    assert_eq!(
+        h.upgrader.settle(&record, true).await.unwrap(),
+        Settled::Retired
+    );
+    assert_eq!(
+        h.row().state,
+        crate::state::SandboxStatus::from(SandboxState::Stopped)
+    );
+    assert_eq!(h.published_execution(), Some(h.envs.target.clone()));
+}
+
 #[tokio::test]
 async fn retirement_waits_for_verification_across_a_crash() {
     // Crashed mid-boot: the sandbox came back to its old state, so the
@@ -1659,6 +1745,41 @@ mod service {
             error.message().contains(&operation_id.to_string()),
             "{error}"
         );
+    }
+
+    /// The State RPC publishes the execution a rollback restores while an
+    /// upgrade fences the sandbox, though the row has the target saved.
+    #[tokio::test]
+    async fn the_state_rpc_publishes_the_retained_execution_while_fenced() {
+        let envs = environments();
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
+        crate::db::upsert_sandbox_execution_metadata(&conn, &sandbox_id, &envs.source).unwrap();
+        crate::db::test_fixtures::fence_runtime_upgrade(
+            &conn,
+            &sandbox_id,
+            reference(&envs.target),
+            crate::db::RuntimeUpgradeTargetState::Stopped,
+            None,
+        );
+        crate::db::upsert_sandbox_execution_metadata(&conn, &sandbox_id, &envs.target).unwrap();
+        let service =
+            SandboxManagerService::new_with_options(conn, SandboxManagerServiceOptions::for_test());
+
+        let response = service
+            .state(root(crate::proto::StateRequest {
+                sandbox_ids: vec![sandbox_id.clone()],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let [info] = response.sandboxes.as_slice() else {
+            panic!("one sandbox: {response:?}");
+        };
+        assert_eq!(info.sandbox_id, sandbox_id);
+        assert_eq!(info.execution, Some((&envs.source).into()));
     }
 
     #[tokio::test]
