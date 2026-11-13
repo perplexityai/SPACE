@@ -302,21 +302,20 @@ pub struct SandboxNetworkPolicyInputs {
 /// that is not placed there is absent from the result, not an error: the
 /// caller is a node asking about its own set.
 pub async fn network_policy_inputs_placed_on(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl sqlx::PgExecutor<'_> + Copy,
     node_id: NodeId,
     sandbox_ids: &[SandboxId],
 ) -> Result<Vec<SandboxNetworkPolicyInputs>, SandboxStoreError> {
     if sandbox_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query_as::<_, SandboxNetworkPolicyInputs>(sql!(
+    let mut rows = sqlx::query_as::<_, SandboxNetworkPolicyInputs>(sql!(
         "SELECT s.id AS sandbox_id,
                 s.template_id,
                 s.network_policy_override_json AS network_policy_json,
                 s.network_policy_generation,
-                t.network_policy_json AS template_network_policy_json
+                NULL::JSONB AS template_network_policy_json
          FROM sandboxes s
-         LEFT JOIN templates t ON t.name = s.template_id
          WHERE s.id = ANY($1)
            AND (s.active_node_id = $2 OR s.target_node_id = $2)"
     ))
@@ -324,6 +323,35 @@ pub async fn network_policy_inputs_placed_on(
     .bind(node_id)
     .fetch_all(executor)
     .await?;
+
+    // A node's sandboxes share a handful of templates, so each template's
+    // policy is read once rather than joined again for every sandbox.
+    let template_names: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row.template_id.as_deref())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if template_names.is_empty() {
+        return Ok(rows);
+    }
+    let policies: std::collections::HashMap<String, JsonValue> =
+        sqlx::query_as::<_, (String, JsonValue)>(sql!(
+            "SELECT t.name, t.network_policy_json
+             FROM templates t
+             WHERE t.name = ANY($1)"
+        ))
+        .bind(&template_names)
+        .fetch_all(executor)
+        .await?
+        .into_iter()
+        .collect();
+    for row in &mut rows {
+        row.template_network_policy_json = row
+            .template_id
+            .as_deref()
+            .and_then(|name| policies.get(name).cloned());
+    }
     Ok(rows)
 }
 
