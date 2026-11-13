@@ -450,6 +450,26 @@ async fn apply_receipt(
     origin_node_id: NodeId,
     completion: &ParsedCompletion,
 ) -> Result<ReceiptOutcome, Status> {
+    // Observed state before the sandboxes row, the order every delete takes.
+    match pplx_space_sandbox_store::delete::lock_observed_states_for_delete(
+        &mut **tx,
+        completion.sandbox_id,
+        true,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(error) if is_lock_not_available(&error) => {
+            return Ok(ReceiptOutcome::Deferred(
+                AutoLifecycleDeleteCompletionReason::LockContended,
+            ));
+        }
+        Err(error) => {
+            return Err(Status::internal(format!(
+                "lock auto-lifecycle delete completion observed state: {error}"
+            )));
+        }
+    }
     let row = sqlx::query_as::<_, CompletionAuthorityRow>(sql!(
         "SELECT s.lifecycle,
                 s.auto_lifecycle_json,

@@ -4811,3 +4811,87 @@ async fn only_a_pruned_inventory_stamps_the_census_timestamp() -> TestResult {
     );
     Ok(())
 }
+
+/// A node publication writes a sandbox's observed state and then its
+/// `sandboxes` row. A delete that locks the `sandboxes` row (the cluster
+/// controller's orphan finalize, the API's user delete) must lock the
+/// observed state first, or each waits on the other and Postgres aborts one
+/// with `deadlock detected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publication_racing_a_locked_delete_does_not_deadlock() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
+    // The node has published this sandbox before, so its observed-state row
+    // exists and the next publication updates it.
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[published_sandbox_state(sandbox_id, "started")],
+    )
+    .await?;
+    drop(conn);
+
+    let mut delete = db.pool.begin().await?;
+    let delete_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *delete)
+        .await?;
+    pplx_space_sandbox_store::delete::lock_observed_states_for_delete(
+        &mut *delete,
+        sandbox_id,
+        false,
+    )
+    .await?;
+    sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
+        .bind(sandbox_id)
+        .execute(&mut *delete)
+        .await?;
+
+    // Writes observed state and advances an activity clock on the row.
+    let mut state = published_sandbox_state(sandbox_id, "started");
+    state.last_access_at = Some(timestamp(1_800_000_000));
+    state.uptime = Some("1m".to_string());
+    let pool = db.pool.clone();
+    let publication = tokio::spawn(async move {
+        let mut tx = pool.begin().await?;
+        publish_sandbox_states(&mut tx, node_id, &[state])
+            .await
+            .map_err(|status| status.message().to_string())?;
+        tx.commit().await?;
+        TestResult::Ok(())
+    });
+
+    // Let the publication run until it waits on the delete's locks.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while sqlx::query_scalar::<_, i64>(sql!(
+        "SELECT COUNT(*) FROM pg_stat_activity
+          WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))"
+    ))
+    .bind(delete_pid)
+    .fetch_one(&db.pool)
+    .await?
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the publication never waited on the delete's locks"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    pplx_space_sandbox_store::delete::delete_with_dependents(&mut delete, sandbox_id).await?;
+    delete.commit().await?;
+    publication.await??;
+
+    let remaining: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes WHERE id = $1"))
+        .bind(sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(remaining, 0, "the delete must win and remove the row");
+    Ok(())
+}
