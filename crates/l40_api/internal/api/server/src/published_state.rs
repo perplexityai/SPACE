@@ -2139,11 +2139,14 @@ pub async fn publish_sandbox_states_with_retirement(
               WHERE input.status IS NOT NULL
          ), candidate AS MATERIALIZED (
              -- Only rows that record or clear a handoff reach the joins.
+             -- The prior handoff is looked up by element, so large nodes
+             -- probe only the published rows instead of scanning them all.
              SELECT input.* FROM input
               WHERE input.payload ? $4::TEXT
-                 OR input.sandbox_id::TEXT IN (
-                     SELECT prior.element FROM node_facet_observed_status prior
+                 OR EXISTS (
+                     SELECT 1 FROM node_facet_observed_status prior
                       WHERE prior.node_id = $1 AND prior.facet = $3
+                        AND prior.element = input.sandbox_id::TEXT
                         AND prior.observed_payload ? $4::TEXT
                  )
          ), observation AS (

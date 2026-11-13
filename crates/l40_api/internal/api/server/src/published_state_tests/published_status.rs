@@ -317,6 +317,45 @@ async fn local_suspend_handoff_records_every_ascii_spelling_of_suspended() -> Te
     Ok(())
 }
 
+/// The local suspend handoff clears per sandbox: a sandbox that publishes
+/// without its handoff loses it, and another sandbox's handoff on the same
+/// node stays.
+#[tokio::test(flavor = "current_thread")]
+async fn local_suspend_handoff_clears_only_the_sandbox_that_dropped_it() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = ready_node(pool).await?;
+    let report = |sandbox_id: SandboxId, handoff: bool| {
+        let mut report =
+            published_sandbox_state(sandbox_id, if handoff { "suspended" } else { "started" });
+        report.execution_generation = Some(1);
+        report.pod_uid = Some("pod-uid-1".to_owned());
+        if handoff {
+            report.current_local_artifact_id = Some(Uuid::now_v7().to_string());
+            report.current_local_artifact_kind =
+                Some(pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32);
+            report.current_local_artifact_origin =
+                Some(pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend as i32);
+        }
+        report
+    };
+    let mut sandboxes = Vec::new();
+    for _ in 0..2 {
+        let sandbox_id = SandboxId::new();
+        insert_active_sandbox(pool, sandbox_id, node_id, "started").await?;
+        insert_k8s_execution(pool, sandbox_id, 1, "running", None).await?;
+        publish(pool, node_id, report(sandbox_id, true)).await?;
+        assert!(facet_has(pool, node_id, sandbox_id, SANDBOX_LOCAL_SUSPEND_KEY).await?);
+        sandboxes.push(sandbox_id);
+    }
+
+    publish(pool, node_id, report(sandboxes[0], false)).await?;
+
+    assert!(!facet_has(pool, node_id, sandboxes[0], SANDBOX_LOCAL_SUSPEND_KEY).await?);
+    assert!(facet_has(pool, node_id, sandboxes[1], SANDBOX_LOCAL_SUSPEND_KEY).await?);
+    Ok(())
+}
+
 /// `converge_published_restoring_to_started`: an accepted spelling of
 /// `started` converges a `restoring` row with a routable execution.
 #[tokio::test(flavor = "current_thread")]
