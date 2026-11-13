@@ -45,8 +45,7 @@ pub(super) struct SubstrateBudgets {
     /// the pod's worker.
     pub(super) teardown_worker_connect: Duration,
     /// [`super::adapter::TEARDOWN_NODE_DELETE_WAIT_BUDGET`]: how long a Delete
-    /// teardown waits on the node's blocking sbx-mgr Delete before it stops
-    /// waiting and leaves an admitted delete to sbx-mgr's durable cleanup.
+    /// teardown waits for durable admission of a nonblocking sbx-mgr Delete.
     pub(super) teardown_node_delete_wait: Duration,
     /// [`super::REFLECTOR_WAIT_BUDGET`]: how long a pod read waits for a
     /// reflector event before it falls back to an apiserver GET, and the

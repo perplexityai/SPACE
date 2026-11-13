@@ -365,6 +365,9 @@ async fn retire(
 enum TeardownCase {
     /// The pod worker cannot be dialed, so the in-VM stop cannot be sent.
     RetireWorkerUnreachable,
+    DeleteWorkerUnreachable,
+    DeleteFailsBeforeAdmission,
+    DeleteReplyLostWithMissingRow,
     RetireStopFails,
     RetireBackupFails,
     DeleteDefersToSuspendPublication,
@@ -382,6 +385,9 @@ enum TeardownCase {
 /// execution tracked and the pod in place, so the retry owner can find both.
 #[rstest::rstest]
 #[case::retire_worker_unreachable(TeardownCase::RetireWorkerUnreachable)]
+#[case::delete_worker_unreachable(TeardownCase::DeleteWorkerUnreachable)]
+#[case::delete_fails_before_admission(TeardownCase::DeleteFailsBeforeAdmission)]
+#[case::delete_reply_lost_with_missing_row(TeardownCase::DeleteReplyLostWithMissingRow)]
 #[case::retire_stop_fails(TeardownCase::RetireStopFails)]
 #[case::retire_backup_fails(TeardownCase::RetireBackupFails)]
 #[case::delete_defers_to_suspend_publication(TeardownCase::DeleteDefersToSuspendPublication)]
@@ -401,7 +407,9 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
     // The unreachable case's worker sits at an address nothing answers on;
     // every other case dials the scripted worker.
     let pod_ip = match case {
-        TeardownCase::RetireWorkerUnreachable => UNDIALED_POD_IP,
+        TeardownCase::RetireWorkerUnreachable | TeardownCase::DeleteWorkerUnreachable => {
+            UNDIALED_POD_IP
+        }
         _ => "127.0.0.1",
     };
     insert_test_sandbox_row(&db.pool, sandbox_id, "started").await?;
@@ -415,7 +423,13 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
     )
     .await?;
     let reply = match case {
-        TeardownCase::RetireWorkerUnreachable => None,
+        TeardownCase::RetireWorkerUnreachable | TeardownCase::DeleteWorkerUnreachable => None,
+        TeardownCase::DeleteFailsBeforeAdmission | TeardownCase::DeleteReplyLostWithMissingRow => {
+            Some((
+                "WorkerApi/DeleteSandbox",
+                ScriptedReply::Status(tonic::Status::internal("scripted admission failure")),
+            ))
+        }
         TeardownCase::RetireStopFails => Some((
             "WorkerApi/StopSandbox",
             ScriptedReply::Status(tonic::Status::internal("scripted stop failure")),
@@ -445,12 +459,20 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
             Some(("WorkerApi/DeleteSandbox", ScriptedReply::Hang))
         }
     };
-    let state_reply = matches!(case, TeardownCase::DeleteAdmissionUnconfirmed).then(|| {
-        (
+    let state_reply = match case {
+        TeardownCase::DeleteAdmissionUnconfirmed => Some((
             "WorkerApi/SandboxState",
             ScriptedReply::Status(tonic::Status::unavailable("scripted state failure")),
-        )
-    });
+        )),
+        TeardownCase::DeleteReplyLostWithMissingRow => Some((
+            "WorkerApi/SandboxState",
+            ScriptedReply::message(&pplx_space_sbx_mgr_client::proto::StateResponse {
+                sandboxes: Vec::new(),
+                missing_ids: vec![sandbox_id.to_string()],
+            }),
+        )),
+        _ => None,
+    };
     let worker = start_scripted_worker(ScriptedWorkerConfig::new(
         reply.into_iter().chain(state_reply),
     ))
@@ -473,7 +495,10 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
             Some(pod_ip),
         )),
     );
-    if let TeardownCase::RetireWorkerUnreachable = case {
+    if matches!(
+        case,
+        TeardownCase::RetireWorkerUnreachable | TeardownCase::DeleteWorkerUnreachable
+    ) {
         // The TEST-NET dial never connects. Where the host silently drops the
         // SYN, this budget ends it, and the bound below proves the substrate's
         // budget rather than the production constant is the one teardown
@@ -489,6 +514,9 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
         | TeardownCase::RetireStopFails
         | TeardownCase::RetireBackupFails => retire(&substrate, sandbox_id).await.map(|_| ()),
         TeardownCase::DeleteDefersToSuspendPublication
+        | TeardownCase::DeleteWorkerUnreachable
+        | TeardownCase::DeleteFailsBeforeAdmission
+        | TeardownCase::DeleteReplyLostWithMissingRow
         | TeardownCase::DeleteRefusesRetainedOnlyCopy
         | TeardownCase::DeleteNotAdmittedWithinWaitBudget
         | TeardownCase::DeleteAdmissionUnconfirmed => substrate.delete_execution(sandbox_id).await,
@@ -507,6 +535,9 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
         )
         | (
             TeardownCase::DeleteNotAdmittedWithinWaitBudget
+            | TeardownCase::DeleteWorkerUnreachable
+            | TeardownCase::DeleteFailsBeforeAdmission
+            | TeardownCase::DeleteReplyLostWithMissingRow
             | TeardownCase::DeleteAdmissionUnconfirmed,
             Err(SubstrateError::NodeDeleteNotAdmitted { .. }),
         )
@@ -536,8 +567,10 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
 
 #[derive(Debug, Clone, Copy)]
 enum BestEffortNodeFailure {
-    /// Delete's node-local delete fails for an ordinary reason.
+    /// Admission committed, but the node's reply was lost.
     DeleteFails,
+    /// The durable executor has accepted cleanup without waiting for it.
+    DeleteAcknowledged,
     /// Delete's node-local delete never answers within the teardown's wait
     /// budget after sbx-mgr admitted it, as a node still freeing a killed
     /// guest's memory does.
@@ -550,6 +583,7 @@ enum BestEffortNodeFailure {
 /// it: the pod is deleted and tracking released.
 #[rstest::rstest]
 #[case::delete_fails(BestEffortNodeFailure::DeleteFails)]
+#[case::delete_acknowledged(BestEffortNodeFailure::DeleteAcknowledged)]
 #[case::delete_outlasts_wait_budget(BestEffortNodeFailure::DeleteOutlastsWaitBudget)]
 #[case::retire_backup_moot(BestEffortNodeFailure::RetireBackupMoot)]
 #[tokio::test(flavor = "current_thread")]
@@ -573,6 +607,12 @@ async fn teardown_continues_past_a_best_effort_node_failure(
     )
     .await?;
     let (failed_method, reply) = match failure {
+        BestEffortNodeFailure::DeleteAcknowledged => (
+            "WorkerApi/DeleteSandbox",
+            ScriptedReply::message(&pplx_space_sbx_mgr_client::proto::DeleteResponse {
+                deleted_ids: vec![sandbox_id.to_string()],
+            }),
+        ),
         BestEffortNodeFailure::DeleteFails => (
             "WorkerApi/DeleteSandbox",
             ScriptedReply::Status(tonic::Status::internal("scripted delete failure")),
@@ -628,7 +668,9 @@ async fn teardown_continues_past_a_best_effort_node_failure(
 
     let started = Instant::now();
     match failure {
-        BestEffortNodeFailure::DeleteFails | BestEffortNodeFailure::DeleteOutlastsWaitBudget => {
+        BestEffortNodeFailure::DeleteFails
+        | BestEffortNodeFailure::DeleteOutlastsWaitBudget
+        | BestEffortNodeFailure::DeleteAcknowledged => {
             substrate.delete_execution(sandbox_id).await?
         }
         BestEffortNodeFailure::RetireBackupMoot => assert_eq!(
@@ -641,6 +683,19 @@ async fn teardown_continues_past_a_best_effort_node_failure(
         !worker.received(failed_method).is_empty(),
         "{failure:?}: the failing step must have run"
     );
+    if matches!(failure, BestEffortNodeFailure::DeleteAcknowledged) {
+        use prost::Message;
+        let calls = worker.received("WorkerApi/DeleteSandbox");
+        let request = pplx_space_sbx_mgr_client::proto::DeleteRequest::decode(calls[0].clone())?;
+        assert!(
+            !request.blocking,
+            "teardown must request admission, not cleanup completion"
+        );
+        assert!(
+            worker.received("WorkerApi/SandboxState").is_empty(),
+            "an acknowledged delete needs no recovery probe"
+        );
+    }
     if let BestEffortNodeFailure::DeleteOutlastsWaitBudget = failure {
         // The substrate's wait budget, not the node RPC timeout, ends the
         // wait, so the teardown frees its dispatcher slot.

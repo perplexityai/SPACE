@@ -325,7 +325,7 @@ fn access_idle_deadline_request(
 /// has not admitted it. Each attempt waits up to the teardown's node-delete
 /// wait and admission probe, so together they span about the node RPC
 /// timeout that bounds any single node call.
-const ROLLBACK_NODE_DELETE_ATTEMPTS: usize = 12;
+const ROLLBACK_NODE_DELETE_ATTEMPTS: usize = 36;
 
 impl SandboxController {
     pub async fn update(

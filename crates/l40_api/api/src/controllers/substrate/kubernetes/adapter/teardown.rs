@@ -36,9 +36,10 @@ fn fenced_runtime_pod_ip(
     assigned_pod_ip(live_pod).ok().flatten()
 }
 
-/// Whether the node reports a blocking delete that outlasted the teardown's
-/// wait budget as admitted: the row is in `deleting`, which sbx-mgr enters
-/// only after the delete's refusals pass, or it is gone. Anything else,
+/// Whether the node reports an ambiguously acknowledged delete as admitted:
+/// the requested row is in `deleting`, which sbx-mgr enters
+/// only after the delete's refusals pass. A missing row is not proof of
+/// admission: node-local files can outlive it. Anything else,
 /// including a probe that fails or does not answer in time, means the refusals
 /// may not have run.
 async fn node_delete_admitted(client: &mut RuntimeClient, sandbox_id: SandboxId) -> bool {
@@ -50,11 +51,10 @@ async fn node_delete_admitted(client: &mut RuntimeClient, sandbox_id: SandboxId)
     else {
         return false;
     };
-    response
-        .into_inner()
-        .sandboxes
-        .iter()
-        .all(|sandbox| sandbox.lifecycle() == SandboxLifecycleState::Deleting)
+    response.into_inner().sandboxes.iter().any(|sandbox| {
+        sandbox.sandbox_id == sandbox_id.to_string()
+            && sandbox.lifecycle() == SandboxLifecycleState::Deleting
+    })
 }
 
 /// Project the world as it is now into the same shape the fence carries, so
@@ -583,42 +583,16 @@ impl KubernetesSubstrate {
                         client.delete_sandbox(pplx_space_sbx_mgr_client::proto::DeleteRequest {
                             sandbox_id: sandbox_id.to_string(),
                             template_filter: None,
-                            blocking: true,
+                            blocking: false,
                         }),
                     )
                     .await;
                     let error = match node_delete {
                         Ok(Ok(_)) => None,
                         Ok(Err(error)) => Some(error),
-                        Err(_elapsed) => {
-                            // sbx-mgr runs the delete's refusals (suspend
-                            // pending, retained only copy) when it moves the
-                            // row to `deleting`. Past that point its cleanup
-                            // executor owns the work: dropping this request
-                            // drops only the waiter, and the executor's
-                            // recovery scan adopts a `deleting` row whose job
-                            // was not yet persisted. So an admitted delete
-                            // continues, as the UNAVAILABLE a node at its
-                            // cgroup deadline does. A delete still queued for
-                            // a cleanup permit or fence has not been checked,
-                            // so the teardown defers and the operation retries
-                            // it within its retry budget.
-                            if !node_delete_admitted(&mut client, sandbox_id).await {
-                                return Err(SubstrateError::NodeDeleteNotAdmitted {
-                                    message: format!(
-                                        "sandbox {sandbox_id} node-local delete was not confirmed admitted within the {}ms teardown wait budget; retry the delete",
-                                        node_delete_wait.as_millis()
-                                    ),
-                                });
-                            }
-                            tracing::warn!(
-                                sandbox_id = %sandbox_id,
-                                wait_budget_ms = node_delete_wait.as_millis() as u64,
-                                "node-local sandbox delete exceeded the teardown wait budget; \
-                                 continuing teardown while sbx-mgr durable cleanup finishes"
-                            );
-                            None
-                        }
+                        Err(_elapsed) => Some(tonic::Status::deadline_exceeded(
+                            "node-local delete admission did not answer within its wait budget",
+                        )),
                     };
                     if let Some(error) = error {
                         match classify_sandbox_delete_rpc_error(&error) {
@@ -636,25 +610,42 @@ impl KubernetesSubstrate {
                                     ),
                                 });
                             }
-                            SandboxDeleteRpcErrorDisposition::ContinueTeardown => {
-                                tracing::warn!(
+                            SandboxDeleteRpcErrorDisposition::ProbeAdmission => {
+                                // A lost reply does not cancel durable cleanup.
+                                // Conversely, a transport or storage error is
+                                // not evidence that admission ever happened.
+                                if !node_delete_admitted(&mut client, sandbox_id).await {
+                                    return Err(SubstrateError::NodeDeleteNotAdmitted {
+                                        message: format!(
+                                            "sandbox {sandbox_id} node-local delete admission is unconfirmed; keeping execution tracked for retry: {error}"
+                                        ),
+                                    });
+                                }
+                                tracing::debug!(
                                     sandbox_id = %sandbox_id,
                                     error = %error,
-                                    "best-effort sandbox delete RPC failed during execution teardown"
+                                    "confirmed node-local delete admission after an ambiguous reply"
                                 );
                             }
                         }
                     }
                 }
-            } else if let Err(cause) = worker
-                && mode.requires_stop_success()
-            {
-                return Err(SubstrateError::Failed {
-                    message: format!(
-                        "{cause} for in-VM stop during execution retire; \
-                         keeping execution tracked for retry"
-                    ),
-                });
+            } else if let Err(cause) = worker {
+                if mode.sends_sandbox_delete() {
+                    return Err(SubstrateError::NodeDeleteNotAdmitted {
+                        message: format!(
+                            "{cause} for node-local delete admission; keeping execution tracked for retry"
+                        ),
+                    });
+                }
+                if mode.requires_stop_success() {
+                    return Err(SubstrateError::Failed {
+                        message: format!(
+                            "{cause} for in-VM stop during execution retire; \
+                             keeping execution tracked for retry"
+                        ),
+                    });
+                }
             }
         }
 
