@@ -561,6 +561,12 @@ const RETRYABLE_REFUSAL: &str = "Failed to create pod sandbox: rpc error: code =
     desc = failed to create shim task: sbx-manager Wake [space-err=Unavailable]: node-manager \
     is restarting";
 
+const MEMORY_REFUSAL: &str = "Failed to create pod sandbox: rpc error: code = ResourceExhausted \
+    desc = sbx-manager Wake [space-err=ResourceExhausted]: network allocate failed: \
+    node memory admission refused: insufficient node memory";
+const QUEUE_REFUSAL: &str = "Failed to create pod sandbox: rpc error: code = ResourceExhausted \
+    desc = sbx-manager Wake [space-err=ResourceExhausted]: lifecycle queue full";
+
 /// What the node records for the create's pod sandbox, and how the apiserver
 /// answers the create's watch of those events.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -572,31 +578,51 @@ enum NodeRefusal {
     /// The node refuses the request as invalid, and the apiserver throttles
     /// the first watch of the pod's events.
     InvalidAfterThrottledWatch,
+    Memory,
+    MemoryWithFlagOff,
+    MemoryWithFlagUnset,
+    QueueFull,
 }
 
-/// A create whose node refuses its pod sandbox as invalid fails with the
-/// node's reason as soon as kubelet records the refusal, instead of waiting
-/// out the readiness budget for a pod IP that never comes; its pod is deleted
-/// and its execution retired. The create watches its pod's refusals from the
-/// apiserver's cache rather than polling a LIST of them, and a watch the
-/// apiserver throttles is watched again. Any other refusal leaves the wait to
-/// its deadline.
+/// Invalid requests and opt-in memory refusals fail with the node's reason,
+/// delete the pod and retire its execution. Other refusals leave kubelet to
+/// retry until the readiness deadline. Events come from a pod-scoped watch,
+/// including after the apiserver throttles it.
 #[rstest::rstest]
 #[case::invalid_request_fails_the_create(NodeRefusal::Invalid)]
 #[case::other_refusals_wait_for_the_deadline(NodeRefusal::Retryable)]
 #[case::a_throttled_watch_is_watched_again(NodeRefusal::InvalidAfterThrottledWatch)]
+#[case::memory_refusal_is_retryable(NodeRefusal::Memory)]
+#[case::memory_refusal_waits_with_flag_off(NodeRefusal::MemoryWithFlagOff)]
+#[case::memory_refusal_waits_by_default(NodeRefusal::MemoryWithFlagUnset)]
+#[case::queue_full_keeps_kubelet_retry(NodeRefusal::QueueFull)]
 #[tokio::test(flavor = "current_thread")]
-async fn create_fails_when_its_node_refuses_the_pod_as_invalid(
-    #[case] refusal: NodeRefusal,
-) -> TestResult {
-    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+async fn create_handles_node_refusal(#[case] refusal: NodeRefusal) -> TestResult {
+    let enabled = if matches!(
+        refusal,
+        NodeRefusal::Invalid | NodeRefusal::MemoryWithFlagOff
+    ) {
+        "false"
+    } else {
+        "true"
+    };
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files_and(&[(
+        "SPACE_CREATE_FAIL_FAST_ON_NODE_REJECTION",
+        (refusal != NodeRefusal::MemoryWithFlagUnset).then(|| std::ffi::OsStr::new(enabled)),
+    )]) {
         return Ok(());
     }
-    let fails_fast = refusal != NodeRefusal::Retryable;
-    let message = if fails_fast {
-        INVALID_DISK_REFUSAL
-    } else {
-        RETRYABLE_REFUSAL
+    let fails_fast = matches!(
+        refusal,
+        NodeRefusal::Invalid | NodeRefusal::InvalidAfterThrottledWatch | NodeRefusal::Memory
+    );
+    let message = match refusal {
+        NodeRefusal::Invalid | NodeRefusal::InvalidAfterThrottledWatch => INVALID_DISK_REFUSAL,
+        NodeRefusal::Memory | NodeRefusal::MemoryWithFlagOff | NodeRefusal::MemoryWithFlagUnset => {
+            MEMORY_REFUSAL
+        }
+        NodeRefusal::QueueFull => QUEUE_REFUSAL,
+        NodeRefusal::Retryable => RETRYABLE_REFUSAL,
     };
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     let sandbox_id = SandboxId::new();
@@ -714,13 +740,18 @@ async fn create_fails_when_its_node_refuses_the_pod_as_invalid(
         return Ok(());
     }
 
-    let SubstrateError::InvalidRequest { message } = &error else {
-        panic!("expected the node's refusal, got {error:?}");
-    };
-    assert!(
-        message.contains("smaller than cloned rootfs size 451 MiB"),
-        "the error carries the node's reason: {message}"
-    );
+    match (&error, refusal) {
+        (SubstrateError::Unavailable { message }, NodeRefusal::Memory) => {
+            assert!(message.contains("node memory admission refused"));
+        }
+        (
+            SubstrateError::InvalidRequest { message },
+            NodeRefusal::Invalid | NodeRefusal::InvalidAfterThrottledWatch,
+        ) => {
+            assert!(message.contains("smaller than cloned rootfs size 451 MiB"));
+        }
+        _ => panic!("expected the node's refusal, got {error:?}"),
+    }
     // Far inside the production readiness budget, with room for a throttled
     // watch's re-watch delay and a loaded runner. The watch assertion above,
     // not this bound, is what rules out polling.

@@ -2109,8 +2109,9 @@ impl ActivationFailureStage {
     ///   CRI layer drops it, leaving only the shim's `[space-err=<Code>]`
     ///   message marker in the pod event. A create waiting for its pod's IP
     ///   reads the `InvalidArgument` marker (`INVALID_ARGUMENT_MARKER` in the
-    ///   API's Kubernetes substrate) and fails with the node's reason; nothing
-    ///   in the control plane reads the other codes yet. Kubelet keeps
+    ///   API's Kubernetes substrate) and fails with the node's reason. The
+    ///   allocation path separately preserves memory-admission refusals for
+    ///   opt-in fail-fast handling. Kubelet keeps
     ///   retrying `RunPodSandbox` on its own backoff whatever is returned
     ///   here, and any other wedged pod is still reaped by the age-based
     ///   stuck-`ContainerCreating` sweep rather than failed at the first
