@@ -450,6 +450,7 @@ impl Harness {
                 ..Default::default()
             },
             checkpoint_local_artifact_id: self.checkpoint_artifact,
+            attempt_id: crate::db::new_runtime_upgrade_attempt_id(),
         }
     }
 
@@ -584,6 +585,22 @@ async fn a_stopped_sandbox_upgrade_ends_stopped_when_asked() {
     );
     assert_eq!(h.row().state, SandboxStatus::from(SandboxState::Stopped));
     assert_eq!(h.row().execution_metadata, Some(h.envs.target.clone()));
+}
+
+/// An upgrade records the attempt it ran as, so its report names it.
+#[tokio::test]
+async fn an_upgrade_records_the_attempt_it_ran_as() {
+    let h = harness(SandboxState::Stopped);
+    let operation_id = operation();
+    let request = h.request(operation_id, RuntimeUpgradeTargetState::Stopped);
+    let attempt_id = request.attempt_id.clone();
+
+    h.upgrader.upgrade(request).await.unwrap();
+
+    let report = crate::db::read::runtime_upgrade_report(&h.db.lock().unwrap(), operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.attempt_id, Some(attempt_id));
 }
 
 #[tokio::test]
@@ -1526,6 +1543,27 @@ fn requests_are_parsed_strictly() {
     assert_eq!(parsed.target_state, RuntimeUpgradeTargetState::Stopped);
     assert_eq!(parsed.target, reference(&envs.target));
     assert!(parsed.authorization.memory_loss);
+    // A request that names no attempt is a fresh one, under an id the node
+    // generates; one that names an attempt runs as it.
+    assert!(!parsed.attempt_id.is_empty());
+    assert_ne!(
+        parse_request(valid()).unwrap().attempt_id,
+        parsed.attempt_id,
+        "each request that names no attempt gets its own"
+    );
+    let named = parse_request(UpgradeRuntimeRequest {
+        attempt_id: Some("attempt-a".into()),
+        ..valid()
+    })
+    .unwrap();
+    assert_eq!(named.attempt_id, "attempt-a");
+    let longest = "a".repeat(MAX_ATTEMPT_ID_BYTES);
+    let at_bound = parse_request(UpgradeRuntimeRequest {
+        attempt_id: Some(longest.clone()),
+        ..valid()
+    })
+    .unwrap();
+    assert_eq!(at_bound.attempt_id, longest, "an id at the bound is kept");
 
     type Mutation = Box<dyn Fn(&mut UpgradeRuntimeRequest)>;
     let refusals: Vec<(&str, Mutation)> = vec![
@@ -1598,6 +1636,18 @@ fn requests_are_parsed_strictly() {
         (
             "stopped start",
             Box::new(|r| r.start.as_mut().unwrap().target_state = WakeTargetState::Stopped as i32),
+        ),
+        (
+            "empty attempt id",
+            Box::new(|r| r.attempt_id = Some(String::new())),
+        ),
+        (
+            "blank attempt id",
+            Box::new(|r| r.attempt_id = Some(" ".into())),
+        ),
+        (
+            "oversized attempt id",
+            Box::new(|r| r.attempt_id = Some("a".repeat(MAX_ATTEMPT_ID_BYTES + 1))),
         ),
     ];
     for (case, mutate) in refusals {

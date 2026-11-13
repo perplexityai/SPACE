@@ -61,6 +61,7 @@ pub fn fence_runtime_upgrade(
                 .execution_metadata
                 .as_ref()
                 .expect("the fixture's sandbox has a saved consumer"),
+            attempt_id: &crate::db::new_runtime_upgrade_attempt_id(),
         },
     )
     .unwrap()
