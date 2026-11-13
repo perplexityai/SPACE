@@ -18,7 +18,6 @@ recorded as null.
 from __future__ import annotations
 
 import argparse
-import base64
 import concurrent.futures
 import json
 import os
@@ -30,15 +29,13 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
 from sbx_bench_common import (
+    ApiError,
     SandboxCli,
+    SpaceApi,
     UUID_RE,
     add_common_ssh_args,
     checked_prereq,
@@ -56,6 +53,7 @@ from sbx_bench_common import (
 )
 
 SCHEMA_VERSION = 1
+IDEMPOTENCY_PREFIX = "bench-balloon"
 PROFILES = ("build", "alloc-free", "file-heavy", "idle")
 MIB = 1024 * 1024
 DISK_RE = re.compile(r"^(nvme\d+n\d+|sd[a-z]+|xvd[a-z]+|vd[a-z]+)$")
@@ -317,214 +315,6 @@ def http_response_split(text: str) -> tuple[int | None, str]:
 
 
 # --- SPACE API client (API mode) --------------------------------------------
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        return None
-
-
-# Never send the management or attachment token through an inherited proxy or a redirect.
-_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
-_TERMINAL_FAILED = {"failed", "canceled", "cancelled", "expired"}
-_SANDBOX_GONE = {"failed", "deleted", "deleting", "stopped"}
-
-
-class ApiError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None) -> None:
-        super().__init__(message)
-        self.status = status
-
-
-class SpaceApi:
-    """Minimal stdlib client for the public SPACE API, used by ``--api-url`` mode.
-
-    Commands inside a sandbox need a route token that only the SPACE API mints,
-    so on clusters that enforce it (EKS) node-local ``space-sbxmgr exec`` is
-    refused. In API mode the harness drives every sandbox operation through
-    the API and keeps taking host measurements locally, so it must run on the
-    node the sandboxes land on.
-    """
-
-    def __init__(self, api_url: str, data_plane_url: str, token: str, *, poll_secs: float = 0.25) -> None:
-        self.api_url = api_url.rstrip("/")
-        self.data_plane_url = data_plane_url.rstrip("/")
-        self.token = token
-        self.poll_secs = poll_secs
-
-    def request(self, method: str, path: str, body: Any = None, *, idempotent: bool = False, timeout: float = 30) -> dict[str, Any]:
-        headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
-        data = None
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-            data = json.dumps(body).encode()
-        if idempotent:
-            headers["Idempotency-Key"] = f"bench-balloon-{uuid.uuid4().hex}"
-        req = urllib.request.Request(self.api_url + path, data=data, headers=headers, method=method)
-        try:
-            with _HTTP.open(req, timeout=timeout) as response:
-                raw = response.read()
-        except urllib.error.HTTPError as error:
-            with error:
-                detail = error.read(2048).decode("utf-8", errors="replace")
-            raise ApiError(f"{method} {path}: HTTP {error.code}: {detail}", error.code) from error
-        except (urllib.error.URLError, OSError) as error:
-            raise ApiError(f"{method} {path}: {error}") from error
-        if not raw.strip():
-            return {}
-        result = json.loads(raw)
-        if not isinstance(result, dict):
-            raise ApiError(f"{method} {path}: expected a JSON object")
-        return result
-
-    def wait_operation(self, operation_id: str, timeout: float) -> None:
-        deadline = time.monotonic() + timeout
-        while True:
-            state = self.request("GET", f"/v1/operations/{operation_id}").get("state")
-            if state == "succeeded":
-                return
-            if state in _TERMINAL_FAILED:
-                raise ApiError(f"operation {operation_id} {state}")
-            if time.monotonic() >= deadline:
-                raise ApiError(f"operation {operation_id} still {state} after {timeout:.0f}s")
-            time.sleep(self.poll_secs)
-
-    def wait_state(self, sandbox_id: str, target: str, timeout: float) -> None:
-        deadline = time.monotonic() + timeout
-        while True:
-            state = self.request("GET", f"/v1/sandboxes/{sandbox_id}").get("state")
-            if state == target:
-                return
-            if state in _SANDBOX_GONE:
-                raise ApiError(f"sandbox {sandbox_id} is {state}, expected {target}")
-            if time.monotonic() >= deadline:
-                raise ApiError(f"sandbox {sandbox_id} still {state} after {timeout:.0f}s, expected {target}")
-            time.sleep(self.poll_secs)
-
-    def wait_ready(self, sandbox_id: str, timeout: float) -> None:
-        self.wait_state(sandbox_id, "running", timeout)
-        self.request("GET", f"/v1/sandboxes/{sandbox_id}/processes?limit=1", timeout=min(timeout, 180))
-
-    def create(self, template: str, resources: dict[str, int]) -> tuple[str, str]:
-        """POST the create and return (sandbox_id, operation_id) without waiting."""
-        body = {"template": template, "runtime": "fc", "resources": resources}
-        result = self.request("POST", "/v1/sandboxes", body, idempotent=True)
-        sandbox_id, operation_id = result.get("sandbox_id"), result.get("operation_id")
-        if not isinstance(sandbox_id, str) or not sandbox_id.startswith("sbx_") or not isinstance(operation_id, str):
-            raise ApiError(f"create returned no sandbox_id or operation_id: {result}")
-        return sandbox_id, operation_id
-
-    def wait_created(self, sandbox_id: str, operation_id: str, timeout: float) -> None:
-        self.wait_operation(operation_id, timeout)
-        self.wait_ready(sandbox_id, timeout)
-
-    def lifecycle(self, sandbox_id: str, action: str, timeout: float) -> None:
-        result = self.request("POST", f"/v1/sandboxes/{sandbox_id}:{action}", {}, idempotent=True)
-        operation_id = result.get("operation_id")
-        if isinstance(operation_id, str):
-            self.wait_operation(operation_id, timeout)
-
-    def delete(self, sandbox_id: str, timeout: float = 300) -> None:
-        result = self.request("DELETE", f"/v1/sandboxes/{sandbox_id}", idempotent=True)
-        operation_id = result.get("operation_id")
-        if isinstance(operation_id, str):
-            self.wait_operation(operation_id, timeout)
-
-    def sandbox_state(self, sandbox_id: str) -> str | None:
-        """Return the sandbox state, or None when the API does not find it."""
-        try:
-            return self.request("GET", f"/v1/sandboxes/{sandbox_id}").get("state")
-        except ApiError as error:
-            if error.status == 404:
-                return None
-            raise
-
-    def delete_after_create(self, sandbox_id: str, create_operation_id: str, timeout: float) -> None:
-        """Delete a sandbox whose create may still be in flight, until the API no longer finds it.
-
-        A delete issued while the create is queued may not take effect, so the
-        sandbox can come up afterwards. The API also cannot find a sandbox before
-        its create records it, so a miss only proves it gone once the create ends.
-        """
-        deadline = time.monotonic() + timeout
-        last = ""
-        try:
-            # Issue one delete now so a create that has not started can be canceled;
-            # don't wait on it, since its operation can queue behind the create.
-            self.request("DELETE", f"/v1/sandboxes/{sandbox_id}", idempotent=True)
-        except ApiError as error:
-            last = str(error)
-        while True:
-            try:
-                created = self.request("GET", f"/v1/operations/{create_operation_id}").get("state")
-                if created == "succeeded" or created in _TERMINAL_FAILED:
-                    state = self.sandbox_state(sandbox_id)
-                    if state in (None, "deleted"):
-                        return
-                    if state != "deleting":
-                        self.delete(sandbox_id, max(1.0, deadline - time.monotonic()))
-            except ApiError as error:
-                last = str(error)
-            if time.monotonic() >= deadline:
-                raise ApiError(f"sandbox {sandbox_id} still present after {timeout:.0f}s: {last}")
-            time.sleep(self.poll_secs)
-
-    def events_url(self, attach: dict[str, Any]) -> str:
-        url = str(attach.get("events_url") or "")
-        path = urllib.parse.urlsplit(url).path if "://" in url else url
-        if not path.startswith("/v1/sessions/"):
-            raise ApiError(f"unexpected events URL {url!r}")
-        if self.data_plane_url:
-            return self.data_plane_url + path
-        if "://" in url:
-            return url
-        raise ApiError("the API returned a relative events URL; pass --data-plane-url")
-
-    def run(self, sandbox_id: str, argv: Sequence[str], timeout: float) -> tuple[int, str]:
-        """Run argv in the guest; return (exit code, stdout+stderr). 125 means no clean exit."""
-        body = {"command": list(argv), "timeout": f"{max(1, int(timeout))}s"}
-        command = self.request("POST", f"/v1/sandboxes/{sandbox_id}/commands", body, idempotent=True)
-        attach = command.get("attach") or {}
-        token = attach.get("token")
-        if not isinstance(token, str) or not token:
-            raise ApiError("command response carried no attach token")
-        req = urllib.request.Request(
-            self.events_url(attach), headers={"Authorization": f"Bearer {token}", "Accept": "text/event-stream"}
-        )
-        chunks: list[bytes] = []
-        exit_code: int | None = None
-        try:
-            with _HTTP.open(req, timeout=timeout + 30) as response:
-                data: list[bytes] = []
-                for line in response:
-                    line = line.rstrip(b"\r\n")
-                    if line:
-                        field, _, value = line.partition(b":")
-                        if field == b"data":
-                            data.append(value[1:] if value.startswith(b" ") else value)
-                        continue
-                    if not data:
-                        continue
-                    frame = json.loads(b"\n".join(data))
-                    data = []
-                    kind = frame.get("type") if isinstance(frame, dict) else None
-                    if kind in ("stdout", "stderr"):
-                        chunks.append(base64.b64decode(frame.get("data_base64") or ""))
-                    elif kind == "process_exited":
-                        code = frame.get("exit_code")
-                        exit_code = code if type(code) is int else 125
-                        break
-                    elif kind in ("error", "resync_required"):
-                        chunks.append(f"\n[event stream {kind}: {frame}]".encode())
-                        break
-        except urllib.error.HTTPError as error:
-            with error:
-                detail = error.read(2048).decode("utf-8", errors="replace")
-            raise ApiError(f"events: HTTP {error.code}: {detail}") from error
-        except (urllib.error.URLError, OSError) as error:
-            raise ApiError(f"events: {error}") from error
-        out = b"".join(chunks).decode("utf-8", errors="replace")
-        return (125 if exit_code is None else exit_code), out
 
 
 def local_id(sandbox_id: str) -> str:
@@ -796,7 +586,7 @@ class BalloonBenchmark:
                 token = Path(args.api_token_file).read_text().strip()
             if not token:
                 raise SystemExit("ERROR: API mode needs SPACE_API_TOKEN or --api-token-file")
-            self.api = SpaceApi(args.api_url, args.data_plane_url, token)
+            self.api = SpaceApi(args.api_url, args.data_plane_url, token, idempotency_prefix=IDEMPOTENCY_PREFIX)
             # The cluster resolves templates, so the prefix only governs the host probes.
             self.prefix = api_mode_sudo_prefix(args)
         else:

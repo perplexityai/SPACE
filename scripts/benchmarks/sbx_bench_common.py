@@ -549,7 +549,7 @@ class SpaceApi:
         token: str,
         *,
         poll_secs: float = 0.25,
-        idempotency_prefix: str = "bench-balloon",
+        idempotency_prefix: str = "bench",
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.data_plane_url = data_plane_url.rstrip("/")
