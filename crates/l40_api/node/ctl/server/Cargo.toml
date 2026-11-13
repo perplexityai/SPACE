@@ -35,6 +35,7 @@ dashmap = { workspace = true }
 futures-util = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 kube = { workspace = true, default-features = false, features = ["aws-lc-rs", "client", "config", "rustls-tls"], optional = true }
+pplx-space-accounts = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-host-layout = { workspace = true }

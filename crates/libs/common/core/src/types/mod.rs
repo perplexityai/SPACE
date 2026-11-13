@@ -23,7 +23,6 @@
 //! ```
 
 pub mod admin;
-pub mod auth;
 pub mod auto_lifecycle;
 pub mod balloon;
 pub mod client_id;
@@ -34,7 +33,6 @@ pub mod disk_io;
 pub mod env;
 pub mod environment;
 pub use pplx_space_execution_spec::execution;
-pub mod federated_identity;
 pub use pplx_space_execution_spec::guest_image;
 pub use pplx_space_execution_spec::host_cpu;
 pub mod host_linux;
@@ -65,7 +63,6 @@ pub use pplx_space_semver as version;
 
 #[cfg(feature = "serde")]
 pub use admin::*;
-pub use auth::*;
 pub use auto_lifecycle::*;
 pub use balloon::*;
 pub use client_id::*;
@@ -76,7 +73,6 @@ pub use disk_io::*;
 pub use env::*;
 pub use environment::*;
 pub use execution::*;
-pub use federated_identity::*;
 pub use host_cpu::*;
 pub use host_linux::*;
 pub use kek::*;

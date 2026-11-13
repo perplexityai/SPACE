@@ -21,11 +21,12 @@ use crate::node_group_placement::{
     NodeGroupPlacementResolveError, PlacementSubject, ResolvePath as NodeGroupResolvePath,
     ResolvedPlacement,
 };
+use pplx_space_accounts::NodeId;
 use pplx_space_cluster_pool::{OpenPoolSlotDeleteLock, WarmPoolStore};
 use pplx_space_common_core::{
     sql,
     types::{
-        ArtifactKind, AutoLifecyclePolicy, BackupSource, ExecutionGeneration, NodeAddress, NodeId,
+        ArtifactKind, AutoLifecyclePolicy, BackupSource, ExecutionGeneration, NodeAddress,
         NodeManagedBy as SpaceNodeManagedBy, PodUid, SandboxLifecycle,
         SandboxTransitionTargetState,
     },

@@ -21,7 +21,8 @@
 //! already be true for, so removing them cannot change the result for any data.
 //! Their job is to give the planner an indexable driver, not to decide anything.
 
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{SandboxId, SnapshotId};
 
 use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{

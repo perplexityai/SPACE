@@ -4,9 +4,10 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::{
     sql,
-    types::{AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakeSource, NodeId, SandboxId},
+    types::{AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakeSource, SandboxId},
 };
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDbResult, pg_test_db};
 use pplx_space_node_api_sim::SimWorkerHarness;

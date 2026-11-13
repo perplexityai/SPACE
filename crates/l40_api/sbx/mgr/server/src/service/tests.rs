@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{JobId, SandboxId, SnapshotId, UserId};
+use pplx_space_accounts::{JobId, UserId};
+use pplx_space_common_core::types::{SandboxId, SnapshotId};
 
 use super::activation::{
     WAKE_ROUTE_SECURITY_CONNECT_RETRY_POLICY, WAKE_ROUTE_SECURITY_SYNC_TIMEOUT,
@@ -264,6 +265,9 @@ pub(crate) mod service_tests {
         SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
         suspend_snapshot_staging_dir, write_deferred_suspend_artifact, write_full_suspend_artifact,
     };
+    use pplx_space_accounts::{
+        BUILDER_SANDBOX_OWNER, DEPLOY_SANDBOX_OWNER, DEV_SANDBOX_OWNER, NodeId, ROOT_SANDBOX_OWNER,
+    };
     use pplx_space_api_route::{
         SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY, SpaceApiBridgeCallerPolicy,
         set_space_api_bridge_caller_policy,
@@ -277,11 +281,10 @@ pub(crate) mod service_tests {
     };
     use pplx_space_common_core::types::{
         ArtifactKind, ArtifactOrigin, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
-        AutoLifecycleStage, BUILDER_SANDBOX_OWNER, ClusterId, DEPLOY_SANDBOX_OWNER,
-        DEV_SANDBOX_OWNER, ExecutionGeneration, LocalArtifactId, NodeId, NodeManagedBy, PodUid,
-        ROOT_SANDBOX_OWNER, RouteGeneration, SandboxActivationAttemptId,
-        SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
-        SandboxQuarantineSource, SandboxRouteIdentity, SpaceApiRouteIdentity,
+        AutoLifecycleStage, ClusterId, ExecutionGeneration, LocalArtifactId, NodeManagedBy, PodUid,
+        RouteGeneration, SandboxActivationAttemptId, SandboxQuarantineHistoryAction,
+        SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
+        SandboxRouteIdentity, SpaceApiRouteIdentity,
     };
     use pplx_space_host_layout::identities::{user_names, users};
     use pplx_space_k8s_node_id::space_k8s_node_id;
@@ -4062,7 +4065,7 @@ pub(crate) mod service_tests {
         };
 
         let user = SandboxOwner::parse("user:00000000-0000-0000-0000-000000000042").unwrap();
-        let tmplmgr = &pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER;
+        let tmplmgr = &pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER;
 
         // Adopted user sandbox holding a live instance subvolume.
         let user_sandbox = SandboxId::new().to_string();
@@ -4244,7 +4247,7 @@ pub(crate) mod service_tests {
                 "UPDATE sandboxes SET user = ?2 WHERE id = ?1",
                 crate::db::fixture::params![
                     id,
-                    pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
+                    pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
                 ],
             )
             .unwrap();
@@ -4336,7 +4339,7 @@ pub(crate) mod service_tests {
             "UPDATE sandboxes SET user = ?2, pool_template = 'seed' WHERE id = ?1",
             crate::db::fixture::params![
                 &ids[window],
-                pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
+                pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
             ],
         )
         .unwrap();
@@ -4460,7 +4463,7 @@ pub(crate) mod service_tests {
                 crate::db::fixture::params![
                     id,
                     template,
-                    pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
+                    pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
                 ],
             )
             .unwrap();

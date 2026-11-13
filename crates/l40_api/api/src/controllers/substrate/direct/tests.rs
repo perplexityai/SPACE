@@ -1,8 +1,10 @@
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{SandboxId, SnapshotId};
 
 use super::*;
+use pplx_space_accounts::{Email, OrgId, UserId};
 use pplx_space_common_core::types::{
-    ArtifactKind, Email, LocalArtifactId, NodeManagedBy, NodePoolName, OrgId, TemplateName, UserId,
+    ArtifactKind, LocalArtifactId, NodeManagedBy, NodePoolName, TemplateName,
 };
 use pplx_space_db_test_fixtures::{
     TestDb, pg_test_db_with_max_connections, try_pg_test_db_with_max_connections,

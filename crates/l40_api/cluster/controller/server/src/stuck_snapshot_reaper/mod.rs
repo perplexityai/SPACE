@@ -79,7 +79,8 @@
 //! substrate-agnostic Postgres CAS plus telemetry, so it runs in both Direct
 //! and Kubernetes modes.
 
-use pplx_space_common_core::types::{NodeId, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::SnapshotId;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Pod;
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_test_env::TestResult;
 
 use super::*;

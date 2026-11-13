@@ -219,7 +219,7 @@ async fn pooled_adoption_applies_per_sandbox_setup_before_route_adoption() -> Te
     assert_eq!(update.sandbox_id, inputs.claim.sandbox_id.to_string());
     assert_eq!(
         update.expected_current_owner.as_deref(),
-        Some(pplx_space_common_core::types::ROOT_SANDBOX_OWNER.as_str()),
+        Some(pplx_space_accounts::ROOT_SANDBOX_OWNER.as_str()),
         "the owner flip is conditional on the pool's root owner"
     );
     assert_eq!(

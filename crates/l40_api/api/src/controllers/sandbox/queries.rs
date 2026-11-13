@@ -2,7 +2,8 @@ use crate::controllers::substrate::{
     ActivationAttribution, ActivationClient, AdoptionLabelOutcome, AdoptionLabelTransient,
     CapPolicy, RecoveryCharge,
 };
-use pplx_space_common_core::types::{ClientId, OrgId, SandboxId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_common_core::types::{ClientId, SandboxId};
 
 use super::*;
 use crate::controllers::substrate::{
@@ -12,10 +13,11 @@ use crate::controllers::substrate::{
 };
 use crate::controllers::{db_contention_error, internal_error, pool_store_error};
 use axum::http::StatusCode;
+use pplx_space_accounts::NodeId;
 use pplx_space_api_route::wait_ready_lifecycle_request;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{DiskIoLimits, NodeId};
+use pplx_space_common_core::types::DiskIoLimits;
 use pplx_space_events::{
     CreateShapeSource, SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger,
     SandboxEventType,
@@ -72,7 +74,7 @@ async fn finalize_created_sandbox(
 }
 
 struct PooledCreateInput<'a> {
-    federated_grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
+    federated_grant_audience: pplx_space_accounts::FederatedGrantAudience,
     pool: &'a PgPool,
     req: &'a CreateSandboxRequest,
     env: &'a BTreeMap<String, String>,
@@ -772,9 +774,9 @@ impl SandboxCreateEventContext<'_> {
                 self.volume_encryption,
             )
             .owner_source(if self.federated_owner.is_some() {
-                pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity.as_str()
+                pplx_space_accounts::SandboxOwnerSource::FederatedIdentity.as_str()
             } else {
-                pplx_space_common_core::types::SandboxOwnerSource::Local.as_str()
+                pplx_space_accounts::SandboxOwnerSource::Local.as_str()
             })
             .requested_template(self.requested_template.to_string())
             .template_id(self.template)

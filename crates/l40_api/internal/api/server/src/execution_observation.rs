@@ -1,11 +1,10 @@
 //! Decode publication evidence without treating omission or collection failure
 //! as an empty inventory. Existing placement projections remain unchanged.
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::{
     sql,
-    types::{
-        ArtifactComponentMetadata, GuestPlatform, NodeId, RuntimeIdentity, StateFormatIdentity,
-    },
+    types::{ArtifactComponentMetadata, GuestPlatform, RuntimeIdentity, StateFormatIdentity},
 };
 use pplx_space_execution_common::proto::NodeExecutionInventory;
 use sqlx::types::Json;

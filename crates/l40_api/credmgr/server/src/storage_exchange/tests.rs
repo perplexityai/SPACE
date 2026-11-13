@@ -2,9 +2,9 @@ use pplx_space_common_core::types::SnapshotId;
 
 use std::collections::HashMap;
 
-use pplx_space_common_core::{
-    types::ContentHash, types::K8sNodeName, types::K8sNodeUid, types::OrgId, types::SandboxId,
-    types::StorageUri, types::TemplateName, types::snapshot_shard,
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::{
+    ContentHash, K8sNodeName, K8sNodeUid, SandboxId, StorageUri, TemplateName, snapshot_shard,
 };
 
 use super::*;

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{JobId, OrgId};
+use pplx_space_accounts::{JobId, OrgId};
 
 pub mod blob;
 mod blob_storage;
@@ -26,8 +26,9 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 pub use crate::metrics::TemplateBuildErrorKind;
+use pplx_space_accounts::BUILDER_SANDBOX_OWNER;
 use pplx_space_common_core::types::{
-    BUILDER_SANDBOX_OWNER, ContentHash, DEFAULT_GUEST_USER, DEFAULT_TEMPLATE_TAG, TemplateBuildId,
+    ContentHash, DEFAULT_GUEST_USER, DEFAULT_TEMPLATE_TAG, TemplateBuildId,
 };
 use pplx_space_host_layout::identities::group_names;
 pub use pplx_space_net_common::NetworkPolicyV1;
@@ -50,7 +51,7 @@ use environment::StepEnvironment;
 pub use environment::{BuildEnvironmentError, PreparedRecipe};
 use execution_binding::BuildExecutionBinding;
 pub use execution_binding::BuildExecutionBindingError;
-pub use pplx_space_common_core::types::{SystemPublicationGrantId, TenantPublicationGrantId};
+pub use pplx_space_accounts::{SystemPublicationGrantId, TenantPublicationGrantId};
 pub use publish::{
     PublishError, TemplateOrg, TemplatePublication, publish_build, register_build_template,
 };

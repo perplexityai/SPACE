@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use axum::response::IntoResponse;
 use futures_util::StreamExt as _;
-use pplx_space_common_core::types::{NodeId, OrgId, SandboxId};
+use pplx_space_accounts::{NodeId, OrgId};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db_with_max_connections};
 use pplx_space_public_api::SandboxConditionType;
 use pplx_space_sandbox_store::{StoredSandboxLifecycle, test_support::NON_CANONICAL_ROWS};

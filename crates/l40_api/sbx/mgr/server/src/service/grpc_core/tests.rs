@@ -354,7 +354,7 @@ impl CleanupFixture {
             .map(|row| row.state)
     }
 
-    fn active_cleanup_job(&self, id: &str) -> Option<pplx_space_common_core::types::JobId> {
+    fn active_cleanup_job(&self, id: &str) -> Option<pplx_space_accounts::JobId> {
         pplx_space_common_jobs::db::find_active_job(
             self.service.db_conn().unwrap().raw(),
             crate::db::cleanup_jobs::KIND,
@@ -903,7 +903,7 @@ async fn auto_lifecycle_delete_requires_one_canonical_id_and_the_expected_policy
                 route_generation: Some(
                     pplx_space_common_core::types::RouteGeneration::new(7).unwrap(),
                 ),
-                current_node_id: Some(pplx_space_common_core::types::NodeId::new()),
+                current_node_id: Some(pplx_space_accounts::NodeId::new()),
                 execution_generation: Some(ExecutionGeneration::new(7).unwrap()),
                 activation_attempt_id: Some(
                     pplx_space_common_core::types::SandboxActivationAttemptId::new(),

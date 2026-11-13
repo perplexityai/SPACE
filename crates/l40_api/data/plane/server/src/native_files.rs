@@ -28,7 +28,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_native_files::FileOperation;
 use pplx_space_native_files::limits::{

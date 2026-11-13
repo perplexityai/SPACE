@@ -25,7 +25,7 @@
 //! repo-wide rule against background work in API servers, no part of
 //! the policy lives in the API process.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::SandboxId;
 
 use std::future::Future;

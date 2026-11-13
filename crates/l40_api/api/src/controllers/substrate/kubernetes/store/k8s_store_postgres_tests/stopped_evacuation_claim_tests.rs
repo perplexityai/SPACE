@@ -5,7 +5,8 @@
 //! the parent is already very large. These take `&PostgresStore` and run from
 //! `k8s_store_postgres_behaviors`.
 
-use pplx_space_common_core::types::{NodeId, SandboxId, SandboxLifecycle};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 
 use super::*;
 

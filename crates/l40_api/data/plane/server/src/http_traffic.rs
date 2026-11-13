@@ -19,7 +19,8 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use http_body::{Frame, SizeHint};
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::SandboxId;
 
 use super::{EcwHostConfig, should_proxy_ecw_service_port_request};
 

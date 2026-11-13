@@ -50,7 +50,7 @@
 //! don't want to use this path. The master enable gate
 //! `SPACE_ORPHANED_NODES_ENABLED` is the per-environment opt-in.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use std::sync::Arc;
 use std::time::Duration;

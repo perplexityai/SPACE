@@ -29,7 +29,7 @@
 //! both are each required to exist, so the comparison cannot pass by finding
 //! nothing.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{

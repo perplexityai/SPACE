@@ -28,11 +28,10 @@
 //!   resumes. The destructure still lists it so a future node-fs requirement is
 //!   surfaced at both consumers.
 //!
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, ClientId, DiskIoLimits, EnvMap, SandboxOwner,
-};
+use pplx_space_accounts::SandboxOwner;
+use pplx_space_common_core::types::{AutoLifecyclePolicy, ClientId, DiskIoLimits, EnvMap};
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_pod::SandboxRuntimePodMetadata;

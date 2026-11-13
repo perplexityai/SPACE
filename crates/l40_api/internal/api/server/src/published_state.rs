@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, SnapshotId, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{SnapshotId, SubstrateKind};
 
 use pplx_space_common_core::sql;
 use std::collections::{BTreeMap, BTreeSet};

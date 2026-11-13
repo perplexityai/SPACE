@@ -3,7 +3,7 @@
 //! ECW's legacy-org bridge is intentionally not part of this contract.
 
 use crate::routes::public::error::database_error;
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
 use axum::{
     extract::{FromRequestParts, Path, Request, State},
@@ -11,7 +11,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use pplx_space_common_core::types::SandboxOwnerSource;
+use pplx_space_accounts::SandboxOwnerSource;
 use pplx_space_public_api::PublicSandboxId;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;

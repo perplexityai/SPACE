@@ -11,6 +11,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-accounts = { workspace = true, features = ["serde"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

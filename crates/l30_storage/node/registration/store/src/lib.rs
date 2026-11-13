@@ -4,7 +4,8 @@
 //! registration check on `node_k8s`: whether a Kubernetes node name and UID
 //! map to a SPACE node. Other `node_k8s` reads stay with their callers.
 
-use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid, NodeId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid};
 use pplx_space_sql_locator::sql;
 
 mod register;

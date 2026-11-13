@@ -7,7 +7,7 @@
 //! set-default, delete) lock the group row `FOR UPDATE` and run their residue
 //! checks inside the same transaction so two operators cannot race a guard.
 
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 
 use std::collections::HashMap;
 

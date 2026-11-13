@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt, stream};
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{NodeManagedBy, NodeRole as SpaceNodeRole};
 use pplx_space_node_api_client::proto::{
     StateReconciliationReason as ProtoReconcileReason, TriggerStateReconciliationRequest,

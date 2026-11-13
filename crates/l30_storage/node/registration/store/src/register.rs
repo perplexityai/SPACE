@@ -1,7 +1,8 @@
 //! Registering a Kubernetes node: its `nodes` row and its `node_k8s` row, in
 //! the caller's transaction.
 
-use pplx_space_common_core::types::{NodeId, NodeRole, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{NodeRole, SubstrateKind};
 use pplx_space_sql_locator::sql;
 use sqlx::PgConnection;
 

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
 use std::time::Duration;
 
@@ -586,12 +586,12 @@ fn resolve_replay_probes(probes: Vec<(OrgId, ObservePublicOperationIdempotency)>
 
 fn fork_owner_for_source(
     federated_owner: Option<&crate::federated_identity::FederatedOwner>,
-    source_owner_source: pplx_space_common_core::types::SandboxOwnerSource,
+    source_owner_source: pplx_space_accounts::SandboxOwnerSource,
 ) -> Option<&crate::federated_identity::FederatedOwner> {
     federated_owner.filter(|_| {
         matches!(
             source_owner_source,
-            pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity
+            pplx_space_accounts::SandboxOwnerSource::FederatedIdentity
         )
     })
 }

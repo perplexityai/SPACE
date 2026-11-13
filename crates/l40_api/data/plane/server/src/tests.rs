@@ -2,6 +2,7 @@ use super::*;
 use crate::{native::first_frame_attach_token_from_recv, runtime_route::sweep_expired_ecw_routes};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
+use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_api_route::{
     RouteIdentityRemediation, SpaceApiRouteIdentityDimension, SpaceApiRouteProtocol,
     set_route_identity_rejection_metadata,
@@ -12,7 +13,7 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Token,
 };
 use pplx_space_common_core::types::{
-    ClusterId, EnvMap, ExecutionGeneration, GuestPort, NodeId, OrgId, PodUid, RouteGeneration,
+    ClusterId, EnvMap, ExecutionGeneration, GuestPort, PodUid, RouteGeneration,
     SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity, SimpleDuration,
     SpaceApiRouteIdentity,
 };

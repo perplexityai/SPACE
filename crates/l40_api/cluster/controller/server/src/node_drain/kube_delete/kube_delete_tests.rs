@@ -4,7 +4,7 @@
 //! the row stuck in `terminating`, so each branch is pinned by what reached the
 //! API server as well as by what `terminate` returned.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use std::sync::{Arc, Mutex};
 

@@ -312,7 +312,8 @@ async fn cancelled_activation_retries_release_admission_without_releasing_the_lo
     use crate::service::activation_support::internal_request;
     use crate::service::tests::service_tests::insert_test_sandbox;
     use crate::state::SandboxState;
-    use pplx_space_common_core::types::{NodeId, SandboxActivationAttemptId, SandboxId};
+    use pplx_space_accounts::NodeId;
+    use pplx_space_common_core::types::{SandboxActivationAttemptId, SandboxId};
 
     enum LockSite {
         Staging,

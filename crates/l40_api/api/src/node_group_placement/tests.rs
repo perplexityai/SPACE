@@ -6,7 +6,8 @@
 //! generic one, and that an empty `node_groups` table is distinguishable from
 //! an absent `templates` row. A fake store would assert neither.
 
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::SandboxId;
 
 use std::collections::BTreeSet;
 

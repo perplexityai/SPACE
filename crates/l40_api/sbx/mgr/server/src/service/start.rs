@@ -57,9 +57,10 @@ use crate::{
     proto::{StartRequest, StartResponse},
     state::{SandboxState, SandboxStatus, SandboxStatusEventDetails},
 };
+use pplx_space_accounts::SandboxOwnerKind;
 use pplx_space_common_core::types::{
-    SandboxCleanupEpisodeId, SandboxId, SandboxOwnerKind, SandboxQuarantineReasonCode,
-    SpaceApiRouteIdentity, StorageUri,
+    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
+    StorageUri,
 };
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -575,7 +576,7 @@ pub(super) struct ResolvedSandboxMemoryPolicy {
 
 async fn prepare_suspend_restore_dir(
     service: &SandboxManagerService,
-    owner: &pplx_space_common_core::types::SandboxOwner,
+    owner: &pplx_space_accounts::SandboxOwner,
     sandbox_id: String,
     storage_uri: Option<String>,
     execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,

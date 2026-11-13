@@ -1,5 +1,5 @@
-use pplx_space_common_core::types::OrgId;
-use pplx_space_common_core::types::UserId;
+use pplx_space_accounts::OrgId;
+use pplx_space_accounts::UserId;
 
 use super::*;
 use pplx_space_api::public_operations::{ApiProduct, CompleteClaimedPublicOperation};

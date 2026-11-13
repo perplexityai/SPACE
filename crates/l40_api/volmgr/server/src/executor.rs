@@ -10,7 +10,7 @@ pub use stream_push::{
     DEFAULT_STREAM_PUSH_BUFFER_BUDGET_BYTES, SnapshotUploadMode, StreamingPushBudget,
 };
 
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -32,8 +32,9 @@ use crate::credentials::{
 use crate::crypto::{self, CryptoError, decrypted_sibling, encrypted_sibling};
 use crate::materialization::{MaterializationLayout, MaterializationMode};
 use dashmap::DashMap;
+use pplx_space_accounts::OrgId;
 use pplx_space_common_core::types::{
-    KekProvider, MasterKeyIdentifier, OrgId, SandboxId, SnapshotArtifact, StorageUri, SubjectId,
+    KekProvider, MasterKeyIdentifier, SandboxId, SnapshotArtifact, StorageUri, SubjectId,
     SubjectIdParseError, TransferScopeId,
 };
 use pplx_space_common_jobs::{

@@ -25,7 +25,7 @@
 //! every termination will fail with a Kubernetes 403 and rows will
 //! stay stuck in `terminating`.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use kube::api::{DeleteParams, Preconditions};
 use pplx_space_common_core::sql;

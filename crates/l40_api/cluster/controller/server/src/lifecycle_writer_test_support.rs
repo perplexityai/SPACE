@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use axum::response::IntoResponse;
 use k8s_openapi::api::core::v1::Pod;
+use pplx_space_accounts::NodeId;
 use pplx_space_api::controllers::substrate::kubernetes::{
     KubernetesSubstrate, TEST_SANDBOX_NAMESPACE,
 };
@@ -19,7 +20,7 @@ use pplx_space_bearer_token::{
     SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV, SPACE_NODE_API_TOKEN_PATH_ENV,
 };
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::internal_transport::INSECURE_DEV_ENV;
 use pplx_space_db_test_fixtures::TestDb;
 use pplx_space_test_env::TestResult;

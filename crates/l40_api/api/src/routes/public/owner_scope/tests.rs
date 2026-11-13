@@ -4,8 +4,8 @@ use axum::{
     body::Body,
     http::{Method, StatusCode},
 };
+use pplx_space_accounts::OrgId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::OrgId;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db};
 use pplx_space_public_api::OperationId;
 use serde_json::{Value, json};

@@ -125,7 +125,8 @@
 //! - RP13 `rp13_backoff_disabled_schedules_no_retry` — base `0` disables the
 //!   backoff: no attempt state written, and the sweep bypasses stale windows
 
-use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
 
 use super::store::PodLessHold;
 use super::*;

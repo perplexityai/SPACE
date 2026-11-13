@@ -1,7 +1,8 @@
 use super::*;
 use crate::node_manager_transport::fake::FakeNodeManager;
+use pplx_space_accounts::SandboxOwner;
+use pplx_space_common_core::types::SandboxRuntimeLabel;
 use pplx_space_common_core::types::guest_image::{GuestDiskLayout, GuestNetwork, GuestReadiness};
-use pplx_space_common_core::types::{SandboxOwner, SandboxRuntimeLabel};
 use pplx_space_node_mgr_client::proto::{ProbeGuestServiceRequest, ProbeGuestServiceResponse};
 use pplx_space_policy_authority::PolicyAuthority;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -464,7 +465,7 @@ async fn restored_windows_registration_preserves_guest_identity_and_native_app_r
     crate::db::update_user(
         &conn,
         &id,
-        &pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER,
+        &pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER,
     )
     .unwrap();
     let service = SandboxManagerService::for_test(conn);

@@ -7,10 +7,8 @@
 //! accepted the build, any builder for one hour. These are the windows
 //! `template_build_base_grants` honours for the same submission.
 
-use pplx_space_common_core::{
-    sql,
-    types::{NodeId, OrgId, TemplateName, TenantPublicationGrantId},
-};
+use pplx_space_accounts::{NodeId, OrgId, TenantPublicationGrantId};
+use pplx_space_common_core::{sql, types::TemplateName};
 use sqlx::PgExecutor;
 
 #[derive(Debug, thiserror::Error)]

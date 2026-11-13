@@ -75,9 +75,10 @@ fn dedicated_node_group_placement(include_shared: bool) -> NodeGroupPlacement {
 use std::collections::BTreeMap;
 
 use super::*;
+use pplx_space_accounts::OrgId;
 use pplx_space_common_core::types::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-    AutoLifecyclePolicy, AutoLifecycleStage, NodeGroupName, OrgId,
+    AutoLifecyclePolicy, AutoLifecycleStage, NodeGroupName,
 };
 
 const TEST_SANDBOX_ID: pplx_space_common_core::types::SandboxId =
@@ -88,14 +89,10 @@ const TEST_POOL_SANDBOX_ID: pplx_space_common_core::types::SandboxId =
     pplx_space_common_core::types::SandboxId::from_uuid(Uuid::from_u128(
         0x019e5f38cd2e7400b3c8e33ae36692d7,
     ));
-const TEST_USER_ID: pplx_space_common_core::types::UserId =
-    pplx_space_common_core::types::UserId::from_uuid(Uuid::from_u128(
-        0x00000000000000000000000000000020,
-    ));
-const TEST_ORG_ID: pplx_space_common_core::types::OrgId =
-    pplx_space_common_core::types::OrgId::from_uuid(Uuid::from_u128(
-        0x00000000000000000000000000000002,
-    ));
+const TEST_USER_ID: pplx_space_accounts::UserId =
+    pplx_space_accounts::UserId::from_uuid(Uuid::from_u128(0x00000000000000000000000000000020));
+const TEST_ORG_ID: pplx_space_accounts::OrgId =
+    pplx_space_accounts::OrgId::from_uuid(Uuid::from_u128(0x00000000000000000000000000000002));
 const TEST_POOL_SLOT_ID: Uuid = Uuid::from_u128(0x019e5f38c3387c13a8d4587fd9fd8dd5);
 const TEST_POOL_CONFIG_ID: Uuid = Uuid::from_u128(0x019e5f38c76e7e229b2fe389cc9dc6b3);
 // This stable fixture is independent of deployed template releases.

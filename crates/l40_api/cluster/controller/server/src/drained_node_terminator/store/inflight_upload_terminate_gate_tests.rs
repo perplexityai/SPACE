@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{SandboxId, SnapshotId, SubstrateKind};
 
 use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::try_pg_test_db;

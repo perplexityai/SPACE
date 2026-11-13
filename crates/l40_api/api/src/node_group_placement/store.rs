@@ -37,9 +37,10 @@
 //! cluster into a total create outage. See
 //! [`super::ResolvedPlacement::Unprovisioned`].
 
+use pplx_space_accounts::OrgId;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy, NodeGroupTemplatePolicy, OrgId,
+    NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy, NodeGroupTemplatePolicy,
     TemplateCompatSpec, TemplateName, TemplateVisibility,
 };
 use uuid::Uuid;

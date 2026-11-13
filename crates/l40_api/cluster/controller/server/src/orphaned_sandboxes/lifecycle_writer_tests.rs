@@ -8,7 +8,8 @@
 //! Deferral on an in-flight upload is pinned in `tests.rs`
 //! (`creating_snapshot_defers_disposition`).
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_db_test_fixtures::pg_test_db;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_test_env::TestResult;

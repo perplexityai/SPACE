@@ -1,5 +1,6 @@
 use crate::controllers::substrate::ActivationClient;
-use pplx_space_common_core::types::{ClientId, OrgId};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::ClientId;
 
 use super::*;
 use pplx_space_common_core::types::{AutoLifecyclePolicy, SandboxLifecycle};
@@ -176,7 +177,7 @@ pub(super) fn federated_owner_ref(
 /// Grants bind to a federated owner row; a legacy local sandbox reached through
 /// the bridge has none, so nothing is persisted for it.
 pub(super) fn grant_to_persist<'a>(
-    sandbox_owner_source: pplx_space_common_core::types::SandboxOwnerSource,
+    sandbox_owner_source: pplx_space_accounts::SandboxOwnerSource,
     federated_owner: Option<&'a crate::federated_identity::FederatedOwner>,
     grant: Option<&'a crate::federated_identity::FederatedServiceGrant>,
 ) -> Option<(
@@ -184,10 +185,8 @@ pub(super) fn grant_to_persist<'a>(
     &'a crate::federated_identity::FederatedServiceGrant,
 )> {
     match sandbox_owner_source {
-        pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity => {
-            federated_owner.zip(grant)
-        }
-        pplx_space_common_core::types::SandboxOwnerSource::Local => None,
+        pplx_space_accounts::SandboxOwnerSource::FederatedIdentity => federated_owner.zip(grant),
+        pplx_space_accounts::SandboxOwnerSource::Local => None,
     }
 }
 

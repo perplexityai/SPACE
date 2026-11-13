@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pplx_space_common_core::types::CredentialReferenceId;
+use pplx_space_accounts::CredentialReferenceId;
 use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 use pplx_space_net_common::NetworkPolicyV1;
 

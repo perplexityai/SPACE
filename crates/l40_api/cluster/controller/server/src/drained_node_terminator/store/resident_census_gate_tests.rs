@@ -9,7 +9,8 @@
 //! fail-closed direction is unchanged: a node the control plane cannot see
 //! keeps every row blocking.
 
-use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{SandboxId, SubstrateKind};
 
 use std::time::Duration;
 

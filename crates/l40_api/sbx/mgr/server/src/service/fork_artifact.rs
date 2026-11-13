@@ -1,5 +1,6 @@
+use pplx_space_accounts::JobId;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, JobId, SandboxId, SnapshotArtifact, SubjectId,
+    ArtifactKind, ArtifactOrigin, SandboxId, SnapshotArtifact, SubjectId,
 };
 use pplx_space_node_disk_admission::{
     CacheDiskMeasurement, CacheDiskProbeError, read_cache_disk_measurement,

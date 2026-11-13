@@ -22,7 +22,8 @@
 //! and an insert that sets a token starts the row in `restoring`, as
 //! `insert_unplaced` does.
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::SandboxId;
 
 use pplx_space_common_core::sql;
 use sqlx::PgExecutor;

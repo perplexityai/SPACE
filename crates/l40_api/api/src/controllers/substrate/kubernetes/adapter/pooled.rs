@@ -288,9 +288,7 @@ impl KubernetesSubstrate {
                     memory_mib: None,
                     pids_max: None,
                     expected_current_owner: Some(
-                        pplx_space_common_core::types::ROOT_SANDBOX_OWNER
-                            .as_str()
-                            .to_string(),
+                        pplx_space_accounts::ROOT_SANDBOX_OWNER.as_str().to_string(),
                     ),
                     owner: Some(sandbox_owner.as_str().to_string()),
                     process_env,
