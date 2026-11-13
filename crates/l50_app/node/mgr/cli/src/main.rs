@@ -6,10 +6,11 @@ use pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA
 use pplx_space_node_api_client::proto::GetControllerStateRequest;
 use pplx_space_node_mgr_client::proto::{
     AllocateRequest, AllowPortRequest, CleanupSandboxRequest, DenyPortRequest, ExposePortRequest,
-    InspectSandboxRequest, ListNetworkLeasesRequest, ListOrphanCandidatesRequest,
-    ListOrphanCandidatesResponse, NetworkLease, NetworkPoolStatus, NetworkPoolStatusRequest,
-    NetworkProtocol, NetworkSlotHealth, NetworkSlotState, ReleaseRequest, RepairNetworkPoolRequest,
-    SetNetworkPoolConfigRequest, SetNetworkPoolDrainRequest, UnexposePortRequest,
+    GrowSandboxRootfsRequest, GrowSandboxRootfsResponse, InspectSandboxRequest,
+    ListNetworkLeasesRequest, ListOrphanCandidatesRequest, ListOrphanCandidatesResponse,
+    NetworkLease, NetworkPoolStatus, NetworkPoolStatusRequest, NetworkProtocol, NetworkSlotHealth,
+    NetworkSlotState, ReleaseRequest, RepairNetworkPoolRequest, SetNetworkPoolConfigRequest,
+    SetNetworkPoolDrainRequest, UnexposePortRequest,
 };
 
 const FACET_SANDBOX_DESIRED_STATE: &str = "sandbox-desired-state";
@@ -149,6 +150,15 @@ enum Commands {
     },
     /// Read-only scan for resources without a node-manager lease; not deletion authority
     Orphans,
+    /// Grow a running or paused sandbox's root disk in place (grow-only, plaintext disks).
+    /// Afterwards grow the filesystem inside the guest: `sudo resize2fs /dev/vda`.
+    GrowRootfs {
+        /// Sandbox ID, long UUID prefix, or short label
+        sandbox_id: SandboxSelector,
+        /// New root disk size in MiB (must be larger than the current size)
+        #[arg(long)]
+        size_mib: u32,
+    },
     /// Comprehensive cleanup of one sandbox (kill, network, cgroup, files, slot). Requires sudo.
     Cleanup {
         /// Sandbox ID, long UUID prefix, or short label
@@ -246,6 +256,17 @@ enum Commands {
         #[arg(long, default_value = "tcp")]
         protocol: String,
     },
+}
+
+fn grow_rootfs_summary(sandbox_id: &str, resp: &GrowSandboxRootfsResponse) -> String {
+    const MIB: u64 = 1024 * 1024;
+    format!(
+        "Grew root disk of {} from {} MiB to {} MiB.\n\
+         Next, grow the filesystem inside the guest: sudo resize2fs /dev/vda",
+        sandbox_label_or_id(sandbox_id),
+        resp.previous_bytes / MIB,
+        resp.rootfs_bytes / MIB,
+    )
 }
 
 fn parse_protocol(protocol: &str) -> Result<NetworkProtocol, String> {
@@ -677,6 +698,27 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!("  Guest IP:  {}", resp.guest_ip);
             println!("  UID:       {}", resp.sandbox_uid);
             println!("  Generation: {}", resp.slot_generation);
+        }
+
+        Commands::GrowRootfs {
+            sandbox_id,
+            size_mib,
+        } => {
+            let sandbox_id = resolve_sandbox_selector(&mut client, &sandbox_id).await?;
+            let execution_fence = operator_execution_fence(&mut client, &sandbox_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or("sandbox has no running execution on this node; wake it first")?;
+            let resp = client
+                .grow_sandbox_rootfs(GrowSandboxRootfsRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    execution_fence: Some(execution_fence),
+                    size_mib,
+                })
+                .await
+                .map_err(|e| format!("ERROR: {e}"))?
+                .into_inner();
+            println!("{}", grow_rootfs_summary(&sandbox_id, &resp));
         }
 
         Commands::Release { sandbox_id, force } => {

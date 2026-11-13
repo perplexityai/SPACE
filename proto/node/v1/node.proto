@@ -158,6 +158,13 @@ service NodeManager {
   // Update cgroup resource limits for a running sandbox.
   rpc UpdateCgroup(UpdateCgroupRequest) returns (UpdateCgroupResponse);
 
+  // Operator-only: grow the root disk of a running or paused Firecracker VM
+  // in place. The guest sees the larger disk immediately; its filesystem must
+  // then be grown from inside the guest (for ext4: `resize2fs /dev/vda`).
+  // Grow-only. Plaintext root disks only. The recorded sandbox size is not
+  // changed, so later wakes, forks and transfers keep the grown disk as-is.
+  rpc GrowSandboxRootfs(GrowSandboxRootfsRequest) returns (GrowSandboxRootfsResponse);
+
   // Clone only into a destination already prepared by sandbox-manager.
   // Cleanup removes that destination under the same node operation gate, so
   // a delayed request cannot recreate it.
@@ -1051,6 +1058,18 @@ message UpdateCgroupRequest {
   ExecutionFence execution_fence = 5;
 }
 message UpdateCgroupResponse {}
+
+message GrowSandboxRootfsRequest {
+  string sandbox_id = 1;
+  ExecutionFence execution_fence = 2;
+  // New root disk size in MiB. Must be larger than the current size and
+  // within the platform maximum.
+  uint32 size_mib = 3;
+}
+message GrowSandboxRootfsResponse {
+  uint64 previous_bytes = 1;
+  uint64 rootfs_bytes = 2;
+}
 
 message CloneSandboxRequest {
   string donor_sandbox_id = 1;  // source sandbox to clone from

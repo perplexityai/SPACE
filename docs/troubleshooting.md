@@ -89,6 +89,31 @@ This prints sandbox listings and the saved creation/deletion operations, sandbox
 
 Inspect a running process with `GET /v1/sandboxes/{sandbox_id}/processes/{process_id}`. An empty process list is expected after a command exits; use the saved event transcript to check its result. Keep a failed transcript for diagnosis, but review it for secrets before sharing it.
 
+## Sandbox disk is full
+
+A sandbox's root disk size is fixed when the sandbox is created, and the API
+cannot change it afterwards. An operator on the worker node can grow the root
+disk of a running or paused sandbox in place, without restarting it:
+
+```bash
+sudo space-nodemgr grow-rootfs <sandbox> --size-mib 30720
+```
+
+This makes the disk larger but does not grow the filesystem on it. Do that
+from inside the sandbox, as root, while it keeps running:
+
+```bash
+sudo resize2fs /dev/vda
+df -h /
+```
+
+What to expect:
+
+- Grow-only. The new size must be larger than the current one and within the platform maximum (128 GiB). Asking for the current size again is allowed; it only re-notifies the guest.
+- Plaintext root disks on Firecracker only. Sandboxes with an encrypted root disk are refused.
+- The grown disk is kept across pause, suspend, wake, fork and node-to-node moves. The size shown in the sandbox's stored configuration stays at its original value.
+- The extra space is allocated only as the guest writes to it, and it counts against the node's disk admission.
+
 ## Timeouts mean different things
 
 A client deadline limits how long the client waits; it does not cancel a lifecycle operation or establish that a process stopped. Inspect the resource before retrying or issuing another command.

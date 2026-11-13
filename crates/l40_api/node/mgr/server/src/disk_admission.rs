@@ -20,6 +20,7 @@ pub enum DiskAllocationOperation {
     PrepareSandbox,
     PrepareExternalRootfs,
     BtrfsReceiveInstance,
+    GrowSandboxRootfs,
 }
 
 impl DiskAllocationOperation {
@@ -28,6 +29,7 @@ impl DiskAllocationOperation {
             Self::PrepareSandbox => "prepare_sandbox",
             Self::PrepareExternalRootfs => "prepare_external_rootfs",
             Self::BtrfsReceiveInstance => "btrfs_receive_instance",
+            Self::GrowSandboxRootfs => "grow_sandbox_rootfs",
         }
     }
 }
