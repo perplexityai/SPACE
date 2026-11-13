@@ -133,6 +133,33 @@ impl K8sStore {
         Ok(true)
     }
 
+    /// Release the node of a `stopped` sandbox whose stopped evacuation the
+    /// drain has torn down, under the sandbox row lock execution creation
+    /// also takes. `Ok(false)`, changing nothing, unless the row is still
+    /// `stopped`, carries the evacuation marker and a durable pinned disk
+    /// artifact, and has no active execution; see
+    /// [`pod_tracking::release_published_stopped_evacuation`].
+    pub(in crate::controllers::substrate::kubernetes) async fn release_stopped_evacuation_placement(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, SubstrateError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start stopped evacuation release transaction")?;
+        if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
+            return Ok(false);
+        }
+        let released = pod_tracking::release_published_stopped_evacuation(&mut tx, sandbox_id)
+            .await
+            .db_context("failed to release stopped evacuation placement")?;
+        tx.commit()
+            .await
+            .db_context("failed to commit stopped evacuation release")?;
+        Ok(released)
+    }
+
     /// Clear pod tracking for a sandbox that has **no** active execution,
     /// proving that inside the same locked transaction.
     ///
@@ -578,14 +605,26 @@ impl K8sStore {
         // retire keeps `placement_changed_at` so the legacy snapshot-freshness
         // gate doesn't strand a markerless row's ready snapshot. See
         // [`PlacementClock`].
-        match placement_clock {
+        let unplaced = match placement_clock {
             PlacementClock::Bump => pod_tracking::unplace_after_pod_teardown(tx, sandbox_id).await,
             PlacementClock::Preserve => {
                 pod_tracking::unplace_after_pod_teardown_preserving_placement_clock(tx, sandbox_id)
                     .await
             }
         }
-        .db_context("failed to mark sandbox unplaced")
+        .db_context("failed to mark sandbox unplaced")?;
+        // The unplace refuses a `stopped` row, whose disk is on the node it
+        // names; see `pod_tracking::unplace_after_pod_teardown`. Every caller
+        // holds the row lock, so the row exists and that refusal is the only
+        // way here. The drain's stopped evacuation releases the node itself,
+        // with `release_stopped_evacuation_placement`.
+        if !unplaced {
+            tracing::debug!(
+                sandbox_id = %sandbox_id,
+                "kept the placement of a stopped sandbox after its pod teardown"
+            );
+        }
+        Ok(())
     }
 
     pub(super) async fn recover_markerless_restoring_after_execution_cleanup_in(

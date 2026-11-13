@@ -10,7 +10,7 @@ use super::*;
 use k8s_openapi::api::core::v1::PodStatus;
 
 pub(crate) use kubernetes_tests::{
-    SequencedWakeWorker, deleted_pod_kubernetes_client,
+    SequencedWakeWorker, conflict_then_created_kubernetes_client, deleted_pod_kubernetes_client,
     existing_then_created_running_pod_kubernetes_client, inert_kubernetes_client,
     insert_k8s_execution, insert_ready_full_snapshot_relative_to_lifecycle,
     insert_test_sandbox_row, mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
@@ -28,6 +28,7 @@ pub(super) mod environment_placement;
 mod native_pod_failover;
 mod runtime_upgrade_dispatch;
 mod slot_headroom;
+mod stopped_start_stale_pod;
 mod substrate_scope;
 
 mod kubernetes_tests {
@@ -1376,7 +1377,7 @@ mod kubernetes_tests {
         );
     }
 
-    fn conflict_then_created_kubernetes_client(
+    pub(crate) fn conflict_then_created_kubernetes_client(
         captured_pod_creates: Arc<Mutex<Vec<serde_json::Value>>>,
     ) -> Client {
         let create_attempts = Arc::new(Mutex::new(0usize));
@@ -15013,7 +15014,9 @@ mod kubernetes_tests {
     /// The other half: with no active execution, the same call releases the
     /// node the way `delete_execution` does — the stopped sandbox's retired
     /// pods deleted, its placement cleared, and the placement clock bumped,
-    /// which the restore sweep's stopped arm orders on.
+    /// which the restore sweep's stopped arm orders on. As in production, the
+    /// drain has marked the row and published its disk first: the unplace
+    /// keeps a `stopped` row on its node otherwise.
     #[tokio::test(flavor = "current_thread")]
     async fn a_stopped_teardown_releases_the_node_when_nothing_is_running() -> Result<(), BoxError>
     {
@@ -15023,6 +15026,8 @@ mod kubernetes_tests {
         let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
         insert_test_sandbox_row(&pool, sandbox_id, "stopped").await?;
         let node_id = place_on_fresh_node(&pool, sandbox_id).await?;
+        mark_stopped_evacuation(&pool, sandbox_id).await?;
+        publish_durable_disk(&pool, sandbox_id).await?;
         insert_k8s_execution(&pool, sandbox_id, 1, &pod_name, "uid-retired", None, false).await?;
         assert_eq!(
             placement_of(&pool, sandbox_id).await,
@@ -15055,6 +15060,13 @@ mod kubernetes_tests {
                 .any(|(path, _)| path.ends_with(&pod_name)),
             "the retired execution's pod must be deleted"
         );
+        assert!(
+            substrate
+                .delete_execution_with_no_active_execution(sandbox_id)
+                .await?,
+            "a retry after the release must converge, not defer the drain"
+        );
+        assert_eq!(placement_of(&pool, sandbox_id).await.0, None);
         Ok(())
     }
 
@@ -15081,8 +15093,9 @@ mod kubernetes_tests {
             .bind(stopped)
             .execute(&pool)
             .await?;
-        // The drain's claim on it.
+        // The drain's claim on it, and the disk it published.
         mark_stopped_evacuation(&pool, stopped).await?;
+        publish_durable_disk(&pool, stopped).await?;
 
         // A whole start→stop cycle since the drain's claim: the execution
         // predates the new stop, but the start cleared the marker.
@@ -15218,6 +15231,7 @@ mod kubernetes_tests {
                 .execute(&pool)
                 .await?;
             mark_stopped_evacuation(&pool, sandbox_id).await?;
+            publish_durable_disk(&pool, sandbox_id).await?;
             sqlx::query(
                 "UPDATE sandbox_k8s_executions
                     SET activation_attempt_id = $2,
@@ -15290,6 +15304,19 @@ mod kubernetes_tests {
                 .await?,
             "a teardown with no sandbox row must refuse"
         );
+        Ok(())
+    }
+
+    /// The durable disk artifact a drain publishes before it releases a
+    /// stopped sandbox's node.
+    async fn publish_durable_disk(pool: &PgPool, sandbox_id: SandboxId) -> Result<(), BoxError> {
+        pplx_space_db_test_fixtures::publish_ready_disk_artifact(
+            pool,
+            sandbox_id,
+            LocalArtifactId::new(),
+            "s3://space-test/stopped-teardown-disk?region=us-east-1",
+        )
+        .await?;
         Ok(())
     }
 

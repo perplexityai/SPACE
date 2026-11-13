@@ -437,8 +437,10 @@ impl StoppedEvacuationClaim {
 ///
 /// * Without the `nodes` term an `:undrain` landing between the claim and here
 ///   would still plant a pin. The claim and the teardown authorization both
-///   ask too; the teardown's placement clear does not (it re-proves only that
-///   no execution is active), which is recorded as an enablement blocker.
+///   ask too; the teardown's placement clear does not (it re-proves the
+///   `stopped` lifecycle, the marker, the durable disk and that no execution
+///   is active, not the node's drain state), which is recorded as an
+///   enablement blocker.
 /// * Without the pin term it wrote whatever identity the node handed back over
 ///   whatever was already there. Benign in the shape the claim guarantees —
 ///   the claim proved the row pinless, so there is nothing to overwrite — but

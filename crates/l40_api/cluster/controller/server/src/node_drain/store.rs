@@ -649,13 +649,12 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
     // its owner's `start` is a hard 503 until the sweep reaches it.
     //
     // `placement_changed_at` is the stopped arm's equivalent: the teardown's
-    // placement clear (`forget_pod_tracking_if_no_active_execution`, in delete
-    // mode) runs under `PlacementClock::Bump` (only `Retire` preserves), so it
-    // is stamped at exactly the moment the row became
-    // unplaced — the same "became the sweep's responsibility" instant the
-    // suspend arm gets from its own column. The `CASE` costs an in-memory sort
-    // the sweep was already doing over a set bounded by the marker's partial
-    // index.
+    // node release (`release_published_stopped_evacuation`) sets it to `NOW()`
+    // in the write that unplaces the row, so it is stamped at exactly the
+    // moment the row became unplaced — the same "became the sweep's
+    // responsibility" instant the suspend arm gets from its own column. The
+    // `CASE` costs an in-memory sort the sweep was already doing over a set
+    // bounded by the marker's partial index.
     format!(
         "SELECT s.id, s.evacuation_restore_target
            FROM sandboxes s
@@ -2671,17 +2670,17 @@ impl SubstrateSink {
                 );
                 // Retryable, and safe to retry: the bytes are already durable,
                 // the claim is still held, and a partially-applied teardown
-                // converges because the delete clears placement even when it
-                // finds no pod left to remove.
+                // converges because the release runs again even when the
+                // delete finds no execution left to retire or pod to remove.
                 return Err(EvacuateError::LocalTeardown(err.to_string()));
             }
         };
         if !torn_down {
             return Ok(StoppedEvacuationOutcome::Deferred {
                 reason: format!(
-                    "sandbox {sandbox_id} is being started, was started or lost its evacuation \
-                     marker after the teardown was authorized; its copy on the node was \
-                     left alone"
+                    "sandbox {sandbox_id} is being started, was started, or lost its evacuation \
+                     marker or its durable disk artifact after the teardown was authorized; \
+                     its node keeps it"
                 ),
             });
         }

@@ -26,6 +26,7 @@ mod stopped_evacuation_claim_tests;
 mod stopped_restore_selector_tests;
 mod substrate_scope_tests;
 mod suspend_lifecycle_matrix_tests;
+mod unplace_lifecycle_matrix_tests;
 use node_registration_tests::{
     RegistrationCaller, RegistrationFootprint, insert_placeable_sandbox, registration_footprint,
 };
