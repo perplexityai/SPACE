@@ -301,14 +301,15 @@ pub struct SandboxNetworkPolicyInputs {
 /// `node_id`, active or as the target of a pending migration. A requested id
 /// that is not placed there is absent from the result, not an error: the
 /// caller is a node asking about its own set.
-pub async fn network_policy_inputs_placed_on(
-    executor: impl sqlx::PgExecutor<'_> + Copy,
+pub async fn network_policy_inputs_placed_on<'c>(
+    executor: impl sqlx::Acquire<'c, Database = sqlx::Postgres>,
     node_id: NodeId,
     sandbox_ids: &[SandboxId],
 ) -> Result<Vec<SandboxNetworkPolicyInputs>, SandboxStoreError> {
     if sandbox_ids.is_empty() {
         return Ok(Vec::new());
     }
+    let mut conn = executor.acquire().await?;
     let mut rows = sqlx::query_as::<_, SandboxNetworkPolicyInputs>(sql!(
         "SELECT s.id AS sandbox_id,
                 s.template_id,
@@ -321,7 +322,7 @@ pub async fn network_policy_inputs_placed_on(
     ))
     .bind(sandbox_ids)
     .bind(node_id)
-    .fetch_all(executor)
+    .fetch_all(&mut *conn)
     .await?;
 
     // A node's sandboxes share a handful of templates, so each template's
@@ -342,7 +343,7 @@ pub async fn network_policy_inputs_placed_on(
              WHERE t.name = ANY($1)"
         ))
         .bind(&template_names)
-        .fetch_all(executor)
+        .fetch_all(&mut *conn)
         .await?
         .into_iter()
         .collect();
