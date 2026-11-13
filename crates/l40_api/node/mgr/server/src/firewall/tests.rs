@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(target_os = "linux")]
+mod linux;
+
 #[test]
 fn exact_comment_handle_extraction_does_not_match_port_prefixes() {
     let output = r#"

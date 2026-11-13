@@ -7,6 +7,9 @@
 //! policy included in `sandbox_base`. Normalize JSON keys and whitespace, keeping
 //! rule order and values. [`HASH_REVISION`] versions this format; markers use
 //! `space-cfg:<part>=r<revision>.<digest>`.
+//!
+//! Reset teardown is best effort. Sandbox table installation uses `create`,
+//! so a surviving table fails the transaction and triggers a namespace rebuild.
 
 use serde::de::Error as _;
 use sha2::Digest;

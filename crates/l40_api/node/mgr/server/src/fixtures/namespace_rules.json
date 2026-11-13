@@ -1,7 +1,7 @@
 {
   "nftables": [
     {
-      "add": {
+      "create": {
         "table": {
           "family": "ip",
           "name": "sandbox"
