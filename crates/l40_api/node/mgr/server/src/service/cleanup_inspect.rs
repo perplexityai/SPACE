@@ -6,6 +6,9 @@ use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
 };
 use pplx_space_host_layout::paths;
+use pplx_space_node_runtime_core::cgroup_paths::{
+    CGROUP_BASE as SANDBOX_CGROUP_ROOT, jailer_cgroup_path_in,
+};
 use pplx_space_sandbox_model::SandboxId;
 use tracing::Instrument as _;
 
@@ -932,7 +935,7 @@ impl NodeManagerService {
 /// or the sidecar cgroup `sbx-{id}` when the jailer cgroup is absent.
 fn sandbox_cgroup_dir(parent: &std::path::Path, sandbox_id: &str) -> Option<std::path::PathBuf> {
     [
-        pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path_in(parent, sandbox_id),
+        jailer_cgroup_path_in(parent, sandbox_id),
         parent.join(format!("sbx-{sandbox_id}")),
     ]
     .into_iter()
@@ -957,8 +960,6 @@ fn parse_cleanup_request(
     request.sandbox_id = sandbox_id.to_string();
     Ok((sandbox_id, request))
 }
-
-const SANDBOX_CGROUP_ROOT: &str = "/sys/fs/cgroup/space";
 
 /// The sandbox cgroup files Stats reports, from the cgroup
 /// `sandbox_cgroup_dir` picks. Absent files read as empty.
