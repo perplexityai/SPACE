@@ -1,19 +1,19 @@
 """A Delete whose node-local delete stalls releases its dispatcher slot.
 
-A Delete teardown waits at most 10 s on the node's blocking sandbox-manager
-`DeleteSandbox`, then asks the node, bounded at 2 s, whether it admitted the
-delete (`SandboxState` reads `deleting`, or no row). If it did, the teardown
-continues and deletes the pod, and the node's cleanup executor finishes the
-rest. If it did not, or the node does not answer, the teardown defers: the
-sandbox is kept and the operation is requeued, so each attempt holds a
-dispatcher slot for about 12 s rather than the node RPC's 150 s.
+A Delete teardown waits at most 2 s for the node's nonblocking durable
+admission, then probes an ambiguous result for at most 2 s. Only a matching
+`deleting` row confirms admission; absence alone does not. Confirmed admission
+allows pod cleanup and control-plane finalization while the node executor
+finishes physical cleanup. Otherwise tracking is retained and the operation
+is requeued.
 
 The stall is the cgroup v2 freezer on one node service's container. A frozen
 sandbox-manager answers nothing, so its delete is never admitted; a frozen
 node-manager leaves sandbox-manager serving while the cleanup it admitted
 hangs on node-manager. The thaw is armed before each freeze, and each stall
 stays under the service's liveness window; the thaw asserts the container's
-restart count is unchanged, so a kubelet restart fails the scenario.
+pod UID, container ID, and restart count are unchanged, so a restart or
+replacement fails the scenario.
 
 A slot is held from the operation's `claimed` event to the `requeued` or
 terminal event that ends that attempt; both are public operation events.
@@ -24,7 +24,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
-from space_smoke.capabilities import NodeDeleteStallControl, OperationEvent
+from space_smoke.capabilities import NodeDeleteStallControl, NodeServiceIdentity, OperationEvent
 
 if TYPE_CHECKING:
     from space_smoke.capabilities import CommandSandbox
@@ -73,7 +73,7 @@ class NodeDeleteStallAssertions:
         self._scope = scope
         self._thaw: Compensation | None = None
         self._frozen_at: float | None = None
-        self._frozen: tuple[str, str, int] | None = None
+        self._frozen: tuple[str, str, NodeServiceIdentity] | None = None
 
     def node_of(self, sandbox_id: str) -> str:
         placement = self._control.sandbox_pod_placement(sandbox_id)
@@ -88,13 +88,27 @@ class NodeDeleteStallAssertions:
     def freeze(self, node_name: str, component: str) -> None:
         """Freeze the service; its thaw is armed first."""
 
-        def thaw() -> None:
-            self._control.thaw_node_service(node_name, component)
+        identity = self._control.node_service_identity(node_name, component)
 
-        self._frozen = (node_name, component, self._control.node_service_restarts(node_name, component))
+        def thaw() -> None:
+            self._control.thaw_node_service(node_name, component, identity)
+
+        self._frozen = (node_name, component, identity)
         self._thaw = self._scope.defer(f"thaw {component} on {node_name}", thaw, critical=True)
-        self._control.freeze_node_service(node_name, component)
+        self._control.freeze_node_service(node_name, component, identity)
         self._frozen_at = time.monotonic()
+
+    def _verify_identity(self, node_name: str, component: str) -> None:
+        assert self._frozen is not None
+        frozen_node, frozen_component, expected = self._frozen
+        after = self._control.node_service_identity(node_name, component)
+        self._fixture.verify(
+            (node_name, component) == (frozen_node, frozen_component) and after == expected,
+            f"the frozen {component} was restarted or replaced",
+            node=node_name,
+            identity_before=repr(expected),
+            identity_after=repr(after),
+        )
 
     def thaw(self) -> float:
         """Thaw the frozen service; returns how long it was frozen.
@@ -104,29 +118,25 @@ class NodeDeleteStallAssertions:
         """
 
         assert self._thaw is not None and self._frozen_at is not None and self._frozen is not None
+        node_name, component, _ = self._frozen
+        self._verify_identity(node_name, component)
         thaw, self._thaw = self._thaw, None
         thaw.release()
         frozen_for = round(time.monotonic() - self._frozen_at, 1)
-        node_name, component, restarts = self._frozen
         self._fixture.record(f"{component}_frozen_seconds", frozen_for)
-        after = self._control.node_service_restarts(node_name, component)
-        self._fixture.verify(
-            after == restarts,
-            f"the kubelet restarted the frozen {component}",
-            node=node_name,
-            restarts_before=restarts,
-            restarts_after=after,
-        )
+        self._verify_identity(node_name, component)
         return frozen_for
 
     def expect_service_hangs(self, node_name: str, component: str) -> None:
         """The frozen service's own health socket does not answer past the teardown's budget."""
 
+        self._verify_identity(node_name, component)
         started = time.monotonic()
         answered = self._control.node_service_health_answers(
             node_name, component, rpc_timeout=HANG_PROOF_SECONDS
         )
         waited = round(time.monotonic() - started, 1)
+        self._verify_identity(node_name, component)
         self._fixture.record(f"{component}_health_unanswered_seconds", waited)
         self._fixture.verify(
             not answered and waited >= HANG_PROOF_SECONDS,

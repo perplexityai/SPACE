@@ -36,6 +36,7 @@ from space_smoke.capabilities import (
     ControllerLease,
     ControllerPod,
     NodeContainer,
+    NodeServiceIdentity,
     LimiterProbeOutcome,
     PodNetwork,
     TcpProbe,
@@ -4365,11 +4366,14 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     # --- stalled node-local delete --------------------------------------------
 
-    def freeze_node_service(self, node_name: str, component: str) -> None:
+    def freeze_node_service(
+        self, node_name: str, component: str, identity: NodeServiceIdentity
+    ) -> None:
         """Freeze the service's container cgroup and wait until the kernel reports it frozen."""
 
         self._require_isolated_kind("node-service freeze")
-        script = _NODE_SERVICE_CGROUP_SCRIPT.replace("__COMPONENT__", _node_service_component(component)) + (
+        self._require_node_service_identity(node_name, component, identity)
+        script = _node_service_cgroup_script(component, identity) + (
             'echo 1 > "$cg/cgroup.freeze"\n'
             "for _ in $(seq 100); do\n"
             '  grep -qx "frozen 1" "$cg/cgroup.events" && exit 0\n'
@@ -4382,9 +4386,12 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"freeze {component} on {node_name}",
         )
 
-    def thaw_node_service(self, node_name: str, component: str) -> None:
+    def thaw_node_service(
+        self, node_name: str, component: str, identity: NodeServiceIdentity
+    ) -> None:
         self._require_isolated_kind("node-service thaw")
-        script = _NODE_SERVICE_CGROUP_SCRIPT.replace("__COMPONENT__", _node_service_component(component)) + (
+        self._require_node_service_identity(node_name, component, identity)
+        script = _node_service_cgroup_script(component, identity) + (
             'echo 0 > "$cg/cgroup.freeze"\n'
         )
         _require_ok(
@@ -4396,7 +4403,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         self, node_name: str, component: str, *, rpc_timeout: float
     ) -> bool:
         seconds = max(1, int(rpc_timeout))
-        script = _NODE_SERVICE_CGROUP_SCRIPT.replace("__COMPONENT__", _node_service_component(component)) + (
+        script = _node_service_cgroup_script(component) + (
             f"exec timeout {seconds + 10} \"/proc/$pid/root/opt/space/bin/grpc_health_probe\" "
             f"\"-addr=unix:///proc/$pid/root/run/health/__COMPONENT__.sock\" -service=liveness "
             f"-connect-timeout={seconds}s -rpc-timeout={seconds}s\n"
@@ -4404,17 +4411,28 @@ ON CONFLICT (key_hash) DO NOTHING;
         result = self._docker_exec(node_name, "sh", "-c", script, timeout=seconds + 30)
         return result.returncode == 0
 
-    def node_service_restarts(self, node_name: str, component: str) -> int:
+    def node_service_identity(self, node_name: str, component: str) -> NodeServiceIdentity:
         pod = self._node_service_pod(node_name, _node_service_component(component))
         out = _require_ok(
-            self.kubectl(
-                "get", "pod", pod, "-o",
-                f"jsonpath={{.status.containerStatuses[?(@.name=='{component}')].restartCount}}",
-                timeout=15,
-            ),
-            f"read {component}'s restart count on {node_name}",
-        ).strip()
-        return int(out) if out.isdigit() else 0
+            self.kubectl("get", "pod", pod, "-o", "json", timeout=15),
+            f"read {component}'s identity on {node_name}",
+        )
+        payload = json.loads(out)
+        uid = payload.get("metadata", {}).get("uid")
+        statuses = payload.get("status", {}).get("containerStatuses", [])
+        status = next((item for item in statuses if item.get("name") == component), {})
+        container_id, restarts = status.get("containerID"), status.get("restartCount")
+        if not isinstance(uid, str) or not uid or not isinstance(container_id, str) or not container_id:
+            raise RuntimeError(f"{component} on {node_name} has no complete pod/container identity")
+        if type(restarts) is not int or restarts < 0:
+            raise RuntimeError(f"{component} on {node_name} has no valid restart count")
+        return NodeServiceIdentity(uid, container_id, restarts)
+
+    def _require_node_service_identity(
+        self, node_name: str, component: str, expected: NodeServiceIdentity
+    ) -> None:
+        if self.node_service_identity(node_name, component) != expected:
+            raise RuntimeError(f"refusing to freeze/thaw a replacement {component} on {node_name}")
 
     def delete_without_waiting(self, sandbox_id: str) -> str:
         self._require_isolated_kind("native delete")
@@ -7348,13 +7366,28 @@ exit 1
 # Sets `pid` to the main process and `cg` to the cgroup of the node's one
 # running __COMPONENT__ container. The component is a fixed service name.
 _NODE_SERVICE_CGROUP_SCRIPT = r"""set -eu
-id="$(crictl ps --state running --name '^__COMPONENT__$' -q)"
+id=__CONTAINER_SELECTOR__
 [ "$(printf '%s\n' "$id" | grep -c .)" = 1 ] || { echo "expected one running __COMPONENT__ container, found: $id" >&2; exit 3; }
 pid="$(crictl inspect -o go-template --template '{{.info.pid}}' "$id")"
 cg="/sys/fs/cgroup$(sed -n 's/^0:://p' "/proc/$pid/cgroup")"
 """
 
 _NODE_SERVICES_THAT_MAY_STALL = ("sandbox-manager", "node-manager")
+
+
+def _node_service_cgroup_script(
+    component: str, identity: NodeServiceIdentity | None = None
+) -> str:
+    """Target the captured container, even if replacement races the Kubernetes check."""
+
+    selector = '"$(crictl ps --state running --name \'^__COMPONENT__$\' -q)"'
+    if identity is not None:
+        container_id = identity.container_id.removeprefix("containerd://")
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise ValueError("expected an exact containerd container ID")
+        selector = shlex.quote(container_id)
+    script = _NODE_SERVICE_CGROUP_SCRIPT.replace("__CONTAINER_SELECTOR__", selector)
+    return script.replace("__COMPONENT__", _node_service_component(component))
 
 
 def _node_service_component(component: str) -> str:

@@ -692,6 +692,15 @@ class OperationEvent:
     details: Mapping[str, object]
 
 
+@dataclass(frozen=True)
+class NodeServiceIdentity:
+    """The exact service instance whose cgroup a fault injection owns."""
+
+    pod_uid: str
+    container_id: str
+    restarts: int
+
+
 class NodeDeleteStallControl(Protocol):
     """Kind-only operations for stalling a node-local delete.
 
@@ -706,9 +715,13 @@ class NodeDeleteStallControl(Protocol):
 
     def sandbox_pod_placement(self, sandbox_id: str) -> SandboxPodPlacement | None: ...
 
-    def freeze_node_service(self, node_name: str, component: str) -> None: ...
+    def freeze_node_service(
+        self, node_name: str, component: str, identity: NodeServiceIdentity
+    ) -> None: ...
 
-    def thaw_node_service(self, node_name: str, component: str) -> None: ...
+    def thaw_node_service(
+        self, node_name: str, component: str, identity: NodeServiceIdentity
+    ) -> None: ...
 
     def node_service_health_answers(
         self, node_name: str, component: str, *, rpc_timeout: float
@@ -720,8 +733,8 @@ class NodeDeleteStallControl(Protocol):
         """
         ...
 
-    def node_service_restarts(self, node_name: str, component: str) -> int:
-        """The service container's kubelet restart count on that node."""
+    def node_service_identity(self, node_name: str, component: str) -> NodeServiceIdentity:
+        """The service pod UID, container ID, and kubelet restart count."""
         ...
 
     def delete_without_waiting(self, sandbox_id: str) -> str:
