@@ -140,6 +140,7 @@ async fn data_plane_identity_cannot_reuse_guest_authority_for_control_or_transfe
             ("ResolveDataPlaneSessionRoute", true),
             ("BindDataPlaneSessionProcess", true),
             ("RecordDataPlaneSessionReconnect", true),
+            ("RecordDataPlaneSessionProcessExited", true),
             ("GetDataPlaneSessionRevocationState", true),
             ("GetDataPlaneOrgRevocationEpoch", true),
             ("GetSandboxRuntimeAccess", true),

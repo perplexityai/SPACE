@@ -1123,6 +1123,39 @@ pub(super) async fn bind_session_process(
     Ok(())
 }
 
+/// Records that the process bound to the session exited, before the stream
+/// reports it, so that a client reading the session once it has
+/// `process_exited` finds it `closed`. Only the session's public state depends
+/// on it, so a failure, such as a cluster API older than the call, is logged
+/// and the stream goes on, and so is a record still unanswered after
+/// [`DataPlaneState::process_exit_record_timeout`].
+pub(super) async fn record_session_process_exited(
+    state: &DataPlaneState,
+    session_id: DataPlaneSessionId,
+    process_id: &ProcessId,
+) {
+    let mut client = state.cluster_api.for_session(&session_id);
+    let record = client.record_data_plane_session_process_exited(
+        RecordDataPlaneSessionProcessExitedRequest {
+            session_id: session_id.to_string(),
+            protocol_session_id: protocol_session_id(session_id),
+            process_id: process_id.to_string(),
+        },
+    );
+    match tokio::time::timeout(state.process_exit_record_timeout, record).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(status)) => tracing::warn!(
+            code = ?status.code(),
+            message = status.message(),
+            "failed to record a data-plane session's process exit"
+        ),
+        Err(_) => tracing::warn!(
+            timeout_ms = state.process_exit_record_timeout.as_millis() as u64,
+            "timed out recording a data-plane session's process exit"
+        ),
+    }
+}
+
 /// A session's process binding, persisted while the stream keeps forwarding
 /// the process's events.
 ///

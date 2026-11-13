@@ -56,10 +56,11 @@ use pplx_space_node_api_client::proto::{
     BindDataPlaneSessionProcessRequest, DataPlaneReconnectReason, DataPlaneRevocationState,
     DataPlaneRevocationStatus, GetDataPlaneOrgRevocationEpochRequest,
     GetDataPlaneSessionRevocationStateRequest, GetSandboxRuntimeAccessRequest,
-    RecordDataPlaneSessionReconnectRequest, ResolveDataPlaneSessionRouteRequest,
-    ResolveDataPlaneSessionRouteResponse, SandboxRuntimeAccess, SandboxRuntimeAccessDecision,
-    SandboxServiceRouteKey, SandboxServiceRouteKind, SandboxServiceRouteTransport,
-    UnstableResetSandboxServiceRouteRequest, worker_api_client::WorkerApiClient,
+    RecordDataPlaneSessionProcessExitedRequest, RecordDataPlaneSessionReconnectRequest,
+    ResolveDataPlaneSessionRouteRequest, ResolveDataPlaneSessionRouteResponse,
+    SandboxRuntimeAccess, SandboxRuntimeAccessDecision, SandboxServiceRouteKey,
+    SandboxServiceRouteKind, SandboxServiceRouteTransport, UnstableResetSandboxServiceRouteRequest,
+    worker_api_client::WorkerApiClient,
 };
 use pplx_space_public_api::{
     CreateFileWatchSessionRequest, CreateProcessRequest, CreateTerminalSessionRequest,
@@ -160,6 +161,10 @@ const REVOCATION_MAX_STALENESS: Duration = Duration::from_secs(60);
 /// How long one revocation check may wait on the cluster API, across all of
 /// its reads. A check that takes longer counts as unavailable.
 const REVOCATION_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a stream waits to record its process's exit before it reports
+/// the exit anyway. Only the session's public state waits on the record, so a
+/// slow cluster API must not hold `process_exited` for its full RPC timeout.
+const PROCESS_EXIT_RECORD_TIMEOUT: Duration = Duration::from_secs(3);
 /// The longest revocation check interval the service accepts: a third of
 /// what is left of the staleness bound after one check timeout, 19 s at the
 /// defaults. A failed check keeps a verdict until it is that bound less one
@@ -292,6 +297,7 @@ struct DataPlaneState {
     revocation_check_interval: Duration,
     revocation_max_staleness: Duration,
     revocation_check_timeout: Duration,
+    process_exit_record_timeout: Duration,
     route_cache_ttl: Duration,
     /// Cancelled on SIGTERM: a child of the caller's shutdown token. New
     /// streams are refused once it is cancelled, and sockets still
@@ -493,6 +499,7 @@ pub async fn run(
             .max(Duration::from_millis(1)),
         revocation_max_staleness: REVOCATION_MAX_STALENESS,
         revocation_check_timeout: REVOCATION_CHECK_TIMEOUT,
+        process_exit_record_timeout: PROCESS_EXIT_RECORD_TIMEOUT,
         route_cache_ttl: config.route_cache_ttl.max(Duration::from_millis(1)),
         drain_started,
         stream_shutdown_token: stream_shutdown_token.clone(),
