@@ -1592,11 +1592,13 @@ impl IntoResponse for ProxyError {
         observe_data_plane_http_error(status, origin, kind);
         (
             status,
-            Json(DataPlaneHttpError {
-                code,
-                message: message.to_string(),
-                retryable,
-                details: Vec::new(),
+            Json(DataPlaneHttpErrorEnvelope {
+                error: DataPlaneHttpError {
+                    code,
+                    message: message.to_string(),
+                    retryable,
+                    details: Vec::new(),
+                },
             }),
         )
             .into_response()
