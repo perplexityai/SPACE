@@ -1,7 +1,7 @@
 //! Guarded writes the Kubernetes substrate makes to `sandboxes` when it
-//! forgets a sandbox's tracked pod: unplacing the row, and recovering a
-//! `restoring` or `started` row to `suspended` once its execution's cleanup
-//! leaves nothing running. Also the read that decides whether retiring the
+//! forgets a sandbox's tracked pod: unplacing the row, releasing a stopped
+//! evacuation's node, and recovering a `restoring` or `started` row to
+//! `suspended` once its execution's cleanup leaves nothing running. Also the read that decides whether retiring the
 //! executions a `stopped` row's stop left active must refuse.
 //!
 //! The Kubernetes store keeps everything around these statements: the
@@ -17,59 +17,115 @@ use std::sync::LazyLock;
 
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
-    failed_repair_revert_eligibility, restore_retry_suspended_revert_snapshot_exists,
-    started_suspend_revert_eligibility,
+    current_disk_artifact_backup_ready, failed_repair_revert_eligibility,
+    restore_retry_suspended_revert_snapshot_exists, started_suspend_revert_eligibility,
 };
 use sqlx::{Postgres, Transaction};
 
 /// Unplace a sandbox whose pod tracking was torn down, clearing its active
 /// and target nodes and bumping `placement_changed_at` to `NOW()`. Writes an
-/// **operation step** (ends the row's placement after pod teardown).
+/// **operation step** (ends the row's placement after pod teardown). Returns
+/// whether the row was unplaced.
 ///
 /// For delete-shaped teardowns, where nothing is left to keep recoverable.
-/// Matches on the id alone: no lifecycle predicate of its own. It relies on
-/// the caller's row lock, and on the caller having already retired the
-/// execution it tore down, or confirmed that none is active, earlier in this
-/// transaction.
+/// It relies on the caller's row lock, and on the caller having already
+/// retired the execution it tore down, or confirmed that none is active,
+/// earlier in this transaction.
+///
+/// It refuses a `stopped` row and leaves it placed. A stopped sandbox's rootfs
+/// stays on the node its `active_node_id` names, and every node-drain guard
+/// finds the node's stopped residents through that column, so unplacing one
+/// would let a drain terminate the node holding its disk. A pod teardown
+/// can't tell whether the rootfs still matches any published copy: a start
+/// can boot the guest, let it write and fail with the row still `stopped`.
+/// The drain's stopped evacuation asks the node that before it releases one,
+/// with [`release_published_stopped_evacuation`].
 pub async fn unplace_after_pod_teardown(
     tx: &mut Transaction<'_, Postgres>,
     sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
         "UPDATE sandboxes
                  SET placement = 'unplaced',
                      active_node_id = NULL,
                      target_node_id = NULL,
                      placement_changed_at = NOW()
-                 WHERE id = $1"
+                 WHERE id = $1
+                   AND lifecycle <> 'stopped'"
     ))
     .bind(sandbox_id)
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 /// [`unplace_after_pod_teardown`] for a recoverability-preserving retire:
 /// `placement_changed_at` is kept, so a markerless row's ready snapshot stays
 /// fresh against it. Writes an **operation step**, as
-/// [`unplace_after_pod_teardown`] does.
-///
-/// Matches on the id alone, as [`unplace_after_pod_teardown`] does.
+/// [`unplace_after_pod_teardown`] does, and returns whether the row was
+/// unplaced. It refuses a `stopped` row, for the same reason.
 pub async fn unplace_after_pod_teardown_preserving_placement_clock(
     tx: &mut Transaction<'_, Postgres>,
     sandbox_id: SandboxId,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
         "UPDATE sandboxes
                  SET placement = 'unplaced',
                      active_node_id = NULL,
                      target_node_id = NULL
-                 WHERE id = $1"
+                 WHERE id = $1
+                   AND lifecycle <> 'stopped'"
     ))
     .bind(sandbox_id)
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
+}
+
+/// Release the node of a `stopped` sandbox the drain's stopped evacuation has
+/// torn down: unplace the row, clearing its active and target nodes and
+/// bumping `placement_changed_at` to `NOW()`, which the restore sweep's
+/// stopped arm orders on. Writes an **operation step**. Returns whether the
+/// row was released.
+///
+/// Guarded on `stopped`, the `'stopped'` evacuation marker, a durable pinned
+/// disk artifact ([`current_disk_artifact_backup_ready`]) and no active
+/// execution. The marker alone isn't enough: the drain sets it when it claims
+/// the row, before the disk is published. The caller holds the sandbox row
+/// lock, which execution creation also takes, and has already confirmed with
+/// the node that the rootfs it holds is the one the artifact describes.
+/// Releasing an already-unplaced row matches again, so a retried teardown
+/// converges.
+pub async fn release_published_stopped_evacuation(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+) -> Result<bool, sqlx::Error> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        let durable = current_disk_artifact_backup_ready("s");
+        sql!(format!(
+            "UPDATE sandboxes s
+                SET placement = 'unplaced',
+                    active_node_id = NULL,
+                    target_node_id = NULL,
+                    placement_changed_at = NOW()
+              WHERE s.id = $1
+                AND s.lifecycle = 'stopped'
+                AND s.evacuation_restore_target = 'stopped'
+                AND {durable}
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM sandbox_k8s_executions e
+                     WHERE e.sandbox_id = s.id
+                       AND e.active
+                )"
+        ))
+    });
+    let result = sqlx::query(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(sandbox_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Revert a markerless `restoring` row whose execution cleanup left no
