@@ -18,6 +18,10 @@ use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
 };
 use std::os::unix::fs::PermissionsExt as _;
 
+// SnapshotRestore discards the process-wide diagnostics even when clock
+// validation fails. Resume tests must not clear each other's warning records.
+static RESUME_DIAGNOSTICS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn bridge_guest_wait_ready_returns_guest_readiness() {
@@ -225,6 +229,7 @@ async fn bridge_guest_data_plane_accepts_after_bridge_listener_is_ready() {
 
 #[tokio::test]
 async fn bridge_guest_notify_resume_rejects_invalid_host_time() {
+    let _diagnostics_guard = RESUME_DIAGNOSTICS_LOCK.lock().await;
     let temp_dir = tempfile::tempdir().expect("temp dir created");
     let bridge_host_socket = temp_dir.path().join("spaced-bridge-host.sock");
     let bridge_guest_socket = temp_dir.path().join("spaced-bridge-guest.sock");
@@ -356,6 +361,7 @@ async fn bridge_guest_snapshot_restore_discards_recorded_diagnostics() {
     };
     use tracing_subscriber::layer::SubscriberExt as _;
 
+    let _diagnostics_guard = RESUME_DIAGNOSTICS_LOCK.lock().await;
     let _subscriber = tracing::subscriber::set_default(
         tracing_subscriber::registry()
             .with(pplx_space_observability::warning_tap::layer_for_test()),
