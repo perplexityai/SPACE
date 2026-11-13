@@ -29,6 +29,8 @@ class ScenarioProcessResult:
     stdout: str
     stderr: str
     report: Mapping[str, Any] | None = None
+    # Which pass of a repeated run (`run --repeat N`) produced this result.
+    pass_number: int | None = None
 
     @property
     def exit_code(self) -> int:

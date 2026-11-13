@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import shlex
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from space_smoke.model import Verdict
 from space_smoke.registry import SUBSTRATES, TIERS, Scenario
 from space_smoke.runtime import SmokeConfigurationError, execute_scenario
 from space_smoke.scenarios import REGISTRY
@@ -30,6 +33,7 @@ from space_smoke.suite import (
     run_scenarios,
     suite_exit_code,
 )
+from space_smoke.suites import Suite, resolve_suite
 
 
 def _describe(scenario_id: str) -> int:
@@ -99,6 +103,7 @@ def _run(scenario_id: str) -> int:
         services = SmokeServices.from_environment(scenario)
     except MissingToolError as error:
         print(f"ERROR: {error}", file=sys.stderr)
+        _print_result(scenario_id, Verdict.INFRA_ERROR.value, str(error), {}, [])
         return 1
     except SmokeConfigurationError as error:
         print(f"ERROR: {error}", file=sys.stderr)
@@ -122,21 +127,42 @@ def _run(scenario_id: str) -> int:
         print(diagnostic, file=sys.stderr, end="", flush=True)
     if result.exit_code != 0:
         print(f"RERUN: {_rerun_command(scenario)}", flush=True)
+    _print_result(
+        scenario_id,
+        result.verdict.value,
+        result.summary,
+        result.evidence,
+        result.cleanup_failures,
+        result.promoted_from.value if result.promoted_from else None,
+    )
+    return result.exit_code
+
+
+def _print_result(
+    scenario_id: str,
+    verdict: str,
+    summary: str,
+    evidence: Mapping[str, Any],
+    cleanup_failures: Sequence[str],
+    promoted_from: str | None = None,
+) -> None:
+    report = {
+        "scenario_id": scenario_id,
+        "verdict": verdict,
+        "summary": summary,
+        "evidence": evidence,
+        "cleanup_failures": list(cleanup_failures),
+    }
+    if promoted_from is not None:
+        report["promoted_from"] = promoted_from
     print(
         RESULT_PREFIX
         + json.dumps(
-            {
-                "scenario_id": scenario_id,
-                "verdict": result.verdict.value,
-                "summary": result.summary,
-                "evidence": result.evidence,
-                "cleanup_failures": result.cleanup_failures,
-            },
+            report,
             sort_keys=True,
         ),
         flush=True,
     )
-    return result.exit_code
 
 
 def _rerun_command(scenario: Scenario[Any]) -> str:
@@ -204,9 +230,17 @@ def _one_line(text: str) -> str:
     return " | ".join(line.strip() for line in text.splitlines() if line.strip())
 
 
+def _labelled_id(result: ScenarioProcessResult) -> str:
+    """The scenario id, with its pass number when the run repeated."""
+
+    if result.pass_number is None:
+        return result.scenario_id
+    return f"{result.scenario_id} (pass {result.pass_number})"
+
+
 def _failure_detail(result: ScenarioProcessResult) -> str:
     verdict, summary = _verdict_and_summary(result)
-    detail = f"{result.scenario_id} [{verdict}]: {_one_line(summary)}"
+    detail = f"{_labelled_id(result)} [{verdict}]: {_one_line(summary)}"
     evidence = (result.report or {}).get("evidence")
     if isinstance(evidence, dict) and evidence.get("sandbox_id"):
         detail += f" (sandbox_id={evidence['sandbox_id']})"
@@ -243,7 +277,7 @@ def _print_not_passed(
     print(f"\nNOT PASSED on the {api_surface} API surface ({len(not_passed)}):")
     for result in not_passed:
         verdict, summary = _verdict_and_summary(result)
-        print(f"  {verdict.upper()} {result.scenario_id}: {summary}")
+        print(f"  {verdict.upper()} {_labelled_id(result)}: {summary}")
         evidence = (result.report or {}).get("evidence")
         if result.last_phase is not None:
             print(f"    last phase: {result.last_phase}")
@@ -357,6 +391,8 @@ def _run_all(
     category: str | None = None,
     shard: tuple[int, int] | None = None,
     tiers: tuple[str, ...] | None = None,
+    suite: Suite | None = None,
+    repeat: int = 1,
 ) -> int:
     template = os.environ.get("E2B_TEMPLATE") or None
     backend = os.environ.get("SPACE_SMOKE_BACKEND", "kind")
@@ -392,6 +428,12 @@ def _run_all(
             category=category, template=template, tiers=selected_tiers,
             include_scenarios=included,
         )
+        if suite is not None:
+            registered = {scenario.id for scenario in REGISTRY}
+            unknown = [scenario_id for scenario_id in suite.scenarios if scenario_id not in registered]
+            if unknown:
+                raise ValueError(f"suite {suite.label} lists unregistered scenarios: {', '.join(unknown)}")
+            eligible = tuple(scenario for scenario in eligible if scenario.id in suite.scenarios)
     except (ValueError, KeyError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
@@ -402,6 +444,8 @@ def _run_all(
     for held in REGISTRY.select(
         category=category, template=template, include_quarantined=True, tiers=TIERS,
     ):
+        if suite is not None and held.id not in suite.scenarios:
+            continue
         if held.quarantined is not None:
             print(f"QUARANTINED {held.id}: {held.quarantined}")
         elif held.tier == "manual":
@@ -409,7 +453,7 @@ def _run_all(
         elif held.tier not in selected_tiers and held.id not in included:
             print(f"SKIPPED {held.id}: tier {held.tier} is not selected")
     api_surface = os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw")
-    if category is None:
+    if category is None and suite is None:
         eligible = tuple(
             scenario for scenario in eligible if api_surface in scenario.api_surfaces
         )
@@ -512,6 +556,11 @@ def _run_all(
                 )
                 return 0
     selection = f"category {category!r}" if category is not None else "this run"
+    if suite is not None:
+        selection = f"suite {suite.label}"
+        if (error := _suite_incomplete(suite, scenarios)) is not None:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 2
     if not scenarios:
         print(
             f"ERROR: no smoke scenarios apply to {selection} on the "
@@ -565,6 +614,9 @@ def _run_all(
     telemetry_error = telemetry_error or browser_error
     if not scenarios:
         return _mode_emptied(selection, "browser state", shard, telemetry_error)
+    if suite is not None and (error := _suite_incomplete(suite, scenarios)) is not None:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
 
     environment = dict(os.environ)
     if environment.get("SPACE_SMOKE_BACKEND", "kind") == "kind":
@@ -580,14 +632,26 @@ def _run_all(
                 "each scenario runs the full bootstrap"
             )
     label = f" {category}" if category is not None else ""
-    print(f"Running {len(scenarios)}{label} smoke scenarios sequentially.")
-    results = run_scenarios(
-        scenarios,
-        environment=environment,
-        on_start=_print_started,
-        line_sink=_print_line,
-        on_result=_print_finished,
-    )
+    if suite is not None:
+        label = f" {suite.label}"
+    passes = f", {repeat} times" if repeat > 1 else ""
+    print(f"Running {len(scenarios)}{label} smoke scenarios sequentially{passes}.")
+    results: tuple[ScenarioProcessResult, ...] = ()
+    for number in range(1, repeat + 1):
+        if repeat > 1:
+            print(f"\n=== PASS {number}/{repeat} ===", flush=True)
+        passed_through = run_scenarios(
+            scenarios,
+            environment=environment,
+            on_start=_print_started,
+            line_sink=_print_line,
+            on_result=_print_finished,
+        )
+        if repeat > 1:
+            passed_through = tuple(
+                dataclasses.replace(result, pass_number=number) for result in passed_through
+            )
+        results += passed_through
     _write_failure_details(results)
 
     passed = sum(result.exit_code == 0 for result in results)
@@ -598,6 +662,8 @@ def _run_all(
         f"SUITE: {passed} passed, {warned} warned, {failed} failed, "
         f"{incomplete} inconclusive or infrastructure errors"
     )
+    if suite is not None or repeat > 1:
+        _print_failure_rate(results, label.strip() or "this run")
     _print_not_passed(
         results,
         scenarios,
@@ -619,6 +685,66 @@ def _run_all(
         if exit_code in (0, 42):
             exit_code = 2
     return exit_code
+
+
+def _suite_incomplete(suite: Suite, scenarios: tuple[Scenario[Any], ...]) -> str | None:
+    """Why this run cannot report the suite's rate, or None when it runs all of it."""
+
+    selected = {scenario.id for scenario in scenarios}
+    missing = [scenario_id for scenario_id in suite.scenarios if scenario_id not in selected]
+    if not missing:
+        return None
+    return (
+        f"suite {suite.label} runs only whole; this run withholds "
+        f"{', '.join(missing)} (see the SKIPPED, QUARANTINED or MANUAL lines above)"
+    )
+
+
+def _failure_rate_conclusive(result: ScenarioProcessResult) -> bool:
+    """A run whose body reached a verdict on the lifecycle under test.
+
+    A pass or warning that a critical cleanup failure turned into an
+    infrastructure error still counts, as a failure.
+    """
+
+    report = result.report or {}
+    if report.get("promoted_from") in (Verdict.PASS.value, Verdict.WARN.value):
+        return True
+    return result.exit_code in (0, 1, 42) and report.get("verdict") != Verdict.INFRA_ERROR.value
+
+
+def _failure_rate_failed(result: ScenarioProcessResult) -> bool:
+    """A run that failed, or passed or warned and left cleanup failures behind."""
+
+    return result.exit_code == 1 or bool(_cleanup_failures(result))
+
+
+def _print_failure_rate(results: tuple[ScenarioProcessResult, ...], label: str) -> None:
+    """Failures per 1,000 conclusive scenario runs, overall and per scenario.
+
+    An inconclusive run or infrastructure error says nothing about the
+    lifecycle under test, so it is reported on its own and left out of the
+    denominator. Known failures count: the list excuses a result from the
+    exit code, not from the rate.
+    """
+
+    conclusive = tuple(result for result in results if _failure_rate_conclusive(result))
+    excluded = len(results) - len(conclusive)
+    if not conclusive:
+        print(f"FAILURE RATE {label}: withheld; no conclusive scenario runs ({excluded} excluded)")
+        return
+    failed = sum(map(_failure_rate_failed, conclusive))
+    print(
+        f"FAILURE RATE {label}: {failed} of {len(conclusive)} conclusive scenario runs "
+        f"failed or left cleanup failures ({1000 * failed / len(conclusive):.1f} per 1,000); "
+        f"{excluded} inconclusive or infrastructure errors excluded"
+    )
+    for scenario_id in dict.fromkeys(result.scenario_id for result in results):
+        runs = [result for result in conclusive if result.scenario_id == scenario_id]
+        skipped = sum(result.scenario_id == scenario_id for result in results) - len(runs)
+        line = f"  {scenario_id}: {sum(map(_failure_rate_failed, runs))}/{len(runs)}"
+        print(line + (f" ({skipped} excluded)" if skipped else ""))
+    sys.stdout.flush()
 
 
 def _mode_emptied(
@@ -893,6 +1019,23 @@ def _parse_shard(value: str) -> tuple[int, int]:
     )
 
 
+def _parse_suite(value: str) -> Suite:
+    try:
+        return resolve_suite(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def _parse_repeat(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError:
+        count = 0
+    if count < 1:
+        raise argparse.ArgumentTypeError("repeat must be a positive integer")
+    return count
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -914,6 +1057,19 @@ def main() -> int:
         metavar="INDEX/COUNT",
         help="run one duration-balanced partition on an isolated backend (1-based)",
     )
+    run.add_argument(
+        "--suite",
+        type=_parse_suite,
+        metavar="NAME[@VERSION]",
+        help="run a versioned suite manifest (space_smoke/suites.py) and report its failure rate",
+    )
+    run.add_argument(
+        "--repeat",
+        type=_parse_repeat,
+        default=1,
+        metavar="N",
+        help="run the selection N times in sequence and report failures per 1,000 scenario runs",
+    )
     args = parser.parse_args()
 
     if args.command == "list":
@@ -928,15 +1084,22 @@ def main() -> int:
             args.scenario is not None,
             args.run_all,
             args.category is not None,
+            args.suite is not None,
         )
     )
     if selectors != 1:
-        parser.error("run requires exactly one scenario, --all, or --category")
-    if args.shard is not None and args.scenario is not None:
+        parser.error("run requires exactly one scenario, --all, --category, or --suite")
+    if args.shard is not None and (args.scenario is not None or args.suite is not None):
         parser.error("--shard requires --all or --category")
+    if args.repeat > 1 and args.scenario is not None:
+        parser.error("--repeat requires --all, --category, or --suite")
     if args.tier is not None and args.scenario is not None:
         parser.error("--tier requires --all or --category; a named scenario runs regardless of tier")
-    selection = {"tiers": tuple(args.tier)} if args.tier is not None else {}
+    selection: dict[str, Any] = {"repeat": args.repeat} if args.repeat > 1 else {}
+    if args.tier is not None:
+        selection["tiers"] = tuple(args.tier)
+    if args.suite is not None:
+        return _run_all(suite=args.suite, **selection)
     if args.run_all:
         return _run_all(shard=args.shard, **selection)
     if args.category is not None:
