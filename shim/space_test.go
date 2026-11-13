@@ -2324,9 +2324,9 @@ func TestLegacyPodTeardownPreservesUserStoppedRootfs(t *testing.T) {
 		// sbx-manager finishes the user's stop.
 		{"stopping", sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING.Enum()}}}}},
 		// A stop or suspend whose cleanup failed keeps its completion.
-		{"stop cleanup required", ownedCleanup(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_REQUIRED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED)},
-		{"stop cleanup failed", ownedCleanup(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED)},
-		{"suspend cleanup failed", ownedCleanup(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING, pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED)},
+		{"stop cleanup required", cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED.Enum())},
+		{"stop cleanup failed", cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED.Enum())},
+		{"suspend cleanup failed", cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED.Enum())},
 		{"missing", sandboxStateResult{err: status.Error(codes.NotFound, "sandbox absent")}},
 		{"empty", sandboxStateResult{resp: &pb.StateResponse{}}},
 	} {
@@ -2361,14 +2361,7 @@ func cleanupState(lifecycle pb.SandboxLifecycleState, completion *pb.SandboxClea
 	return sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{sandbox}}}
 }
 
-// ownedCleanup is a row the cleanup in state owns, published under the
-// teardown transition it is over.
-func ownedCleanup(lifecycle pb.SandboxLifecycleState, state pb.SandboxCleanupState, completion pb.SandboxCleanupCompletion) sandboxStateResult {
-	sandbox := &pb.SandboxInfo{Lifecycle: lifecycle.Enum(), Cleanup: &pb.SandboxCleanup{Completion: completion, State: state}}
-	return sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{sandbox}}}
-}
-
-// Without a cleanup state, a published completion can be an armed activation's
+// Outside CLEANUP_*, a published completion can be an armed activation's
 // rollback target while the start runs. These are the shapes sbx-manager
 // publishes today, each with its lifecycle's answer spelled out.
 func TestLegacyTeardownKeepsTheLifecycleAnswerForArmedActivations(t *testing.T) {
@@ -2413,9 +2406,8 @@ func TestLegacyTeardownKeepsTheLifecycleAnswerForArmedActivations(t *testing.T) 
 	}
 }
 
-// Without a cleanup state, every lifecycle gets the same answer with any
-// completion as with none, so a lifecycle or completion added later is covered
-// too.
+// Every lifecycle outside CLEANUP_* gets the same answer with any completion
+// as with none, so a lifecycle or completion added later is covered too.
 func TestLegacyTeardownIgnoresACompletionOutsideFailedCleanup(t *testing.T) {
 	type outcome struct {
 		detached         bool
@@ -2430,6 +2422,10 @@ func TestLegacyTeardownIgnoresACompletionOutsideFailedCleanup(t *testing.T) {
 	}
 	for lifecycleValue := range pb.SandboxLifecycleState_name {
 		lifecycle := pb.SandboxLifecycleState(lifecycleValue)
+		if lifecycle == pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED ||
+			lifecycle == pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED {
+			continue
+		}
 		for completionValue := range pb.SandboxCleanupCompletion_name {
 			completion := pb.SandboxCleanupCompletion(completionValue)
 			for _, operation := range []string{"kill", "delete"} {
@@ -2446,8 +2442,9 @@ func TestLegacyTeardownIgnoresACompletionOutsideFailedCleanup(t *testing.T) {
 	}
 }
 
-// A cleanup-owned row gets the same teardown answer whichever teardown
-// transition it is published under.
+// A node may report a cleanup-owned row under the teardown transition it is
+// in, with its cleanup state, instead of under CLEANUP_REQUIRED or
+// CLEANUP_FAILED. Whichever it reports, the teardown answer is the same.
 func TestLegacyTeardownDecidesAnOwnedCleanupByItsCleanupStateNotItsLifecycle(t *testing.T) {
 	type outcome struct {
 		detached         bool
@@ -2463,19 +2460,24 @@ func TestLegacyTeardownDecidesAnOwnedCleanupByItsCleanupStateNotItsLifecycle(t *
 		detached, err := releaseLegacyTaskTeardown(context.Background(), client, operation, identity, nil)
 		return outcome{detached, status.Code(err), client.stopCalls, client.deleteCalls}
 	}
-	for _, owner := range []pb.SandboxCleanupState{pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_REQUIRED, pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED} {
+	owners := map[pb.SandboxCleanupState]pb.SandboxLifecycleState{
+		pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_REQUIRED: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED,
+		pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED:   pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED,
+	}
+	for owner, combined := range owners {
 		for completionValue := range pb.SandboxCleanupCompletion_name {
 			cleanup := &pb.SandboxCleanup{Completion: pb.SandboxCleanupCompletion(completionValue), State: owner}
 			for _, operation := range []string{"kill", "delete"} {
 				for _, stopIssued := range []bool{false, true} {
-					want := run(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, cleanup, operation, stopIssued)
+					want := run(combined, cleanup, operation, stopIssued)
 					for _, lifecycle := range []pb.SandboxLifecycleState{
+						pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING,
 						pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_DELETING,
 						pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING,
 					} {
 						if got := run(lifecycle, cleanup, operation, stopIssued); got != want {
-							t.Errorf("%s with %s %s, %s, stop_issued=%t: got %+v, want the STOPPING answer %+v",
-								lifecycle, owner, cleanup.Completion, operation, stopIssued, got, want)
+							t.Errorf("%s with %s %s, %s, stop_issued=%t: got %+v, want the %s answer %+v",
+								lifecycle, owner, cleanup.Completion, operation, stopIssued, got, combined, want)
 						}
 					}
 				}
@@ -2493,28 +2495,11 @@ func TestLegacyTeardownDecidesAnOwnedCleanupByItsCleanupStateNotItsLifecycle(t *
 		t.Errorf("handed-off suspend after own stop: got %+v, want a release", got)
 	}
 
-	// A cleanup over a lifecycle no cleanup can be over authorizes nothing.
-	for _, lifecycle := range []pb.SandboxLifecycleState{
-		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED,
-		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED,
-		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDED,
-	} {
-		misplaced := &pb.SandboxCleanup{
-			Completion: pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED,
-			State:      pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED,
-		}
-		for _, operation := range []string{"kill", "delete"} {
-			if got := run(lifecycle, misplaced, operation, false); got != (outcome{code: codes.FailedPrecondition}) {
-				t.Errorf("%s with a cleanup, %s: got %+v, want FailedPrecondition", lifecycle, operation, got)
-			}
-		}
-	}
-
 	// A cleanup state this shim doesn't know authorizes nothing.
 	unknown := &pb.SandboxCleanup{State: pb.SandboxCleanupState(99)}
 	for _, lifecycle := range []pb.SandboxLifecycleState{
 		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING,
-		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_DELETING,
+		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED,
 	} {
 		for _, operation := range []string{"kill", "delete"} {
 			if got := run(lifecycle, unknown, operation, false); got != (outcome{code: codes.FailedPrecondition}) {
@@ -2554,18 +2539,22 @@ func TestStoppedRestartRefusesACleanupOwnedRowWhateverItsLifecycle(t *testing.T)
 // whose completion this shim doesn't know, keeps the destructive teardown it
 // had before completions were reported.
 func TestLegacyTeardownStillTearsDownOtherFailedCleanups(t *testing.T) {
-	for _, completion := range []pb.SandboxCleanupCompletion{
-		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_DELETE_ROW,
-		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_DELETE_POOL_CLONE,
-		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_CREATED,
-		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_QUARANTINE,
-		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_UNSPECIFIED,
-		pb.SandboxCleanupCompletion(99),
+	for _, completion := range []*pb.SandboxCleanupCompletion{
+		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_DELETE_ROW.Enum(),
+		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_DELETE_POOL_CLONE.Enum(),
+		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_CREATED.Enum(),
+		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_QUARANTINE.Enum(),
+		nil,
+		pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_UNSPECIFIED.Enum(),
+		pb.SandboxCleanupCompletion(99).Enum(),
 	} {
-		for _, owner := range []pb.SandboxCleanupState{pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_REQUIRED, pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED} {
+		for _, lifecycle := range []pb.SandboxLifecycleState{
+			pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED,
+			pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED,
+		} {
 			for _, operation := range []string{"kill", "delete"} {
-				t.Run(fmt.Sprintf("%v/%s/%s", completion, owner, operation), func(t *testing.T) {
-					client := &fakeSandboxManagerClient{results: []sandboxStateResult{ownedCleanup(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, owner, completion)}}
+				t.Run(fmt.Sprintf("%v/%s/%s", completion, lifecycle, operation), func(t *testing.T) {
+					client := &fakeSandboxManagerClient{results: []sandboxStateResult{cleanupState(lifecycle, completion)}}
 					identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 1}
 					detached, err := releaseLegacyTaskTeardown(context.Background(), client, operation, identity, nil)
 					if err != nil || detached {
@@ -2646,7 +2635,7 @@ func TestLegacyKillThenDeleteStillCallsManagerDelete(t *testing.T) {
 	}{
 		{"stopped", cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED, nil)},
 		{"stopping", cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, nil)},
-		{"stop cleanup failed", ownedCleanup(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED)},
+		{"stop cleanup failed", cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED, pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED.Enum())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			podTask := &task{

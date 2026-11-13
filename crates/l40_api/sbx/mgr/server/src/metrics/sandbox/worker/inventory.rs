@@ -1,26 +1,21 @@
-//! Inventory: list budgets, status counts, orphan rows and inventory reconciliation.
+//! Inventory: list budgets, lifecycle and status counts, orphan rows and inventory reconciliation.
 
 use super::*;
 
-/// Current node-local durable sandbox rows with one stored lifecycle, cleanup
-/// state and runtime. A cleanup is not folded into the lifecycle:
-/// `cleanup_state` is `required`, `failed` or `none`, and `state` is always a
-/// lifecycle state. The caller supplies values decoded through the
-/// sandbox-manager's bounded enums; do not attach sandbox, pod, node, or
-/// execution identifiers.
-pub fn lifecycle_status_count(
+/// Current node-local durable sandbox rows in one lifecycle/runtime bucket. The caller
+/// supplies a value decoded through the sandbox-manager's bounded state enum;
+/// do not attach sandbox, pod, node, or execution identifiers.
+pub fn lifecycle_count(
     value: u64,
     state: &str,
-    cleanup_state: &str,
     runtime: Option<pplx_space_execution_spec::RuntimeKind>,
     runtime_version: Option<&pplx_space_execution_spec::RuntimeVersion>,
 ) {
     gauge(
-        "sandbox.worker.lifecycle.status_count",
+        "sandbox.worker.lifecycle.count",
         value as f64,
         &[
             tag("state", state),
-            tag("cleanup_state", cleanup_state),
             tag(
                 "runtime",
                 runtime.map_or("unknown", |runtime| runtime.as_str()),
@@ -30,6 +25,20 @@ pub fn lifecycle_status_count(
                 runtime_version.map_or("unknown", |version| version.as_str()),
             ),
         ],
+    );
+}
+
+/// Current node-local durable sandbox rows with one stored lifecycle and
+/// cleanup state. Unlike `sandbox.worker.lifecycle.count`, a cleanup is not
+/// folded into the lifecycle: `cleanup_state` is `required`, `failed` or
+/// `none`, and `state` is always a lifecycle state. The caller supplies values
+/// decoded through the sandbox-manager's bounded state enums; do not attach
+/// sandbox, pod, node, or execution identifiers.
+pub fn lifecycle_status_count(value: u64, state: &str, cleanup_state: &str) {
+    gauge(
+        "sandbox.worker.lifecycle.status_count",
+        value as f64,
+        &[tag("state", state), tag("cleanup_state", cleanup_state)],
     );
 }
 

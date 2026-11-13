@@ -588,8 +588,13 @@ const (
 	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING    SandboxLifecycleState = 12
 	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDED     SandboxLifecycleState = 13
 	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING     SandboxLifecycleState = 14
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_QUARANTINED   SandboxLifecycleState = 17
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_FAILED        SandboxLifecycleState = 18
+	// Published only by an older node, for a row a cleanup owns, with or without
+	// `SandboxCleanup.state`. A current node publishes the lifecycle the cleanup
+	// is over and names the cleanup in `SandboxCleanup.state`.
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED SandboxLifecycleState = 15
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED   SandboxLifecycleState = 16
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_QUARANTINED      SandboxLifecycleState = 17
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_FAILED           SandboxLifecycleState = 18
 )
 
 // Enum value maps for SandboxLifecycleState.
@@ -610,27 +615,31 @@ var (
 		12: "SANDBOX_LIFECYCLE_STATE_SUSPENDING",
 		13: "SANDBOX_LIFECYCLE_STATE_SUSPENDED",
 		14: "SANDBOX_LIFECYCLE_STATE_RESTORING",
+		15: "SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED",
+		16: "SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED",
 		17: "SANDBOX_LIFECYCLE_STATE_QUARANTINED",
 		18: "SANDBOX_LIFECYCLE_STATE_FAILED",
 	}
 	SandboxLifecycleState_value = map[string]int32{
-		"SANDBOX_LIFECYCLE_STATE_UNSPECIFIED":   0,
-		"SANDBOX_LIFECYCLE_STATE_CREATING":      1,
-		"SANDBOX_LIFECYCLE_STATE_CREATED":       2,
-		"SANDBOX_LIFECYCLE_STATE_STARTING":      3,
-		"SANDBOX_LIFECYCLE_STATE_STARTED":       4,
-		"SANDBOX_LIFECYCLE_STATE_STOPPING":      5,
-		"SANDBOX_LIFECYCLE_STATE_STOPPED":       6,
-		"SANDBOX_LIFECYCLE_STATE_DELETING":      7,
-		"SANDBOX_LIFECYCLE_STATE_PAUSING":       8,
-		"SANDBOX_LIFECYCLE_STATE_PAUSED":        9,
-		"SANDBOX_LIFECYCLE_STATE_RESUMING":      10,
-		"SANDBOX_LIFECYCLE_STATE_CHECKPOINTING": 11,
-		"SANDBOX_LIFECYCLE_STATE_SUSPENDING":    12,
-		"SANDBOX_LIFECYCLE_STATE_SUSPENDED":     13,
-		"SANDBOX_LIFECYCLE_STATE_RESTORING":     14,
-		"SANDBOX_LIFECYCLE_STATE_QUARANTINED":   17,
-		"SANDBOX_LIFECYCLE_STATE_FAILED":        18,
+		"SANDBOX_LIFECYCLE_STATE_UNSPECIFIED":      0,
+		"SANDBOX_LIFECYCLE_STATE_CREATING":         1,
+		"SANDBOX_LIFECYCLE_STATE_CREATED":          2,
+		"SANDBOX_LIFECYCLE_STATE_STARTING":         3,
+		"SANDBOX_LIFECYCLE_STATE_STARTED":          4,
+		"SANDBOX_LIFECYCLE_STATE_STOPPING":         5,
+		"SANDBOX_LIFECYCLE_STATE_STOPPED":          6,
+		"SANDBOX_LIFECYCLE_STATE_DELETING":         7,
+		"SANDBOX_LIFECYCLE_STATE_PAUSING":          8,
+		"SANDBOX_LIFECYCLE_STATE_PAUSED":           9,
+		"SANDBOX_LIFECYCLE_STATE_RESUMING":         10,
+		"SANDBOX_LIFECYCLE_STATE_CHECKPOINTING":    11,
+		"SANDBOX_LIFECYCLE_STATE_SUSPENDING":       12,
+		"SANDBOX_LIFECYCLE_STATE_SUSPENDED":        13,
+		"SANDBOX_LIFECYCLE_STATE_RESTORING":        14,
+		"SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED": 15,
+		"SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED":   16,
+		"SANDBOX_LIFECYCLE_STATE_QUARANTINED":      17,
+		"SANDBOX_LIFECYCLE_STATE_FAILED":           18,
 	}
 )
 
@@ -739,9 +748,11 @@ type SandboxCleanupState int32
 const (
 	// No cleanup owns the row.
 	SandboxCleanupState_SANDBOX_CLEANUP_STATE_UNSPECIFIED SandboxCleanupState = 0
-	// A forced teardown owns the row and is owed.
+	// A forced teardown owns the row and is owed. An older node may also publish
+	// it as the CLEANUP_REQUIRED lifecycle.
 	SandboxCleanupState_SANDBOX_CLEANUP_STATE_REQUIRED SandboxCleanupState = 1
-	// A teardown owns the row and its last attempt failed; it is retried.
+	// A teardown owns the row and its last attempt failed; it is retried. An
+	// older node may also publish it as the CLEANUP_FAILED lifecycle.
 	SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED SandboxCleanupState = 2
 )
 
@@ -4258,7 +4269,8 @@ func (x *SandboxInfo) GetCleanup() *SandboxCleanup {
 // as does a stop, suspend or delete admitted with a persisted intent. A row a
 // cleanup owns keeps the completion it was admitted with, but can also have
 // none, for example one that sbx-manager's cleanup recovery will quarantine.
-// Such a row is published with `state` set and `completion` UNSPECIFIED.
+// A node that sets `state` publishes such a row with `state` set and
+// `completion` UNSPECIFIED; an older node publishes no message for it.
 type SandboxCleanup struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// What the cleanup does to the row when it finishes. Every writer of
@@ -4275,7 +4287,9 @@ type SandboxCleanup struct {
 	// field, not the presence of this message, to tell a cleanup-owned row. A
 	// row can be REQUIRED or FAILED with no completion recorded. A node publishes
 	// such a row with the teardown transition the cleanup is over (STOPPING,
-	// DELETING or SUSPENDING).
+	// DELETING or SUSPENDING). An older node may instead publish the
+	// CLEANUP_REQUIRED or CLEANUP_FAILED lifecycle, with or without this field
+	// set: honor those too.
 	State         SandboxCleanupState `protobuf:"varint,2,opt,name=state,proto3,enum=space.sandbox.manager.v1.SandboxCleanupState" json:"state,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -15317,7 +15331,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x16WAKE_TRANSITION_RESUME\x10\x02\x12\x1b\n" +
 	"\x17WAKE_TRANSITION_RESTORE\x10\x03\x12\x19\n" +
 	"\x15WAKE_TRANSITION_START\x10\x04\x12\x18\n" +
-	"\x14WAKE_TRANSITION_WAIT\x10\x05*\x82\x06\n" +
+	"\x14WAKE_TRANSITION_WAIT\x10\x05*\xfe\x05\n" +
 	"\x15SandboxLifecycleState\x12'\n" +
 	"#SANDBOX_LIFECYCLE_STATE_UNSPECIFIED\x10\x00\x12$\n" +
 	" SANDBOX_LIFECYCLE_STATE_CREATING\x10\x01\x12#\n" +
@@ -15334,9 +15348,11 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"%SANDBOX_LIFECYCLE_STATE_CHECKPOINTING\x10\v\x12&\n" +
 	"\"SANDBOX_LIFECYCLE_STATE_SUSPENDING\x10\f\x12%\n" +
 	"!SANDBOX_LIFECYCLE_STATE_SUSPENDED\x10\r\x12%\n" +
-	"!SANDBOX_LIFECYCLE_STATE_RESTORING\x10\x0e\x12'\n" +
+	"!SANDBOX_LIFECYCLE_STATE_RESTORING\x10\x0e\x12,\n" +
+	"(SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED\x10\x0f\x12*\n" +
+	"&SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED\x10\x10\x12'\n" +
 	"#SANDBOX_LIFECYCLE_STATE_QUARANTINED\x10\x11\x12\"\n" +
-	"\x1eSANDBOX_LIFECYCLE_STATE_FAILED\x10\x12\"\x04\b\x0f\x10\x0f\"\x04\b\x10\x10\x10*(SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED*&SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED*\xd7\x02\n" +
+	"\x1eSANDBOX_LIFECYCLE_STATE_FAILED\x10\x12*\xd7\x02\n" +
 	"\x18SandboxCleanupCompletion\x12*\n" +
 	"&SANDBOX_CLEANUP_COMPLETION_UNSPECIFIED\x10\x00\x12+\n" +
 	"'SANDBOX_CLEANUP_COMPLETION_MARK_CREATED\x10\x01\x12+\n" +

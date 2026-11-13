@@ -4,11 +4,12 @@
 use crate::auto_lifecycle_delete_receipts::{
     AutoLifecycleDeleteBlockedStats, AutoLifecycleDeleteOutboxStats,
 };
-use crate::db::{Connection, Result, SandboxStatusCount};
+use crate::db::{Connection, Result, SandboxLifecycleCount, SandboxStatusCount};
 
 /// Only the store defines these; callers pick one, they do not add their own.
 mod sealed {
     pub trait Sealed {}
+    impl Sealed for super::ByLifecycle {}
     impl Sealed for super::ByStatus {}
     impl Sealed for super::Resident {}
     impl Sealed for super::MalformedSuspendedUpdatedAt {}
@@ -28,9 +29,21 @@ pub fn counts<C: Count>(conn: &Connection, count: C) -> Result<C::Output> {
     count.count(conn)
 }
 
-/// Rows per stored lifecycle, cleanup state and runtime, each lifecycle and
-/// cleanup pair counted apart. A label this binary does not know fails the
-/// count rather than being dropped from it.
+/// Rows per combined status, the legacy lifecycle that folds a cleanup into
+/// it. A state label this binary does not know fails the count rather than
+/// being dropped from it.
+#[derive(Clone, Copy, Debug)]
+pub struct ByLifecycle;
+
+impl Count for ByLifecycle {
+    type Output = Vec<SandboxLifecycleCount>;
+
+    fn count(self, conn: &Connection) -> Result<Self::Output> {
+        crate::db::sandbox_lifecycle_counts(conn)
+    }
+}
+
+/// Rows per stored lifecycle and cleanup state, each pair counted apart.
 #[derive(Clone, Copy, Debug)]
 pub struct ByStatus;
 

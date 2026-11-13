@@ -4,49 +4,90 @@ use std::time::Duration;
 use pplx_space_execution_spec::{RuntimeKind, RuntimeVersion};
 use tokio_util::sync::CancellationToken;
 
-use crate::db::SandboxStatusCount;
+use crate::db::{SandboxLifecycleCount, SandboxStatusCount};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// A `sandbox.worker.lifecycle.status_count` series: a stored lifecycle, the
-/// cleanup state over it (`none` when no cleanup owns the rows) and the
-/// recorded runtime.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct StatusBucket {
+struct LifecycleBucket {
     state: String,
-    cleanup_state: String,
     runtime: Option<RuntimeKind>,
     runtime_version: Option<RuntimeVersion>,
 }
 
-impl StatusBucket {
-    fn of(count: &SandboxStatusCount) -> Self {
+/// A `sandbox.worker.lifecycle.status_count` series: a stored lifecycle and
+/// the cleanup state over it, `none` when no cleanup owns the rows.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct StatusBucket {
+    state: String,
+    cleanup_state: String,
+}
+
+/// A sampled count and the gauge series it is emitted under.
+trait SampledCount {
+    type Bucket: Clone + Ord;
+
+    fn bucket(&self) -> Self::Bucket;
+    fn count(&self) -> u64;
+}
+
+impl SampledCount for SandboxLifecycleCount {
+    type Bucket = LifecycleBucket;
+
+    fn bucket(&self) -> LifecycleBucket {
+        LifecycleBucket {
+            // `sandbox.worker.lifecycle.count` keeps the label that predates
+            // the cleanup-state split.
+            state: self.state.legacy_label().to_owned(),
+            runtime: self.runtime,
+            runtime_version: self.runtime_version.clone(),
+        }
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+impl SampledCount for SandboxStatusCount {
+    type Bucket = StatusBucket;
+
+    fn bucket(&self) -> StatusBucket {
+        StatusBucket {
+            state: self.state.as_str().to_owned(),
+            cleanup_state: self.cleanup_state.unwrap_or("none").to_owned(),
+        }
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+/// Emits one metric's series and zeroes, once, each series that disappeared
+/// since the previous sample. Each metric has its own sampler.
+struct LifecycleGaugeSampler<B> {
+    previous_buckets: BTreeSet<B>,
+}
+
+impl<B> Default for LifecycleGaugeSampler<B> {
+    fn default() -> Self {
         Self {
-            state: count.state.as_str().to_owned(),
-            cleanup_state: count.cleanup_state.unwrap_or("none").to_owned(),
-            runtime: count.runtime,
-            runtime_version: count.runtime_version.clone(),
+            previous_buckets: BTreeSet::new(),
         }
     }
 }
 
-/// Emits the series and zeroes, once, each series that disappeared since the
-/// previous sample.
-#[derive(Default)]
-struct StatusGaugeSampler {
-    previous_buckets: BTreeSet<StatusBucket>,
-}
-
-impl StatusGaugeSampler {
-    fn emit_sample(
+impl<B: Clone + Ord> LifecycleGaugeSampler<B> {
+    fn emit_sample<C: SampledCount<Bucket = B>>(
         &mut self,
-        counts: &[SandboxStatusCount],
-        mut emit: impl FnMut(&StatusBucket, u64),
+        counts: &[C],
+        mut emit: impl FnMut(&B, u64),
     ) {
-        let current = counts.iter().map(StatusBucket::of).collect::<BTreeSet<_>>();
+        let current = counts.iter().map(C::bucket).collect::<BTreeSet<_>>();
 
         for count in counts {
-            emit(&StatusBucket::of(count), count.count);
+            emit(&count.bucket(), count.count());
         }
         for bucket in self.previous_buckets.difference(&current) {
             emit(bucket, 0);
@@ -57,7 +98,8 @@ impl StatusGaugeSampler {
 }
 
 pub(crate) async fn run(db: crate::db::SharedConnection, shutdown_token: CancellationToken) {
-    let mut sampler = StatusGaugeSampler::default();
+    let mut lifecycle_sampler = LifecycleGaugeSampler::default();
+    let mut status_sampler = LifecycleGaugeSampler::default();
     let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -67,7 +109,7 @@ pub(crate) async fn run(db: crate::db::SharedConnection, shutdown_token: Cancell
             _ = interval.tick() => {}
         }
 
-        let counts = {
+        let (lifecycle_counts, status_counts) = {
             let db = match db.lock() {
                 Ok(db) => db,
                 Err(error) => {
@@ -75,16 +117,32 @@ pub(crate) async fn run(db: crate::db::SharedConnection, shutdown_token: Cancell
                     continue;
                 }
             };
-            crate::db::read::counts(&db, crate::db::read::ByStatus)
+            (
+                crate::db::read::counts(&db, crate::db::read::ByLifecycle),
+                crate::db::read::counts(&db, crate::db::read::ByStatus),
+            )
         };
-        match counts {
-            Ok(counts) => sampler.emit_sample(&counts, |bucket, count| {
+        match lifecycle_counts {
+            Ok(counts) => {
+                lifecycle_sampler.emit_sample(&counts, |bucket: &LifecycleBucket, count| {
+                    crate::metrics::sandbox::worker::lifecycle_count(
+                        count,
+                        &bucket.state,
+                        bucket.runtime,
+                        bucket.runtime_version.as_ref(),
+                    );
+                })
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to sample durable sandbox lifecycle counts");
+            }
+        }
+        match status_counts {
+            Ok(counts) => status_sampler.emit_sample(&counts, |bucket: &StatusBucket, count| {
                 crate::metrics::sandbox::worker::lifecycle_status_count(
                     count,
                     &bucket.state,
                     &bucket.cleanup_state,
-                    bucket.runtime,
-                    bucket.runtime_version.as_ref(),
                 );
             }),
             Err(error) => {

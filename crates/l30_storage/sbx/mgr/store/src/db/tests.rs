@@ -1060,7 +1060,56 @@ fn access_idle_policy() -> AutoLifecyclePolicy {
 }
 
 #[test]
-fn sandbox_status_counts_preserve_rows_across_runtime_versions_and_legacy_metadata() {
+fn sandbox_lifecycle_counts_groups_durable_rows() {
+    let conn = test_conn();
+    for (id, uuid8, state) in [
+        (
+            "started-1",
+            "abc00001",
+            SandboxStatus::from(SandboxState::Started),
+        ),
+        (
+            "started-2",
+            "abc00002",
+            SandboxStatus::from(SandboxState::Started),
+        ),
+        ("cleanup-suspend", "abc00003", SandboxStatus::CLEANUP_FAILED),
+        ("cleanup-delete", "abc00004", SandboxStatus::CLEANUP_FAILED),
+    ] {
+        insert_test_sandbox(&conn, TestSandboxInsert::new(id, uuid8, state));
+    }
+    set_cleanup_intent(
+        &conn,
+        "cleanup-suspend",
+        true,
+        CleanupCompletion::MarkSuspended,
+    )
+    .unwrap();
+    set_cleanup_intent(&conn, "cleanup-delete", false, CleanupCompletion::DeleteRow).unwrap();
+
+    let counts = sandbox_lifecycle_counts(&conn).unwrap();
+
+    assert_eq!(
+        counts,
+        vec![
+            SandboxLifecycleCount {
+                state: SandboxStatus::CLEANUP_FAILED,
+                runtime: Some(RuntimeKind::Firecracker),
+                runtime_version: None,
+                count: 2,
+            },
+            SandboxLifecycleCount {
+                state: SandboxStatus::from(SandboxState::Started),
+                runtime: Some(RuntimeKind::Firecracker),
+                runtime_version: None,
+                count: 2,
+            },
+        ]
+    );
+}
+
+#[test]
+fn sandbox_lifecycle_counts_preserve_rows_across_runtime_versions_and_legacy_metadata() {
     let conn = test_conn();
     let versions = [
         ("old-a", "abc00101", SandboxState::Started, "fc", "1.15.1"),
@@ -1161,14 +1210,13 @@ fn sandbox_status_counts_preserve_rows_across_runtime_versions_and_legacy_metada
         );
     }
 
-    let counts = sandbox_status_counts(&conn).unwrap();
+    let counts = sandbox_lifecycle_counts(&conn).unwrap();
     assert_eq!(counts.iter().map(|count| count.count).sum::<u64>(), 11);
     let actual: Vec<_> = counts
         .iter()
         .map(|count| {
             (
                 count.state,
-                count.cleanup_state,
                 count.runtime,
                 count
                     .runtime_version
@@ -1181,38 +1229,33 @@ fn sandbox_status_counts_preserve_rows_across_runtime_versions_and_legacy_metada
     assert_eq!(
         actual,
         vec![
-            (SandboxState::Started, None, None, None, 1),
+            (SandboxStatus::from(SandboxState::Started), None, None, 1),
             (
-                SandboxState::Started,
-                None,
+                SandboxStatus::from(SandboxState::Started),
                 Some(RuntimeKind::Firecracker),
                 None,
                 5
             ),
             (
-                SandboxState::Started,
-                None,
+                SandboxStatus::from(SandboxState::Started),
                 Some(RuntimeKind::Firecracker),
                 Some("1.15.1"),
                 2
             ),
             (
-                SandboxState::Started,
-                None,
+                SandboxStatus::from(SandboxState::Started),
                 Some(RuntimeKind::Firecracker),
                 Some("1.17.0"),
                 1
             ),
             (
-                SandboxState::Started,
-                None,
+                SandboxStatus::from(SandboxState::Started),
                 Some(RuntimeKind::CloudHypervisor),
                 Some("49.0"),
                 1
             ),
             (
-                SandboxState::Suspended,
-                None,
+                SandboxStatus::from(SandboxState::Suspended),
                 Some(RuntimeKind::Firecracker),
                 Some("1.17.0"),
                 1
@@ -1222,10 +1265,10 @@ fn sandbox_status_counts_preserve_rows_across_runtime_versions_and_legacy_metada
 
     conn.execute(sql!("DELETE FROM sandboxes WHERE id = ?1"), ["new"])
         .unwrap();
-    let counts = sandbox_status_counts(&conn).unwrap();
+    let counts = sandbox_lifecycle_counts(&conn).unwrap();
     assert_eq!(counts.iter().map(|count| count.count).sum::<u64>(), 10);
     assert!(!counts.iter().any(|count| {
-        count.state == SandboxState::Started
+        count.state.is_unowned(SandboxState::Started)
             && count
                 .runtime_version
                 .as_ref()
@@ -1266,8 +1309,6 @@ fn sandbox_status_counts_keep_each_lifecycle_and_cleanup_pair_apart() {
     let status = |state, cleanup_state| SandboxStatusCount {
         state,
         cleanup_state,
-        runtime: Some(RuntimeKind::Firecracker),
-        runtime_version: None,
         count: 1,
     };
     assert_eq!(
@@ -1279,6 +1320,23 @@ fn sandbox_status_counts_keep_each_lifecycle_and_cleanup_pair_apart() {
             status(SandboxState::Stopping, None),
             status(SandboxState::Stopping, Some("failed")),
             status(SandboxState::Stopping, Some("required")),
+        ]
+    );
+
+    // The legacy count folds each cleanup into its combined status.
+    let legacy: Vec<_> = sandbox_lifecycle_counts(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|count| (count.state, count.count))
+        .collect();
+    assert_eq!(
+        legacy,
+        vec![
+            (SandboxStatus::CLEANUP_FAILED, 2),
+            (SandboxStatus::CLEANUP_REQUIRED, 1),
+            (SandboxStatus::from(SandboxState::Deleting), 1),
+            (SandboxStatus::from(SandboxState::Started), 1),
+            (SandboxStatus::from(SandboxState::Stopping), 1),
         ]
     );
 }

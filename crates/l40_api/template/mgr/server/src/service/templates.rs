@@ -431,7 +431,7 @@ impl TemplateManagerService {
 
         for sandbox in &sbx_sandboxes {
             sandbox
-                .observed_status()
+                .observed_lifecycle()
                 .map_err(|error| Status::internal(error.to_string()))?;
         }
 
@@ -477,7 +477,7 @@ impl TemplateManagerService {
                         .iter()
                         .filter(|s| {
                             s.pool_template.as_deref() == Some(build.name.as_str())
-                                && s.observed_status().is_ok_and(|state| state.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused))
+                                && s.observed_lifecycle().is_ok_and(|state| state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused)
                         })
                         .count(),
                 )
