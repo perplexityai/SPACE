@@ -912,36 +912,36 @@ pub(super) fn validate_slot_ready(
             net::TAP_DEVICE
         )));
     }
-    let has_snat = crate::firewall::try_ns_has_snat(&ns).map_err(|source| {
+    // One listing feeds every nftables check below; nothing writes between them.
+    let snapshot = crate::firewall::RulesetSnapshot::read(&ns).map_err(|source| {
         SlotValidationError::Probe(net::NetworkProbeError::Nft {
             detail: source.to_string(),
         })
     })?;
-    let has_dnat = crate::firewall::try_ns_has_dnat(&ns).map_err(|source| {
-        SlotValidationError::Probe(net::NetworkProbeError::Nft {
-            detail: source.to_string(),
-        })
-    })?;
-    if !has_snat || !has_dnat {
+    if !snapshot.has_nat_rules() {
         return Err(SlotValidationError::Missing(
             "namespace sandbox nft rules are missing".to_string(),
         ));
     }
-    crate::firewall::validate_namespace_firewall_config(&ns, &net.vpeer(), net::GUEST_IP).map_err(
-        |error| match error {
-            crate::firewall::FirewallValidationError::Inspect(source) => {
-                SlotValidationError::Probe(net::NetworkProbeError::Nft {
-                    detail: source.to_string(),
-                })
-            }
-            crate::firewall::FirewallValidationError::Missing(message) => {
-                SlotValidationError::Invalid(message)
-            }
-            crate::firewall::FirewallValidationError::PackagedPolicy(source) => {
-                SlotValidationError::PackagedPolicy(source)
-            }
-        },
-    )?;
+    crate::firewall::validate_namespace_firewall_config(
+        &snapshot,
+        &ns,
+        &net.vpeer(),
+        net::GUEST_IP,
+    )
+    .map_err(|error| match error {
+        crate::firewall::FirewallValidationError::Inspect(source) => {
+            SlotValidationError::Probe(net::NetworkProbeError::Nft {
+                detail: source.to_string(),
+            })
+        }
+        crate::firewall::FirewallValidationError::Missing(message) => {
+            SlotValidationError::Invalid(message)
+        }
+        crate::firewall::FirewallValidationError::PackagedPolicy(source) => {
+            SlotValidationError::PackagedPolicy(source)
+        }
+    })?;
     if !net::try_ns_sysctl_check(&ns, "net.ipv4.icmp_ratemask", net::NAMESPACE_ICMP_RATEMASK)? {
         return Err(SlotValidationError::Invalid(
             "namespace ICMP rate mask differs from packaged policy".to_string(),

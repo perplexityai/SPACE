@@ -1099,3 +1099,61 @@ fn dhcp_reconcile_accepts_nft_listing_and_repairs_old_or_duplicate_rules() {
     }
     assert_eq!(guest_dhcp_bootstrap_updates(None).unwrap().len(), 1);
 }
+
+// The fixtures are `nft -j list ruleset` of a namespace after its full
+// installations, from each supported nftables version.
+#[test]
+fn ruleset_snapshot_feeds_the_chain_validators_on_each_nft_version() {
+    let packaged: Vec<serde_json::Value> =
+        serde_json::from_str(&format!("[{}]", packaged_pre_tproxy_guardrails_policy())).unwrap();
+    for listing in [
+        include_str!("../fixtures/stamped_namespace_nft_1_0_4.json"),
+        include_str!("../fixtures/stamped_namespace_nft_1_0_9.json"),
+        include_str!("../fixtures/stamped_namespace_nft_1_1_3.json"),
+    ] {
+        let listing: serde_json::Value = serde_json::from_str(listing).unwrap();
+        let snapshot = RulesetSnapshot::from_listing(listing.clone());
+        let chain = |family, table, chain| snapshot.chain(family, table, chain).unwrap();
+        validate_guest_l2_ingress_chain(chain("netdev", SANDBOX_L2_TABLE, "ingress")).unwrap();
+        validate_forward_drop_chain(chain("ip", SANDBOX_TABLE, "forward"), "vpeer-000001").unwrap();
+        validate_pre_tproxy_guardrails_chain(
+            chain("ip", SANDBOX_TABLE, PRE_TPROXY_GUARDRAILS_CHAIN),
+            crate::net::GUEST_IP,
+            &packaged,
+        )
+        .unwrap();
+        assert!(snapshot.has_nat_rules());
+        // A chain's view is its chain object, then its own rules only, in
+        // listing order.
+        let listed: Vec<_> = listing["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                entry["rule"]["family"] == "ip"
+                    && entry["rule"]["table"] == PROXY_TABLE
+                    && entry["rule"]["chain"] == "prerouting"
+            })
+            .collect();
+        let (head, rules) = chain("ip", PROXY_TABLE, "prerouting")["nftables"]
+            .as_array()
+            .unwrap()
+            .split_first()
+            .unwrap();
+        assert_eq!(head["chain"]["name"], "prerouting");
+        assert!(listed.len() > 1);
+        assert_eq!(rules.iter().collect::<Vec<_>>(), listed);
+        assert!(snapshot.chain("ip", SANDBOX_TABLE, "missing").is_none());
+
+        for (chain, statement) in [("postrouting", "snat"), ("prerouting", "dnat")] {
+            let mut without = listing.clone();
+            without["nftables"].as_array_mut().unwrap().retain(|entry| {
+                !(entry["rule"]["table"] == SANDBOX_TABLE && entry["rule"]["chain"] == chain)
+            });
+            assert!(
+                !RulesetSnapshot::from_listing(without).has_nat_rules(),
+                "missing {statement}"
+            );
+        }
+    }
+}

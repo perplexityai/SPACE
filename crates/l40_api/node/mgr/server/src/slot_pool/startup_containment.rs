@@ -77,7 +77,23 @@ pub(super) fn contain_namespace(namespace: &str) -> Result<bool, PoolOpenError> 
         return Ok(false);
     }
     let mut error = None;
-    if let Err(source) = firewall::ensure_guest_l2_ingress_policy(namespace) {
+    let l2_ingress = firewall::apply_guest_l2_ingress_policy(namespace);
+    // One listing after the L2 write serves its check and the reply-path
+    // repair. If it cannot be read, the repair still runs on its own reads:
+    // live guests need that containment even when this one fails.
+    let (l2_ingress, reply_path) = match firewall::RulesetSnapshot::read(namespace) {
+        Ok(snapshot) => (
+            l2_ingress.map_err(Into::into).and_then(|()| {
+                firewall::validate_installed_guest_l2_ingress_policy(&snapshot, namespace)
+            }),
+            firewall::constrain_direct_inbound_reply_path_from(&snapshot, namespace).map(|_| ()),
+        ),
+        Err(read) => (
+            l2_ingress.and(Err(read)).map_err(Into::into),
+            firewall::constrain_direct_inbound_reply_path(namespace),
+        ),
+    };
+    if let Err(source) = l2_ingress {
         let failure = PoolOpenError::GuestL2Ingress {
             namespace: namespace.into(),
             source,
@@ -85,7 +101,7 @@ pub(super) fn contain_namespace(namespace: &str) -> Result<bool, PoolOpenError> 
         tracing::error!(%failure, "cannot install existing TAP containment");
         error = Some(failure);
     }
-    if let Err(source) = firewall::constrain_direct_inbound_reply_path(namespace) {
+    if let Err(source) = reply_path {
         let failure = PoolOpenError::DirectInboundReplyPath {
             namespace: namespace.into(),
             source,

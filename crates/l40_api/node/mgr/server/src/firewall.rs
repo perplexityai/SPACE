@@ -7,6 +7,7 @@
 //! a "sandbox" table created inside each network namespace.
 
 use crate::host_command::Command;
+use std::collections::HashMap;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Output;
@@ -85,16 +86,112 @@ add rule netdev {SANDBOX_L2_TABLE} ingress meta protocol {{ 0x0800, 0x0806 }} me
 /// Atomically install or refresh guest L2 ingress filtering in an existing
 /// sandbox namespace. Flushing the owned chain prevents duplicate rules on
 /// node-manager restart and resets only this policy's kernel counters.
-pub fn ensure_guest_l2_ingress_policy(ns: &str) -> Result<(), FirewallValidationError> {
-    apply_nft_script(&guest_l2_ingress_policy_script(), Some(ns))?;
-    let chain =
-        nft_chain_json(Some(ns), "netdev", SANDBOX_L2_TABLE, "ingress")?.ok_or_else(|| {
+/// Confirm the result with [`validate_installed_guest_l2_ingress_policy`] on
+/// a snapshot taken afterwards.
+pub fn apply_guest_l2_ingress_policy(ns: &str) -> FirewallResult<()> {
+    apply_nft_script(&guest_l2_ingress_policy_script(), Some(ns))
+}
+
+/// Check the L2 ingress policy that [`apply_guest_l2_ingress_policy`]
+/// installed, from a snapshot taken after it.
+pub fn validate_installed_guest_l2_ingress_policy(
+    snapshot: &RulesetSnapshot,
+    ns: &str,
+) -> Result<(), FirewallValidationError> {
+    let chain = snapshot
+        .chain("netdev", SANDBOX_L2_TABLE, "ingress")
+        .ok_or_else(|| {
             FirewallValidationError::Missing(
                 "guest L2 ingress chain is missing after apply".to_string(),
             )
         })?;
-    validate_guest_l2_ingress_chain(&chain)?;
+    validate_guest_l2_ingress_chain(chain)?;
     validate_guest_l2_ingress_binding(ns)
+}
+
+/// One `nft -j list ruleset` of a namespace, indexed by family, table and
+/// chain. Checks that run at the same point share one snapshot instead of
+/// listing each chain. A snapshot is never refreshed: after any write to the
+/// namespace, take a new one rather than checking the result against it.
+#[derive(Debug)]
+pub struct RulesetSnapshot {
+    /// Each chain by family, table and name, as `nft -j list chain` would
+    /// render it: the chain object, then its rules in order.
+    chains: HashMap<String, HashMap<String, HashMap<String, serde_json::Value>>>,
+}
+
+impl RulesetSnapshot {
+    pub fn read(ns: &str) -> FirewallResult<Self> {
+        let output =
+            nft_output(Some(ns), &["-j", "list", "ruleset"]).map_err(FirewallError::ListStart)?;
+        if !output.status.success() {
+            return Err(FirewallError::ListFailed {
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        serde_json::from_slice(&output.stdout)
+            .map(Self::from_listing)
+            .map_err(FirewallError::ListJson)
+    }
+
+    fn from_listing(listing: serde_json::Value) -> Self {
+        let names = |object: &serde_json::Value, name: &str| {
+            let field = |field: &str| object.get(field)?.as_str().map(str::to_string);
+            Some((field("family")?, field("table")?, field(name)?))
+        };
+        let mut chains: HashMap<String, HashMap<String, HashMap<String, serde_json::Value>>> =
+            HashMap::new();
+        let entries = listing
+            .get("nftables")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for entry in entries {
+            if let Some(chain) = entry.get("chain")
+                && let Some((family, table, name)) = names(chain, "name")
+            {
+                chains
+                    .entry(family)
+                    .or_default()
+                    .entry(table)
+                    .or_default()
+                    .insert(name, serde_json::json!({ "nftables": [entry] }));
+            }
+        }
+        for entry in entries {
+            if let Some(rule) = entry.get("rule")
+                && let Some((family, table, name)) = names(rule, "chain")
+                && let Some(serde_json::Value::Array(chain)) = chains
+                    .get_mut(&family)
+                    .and_then(|tables| tables.get_mut(&table))
+                    .and_then(|chains| chains.get_mut(&name))
+                    .map(|chain| &mut chain["nftables"])
+            {
+                chain.push(entry.clone());
+            }
+        }
+        Self { chains }
+    }
+
+    /// The chain and its rules, or `None` when the chain or its table is
+    /// absent.
+    pub fn chain(&self, family: &str, table: &str, chain: &str) -> Option<&serde_json::Value> {
+        self.chains.get(family)?.get(table)?.get(chain)
+    }
+
+    /// Whether the namespace's SNAT and DNAT rules are present.
+    pub fn has_nat_rules(&self) -> bool {
+        let has_statement = |chain, statement| {
+            self.chain("ip", SANDBOX_TABLE, chain)
+                .and_then(|chain| chain["nftables"].as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.pointer("/rule/expr")?.as_array())
+                .flatten()
+                .any(|expr| expr.get(statement).is_some())
+        };
+        has_statement("postrouting", "snat") && has_statement("prerouting", "dnat")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,7 +374,7 @@ pub fn setup_namespace_rules(
     install_namespace_rules(ns, vpeer, vpeer_ip, guest_ip, &pre_tproxy_guardrail_rules)
 }
 
-fn install_namespace_rules(
+pub(crate) fn install_namespace_rules(
     ns: &str,
     vpeer: &str,
     vpeer_ip: &str,
@@ -829,41 +926,45 @@ fn nft_chain_has_rule_comment(chain: &serde_json::Value, expected_comment: &str)
         })
 }
 
+/// Validate the namespace's filtering from one snapshot. The L2 device
+/// binding, which JSON listings omit, is read separately from `ns`.
 pub fn validate_namespace_firewall_config(
+    snapshot: &RulesetSnapshot,
     ns: &str,
     vpeer: &str,
     guest_ip: &str,
 ) -> Result<(), FirewallValidationError> {
-    let sandbox_forward =
-        nft_chain_json(Some(ns), "ip", SANDBOX_TABLE, "forward")?.ok_or_else(|| {
+    let sandbox_forward = snapshot
+        .chain("ip", SANDBOX_TABLE, "forward")
+        .ok_or_else(|| {
             FirewallValidationError::Missing(
                 "namespace sandbox forward chain is missing".to_string(),
             )
         })?;
-    validate_forward_drop_chain(&sandbox_forward, vpeer)
+    validate_forward_drop_chain(sandbox_forward, vpeer)
         .map_err(FirewallValidationError::Missing)?;
 
-    let pre_tproxy_guardrails =
-        nft_chain_json(Some(ns), "ip", SANDBOX_TABLE, PRE_TPROXY_GUARDRAILS_CHAIN)?.ok_or_else(
-            || {
-                FirewallValidationError::Missing(
-                    "namespace pre-TPROXY guardrails chain is missing".to_string(),
-                )
-            },
-        )?;
-    let guest_l2_ingress = nft_chain_json(Some(ns), "netdev", SANDBOX_L2_TABLE, "ingress")?
+    let pre_tproxy_guardrails = snapshot
+        .chain("ip", SANDBOX_TABLE, PRE_TPROXY_GUARDRAILS_CHAIN)
+        .ok_or_else(|| {
+            FirewallValidationError::Missing(
+                "namespace pre-TPROXY guardrails chain is missing".to_string(),
+            )
+        })?;
+    let guest_l2_ingress = snapshot
+        .chain("netdev", SANDBOX_L2_TABLE, "ingress")
         .ok_or_else(|| {
             FirewallValidationError::Missing(
                 "namespace guest L2 ingress chain is missing".to_string(),
             )
         })?;
-    validate_guest_l2_ingress_chain(&guest_l2_ingress)?;
+    validate_guest_l2_ingress_chain(guest_l2_ingress)?;
     validate_guest_l2_ingress_binding(ns)?;
     // A rollback must fence idle namespaces that still carry a newer verdict.
     let policy = load_pre_tproxy_guardrail_rules()?;
     let packaged: Vec<serde_json::Value> =
         serde_json::from_str(&format!("[{}]", policy)).map_err(PackagedPolicyError)?;
-    validate_pre_tproxy_guardrails_chain(&pre_tproxy_guardrails, guest_ip, &packaged)
+    validate_pre_tproxy_guardrails_chain(pre_tproxy_guardrails, guest_ip, &packaged)
 }
 
 fn validate_guest_l2_ingress_chain(
@@ -1378,10 +1479,31 @@ fn local_service_reply_rule_updates(
 pub fn constrain_direct_inbound_reply_path(ns: &str) -> FirewallResult<()> {
     let forward = nft_chain_json(Some(ns), "ip", SANDBOX_TABLE, "forward")?;
     let proxy = nft_chain_json(Some(ns), "ip", PROXY_TABLE, "prerouting")?;
-    let mut removals = inbound_reply_rule_removals(forward.as_ref())?;
-    removals.extend(local_service_reply_rule_updates(proxy.as_ref())?);
+    constrain_inbound_reply_chains(ns, forward.as_ref(), proxy.as_ref()).map(|_| ())
+}
+
+/// [`constrain_direct_inbound_reply_path`] from chains in a snapshot. Returns
+/// whether it changed the namespace, which makes the snapshot stale.
+pub fn constrain_direct_inbound_reply_path_from(
+    snapshot: &RulesetSnapshot,
+    ns: &str,
+) -> FirewallResult<bool> {
+    constrain_inbound_reply_chains(
+        ns,
+        snapshot.chain("ip", SANDBOX_TABLE, "forward"),
+        snapshot.chain("ip", PROXY_TABLE, "prerouting"),
+    )
+}
+
+fn constrain_inbound_reply_chains(
+    ns: &str,
+    forward: Option<&serde_json::Value>,
+    proxy: Option<&serde_json::Value>,
+) -> FirewallResult<bool> {
+    let mut removals = inbound_reply_rule_removals(forward)?;
+    removals.extend(local_service_reply_rule_updates(proxy)?);
     if removals.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let nftables = removals
         .into_iter()
@@ -1395,7 +1517,8 @@ pub fn constrain_direct_inbound_reply_path(ns: &str) -> FirewallResult<()> {
 ] }}"#
         ),
         Some(ns),
-    )
+    )?;
+    Ok(true)
 }
 
 fn owned_rule_removals(

@@ -105,7 +105,7 @@ fn startup_l2_reinstall_keeps_one_l2_marker() {
     }
     let namespace = TestNamespace::create();
     install(&namespace);
-    ensure_guest_l2_ingress_policy(namespace.name()).unwrap();
+    apply_guest_l2_ingress_policy(namespace.name()).unwrap();
     assert_eq!(
         marker(&namespace, ConfigPart::L2Ingress),
         Some(expected(ConfigPart::L2Ingress))

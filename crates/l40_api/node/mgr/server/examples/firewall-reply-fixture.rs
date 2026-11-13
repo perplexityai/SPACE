@@ -22,7 +22,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some("validate") => {
-            firewall::validate_namespace_firewall_config(namespace, "vpeer", "169.254.0.21")?;
+            let snapshot = firewall::RulesetSnapshot::read(namespace)?;
+            firewall::validate_namespace_firewall_config(
+                &snapshot,
+                namespace,
+                "vpeer",
+                "169.254.0.21",
+            )?;
         }
         Some("reapply") => {
             net::setup_tproxy(namespace, 12345, "vpeer", false)?;
