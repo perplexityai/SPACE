@@ -59,10 +59,9 @@ fn connect() -> ConnectFuture {
             .keep_alive_timeout(Duration::from_secs(5))
             .keep_alive_while_idle(true)
             .connect_with_connector(tower::service_fn(|_| async {
-                let stream = tokio::net::UnixStream::connect(
-                    pplx_space_common_core::host::linux::paths::NODE_CTL_SOCKET,
-                )
-                .await?;
+                let stream =
+                    tokio::net::UnixStream::connect(pplx_space_host_layout::paths::NODE_CTL_SOCKET)
+                        .await?;
                 Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
             }))
             .await

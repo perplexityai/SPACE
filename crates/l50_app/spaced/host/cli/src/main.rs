@@ -146,9 +146,9 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let mut config = pplx_space_spaced_host_client::SpacedHostClientConfig::default();
     if let Some(sandbox_id) = cli.sandbox {
-        config = config.with_socket_path(
-            pplx_space_common_core::host::linux::paths::spaced_host_socket(&sandbox_id),
-        );
+        config = config.with_socket_path(pplx_space_host_layout::paths::spaced_host_socket(
+            &sandbox_id,
+        ));
     }
     if let Some(socket) = cli.socket {
         config = config.with_socket_path(socket);

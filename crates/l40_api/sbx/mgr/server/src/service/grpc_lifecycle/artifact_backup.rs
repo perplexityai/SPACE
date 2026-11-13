@@ -754,11 +754,10 @@ impl SandboxManagerService {
                             "requested {expected_kind} backup but snapshot {name} is {adopted_kind}"
                         )));
                     }
-                    let local_path =
-                        pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-                            &sandbox.id,
-                            name.as_str(),
-                        );
+                    let local_path = pplx_space_host_layout::paths::sandbox_snapshot_dir(
+                        &sandbox.id,
+                        name.as_str(),
+                    );
                     if !std::path::Path::new(&local_path).is_dir() {
                         return Err(Status::failed_precondition(format!(
                             "snapshot {name} has no published local artifact"
@@ -839,11 +838,10 @@ impl SandboxManagerService {
                             )
                             .await
                             .map_err(stopped_disk_adoption_status)?;
-                        let local_path =
-                            pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-                                &sandbox.id,
-                                &snapshot_name,
-                            );
+                        let local_path = pplx_space_host_layout::paths::sandbox_snapshot_dir(
+                            &sandbox.id,
+                            &snapshot_name,
+                        );
                         let sandbox_id = sandbox.id.parse().map_err(|error| {
                             Status::internal(format!("persisted sandbox id is invalid: {error}"))
                         })?;

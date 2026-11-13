@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::host::linux::paths;
+use pplx_space_host_layout::paths;
 use tokio_stream::StreamExt;
 
 use crate::proto::sandbox_manager_client::SandboxManagerClient;
@@ -138,7 +138,7 @@ impl Server {
 }
 
 fn template_rootfs(scenario: &Scenario) -> PathBuf {
-    Path::new(&paths::template_build_dir(
+    Path::new(&pplx_space_common_core::types::template_build_dir(
         &scenario.template,
         &scenario.content_hash,
         pplx_space_common_core::types::TemplateCachePartition::Legacy,

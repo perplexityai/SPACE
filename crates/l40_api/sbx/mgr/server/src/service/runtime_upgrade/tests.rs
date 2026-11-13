@@ -1621,7 +1621,7 @@ async fn a_verified_upgrade_that_must_end_stopped_retires_only_once_stopped() {
 mod service {
     use super::*;
     use crate::service::{SandboxManagerService, SandboxManagerServiceOptions};
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     use pplx_space_uds_peer_auth::PeerIdentity;
 
     fn root<T>(message: T) -> tonic::Request<T> {
@@ -1847,7 +1847,7 @@ mod service {
     #[test]
     fn the_upgrade_callers_may_also_start_and_stop() {
         let authorizer = crate::service::activation_support::sandbox_peer_authorizer();
-        let identity = |user: pplx_space_common_core::host::linux::identities::LinuxUser| {
+        let identity = |user: pplx_space_host_layout::identities::LinuxUser| {
             PeerIdentity::new(user.uid, user.primary_group.gid, None)
         };
         let allowed = [

@@ -7,13 +7,22 @@
 //! it sees every consumer, including ones a single loop can't reclaim
 //! — and is portable across large and small node filesystems.
 //!
-//! The measurement itself lives in `pplx-space-common-core` so the
-//! node-ctl Kubernetes SSD-headroom tier label reads the identical signal;
-//! this module keeps the eviction-specific hysteresis gates.
+//! The `statvfs` probe itself is `pplx-space-host-linux`'s; this module
+//! points it at the cache filesystem and keeps the eviction-specific
+//! hysteresis gates.
 
 use std::time::Duration;
 
-pub use pplx_space_common_core::host::disk::{DiskUsage, read_cache_disk_usage};
+pub use pplx_space_host_linux::disk::DiskUsage;
+use pplx_space_host_linux::disk::{DiskStatus, statvfs_status};
+
+/// `statvfs` the SPACE cache filesystem. `None` when the syscall
+/// fails (cache not mounted yet, permissions) — callers treat that as
+/// "cannot evaluate the signal this tick" and skip rather than guess.
+#[cfg(unix)]
+pub fn read_cache_disk_usage() -> Option<DiskUsage> {
+    statvfs_status(pplx_space_host_layout::paths::SPACE_CACHE_DIR).map(DiskStatus::usage)
+}
 
 /// Shared validation for an `(engage, target)` hysteresis pair: both
 /// clamped to `[0, 1]`; a `target >= engage` misconfiguration warns

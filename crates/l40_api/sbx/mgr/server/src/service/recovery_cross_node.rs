@@ -991,7 +991,7 @@ pub(super) fn transition_restored_sandbox_to_stopped(
         conn,
         canonical_id,
         local_artifact_id,
-        &pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
+        &pplx_space_host_layout::paths::sandbox_snapshot_dir(
             canonical_id,
             &format!("d-stop-{local_artifact_id}"),
         ),
@@ -1441,8 +1441,7 @@ impl SandboxManagerService {
                         "refusing to remove orphan residue for live sandbox {canonical_id}"
                     )));
                 }
-                let canonical_dir =
-                    pplx_space_common_core::host::linux::paths::sandbox_cache_dir(&canonical_id);
+                let canonical_dir = pplx_space_host_layout::paths::sandbox_cache_dir(&canonical_id);
                 if std::path::Path::new(&canonical_dir).exists() {
                     // This is intentionally whole-sandbox disposal, not partial
                     // restore cleanup. Keep teardown and recursive removal with
@@ -1598,9 +1597,7 @@ impl SandboxManagerService {
                         activation_attempt_id,
                     )?;
                     let canonical_dir =
-                        pplx_space_common_core::host::linux::paths::sandbox_cache_dir(
-                            &canonical_id,
-                        );
+                        pplx_space_host_layout::paths::sandbox_cache_dir(&canonical_id);
                     let old_source = canonical_restore_exchange_old_source_at(
                         std::path::Path::new(&canonical_dir),
                         sandbox_id,
@@ -1623,8 +1620,7 @@ impl SandboxManagerService {
                 } else {
                     None
                 };
-                let canonical_dir =
-                    pplx_space_common_core::host::linux::paths::sandbox_cache_dir(&canonical_id);
+                let canonical_dir = pplx_space_host_layout::paths::sandbox_cache_dir(&canonical_id);
                 if let Some(scope) = exchanged_scope_to_clean {
                     finalize_exchanged_restore_after_cleanup(
                         &self.db,
@@ -1745,8 +1741,7 @@ impl SandboxManagerService {
         };
 
         let restore_as_new_destination = restore_artifact_as_new.map(|_| {
-            let canonical_dir =
-                pplx_space_common_core::host::linux::paths::sandbox_cache_dir(&canonical_id);
+            let canonical_dir = pplx_space_host_layout::paths::sandbox_cache_dir(&canonical_id);
             restore_as_new_metadata_destination(
                 retrying_interrupted_restore,
                 std::path::Path::new(&canonical_dir).exists(),
@@ -2083,8 +2078,7 @@ impl SandboxManagerService {
                 reclaimable_published_remote_restore_source_at(&staged.sandbox_dir, sandbox_id)?;
             ensure_staged_restore_source(&restore_source, current_staged_source.as_ref())?;
 
-            let canonical_dir =
-                pplx_space_common_core::host::linux::paths::sandbox_cache_dir(&canonical_id);
+            let canonical_dir = pplx_space_host_layout::paths::sandbox_cache_dir(&canonical_id);
             let current_source = reclaimable_published_remote_restore_source(sandbox_id).await?;
             match canonical_root_reclaim_decision(
                 initially_observed_source,

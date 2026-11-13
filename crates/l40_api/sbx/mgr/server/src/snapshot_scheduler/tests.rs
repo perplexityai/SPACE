@@ -620,7 +620,7 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
         for (name, setup) in names.iter().zip(candidates) {
             let id = LocalArtifactId::new();
             ids.push(id);
-            let local_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
+            let local_path = pplx_space_host_layout::paths::sandbox_snapshot_dir_in(
                 &cache_root,
                 &sandbox_id,
                 name,

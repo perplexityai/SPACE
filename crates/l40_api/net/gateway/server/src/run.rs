@@ -303,7 +303,7 @@ pub async fn run(
     let known_egress_state = KnownEgressState::new(config.known_egress_domains.clone());
     let proxy_shutdown_token = CancellationToken::new();
     let authority = GatewayAuthority::new(
-        pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.into(),
+        pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.into(),
         service_port_ingress.clone(),
         proxy_shutdown_token.clone(),
     )

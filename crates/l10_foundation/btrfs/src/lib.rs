@@ -39,8 +39,7 @@
 //! degrades to the legacy `create + reflink` lifecycle.
 //!
 //! It is its own crate so that code can use these helpers without depending
-//! on `pplx-space-common-core`. `pplx-space-common-core` re-exports it from
-//! `host::btrfs`.
+//! on `pplx-space-common-core`.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;

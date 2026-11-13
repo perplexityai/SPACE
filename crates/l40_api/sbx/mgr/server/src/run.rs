@@ -19,11 +19,11 @@ use std::time::Duration;
 
 use http::{HeaderMap, Request as HttpRequest, Response as HttpResponse};
 use http_body::{Body, Frame, SizeHint};
-use pplx_space_common_core::host::linux::identities::group_names;
-use pplx_space_common_core::{
-    host::linux::paths::SANDBOX_MANAGER_DEPENDENCY_ADMISSION_GATE,
-    host::linux::paths::SANDBOX_MANAGER_DEPENDENCY_DRAIN_CAPABILITY,
-    host::linux::paths::SANDBOX_MANAGER_DEPENDENCY_WORK_GATE,
+use pplx_space_host_layout::identities::group_names;
+use pplx_space_host_layout::{
+    paths::SANDBOX_MANAGER_DEPENDENCY_ADMISSION_GATE,
+    paths::SANDBOX_MANAGER_DEPENDENCY_DRAIN_CAPABILITY,
+    paths::SANDBOX_MANAGER_DEPENDENCY_WORK_GATE,
 };
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::{DEFAULT_DRAIN_TIMEOUT, DEFAULT_SERVICE_MUTEX_TIMEOUT};

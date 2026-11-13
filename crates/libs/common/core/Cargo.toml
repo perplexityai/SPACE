@@ -12,11 +12,8 @@ workspace = true
 
 [dependencies]
 aws-lc-rs = { workspace = true, optional = true }
-libc = { workspace = true }
-nix = { workspace = true, features = ["fs", "ioctl"] }
 pplx-space-accounts = { workspace = true }
 pplx-space-auto-lifecycle = { workspace = true }
-pplx-space-btrfs = { workspace = true }
 pplx-space-byte-size = { workspace = true }
 pplx-space-cluster-id = { workspace = true }
 pplx-space-content-digest = { workspace = true }
@@ -26,6 +23,7 @@ pplx-space-durations = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
 pplx-space-guest-process = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 pplx-space-job-id = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-linux-ids = { workspace = true }
@@ -35,7 +33,6 @@ pplx-space-pii = { workspace = true }
 pplx-space-rpc-contracts = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
-pplx-space-test-hooks = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 sqlx = { workspace = true, features = ["postgres", "uuid"], optional = true }
@@ -45,7 +42,6 @@ uuid = { workspace = true, features = ["v5", "v7"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-tempfile = { workspace = true }
 
 [features]
 default = []

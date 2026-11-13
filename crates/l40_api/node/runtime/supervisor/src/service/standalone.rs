@@ -231,7 +231,7 @@ fn standalone_config_for_environment(
     }
     Ok(crate::contained_launcher::Config {
         root,
-        registration_directory: pplx_space_common_core::host::linux::paths::sandbox_run_dir(
+        registration_directory: pplx_space_host_layout::paths::sandbox_run_dir(
             &sandbox.to_string(),
         )
         .into(),

@@ -941,7 +941,7 @@ ON CONFLICT (template_release_id, storage_connection_string) DO UPDATE
     SET org_id = COALESCE(template_release_storage_locations.org_id, EXCLUDED.org_id);
 """
 # sandbox-manager's per-sandbox cache root (`SANDBOX_CACHE_DIR` in
-# common-core's linux paths); cold eviction removes `<root>/<sandbox uuid>`.
+# host-layout's paths); cold eviction removes `<root>/<sandbox uuid>`.
 SANDBOX_CACHE_ROOT = "/space/cache/firecracker/sandboxes"
 _COLD_EVICTION_DEFAULT_ENGAGE = 0.75
 _COLD_EVICTION_DEFAULT_TARGET = 0.70

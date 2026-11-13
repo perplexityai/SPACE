@@ -52,9 +52,19 @@ pub use pplx_space_spaced_common::{
     DEFAULT_COMMAND_RETRY_POLICY, DEFAULT_CONNECT_RETRY_POLICY, RetryPolicy,
 };
 
+/// The spaced-host socket: under [`SPACED_HOST_SOCKET_DIR`] on Linux, and in
+/// the temporary directory on other hosts, which have no node layout.
+///
+/// [`SPACED_HOST_SOCKET_DIR`]: pplx_space_host_layout::paths::SPACED_HOST_SOCKET_DIR
 pub fn default_host_uds_path() -> std::path::PathBuf {
-    pplx_space_common_core::host::linux::paths::default_host_uds_path(
-        pplx_space_common_core::host::linux::paths::SPACED_HOST_SOCKET_FILE,
+    let socket_dir = if cfg!(target_os = "linux") {
+        std::path::PathBuf::from(pplx_space_host_layout::paths::SPACED_HOST_SOCKET_DIR)
+    } else {
+        std::env::temp_dir()
+    };
+    pplx_space_host_layout::paths::host_uds_path(
+        socket_dir,
+        pplx_space_host_layout::paths::SPACED_HOST_SOCKET_FILE,
     )
 }
 

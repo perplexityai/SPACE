@@ -250,7 +250,7 @@ pub(crate) fn create_transfer_directory(path: &Path) -> Result<(), Status> {
         let filesystem = nix::sys::statfs::statfs(parent)
             .map_err(|error| Status::internal(format!("inspect transfer filesystem: {error}")))?;
         if filesystem.filesystem_type() == nix::sys::statfs::BTRFS_SUPER_MAGIC {
-            return pplx_space_common_core::host::btrfs::create_subvolume(path)
+            return pplx_space_btrfs::create_subvolume(path)
                 .map_err(|error| Status::internal(format!("create transfer subvolume: {error}")));
         }
     }
@@ -259,9 +259,8 @@ pub(crate) fn create_transfer_directory(path: &Path) -> Result<(), Status> {
 }
 
 pub(crate) fn remove_transfer_directory(path: &Path) -> std::io::Result<()> {
-    if pplx_space_common_core::host::btrfs::is_subvolume(path) {
-        pplx_space_common_core::host::btrfs::delete_subvolume_if_present(path)
-            .map_err(std::io::Error::other)
+    if pplx_space_btrfs::is_subvolume(path) {
+        pplx_space_btrfs::delete_subvolume_if_present(path).map_err(std::io::Error::other)
     } else {
         std::fs::remove_dir_all(path)
     }

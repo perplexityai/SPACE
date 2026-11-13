@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::host::disk::{DiskStatus, statvfs_status};
+use pplx_space_host_linux::disk::{DiskStatus, statvfs_status};
 
 pub(crate) trait StorageProbe: Send + Sync {
     fn status(&self, root: &Path) -> Option<DiskStatus>;

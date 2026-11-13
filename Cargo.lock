@@ -5083,10 +5083,13 @@ dependencies = [
  "pplx-space-credmgr-client",
  "pplx-space-db-test-fixtures",
  "pplx-space-execution-common",
+ "pplx-space-host-layout",
+ "pplx-space-host-linux",
  "pplx-space-internal-api-server",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
+ "pplx-space-node-disk-admission",
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-object-store",
@@ -5208,7 +5211,7 @@ dependencies = [
  "anyhow",
  "clap",
  "pplx-space-build-mgr-server",
- "pplx-space-common-core",
+ "pplx-space-host-layout",
  "pplx-space-service-host",
  "pplx-space-service-lifecycle",
  "pplx-space-tokio-runtime",
@@ -5384,11 +5387,8 @@ name = "pplx-space-common-core"
 version = "0.8.2"
 dependencies = [
  "aws-lc-rs",
- "libc",
- "nix 0.31.3",
  "pplx-space-accounts",
  "pplx-space-auto-lifecycle",
- "pplx-space-btrfs",
  "pplx-space-byte-size",
  "pplx-space-cluster-id",
  "pplx-space-content-digest",
@@ -5398,6 +5398,7 @@ dependencies = [
  "pplx-space-env-vars",
  "pplx-space-execution-spec",
  "pplx-space-guest-process",
+ "pplx-space-host-layout",
  "pplx-space-job-id",
  "pplx-space-k8s-ids",
  "pplx-space-linux-ids",
@@ -5407,11 +5408,9 @@ dependencies = [
  "pplx-space-rpc-contracts",
  "pplx-space-semver",
  "pplx-space-sql-locator",
- "pplx-space-test-hooks",
  "serde",
  "serde_json",
  "sqlx",
- "tempfile",
  "thiserror 2.0.20",
  "tracing",
  "uuid",
@@ -5611,6 +5610,7 @@ dependencies = [
  "pplx-space-federated-identity",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
+ "pplx-space-host-layout",
  "pplx-space-k8s-node-id",
  "pplx-space-kube-client",
  "pplx-space-local-health",
@@ -5658,11 +5658,11 @@ name = "pplx-space-credmgr-client"
 version = "0.8.2"
 dependencies = [
  "anyhow",
- "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
  "pplx-space-credential-injection",
  "pplx-space-env-vars",
+ "pplx-space-host-layout",
  "pplx-space-rustls-provider",
  "pplx-space-test-env",
  "prost",
@@ -5683,8 +5683,8 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "clap",
- "pplx-space-common-core",
  "pplx-space-credmgr",
+ "pplx-space-host-layout",
  "pplx-space-service-host",
  "pplx-space-service-lifecycle",
  "pplx-space-tokio-runtime",
@@ -5724,6 +5724,7 @@ dependencies = [
  "pplx-space-native-files",
  "pplx-space-net-gateway-client",
  "pplx-space-node-api-client",
+ "pplx-space-node-disk-admission",
  "pplx-space-observability",
  "pplx-space-public-api",
  "pplx-space-public-api-http",
@@ -5780,6 +5781,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-jobs",
  "pplx-space-db-test-fixtures",
+ "pplx-space-host-layout",
  "pplx-space-migration-checksums",
  "pplx-space-sbx-mgr-store",
  "pplx-space-sql-locator",
@@ -6055,6 +6057,22 @@ dependencies = [
 [[package]]
 name = "pplx-space-guest-status"
 version = "0.8.2"
+
+[[package]]
+name = "pplx-space-host-layout"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-linux-ids",
+ "uuid",
+]
+
+[[package]]
+name = "pplx-space-host-linux"
+version = "0.8.2"
+dependencies = [
+ "libc",
+ "nix 0.31.3",
+]
 
 [[package]]
 name = "pplx-space-http-server"
@@ -6356,6 +6374,7 @@ dependencies = [
  "pplx-space-events",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
+ "pplx-space-host-layout",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-net-gateway-client",
@@ -6399,6 +6418,7 @@ dependencies = [
  "pplx-space-api-route",
  "pplx-space-common-core",
  "pplx-space-credential-injection",
+ "pplx-space-host-layout",
  "pplx-space-net-common",
  "pplx-space-net-gateway",
  "pplx-space-net-gateway-client",
@@ -6422,8 +6442,8 @@ name = "pplx-space-net-gateway-client"
 version = "0.8.2"
 dependencies = [
  "nix 0.31.3",
- "pplx-space-common-core",
  "pplx-space-common-grpc",
+ "pplx-space-host-layout",
  "pplx-space-net-common",
  "pplx-space-net-gateway-protocol",
  "pplx-space-test-env",
@@ -6485,6 +6505,7 @@ dependencies = [
  "pplx-space-common-proto-build",
  "pplx-space-execution-common",
  "pplx-space-grpc-lb",
+ "pplx-space-host-layout",
  "pplx-space-net-common",
  "pplx-space-net-gateway-client",
  "pplx-space-node-mgr-client",
@@ -6529,6 +6550,7 @@ dependencies = [
  "pplx-space-env-vars",
  "pplx-space-grpc-metrics",
  "pplx-space-grpc-server",
+ "pplx-space-host-layout",
  "pplx-space-k8s-node-id",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
@@ -6615,6 +6637,7 @@ dependencies = [
  "hyper-util",
  "jiff",
  "pplx-space-common-core",
+ "pplx-space-host-layout",
  "pplx-space-node-api-client",
  "serde",
  "serde_json",
@@ -6629,9 +6652,9 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "hyper-util",
- "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
+ "pplx-space-host-layout",
  "prost",
  "tokio",
  "tonic",
@@ -6660,6 +6683,7 @@ dependencies = [
  "pplx-space-grpc-metrics",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
+ "pplx-space-host-layout",
  "pplx-space-kube-client",
  "pplx-space-local-health",
  "pplx-space-metrics-emit",
@@ -6705,7 +6729,7 @@ dependencies = [
  "clap",
  "hyper-util",
  "nix 0.31.3",
- "pplx-space-common-core",
+ "pplx-space-host-layout",
  "pplx-space-node-ctl-server",
  "pplx-space-service-host",
  "pplx-space-service-lifecycle",
@@ -6715,6 +6739,17 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tower",
+]
+
+[[package]]
+name = "pplx-space-node-disk-admission"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-btrfs",
+ "pplx-space-host-layout",
+ "pplx-space-host-linux",
+ "pplx-space-test-hooks",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -6732,6 +6767,7 @@ dependencies = [
  "jiff",
  "libc",
  "nix 0.31.3",
+ "pplx-space-btrfs",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-credmgr-client",
@@ -6742,10 +6778,13 @@ dependencies = [
  "pplx-space-grpc-metrics",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
+ "pplx-space-host-layout",
+ "pplx-space-host-linux",
  "pplx-space-local-health",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-ctl-client",
+ "pplx-space-node-disk-admission",
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
@@ -6803,6 +6842,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-execution-common",
+ "pplx-space-host-layout",
  "pplx-space-node-mgr-protocol",
  "pplx-space-tokio-runtime",
  "prost",
@@ -6863,6 +6903,8 @@ dependencies = [
  "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-file-io",
+ "pplx-space-host-layout",
+ "pplx-space-host-linux",
  "pplx-space-metrics-emit",
  "pplx-space-template-runtime",
  "pplx-space-test-env",
@@ -6905,6 +6947,7 @@ dependencies = [
  "pplx-space-common-jobs",
  "pplx-space-execution-common",
  "pplx-space-grpc-server",
+ "pplx-space-host-layout",
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-node-runtime-manager-client",
@@ -6952,10 +6995,10 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "hyper-util",
- "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
  "pplx-space-execution-common",
+ "pplx-space-host-layout",
  "pplx-space-unix-socket-path",
  "prost",
  "serde",
@@ -6975,6 +7018,7 @@ dependencies = [
  "anyhow",
  "clap",
  "pplx-space-common-core",
+ "pplx-space-host-layout",
  "pplx-space-node-runtime-core",
  "pplx-space-node-runtime-manager",
  "pplx-space-service-host",
@@ -6994,6 +7038,8 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-execution-common",
  "pplx-space-grpc-server",
+ "pplx-space-host-layout",
+ "pplx-space-host-linux",
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
  "pplx-space-service-host",
@@ -7018,7 +7064,7 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "clap",
- "pplx-space-common-core",
+ "pplx-space-host-layout",
  "pplx-space-node-runtime-supervisor",
 ]
 
@@ -7204,6 +7250,7 @@ dependencies = [
  "pplx-space-bearer-token",
  "pplx-space-common-core",
  "pplx-space-env-vars",
+ "pplx-space-host-layout",
  "pplx-space-kube-client",
  "pplx-space-metrics-emit",
  "pplx-space-test-env",
@@ -7404,6 +7451,7 @@ dependencies = [
  "pplx-space-api-route",
  "pplx-space-auto-lifecycle-receipt",
  "pplx-space-bearer-token",
+ "pplx-space-btrfs",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-jobs",
@@ -7420,6 +7468,8 @@ dependencies = [
  "pplx-space-grpc-metrics",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
+ "pplx-space-host-layout",
+ "pplx-space-host-linux",
  "pplx-space-ingress-admission",
  "pplx-space-k8s-node-id",
  "pplx-space-local-health",
@@ -7429,6 +7479,7 @@ dependencies = [
  "pplx-space-net-gateway",
  "pplx-space-net-gateway-client",
  "pplx-space-node-api-client",
+ "pplx-space-node-disk-admission",
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
@@ -7444,6 +7495,7 @@ dependencies = [
  "pplx-space-spaced-host-client",
  "pplx-space-spaced-update",
  "pplx-space-state-reconciliation",
+ "pplx-space-template-cache-permissions",
  "pplx-space-template-manifest",
  "pplx-space-template-mgr-client",
  "pplx-space-template-runtime",
@@ -7487,6 +7539,7 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-cli",
  "pplx-space-common-core",
+ "pplx-space-host-layout",
  "pplx-space-net-common",
  "pplx-space-net-gateway-client",
  "pplx-space-node-api-client",
@@ -7509,6 +7562,7 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
+ "pplx-space-host-layout",
  "pplx-space-sbx-mgr-protocol",
  "thiserror 2.0.20",
  "tokio",
@@ -7554,6 +7608,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-jobs",
  "pplx-space-events",
+ "pplx-space-host-layout",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-mgr-protocol",
@@ -7586,7 +7641,7 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "clap",
- "pplx-space-common-core",
+ "pplx-space-host-layout",
  "pplx-space-sbx-mgr",
  "pplx-space-service-host",
  "pplx-space-service-lifecycle",
@@ -7716,6 +7771,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-proto-build",
  "pplx-space-credential-injection",
+ "pplx-space-host-layout",
  "pplx-space-net-common",
  "pplx-space-spaced-build",
  "pplx-space-spaced-guest-protocol",
@@ -7780,6 +7836,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-env-vars",
  "pplx-space-grpc-metrics",
+ "pplx-space-host-linux",
  "pplx-space-observability",
  "pplx-space-service-host",
  "pplx-space-spaced-guest-protocol",
@@ -7928,6 +7985,7 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-cli",
  "pplx-space-common-core",
+ "pplx-space-host-layout",
  "pplx-space-spaced-guest-server",
  "pplx-space-spaced-host-client",
  "pplx-space-spaced-host-server",
@@ -7943,6 +8001,7 @@ version = "0.8.2"
 dependencies = [
  "futures-util",
  "pplx-space-common-core",
+ "pplx-space-host-layout",
  "pplx-space-spaced-common",
  "prost",
  "prost-types",
@@ -7970,6 +8029,7 @@ dependencies = [
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
  "pplx-space-guest-process",
+ "pplx-space-host-layout",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-observability",
@@ -8088,6 +8148,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-template-cache-permissions"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-host-layout",
+]
+
+[[package]]
 name = "pplx-space-template-manifest"
 version = "0.8.2"
 dependencies = [
@@ -8109,6 +8176,7 @@ dependencies = [
  "hex",
  "jiff",
  "nix 0.31.3",
+ "pplx-space-btrfs",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-jobs",
@@ -8120,6 +8188,7 @@ dependencies = [
  "pplx-space-file-io",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
+ "pplx-space-host-layout",
  "pplx-space-internal-api-server",
  "pplx-space-local-health",
  "pplx-space-lru-reaper",
@@ -8140,6 +8209,7 @@ dependencies = [
  "pplx-space-sqlite",
  "pplx-space-state-reconciliation",
  "pplx-space-stopwatch",
+ "pplx-space-template-cache-permissions",
  "pplx-space-template-manifest",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
@@ -8194,6 +8264,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
  "pplx-space-execution-common",
+ "pplx-space-host-layout",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-observability",
@@ -8360,8 +8431,11 @@ dependencies = [
  "pplx-space-file-io",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
+ "pplx-space-host-layout",
+ "pplx-space-host-linux",
  "pplx-space-local-health",
  "pplx-space-metrics-emit",
+ "pplx-space-node-disk-admission",
  "pplx-space-node-mgr-client",
  "pplx-space-object-store",
  "pplx-space-page-cache",
@@ -8416,6 +8490,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
+ "pplx-space-host-layout",
  "prost",
  "serde",
  "serde_json",
@@ -8433,8 +8508,8 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "clap",
- "pplx-space-common-core",
  "pplx-space-credmgr-client",
+ "pplx-space-host-layout",
  "pplx-space-service-host",
  "pplx-space-service-lifecycle",
  "pplx-space-tokio-runtime",

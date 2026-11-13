@@ -26,13 +26,10 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 pub use crate::metrics::TemplateBuildErrorKind;
-use pplx_space_common_core::{
-    host::linux::identities::group_names,
-    types::{
-        BUILDER_SANDBOX_OWNER, ContentHash, DEFAULT_GUEST_USER, DEFAULT_TEMPLATE_TAG,
-        TemplateBuildId,
-    },
+use pplx_space_common_core::types::{
+    BUILDER_SANDBOX_OWNER, ContentHash, DEFAULT_GUEST_USER, DEFAULT_TEMPLATE_TAG, TemplateBuildId,
 };
+use pplx_space_host_layout::identities::group_names;
 pub use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyV1Proto;
 use pplx_space_node_mgr_client::proto::{
@@ -680,10 +677,8 @@ impl TemplateBuilder {
                 let seeds = oci::GuestSeeds::from_env()?;
                 let selected = if seeds.applies_to(base) {
                     let image = oci::mount(oci::OciMountRequest {
-                        cache_dir: Path::new(
-                            pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR,
-                        )
-                        .join("builds/oci"),
+                        cache_dir: Path::new(pplx_space_host_layout::paths::FIRECRACKER_CACHE_DIR)
+                            .join("builds/oci"),
                         reference: reference.clone(),
                     })
                     .await
@@ -880,8 +875,7 @@ impl TemplateBuilder {
         let oci_guest_runtime = if let Some((reference, guest_runtime, guest_bin_dir)) = oci_inputs
         {
             let cache_dir =
-                Path::new(pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR)
-                    .join("builds/oci");
+                Path::new(pplx_space_host_layout::paths::FIRECRACKER_CACHE_DIR).join("builds/oci");
             let seed_rootfs = resolved_base.rootfs_path.clone();
             let bundle_version = guest_runtime.spaced_version.clone();
             let result = build_phase(template_id, BuildPhase::PrepareOciRootfs, async {
@@ -1131,8 +1125,7 @@ impl TemplateBuilder {
         // For runtime-bearing images, confirmed Stop proves the runtime cgroups
         // are gone; no container-local /proc check can strengthen that barrier.
         // Copy the modified rootfs out BEFORE delete removes it.
-        let cache_rootfs =
-            pplx_space_common_core::host::linux::paths::sandbox_rootfs_path(&sandbox_id);
+        let cache_rootfs = pplx_space_host_layout::paths::sandbox_rootfs_path(&sandbox_id);
         let final_rootfs = format!("{output_dir}/rootfs.ext4");
         if let Err(e) = build_phase(template_id, BuildPhase::CopyRootfs, async {
             std::fs::create_dir_all(&output_dir).map_err(|source| BuildError::Io {
@@ -1160,7 +1153,7 @@ impl TemplateBuilder {
         }
 
         let sandbox_metadata_path =
-            pplx_space_common_core::host::linux::paths::sandbox_metadata_path(&sandbox_id);
+            pplx_space_host_layout::paths::sandbox_metadata_path(&sandbox_id);
         let execution = match tokio::fs::read(&sandbox_metadata_path).await {
             Ok(bytes) => serde_json::from_slice::<
                 pplx_space_common_core::types::SandboxArtifactMetadata,
@@ -1402,7 +1395,7 @@ impl TemplateBuilder {
         let workspace_cargo_toml = scratch_workspace_cargo_toml();
         let cache_dir = format!(
             "{}/builds/seed-cache",
-            pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR
+            pplx_space_host_layout::paths::FIRECRACKER_CACHE_DIR
         );
 
         println!("=== Building template '{template_id}' from recipe '{recipe_label}' ===");
@@ -1749,9 +1742,8 @@ fn validate_scratch_recipe(recipe: &Recipe) -> Result<(), BuildError> {
 }
 
 fn write_scratch_scripts() -> Result<ScratchScriptBundle, BuildError> {
-    let scratch_script_root =
-        Path::new(pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR)
-            .join(SCRATCH_SCRIPT_STAGE_SUBDIR);
+    let scratch_script_root = Path::new(pplx_space_host_layout::paths::FIRECRACKER_CACHE_DIR)
+        .join(SCRATCH_SCRIPT_STAGE_SUBDIR);
     fs::create_dir_all(&scratch_script_root).map_err(|source| BuildError::Io {
         operation: "create scratch script staging dir",
         source,

@@ -386,8 +386,7 @@ async fn command(command: Command) -> anyhow::Result<()> {
             } else {
                 None
             };
-            let socket =
-                Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET);
+            let socket = Path::new(pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET);
             tokio::fs::create_dir_all(socket.parent().context("host-control socket parent")?)
                 .await?;
             let listener = UnixListener::bind(socket)?;

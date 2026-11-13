@@ -74,7 +74,7 @@ impl Drop for GatewayNode {
 
 #[test]
 fn launches_require_isolated_gateway_identity() {
-    // Slot mapping and range boundaries are covered in common-core's gateway tests.
+    // Slot mapping and range boundaries are covered in host-layout's gateway tests.
     assert_eq!(launch_uid(10_042).unwrap(), 2_000_042);
     assert_eq!(
         launch_uid(501).unwrap_err().code(),

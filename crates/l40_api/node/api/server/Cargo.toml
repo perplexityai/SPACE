@@ -52,6 +52,7 @@ pplx-space-api-route = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-host-layout = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-grpc-server = { workspace = true }

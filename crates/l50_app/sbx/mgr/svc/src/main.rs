@@ -32,7 +32,7 @@ struct Cli {
     /// mutex is acquired.
     #[arg(
         long,
-        default_value = pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET
+        default_value = pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET
     )]
     host_control_socket: PathBuf,
 

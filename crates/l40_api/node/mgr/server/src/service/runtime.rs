@@ -3,8 +3,8 @@ use super::disk::*;
 use super::network_helpers::*;
 use super::validation::*;
 use super::*;
-use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::types::{LinuxPid, SandboxId};
+use pplx_space_host_layout::paths;
 
 pub(super) fn registered_firecracker_pid(
     run_dir: &Path,
@@ -509,7 +509,7 @@ impl NodeManagerService {
             let sandbox_uid = info.sandbox_uid;
             let net_id = NetId::from_slot_info(info);
             let expected_spaced_host_peer = (req.program
-                == pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN)
+                == pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN)
                 .then(|| {
                     registered_firecracker_pid(Path::new(RUN_DIR), &req.sandbox_id).map(|pid| {
                         ExpectedSpacedHostPeer::new(
@@ -629,7 +629,7 @@ impl NodeManagerService {
         })?;
 
         // Set up TPROXY rules if launching net-gateway (needs UID for anti-loop rule).
-        if req.program == pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN {
+        if req.program == pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN {
             let details = || {
                 SandboxEventDetails::default()
                     .operation("tproxy_setup")
@@ -665,8 +665,7 @@ impl NodeManagerService {
         }
 
         // Build pre-exec sockets for net-gateway (TPROXY needs IP_TRANSPARENT as root)
-        let pre_exec_sockets = if req.program
-            == pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN
+        let pre_exec_sockets = if req.program == pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN
         {
             vec![
                 launch::PreExecSocket {
@@ -702,8 +701,7 @@ impl NodeManagerService {
             vec![]
         };
 
-        let grant_cap =
-            req.program == pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN;
+        let grant_cap = req.program == pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN;
         let pid = self
             .runtime_supervisor
             .launch_sidecar(pplx_space_node_runtime_core::proto::LaunchSidecarRequest {
@@ -766,7 +764,7 @@ impl NodeManagerService {
             )));
         }
 
-        if req.program == pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN {
+        if req.program == pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN {
             if let Some(socket_path) = req.args.windows(2).find_map(|args| {
                 (args.first()? == "--socket")
                     .then(|| args.get(1).map(String::as_str))

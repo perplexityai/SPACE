@@ -31,9 +31,7 @@ const ROOTFS: &str = "rootfs.ext4";
 const ALLOWED: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Admin),
-    UdsPeerPrincipal::Service(
-        pplx_space_common_core::host::linux::identities::user_names::SPACE_SBXMGR,
-    ),
+    UdsPeerPrincipal::Service(pplx_space_host_layout::identities::user_names::SPACE_SBXMGR),
 ];
 
 /// Read only: the private parent carries the template's received UUID, or once
@@ -362,7 +360,7 @@ pub(super) fn materialize(
             }
             trusted_paths::set_permissions(
                 output,
-                Some(pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW),
+                Some(pplx_space_host_layout::identities::gids::SPACE_CACHE_RW),
                 0o660,
             )
         })?;

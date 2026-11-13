@@ -127,7 +127,7 @@ struct EcrAuthObservingRunner {
 }
 
 struct SequenceStorageProbe {
-    statuses: Mutex<VecDeque<pplx_space_common_core::host::disk::DiskStatus>>,
+    statuses: Mutex<VecDeque<pplx_space_host_linux::disk::DiskStatus>>,
 }
 
 const FIXTURE_MANIFEST_DIGEST: &str =
@@ -167,13 +167,11 @@ impl SequenceStorageProbe {
             statuses: Mutex::new(
                 available_bytes
                     .into_iter()
-                    .map(
-                        |available_bytes| pplx_space_common_core::host::disk::DiskStatus {
-                            total_bytes: 1_000,
-                            free_bytes: available_bytes,
-                            available_bytes,
-                        },
-                    )
+                    .map(|available_bytes| pplx_space_host_linux::disk::DiskStatus {
+                        total_bytes: 1_000,
+                        free_bytes: available_bytes,
+                        available_bytes,
+                    })
                     .collect(),
             ),
         }
@@ -181,7 +179,7 @@ impl SequenceStorageProbe {
 }
 
 impl StorageProbe for SequenceStorageProbe {
-    fn status(&self, _root: &Path) -> Option<pplx_space_common_core::host::disk::DiskStatus> {
+    fn status(&self, _root: &Path) -> Option<pplx_space_host_linux::disk::DiskStatus> {
         self.statuses
             .lock()
             .expect("storage status lock")

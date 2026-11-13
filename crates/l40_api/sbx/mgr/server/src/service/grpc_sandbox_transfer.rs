@@ -55,8 +55,7 @@ struct SandboxImportPaths {
 
 impl SandboxImportPaths {
     fn new(sandbox_id: &str) -> Self {
-        let sandbox_base =
-            pplx_space_common_core::host::linux::paths::sandbox_cache_dir(sandbox_id);
+        let sandbox_base = pplx_space_host_layout::paths::sandbox_cache_dir(sandbox_id);
         let instance_dir = format!("{sandbox_base}/instance");
         let snapshot_dir = format!("{sandbox_base}/snapshot");
         let import_id = uuid::Uuid::now_v7();
@@ -694,8 +693,7 @@ async fn write_imported_sandbox_metadata(
     );
     let sandbox_metadata_bytes = serde_json::to_vec_pretty(&sandbox_metadata)
         .map_err(|error| Status::internal(format!("serialize sandbox metadata: {error}")))?;
-    let sandbox_metadata_path =
-        pplx_space_common_core::host::linux::paths::sandbox_metadata_path(sandbox_id);
+    let sandbox_metadata_path = pplx_space_host_layout::paths::sandbox_metadata_path(sandbox_id);
     let sandbox_metadata_staging = format!("{sandbox_metadata_path}.importing");
     tokio::fs::write(&sandbox_metadata_staging, sandbox_metadata_bytes)
         .await
@@ -762,8 +760,7 @@ impl SandboxManagerService {
             ));
         }
 
-        let instance_dir =
-            pplx_space_common_core::host::linux::paths::sandbox_instance_dir(&sandbox.id);
+        let instance_dir = pplx_space_host_layout::paths::sandbox_instance_dir(&sandbox.id);
         if !std::path::Path::new(&instance_dir).is_dir() {
             return Err(Status::not_found("sandbox instance directory not found"));
         }
@@ -817,9 +814,7 @@ impl SandboxManagerService {
                             let mut required = vec![sandbox_rootfs.clone()];
                             if include_snapshot {
                                 let directory =
-                                    pplx_space_common_core::host::linux::paths::sandbox_cache_dir(
-                                        &sandbox_id,
-                                    );
+                                    pplx_space_host_layout::paths::sandbox_cache_dir(&sandbox_id);
                                 required.extend([
                                     format!("{directory}/snapshot/vmstate"),
                                     format!("{directory}/snapshot/memory"),
@@ -868,9 +863,8 @@ impl SandboxManagerService {
                             let _diff_guard = DiffCleanup(diff_path.clone());
 
                             let snapshot_working_dir =
-                                pplx_space_common_core::host::linux::paths::sandbox_cache_dir(
-                                    &sandbox_id,
-                                ) + "/snapshot";
+                                pplx_space_host_layout::paths::sandbox_cache_dir(&sandbox_id)
+                                    + "/snapshot";
                             let (files, total_size) = match receive::sandbox_export_files(
                                 std::path::Path::new(&instance_dir),
                                 include_snapshot

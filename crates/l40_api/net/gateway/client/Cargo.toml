@@ -16,8 +16,8 @@ tokio = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-net-gateway-protocol = { workspace = true }
 pplx-space-transparent-proxy-socket = { workspace = true }

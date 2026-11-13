@@ -9,13 +9,13 @@ use super::validation::*;
 use super::*;
 use crate::snapshot_request::SnapshotStorage;
 
-use pplx_space_common_core::host::linux::identities::gids;
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_host_layout::identities::gids;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use pplx_space_common_core::host::linux::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX as INTERNAL_INSTANCE_SNAPSHOT_PREFIX;
+use pplx_space_host_layout::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX as INTERNAL_INSTANCE_SNAPSHOT_PREFIX;
 
 #[cfg(test)]
 type CaptureIo = std::sync::Arc<
@@ -580,13 +580,13 @@ impl NodeManagerService {
                     )?;
                     super::trusted_paths::set_permissions(
                         &copied,
-                        Some(pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW),
+                        Some(pplx_space_host_layout::identities::gids::SPACE_CACHE_RW),
                         0o660,
                     )?;
                 }
                 super::trusted_paths::set_permissions(
                     &destination,
-                    Some(pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW),
+                    Some(pplx_space_host_layout::identities::gids::SPACE_CACHE_RW),
                     0o2770,
                 )?;
                 destination.sync_all().map_err(super::artifact_fs::error)
@@ -1512,14 +1512,13 @@ fn validate_cache_artifact_path(local_path: &str) -> Result<(), Status> {
     let owner = parts
         .next()
         .ok_or_else(|| Status::invalid_argument("missing artifact owner"))?;
-    if owner != pplx_space_common_core::host::linux::paths::FORK_COPY_STAGING_DIR_NAME {
+    if owner != pplx_space_host_layout::paths::FORK_COPY_STAGING_DIR_NAME {
         super::trusted_paths::canonical_sandbox_id(owner)?;
     }
     let artifact = parts.next().ok_or_else(|| {
         Status::invalid_argument("artifact path must not name a sandbox or staging root")
     })?;
-    let allowed = if owner == pplx_space_common_core::host::linux::paths::FORK_COPY_STAGING_DIR_NAME
-    {
+    let allowed = if owner == pplx_space_host_layout::paths::FORK_COPY_STAGING_DIR_NAME {
         uuid::Uuid::parse_str(artifact).is_ok()
     } else {
         // GC staging sits beside the artifact it held: `.gc-pending-<id>`, or

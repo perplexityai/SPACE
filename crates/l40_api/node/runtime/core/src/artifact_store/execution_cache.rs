@@ -52,7 +52,7 @@ impl StageExecutionError {
             | Self::Verity {
                 source: crate::verity::VerityError::Io { source, .. },
                 ..
-            } => pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(source),
+            } => pplx_space_host_linux::path_errors::host_path_io_error_is_transient(source),
             Self::UnsupportedBackend(_)
             | Self::FallbackOnCapableBackend(_)
             | Self::Catalog(_)

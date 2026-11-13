@@ -173,7 +173,7 @@ fn signal_process_handle(
     handle: &ProcessHandle,
     signal: ProcessSignal,
 ) -> Result<bool, ProcessHandleError> {
-    match pplx_space_common_core::host::linux::signal_pidfd(&handle.pidfd, signal) {
+    match pplx_space_host_linux::signal_pidfd(&handle.pidfd, signal.as_i32()) {
         Ok(()) => Ok(true),
         Err(source) if source.raw_os_error() == Some(libc::ESRCH) => Ok(false),
         Err(source) => Err(ProcessHandleError::Signal {
@@ -385,7 +385,7 @@ pub fn prepare_sidecar_launch(
 
     // Before setuid: an unprivileged, non-dumpable process cannot open its own
     // /proc/self/oom_score_adj.
-    pplx_space_common_core::host::linux::prefer_for_oom_kill()
+    pplx_space_host_linux::prefer_for_oom_kill()
         .map_err(|error| format!("set oom_score_adj failed: {error}"))?;
     nix::unistd::setgroups(&[]).map_err(|e| format!("setgroups([]) failed: {e}"))?;
     nix::unistd::setgid(Gid::from_raw(gid)).map_err(|e| format!("setgid failed: {e}"))?;
@@ -433,8 +433,8 @@ fn apply_child_hardening() -> Result<(), String> {
     set_child_rlimit(
         "RLIMIT_NOFILE",
         Resource::RLIMIT_NOFILE,
-        pplx_space_common_core::host::linux::SANDBOX_PROCESS_NOFILE_LIMIT,
-        pplx_space_common_core::host::linux::SANDBOX_PROCESS_NOFILE_LIMIT,
+        pplx_space_host_layout::SANDBOX_PROCESS_NOFILE_LIMIT,
+        pplx_space_host_layout::SANDBOX_PROCESS_NOFILE_LIMIT,
     )?;
     set_child_rlimit("RLIMIT_NPROC", Resource::RLIMIT_NPROC, 512, 512)?;
 
@@ -674,7 +674,7 @@ fn jailer_args(config: JailerArgs<'_>) -> Vec<String> {
         "--resource-limit".to_string(),
         format!(
             "no-file={}",
-            pplx_space_common_core::host::linux::SANDBOX_PROCESS_NOFILE_LIMIT
+            pplx_space_host_layout::SANDBOX_PROCESS_NOFILE_LIMIT
         ),
         "--new-pid-ns".to_string(),
     ];
@@ -720,12 +720,14 @@ fn direct_jailer_command(
     let mut cmd = std::process::Command::new(&program);
     cmd.env_clear().env("PATH", JAILER_PATH);
     cmd.args(jailer_args);
-    // Jailer and the Firecracker process it daemonizes inherit this score.
+    // Firecracker and sandbox sidecars run with the maximum OOM score so host
+    // memory pressure kills sandboxes before node services. Jailer and the
+    // Firecracker process it daemonizes inherit this score.
     // Registered first: the sealed-executable hook below never returns.
     // SAFETY: `prefer_for_oom_kill` is async-signal-safe.
     unsafe {
         use std::os::unix::process::CommandExt;
-        cmd.pre_exec(pplx_space_common_core::host::linux::prefer_for_oom_kill);
+        cmd.pre_exec(pplx_space_host_linux::prefer_for_oom_kill);
     }
     if let JailerExecutable::Sealed(file) = jailer {
         bind_jailer_descriptor(&mut cmd, file.file().try_clone()?, &program, jailer_args)?;

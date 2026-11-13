@@ -139,8 +139,9 @@ impl DigestDirRejection {
 /// never clears keeps the dir without a row, so every pull of its digest is
 /// refused until it clears or `DeleteTemplateBuild` removes the dir, with a
 /// warning each time the GC tick examines it. That's where this differs from
-/// `host::path_errors::host_path_io_error_is_transient`, whose permanent
-/// answer fails a sandbox create rather than deleting a build.
+/// `host_path_io_error_is_transient` in `pplx-space-host-linux`'s
+/// `path_errors`, whose permanent answer fails a sandbox create on the node's
+/// launch path rather than deleting a build.
 fn io_error_is_transient(error: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     let permanent = matches!(
@@ -477,11 +478,9 @@ async fn remove_digest_dir_from_disk(template_root: &Path, build: DigestDirBuild
     let canonical_root = template_root == Path::new(TEMPLATE_DIR);
     let dir = digest_dir.to_path_buf();
     let take_rpc_leg = canonical_root
-        && tokio::task::spawn_blocking(move || {
-            pplx_space_common_core::host::btrfs::is_subvolume(&dir)
-        })
-        .await
-        .unwrap_or(false);
+        && tokio::task::spawn_blocking(move || pplx_space_btrfs::is_subvolume(&dir))
+            .await
+            .unwrap_or(false);
     if take_rpc_leg {
         match crate::btrfs_via_nodemgr::delete_template_subvolume(name, hash_name, partition).await
         {

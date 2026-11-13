@@ -24,11 +24,11 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::types::{
     Arch, ArtifactComponentKind, ArtifactComponentRole, ArtifactVersion, Digest, RuntimeIdentity,
     RuntimeKind, RuntimeVersion, StateFormatIdentity,
 };
+use pplx_space_host_layout::paths;
 use sha2::{Digest as _, Sha256};
 
 mod boot_artifact;

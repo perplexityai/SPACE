@@ -146,7 +146,7 @@ fn root_request<T>(message: T) -> Request<T> {
 
 fn service_request<T>(
     message: T,
-    user: pplx_space_common_core::host::linux::identities::LinuxUser,
+    user: pplx_space_host_layout::identities::LinuxUser,
 ) -> Request<T> {
     request_from_peer(message, user.uid, user.primary_group.gid)
 }
@@ -266,7 +266,7 @@ async fn pull_artifact_as(
     service: &VolumeManagerService,
     subject_id: &str,
     artifact_id: &str,
-    user: pplx_space_common_core::host::linux::identities::LinuxUser,
+    user: pplx_space_host_layout::identities::LinuxUser,
 ) -> Result<String, Status> {
     VolumeManager::pull_files_async(
         service,
@@ -366,7 +366,7 @@ async fn closing_admission_rejects_mutations() {
 
 #[tokio::test]
 async fn rpc_authorization_rejects_group_members_and_separates_subject_kinds() {
-    use pplx_space_common_core::{host::linux::identities::groups, host::linux::identities::users};
+    use pplx_space_host_layout::{identities::groups, identities::users};
 
     let temp = tempfile::tempdir().expect("tempdir");
     let service = test_service(&temp).await;
@@ -471,7 +471,7 @@ async fn rpc_authorization_rejects_group_members_and_separates_subject_kinds() {
 
 #[tokio::test]
 async fn pull_artifact_dedup_never_returns_the_other_manager_class_job() {
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
 
     const SANDBOX_SUBJECT: &str = "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2";
     const TEMPLATE_SUBJECT: &str = "template:seed";

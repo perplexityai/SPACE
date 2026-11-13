@@ -86,7 +86,7 @@ pub async fn connect(socket_path: &str) -> Result<ConnectedVolumeManagerClient, 
     Ok(VolumeManagerClient::new(wrap_grpc_client_channel(channel)))
 }
 
-pub const VOLMGR_SOCKET: &str = pplx_space_common_core::host::linux::paths::VOLUME_MANAGER_SOCKET;
+pub const VOLMGR_SOCKET: &str = pplx_space_host_layout::paths::VOLUME_MANAGER_SOCKET;
 pub const RESTORE_PRIORITY: i32 = 100;
 pub const VERIFIED_REPLICA_PROVENANCE_VERSION: u32 = 1;
 const ENSURE_FILE_REPLICA_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {

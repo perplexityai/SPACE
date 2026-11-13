@@ -11,9 +11,9 @@ pub mod proto {
     tonic::include_proto!("space.node.runtime.manager.v1");
 }
 
-pub use pplx_space_common_core::host::linux::paths::RUNTIME_MANAGER_SOCKET;
 /// The shared execution vocabulary the listing's runtime and component kinds use.
 pub use pplx_space_execution_common::proto as execution;
+pub use pplx_space_host_layout::paths::RUNTIME_MANAGER_SOCKET;
 pub use pplx_space_unix_socket_path::UnixSocketPath;
 
 const LOCAL_ENDPOINT_URI: &str = "http://[::]:50051";

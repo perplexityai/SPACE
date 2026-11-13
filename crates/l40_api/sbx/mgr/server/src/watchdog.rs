@@ -69,7 +69,7 @@ const SIDECAR_RESTART_CONCURRENCY: usize = 16;
 const NODE_LEASE_MISSING_BACKOFF_INITIAL: Duration = SIDECAR_CHECK_INTERVAL;
 const NODE_LEASE_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(300);
 const NODE_LEASE_MISSING_HEALTH_DETAIL: &str = "node lease missing: the last sidecar relaunch found no node-manager network lease; relaunches are backing off";
-const RUN_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR;
+const RUN_DIR: &str = pplx_space_host_layout::paths::SANDBOX_RUN_DIR;
 const GUEST_HEALTH_LIFECYCLES: [crate::state::SandboxState; 9] = [
     crate::state::SandboxState::Starting,
     crate::state::SandboxState::Started,
@@ -3287,7 +3287,7 @@ async fn restart_spaced_host(
                 pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(id, None).into()
             }),
             sandbox_id: id.clone(),
-            program: pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN.to_string(),
+            program: pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN.to_string(),
             args: spaced_host_restart_args(id, vsock_uds_path, agent),
             uid,
             gid: uid,
@@ -3300,7 +3300,7 @@ async fn restart_spaced_host(
     let config =
         pplx_space_spaced_host_client::SpacedHostClientConfig::default().with_socket_path(format!(
             "{RUN_DIR}/{id}/{}",
-            pplx_space_common_core::host::linux::paths::SPACED_HOST_SOCKET_FILE
+            pplx_space_host_layout::paths::SPACED_HOST_SOCKET_FILE
         ));
     let spaced_host =
         pplx_space_spaced_host_client::SpacedHostClient::new_with_config_and_expected_peer(
@@ -3360,13 +3360,13 @@ fn spaced_host_restart_args(
 ) -> Vec<String> {
     vec![
         "--socket".to_string(),
-        pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+        pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
         "--sandbox-id".to_string(),
         sandbox_id.to_string(),
         "--vsock-uds".to_string(),
         vsock_uds_path,
         "--host-control-socket".to_string(),
-        pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
+        pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
         "--boot-type".to_string(),
         if agent.supports_memory_lifecycle() {
             "resume"
@@ -3438,7 +3438,7 @@ async fn relaunch_netgtw(
                 pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(id, None).into()
             }),
             sandbox_id: sandbox_id.to_string(),
-            program: pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN.to_string(),
+            program: pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN.to_string(),
             args,
             uid: process_uid,
             gid: process_uid,
@@ -3541,7 +3541,7 @@ fn clear_netgtw_probe_state(state: &mut HashMap<String, SandboxHealth>, sandbox_
 fn spaced_host_socket_path(sandbox_id: &str) -> String {
     format!(
         "{RUN_DIR}/{sandbox_id}/{}",
-        pplx_space_common_core::host::linux::paths::SPACED_HOST_SOCKET_FILE
+        pplx_space_host_layout::paths::SPACED_HOST_SOCKET_FILE
     )
 }
 

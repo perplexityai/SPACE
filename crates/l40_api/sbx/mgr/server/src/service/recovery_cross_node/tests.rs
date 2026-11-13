@@ -680,7 +680,7 @@ fn materializing_a_stopped_sandbox_lands_stopped_with_its_pin() {
         .expect("the pin names a local artifact row");
     assert_eq!(
         row.local_path,
-        pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
+        pplx_space_host_layout::paths::sandbox_snapshot_dir(
             &sandbox_id,
             &format!("d-stop-{}", meta.local_artifact_id.unwrap()),
         ),

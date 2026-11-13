@@ -1137,7 +1137,7 @@ impl SandboxManagerService {
         pid: u32,
         uid: u32,
     ) -> Result<crate::db::SandboxRow, Status> {
-        let uid = pplx_space_common_core::host::linux::gateway::sandbox_uid(
+        let uid = pplx_space_host_layout::gateway::sandbox_uid(
             pplx_space_common_core::types::LinuxUid::new(uid),
         )
         .map(|owner| owner.get())

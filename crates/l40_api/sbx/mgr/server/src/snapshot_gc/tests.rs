@@ -847,11 +847,8 @@ async fn named_delete_failing_partway_leaves_staging_for_the_orphan_sweep() {
     let root = TempDir::new().unwrap();
     let cache_root = root.path().to_str().unwrap().to_owned();
     let sandbox = SandboxId::new().to_string();
-    let local_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
-        &cache_root,
-        &sandbox,
-        NAME,
-    );
+    let local_path =
+        pplx_space_host_layout::paths::sandbox_snapshot_dir_in(&cache_root, &sandbox, NAME);
     fs::create_dir_all(Path::new(&local_path).join("nested")).unwrap();
     for file in ["memory", "vmstate", "nested/rootfs"] {
         fs::write(Path::new(&local_path).join(file), file).unwrap();
