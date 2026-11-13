@@ -420,6 +420,10 @@ pub struct TemplateManagerService {
     /// Lists the node's sandboxes for pool counts. A field so a test can
     /// answer and count the listing without a sandbox-manager socket.
     pool_sandbox_lister: PoolSandboxLister,
+    /// The sandbox memory policy `ListTemplates` reports snapshot memory
+    /// under, kept off the listing's path. A field so a test can answer it
+    /// without a sandbox-manager socket.
+    sandbox_memory_policy: memory_policy_cache::SandboxMemoryPolicyCache,
     /// Shared by the GC loop, startup recovery and `DeleteIdleTemplate`.
     eviction_gate: crate::eviction::EvictionGate,
     /// The last `(template, build dir)` the GC tick's rowless check
@@ -1787,6 +1791,7 @@ impl TemplateManagerService {
             background_worker,
             sbx_connect_retry_policy: pplx_space_sbx_mgr_client::DEFAULT_CONNECT_RETRY_POLICY,
             pool_sandbox_lister: PoolSandboxLister::sandbox_manager(),
+            sandbox_memory_policy: memory_policy_cache::SandboxMemoryPolicyCache::sandbox_manager(),
             eviction_gate: crate::eviction::EvictionGate::default(),
             rowless_cursor: Arc::new(Mutex::new(None)),
             rowless_checks: Arc::new(tokio::sync::Semaphore::new(ROWLESS_BUILD_DIRS_PER_GC_TICK)),
@@ -1837,6 +1842,15 @@ impl TemplateManagerService {
     #[cfg(test)]
     fn without_sbx_connect_retries(mut self) -> Self {
         self.sbx_connect_retry_policy = pplx_space_sbx_mgr_client::GrpcRetryPolicy::none();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_sandbox_memory_policy(
+        mut self,
+        policy: memory_policy_cache::SandboxMemoryPolicyCache,
+    ) -> Self {
+        self.sandbox_memory_policy = policy;
         self
     }
 
@@ -2750,6 +2764,7 @@ async fn expand_template_rootfs(
 mod adapter;
 mod import_helpers;
 mod lookup;
+mod memory_policy_cache;
 mod pools;
 mod snapshots;
 mod startup_recovery;
