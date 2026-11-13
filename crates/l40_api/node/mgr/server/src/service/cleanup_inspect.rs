@@ -7,6 +7,9 @@ use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
 };
 use pplx_space_host_layout::paths;
+use pplx_space_node_runtime_core::cgroup_paths::{
+    CGROUP_BASE as SANDBOX_CGROUP_ROOT, jailer_cgroup_path_in,
+};
 use tracing::Instrument as _;
 
 type CleanupOperationResult = Result<CleanupSandboxResponse, Status>;
@@ -931,10 +934,10 @@ fn parse_cleanup_request(
     Ok((sandbox_id, request))
 }
 
-const SANDBOX_CGROUP_ROOT: &str = "/sys/fs/cgroup/space";
-
-/// The sandbox cgroup files Stats reports, under the `sbx-` prefixed or the
-/// direct jailer name. Absent files read as empty.
+/// The sandbox cgroup files Stats reports. The `sbx-` prefixed cgroup is read
+/// when it exists, else the jailer cgroup. That order predates this helper and
+/// is not a statement about which cgroup holds the VM. Absent files read as
+/// empty.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SandboxCgroup {
     exists: bool,
@@ -948,11 +951,12 @@ struct SandboxCgroup {
 
 impl SandboxCgroup {
     fn read(root: &std::path::Path, sandbox_id: &str) -> Self {
-        let Some(base) = [format!("sbx-{sandbox_id}"), sandbox_id.to_string()]
-            .into_iter()
-            .map(|name| root.join(name))
-            .find(|path| path.exists())
-        else {
+        let Some(base) = [
+            root.join(format!("sbx-{sandbox_id}")),
+            jailer_cgroup_path_in(root, sandbox_id),
+        ]
+        .into_iter()
+        .find(|path| path.exists()) else {
             return Self::default();
         };
         let read = |file: &str| {

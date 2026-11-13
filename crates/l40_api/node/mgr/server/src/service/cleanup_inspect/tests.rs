@@ -916,27 +916,27 @@ async fn cleanup_proceeds_once_the_claim_holder_releases_it() {
 
 #[test]
 fn sandbox_cgroup_reads_either_cgroup_name_and_reports_an_absent_one() {
-    let root = tempfile::tempdir().unwrap();
     let id = SandboxId::new().to_string();
-    assert_eq!(
-        SandboxCgroup::read(root.path(), &id),
-        SandboxCgroup::default()
-    );
-
     for name in [id.clone(), format!("sbx-{id}")] {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            SandboxCgroup::read(root.path(), &id),
+            SandboxCgroup::default()
+        );
         let dir = root.path().join(&name);
         std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("memory.current"), format!("{}\n", name.len())).unwrap();
+        std::fs::write(dir.join("memory.current"), "4096\n").unwrap();
         std::fs::write(dir.join("cpu.stat"), "usage_usec 7\n").unwrap();
-        // The prefixed name wins once it exists; absent files read as empty.
+        // Absent files read as empty.
         assert_eq!(
             SandboxCgroup::read(root.path(), &id),
             SandboxCgroup {
                 exists: true,
-                memory_current: name.len().to_string(),
+                memory_current: "4096".to_string(),
                 cpu_stat: "usage_usec 7".to_string(),
                 ..Default::default()
-            }
+            },
+            "{name}"
         );
     }
 }
