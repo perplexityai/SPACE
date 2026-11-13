@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use pplx_space_api::controllers::substrate::ActivationOptions;
 use pplx_space_api::controllers::substrate::kubernetes::{
-    GenerationTeardownEvidence, KubernetesSubstrate, observe_generation_teardown_with_node_api,
+    GenerationTeardownEvidence, KubernetesSubstrate, LeftoverStoppedUpgrade,
+    StoppedEvacuationOpening, leftover_stopped_upgrade, observe_generation_teardown_with_node_api,
+    open_stopped_evacuation,
 };
 use pplx_space_api::controllers::substrate::{
     EnqueuedArtifactBackup, NodeApiTarget, NodeReportedArtifact, NodeSchedulability,
@@ -35,9 +37,11 @@ use pplx_space_sandbox_portability::{
     snapshot_durable_for_source_release, snapshot_is_current_local_artifact,
 };
 use pplx_space_sandbox_store as sandbox_store;
+#[cfg(test)]
+use pplx_space_sandbox_store::drain::claim_stopped_evacuation;
 use pplx_space_sandbox_store::drain::{
-    self, StoppedEvacuationClaim, claim_evacuation_suspend, claim_stopped_evacuation,
-    gone_node_identity_guards, record_stopped_evacuation_artifact, revert_evacuation_suspend_claim,
+    self, StoppedEvacuationClaim, claim_evacuation_suspend, gone_node_identity_guards,
+    record_stopped_evacuation_artifact, revert_evacuation_suspend_claim,
 };
 
 use pplx_space_api::metrics::sandbox::api::SandboxApiMetricIdentity;
@@ -207,7 +211,7 @@ async fn node_api_row(
 /// and its local copy still on the node, holding the drain and refusing its
 /// owner's `start` forever. A row already carrying the marker is work in
 /// progress, and this queue has to keep offering it until it finishes.
-/// [`claim_stopped_evacuation`] is where the flag actually bites: it refuses to
+/// [`claim_stopped_evacuation`](drain::claim_stopped_evacuation) is where the flag actually bites: it refuses to
 /// open a new evacuation while resuming an existing one.
 ///
 /// **The `ORDER BY` is load-bearing, not tidiness.** `spawn_bounded` walks this
@@ -237,7 +241,7 @@ async fn node_api_row(
 /// re-competes for a slot every tick, so a large enough set of them can crowd
 /// out the *evacuable* stopped rows behind them. That is bounded by the
 /// `unattributable_artifact` counter being visible, and it stops mattering when
-/// the refusal stops being the common case — see [`claim_stopped_evacuation`]
+/// the refusal stops being the common case — see [`claim_stopped_evacuation`](drain::claim_stopped_evacuation)
 /// for the node-side fact that makes it rare.
 ///
 /// **An encrypted `stopped` sandbox is never listed**, on either the fresh or
@@ -767,7 +771,7 @@ pub(crate) fn stopped_replacements_pending_query() -> &'static str {
 /// is registration time, which comes after the claim, so it can under-report;
 /// the value also drops when the first catalog row appears and the clock
 /// switches from the drain's start to it. None is a
-/// claim about the artifact's *contents* — see [`claim_stopped_evacuation`] for
+/// claim about the artifact's *contents* — see [`claim_stopped_evacuation`](drain::claim_stopped_evacuation) for
 /// why no timestamp here could be.
 ///
 /// **Scoped to claimed evacuations, and only those.** This selects on the
@@ -1397,7 +1401,7 @@ pub enum PinnedLocalSource {
 /// [`stopped_evacuation_stall_secs_query`] and `SubstrateSink::stopped_evacuation_state`.
 /// The pod-less give-up's precheck binds [`PHASE_DRAINING`] and
 /// [`NodeDrainMode::Forced`]. Three statements in `pplx_space_sandbox_store::drain`
-/// ([`claim_evacuation_suspend`], [`claim_stopped_evacuation`],
+/// ([`claim_evacuation_suspend`], [`claim_stopped_evacuation`](drain::claim_stopped_evacuation),
 /// [`record_stopped_evacuation_artifact`]) bind `NodeDrainPhase::Draining` and
 /// `NodeDrainMode::Forced`. All of them render `'draining'` and `'forced'`. The
 /// binding statements are left as they are, because converting a guarded
@@ -1676,6 +1680,12 @@ pub struct SubstrateSink {
     /// only while it's on, and by `tear_down_stopped_local_copy`, which
     /// releases a node's copy only while it's on.
     replace_stopped_evacuations: bool,
+    /// The stay-stopped upgrade operations whose abandon a node refused as
+    /// invalid, by sandbox, so the drain doesn't ask again; see
+    /// [`StoppedEvacuationOutcome::UpgradeAbandonRefused`]. One entry per such
+    /// sandbox, kept for the process's lifetime: each needs an operator, so
+    /// there are few, and a stale entry costs only a log line at `debug`.
+    refused_upgrade_abandons: std::sync::Mutex<HashMap<SandboxId, RefusedUpgradeAbandon>>,
 }
 
 enum SubstrateSinkBackend {
@@ -1709,6 +1719,27 @@ struct TestStoppedPath {
     /// pinned to exactly the artifact the cluster row records.
     teardown_node_artifact: Option<NodeReportedArtifact>,
     teardowns: std::sync::Mutex<Vec<SandboxId>>,
+    /// The pod an unfinished stay-stopped runtime upgrade left, if any.
+    upgrade_pod: std::sync::Mutex<TestUpgradePod>,
+    /// The publishes and upgrade-pod steps, in the order they ran.
+    events: std::sync::Mutex<Vec<&'static str>>,
+    /// The sandboxes step 0a asked to settle an expired stay-stopped upgrade
+    /// for, in order.
+    settled: std::sync::Mutex<Vec<SandboxId>>,
+    /// Whether the faked node refuses, as invalid, to abandon an upgrade's
+    /// operation once its pod is gone.
+    refuse_abandon: std::sync::atomic::AtomicBool,
+}
+
+/// The faked pod of an unfinished stay-stopped runtime upgrade: running until
+/// the evacuation deletes it, then terminating until the next look finds it
+/// gone.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TestUpgradePod {
+    Absent,
+    Running,
+    Terminating,
 }
 
 type SuspendExecutionResult = Result<Option<PublishedLocalArtifact>, SubstrateError>;
@@ -1766,7 +1797,7 @@ struct StoppedEvacuationState {
     /// `current_disk_artifact_backup_ready` answers "the pinned disk artifact is
     /// durably restorable", not "the pinned disk artifact describes the current
     /// rootfs"; its own doc says so in those terms. The provenance half is
-    /// established upstream, by [`claim_stopped_evacuation`] refusing to open on
+    /// established upstream, by [`claim_stopped_evacuation`](drain::claim_stopped_evacuation) refusing to open on
     /// a row the node already has pinned. Conflating the two here would let a
     /// durable artifact authorize giving up bytes it does not describe.
     ///
@@ -1809,6 +1840,15 @@ struct StoppedEvacuationState {
     /// is ordinary drift that resolves itself. Reporting the second as the first
     /// sends a responder to clear a pin on a sandbox that is fine.
     marked: bool,
+    /// The row is still a `stopped` resident of a node this drain is
+    /// force-draining: [`Self::claim_holds`] without the marker conjunct.
+    ///
+    /// Read for step 0a, which acts on an unmarked row before any claim
+    /// re-checks the drain. Without it, a row whose node was undrained after
+    /// the listing would still have its expired stay-stopped upgrade settled,
+    /// its pod deleted and its operation abandoned, by a drain that no longer
+    /// owns it.
+    resident: bool,
 }
 
 /// The longest-waiting stopped evacuation, with enough identity to act on.
@@ -1908,6 +1948,52 @@ pub enum StoppedEvacuationOutcome {
     UnattributableArtifact {
         local_artifact_id: Option<LocalArtifactId>,
     },
+    /// The sandbox's node refused, as invalid, to abandon the operation of an
+    /// unfinished stay-stopped runtime upgrade this evacuation has to settle
+    /// before it can capture the disk (steps 0a and 1c of
+    /// `evacuate_stopped_sandbox`): sandbox-manager records the operation for
+    /// another sandbox, or can't parse its ids. No retry changes that, so the
+    /// sandbox needs an operator. Nothing published, nothing destroyed.
+    ///
+    /// **A repair of the node's record doesn't release the node by itself.**
+    /// The drain asks the node once per sandbox and operation per controller
+    /// process (below), so the node stays held after a repair until a
+    /// controller restart or leader change, or a new upgrade operation on the
+    /// sandbox, has the drain ask again. Deleting the sandbox stops it holding
+    /// the node once the row reaches `deleted`: a `deleting` row still counts as
+    /// resident (`sandbox_residency::NON_RESIDENT_LIFECYCLES`).
+    ///
+    /// **The node keeps holding the sandbox's only copy, and is held for it.**
+    /// The sandbox stays `stopped` and placed on the node (`active_node_id`),
+    /// which `sandbox_residency::active_resident_predicate` counts. That
+    /// predicate is what node drain's fourth gate term and its guarded
+    /// `draining → drained` write read (`termination_blocking_residents_query`
+    /// and `set_drain_phase_query`; the stopped evacuation runs only with that
+    /// term on), and what the drained-node terminator's `drained →
+    /// terminating` write re-checks (`mark_terminating_query`). So the node is
+    /// neither drained nor terminated while the sandbox's only copy is on it.
+    ///
+    /// The drain asks the node to abandon that operation once:
+    /// [`SubstrateSink`] remembers the refusal for the controller process's
+    /// lifetime (`SubstrateSink::refused_upgrade_abandon`), and later ticks
+    /// report this outcome from that memory without calling the node. A
+    /// controller restart or leader change (losing the lease ends the
+    /// process) asks once more, and so does a new upgrade operation on the
+    /// sandbox.
+    /// `newly_refused` is `true` only on the tick that got the refusal.
+    UpgradeAbandonRefused {
+        operation_id: uuid::Uuid,
+        reason: String,
+        newly_refused: bool,
+    },
+}
+
+/// A node's refusal, as invalid, to abandon a stay-stopped runtime upgrade's
+/// operation; see [`StoppedEvacuationOutcome::UpgradeAbandonRefused`].
+#[derive(Debug, Clone)]
+struct RefusedUpgradeAbandon {
+    operation_id: uuid::Uuid,
+    reason: String,
 }
 
 /// Outcome of attempting the cohort restore for an evacuated sandbox.
@@ -2028,6 +2114,7 @@ impl SubstrateSink {
             termination_blocking_gate,
             evacuate_stopped_residents,
             replace_stopped_evacuations,
+            refused_upgrade_abandons: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2048,6 +2135,7 @@ impl SubstrateSink {
             termination_blocking_gate: true,
             evacuate_stopped_residents: true,
             replace_stopped_evacuations: true,
+            refused_upgrade_abandons: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2064,6 +2152,10 @@ impl SubstrateSink {
                 node_artifact: Self::stopped_pinless_node(),
                 teardown_node_artifact: None,
                 teardowns: std::sync::Mutex::new(Vec::new()),
+                upgrade_pod: std::sync::Mutex::new(TestUpgradePod::Absent),
+                events: std::sync::Mutex::new(Vec::new()),
+                settled: std::sync::Mutex::new(Vec::new()),
+                refuse_abandon: std::sync::atomic::AtomicBool::new(false),
             })),
             promotion_node_api_clients: tokio::sync::Mutex::new(HashMap::new()),
             restore_listener: tokio::sync::Mutex::new(None),
@@ -2071,6 +2163,7 @@ impl SubstrateSink {
             termination_blocking_gate: true,
             evacuate_stopped_residents: true,
             replace_stopped_evacuations: true,
+            refused_upgrade_abandons: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2118,8 +2211,65 @@ impl SubstrateSink {
             node_artifact,
             teardown_node_artifact,
             teardowns: std::sync::Mutex::new(Vec::new()),
+            upgrade_pod: std::sync::Mutex::new(TestUpgradePod::Absent),
+            events: std::sync::Mutex::new(Vec::new()),
+            settled: std::sync::Mutex::new(Vec::new()),
+            refuse_abandon: std::sync::atomic::AtomicBool::new(false),
         }));
         sink
+    }
+
+    /// Same as [`Self::with_stopped_path`], with an unfinished stay-stopped
+    /// runtime upgrade's pod running at the sandbox's execution.
+    #[cfg(test)]
+    fn with_stopped_path_upgrade_pod(pool: PgPool, artifact: EnqueuedArtifactBackup) -> Self {
+        let sink = Self::with_stopped_path(pool, artifact);
+        if let SubstrateSinkBackend::StoppedPath(fake) = &sink.substrate {
+            *fake
+                .upgrade_pod
+                .lock()
+                .expect("stopped-path upgrade pod poisoned") = TestUpgradePod::Running;
+        }
+        sink
+    }
+
+    /// Same as [`Self::with_stopped_path`], with the node refusing, as
+    /// invalid, to abandon a leftover stay-stopped upgrade's operation.
+    #[cfg(test)]
+    fn with_stopped_path_refused_abandon(pool: PgPool, artifact: EnqueuedArtifactBackup) -> Self {
+        let sink = Self::with_stopped_path(pool, artifact);
+        if let SubstrateSinkBackend::StoppedPath(fake) = &sink.substrate {
+            fake.refuse_abandon
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        sink
+    }
+
+    /// The publishes and upgrade-pod steps the faked stopped path ran, in
+    /// order.
+    #[cfg(test)]
+    fn stopped_path_events(&self) -> Vec<&'static str> {
+        match &self.substrate {
+            SubstrateSinkBackend::StoppedPath(fake) => fake
+                .events
+                .lock()
+                .expect("stopped-path events poisoned")
+                .clone(),
+            _ => panic!("stopped_path_events is only meaningful on the stopped-path backend"),
+        }
+    }
+
+    /// The sandboxes step 0a asked the faked stopped path to settle, in order.
+    #[cfg(test)]
+    fn stopped_path_settles(&self) -> Vec<SandboxId> {
+        match &self.substrate {
+            SubstrateSinkBackend::StoppedPath(fake) => fake
+                .settled
+                .lock()
+                .expect("stopped-path settles poisoned")
+                .clone(),
+            _ => panic!("stopped_path_settles is only meaningful on the stopped-path backend"),
+        }
     }
 
     /// A node that reports the sandbox present, stopped and pinless.
@@ -2268,7 +2418,7 @@ impl SubstrateSink {
     /// `ExecutionTeardown::Retire` and never under `Delete`. That indirection
     /// matters beyond attribution: it is why a sandbox can arrive here already
     /// carrying a pin registered *before* its `stopped` transition — which is
-    /// why [`claim_stopped_evacuation`] refuses to evacuate a pinned row at
+    /// why [`claim_stopped_evacuation`](drain::claim_stopped_evacuation) refuses to evacuate a pinned row at
     /// all, rather than trying to date the artifact. The difference here is
     /// that this caller then *waits* on the result rather than treating the
     /// enqueue as done.
@@ -2292,6 +2442,10 @@ impl SubstrateSink {
                 .publish_calls
                 .lock()
                 .expect("stopped-path publish counter poisoned") += 1;
+            fake.events
+                .lock()
+                .expect("stopped-path events poisoned")
+                .push("publish");
             return (fake.publish)(sandbox_id);
         }
         let node = node_api_row(&self.pool, source_node_id)
@@ -2350,11 +2504,11 @@ impl SubstrateSink {
     /// and no cluster-visible clock carries that, so the node reports its own:
     /// [`NodeReportedArtifact::pin_captured_at`] against
     /// [`NodeReportedArtifact::stopped_since`]. See
-    /// [`claim_stopped_evacuation`] for why both clocks have to be the node's.
+    /// [`claim_stopped_evacuation`](drain::claim_stopped_evacuation) for why both clocks have to be the node's.
     ///
     /// One RPC per tick that tries to *open* an evacuation, and one more on
     /// the tick that would release the node; a resumed claim in between needs
-    /// none (see [`claim_stopped_evacuation`]), and the steady-state tick
+    /// none (see [`claim_stopped_evacuation`](drain::claim_stopped_evacuation)), and the steady-state tick
     /// returns before reaching this. A row this refuses
     /// writes nothing, so it is listed and asked again on every tick until the
     /// refusal clears: the price of keeping the refusal stateless.
@@ -2424,7 +2578,7 @@ impl SubstrateSink {
     ///
     /// What it does **not** re-establish is that the artifact describes the
     /// rootfs about to be given up. That is provenance, not state, and it is
-    /// settled at the claim — see [`claim_stopped_evacuation`] — and checked
+    /// settled at the claim — see [`claim_stopped_evacuation`](drain::claim_stopped_evacuation) — and checked
     /// again against the node by `tear_down_stopped_local_copy`. No query here
     /// could recover it: registration time is not capture time.
     ///
@@ -2491,10 +2645,225 @@ impl SubstrateSink {
         )
     }
 
+    /// Step 1c of [`NodeDrainSink::evacuate_stopped_sandbox`]: `None` when no
+    /// unfinished stay-stopped runtime upgrade's pod can still boot, otherwise
+    /// the deferral to report while its lease runs or its pod is going, or
+    /// [`StoppedEvacuationOutcome::UpgradeAbandonRefused`] once the node has
+    /// refused to abandon its operation.
+    async fn remove_leftover_stopped_upgrade_pod(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<StoppedEvacuationOutcome>, EvacuateError> {
+        let Some(leftover) = leftover_stopped_upgrade(&self.pool, sandbox_id)
+            .await
+            .map_err(|err| EvacuateError::Lookup(err.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if leftover.lease_live {
+            return Ok(Some(StoppedEvacuationOutcome::Deferred {
+                reason: format!(
+                    "a runtime upgrade of stopped sandbox {sandbox_id} holds a live lease on its \
+                     execution; the evacuation mints its backup once it ends"
+                ),
+            }));
+        }
+        if let Some(refused) = self.refused_upgrade_abandon(sandbox_id, leftover.operation_id) {
+            return Ok(Some(refused));
+        }
+        match self.leftover_upgrade_pod_gone(sandbox_id, &leftover).await {
+            Ok(true) => Ok(None),
+            Ok(false) => Ok(Some(StoppedEvacuationOutcome::Deferred {
+                reason: format!(
+                    "stopped sandbox {sandbox_id}'s unfinished runtime upgrade left pod {}, \
+                     which is being deleted; the evacuation mints its backup once it's gone",
+                    leftover.pod_name
+                ),
+            })),
+            Err(error) => self
+                .upgrade_abandon_outcome(sandbox_id, leftover.operation_id, error)
+                .map(Some),
+        }
+    }
+
+    /// Step 0a of [`NodeDrainSink::evacuate_stopped_sandbox`]: `None` when the
+    /// drain may check the node, otherwise the deferral to report while an
+    /// expired stay-stopped upgrade is being settled
+    /// (`KubernetesSubstrate::settle_expired_stopped_upgrade`), or
+    /// [`StoppedEvacuationOutcome::UpgradeAbandonRefused`] once the node has
+    /// refused to abandon its operation.
+    ///
+    /// The leftover upgrade is read here first, so a refusal already on record
+    /// for its operation answers without calling the substrate. A row with no
+    /// leftover upgrade, or one whose lease still runs, goes on: the
+    /// substrate's settle answers the same for both.
+    ///
+    /// A stopped-path test records the call and stands in for the substrate's
+    /// pod handling: for an upgrade whose lease ended it deletes its pod
+    /// through the same seam as step 1c ([`Self::leftover_upgrade_pod_gone`]).
+    /// It doesn't write the reservation the substrate takes meanwhile, which
+    /// keeps a retry off the execution and, once released, leaves the lease
+    /// ended under a new attempt id. So these tests don't cover the
+    /// reservation, which the api crate's own tests of the settle do.
+    async fn settle_expired_stopped_upgrade(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<StoppedEvacuationOutcome>, EvacuateError> {
+        let Some(leftover) = leftover_stopped_upgrade(&self.pool, sandbox_id)
+            .await
+            .map_err(|err| EvacuateError::Lookup(err.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if leftover.lease_live {
+            return Ok(None);
+        }
+        if let Some(refused) = self.refused_upgrade_abandon(sandbox_id, leftover.operation_id) {
+            return Ok(Some(refused));
+        }
+        #[cfg(test)]
+        let faked = if let SubstrateSinkBackend::StoppedPath(fake) = &self.substrate {
+            fake.settled
+                .lock()
+                .expect("stopped-path settles poisoned")
+                .push(sandbox_id);
+            Some(self.leftover_upgrade_pod_gone(sandbox_id, &leftover).await)
+        } else {
+            None
+        };
+        #[cfg(not(test))]
+        let faked = None;
+        let settled = match faked {
+            Some(settled) => settled,
+            None => {
+                self.substrate
+                    .kubernetes()
+                    .settle_expired_stopped_upgrade(sandbox_id)
+                    .await
+            }
+        };
+        match settled {
+            Ok(true) => Ok(None),
+            Ok(false) => Ok(Some(StoppedEvacuationOutcome::Deferred {
+                reason: format!(
+                    "stopped sandbox {sandbox_id}'s expired runtime upgrade is being settled on \
+                     its node; the evacuation checks the node once it has"
+                ),
+            })),
+            Err(error) => self
+                .upgrade_abandon_outcome(sandbox_id, leftover.operation_id, error)
+                .map(Some),
+        }
+    }
+
+    /// The refusal on record for `operation_id`, the leftover upgrade's
+    /// operation, as this tick's outcome; `None` when the node hasn't refused
+    /// to abandon that operation.
+    fn refused_upgrade_abandon(
+        &self,
+        sandbox_id: SandboxId,
+        operation_id: uuid::Uuid,
+    ) -> Option<StoppedEvacuationOutcome> {
+        self.refused_upgrade_abandons
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&sandbox_id)
+            .filter(|refused| refused.operation_id == operation_id)
+            .map(|refused| StoppedEvacuationOutcome::UpgradeAbandonRefused {
+                operation_id,
+                reason: refused.reason.clone(),
+                newly_refused: false,
+            })
+    }
+
+    /// Classify an error from settling an upgrade or removing its pod.
+    /// `FailedPrecondition` is the node refusing to abandon the operation as
+    /// invalid: the only `FailedPrecondition` either answers, since their
+    /// store errors are `Failed` or `LockContention` and their pod and
+    /// node-api errors `Unavailable`. It's recorded so no later tick asks
+    /// again. Anything else is a retryable failure of the step.
+    fn upgrade_abandon_outcome(
+        &self,
+        sandbox_id: SandboxId,
+        operation_id: uuid::Uuid,
+        error: SubstrateError,
+    ) -> Result<StoppedEvacuationOutcome, EvacuateError> {
+        let SubstrateError::FailedPrecondition { message } = error else {
+            return Err(EvacuateError::LocalTeardown(error.to_string()));
+        };
+        self.refused_upgrade_abandons
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                sandbox_id,
+                RefusedUpgradeAbandon {
+                    operation_id,
+                    reason: message.clone(),
+                },
+            );
+        Ok(StoppedEvacuationOutcome::UpgradeAbandonRefused {
+            operation_id,
+            reason: message,
+            newly_refused: true,
+        })
+    }
+
+    /// Delete the pod `leftover`'s upgrade placed and answer whether it's
+    /// gone and its operation abandoned on the node, behind a seam so a test
+    /// can script the pod and the node.
+    async fn leftover_upgrade_pod_gone(
+        &self,
+        sandbox_id: SandboxId,
+        leftover: &LeftoverStoppedUpgrade,
+    ) -> Result<bool, SubstrateError> {
+        #[cfg(test)]
+        if let SubstrateSinkBackend::StoppedPath(fake) = &self.substrate {
+            let mut pod = fake
+                .upgrade_pod
+                .lock()
+                .expect("stopped-path upgrade pod poisoned");
+            let mut events = fake.events.lock().expect("stopped-path events poisoned");
+            let gone = match *pod {
+                TestUpgradePod::Absent => true,
+                TestUpgradePod::Running => {
+                    events.push("delete upgrade pod");
+                    *pod = TestUpgradePod::Terminating;
+                    false
+                }
+                TestUpgradePod::Terminating => {
+                    events.push("upgrade pod gone");
+                    *pod = TestUpgradePod::Absent;
+                    true
+                }
+            };
+            if gone
+                && fake
+                    .refuse_abandon
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                events.push("abandon refused");
+                return Err(SubstrateError::FailedPrecondition {
+                    message: format!(
+                        "sandbox {sandbox_id}'s runtime upgrade {} can't be abandoned on its node",
+                        leftover.operation_id
+                    ),
+                });
+            }
+            return Ok(gone);
+        }
+        self.substrate
+            .kubernetes()
+            .remove_leftover_upgrade_pod(sandbox_id, leftover)
+            .await
+    }
+
     /// The teardown's one irreversible call, behind a seam so a test can
     /// observe whether it happened at all. Production has exactly one arm.
     /// `Ok(false)` when an active execution newer than the stop exists, in
-    /// which case nothing was torn down.
+    /// which case nothing was torn down. The one exception is an unfinished
+    /// stay-stopped runtime upgrade's execution whose lease has ended: it
+    /// postdates the stop, and it's retired with the pre-stop one
+    /// (`retire_executions_predating_current_stop`).
     ///
     /// Fenced rather than unfenced, and on "no execution newer than the stop"
     /// rather than "no active execution". On Kubernetes a stop leaves its
@@ -2780,12 +3149,17 @@ impl SubstrateSink {
                   WHERE sn.sandbox_id = s.id
                     AND {pinned}
                     AND sn.state = 'creating'
-             ) AS upload_in_flight
+             ) AS upload_in_flight,
+             COALESCE((
+                 s.lifecycle = 'stopped'
+                 AND s.active_node_id = $2
+                 AND {node_force_draining}
+             ), FALSE) AS resident
              FROM sandboxes s
              WHERE s.id = $1"
         );
-        let row: Option<(bool, bool, Option<LocalArtifactId>, bool, bool)> =
-            sqlx::query_as::<_, (bool, bool, Option<LocalArtifactId>, bool, bool)>(
+        let row: Option<(bool, bool, Option<LocalArtifactId>, bool, bool, bool)> =
+            sqlx::query_as::<_, (bool, bool, Option<LocalArtifactId>, bool, bool, bool)>(
                 sqlx::AssertSqlSafe(sql!(query.as_str())),
             )
             .bind(sandbox_id)
@@ -2804,13 +3178,14 @@ impl SubstrateSink {
         // a row that drifted, which is the fail-closed reading of both.
         Ok(row.map_or(
             StoppedEvacuationState::default(),
-            |(claim_holds, bytes_durable, pinned_artifact, marked, upload_in_flight)| {
+            |(claim_holds, bytes_durable, pinned_artifact, marked, upload_in_flight, resident)| {
                 StoppedEvacuationState {
                     claim_holds,
                     marked,
                     upload_in_flight,
                     bytes_durable,
                     pinned_artifact,
+                    resident,
                 }
             },
         ))
@@ -4224,7 +4599,7 @@ impl NodeDrainSink for SubstrateSink {
     ///
     /// ## The sequence, and why it is re-entrant instead of long-running
     ///
-    /// 1. **Claim** ([`claim_stopped_evacuation`]) — the marker, under
+    /// 1. **Claim** ([`claim_stopped_evacuation`](drain::claim_stopped_evacuation)) — the marker, under
     ///    `active_node_id` + node-still-force-draining guards.
     /// 2. **Publish** — `EnqueueArtifactBackup(CurrentInstance, Disk)`. On a
     ///    `Stopped` sandbox with no pin, sbx-mgr mints a read-only `d-stop-{id}`
@@ -4297,13 +4672,23 @@ impl NodeDrainSink for SubstrateSink {
 
         // 0. Read the row once, and let it decide which of the steps below are
         //    needed. On the tick that finishes the evacuation it is followed only
-        //    by the node re-check and the teardown; on every tick in between it
-        //    is the only query at all. See `stopped_evacuation_state` for why re-running
+        //    by the leftover-upgrade read, the node re-check and the teardown. A
+        //    tick that may open a fresh evacuation reads the leftover upgrade
+        //    first too (0a). See `stopped_evacuation_state` for why re-running
         //    the idempotent writes instead is not free.
         let state = self
             .stopped_evacuation_state(sandbox_id, source_node_id)
             .await?;
         if state.claim_holds && state.bytes_durable {
+            // Step 1c's wait runs here too, for a resumed evacuation whose
+            // backup is already durable: the teardown retires an expired
+            // stay-stopped upgrade's execution, and it mustn't while that
+            // upgrade's pod, whose creates kubelet keeps retrying, is still
+            // there. One more read on the tick that tears down, plus a pod
+            // lookup and an abandon on the node when an upgrade is left.
+            if let Some(waiting) = self.remove_leftover_stopped_upgrade_pod(sandbox_id).await? {
+                return Ok(waiting);
+            }
             return self
                 .tear_down_stopped_local_copy(
                     sandbox_id,
@@ -4360,6 +4745,24 @@ impl NodeDrainSink for SubstrateSink {
                 });
             }
 
+            // 0a. A stay-stopped runtime upgrade whose lease ended may have
+            //     verified a boot it never stopped: the node then reports the
+            //     sandbox running, 0c would defer on it on every tick, and
+            //     1c, which settles it, would never run. Settle it before 0c,
+            //     but after 0b, which refuses a row on its cluster pin whatever
+            //     the upgrade did, so such a row keeps its upgrade for the
+            //     retry. A row 0c or 0d then refuses on the node's pin has had
+            //     its upgrade settled all the same: they read the node, which
+            //     an unsettled boot would hold running. And only on a row
+            //     still resident on a node this drain is force-draining: one
+            //     whose node was undrained, or that moved off it, goes on to
+            //     the claim below, which refuses it.
+            if state.resident
+                && let Some(waiting) = self.settle_expired_stopped_upgrade(sandbox_id).await?
+            {
+                return Ok(waiting);
+            }
+
             // 0c. The *node's* pin, which is the one that decides whether the
             //     next publish mints or reuses. Everything cluster-side is a
             //     backstop: the mint arm reads sbx-mgr's own SQLite row, and for
@@ -4373,7 +4776,7 @@ impl NodeDrainSink for SubstrateSink {
             //
             //     Only an unclaimed row reaches this. A resumed claim is
             //     trusted by the marker-plus-lifecycle conjunction (see
-            //     [`claim_stopped_evacuation`]) and returns above, so an
+            //     [`claim_stopped_evacuation`](drain::claim_stopped_evacuation)) and returns above, so an
             //     evacuation in progress costs no RPC per tick; a row refused
             //     here is asked again on every tick.
             let node = self
@@ -4492,10 +4895,13 @@ impl NodeDrainSink for SubstrateSink {
         // sandbox whose disk is published and whose local copy is not yet gone.
         //    Skipped entirely when the read above already proved every conjunct
         //    of it: re-claiming would write the marker it just read.
+        //    The claim takes the sandbox row's lock, under which a stay-stopped
+        //    runtime upgrade's claim and takeover read the marker this sets, and
+        //    refuses while such an upgrade holds a live lease: see 1c.
         let claim = if state.claim_holds {
             StoppedEvacuationClaim::Resumed
         } else {
-            claim_stopped_evacuation(
+            match open_stopped_evacuation(
                 &self.pool,
                 sandbox_id,
                 source_node_id,
@@ -4505,7 +4911,17 @@ impl NodeDrainSink for SubstrateSink {
             .await
             .map_err(|err| {
                 EvacuateError::Lookup(format!("stopped evacuation claim query failed: {err}"))
-            })?
+            })? {
+                StoppedEvacuationOpening::Claimed(claim) => claim,
+                StoppedEvacuationOpening::UpgradeInFlight => {
+                    return Ok(StoppedEvacuationOutcome::Deferred {
+                        reason: format!(
+                            "a runtime upgrade of stopped sandbox {sandbox_id} holds a live \
+                             lease on its execution; the evacuation opens once it ends"
+                        ),
+                    });
+                }
+            }
         };
         if !claim.holds() {
             emit_node_drain_event(
@@ -4591,6 +5007,22 @@ impl NodeDrainSink for SubstrateSink {
             return Ok(StoppedEvacuationOutcome::AwaitingDurableDisk {
                 local_artifact_id: pinned,
             });
+        }
+
+        // 1c. A stay-stopped runtime upgrade that didn't finish left an
+        //     execution, and kubelet keeps retrying its pod's create, each try
+        //     a boot of the upgrade, after the upgrade's lease ends. A boot
+        //     after the mint below drops the node's pin on the artifact it
+        //     mints, and the teardown then defers forever. So the evacuation
+        //     takes the execution over (nothing claims or takes over the
+        //     upgrade while the marker is set) and deletes the pod, and mints
+        //     only once the pod is gone. Waiting doesn't hold the tick: the
+        //     sandbox defers and the next tick looks again. A lease that still
+        //     runs defers too. The claim above refuses to open on one, so it's
+        //     a lease taken after the evacuation opened, or one on a claim an
+        //     older controller opened.
+        if let Some(waiting) = self.remove_leftover_stopped_upgrade_pod(sandbox_id).await? {
+            return Ok(waiting);
         }
 
         // A pin 0d took is already this row's and already durable, so
@@ -5334,6 +5766,12 @@ mod termination_gate_tests;
 /// destroying the user's rootfs, and the re-placement sweep's second arm.
 #[cfg(test)]
 mod stopped_evacuation_tests;
+
+/// Coverage for evacuating a stopped sandbox whose stay-stopped runtime
+/// upgrade didn't finish: the evacuation waits out a live lease, takes an
+/// ended one over, and mints only once the upgrade's pod is gone.
+#[cfg(test)]
+mod stopped_evacuation_upgrade_tests;
 
 /// Coverage for the node's capture-order evidence: which node pins a fresh
 /// stopped evacuation may open on, and which the teardown still refuses.

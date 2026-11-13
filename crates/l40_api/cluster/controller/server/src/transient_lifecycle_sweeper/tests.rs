@@ -2812,6 +2812,7 @@ mod activation_owner;
 mod crashed_create;
 mod episode_deadline;
 mod failed_cleanup_stop_route;
+mod stopped_runtime_upgrade;
 
 mod postgres_backed {
 

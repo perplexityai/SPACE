@@ -69,7 +69,7 @@ pub(super) async fn insert_sandbox(
     Ok(sandbox_id)
 }
 
-async fn set_current_artifact(
+pub(super) async fn set_current_artifact(
     pool: &PgPool,
     sandbox_id: SandboxId,
     artifact_id: LocalArtifactId,
@@ -147,7 +147,7 @@ pub(super) async fn marker_of(pool: &PgPool, sandbox_id: SandboxId) -> TestResul
     .await?)
 }
 
-async fn disk_backup_ready(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<bool> {
+pub(super) async fn disk_backup_ready(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<bool> {
     let ready = current_disk_artifact_backup_ready("s");
     let query = format!("SELECT {ready} FROM sandboxes s WHERE s.id = $1");
     Ok(
@@ -170,7 +170,7 @@ async fn restore_pending(pool: &PgPool) -> TestResult<Vec<(SandboxId, String)>> 
 /// Claim with new evacuations enabled — what a cluster that has opted in does.
 /// The disabled case has its own test, since it is the one whose behaviour
 /// differs between opening and resuming.
-async fn claim(
+pub(super) async fn claim(
     pool: &PgPool,
     sandbox: SandboxId,
     node: NodeId,

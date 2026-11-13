@@ -10,6 +10,8 @@ use uuid::Uuid;
 use super::*;
 use pplx_space_api::controllers::substrate::kubernetes::SandboxPodView;
 
+use crate::lifecycle_writer_test_support::pod_name;
+
 const THRESHOLD_SECS: u64 = 600;
 
 fn threshold() -> Duration {
@@ -1094,6 +1096,77 @@ fn from_pod_flags_restore_pods() {
     assert!(restore_pod(json!({ "space.pplx.net/checkpoint": "ckpt-1" })).is_restore);
     // A fresh create carries the id/template annotations but no restore marker.
     assert!(!restore_pod(json!({ "space.pplx.net/template": "seed" })).is_restore);
+}
+
+/// The pod a stopped sandbox's runtime upgrade boots on is the one a start
+/// of that sandbox places, in its runtime-upgrade mode: pinned to the node
+/// holding its disk by the source-node restore annotation. Wedged in `ContainerCreating` well past
+/// the threshold, it is still left alone; the upgrade retires it itself.
+#[tokio::test]
+async fn a_stopped_runtime_upgrade_pod_is_never_reaped() {
+    let pod: Pod = serde_json::from_value(json!({
+        "metadata": {
+            "name": "p",
+            "uid": "p-uid",
+            "resourceVersion": "p-rv",
+            "annotations": {
+                "space.pplx.net/sandbox-id": SandboxId::new().to_string(),
+                "space.pplx.net/suspend-restore-source-node": "node-a",
+                "space.pplx.net/checkpoint": "runtime-upgrade",
+                "space.pplx.net/runtime-upgrade-operation-id": Uuid::now_v7().to_string(),
+                "space.pplx.net/runtime-upgrade-target-state": "stopped"
+            }
+        },
+        "spec": { "nodeName": "node-a" },
+        "status": {
+            "phase": "Pending",
+            "containerStatuses": [{
+                "name": "sandbox",
+                "image": "sandbox",
+                "imageID": "",
+                "ready": false,
+                "restartCount": 0,
+                "state": { "waiting": { "reason": "ContainerCreating" } }
+            }]
+        }
+    }))
+    .unwrap();
+    let snapshot = PodSnapshot::from_pod(&SandboxPodView::from(pod));
+    assert!(is_stuck_shaped(&snapshot), "{snapshot:?}");
+    let backend = FakeBackend::new(vec![snapshot]);
+    let (mut reconciler, _clock) = build(test_config(60), backend);
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(report.deleted, 0);
+    assert_eq!(skip_count(&report, SkipReason::RestorePod), 1);
+    assert_eq!(reconciler.backend.delete_count(), 0);
+}
+
+/// An unsettled runtime upgrade of a stopped sandbox leaves its pod for the
+/// upgrade's retry. This GC sees only pods (`list_sandbox_pods`) and reads no
+/// Postgres row, so the pod is the whole of what it could take: a tick that
+/// reaps an unrelated stuck pod leaves the upgrade's pod, wedged in
+/// `ContainerCreating` past the threshold, alone.
+#[tokio::test]
+async fn an_unsettled_stopped_runtime_upgrade_pod_is_left_for_its_retry() {
+    let sandbox_id = SandboxId::new();
+    let pods = vec![
+        stuck_snapshot("unrelated"),
+        // A runtime-upgrade pod is a restore pod.
+        PodSnapshot {
+            sandbox_id: Some(sandbox_id),
+            is_restore: true,
+            ..stuck_snapshot(&pod_name(sandbox_id, 2))
+        },
+    ];
+    let (mut reconciler, _clock) = build(test_config(60), FakeBackend::new(pods));
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(report.deleted, 1);
+    assert_eq!(reconciler.backend.deleted_names(), vec!["unrelated"]);
+    assert_eq!(skip_count(&report, SkipReason::RestorePod), 1);
 }
 
 #[tokio::test]
