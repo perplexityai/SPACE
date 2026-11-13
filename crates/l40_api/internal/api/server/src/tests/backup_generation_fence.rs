@@ -632,6 +632,18 @@ async fn verdict_only_registration_persists_nothing() -> TestResult {
     let ready_attempt = SnapshotId::new();
     begin_teardown_backup(&fixture.service, source_ip, sandbox_id, ready_attempt, 1).await?;
     finalize_artifact_backup_from_node(&fixture.service, source_ip, ready_attempt).await?;
+    // The projection pinned the capture with a generation. Unpinned, the release check
+    // refuses to look past any newer full row, which is what this probes.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = NULL,
+                current_local_artifact_kind = NULL,
+                current_local_artifact_origin = NULL
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
     assert!(pplx_space_sandbox_store::durably_restorable(pool, sandbox_id).await?);
 
     let verdict_only = |backup_attempt_id, generation| BeginArtifactBackupRequest {

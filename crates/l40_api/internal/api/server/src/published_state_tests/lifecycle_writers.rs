@@ -842,6 +842,229 @@ async fn ready_backup_projects_suspended_only_out_of_running_and_restoring_lifec
     Ok(())
 }
 
+/// What a node-local suspend's capture looks like when its projection runs.
+#[derive(Debug, Clone, Copy)]
+enum Capture {
+    /// Records the generation of the execution being suspended.
+    OfActiveExecution,
+    /// Records no generation: the node didn't vouch for it.
+    NoGeneration,
+    /// Records no generation, after the earlier cycle's capture recorded one:
+    /// the history is unordered.
+    NoGenerationAfterStamped,
+    /// Records the generation of the sandbox's previous, retired execution:
+    /// an older capture's re-upload.
+    OfRetiredExecution,
+    /// Records the active execution's generation, but a later capture
+    /// outranks it, so the row doesn't finalize yet.
+    Outranked,
+    /// A re-upload, after the row's last lifecycle change, of a capture the
+    /// active execution took before it, as a reverted suspend leaves.
+    ReuploadOfEarlier,
+    /// An earlier capture of the active execution, finalized after a later
+    /// one of the same execution registered.
+    SupersededInExecution,
+}
+
+/// Insert the ready backup a node-local suspend of `sandbox_id` (whose
+/// active execution is generation 7) uploaded, shaped as `capture`.
+async fn insert_capture(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    node_id: NodeId,
+    capture: Capture,
+) -> TestResult<(SnapshotId, Uuid)> {
+    let snapshot_id = insert_ready_suspend_snapshot(pool, sandbox_id, node_id).await?;
+    let generation = match capture {
+        Capture::OfActiveExecution
+        | Capture::Outranked
+        | Capture::ReuploadOfEarlier
+        | Capture::SupersededInExecution => Some(7_i64),
+        Capture::NoGeneration | Capture::NoGenerationAfterStamped => None,
+        Capture::OfRetiredExecution => Some(6),
+    };
+    let artifact: Uuid = sqlx::query_scalar(sql!(
+        "UPDATE snapshots SET generation = $2 WHERE id = $1 RETURNING local_artifact_id"
+    ))
+    .bind(snapshot_id)
+    .bind(generation)
+    .fetch_one(pool)
+    .await?;
+    if matches!(capture, Capture::NoGenerationAfterStamped) {
+        sqlx::query(sql!(
+            "UPDATE snapshots SET generation = 6
+              WHERE sandbox_id = $1 AND id <> $2 AND generation IS NULL"
+        ))
+        .bind(sandbox_id)
+        .bind(snapshot_id)
+        .execute(pool)
+        .await?;
+    }
+    if matches!(capture, Capture::OfRetiredExecution) {
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions (
+                 sandbox_id, generation, pod_name, pod_namespace, state, active
+             )
+             VALUES ($1, 6, $2, 'sandboxes', 'suspended', FALSE)"
+        ))
+        .bind(sandbox_id)
+        .bind(format!("space-sbx-{}-g6", sandbox_id.as_uuid().simple()))
+        .execute(pool)
+        .await?;
+    }
+    if matches!(capture, Capture::ReuploadOfEarlier) {
+        let first = insert_ready_suspend_snapshot(pool, sandbox_id, node_id).await?;
+        sqlx::query(sql!(
+            "UPDATE snapshots sn
+                SET local_artifact_id = $2, generation = 7,
+                    timestamp = s.lifecycle_changed_at - INTERVAL '2 hours'
+               FROM sandboxes s
+              WHERE sn.id = $1 AND s.id = sn.sandbox_id"
+        ))
+        .bind(first)
+        .bind(artifact)
+        .execute(pool)
+        .await?;
+        // The earlier cycle's capture was the previous execution's, so the
+        // history stays ordered and only the re-upload rule decides.
+        sqlx::query(sql!(
+            "UPDATE snapshots SET generation = 6 WHERE sandbox_id = $1 AND generation IS NULL"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+    }
+    if matches!(capture, Capture::SupersededInExecution) {
+        let later = insert_ready_suspend_snapshot(pool, sandbox_id, node_id).await?;
+        sqlx::query(sql!(
+            "UPDATE snapshots SET generation = 7, timestamp = timestamp + INTERVAL '1 second'
+              WHERE id = $1"
+        ))
+        .bind(later)
+        .execute(pool)
+        .await?;
+    }
+    if matches!(capture, Capture::Outranked) {
+        let later = insert_ready_suspend_snapshot(pool, sandbox_id, node_id).await?;
+        sqlx::query(sql!(
+            "UPDATE snapshots SET generation = 8, state = 'creating' WHERE id = $1"
+        ))
+        .bind(later)
+        .execute(pool)
+        .await?;
+    }
+    Ok((snapshot_id, artifact))
+}
+
+async fn pin(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> TestResult<(Option<Uuid>, Option<String>, Option<String>)> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT current_local_artifact_id, current_local_artifact_kind,
+                current_local_artifact_origin
+           FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// A node-local suspend's projection pins the row to the capture that records
+/// its active execution's generation, through either path that finalizes it: the ready
+/// backup and the node's `suspended` report naming that artifact. It replaces
+/// a pin left from an earlier cycle. A capture with another execution's
+/// generation, or one a later capture outranks, isn't pinned, and the stale
+/// pin is cleared: pinning a re-upload of an older capture would restore the
+/// older state. A capture with no generation is pinned only on the node's
+/// report that it holds it. Either finalizes after an earlier cycle's capture
+/// with a generation too, an unordered history: finalizing chooses no restore
+/// source. While a later capture outranks it, the row doesn't finalize and
+/// keeps its pin.
+#[rstest::rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn node_local_suspend_pins_only_its_executions_capture(
+    #[values(false, true)] by_report: bool,
+) -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = ready_node(pool).await?;
+
+    let mut mismatches = Vec::new();
+    for capture in [
+        Capture::OfActiveExecution,
+        Capture::NoGeneration,
+        Capture::NoGenerationAfterStamped,
+        Capture::OfRetiredExecution,
+        Capture::Outranked,
+        Capture::ReuploadOfEarlier,
+        Capture::SupersededInExecution,
+    ] {
+        let (sandbox_id, _) = insert_running(pool, node_id, "started").await?;
+        // A pin from an earlier cycle: its capture registered before the row's
+        // last lifecycle change.
+        let earlier = insert_ready_suspend_snapshot(pool, sandbox_id, node_id).await?;
+        sqlx::query(sql!(
+            "UPDATE snapshots sn
+                SET timestamp = s.lifecycle_changed_at - INTERVAL '1 hour'
+               FROM sandboxes s
+              WHERE sn.id = $1 AND s.id = sn.sandbox_id"
+        ))
+        .bind(earlier)
+        .execute(pool)
+        .await?;
+        let earlier_artifact = pin_snapshot_artifact(pool, sandbox_id, earlier).await?;
+        let (snapshot_id, artifact) = insert_capture(pool, sandbox_id, node_id, capture).await?;
+
+        if by_report {
+            let mut report = published_sandbox_state(sandbox_id, "suspended");
+            report.current_local_artifact_id = Some(artifact.to_string());
+            report.current_local_artifact_kind =
+                Some(pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32);
+            report.current_local_artifact_origin =
+                Some(pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend as i32);
+            publish(pool, node_id, report).await?;
+        } else {
+            project_ready_backup(pool, snapshot_id).await?;
+        }
+
+        let full_suspend = |id| {
+            (
+                Some(id),
+                Some("full".to_owned()),
+                Some("suspend".to_owned()),
+            )
+        };
+        let (expected_lifecycle, expected) = match capture {
+            Capture::OfActiveExecution => ("suspended", full_suspend(artifact)),
+            Capture::NoGeneration | Capture::NoGenerationAfterStamped if by_report => {
+                ("suspended", full_suspend(artifact))
+            }
+            Capture::NoGeneration
+            | Capture::NoGenerationAfterStamped
+            | Capture::OfRetiredExecution => ("suspended", (None, None, None)),
+            Capture::Outranked => ("started", full_suspend(earlier_artifact)),
+            Capture::ReuploadOfEarlier | Capture::SupersededInExecution => {
+                ("suspended", (None, None, None))
+            }
+        };
+        let lifecycle: String =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(pool)
+                .await?;
+        let actual = pin(pool, sandbox_id).await?;
+        if lifecycle != expected_lifecycle || actual != expected {
+            mismatches.push(format!("{capture:?}: {lifecycle}, {actual:?}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "by_report {by_report}: {mismatches:#?}"
+    );
+    Ok(())
+}
+
 /// A quarantine-recovery receipt for the node's own restore quarantine moves
 /// the row to `suspended` only while it is still `quarantined`: the move
 /// unplaces it, clears `active_node_id`, retires the execution as

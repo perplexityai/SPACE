@@ -127,6 +127,8 @@ pub mod pod_tracking;
 pub mod quarantine;
 pub mod repair;
 pub mod restore_lease;
+pub mod restore_pin;
+pub mod restore_pin_repair;
 pub mod restore_source;
 pub mod runtime_population;
 pub mod stuck;
@@ -478,8 +480,9 @@ pub async fn any_undescribed_artifact_owner(
 /// full snapshot, and any other unmarked one a ready full snapshot fresher
 /// than its last placement change with no newer full row in any state. That
 /// last rule is stricter than the user restore selector, which would still
-/// pick the fresh ready snapshot under a newer failed row; erring that way
-/// only holds a release. An older ready snapshot the restore wouldn't select
+/// pick the fresh ready snapshot under a newer row in another state that
+/// doesn't outrank it by capture generation; erring that way only holds a
+/// release. An older ready snapshot the restore wouldn't select
 /// doesn't count. `false` for a missing sandbox.
 pub async fn durably_restorable(
     executor: impl sqlx::PgExecutor<'_>,

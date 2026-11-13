@@ -30,7 +30,8 @@ use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_portability::{
-    started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible,
+    started_suspend_finalize_eligibility, suspend_snapshot_is_current_capture,
+    suspended_projection_lifecycle_eligible,
 };
 use pplx_space_sandbox_quarantine_store::{
     quarantine_history_insert_columns, quarantine_state_conflict_assignments,
@@ -2659,6 +2660,7 @@ async fn project_node_published_suspended_sandboxes(
             clear_marker: candidate.clear_marker,
             published_artifact: candidate.published_artifact.clone(),
             published_execution_identity: candidate.published_execution_identity.clone(),
+            captured_artifact: candidate.captured_artifact,
         })
         .collect::<Vec<_>>();
     let rows = apply_suspended_k8s_finalization(conn, &finalization_candidates).await?;
@@ -2694,7 +2696,8 @@ pub(crate) async fn project_ready_suspend_snapshot(
     conn: &mut sqlx::PgConnection,
     snapshot_id: SnapshotId,
 ) -> Result<Option<(SandboxId, NodeId, String)>, Status> {
-    let eligibility = started_suspend_revert_eligibility("s");
+    // Finalizing records the node's suspend; it chooses no restore source.
+    let eligibility = started_suspend_finalize_eligibility("s");
     let clear_marker = eligibility.clear_marker;
     let eligible = eligibility.eligible;
     let committed_suspend_evidence = "
@@ -2704,11 +2707,15 @@ pub(crate) async fn project_ready_suspend_snapshot(
     ";
     let lifecycle_eligible =
         suspended_projection_lifecycle_eligible("s", committed_suspend_evidence);
+    // The ready backup is this suspend's capture when nothing is newer: the
+    // row is pinned to its artifact, so the restore loads exactly it.
+    let current_capture = suspend_snapshot_is_current_capture("s", "sn");
     let candidate_query = format!(
         "SELECT s.id,
                 {clear_marker} AS clear_marker,
                 sn.source_node_id,
-                s.lifecycle
+                s.lifecycle,
+                CASE WHEN {current_capture} THEN sn.local_artifact_id END AS captured_artifact
            FROM snapshots sn
            JOIN sandboxes s ON s.id = sn.sandbox_id
           WHERE sn.id = $1
@@ -2726,13 +2733,13 @@ pub(crate) async fn project_ready_suspend_snapshot(
             AND {eligible}
           FOR UPDATE OF s",
     );
-    let candidates: Vec<(SandboxId, bool, NodeId, String)> =
+    let candidates: Vec<(SandboxId, bool, NodeId, String, Option<LocalArtifactId>)> =
         sqlx::query_as(sqlx::AssertSqlSafe(sql!(candidate_query.as_str())))
             .bind(snapshot_id)
             .fetch_all(&mut *conn)
             .await
             .map_err(|err| Status::internal(format!("select ready suspend projection: {err}")))?;
-    let Some((sandbox_id, clear_marker, source_node_id, from_lifecycle)) =
+    let Some((sandbox_id, clear_marker, source_node_id, from_lifecycle, captured_artifact)) =
         candidates.first().cloned()
     else {
         return Ok(None);
@@ -2745,6 +2752,7 @@ pub(crate) async fn project_ready_suspend_snapshot(
             clear_marker,
             published_artifact: None,
             published_execution_identity: None,
+            captured_artifact,
         }],
     )
     .await?;

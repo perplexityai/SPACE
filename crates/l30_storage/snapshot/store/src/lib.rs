@@ -227,7 +227,9 @@ impl NewSnapshot {
     }
 
     /// Set the generation of the execution that captured the bytes, which
-    /// orders this capture against the sandbox's others.
+    /// orders this capture against the sandbox's others. An earlier backup
+    /// of the same artifact that recorded one takes precedence (see
+    /// [`insert`]).
     pub fn with_generation(mut self, generation: Option<ExecutionGeneration>) -> Self {
         self.generation = generation;
         self
@@ -694,46 +696,12 @@ pub struct ReadyArtifactLocation {
     pub size_bytes: Option<i64>,
 }
 
-/// The newest `ready` suspend snapshot of `sandbox_id`, when that sandbox is
-/// placed on one of `node_ids`: active there, or the target of a pending
-/// migration or restore. A sandbox placed elsewhere reads as absent, not as
-/// an error: the caller is a node asking about its own set.
-///
-/// `timestamp` is the row's immutable creation time, so the newest row is the
-/// suspend attempt that started most recently and reached `ready`. Rows in
-/// `creating`, `failed` or `deleting` are invisible, which keeps a mid-flight
-/// upload, or a row claimed for prune, out of restore.
-pub async fn latest_ready_suspend_location_placed_on(
-    executor: impl sqlx::PgExecutor<'_>,
-    sandbox_id: SandboxId,
-    node_ids: &[NodeId],
-) -> Result<Option<ReadyArtifactLocation>, ReadyArtifactLocationError> {
-    let row = sqlx::query_as::<_, ReadyArtifactLocation>(sql!(
-        "SELECT s.id AS snapshot_id,
-                ssl.storage_connection_string,
-                s.size_bytes
-         FROM snapshots s
-         JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
-         JOIN sandboxes sb ON sb.id = s.sandbox_id
-         WHERE s.sandbox_id = $1
-           AND (sb.active_node_id = ANY($2) OR sb.target_node_id = ANY($2))
-           AND s.type = 'full'
-           AND (s.artifact_origin IS NULL OR s.artifact_origin = 'suspend')
-           AND s.state = 'ready'
-         ORDER BY s.timestamp DESC
-         LIMIT 1"
-    ))
-    .bind(sandbox_id)
-    .bind(node_ids)
-    .fetch_optional(executor)
-    .await?;
-    Ok(row)
-}
-
 /// The newest `ready` backup of the exact local artifact
 /// (`sandbox_id`, `local_artifact_id`, `artifact_kind`), when that sandbox is
-/// placed on one of `node_ids`. Same placement and absence semantics as
-/// [`latest_ready_suspend_location_placed_on`].
+/// placed on one of `node_ids`: active there, or the target of a pending
+/// migration or restore. A sandbox placed elsewhere reads as absent, not as
+/// an error: the caller is a node asking about its own set. Rows in
+/// `creating`, `failed` or `deleting` are invisible.
 pub async fn ready_backup_location_placed_on(
     executor: impl sqlx::PgExecutor<'_>,
     sandbox_id: SandboxId,
@@ -878,28 +846,41 @@ pub async fn artifact_registered_by_another_attempt(
 /// `sandbox_id`, with a live storage location. This is the proof an unpinned
 /// local cache needs: a ready backup of an older attempt cannot show which
 /// generation that cache contains.
+///
+/// Never while the sandbox is unpinned and its history is unordered
+/// (`restore_order_unordered`): its restore refuses off its node, so the
+/// local cache may be its only restore path.
 pub async fn is_latest_ready_suspend(
     executor: impl sqlx::PgExecutor<'_>,
     sandbox_id: SandboxId,
     snapshot_id: SnapshotId,
 ) -> Result<bool, CheckBackupError> {
-    Ok(sqlx::query_scalar(sql!(
-        "SELECT COALESCE((
-             SELECT s.id = $2 AND ssl.orphaned_at IS NULL
-             FROM snapshots s
-             JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
-             WHERE s.sandbox_id = $1
-               AND s.type = 'full'
-               AND (s.artifact_origin IS NULL OR s.artifact_origin = 'suspend')
-               AND s.state = 'ready'
-             ORDER BY s.timestamp DESC
-             LIMIT 1
-         ), FALSE)"
-    ))
-    .bind(sandbox_id)
-    .bind(snapshot_id)
-    .fetch_one(executor)
-    .await?)
+    /// Built once: every input is a literal or a bind placeholder.
+    static LATEST_READY_SUSPEND: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let unordered = pplx_space_sandbox_portability::restore_order_unordered("sb");
+        sql!(format!(
+            "SELECT COALESCE((
+                 SELECT s.id = $2 AND ssl.orphaned_at IS NULL
+                        AND (sb.current_local_artifact_id IS NOT NULL OR NOT {unordered})
+                 FROM snapshots s
+                 JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
+                 JOIN sandboxes sb ON sb.id = s.sandbox_id
+                 WHERE s.sandbox_id = $1
+                   AND s.type = 'full'
+                   AND (s.artifact_origin IS NULL OR s.artifact_origin = 'suspend')
+                   AND s.state = 'ready'
+                 ORDER BY s.timestamp DESC
+                 LIMIT 1
+             ), FALSE)"
+        ))
+    });
+    Ok(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(LATEST_READY_SUSPEND.as_str()))
+            .bind(sandbox_id)
+            .bind(snapshot_id)
+            .fetch_one(executor)
+            .await?,
+    )
 }
 
 /// Fetch one snapshot catalog row by id.
@@ -1115,6 +1096,10 @@ fn snapshot_artifact(
         .map_err(|_| GetSnapshotError::InvalidArtifactIdentity { snapshot_id })
 }
 
+/// Namespace of the per-artifact advisory lock [`insert`] takes so that one
+/// artifact's backups record one capture generation.
+const CAPTURE_GENERATION_LOCK_SEED: i64 = 581_204_337;
+
 /// Whether [`insert`] wrote the snapshot row or found the same identity already
 /// registered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1126,6 +1111,21 @@ pub enum InsertOutcome {
 }
 
 /// Insert one snapshot and its single durable storage location.
+///
+/// ## Capture generation
+///
+/// `snapshots.generation` is the generation of the execution that captured
+/// the bytes, and one artifact's bytes have one: every backup row of
+/// (`sandbox_id`, `local_artifact_id`, `artifact_kind`) that records a
+/// generation records the same one. Rows registered before any backup of the
+/// artifact recorded one keep none. The first registration of an artifact to record one fixes it,
+/// and every later row of the artifact inherits it, whatever its own
+/// [`NewSnapshot::with_generation`] says. A re-upload therefore keeps its
+/// capture's place in the order however late it registers, even once the
+/// node no longer holds the evidence to vouch for it, as long as an earlier
+/// backup of the artifact that recorded the generation remains; and a later
+/// registration that names another generation can't move it. A row with no
+/// generation of its own, and no earlier one to inherit, records none.
 ///
 /// The operation is idempotent for the same durable identity and exact URI,
 /// and reports which case it took so a caller can admit a new registration
@@ -1148,6 +1148,21 @@ pub async fn insert(
         .as_ref()
         .map(SnapshotContentHash::as_stored);
 
+    // Two first registrations of one artifact must not both miss each other's
+    // generation, or one row would record none and rank by registration time.
+    // The lock serializes them per artifact. It's taken before any other lock
+    // in the transaction (the insert's foreign-key locks, the caller's
+    // fence), and nothing else takes it, so it can't deadlock against them.
+    if let Some(local_artifact_id) = artifact.and_then(SnapshotArtifact::local_artifact_id) {
+        sqlx::query(sql!(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
+        ))
+        .bind(local_artifact_id.as_uuid())
+        .bind(CAPTURE_GENERATION_LOCK_SEED)
+        .execute(&mut **tx)
+        .await?;
+    }
+
     // Keep the conflict target implicit: snapshots has both a primary key on
     // id and a unique constraint on (id, org_id), and concurrent idempotent
     // inserts may collide on either one.
@@ -1160,7 +1175,17 @@ pub async fn insert(
               guest_arch, state_format_name, state_format_version,
               execution_metadata, generation)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+                 COALESCE(
+                     (SELECT recorded.generation
+                        FROM snapshots recorded
+                       WHERE recorded.sandbox_id = $2
+                         AND recorded.local_artifact_id = $12
+                         AND recorded.artifact_kind = $13
+                         AND recorded.generation IS NOT NULL
+                       ORDER BY recorded.timestamp, recorded.id
+                       LIMIT 1),
+                     $23))
          ON CONFLICT DO NOTHING
          RETURNING id"
     ))

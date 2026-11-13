@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db_with_max_connections};
 use pplx_space_k8s_node_id::space_k8s_node_id;
-use pplx_space_sandbox_portability::portable_for_restore_affinity;
+use pplx_space_sandbox_portability::{fresh_ready_snapshot_exists, portable_for_restore_affinity};
 use time::OffsetDateTime;
 
 use super::*;
@@ -1499,6 +1499,7 @@ mod k8s_store_postgres_behaviors {
         forget_pod_tracking_defers_to_suspend_finalization,
         explicit_teardown_forget_retires_execution_while_suspending,
         forget_pod_tracking_recovers_markerless_restoring_with_ready_snapshot,
+        forget_pod_tracking_keeps_the_pin_of_an_unordered_restoring_row,
         forget_pod_tracking_keeps_restoring_when_recovery_is_not_safe,
         forget_pod_tracking_recovers_started_suspended_by_node_after_current_backup,
         forget_pod_tracking_keeps_started_without_current_suspend_backup,
@@ -5265,6 +5266,93 @@ async fn explicit_teardown_forget_retires_execution_while_suspending(
         "explicit teardown must retire the execution as forgotten"
     );
 
+    Ok(())
+}
+
+/// A failed restore's cleanup doesn't unpin a row whose history is
+/// unordered: unpinned, its next restore would refuse where the pin restores.
+/// It stays `restoring`, pinned, for the sweeper's revert, which keeps the
+/// pin.
+async fn forget_pod_tracking_keeps_the_pin_of_an_unordered_restoring_row(
+    fixture: &PostgresStore,
+) -> TestResult {
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "restoring").await?;
+    let (stamped, pinned) = (LocalArtifactId::new(), LocalArtifactId::new());
+    // The pinned capture records no generation and registered after one that
+    // does: unordered. Both registered before the restore's claim.
+    for (artifact, generation, minutes_before) in [(stamped, Some(5_i64), 30), (pinned, None, 20)] {
+        let snapshot_id = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (
+                 id, sandbox_id, type, state, timestamp, local_artifact_id, artifact_kind,
+                 artifact_origin, generation
+             )
+             SELECT $1, $2, 'full', 'ready',
+                    s.lifecycle_changed_at - make_interval(mins => $4::INT), $3, 'full',
+                    'suspend', $5
+               FROM sandboxes s
+              WHERE s.id = $2"
+        ))
+        .bind(snapshot_id)
+        .bind(sandbox_id)
+        .bind(artifact)
+        .bind(minutes_before)
+        .bind(generation)
+        .execute(&fixture.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+             VALUES ($1, 's3://space-test/unordered-restore?region=us-east-1')"
+        ))
+        .bind(snapshot_id)
+        .execute(&fixture.pool)
+        .await?;
+    }
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+         SET current_local_artifact_id = $2,
+             current_local_artifact_kind = 'full',
+             current_local_artifact_origin = 'suspend',
+             placement = 'on_node',
+             placement_changed_at = NOW()
+         WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(pinned)
+    .execute(&fixture.pool)
+    .await?;
+    let execution = fixture
+        .store
+        .ensure_active_execution_row(sandbox_id)
+        .await?;
+
+    let forgotten = fixture
+        .store
+        .forget_pod_tracking_if_generation(
+            sandbox_id,
+            execution.generation,
+            PodTrackingCleanupCause::MissingPodObservation,
+        )
+        .await?;
+    // The cleanup ran: it retired the execution, and only the revert refused.
+    assert!(forgotten, "cleanup must run on the restoring row");
+    assert!(
+        fixture
+            .store
+            .active_execution_status(sandbox_id)
+            .await?
+            .is_none()
+    );
+
+    let (lifecycle, pin): (String, Option<LocalArtifactId>) = sqlx::query_as(sql!(
+        "SELECT lifecycle, current_local_artifact_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert_eq!(lifecycle, "restoring");
+    assert_eq!(pin, Some(pinned));
     Ok(())
 }
 

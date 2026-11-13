@@ -45,7 +45,9 @@ use crate::routes::public::sandboxes::parse_rollback_body;
 use pplx_space_public_api::routes as native_routes;
 
 mod guest_access;
+mod restore_pin;
 pub use guest_access::{create_command, create_terminal_session, list_snapshots};
+pub use restore_pin::{get_restore_pin, pin_restore_source};
 
 /// Admission gate for create-time sandbox node-pool placement.
 const SANDBOX_ALLOW_PLACEMENT_ENV: &str = "SPACE_ALLOW_SANDBOX_PLACEMENT";

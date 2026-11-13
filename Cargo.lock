@@ -7283,6 +7283,7 @@ version = "0.8.2"
 dependencies = [
  "log",
  "pplx-space-db-identity",
+ "pplx-space-db-test-fixtures",
  "pplx-space-metrics-emit",
  "pplx-space-observability",
  "pplx-space-postgres-contention",

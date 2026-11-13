@@ -178,6 +178,13 @@ pub struct SuspendedFinalizationCandidate {
     pub clear_marker: bool,
     pub published_artifact: Option<PublishedSuspendArtifact>,
     pub published_execution_identity: Option<PublishedExecutionIdentity>,
+    /// The full suspend artifact the caller proved is the capture this suspend
+    /// left (`pplx_space_sandbox_portability::suspend_snapshot_is_current_capture`).
+    /// When there's no published artifact, the row is pinned to it instead of
+    /// keeping or clearing its pin. Unlike a published artifact, it doesn't
+    /// require the active execution to match a published identity: the
+    /// capture's ready backup is the evidence.
+    pub captured_artifact: Option<LocalArtifactId>,
 }
 
 /// Finalize the selected rows as `suspended`, returning each finalized row
@@ -187,7 +194,7 @@ pub struct SuspendedFinalizationCandidate {
 /// One statement retires the active execution, resets open port exposures
 /// to pending and leaves the row `suspended` and unplaced, backfilling its
 /// target node from its active node, with the artifact marker published,
-/// cleared or kept. A candidate with a published artifact finalizes only
+/// set to the proven captured artifact, cleared or kept. A candidate with a published artifact finalizes only
 /// when its active execution is the exact one the node published from
 /// ([`node_published_execution_identity_matches`]); one without finalizes
 /// whatever its execution, or with none, as a Direct row has.
@@ -261,6 +268,10 @@ pub async fn finalize_suspended(
                 .map(|identity| identity.pod_uid_was_missing)
         })
         .collect::<Vec<_>>();
+    let captured_artifact_ids = candidates
+        .iter()
+        .map(|candidate| candidate.captured_artifact.map(LocalArtifactId::as_uuid))
+        .collect::<Vec<_>>();
     /// Built once: every input is a literal or a bind placeholder.
     static FINALIZATION_QUERY: LazyLock<String> = LazyLock::new(|| {
         let exact_execution_identity = node_published_execution_identity_matches(
@@ -274,12 +285,12 @@ pub async fn finalize_suspended(
              SELECT *
                FROM UNNEST(
                    $1::UUID[], $2::BOOL[], $3::UUID[], $4::TEXT[], $5::TEXT[],
-                   $6::BIGINT[], $7::TEXT[], $8::BOOL[]
+                   $6::BIGINT[], $7::TEXT[], $8::BOOL[], $9::UUID[]
                ) AS candidate(
                    id, clear_marker, published_artifact_id,
                    published_artifact_kind, published_artifact_origin,
                    published_execution_generation, published_pod_uid,
-                   published_pod_uid_was_missing
+                   published_pod_uid_was_missing, captured_artifact_id
                )
          ),
          retired_execution AS (
@@ -330,16 +341,19 @@ pub async fn finalize_suspended(
                     target_node_id = COALESCE(s.target_node_id, s.active_node_id),
                     current_local_artifact_id = CASE
              WHEN candidate.published_artifact_id IS NOT NULL THEN candidate.published_artifact_id
+             WHEN candidate.captured_artifact_id IS NOT NULL THEN candidate.captured_artifact_id
              WHEN candidate.clear_marker THEN NULL
              ELSE s.current_local_artifact_id
          END,
          current_local_artifact_kind = CASE
              WHEN candidate.published_artifact_id IS NOT NULL THEN candidate.published_artifact_kind
+             WHEN candidate.captured_artifact_id IS NOT NULL THEN 'full'
              WHEN candidate.clear_marker THEN NULL
              ELSE s.current_local_artifact_kind
          END,
          current_local_artifact_origin = CASE
              WHEN candidate.published_artifact_id IS NOT NULL THEN candidate.published_artifact_origin
+             WHEN candidate.captured_artifact_id IS NOT NULL THEN 'suspend'
              WHEN candidate.clear_marker THEN NULL
              ELSE s.current_local_artifact_origin
          END
@@ -357,6 +371,7 @@ pub async fn finalize_suspended(
         .bind(&published_execution_generations)
         .bind(&published_pod_uids)
         .bind(&published_pod_uids_were_missing)
+        .bind(&captured_artifact_ids)
         .fetch_all(executor)
         .await
 }

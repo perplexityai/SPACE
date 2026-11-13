@@ -2,11 +2,30 @@
 //! artifact storage URI a restore reads.
 
 use super::*;
-use pplx_space_sandbox_store::restore_source;
+use pplx_space_sandbox_store::restore_source::{
+    self, RestoreSourceMode, RestoreSourcePlacement, RestoreSourceSelection,
+};
+
+/// Check a selected restore URI the catalog holds. Parsing is validation
+/// rather than conversion: the caller wants the wire string, and a value
+/// `StorageUri` rejects is a stored-data fault worth failing on rather than
+/// handing to a node. `label` names the selector in the error.
+fn validated_restore_storage_uri(
+    storage_uri: Option<String>,
+    label: &str,
+) -> Result<Option<String>, SubstrateError> {
+    if let Some(storage_uri) = &storage_uri {
+        StorageUri::parse(storage_uri).map_err(|err| SubstrateError::Failed {
+            message: format!("invalid selected {label} restore storage URI: {err}"),
+        })?;
+    }
+    Ok(storage_uri)
+}
 
 /// Which suspend snapshot a restore selects when no existing restore pod
 /// already names one, and whether its source node's local copy counts.
-/// `K8sStore::selected_suspend_restore_storage_uri` holds the full rule.
+/// `pplx_space_sandbox_store::restore_source::select_restore_source` holds the
+/// full rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::controllers::substrate::kubernetes) enum RestoreSnapshotChoice {
     /// The source node's local copy, or the remote snapshot the user-restore
@@ -21,6 +40,28 @@ pub(in crate::controllers::substrate::kubernetes) enum RestoreSnapshotChoice {
 }
 
 impl K8sStore {
+    /// Whether the registered Kubernetes node named `node_name` is ready:
+    /// `None` when no registered node has that name.
+    pub(in crate::controllers::substrate::kubernetes) async fn restore_source_node_ready(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<bool>, SubstrateError> {
+        sqlx::query_scalar(sql!(
+            "SELECT n.state = 'ready'
+               FROM node_k8s nk
+               JOIN nodes n ON n.id = nk.node_id
+              WHERE nk.k8s_node_name = $1
+                AND n.managed_by = $2
+              ORDER BY n.state = 'ready' DESC
+              LIMIT 1"
+        ))
+        .bind(node_name)
+        .bind(pplx_space_common_core::types::SubstrateKind::Kubernetes)
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to look up the Kubernetes restore source node")
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn restore_source_node_name(
         &self,
         sandbox: &Sandbox,
@@ -130,118 +171,60 @@ impl K8sStore {
         })
     }
 
+    /// The storage URI of the suspend capture a restore of `sandbox` loads:
+    /// `snapshot`, and on a `restoring` sandbox the retry, mapped onto the
+    /// shared [`restore_source::select_restore_source`] rule. The node-drain
+    /// cohort restore (`NewestRemote`) applies its rule on every attempt.
     pub(in crate::controllers::substrate::kubernetes) async fn selected_suspend_restore_storage_uri(
         &self,
         sandbox: &Sandbox,
         snapshot: RestoreSnapshotChoice,
     ) -> Result<Option<String>, SubstrateError> {
-        // Three snapshot-selection modes:
-        //
-        // * **Suspended user restore** (`SourceNodeOrFresh`): the placement-
-        //   freshness gate — only a snapshot newer than the last placement is
-        //   canonical, so a `wake → modify → re-suspend` cycle can't restore
-        //   stale bytes.
-        // * **Restore retry** (`lifecycle = restoring`): pick the newest ready
-        //   snapshot from before the sandbox entered restore. A failed restore
-        //   branch can publish a later artifact, but retry pods need the source
-        //   state that restore originally started from. If the last placement
-        //   predates restore, it still bounds stale prior-cycle snapshots; if
-        //   placement moved during restore, it belongs to the retry branch and
-        //   must not strand the original source snapshot. When current local
-        //   artifact identity exists, legacy markerless snapshots are not
-        //   enough proof that the remote row belongs to this restore source.
-        // * **Node-drain cohort restore** (`NewestRemote`): require the
-        //   selected snapshot to be the **newest** full snapshot for the same
-        //   stale-prior-cycle and failed-placement reasons.
         let restore_retry = sandbox.lifecycle.trim().eq_ignore_ascii_case("restoring");
-        let newest_remote = snapshot == RestoreSnapshotChoice::NewestRemote;
-        let snapshot_guard = if restore_retry && !newest_remote {
-            format!(
-                "AND {}",
-                restore_retry_source_snapshot_is_current("s", "sn")
-            )
-        } else {
-            let legacy_snapshot_guard = if newest_remote {
-                no_newer_full_snapshot("s", "sn")
-            } else {
-                fresh_ready_snapshot_exists("s")
-            };
-            // The marked branch uses the shared fragment rather than an
-            // inline copy: this is the selector that resolves a marked
-            // row's restore source, and the retention sweeper's
-            // never-prune-the-current-artifact guard is built from the same
-            // fragment. Sharing it is what makes "the sweep cannot delete
-            // what restore would select" a property instead of a comment.
-            let marked_snapshot_guard = snapshot_is_current_local_artifact("s", "sn");
-            format!(
-                "AND (
-                    {marked_snapshot_guard}
-                    OR (s.current_local_artifact_id IS NULL AND {legacy_snapshot_guard})
-                )"
-            )
+        let mode = match snapshot {
+            RestoreSnapshotChoice::SourceNodeOrFresh => {
+                RestoreSourceMode::or_retry(RestoreSourceMode::PlacementFresh, restore_retry)
+            }
+            RestoreSnapshotChoice::NewestRemote => RestoreSourceMode::NewestFull,
         };
-        // `sql!` is expanded here, not in the shared body: it stamps the
-        // statement with *its own* `module_path!()`/`line!()`, which is what
-        // attributes an in-flight query in `pg_stat_activity` and DBM back to
-        // the code that issued it. Hoisting it into the helper would give both
-        // selectors one identical locator and silently move this one.
-        let query = sql!(format!(
-            "SELECT ssl.storage_connection_string
-               FROM sandboxes s
-               JOIN snapshots sn ON sn.sandbox_id = s.id
-               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
-              WHERE s.id = $1
-                AND s.lifecycle IN ('suspended', 'restoring')
-                AND ssl.orphaned_at IS NULL
-                AND sn.type = 'full'
-                AND sn.state = 'ready'
-                {snapshot_guard}
-              ORDER BY sn.timestamp DESC
-              LIMIT 1"
-        ));
-        self.fetch_restore_storage_uri(query, sandbox.id, "suspend")
-            .await
+        let storage_uri = match restore_source::select_restore_source(
+            &self.pool,
+            sandbox.id,
+            mode,
+            RestoreSourcePlacement::Any,
+        )
+        .await
+        .db_context("failed to select Kubernetes suspend restore URI")?
+        {
+            RestoreSourceSelection::Selected(selected) => Some(selected.storage_connection_string),
+            RestoreSourceSelection::Unavailable => None,
+            // The caller falls back to the source node's local copy while
+            // that node is registered (`suspend_restore_plan`).
+            RestoreSourceSelection::Unordered => {
+                return Err(SubstrateError::RestoreContextUnavailable {
+                    message: restore_source::unordered_restore_source_message(sandbox.id),
+                });
+            }
+        };
+        validated_restore_storage_uri(storage_uri, "suspend")
     }
 
-    /// Run a restore-source selector and validate what it returns.
+    /// Run the stopped restore-source selector and validate what it returns.
     ///
-    /// Shared by the suspend and stopped selectors, which each keep their own
-    /// whole `SELECT`: the storage guidance requires a statement to stay
-    /// syntactically whole and reviewable at its query site, so only the
-    /// binding and the result processing are factored out here, never a
-    /// predicate. The cost is that a filter belonging to both — the
-    /// non-orphaned-location requirement, say — has to be fixed in two
-    /// places; that is the trade the guidance makes deliberately, in exchange
-    /// for each query being readable where it is written.
-    ///
-    /// `query` arrives already `sql!`-stamped by its caller, so each selector
-    /// keeps its own locator token and stays separable in `pg_stat_activity`
-    /// and DBM. Do not re-stamp it here.
-    ///
-    /// `label` names the caller in the two error messages. Parsing the URI is
-    /// validation rather than conversion: the caller wants the wire string,
-    /// and a value the catalog holds but `StorageUri` rejects is a stored-data
-    /// fault worth failing on rather than handing to a node.
-    async fn fetch_restore_storage_uri(
+    /// `query` arrives already `sql!`-stamped by its caller, so the selector
+    /// keeps its own locator token in `pg_stat_activity` and DBM. Do not
+    /// re-stamp it here.
+    async fn fetch_stopped_restore_storage_uri(
         &self,
         query: String,
         sandbox_id: SandboxId,
-        label: &str,
     ) -> Result<Option<String>, SubstrateError> {
         let storage_uri: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
             .bind(sandbox_id)
             .fetch_optional(&self.pool)
             .await
-            // `db_context_with` rather than `db_context`: the message
-            // interpolates the caller's `label`, so it cannot be a
-            // `&'static str`.
-            .db_context_with(|| format!("failed to select Kubernetes {label} restore URI"))?;
-        if let Some(storage_uri) = &storage_uri {
-            StorageUri::parse(storage_uri).map_err(|err| SubstrateError::Failed {
-                message: format!("invalid selected {label} restore storage URI: {err}"),
-            })?;
-        }
-        Ok(storage_uri)
+            .db_context("failed to select Kubernetes stopped restore URI")?;
+        validated_restore_storage_uri(storage_uri, "stopped")
     }
 
     /// Disk-only sibling of [`Self::selected_suspend_restore_storage_uri`]:
@@ -333,11 +316,8 @@ impl K8sStore {
         // the same reason, though it spells it as a row-value comparison in a
         // keep-N probe (`(newer.timestamp, newer.id) > (s.timestamp, s.id)`)
         // rather than an `ORDER BY` — don't go looking for a matching clause
-        // there. The suspend sibling has no tiebreak and is not changed here:
-        // its ordering is load-bearing for a guard that shields every matching
-        // row, so narrowing it is a separate decision.
-        // Stamped here rather than in the shared body, for the reason the
-        // suspend selector's own call site gives.
+        // there. The suspend sibling, `select_restore_source`, breaks ties the
+        // same way.
         let query = sql!(format!(
             "SELECT ssl.storage_connection_string
                FROM sandboxes s
@@ -352,7 +332,7 @@ impl K8sStore {
               ORDER BY sn.timestamp DESC, sn.id DESC
               LIMIT 1"
         ));
-        self.fetch_restore_storage_uri(query, sandbox.id, "stopped")
+        self.fetch_stopped_restore_storage_uri(query, sandbox.id)
             .await
     }
 

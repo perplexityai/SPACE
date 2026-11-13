@@ -227,6 +227,11 @@ impl KubernetesSubstrate {
         let existing = self
             .existing_suspend_restore_annotations(sandbox.id)
             .await?;
+        // An unordered history refuses a remote source. A restore on the
+        // sandbox's own node can still load its local copy, the state it last
+        // suspended with there, so that refusal is kept for when there's no
+        // source node.
+        let mut unordered = None;
         let storage_uri = match existing.as_ref().and_then(|plan| plan.storage_uri.clone()) {
             Some(storage_uri) => Some(storage_uri),
             None => {
@@ -235,9 +240,19 @@ impl KubernetesSubstrate {
                 // for the current suspend upload (not a stale prior-cycle
                 // snapshot) and survives a failed restore attempt's placement
                 // bump (see `selected_suspend_restore_storage_uri`).
-                self.store
+                match self
+                    .store
                     .selected_suspend_restore_storage_uri(sandbox, snapshot)
-                    .await?
+                    .await
+                {
+                    Err(error @ SubstrateError::RestoreContextUnavailable { .. })
+                        if snapshot == RestoreSnapshotChoice::SourceNodeOrFresh =>
+                    {
+                        unordered = Some(error);
+                        None
+                    }
+                    result => result?,
+                }
             }
         };
         if snapshot == RestoreSnapshotChoice::NewestRemote {
@@ -256,6 +271,27 @@ impl KubernetesSubstrate {
             Some(source_node_name) => Some(source_node_name),
             None => self.store.restore_source_node_name(sandbox).await?,
         };
+        // Refused remotely, the restore has only the source node's local copy:
+        // a node that's gone has none, and a node-only pod there would never
+        // come up. One that's registered but not ready may come back.
+        if storage_uri.is_none()
+            && let Some(unordered) = unordered
+        {
+            let Some(node_name) = source_node_name.as_deref() else {
+                return Err(unordered);
+            };
+            match self.store.restore_source_node_ready(node_name).await? {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(SubstrateError::Unavailable {
+                        message: format!(
+                            "{unordered}; the node holding its local copy isn't ready"
+                        ),
+                    });
+                }
+                None => return Err(unordered),
+            }
+        }
         if source_node_name.is_none() && storage_uri.is_none() {
             return Err(SubstrateError::Timeout {
                 message: "cannot restore suspended sandbox before source node or remote snapshot is available"

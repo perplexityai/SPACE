@@ -772,6 +772,7 @@ async fn post_selection_execution_identity_change_blocks_exact_finalization() ->
                     pod_uid_was_missing: false,
                 },
             ),
+            captured_artifact: None,
         }],
     )
     .await?;

@@ -301,6 +301,17 @@ fn restore_retries_node_local_candidate_errors() {
         restore_status_error(&invalid_key),
         SubstrateError::FailedPrecondition { .. }
     ));
+
+    // A node's refusal of an unordered restore source is the same terminal
+    // 412 the control plane gives, not another candidate or a retry.
+    let unordered = pplx_space_sbx_mgr_client::restore_source_unordered_status(
+        "refusing to restore sandbox: its captures can't be ordered",
+    );
+    assert!(!should_try_next_restore_candidate(&unordered));
+    assert!(matches!(
+        restore_status_error(&unordered),
+        SubstrateError::RestoreContextUnavailable { message } if message.contains("can't be ordered")
+    ));
 }
 
 fn invalid_key_reference_status(message: &'static str) -> tonic::Status {
@@ -1574,6 +1585,350 @@ async fn deleting_newest_snapshot_blocks_stale_remote_fallback() -> TestResult {
         candidates.is_empty(),
         "the claimed newest artifact must block fallback to an older remote snapshot"
     );
+    Ok(())
+}
+
+/// A restore on another node loads the sandbox's pinned capture, as a
+/// Kubernetes one does. Neither a backup of a full named snapshot nor a
+/// re-upload of an older capture, both registered after the suspend, is the
+/// sandbox's state, however late they registered.
+#[tokio::test(flavor = "current_thread")]
+async fn remote_restore_loads_the_pinned_capture_over_later_registrations() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    let source_node_id = NodeId::new();
+    let alternate_node_id = NodeId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, Some(source_node_id)).await?;
+    insert_ready_worker(&fixture.pool, source_node_id, "127.0.0.1:1", "9.0.0").await?;
+    insert_ready_worker(&fixture.pool, alternate_node_id, "127.0.0.1:2", "9.0.0").await?;
+    let pinned = Uuid::now_v7();
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(pinned)
+    .execute(&fixture.pool)
+    .await?;
+    // (URI, artifact, origin, capture generation, seconds ago)
+    for (uri, artifact, origin, generation, seconds_ago) in [
+        (
+            "s3://bucket/snapshots/sandbox/older",
+            Uuid::now_v7(),
+            "suspend",
+            3_i64,
+            30,
+        ),
+        (
+            "s3://bucket/snapshots/sandbox/pinned",
+            pinned,
+            "suspend",
+            5,
+            20,
+        ),
+        (
+            "s3://bucket/snapshots/sandbox/named",
+            Uuid::now_v7(),
+            "snapshot",
+            5,
+            10,
+        ),
+        (
+            "s3://bucket/snapshots/sandbox/older-reupload",
+            Uuid::now_v7(),
+            "suspend",
+            3,
+            0,
+        ),
+    ] {
+        let snapshot_id = insert_ready_snapshot(
+            &fixture.pool,
+            sandbox_id,
+            source_node_id,
+            "9.0.0",
+            Some(uri),
+        )
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE snapshots
+                SET local_artifact_id = $2,
+                    artifact_kind = 'full',
+                    artifact_origin = $3,
+                    artifact_snapshot_name = CASE WHEN $3 = 'snapshot' THEN 'f-named' END,
+                    generation = $4,
+                    timestamp = NOW() - make_interval(secs => $5::INT)
+              WHERE id = $1"
+        ))
+        .bind(snapshot_id)
+        .bind(artifact)
+        .bind(origin)
+        .bind(generation)
+        .bind(seconds_ago)
+        .execute(&fixture.pool)
+        .await?;
+    }
+
+    let candidates = fixture
+        .substrate
+        .direct_restore_candidates(sandbox_id)
+        .await?;
+
+    let remote = candidates
+        .iter()
+        .find(|candidate| candidate.kind == DirectRestoreCandidateKind::RemoteSnapshot)
+        .expect("remote candidate selected");
+    assert_eq!(remote.node.id, alternate_node_id);
+    assert_eq!(
+        remote.storage_uri.as_deref(),
+        Some("s3://bucket/snapshots/sandbox/pinned")
+    );
+    Ok(())
+}
+
+/// An unpinned sandbox whose history is unordered, a capture without a
+/// generation registered after one with a generation, gets no remote
+/// candidate. Its source node
+/// still restores the local copy it suspended with. While the node is
+/// registered but can't take it, the restore is retryable; with no source node
+/// it's refused with the reason, never left to a remote guess.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unordered_history_restores_only_from_its_source_node() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    for (case, observed) in [true, false].into_iter().enumerate() {
+        let sandbox_id = SandboxId::new();
+        let source_node_id = NodeId::new();
+        let alternate_node_id = NodeId::new();
+        insert_sandbox(&fixture.pool, sandbox_id, Some(source_node_id)).await?;
+        let (source_endpoint, alternate_endpoint) = (
+            format!("127.0.0.1:{}", case * 2 + 1),
+            format!("127.0.0.1:{}", case * 2 + 2),
+        );
+        insert_ready_worker(&fixture.pool, source_node_id, &source_endpoint, "9.0.0").await?;
+        insert_ready_worker(
+            &fixture.pool,
+            alternate_node_id,
+            &alternate_endpoint,
+            "9.0.0",
+        )
+        .await?;
+        if observed {
+            insert_observed_source(&fixture.pool, sandbox_id, source_node_id).await?;
+        }
+        for (uri, generation, seconds_ago) in [
+            (
+                "s3://bucket/snapshots/sandbox/with-generation",
+                Some(5_i64),
+                20,
+            ),
+            ("s3://bucket/snapshots/sandbox/no-generation", None, 10),
+        ] {
+            let snapshot_id = insert_ready_snapshot(
+                &fixture.pool,
+                sandbox_id,
+                source_node_id,
+                "9.0.0",
+                Some(uri),
+            )
+            .await?;
+            sqlx::query(sql!(
+                "UPDATE snapshots
+                    SET local_artifact_id = $2,
+                        artifact_kind = 'full',
+                        artifact_origin = 'suspend',
+                        generation = $3,
+                        timestamp = NOW() - make_interval(secs => $4::INT)
+                  WHERE id = $1"
+            ))
+            .bind(snapshot_id)
+            .bind(Uuid::now_v7())
+            .bind(generation)
+            .bind(seconds_ago)
+            .execute(&fixture.pool)
+            .await?;
+        }
+
+        let result = fixture
+            .substrate
+            .direct_restore_candidates(sandbox_id)
+            .await;
+        if observed {
+            let candidates = result?;
+            assert!(!candidates.is_empty());
+            assert!(candidates.iter().all(|candidate| {
+                candidate.kind == DirectRestoreCandidateKind::SourceNode
+                    && candidate.node.id == source_node_id
+            }));
+        } else {
+            // The node is registered but not a candidate now: it may take the
+            // restore later, so that's transient.
+            let error = result.expect_err("no source candidate and no orderable capture");
+            assert!(
+                matches!(&error, SubstrateError::Unavailable { message } if message.contains("can't be ordered")),
+                "{error:?}"
+            );
+            // Deregistered, the node can't take it either, and nothing else
+            // can restore it; with no source node at all, the same.
+            sqlx::query(sql!(
+                "UPDATE node_direct SET deleted_at = NOW() WHERE node_id = $1"
+            ))
+            .bind(source_node_id)
+            .execute(&fixture.pool)
+            .await?;
+            for case in ["deregistered", "no source node"] {
+                if case == "no source node" {
+                    sqlx::query(sql!(
+                        "UPDATE sandboxes SET target_node_id = NULL, active_node_id = NULL WHERE id = $1"
+                    ))
+                    .bind(sandbox_id)
+                    .execute(&fixture.pool)
+                    .await?;
+                }
+                let error = fixture
+                    .substrate
+                    .direct_restore_candidates(sandbox_id)
+                    .await
+                    .expect_err("no source node and no orderable capture");
+                assert!(
+                    matches!(&error, SubstrateError::RestoreContextUnavailable { message } if message.contains("can't be ordered")),
+                    "{case}: {error:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A retry of a pinned sandbox restores its pin when the window holds it,
+/// even below a later execution's capture there, and the source-node leg
+/// checks compatibility against that same capture: a source node that can
+/// load the pin, and not the other capture, is still a candidate.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pinned_retry_checks_the_source_node_against_its_pin() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    let source_node_id = NodeId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, Some(source_node_id)).await?;
+    insert_ready_worker(&fixture.pool, source_node_id, "127.0.0.1:1", "9.0.0").await?;
+    insert_observed_source(&fixture.pool, sandbox_id, source_node_id).await?;
+    let pinned = Uuid::now_v7();
+    // (URI, artifact, state format, generation, seconds ago)
+    for (uri, artifact, version, generation, seconds_ago) in [
+        (
+            "s3://bucket/snapshots/sandbox/later",
+            Uuid::now_v7(),
+            "8.0.0",
+            5_i64,
+            30,
+        ),
+        (
+            "s3://bucket/snapshots/sandbox/pinned",
+            pinned,
+            "9.0.0",
+            3,
+            20,
+        ),
+    ] {
+        let snapshot_id = insert_ready_snapshot(
+            &fixture.pool,
+            sandbox_id,
+            source_node_id,
+            version,
+            Some(uri),
+        )
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE snapshots
+                SET local_artifact_id = $2, artifact_kind = 'full', artifact_origin = 'suspend',
+                    generation = $3, timestamp = NOW() - make_interval(secs => $4::INT)
+              WHERE id = $1"
+        ))
+        .bind(snapshot_id)
+        .bind(artifact)
+        .bind(generation)
+        .bind(seconds_ago)
+        .execute(&fixture.pool)
+        .await?;
+    }
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'restoring', lifecycle_changed_at = NOW(),
+                current_local_artifact_id = $2, current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(pinned)
+    .execute(&fixture.pool)
+    .await?;
+
+    let candidates = fixture
+        .substrate
+        .direct_restore_retry_candidates(sandbox_id)
+        .await?;
+    assert!(
+        candidates.iter().any(|candidate| {
+            candidate.kind == DirectRestoreCandidateKind::SourceNode
+                && candidate.node.id == source_node_id
+        }),
+        "{candidates:?}"
+    );
+    Ok(())
+}
+
+/// A Direct node's target carries its live endpoint, which the Direct
+/// substrate resolves from, and none once its Direct row is deleted. An
+/// unregistered node, or another substrate's, has no target.
+#[tokio::test(flavor = "current_thread")]
+async fn a_direct_node_target_carries_its_live_endpoint() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker(&fixture.pool, node_id, "127.0.0.1:7", "9.0.0").await?;
+    let target = fixture
+        .substrate
+        .node_api_target(node_id)
+        .await?
+        .expect("registered node");
+    assert_eq!(target.direct_endpoint.as_deref(), Some("127.0.0.1:7"));
+    sqlx::query(sql!(
+        "UPDATE node_direct SET deleted_at = NOW() WHERE node_id = $1"
+    ))
+    .bind(node_id)
+    .execute(&fixture.pool)
+    .await?;
+    let target = fixture
+        .substrate
+        .node_api_target(node_id)
+        .await?
+        .expect("registered node");
+    assert_eq!(target.direct_endpoint, None);
+    assert!(
+        fixture
+            .substrate
+            .node_api_target(NodeId::new())
+            .await?
+            .is_none()
+    );
+    // Another substrate's node isn't this one's.
+    let foreign = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.13', 'worker', 'k8s', 'ready')"
+    ))
+    .bind(foreign)
+    .execute(&fixture.pool)
+    .await?;
+    assert!(fixture.substrate.node_api_target(foreign).await?.is_none());
     Ok(())
 }
 

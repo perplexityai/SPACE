@@ -3375,6 +3375,71 @@ async fn pre_quarantine_recovery_ignores_only_failed_retry_of_same_artifact() ->
     Ok(())
 }
 
+/// The markerless recovery chooses by capture order, so it refuses an
+/// unordered history as the restore selector does: a capture without a
+/// generation registered after one with a generation, whose later re-upload
+/// doesn't order it.
+#[tokio::test(flavor = "current_thread")]
+async fn pre_quarantine_recovery_refuses_an_unordered_history() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    insert_active_sandbox(&db.pool, sandbox_id, node_id, "restoring").await?;
+    insert_k8s_execution(&db.pool, sandbox_id, 12, "running", Some("100.64.0.12")).await?;
+    let (stamped, unstamped) = (Uuid::now_v7(), Uuid::now_v7());
+    // (artifact, generation, seconds ago)
+    for (artifact, generation, seconds_ago) in [
+        (stamped, Some(5_i64), 30),
+        (unstamped, None, 20),
+        (stamped, Some(5), 10),
+    ] {
+        let snapshot_id = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (
+                 id, sandbox_id, type, state, source_node_id, org_id, timestamp,
+                 local_artifact_id, artifact_kind, artifact_origin, generation
+             )
+             VALUES (
+                 $1, $2, 'full', 'ready', $3,
+                 '00000000-0000-0000-0000-000000000001',
+                 NOW() - make_interval(secs => $5::INT), $4, 'full', 'suspend', $6
+             )",
+        ))
+        .bind(snapshot_id)
+        .bind(sandbox_id)
+        .bind(node_id)
+        .bind(artifact)
+        .bind(seconds_ago)
+        .bind(generation)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations
+                 (snapshot_id, storage_connection_string, org_id)
+             VALUES ($1, 's3://space-test/suspend-snapshot',
+                     '00000000-0000-0000-0000-000000000001')"
+        ))
+        .bind(snapshot_id)
+        .execute(&db.pool)
+        .await?;
+    }
+
+    let reason_code = SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+    let mut quarantined = quarantined_sandbox_state(sandbox_id);
+    quarantined.quarantine_reason_code = Some(reason_code.to_string());
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(&mut conn, node_id, &[quarantined]).await?;
+    let service = ClusterApiService::new(db.pool.clone());
+
+    let error = service
+        .get_quarantine_recovery_plan(quarantine_recovery_plan_request(node_id, sandbox_id))
+        .await
+        .expect_err("an unordered history has no single recovery source");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn recovery_plan_supports_current_legacy_snapshot_without_artifact_identity() -> TestResult {
     let db = pg_test_db().await?;

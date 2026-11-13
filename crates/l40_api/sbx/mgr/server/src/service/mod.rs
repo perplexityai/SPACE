@@ -2144,6 +2144,8 @@ pub(crate) use eviction::{EvictionClaim, is_unrecorded_snapshot_refusal};
 mod grpc_auto_lifecycle_delete_receipts;
 mod grpc_core;
 mod grpc_lifecycle;
+#[cfg(test)]
+pub(crate) use grpc_lifecycle::{answer, with_cluster_api};
 mod grpc_local_backup_inventory;
 mod grpc_memory_policy;
 mod grpc_net_gateway;

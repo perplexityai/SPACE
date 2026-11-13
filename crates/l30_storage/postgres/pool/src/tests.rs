@@ -1,6 +1,7 @@
 use super::{
     DatabaseConnectOptionsError, connect_postgres_lazy_as, connect_postgres_lazy_as_capped,
     database_connect_options, jittered_lifetime, pool_utilization, postgres_pool_options,
+    service_session_options,
 };
 use pplx_space_db_identity::DatabaseIdentity;
 use std::time::Duration;
@@ -21,6 +22,24 @@ async fn lazy_pool_does_not_require_database_at_startup() {
 
         assert_eq!(pool.size(), 0);
     }
+}
+
+/// Service pools run with JIT off for the session: a connection made with
+/// their session options reports `jit` off.
+#[tokio::test]
+async fn service_pools_turn_jit_off() {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await.unwrap() else {
+        return;
+    };
+    let options: sqlx::postgres::PgConnectOptions = db.database_url.parse().unwrap();
+    let mut connection = sqlx::ConnectOptions::connect(&service_session_options(options))
+        .await
+        .unwrap();
+    let jit: String = sqlx::query_scalar("SHOW jit")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(jit, "off");
 }
 
 #[test]

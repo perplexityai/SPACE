@@ -39,6 +39,14 @@
 //!   stays `suspended` until the stamp. A start and a stop also write over
 //!   `stopped` and `restoring`, so a start or stop that races a restore lease
 //!   can make the lease's completion miss.
+//! - A restore's source is the shared rule
+//!   (`pplx_space_sandbox_store::restore_source::select_restore_source`).
+//!   The source-node candidate sends no URI, and reads its compatibility
+//!   metadata from the pinned artifact's snapshot row, or else the latest
+//!   capture's, in any upload state. A remote candidate restores the pinned
+//!   artifact's ready backup, or for an unpinned row the newest suspend
+//!   capture by capture generation, from a live storage location, and a
+//!   retry restores the source its restore claimed.
 //! - Warm-pool claims adopt node-side, so `label_adopted_execution` has no
 //!   pod to label and answers `Labeled`.
 //! - Create, pool-adoption and restore candidates evaluate the environment
@@ -130,9 +138,10 @@ use pplx_space_k8s_ids::{PodUid, PodUidParseError};
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyV1 as NetworkPolicyProto};
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_portability::{
-    no_newer_full_snapshot, restore_retry_source_snapshot_is_current,
+    capture_registered_at, full_snapshot_outranked_by_generation, registered_before_restore_claim,
+    restore_retry_source_snapshot_is_current, snapshot_is_current_local_artifact,
 };
-use pplx_space_sandbox_store::direct as direct_store;
+use pplx_space_sandbox_store::{direct as direct_store, restore_source};
 use pplx_space_sbx_mgr_client::proto::{
     BootMode, StartRequest, SuspendRequest, WakeResponse, WakeTransition,
 };
@@ -395,7 +404,11 @@ fn should_try_next_worker_candidate(error: &tonic::Status) -> bool {
 }
 
 fn should_try_next_restore_candidate(error: &tonic::Status) -> bool {
-    if pplx_space_credmgr_client::status_is_invalid_key_reference(error) {
+    // A refused restore source is terminal: every node asks the control plane
+    // the same question.
+    if pplx_space_credmgr_client::status_is_invalid_key_reference(error)
+        || pplx_space_sbx_mgr_client::status_is_restore_source_unordered(error)
+    {
         return false;
     }
     matches!(
@@ -430,6 +443,11 @@ fn direct_route_generation_reservation_error(error: sqlx::Error) -> SubstrateErr
 }
 
 fn restore_status_error(status: &tonic::Status) -> SubstrateError {
+    if pplx_space_sbx_mgr_client::status_is_restore_source_unordered(status) {
+        return SubstrateError::RestoreContextUnavailable {
+            message: status.message().to_owned(),
+        };
+    }
     let message = format!("node-api restore error: {status}");
     if pplx_space_credmgr_client::status_is_invalid_key_reference(status) {
         SubstrateError::FailedPrecondition { message }
@@ -2901,15 +2919,28 @@ impl DirectSubstrate {
     ) -> Result<Vec<DirectRestoreCandidate>, SubstrateError> {
         let mut candidates = Vec::new();
         let retry_source = restore_retry_source_snapshot_is_current("s", "sn");
+        let pinned = snapshot_is_current_local_artifact("s", "sn");
+        let captured = capture_registered_at("sn");
+        let pinned_or_latest_capture = format!(
+            "({pinned} OR NOT {})",
+            full_snapshot_outranked_by_generation("s", "sn")
+        );
+        // A retry's source is the pin when its window holds it, as the shared
+        // selector's remote leg reads it.
+        let retry_or_pinned = format!(
+            "({retry_source} OR ({pinned} AND {}))",
+            registered_before_restore_claim("s", "sn")
+        );
         let source_snapshot = if restore_retry {
-            retry_source.as_str()
+            retry_or_pinned.as_str()
         } else {
-            "TRUE"
+            pinned_or_latest_capture.as_str()
         };
 
-        // A fresh restore uses the newest full row regardless of upload state:
-        // those execution columns describe the artifact held by the source
-        // node even when its upload failed or its durable copy was claimed.
+        // A fresh restore uses the pinned artifact's row, or the latest capture,
+        // regardless of upload state: those execution columns describe the
+        // artifact held by the source node even when its upload failed or its
+        // durable copy was claimed.
         // A retry instead uses the same pre-claim source row as the remote leg;
         // newer post-claim attempts are not authoritative for compatibility.
         // The observed-state join supplies only existence and placement.
@@ -2926,7 +2957,8 @@ impl DirectSubstrate {
                  WHERE s.id = $1
                    AND sn.type = 'full'
                    AND {source_snapshot}
-                 ORDER BY sn.timestamp DESC, sn.id DESC
+                 ORDER BY {pinned} DESC NULLS LAST, {captured} DESC, sn.timestamp DESC,
+                          sn.id DESC
                  LIMIT 1
              )
              SELECT n.id,
@@ -3040,16 +3072,64 @@ impl DirectSubstrate {
                 .map(DirectRestoreCandidate::source_node),
         );
 
-        let no_newer = no_newer_full_snapshot("s", "sn");
-        let remote_source = if restore_retry {
-            retry_source.as_str()
-        } else {
-            no_newer.as_str()
+        // The remote leg restores the capture the shared rule selects, the
+        // same one a Kubernetes restore away from the source node loads.
+        let selected = match restore_source::select_restore_source(
+            &self.pool,
+            sandbox_id,
+            restore_source::RestoreSourceMode::or_retry(
+                restore_source::RestoreSourceMode::NewestFull,
+                restore_retry,
+            ),
+            restore_source::RestoreSourcePlacement::Any,
+        )
+        .await
+        .db_context("failed to select direct remote restore snapshot")?
+        {
+            restore_source::RestoreSourceSelection::Selected(selected) => selected,
+            restore_source::RestoreSourceSelection::Unavailable => return Ok(candidates),
+            // No remote source: capture order can't choose one. The source
+            // node's local copy is the state it last suspended with there, so
+            // its leg still restores, unless the node refuses too
+            // (`status_is_restore_source_unordered`), which is terminal.
+            restore_source::RestoreSourceSelection::Unordered if !candidates.is_empty() => {
+                return Ok(candidates);
+            }
+            // No source leg now. While the node that holds the local copy is
+            // still registered (its `node_direct` row not deleted), it may take
+            // the restore once it's eligible again, so that's transient; with
+            // the node gone or deregistered, nothing can.
+            restore_source::RestoreSourceSelection::Unordered => {
+                let source_node_registered: bool = sqlx::query_scalar(sql!(
+                    "SELECT EXISTS (
+                         SELECT 1
+                           FROM sandboxes s
+                           JOIN nodes n ON n.id = COALESCE(s.target_node_id, s.active_node_id)
+                           JOIN node_direct nd ON nd.node_id = n.id AND nd.deleted_at IS NULL
+                          WHERE s.id = $1
+                            AND n.managed_by = $2
+                     )"
+                ))
+                .bind(sandbox_id.as_uuid())
+                .bind(SubstrateKind::Space)
+                .fetch_one(&self.pool)
+                .await
+                .db_context("failed to look up the direct restore source node")?;
+                let message = restore_source::unordered_restore_source_message(sandbox_id);
+                return Err(if source_node_registered {
+                    SubstrateError::Unavailable {
+                        message: format!(
+                            "{message}; the node holding its local copy isn't taking the restore now"
+                        ),
+                    }
+                } else {
+                    SubstrateError::RestoreContextUnavailable { message }
+                });
+            }
         };
         let remote_query = format!(
-            "WITH latest_snapshot AS (
-                 SELECT sn.id AS snapshot_id,
-                        storage.storage_connection_string AS storage_uri,
+            "WITH selected_snapshot AS (
+                 SELECT $5::TEXT AS storage_uri,
                         COALESCE(sn.source_node_id, s.target_node_id, s.active_node_id) AS source_node_id,
                         sn.runtime,
                         sn.guest_os,
@@ -3059,27 +3139,16 @@ impl DirectSubstrate {
                         sn.execution_metadata
                  FROM sandboxes s
                  JOIN snapshots sn ON sn.sandbox_id = s.id
-                 JOIN LATERAL (
-                     SELECT ssl.storage_connection_string
-                     FROM snapshot_storage_locations ssl
-                     WHERE ssl.snapshot_id = sn.id
-                     ORDER BY ssl.created_at DESC, ssl.id DESC
-                     LIMIT 1
-                 ) storage ON TRUE
                  WHERE s.id = $1
-                   AND sn.type = 'full'
-                   AND sn.state = 'ready'
-                   AND {remote_source}
-                 ORDER BY sn.timestamp DESC, sn.id DESC
-                 LIMIT 1
+                   AND sn.id = $6
              )
              SELECT n.id,
                     nd.node_api_endpoint,
-                    latest_snapshot.storage_uri,
-                    latest_snapshot.source_node_id,
+                    selected_snapshot.storage_uri,
+                    selected_snapshot.source_node_id,
                     environment_gate.refusal AS environment_refusal
-             FROM latest_snapshot
-             JOIN nodes n ON n.id IS DISTINCT FROM latest_snapshot.source_node_id
+             FROM selected_snapshot
+             JOIN nodes n ON n.id IS DISTINCT FROM selected_snapshot.source_node_id
              JOIN node_direct nd ON nd.node_id = n.id
              JOIN node_status_snapshots nss ON nss.node_id = n.id
              CROSS JOIN LATERAL (
@@ -3092,18 +3161,18 @@ impl DirectSubstrate {
                AND nss.reachable IS TRUE
                AND nss.stale_after > NOW()
                AND nss.scheduling_status = 'ready'
-               AND (latest_snapshot.runtime = 'fc' OR (
+               AND (selected_snapshot.runtime = 'fc' OR (
                     nss.execution_inventory_status = 'complete'
                     AND nss.execution_inventory_received_at
                         + (nss.stale_after - nss.observed_at) > NOW()
-                    AND latest_snapshot.execution_metadata IS NOT NULL
+                    AND selected_snapshot.execution_metadata IS NOT NULL
                ))
-               AND latest_snapshot.runtime IS NOT NULL
-               AND latest_snapshot.guest_os IS NOT NULL
-               AND latest_snapshot.guest_arch IS NOT NULL
-               AND latest_snapshot.state_format_name IS NOT NULL
-               AND latest_snapshot.state_format_version IS NOT NULL
-               AND (($4::BOOLEAN IS TRUE AND latest_snapshot.execution_metadata->>'environment' IS NOT NULL)
+               AND selected_snapshot.runtime IS NOT NULL
+               AND selected_snapshot.guest_os IS NOT NULL
+               AND selected_snapshot.guest_arch IS NOT NULL
+               AND selected_snapshot.state_format_name IS NOT NULL
+               AND selected_snapshot.state_format_version IS NOT NULL
+               AND (($4::BOOLEAN IS TRUE AND selected_snapshot.execution_metadata->>'environment' IS NOT NULL)
                     OR EXISTS (
                     SELECT 1
                     FROM node_runtime_installations runtime
@@ -3112,18 +3181,18 @@ impl DirectSubstrate {
                      AND guest.runtime = runtime.runtime
                      AND guest.runtime_version = runtime.runtime_version
                     WHERE runtime.node_id = n.id
-                      AND runtime.runtime = latest_snapshot.runtime
-                      AND guest.guest_os = latest_snapshot.guest_os
-                      AND guest.guest_arch = latest_snapshot.guest_arch
+                      AND runtime.runtime = selected_snapshot.runtime
+                      AND guest.guest_os = selected_snapshot.guest_os
+                      AND guest.guest_arch = selected_snapshot.guest_arch
                       AND EXISTS (
                               SELECT 1
                               FROM node_runtime_state_formats state_format
                               WHERE state_format.node_id = runtime.node_id
                                 AND state_format.runtime = runtime.runtime
                                 AND state_format.runtime_version = runtime.runtime_version
-                                AND state_format.state_format_name = latest_snapshot.state_format_name
+                                AND state_format.state_format_name = selected_snapshot.state_format_name
                                 AND split_part(state_format.state_format_version, '.', 1)
-                                    = split_part(latest_snapshot.state_format_version, '.', 1)
+                                    = split_part(selected_snapshot.state_format_version, '.', 1)
                                 AND state_format.can_load IS TRUE
                           )
                    ))
@@ -3141,11 +3210,11 @@ impl DirectSubstrate {
                    AND NOT EXISTS (
                     SELECT 1
                     FROM jsonb_to_recordset(
-                             COALESCE(latest_snapshot.execution_metadata->'components',
+                             COALESCE(selected_snapshot.execution_metadata->'components',
                                       '[]'::jsonb)
                          ) AS requested(kind text, role text, digest text,
                                         version text, format text)
-                    WHERE (latest_snapshot.runtime <> 'fc' OR requested.kind IS DISTINCT FROM 'kernel')
+                    WHERE (selected_snapshot.runtime <> 'fc' OR requested.kind IS DISTINCT FROM 'kernel')
                       AND NOT EXISTS (
                           SELECT 1
                           FROM node_artifact_components installed
@@ -3168,7 +3237,7 @@ impl DirectSubstrate {
                )
              ORDER BY random()
              LIMIT $2",
-            refusal = environment_refusal("nss", "latest_snapshot.execution_metadata->>'environment'"),
+            refusal = environment_refusal("nss", "selected_snapshot.execution_metadata->>'environment'"),
         );
         let remote_candidates = sqlx::query_as::<_, DirectRestoreCandidateRow>(
             sqlx::AssertSqlSafe(sql!(remote_query.as_str())),
@@ -3177,6 +3246,8 @@ impl DirectSubstrate {
         .bind(DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT)
         .bind(SubstrateKind::Space)
         .bind(self.environment_placement.refuses())
+        .bind(&selected.storage_connection_string)
+        .bind(selected.snapshot_id)
         .fetch_all(&self.pool)
         .await
         .db_context("failed to select direct remote restore candidates")?;
@@ -5548,6 +5619,30 @@ impl SubstrateAdapter for DirectSubstrate {
             .ok_or_else(|| SubstrateError::NotFound {
                 message: "direct node has no node_api_endpoint".to_string(),
             })
+    }
+
+    async fn node_api_target(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<OwnedNodeApiTarget>, SubstrateError> {
+        let row: Option<(SpaceNodeRole, Option<String>)> = sqlx::query_as(sql!(
+            "SELECT n.role, nd.node_api_endpoint
+               FROM nodes n
+               LEFT JOIN node_direct nd ON nd.node_id = n.id AND nd.deleted_at IS NULL
+              WHERE n.id = $1
+                AND n.managed_by = $2"
+        ))
+        .bind(node_id)
+        .bind(SubstrateKind::Space)
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to look up direct node-api target")?;
+        Ok(row.map(|(role, direct_endpoint)| OwnedNodeApiTarget {
+            managed_by: NodeManagedBy::Space,
+            role,
+            direct_endpoint,
+            substrate_node_id: None,
+        }))
     }
 
     async fn select_ready_worker_node_api_target(

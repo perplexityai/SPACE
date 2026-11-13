@@ -286,6 +286,41 @@ fn write_suspend_snapshot_files(
     }
 }
 
+/// A restore the control plane refused to choose a source for fails for
+/// good, `FAILED_PRECONDITION`, whether the node lost its local copy or
+/// stages a newer remote one: a retry would ask the same question.
+#[tokio::test]
+async fn an_ambiguous_restore_source_is_permanent_not_a_retry_response() {
+    // No selected URI: the stage-in asks the control plane where to restore
+    // from, and it refuses.
+    let directory = tempfile::tempdir().unwrap();
+    let sandbox_id = SandboxId::new().to_string();
+    let mut provenance = RestoredSnapshotProvenance::default();
+    let error = stage_remote_suspend_restore_if_needed(
+        &sandbox_id,
+        directory.path(),
+        SuspendRestorePlacement::RemoteOnly,
+        None,
+        &mut provenance,
+        |sandbox_id, _| async move {
+            Err(crate::snapshot_restore::RestoreError::RestoreSourceUnordered(sandbox_id))
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        pplx_space_sbx_mgr_client::status_is_restore_source_unordered(&error),
+        "{error:?}"
+    );
+    assert!(
+        error.message().contains("can't be ordered"),
+        "{}",
+        error.message()
+    );
+    assert!(provenance.storage_uri.is_none());
+}
+
 #[tokio::test]
 async fn restore_rootfs_policy_failure_is_permanent_not_a_retry_response() {
     let directory = tempfile::tempdir().unwrap();

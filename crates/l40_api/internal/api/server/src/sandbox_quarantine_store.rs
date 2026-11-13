@@ -17,9 +17,11 @@ use pplx_space_sandbox_metrics::publication::{
     StatePublicationComponent, StatePublicationDisposition, StatePublicationField,
 };
 use pplx_space_sandbox_portability::{
-    current_suspend_origin_marker_snapshot_ready, exact_marker_snapshot_backup_current,
+    capture_registered_at, current_suspend_origin_marker_snapshot_ready,
+    exact_marker_snapshot_backup_current, node_held_capture_is_latest,
     node_published_suspend_evidence, pre_quarantine_suspend_snapshot_current,
-    quarantine_recovery_suspend_snapshot_current, started_suspend_revert_eligibility,
+    quarantine_recovery_suspend_snapshot_current, started_suspend_finalize_eligibility,
+    suspend_snapshot_is_current_capture,
     suspended_projection_lifecycle_eligible_with_node_evidence,
 };
 use pplx_space_sandbox_store::ingest::TRANSITION_RECEIPT_RECORD_COLUMNS;
@@ -47,6 +49,7 @@ pub(super) struct SuspendedProjectionCandidate {
     pub(super) clear_marker: bool,
     pub(super) published_artifact: Option<PublishedSuspendArtifact>,
     pub(super) published_execution_identity: Option<PublishedExecutionIdentity>,
+    pub(super) captured_artifact: Option<LocalArtifactId>,
     pub(super) recovery: Option<QuarantineRecoveryCandidate>,
 }
 
@@ -683,7 +686,8 @@ pub(super) async fn select_suspended_projection_candidates(
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
 ) -> Result<Vec<SuspendedProjectionCandidate>, Status> {
-    let eligibility = started_suspend_revert_eligibility("s");
+    // Finalizing records the node's suspend; it chooses no restore source.
+    let eligibility = started_suspend_finalize_eligibility("s");
     let clear_marker = eligibility.clear_marker;
     let eligible = eligibility.eligible;
     // Recovery may retire only the active execution whose generation the node
@@ -700,6 +704,17 @@ pub(super) async fn select_suspended_projection_candidates(
          AND ({committed_suspend_marker_current})"
     );
     let node_suspend_evidence = node_published_suspend_evidence("s", "input");
+    // The artifact the node publishes is pinned when its ready backup is the
+    // capture the active execution left, even without the published identity.
+    let current_capture = suspend_snapshot_is_current_capture("s", "captured");
+    // So is a capture without a generation that the node reports holding
+    // suspended, while its backup from this node is still the latest capture
+    // of this run: the node's report is the proof the generation can't give,
+    // as it is for the restore-pin repair. A capture with another execution's
+    // generation stays unpinned.
+    let held_capture =
+        node_held_capture_is_latest("s", "held", "input.current_local_artifact_id", "$1");
+    let held_captured = capture_registered_at("held");
     let lifecycle_eligible = suspended_projection_lifecycle_eligible_with_node_evidence(
         "s",
         &committed_suspend_evidence,
@@ -748,7 +763,32 @@ pub(super) async fn select_suspended_projection_candidates(
                             AND execution.state = 'running'
                             AND execution.generation = input.execution_generation
                             AND execution.pod_uid IS NULL
-                     ) END AS published_pod_uid_was_missing
+                     ) END AS published_pod_uid_was_missing,
+                CASE WHEN LOWER(TRIM(s.lifecycle)) != 'quarantined'
+                          AND (EXISTS (
+                                  SELECT 1
+                                    FROM snapshots captured
+                                   WHERE captured.sandbox_id = s.id
+                                     AND captured.local_artifact_id = input.current_local_artifact_id
+                                     AND {current_capture}
+                              )
+                              OR (input.current_local_artifact_kind = 'full'
+                                  AND input.current_local_artifact_origin = 'suspend'
+                                  AND EXISTS (
+                                      SELECT 1
+                                        FROM snapshots held
+                                       WHERE held.sandbox_id = s.id
+                                         AND {held_capture}
+                                         AND {held_captured} >= s.lifecycle_changed_at
+                                         AND NOT EXISTS (
+                                             SELECT 1
+                                               FROM snapshots stamped
+                                              WHERE stamped.sandbox_id = s.id
+                                                AND stamped.local_artifact_id = held.local_artifact_id
+                                                AND stamped.generation IS NOT NULL
+                                         )
+                                  )))
+                     THEN input.current_local_artifact_id END AS captured_artifact_id
            FROM sandboxes s
            JOIN input ON input.sandbox_id = s.id
            LEFT JOIN sandbox_quarantine_state qs ON qs.sandbox_id = s.id
@@ -834,6 +874,7 @@ pub(super) async fn select_suspended_projection_candidates(
         Option<i64>,
         Option<String>,
         Option<bool>,
+        Option<Uuid>,
     );
     let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(node_id)
@@ -863,6 +904,7 @@ pub(super) async fn select_suspended_projection_candidates(
                 published_execution_generation,
                 published_pod_uid,
                 published_pod_uid_was_missing,
+                captured_artifact_id,
             )| {
                 let published_artifact = match (
                     published_artifact_id,
@@ -943,6 +985,7 @@ pub(super) async fn select_suspended_projection_candidates(
                     clear_marker,
                     published_artifact,
                     published_execution_identity,
+                    captured_artifact: captured_artifact_id.map(LocalArtifactId::from_uuid),
                     recovery,
                 })
             },

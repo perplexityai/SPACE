@@ -55,6 +55,8 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` | off | API and cluster controller, Kubernetes only: whether starting a stopped sandbox or resuming a suspended one first decides a runtime upgrade from the cluster execution environment policy and the certified edges in `runtime_environments`, and runs it through the node's `UpgradeRuntime` instead of a plain start or restore. A sandbox whose environment may not execute and has no edge to the cluster default is refused as stranded (412). Off, every start and restore proceeds as recorded. Set it the same on every API and cluster-controller replica, since either may drive an activation, and give both node-api's policy-mutation trust, which an upgrade Wake needs. Leave it off on Kubernetes for now: a Kubernetes sandbox boots in its pod's shim, never from the Wake, so sandbox-manager refuses an upgrade Wake with a Kubernetes route identity, and with the flag on every activation that decides an upgrade fails until the API renders `runtime-upgrade` pods (see "Booting an upgrade in its pod" in [execution-environments.md](execution-environments.md)). Node publications populate `runtime_environments`, so until nodes on a build that publishes environment observations have reported, every move off an environment that may not execute is refused as stranded. `1`, `true`, `yes`, `on` or `enabled` turns it on; anything else keeps it off. See "Upgrading at resume and start" in [execution-environments.md](execution-environments.md). |
 | `SPACE_ENVIRONMENT_PLACEMENT_GATE` | off | API and cluster controller: `off`, `shadow` or `on`. `on` places work bound to an execution environment only on nodes whose published environments list it as usable, E0 work included; unbound work is never refused. On Direct that's fresh, complete evidence; on Kubernetes, a bound pod requires the node label node-ctl writes for its environment. `shadow` places as `off` and reports what `on` would refuse (`environment_placement.would_refuse` on Direct, `environment_placement.running_pods` on Kubernetes). On Kubernetes, `on` fails startup until the worker boots the environment a pod requires ("Not covered" in [execution-environments.md](execution-environments.md)); `off` and `shadow` run. Any other value fails startup. Set it the same on every API and cluster-controller replica, since either may place a create or a restore. See "Placing work by environment" in [execution-environments.md](execution-environments.md). |
 | `SPACE_STUCK_SNAPSHOT_REAPER_ENABLED` | off | |
+| `SPACE_RESTORE_PIN_REPAIR_ENABLED` | off | A backfill to run after deploying a build whose idle suspends pin their capture. Each tick asks the node an unpinned `suspended` sandbox is placed on which artifact it holds, and pins the row to it when a ready backup from that node is still the latest capture the control plane knows of. A row it can't pin is logged with the reason; an operator can pin its capture through the admin restore-pin route (see the [admin CLI runbook](../crates/l50_app/admin/cli/README.md#restore-refused-captures-cant-be-ordered)). Turn it off once the unpinned population stops shrinking. `1`, `true`, `yes`, `on` or `enabled` turns it on; anything else keeps it off. |
+| `SPACE_RESTORE_PIN_REPAIR_TICK_SECS`, `SPACE_RESTORE_PIN_REPAIR_BATCH` | 30, 100 | Tick cadence, and rows asked about per tick (one node-api call each), at most 1000. |
 | `SPACE_SUSPENDED_EXECUTION_REAPER_ENABLED` | off | Runs dry by default. |
 | `SPACE_STUCK_CONTAINER_CREATING_GC_ENABLED` | off | |
 | `SPACE_STUCK_CONTAINER_CREATING_GC_MAX_DELETES_PER_MINUTE` | built-in | |
@@ -756,6 +758,12 @@ forwarding never relabels it.
 Service database pools always emit SQLx `sqlx::query` events at `INFO`, which
 become DB spans under traced requests. To turn them off, add a
 `sqlx::query=off` directive to `RUST_LOG` or `SPACE_TRACE_FILTER`.
+
+Service database pools set `jit = off` on every connection. The restore and
+retention predicates are many small correlated subqueries whose estimated
+cost crosses `jit_above_cost`, and compiling them takes longer than running
+them. Connections that don't go through a service pool, such as `psql`, keep
+the server's setting.
 
 ## Execution eligibility
 

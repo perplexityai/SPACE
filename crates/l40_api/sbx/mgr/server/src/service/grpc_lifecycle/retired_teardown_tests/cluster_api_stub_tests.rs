@@ -310,7 +310,7 @@ where
 /// Serves `stub` and runs `test` in an isolated child process whose
 /// cluster-api client wiring points at it, with a synthetic snapshot upload
 /// destination configured.
-pub(in crate::service) async fn with_cluster_api<S>(stub: S, test: impl AsyncFnOnce())
+pub(crate) async fn with_cluster_api<S>(stub: S, test: impl AsyncFnOnce())
 where
     S: tower::Service<
             http::Request<tonic::body::Body>,
@@ -410,7 +410,7 @@ where
 }
 
 /// Answer one gRPC `request` with `handler`, for a stub's `tower::Service`.
-pub(in crate::service) async fn answer<B, Req, Resp>(
+pub(crate) async fn answer<B, Req, Resp>(
     request: http::Request<B>,
     handler: impl Fn(Req) -> Result<Resp, tonic::Status>,
 ) -> http::Response<tonic::body::Body>

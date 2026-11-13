@@ -44,7 +44,7 @@ use pplx_space_sandbox_portability::{
     current_disk_artifact_backup_ready, current_suspend_snapshot_ready,
     failed_repair_revert_eligibility, inflight_suspend_upload_exists, latest_full_snapshot_ready,
     newest_full_snapshot_unambiguous, pod_less_drain_revert_loses_no_newer_bytes,
-    recoverable_suspend_snapshot_exists, snapshot_durable_for_source_release,
+    recoverable_suspend_snapshot_exists, restore_order_unordered, snapshot_durable_copy_exists,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -715,7 +715,10 @@ pub fn mark_sandbox_lost_query() -> String {
     // marked `failed` if its artifacts are genuinely gone, never restored
     // from a stale older snapshot. For an unmarked sandbox this is identical
     // to `fresh_ready_snapshot_exists`.
-    let snapshot_exists = snapshot_durable_for_source_release("sandboxes");
+    // An unordered history's durable copies keep the row too
+    // (`snapshot_durable_copy_exists`): failing it would end its last restore
+    // path.
+    let snapshot_exists = snapshot_durable_copy_exists("sandboxes");
     // Node-agnostic: marking the sandbox `failed` is a terminal flip on the
     // sandbox row, so it must not race a durable upload from *any* node. A
     // `$2`-scoped check would miss an upload still in flight from the
@@ -760,7 +763,7 @@ pub async fn mark_sandbox_lost(
 /// artifact is gone" needs no on-node RPC to establish.
 ///
 /// **Stricter snapshot guard than [`mark_sandbox_lost_query`], on purpose.**
-/// That query refuses on `snapshot_durable_for_source_release`, whose
+/// That query refuses on `snapshot_durable_copy_exists`, whose
 /// unmarked branch is placement-freshness-anchored — a ready snapshot left
 /// placement-stale by a stuck restore's pod bump does *not* refuse it. On
 /// the artifact-missing path that's correct (the freshness test is the
@@ -880,6 +883,9 @@ pub fn adopt_remote_snapshot_on_gone_node_query() -> String {
     let inflight_upload = inflight_suspend_upload_exists("s");
     let latest_ready = latest_full_snapshot_ready("s");
     let current_cycle_ready = current_suspend_snapshot_ready("s");
+    // Adopting unpins the row, and an unpinned unordered history refuses to
+    // restore: leave it pinned and blocking instead.
+    let unordered = restore_order_unordered("s");
     // The identity guards are uncorrelated EXISTS subqueries on `nodes` /
     // `node_k8s`, so they compose unchanged under this query's `s` alias.
     let identity_guards = gone_node_identity_guards("$2", "$3");
@@ -897,6 +903,7 @@ pub fn adopt_remote_snapshot_on_gone_node_query() -> String {
             AND NOT {inflight_upload}
             AND {latest_ready}
             AND {current_cycle_ready}
+            AND NOT {unordered}
             {identity_guards}"
     )
 }
@@ -1006,7 +1013,7 @@ pub async fn mark_sandbox_failed_on_node(
 /// The flip clears the current-artifact pointer (`current_local_artifact_id`
 /// /kind/origin → NULL) and the `evacuation_restore_target` marker, and resets
 /// `placement_changed_at` to NULL. Together these route the portability gate
-/// ([`snapshot_durable_for_source_release`]) through the unmarked legacy
+/// (`snapshot_durable_for_source_release`) through the unmarked legacy
 /// `fresh_ready_snapshot_exists` branch with the placement-freshness
 /// comparison short-circuited, so the existing ready full snapshot satisfies
 /// "durable for source release" unconditionally and the row drops out of both
@@ -1062,6 +1069,9 @@ pub fn adopt_remote_snapshot_for_drain_query() -> String {
     // unwedges the drain and refuses a stale prior-cycle snapshot left behind a
     // newer failed re-suspend.
     let latest_ready = latest_full_snapshot_ready("s");
+    // Adopting unpins the row, and an unpinned unordered history refuses to
+    // restore: leave it pinned and blocking instead.
+    let unordered = restore_order_unordered("s");
     format!(
         "UPDATE sandboxes s
             SET current_local_artifact_id = NULL,
@@ -1074,7 +1084,8 @@ pub fn adopt_remote_snapshot_for_drain_query() -> String {
             AND s.target_node_id = $2
             AND s.lifecycle_changed_at < NOW() - make_interval(secs => $3::BIGINT)
             AND NOT {inflight_upload}
-            AND {latest_ready}"
+            AND {latest_ready}
+            AND NOT {unordered}"
     )
 }
 

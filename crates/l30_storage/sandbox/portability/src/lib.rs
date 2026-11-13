@@ -46,24 +46,27 @@
 //! refuse to prune a sandbox's tracked restore target. It lives here for the
 //! same anti-drift reason: the sweep's "never delete this" and the restore
 //! selector's "this is the one to load" must be the same predicate, or the
-//! sweep can delete exactly what restore would have selected. **Five** callers
-//! build from it today — five *production* call sites, plus a test that builds
-//! it directly. Enumerated rather than counted, because an earlier revision of
-//! this paragraph undercounted them:
+//! sweep can delete exactly what restore would have selected. Its consumers
+//! include:
 //!
 //! 1. [`matching_ready_backup_exists`], in this file.
 //! 2. [`snapshot_is_live_restore_source`], in this file — the deletion guard.
 //! 3. The snapshot-retention store's marked-restore-breach reporting query,
 //!    which composes the fragment directly rather than through (2).
-//! 4. The Kubernetes substrate's marked suspend restore-source selector.
-//! 5. Its disk-only sibling, for an evacuated `stopped` sandbox. That one
-//!    exists because (4) filters `sn.type = 'full'`; both resolve their
-//!    source through this fragment, so one guard covers both.
+//! 4. The shared restore-source selector
+//!    (`pplx_space_sandbox_store::restore_source::select_restore_source`),
+//!    which every substrate's suspend restore and the node's
+//!    `GetSuspendSnapshotLocation` lookup call.
+//! 5. The Kubernetes substrate's disk-only sibling, for an evacuated `stopped`
+//!    sandbox. That one exists because (4) filters `sn.type = 'full'`; both
+//!    resolve their source through this fragment, so one guard covers both.
 //!
-//! Narrowing the fragment therefore touches a *reporting* query and a
-//! portability probe, not just the two selectors and the guard.
+//! The drain, occupancy and placement reads and the admin runtime population
+//! build from it too; `grep` for the rest rather than trusting a count.
+//! Narrowing the fragment therefore touches *reporting* queries and
+//! portability probes, not just the selectors and the guard.
 //!
-//! It is not yet the *only* spelling of that pair. Six other fragments in this
+//! It is not yet the *only* spelling of that pair. Four other fragments in this
 //! file still inline `sn.local_artifact_id = {alias}.current_local_artifact_id
 //! AND sn.artifact_kind = {alias}.current_local_artifact_kind` directly. Each
 //! is equivalent today — they all sit inside an `EXISTS`, where the
@@ -97,6 +100,51 @@
 //! `wake → modify → re-suspend` race and the residual late-register race
 //! that earlier versions of this module documented are both closed by the
 //! immutable-row design.
+//!
+//! ## Capture generation
+//!
+//! `timestamp` orders *registrations*, not captures. A re-upload of an older
+//! capture (the drain reupload queue, a disk eviction's upload before delete)
+//! registers a fresh attempt row whose `timestamp` is later than every
+//! capture taken since. `snapshots.generation` is the generation of the
+//! execution that captured the bytes; every backup row of one artifact
+//! that records one records the same one (`pplx_space_snapshot_store::insert`
+//! says how it's recorded). Executions' generations only grow, so it orders captures taken
+//! by different executions whatever the order they registered in. Captures
+//! one execution took record the same generation, and among them the
+//! captures' first registrations decide.
+//!
+//! The "is this the newest full snapshot?" fragments
+//! ([`no_newer_full_snapshot`], [`no_newer_full_snapshot_ignoring_failed_retry`]
+//! and [`restore_retry_source_snapshot_is_current`]) and the restore-source
+//! selector (`pplx_space_sandbox_store::restore_source::select_restore_source`)
+//! rank by it first ([`capture_rank`]). Between rows of one rank they order
+//! by the capture's first registration ([`capture_registered_at`]), not the
+//! row's own, so a re-upload of a capture's artifact is never newer than the
+//! capture. A pinned row restores its pinned artifact whatever the
+//! generations say: the pin names the bytes exactly.
+//!
+//! A row that records no generation, from before it was recorded or from a
+//! capture the node couldn't vouch for, ranks below every capture with a
+//! generation only when a later execution's capture provably follows it: the
+//! execution that took a capture with a generation started
+//! (`sandbox_k8s_executions.created_at`) after this capture first registered,
+//! so this capture was taken before that execution existed. Both clocks are
+//! the control plane's. A first registration can be pruned, or can come long
+//! after its capture, so the registration order of the two captures alone
+//! proves nothing. A Direct sandbox keeps no execution history; there a
+//! later-registered capture with a higher generation than every capture
+//! registered before this one still ranks it below. In a history where no
+//! capture has a generation, the rows keep registration order. A capture without a generation registered after one with a
+//! generation, with no later execution's capture after it, can't be ordered
+//! against it: it may be a re-upload of an older capture the
+//! node couldn't vouch for. That history is unordered
+//! ([`restore_order_unordered`]): the restore refuses it explicitly rather
+//! than guess, unless the row is pinned.
+//!
+//! Comparisons of a snapshot against a sandbox clock (`placement_changed_at`,
+//! `lifecycle_changed_at`, the activity clocks) stay on `timestamp`, since a
+//! generation can't be compared with a wall-clock bound.
 
 use pplx_space_common_core::types::{ArtifactOrigin, SandboxLifecycle};
 
@@ -176,10 +224,23 @@ fn artifact_identity_or_legacy(sandbox_alias: &str, exact: &str, legacy: &str) -
     )
 }
 
+/// Returns a self-contained boolean SQL fragment: the sandbox aliased as
+/// `sandbox_alias` has a durable copy a user restore on its own node would
+/// load. A pinned row needs a ready backup of its pinned artifact. An
+/// unpinned row needs a ready full snapshot with a live location that
+/// registered at or after the last placement, and that no full snapshot in
+/// any state outranks by capture generation: the restore loads the latest
+/// capture, and a re-upload of an older one registered since the placement
+/// isn't it, nor is one of the previous capture while the latest's upload is
+/// in flight or failed. An unordered history ([`restore_order_unordered`])
+/// has none: its restore refuses.
 pub fn fresh_ready_snapshot_exists(sandbox_alias: &str) -> String {
     let exact = matching_ready_backup_exists(sandbox_alias);
+    let captured = capture_registered_at("sn");
+    let outranked = full_snapshot_outranked_by_generation(sandbox_alias, "sn");
+    let unordered = restore_order_unordered(sandbox_alias);
     let legacy = format!(
-        "EXISTS (\n\
+        "(NOT {unordered} AND EXISTS (\n\
              SELECT 1\n\
                FROM snapshots sn\n\
                JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id\n\
@@ -189,9 +250,10 @@ pub fn fresh_ready_snapshot_exists(sandbox_alias: &str) -> String {
                 AND sn.state = 'ready'\n\
                 AND (\n\
                     {sandbox_alias}.placement_changed_at IS NULL\n\
-                    OR sn.timestamp >= {sandbox_alias}.placement_changed_at\n\
+                    OR {captured} >= {sandbox_alias}.placement_changed_at\n\
                 )\n\
-         )"
+                AND NOT {outranked}\n\
+         ))"
     );
     artifact_identity_or_legacy(sandbox_alias, &exact, &legacy)
 }
@@ -635,8 +697,8 @@ pub fn deleting_snapshot_matches_artifact(
 /// live sandbox.
 ///
 /// This is the deletion-side counterpart to the restore *selector*, and it
-/// has to cover **both** shapes that selector can take, because which one
-/// applies depends on the row's lifecycle:
+/// has to cover **every** shape that selector can take, because which one
+/// applies depends on the row's lifecycle and pin:
 ///
 /// 1. A marked row restores by exact artifact identity
 ///    ([`snapshot_is_current_local_artifact`]).
@@ -646,13 +708,63 @@ pub fn deleting_snapshot_matches_artifact(
 ///    artifact after the row entered `restoring`, and the retry must load the
 ///    state restore originally started from, not that later one.
 ///
+/// 3. An unpinned row restores its latest capture by [`capture_rank`], then
+///    by the capture's first registration ([`capture_registered_at`]), while
+///    the retention rank counts each row's own registration. That's a
+///    `suspended` or `restoring` row, and also a `started` one whose runtime
+///    a node recovers through `GetSuspendSnapshotLocation`. Otherwise `keep_n`
+///    later re-uploads of older captures would push the selector's pick out
+///    of the keep-set, and once it was pruned restore would load older bytes.
+///    So every full snapshot of such a row that no candidate the selector
+///    could load (a `ready` full snapshot with a live location) is newer
+///    than is shielded too: a higher generation than its rank, or the same
+///    rank and a later first registration, a tie broken by registration and
+///    then id as the selector breaks it. That's the selector's possible
+///    picks and no more: every backup of the latest capture, and, while the
+///    history is unordered ([`restore_order_unordered`]), the latest capture
+///    of each side, which an operator chooses between. An outranked capture,
+///    with a generation or without, prunes by rank. A failed or unbacked upload of a later
+///    capture doesn't lift the shield: the selector won't load the capture
+///    while that row outranks it, and nothing removes a failed row, so the
+///    shield can keep a capture no selector loads until a later capture or a
+///    backup of the failed one lands. Unlike the `restoring` arm, this one
+///    isn't bounded by a transient lifecycle: it holds in every lifecycle
+///    while the row stays unpinned, and a suspend that publishes its artifact
+///    pins the row and ends it.
+///
+/// 4. While the history is unordered ([`restore_order_unordered`]), every
+///    full snapshot registered at or before a capture that makes it so: one
+///    without a generation and without a rank ([`capture_rank`]). Pruning one
+///    of them could turn the refused history into a chosen one. It holds
+///    pinned rows too, since a pin can be cleared later. Rows registered
+///    after it prune by rank, since pruning them can only leave the history
+///    more ambiguous, which refuses. It lifts once a later execution's
+///    capture ranks that capture below it. In an ordered history, pinned or
+///    not, it holds nothing.
+///
+/// 5. The first backup of an artifact that has later backups. It anchors
+///    the capture's first registration ([`capture_registered_at`]): pruned,
+///    a re-upload of an older capture would take its place in the order,
+///    registered late, and could outrank the latest capture. It's held only
+///    while another backup of the artifact remains, and only while no
+///    restorable capture outranks it: then its registration can't decide
+///    anything. Except for a capture without a generation that ranks 0
+///    ([`capture_rank`]): its rank rests on its first registration preceding
+///    a later execution's start, and pruned, its registration could move past
+///    that start and make the history unordered, so it's held while it ranks
+///    0. So is the artifact's first backup that records a generation while
+///    one that records none remains: that one takes its rank from it.
+///
 /// Covering only (1) leaves a real hole: those later failed-branch artifacts
 /// still count toward the retention rank, so once `keep_n` of them pile up,
 /// the retry's actual source falls outside the keep-set and becomes
 /// prune-eligible while the sandbox is still trying to restore from it.
 ///
 /// The `restoring` arm is deliberately wider than the selector: the selector
-/// takes the newest row in the window, this shields every row in it.
+/// takes the newest row in the window, this shields every row in it, and
+/// every later backup of an artifact in it, which a node's
+/// `GetSuspendSnapshotLocation` can restore when the claim's source was
+/// re-uploaded after the claim.
 /// The excess is temporary: `restoring` is a transient lifecycle the sweeper
 /// bounds, so those rows become reclaimable again as soon as the row leaves
 /// it — and erring wide costs deferred disk while erring narrow costs an
@@ -666,12 +778,12 @@ pub fn deleting_snapshot_matches_artifact(
 /// ## Why neither arm narrows to "the row the selector would pick"
 ///
 /// Both arms match a *set* of snapshots while the selector takes one row
-/// from it (`ORDER BY timestamp DESC LIMIT 1`), so both shield more than
-/// strictly necessary. That is deliberate.
+/// from it (the latest capture), so both shield more than strictly
+/// necessary. That is deliberate.
 ///
 /// For the marker arm, narrowing is not even expressible here:
-/// [`snapshot_is_current_local_artifact`] has five consumers (listed in this
-/// module's docs) and "newest matching" is meaningful only for the two
+/// [`snapshot_is_current_local_artifact`] has many consumers (see this
+/// module's docs) and "newest matching" is meaningful only for the
 /// selectors. The portability check asks whether *any* matching ready backup
 /// exists; the retention store's reporting query asks whether one specific row
 /// is the marked one; and each selector's branch is a filter it then orders and
@@ -679,29 +791,140 @@ pub fn deleting_snapshot_matches_artifact(
 /// a second near-identical fragment would reintroduce exactly the drift this
 /// file exists to prevent.
 ///
-/// Narrowing this safety guard is dangerous: the suspend selector's `ORDER BY`
-/// has no id tiebreak, so on equal timestamps its choice is not deterministic.
-/// A "newest by `(timestamp, id)`" guard could shield a different row than
-/// restore actually loads, making the sandbox unrestorable. Its disk-only
-/// sibling does order by `(timestamp, id)`, but the shared guard must protect
-/// both selectors.
+/// Narrowing this safety guard is dangerous: a guard that re-derived "the row
+/// the selector picks" could shield a different row than restore actually
+/// loads, making the sandbox unrestorable, and both selectors, the suspend
+/// one and its disk-only sibling, would have to be re-derived exactly.
 pub fn snapshot_is_live_restore_source(sandbox_alias: &str, snapshot_alias: &str) -> String {
     let marked = snapshot_is_current_local_artifact(sandbox_alias, snapshot_alias);
     let retry_window = restore_retry_source_snapshot_window(sandbox_alias, snapshot_alias);
+    let source_window = restore_retry_source_snapshot_window(sandbox_alias, "source");
     let restoring = SandboxLifecycle::Restoring.as_str();
+    let rank = capture_rank(snapshot_alias);
+    let captured = capture_registered_at(snapshot_alias);
+    let shadow_rank = capture_rank("shadow");
+    let shadow_captured = capture_registered_at("shadow");
+    let frozen_rank = capture_rank("frozen_by");
+    let suspend = ArtifactOrigin::Suspend.as_str();
     format!(
         "(\n\
              {marked}\n\
-             OR ({sandbox_alias}.lifecycle = '{restoring}' AND {retry_window})\n\
+             OR ({snapshot_alias}.type = 'full'\n\
+                 AND EXISTS (\n\
+                     SELECT 1\n\
+                       FROM snapshots frozen_era\n\
+                      WHERE frozen_era.sandbox_id = {sandbox_alias}.id\n\
+                        AND frozen_era.type = 'full'\n\
+                        AND frozen_era.generation IS NOT NULL\n\
+                 )\n\
+                 AND EXISTS (\n\
+                     SELECT 1\n\
+                       FROM snapshots frozen_by\n\
+                      WHERE frozen_by.sandbox_id = {sandbox_alias}.id\n\
+                        AND frozen_by.type = 'full'\n\
+                        AND frozen_by.generation IS NULL\n\
+                        AND frozen_by.timestamp >= {snapshot_alias}.timestamp\n\
+                        AND {frozen_rank} IS NULL\n\
+                 ))\n\
+             OR ({snapshot_alias}.type = 'full'\n\
+                 AND {snapshot_alias}.local_artifact_id IS NOT NULL\n\
+                 AND NOT EXISTS (\n\
+                     SELECT 1\n\
+                       FROM snapshots anchor\n\
+                      WHERE anchor.sandbox_id = {sandbox_alias}.id\n\
+                        AND anchor.type = 'full'\n\
+                        AND anchor.local_artifact_id = {snapshot_alias}.local_artifact_id\n\
+                        AND anchor.artifact_kind IS NOT DISTINCT FROM {snapshot_alias}.artifact_kind\n\
+                        AND (anchor.timestamp, anchor.id) < ({snapshot_alias}.timestamp, {snapshot_alias}.id)\n\
+                 )\n\
+                 AND EXISTS (\n\
+                     SELECT 1\n\
+                       FROM snapshots anchor\n\
+                      WHERE anchor.sandbox_id = {sandbox_alias}.id\n\
+                        AND anchor.type = 'full'\n\
+                        AND anchor.local_artifact_id = {snapshot_alias}.local_artifact_id\n\
+                        AND anchor.artifact_kind IS NOT DISTINCT FROM {snapshot_alias}.artifact_kind\n\
+                        AND anchor.id <> {snapshot_alias}.id\n\
+                 )\n\
+                 AND (\n\
+                     COALESCE({rank} = 0, FALSE)\n\
+                     OR NOT EXISTS (\n\
+                         SELECT 1\n\
+                           FROM snapshots shadow\n\
+                           JOIN snapshot_storage_locations shadow_location\n\
+                             ON shadow_location.snapshot_id = shadow.id\n\
+                            AND shadow_location.orphaned_at IS NULL\n\
+                          WHERE shadow.sandbox_id = {sandbox_alias}.id\n\
+                            AND shadow.type = 'full'\n\
+                            AND shadow.state = 'ready'\n\
+                            AND shadow.generation IS NOT NULL\n\
+                            AND shadow.generation > {rank}\n\
+                     )))\n\
+             OR ({snapshot_alias}.type = 'full'\n\
+                 AND {snapshot_alias}.local_artifact_id IS NOT NULL\n\
+                 AND {snapshot_alias}.generation IS NOT NULL\n\
+                 AND NOT EXISTS (\n\
+                     SELECT 1\n\
+                       FROM snapshots anchor\n\
+                      WHERE anchor.sandbox_id = {sandbox_alias}.id\n\
+                        AND anchor.type = 'full'\n\
+                        AND anchor.local_artifact_id = {snapshot_alias}.local_artifact_id\n\
+                        AND anchor.artifact_kind IS NOT DISTINCT FROM {snapshot_alias}.artifact_kind\n\
+                        AND anchor.generation IS NOT NULL\n\
+                        AND (anchor.timestamp, anchor.id) < ({snapshot_alias}.timestamp, {snapshot_alias}.id)\n\
+                 )\n\
+                 AND EXISTS (\n\
+                     SELECT 1\n\
+                       FROM snapshots anchor\n\
+                      WHERE anchor.sandbox_id = {sandbox_alias}.id\n\
+                        AND anchor.type = 'full'\n\
+                        AND anchor.local_artifact_id = {snapshot_alias}.local_artifact_id\n\
+                        AND anchor.artifact_kind IS NOT DISTINCT FROM {snapshot_alias}.artifact_kind\n\
+                        AND anchor.generation IS NULL\n\
+                 ))\n\
+             OR ({sandbox_alias}.lifecycle = '{restoring}'\n\
+                 AND ({retry_window}\n\
+                      OR ({snapshot_alias}.local_artifact_id IS NOT NULL\n\
+                          AND EXISTS (\n\
+                              SELECT 1\n\
+                                FROM snapshots source\n\
+                               WHERE source.sandbox_id = {sandbox_alias}.id\n\
+                                 AND source.type = 'full'\n\
+                                 AND source.local_artifact_id = {snapshot_alias}.local_artifact_id\n\
+                                 AND source.artifact_kind = {snapshot_alias}.artifact_kind\n\
+                                 AND {source_window}\n\
+                          ))))\n\
+             OR ({sandbox_alias}.current_local_artifact_id IS NULL\n\
+                 AND {snapshot_alias}.type = 'full'\n\
+                 AND NOT EXISTS (\n\
+                     SELECT 1\n\
+                       FROM snapshots shadow\n\
+                       JOIN snapshot_storage_locations shadow_location\n\
+                         ON shadow_location.snapshot_id = shadow.id\n\
+                        AND shadow_location.orphaned_at IS NULL\n\
+                      WHERE shadow.sandbox_id = {sandbox_alias}.id\n\
+                        AND shadow.type = 'full'\n\
+                        AND shadow.state = 'ready'\n\
+                        AND COALESCE(shadow.artifact_origin, '{suspend}') = '{suspend}'\n\
+                        AND (shadow.generation > {rank}\n\
+                             OR ({shadow_rank} IS NOT DISTINCT FROM {rank}\n\
+                                 AND ({shadow_captured} > {captured}\n\
+                                      OR ({shadow_captured} = {captured}\n\
+                                          AND NOT ({snapshot_alias}.local_artifact_id IS NOT NULL\n\
+                                                   AND shadow.local_artifact_id = {snapshot_alias}.local_artifact_id\n\
+                                                   AND shadow.artifact_kind IS NOT DISTINCT FROM {snapshot_alias}.artifact_kind)\n\
+                                          AND (shadow.timestamp, shadow.id)\n\
+                                              > ({snapshot_alias}.timestamp, {snapshot_alias}.id)))))\n\
+                 ))\n\
          )"
     )
 }
 
-/// Returns a correlated `NOT EXISTS(...)` SQL fragment that is TRUE iff the
-/// snapshot aliased as `snapshot_alias` is the **newest** `type='full'`
-/// snapshot for the sandbox aliased as `sandbox_alias` — i.e. no later
-/// (`timestamp >`) full snapshot of any state exists. Compose it into a query
-/// that already joins a `snapshots` row.
+/// Returns a boolean SQL fragment that is TRUE iff the snapshot aliased as
+/// `snapshot_alias` is the **newest** `type='full'` snapshot for the sandbox
+/// aliased as `sandbox_alias`: no full snapshot of any state was captured
+/// after it (see "Newest by capture, not by registration" below). Compose it
+/// into a query that already joins a `snapshots` row.
 ///
 /// A newer `creating` (upload in flight) or `failed` row both count as
 /// "newer," so they both
@@ -724,20 +947,291 @@ pub fn snapshot_is_live_restore_source(sandbox_alias: &str, snapshot_alias: &str
 /// older snapshot. A `deleting` row remains a blocker even though it cannot be
 /// selected: falling back past a claimed newest artifact before its catalog
 /// row is finalized could restore stale state after a floor breach.
+///
+/// ## Newest by capture, not by registration
+///
+/// "Newer" follows the capture rank first (see "Capture generation" in the
+/// module docs): the row must not be outranked by a full snapshot with a
+/// higher `generation` than its [`capture_rank`], nor have its capture
+/// registered before the capture of a full snapshot nothing outranks. Rows
+/// with no rank outrank nothing and are outranked by nothing, so among them,
+/// and among rows of one rank, the captures' first registrations decide. A
+/// re-upload of an old capture registers last, but its capture registered
+/// with its first backup, and its inherited generation is outranked, so it
+/// can't make the latest capture look stale.
+///
+/// The two clauses are deliberately not a pairwise "rank, else timestamp"
+/// comparison: that order isn't transitive once ranked and unranked rows
+/// mix. Generation 5 at t1, an unranked row at t2 and a generation 3
+/// re-upload at t3 form a cycle (t2 beats t1, t3 beats t2, 5 beats 3) in
+/// which every row has a newer one, so no row would ever be newest. Here the
+/// unranked row is: nothing outranks it, and the only row registered after
+/// it is outranked. Such a history is unordered
+/// ([`restore_order_unordered`]), and the callers that restore refuse it.
 pub fn no_newer_full_snapshot(sandbox_alias: &str, snapshot_alias: &str) -> String {
+    let captured = capture_registered_at(snapshot_alias);
+    let newer_captured = capture_registered_at("newer");
+    let outranked = full_snapshot_outranked_by_generation(sandbox_alias, snapshot_alias);
+    let newer_outranked = full_snapshot_outranked_by_generation(sandbox_alias, "newer");
     format!(
-        "NOT EXISTS (\n\
+        "(NOT {outranked}\n\
+         AND NOT EXISTS (\n\
              SELECT 1\n\
                FROM snapshots newer\n\
               WHERE newer.sandbox_id = {sandbox_alias}.id\n\
                 AND newer.type = 'full'\n\
-                AND newer.timestamp > {snapshot_alias}.timestamp\n\
+                AND {newer_captured} > {captured}\n\
+                AND NOT {newer_outranked}\n\
+         ))"
+    )
+}
+
+/// [`no_newer_full_snapshot`] among suspend captures: a newer full snapshot of
+/// another origin, a named snapshot's or a stop's backup, doesn't make the
+/// snapshot aliased as `snapshot_alias` stale unless it outranks it by capture
+/// generation, since a later registration of the same execution's named
+/// snapshot was taken before the suspend. For the restore selector, which
+/// restores an unpinned row only from suspend captures.
+pub fn no_newer_suspend_capture(sandbox_alias: &str, snapshot_alias: &str) -> String {
+    let suspend = ArtifactOrigin::Suspend.as_str();
+    let captured = capture_registered_at(snapshot_alias);
+    let newer_captured = capture_registered_at("newer");
+    let outranked = full_snapshot_outranked_by_generation(sandbox_alias, snapshot_alias);
+    let newer_outranked = full_snapshot_outranked_by_generation(sandbox_alias, "newer");
+    format!(
+        "(NOT {outranked}\n\
+         AND NOT EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots newer\n\
+              WHERE newer.sandbox_id = {sandbox_alias}.id\n\
+                AND newer.type = 'full'\n\
+                AND COALESCE(newer.artifact_origin, '{suspend}') = '{suspend}'\n\
+                AND {newer_captured} > {captured}\n\
+                AND NOT {newer_outranked}\n\
+         ))"
+    )
+}
+
+/// [`full_snapshot_outranked_by_generation`], counting only outranking rows
+/// that haven't failed: a capture that is uploading or ready. A failed upload
+/// won't land, and nothing retries one for an unpinned row on a gentle drain,
+/// so a hold on it would never end.
+pub fn full_snapshot_outranked_by_live_capture(
+    sandbox_alias: &str,
+    snapshot_alias: &str,
+) -> String {
+    let rank = capture_rank(snapshot_alias);
+    full_snapshot_outranked_where(sandbox_alias, &rank, "dom.state <> 'failed'")
+}
+
+/// [`no_newer_suspend_capture`], counting only later captures that haven't
+/// failed ([`full_snapshot_outranked_by_live_capture`]). An upload in flight
+/// ends: the node's worker finalizes it, or the stuck-snapshot reaper fails
+/// it. So a hold on one is bounded.
+pub fn no_newer_live_suspend_capture(sandbox_alias: &str, snapshot_alias: &str) -> String {
+    let suspend = ArtifactOrigin::Suspend.as_str();
+    let captured = capture_registered_at(snapshot_alias);
+    let newer_captured = capture_registered_at("newer");
+    let outranked = full_snapshot_outranked_by_live_capture(sandbox_alias, snapshot_alias);
+    let newer_outranked = full_snapshot_outranked_by_live_capture(sandbox_alias, "newer");
+    format!(
+        "(NOT {outranked}\n\
+         AND NOT EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots newer\n\
+              WHERE newer.sandbox_id = {sandbox_alias}.id\n\
+                AND newer.type = 'full'\n\
+                AND newer.state <> 'failed'\n\
+                AND COALESCE(newer.artifact_origin, '{suspend}') = '{suspend}'\n\
+                AND {newer_captured} > {captured}\n\
+                AND NOT {newer_outranked}\n\
+         ))"
+    )
+}
+
+/// Returns a timestamp SQL expression: when the capture of the snapshot
+/// aliased as `snapshot_alias` first registered. That's the earliest
+/// registration of any backup row of its artifact (`local_artifact_id`,
+/// `artifact_kind`), in any state, or the row's own for a row with no
+/// artifact id. A re-upload of a capture registers late, but its capture
+/// registered when its first backup did. Never NULL.
+pub fn capture_registered_at(snapshot_alias: &str) -> String {
+    format!(
+        "COALESCE((\n\
+             SELECT MIN(first_backup.timestamp)\n\
+               FROM snapshots first_backup\n\
+              WHERE first_backup.sandbox_id = {snapshot_alias}.sandbox_id\n\
+                AND first_backup.type = {snapshot_alias}.type\n\
+                AND first_backup.local_artifact_id = {snapshot_alias}.local_artifact_id\n\
+                AND first_backup.artifact_kind IS NOT DISTINCT FROM {snapshot_alias}.artifact_kind\n\
+         ), {snapshot_alias}.timestamp)"
+    )
+}
+
+/// Returns a `BIGINT` SQL expression: the capture rank of the full snapshot
+/// aliased as `snapshot_alias`. A row with a generation ranks by its
+/// `generation`, and so does a backup without one of an artifact another
+/// backup records one for: the same capture. Any other row without a
+/// generation ranks 0, below every generation, when a full snapshot of the
+/// sandbox with a generation, in any state, is a later execution's capture,
+/// taken after this one:
+///
+/// - the sandbox's execution of that generation started after this capture
+///   first registered, so it couldn't have taken a capture before this one.
+///   Neither a pruned first backup nor a capture first uploaded long after
+///   it was taken can fake that;
+/// - or, when the sandbox has no execution of that generation (Direct keeps
+///   no execution history), that capture first registered after this one did
+///   and records a higher generation than every capture with a generation
+///   first registered before it.
+///
+/// Otherwise NULL: in a history where no capture has a generation, and for a
+/// capture without one that no such capture follows
+/// ([`restore_order_unordered`]).
+pub fn capture_rank(snapshot_alias: &str) -> String {
+    capture_rank_where(snapshot_alias, "TRUE")
+}
+
+/// [`capture_rank`] for a restore retry, as the retry's pre-claim source
+/// window ([`restore_retry_source_snapshot_window`]) sees it: only a later
+/// execution's capture in the window can rank a capture without a generation
+/// below the ones with one. A capture the failed branch registered after the claim says
+/// nothing about the order of the captures the retry chooses between.
+pub fn capture_rank_in_retry_window(sandbox_alias: &str, snapshot_alias: &str) -> String {
+    let window = restore_retry_source_snapshot_window(sandbox_alias, "rank_later");
+    capture_rank_where(snapshot_alias, &window)
+}
+
+fn capture_rank_where(snapshot_alias: &str, later_condition: &str) -> String {
+    let later = capture_registered_at("rank_later");
+    let before = capture_registered_at("rank_before");
+    let this = capture_registered_at(snapshot_alias);
+    format!(
+        "COALESCE({snapshot_alias}.generation, (\n\
+             SELECT MIN(same_artifact.generation)\n\
+               FROM snapshots same_artifact\n\
+              WHERE same_artifact.sandbox_id = {snapshot_alias}.sandbox_id\n\
+                AND same_artifact.type = {snapshot_alias}.type\n\
+                AND same_artifact.local_artifact_id = {snapshot_alias}.local_artifact_id\n\
+                AND same_artifact.artifact_kind IS NOT DISTINCT FROM {snapshot_alias}.artifact_kind\n\
+                AND same_artifact.generation IS NOT NULL\n\
+         ), CASE WHEN EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots rank_later\n\
+              WHERE rank_later.sandbox_id = {snapshot_alias}.sandbox_id\n\
+                AND rank_later.type = 'full'\n\
+                AND rank_later.generation IS NOT NULL\n\
+                AND {later_condition}\n\
+                AND CASE WHEN EXISTS (\n\
+                         SELECT 1\n\
+                           FROM sandbox_k8s_executions rank_execution\n\
+                          WHERE rank_execution.sandbox_id = {snapshot_alias}.sandbox_id\n\
+                            AND rank_execution.generation = rank_later.generation\n\
+                     )\n\
+                     THEN NOT EXISTS (\n\
+                         SELECT 1\n\
+                           FROM sandbox_k8s_executions rank_execution\n\
+                          WHERE rank_execution.sandbox_id = {snapshot_alias}.sandbox_id\n\
+                            AND rank_execution.generation = rank_later.generation\n\
+                            AND rank_execution.created_at <= {this}\n\
+                     )\n\
+                     ELSE {later} > {this}\n\
+                          AND NOT EXISTS (\n\
+                              SELECT 1\n\
+                                FROM snapshots rank_before\n\
+                               WHERE rank_before.sandbox_id = {snapshot_alias}.sandbox_id\n\
+                                 AND rank_before.type = 'full'\n\
+                                 AND rank_before.generation >= rank_later.generation\n\
+                                 AND {before} <= {this}\n\
+                          )\n\
+                     END\n\
+         ) THEN 0 END)"
+    )
+}
+
+/// Returns an `EXISTS(...)` SQL fragment: the sandbox aliased as
+/// `sandbox_alias` has a full snapshot, in any state, that records no
+/// generation, registered after one with a generation, and no later
+/// execution's capture registered after it ([`capture_rank`] is NULL).
+/// Nothing orders it against the captures with a generation: it
+/// may be the latest capture, from a node that couldn't vouch for it, or a
+/// re-upload of an older one. An unpinned restore refuses such a history
+/// explicitly instead of guessing, and the gates and retention treat it as
+/// having no single source.
+pub fn restore_order_unordered(sandbox_alias: &str) -> String {
+    restore_order_unordered_where(sandbox_alias, &capture_rank("unordered"), "TRUE", "TRUE")
+}
+
+/// [`restore_order_unordered`] within a restore retry's pre-claim source
+/// window ([`restore_retry_source_snapshot_window`]): a row the failed
+/// branch registered after the claim can't make the retry's source
+/// ambiguous, since the retry never loads it.
+pub fn restore_order_unordered_in_retry_window(sandbox_alias: &str) -> String {
+    let window = restore_retry_source_snapshot_window(sandbox_alias, "unordered");
+    let rank = capture_rank_in_retry_window(sandbox_alias, "unordered");
+    let era_window = restore_retry_source_snapshot_window(sandbox_alias, "era");
+    restore_order_unordered_where(sandbox_alias, &rank, &window, &era_window)
+}
+
+fn restore_order_unordered_where(
+    sandbox_alias: &str,
+    rank: &str,
+    condition: &str,
+    era_condition: &str,
+) -> String {
+    // The probe for a capture with a generation goes first: a sandbox with
+    // none, nearly every one, never ranks its rows without one.
+    format!(
+        "(EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots era\n\
+              WHERE era.sandbox_id = {sandbox_alias}.id\n\
+                AND era.type = 'full'\n\
+                AND era.generation IS NOT NULL\n\
+                AND {era_condition}\n\
+         )\n\
+         AND EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots unordered\n\
+              WHERE unordered.sandbox_id = {sandbox_alias}.id\n\
+                AND unordered.type = 'full'\n\
+                AND unordered.generation IS NULL\n\
+                AND {rank} IS NULL\n\
+                AND {condition}\n\
+         ))"
+    )
+}
+
+/// Returns an `EXISTS(...)` SQL fragment: some full snapshot of the sandbox
+/// aliased as `sandbox_alias`, in any state, records a higher capture
+/// `generation` than the [`capture_rank`] of the snapshot aliased as
+/// `snapshot_alias`. Never TRUE when that snapshot has no rank. The fragment's own alias is `dom`, so
+/// `snapshot_alias` must be another one.
+pub fn full_snapshot_outranked_by_generation(sandbox_alias: &str, snapshot_alias: &str) -> String {
+    let rank = capture_rank(snapshot_alias);
+    full_snapshot_outranked_where(sandbox_alias, &rank, "TRUE")
+}
+
+/// [`full_snapshot_outranked_by_generation`], counting only the outranking
+/// rows `dom` for which `condition` holds.
+fn full_snapshot_outranked_where(sandbox_alias: &str, rank: &str, condition: &str) -> String {
+    format!(
+        "EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots dom\n\
+              WHERE dom.sandbox_id = {sandbox_alias}.id\n\
+                AND dom.type = 'full'\n\
+                -- First, so a row without a generation never computes the rank.\n\
+                AND dom.generation IS NOT NULL\n\
+                AND dom.generation > {rank}\n\
+                AND {condition}\n\
          )"
     )
 }
 
-/// Like [`no_newer_full_snapshot`], except that a newer failed retry of the
-/// same immutable artifact does not invalidate an already-ready snapshot.
+/// Like [`no_newer_full_snapshot`], newest by capture generation first, except
+/// that a newer failed retry of the same immutable artifact does not
+/// invalidate an already-ready snapshot.
 ///
 /// A non-null local artifact ID is required to prove identity. Markerless
 /// legacy snapshots keep the strict newest-full-snapshot rule.
@@ -745,14 +1239,20 @@ pub fn no_newer_full_snapshot_ignoring_failed_retry(
     sandbox_alias: &str,
     snapshot_alias: &str,
 ) -> String {
+    let captured = capture_registered_at(snapshot_alias);
+    let newer_captured = capture_registered_at("newer");
     let suspend = ArtifactOrigin::Suspend.as_str();
+    let outranked = full_snapshot_outranked_by_generation(sandbox_alias, snapshot_alias);
+    let newer_outranked = full_snapshot_outranked_by_generation(sandbox_alias, "newer");
     format!(
-        "NOT EXISTS (\n\
+        "(NOT {outranked}\n\
+         AND NOT EXISTS (\n\
              SELECT 1\n\
                FROM snapshots newer\n\
               WHERE newer.sandbox_id = {sandbox_alias}.id\n\
                 AND newer.type = 'full'\n\
-                AND newer.timestamp > {snapshot_alias}.timestamp\n\
+                AND {newer_captured} > {captured}\n\
+                AND NOT {newer_outranked}\n\
                 AND NOT (\n\
                     {snapshot_alias}.local_artifact_id IS NOT NULL\n\
                     AND newer.state = 'failed'\n\
@@ -761,7 +1261,7 @@ pub fn no_newer_full_snapshot_ignoring_failed_retry(
                     AND COALESCE(newer.artifact_origin, '{suspend}') =\n\
                         COALESCE({snapshot_alias}.artifact_origin, '{suspend}')\n\
                 )\n\
-         )"
+         ))"
     )
 }
 
@@ -787,16 +1287,21 @@ pub fn quarantine_recovery_suspend_snapshot_current(
 }
 
 /// The orphan fallback additionally requires evidence that predates the
-/// quarantine episode it is intended to recover.
+/// quarantine episode it is intended to recover. It names no artifact, so it
+/// chooses by capture order, and like the restore selector it refuses an
+/// unordered history ([`restore_order_unordered`]): either capture could be
+/// the latest.
 pub fn pre_quarantine_suspend_snapshot_current(
     sandbox_alias: &str,
     snapshot_alias: &str,
     quarantine_entered_at: &str,
 ) -> String {
     let current = quarantine_recovery_suspend_snapshot_current(sandbox_alias, snapshot_alias);
+    let unordered = restore_order_unordered(sandbox_alias);
     format!(
         "{current}\n\
-         AND {snapshot_alias}.timestamp <= {quarantine_entered_at}"
+         AND {snapshot_alias}.timestamp <= {quarantine_entered_at}\n\
+         AND NOT {unordered}"
     )
 }
 
@@ -838,8 +1343,9 @@ pub fn pre_quarantine_suspend_snapshot_current(
 pub fn latest_full_snapshot_ready(sandbox_alias: &str) -> String {
     let no_newer = no_newer_full_snapshot(sandbox_alias, "sn");
     let exact = matching_ready_backup_exists(sandbox_alias);
+    let unordered = restore_order_unordered(sandbox_alias);
     let legacy = format!(
-        "EXISTS (\n\
+        "(NOT {unordered} AND EXISTS (\n\
              SELECT 1\n\
                FROM snapshots sn\n\
                JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id\n\
@@ -848,7 +1354,7 @@ pub fn latest_full_snapshot_ready(sandbox_alias: &str) -> String {
                 AND sn.type = 'full'\n\
                 AND sn.state = 'ready'\n\
                 AND {no_newer}\n\
-         )"
+         ))"
     );
     artifact_identity_or_legacy(sandbox_alias, &exact, &legacy)
 }
@@ -863,8 +1369,15 @@ pub fn latest_full_snapshot_ready(sandbox_alias: &str) -> String {
 /// if placement moved during restore, it belongs to the failed branch and must
 /// not strand the original source snapshot. When the sandbox currently carries
 /// a local artifact id, markerless snapshots are not strong enough evidence for
-/// this restore source.
+/// this restore source, and only a suspend capture is: the retry ignores the
+/// pin, which names a suspend's artifact. Either way a backup of a full named
+/// snapshot, or of a stop, registered before the claim isn't the state the
+/// restore started from: a named snapshot is taken while the sandbox runs, so
+/// one registered after a suspend capture of the same execution was taken
+/// before it. The window admits only suspend captures (and rows from before
+/// origins were recorded), as an unpinned first attempt does.
 pub fn restore_retry_source_snapshot_window(sandbox_alias: &str, snapshot_alias: &str) -> String {
+    let suspend = ArtifactOrigin::Suspend.as_str();
     format!(
         "(\n\
              ({sandbox_alias}.lifecycle_changed_at IS NULL\n\
@@ -875,6 +1388,7 @@ pub fn restore_retry_source_snapshot_window(sandbox_alias: &str, snapshot_alias:
                  OR {sandbox_alias}.placement_changed_at >= {sandbox_alias}.lifecycle_changed_at\n\
                  OR {snapshot_alias}.timestamp >= {sandbox_alias}.placement_changed_at\n\
              )\n\
+             AND COALESCE({snapshot_alias}.artifact_origin, '{suspend}') = '{suspend}'\n\
              AND (\n\
                  {sandbox_alias}.current_local_artifact_id IS NULL\n\
                  OR ({snapshot_alias}.local_artifact_id IS NOT NULL\n\
@@ -884,28 +1398,53 @@ pub fn restore_retry_source_snapshot_window(sandbox_alias: &str, snapshot_alias:
     )
 }
 
+/// Returns a boolean SQL fragment: the snapshot aliased as `snapshot_alias`
+/// registered before the restore of the sandbox aliased as `sandbox_alias`
+/// claimed it, the one bound a retry applies to its pinned artifact. The pin
+/// names the bytes exactly, so the placement bounds of
+/// [`restore_retry_source_snapshot_window`], which keep a markerless retry off
+/// stale captures, don't apply: a failed restore can leave the placement clock
+/// newer than the pin's backup.
+pub fn registered_before_restore_claim(sandbox_alias: &str, snapshot_alias: &str) -> String {
+    format!(
+        "({sandbox_alias}.lifecycle_changed_at IS NULL\n\
+          OR {snapshot_alias}.timestamp < {sandbox_alias}.lifecycle_changed_at)"
+    )
+}
+
 /// Returns TRUE when `snapshot_alias` is the newest full snapshot in the
 /// restore attempt's pre-claim source window. Newer rows created after the
 /// restore claim are ignored. A newer pre-claim `creating` row or `failed` row
 /// for a different artifact still blocks stale fallback. A `deleting` row also
 /// blocks fallback until finalization; only failed retries of the same
 /// immutable artifact are ignored.
+///
+/// Newest is by capture generation first, as in [`no_newer_full_snapshot`],
+/// but only rows in the window can outrank one: a capture the failed restore
+/// branch registered after the claim carries a later generation than the
+/// source, and must not strand it.
 pub fn restore_retry_source_snapshot_is_current(
     sandbox_alias: &str,
     snapshot_alias: &str,
 ) -> String {
+    let captured = capture_registered_at(snapshot_alias);
+    let newer_captured = capture_registered_at("newer");
     let suspend = ArtifactOrigin::Suspend.as_str();
     let source_window = restore_retry_source_snapshot_window(sandbox_alias, snapshot_alias);
     let newer_source_window = restore_retry_source_snapshot_window(sandbox_alias, "newer");
+    let outranked = full_snapshot_outranked_in_retry_window(sandbox_alias, snapshot_alias);
+    let newer_outranked = full_snapshot_outranked_in_retry_window(sandbox_alias, "newer");
     format!(
         "({source_window}\n\
+         AND NOT {outranked}\n\
          AND NOT EXISTS (\n\
              SELECT 1\n\
                FROM snapshots newer\n\
               WHERE newer.sandbox_id = {sandbox_alias}.id\n\
                 AND newer.type = 'full'\n\
-                AND newer.timestamp > {snapshot_alias}.timestamp\n\
+                AND {newer_captured} > {captured}\n\
                 AND {newer_source_window}\n\
+                AND NOT {newer_outranked}\n\
                 AND NOT (\n\
                     {snapshot_alias}.local_artifact_id IS NOT NULL\n\
                     AND newer.state = 'failed'\n\
@@ -918,10 +1457,23 @@ pub fn restore_retry_source_snapshot_is_current(
     )
 }
 
+/// [`full_snapshot_outranked_by_generation`] restricted to the restore retry's
+/// pre-claim source window.
+fn full_snapshot_outranked_in_retry_window(sandbox_alias: &str, snapshot_alias: &str) -> String {
+    let window = restore_retry_source_snapshot_window(sandbox_alias, "dom");
+    let rank = capture_rank_in_retry_window(sandbox_alias, snapshot_alias);
+    full_snapshot_outranked_where(sandbox_alias, &rank, &window)
+}
+
 /// Returns a SQL fragment evaluating to TRUE iff the sandbox has a durable
-/// snapshot that the `restoring` retry path can use as its source.
+/// snapshot that the `restoring` retry path can use as its source: its
+/// pinned artifact when the window holds it, else the window's newest
+/// capture of a history that isn't unordered ([`restore_order_unordered`]).
 pub fn restore_retry_source_snapshot_exists(sandbox_alias: &str) -> String {
     let source_is_current = restore_retry_source_snapshot_is_current(sandbox_alias, "sn");
+    let pinned = snapshot_is_current_local_artifact(sandbox_alias, "sn");
+    let window = registered_before_restore_claim(sandbox_alias, "sn");
+    let unordered = restore_order_unordered_in_retry_window(sandbox_alias);
     format!(
         "EXISTS (\n\
              SELECT 1\n\
@@ -931,7 +1483,8 @@ pub fn restore_retry_source_snapshot_exists(sandbox_alias: &str) -> String {
                 AND ssl.orphaned_at IS NULL\n\
                 AND sn.type = 'full'\n\
                 AND sn.state = 'ready'\n\
-                AND {source_is_current}\n\
+                AND (({source_is_current} AND ({pinned} OR NOT {unordered}))\n\
+                     OR ({pinned} AND {window}))\n\
          )"
     )
 }
@@ -1244,6 +1797,20 @@ pub fn started_suspend_revert_eligibility(sandbox_alias: &str) -> SuspendRevertE
     suspend_revert_eligibility(sandbox_alias, marker_current, newest_current)
 }
 
+/// [`started_suspend_revert_eligibility`] for finalizing a node-local suspend
+/// the node reports: the node keeps the sandbox, suspended, on its own disk,
+/// and the row only records that. Its markerless arm doesn't refuse an
+/// unordered history ([`restore_order_unordered`]): finalizing chooses no
+/// restore source, and refusing it would leave the row `started` with an
+/// execution while the node holds the sandbox suspended. The restore still
+/// refuses that history off the sandbox's node until it's pinned. Reverts that
+/// unplace the row keep the refusal.
+pub fn started_suspend_finalize_eligibility(sandbox_alias: &str) -> SuspendRevertEligibility {
+    let marker_current = current_suspend_origin_marker_snapshot_ready(sandbox_alias);
+    let newest_current = newest_suspend_snapshot_published(sandbox_alias);
+    suspend_revert_eligibility(sandbox_alias, marker_current, newest_current)
+}
+
 /// Returns eligibility for finalizing a `suspending` sandbox whose active pod
 /// disappeared after publishing a durable snapshot.
 ///
@@ -1349,15 +1916,18 @@ pub fn pod_less_drain_revert_loses_no_newer_bytes(sandbox_alias: &str) -> String
 /// artifact, and no other ready full snapshot at the same timestamp unless
 /// it holds the same artifact.
 ///
-/// The restore orders ready full snapshots by timestamp alone, so a tie can
-/// load either, and a newer snapshot still `deleting` (or in any state other
-/// than ready) names bytes the activity-anchored eligibility, which reads
+/// Among ready full snapshots of one capture rank the restore orders by their
+/// captures' first registrations, then their own; two artifacts' rows
+/// registered at the same instant leave that to the snapshot id, so such a tie
+/// counts as ambiguous. A newer snapshot still `deleting` (or in any state
+/// other than ready) names bytes the activity-anchored eligibility, which reads
 /// only ready snapshots, never compares against. Node drain's pod-less
 /// give-up conjoins this with that eligibility before unplacing a row.
 pub fn newest_full_snapshot_unambiguous(sandbox_alias: &str) -> String {
     let newest = no_newer_full_snapshot_ignoring_failed_retry(sandbox_alias, "source");
+    let unordered = restore_order_unordered(sandbox_alias);
     format!(
-        "EXISTS (\n\
+        "(NOT {unordered} AND EXISTS (\n\
              SELECT 1\n\
                FROM snapshots source\n\
                JOIN snapshot_storage_locations source_storage\n\
@@ -1381,7 +1951,7 @@ pub fn newest_full_snapshot_unambiguous(sandbox_alias: &str) -> String {
                            AND tied.artifact_kind IS NOT DISTINCT FROM source.artifact_kind\n\
                        )\n\
                 )\n\
-         )"
+         ))"
     )
 }
 
@@ -1402,10 +1972,10 @@ pub fn newest_full_snapshot_unambiguous(sandbox_alias: &str) -> String {
 ///
 /// The no-rollback proof carries over unchanged from
 /// [`newest_suspend_snapshot_current`]: the snapshot must cover the last
-/// recorded command/access clocks, and no concretely-non-suspend full-ready
-/// snapshot may tie or beat it by timestamp (faithfulness to the markerless
-/// restore selector, which picks the newest full-ready snapshot with no
-/// origin filter).
+/// recorded command/access clocks, no full snapshot may outrank it by capture
+/// generation, and no concretely-non-suspend full-ready snapshot may tie or
+/// beat it by timestamp (faithfulness to the markerless restore selector; see
+/// that function).
 ///
 /// Only for callers that separately prove no runtime can modify the artifact:
 /// either an aged inactive repair candidate, or the exact terminal recovery
@@ -1414,8 +1984,10 @@ pub fn newest_full_snapshot_unambiguous(sandbox_alias: &str) -> String {
 /// must use the lifecycle-bounded variant.
 pub fn newest_suspend_snapshot_activity_current(sandbox_alias: &str) -> String {
     let suspend = ArtifactOrigin::Suspend.as_str();
+    let outranked = full_snapshot_outranked_by_generation(sandbox_alias, "sn");
+    let unordered = restore_order_unordered(sandbox_alias);
     format!(
-        "EXISTS (\n\
+        "(NOT {unordered} AND EXISTS (\n\
              SELECT 1\n\
                FROM snapshots sn\n\
                JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id\n\
@@ -1428,6 +2000,7 @@ pub fn newest_suspend_snapshot_activity_current(sandbox_alias: &str) -> String {
                      OR sn.timestamp >= {sandbox_alias}.last_command_at)\n\
                 AND ({sandbox_alias}.last_access_at IS NULL\n\
                      OR sn.timestamp >= {sandbox_alias}.last_access_at)\n\
+                AND NOT {outranked}\n\
                 AND NOT EXISTS (\n\
                     SELECT 1\n\
                       FROM snapshots sn2\n\
@@ -1440,7 +2013,7 @@ pub fn newest_suspend_snapshot_activity_current(sandbox_alias: &str) -> String {
                        AND sn2.artifact_origin <> '{suspend}'\n\
                        AND sn2.timestamp >= sn.timestamp\n\
                 )\n\
-         )"
+         ))"
     )
 }
 
@@ -1466,6 +2039,110 @@ pub fn failed_repair_revert_eligibility(sandbox_alias: &str) -> SuspendRevertEli
     suspend_revert_eligibility(sandbox_alias, marker_current, newest_current)
 }
 
+/// Returns a boolean SQL fragment: the snapshot aliased as `snapshot_alias` is
+/// the capture the sandbox aliased as `sandbox_alias` is being suspended with,
+/// so the row can be pinned to its artifact. It's a `ready` full backup of a
+/// suspend artifact (`artifact_kind = 'full'`, origin `suspend`) with a storage
+/// location that isn't orphaned, whose capture first registered at or after
+/// the row's last lifecycle change (so not a re-upload of a capture from
+/// before it, which one execution can also own after a reverted suspend);
+/// and it records the capture generation of the sandbox's
+/// active execution, so that execution, the one being suspended, captured it.
+/// And no full snapshot of the sandbox, in any state, is newer by capture
+/// ([`no_newer_full_snapshot`]): one execution can own several captures, a
+/// reverted suspend's and the next one, and only the latest is the state.
+///
+/// The generation is the proof. Registration time alone can't tell this
+/// suspend's capture from a re-upload of an older one that registered while
+/// the suspend ran, and pinning that re-upload would restore the older state.
+/// A capture the node didn't vouch for isn't pinned.
+///
+/// A node-local suspend finalizes the row without the API's suspend handoff,
+/// which is what pins an API suspend. Pinning the capture there gives the
+/// restore the exact artifact, so a later re-upload of an older capture can't
+/// be selected in its place. Never NULL.
+pub fn suspend_snapshot_is_current_capture(sandbox_alias: &str, snapshot_alias: &str) -> String {
+    let suspend = ArtifactOrigin::Suspend.as_str();
+    let captured = capture_registered_at(snapshot_alias);
+    let no_newer = no_newer_full_snapshot(sandbox_alias, snapshot_alias);
+    format!(
+        "({snapshot_alias}.type = 'full'\n\
+          AND {snapshot_alias}.state = 'ready'\n\
+          AND {snapshot_alias}.local_artifact_id IS NOT NULL\n\
+          AND {snapshot_alias}.artifact_kind IS NOT DISTINCT FROM 'full'\n\
+          AND {snapshot_alias}.artifact_origin IS NOT DISTINCT FROM '{suspend}'\n\
+          AND EXISTS (\n\
+              SELECT 1\n\
+                FROM snapshot_storage_locations capture_ssl\n\
+               WHERE capture_ssl.snapshot_id = {snapshot_alias}.id\n\
+                 AND capture_ssl.orphaned_at IS NULL\n\
+          )\n\
+          AND {captured} >= {sandbox_alias}.lifecycle_changed_at\n\
+          AND EXISTS (\n\
+              SELECT 1\n\
+                FROM sandbox_k8s_executions capture_execution\n\
+               WHERE capture_execution.sandbox_id = {sandbox_alias}.id\n\
+                 AND capture_execution.active\n\
+                 AND capture_execution.generation = {snapshot_alias}.generation\n\
+          )\n\
+          AND {no_newer})"
+    )
+}
+
+/// Returns a boolean SQL fragment: the snapshot aliased as `snapshot_alias`
+/// is a `ready` full backup, with a live location, of the full suspend
+/// artifact `artifact_expr` that node `node_expr` reports holding for the
+/// sandbox aliased as `sandbox_alias`, uploaded from that node, and it's
+/// still the sandbox's latest capture as far as the control plane can tell:
+/// no full snapshot in any state outranks it by generation, and no suspend
+/// capture of another artifact, from any node, first registered after it
+/// did, which would mean the sandbox ran since, or at the same instant, which
+/// capture order can't break. A named snapshot's or a
+/// stop's backup isn't a capture the sandbox resumes from, so it doesn't
+/// count.
+///
+/// The node's report is the evidence, not the generation, so this pins a
+/// capture without one too: the node holds the bytes it suspended. The
+/// restore-pin repair and a node-local suspend's finalization use it to pin
+/// the row.
+pub fn node_held_capture_is_latest(
+    sandbox_alias: &str,
+    snapshot_alias: &str,
+    artifact_expr: &str,
+    node_expr: &str,
+) -> String {
+    let suspend = ArtifactOrigin::Suspend.as_str();
+    let outranked = full_snapshot_outranked_by_generation(sandbox_alias, snapshot_alias);
+    let captured = capture_registered_at(snapshot_alias);
+    let later_captured = capture_registered_at("elsewhere");
+    format!(
+        "({snapshot_alias}.sandbox_id = {sandbox_alias}.id\n\
+          AND {snapshot_alias}.type = 'full'\n\
+          AND {snapshot_alias}.state = 'ready'\n\
+          AND {snapshot_alias}.local_artifact_id = {artifact_expr}\n\
+          AND {snapshot_alias}.artifact_kind = 'full'\n\
+          AND {snapshot_alias}.artifact_origin = '{suspend}'\n\
+          AND {snapshot_alias}.source_node_id = {node_expr}\n\
+          AND EXISTS (\n\
+              SELECT 1\n\
+                FROM snapshot_storage_locations held_ssl\n\
+               WHERE held_ssl.snapshot_id = {snapshot_alias}.id\n\
+                 AND held_ssl.orphaned_at IS NULL\n\
+          )\n\
+          AND NOT {outranked}\n\
+          AND NOT EXISTS (\n\
+              SELECT 1\n\
+                FROM snapshots elsewhere\n\
+               WHERE elsewhere.sandbox_id = {sandbox_alias}.id\n\
+                 AND elsewhere.type = 'full'\n\
+                 AND (elsewhere.artifact_origin IS NULL\n\
+                      OR elsewhere.artifact_origin = '{suspend}')\n\
+                 AND elsewhere.local_artifact_id IS DISTINCT FROM {artifact_expr}\n\
+                 AND {later_captured} >= {captured}\n\
+          ))"
+    )
+}
+
 /// Returns a SQL fragment evaluating to TRUE iff the snapshot the markerless
 /// restore selector would actually load is a ready, durable full `suspend`
 /// snapshot that provably loses no writes.
@@ -1479,15 +2156,17 @@ pub fn failed_repair_revert_eligibility(sandbox_alias: &str) -> SuspendRevertEli
 /// is itself a suspend artifact and (b) nothing ran after it.
 ///
 /// **Faithfulness to the restore selector.** After the marker is cleared, the
-/// markerless suspend-restore selector picks the newest `type='full'
-/// state='ready'` snapshot **with no `artifact_origin` filter** (`ORDER BY
-/// sn.timestamp DESC LIMIT 1` in `kubernetes/store/restore_source.rs`). So
-/// this predicate must vouch for *that* snapshot, not merely for the existence
-/// of some current suspend snapshot: it requires a current suspend/null-origin
-/// snapshot that no concretely-non-suspend full-ready snapshot ties or beats by
-/// timestamp. If a newer (or equal-timestamp) `stop`/`checkpoint`/other-origin
-/// full snapshot exists, restore would load that instead, so recovery must
-/// refuse.
+/// markerless restore selector
+/// (`pplx_space_sandbox_store::restore_source::select_restore_source`) picks
+/// the latest capture among ready full suspend (or null-origin) snapshots:
+/// no candidate outranks it by capture generation, and it registered last
+/// among those. So this predicate must vouch for *that* snapshot, not merely
+/// for the existence of some current suspend snapshot: it requires a current
+/// suspend/null-origin snapshot that no full snapshot outranks by generation.
+/// It also refuses when a concretely-non-suspend full-ready snapshot ties or
+/// beats it by timestamp, which the selector no longer loads: stricter than
+/// the selector, so it can only leave a row unrecovered, never recover one
+/// the selector would restore differently.
 ///
 /// The `timestamp >= GREATEST(lifecycle_changed_at, last_command_at,
 /// last_access_at)` guard proves the snapshot post-dates this lifecycle cycle and
@@ -1498,6 +2177,15 @@ pub fn failed_repair_revert_eligibility(sandbox_alias: &str) -> SuspendRevertEli
 /// invariant is ever violated, the repaired row may be restore-ineligible, but
 /// not restored from stale bytes.
 pub fn newest_suspend_snapshot_current(sandbox_alias: &str) -> String {
+    let unordered = restore_order_unordered(sandbox_alias);
+    let newest = newest_suspend_snapshot_published(sandbox_alias);
+    format!("(NOT {unordered} AND {newest})")
+}
+
+/// [`newest_suspend_snapshot_current`] without its refusal of an unordered
+/// history: the snapshot is the newest current suspend capture as far as
+/// capture order can tell. Only for [`started_suspend_finalize_eligibility`].
+fn newest_suspend_snapshot_published(sandbox_alias: &str) -> String {
     let suspend = ArtifactOrigin::Suspend.as_str();
     let selection_guard = format!(
         "AND NOT EXISTS (\n\
@@ -1517,6 +2205,7 @@ pub fn newest_suspend_snapshot_current(sandbox_alias: &str) -> String {
 }
 
 fn newest_suspend_snapshot_current_from_active_node(sandbox_alias: &str) -> String {
+    let unordered = restore_order_unordered(sandbox_alias);
     let source_guard = format!("AND sn.source_node_id = {sandbox_alias}.active_node_id");
     let selection_guard = format!(
         "AND NOT EXISTS (\n\
@@ -1531,7 +2220,9 @@ fn newest_suspend_snapshot_current_from_active_node(sandbox_alias: &str) -> Stri
                 AND sn2.timestamp >= sn.timestamp\n\
          )"
     );
-    newest_suspend_snapshot_current_with_guards(sandbox_alias, &source_guard, &selection_guard)
+    let newest =
+        newest_suspend_snapshot_current_with_guards(sandbox_alias, &source_guard, &selection_guard);
+    format!("(NOT {unordered} AND {newest})")
 }
 
 fn newest_suspend_snapshot_current_with_guards(
@@ -1540,6 +2231,7 @@ fn newest_suspend_snapshot_current_with_guards(
     selection_guard: &str,
 ) -> String {
     let suspend = ArtifactOrigin::Suspend.as_str();
+    let outranked = full_snapshot_outranked_by_generation(sandbox_alias, "sn");
     format!(
         "EXISTS (\n\
              SELECT 1\n\
@@ -1554,6 +2246,7 @@ fn newest_suspend_snapshot_current_with_guards(
                         {sandbox_alias}.lifecycle_changed_at,\n\
                         COALESCE({sandbox_alias}.last_command_at, {sandbox_alias}.lifecycle_changed_at),\n\
                         COALESCE({sandbox_alias}.last_access_at, {sandbox_alias}.lifecycle_changed_at))\n\
+                AND NOT {outranked}\n\
                 {source_guard}\n\
                 {selection_guard}\n\
          )"
@@ -1612,12 +2305,109 @@ pub fn recoverable_suspend_snapshot_exists(sandbox_alias: &str) -> String {
 ///   not by a subtle reachability argument that future placement-timestamp
 ///   changes could quietly break.
 /// * **Unmarked** (plain user-suspended): placement-freshness
-///   ([`fresh_ready_snapshot_exists`]) is the right portability question — a
+///   ([`fresh_ready_snapshot_exists`]) is the right portability question, and
+///   the capture must also be newest among suspend captures, as for a marked
+///   row: a later capture still uploading or failed holds the source — a
 ///   `wake → modify → re-suspend` cycle must not release the source on a stale
 ///   prior-cycle snapshot, and there is no cohort restore to keep in step with.
+///   As there, the fresh snapshot must be the latest capture: a re-upload of an
+///   older one registered since the placement doesn't release the source, nor
+///   does one of the previous capture while the latest's upload is in flight
+///   or failed.
+/// * An unpinned row releases its source only on a suspend capture: the
+///   restore never loads a named snapshot's or a stop's backup for it.
+/// * Neither releases the source of an unpinned row whose history is
+///   unordered ([`restore_order_unordered`]): its restore refuses, and the
+///   source may hold the only copy of the latest state.
 pub fn snapshot_durable_for_source_release(sandbox_alias: &str) -> String {
+    let unordered = restore_order_unordered(sandbox_alias);
+    // An unpinned row releases its source only on a copy the restore would
+    // load: a suspend capture, by the rules below. A named snapshot's or a
+    // stop's backup isn't one, and while it outranks the suspend capture,
+    // nothing is.
+    let copy = durable_copy_exists_where(sandbox_alias, &released_unpinned_copy(sandbox_alias));
+    // The unordered check is per sandbox, so it's ANDed outside the copy's
+    // EXISTS, once.
+    format!(
+        "(({sandbox_alias}.current_local_artifact_id IS NOT NULL OR NOT {unordered})
+         AND {copy})"
+    )
+}
+
+/// [`snapshot_durable_for_source_release`] without its refusal of an
+/// unpinned unordered history: a durable copy exists that the sandbox could
+/// still restore from. For the give-ups that fail a sandbox with no durable
+/// copy (the drain's after `ArtifactMissing`, the drained-node terminator's).
+/// An unordered history keeps every ready durable copy, evacuation-marked or
+/// not, since its newest rows may be captures that never uploaded and an
+/// operator chooses between them; failing it would end the sandbox's last
+/// restore path. Such a row stays `suspended`, and its restore refuses until
+/// it's pinned. A named snapshot's backup counts here too: a give-up keeps
+/// the row rather than fail it. So does every copy
+/// [`snapshot_durable_for_source_release`] accepts.
+pub fn snapshot_durable_copy_exists(sandbox_alias: &str) -> String {
+    let unordered = restore_order_unordered(sandbox_alias);
+    let ordered =
+        ordered_unpinned_copy(sandbox_alias, &no_newer_full_snapshot(sandbox_alias, "sn"));
+    // Everything the source-release gate would accept counts too.
+    let released = released_unpinned_copy(sandbox_alias);
+    durable_copy_exists_where(
+        sandbox_alias,
+        &format!("({unordered} OR {ordered} OR {released})"),
+    )
+}
+
+/// Whether the ready full snapshot aliased `sn` is the copy that releases an
+/// unpinned row's source ([`snapshot_durable_for_source_release`]): a suspend
+/// capture, newest among suspend captures, since a later capture may hold
+/// bytes only the source node has and releasing it would leave the restore an
+/// older capture. For an evacuation-marked row a failed later capture holds it
+/// too, since the evacuating drain re-uploads it from the node, and fails the
+/// row if its bytes are gone. For an unmarked row only an upload still in
+/// flight holds it, which ends: nothing retries a failed one there, so a hold
+/// on it would never end. An unmarked row also needs a capture fresher than
+/// its last placement.
+fn released_unpinned_copy(sandbox_alias: &str) -> String {
+    let suspend = ArtifactOrigin::Suspend.as_str();
+    let newest = no_newer_suspend_capture(sandbox_alias, "sn");
+    let newest_live = no_newer_live_suspend_capture(sandbox_alias, "sn");
+    let captured = capture_registered_at("sn");
+    format!(
+        "((sn.artifact_origin IS NULL OR sn.artifact_origin = '{suspend}')
+          AND (({sandbox_alias}.evacuation_restore_target IS NOT NULL AND {newest})
+               OR ({sandbox_alias}.evacuation_restore_target IS NULL
+                   AND {newest_live}
+                   AND ({sandbox_alias}.placement_changed_at IS NULL
+                        OR {captured} >= {sandbox_alias}.placement_changed_at))))"
+    )
+}
+
+/// Whether the ready full snapshot aliased `sn` is the copy an unpinned row
+/// with an ordered history restores from: for an evacuation-marked row, the
+/// newest by `no_newer` ([`no_newer_full_snapshot`] or
+/// [`no_newer_suspend_capture`]); otherwise one fresher than the last
+/// placement that no capture outranks.
+fn ordered_unpinned_copy(sandbox_alias: &str, no_newer: &str) -> String {
+    let captured = capture_registered_at("sn");
+    let outranked = full_snapshot_outranked_by_generation(sandbox_alias, "sn");
+    format!(
+        "(({sandbox_alias}.evacuation_restore_target IS NOT NULL AND {no_newer})
+          OR (
+              {sandbox_alias}.evacuation_restore_target IS NULL
+              AND (
+                  {sandbox_alias}.placement_changed_at IS NULL
+                  OR {captured} >= {sandbox_alias}.placement_changed_at
+              )
+              AND NOT {outranked}
+          ))"
+    )
+}
+
+/// An `EXISTS` over the sandbox's ready full snapshots with a live location:
+/// one of its pinned artifact, or, for an unpinned row, one for which
+/// `unpinned` holds.
+fn durable_copy_exists_where(sandbox_alias: &str, unpinned: &str) -> String {
     let pinned = snapshot_is_current_local_artifact(sandbox_alias, "sn");
-    let no_newer = no_newer_full_snapshot(sandbox_alias, "sn");
     // Keep the sandbox correlation in a single EXISTS so a fleet-wide caller
     // can use a hash semi/anti join. OR-ing complete EXISTS expressions makes
     // Postgres probe snapshots and storage locations separately for each row.
@@ -1632,19 +2422,7 @@ pub fn snapshot_durable_for_source_release(sandbox_alias: &str) -> String {
                 AND ssl.orphaned_at IS NULL
                 AND (
                     {pinned}
-                    OR (
-                        {sandbox_alias}.current_local_artifact_id IS NULL
-                        AND (
-                            ({sandbox_alias}.evacuation_restore_target IS NOT NULL AND {no_newer})
-                            OR (
-                                {sandbox_alias}.evacuation_restore_target IS NULL
-                                AND (
-                                    {sandbox_alias}.placement_changed_at IS NULL
-                                    OR sn.timestamp >= {sandbox_alias}.placement_changed_at
-                                )
-                            )
-                        )
-                    )
+                    OR ({sandbox_alias}.current_local_artifact_id IS NULL AND {unpinned})
                 )
          )"
     )
