@@ -202,6 +202,14 @@ const LEGACY_DROP_UP: &str = include_str!(
 const LEGACY_DROP_DOWN: &str = include_str!(
     "../../../../../../../../db/sandbox-manager/20261109120000_drop_sandbox_legacy_state.down.sql"
 );
+/// The migration after `suspend_attempt` restores `legacy_state` for releases
+/// that still read it.
+const LEGACY_RESTORE_UP: &str = include_str!(
+    "../../../../../../../../db/sandbox-manager/20261113190000_restore_sandbox_legacy_state.up.sql"
+);
+const LEGACY_RESTORE_DOWN: &str = include_str!(
+    "../../../../../../../../db/sandbox-manager/20261113190000_restore_sandbox_legacy_state.down.sql"
+);
 
 /// Insert a row in the split form, keeping the filesystem for every
 /// completion that keeps the row.
@@ -353,7 +361,8 @@ fn the_migration_round_trips_every_cleanup_shape_and_keeps_historical_labels() {
             .collect()
     };
 
-    // Reverse dependent migrations before dropping the generated column.
+    // Reverse dependent migrations newest first.
+    conn.execute_batch(LEGACY_RESTORE_DOWN).unwrap();
     conn.execute_batch(include_str!(
         "../../../../../../../../db/sandbox-manager/20261112160000_suspend_attempt.down.sql"
     ))
@@ -381,6 +390,7 @@ fn the_migration_round_trips_every_cleanup_shape_and_keeps_historical_labels() {
         "../../../../../../../../db/sandbox-manager/20261112160000_suspend_attempt.up.sql"
     ))
     .unwrap();
+    conn.execute_batch(LEGACY_RESTORE_UP).unwrap();
     // A migration can't tell a handed-off suspend from a restore rollback, so
     // `c` comes back `stopping`; its combined status is unchanged.
     for (id, expected) in [

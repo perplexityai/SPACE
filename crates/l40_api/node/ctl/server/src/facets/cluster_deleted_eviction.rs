@@ -160,11 +160,7 @@ pub(super) fn select_cluster_deleted_evict_candidates<'a>(
 /// budget and back-off slots on ids sbx-manager is bound to refuse.
 pub(super) fn local_row_is_cluster_deleted_reclaimable(state: &SandboxInfo) -> bool {
     use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
-    match state
-        .observed_status()
-        .ok()
-        .and_then(|status| status.unowned())
-    {
+    match state.observed_lifecycle().ok() {
         Some(
             SandboxLifecycleState::Stopped
             | SandboxLifecycleState::Suspended

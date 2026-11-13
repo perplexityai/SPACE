@@ -450,7 +450,7 @@ pub(super) async fn handle(
                     sandbox.sandbox_id,
                     sandbox.template.as_deref().unwrap_or("-"),
                     sandbox
-                        .observed_status()
+                        .observed_lifecycle()
                         .map(|state| state.label())
                         .unwrap_or("unknown"),
                 );

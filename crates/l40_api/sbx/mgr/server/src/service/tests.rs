@@ -7227,7 +7227,6 @@ pub(crate) mod service_tests {
 
     #[tokio::test(start_paused = true)]
     async fn wait_completes_only_for_terminal_statuses_without_a_caller_deadline() {
-        use pplx_space_sbx_mgr_client::lifecycle::{ObservedCleanup, ObservedStatus, Teardown};
         for state in [
             SandboxStatus::from(SandboxState::Quarantined),
             SandboxStatus::from(SandboxState::Stopped),
@@ -7250,13 +7249,10 @@ pub(crate) mod service_tests {
             .await;
             let expected = match state.cleanup() {
                 Some(CleanupState::Required) => None,
-                Some(CleanupState::Failed) => Some(ObservedStatus::Owned {
-                    teardown: Teardown::Stopping,
-                    cleanup: ObservedCleanup::Failed,
-                }),
-                None => Some(ObservedStatus::Unowned(
-                    crate::proto::SandboxLifecycleState::from(state.lifecycle()),
-                )),
+                Some(CleanupState::Failed) => {
+                    Some(crate::proto::SandboxLifecycleState::CleanupFailed)
+                }
+                None => Some(crate::proto::SandboxLifecycleState::from(state.lifecycle())),
             };
             if let Some(expected) = expected {
                 assert_eq!(
@@ -7264,7 +7260,7 @@ pub(crate) mod service_tests {
                         .expect("Wait must complete without requiring an API timeout")
                         .unwrap()
                         .into_inner()
-                        .observed_status()
+                        .observed_lifecycle()
                         .unwrap(),
                     expected,
                 );
@@ -14036,10 +14032,8 @@ pub(crate) mod service_tests {
             .pop()
             .expect("quarantined sandbox should be returned");
         assert_eq!(
-            published.observed_status().unwrap(),
-            pplx_space_sbx_mgr_client::lifecycle::ObservedStatus::Unowned(
-                crate::proto::SandboxLifecycleState::Quarantined
-            )
+            published.observed_lifecycle().unwrap(),
+            crate::proto::SandboxLifecycleState::Quarantined
         );
         assert_eq!(
             published.quarantine_reason_code.as_deref(),
@@ -14105,10 +14099,8 @@ pub(crate) mod service_tests {
                 .find(|sandbox| sandbox.sandbox_id == *sandbox_id)
                 .unwrap();
             assert_eq!(
-                published.observed_status().unwrap(),
-                pplx_space_sbx_mgr_client::lifecycle::ObservedStatus::Unowned(
-                    crate::proto::SandboxLifecycleState::Quarantined
-                )
+                published.observed_lifecycle().unwrap(),
+                crate::proto::SandboxLifecycleState::Quarantined
             );
             assert_eq!(
                 published.quarantine_reason_code.as_deref(),
@@ -14230,7 +14222,7 @@ pub(crate) mod service_tests {
             .iter()
             .find(|sandbox| sandbox.sandbox_id == malformed_core_id)
             .expect("a malformed local row must still report its node lifecycle");
-        malformed_core.observed_status().unwrap_err();
+        malformed_core.observed_lifecycle().unwrap_err();
         assert!(malformed_core.state_degraded);
         assert_eq!(
             malformed_core.cleanup.map(|cleanup| cleanup.completion),
@@ -14252,10 +14244,8 @@ pub(crate) mod service_tests {
             .find(|sandbox| sandbox.sandbox_id == quarantined_id)
             .unwrap();
         assert_eq!(
-            quarantined.observed_status().unwrap(),
-            pplx_space_sbx_mgr_client::lifecycle::ObservedStatus::Unowned(
-                crate::proto::SandboxLifecycleState::Quarantined
-            )
+            quarantined.observed_lifecycle().unwrap(),
+            crate::proto::SandboxLifecycleState::Quarantined
         );
         assert_eq!(
             quarantined.quarantine_reason_code.as_deref(),
@@ -14294,10 +14284,8 @@ pub(crate) mod service_tests {
             .find(|sandbox| sandbox.sandbox_id == healthy_id)
             .unwrap();
         assert_eq!(
-            healthy.observed_status().unwrap(),
-            pplx_space_sbx_mgr_client::lifecycle::ObservedStatus::Unowned(
-                crate::proto::SandboxLifecycleState::Created
-            )
+            healthy.observed_lifecycle().unwrap(),
+            crate::proto::SandboxLifecycleState::Created
         );
         assert!(!healthy.state_degraded);
     }
@@ -16756,31 +16744,8 @@ pub(crate) mod service_tests {
             );
         }
 
-        // Every store teardown is in `SandboxStatus::all()`: the match stops
-        // compiling when one is added, so it can't be published unchecked.
-        for teardown in [
-            crate::state::Teardown::Stopping,
-            crate::state::Teardown::Deleting,
-            crate::state::Teardown::Suspending,
-        ] {
-            match teardown {
-                crate::state::Teardown::Stopping
-                | crate::state::Teardown::Deleting
-                | crate::state::Teardown::Suspending => {}
-            }
-            for cleanup in [
-                crate::state::CleanupState::Required,
-                crate::state::CleanupState::Failed,
-            ] {
-                assert!(
-                    SandboxStatus::all().contains(&SandboxStatus::owned(teardown, cleanup)),
-                    "{teardown:?} {cleanup:?}"
-                );
-            }
-        }
         // Without a recorded completion, only the two cleanup statuses
-        // publish a cleanup, and each names its own owner. Readers decode
-        // every status sandbox manager publishes, to the same label.
+        // publish a cleanup, and each names its own owner.
         for state in SandboxStatus::all() {
             let mut sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
             sandbox.state = state;
@@ -16809,15 +16774,6 @@ pub(crate) mod service_tests {
                 info.cleanup
                     .map(|cleanup| (cleanup.completion, cleanup.state)),
                 owner.map(|owner| (Completion::Unspecified as i32, owner as i32)),
-                "{state}"
-            );
-            let observed = info
-                .observed_status()
-                .unwrap_or_else(|error| panic!("{state}: {error}"));
-            assert_eq!(observed.label(), state.legacy_label(), "{state}");
-            assert_eq!(
-                observed.cleanup().is_some(),
-                state.is_cleanup_owned(),
                 "{state}"
             );
         }
