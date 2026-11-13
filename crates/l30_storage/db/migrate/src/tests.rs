@@ -226,20 +226,22 @@ async fn capture_time_marker_round_trips_and_reupgrades_as_not_comparable() {
     );
 }
 
-/// The four runtime-upgrade migrations: the attempt id, refused attempts,
-/// attempt outcomes and abandoned operations.
-const RUNTIME_UPGRADE_MIGRATIONS: [i64; 4] = [
+/// The five runtime-upgrade migrations: the attempt id, refused attempts,
+/// attempt outcomes, abandoned operations, and the per-attempt tables'
+/// foreign keys dropped.
+const RUNTIME_UPGRADE_MIGRATIONS: [i64; 5] = [
     20261112170001,
     20261112170002,
     20261112170003,
     20261112170004,
+    20261112170005,
 ];
 /// The newest sandbox-manager migration that shipped before them.
 const BEFORE_RUNTIME_UPGRADE_MIGRATIONS: i64 = 20261112160000;
 
 /// The runtime-upgrade migrations come after every migration that shipped
 /// before them, next to each other, so a database at that earlier head takes
-/// them as its next four and a `down` reverts them, newest first, before it
+/// them as its next five and a `down` reverts them, newest first, before it
 /// reaches any earlier migration. Up, down and up again round-trip; newer
 /// migrations are rolled back first.
 #[tokio::test]
@@ -281,10 +283,68 @@ async fn runtime_upgrade_migrations_follow_their_predecessors_and_round_trip() {
             .unwrap();
     };
 
+    // How many of the per-attempt tables reference `sandboxes`.
+    let bound_per_attempt_tables = || {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master AS t, pragma_foreign_key_list(t.name) AS fk
+                  WHERE t.type = 'table'
+                    AND t.name IN (
+                        'sandbox_runtime_upgrade_refused_attempts',
+                        'sandbox_runtime_upgrade_attempt_outcomes'
+                    )
+                    AND fk.\"table\" = 'sandboxes'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let per_attempt_tables_unbound = *RUNTIME_UPGRADE_MIGRATIONS.last().unwrap();
+
     migrate_sqlite_up(database, &path).await.unwrap();
     for round in 0..2 {
         for _ in 0..newer {
             rollback().await;
+        }
+        assert_eq!(
+            bound_per_attempt_tables(),
+            0,
+            "round {round}: unbound at the head"
+        );
+        if round == 0 {
+            // A per-attempt row whose sandbox was deleted can't be kept under the
+            // foreign key, so the down refuses while one is recorded in
+            // either table.
+            let orphan = |sql: &str| Connection::open(&path).unwrap().execute(sql, []).unwrap();
+            for (insert, clear) in [
+                (
+                    "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes
+                         (operation_id, attempt_id, sandbox_id, outcome, failure, recorded_at)
+                     VALUES ('op', 'attempt-a', 'deleted-sandbox', 'refused', NULL, '0')",
+                    "DELETE FROM sandbox_runtime_upgrade_attempt_outcomes",
+                ),
+                (
+                    "INSERT INTO sandbox_runtime_upgrade_refused_attempts
+                         (operation_id, attempt_id, sandbox_id, failure, recorded_at)
+                     VALUES ('op', 'attempt-a', 'deleted-sandbox', NULL, '0')",
+                    "DELETE FROM sandbox_runtime_upgrade_refused_attempts",
+                ),
+            ] {
+                orphan(insert);
+                // The guard refuses it, whether or not the migration's
+                // connection enforces foreign keys.
+                let refused =
+                    rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+                        .await
+                        .unwrap_err();
+                assert!(
+                    format!("{refused:?}").contains("CHECK constraint failed"),
+                    "{insert}: {refused:?}"
+                );
+                assert!(applied().await.contains(&per_attempt_tables_unbound));
+                orphan(clear);
+            }
         }
         for reverted in RUNTIME_UPGRADE_MIGRATIONS.iter().rev() {
             rollback().await;
@@ -292,6 +352,9 @@ async fn runtime_upgrade_migrations_follow_their_predecessors_and_round_trip() {
                 !applied().await.contains(reverted),
                 "round {round}: the down that follows is {reverted}'s"
             );
+            if *reverted == per_attempt_tables_unbound {
+                assert_eq!(bound_per_attempt_tables(), 2, "round {round}: bound again");
+            }
         }
         assert_eq!(
             applied().await,
@@ -324,9 +387,78 @@ async fn runtime_upgrade_migrations_follow_their_predecessors_and_round_trip() {
     }
 }
 
-/// Each runtime-upgrade down refuses while a row an older release would
-/// misread is recorded, leaves its migration applied, and goes through once
-/// the row is gone. A `rolled_back` outcome, which an older release reads,
+/// The migration that drops the per-attempt tables' foreign keys keeps every row
+/// and column it copies: each attempt's rollback or refusal, and each refused
+/// create, recorded before it applies is there after it, unchanged.
+#[tokio::test]
+async fn the_per_attempt_foreign_key_migration_keeps_every_recorded_row() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.sqlite");
+    let database = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
+    let migrator = pplx_space_sbx_mgr_store::db::migration::target().service;
+    let unbound = *RUNTIME_UPGRADE_MIGRATIONS.last().unwrap();
+    let newer = migrator
+        .iter()
+        .filter(|migration| {
+            migration.migration_type.is_up_migration() && migration.version >= unbound
+        })
+        .count();
+    migrate_sqlite_up(database, &path).await.unwrap();
+    for _ in 0..newer {
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    }
+    const OUTCOMES: &str =
+        "SELECT operation_id, attempt_id, sandbox_id, outcome, failure, recorded_at
+                              FROM sandbox_runtime_upgrade_attempt_outcomes ORDER BY rowid";
+    const REFUSED: &str = "SELECT operation_id, attempt_id, sandbox_id, failure, recorded_at
+                             FROM sandbox_runtime_upgrade_refused_attempts ORDER BY rowid";
+    let rows = |sql: &str| -> Vec<Vec<Option<String>>> {
+        let conn = Connection::open(&path).unwrap();
+        let mut statement = conn.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    {
+        // Seeded without sandbox rows behind them, which the foreign key
+        // would otherwise demand.
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes
+                 (operation_id, attempt_id, sandbox_id, outcome, failure, recorded_at)
+             VALUES ('op-1', 'attempt-b', 'sandbox-1', 'rolled_back', 'boot failed', '2'),
+                    ('op-1', 'attempt-a', 'sandbox-1', 'refused', NULL, '1');
+             INSERT INTO sandbox_runtime_upgrade_refused_attempts
+                 (operation_id, attempt_id, sandbox_id, failure, recorded_at)
+             VALUES ('op-2', 'attempt-c', 'sandbox-2', 'runs another pod', '3'),
+                    ('op-2', 'attempt-a', 'sandbox-2', NULL, '4');",
+        )
+        .unwrap();
+    }
+    let outcomes = rows(OUTCOMES);
+    let refused = rows(REFUSED);
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(refused.len(), 2);
+
+    migrate_sqlite_up(database, &path).await.unwrap();
+
+    assert_eq!(rows(OUTCOMES), outcomes, "attempt outcomes, in their order");
+    assert_eq!(rows(REFUSED), refused, "refused attempts, in their order");
+}
+
+/// Each of the four runtime-upgrade downs that guard against an older
+/// release refuses while a row that release would misread is recorded, leaves
+/// its migration applied, and goes through once the row is gone. The
+/// foreign-key migration's down, whose guard counts orphaned per-attempt rows
+/// instead, is covered by the round trip above. A `rolled_back` outcome, which an older release reads,
 /// doesn't hold back the attempt id's down.
 #[tokio::test]
 async fn runtime_upgrade_downs_refuse_while_a_row_an_older_release_misreads_is_recorded() {

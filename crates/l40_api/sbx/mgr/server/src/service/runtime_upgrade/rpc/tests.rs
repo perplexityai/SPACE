@@ -1341,7 +1341,7 @@ async fn a_final_staging_refusal_is_recorded_for_its_attempt() {
 }
 
 /// The node's report of `operation_id` for the attempt `attempt_id`.
-fn report_for_attempt(
+pub(in crate::service::runtime_upgrade) fn report_for_attempt(
     service: &SandboxManagerService,
     sandbox_id: &str,
     operation_id: RuntimeUpgradeOperationId,
@@ -2238,6 +2238,184 @@ async fn a_started_targets_refused_activation_is_recorded_and_final_for_its_atte
             "{target_state:?}"
         );
     }
+}
+
+/// A refused activation outlives the sandbox's row, as a rollback does, and
+/// stays visible: with the operation's report gone, `GetRuntimeUpgrade` for
+/// that attempt answers ABSENT naming it as `refused_attempt_id`, so a caller
+/// waiting on it settles while its retries are still refused, and it does
+/// so even once another attempt's refusal, or its upgrade in progress, is the
+/// operation's report again.
+/// Another attempt sees nothing, and a request naming another sandbox for
+/// that attempt is told so by both RPCs, not handed the refusal.
+#[tokio::test]
+async fn a_refused_activation_stays_reported_after_its_sandbox_row_is_deleted() {
+    let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+    let target = certified_target(&f.source);
+    let operation_id = operation();
+    f.put_on(&target);
+    run_as(&f, &pod_identity(&f.sandbox_id, OTHER_POD_UID, 4));
+    let request =
+        |sandbox_id: &str| pod_upgrade(sandbox_id, &target, operation_id, WakeTargetState::Started);
+    let refused = upgrade(&f.service, request(&f.sandbox_id))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{refused}");
+    let own = report_for_attempt(&f.service, &f.sandbox_id, operation_id, POD_UID);
+    assert_eq!(own.status, RuntimeUpgradeStatus::AlreadyOnTarget as i32);
+    assert_eq!(own.refused_attempt_id.as_deref(), Some(POD_UID));
+
+    crate::db::delete_sandbox(&f.service.db.lock().unwrap(), &f.sandbox_id).unwrap();
+
+    let retried = upgrade(&f.service, request(&f.sandbox_id))
+        .await
+        .unwrap_err();
+    assert!(
+        retried.message().contains("only a new attempt retries it"),
+        "{retried}"
+    );
+    // The attempt asked for a started target; asking for a stopped one is
+    // another request, even with the operation's records gone.
+    let stopped = upgrade(
+        &f.service,
+        pod_upgrade(
+            &f.sandbox_id,
+            &target,
+            operation_id,
+            WakeTargetState::Stopped,
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stopped.code(), tonic::Code::InvalidArgument, "{stopped}");
+    let reported = report_for_attempt(&f.service, &f.sandbox_id, operation_id, POD_UID);
+    assert_eq!(reported.status, RuntimeUpgradeStatus::Absent as i32);
+    assert_eq!(reported.refused_attempt_id.as_deref(), Some(POD_UID));
+    assert_eq!(
+        reported.refused_attempt_failure.as_deref(),
+        Some(refused.message())
+    );
+    let other = report_for_attempt(&f.service, &f.sandbox_id, operation_id, OTHER_POD_UID);
+    assert_eq!(other.refused_attempt_id, None, "{other:?}");
+
+    // The sandbox is back, and another attempt's refusal is now the
+    // operation's report; it says nothing about this attempt, whose refused
+    // activation still does.
+    {
+        let db = f.service.db.lock().unwrap();
+        crate::db::fixture::insert_test_sandbox(&db, &f.sandbox_id, SandboxState::Stopped);
+        let identity = crate::db::RuntimeUpgradeRequestIdentity {
+            operation_id,
+            sandbox_id: f.sandbox_id.clone(),
+            target_environment: target.environment().unwrap(),
+            target_state: crate::db::RuntimeUpgradeTargetState::Started,
+            authorization_id: authorization().authorization_id,
+        };
+        assert!(
+            crate::db::record_runtime_upgrade_refusal(
+                &db,
+                &identity,
+                OTHER_POD_UID,
+                "the other attempt was refused"
+            )
+            .unwrap()
+        );
+    }
+    let latest = report(&f.service, &f.sandbox_id, operation_id);
+    assert_eq!(latest.status, RuntimeUpgradeStatus::Refused as i32);
+    assert_eq!(latest.attempt_id.as_deref(), Some(OTHER_POD_UID));
+    assert_eq!(latest.refused_attempt_id, None, "{latest:?}");
+    let reported = report_for_attempt(&f.service, &f.sandbox_id, operation_id, POD_UID);
+    assert_eq!(reported.status, RuntimeUpgradeStatus::Absent as i32);
+    assert_eq!(reported.refused_attempt_id.as_deref(), Some(POD_UID));
+    assert_eq!(
+        reported.refused_attempt_failure.as_deref(),
+        Some(refused.message())
+    );
+
+    // Deleted and staged again once more, the sandbox is fenced by a third
+    // attempt whose upgrade is still in progress: that report doesn't speak
+    // for this attempt either.
+    crate::db::delete_sandbox(&f.service.db.lock().unwrap(), &f.sandbox_id).unwrap();
+    {
+        let db = f.service.db.lock().unwrap();
+        crate::db::fixture::insert_test_sandbox(&db, &f.sandbox_id, SandboxState::Stopped);
+        crate::db::upsert_sandbox_execution_metadata(&db, &f.sandbox_id, &f.source).unwrap();
+        let row = crate::db::get_sandbox(&db, &f.sandbox_id).unwrap().unwrap();
+        let fenced = crate::db::begin_runtime_upgrade(
+            &db,
+            crate::db::NewRuntimeUpgrade {
+                operation_id,
+                sandbox_id: &f.sandbox_id,
+                observed: crate::db::ObservedSandbox::of(&row),
+                target_environment: target.environment().unwrap(),
+                target_state: crate::db::RuntimeUpgradeTargetState::Started,
+                authorization: &crate::db::RuntimeUpgradeAuthorization {
+                    id: authorization().authorization_id,
+                    reason: "a third attempt".to_string(),
+                    memory_loss: false,
+                },
+                checkpoint_dir_identity: None,
+                previous_execution: &f.source,
+                attempt_id: "attempt-c",
+            },
+        )
+        .unwrap();
+        assert!(matches!(fenced, crate::db::BeginRuntimeUpgrade::Fenced(_)));
+    }
+    let latest = report(&f.service, &f.sandbox_id, operation_id);
+    assert_eq!(latest.status, RuntimeUpgradeStatus::InProgress as i32);
+    assert_eq!(latest.refused_attempt_id, None, "{latest:?}");
+    let reported = report_for_attempt(&f.service, &f.sandbox_id, operation_id, POD_UID);
+    assert_eq!(reported.status, RuntimeUpgradeStatus::Absent as i32);
+    assert_eq!(reported.refused_attempt_id.as_deref(), Some(POD_UID));
+
+    // Another sandbox naming this attempt is told so by both RPCs, from the
+    // kept row alone once the sandbox's row and its upgrade are gone, and
+    // still once that other sandbox holds a report of the operation.
+    let elsewhere = pplx_space_common_core::types::SandboxId::new().to_string();
+    crate::db::delete_sandbox(&f.service.db.lock().unwrap(), &f.sandbox_id).unwrap();
+    let read_elsewhere = || {
+        f.service
+            .get_runtime_upgrade(&internal_request(GetRuntimeUpgradeRequest {
+                sandbox_id: elsewhere.clone(),
+                operation_id: operation_id.to_string(),
+                attempt_id: Some(POD_UID.to_string()),
+            }))
+            .unwrap_err()
+    };
+    let named = upgrade(&f.service, request(&elsewhere)).await.unwrap_err();
+    assert_eq!(named.code(), tonic::Code::InvalidArgument, "{named}");
+    let read = read_elsewhere();
+    assert_eq!(read.code(), tonic::Code::InvalidArgument, "{read}");
+    {
+        let db = f.service.db.lock().unwrap();
+        crate::db::fixture::insert_test_sandbox(&db, &elsewhere, SandboxState::Stopped);
+        crate::db::upsert_sandbox_execution_metadata(&db, &elsewhere, &f.source).unwrap();
+        let row = crate::db::get_sandbox(&db, &elsewhere).unwrap().unwrap();
+        let fenced = crate::db::begin_runtime_upgrade(
+            &db,
+            crate::db::NewRuntimeUpgrade {
+                operation_id,
+                sandbox_id: &elsewhere,
+                observed: crate::db::ObservedSandbox::of(&row),
+                target_environment: target.environment().unwrap(),
+                target_state: crate::db::RuntimeUpgradeTargetState::Started,
+                authorization: &crate::db::RuntimeUpgradeAuthorization {
+                    id: authorization().authorization_id,
+                    reason: "an operation id reused for another sandbox".to_string(),
+                    memory_loss: false,
+                },
+                checkpoint_dir_identity: None,
+                previous_execution: &f.source,
+                attempt_id: "attempt-d",
+            },
+        )
+        .unwrap();
+        assert!(matches!(fenced, crate::db::BeginRuntimeUpgrade::Fenced(_)));
+    }
+    let read = read_elsewhere();
+    assert_eq!(read.code(), tonic::Code::InvalidArgument, "{read}");
 }
 
 /// A started-target request that reuses an operation id with another target

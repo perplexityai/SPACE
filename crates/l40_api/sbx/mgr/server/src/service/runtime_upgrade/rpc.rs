@@ -204,9 +204,6 @@ impl crate::service::SandboxManagerService {
         started: bool,
     ) -> Result<(), Status> {
         upgrader.refuse_settled_for_attempt(upgrade)?;
-        if !started {
-            return Ok(());
-        }
         let operation_id = upgrade.operation_id;
         let attempt_id = &upgrade.attempt_id;
         let refused = crate::db::read::runtime_upgrade_refused_attempt(
@@ -217,6 +214,11 @@ impl crate::service::SandboxManagerService {
         .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?;
         match refused {
             None => Ok(()),
+            // Recorded only for a started target, so this attempt asking for
+            // another is another request, as the operation's records said
+            // while the sandbox's row stood; the refused activation outlives
+            // them.
+            Some(_) if !started => Err(upgrade.names_another()),
             Some(refused) => Err(Status::failed_precondition(format!(
                 "runtime upgrade {operation_id} reached its target but refused attempt \
                  {attempt_id}'s activation: {}; only a new attempt retries it",
@@ -707,52 +709,77 @@ impl crate::service::SandboxManagerService {
             }
             abandoned_for => abandoned_for.is_some(),
         };
+        // An attempt's final outcome names its sandbox, and outlives the
+        // sandbox's row and the operation's report with it, as when another
+        // attempt's upgrade evicted a stale copy and staged the sandbox again.
+        // A caller naming another sandbox for that attempt is refused, as
+        // `UpgradeRuntime` refuses it, whether or not a report stands since.
+        let attempt_recorded = match attempt {
+            None => false,
+            Some(attempt) => {
+                match crate::db::read::runtime_upgrade_attempt_sandbox(&db, operation_id, attempt)
+                    .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?
+                {
+                    Some(recorded_for) if recorded_for != sandbox_id => {
+                        return Err(Status::invalid_argument(format!(
+                            "runtime upgrade {operation_id} names another sandbox"
+                        )));
+                    }
+                    recorded_for => recorded_for.is_some(),
+                }
+            }
+        };
         let Some(report) = report else {
-            return Ok(GetRuntimeUpgradeResponse {
-                status: Wire::Absent as i32,
-                abandoned,
-                ..Default::default()
-            });
+            // The attempt's retries are still refused from its kept outcome,
+            // so a caller waiting on that attempt gets it too: its rollback or
+            // refusal as the status, or its refused activation through
+            // `refused_attempt_id`, with the operation's report gone.
+            return match attempt {
+                Some(attempt) if attempt_recorded => {
+                    match settled_attempt_answer(&db, operation_id, attempt, abandoned)? {
+                        Some(answer) => Ok(answer),
+                        None => absent_for_attempt(&db, operation_id, attempt, abandoned),
+                    }
+                }
+                _ => Ok(GetRuntimeUpgradeResponse {
+                    status: Wire::Absent as i32,
+                    abandoned,
+                    ..Default::default()
+                }),
+            };
         };
         if report.sandbox_id != sandbox_id {
             return Err(Status::invalid_argument(format!(
                 "runtime upgrade {operation_id} names another sandbox"
             )));
         }
+        // Only a report that reached the target carries a refused activation:
+        // one kept from before the sandbox's row was deleted says nothing of
+        // a later attempt's report that hasn't.
+        let reached = matches!(
+            report.status,
+            RuntimeUpgradeStatus::Upgraded | RuntimeUpgradeStatus::AlreadyOnTarget { .. }
+        );
         // A caller waiting on an attempt gets that attempt's own answer, from
         // its own rows, so a later attempt never changes it.
         if let Some(attempt) = attempt {
-            let settled =
-                crate::db::read::runtime_upgrade_attempt_outcome(&db, operation_id, attempt)
-                    .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?;
-            let status = settled.as_ref().and_then(|settled| match settled.outcome {
-                crate::db::RecordedRuntimeUpgradeOutcome::RolledBack => Some(Wire::RolledBack),
-                crate::db::RecordedRuntimeUpgradeOutcome::Refused => Some(Wire::Refused),
-                crate::db::RecordedRuntimeUpgradeOutcome::AlreadyOnTarget => None,
-            });
-            if let (Some(status), Some(settled)) = (status, settled) {
-                return Ok(GetRuntimeUpgradeResponse {
-                    status: status as i32,
-                    failure: settled.failure,
-                    attempt_id: Some(attempt.to_owned()),
-                    abandoned,
-                    ..Default::default()
-                });
+            if let Some(answer) = settled_attempt_answer(&db, operation_id, attempt, abandoned)? {
+                return Ok(answer);
             }
             // Another attempt's rollback or refusal says nothing about this
             // one. This attempt's own is reported below even before its
             // history is written: a rollback whose disk discard failed stays on
-            // the live row until a retry or recovery finishes it.
-            if matches!(
+            // the live row until a retry or recovery finishes it. An activation
+            // is refused only once the operation reached its target, so this
+            // attempt's refused activation beside a report that hasn't was
+            // kept from before the sandbox's row was deleted: it still speaks
+            // for this attempt, and the report, a later attempt's, doesn't.
+            let others = matches!(
                 report.status,
                 RuntimeUpgradeStatus::RolledBack { .. } | RuntimeUpgradeStatus::Refused { .. }
-            ) && report.attempt_id.as_deref() != Some(attempt)
-            {
-                return Ok(GetRuntimeUpgradeResponse {
-                    status: Wire::Absent as i32,
-                    abandoned,
-                    ..Default::default()
-                });
+            ) && report.attempt_id.as_deref() != Some(attempt);
+            if others || (attempt_recorded && !reached) {
+                return absent_for_attempt(&db, operation_id, attempt, abandoned);
             }
         }
         let refused_attempt = match attempt {
@@ -760,7 +787,7 @@ impl crate::service::SandboxManagerService {
                 crate::db::read::runtime_upgrade_refused_attempt(&db, operation_id, attempt)
                     .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?
             }
-            None => report.refused_attempt,
+            None => report.refused_attempt.filter(|_| reached),
         };
         drop(db);
         let (refused_attempt_id, refused_attempt_failure) = refused_attempt
@@ -828,4 +855,55 @@ fn refuse_moving(sandbox: &SandboxRow) -> Result<(), Status> {
         )));
     }
     Ok(())
+}
+
+/// ABSENT for a caller waiting on the attempt `attempt`, with that attempt's
+/// refused activation when one is recorded: no report of the operation
+/// speaks for it, but its activation's refusal stays final for it.
+fn absent_for_attempt(
+    db: &crate::db::Connection,
+    operation_id: crate::db::RuntimeUpgradeOperationId,
+    attempt: &str,
+    abandoned: bool,
+) -> Result<GetRuntimeUpgradeResponse, Status> {
+    let refused = crate::db::read::runtime_upgrade_refused_attempt(db, operation_id, attempt)
+        .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?;
+    let (refused_attempt_id, refused_attempt_failure) = refused
+        .map(|refused| (Some(refused.attempt_id), refused.failure))
+        .unwrap_or_default();
+    Ok(GetRuntimeUpgradeResponse {
+        status: crate::proto::RuntimeUpgradeStatus::Absent as i32,
+        abandoned,
+        refused_attempt_id,
+        refused_attempt_failure,
+        ..Default::default()
+    })
+}
+
+/// `attempt`'s own rollback or refusal under `operation_id`, as
+/// `GetRuntimeUpgrade` answers it, `None` when none is recorded for it.
+fn settled_attempt_answer(
+    db: &crate::db::Connection,
+    operation_id: crate::db::RuntimeUpgradeOperationId,
+    attempt: &str,
+    abandoned: bool,
+) -> Result<Option<GetRuntimeUpgradeResponse>, Status> {
+    use crate::proto::RuntimeUpgradeStatus as Wire;
+    let Some(settled) = crate::db::read::runtime_upgrade_attempt_outcome(db, operation_id, attempt)
+        .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?
+    else {
+        return Ok(None);
+    };
+    let status = match settled.outcome {
+        crate::db::RecordedRuntimeUpgradeOutcome::RolledBack => Wire::RolledBack,
+        crate::db::RecordedRuntimeUpgradeOutcome::Refused => Wire::Refused,
+        crate::db::RecordedRuntimeUpgradeOutcome::AlreadyOnTarget => return Ok(None),
+    };
+    Ok(Some(GetRuntimeUpgradeResponse {
+        status: status as i32,
+        failure: settled.failure,
+        attempt_id: Some(attempt.to_owned()),
+        abandoned,
+        ..Default::default()
+    }))
 }

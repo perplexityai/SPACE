@@ -1154,6 +1154,35 @@ db_private_outside_tests! {
 }
 
 db_private_outside_tests! {
+    /// The sandbox the attempt `attempt_id`'s final outcome under
+    /// `operation_id` was recorded for: its rollback or refusal, or its
+    /// activation refused after the operation reached its target. `None`
+    /// without one. Both rows outlive the sandbox's row; the operation's
+    /// report doesn't. An attempt holds at most one of them.
+    fn runtime_upgrade_attempt_sandbox(
+        conn: &Connection,
+        operation_id: RuntimeUpgradeOperationId,
+        attempt_id: &str,
+    ) -> Result<Option<String>> {
+        conn.query_row(
+            "SELECT sandbox_id
+               FROM sandbox_runtime_upgrade_attempt_outcomes
+              WHERE operation_id = ?1
+                AND attempt_id = ?2
+             UNION ALL
+             SELECT sandbox_id
+               FROM sandbox_runtime_upgrade_refused_attempts
+              WHERE operation_id = ?1
+                AND attempt_id = ?2
+             LIMIT 1",
+            params![operation_id.to_string(), attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+}
+
+db_private_outside_tests! {
     /// What the operation a recorded outcome belongs to asked for, `None`
     /// without a recorded outcome.
     fn recorded_runtime_upgrade_request(
@@ -1263,10 +1292,10 @@ db_private_outside_tests! {
 }
 
 /// The latest attempt the operation refused after reaching its target,
-/// `None` without one. A row is never rewritten, and is deleted only
-/// with its sandbox, which takes every row of the operation with it, so the
-/// newest rowid is the latest recorded, however coarse or unsteady the clock
-/// that stamped `recorded_at`.
+/// `None` without one. A row is never rewritten or deleted, and the migration
+/// that rebuilt the table copied its rows in rowid order (`ORDER BY rowid`),
+/// so the newest rowid is the latest recorded, however coarse or unsteady the
+/// clock that stamped `recorded_at`.
 fn latest_refused_attempt(
     conn: &Connection,
     operation_id: RuntimeUpgradeOperationId,
