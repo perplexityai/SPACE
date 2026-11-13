@@ -291,3 +291,28 @@ binding. Compiled environment artifacts remain protected across restarts and
 deployment-mode changes; stopping benchmark submissions does not retire them.
 These measurements qualify cold boot and stop/start. Memory-state operations,
 production placement, and other VMMs require their own qualification.
+
+## Create-to-usable benchmark
+
+`bench-sbx-create-to-usable.py` measures, through the public API only, how long
+a sandbox takes to run its first guest command: once after a cold create and
+once after a wake from suspend. Runs are sequential, one sandbox at a time, and
+every sandbox is deleted after its run. Unlike the other scripts here it does not
+run on a worker; any host that reaches the management API and the data plane
+can run it, including a Kind devbox:
+
+```bash
+python3 scripts/benchmarks/bench-sbx-create-to-usable.py \
+  --token-file "$TOKEN_FILE" --runs 10 --output-dir /tmp/create-to-usable
+```
+
+`--api-url` and `--data-plane-url` default to `$SPACE_API_URL` and
+`$SPACE_DATA_PLANE_URL`, then to the Kind ports. Each row of `results.jsonl`
+records `cold_op_ms` and `warm_op_ms` (the create or wake operation) and
+`cold_usable_ms` and `warm_usable_ms` (until `true` exits 0 in the guest,
+probed every `--poll-secs`). `summary.json` holds p50/p95 per metric and the
+sandboxes the API still finds. The script exits non-zero when a run fails or a
+sandbox is left behind.
+
+To compare two revisions, alternate them in blocks on the same cluster rather
+than measuring one after the other.
