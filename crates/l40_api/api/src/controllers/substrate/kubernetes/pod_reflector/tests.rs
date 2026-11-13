@@ -48,7 +48,7 @@ fn slot_pod(name: &str, node: &str, slots: u64) -> Pod {
                 "name": "sandbox",
                 "resources": {
                     "requests": {
-                        pplx_space_common_core::kubernetes::SANDBOX_NETWORK_SLOTS_RESOURCE:
+                        pplx_space_sandbox_pod::SANDBOX_NETWORK_SLOTS_RESOURCE:
                             slots.to_string()
                     }
                 }

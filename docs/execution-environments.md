@@ -1589,7 +1589,7 @@ doesn't render it yet.
   the target environment, the authorization's id, reason and memory-loss
   consent, the target state (`started` or `stopped`), and for a suspended
   source the local artifact of the checkpoint the upgrade was decided from
-  (`PodRuntimeUpgrade` in `crates/libs/common/core/src/k8s/runtime_upgrade.rs`).
+  (`PodRuntimeUpgrade` in `crates/l40_api/sandbox/pod/src/runtime_upgrade.rs`).
   The restore's storage URI and source node stay where they are.
 - **Shim.** The shim builds the `Start` it would send, with the pod's
   namespace and route identity, as the blocking cold start the upgrade boots,

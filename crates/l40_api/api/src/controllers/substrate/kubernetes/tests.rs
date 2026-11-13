@@ -68,12 +68,6 @@ mod kubernetes_tests {
         ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV,
         ed25519::SpaceApiRouteEd25519Authority,
     };
-    use pplx_space_common_core::kubernetes::{
-        NodeGroupPlacement, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION,
-        SANDBOX_NETWORK_SLOTS_RESOURCE, SANDBOX_NODE_GROUP_LABEL,
-        SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
-        SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
-    };
     use pplx_space_common_core::sql;
     use pplx_space_common_core::types::{
         ArtifactKind, ArtifactOrigin, ExecutionGeneration, NodeAddress, NodeGroup, NodeGroupName,
@@ -89,6 +83,12 @@ mod kubernetes_tests {
     };
     use pplx_space_node_api_client::proto::worker_api_server::WorkerApiServer;
     use pplx_space_node_api_sim::{SimState, SimWorkerApiService, SimWorkerHarness};
+    use pplx_space_sandbox_pod::{
+        NodeGroupPlacement, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION,
+        SANDBOX_NETWORK_SLOTS_RESOURCE, SANDBOX_NODE_GROUP_LABEL,
+        SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
+        SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
+    };
     use pplx_space_sbx_mgr_client::{
         operations as spaced_ops,
         proto::{SpacedStartProcessRequest, spaced_process_event},
@@ -694,8 +694,8 @@ mod kubernetes_tests {
         let config = SandboxPodConfigValues::default();
         let mut blocked_labels = config.base_node_selector().into_labels();
         blocked_labels.insert(
-            pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_LABEL.to_string(),
-            pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_VALUE.to_string(),
+            pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_LABEL.to_string(),
+            pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_VALUE.to_string(),
         );
         let mut wrong_selector = config.base_node_selector().into_labels();
         wrong_selector.insert(
@@ -7483,7 +7483,7 @@ mod kubernetes_tests {
                     .annotations
                     .as_ref()
                     .unwrap()
-                    .get(pplx_space_common_core::kubernetes::SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION)
+                    .get(pplx_space_sandbox_pod::SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION)
                     .map(String::as_str),
                 Some(seeded_generation),
                 "{label}"
@@ -7583,9 +7583,11 @@ mod kubernetes_tests {
             );
             let pod = build_sandbox_pod(&sandbox_pod_config(&substrate.k8s), request);
             assert_eq!(
-                pod.metadata.annotations.as_ref().unwrap().get(
-                    pplx_space_common_core::kubernetes::SANDBOX_ACTIVATION_ATTEMPT_ID_ANNOTATION
-                ),
+                pod.metadata
+                    .annotations
+                    .as_ref()
+                    .unwrap()
+                    .get(pplx_space_sandbox_pod::SANDBOX_ACTIVATION_ATTEMPT_ID_ANNOTATION),
                 Some(&route.to_string()),
                 "{label}: shim bootstrap must install the published route, not the operation lease"
             );
@@ -9002,7 +9004,7 @@ mod kubernetes_tests {
                 "namespace": "space",
                 "uid": "lingering-pod-uid",
                 "annotations": {
-                    pplx_space_common_core::kubernetes::SANDBOX_ID_ANNOTATION: sandbox_id.to_string(),
+                    pplx_space_sandbox_pod::SANDBOX_ID_ANNOTATION: sandbox_id.to_string(),
                     SANDBOX_EXECUTION_GENERATION_ANNOTATION: "1"
                 }
             },
@@ -9520,11 +9522,11 @@ mod kubernetes_tests {
         let mut labels = config.base_node_selector().into_labels();
         if let Some(ready) = services_ready {
             labels.insert(
-                pplx_space_common_core::kubernetes::NODE_SERVICES_READY_LABEL.to_string(),
+                pplx_space_sandbox_pod::NODE_SERVICES_READY_LABEL.to_string(),
                 if ready {
-                    pplx_space_common_core::kubernetes::NODE_SERVICES_READY_VALUE
+                    pplx_space_sandbox_pod::NODE_SERVICES_READY_VALUE
                 } else {
-                    pplx_space_common_core::kubernetes::NODE_SERVICES_NOT_READY_VALUE
+                    pplx_space_sandbox_pod::NODE_SERVICES_NOT_READY_VALUE
                 }
                 .to_string(),
             );
@@ -9823,11 +9825,11 @@ mod kubernetes_tests {
         }
         if let Some(ready) = services_ready {
             labels.insert(
-                pplx_space_common_core::kubernetes::NODE_SERVICES_READY_LABEL.to_string(),
+                pplx_space_sandbox_pod::NODE_SERVICES_READY_LABEL.to_string(),
                 if ready {
-                    pplx_space_common_core::kubernetes::NODE_SERVICES_READY_VALUE
+                    pplx_space_sandbox_pod::NODE_SERVICES_READY_VALUE
                 } else {
-                    pplx_space_common_core::kubernetes::NODE_SERVICES_NOT_READY_VALUE
+                    pplx_space_sandbox_pod::NODE_SERVICES_NOT_READY_VALUE
                 }
                 .to_string(),
             );
@@ -9929,8 +9931,8 @@ mod kubernetes_tests {
         // spare capacity the scheduler can't actually use.
         let mut blocked_labels = config.base_node_selector().into_labels();
         blocked_labels.insert(
-            pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_LABEL.to_string(),
-            pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_VALUE.to_string(),
+            pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_LABEL.to_string(),
+            pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_VALUE.to_string(),
         );
         let blocked =
             node_with_network_slots("blocked", blocked_labels, Some(8), None, true, false);
@@ -12347,9 +12349,7 @@ mod kubernetes_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn claiming_a_warm_slot_requires_its_node_to_publish_the_environment()
     -> Result<(), BoxError> {
-        use pplx_space_common_core::kubernetes::{
-            ENVIRONMENT_USABLE_LABEL_VALUE, environment_label_key,
-        };
+        use pplx_space_sandbox_pod::{ENVIRONMENT_USABLE_LABEL_VALUE, environment_label_key};
         const E0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
         let label = |environment: &str| {
@@ -12449,9 +12449,7 @@ mod kubernetes_tests {
     async fn adopting_an_admitted_warm_slot_requires_its_node_to_publish_the_environment()
     -> Result<(), BoxError> {
         use crate::controllers::substrate::{AdmittedPoolClaim, AdmittedPoolClaimLookup};
-        use pplx_space_common_core::kubernetes::{
-            ENVIRONMENT_USABLE_LABEL_VALUE, environment_label_key,
-        };
+        use pplx_space_sandbox_pod::{ENVIRONMENT_USABLE_LABEL_VALUE, environment_label_key};
         const E0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
         for (node_publishes, adopted) in [(E0, false), (E1, true)] {

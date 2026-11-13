@@ -46,10 +46,8 @@ pub(in crate::controllers::substrate::kubernetes) fn node_not_placement_blocked(
     node.metadata
         .labels
         .as_ref()
-        .and_then(|labels| {
-            labels.get(pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_LABEL)
-        })
-        .map(|value| value != pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_VALUE)
+        .and_then(|labels| labels.get(pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_LABEL))
+        .map(|value| value != pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_VALUE)
         .unwrap_or(true)
 }
 
@@ -64,12 +62,8 @@ pub(in crate::controllers::substrate::kubernetes) fn node_services_not_ready(nod
     node.metadata
         .labels
         .as_ref()
-        .and_then(|labels| {
-            labels.get(pplx_space_common_core::kubernetes::NODE_SERVICES_READY_LABEL)
-        })
-        .is_some_and(|value| {
-            value == pplx_space_common_core::kubernetes::NODE_SERVICES_NOT_READY_VALUE
-        })
+        .and_then(|labels| labels.get(pplx_space_sandbox_pod::NODE_SERVICES_READY_LABEL))
+        .is_some_and(|value| value == pplx_space_sandbox_pod::NODE_SERVICES_NOT_READY_VALUE)
 }
 
 fn node_network_slot_capacity(node: &Node) -> Option<u64> {
@@ -77,9 +71,7 @@ fn node_network_slot_capacity(node: &Node) -> Option<u64> {
     let advertised = status
         .capacity
         .as_ref()
-        .and_then(|capacity| {
-            capacity.get(pplx_space_common_core::kubernetes::SANDBOX_NETWORK_SLOTS_RESOURCE)
-        })
+        .and_then(|capacity| capacity.get(pplx_space_sandbox_pod::SANDBOX_NETWORK_SLOTS_RESOURCE))
         .and_then(quantity_as_u64)?;
     if advertised == 0 {
         return None;
@@ -89,7 +81,7 @@ fn node_network_slot_capacity(node: &Node) -> Option<u64> {
         .allocatable
         .as_ref()
         .and_then(|allocatable| {
-            allocatable.get(pplx_space_common_core::kubernetes::SANDBOX_NETWORK_SLOTS_RESOURCE)
+            allocatable.get(pplx_space_sandbox_pod::SANDBOX_NETWORK_SLOTS_RESOURCE)
         })
         .and_then(quantity_as_u64)
         .or(Some(advertised))

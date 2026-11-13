@@ -1,5 +1,5 @@
 use kube::runtime::reflector::ObjectRef;
-use pplx_space_common_core::kubernetes::SANDBOX_PROCESS_ENV_ANNOTATION;
+use pplx_space_sandbox_pod::SANDBOX_PROCESS_ENV_ANNOTATION;
 
 use super::*;
 
@@ -421,7 +421,7 @@ fn an_overflowing_slot_request_saturates_without_corrupting_the_node_total() {
 /// alone, as in shadow, or a preferred term doesn't count.
 #[test]
 fn view_reads_whether_a_pod_requires_its_environment_label() {
-    let environment_key = pplx_space_common_core::kubernetes::environment_label_key(
+    let environment_key = pplx_space_sandbox_pod::environment_label_key(
         &format!("sha256:{}", "1".repeat(64))
             .parse()
             .expect("valid reference"),

@@ -9926,11 +9926,11 @@ async fn retired_pool_reserved_generation_moves_cold_create_past_the_pool_pod() 
     assert_eq!(claim.row.generation, 2);
     assert_eq!(
         claim.row.pod_name,
-        pplx_space_common_core::kubernetes::sandbox_pod_name(sandbox_id, 2)
+        pplx_space_sandbox_pod::sandbox_pod_name(sandbox_id, 2)
     );
     assert_ne!(
         claim.row.pod_name,
-        pplx_space_common_core::kubernetes::sandbox_pod_name(sandbox_id, 1)
+        pplx_space_sandbox_pod::sandbox_pod_name(sandbox_id, 1)
     );
 
     // Once the sandbox has executions, retiring is a no-op.
@@ -9968,7 +9968,7 @@ async fn retired_pool_reserved_generation_moves_cold_create_past_the_pool_pod() 
     assert_eq!(next.row.generation, 3);
     assert_eq!(
         next.row.pod_name,
-        pplx_space_common_core::kubernetes::sandbox_pod_name(sandbox_id, 3)
+        pplx_space_sandbox_pod::sandbox_pod_name(sandbox_id, 3)
     );
     Ok(())
 }

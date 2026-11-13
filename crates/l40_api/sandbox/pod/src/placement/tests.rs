@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use super::*;
-use crate::types::{
+use pplx_space_common_core::types::{
     NodeGroupId, NodeGroupPolicy, NodeGroupTemplatePolicy, TemplateCompatSpec, TemplateName,
     TemplateVisibility,
 };

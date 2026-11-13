@@ -42,11 +42,11 @@ use std::str::FromStr;
 use crate::metrics::environment_placement::EnvironmentPlacementPath;
 use pplx_space_common_core::env::Environment;
 #[cfg(feature = "kubernetes")]
-use pplx_space_common_core::kubernetes::PodEnvironment;
-#[cfg(feature = "kubernetes")]
 use pplx_space_common_core::types::EnvironmentReference;
 use pplx_space_common_core::types::NodeId;
 use pplx_space_node_status_store::EnvironmentRefusal;
+#[cfg(feature = "kubernetes")]
+use pplx_space_sandbox_pod::PodEnvironment;
 use sqlx::PgPool;
 
 #[cfg(test)]

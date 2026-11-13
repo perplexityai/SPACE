@@ -127,7 +127,7 @@ For new work:
 
 ## Tests
 
-Kubernetes pod rendering is owned by `pplx_space_common_core::kubernetes`.
+Kubernetes pod rendering is owned by `pplx_space_sandbox_pod`.
 Keep broad, human-readable golden snapshots for the shared pod shapes there
 rather than in controller-specific tests, so reviewers can compare on-demand,
 restore, and pooled manifests in one place.

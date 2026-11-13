@@ -14,9 +14,7 @@ use std::sync::{
 
 use k8s_openapi::api::core::v1::PodStatus;
 use kube::error::Status;
-use pplx_space_common_core::kubernetes::{
-    SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION,
-};
+use pplx_space_sandbox_pod::{SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION};
 
 use super::*;
 
@@ -739,7 +737,7 @@ mod stopped_restore_plan_tests {
                 "namespace": "space",
                 "uid": "lingering-pod-uid",
                 "annotations": {
-                    pplx_space_common_core::kubernetes::SANDBOX_ID_ANNOTATION: sandbox_id.to_string(),
+                    pplx_space_sandbox_pod::SANDBOX_ID_ANNOTATION: sandbox_id.to_string(),
                     SANDBOX_EXECUTION_GENERATION_ANNOTATION: "1"
                 }
             },

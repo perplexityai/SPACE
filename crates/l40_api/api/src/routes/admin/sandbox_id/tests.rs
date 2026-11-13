@@ -40,7 +40,7 @@ fn every_accepted_form_names_the_same_sandbox() {
 #[cfg(feature = "kubernetes")]
 #[test]
 fn the_pod_builder_names_resolve() {
-    use pplx_space_common_core::kubernetes::sandbox_pod_name;
+    use pplx_space_sandbox_pod::sandbox_pod_name;
 
     for generation in [0, 1, i64::MAX] {
         let name = sandbox_pod_name(sandbox(), generation);

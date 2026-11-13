@@ -178,10 +178,7 @@ impl KubernetesSubstrate {
             return Ok(PooledPodEnvironment::Unknown);
         };
         let published = node.metadata.labels.as_ref().is_some_and(|labels| {
-            pplx_space_common_core::kubernetes::node_publishes_environment(
-                labels,
-                &environment.reference,
-            )
+            pplx_space_sandbox_pod::node_publishes_environment(labels, &environment.reference)
         });
         Ok(if published {
             PooledPodEnvironment::Admitted
@@ -524,7 +521,7 @@ impl KubernetesSubstrate {
         client_id: Option<&pplx_space_common_core::types::ClientId>,
     ) -> AdoptionLabelWrite {
         use kube::api::{Patch, PatchParams};
-        use pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL;
+        use pplx_space_sandbox_pod::SANDBOX_CLIENT_ID_LABEL;
 
         let pods: Api<Pod> = Api::namespaced(self.k8s.client.clone(), &self.k8s.sandbox_namespace);
         // A merge patch removes a label whose value is `null`.

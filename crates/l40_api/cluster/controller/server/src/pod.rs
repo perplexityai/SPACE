@@ -3,11 +3,11 @@ use pplx_space_common_core::types::SandboxId;
 use k8s_openapi::api::core::v1::Pod;
 use pplx_space_api::controllers::substrate::kubernetes::SandboxPodView;
 use pplx_space_cluster_pool::PoolSlot;
-use pplx_space_common_core::kubernetes::{
+use pplx_space_common_core::types::SandboxActivationAttemptId;
+use pplx_space_sandbox_pod::{
     NodeGroupPlacement, PodEnvironment, SandboxPodCommon, SandboxPodConfigValues,
     SandboxPodRequest, SandboxPoolPodMetadata, build_sandbox_pod, sandbox_pod_name,
 };
-use pplx_space_common_core::types::SandboxActivationAttemptId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyPodMetadata {

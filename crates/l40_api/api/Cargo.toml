@@ -22,7 +22,7 @@ kubernetes = [
     "dep:kube",
     "dep:k8s-openapi",
     "dep:pplx-space-work-coalescer",
-    "pplx-space-common-core/kubernetes",
+    "dep:pplx-space-sandbox-pod",
     "dep:pplx-space-kube-client",
     "pplx-space-rpc-auth/k8s",
 ]
@@ -94,6 +94,7 @@ pplx-space-http-server = { workspace = true }
 pplx-space-ingress-admission = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
+pplx-space-sandbox-pod = { workspace = true, optional = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-registration-store = { workspace = true }
