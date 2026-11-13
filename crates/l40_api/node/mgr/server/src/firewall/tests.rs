@@ -182,7 +182,7 @@ fn namespace_rules_json_matches_expected_shape() {
         "vpeer-000000",
         "10.12.128.2",
         "169.254.0.21",
-        &pre_tproxy_guardrail_rules,
+        pre_tproxy_guardrail_rules,
     );
     let actual: serde_json::Value = serde_json::from_str(&json).unwrap();
     let expected: serde_json::Value =
@@ -261,7 +261,7 @@ fn namespace_source_guard_precedes_established_conntrack_bypass() {
         "vpeer-000000",
         "10.12.128.2",
         guest_ip,
-        &packaged_pre_tproxy_guardrails_policy(),
+        packaged_pre_tproxy_guardrails_policy(),
     );
     let rendered: serde_json::Value = serde_json::from_str(&json).unwrap();
     let rules = rendered["nftables"]
@@ -328,7 +328,7 @@ fn namespace_postrouting_snat_matches_gateway_outbound_mark() {
         "vpeer-000000",
         "10.12.128.2",
         "169.254.0.21",
-        &pre_tproxy_guardrail_rules,
+        pre_tproxy_guardrail_rules,
     );
     let rules: serde_json::Value = serde_json::from_str(&json).unwrap();
     let actual = rules["nftables"]
@@ -445,11 +445,9 @@ fn namespace_source_guard_validator_rejects_ineffective_rules() {
     }
 }
 
-// The fixture is verbatim `nft -j list chain ip sandbox pre_tproxy_guardrails`
-// output, captured after applying fixtures/namespace_rules.json — the same two
-// argvs apply_nft_json and nft_chain_json use. Every other firewall fixture is
-// hand-authored in nft's *input* shape, so a validator that reads rules back
-// was untestable: nft rewrites `"op": "in"` to `"op": "=="` for set membership.
+// Captured `nft -j list chain ip sandbox pre_tproxy_guardrails` output checks
+// readback rather than input syntax: nft rewrites `"op": "in"` to `"op": "=="`
+// for set membership.
 #[test]
 fn namespace_source_guard_validator_accepts_live_nft_chain_output() {
     let chain: serde_json::Value = serde_json::from_str(include_str!(
@@ -499,10 +497,10 @@ fn sandbox_forward_drop_validator_rejects_missing_guest_egress_drop_rule() {
     );
 }
 
-fn packaged_pre_tproxy_guardrails_policy() -> String {
+/// The image's packaged pre-TPROXY policy as the tests install it.
+pub(crate) fn packaged_pre_tproxy_guardrails_policy() -> &'static str {
     include_str!("../../../../../../../docker/space/nftables/sandbox-pre-tproxy-guardrails.json")
         .trim_end()
-        .to_string()
 }
 
 #[test]
