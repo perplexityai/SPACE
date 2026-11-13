@@ -191,6 +191,10 @@ def main() -> int:
             if interrupted:
                 print("interrupted; checking for leftovers", file=sys.stderr)
                 break
+            if row.get("deleted") is False:
+                # Another create could pile up live sandboxes and skew later samples.
+                print("delete not confirmed; stopping before the next sample", file=sys.stderr)
+                break
 
     summary = summarize(rows, *leftovers(api, rows))
     summary["interrupted"] = interrupted

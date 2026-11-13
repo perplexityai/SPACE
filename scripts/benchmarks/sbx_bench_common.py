@@ -7,6 +7,7 @@ import argparse
 import base64
 import concurrent.futures
 import dataclasses
+import http.client
 import ipaddress
 import json
 import math
@@ -605,7 +606,7 @@ class SpaceApi:
             with error:
                 detail = error.read(2048).decode("utf-8", errors="replace")
             raise ApiError(f"{method} {path}: HTTP {error.code}: {detail}", error.code) from error
-        except (urllib.error.URLError, OSError) as error:
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
             raise ApiError(f"{method} {path}: {error}") from error
         if not raw.strip():
             return {}
@@ -781,7 +782,7 @@ class SpaceApi:
             with error:
                 detail = error.read(2048).decode("utf-8", errors="replace")
             raise ApiError(f"events: HTTP {error.code}: {detail}") from error
-        except (urllib.error.URLError, OSError) as error:
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
             raise ApiError(f"events: {error}") from error
         out = b"".join(chunks).decode("utf-8", errors="replace")
         return (125 if exit_code is None else exit_code), out
