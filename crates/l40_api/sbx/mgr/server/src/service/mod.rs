@@ -34,8 +34,10 @@ use pplx_space_node_mgr_client::proto::{
     PrepareSandboxArtifactDirRequest, PrepareSandboxRequest, ReleaseRequest, RestoreVmStateRequest,
     ResumeSandboxRequest, StopProcessRequest, SyncGuestRequest,
 };
-use pplx_space_spaced_common::proto::host_control::host_control_server::HostControl;
-use pplx_space_spaced_common::proto::host_control::{
+use pplx_space_spaced_guest_protocol::{validate_duration, validate_optional_reason};
+use pplx_space_spaced_host_client::proto as host_proto;
+use pplx_space_spaced_protocol::proto::host_control::host_control_server::HostControl;
+use pplx_space_spaced_protocol::proto::host_control::{
     ActiveForAccepted as HostControlActiveForAccepted, ActivityState as HostControlActivityState,
     Denied as HostControlDenied, GetNetworkPolicyRequest as HostControlGetNetworkPolicyRequest,
     GetNetworkPolicyResponse as HostControlGetNetworkPolicyResponse,
@@ -49,8 +51,6 @@ use pplx_space_spaced_common::proto::host_control::{
     request_active_for_response::Outcome as HostControlActiveForOutcome,
     request_shutdown_response::Outcome as HostControlShutdownOutcome,
 };
-use pplx_space_spaced_common::{validate_duration, validate_optional_reason};
-use pplx_space_spaced_host_client::proto as host_proto;
 use pplx_space_state_reconciliation::{ApplyDecisionKind, FACET_NETWORK_POLICY};
 use pplx_space_template_cache_permissions::{
     normalize_template_cache_tree as normalize_template_cache_tree_io,

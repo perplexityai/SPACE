@@ -18,7 +18,7 @@ impl SpacedHostClient {
         wait_timeout: Option<std::time::Duration>,
     ) -> Result<proto::OpenLoopbackBridgeResponse, tonic::Status> {
         let wait_timeout_proto = wait_timeout
-            .map(pplx_space_spaced_common::duration_to_proto)
+            .map(pplx_space_spaced_guest_protocol::duration_to_proto)
             .transpose()?;
         let mut client = self.networking.clone();
         client

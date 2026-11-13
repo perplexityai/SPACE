@@ -28,7 +28,7 @@ use pplx_space_host_layout::{
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::{DEFAULT_DRAIN_TIMEOUT, DEFAULT_SERVICE_MUTEX_TIMEOUT};
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
-use pplx_space_spaced_common::proto::host_control::host_control_server::HostControlServer;
+use pplx_space_spaced_protocol::proto::host_control::host_control_server::HostControlServer;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;

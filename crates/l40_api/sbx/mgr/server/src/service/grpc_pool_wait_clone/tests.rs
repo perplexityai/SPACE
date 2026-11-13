@@ -122,8 +122,8 @@ async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
         let template = tempfile::tempdir().unwrap();
         std::fs::write(template.path().join("metadata.json"), serde_json::json!({
             "arch": std::env::consts::ARCH,
-            "spaced_version": pplx_space_spaced_common::spaced_version(),
-            "spaced_compatibility_family": pplx_space_spaced_common::spaced_compatibility_family(),
+            "spaced_version": pplx_space_spaced_protocol::spaced_version(),
+            "spaced_compatibility_family": pplx_space_spaced_guest_protocol::spaced_compatibility_family(),
         }).to_string()).unwrap();
         let directory = template.path().to_str().unwrap().to_string();
         service.template_resolver = Arc::new(FakeTemplateResolver::new(move || {

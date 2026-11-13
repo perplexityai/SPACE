@@ -162,7 +162,7 @@ async fn replaying_an_armed_receipt_still_requests_systemd_restart() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn transfer_error_after_complete_payload_does_not_publish_staged_authority() {
-    use pplx_space_spaced_common::proto::bridge_guest::{
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
         guest_update_client::GuestUpdateClient, guest_update_server::GuestUpdateServer,
     };
     if !pplx_space_test_env::root_or_skip("inspect slot references before staging") {

@@ -1,3 +1,5 @@
+use pplx_space_spaced_guest_protocol::BRIDGE_GUEST_VSOCK_PORT;
+
 use super::*;
 
 #[tokio::test]

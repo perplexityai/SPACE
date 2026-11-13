@@ -68,7 +68,8 @@ impl SpacedHostClient {
         &self,
         reason: ResumeReason,
     ) -> Result<proto::NotifyResumeResponse, tonic::Status> {
-        let now = pplx_space_spaced_common::system_time_to_proto(std::time::SystemTime::now())?;
+        let now =
+            pplx_space_spaced_guest_protocol::system_time_to_proto(std::time::SystemTime::now())?;
         self.call_meta_once("notify_resume", |mut client| async move {
             client
                 .notify_resume(NotifyResumeRequest {

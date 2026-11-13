@@ -61,6 +61,9 @@ assert_needed true crates/l40_api/internal/api/server/src/template_builds.rs
 assert_needed true shim/telemetry_export.go
 assert_needed true docs/unrelated.md crates/l40_api/template/mgr/server/src/volume.rs
 assert_needed true .github/workflows/pull-ci.yml
+# The spaced transport and protocol crates run in every sandbox.
+assert_needed true crates/l40_api/spaced/client/src/retry_policy.rs
+assert_needed true crates/l20_domain/spaced/protocol/src/lib.rs
 assert_needed false crates/l40_api/internal/api/server/src/template_x/nested.rs
 assert_needed false shim/telemetry/nested.go
 assert_needed false scripts/tests/smoke-kind-x/nested.sh

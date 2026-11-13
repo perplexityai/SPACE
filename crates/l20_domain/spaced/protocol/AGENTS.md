@@ -1,4 +1,4 @@
-# `pplx-space-spaced-common`
+# `pplx-space-spaced-protocol`
 
 A guest from an older release keeps running against newer hosts; the
 guest-compatibility section of `docs/versioning.md` is the policy.

@@ -8,9 +8,8 @@ representation. The daemon owns guest readiness, listeners, host communication,
 cgroup initialization and the overall shutdown deadline.
 
 The guest bridge and worker schemas live in `pplx-space-spaced-guest-protocol`.
-`spaced-common` re-exports those types for existing callers. This service is
-distinct from `execution/common`, which describes portable sandbox runtimes and
-execution metadata.
+This service is distinct from `execution/common`, which describes portable
+sandbox runtimes and execution metadata.
 
 ## Rust API compatibility
 

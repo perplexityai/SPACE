@@ -47,7 +47,7 @@ impl SpacedHostClient {
             None => IdempotencyKey::parse(uuid::Uuid::now_v7().to_string())
                 .map_err(invalid_argument_status)?,
         });
-        pplx_space_spaced_common::retry_status(
+        pplx_space_spaced_client::retry_status(
             "spaced host",
             "process_start",
             self.config.command_retry_policy,
@@ -98,7 +98,7 @@ impl SpacedHostClient {
             .map(ReadyTimeout::new)
             .transpose()
             .map_err(invalid_argument_status)?;
-        pplx_space_spaced_common::retry_status(
+        pplx_space_spaced_client::retry_status(
             "spaced host",
             "process_connect",
             self.config.command_retry_policy,
@@ -131,7 +131,7 @@ impl SpacedHostClient {
     ) -> Result<Vec<proto::ProcessInfo>, tonic::Status> {
         tokio::time::timeout(
             PROCESS_LIST_TIMEOUT,
-            pplx_space_spaced_common::retry_status(
+            pplx_space_spaced_client::retry_status(
                 "spaced host",
                 "process_list",
                 self.config.command_retry_policy,

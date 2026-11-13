@@ -8,7 +8,7 @@
 use uuid::Uuid;
 
 pub mod operations {
-    pub use pplx_space_spaced_common::proto::operations::*;
+    pub use pplx_space_spaced_guest_protocol::proto::operations::*;
 }
 
 #[allow(clippy::large_enum_variant)]

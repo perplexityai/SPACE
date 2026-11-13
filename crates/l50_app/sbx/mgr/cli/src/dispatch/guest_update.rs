@@ -78,16 +78,16 @@ pub(super) async fn handle(
                 operation_id: operation,
                 expected_execution_id: execution,
                 force: args.force,
-                promotion: Some(pplx_space_spaced_common::proto::update::Promotion {
+                promotion: Some(pplx_space_spaced_guest_protocol::proto::update::Promotion {
                     channel: p.channel,
                     target_version: p.target_version.to_string(),
                     guest_update_required_since: p.guest_update_required_since.to_string(),
                     intent: match p.intent {
                         pplx_space_spaced_update::policy::SelectionIntent::Upgrade => {
-                            pplx_space_spaced_common::proto::update::SelectionIntent::Upgrade
+                            pplx_space_spaced_guest_protocol::proto::update::SelectionIntent::Upgrade
                         }
                         pplx_space_spaced_update::policy::SelectionIntent::Rollback => {
-                            pplx_space_spaced_common::proto::update::SelectionIntent::Rollback
+                            pplx_space_spaced_guest_protocol::proto::update::SelectionIntent::Rollback
                         }
                     } as i32,
                     target_digest: p.target.to_string(),
@@ -119,7 +119,7 @@ fn display(result: GuestUpdateOperation, json: bool) {
             "version": guest.committed_version, "incarnation": guest.incarnation, "admission_held": guest.customer_admission_held,
             "committed_digest": guest.committed.as_ref().map(|value| &value.digest),
             "running_digest": guest.running.as_ref().map(|value| &value.digest),
-            "defer_reasons": guest.defer_reasons.iter().filter_map(|reason| pplx_space_spaced_common::proto::update::DeferReason::try_from(*reason).ok()).map(|reason| reason.as_str_name()).collect::<Vec<_>>(),
+            "defer_reasons": guest.defer_reasons.iter().filter_map(|reason| pplx_space_spaced_guest_protocol::proto::update::DeferReason::try_from(*reason).ok()).map(|reason| reason.as_str_name()).collect::<Vec<_>>(),
         }));
         println!(
             "{}",

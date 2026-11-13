@@ -59,7 +59,7 @@ pplx-space-page-cache = { workspace = true }
 pplx-space-policy-authority = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
-pplx-space-spaced-common = { workspace = true }
+pplx-space-spaced-guest-protocol = { workspace = true }
 pplx-space-template-manifest = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 

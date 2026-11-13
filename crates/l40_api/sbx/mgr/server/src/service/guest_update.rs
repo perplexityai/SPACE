@@ -7,7 +7,7 @@ use crate::db::guest_updates::{
 };
 use crate::service::cleanup_support::CleanupLockTryResult;
 use pplx_space_common_core::types::SandboxActivationAttemptId;
-use pplx_space_spaced_common::proto::update as wire;
+use pplx_space_spaced_guest_protocol::proto::update as wire;
 use pplx_space_spaced_host_client::RawSpacedHostGuestUpdateClient as Client;
 use pplx_space_spaced_update as model;
 
@@ -19,7 +19,7 @@ mod policy;
 // The candidate itself has only model::TRIAL_CONFIRMATION_WINDOW from
 // selection to commit. These larger bounds do not extend that trial or lifecycle clocks.
 const OPERATION_BUDGET: Duration = Duration::from_secs(420);
-use pplx_space_spaced_common::update::ACTIVATION_BUDGET;
+use pplx_space_spaced_guest_protocol::update::ACTIVATION_BUDGET;
 const LIFECYCLE_MARGIN: Duration = Duration::from_secs(30);
 const RPC_BUDGET: Duration = Duration::from_secs(5);
 
@@ -162,7 +162,7 @@ impl SandboxManagerService {
         self.authorize_peer(&req, "ApplyGuestUpdate", ALLOW_LOCAL_ARTIFACT_OPERATOR)?;
         let req = req.into_inner();
         let execution = parse_execution(&req.expected_execution_id)?;
-        pplx_space_spaced_common::update::HoldOwner::validate_operation(
+        pplx_space_spaced_guest_protocol::update::HoldOwner::validate_operation(
             uuid(&req.operation_id)?,
             uuid(&execution.to_string())?,
         )?;
@@ -218,7 +218,7 @@ impl SandboxManagerService {
         self.authorize_peer(&req, "RestartGuest", ALLOW_LOCAL_ARTIFACT_OPERATOR)?;
         let req = req.into_inner();
         let execution = parse_execution(&req.expected_execution_id)?;
-        pplx_space_spaced_common::update::HoldOwner::validate_operation(
+        pplx_space_spaced_guest_protocol::update::HoldOwner::validate_operation(
             uuid(&req.operation_id)?,
             uuid(&execution.to_string())?,
         )?;
@@ -1241,7 +1241,7 @@ async fn stage(
     // Allow the host's 150-second transfer/verification window to return its
     // result before the manager abandons the RPC. Ambiguous results reconcile.
     tokio::time::timeout(
-        pplx_space_spaced_common::update::STAGE_MANAGER_BUDGET,
+        pplx_space_spaced_guest_protocol::update::STAGE_MANAGER_BUDGET,
         transfer,
     )
     .await

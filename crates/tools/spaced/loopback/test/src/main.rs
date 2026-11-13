@@ -19,7 +19,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use pplx_space_spaced_common::proto::bridge_guest::LoopbackBridgeStatus;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::LoopbackBridgeStatus;
 use pplx_space_spaced_guest_server::loopback_diagnostic::LoopbackBridgeManager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

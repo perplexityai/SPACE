@@ -10,11 +10,11 @@ use arc_swap::ArcSwapOption;
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use jiff::Timestamp;
 use pplx_space_net_common::DomainName;
-use pplx_space_spaced_common::proto::host_control::{
+use pplx_space_spaced_client::{LazyClient, connect_uds_channel};
+use pplx_space_spaced_protocol::proto::host_control::{
     IssueGatewayIntermediateCertificateRequest, IssueGatewayIntermediateCertificateResponse,
     host_control_client::HostControlClient,
 };
-use pplx_space_spaced_common::{LazyClient, connect_uds_channel};
 use rcgen::{
     CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, PublicKeyData,
 };

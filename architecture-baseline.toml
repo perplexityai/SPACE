@@ -86,20 +86,10 @@ pplx-space-snapshot-retention = [
 [layers.direction]
 
 [layers.domain_dependencies]
-pplx-space-spaced-common = [
-  "hyper-util",
-  "tokio",
-  "tokio-stream",
-  "tokio-util",
-  "tokio-vsock",
-]
 
 [layers.model_protocol]
 pplx-space-common-core = [
   "pplx-space-rpc-contracts",
-]
-pplx-space-spaced-common = [
-  "pplx-space-spaced-guest-protocol",
 ]
 
 [layers.storage_access]
@@ -293,4 +283,3 @@ pplx-space-common-proto-build = "crates/l10_foundation/common/proto/build"
 pplx-space-execution-common = "crates/l20_domain/execution/common"
 pplx-space-net-common = "crates/l20_domain/net/common"
 pplx-space-node-runtime-core = "crates/l40_api/node/runtime/core"
-pplx-space-spaced-common = "crates/l20_domain/spaced/common"

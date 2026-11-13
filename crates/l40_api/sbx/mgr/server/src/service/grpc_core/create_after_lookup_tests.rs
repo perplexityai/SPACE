@@ -94,8 +94,8 @@ impl TemplateBuild {
             dir.path().join("metadata.json"),
             serde_json::json!({
                 "arch": std::env::consts::ARCH,
-                "spaced_version": pplx_space_spaced_common::spaced_version(),
-                "spaced_compatibility_family": pplx_space_spaced_common::spaced_compatibility_family(),
+                "spaced_version": pplx_space_spaced_protocol::spaced_version(),
+                "spaced_compatibility_family": pplx_space_spaced_guest_protocol::spaced_compatibility_family(),
             })
             .to_string(),
         )

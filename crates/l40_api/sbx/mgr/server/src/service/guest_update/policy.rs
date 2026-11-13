@@ -85,7 +85,7 @@ pub(super) async fn load(target: model::ArtifactDigest) -> Result<Bundle, Status
                 "promotion identity or compatibility ceiling rejected",
             ));
         }
-        pplx_space_spaced_common::validate_spaced_guest_compatibility(
+        pplx_space_spaced_protocol::validate_spaced_guest_compatibility(
             Some(&descriptor.version.to_string()),
             Some(&descriptor.compatibility_family),
         )
