@@ -24,6 +24,7 @@ tonic-prost = { workspace = true }
 # internal
 pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-template-runtime = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 
 [build-dependencies]

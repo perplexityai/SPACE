@@ -42,7 +42,6 @@ serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 sqlx = { workspace = true, features = ["postgres", "uuid"], optional = true }
 thiserror = { workspace = true }
-toml = { workspace = true, optional = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }
 
@@ -56,7 +55,6 @@ default = []
 archive = ["dep:aws-lc-rs"]
 kubernetes = ["dep:base64", "dep:k8s-openapi", "dep:sha2", "serde", "pplx-space-net-common/serde"]
 serde = [
-    "dep:toml",
     "dep:serde",
     "dep:serde_json",
     "pplx-space-byte-size/serde",

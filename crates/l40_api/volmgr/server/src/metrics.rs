@@ -33,7 +33,7 @@
 
 use std::time::Instant;
 
-use pplx_space_common_core::types::{MaterializationLayout, MaterializationMode};
+use crate::materialization::{MaterializationLayout, MaterializationMode};
 use pplx_space_metrics_emit::{counter, distribution, elapsed_ms, gauge, tag, timing_ms};
 
 #[derive(Clone, Copy)]

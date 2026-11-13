@@ -4,7 +4,7 @@ use crate::{
     recipe::{Origin, Recipe, Step},
     ssh::{SshError, SshSession},
 };
-use pplx_space_common_core::types::TemplateRuntime;
+use pplx_space_template_runtime::TemplateRuntime;
 
 mod render;
 use render::{Files, MAX_BUNDLE_BYTES};
