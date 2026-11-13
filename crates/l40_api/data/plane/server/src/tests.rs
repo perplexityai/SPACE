@@ -121,10 +121,11 @@ async fn unsupported_envd_method_returns_explicit_ecw_error() {
     );
 }
 
-/// Both proxy routes must reach the handler through the router. The subpath
-/// mount captures `session_id` and `path`; a scalar extractor rejects it with a
-/// 500 before authentication, so an unauthenticated request must surface the
-/// handler's 401 on every route shape.
+/// Every proxy route must reach the handler through the router, the service
+/// root `/proxy/` included. The subpath mount captures `session_id` and
+/// `path`; a scalar extractor rejects it with a 500 before authentication, so
+/// an unauthenticated request must surface the handler's 401 on every route
+/// shape.
 #[tokio::test]
 async fn proxy_session_routes_extract_path_parameters() {
     if !pplx_space_test_env::enter_test_process(&[(
@@ -136,20 +137,20 @@ async fn proxy_session_routes_extract_path_parameters() {
 
     let app = router(test_data_plane_state().await);
     let session_id = DataPlaneSessionId::Port(Default::default());
-    for path in [
-        format!("/v1/sessions/{session_id}/proxy"),
-        format!("/v1/sessions/{session_id}/proxy/api/v1/healthz"),
-        format!("/v1/sessions/{session_id}/proxy/assets/app.js?v=1"),
-    ] {
+    for route in ["", "/", "/?tab=1", "/api/v1/healthz", "/assets/app.js?v=1"] {
+        let path = format!("/v1/sessions/{session_id}/proxy{route}");
         let response = app
             .clone()
             .oneshot(Request::get(&path).body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "proxy{route}");
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
-        assert_eq!(body["message"], "data-plane token is required", "{path}");
+        assert_eq!(
+            body["message"], "data-plane token is required",
+            "proxy{route}"
+        );
     }
 }
 
