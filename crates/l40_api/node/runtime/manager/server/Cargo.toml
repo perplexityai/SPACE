@@ -46,7 +46,7 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true, features = ["rusqlite", "serde"] }
+pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-observability = { workspace = true }

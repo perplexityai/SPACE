@@ -4,8 +4,8 @@
 //! It is its own crate so that the job queue (`pplx-space-common-jobs`) can
 //! name a job without depending on `pplx-space-accounts` or
 //! `pplx-space-common-core`. The account identifiers in
-//! `pplx-space-accounts` are made with the same [`uuid_id!`] and
-//! [`sqlite_uuid!`] macros and share [`AuthIdParseError`].
+//! `pplx-space-accounts` are made with the same [`uuid_id!`] macro and share
+//! [`AuthIdParseError`].
 
 /// Error returned when an auth/account UUID cannot be parsed.
 ///
