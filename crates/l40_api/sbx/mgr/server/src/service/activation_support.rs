@@ -1701,8 +1701,10 @@ fn emit_guest_observed_specs(
     crate::metrics::sandbox::worker::guest_observed_specs(template, mem_total_bytes, vcpu_count);
 }
 
+const RESTORE_READY_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Check the restored guest against this host before publishing Started, with a
-/// 30s readiness budget followed by the existing 60s network budget. A paused
+/// 45s readiness budget followed by the existing 60s network budget. A paused
 /// restore cannot answer guest RPCs; its guest check runs on resident resume.
 pub(super) async fn complete_restore_and_mark_final(
     db: crate::db::SharedConnection,
@@ -1720,11 +1722,7 @@ pub(super) async fn complete_restore_and_mark_final(
         process_env,
         final_state,
         cleanup_id,
-        wait_ready_via_spaced_host(
-            sandbox_id,
-            Duration::from_secs(u64::from(DEFAULT_BLOCKING_READY_TIMEOUT_SECS)),
-            "restore",
-        ),
+        wait_ready_via_spaced_host(sandbox_id, RESTORE_READY_TIMEOUT, "restore"),
     ))
     .await
 }
