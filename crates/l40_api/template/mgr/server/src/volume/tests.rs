@@ -1490,3 +1490,172 @@ async fn pull_refuses_retryably_before_counting_a_row_mid_eviction() {
         "{outcome:?}"
     );
 }
+
+/// A fake node-manager `BtrfsCreateTemplateSubvolume`: answers with
+/// `failures` for its first calls, then "creates" the subvolume, marking it
+/// so a test can tell it from the pull's plain-directory fallback.
+struct FakeSubvolumeCreate {
+    dir: PathBuf,
+    failures: std::collections::VecDeque<crate::btrfs_via_nodemgr::BtrfsViaNodemgrError>,
+    calls: usize,
+}
+
+const FAKE_SUBVOLUME_MARKER: &str = ".fake-subvolume";
+
+impl FakeSubvolumeCreate {
+    fn new(
+        dir: PathBuf,
+        failures: impl IntoIterator<Item = crate::btrfs_via_nodemgr::BtrfsViaNodemgrError>,
+    ) -> Self {
+        Self {
+            dir,
+            failures: failures.into_iter().collect(),
+            calls: 0,
+        }
+    }
+
+    fn call(
+        &mut self,
+    ) -> impl std::future::Future<
+        Output = Result<PathBuf, crate::btrfs_via_nodemgr::BtrfsViaNodemgrError>,
+    > + use<> {
+        self.calls += 1;
+        let result = match self.failures.pop_front() {
+            Some(error) => Err(error),
+            None => {
+                std::fs::create_dir(&self.dir).unwrap();
+                std::fs::write(self.dir.join(FAKE_SUBVOLUME_MARKER), b"").unwrap();
+                Ok(self.dir.clone())
+            }
+        };
+        std::future::ready(result)
+    }
+}
+
+fn node_manager_unreachable() -> crate::btrfs_via_nodemgr::BtrfsViaNodemgrError {
+    crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Connect(
+        "transport error: No such file or directory".into(),
+    )
+}
+
+/// The rolling-deploy handoff: node-manager's socket is gone for a few
+/// seconds while a pull asks it to create the build dir. The pull must wait
+/// for it rather than mint a plain directory that can never be a
+/// btrfs-send parent.
+#[tokio::test(start_paused = true)]
+async fn build_dir_waits_out_a_node_manager_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("sha256:abc");
+    let mut fake = FakeSubvolumeCreate::new(
+        dir.clone(),
+        std::iter::repeat_with(node_manager_unreachable).take(3),
+    );
+
+    create_build_dir(
+        "base",
+        "sha256:abc",
+        dir.to_str().unwrap(),
+        || fake.call(),
+        || false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(fake.calls, 4, "the pull retries until node-manager answers");
+    assert!(
+        dir.join(FAKE_SUBVOLUME_MARKER).exists(),
+        "the build dir is node-manager's subvolume, not a plain-directory fallback"
+    );
+}
+
+/// Node-manager still unreachable after the restart window: the pull fails
+/// retryably and leaves no build dir behind.
+#[tokio::test(start_paused = true)]
+async fn build_dir_fails_retryably_while_node_manager_stays_down() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("sha256:abc");
+    let mut fake = FakeSubvolumeCreate::new(
+        dir.clone(),
+        std::iter::repeat_with(node_manager_unreachable).take(10_000),
+    );
+
+    let result = create_build_dir(
+        "base",
+        "sha256:abc",
+        dir.to_str().unwrap(),
+        || fake.call(),
+        || false,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(PullError::Retryable(ref status)) if status.code() == tonic::Code::Unavailable),
+        "expected a retryable failure, got {result:?}"
+    );
+    assert!(!dir.exists(), "no plain-directory build was minted");
+}
+
+/// Node-manager's own verdict that this filesystem can't hold a subvolume
+/// (non-btrfs host) still falls back to a plain directory.
+#[tokio::test(start_paused = true)]
+async fn build_dir_falls_back_to_plain_directory_when_subvolumes_are_unsupported() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("sha256:abc");
+    let mut fake = FakeSubvolumeCreate::new(
+        dir.clone(),
+        [crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc {
+            rpc: "BtrfsCreateTemplateSubvolume",
+            status: Status::failed_precondition(
+                "artifact filesystem operation: Inappropriate ioctl for device",
+            ),
+        }],
+    );
+
+    create_build_dir(
+        "base",
+        "sha256:abc",
+        dir.to_str().unwrap(),
+        || fake.call(),
+        || false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(fake.calls, 1);
+    assert!(dir.is_dir());
+    assert!(!dir.join(FAKE_SUBVOLUME_MARKER).exists());
+}
+
+/// node-manager refusing the create on a btrfs cache (EROFS while its mounts
+/// are torn down on shutdown) is not "subvolumes unsupported": no plain
+/// directory is minted.
+#[tokio::test(start_paused = true)]
+async fn build_dir_never_falls_back_on_a_btrfs_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("sha256:abc");
+    let mut fake = FakeSubvolumeCreate::new(
+        dir.clone(),
+        std::iter::repeat_with(|| crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc {
+            rpc: "BtrfsCreateTemplateSubvolume",
+            status: Status::failed_precondition(
+                "artifact filesystem operation: EROFS: Read-only file system",
+            ),
+        })
+        .take(10_000),
+    );
+
+    let result = create_build_dir(
+        "base",
+        "sha256:abc",
+        dir.to_str().unwrap(),
+        || fake.call(),
+        || true,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(PullError::Retryable(_))),
+        "expected a retryable failure, got {result:?}"
+    );
+    assert!(!dir.exists(), "no plain-directory build was minted");
+}
