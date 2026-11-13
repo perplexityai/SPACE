@@ -33,15 +33,18 @@ if TYPE_CHECKING:
 
 SANDBOX_MANAGER = "sandbox-manager"
 NODE_MANAGER = "node-manager"
-# The teardown's wait on the node's blocking delete.
-NODE_DELETE_WAIT_SECONDS = 10.0
+# The teardown's wait for acknowledgment of nonblocking delete admission.
+NODE_DELETE_WAIT_SECONDS = 2.0
 # The shortest hold of an attempt that sat out the wait: the wait, less slack
 # for event timestamps and the 0.1 s rounding of each hold.
 MIN_STALLED_HOLD_SECONDS = NODE_DELETE_WAIT_SECONDS - 0.5
 # Claim, event write and pod delete on top of the budget, on a loaded runner.
-SLOT_HOLD_LIMIT_SECONDS = 20.0
-# Longer than the budget, so a Delete that answered in time is told apart.
-HANG_PROOF_SECONDS = 15.0
+SLOT_HOLD_LIMIT_SECONDS = 12.0
+# Allow admission and control-plane overhead, but require completion before
+# the frozen service's hang-proof interval even though cleanup cannot finish.
+ADMITTED_SLOT_HOLD_LIMIT_SECONDS = 8.0
+# The node must stay stalled after the admitted operation has completed.
+HANG_PROOF_SECONDS = 10.0
 ENDING_EVENTS = ("requeued", "completed", "failed", "canceled", "expired")
 
 

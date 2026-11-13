@@ -2,6 +2,7 @@
 
 import space_smoke as smoke
 from space_smoke.node_delete_stall import (
+    ADMITTED_SLOT_HOLD_LIMIT_SECONDS,
     MIN_STALLED_HOLD_SECONDS,
     NODE_MANAGER,
     SANDBOX_MANAGER,
@@ -16,9 +17,9 @@ NOT_ADMITTED_ATTEMPTS = 2
 # the Delete and the admission probe both hang, so each attempt ends requeued
 # after the teardown's budget while the sandbox stays, and once thawed the
 # delete succeeds. Admitted: with node-manager frozen, sandbox-manager admits
-# the delete (its row reads `deleting`) and its cleanup hangs, so the teardown
-# continues after the budget and the operation succeeds on its first attempt
-# while node-manager is still frozen; the node's row goes once thawed. Each attempt's slot
+# the delete and its cleanup hangs, but the nonblocking acknowledgment lets
+# the operation succeed promptly on its first attempt while node-manager is
+# still frozen; the node's row goes once thawed. Each attempt's slot
 # hold is read from the operation's public events (`space_smoke.node_delete_stall`).
 # Do not run concurrently with other scenarios on the same workers.
 @smoke.scenario(
@@ -70,14 +71,16 @@ def stalled_node_delete_releases_its_dispatcher_slot(test: smoke.KindEcw) -> Non
         operation_id = stall.delete(admitted.sandbox_id)
         stall.expect_service_hangs(node, NODE_MANAGER)
 
-    with test.phase("admitted: the teardown continues after its budget"):
+    with test.phase("admitted: acknowledgment releases the slot before cleanup finishes"):
         # sandbox-manager's own reads wait on the frozen node-manager, so the
         # node's row is read only after the thaw.
         holds = stall.expect_succeeded(operation_id, timeout=30)
         test.record("admitted_slot_holds", holds)
         test.verify(
-            len(holds) == 1 and holds[0][0] >= MIN_STALLED_HOLD_SECONDS,
-            "the admitted delete did not succeed on one attempt cut at the budget",
+            len(holds) == 1
+            and holds[0][1] == "completed"
+            and holds[0][0] < ADMITTED_SLOT_HOLD_LIMIT_SECONDS,
+            "the admitted delete waited for cleanup instead of releasing its dispatcher slot",
             holds=holds,
         )
         stall.expect_gone(admitted)
