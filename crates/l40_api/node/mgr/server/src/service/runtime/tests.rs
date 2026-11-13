@@ -323,6 +323,16 @@ async fn allocate_refusal_grants_no_lease(
 
     assert_eq!(error.code(), code, "{error}");
     assert!(error.message().contains(message), "{error}");
+    assert_eq!(
+        error
+            .message()
+            .starts_with("node memory admission refused:"),
+        matches!(
+            refusal,
+            AllocateRefusal::InsufficientNodeMemory | AllocateRefusal::OverflowingMemoryDemand
+        ),
+        "only memory admission carries the fail-fast verdict: {error}"
+    );
     assert!(node.service.pool.get(&sandbox_id).unwrap().is_none());
     assert!(
         node.service

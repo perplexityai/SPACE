@@ -2,6 +2,10 @@
 /// plus staging overhead. Expiry does not cancel node-owned capture work.
 pub const MEMORY_CAPTURE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(960);
 
+/// Stable allocation-status prefix preserved through the shim into kubelet
+/// Events. Distinguishes memory admission from other ResourceExhausted errors.
+pub const MEMORY_ADMISSION_REFUSAL_PREFIX: &str = "node memory admission refused:";
+
 pub use pplx_space_node_mgr_protocol::proto;
 
 pub mod environment_selection;

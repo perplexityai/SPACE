@@ -31,6 +31,12 @@ pub(crate) fn enter_sim_worker_process_with(extra: &[(&str, Option<&std::ffi::Os
 /// The parent creates the files and keeps them until its child exits; the
 /// child's own copy of the directory is unused.
 pub(crate) fn enter_sim_worker_process_with_owned_token_files() -> bool {
+    enter_sim_worker_process_with_owned_token_files_and(&[])
+}
+
+pub(crate) fn enter_sim_worker_process_with_owned_token_files_and(
+    extra: &[(&str, Option<&std::ffi::OsStr>)],
+) -> bool {
     let tokens = tempfile::tempdir().expect("create test token directory");
     let node_api = tokens.path().join("node-api.token");
     let node_api_internal = tokens.path().join("node-api-internal.token");
@@ -40,7 +46,7 @@ pub(crate) fn enter_sim_worker_process_with_owned_token_files() -> bool {
     enter_sim_worker_process_with_token_paths(
         Some(node_api.as_os_str()),
         Some(node_api_internal.as_os_str()),
-        &[],
+        extra,
     )
 }
 

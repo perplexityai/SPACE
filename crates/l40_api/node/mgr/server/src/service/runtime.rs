@@ -350,7 +350,10 @@ impl NodeManagerService {
                     SandboxEventSource::NodeManager,
                 )
                 .emit_with(details);
-                return Err(Status::resource_exhausted(error.to_string()));
+                return Err(Status::resource_exhausted(format!(
+                    "{} {error}",
+                    pplx_space_node_mgr_client::MEMORY_ADMISSION_REFUSAL_PREFIX
+                )));
             }
             Err(AllocateNewLeaseError::Slot(error)) => {
                 let status = allocate_error_to_status(error);

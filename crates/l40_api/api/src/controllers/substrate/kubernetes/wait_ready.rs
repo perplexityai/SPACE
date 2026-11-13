@@ -3,6 +3,7 @@ use super::support::*;
 use super::*;
 use k8s_openapi::api::core::v1::Event;
 use pplx_space_api_route::wait_ready_lifecycle_request;
+use pplx_space_node_mgr_client::MEMORY_ADMISSION_REFUSAL_PREFIX;
 
 /// The kubelet event reason for a pod sandbox the runtime failed to start.
 const FAILED_CREATE_POD_SANDBOX_REASON: &str = "FailedCreatePodSandBox";
@@ -11,17 +12,37 @@ const FAILED_CREATE_POD_SANDBOX_REASON: &str = "FailedCreatePodSandBox";
 /// `InvalidArgument`: the request fails identically on every node. sbx-mgr's
 /// `failure_status` decides which node-manager codes reach the shim intact.
 const INVALID_ARGUMENT_MARKER: &str = "[space-err=InvalidArgument]";
+const RESOURCE_EXHAUSTED_MARKER: &str = "[space-err=ResourceExhausted]";
 
 /// How long a create waiting for its pod's IP waits to watch that pod's
 /// events again after a watch ended or failed. A watch from `"0"` replays the
 /// events already recorded, so a refusal recorded in between is not missed.
 const POD_SANDBOX_REJECTION_REWATCH_DELAY: Duration = Duration::from_secs(1);
 
-/// The node's reason from a `FailedCreatePodSandBox` event message that
-/// carries the shim's `InvalidArgument` marker.
-fn rejected_pod_sandbox_reason(event_message: &str) -> Option<&str> {
-    let (_, reason) = event_message.split_once(INVALID_ARGUMENT_MARKER)?;
-    Some(reason.trim_start_matches(':').trim())
+/// Only explicit node-manager verdicts end the wait; other failures remain
+/// eligible for kubelet's retry of the same pod.
+fn pod_sandbox_rejection_error(
+    event_message: &str,
+    fail_fast_on_memory_refusal: bool,
+) -> Option<SubstrateError> {
+    if let Some((_, reason)) = event_message.split_once(INVALID_ARGUMENT_MARKER) {
+        return Some(SubstrateError::InvalidRequest {
+            message: format!(
+                "the node refused to start the sandbox: {}",
+                reason.trim_start_matches(':').trim()
+            ),
+        });
+    }
+    if !fail_fast_on_memory_refusal {
+        return None;
+    }
+    let (_, reason) = event_message.split_once(RESOURCE_EXHAUSTED_MARKER)?;
+    // ResourceExhausted also covers transient queue/slot pressure. The
+    // allocation path's explicit prefix distinguishes memory admission.
+    let (_, reason) = reason.split_once(MEMORY_ADMISSION_REFUSAL_PREFIX)?;
+    Some(SubstrateError::Unavailable {
+        message: format!("{MEMORY_ADMISSION_REFUSAL_PREFIX} {}", reason.trim()),
+    })
 }
 
 /// Why a watch of a pod's sandbox refusals ended without one.
@@ -51,12 +72,13 @@ impl RejectionWatchFailure {
     }
 }
 
-/// Watch `params`' events from `"0"` until one carries a refusal, as the
-/// node's reason, or the watch ends (`None`).
+/// Watch `params`' events from `"0"` until one carries a classified refusal,
+/// or the watch ends (`None`).
 async fn watch_pod_sandbox_rejection(
     events: &Api<Event>,
     params: &WatchParams,
-) -> Result<Option<String>, RejectionWatchFailure> {
+    fail_fast_on_memory_refusal: bool,
+) -> Result<Option<SubstrateError>, RejectionWatchFailure> {
     let stream = events
         .watch(params, "0")
         .await
@@ -69,12 +91,10 @@ async fn watch_pod_sandbox_rejection(
     {
         match event {
             WatchEvent::Added(event) | WatchEvent::Modified(event) => {
-                if let Some(reason) = event
-                    .message
-                    .as_deref()
-                    .and_then(rejected_pod_sandbox_reason)
-                {
-                    return Ok(Some(reason.to_owned()));
+                if let Some(error) = event.message.as_deref().and_then(|message| {
+                    pod_sandbox_rejection_error(message, fail_fast_on_memory_refusal)
+                }) {
+                    return Ok(Some(error));
                 }
             }
             WatchEvent::Deleted(_) | WatchEvent::Bookmark(_) => {}
@@ -574,10 +594,9 @@ impl KubernetesSubstrate {
         }
     }
 
-    /// Resolve once the node has refused to start `pod_uid`'s pod sandbox
-    /// with a verdict no retry or other node can change, as that error;
-    /// otherwise never. Kubelet records each refusal as a pod event, and the
-    /// shim marks node-manager's `InvalidArgument` verdict in its message.
+    /// Resolve once the node refuses `pod_uid`'s pod sandbox as invalid or,
+    /// when enabled, refuses memory admission; otherwise never. A memory
+    /// refusal fails this placement but lets the caller retry the create.
     ///
     /// A watch the apiserver refuses outright, with a client error other than
     /// a timeout, throttling or an expired version (such as a missing `watch`
@@ -599,14 +618,12 @@ impl KubernetesSubstrate {
                 "involvedObject.uid={pod_uid},reason={FAILED_CREATE_POD_SANDBOX_REASON}"
             ))
             .timeout(POD_IP_WATCH_TIMEOUT_SECS);
+        let fail_fast_on_memory_refusal =
+            pplx_space_env_vars::env_flag_var("SPACE_CREATE_FAIL_FAST_ON_NODE_REJECTION", false);
         let mut warned = false;
         loop {
-            match watch_pod_sandbox_rejection(&events, &params).await {
-                Ok(Some(reason)) => {
-                    return SubstrateError::InvalidRequest {
-                        message: format!("the node refused to start the sandbox: {reason}"),
-                    };
-                }
+            match watch_pod_sandbox_rejection(&events, &params, fail_fast_on_memory_refusal).await {
+                Ok(Some(error)) => return error,
                 Ok(None) => {}
                 Err(failure) if failure.is_permanent() => {
                     tracing::warn!(
