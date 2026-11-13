@@ -74,8 +74,7 @@ pub fn label<E: ProtoEnumLabel>(value: i32) -> String {
     match E::try_from(value) {
         Ok(known) => {
             let name = known.proto_name();
-            name.strip_prefix(E::PREFIX)
-                .unwrap_or(name)
+            name.trim_prefix(E::PREFIX)
                 .to_ascii_lowercase()
                 .replace('_', "-")
         }

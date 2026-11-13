@@ -1616,7 +1616,7 @@ fn e2b_event_name(root: &str, path: &str) -> Option<String> {
         return None;
     }
     if !path.starts_with('/') {
-        return Some(path.strip_prefix("./").unwrap_or(path).to_string());
+        return Some(path.trim_prefix("./").to_string());
     }
 
     let root = normalized_absolute_path(root);

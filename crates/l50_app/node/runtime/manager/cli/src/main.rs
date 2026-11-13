@@ -244,7 +244,7 @@ fn parse_release(value: &str) -> Result<ReleaseArg, String> {
             "'{value}' names no release; expected <runtime>-<version>, such as fc-1.16.2 or cloud-hypervisor-54.0"
         )
     })?;
-    let version = RuntimeVersion::parse(version.strip_prefix('v').unwrap_or(&version))
+    let version = RuntimeVersion::parse(version.trim_prefix('v'))
         .map_err(|error| format!("'{value}' names no release: {error}"))?;
     Ok(ReleaseArg {
         kind: runtime.kind,

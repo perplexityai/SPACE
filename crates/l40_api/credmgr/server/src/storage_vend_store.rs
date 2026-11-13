@@ -262,10 +262,7 @@ impl StorageVendStore for PgStorageVendStore {
         // and, for releases registered before the prefix was required, the
         // bare hex. A published release must be found under either spelling.
         let canonical = hash.to_string();
-        let bare = canonical
-            .strip_prefix("sha256:")
-            .unwrap_or(&canonical)
-            .to_string();
+        let bare = canonical.trim_prefix("sha256:").to_string();
         let published: bool = sqlx::query_scalar(sql!(
             "SELECT EXISTS (
                  SELECT 1

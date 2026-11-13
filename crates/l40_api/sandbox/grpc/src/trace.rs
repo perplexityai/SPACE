@@ -67,11 +67,7 @@ impl RecordClientSpan for SandboxTraceContext {
 /// not a sandbox UUID is not recorded: a malformed request cannot put an
 /// arbitrary string on the span.
 pub fn record_sandbox_id(span: &tracing::Span, sandbox_id: &str) -> Option<SandboxId> {
-    let canonical = sandbox_id
-        .strip_prefix("sbx_")
-        .unwrap_or(sandbox_id)
-        .parse::<SandboxId>()
-        .ok()?;
+    let canonical = sandbox_id.trim_prefix("sbx_").parse::<SandboxId>().ok()?;
     span.record("sandbox_id", tracing::field::display(canonical));
     Some(canonical)
 }

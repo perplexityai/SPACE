@@ -33,21 +33,21 @@ repack() {
 
 state="${tmp_dir}/state"
 release="${state}/target/release"
-mkdir -p "${release}/.fingerprint/crate-0123456789abcdef" "${release}/deps" \
+mkdir -p "${release}/build/crate/0123456789abcdef/fingerprint" "${release}/build/crate/0123456789abcdef/out" \
   "${state}/src/crates/a/src" "${state}/cargo-home/registry/cache/index"
-echo fingerprint >"${release}/.fingerprint/crate-0123456789abcdef/lib-crate"
-echo library >"${release}/deps/libcrate-0123456789abcdef.rlib"
-head -c 3000000 /dev/urandom >"${release}/deps/big-0123456789abcdef.rlib"
+echo fingerprint >"${release}/build/crate/0123456789abcdef/fingerprint/lib-crate"
+echo library >"${release}/build/crate/0123456789abcdef/out/libcrate.rlib"
+head -c 3000000 /dev/urandom >"${release}/build/crate/0123456789abcdef/out/big.rlib"
 echo uplifted >"${release}/space-api-svc"
 ln -s space-api-svc "${release}/space-api-svc-link"
 echo 'pub fn a() {}' >"${state}/src/crates/a/src/lib.rs"
 echo crate >"${state}/cargo-home/registry/cache/index/crate-1.0.0.crate"
 touch -d '2001-02-03T04:05:06Z' "${state}/src/crates/a/src/lib.rs"
-touch -d '2002-03-04T05:06:07Z' "${release}/deps/libcrate-0123456789abcdef.rlib"
+touch -d '2002-03-04T05:06:07Z' "${release}/build/crate/0123456789abcdef/out/libcrate.rlib"
 # A build script's rerun-if-changed=<dir> reads the newest mtime in the walk,
 # directories included, so a directory restored newer than its build reruns it.
 touch -d '2003-04-05T06:07:08Z' "${state}/src/crates/a/src" "${state}/src/crates/a"
-checksum="$(sha256sum "${release}/deps/big-0123456789abcdef.rlib" | cut -d' ' -f1)"
+checksum="$(sha256sum "${release}/build/crate/0123456789abcdef/out/big.rlib" | cut -d' ' -f1)"
 
 run pack "${state}" "${tmp_dir}/parts"
 [[ -f "${tmp_dir}/parts/dirs.tar.zst" ]] || fail "pack wrote no directory archive"
@@ -59,15 +59,15 @@ run unpack "${tmp_dir}/parts" "${tmp_dir}/out"
 out_release="${tmp_dir}/out/target/release"
 [[ "$(stat -c %Y "${tmp_dir}/out/src/crates/a/src/lib.rs")" == "$(date -d '2001-02-03T04:05:06Z' +%s)" ]] \
   || fail "the source mirror's mtime was not kept"
-[[ "$(stat -c %Y "${out_release}/deps/libcrate-0123456789abcdef.rlib")" == "$(date -d '2002-03-04T05:06:07Z' +%s)" ]] \
+[[ "$(stat -c %Y "${out_release}/build/crate/0123456789abcdef/out/libcrate.rlib")" == "$(date -d '2002-03-04T05:06:07Z' +%s)" ]] \
   || fail "a build output's mtime was not kept"
 for dir in src/crates/a src/crates/a/src; do
   [[ "$(stat -c %Y "${tmp_dir}/out/${dir}")" == "$(date -d '2003-04-05T06:07:08Z' +%s)" ]] \
     || fail "the mtime of directory ${dir} was not kept"
 done
-[[ "$(sha256sum "${out_release}/deps/big-0123456789abcdef.rlib" | cut -d' ' -f1)" == "${checksum}" ]] \
+[[ "$(sha256sum "${out_release}/build/crate/0123456789abcdef/out/big.rlib" | cut -d' ' -f1)" == "${checksum}" ]] \
   || fail "a build output's content changed"
-[[ -f "${out_release}/.fingerprint/crate-0123456789abcdef/lib-crate" ]] || fail "a fingerprint was dropped"
+[[ -f "${out_release}/build/crate/0123456789abcdef/fingerprint/lib-crate" ]] || fail "a fingerprint was dropped"
 [[ -f "${tmp_dir}/out/cargo-home/registry/cache/index/crate-1.0.0.crate" ]] || fail "the Cargo home was dropped"
 [[ ! -e "${out_release}/space-api-svc" && ! -L "${out_release}/space-api-svc-link" ]] \
   || fail "an uplifted output survived the round trip"

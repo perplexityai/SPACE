@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
+use std::mem::DropGuard;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -547,20 +548,14 @@ struct TrackedHandle {
 
 impl Spawn for TrackedHandle {
     fn spawn_bg(&mut self, future: impl Future<Output = ()> + Send + 'static) {
-        let exited = SetOnDrop(self.exited.clone());
+        let exited = DropGuard::new(self.exited.clone(), |exited| {
+            exited.store(true, Ordering::Release);
+        });
         self.handle.spawn_bg(async move {
             // Declared first, so it drops after the task and its queue.
             let _exited = exited;
             future.await;
         });
-    }
-}
-
-struct SetOnDrop(Arc<AtomicBool>);
-
-impl Drop for SetOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
     }
 }
 

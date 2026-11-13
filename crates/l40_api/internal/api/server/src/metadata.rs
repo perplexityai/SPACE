@@ -1494,7 +1494,7 @@ async fn find_template_release_row(
     template_name: &str,
     hash: &str,
 ) -> Result<Option<TemplateReleaseRow>, Status> {
-    let bare_hash = hash.strip_prefix("sha256:").unwrap_or(hash);
+    let bare_hash = hash.trim_prefix("sha256:");
     sqlx::query_as::<_, TemplateReleaseRow>(sql!(
         "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at
          FROM template_releases r

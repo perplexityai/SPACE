@@ -483,7 +483,7 @@ impl<S: RetentionSink> Reconciler<S> {
         let total_budget = usize::try_from(self.policy.max_per_tick).unwrap_or(usize::MAX);
         let recovery_budget =
             total_budget / 2 + usize::from(total_budget % 2 == 1 && self.recovery_gets_extra);
-        self.recovery_gets_extra = !self.recovery_gets_extra;
+        self.recovery_gets_extra.toggle();
 
         // Recovery and fresh claims share one hard work budget so the metric
         // and monitor ceiling describe the actual number of destructive

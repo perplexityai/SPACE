@@ -274,9 +274,7 @@ const DASHED_UUID_DASH_POSITIONS: [usize; 4] = [8, 13, 18, 23];
 const UNDASHED_UUID_LEN: usize = 32;
 
 fn id_prefix_range(prefix: &str) -> Option<(SandboxId, SandboxId)> {
-    let id = prefix
-        .strip_prefix(PUBLIC_SANDBOX_ID_PREFIX)
-        .unwrap_or(prefix);
+    let id = prefix.trim_prefix(PUBLIC_SANDBOX_ID_PREFIX);
     let dashed = id.contains('-');
     let mut hex = String::with_capacity(UNDASHED_UUID_LEN);
     for (position, character) in id.chars().enumerate() {

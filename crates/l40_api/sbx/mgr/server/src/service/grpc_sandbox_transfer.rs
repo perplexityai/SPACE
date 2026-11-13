@@ -2,6 +2,7 @@ use super::cleanup_support::{ActivationCleanupSpec, CleanupLockTryResult};
 use super::create_support::{sanitize_process_env, validate_path_component};
 use super::tail_support::{host_architecture, sandbox_execution_metadata};
 use super::*;
+use std::mem::DropGuard;
 
 fn import_header_execution_metadata(
     header: &crate::proto::ImportSandboxHeader,
@@ -851,16 +852,14 @@ impl SandboxManagerService {
                                 (None, false)
                             };
 
-                            // RAII guard: clean up temp diff file on any exit path
-                            struct DiffCleanup(Option<String>);
-                            impl Drop for DiffCleanup {
-                                fn drop(&mut self) {
-                                    if let Some(ref p) = self.0 {
-                                        let _ = std::fs::remove_file(p);
-                                    }
+                            let diff_path = DropGuard::new(diff_path, |path| {
+                                if let Some(path) = path
+                                    && let Err(error) = std::fs::remove_file(&path)
+                                    && error.kind() != std::io::ErrorKind::NotFound
+                                {
+                                    tracing::warn!(%path, %error, "failed to remove temporary rootfs diff");
                                 }
-                            }
-                            let _diff_guard = DiffCleanup(diff_path.clone());
+                            });
 
                             let snapshot_working_dir =
                                 pplx_space_host_layout::paths::sandbox_cache_dir(&sandbox_id)
@@ -949,7 +948,6 @@ impl SandboxManagerService {
                                 }
                             }
 
-                            // diff file cleanup handled by _diff_guard (RAII Drop)
                         })();
                         Ok(())
                     })

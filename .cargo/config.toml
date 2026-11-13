@@ -4,6 +4,9 @@ lint = "clippy --workspace --locked -- -D warnings"
 # must not wait on a concurrent workspace build sets CARGO_TARGET_DIR itself.
 arch = "run -q --locked -p pplx-space-archcheck --"
 
+[registry]
+global-min-publish-age = "3 days"
+
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-linux-musl-gcc"
 rustflags = [

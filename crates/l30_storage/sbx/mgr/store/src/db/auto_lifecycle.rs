@@ -199,7 +199,7 @@ db_private_outside_tests! {
             }
         }
         if available == 1 {
-            cursor.fresh_turn = !cursor.fresh_turn;
+            cursor.fresh_turn.toggle();
         }
         Ok(selected)
     }

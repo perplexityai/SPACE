@@ -125,7 +125,7 @@ impl HostCpu {
         let decimal = |name: &str| field(name)?.parse::<u32>().ok();
         let hex = |name: &str| {
             let raw = field(name)?;
-            u32::from_str_radix(raw.strip_prefix("0x").unwrap_or(raw), 16).ok()
+            u32::from_str_radix(raw.trim_prefix("0x"), 16).ok()
         };
 
         let identity = if let Some(vendor) = field("vendor_id") {
