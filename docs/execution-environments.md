@@ -1650,7 +1650,8 @@ Wake carrying `runtime_upgrade` is refused with `FailedPrecondition`, before
 anything is staged, fenced or booted, when its route identity or the
 sandbox's local row names a Kubernetes pod; Direct keeps its Wake path. The
 pod carries the upgrade instead. The control plane renders it for a start or
-resume that decides an upgrade (below).
+resume that decides an upgrade (below) and for a stopped sandbox's upgrade
+that leaves it stopped.
 
 - **Pod.** A restore pod's `space.pplx.net/checkpoint` is `runtime-upgrade`,
   and `space.pplx.net/runtime-upgrade-*` annotations carry the operation id,
@@ -1880,6 +1881,11 @@ This release's control plane settles a rollback only on a report whose
 attempt id it never settles one: the wait runs to its deadline and keeps the
 pod and its claim, as for any outcome it can't confirm. The same holds for a
 refused create against a sandbox-manager that predates `refused_attempt_id`.
+
+For a stopped sandbox's upgrade, a node whose sandbox-manager or node-api
+predates `AbandonRuntimeUpgrade` keeps the owed backup and the drain's
+stopped evacuation answering retryably for a sandbox an unfinished
+stay-stopped upgrade left there, until the node rolls.
 
 ### Upgrading at resume and start
 
@@ -2203,6 +2209,382 @@ While an upgrade holds the sandbox, other activations get the retryable 503
 the restore and activation leases already give, and a Wake that meets the
 node's fence is retried to its deadline and answers a retryable 503. The
 decision is counted by `runtime_upgrade.activation.decision`.
+
+### Upgrading a stopped sandbox without starting it
+
+`SubstrateAdapter::upgrade_stopped_runtime` moves a stopped sandbox to the
+cluster default and leaves it stopped, for a caller such as an upgrade
+campaign that shouldn't start anything. It takes the start-time decision
+above, whatever `SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` says, so it
+reads the same evidence and refuses a stranded sandbox with the same 412. Its
+operation id is its own, not the one a start of the sandbox would name: a node
+refuses an operation id reused for another target state, so a start after a
+stopped upgrade rolled back runs its own upgrade instead of being refused.
+Nothing in SPACE calls it yet. A test cluster can trigger it through
+`POST /debug/sandbox/{sandbox_id}/upgrade-stopped-runtime` on the admin
+surface, which exists only while the `SPACE_ADMIN_RUNTIME_UPGRADE_TEST_HOOK_ENABLED`
+test hook is on. Like every test hook it's read only by binaries built with the
+`test-hooks` feature, as the Kind images are, so release images never mount the
+route. Direct returns `Unsupported`
+(its gap table has the row).
+
+On Kubernetes
+(`crates/l40_api/api/src/controllers/substrate/kubernetes/adapter/stopped_runtime_upgrade.rs`):
+
+1. **Claim.** An activation attempt targeting `stopped` on the sandbox's
+   execution. Only a drain's re-placement of an evacuated stopped sandbox
+   claims that target too, and it claims it on a `restoring` row.
+   Activation-completion receipts project only a `created`, `started` or
+   `paused` target, so the claim never moves the row, and a user start meets
+   it like any activation's claim. An activation-rollback receipt for the
+   claim's attempt, which the node publishes when the upgrade's boot fails,
+   retires the execution but leaves the sandbox placed on its node, as the
+   upgrade's own retire does. A sandbox on encrypted volumes is refused with
+   `FailedPrecondition` (412) before anything is claimed: its stopped disk
+   has no artifact the platform can use, so the backup the upgrade owes
+   could never be a real one. A sandbox that isn't `stopped` is refused
+   with `Conflict` (409), except one a drain's re-placement holds
+   `restoring` while it moves the disk, which answers a retryable 503, as
+   does one a drain's stopped evacuation has claimed (see below). Once
+   the decision chooses an upgrade, a stopped sandbox whose disk is on no
+   node (only in object storage) is refused with `FailedPrecondition` (412)
+   before anything is placed, and so is one whose disk node isn't a
+   registered node or is outside the sandbox node selector, since no retry
+   changes either. The disk node also has to be the disk pin: the node
+   `active_node_id` names, mapped through `node_k8s`, with no other
+   re-placement target chosen. A disk node named only by the newest
+   execution that ran on one, a placement node with no Kubernetes
+   registration, or a re-placement's chosen target is refused with 412,
+   since an attempt that ends before persisting its pod can be backed up
+   only on the pinned node. A disk node that can't take work now (not Ready, cordoned,
+   placement-blocked, or with no free network slot) answers a retryable 503,
+   and so does a Node or pod reflector that hasn't synced. A retry that will
+   reuse the pod an earlier attempt left on the node, one carrying the
+   recorded operation, needs no new network slot, so that pod's own isn't
+   counted against the node.
+2. **Record** the upgrade (operation, target and authorization) on the
+   claimed execution in `sandbox_k8s_executions`, in the claim's own
+   transaction, before any pod is created and while the row is still
+   `stopped`, so a retry repeats exactly that upgrade, and an attempt that
+   ends right after its claim never leaves a `stopped` claim without its
+   record. An execution that replaces it while its pod is placed, because
+   the pod it found had failed, was deleting or didn't carry the operation,
+   records the same upgrade in its own claim's transaction. The record is
+   what marks the claim as the upgrade's: any other activation that claims
+   the execution clears it, and a drain's re-placement doesn't join an
+   attempt that carries one.
+3. **Place** the sandbox's pod on the node checked above, pinned by
+   `spec.nodeName`, never resolved again or re-driven to another node: no
+   other node holds the disk. The pod carries the
+   `runtime-upgrade` checkpoint and target state `stopped`. Its shim boots the
+   disk under the target and stops it again, then runs a placeholder task
+   with no microVM; or the node rolls back to the old environment and the
+   create fails. A pod already at the execution's name that doesn't carry
+   the operation, such as one a crashed start left, is replaced under a new
+   generation, as for any activation whose pod renders an upgrade.
+4. **Wait** for the node's `GetRuntimeUpgrade` to settle, as in "Outcome"
+   above, and, for an upgrade that reached the target, until the node has
+   published the sandbox stopped under it. The
+   pod is a placeholder, so the publication, not the pod's status, says the
+   sandbox ended at rest; a node that finds the sandbox on the target but
+   running refuses the pod's create and never publishes it stopped. Each read
+   of the publication gets the time left to the wait's deadline, at least
+   one second, as a look at the outcome does. The publication wait follows
+   the outcome's, each with its own one-second floor, so a look at the
+   outcome and then a read of the publication that each hang near the
+   deadline can hold the wait about two seconds past it, still inside the
+   five seconds the readiness budget keeps past that deadline. That bound is
+   the wait's only: the backup enqueue, the pod delete and the database
+   writes of the steps below run after the wait, each under its own RPC or
+   database bound, so the operation can return later than the caller's
+   timeout by their duration.
+5. **Back up** the upgraded disk: enqueue the current-instance disk backup
+   the stop path enqueues, so the backup that replaces the durable copy is
+   of the environment the node published. The enqueue goes to the disk node
+   the pod is pinned to, by name, not through the pod: the node settles the
+   upgrade inside the shim's pod-sandbox create, before kubelet posts the
+   pod's address. It settles once the sandbox's cleanup returns, but
+   node-manager's network-slot reset after that cleanup still holds the
+   sandbox's host-mutation claim for a moment, and node-manager refuses the
+   backup's disk snapshot with `Unavailable` while it does. Sandbox-manager
+   passes that code through, and the operation asks again every 250 ms until
+   the wait's deadline. A refusal that outlasts the deadline, or any other
+   failure, answers a retryable 503 and keeps the execution.
+6. **Retire** the execution: delete the pod under its UID and forget its
+   tracking, guarded by generation and attempt. An execution that changed in
+   between, or a pod delete that fails, keeps the execution, and the
+   operation answers a retryable 503. An execution whose pod name doesn't
+   parse can't be retired by any retry: it's kept for an operator, and the
+   operation answers `Failed`, whether the upgrade reached the target or
+   rolled back. The retire leaves the sandbox's placement alone, on every
+   outcome: `active_node_id` still names the node holding the disk, as after
+   an ordinary stop. Node drain finds a node's stopped sandboxes only through
+   that column, so after any stay-stopped upgrade the drain still lists the
+   sandbox, waits for it and evacuates its disk.
+
+A rollback, or an operation the node refused before it began, retires the
+execution without a backup; the sandbox stays stopped on its old
+environment. As for a start, a rollback or refusal settles only when the
+node's report names the pod's UID, and the wait deletes that pod. A refusal
+the node recorded answers `FailedPrecondition` (412), since the node refuses
+the upgrade until what it checked changes; a rollback, and an operation that
+never began, answer a retryable 503. Each decision names a fresh operation id,
+which its claim records on the execution in the same transaction, before
+any pod carries it; a retry that takes the execution over reads the
+operation back from there, and a retry after the execution was retired (a
+rollback or refusal retires it) is a new decision under a new operation.
+Either way the retry places a new pod, which the node takes as a new
+attempt, so it boots the upgrade again and may succeed. While retiring a rollback's execution fails, the
+operation keeps the execution and its pod, expires the claim's lease and
+answers 503, and the retry that takes them over reads the operation from the
+node again before it retires. A backup that wasn't enqueued is kept the same
+way. Anything else (an outcome not yet settled, a report that doesn't name
+the pod, a node that can't be read, a publication that hasn't landed) may
+leave the node working, so the operation keeps the pod, the execution and
+its claim's lease, and answers a retryable error. Until the lease ends, a
+start, a drain's re-placement or a retry is refused rather than taking the
+execution mid-upgrade; a retry after it ends re-drives the upgrade.
+
+A retry that finds the execution an earlier attempt left takes it over with
+an activation attempt of its own before it reads what was recorded, so
+nothing can be recorded between the two; a start that moved the sandbox on
+or another attempt that replaced the claim keeps the execution, and the
+retry answers a retryable 503. The takeover's claim ends as soon as that
+read returns, whatever it found or however it failed: it's expired with the
+record kept, or given up when nothing is recorded, so a failed read never
+leaves a live claim refusing starts and retries until its lease runs out. It
+places the recorded upgrade again, whatever
+the policy says now, and reads the same operation, so the node finishes,
+replays or rolls back what it may have begun. A pod at the execution's name
+that doesn't carry the operation is never read as its outcome. One that
+carries it, under an execution still `creating` because the earlier attempt
+ended between creating the pod and persisting it, is that attempt's pod: the
+retry records its UID, address and node, which places the sandbox on that
+node again, as the node's publication needs. With no pod at that name, the
+earlier attempt ended before its create was sent, and the retry, which holds
+the claim, creates the pod there: claims and takeovers refresh the execution,
+so it never ages into a stale create, and waiting for one would leave every
+retry with no pod to read. A create the earlier attempt still had in flight
+conflicts with it, and the retry reads the pod it left. A claim targeting
+`stopped` with nothing recorded is a drain re-placement's, whose pod holds
+the sandbox's re-placed copy: while its lease runs, the operation answers a
+retryable 503 and leaves it to the drain. Once the lease has ended, the
+operation claims the execution as any activation may claim one whose lease
+ended, and replaces that pod, which doesn't carry the upgrade.
+
+A user start that comes first, once the claim's lease has ended, never
+reuses the placeholder pod such an attempt left: it runs no microVM, and a
+Wake through it carries no network namespace to launch one. The start
+deletes the pod and replaces the execution with its own, as it replaces any
+stale pod. That holds for an attempt that ended between creating its pod
+and persisting it, leaving the execution `creating`, once the replica's pod
+cache has the pod; the same rule keeps a drain's re-placement from taking
+such a placeholder for the re-placed copy, and an upgrade from reading a
+crashed start's unpersisted pod as its outcome. The recorded upgrade goes with the replaced execution, so the
+sandbox starts under whatever the start's own decision chooses, and a later
+upgrade of the stopped sandbox decides afresh. A start that reuses an
+execution without a pod clears the recorded upgrade when it claims it. Only a retry of the same
+operation reuses the pod. Before any activation other than the upgrade's
+retry claims such an execution, a start or a drain's re-placement, it
+enqueues the disk backup the upgrade may still owe, through the node holding
+the disk; claiming clears the record, the only trace of that debt. The
+backup counts as owed whenever the record is there, whether or not the node
+has published the upgrade's result: an upgrade whose publication is late or
+lost may have changed the disk all the same, and one that never booted costs
+a backup of the unchanged disk. The node is the one the execution names, or,
+for an attempt that ended before persisting its pod, the node the sandbox's
+placement record pins its disk to (`active_node_id`, with no other
+re-placement target chosen), and only when that node registered a
+Kubernetes node name. Execution history and a re-placement's target never
+stand in for it: they could name a node without the upgraded disk, whose
+backup would clear the record while the durable copy is still the
+pre-upgrade disk. A node that refuses that enqueue with
+`Unavailable` is asked again for up to two seconds. While the enqueue fails,
+the activation claims nothing. A cause no retry changes answers
+`FailedPrecondition` (412) with its reason: neither the execution nor the
+placement names a registered node holding the disk, the node holding it is
+gone, or sandbox-manager refuses the enqueue as
+`NotFound`, `FailedPrecondition` or `InvalidArgument`. A sandbox the node
+hasn't stopped yet, such as a kubelet-retried boot of the upgrade pod that's
+still running, is no such cause: sandbox-manager answers it `Aborted`, and
+like any other failure it answers a retryable 503. That check runs before
+the claim, outside the sandbox row's lock, and skips a claim whose lease still runs, so the claim
+decides again under the lock: if it would clear a record and the activation
+enqueued no backup for that operation (the lease ended in between), it's
+refused with a retryable 503 and the record stays; the retry's check
+enqueues the backup first.
+
+A create claim that records the upgrade is never retired by the generic
+cleanup of a create that fails before its pod exists (a prior-generation pod
+sweep that runs out of budget, say): a retry copies the record onto the
+generation it mints, so that claim may be the only trace of the debt. It
+keeps its record with its lease ended, and the next activation enqueues the
+owed backup first. The same holds for the cleanup of a stale pod found after
+a create whose answer was lost (one that committed, then read back terminal
+or deleting): that execution goes back to `creating` with the deleted pod
+forgotten, record kept, and the attempt answers a retryable 503 rather than
+read an outcome from a pod it deleted.
+
+Before it touches the upgrade's pod or operation, which a retry of the
+upgrade reuses, the operation takes the expired claim over in one fenced
+update (same generation and attempt, lease ended) and gives it a live lease
+of its own, so a retry, a drain or another activation that comes meanwhile
+sees a claim in flight and refuses; every early answer ends that lease again,
+so the next attempt retries at once. The upgrade's pod may still be pending
+in its create, which kubelet keeps retrying, and a retry that booted the upgrade after the capture would leave
+the durable copy older than the disk once the claim clears the record. So
+before the enqueue the operation deletes that pod by its UID and answers a
+retryable 503 until the API server no longer has it. A pod that's gone
+doesn't prove its shim's `UpgradeRuntime` call is: one force-deleted
+mid-create can still have the call on its way to the node. So the operation
+then asks the disk node to abandon the upgrade's operation
+(`AbandonRuntimeUpgrade`, through node-api) and answers a retryable 503
+until it has. A node that refuses the request as invalid (it records the
+operation for another sandbox, or an id doesn't parse) gets
+`FailedPrecondition` (412) instead, since no retry changes that: an
+operation recorded for another sandbox stays refused until an operator
+repairs the node's record or deletes the sandbox.
+Sandbox-manager takes the sandbox's upgrade lock, which an `UpgradeRuntime`
+holds for its whole call, waiting up to five seconds (`LOCK_WAIT`) for it:
+an upgrade running there finishes first, or the abandon answers
+`UNAVAILABLE`. The control plane waits ten seconds for the answer
+(`ABANDON_TIMEOUT`), the lock wait and the settle below included. An
+answer that doesn't come in time is retryable the same way, though the node
+may still finish and record the abandonment, and the operation's next
+attempt asks again. A stay-stopped operation that hasn't settled is settled
+there first, as a retry of it would be (an interrupted one rolls back, and a
+verified boot stops the sandbox and retires what it superseded), since its
+pod, whose kubelet retries would do that, may already be gone. A
+started-target operation that hasn't settled answers `ABORTED`, since
+settling it would start the sandbox. Once nothing is left unsettled
+(a settle that fails answers its error and records nothing), sandbox-manager
+records the operation abandoned, after which every
+call for it, from any pod, is refused with `FAILED_PRECONDITION` before it
+stages, fences or boots. `GetRuntimeUpgrade` reports the abandonment
+(`abandoned`), and a wait that reads an operation the node never recorded
+as abandoned settles it as not started: it never began there and never
+will. A rollback or refusal the node recorded for an abandoned operation
+settles the pod it names as that outcome, and any other pod's wait as not
+started, since a retry's new pod is refused before the node records
+anything for it. So a retry of the upgrade whose execution still records an abandoned
+operation (the owed backup's enqueue or retire failed after the abandon)
+settles and retires the execution instead of running out its deadline. An
+abandoned operation stays refused for good, which is why each stay-stopped
+decision names a fresh operation (see the retry rule above): the next
+decision after an abandonment isn't the abandoned one. Sandbox-manager's own
+recovery of an interrupted upgrade boot can't race the capture either: it
+rolls the disk back while the upgrade's row still fences the sandbox, and
+the backup checks that fence under the artifact lock. Once the backup is
+enqueued, the upgrade's execution is retired with the sandbox's placement
+kept, fenced on the generation and attempt the check read, so the
+activation mints an execution and a pod of its own rather than waiting on
+the gone pod as a create still in flight. An execution that changed hands
+meanwhile, say to a retry of the upgrade that may boot again after the
+capture, is left alone and the activation answers a retryable 503: the
+retry names the same operation, so the older capture must not clear its
+record.
+
+How long the 412 holds depends on its cause. With no node holding the disk,
+a node that's gone, or a sandbox-manager that holds no such sandbox, no
+copy of the upgraded disk is reachable, and it holds until the sandbox is
+gone: an operator's way out is to delete the sandbox. A sandbox-manager that
+refuses the backup for its sandbox's state (failed, quarantined or being
+deleted), for missing local files or for missing backup configuration keeps
+refusing until an operator repairs that or deletes the sandbox. There's no
+override that lets a start proceed without the
+backup, since the durable copy may be the pre-upgrade disk and the start
+would then run on, and later back up, a disk the copy doesn't describe.
+
+Letting a start proceed from the durable copy when the disk node is gone
+for good isn't covered: it would need the stop path to enqueue, and
+confirm, a stopped-disk backup first, and an ordinary Kubernetes stop
+enqueues no disk backup today. The API's stop sends only the in-VM stop or
+kill (`run_stop_or_kill` in
+`crates/l40_api/api/src/controllers/sandbox/lifecycle.rs`), and
+sandbox-manager's `Stop` stops the runtime without capturing anything
+(`crates/l40_api/sbx/mgr/server/src/service/grpc_core.rs`).
+
+The claim also clears the sandbox's control-plane disk pin, in its own
+transaction, as a start's boot clears it. The upgrade's boot may rewrite the
+disk and a rollback's cleanup drops the node's pin, so a pin captured before
+the upgrade (an earlier drain's, say) describes the disk on no outcome, and
+nothing projects a stopped sandbox's node pin up: left set, a drain would
+refuse the sandbox on every tick and a restart with no known source node
+would select pre-upgrade bytes. With no pin, a drain takes the node's own.
+
+A drain's stopped evacuation and the upgrade exclude each other under the
+sandbox row's lock. The evacuation opens (sets its `stopped` marker) only
+while no upgrade holds a live lease on the execution; it defers that
+sandbox, retryably, and moves on to the rest of the node. A caller that
+retries the upgrade back to back can hold a live lease on nearly every drain
+tick and keep that one sandbox's evacuation deferred, though no other
+sandbox's. Once the marker is
+set, the upgrade's claim and its retry's takeover both refuse with a
+retryable 503, for as long as the marker stays, which is past an `:undrain`
+until the sandbox's lifecycle next changes: a later forced drain resumes the
+evacuation on the artifact it minted, and the teardown releases the node only
+while the node still pins that artifact, which any upgrade boot drops. An
+upgrade whose lease ended when the evacuation opened is taken over by it.
+Kubelet keeps retrying the upgrade pod's create after the lease ends, each
+try a boot of the upgrade, since the node records no transient refusal, so
+before it mints its backup the evacuation deletes that pod under its UID and
+defers the sandbox until the API server no longer has it, rather than
+waiting inside the tick. A pod that's gone doesn't prove its shim's
+`UpgradeRuntime` call is, since a pod force-deleted mid-create can still have
+the call on its way to the node, so the evacuation also defers until the
+disk node has abandoned the operation (`AbandonRuntimeUpgrade`, see the owed
+backup above). A node that refuses that abandon as invalid (it records the
+operation for another sandbox, or can't parse its ids) is asked once per
+controller process for that operation and then held: the sandbox stays
+`stopped` and placed on it, so the node is neither drained nor terminated,
+and `node_drain.stopped_evacuation` counts it as `upgrade_abandon_refused`.
+The controller remembers the refusal in memory, so an operator who repairs the
+node's record of the operation releases the node only once the controller
+restarts or its leadership moves and the node is asked again; deleting the
+sandbox releases it once the delete completes. An evacuation resumed with its backup already
+durable runs the same check before its teardown. The teardown then retires
+the upgrade's execution with the stop's, although it postdates the stop: the evacuation's
+current-instance backup, durable before the teardown runs, is of the disk as
+the upgrade left it, and stands in for the backup the upgrade owed
+(`node_drain/store.rs`, `kubernetes/stopped_evacuation.rs`).
+
+Before a fresh evacuation checks the node, the drain settles a stay-stopped
+upgrade whose lease ended (`settle_expired_stopped_upgrade`), but only for a
+row that's still a `stopped` resident of a node it's force-draining: a node
+undrained since the listing keeps its upgrade untouched. A boot the
+upgrade verified but never stopped leaves the node reporting the sandbox
+running, the node check would defer on it on every tick, and the
+leftover-upgrade step that settles it would never run. It reserves the
+expired claim as the owed backup does, deletes the pod (deferring until it's
+gone) and abandons the operation on the node (a refusal holds the node as
+above), which stops a verified boot,
+then ends the reservation's lease again, leaving the execution for the
+evacuation to take over.
+
+The claim, record, retire and re-drive live in the Kubernetes adapter rather
+than in shared code above it, which the substrate rules count as debt; this
+operation leaves that placement as it is.
+
+When the node's cold boot of the upgrade fails, sandbox-manager's activation
+cleanup returns the sandbox to `stopped` and publishes an activation-rollback
+receipt for the generation and attempt the pod carries. While the upgrade's
+claim still holds that attempt, the receipt retires the execution as
+`replaced` and leaves the row `stopped` and placed on its node, unlike a
+failed start of a stopped sandbox, which it unplaces: the stay-stopped
+upgrade booted the disk where it lay, and the drain finds a stopped sandbox
+only through its placement. It doesn't quarantine it. An upgrade that had read its execution
+then reads the rollback from `GetRuntimeUpgrade`, deletes the pod at its
+execution's name and answers a retryable 503: under the UID it read with the execution,
+or, when the execution hadn't recorded one, under the UID of the pod there
+that carries the operation. One the receipt beat to that read answers a retryable 503,
+and its retry's create sweeps the earlier generation's pod before it places
+its own.
+
+The `orphaned_sandboxes`,
+transient-lifecycle, `stuck_container_creating_gc` and
+`orphaned_restore_pod_gc` loops all leave the claimed execution alone: the
+first two never select a `stopped` row, the stuck-pod GC skips restore pods,
+and the restore-pod GC keeps a pod at the active generation.
 
 ### Node runtime provisioning
 

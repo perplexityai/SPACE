@@ -33,6 +33,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
+    CatalogRowSnapshot,
     ControllerLease,
     ControllerPod,
     NodeContainer,
@@ -57,6 +58,8 @@ from space_smoke.capabilities import (
     SandboxPodRender,
     AdminNodeView,
     SandboxResidency,
+    PublishedExecution,
+    RuntimeEnvironmentSnapshot,
     StoppedResidency,
     EncryptedSnapshotObservation,
     ExecutionRow,
@@ -402,6 +405,78 @@ def _sql_identifier_ish(value: str) -> str:
     return value
 
 
+_ENVIRONMENT_REF = re.compile(r"^(sha256|blake3):[0-9a-f]{64}$")
+_ENVIRONMENT_STATES = frozenset({"allowed", "deprecated", "blocked"})
+# How long the stopped runtime upgrade trigger may take, from the server's
+# budgets. It bounds the boot by `NODE_RPC_BLOCKING_BUDGET`, `NODE_RPC_TIMEOUT`
+# (150 s) less `BLOCKING_WAIT_MARGIN_SECS` (15 s): 135 s. Then it retires the
+# execution: the backup enqueue dials the disk node's node-api by name within
+# `POD_WORKER_CONNECT_TIMEOUT` (3 s) and its call is bounded only by
+# `NODE_RPC_TIMEOUT` (150 s), around a pod read and a pod delete. That's
+# 288 s, plus 30 s for the Kubernetes and database calls. (The enqueue's
+# retries of a transient refusal end at the boot's phase deadline.)
+_UPGRADE_STOPPED_RUNTIME_TIMEOUT_SECONDS = 135 + 3 + 150 + 30
+
+
+def _require_restorable_states(snapshot: RuntimeEnvironmentSnapshot) -> None:
+    """Refuse a captured policy whose states the restore couldn't write back."""
+
+    unknown = sorted({state for _, state in snapshot.states if state not in _ENVIRONMENT_STATES})
+    if unknown:
+        raise SmokeConfigurationError(
+            f"the runtime environment policy holds states {unknown} the scenario can't restore; "
+            f"it handles only {sorted(_ENVIRONMENT_STATES)}"
+        )
+
+
+def _sql_environment_ref(value: str) -> str:
+    if not _ENVIRONMENT_REF.fullmatch(value):
+        raise ValueError(f"unexpected environment reference: {value!r}")
+    return value
+
+
+def _sql_epoch(value: str) -> str:
+    if not re.fullmatch(r"-?[0-9]+(\.[0-9]+)?", value):
+        raise ValueError(f"unexpected epoch: {value!r}")
+    return value
+
+
+def _sql_edges(text: str, column: str) -> tuple[str, ...]:
+    """A `TEXT[]` of environment references in its text form, `{a,b}`."""
+
+    if not (text.startswith("{") and text.endswith("}")):
+        raise ValueError(f"unexpected {column}: {text!r}")
+    inner = text[1:-1]
+    return tuple(_sql_environment_ref(edge) for edge in inner.split(",")) if inner else ()
+
+
+def _catalog_row(reference: str, columns: str) -> CatalogRowSnapshot:
+    """A `RUNTIME_ENVIRONMENT_SNAPSHOT_SQL` catalog row: `{upgrade}|{memory}|epoch`."""
+
+    parts = columns.split("|")
+    if len(parts) != 3:
+        raise ValueError(f"unexpected catalog columns: {columns!r}")
+    upgrade_text, memory_text, retired_text = parts
+    return CatalogRowSnapshot(
+        environment_ref=_sql_environment_ref(reference),
+        upgrade_edges=_sql_edges(upgrade_text, "upgrade edges"),
+        memory_edges=_sql_edges(memory_text, "memory edges"),
+        retired_at_epoch=_sql_epoch(retired_text) if retired_text else None,
+    )
+
+
+def _sql_version(value: str) -> str:
+    if not re.fullmatch(r"[0-9]+(\.[0-9]+)*", value):
+        raise ValueError(f"unexpected version: {value!r}")
+    return value
+
+
+def _sql_environment_refs(values: Sequence[str]) -> str:
+    """A SQL list of references; one that can match nothing when empty."""
+
+    return ", ".join(f"'{_sql_environment_ref(value)}'" for value in values) or "''"
+
+
 def _sql_uuid_list(values: Sequence[str]) -> str:
     if not values:
         raise ValueError("refusing an empty id list")
@@ -632,6 +707,72 @@ STOPPED_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, ''), placement, coalesce(evacuation_restore_target, '')
 FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
 """
+# The pod runtime-upgrade scenario (`space_smoke.runtime_upgrade`). Every
+# value is validated by `_sql_environment_ref` and friends before formatting.
+PUBLISHED_EXECUTION_SQL = """\
+SELECT COALESCE(LOWER(TRIM(status)), ''), COALESCE(execution_metadata->>'environment', '')
+  FROM sandbox_observed_states WHERE sandbox_id = '{sandbox_id}'::uuid;
+"""
+# A catalog row carries the three columns the seed's upsert overwrites, so the
+# restore can put them back: `upgrade_edges` and `memory_edges` in their text
+# form and `retired_at` as epoch seconds ('' for NULL), joined by '|'.
+RUNTIME_ENVIRONMENT_SNAPSHOT_SQL = """\
+SELECT 'catalog', environment_ref,
+       upgrade_edges::text || '|' || memory_edges::text || '|'
+           || COALESCE(EXTRACT(EPOCH FROM retired_at)::text, '')
+  FROM runtime_environments
+UNION ALL
+SELECT 'policy', COALESCE(default_environment_ref, ''),
+       COALESCE(legacy_unbound_allowed::text, '') || ':' || generation::text
+  FROM runtime_environment_policy
+UNION ALL
+SELECT 'state', environment_ref, state FROM runtime_environment_states;
+"""
+# A memory edge must also be an upgrade edge
+# (`runtime_environments_memory_edges_check`), so an existing row keeps only
+# the memory edges the seeded upgrade edges still hold: seeding E0 with no
+# edge to E1 drops a certified E0 -> E1 memory edge with it.
+SEED_RUNTIME_ENVIRONMENT_SQL = """\
+INSERT INTO runtime_environments
+    (environment_ref, runtime, runtime_version, kernel_version,
+     state_format_name, state_format_version, upgrade_edges)
+VALUES ('{ref}', 'firecracker', '{version}', '{kernel}', 'firecracker-snapshot', '{format}',
+        ARRAY[{edges}]::text[])
+ON CONFLICT (environment_ref) DO UPDATE SET upgrade_edges = EXCLUDED.upgrade_edges,
+    memory_edges = ARRAY(
+        SELECT edge FROM unnest(runtime_environments.memory_edges) AS edge
+         WHERE edge = ANY(EXCLUDED.upgrade_edges)
+    ),
+    retired_at = NULL, updated_at = NOW();
+"""
+# The policy store has no verb that clears a default, so the restore writes
+# the captured policy back in one transaction, moving the generation forward
+# (nodes apply only a newer one), then drops what the scenario added and puts
+# back the catalog columns its seed overwrote.
+#
+# The default references its state row as `(ref, 'allowed')` through
+# `runtime_environment_policy_default_fkey`, which isn't deferrable. So the
+# default is cleared before any state row changes and named again only once
+# the captured states are back: naming E0 while the scenario still has it
+# `deprecated` or `blocked` would fail the key and abort the restore.
+RESTORE_RUNTIME_ENVIRONMENTS_SQL = """\
+BEGIN;
+UPDATE runtime_environment_policy
+   SET default_environment_ref = NULL, legacy_unbound_allowed = {legacy},
+       generation = generation + 1, reason = 'space-smoke: restore the captured policy',
+       updated_by_user_id = NULL, updated_at = NOW();
+DELETE FROM runtime_environment_states WHERE environment_ref NOT IN ({state_refs});
+{state_upserts}
+UPDATE runtime_environment_policy SET default_environment_ref = {default};
+DELETE FROM runtime_environments WHERE environment_ref NOT IN ({catalog_refs});
+{catalog_updates}
+COMMIT;
+"""
+RESTORE_CATALOG_ROW_SQL = (
+    "UPDATE runtime_environments SET upgrade_edges = '{edges}'::text[], "
+    "memory_edges = '{memory_edges}'::text[], "
+    "retired_at = {retired_at} WHERE environment_ref = '{ref}';"
+)
 DISK_SNAPSHOT_IDS_SQL = """\
 SELECT id FROM snapshots
  WHERE sandbox_id = '{sandbox_id}'::uuid AND type = 'disk'
@@ -5702,6 +5843,212 @@ ON CONFLICT (key_hash) DO NOTHING;
             action="list disk snapshots",
         )
         return [line.strip() for line in rows.splitlines() if line.strip()]
+
+    # --- pod runtime upgrade --------------------------------------------------
+    #
+    # The key lists and verdicts live in `space_smoke.runtime_upgrade`. The
+    # API Deployment is written under the public-API mutation Lease and the
+    # controller's under the controller-mutation Lease.
+
+    def runtime_upgrade_env(self) -> tuple[dict[str, str | None], dict[str, str | None]]:
+        from space_smoke.runtime_upgrade import API_ENV_KEYS, CONTROLLER_ENV_KEYS
+
+        return (
+            self._deployment_env_literals(self._public_api_deployment(), API_ENV_KEYS),
+            self._deployment_env_literals(self._controller_deployment(), CONTROLLER_ENV_KEYS),
+        )
+
+    def set_runtime_upgrade_env(self, api: Mapping[str, str], controller: Mapping[str, str]) -> None:
+        for value in (*api.values(), *controller.values()):
+            if value not in ("true", "false"):
+                raise ValueError(f"refusing runtime-upgrade env value {value!r}")
+        self._apply_runtime_upgrade_env(api, controller)
+
+    def restore_runtime_upgrade_env(
+        self, api: Mapping[str, str | None], controller: Mapping[str, str | None]
+    ) -> None:
+        self._apply_runtime_upgrade_env(api, controller)
+
+    def _apply_runtime_upgrade_env(
+        self, api: Mapping[str, str | None], controller: Mapping[str, str | None]
+    ) -> None:
+        from space_smoke.runtime_upgrade import validate_runtime_upgrade_env
+
+        validate_runtime_upgrade_env(api, controller)
+        self._require_isolated_kind("runtime-upgrade env override")
+        api_lease = self._held_public_api_lease("a runtime-upgrade API env write")
+        controller_lease = self._retention_lease_ownership
+        if controller_lease is None:
+            raise SmokeConfigurationError(
+                "refusing a runtime-upgrade controller env write without the caller's live "
+                "mutation Lease"
+            )
+        self._assert_lease_owned(api_lease, "a runtime-upgrade API env write")
+        self._assert_lease_owned(controller_lease, "a runtime-upgrade controller env write")
+        name = self._public_api_deployment()
+        with self._fast_rollout(name, api_lease):
+            self._set_deployment_env(name, api, timeout=240)
+        self._set_deployment_env(self._controller_deployment(), controller, timeout=180)
+        self.wait_public_api_ready(timeout=240)
+
+    def runtime_environment_snapshot(self) -> RuntimeEnvironmentSnapshot:
+        rows = self._psql(RUNTIME_ENVIRONMENT_SNAPSHOT_SQL, action="read the runtime environment catalog and policy")
+        catalog: list[CatalogRowSnapshot] = []
+        states: list[tuple[str, str]] = []
+        default: str | None = None
+        legacy: bool | None = None
+        generation = 0
+        for line in rows.splitlines():
+            if not line.strip():
+                continue
+            kind, first, second = (part.strip() for part in line.split("|", 2))
+            if kind == "catalog":
+                catalog.append(_catalog_row(first, second))
+            elif kind == "state":
+                states.append((_sql_environment_ref(first), second))
+            elif kind == "policy":
+                default = _sql_environment_ref(first) if first else None
+                legacy_text, _, generation_text = second.partition(":")
+                legacy = {"true": True, "false": False}.get(legacy_text)
+                generation = int(generation_text)
+        snapshot = RuntimeEnvironmentSnapshot(
+            catalog=tuple(catalog),
+            default_environment_ref=default,
+            legacy_unbound_allowed=legacy,
+            generation=generation,
+            states=tuple(states),
+        )
+        _require_restorable_states(snapshot)
+        return snapshot
+
+    def seed_runtime_environments(
+        self,
+        rows: Sequence[tuple[str, str, str, str]],
+        *,
+        upgrade_edges: Mapping[str, Sequence[str]],
+    ) -> None:
+        self._require_isolated_kind("runtime environment catalog seed")
+        for reference, version, kernel, state_format in rows:
+            self._psql(
+                SEED_RUNTIME_ENVIRONMENT_SQL.format(
+                    ref=_sql_environment_ref(reference),
+                    version=_sql_version(version),
+                    kernel=_sql_version(kernel),
+                    format=_sql_version(state_format),
+                    edges=", ".join(
+                        f"'{_sql_environment_ref(edge)}'" for edge in upgrade_edges.get(reference, ())
+                    ),
+                ),
+                action=f"seed runtime environment {reference}",
+            )
+
+    def restore_runtime_environments(self, snapshot: RuntimeEnvironmentSnapshot) -> None:
+        self._require_isolated_kind("runtime environment catalog restore")
+        # The restore deletes every state row it doesn't upsert, so it refuses
+        # a snapshot holding a state it can't write back before touching any.
+        _require_restorable_states(snapshot)
+        upserts = "\n".join(
+            "INSERT INTO runtime_environment_states (environment_ref, state, reason) "
+            f"VALUES ('{_sql_environment_ref(reference)}', '{state}', "
+            "'space-smoke: restore the captured policy') "
+            "ON CONFLICT (environment_ref) DO UPDATE SET state = EXCLUDED.state, "
+            "reason = EXCLUDED.reason;"
+            for reference, state in snapshot.states
+        )
+        catalog_updates = "\n".join(
+            RESTORE_CATALOG_ROW_SQL.format(
+                ref=_sql_environment_ref(row.environment_ref),
+                edges="{" + ",".join(_sql_environment_ref(edge) for edge in row.upgrade_edges) + "}",
+                memory_edges="{" + ",".join(_sql_environment_ref(edge) for edge in row.memory_edges) + "}",
+                retired_at=(
+                    f"to_timestamp({_sql_epoch(row.retired_at_epoch)})"
+                    if row.retired_at_epoch is not None
+                    else "NULL"
+                ),
+            )
+            for row in snapshot.catalog
+        )
+        self._psql(
+            RESTORE_RUNTIME_ENVIRONMENTS_SQL.format(
+                default=(
+                    f"'{_sql_environment_ref(snapshot.default_environment_ref)}'"
+                    if snapshot.default_environment_ref
+                    else "NULL"
+                ),
+                legacy={True: "TRUE", False: "FALSE", None: "NULL"}[snapshot.legacy_unbound_allowed],
+                state_refs=_sql_environment_refs([reference for reference, _ in snapshot.states]),
+                state_upserts=upserts,
+                catalog_refs=_sql_environment_refs([row.environment_ref for row in snapshot.catalog]),
+                catalog_updates=catalog_updates,
+            ),
+            action="restore the runtime environment catalog and policy",
+        )
+
+    def set_runtime_environment_policy(self, *, default: str, states: Mapping[str, str]) -> None:
+        reason = "space-smoke runtime upgrade scenario"
+        self._admin(
+            "PUT",
+            "runtime-environments/default",
+            expect=(200,),
+            body={"environment_ref": _sql_environment_ref(default), "reason": reason, "strand": True},
+        )
+        for reference, state in states.items():
+            if state not in _ENVIRONMENT_STATES:
+                raise ValueError(f"refusing environment state {state!r}")
+            self._admin(
+                "PUT",
+                f"runtime-environments/{quote(_sql_environment_ref(reference), safe='')}/state",
+                expect=(200,),
+                # The API accepts `strand` only on a block.
+                body={"state": state, "reason": reason, **({"strand": True} if state == "blocked" else {})},
+            )
+
+    def runtime_policy_nodes(self) -> list[dict[str, Any]]:
+        nodes: list[dict[str, Any]] = []
+        after: str | None = None
+        while True:
+            page = self._admin(
+                "GET",
+                "runtime-environments/nodes" + (f"?after={quote(after, safe='')}" if after else ""),
+                expect=(200,),
+            )
+            nodes.extend(node for node in (page or {}).get("nodes") or [] if isinstance(node, dict))
+            after = (page or {}).get("next_after")
+            if not after:
+                return nodes
+
+    def published_execution(self, sandbox_id: str) -> PublishedExecution:
+        row = self._psql(
+            PUBLISHED_EXECUTION_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="read the sandbox's published execution",
+        )
+        if not row:
+            return PublishedExecution(status=None, environment=None)
+        status, environment = (part.strip() for part in row.split("|", 1))
+        return PublishedExecution(status=status or None, environment=environment or None)
+
+    def upgrade_stopped_runtime(self, sandbox_id: str) -> tuple[int, dict[str, Any]]:
+        """The admin test trigger; a refusal is an answer, not an error."""
+
+        self._require_isolated_kind("stopped runtime upgrade trigger")
+        request = Request(
+            self.config.api_url.rstrip("/")
+            + f"/admin/api/v1/debug/sandbox/{_sql_uuid(sandbox_id)}/upgrade-stopped-runtime",
+            method="POST",
+            headers={"Authorization": "Bearer " + self._admin_token()},
+        )
+        try:
+            with urlopen(request, timeout=_UPGRADE_STOPPED_RUNTIME_TIMEOUT_SECONDS) as response:
+                status, raw = response.status, response.read()
+        except HTTPError as error:
+            status, raw = error.code, error.read()
+        except (URLError, OSError):
+            raise RuntimeError("the stopped runtime upgrade trigger failed") from None
+        try:
+            body = json.loads(raw) if raw else {}
+        except ValueError:
+            body = {"raw": raw[:500].decode(errors="replace")}
+        return status, body if isinstance(body, dict) else {"body": body}
 
     def sandbox_manager_lifecycle(self, node_name: str, sandbox_id: str) -> str:
         canonical = _sql_uuid(sandbox_id)
