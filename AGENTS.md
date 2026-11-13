@@ -41,6 +41,20 @@ its description matches the task.
 - Existing validators and CI guards are the enforcement source. Do not restate
   their implementation in agent instructions.
 
+## Mixed-version safety
+
+Assume old and new versions coexist during deploys and rollbacks. For schema,
+protocol, metric, recovery, or automatic-behavior changes, explain in the PR
+how both versions remain compatible, including persisted and in-flight state,
+and what rollback actually executes or requires. Add focused compatibility
+evidence; current-version tests and the existence of down SQL are not enough.
+
+Do not remove compatibility until prerequisite releases are deployed and the
+rollback target no longer needs it. Merged is not deployed; prerequisites in
+the same release do not count. If that cannot be verified, stop and request
+maintainer confirmation before recommending merge. Stage new customer-affecting
+automation behind a default-off switch unless a maintainer approves otherwise.
+
 ## Public-safe reproductions
 
 Treat this repository as upstream when investigating a problem from a private
