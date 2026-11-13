@@ -18,8 +18,9 @@ tonic = { workspace = true }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-net-common = { workspace = true, features = ["host-sockets"] }
+pplx-space-net-common = { workspace = true }
 pplx-space-net-gateway-protocol = { workspace = true }
+pplx-space-transparent-proxy-socket = { workspace = true }
 
 [dev-dependencies]
 nix = { workspace = true, features = ["fs", "mount", "sched", "user"] }

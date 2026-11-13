@@ -12,15 +12,17 @@ fn selected_create_and_cleanup_intent_commit_or_roll_back_together() {
         let conn = test_conn();
         let id = SandboxId::new().to_string();
         let params = TestSandboxInsert::new(&id, "bind0001", SandboxState::Creating);
-        let initial = pplx_space_node_runtime_core::catalog::InitialEnvironment::for_architecture(
-            pplx_space_common_core::types::Arch::X86_64,
+        let execution = ExecutionMetadata::initial_firecracker(
+            Arch::X86_64,
+            vec![ArtifactComponentMetadata {
+                kind: ArtifactComponentKind::Kernel,
+                role: Some("boot".parse().unwrap()),
+                version: Some(ArtifactVersion::parse("6.1.155").unwrap()),
+                digest: Some(format!("sha256:{}", "c".repeat(64)).parse().unwrap()),
+                format: Some(ArtifactFormat::parse("vmlinux").unwrap()),
+            }],
         )
-        .unwrap();
-        let execution = initial
-            .definition()
-            .unwrap()
-            .execution_requirements()
-            .unwrap();
+        .with_environment(format!("sha256:{}", "a".repeat(64)).parse().unwrap());
         let execution = if matches!(fault, Fault::RuntimeMismatch) {
             ExecutionMetadata::new(
                 pplx_space_common_core::types::RuntimeIdentity {
