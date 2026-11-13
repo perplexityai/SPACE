@@ -30,6 +30,13 @@ use pplx_space_common_core::kubernetes::{
     SANDBOX_ENVIRONMENT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION,
     SANDBOX_MANAGED_BY_LABEL, SANDBOX_NETWORK_SLOTS_RESOURCE, SANDBOX_POOL_CONFIG_ID_KEY,
     SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_SLOT_ID_KEY,
+    SANDBOX_RUNTIME_UPGRADE_AUTHORIZATION_ID_ANNOTATION,
+    SANDBOX_RUNTIME_UPGRADE_AUTHORIZATION_REASON_ANNOTATION,
+    SANDBOX_RUNTIME_UPGRADE_CHECKPOINT_LOCAL_ARTIFACT_ID_ANNOTATION,
+    SANDBOX_RUNTIME_UPGRADE_MEMORY_LOSS_ANNOTATION,
+    SANDBOX_RUNTIME_UPGRADE_OPERATION_ID_ANNOTATION,
+    SANDBOX_RUNTIME_UPGRADE_TARGET_ENVIRONMENT_ANNOTATION,
+    SANDBOX_RUNTIME_UPGRADE_TARGET_STATE_ANNOTATION,
     SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION, SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
     SANDBOX_TRACEPARENT_ANNOTATION, is_environment_label_key,
 };
@@ -68,6 +75,14 @@ sandbox_pod_keys! {
     SuspendRestoreStorageUri => SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
     SuspendRestoreSourceNode => SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
     Checkpoint => SANDBOX_CHECKPOINT_ANNOTATION,
+    RuntimeUpgradeOperationId => SANDBOX_RUNTIME_UPGRADE_OPERATION_ID_ANNOTATION,
+    RuntimeUpgradeTargetState => SANDBOX_RUNTIME_UPGRADE_TARGET_STATE_ANNOTATION,
+    RuntimeUpgradeTargetEnvironment => SANDBOX_RUNTIME_UPGRADE_TARGET_ENVIRONMENT_ANNOTATION,
+    RuntimeUpgradeAuthorizationId => SANDBOX_RUNTIME_UPGRADE_AUTHORIZATION_ID_ANNOTATION,
+    RuntimeUpgradeAuthorizationReason => SANDBOX_RUNTIME_UPGRADE_AUTHORIZATION_REASON_ANNOTATION,
+    RuntimeUpgradeMemoryLoss => SANDBOX_RUNTIME_UPGRADE_MEMORY_LOSS_ANNOTATION,
+    RuntimeUpgradeCheckpointLocalArtifactId =>
+        SANDBOX_RUNTIME_UPGRADE_CHECKPOINT_LOCAL_ARTIFACT_ID_ANNOTATION,
     Traceparent => SANDBOX_TRACEPARENT_ANNOTATION,
     ManagedBy => SANDBOX_MANAGED_BY_LABEL,
     PoolRole => SANDBOX_POOL_ROLE_KEY,
@@ -181,6 +196,20 @@ impl SandboxPodView {
 
     pub fn uid(&self) -> Option<&str> {
         self.uid.as_deref()
+    }
+
+    /// [`Self::uid`] as a [`PodUid`]; `None` without one, or with one that
+    /// isn't a valid UID.
+    pub fn pod_uid(&self) -> Option<pplx_space_common_core::types::PodUid> {
+        self.uid()
+            .and_then(|uid| pplx_space_common_core::types::PodUid::parse(uid).ok())
+    }
+
+    /// Whether the pod renders the runtime upgrade `operation_id`: its
+    /// operation annotation names it.
+    pub fn carries_runtime_upgrade(&self, operation_id: uuid::Uuid) -> bool {
+        self.annotation(SandboxPodKey::RuntimeUpgradeOperationId)
+            == Some(operation_id.to_string().as_str())
     }
 
     pub fn resource_version(&self) -> Option<&str> {

@@ -37,7 +37,7 @@ pub(in crate::controllers::substrate::kubernetes) enum ExecutionHydrationOutcome
 /// sandbox-id and execution-generation stamps written at create time. Phase-
 /// agnostic (unlike [`restored_pod_routability`]): used to recognize a
 /// still-Pending successor a prior interrupted attempt created.
-pub(super) fn pod_matches_execution_generation(
+pub(in crate::controllers::substrate::kubernetes) fn pod_matches_execution_generation(
     pod: &SandboxPodView,
     sandbox_id: SandboxId,
     generation: i64,

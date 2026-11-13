@@ -1346,6 +1346,7 @@ mod execution;
 mod node_sync;
 mod per_sandbox_setup;
 mod pod_ops;
+mod pod_runtime_upgrade;
 mod pool;
 mod restore_intent;
 mod runtime_upgrade;

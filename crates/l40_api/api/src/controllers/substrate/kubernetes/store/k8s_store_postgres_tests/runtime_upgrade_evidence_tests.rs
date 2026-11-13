@@ -328,6 +328,97 @@ async fn the_catalog_lists_unretired_environments_with_their_edges() -> TestResu
     Ok(())
 }
 
+/// The node publishes the legacy runtime column under the runtime's alias
+/// (`fc`), while execution metadata and the catalog name it by its identifier
+/// (`firecracker`). An unbound record attributes by that column, so it must
+/// match the catalog whichever spelling either side holds, for a start's
+/// published execution and a restore's checkpoint alike: a guard that never
+/// attributes an unbound sandbox never moves it.
+#[tokio::test]
+async fn an_unbound_record_attributes_whichever_runtime_spelling_it_holds() -> TestResult {
+    use crate::controllers::substrate::runtime_upgrade::attribute;
+    let fixture = postgres_store().await?;
+    let node_id = NodeId::new();
+    pplx_space_db_test_fixtures::insert_ready_worker_node(&fixture.pool, node_id).await?;
+    let e0: pplx_space_common_core::types::EnvironmentReference = E0.parse().unwrap();
+    // Unbound: the identity columns and the kernel component, no environment.
+    let unbound = serde_json::json!({"components": [{"kind": "kernel", "version": "6.1.155"}]});
+    for catalog_runtime in ["fc", "firecracker"] {
+        sqlx::query(sql!("DELETE FROM runtime_environments"))
+            .execute(&fixture.pool)
+            .await?;
+        for (reference, version, format) in [(E0, "1.15.1", "9.0.0"), (E1, "1.17.0", "12.0.0")] {
+            sqlx::query(sql!(
+                "INSERT INTO runtime_environments
+                     (environment_ref, runtime, runtime_version, kernel_version,
+                      state_format_name, state_format_version)
+                 VALUES ($1, $2, $3, '6.1.155', 'firecracker-snapshot', $4)"
+            ))
+            .bind(reference)
+            .bind(catalog_runtime)
+            .bind(version)
+            .bind(format)
+            .execute(&fixture.pool)
+            .await?;
+        }
+        let catalog = fixture.store.unretired_runtime_environments().await?;
+        for recorded_runtime in ["fc", "firecracker"] {
+            let case = format!("catalog {catalog_runtime}, recorded {recorded_runtime}");
+            let sandbox_id = SandboxId::new();
+            insert_sandbox(&fixture.pool, sandbox_id, "stopped").await?;
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_observed_states
+                     (sandbox_id, node_id, status, runtime, runtime_version, state_format_name,
+                      state_format_version, execution_metadata)
+                 VALUES ($1, $2, 'stopped', $3, '1.15.1', 'firecracker-snapshot', '9.0.0', $4)"
+            ))
+            .bind(sandbox_id)
+            .bind(node_id)
+            .bind(recorded_runtime)
+            .bind(sqlx::types::Json(&unbound))
+            .execute(&fixture.pool)
+            .await?;
+            let uri = format!("s3://bucket/{sandbox_id}");
+            let snapshot_id = insert_full_snapshot(
+                &fixture.pool,
+                sandbox_id,
+                &uri,
+                0,
+                Some(LocalArtifactId::new()),
+                unbound.clone(),
+            )
+            .await?;
+            sqlx::query(sql!("UPDATE snapshots SET runtime = $2 WHERE id = $1"))
+                .bind(snapshot_id)
+                .bind(recorded_runtime)
+                .execute(&fixture.pool)
+                .await?;
+
+            let published = fixture
+                .store
+                .last_published_execution(sandbox_id)
+                .await?
+                .unwrap();
+            assert_eq!(
+                attribute(&published.execution, &catalog, None),
+                Some(e0),
+                "start, {case}"
+            );
+            let checkpoint = fixture
+                .store
+                .restore_checkpoint_execution(sandbox_id, Some(&uri))
+                .await?
+                .unwrap();
+            assert_eq!(
+                attribute(&checkpoint.execution, &catalog, None),
+                Some(e0),
+                "restore, {case}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn the_policy_reads_through_the_policy_store() -> TestResult {
     let fixture = postgres_store().await?;

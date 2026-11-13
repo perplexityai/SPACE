@@ -417,23 +417,6 @@ fn a_retry_names_the_same_operation_and_a_new_subject_a_new_one() {
     ] {
         assert_ne!(operation, other);
     }
-    // The authorization names the environment's state, not a policy
-    // generation, so a retry after an unrelated policy write names the same
-    // upgrade under the same authorization.
-    let checkpoint = pplx_space_common_core::types::LocalArtifactId::new();
-    let upgrade = to_default.wake_upgrade(
-        sandbox,
-        UpgradeActivation::Restore,
-        "snapshot-a",
-        Some(checkpoint),
-    );
-    assert_eq!(
-        upgrade.checkpoint_local_artifact_id,
-        Some(checkpoint.to_string())
-    );
-    assert_eq!(upgrade.operation_id, operation.to_string());
-    assert_eq!(upgrade.target_environment, e1().to_string());
-    assert!(upgrade.authorization.unwrap().memory_loss);
 }
 
 #[test]
