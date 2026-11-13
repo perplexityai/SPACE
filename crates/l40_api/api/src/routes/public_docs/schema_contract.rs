@@ -131,8 +131,8 @@ pub(super) fn insert_command_event_stream_schema(spec: &mut Value) {
         json!({
             "200": response,
             "400": data_plane_error_response("Invalid session id, session kind, token transport, or Last-Event-ID, or a pty process session that has not started"),
-            "401": data_plane_error_response("Missing, invalid, or expired data-plane token"),
-            "403": data_plane_error_response("Token does not authorize this session"),
+            "401": data_plane_error_response("Missing, malformed, invalid, or expired data-plane token, including a token issued for another session. The `Bearer` scheme is case-insensitive"),
+            "403": data_plane_error_response("The token was issued for this session but does not grant this access"),
             "404": data_plane_error_response("Session not found"),
             "409": data_plane_error_response("Process session is already attached (retryable), or the sandbox is not running and this command cannot wake it (not retryable; `details` as on createCommand's conflict). The same 409 answers whether the node refused to start the command or the sandbox has no node and nothing is about to wake it. Over WebSocket the same refusal is an `error` frame with code `backend_stream_error` and the same `details`: branch on `details` `reason` (`sandbox_not_running`), not on the code"),
             "429": data_plane_error_response("Attached-stream limit exceeded"),
