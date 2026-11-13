@@ -3,7 +3,9 @@
 //! catalog's certified edges.
 
 use super::*;
-use crate::controllers::substrate::runtime_upgrade::{CatalogEnvironment, RecordedExecution};
+use crate::controllers::substrate::runtime_upgrade::{
+    CatalogEnvironment, RecordedExecution, canonical_runtime,
+};
 use pplx_space_common_core::types::{ArtifactComponentKind, EnvironmentReference, LocalArtifactId};
 
 /// An execution the control plane recorded, with the identity of what it
@@ -57,7 +59,9 @@ impl From<RecordedExecutionRow> for RecordedActivation {
             local_artifact_id: row.local_artifact_id,
             execution: RecordedExecution {
                 environment,
-                runtime: row.runtime,
+                // The node publishes the legacy column under the runtime's
+                // alias (`fc`), the catalog under its identifier.
+                runtime: row.runtime.map(canonical_runtime),
                 runtime_version: row.runtime_version,
                 kernel_version,
                 state_format_name: row.state_format_name,
@@ -172,7 +176,7 @@ impl K8sStore {
             .map(|row| {
                 Ok(CatalogEnvironment {
                     reference: catalog_reference(&row.environment_ref)?,
-                    runtime: row.runtime,
+                    runtime: canonical_runtime(row.runtime),
                     runtime_version: row.runtime_version,
                     kernel_version: row.kernel_version,
                     state_format_name: row.state_format_name,

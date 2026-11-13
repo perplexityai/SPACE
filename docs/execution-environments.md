@@ -1649,8 +1649,8 @@ container create, never from a Wake, so an upgrade has to boot there too. A
 Wake carrying `runtime_upgrade` is refused with `FailedPrecondition`, before
 anything is staged, fenced or booted, when its route identity or the
 sandbox's local row names a Kubernetes pod; Direct keeps its Wake path. The
-pod carries the upgrade instead, and this is the node half of that: the api
-doesn't render it yet.
+pod carries the upgrade instead. The control plane renders it for a start or
+resume that decides an upgrade (below).
 
 - **Pod.** A restore pod's `space.pplx.net/checkpoint` is `runtime-upgrade`,
   and `space.pplx.net/runtime-upgrade-*` annotations carry the operation id,
@@ -1785,11 +1785,16 @@ doesn't render it yet.
 A failed upgrade fails the pod's sandbox create, so the pod stays pending in
 `ContainerCreating`, with no container ever ending, while kubelet retries the
 create under the same pod UID, and so as the same attempt. Per-attempt
-finality is what makes that safe to wait on: once the node records an
-attempt's rollback or final refusal, no retry of that attempt can still
-upgrade the disk, and the report names the attempt it's for (`attempt_id`,
-`refused_attempt_id`), so a caller waiting on one attempt can tell its own
-outcome from another's.
+finality is what lets the control plane settle on it: **a rollback the api
+settles on is final: no retry of that attempt can still upgrade the disk, and
+the api's own retry gets a new pod, which is a new attempt.** A pod's attempt
+is its UID. The control plane settles a rolled-back or refused report only
+when its `attempt_id` names the pod it's waiting on, then deletes that pod
+under its UID, so its own retry places a new one. A started target's upgraded
+or already-on-target report settles the same way, retryably, when its
+`refused_attempt_id` names that pod, and so does an absent report carrying a
+refusal the node kept for that pod after the sandbox's row went; one naming
+another attempt, or none, leaves the wait on the pod's container as before.
 
 After a verified boot to a `stopped` target, the sandbox runs the boot's
 execution unfenced until the upgrade stops it, and a suspend there would
@@ -1870,6 +1875,12 @@ treat a report that doesn't name its attempt, and an abandon that isn't OK,
 as an outcome it can't confirm, so deploy sandbox-manager and node-api before
 any control plane that relies on them.
 
+This release's control plane settles a rollback only on a report whose
+`attempt_id` names its pod, so against a sandbox-manager that predates the
+attempt id it never settles one: the wait runs to its deadline and keeps the
+pod and its claim, as for any outcome it can't confirm. The same holds for a
+refused create against a sandbox-manager that predates `refused_attempt_id`.
+
 ### Upgrading at resume and start
 
 On Kubernetes, the control plane can decide a runtime upgrade when a stopped
@@ -1903,7 +1914,11 @@ is stranded.
    when its runtime, version, kernel and state format all match exactly one
    unretired row of `runtime_environments`; one that matches here but not on
    the node is refused there before the fence, for want of a certified
-   edge. A record from before execution
+   edge. Runtime names compare by their `RuntimeKind` identifier: the node
+   publishes the legacy `runtime` column of `sandbox_observed_states` and
+   `snapshots` under the kind's alias (`fc`), and execution metadata and the
+   catalog use the identifier (`firecracker`), so both sides are read into
+   the identifier first. A record from before execution
    metadata counts as E0 (Firecracker 1.15.1 with format 9.0.0, the
    `INITIAL_FIRECRACKER_*` identity) only when the cluster disables legacy
    unbound work, and a kernel it names must match. A bound record on an
@@ -1933,31 +1948,162 @@ is stranded.
    allowing the environment undoes. The policy is read through a 5-second
    cache, and a resume that would discard memory decides again on the
    uncached policy first.
-3. **Dispatch.** The activation's Wake carries `WakeRequest.runtime_upgrade`:
-   the target, an operation id derived from the sandbox, the move, its cause
-   and the checkpoint or execution being moved (so every retry names the same
-   upgrade under the same authorization), and the authorization. The authorization is the environment's
-   state, `runtime-environment-<blocked|unlisted|deprecated>:<environment>`,
-   and it accepts memory loss only for a suspended sandbox whose environment
-   is `blocked`. Placement doesn't change. Sandbox-manager runs the upgrade
-   under the Wake's lock, booting the cold start the Wake would run for a
-   stopped sandbox, and finishes the Wake as a resident one. When the upgrade
-   finds the sandbox already on the target, the Wake starts or restores it as
-   usual. A sandbox absent from the node, a restore pod scheduled away from
-   the node holding its checkpoint, is first staged from the checkpoint's
-   storage URI and left suspended, never launched from it, and then
-   upgraded: that's the cluster-side materialization for a sandbox with no
-   pod. A sandbox-manager that predates the field ignores it and wakes
-   normally, where its execution policy refuses a runtime that may not run.
-   Node-api serves Wake only on `WorkerApiInternal`, and forwards
-   `runtime_upgrade` only for a caller with the control-plane authority a
-   policy write needs. A Kubernetes sandbox launches in its pod's shim,
-   though, which never sees this Wake, so sandbox-manager now refuses the
-   field for a Kubernetes route identity (see "Booting an upgrade in its
-   pod"), and with the flag on these activations fail until the api moves
-   them onto the pod.
+3. **Dispatch.** The activation's pod boots the upgrade ("Booting an upgrade
+   in its pod" above): a restore pod with the `runtime-upgrade` checkpoint and
+   target state `started`, placed as the start or resume would be. Its
+   annotations name the target, an operation id derived from the sandbox, the
+   move, its cause and the checkpoint or execution being moved (so every
+   retry names the same upgrade under the same authorization), the
+   authorization and, for a resume, the local artifact of the checkpoint the
+   decision read. The authorization is the environment's state,
+   `runtime-environment-<blocked|unlisted|deprecated>:<environment>`, and it
+   accepts memory loss only for a suspended sandbox whose environment is
+   `blocked`. A restore pod placed away from the node holding the checkpoint
+   carries its storage URI, from which the node stages it first; a re-drive
+   of an unschedulable source-pinned pod carries the same upgrade. Only a
+   start or resume pod can carry one: a pod of any other kind is built
+   without it, and the wait below refuses a pod that doesn't carry the
+   operation. A start of a still-`stopped` sandbox that finds an earlier
+   start's pod carrying an upgrade it didn't decide (the policy or the
+   sandbox's record changed in between) replaces that pod rather than
+   booting under its target; a start that decided the same upgrade reuses
+   it, and one deciding after the node published the sandbox under the
+   target decides afresh and replaces the pod if its decision differs. Once the sandbox has left `stopped`, its upgraded pod is its running
+   pod, and a materialization that renders no upgrade, such as an access,
+   keeps it. A `restoring` sandbox's pod carrying an upgrade is kept whatever
+   a later resume renders, since that upgrade may have retired the checkpoint
+   the resume read. The resume settles on the upgrade that pod carries
+   instead: a rollback or refusal the node recorded for the pod deletes it,
+   so the retry places a new one, and an outcome that reached the target
+   goes on to the Wake. That includes a pod an earlier activation created
+   and failed to record, which it keeps since the pod's shim may be booting
+   the upgrade: with the execution still `creating` and no pod recorded, the
+   pod at its name counts while its annotations name the execution's
+   generation and it isn't being deleted. The node doesn't read the control
+   plane's policy, so kubelet's retries of that pod can boot the upgrade
+   even after a later decision strands the sandbox. The resume settles the
+   kept pod's upgrade before anything its own decision renders, unless the
+   decision renders that same operation, and whether it refused, renders no
+   upgrade or renders another. That upgrade only settles the kept pod: the
+   pod is kept whatever its phase, failed or being deleted included, it isn't
+   re-driven, and no new pod is placed for the upgrade, since the node takes
+   a new pod as a new attempt the decision didn't authorize, and a plain
+   replacement could restore from a checkpoint the upgrade retired. A resume
+   that finds the kept pod gone answers retryably and keeps the restore
+   `restoring`, since that pod may have booted the upgrade.
+4. **Outcome.** Before the activation's Wake, the control plane reads the
+   operation from the pod's node with `GetRuntimeUpgrade`, through that node's
+   node-api, by node name, since a pod whose create failed has no address.
+   The read names the pod's attempt (`GetRuntimeUpgradeRequest.attempt_id`,
+   the UID the shim names its attempt by: the pod at the name or, once it's
+   gone, the one the wait knew), so a node from this release answers that
+   attempt's own rollback or refusal, and absent in place of another
+   attempt's, carrying a refused create it kept for the pod after the
+   sandbox's row went; a node that predates the field answers the operation's
+   latest outcome, and the wait still settles only on a report naming its
+   pod. The report is the upgrade's outcome on the node, not the
+   pod's, so it's read with the pod's status. Upgraded or already on the target continues to
+   the Wake once the pod's container runs; the Wake carries no upgrade and
+   only acknowledges the route the pod's execution runs under. Upgraded or
+   already on the target while the pod's container has ended, or the pod is
+   gone, means the node refused the pod's create, as it does a retry's new pod
+   once the sandbox left the execution the operation started. That refuses
+   the activation with a retryable 503 before any Wake. A resume isn't put
+   back to `suspended` then: the node booted the sandbox on the target and
+   retired the checkpoint the resume read, which may exist nowhere else. The
+   restore stays `restoring` on its node, the node stops the sandbox once the
+   pod's runtime has ended, keeping its disk, and its publication of the
+   sandbox `stopped` converges the row to `stopped` there. A rollback, or a
+   refusal before anything was fenced, that names this pod's UID refuses it
+   the same way and leaves the sandbox on its old environment, whatever the
+   pod's containers show: the pod stays pending in its create, and the node
+   answers kubelet's retries of it with the same outcome. The node keeps
+   that outcome for the pod even after a later pod's attempt replaces it in
+   the report, so a delayed retry from the earlier pod never fences again.
+   It records only a refusal a retry can't change (`FAILED_PRECONDITION` or
+   `INVALID_ARGUMENT`); a transient one (the sandbox isn't stopped or
+   suspended yet, cleanup owns it, another operation fences it, a
+   node-manager or staging failure) stays unrecorded,
+   so kubelet's retry from the same pod tries again, and the report, still
+   the earlier pod's or absent, never settles this pod: the wait runs to its
+   deadline and keeps the pod. A recorded refusal answers
+   `FailedPrecondition` (412) rather than 503, as a stranded sandbox does: a
+   retry decides the same operation from the same inputs, and the node
+   refuses it until what it checked changes. The activation
+   deletes that pod under its UID and gives up its attempt, so its retry
+   places a new pod. A retry after a rollback boots the upgrade again: the
+   operation id is derived from the same inputs on every retry, but the node
+   takes a new pod's request as a new attempt, which may succeed. Until that
+   pod's shim reaches the node, the node still reports the earlier pod's
+   rollback, which never settles the retry. Nor does a rollback that names
+   no pod, from a sandbox-manager that predates the pod UID: the wait fails
+   closed. A rollback or refusal naming another pod, or none, on an operation
+   the node has since abandoned settles as not started, when the report
+   comes from the node the pod is bound to or, for a pod that's gone, the
+   node a look saw it bound to: the node refuses every later call for it
+   before it records anything, and abandons the operation for itself only.
+   An operation the node never recorded and has since abandoned settles as
+   not started on the same terms, whatever the pod shows. Apart from that, a rollback or refusal settles only for
+   the pod it names, as follows. With no pod there at all, a rollback or refusal settles only when
+   it names the pod the wait last saw, or the one the execution recorded, so
+   a pod force-deleted mid-create never settles on an earlier pod's outcome. An operation the node never recorded
+   settles only once the pod's container has terminated: the shim's call
+   has returned by then. A pod phase marked failed (an eviction of a pending
+   pod, say) proves no such thing, so it waits. A pod that's gone proves no such thing, since it can be
+   deleted while its create's call is still on its way to the node, so that
+   case waits like one in progress, and so does a pod that's gone with no
+   node recorded for it, unless the pod never existed. A rollback or refusal
+   settles only once the wait deletes its pod under its UID, or once that
+   delete fails, which leaves the pod for the retry's wait to delete: a
+   delete that finds another pod at the name, or no pod, means the read was
+   of a pod the API has replaced or no longer has, so the wait reads again. On every look
+   the wait reads the execution that owns the pod's name: a pod being
+   deleted, or one that isn't the pod the execution recorded (an earlier
+   attempt's pod a cache still holds under the same name and operation),
+   settles nothing, and the execution's recorded pod outranks the one the
+   wait saw. A gone pod with no execution left owning its name settles
+   nothing either. An activation that joined another attempt's claim can't
+   see that attempt's create, so no pod at the name settles nothing for it
+   while the execution records no pod. Once the joiner's wait has seen the
+   pod the execution records and an uncached read finds no pod, the pod is
+   gone: the owner creates a pod only after a materialization clears the
+   recorded pod, so nothing runs for the upgrade there, and the joiner
+   settles as for a gone pod. A recorded pod the joiner never saw settles
+   nothing: an attempt that settled deletes its pod and gives itself up with
+   the pod's UID still recorded, the next attempt claims the execution with
+   that record standing until its own materialization clears it, and the
+   node keeps reporting the earlier pod's outcome until the new pod's shim
+   reaches it. A rollback or refusal that
+   settles a restore's upgrade gives up the restore's attempt only after the
+   restore reverts to `suspended`, since that revert retires the restore's
+   execution only while it still carries the attempt. An
+   operation still in progress, a pod whose create hasn't returned, a report
+   that doesn't name the pod, or a node that can't be read runs out the
+   activation's readiness budget and answers its retryable timeout. Each look
+   at the outcome (a read of the pod, from the cache or, on a miss, uncached,
+   and always uncached for a joiner, so a cache still holding an earlier
+   attempt's pod never passes for its owner's; a Postgres read of its
+   execution; then the
+   `GetRuntimeUpgrade` read, including any dial it needs) gets the time left
+   to that budget's deadline, at least one second, so an API server,
+   database or node that never answers holds each look at most a second past
+   it. The delete of a settled pod isn't bounded by it, only by the
+   activation's outer budget, and a restore gives its attempt up after that
+   budget. A pod's materialization that fails after it
+   created, or kept, a pod carrying the operation (recording the pod's node,
+   say) is treated the same way, since the pod's shim may be running the
+   upgrade: a restore keeps the sandbox `restoring` and its pod rather than
+   reverting to `suspended`, and a start keeps its attempt's claim until the
+   lease ends. A retry names the same operation, which the node
+   refuses for a new pod once anything has started the sandbox since, until
+   the node publishes the sandbox under the target and the decision no longer
+   moves it; an already-on-target operation whose start was refused before
+   its activation claimed the sandbox may start it on a retry. The same holds
+   for a resume whose upgraded pod died before its restore completed: every
+   resume derives the same operation id from the checkpoint's metadata, and
+   the node refuses the replacement pod.
    A suspended sandbox's checkpoint on the node is booted only if it's the
-   one the upgrade was decided from: the Wake names that checkpoint's local
+   one the upgrade was decided from: the pod names that checkpoint's local
    artifact, and the row must pin it, as it does on the checkpoint's source
    node and after staging, so the check holds across retries. An upgrade of a
    suspended sandbox that names no checkpoint is refused. A stale copy, a
@@ -2036,6 +2182,22 @@ is stranded.
    encrypted checkpoint writes no plaintext rootfs, so an encrypted sandbox
    restored away from its checkpoint is refused before the fence, and an
    encrypted stale copy is left in place.
+
+**A start whose decided upgrade didn't take effect never reports it as
+done: the sandbox runs on its old environment and the upgrade stays visibly
+not done.** A start's success says the sandbox runs, not that it moved.
+Nothing the control plane records for a start names the target as reached:
+not the start's operation, and not the plain pod and execution of a start
+that fell back. The upgrade's record is the environment the node publishes
+the sandbox under, which `GET /runtime-environments/population` counts and
+the next decision reads, together with the node's outcome for the pod
+(`GetRuntimeUpgrade`). A campaign reads those, not the start's result. The
+node never publishes a fenced sandbox under the target, so a rollback or a
+refusal leaves it published on its old environment: the start is refused,
+retryably for a rollback and with a 412 for a refusal the node recorded, and
+its retry decides the same upgrade again. A start falls back
+to a plain start only when its decision changes, say an operator allowed the
+old environment meanwhile, and the sandbox then runs and is published there.
 
 While an upgrade holds the sandbox, other activations get the retryable 503
 the restore and activation leases already give, and a Wake that meets the

@@ -1,4 +1,5 @@
 use super::pod_ops::{ActivationWakeFailure, WakeDispatchStatus};
+use super::pod_runtime_upgrade::{MissingPod, PodUpgradeFailure};
 use super::support::{
     activation_wake_action, ready_wait_bounds, remaining_ready_window, wake_request_route_identity,
 };
@@ -1870,6 +1871,10 @@ impl KubernetesSubstrate {
         // the lifecycle cleanup decision without being reduced to a plain
         // `SubstrateError`.
         let wake_was_dispatched = AtomicBool::new(false);
+        // Set when the owned attempt's runtime upgrade settled off its
+        // target: the attempt is given up only after the restore's revert,
+        // which retires the execution only while it still carries the attempt.
+        let give_up_after_revert = AtomicBool::new(false);
         let wait = async {
             let restore_plan = if target_state == SandboxLifecycle::Stopped {
                 Some(self.stopped_evacuation_restore_plan(&sandbox).await?)
@@ -1883,17 +1888,51 @@ impl KubernetesSubstrate {
             // Decided before the pod exists, so a stranded sandbox is refused
             // before anything is placed. Every restore here lands in the
             // started lifecycle except a drain's evacuation, which keeps the
-            // sandbox's lifecycle and its environment.
-            let runtime_upgrade = match &restore_plan {
+            // sandbox's lifecycle and its environment. The pod's shim boots
+            // the upgrade (`pod_runtime_upgrade.rs`); the Wake carries none.
+            //
+            // A resume taking over a restore an earlier one left `restoring`
+            // may find that one's upgrade pod kept. A decision that now
+            // refuses (the policy or catalog changed, say, so the sandbox is
+            // stranded) doesn't stop it from settling that pod: it goes on
+            // with the upgrade the pod carries, which settles as below.
+            let takes_over_restoring = matches!(
+                prepared.restore_claim,
+                Some(RestoreClaim::RedroveRestoring { .. })
+            );
+            // A takeover settles its kept pod's upgrade before anything its
+            // own decision renders, unless the decision renders that same
+            // operation: whether the decision refused, renders no upgrade or
+            // renders another, the kept upgrade may have retired the
+            // checkpoint the resume read. It only settles that pod; nothing
+            // renders it on a new one, and the ordinary stale-pod rules
+            // don't replace the pod first.
+            let (runtime_upgrade, runtime_upgrade_kept) = match &restore_plan {
                 Some(plan) if intent.allows_runtime_upgrade => {
-                    self.activation_runtime_upgrade(
-                        sandbox_id,
-                        UpgradeActivation::Restore,
-                        plan.storage_uri.as_deref(),
-                    )
-                    .await?
+                    let decided = self
+                        .activation_runtime_upgrade(
+                            sandbox_id,
+                            UpgradeActivation::Restore,
+                            plan.storage_uri.as_deref(),
+                        )
+                        .await;
+                    let kept = if takes_over_restoring {
+                        self.kept_runtime_upgrade(sandbox_id).await
+                    } else {
+                        None
+                    };
+                    match (decided, kept) {
+                        (Ok(Some(decided)), Some(kept))
+                            if decided.operation_id == kept.operation_id =>
+                        {
+                            (Some(decided), false)
+                        }
+                        (_, Some(kept)) => (Some(kept), true),
+                        (Ok(decided), None) => (decided, false),
+                        (Err(refusal), None) => return Err(refusal),
+                    }
                 }
-                _ => None,
+                _ => (None, false),
             };
             // Boxed: `ensure_pod_exists` is a large future; inlining it here
             // overflows the test thread's stack.
@@ -1922,7 +1961,9 @@ impl KubernetesSubstrate {
                         restore_plan
                             .as_ref()
                             .and_then(|plan| plan.expected_local_artifact_id),
-                    ),
+                    )
+                    .upgrading_runtime(runtime_upgrade.clone())
+                    .keeping_runtime_upgrade(runtime_upgrade_kept),
                 ),
             )
             .await
@@ -1933,8 +1974,113 @@ impl KubernetesSubstrate {
                     owner_attempt_id,
                     ..
                 }) => (requested_attempt_id, Some(owner_attempt_id)),
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // The materialization may have failed after a pod
+                    // carrying the upgrade was created, or kept: its shim may
+                    // be running it, so this isn't a clean failure.
+                    if activation_assignment.upgrade_pod_may_run() {
+                        wake_was_dispatched.store(true, Ordering::Release);
+                    }
+                    return Err(error);
+                }
             };
+            // A `restoring` sandbox's pod carrying an upgrade this restore
+            // doesn't render is kept (`runtime_upgrade_stale_reason`), since
+            // that upgrade may have retired the checkpoint the restore read.
+            // Its outcome decides the restore instead: a rollback or refusal
+            // the node recorded for the pod deletes it, so the retry places a
+            // new pod, rather than every resume waiting on a pod that never
+            // runs. That holds with the decision off too, for a pod left from
+            // while it was on. Only a restore that took over a row an earlier
+            // one left `restoring` can find such a pod; a drain's evacuation
+            // renders no upgrade and settles none.
+            let assigned_pod_name = activation_assignment.assigned_pod_name();
+            let runtime_upgrade = match assigned_pod_name.as_deref() {
+                Some(pod_name) if intent.allows_runtime_upgrade && takes_over_restoring => self
+                    .carried_runtime_upgrade(sandbox_id, pod_name, runtime_upgrade.as_ref())
+                    .await
+                    .or(runtime_upgrade),
+                _ => runtime_upgrade,
+            };
+            if let Some(upgrade) = runtime_upgrade.as_ref() {
+                // The pod's create runs the upgrade on the node, so until the
+                // node says it settled, the restore's cleanup treats it as
+                // node work that may still run.
+                wake_was_dispatched.store(true, Ordering::Release);
+                // The claim names the pod; a restore that joined another
+                // attempt's claim reads the execution it joined. That
+                // attempt may not have sent its pod's create yet, so no pod
+                // there settles nothing for the joiner: settling would end
+                // the restore as clean while the owner's pod is about to
+                // boot the upgrade.
+                let missing = if joined_attempt_id.is_some() {
+                    MissingPod::NotCreatedYet
+                } else {
+                    MissingPod::Gone
+                };
+                let pod_name = match assigned_pod_name {
+                    Some(pod_name) => pod_name,
+                    None => self
+                        .store
+                        .active_execution_status(sandbox_id)
+                        .await?
+                        .map(|execution| execution.pod_name)
+                        .ok_or_else(|| SubstrateError::Unavailable {
+                            message: format!(
+                                "sandbox {sandbox_id}'s execution disappeared during its runtime \
+                                 upgrade; retry"
+                            ),
+                        })?,
+                };
+                let owned_attempt = activation_assignment
+                    .assigned()
+                    .filter(|_| joined_attempt_id.is_none());
+                // The attempt isn't given up here: a clean failure reverts
+                // the restore first (below), and that revert retires the
+                // execution only while it still carries the attempt.
+                match self
+                    .settle_pod_runtime_upgrade(
+                        sandbox_id,
+                        &pod_name,
+                        missing,
+                        upgrade,
+                        phase_deadline,
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    // Nothing of it runs in this pod: a rollback or a refused
+                    // call left the sandbox on its old checkpoint, and a pod
+                    // the node refused never started it.
+                    Err(PodUpgradeFailure::Settled(refusal)) => {
+                        wake_was_dispatched.store(false, Ordering::Release);
+                        give_up_after_revert.store(owned_attempt.is_some(), Ordering::Release);
+                        return Err(refusal);
+                    }
+                    // The node booted the sandbox on the target and retired
+                    // the checkpoint this restore read, so it isn't a clean
+                    // failure: reverting to `suspended` would point the next
+                    // restore at a checkpoint that may exist nowhere. The
+                    // restore stays `restoring` on this node, and the node's
+                    // publication decides what comes next: once the pod's
+                    // runtime has ended, the node stops the sandbox, keeping
+                    // its disk, and its `stopped` publication converges the
+                    // row there (`converge_published_stopped`); a sandbox
+                    // the node runs under another pod's execution is
+                    // published as whatever that execution left it.
+                    Err(PodUpgradeFailure::LeftOnTarget(error)) => {
+                        if let Some((attempt_id, generation)) = owned_attempt {
+                            self.store
+                                .give_up_activation_attempt_best_effort(
+                                    sandbox_id, generation, attempt_id,
+                                )
+                                .await;
+                        }
+                        return Err(error);
+                    }
+                    Err(PodUpgradeFailure::MayStillRun(error)) => return Err(error),
+                }
+            }
             self.ensure_active_execution_pod_proxy_reachable(
                 metric_identity,
                 sandbox_id,
@@ -2041,7 +2187,9 @@ impl KubernetesSubstrate {
                                 },
                             ),
                             target_state: wake_target_state,
-                            runtime_upgrade: runtime_upgrade.clone(),
+                            // Kubernetes boots the upgrade in the pod's shim, which already
+                            // ran it; this Wake carries none.
+                            runtime_upgrade: None,
                         }
                     },
                     emit_wake_requested,
@@ -2293,6 +2441,16 @@ impl KubernetesSubstrate {
                 activation_assignment.assigned(),
             )
             .await;
+        }
+        // After the revert: one that retired the execution leaves nothing to
+        // give up, and one that kept it (retirement off, or no proven source)
+        // still frees the lease for the retry.
+        if give_up_after_revert.load(Ordering::Acquire)
+            && let Some((attempt_id, generation)) = activation_assignment.assigned()
+        {
+            self.store
+                .give_up_activation_attempt_best_effort(sandbox_id, generation, attempt_id)
+                .await;
         }
         if cleanup_on_failure
             && !restore_failure_should_revert_to_suspended(
