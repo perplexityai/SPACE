@@ -38,6 +38,7 @@ use pplx_space_common_core::types::{
 use pplx_space_durations::PositiveDuration;
 
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
@@ -1104,6 +1105,12 @@ pub async fn adopt_remote_snapshot_for_drain(
     .rows_affected();
     Ok(flipped)
 }
+
+/// How long a sandbox may sit in a non-evacuable resident transient
+/// lifecycle before a forced drain's [`abandon_stale_resident_sandboxes`]
+/// fails it. The cluster-controller's stale-abandon default and the node holds
+/// read's [`crate::node_holds::STUCK_TRANSIENT_AFTER`] are both this constant.
+pub const STALE_ABANDON_AFTER: Duration = Duration::from_secs(600);
 
 /// `$1` = node id, `$2` = age seconds (BIGINT), `$3` = the non-evacuable
 /// resident transient lifecycle strings (the drain's

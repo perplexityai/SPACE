@@ -17,6 +17,10 @@ use pplx_space_common_core::types::{
     NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeManagedBy, SandboxId,
 };
 use pplx_space_sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::node_placements::{
+    self, NodePlacementChangeCursor, NodePlacementChangeRow, NodePlacementFilter,
+};
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -33,7 +37,9 @@ use crate::middleware::auth::AuthUser;
 use crate::models::User;
 use crate::routes::AppState;
 
+mod holds;
 mod read_state;
+pub(super) use holds::list_node_holds;
 use read_state::attach_node_read_state;
 
 /// Drain-phase states stored in `nodes.drain_phase`. NULL means the node is
@@ -796,37 +802,280 @@ fn parse_long_runner_age(
     }
 }
 
+/// The single-valued parameters of `GET /nodes/{node_id}/sandboxes`.
+/// `lifecycle` repeats, so it is read from the query pairs instead; serde
+/// ignores it here. An empty value of a history parameter is unset, as
+/// leaving the name out is: the list ignored these names before it read them.
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct NodeSandboxesQuery {
     after: Option<SandboxId>,
+    #[serde(default, deserialize_with = "super::sandbox_list::empty_as_unset")]
+    order: Option<NodeSandboxOrder>,
+    #[serde(default, deserialize_with = "super::sandbox_list::empty_as_unset")]
+    cursor: Option<String>,
+    #[serde(default, deserialize_with = "super::sandbox_list::empty_as_unset")]
+    changed_since: Option<String>,
+}
+
+/// How a node's sandbox list is ordered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum NodeSandboxOrder {
+    /// By sandbox id, paged with `after`: the order the list always had.
+    #[default]
+    Id,
+    /// Newest `lifecycle_changed_at` first, then id descending, paged with
+    /// `cursor`.
+    LifecycleChangedDesc,
+}
+
+impl FromStr for NodeSandboxOrder {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "id" => Ok(Self::Id),
+            "lifecycle_changed_desc" => Ok(Self::LifecycleChangedDesc),
+            other => Err(format!(
+                "unknown order {other:?}; expected id or lifecycle_changed_desc"
+            )),
+        }
+    }
+}
+
+/// Where a node's sandbox page starts, by order.
+#[derive(Debug, Clone, Copy)]
+enum NodeSandboxPaging {
+    Id(Option<SandboxId>),
+    Change(Option<NodePlacementChangeCursor>),
+}
+
+const NODE_SANDBOX_PAGE: usize = 100;
+const NODE_SANDBOX_CURSOR_VERSION: &str = "v1";
+
+/// `v1:<lifecycle_changed_at unix microseconds>:<id>`, base64url without
+/// padding. Microseconds are what `timestamptz` keeps, so the position
+/// round-trips exactly.
+fn encode_node_sandbox_cursor(row: &NodePlacementChangeRow) -> String {
+    let micros = row.lifecycle_changed_at.unix_timestamp_nanos() / 1_000;
+    base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        format!("{NODE_SANDBOX_CURSOR_VERSION}:{micros}:{}", row.id),
+    )
+}
+
+fn decode_node_sandbox_cursor(
+    cursor: &str,
+) -> Result<NodePlacementChangeCursor, (StatusCode, Json<serde_json::Value>)> {
+    let invalid = || api_error(StatusCode::BAD_REQUEST, "invalid cursor");
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, cursor)
+        .map_err(|_| invalid())?;
+    let raw = std::str::from_utf8(&raw).map_err(|_| invalid())?;
+    let mut parts = raw.splitn(3, ':');
+    let (Some(NODE_SANDBOX_CURSOR_VERSION), Some(micros), Some(id)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(invalid());
+    };
+    let lifecycle_changed_at = micros
+        .parse::<i64>()
+        .ok()
+        .and_then(|micros| {
+            OffsetDateTime::from_unix_timestamp_nanos(i128::from(micros) * 1_000).ok()
+        })
+        .ok_or_else(invalid)?;
+    let id = SandboxId::from_str(id).map_err(|_| invalid())?;
+    Ok(NodePlacementChangeCursor {
+        lifecycle_changed_at,
+        id,
+    })
+}
+
+/// The history parameters of a node's sandbox list.
+#[derive(Debug)]
+struct NodeSandboxHistory {
+    filter: NodePlacementFilter,
+    paging: NodeSandboxPaging,
+}
+
+/// The request's history parameters, or `None` when it uses none of them
+/// and gets the list as it always was.
+fn node_sandbox_history(
+    query: NodeSandboxesQuery,
+    uri: &axum::http::Uri,
+) -> Result<Option<NodeSandboxHistory>, (StatusCode, Json<serde_json::Value>)> {
+    let pairs: Vec<(String, String)> = Query::try_from_uri(uri)
+        .map(|Query(pairs)| pairs)
+        .map_err(|rejection| api_error(StatusCode::BAD_REQUEST, rejection.body_text()))?;
+    let mut lifecycles = Vec::new();
+    for (_, value) in pairs
+        .iter()
+        .filter(|(name, value)| name == "lifecycle" && !value.is_empty())
+    {
+        for part in value.split(',') {
+            let lifecycle = StoredSandboxLifecycle::from_str(part).map_err(|_| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown lifecycle {part:?}"),
+                )
+            })?;
+            if !lifecycles.contains(&lifecycle) {
+                lifecycles.push(lifecycle);
+            }
+        }
+    }
+    let changed_since = query
+        .changed_since
+        .as_deref()
+        .map(|value| {
+            super::sandbox_list::parse_timestamp("changed_since", value).and_then(|since| {
+                super::sandbox_list::round_up_to_microsecond("changed_since", since)
+            })
+        })
+        .transpose()?;
+    let filter = NodePlacementFilter {
+        lifecycles: (!lifecycles.is_empty()).then_some(lifecycles),
+        changed_since,
+    };
+    let paging = match (query.order.unwrap_or_default(), query.after, query.cursor) {
+        (NodeSandboxOrder::Id, after, None) => NodeSandboxPaging::Id(after),
+        (NodeSandboxOrder::Id, _, Some(_)) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "cursor pages order=lifecycle_changed_desc; order=id pages with after",
+            ));
+        }
+        (NodeSandboxOrder::LifecycleChangedDesc, Some(_), _) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "after pages order=id; order=lifecycle_changed_desc pages with cursor",
+            ));
+        }
+        (NodeSandboxOrder::LifecycleChangedDesc, None, cursor) => NodeSandboxPaging::Change(
+            cursor
+                .as_deref()
+                .map(decode_node_sandbox_cursor)
+                .transpose()?,
+        ),
+    };
+    let unchanged = filter.lifecycles.is_none()
+        && filter.changed_since.is_none()
+        && matches!(paging, NodeSandboxPaging::Id(_));
+    Ok((!unchanged).then_some(NodeSandboxHistory { filter, paging }))
+}
+
+/// One row of the newest-change-first list.
+#[derive(Debug, serde::Serialize)]
+struct NodeSandboxChangeEntry {
+    id: SandboxId,
+    lifecycle: String,
+    active_node_id: Option<NodeId>,
+    target_node_id: Option<NodeId>,
+    lifecycle_changed_at: String,
 }
 
 pub(super) async fn list_node_sandboxes(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
     Path(node_id): Path<NodeId>,
-    Query(query): Query<NodeSandboxesQuery>,
+    uri: axum::http::Uri,
 ) -> axum::response::Response {
+    // Parsed before authorization, where an extractor would run, so a
+    // malformed query answers axum's 400 whoever sends it.
+    let query = match Query::<NodeSandboxesQuery>::try_from_uri(&uri) {
+        Ok(Query(query)) => query,
+        Err(rejection) => return rejection.into_response(),
+    };
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
     }
+    let legacy_after = query.after;
+    let history = match node_sandbox_history(query, &uri) {
+        Ok(history) => history,
+        Err(err) => return err.into_response(),
+    };
     let store = AdminNodeStore::new(state.pool.clone());
     match store.fetch(node_id).await {
         Ok(Some(_)) => {}
         Ok(None) => return api_error(StatusCode::NOT_FOUND, "Node not found").into_response(),
         Err(err) => return db_error(err).into_response(),
     }
-    let mut sandboxes = match store.list_sandboxes(node_id, query.after, 101).await {
-        Ok(rows) => rows,
-        Err(err) => return db_error(err).into_response(),
+    let page_rows = i64::try_from(NODE_SANDBOX_PAGE + 1).expect("page size fits in i64");
+    let NodeSandboxHistory { filter, paging } = match history {
+        Some(history) => history,
+        None => {
+            let mut sandboxes = match store.list_sandboxes(node_id, legacy_after, 101).await {
+                Ok(rows) => rows,
+                Err(err) => return db_error(err).into_response(),
+            };
+            let next_after = if sandboxes.len() > 100 {
+                sandboxes.truncate(100);
+                sandboxes.last().map(|row| row.id)
+            } else {
+                None
+            };
+            return Json(serde_json::json!({ "sandboxes": sandboxes, "next_after": next_after }))
+                .into_response();
+        }
     };
-    let next_after = if sandboxes.len() > 100 {
-        sandboxes.truncate(100);
-        sandboxes.last().map(|row| row.id)
-    } else {
-        None
-    };
-    Json(serde_json::json!({ "sandboxes": sandboxes, "next_after": next_after })).into_response()
+    match paging {
+        NodeSandboxPaging::Id(after) => {
+            let mut sandboxes: Vec<node_store::NodeSandboxRow> =
+                match node_placements::list_by_id(&state.pool, node_id, &filter, after, page_rows)
+                    .await
+                {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .map(|row| node_store::NodeSandboxRow {
+                            id: row.id,
+                            lifecycle: row.lifecycle.as_str().to_owned(),
+                            active_node_id: row.active_node_id,
+                            target_node_id: row.target_node_id,
+                        })
+                        .collect(),
+                    Err(err) => return db_error(err).into_response(),
+                };
+            let next_after = if sandboxes.len() > NODE_SANDBOX_PAGE {
+                sandboxes.truncate(NODE_SANDBOX_PAGE);
+                sandboxes.last().map(|row| row.id)
+            } else {
+                None
+            };
+            Json(serde_json::json!({ "sandboxes": sandboxes, "next_after": next_after }))
+                .into_response()
+        }
+        NodeSandboxPaging::Change(cursor) => {
+            let mut rows = match node_placements::list_by_change(
+                &state.pool,
+                node_id,
+                &filter,
+                cursor,
+                page_rows,
+            )
+            .await
+            {
+                Ok(rows) => rows,
+                Err(err) => return db_error(err).into_response(),
+            };
+            let next_cursor = if rows.len() > NODE_SANDBOX_PAGE {
+                rows.truncate(NODE_SANDBOX_PAGE);
+                rows.last().map(encode_node_sandbox_cursor)
+            } else {
+                None
+            };
+            let sandboxes: Vec<NodeSandboxChangeEntry> = rows
+                .into_iter()
+                .map(|row| NodeSandboxChangeEntry {
+                    id: row.id,
+                    lifecycle: row.lifecycle.as_str().to_owned(),
+                    active_node_id: row.active_node_id,
+                    target_node_id: row.target_node_id,
+                    lifecycle_changed_at: format_time(row.lifecycle_changed_at),
+                })
+                .collect();
+            Json(serde_json::json!({ "sandboxes": sandboxes, "next_cursor": next_cursor }))
+                .into_response()
+        }
+    }
 }
 
 pub async fn get_admin_node(
@@ -966,7 +1215,7 @@ fn terminate_conflict_body(occupancy: &node_store::TerminateOccupancy) -> serde_
 /// `controllers::sandbox::lifecycle`. Both halves matter, and the
 /// `active` half is the one that was computed and not checked; see the call site
 /// for what that cost.
-fn terminate_blocked_by_occupancy(occupancy: &node_store::TerminateOccupancy) -> bool {
+pub(super) fn terminate_blocked_by_occupancy(occupancy: &node_store::TerminateOccupancy) -> bool {
     occupancy.active > 0 || occupancy.drain_blockers > 0
 }
 

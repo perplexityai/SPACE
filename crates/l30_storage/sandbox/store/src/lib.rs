@@ -70,7 +70,11 @@
 //!   as a `get` plus a filter.
 //! * **Aggregate reads are modules too.** [`stuck`] counts the rows in each
 //!   transient lifecycle by age for a gauge; it reads the row's own clock and
-//!   writes nothing.
+//!   writes nothing. [`node_holds`] lists the rows the node-release gates
+//!   count against one node, each with the gate terms that count it, composed
+//!   from the residency and portability fragments those gates read.
+//!   [`node_placements`] pages one node's placement history, every lifecycle
+//!   included.
 //!
 //! # Fact kinds
 //!
@@ -122,6 +126,8 @@ pub mod ingest;
 pub mod intent;
 mod lifecycle;
 pub mod lost;
+pub mod node_holds;
+pub mod node_placements;
 pub mod orphan;
 pub mod pod_tracking;
 pub mod quarantine;
