@@ -800,6 +800,9 @@ message InspectSandboxRequest {
   optional string template = 5;
   // Read durable authority without host probes; works after lease release too.
   bool execution_only = 6;
+  // Read only the sandbox cgroup files, without network, process or
+  // filesystem probes. Ignored when execution_only is set.
+  bool cgroup_only = 7;
 }
 
 message InspectSandboxResponse {

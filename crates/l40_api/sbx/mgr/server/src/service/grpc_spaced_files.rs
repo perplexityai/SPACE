@@ -212,6 +212,9 @@ impl SandboxManagerService {
             slot: Some(slot),
             template: Some(sandbox.template.clone()),
             execution_only: false,
+            // Stats reads only cgroup figures. A node-manager without this
+            // mode answers the full inspection from the identity above.
+            cgroup_only: true,
         };
         let inspect_started = Instant::now();
         let inspect = match pplx_space_common_grpc::retry_grpc_status_with_context(
