@@ -11465,15 +11465,15 @@ mod kubernetes_tests {
         );
         assert_eq!(
             classify_sandbox_delete_rpc_error(&tonic::Status::aborted("another cleanup conflict",)),
-            SandboxDeleteRpcErrorDisposition::ContinueTeardown
+            SandboxDeleteRpcErrorDisposition::ProbeAdmission
         );
         assert_eq!(
             classify_sandbox_delete_rpc_error(&tonic::Status::not_found("already gone")),
-            SandboxDeleteRpcErrorDisposition::ContinueTeardown
+            SandboxDeleteRpcErrorDisposition::ProbeAdmission
         );
         assert_eq!(
             classify_sandbox_delete_rpc_error(&tonic::Status::internal("cleanup failed")),
-            SandboxDeleteRpcErrorDisposition::ContinueTeardown
+            SandboxDeleteRpcErrorDisposition::ProbeAdmission
         );
     }
 

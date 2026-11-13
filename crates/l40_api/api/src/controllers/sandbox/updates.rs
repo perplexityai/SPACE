@@ -321,6 +321,32 @@ fn access_idle_deadline_request(
     Ok(request)
 }
 
+/// Retry admission for this elapsed-time window, even when failures are immediate.
+const ROLLBACK_NODE_DELETE_RETRY_WINDOW: Duration = Duration::from_secs(144);
+
+/// Space unconfirmed admission retries from 250 ms up to 5 s apart. The deadline
+/// bounds starting retries, not an in-flight destructive teardown: cancelling
+/// that call could leak a backing instance, especially on the Direct substrate.
+async fn rollback_node_delete<F, Fut>(mut delete: F) -> Result<(), SubstrateError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), SubstrateError>>,
+{
+    let deadline = tokio::time::Instant::now() + ROLLBACK_NODE_DELETE_RETRY_WINDOW;
+    let mut backoff = Duration::from_millis(250);
+    loop {
+        let result = delete().await;
+        if !matches!(result, Err(SubstrateError::NodeDeleteNotAdmitted { .. })) {
+            return result;
+        }
+        tokio::time::sleep_until((tokio::time::Instant::now() + backoff).min(deadline)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return result;
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
+}
+
 impl SandboxController {
     pub async fn update(
         &self,
@@ -1133,24 +1159,17 @@ impl SandboxController {
     }
 
     pub(super) async fn rollback_created_sandbox(&self, pool: &PgPool, sandbox_id: SandboxId) {
-        // Let the delete complete — it is NOT response-margin-critical: the
-        // binding upstream cut is the node-RPC channel timeout (which bounds the
-        // individual worker stop/delete RPCs), and the ALB idle timeout is far
-        // higher (see `ALB_IDLE_TIMEOUT_SECS`). Cancelling a slow delete would
-        // leak the backing instance (on direct, with no orphan GC, a running VM
-        // invisibly), so the unbounded delete is the safe choice.
+        // Keep teardown request-owned until admission succeeds or its retry
+        // window ends. Each in-flight call keeps its substrate-specific bounds;
+        // durable ownership after exhausted rollback is a separate obligation.
         let teardown = self.live_teardown(sandbox_id).await;
-        let deleted = self.substrate.delete_execution(sandbox_id).await;
-        // As for a delete: only a confirmed teardown, or a node that had no
-        // such sandbox, uncounts it; after a failed one its pod may still
-        // exist, so its pending member stays to lapse.
-        if matches!(
-            deleted,
-            Ok(()) | Err(crate::controllers::substrate::SubstrateError::NotFound { .. })
-        ) {
+        let result = rollback_node_delete(|| self.substrate.delete_execution(sandbox_id)).await;
+        // Only a confirmed teardown, or an absent sandbox, uncounts it.
+        // Otherwise its pending live-cap member stays to lapse.
+        if matches!(result, Ok(()) | Err(SubstrateError::NotFound { .. })) {
             self.forget_live_sandbox(teardown).await;
         }
-        if let Err(err) = deleted {
+        if let Err(err) = result {
             tracing::warn!(
                 sandbox_id = %sandbox_id,
                 error = %err,
@@ -1221,6 +1240,8 @@ fn snapshots_response_json(
 
 #[cfg(test)]
 mod postgres_tests;
+#[cfg(test)]
+mod rollback_tests;
 #[cfg(test)]
 mod transport_tests;
 

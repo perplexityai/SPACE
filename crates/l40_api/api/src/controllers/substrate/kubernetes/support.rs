@@ -917,14 +917,14 @@ pub(super) enum ExecutionTeardown {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SandboxDeleteRpcErrorDisposition {
-    ContinueTeardown,
+    ProbeAdmission,
     DeferTeardown,
     RetainedFilesystemOnlyCopy,
 }
 
-/// Preserve the pod and execution tracking only when sbx-mgr explicitly says
-/// an unpublished suspend owns the sandbox. Other `Aborted` cleanup failures
-/// keep the historical best-effort delete behavior.
+/// Explicit safety refusals retain their meaning. Any other failed reply is
+/// ambiguous: admission may have committed before the reply was lost, or the
+/// node may have rejected the request without admitting it.
 pub(super) fn classify_sandbox_delete_rpc_error(
     error: &tonic::Status,
 ) -> SandboxDeleteRpcErrorDisposition {
@@ -933,7 +933,7 @@ pub(super) fn classify_sandbox_delete_rpc_error(
     } else if pplx_space_sbx_mgr_client::is_suspend_publication_pending_status(error) {
         SandboxDeleteRpcErrorDisposition::DeferTeardown
     } else {
-        SandboxDeleteRpcErrorDisposition::ContinueTeardown
+        SandboxDeleteRpcErrorDisposition::ProbeAdmission
     }
 }
 

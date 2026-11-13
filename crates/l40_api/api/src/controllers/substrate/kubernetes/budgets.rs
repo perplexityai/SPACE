@@ -44,6 +44,9 @@ pub(super) struct SubstrateBudgets {
     /// [`super::POD_WORKER_CONNECT_TIMEOUT`], as teardown's connect bound for
     /// the pod's worker.
     pub(super) teardown_worker_connect: Duration,
+    /// [`super::adapter::TEARDOWN_NODE_DELETE_WAIT_BUDGET`]: how long a Delete
+    /// teardown waits for durable admission of a nonblocking sbx-mgr Delete.
+    pub(super) teardown_node_delete_wait: Duration,
     /// [`super::REFLECTOR_WAIT_BUDGET`]: how long a pod read waits for a
     /// reflector event before it falls back to an apiserver GET, and the
     /// re-check interval of a scheduling-outcome wait.
@@ -64,6 +67,7 @@ impl SubstrateBudgets {
         pooled_command_ready: super::adapter::POOLED_COMMAND_READY_BUDGET,
         adoption_label: super::adapter::ADOPTION_LABEL_TIMEOUT,
         teardown_worker_connect: super::POD_WORKER_CONNECT_TIMEOUT,
+        teardown_node_delete_wait: super::adapter::TEARDOWN_NODE_DELETE_WAIT_BUDGET,
         reflector_wait: super::REFLECTOR_WAIT_BUDGET,
         retry_deferral_grace: super::execution::RETRY_DEFERRAL_GRACE,
     };

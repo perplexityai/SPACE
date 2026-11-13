@@ -88,6 +88,15 @@ pub(super) const ADOPTION_LABEL_TIMEOUT: Duration = Duration::from_secs(5);
 // durable before retiring the pod. Full-codec artifacts can outlive the
 // generic node-RPC budget, so this path needs its own outer deadline.
 pub(super) const TEARDOWN_SUSPEND_DURABILITY_BUDGET: Duration = Duration::from_secs(300);
+/// Bound on acknowledging a nonblocking Delete, not on executing cleanup.
+/// sbx-mgr persists admission before replying and its durable executor owns
+/// cleanup independently of the request. A healthy node replies immediately
+/// after admission; an overloaded node must not hold a dispatcher slot while
+/// waiting for admission capacity or storage.
+pub(super) const TEARDOWN_NODE_DELETE_WAIT_BUDGET: Duration = Duration::from_secs(2);
+/// Bound on recovering an ambiguous admission reply. The state read takes no
+/// cleanup request permit; an unanswered probe cannot authorize teardown.
+pub(super) const TEARDOWN_NODE_DELETE_ADMISSION_PROBE: Duration = Duration::from_secs(2);
 const MAX_LOGGED_SUSPEND_PENDING_REASON_BYTES: usize = 512;
 const MAX_SUSPEND_PENDING_REASON_LOGS: u8 = 3;
 const SUSPEND_PENDING_REASON_LOG_INTERVAL: Duration = Duration::from_secs(30);
