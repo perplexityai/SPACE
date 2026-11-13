@@ -118,13 +118,13 @@ pub enum RecoveredSandboxRowFieldsError {
     #[error("invalid template in snapshot metadata: {0}")]
     Template(#[from] pplx_space_common_core::types::TemplateParseError),
     #[error("invalid runtime in snapshot metadata: {0}")]
-    Runtime(#[from] pplx_space_common_core::types::RuntimeKindParseError),
+    Runtime(#[from] pplx_space_execution_spec::RuntimeKindParseError),
     #[error("invalid template content hash in snapshot metadata: {0}")]
-    ContentHash(#[from] pplx_space_common_core::types::DigestParseError),
+    ContentHash(#[from] pplx_space_content_digest::DigestParseError),
     #[error("invalid sandbox owner in snapshot metadata: {0}")]
     Owner(#[from] pplx_space_accounts::AuthParseError),
     #[error("invalid disk I/O limits in snapshot metadata: {0}")]
-    DiskIoLimits(#[from] pplx_space_common_core::types::DiskIoLimitsError),
+    DiskIoLimits(#[from] pplx_space_execution_spec::DiskIoLimitsError),
 }
 
 /// Errors returned from [`prepare_restore_dir`].
@@ -2882,7 +2882,7 @@ async fn ensure_local_template(
     owner: &pplx_space_accounts::SandboxOwner,
     template_name: &str,
     content_hash: &str,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 ) -> Result<String, RestoreError> {
     use crate::template_resolver::TemplateLookupError;
     async {

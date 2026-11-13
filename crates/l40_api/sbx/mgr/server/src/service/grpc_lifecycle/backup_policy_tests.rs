@@ -96,7 +96,7 @@ async fn artifact_backup_refuses_a_runtime_upgrade_and_its_internal_copy() {
         return;
     }
     let execution = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .first()
@@ -510,8 +510,8 @@ fn upload_config(bucket: &str) -> crate::snapshot_upload::SnapshotUploadConfig {
 /// Write a published artifact directory whose metadata names no artifact
 /// identity, so any identity in the durable intent came from the submission.
 fn write_artifact(dir: &std::path::Path, sandbox_id: &str, files: &[&str]) {
-    let execution = pplx_space_common_core::types::SnapshotExecutionMetadata::new(
-        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+    let execution = pplx_space_execution_spec::SnapshotExecutionMetadata::new(
+        pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
             std::env::consts::ARCH.parse().unwrap(),
             vec![],
         ),

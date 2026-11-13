@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::types::LabelValue;
+use pplx_space_k8s_ids::LabelValue;
 
 /// The id of the client whose activation created a sandbox's runtime: what an
 /// ECW caller sent in `X-Client-ID`, or one of the reserved ids.

@@ -14,7 +14,7 @@ async fn only_explicit_finish_completes_a_worker_upload() {
         let current = nix::unistd::User::from_uid(nix::unistd::Uid::current())
             .expect("lookup")
             .expect("account");
-        let user = pplx_space_common_core::types::GuestUserName::parse(current.name).expect("user");
+        let user = pplx_space_guest_process::GuestUserName::parse(current.name).expect("user");
         let account = GuestAccount::resolve(user).expect("account");
         let finished = matches!(terminal, Some(write_frame::Frame::Finish(_)));
         let mut frames = vec![
@@ -180,7 +180,7 @@ async fn write_frames(
     let current = nix::unistd::User::from_uid(nix::unistd::Uid::current())
         .expect("lookup")
         .expect("account");
-    let user = pplx_space_common_core::types::GuestUserName::parse(current.name).expect("user");
+    let user = pplx_space_guest_process::GuestUserName::parse(current.name).expect("user");
     let account = GuestAccount::resolve(user).expect("account");
     let mut frames = vec![Ok(WriteFrame {
         frame: Some(write_frame::Frame::Open(WriteStart {

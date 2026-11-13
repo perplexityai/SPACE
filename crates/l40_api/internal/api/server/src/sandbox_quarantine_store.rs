@@ -6,12 +6,13 @@ use std::sync::LazyLock;
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, LocalArtifactId, PodUid, QuarantineRecoveryPlanRejectionCause,
+    ExecutionGeneration, LocalArtifactId, QuarantineRecoveryPlanRejectionCause,
     SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxLifecycle,
     SandboxQuarantineHistoryAction, SandboxQuarantineReasonCode, SandboxQuarantineRecoveryPolicy,
     SandboxQuarantineSource, SandboxTransitionReceiptKind, SandboxTransitionTargetState,
     SnapshotId,
 };
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_metrics::publication::{
     StatePublicationComponent, StatePublicationDisposition, StatePublicationField,
 };

@@ -1082,7 +1082,7 @@ impl SandboxManagerService {
         requested: BootMode,
         template: &str,
         snapshot_dir: Option<&str>,
-        execution: &pplx_space_common_core::types::ExecutionMetadata,
+        execution: &pplx_space_execution_spec::ExecutionMetadata,
     ) -> Result<BootMode, Status> {
         if requested == BootMode::Pool {
             let has_pool = {

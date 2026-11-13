@@ -14,9 +14,8 @@
 
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
-use pplx_space_common_core::types::{
-    BackupAttemptId, EnvMap, EnvSanitizationIssue, LocalArtifactId, NodeManagedBy,
-};
+use pplx_space_common_core::types::{BackupAttemptId, LocalArtifactId, NodeManagedBy};
+use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
 use pplx_space_net_gateway_client::proto::{ServicePortIngressFrame, service_port_ingress_frame};
 use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
 use pplx_space_node_api_client::proto::worker_api_server::WorkerApi;
@@ -1643,8 +1642,7 @@ async fn sim_install_activation_policy(
 ) -> Result<(), Status> {
     use prost::Message;
     if let Some(policy) = policy {
-        pplx_space_common_core::types::AutoLifecyclePolicy::try_from(policy)
-            .map_err(Status::from)?;
+        pplx_space_auto_lifecycle::AutoLifecyclePolicy::try_from(policy).map_err(Status::from)?;
         let encoded = policy.encode_to_vec();
         let record = state.get(sandbox_id).await.map_err(map_state_error)?;
         if record.auto_lifecycle_authority != pplx_space_policy_authority::PolicyAuthority::Local

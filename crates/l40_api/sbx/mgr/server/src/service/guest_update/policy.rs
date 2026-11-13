@@ -158,7 +158,7 @@ pub(super) fn supported_guest(
 }
 
 pub(super) fn platform(row: &crate::db::SandboxRow) -> Option<model::RecoveryPlatform> {
-    use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+    use pplx_space_execution_spec::guest_image::QualifiedGuestAgent;
     match super::super::guest_image::profile_for_sandbox(row)
         .ok()?
         .agent_protocol()

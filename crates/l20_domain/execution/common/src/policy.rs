@@ -1,12 +1,13 @@
 //! Validate portable policy observations without assigning approval authority.
-use pplx_space_common_core::types::{DigestParseError, ExecutionPolicyObservation};
+use pplx_space_content_digest::DigestParseError;
+use pplx_space_execution_spec::ExecutionPolicyObservation;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyObservationError {
     #[error("invalid execution policy reference: {0}")]
     Reference(#[from] DigestParseError),
     #[error(transparent)]
-    Policy(#[from] pplx_space_common_core::types::ExecutionPolicyObservationError),
+    Policy(#[from] pplx_space_execution_spec::ExecutionPolicyObservationError),
 }
 
 impl TryFrom<&crate::proto::ExecutionPolicyObservation> for ExecutionPolicyObservation {

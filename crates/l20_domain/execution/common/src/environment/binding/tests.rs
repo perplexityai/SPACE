@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "serde")]
+use pplx_space_execution_spec::SnapshotExecutionMetadata;
 
 fn observed(definition: &EnvironmentDefinition) -> ExecutionMetadata {
     let spec = definition.descriptor().spec();

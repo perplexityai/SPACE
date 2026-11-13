@@ -14,7 +14,8 @@ use std::sync::Arc;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, DeleteParams, Preconditions};
 use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
-use pplx_space_common_core::types::{PodUid, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_k8s_ids::PodUid;
 
 use super::classify::{RestorePodSnapshot, SandboxRestoreState};
 

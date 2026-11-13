@@ -8,9 +8,11 @@
 use std::collections::BTreeMap;
 
 use crate::StoredSandboxLifecycle;
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, AutoLifecycleWakePolicy, AutoLifecycleWakeSource, ClientId, DiskIoLimits,
+use pplx_space_auto_lifecycle::{
+    AutoLifecyclePolicy, AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
 };
+use pplx_space_common_core::types::ClientId;
+use pplx_space_execution_spec::DiskIoLimits;
 use sqlx::types::JsonValue;
 
 use super::*;

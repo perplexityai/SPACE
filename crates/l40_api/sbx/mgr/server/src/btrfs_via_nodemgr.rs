@@ -134,7 +134,7 @@ impl CapturedRootfs {
 /// resolves the legacy build.
 pub(crate) fn codec_environment_build(
     content_hash: &str,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 ) -> Option<pplx_space_node_mgr_client::proto::EnvironmentTemplateBuild> {
     let environment = environment?;
     (pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment))
@@ -154,7 +154,7 @@ pub(crate) async fn encode_rootfs_send(
     sandbox_id: &str,
     template_name: &str,
     content_hash: &str,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     snapshot_dir: &str,
     execution_fence: ExecutionFence,
     node_manager: &NodeManagerConnector,
@@ -197,7 +197,7 @@ pub(crate) async fn encode_snapshot_rootfs_send(
     sandbox_id: &str,
     template_name: &str,
     content_hash: &str,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     snapshot_name: &str,
     dest_dir: &str,
     node_manager: &NodeManagerConnector,
@@ -236,7 +236,7 @@ pub(crate) async fn receive_instance(
     sandbox_id: &str,
     template_name: &str,
     content_hash: &str,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     target: InstanceTarget,
     node_manager: &NodeManagerConnector,
 ) -> Result<(), BtrfsViaNodemgrError> {

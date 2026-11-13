@@ -24,12 +24,16 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519KeyId, ed25519::SpaceApiRouteEd25519Signer,
     ed25519::insert_space_api_route_ed25519_token,
 };
-use pplx_space_common_core::types::{
+use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-    AutoLifecyclePolicy, AutoLifecycleStage, CLUSTER_ID_ENV, ClusterId, ExecutionGeneration,
-    NodeManagedBy, PodUid, RouteGeneration, SandboxActivationAttemptId, SandboxId,
-    SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
+    AutoLifecyclePolicy, AutoLifecycleStage,
 };
+use pplx_space_common_core::types::{
+    CLUSTER_ID_ENV, ClusterId, ExecutionGeneration, NodeManagedBy, RouteGeneration,
+    SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity, SandboxRuntimeLabel,
+    SpaceApiRouteIdentity,
+};
+use pplx_space_k8s_ids::PodUid;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;

@@ -19,7 +19,9 @@ tonic-prost = { workspace = true }
 uuid = { workspace = true }
 
 # internal
+pplx-space-auto-lifecycle = { workspace = true }
 pplx-space-common-core = { workspace = true }
+pplx-space-durations = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-net-gateway-protocol = { workspace = true }

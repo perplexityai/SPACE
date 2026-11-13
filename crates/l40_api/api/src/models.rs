@@ -9,12 +9,18 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use pplx_space_accounts::{NodeId, SandboxOwnerSource};
-use pplx_space_common_core::types::{
-    ArtifactVersion, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, Digest,
-    EcwCredentialEpoch, NodeAddress, NodeManagedBy, NodePoolName, NodeRole, PodUid,
-    SandboxActivationAttemptId, SandboxAutoLifecyclePatch, SemVer, TemplateReference,
+use pplx_space_auto_lifecycle::{
+    AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, SandboxAutoLifecyclePatch,
 };
+use pplx_space_common_core::types::{
+    EcwCredentialEpoch, NodeAddress, NodeManagedBy, NodePoolName, NodeRole,
+    SandboxActivationAttemptId, TemplateReference,
+};
+use pplx_space_content_digest::Digest;
+use pplx_space_execution_spec::ArtifactVersion;
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
+use pplx_space_semver::SemVer;
 
 use crate::user_role::UserRole;
 use pplx_space_cluster_pool::PoolConfigOwner;
@@ -869,7 +875,7 @@ pub struct TemplateBuildRequest {
 pub struct SystemTemplateBuildRequest {
     /// Exact qualified runtime/kernel pair. Omitted: retain the bundled recipe's behavior.
     #[serde(default)]
-    pub environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    pub environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     #[serde(default)]
     pub base: Option<pplx_space_common_core::types::TemplateReference>,
     #[serde(default)]
@@ -917,7 +923,7 @@ pub struct TemplateBuildConfig {
     #[serde(default)]
     pub disk_bytes: Option<u64>,
     #[serde(default)]
-    pub balloon: Option<pplx_space_common_core::types::BalloonConfig>,
+    pub balloon: Option<pplx_space_execution_spec::BalloonConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

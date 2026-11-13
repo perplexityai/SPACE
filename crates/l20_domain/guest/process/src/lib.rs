@@ -7,9 +7,7 @@
 //! that time sandbox readiness, retries, uptime and snapshots ([`time`]).
 //!
 //! It is its own crate so that code can name these values without depending
-//! on `pplx-space-common-core`. `pplx-space-common-core` re-exports each
-//! module from `types::process`, `types::path`, `types::env` and
-//! `types::time`.
+//! on `pplx-space-common-core`: import them from here.
 
 pub mod env;
 pub mod path;

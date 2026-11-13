@@ -339,11 +339,13 @@ fn sandbox_event_details_store_restore_provenance() {
 
 #[test]
 fn sandbox_event_details_project_execution_metadata() {
-    use pplx_space_common_core::types::{
-        Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole,
-        ArtifactFormat, ArtifactVersion, Digest, ExecutionMetadata, FIRECRACKER_STATE_FORMAT,
-        GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind, RuntimeVersion,
-        StateFormatIdentity, StateFormatName, StateFormatVersion,
+    use pplx_space_content_digest::Digest;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{
+        ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
+        ArtifactVersion, ExecutionMetadata, FIRECRACKER_STATE_FORMAT, GuestOperatingSystem,
+        GuestPlatform, RuntimeIdentity, RuntimeKind, RuntimeVersion, StateFormatIdentity,
+        StateFormatName, StateFormatVersion,
     };
 
     let execution = ExecutionMetadata::new(

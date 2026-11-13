@@ -332,7 +332,7 @@ impl KubernetesSubstrate {
             .ok()
             .zip(u64::try_from(sandbox.disk_io_max_bandwidth_mib_per_sec).ok())
             .and_then(|(operations, bandwidth)| {
-                pplx_space_common_core::types::DiskIoLimits::try_new(operations, bandwidth).ok()
+                pplx_space_execution_spec::DiskIoLimits::try_new(operations, bandwidth).ok()
             })
             .unwrap_or_else(|| {
                 tracing::warn!(
@@ -341,7 +341,7 @@ impl KubernetesSubstrate {
                     bandwidth_mib_per_sec = sandbox.disk_io_max_bandwidth_mib_per_sec,
                     "invalid persisted sandbox disk I/O limits; using platform defaults"
                 );
-                pplx_space_common_core::types::DiskIoLimits::default()
+                pplx_space_execution_spec::DiskIoLimits::default()
             });
         let runtime = SandboxRuntimePodMetadata {
             sandbox_owner,

@@ -12,8 +12,8 @@ pub fn lifecycle_status_count(
     value: u64,
     state: &str,
     cleanup_state: &str,
-    runtime: Option<pplx_space_common_core::types::RuntimeKind>,
-    runtime_version: Option<&pplx_space_common_core::types::RuntimeVersion>,
+    runtime: Option<pplx_space_execution_spec::RuntimeKind>,
+    runtime_version: Option<&pplx_space_execution_spec::RuntimeVersion>,
 ) {
     gauge(
         "sandbox.worker.lifecycle.status_count",

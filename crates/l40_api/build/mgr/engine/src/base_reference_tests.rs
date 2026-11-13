@@ -3,7 +3,8 @@ use super::{
     GuestRuntimeMetadata, build_vm_create_request, build_vm_rootfs_size_mb, build_vm_start_request,
     oci_source_message, template_guest_runtime_metadata,
 };
-use pplx_space_common_core::types::{ContentHash, TemplateBuildId, TemplateName};
+use pplx_space_common_core::types::{TemplateBuildId, TemplateName};
+use pplx_space_content_digest::ContentHash;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyV1Proto;
 use pplx_space_net_common::{EgressDestinationV1, NetworkPolicyV1};
 use pplx_space_template_manifest::TemplateMetadata;

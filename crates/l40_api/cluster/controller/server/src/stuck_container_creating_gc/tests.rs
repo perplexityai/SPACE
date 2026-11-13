@@ -3,7 +3,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::Pod;
-use pplx_space_common_core::types::{PodUid, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_k8s_ids::PodUid;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -300,7 +301,7 @@ fn convergence_gate_requires_both_reconcilers_live() {
 #[test]
 fn transient_lifecycle_covered_rejects_disabled_and_practically_disabled() {
     use crate::transient_lifecycle_sweeper::LifecycleAge;
-    use pplx_space_common_core::types::PositiveDuration;
+    use pplx_space_durations::PositiveDuration;
     let bounded = Duration::from_secs(600);
     let year = Duration::from_secs(365 * 24 * 60 * 60);
 

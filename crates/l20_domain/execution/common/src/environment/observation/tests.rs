@@ -1,4 +1,8 @@
-use pplx_space_common_core::types::*;
+use pplx_space_content_digest::Digest;
+use pplx_space_execution_spec::{
+    EXECUTION_POLICY_SCHEMA_VERSION, ExecutionCompatibilityProfile, FIRECRACKER_STATE_FORMAT,
+    RuntimeBinding, StateFormatIdentity, VersionSortKey,
+};
 use prost::Message;
 
 use super::*;

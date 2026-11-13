@@ -181,7 +181,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_api::controllers::substrate::SubstrateCapabilities;
-use pplx_space_common_core::types::PositiveDuration;
+use pplx_space_durations::PositiveDuration;
 use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;

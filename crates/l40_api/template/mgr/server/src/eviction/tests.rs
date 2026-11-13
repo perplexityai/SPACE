@@ -1753,7 +1753,7 @@ async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() 
         crate::db::upsert_template_settings(
             &conn,
             "doomed",
-            &pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            &pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         )
         .unwrap();
         let db = Arc::new(Mutex::new(conn));
@@ -1895,7 +1895,7 @@ async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
         crate::db::upsert_template_settings(
             &conn,
             "doomed",
-            &pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            &pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         )
         .unwrap();
         let db = Arc::new(Mutex::new(conn));
@@ -2223,8 +2223,8 @@ async fn gc_loop_checks_rowless_dirs_without_holding_the_eviction_gate(#[case] e
 fn twin_build(hash: &str, size: u64, used: u64) -> BuildSnapshot {
     BuildSnapshot {
         cache_partition: crate::db::TemplateCachePartition::Environment(
-            pplx_space_common_core::types::EnvironmentReference::new(
-                pplx_space_common_core::types::Digest::sha256([2; 32]),
+            pplx_space_execution_spec::EnvironmentReference::new(
+                pplx_space_content_digest::Digest::sha256([2; 32]),
             ),
         ),
         ..build("seed", hash, size, 0, used)

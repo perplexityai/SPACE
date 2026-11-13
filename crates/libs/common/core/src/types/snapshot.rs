@@ -49,9 +49,9 @@ pub fn snapshot_sweeper_grace_seconds(
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use super::compute::{ComputeShape, VcpuCount};
-use super::size::{DiskSize, MemorySize};
 use super::template::TemplateArtifactDigest;
+use pplx_space_byte_size::{DiskSize, MemorySize};
+use pplx_space_execution_spec::compute::{ComputeShape, VcpuCount};
 
 const MAX_SNAPSHOT_NAME_BYTES: usize = 255;
 
@@ -923,6 +923,8 @@ impl From<SnapshotState> for String {
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_execution_spec::{ComputeShape, CpuLimit};
+/// # use pplx_space_byte_size::{DiskSize, MemorySize};
 /// let compute = ComputeShape::new(CpuLimit::vcpu(2)?, MemorySize::gib(4)?);
 /// let disk = DiskSize::gib(16)?;
 /// let config = SnapshotConfig::new(compute, Some(disk));
@@ -944,6 +946,8 @@ impl SnapshotConfig {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_execution_spec::{ComputeShape, CpuLimit};
+    /// # use pplx_space_byte_size::MemorySize;
     /// let compute = ComputeShape::new(CpuLimit::vcpu(2)?, MemorySize::gib(4)?);
     /// let config = SnapshotConfig::new(compute, None);
     /// assert_eq!(config.compute(), compute);
@@ -960,6 +964,8 @@ impl SnapshotConfig {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_execution_spec::{ComputeShape, CpuLimit};
+    /// # use pplx_space_byte_size::MemorySize;
     /// let compute = ComputeShape::new(CpuLimit::vcpu(1)?, MemorySize::gib(1)?);
     /// let config = SnapshotConfig::new(compute, None);
     /// assert_eq!(config.compute(), compute);
@@ -975,6 +981,8 @@ impl SnapshotConfig {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_execution_spec::{ComputeShape, CpuLimit};
+    /// # use pplx_space_byte_size::{DiskSize, MemorySize};
     /// let compute = ComputeShape::new(CpuLimit::vcpu(1)?, MemorySize::gib(1)?);
     /// let disk = DiskSize::gib(8)?;
     /// let config = SnapshotConfig::new(compute, Some(disk));

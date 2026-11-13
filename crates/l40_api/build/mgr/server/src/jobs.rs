@@ -15,7 +15,7 @@ pub const BUILD_JOB_KIND: &str = "template_build";
 pub enum VersionedBuildJobPayload {
     #[serde(rename = "environment_v1")]
     Environment {
-        environment: pplx_space_common_core::types::EnvironmentReference,
+        environment: pplx_space_execution_spec::EnvironmentReference,
         build: BuildJobPayload,
     },
 }
@@ -25,7 +25,7 @@ pub fn decode_payload(
 ) -> Result<
     (
         BuildJobPayload,
-        Option<pplx_space_common_core::types::EnvironmentReference>,
+        Option<pplx_space_execution_spec::EnvironmentReference>,
     ),
     pplx_space_common_jobs::JobError,
 > {

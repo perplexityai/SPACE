@@ -155,13 +155,13 @@ fn paths_compose_under_expected_roots() {
 }
 
 fn fixture_hash() -> String {
-    pplx_space_common_core::types::Digest::blake3([7; 32]).to_string()
+    pplx_space_content_digest::Digest::blake3([7; 32]).to_string()
 }
 
-fn other_environment() -> pplx_space_common_core::types::EnvironmentReference {
-    pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_common_core::types::Digest::sha256([9; 32]),
-    )
+fn other_environment() -> pplx_space_execution_spec::EnvironmentReference {
+    pplx_space_execution_spec::EnvironmentReference::new(pplx_space_content_digest::Digest::sha256(
+        [9; 32],
+    ))
 }
 
 #[test]
@@ -345,7 +345,7 @@ fn sandbox_codec_requests_resolve_their_parent_in_its_partition() {
         assert_eq!(target.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
     let mismatched = EnvironmentTemplateBuild {
-        content_hash: pplx_space_common_core::types::Digest::blake3([8; 32]).to_string(),
+        content_hash: pplx_space_content_digest::Digest::blake3([8; 32]).to_string(),
         environment: environment.to_string(),
     };
     for target in targets(Some(mismatched)) {
@@ -396,7 +396,7 @@ fn sandbox_codec_parent_candidates_fall_back_to_the_legacy_build() {
 #[test]
 fn sandbox_codec_parent_candidates_include_the_digest_s_other_cached_partitions() {
     let hash = fixture_hash();
-    let other_hash = pplx_space_common_core::types::Digest::blake3([9; 32]).to_string();
+    let other_hash = pplx_space_content_digest::Digest::blake3([9; 32]).to_string();
     let environment = other_environment();
     let legacy = TemplateBuildTarget::parse("seed", &hash, None).unwrap();
     let dirs = |targets: Vec<TemplateBuildTarget>| {
@@ -428,11 +428,11 @@ fn sandbox_codec_parent_candidates_include_the_digest_s_other_cached_partitions(
     )
     .unwrap();
     // The digest's other partitions follow, in directory-name order.
-    let third = pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_common_core::types::Digest::sha256([3; 32]),
+    let third = pplx_space_execution_spec::EnvironmentReference::new(
+        pplx_space_content_digest::Digest::sha256([3; 32]),
     );
-    let fourth = pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_common_core::types::Digest::sha256([1; 32]),
+    let fourth = pplx_space_execution_spec::EnvironmentReference::new(
+        pplx_space_content_digest::Digest::sha256([1; 32]),
     );
     let mut listing = listing.to_vec();
     listing.extend([format!("{hash}@{third}"), format!("{hash}@{fourth}")]);

@@ -38,7 +38,7 @@ pub fn update_runtime_fields(
 pub fn fence_runtime_upgrade(
     conn: &Connection,
     sandbox_id: &str,
-    target: pplx_space_common_core::types::EnvironmentReference,
+    target: pplx_space_execution_spec::EnvironmentReference,
     target_state: RuntimeUpgradeTargetState,
     checkpoint_dir_identity: Option<&str>,
 ) -> RuntimeUpgradeRecord {
@@ -235,7 +235,7 @@ pub struct TestSandboxInsert {
     pub(crate) state: crate::state::SandboxStatus,
     pub(crate) user: String,
     pub(crate) rootfs_size_mb: Option<u32>,
-    pub(crate) disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub(crate) disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     pub(crate) pool_template: Option<String>,
     pub(crate) volume_encryption: bool,
     pub(crate) process_env: BTreeMap<String, String>,

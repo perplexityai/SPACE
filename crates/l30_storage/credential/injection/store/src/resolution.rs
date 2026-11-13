@@ -3,8 +3,9 @@
 use pplx_space_accounts::{CredentialReferenceId, NodeId};
 use pplx_space_common_core::{
     sql,
-    types::{ExecutionGeneration, K8sNodeUid, SandboxId},
+    types::{ExecutionGeneration, SandboxId},
 };
+use pplx_space_k8s_ids::K8sNodeUid;
 use pplx_space_net_common::{
     EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope, NetworkPolicyV1, network_policy_hash,
 };

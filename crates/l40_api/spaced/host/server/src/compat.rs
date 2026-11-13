@@ -7,7 +7,7 @@
 use super::*;
 use crate::bridge::BridgeGuestOperationBudget;
 use crate::protocol::{HostFileInfoStream, bridge_file_type_to_host, relay_stream};
-use pplx_space_common_core::types::{GuestPath, GuestUserName};
+use pplx_space_guest_process::{GuestPath, GuestUserName};
 
 impl SpacedHostService {
     pub(super) async fn call_bridge_guest_stat(

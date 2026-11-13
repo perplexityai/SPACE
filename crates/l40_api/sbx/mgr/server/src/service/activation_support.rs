@@ -4,14 +4,15 @@ use super::start_support::ActivationCleanupGuard;
 use super::*;
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeRole as SpaceNodeRole, PodUid, RouteGeneration,
-    SandboxActivationAttemptId, SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
+    ExecutionGeneration, NodeRole as SpaceNodeRole, RouteGeneration, SandboxActivationAttemptId,
+    SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
 };
 use pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 use pplx_space_host_layout::identities::users;
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_k8s_node_id::space_node_id;
 
 const NODE_ID_PATH: &str = "/space/etc/node-id";
@@ -1411,7 +1412,7 @@ pub(super) async fn wait_ready_and_mark_started(
     // Keep the RPC-heavy readiness future off the detached finalizer's stack.
     let guest = Box::pin(async {
         match image_and_fence.0.readiness() {
-            pplx_space_common_core::types::guest_image::GuestReadiness::Agent => {
+            pplx_space_execution_spec::guest_image::GuestReadiness::Agent => {
                 let budget = Duration::from_secs(ready_timeout_secs.into());
                 let deadline = tokio::time::Instant::now() + budget;
                 // The readiness wait owns its timeout outcome. An outer timer
@@ -1427,7 +1428,7 @@ pub(super) async fn wait_ready_and_mark_started(
                 })??;
                 Ok(GuestReadyEvidence::Agent(ready))
             }
-            pplx_space_common_core::types::guest_image::GuestReadiness::TcpService { port } => {
+            pplx_space_execution_spec::guest_image::GuestReadiness::TcpService { port } => {
                 let execution = image_and_fence.1.ok_or_else(|| {
                     Status::failed_precondition(
                         "guest service readiness requires an execution identity",

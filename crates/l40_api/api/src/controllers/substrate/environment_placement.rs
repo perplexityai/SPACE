@@ -41,9 +41,9 @@ use std::str::FromStr;
 
 use crate::metrics::environment_placement::EnvironmentPlacementPath;
 use pplx_space_accounts::NodeId;
-#[cfg(feature = "kubernetes")]
-use pplx_space_common_core::types::EnvironmentReference;
 use pplx_space_env_vars::Environment;
+#[cfg(feature = "kubernetes")]
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_status_store::EnvironmentRefusal;
 #[cfg(feature = "kubernetes")]
 use pplx_space_sandbox_pod::PodEnvironment;
@@ -311,7 +311,7 @@ pub enum BoundEnvironmentError {
         subject: String,
         value: String,
         #[source]
-        source: pplx_space_common_core::types::DigestParseError,
+        source: pplx_space_content_digest::DigestParseError,
     },
     #[error(transparent)]
     Database(#[from] sqlx::Error),

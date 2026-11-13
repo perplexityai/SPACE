@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::{StreamExt, stream};
-use pplx_space_common_core::types::IdempotencyKey;
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_native_files::{
     BatchEntry, FileCallFailure, admit_list_entry, decode_write_batch_entries, decode_write_chunks,
     guest_key, list_depth, parse_guest_path, parse_guest_user, public_file_info,

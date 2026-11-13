@@ -1,6 +1,6 @@
 //! Capture preserves the producer binding through generic and transitional transports.
 
-use pplx_space_common_core::types::ExecutionMetadata;
+use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{CaptureVmStateRequest, VmStateArtifact};
 
 pub(crate) fn bind(

@@ -1,8 +1,9 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeManagedBy, PodUid, RouteGeneration, SandboxActivationAttemptId,
-    SandboxId, SandboxRouteIdentity, SpaceApiRouteIdentity,
+    ExecutionGeneration, NodeManagedBy, RouteGeneration, SandboxActivationAttemptId, SandboxId,
+    SandboxRouteIdentity, SpaceApiRouteIdentity,
 };
+use pplx_space_k8s_ids::PodUid;
 use tonic::metadata::{MetadataMap, MetadataValue};
 
 use super::*;

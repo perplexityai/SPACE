@@ -6,7 +6,8 @@ use super::{
     source::*,
 };
 use futures_util::TryStreamExt;
-use pplx_space_common_core::types::{Arch, RuntimeKind};
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::RuntimeKind;
 
 const BASE: &str = "https://github.com/cloud-hypervisor/linux/releases/download";
 const RELEASE: &str = "ch-release-v7.2.8-20261009";

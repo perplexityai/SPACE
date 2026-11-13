@@ -1,10 +1,10 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_accounts::{OrgId, UserId};
-use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_core::types::{
+use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
     AutoLifecycleStage,
 };
+use pplx_space_common_core::types::SandboxId;
 use uuid::Uuid;
 
 use super::*;

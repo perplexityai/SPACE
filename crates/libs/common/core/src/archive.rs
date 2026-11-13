@@ -9,7 +9,8 @@ use std::{fmt, num::NonZeroU16};
 use aws_lc_rs::digest::{SHA256, digest};
 use uuid::Uuid;
 
-use crate::types::{Digest, SandboxId};
+use crate::types::SandboxId;
+use pplx_space_content_digest::Digest;
 
 const MAGIC: &[u8; 8] = b"SPARCH\0\0";
 const ARCHIVE_FORMAT_VERSION: u16 = 1;

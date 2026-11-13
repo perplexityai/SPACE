@@ -20,10 +20,10 @@ use crate::service::suspend_snapshot_publication::publish_suspend_snapshot_dir;
 use crate::service::suspend_snapshot_publication::write_full_suspend_artifact;
 use crate::state::{SandboxState, SandboxStatus};
 use pplx_space_accounts::SandboxOwner;
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, HostCpu, LocalArtifactId, SandboxId, SandboxRuntimeLabel,
-};
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SandboxRuntimeLabel};
 use pplx_space_events::SandboxEventTrigger;
+use pplx_space_execution_spec::HostCpu;
 use pplx_space_node_runtime_core::vm_state::VmState;
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
 use std::collections::BTreeMap;
@@ -869,9 +869,9 @@ fn only_a_captured_suspend_records_this_hosts_cpu() {
 /// whatever its metadata says; a full artifact keeps the CPU it recorded.
 #[test]
 fn artifact_backup_execution_keeps_a_capture_cpu_only_for_full_artifacts() {
-    use pplx_space_common_core::types::{
-        Arch, ArtifactKind, ExecutionMetadata, SnapshotExecutionMetadata,
-    };
+    use pplx_space_common_core::types::ArtifactKind;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{ExecutionMetadata, SnapshotExecutionMetadata};
 
     let host_cpu = HostCpu::parse("genuineintel-6-85-7").unwrap();
     let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
@@ -2983,7 +2983,7 @@ async fn teardown_suspend_waits_while_a_stay_stopped_upgrade_runs() {
     use crate::service::tests::service_tests::insert_test_sandbox;
     use pplx_space_common_core::types::ExecutionGeneration;
     let execution = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .first()

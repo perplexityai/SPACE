@@ -12,9 +12,9 @@
 //! the arrays then age out by their own receipt.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::ArtifactComponentKind;
 use pplx_space_execution_common::environment::{EnvironmentObservation, KnownEnvironment};
 use pplx_space_execution_common::proto::NodeExecutionInventory;
+use pplx_space_execution_spec::ArtifactComponentKind;
 use pplx_space_runtime_environment_catalog_store::{
     self as catalog_store, CatalogIdentity, CertifiedEnvironment,
 };
@@ -156,7 +156,7 @@ fn certified(environment: &KnownEnvironment) -> CertifiedEnvironment {
 /// alias, the kernel component's version and the state format.
 fn catalog_identity(environment: &KnownEnvironment) -> Option<CatalogIdentity> {
     let spec = environment.definition().descriptor().spec();
-    let pplx_space_common_core::types::RuntimeBinding::ManagedRelease(release) = &spec.runtime;
+    let pplx_space_execution_spec::RuntimeBinding::ManagedRelease(release) = &spec.runtime;
     let kernel = spec
         .boot
         .components()

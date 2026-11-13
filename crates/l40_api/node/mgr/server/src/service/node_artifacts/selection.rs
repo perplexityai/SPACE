@@ -1,5 +1,5 @@
 //! Read-only compatible selection; launches continue to admit exact identities.
-use pplx_space_common_core::types::ExecutionMetadata;
+use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_node_runtime_core::selection::{self, CompatibleSelection};
 use tonic::Status;
 

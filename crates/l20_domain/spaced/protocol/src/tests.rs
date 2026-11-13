@@ -45,7 +45,7 @@ fn interactive_process_control_requires_guest_version_with_bridge_rpcs() {
 
 #[test]
 fn lifecycle_qualification_agrees_with_the_guest_operation_allowlist() {
-    use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+    use pplx_space_execution_spec::guest_image::QualifiedGuestAgent;
     use pplx_space_spaced_guest_protocol::proto::platform::GuestOperation;
     for agent in [
         QualifiedGuestAgent::Absent,

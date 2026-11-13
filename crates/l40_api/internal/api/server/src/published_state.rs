@@ -10,20 +10,23 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::metadata::artifact_kind_from_proto;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_cluster_trigger_queue::{
     QueuedRefConflict, enqueue_triggers_conn, queue_node_reconcile_refs,
 };
 use pplx_space_common_core::types::{
-    Arch, ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration,
-    ExecutionMetadata, LocalArtifactId, NodeRole, PodUid, RuntimeKind, SandboxActivationAttemptId,
-    SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
-    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxTransitionReceipt,
-    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
-    SandboxTransitionTargetState, SemVer,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeRole,
+    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
+    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
+    SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
+    SandboxTransitionTargetState,
 };
+use pplx_space_cpu_arch::Arch;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_execution_spec::{ExecutionMetadata, RuntimeKind};
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_portability::{
@@ -36,6 +39,7 @@ use pplx_space_sandbox_quarantine_store::{
 use pplx_space_sbx_mgr_client::proto::{
     QuarantineRecoveryObservedOwner, SnapshotDetail, SnapshotType,
 };
+use pplx_space_semver::SemVer;
 use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
     FACET_TEMPLATE_DESIRED_STATE, NetworkPolicyTarget, ReconcileReason,
@@ -482,12 +486,12 @@ fn quarantine_recovery_projection(
 /// a loud `INVALID_ARGUMENT` instead of a silently backfilled identity.
 pub(crate) fn snapshot_execution_metadata(
     execution: Option<&pplx_space_execution_common::proto::ExecutionMetadata>,
-) -> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, Status> {
+) -> Result<pplx_space_execution_spec::SnapshotExecutionMetadata, Status> {
     let execution =
         execution.ok_or_else(|| Status::invalid_argument("execution metadata is required"))?;
     let execution = ExecutionMetadata::try_from(execution)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    pplx_space_common_core::types::SnapshotExecutionMetadata::new(execution)
+    pplx_space_execution_spec::SnapshotExecutionMetadata::new(execution)
         .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
@@ -505,7 +509,7 @@ pub(crate) fn capture_host_cpu(
     raw: Option<&str>,
     artifact_kind: ArtifactKind,
     sandbox_id: SandboxId,
-) -> Option<pplx_space_common_core::types::HostCpu> {
+) -> Option<pplx_space_execution_spec::HostCpu> {
     if artifact_kind == ArtifactKind::Disk {
         return None;
     }
@@ -513,7 +517,7 @@ pub(crate) fn capture_host_cpu(
     if raw.is_empty() {
         return None;
     }
-    pplx_space_common_core::types::HostCpu::parse(raw)
+    pplx_space_execution_spec::HostCpu::parse(raw)
         .inspect_err(|error| {
             let logged = pplx_space_grpc_server::truncate_utf8_for_log(
                 raw,

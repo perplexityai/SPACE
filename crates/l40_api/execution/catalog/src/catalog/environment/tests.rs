@@ -1,4 +1,6 @@
 use super::*;
+use pplx_space_content_digest::Digest;
+use pplx_space_execution_spec::RuntimeIdentity;
 
 #[test]
 fn compiled_pins_produce_the_e0_golden_definition() {
@@ -137,7 +139,7 @@ fn firmware_environment_qualifies_memory_state_but_requires_an_agent_for_lifecyc
     assert!(entry.kernel().is_none());
     assert!(entry.supports_memory_state());
     assert_eq!(execution.guest().os, GuestOperatingSystem::Windows);
-    use pplx_space_common_core::types::guest_image::{
+    use pplx_space_execution_spec::guest_image::{
         GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
     };
     let image = GuestImageContract::new(

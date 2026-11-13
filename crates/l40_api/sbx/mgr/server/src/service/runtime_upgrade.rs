@@ -27,9 +27,8 @@
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::{
-    EnvironmentReference, ExecutionMetadata, LocalArtifactId, SandboxActivationAttemptId,
-};
+use pplx_space_common_core::types::{LocalArtifactId, SandboxActivationAttemptId};
+use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
 use tonic::Status;
 
 use crate::db::{

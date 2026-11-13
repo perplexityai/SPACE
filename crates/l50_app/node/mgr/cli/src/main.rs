@@ -135,7 +135,7 @@ enum Commands {
     /// Resolve and verify an execution environment on this node; JSON output.
     Environment {
         #[arg(long)]
-        reference: Option<pplx_space_common_core::types::EnvironmentReference>,
+        reference: Option<pplx_space_execution_spec::EnvironmentReference>,
     },
     /// Show allocated network slots and health
     Status {
@@ -334,7 +334,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     response.definition.as_ref().ok_or("missing definition")?,
                 )
                 .map_err(|error| error.to_string())?;
-            let execution = pplx_space_common_core::types::ExecutionMetadata::try_from(
+            let execution = pplx_space_execution_spec::ExecutionMetadata::try_from(
                 response.execution.as_ref().ok_or("missing execution")?,
             )
             .map_err(|error| error.to_string())?;

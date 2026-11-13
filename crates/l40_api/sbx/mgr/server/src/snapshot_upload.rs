@@ -130,7 +130,7 @@ pub struct SnapshotMeta {
     /// Version 2 execution metadata. Version 1 snapshots derive this from
     /// the legacy flat fields in `source` at the Firecracker boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution: Option<pplx_space_common_core::types::SnapshotExecutionMetadata>,
+    pub execution: Option<pplx_space_execution_spec::SnapshotExecutionMetadata>,
     pub sandbox_id: String,
     /// Total logical (uncompressed) bytes of all VM artifacts, summed from
     /// the local files at submit time. vol-mgr may compress the bytes it
@@ -193,13 +193,11 @@ pub const SNAPSHOT_METADATA_VERSION: u32 = 2;
 impl SnapshotMeta {
     pub fn execution_metadata(
         &self,
-        legacy_architecture: pplx_space_common_core::types::Arch,
-    ) -> Result<
-        pplx_space_common_core::types::SnapshotExecutionMetadata,
-        SnapshotRuntimeMetadataError,
-    > {
+        legacy_architecture: pplx_space_cpu_arch::Arch,
+    ) -> Result<pplx_space_execution_spec::SnapshotExecutionMetadata, SnapshotRuntimeMetadataError>
+    {
         match self.version {
-            1 => pplx_space_common_core::types::SnapshotExecutionMetadata::new(
+            1 => pplx_space_execution_spec::SnapshotExecutionMetadata::new(
                 self.source.legacy_execution_metadata(legacy_architecture)?,
             )
             .map_err(SnapshotRuntimeMetadataError::InvalidExecution),
@@ -275,7 +273,7 @@ pub struct SnapshotSandbox {
     #[serde(default)]
     pub process_env: std::collections::BTreeMap<String, String>,
     /// Auto-suspend / auto-stop policy.
-    pub auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy,
+    pub auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 }
 
 /// Capture-time description of what a snapshot was taken from. Stored inline
@@ -292,11 +290,11 @@ pub struct SnapshotSource {
     /// runtime. Snapshots written before this field existed are assigned the
     /// initial Firecracker `1.15.1` identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_version: Option<pplx_space_common_core::types::RuntimeVersion>,
+    pub runtime_version: Option<pplx_space_execution_spec::RuntimeVersion>,
     /// Persisted VM state format produced by the runtime. Legacy snapshots
     /// without either version field are assigned Firecracker format `9.0.0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_format_version: Option<pplx_space_common_core::types::StateFormatVersion>,
+    pub state_format_version: Option<pplx_space_execution_spec::StateFormatVersion>,
     /// Template the sandbox was created from.
     pub template_id: String,
     /// Pinned content hash of the template build at suspend time. Restoring
@@ -330,10 +328,9 @@ pub struct SnapshotSource {
 impl SnapshotSource {
     pub fn legacy_execution_metadata(
         &self,
-        architecture: pplx_space_common_core::types::Arch,
-    ) -> Result<pplx_space_common_core::types::ExecutionMetadata, SnapshotRuntimeMetadataError>
-    {
-        use pplx_space_common_core::types::{
+        architecture: pplx_space_cpu_arch::Arch,
+    ) -> Result<pplx_space_execution_spec::ExecutionMetadata, SnapshotRuntimeMetadataError> {
+        use pplx_space_execution_spec::{
             ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole,
             ArtifactFormat, ArtifactVersion, ExecutionMetadata, FIRECRACKER_STATE_FORMAT,
             GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
@@ -408,23 +405,23 @@ pub enum SnapshotRuntimeMetadataError {
     #[error("snapshot metadata version 2 requires execution metadata")]
     MissingExecution,
     #[error("legacy snapshot metadata cannot describe runtime {0}")]
-    UnsupportedLegacyRuntime(pplx_space_common_core::types::RuntimeKind),
+    UnsupportedLegacyRuntime(pplx_space_execution_spec::RuntimeKind),
     #[error(transparent)]
-    Runtime(#[from] pplx_space_common_core::types::RuntimeKindParseError),
+    Runtime(#[from] pplx_space_execution_spec::RuntimeKindParseError),
     #[error("runtime_version and state_format_version must be populated together")]
     PartialRuntime,
     #[error(transparent)]
-    InvalidExecution(#[from] pplx_space_common_core::types::ExecutionMetadataError),
+    InvalidExecution(#[from] pplx_space_execution_spec::ExecutionMetadataError),
     #[error(transparent)]
-    KernelVersion(#[from] pplx_space_common_core::types::ArtifactVersionParseError),
+    KernelVersion(#[from] pplx_space_execution_spec::ArtifactVersionParseError),
     #[error(transparent)]
-    KernelRole(#[from] pplx_space_common_core::types::ArtifactComponentRoleParseError),
+    KernelRole(#[from] pplx_space_execution_spec::ArtifactComponentRoleParseError),
     #[error(transparent)]
-    KernelDigest(#[from] pplx_space_common_core::types::DigestParseError),
+    KernelDigest(#[from] pplx_space_content_digest::DigestParseError),
     #[error(transparent)]
-    KernelFormat(#[from] pplx_space_common_core::types::ArtifactFormatParseError),
+    KernelFormat(#[from] pplx_space_execution_spec::ArtifactFormatParseError),
     #[error(transparent)]
-    StateFormat(#[from] pplx_space_common_core::types::StateFormatNameParseError),
+    StateFormat(#[from] pplx_space_execution_spec::StateFormatNameParseError),
     #[error("kernel_version and kernel_digest must be populated together")]
     PartialKernel,
 }

@@ -1,10 +1,11 @@
-//! Shared SPACE domain types.
+//! Shared SPACE sandbox, template, snapshot and node domain types.
 //!
 //! These newtypes turn repeated primitive values into named domain concepts:
-//! sandbox IDs are not template names, memory sizes are not disk sizes, and
-//! guest paths are not node paths. Boundary code should parse raw strings,
-//! integers, and UUIDs into these types once and pass the typed values through
-//! the rest of the call graph.
+//! sandbox IDs are not template names, node paths are not storage URIs, and
+//! snapshot names are not template references. Value types that have their own
+//! `pplx-space-*` crate are imported from that crate, not through `types`.
+//! Boundary code should parse raw strings, integers, and UUIDs into these
+//! types once and pass the typed values through the rest of the call graph.
 //!
 //! The module stays dependency-light. It intentionally does not depend on
 //! transport, database, web framework, or daemon-specific crates.
@@ -13,6 +14,8 @@
 //!
 //! ```rust
 //! # use pplx_space_common_core::types::*;
+//! # use pplx_space_execution_spec::{ComputeShape, CpuLimit};
+//! # use pplx_space_byte_size::MemorySize;
 //! let sandbox_id = SandboxId::new();
 //! let template = TemplateName::parse("seed").unwrap();
 //! let memory = MemorySize::gib(4).unwrap();
@@ -23,88 +26,42 @@
 //! ```
 
 pub mod admin;
-pub mod auto_lifecycle;
-pub mod balloon;
 pub mod client_id;
 pub mod cluster;
-pub mod compute;
-pub use pplx_space_db_identity as database;
-pub mod disk_io;
-pub mod env;
-pub mod environment;
-pub use pplx_space_execution_spec::execution;
-pub use pplx_space_execution_spec::guest_image;
-pub use pplx_space_execution_spec::host_cpu;
-pub mod host_linux;
 pub mod kek;
-pub mod label;
-pub mod network;
 pub mod node;
 pub mod node_fs;
 pub mod node_group;
 pub mod object_store;
-pub mod path;
 #[cfg(feature = "sqlx")]
 mod postgres;
-pub mod privacy;
-pub mod process;
 pub mod restore_retirement;
-pub mod runtime;
 pub mod sandbox;
 #[cfg(feature = "serde")]
 pub mod sandbox_artifact;
-pub use pplx_space_byte_size as size;
 pub mod snapshot;
 pub mod subject;
 pub mod template;
-pub mod time;
-pub mod transport_vsock;
-pub use pplx_space_semver as version;
 
 #[cfg(feature = "serde")]
 pub use admin::*;
-pub use auto_lifecycle::*;
-pub use balloon::*;
 pub use client_id::*;
 pub use cluster::*;
-pub use compute::*;
-pub use database::*;
-pub use disk_io::*;
-pub use env::*;
-pub use environment::*;
-pub use execution::*;
-pub use host_cpu::*;
-pub use host_linux::*;
 pub use kek::*;
-pub use label::*;
-pub use network::*;
 pub use node::*;
 pub use node_fs::*;
 pub use node_group::*;
 pub use object_store::*;
-pub use path::*;
-pub use privacy::*;
-pub use process::*;
 pub use restore_retirement::*;
-pub use runtime::{
-    EffectiveStartup, RUNTIME_CLOUD_HYPERVISOR, RUNTIME_CLOUD_HYPERVISOR_ALIAS,
-    RUNTIME_FIRECRACKER, RUNTIME_FIRECRACKER_ALIAS, RUNTIME_GVISOR, RUNTIME_GVISOR_ALIAS,
-    RuntimeCapabilities, RuntimeDeploymentId, RuntimeDeploymentIdParseError, RuntimeKind,
-    RuntimeKindParseError, StartupPolicy, UnsupportedStartupPolicyError,
-};
 pub use sandbox::*;
 #[cfg(feature = "serde")]
 pub use sandbox_artifact::*;
-pub use size::*;
 pub use snapshot::*;
 pub use subject::{SubjectId, SubjectIdParseError, SubjectKind};
 pub use template::{
-    Arch, ArchParseError, BuildRunId, BuildRunIdParseError, ContentHash,
-    DEFAULT_DIGEST_PREFIX_HEX_LEN, DEFAULT_TEMPLATE_TAG, Digest, DigestParseError, DigestPrefix,
-    DigestPrefixParseError, DigestPrefixResolveError, HashAlg, HashAlgParseError,
-    MIN_DIGEST_PREFIX_HEX_LEN, ORPHANED_SANDBOX_TEMPLATE, OwnerType, ResolvedTemplateReference,
-    ResolvedTemplateVariant, RuntimeScopedTemplateReference, SystemTemplate,
-    SystemTemplateParseError, TemplateArtifactDigest, TemplateArtifactDigestPrefix,
+    BuildRunId, BuildRunIdParseError, DEFAULT_TEMPLATE_TAG, ORPHANED_SANDBOX_TEMPLATE, OwnerType,
+    ResolvedTemplateReference, ResolvedTemplateVariant, RuntimeScopedTemplateReference,
+    SystemTemplate, SystemTemplateParseError, TemplateArtifactDigest, TemplateArtifactDigestPrefix,
     TemplateBuildId, TemplateBuildJobState, TemplateBuildJobStateParseError, TemplateBuildState,
     TemplateCachePartition, TemplateDesiredState, TemplateDesiredStateParseError, TemplateId,
     TemplateIndexDigest, TemplateIndexDigestPrefix, TemplateName, TemplateParseError,
@@ -112,6 +69,3 @@ pub use template::{
     TemplateSelector, TemplateTag, TemplateTagParseError, TemplateVisibility,
     TemplateVisibilityParseError,
 };
-pub use time::*;
-pub use transport_vsock::*;
-pub use version::{SemVer, SemVerParseError};

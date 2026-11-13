@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::Arch;
+use pplx_space_cpu_arch::Arch;
 use pplx_space_node_runtime_core::artifact_store::managed_release_directory;
 
 #[test]
@@ -95,14 +95,14 @@ fn source_io_failures_remain_retryable_through_launch_admission() {
             assert_eq!(supervisor_launch_status(status).code(), expected);
         }
     }
-    let digest = VerityDigest::new(pplx_space_common_core::types::Digest::sha256([1; 32]));
+    let digest = VerityDigest::new(pplx_space_content_digest::Digest::sha256([1; 32]));
     for source in [
         VerityError::Unsupported,
         VerityError::Unsealed,
         VerityError::DigestFormat,
         VerityError::Mismatch {
             expected: digest,
-            actual: VerityDigest::new(pplx_space_common_core::types::Digest::sha256([2; 32])),
+            actual: VerityDigest::new(pplx_space_content_digest::Digest::sha256([2; 32])),
         },
     ] {
         let error = SourceError::Verity {

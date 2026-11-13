@@ -1,9 +1,9 @@
 use super::*;
 use futures_util::StreamExt as _;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, LinuxPid, LinuxUid, SandboxActivationAttemptId, SandboxId,
-    SpaceApiRouteIdentity, VsockCid,
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxId, SpaceApiRouteIdentity,
 };
+use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
 
 pub(super) fn endpoint_proof(start_time_ticks: u64) -> crate::endpoint_proof::SpacedEndpointProof {
     crate::endpoint_proof::SpacedEndpointProof {
@@ -669,11 +669,9 @@ async fn producer_panic_is_an_explicit_stream_error() {
 
 #[tokio::test]
 async fn windows_start_defers_proof_and_refuses_lazy_serving_capture() {
-    use pplx_space_common_core::types::{
-        Arch,
-        guest_image::{
-            GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
-        },
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::guest_image::{
+        GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
     };
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();

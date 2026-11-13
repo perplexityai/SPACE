@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::MAX_ENV_VALUE_BYTES;
+use pplx_space_guest_process::MAX_ENV_VALUE_BYTES;
 use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
 use pplx_space_node_api_client::proto::worker_api_server::WorkerApi;
 use pplx_space_sbx_mgr_client::operations as ops;
@@ -1057,9 +1057,8 @@ async fn wake_policy_fences_only_resident_resume() {
                 blocking: true,
                 start_context: Some(sbx::WakeStartContext {
                     expected_execution_generation: expected,
-                    activation_auto_lifecycle: policy.then(|| {
-                        pplx_space_common_core::types::AutoLifecyclePolicy::disabled().into()
-                    }),
+                    activation_auto_lifecycle: policy
+                        .then(|| pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled().into()),
                     ..Default::default()
                 }),
                 ..Default::default()

@@ -155,7 +155,7 @@ fn proof_capture_rejects_a_pre_peer_pinning_spaced_host() {
         guest_cid: 3,
         spaced_host_pid: 43,
         runtime_pid: 42,
-        runtime_kind: pplx_space_common_core::types::RuntimeKind::Firecracker,
+        runtime_kind: pplx_space_execution_spec::RuntimeKind::Firecracker,
         vsock_path: PathBuf::from("/space/jail/firecracker/sandbox/root/v.sock"),
     };
     let arguments = format!(
@@ -168,7 +168,7 @@ fn proof_capture_rejects_a_pre_peer_pinning_spaced_host() {
 
 #[test]
 fn validation_uses_the_recorded_runtime_endpoint() {
-    use pplx_space_common_core::types::RuntimeKind;
+    use pplx_space_execution_spec::RuntimeKind;
     use pplx_space_node_runtime_core::control::{guest_endpoint_identity, guest_socket_path};
     for (kind, executable) in [
         (RuntimeKind::Firecracker, "firecracker"),
@@ -224,7 +224,7 @@ fn captured_host_binding_rejects_process_descriptor_and_socket_replacement() {
         guest_cid: 3,
         spaced_host_pid: pid,
         runtime_pid: pid,
-        runtime_kind: pplx_space_common_core::types::RuntimeKind::Firecracker,
+        runtime_kind: pplx_space_execution_spec::RuntimeKind::Firecracker,
         vsock_path: socket_path.clone(),
     };
     let proof = capture_endpoint_proof_host_state(

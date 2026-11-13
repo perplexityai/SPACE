@@ -8,13 +8,13 @@ fn projection_order_does_not_change_values_or_corrupt_column_diagnostics() {
     let id = SandboxId::new().to_string();
     let runtime_label = SandboxRuntimeLabel::parse("abcdef12").unwrap();
     let owner = SandboxOwner::parse("row-owner").unwrap();
-    let image = pplx_space_common_core::types::guest_image::GuestImageContract::new(
-        pplx_space_common_core::types::guest_image::GuestDiskLayout::OpaqueRawDisk,
-        pplx_space_common_core::types::guest_image::GuestReadiness::TcpService {
+    let image = pplx_space_execution_spec::guest_image::GuestImageContract::new(
+        pplx_space_execution_spec::guest_image::GuestDiskLayout::OpaqueRawDisk,
+        pplx_space_execution_spec::guest_image::GuestReadiness::TcpService {
             port: std::num::NonZeroU16::new(3389).unwrap(),
         },
-        pplx_space_common_core::types::guest_image::GuestNetwork::SlotDhcpV1,
-        pplx_space_common_core::types::guest_image::GuestAgent::Absent,
+        pplx_space_execution_spec::guest_image::GuestNetwork::SlotDhcpV1,
+        pplx_space_execution_spec::guest_image::GuestAgent::Absent,
     )
     .unwrap();
     let env = BTreeMap::from([("KEY".to_owned(), "value".to_owned())]);

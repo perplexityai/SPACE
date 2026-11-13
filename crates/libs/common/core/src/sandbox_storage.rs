@@ -3,7 +3,7 @@
 //! This limits the writable guest disk, not snapshot amplification or aggregate
 //! node occupancy. Allocation admission must still account for backing storage.
 
-use crate::types::DiskSize;
+use pplx_space_byte_size::DiskSize;
 
 pub const MAX_SANDBOX_ROOTFS_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 

@@ -1,8 +1,8 @@
 /// Node identity supplied by Kubernetes in a reviewed pod-bound token.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthenticatedKubernetesNode {
-    name: pplx_space_common_core::types::K8sNodeName,
-    uid: pplx_space_common_core::types::K8sNodeUid,
+    name: pplx_space_k8s_ids::K8sNodeName,
+    uid: pplx_space_k8s_ids::K8sNodeUid,
 }
 
 /// How an authenticated caller is bound to registered node inventory.
@@ -18,11 +18,11 @@ pub enum AuthenticatedNodeIdentity {
 }
 
 impl AuthenticatedKubernetesNode {
-    pub fn name(&self) -> &pplx_space_common_core::types::K8sNodeName {
+    pub fn name(&self) -> &pplx_space_k8s_ids::K8sNodeName {
         &self.name
     }
 
-    pub fn uid(&self) -> &pplx_space_common_core::types::K8sNodeUid {
+    pub fn uid(&self) -> &pplx_space_k8s_ids::K8sNodeUid {
         &self.uid
     }
 
@@ -54,7 +54,7 @@ impl AuthenticatedNodeIdentity {
     pub(super) fn from_reviewed_user_info(
         user: &k8s_openapi::api::authentication::v1::UserInfo,
     ) -> Self {
-        use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid, PodName, PodUid};
+        use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid, PodName, PodUid};
         let claim = |key| match user.extra.as_ref().and_then(|extra| extra.get(key)) {
             None => Some(None),
             Some(values) => match values.as_slice() {

@@ -1,8 +1,8 @@
 //! Launch-time gateway isolation. Existing processes retain their identity
 //! until the normal cycle/cleanup owner stops them.
 
-use pplx_space_common_core::types::LinuxUid;
 use pplx_space_host_layout::gateway;
+use pplx_space_linux_ids::LinuxUid;
 use tonic::Status;
 
 impl super::SandboxManagerService {

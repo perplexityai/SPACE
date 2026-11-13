@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use pplx_space_common_core::types::{PositiveDuration, snapshot_sweeper_grace_seconds};
+use pplx_space_common_core::types::snapshot_sweeper_grace_seconds;
+use pplx_space_durations::PositiveDuration;
 
 /// A borrowed configuration source shared by the reconciler parsers.
 pub(crate) struct EnvConfig<'a>(pub(crate) &'a dyn pplx_space_env_vars::Environment);

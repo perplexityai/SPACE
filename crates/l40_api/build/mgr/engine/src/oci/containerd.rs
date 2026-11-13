@@ -6,7 +6,8 @@ use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use oci_spec::distribution::Reference as OciReference;
-use pplx_space_common_core::types::{Arch, ArchParseError, Digest, DigestParseError};
+use pplx_space_content_digest::{Digest, DigestParseError};
+use pplx_space_cpu_arch::{Arch, ArchParseError};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::Instrument as _;

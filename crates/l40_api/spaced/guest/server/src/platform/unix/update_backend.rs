@@ -58,6 +58,6 @@ impl SpacedGuestService {
 
 pub(super) fn parse_environment(
     values: std::collections::HashMap<String, String>,
-) -> Result<pplx_space_common_core::types::EnvMap, Status> {
+) -> Result<pplx_space_guest_process::EnvMap, Status> {
     Ok(parse_env(values))
 }

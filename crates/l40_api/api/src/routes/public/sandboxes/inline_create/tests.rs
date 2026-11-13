@@ -1089,7 +1089,7 @@ mod postgres {
             &fixture.db.pool,
             fixture.org_id,
             fixture.user_id,
-            &pplx_space_common_core::types::IdempotencyKey::parse(idempotency_key)
+            &pplx_space_guest_process::IdempotencyKey::parse(idempotency_key)
                 .expect("test key parses"),
             fixture.request(),
             None,

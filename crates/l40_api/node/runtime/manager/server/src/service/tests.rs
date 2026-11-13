@@ -18,7 +18,7 @@ const LIMITS: ScanLimits = ScanLimits {
 fn roots(base: &std::path::Path) -> ScanRoots {
     ScanRoots {
         runtime_releases: vec![RuntimeInstallationRoot::new(
-            pplx_space_common_core::types::RuntimeKind::Firecracker,
+            pplx_space_execution_spec::RuntimeKind::Firecracker,
             base.join("vendor/firecracker"),
         )],
         vendor_kernels: base.join("vendor/kernels"),
@@ -498,8 +498,8 @@ async fn artifact_mutations_require_an_operator_and_an_enabled_installer() {
         ],
     );
     let identity =
-        crate::convert::component_identity(pplx_space_common_core::types::ComponentIdentity {
-            kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
+        crate::convert::component_identity(pplx_space_execution_spec::ComponentIdentity {
+            kind: pplx_space_execution_spec::ArtifactComponentKind::Kernel,
             version: "6.1.158".parse().unwrap(),
             digest: Digest::sha256([7; 32]),
         });
@@ -556,7 +556,7 @@ async fn catalog_listing_routes_only_configured_sources_without_a_mutation_worke
     use crate::installs::test_support::{
         FakeExecutableSource, FakeReleaseSource, FakeSource, TestPins, release_pin,
     };
-    use pplx_space_common_core::types::RuntimeKind;
+    use pplx_space_execution_spec::RuntimeKind;
     for (include_ch, include_kernels) in
         [(false, false), (false, true), (true, false), (true, true)]
     {

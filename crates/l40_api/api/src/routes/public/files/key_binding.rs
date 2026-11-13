@@ -1,5 +1,5 @@
 use crate::routes::public::error::database_error;
-use pplx_space_common_core::types::IdempotencyKey;
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_native_files::RequestDigest;
 use pplx_space_public_api::{
     RequestFingerprint,

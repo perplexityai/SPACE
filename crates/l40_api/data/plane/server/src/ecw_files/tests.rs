@@ -1,6 +1,7 @@
 use super::multipart::*;
 use super::*;
-use pplx_space_common_core::types::{MAX_GUEST_PATH_BYTES, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_guest_process::MAX_GUEST_PATH_BYTES;
 use std::{
     convert::Infallible,
     sync::{

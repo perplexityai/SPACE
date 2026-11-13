@@ -52,7 +52,7 @@ struct RegisteredEndpointRuntime {
     guest_cid: u32,
     spaced_host_pid: u32,
     runtime_pid: u32,
-    runtime_kind: pplx_space_common_core::types::RuntimeKind,
+    runtime_kind: pplx_space_execution_spec::RuntimeKind,
     vsock_path: PathBuf,
 }
 
@@ -77,7 +77,7 @@ impl NodeManagerService {
             .map_err(slot_store_status)?
             .ok_or_else(|| Status::permission_denied("gateway has no registered sandbox lease"))?;
         let expected_uid = pplx_space_host_layout::gateway::gateway_uid(
-            pplx_space_common_core::types::LinuxUid::new(lease.sandbox_uid),
+            pplx_space_linux_ids::LinuxUid::new(lease.sandbox_uid),
         );
         if expected_uid.map(|uid| uid.get()) != Some(request.uid)
             || request.launch_capability.len() != 64
@@ -156,7 +156,7 @@ impl NodeManagerService {
             .recorded_execution(sandbox_id.to_owned())
             .await?
             .map_or(
-                pplx_space_common_core::types::RuntimeKind::Firecracker,
+                pplx_space_execution_spec::RuntimeKind::Firecracker,
                 |execution| execution.runtime().kind,
             );
         let vsock_path =

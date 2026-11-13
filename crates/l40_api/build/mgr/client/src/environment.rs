@@ -1,6 +1,6 @@
 //! Explicit environment submission across rolling service upgrades.
 use crate::{BuildManagerGrpcClient, proto};
-use pplx_space_common_core::types::EnvironmentReference;
+use pplx_space_execution_spec::EnvironmentReference;
 use tonic::Status;
 
 /// Move the recipe into the selected input. Old servers reject missing recipe.

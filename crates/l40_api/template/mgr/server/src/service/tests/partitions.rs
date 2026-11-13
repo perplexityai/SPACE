@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::db::TemplateCachePartition;
-use pplx_space_common_core::types::{Arch, EnvironmentReference, ExecutionMetadata};
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
 use pplx_space_template_manifest::TemplateManifest;
 
 const NAME: &str = "seed";
@@ -423,7 +424,7 @@ fn base_snapshot_capture_boots_a_twin_under_its_environment() {
         &hash(),
         TemplateCachePartition::Legacy,
         Some(4),
-        pplx_space_common_core::types::RuntimeKind::Firecracker,
+        pplx_space_execution_spec::RuntimeKind::Firecracker,
     );
     assert_eq!(legacy.environment, None);
     assert_eq!(legacy.template, NAME);
@@ -434,7 +435,7 @@ fn base_snapshot_capture_boots_a_twin_under_its_environment() {
         &hash(),
         twin(),
         Some(4),
-        pplx_space_common_core::types::RuntimeKind::Firecracker,
+        pplx_space_execution_spec::RuntimeKind::Firecracker,
     );
     let input = twin
         .environment

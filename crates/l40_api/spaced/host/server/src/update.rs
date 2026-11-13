@@ -454,7 +454,7 @@ impl SpacedHostService {
         ),
         Status,
     > {
-        use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+        use pplx_space_execution_spec::guest_image::QualifiedGuestAgent;
         if !matches!(
             self.inner.guest_agent,
             QualifiedGuestAgent::LinuxV1 | QualifiedGuestAgent::WindowsV1

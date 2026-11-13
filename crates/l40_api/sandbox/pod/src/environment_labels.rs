@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::NodeSelectorRequirement;
 
-use pplx_space_common_core::types::EnvironmentReference;
+use pplx_space_execution_spec::EnvironmentReference;
 
 /// Every environment label's key starts with this.
 pub const ENVIRONMENT_LABEL_KEY_PREFIX: &str = "space.pplx.net/env-";

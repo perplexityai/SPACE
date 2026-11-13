@@ -40,7 +40,9 @@ pplx-space-common-grpc = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-host-linux = { workspace = true }
+pplx-space-guest-process = { workspace = true }
 pplx-space-observability = { workspace = true, optional = true }
+pplx-space-pii = { workspace = true }
 pplx-space-service-host = { workspace = true, optional = true }
 pplx-space-spaced-guest-protocol = { workspace = true }
 pplx-space-test-hooks = { workspace = true }

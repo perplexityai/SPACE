@@ -33,7 +33,7 @@ fn main() {}
 
 #[cfg(target_os = "linux")]
 async fn run() {
-    use pplx_space_common_core::types::GuestUserName;
+    use pplx_space_guest_process::GuestUserName;
     use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
         StatRequest, WriteOpen, WriteRequest, filesystem_client::FilesystemClient,
         write_request::Message,

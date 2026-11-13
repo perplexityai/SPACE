@@ -1,7 +1,7 @@
 use clap::builder::TypedValueParser;
 use clap::{Parser, Subcommand, ValueEnum};
-use pplx_space_common_core::types::EnvironmentReference;
 use pplx_space_common_core::types::admin::AdminNodeSort;
+use pplx_space_execution_spec::EnvironmentReference;
 use std::str::FromStr;
 
 /// Operator-facing SPACE CLI. The current command set is a thin wrapper over
@@ -269,7 +269,7 @@ pub(crate) enum TemplateCommands {
         base: Option<pplx_space_common_core::types::TemplateReference>,
         /// Exact qualified runtime/kernel pair for the build.
         #[arg(long)]
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         /// Assign a release tag, such as latest, after a successful build.
         #[arg(long = "publish-tag")]
         publish_tags: Vec<pplx_space_common_core::types::TemplateTag>,

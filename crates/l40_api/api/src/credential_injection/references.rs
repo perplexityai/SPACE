@@ -1,10 +1,10 @@
 use super::idempotency;
 use pplx_space_accounts::{CredentialReferenceId, OrgId};
-use pplx_space_common_core::types::IdempotencyKey;
 use pplx_space_credential_injection::validation::{
     ReferenceValidationError, ValidatedCredentialReference,
 };
 use pplx_space_credential_injection_store::references::{self as store, ReferenceState};
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::credential_references as wire;
 
 #[derive(Debug, thiserror::Error)]

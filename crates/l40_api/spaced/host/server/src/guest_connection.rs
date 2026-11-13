@@ -1,7 +1,7 @@
 //! Capabilities belong to the transport used for dispatch, not a readiness cache.
 use super::*;
-use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
 use pplx_space_common_grpc::{GuestCapability, guest_capability_unsupported_status};
+use pplx_space_execution_spec::guest_image::QualifiedGuestAgent;
 use pplx_space_spaced_guest_protocol::proto::platform::GuestOs;
 
 /// Readiness probes and teardown must work before operation negotiation.

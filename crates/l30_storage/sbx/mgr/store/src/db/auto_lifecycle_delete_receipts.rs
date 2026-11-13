@@ -242,9 +242,8 @@ pub fn classify_and_record_admission(
         return Err(AutoLifecycleDeleteEvidenceError::Database(Error::no_rows()));
     };
 
-    let policy: pplx_space_common_core::types::AutoLifecyclePolicy =
-        serde_json::from_str(&policy_json)
-            .map_err(|error| crate::db::Error::decode(1, Type::Text, error))?;
+    let policy: pplx_space_auto_lifecycle::AutoLifecyclePolicy = serde_json::from_str(&policy_json)
+        .map_err(|error| crate::db::Error::decode(1, Type::Text, error))?;
     if AutoLifecyclePolicyFingerprint::for_policy(&policy) != expectation.policy_fingerprint {
         return Err(AutoLifecycleDeleteEvidenceError::PolicyChanged);
     }
@@ -783,7 +782,7 @@ fn record_block(
     )?;
     let policy = serde_json::from_str(&policy_json)
         .map_err(|error| crate::db::Error::decode(0, Type::Text, error))?;
-    let mut runtime_state: pplx_space_common_core::types::AutoLifecycleRuntimeState =
+    let mut runtime_state: pplx_space_auto_lifecycle::AutoLifecycleRuntimeState =
         serde_json::from_str(&runtime_state_json)
             .map_err(|error| crate::db::Error::decode(1, Type::Text, error))?;
     let retry_delay = i64::try_from(AUTO_LIFECYCLE_DELETE_RETRY_DELAY.as_secs())
@@ -836,7 +835,7 @@ pub fn record_receipt_conflict_retry(
     let policy = serde_json::from_str(&policy_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
     })?;
-    let mut runtime_state: pplx_space_common_core::types::AutoLifecycleRuntimeState =
+    let mut runtime_state: pplx_space_auto_lifecycle::AutoLifecycleRuntimeState =
         serde_json::from_str(&runtime_state_json).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
         })?;

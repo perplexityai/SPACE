@@ -1,6 +1,6 @@
 use super::*;
 use crate::control::ControlError;
-use pplx_space_common_core::types::RuntimeKind;
+use pplx_space_execution_spec::RuntimeKind;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]

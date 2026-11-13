@@ -66,9 +66,10 @@ use std::time::{Duration, Instant};
 
 use pplx_space_accounts::OrgId;
 use pplx_space_common_core::types::{
-    ContentHash, StorageUri, SubjectId, TEMPLATE_ROOTFS_FILE, TemplateCachePartition, TemplateName,
+    StorageUri, SubjectId, TEMPLATE_ROOTFS_FILE, TemplateCachePartition, TemplateName,
 };
 use pplx_space_common_grpc::GrpcClientTrace;
+use pplx_space_content_digest::ContentHash;
 use pplx_space_host_layout::paths::{TEMPLATE_CACHE_DIR_MODE, TEMPLATE_CACHE_FILE_MODE};
 use pplx_space_node_api_client::cluster::connect_from_env as connect_cluster_api_from_env;
 use pplx_space_node_api_client::proto::{
@@ -100,7 +101,7 @@ const TEMPLATE_DIR: &str = pplx_space_host_layout::paths::TEMPLATE_DIR;
 /// Default runtime passed to `FindTemplateRelease`. The cluster API accepts
 /// both full names and aliases, but the release column currently stores the
 /// legacy Firecracker alias `fc`, so this caller sends the stored spelling.
-pub(crate) const DEFAULT_RUNTIME: &str = pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS;
+pub(crate) const DEFAULT_RUNTIME: &str = pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS;
 
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, context: &'static str) -> MutexGuard<'a, T> {
     match mutex.lock() {
@@ -1463,7 +1464,7 @@ async fn do_pull(
         PullError::Failure(PullFailure::InvalidTemplateName)
     })?;
     if content_hash
-        .parse::<pplx_space_common_core::types::ContentHash>()
+        .parse::<pplx_space_content_digest::ContentHash>()
         .is_err()
     {
         warn!(content_hash, "release hash is not a valid ContentHash");
@@ -2076,7 +2077,7 @@ async fn try_pull_from(
     }
     let build_date = manifest.build_date.clone();
     let runtime = if manifest.runtime.is_empty() {
-        pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.to_string()
+        pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.to_string()
     } else {
         manifest.runtime.clone()
     };
@@ -3028,7 +3029,7 @@ async fn materialize_rootfs(
     // for the bootable rootfs, so the pull plan downloaded the rootfs
     // directly. Stream-hash it using the release identity.
     let algorithm = content_hash
-        .parse::<pplx_space_common_core::types::Digest>()
+        .parse::<pplx_space_content_digest::Digest>()
         .map_err(|error| PullError::Failed(tonic::Status::invalid_argument(error.to_string())))?
         .algorithm();
     let hash_source = rootfs_path.to_string();

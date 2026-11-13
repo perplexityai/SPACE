@@ -20,7 +20,10 @@ workspace = true
 [features]
 default = ["kubernetes"]
 kubernetes = [
+    "dep:pplx-space-byte-size",
     "dep:pplx-space-common-core",
+    "dep:pplx-space-content-digest",
+    "dep:pplx-space-execution-spec",
     "dep:serde",
     "dep:sqlx",
     "dep:thiserror",
@@ -29,7 +32,10 @@ kubernetes = [
 ]
 
 [dependencies]
+pplx-space-byte-size = { workspace = true, features = ["serde"], optional = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"], optional = true }
+pplx-space-content-digest = { workspace = true, features = ["serde"], optional = true }
+pplx-space-execution-spec = { workspace = true, features = ["serde"], optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 sqlx = { workspace = true, features = ["derive", "migrate", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"], optional = true }
 thiserror = { workspace = true, optional = true }

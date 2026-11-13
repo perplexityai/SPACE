@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::MAX_GUEST_USER_NAME_BYTES;
+use pplx_space_guest_process::MAX_GUEST_USER_NAME_BYTES;
 
 const LINUX_CWD: &str = "/workspace";
 const WINDOWS_DRIVE_CWD: &str = "C:\\Users\\me";

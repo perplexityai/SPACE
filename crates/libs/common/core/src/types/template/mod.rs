@@ -4,7 +4,7 @@
 //! user-facing template grammar is OCI-like:
 //! `seed` means `seed:latest`, `seed:v1` selects a mutable tag, and
 //! `seed@sha256:...` selects a runtime-specific artifact digest after a
-//! [`RuntimeKind`] is provided. Short digest prefixes such as
+//! [`RuntimeKind`](pplx_space_execution_spec::RuntimeKind) is provided. Short digest prefixes such as
 //! `seed@sha256:0123456789ab` are accepted at input boundaries, but they must
 //! be resolved against a repository/index before they become exact immutable
 //! references. Logical template index digests use the explicit resolved form
@@ -15,6 +15,7 @@
 //! ```rust
 //! # use std::str::FromStr;
 //! # use pplx_space_common_core::types::*;
+//! # use pplx_space_execution_spec::RuntimeKind;
 //! let input = TemplateReference::from_str("seed").unwrap();
 //! assert_eq!(input.to_string(), "seed:latest");
 //!
@@ -48,19 +49,14 @@ mod visibility;
 use pplx_space_content_digest as hash;
 
 pub use build::{
-    Arch, ArchParseError, BuildRunId, BuildRunIdParseError, OwnerType, TemplateBuildId,
-    TemplateBuildJobState, TemplateBuildJobStateParseError, TemplateBuildState,
+    BuildRunId, BuildRunIdParseError, OwnerType, TemplateBuildId, TemplateBuildJobState,
+    TemplateBuildJobStateParseError, TemplateBuildState,
 };
 pub use cache_partition::TemplateCachePartition;
 pub use desired_state::{TemplateDesiredState, TemplateDesiredStateParseError};
 pub use digest::{
     TemplateArtifactDigest, TemplateArtifactDigestPrefix, TemplateIndexDigest,
     TemplateIndexDigestPrefix,
-};
-pub use hash::{
-    ContentHash, DEFAULT_DIGEST_PREFIX_HEX_LEN, Digest, DigestParseError, DigestPrefix,
-    DigestPrefixParseError, DigestPrefixResolveError, HashAlg, HashAlgParseError,
-    MIN_DIGEST_PREFIX_HEX_LEN,
 };
 pub use identity::{
     DEFAULT_TEMPLATE_TAG, ORPHANED_SANDBOX_TEMPLATE, TemplateId, TemplateName, TemplateParseError,

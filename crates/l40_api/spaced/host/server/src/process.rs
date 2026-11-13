@@ -1,7 +1,7 @@
 use super::*;
 use crate::bridge::BridgeGuestOperationBudget;
 use crate::protocol::*;
-use pplx_space_common_core::types::ProcessId;
+use pplx_space_guest_process::ProcessId;
 
 const MAX_GUEST_PROCESS_INFO_ARGUMENTS: usize = 4_096;
 const MAX_GUEST_PROCESS_INFO_ENVIRONMENT: usize = 4_096;

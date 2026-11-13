@@ -384,7 +384,7 @@ fn import_header_execution_metadata_backfills_legacy_firecracker_header() {
 
     assert_eq!(
         execution.runtime().kind,
-        pplx_space_common_core::types::RuntimeKind::Firecracker
+        pplx_space_execution_spec::RuntimeKind::Firecracker
     );
     assert_eq!(execution.runtime().version.as_str(), "1.15.1");
     assert_eq!(execution.state_format().unwrap().version.as_str(), "9.0.0");

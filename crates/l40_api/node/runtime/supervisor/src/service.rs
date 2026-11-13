@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use pplx_space_common_core::types::{ProcessSignal, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_guest_process::ProcessSignal;
 use pplx_space_node_runtime_core::cgroup::{self, CgroupLimits};
 use pplx_space_node_runtime_core::launch;
 use pplx_space_node_runtime_core::launch_admission::runtime_operation_status;
@@ -586,7 +587,7 @@ impl RuntimeSupervisorService {
         &self,
         sandbox_id: SandboxId,
         execution: pplx_space_common_core::types::SandboxActivationAttemptId,
-        budget: pplx_space_common_core::types::VcpuCount,
+        budget: pplx_space_execution_spec::VcpuCount,
         sealed_launch: Option<crate::verified_launch::VerifiedLaunch>,
     ) -> Result<Option<crate::verified_launch::OpenedRuntime>, Status> {
         self.execution_io(move |store| {

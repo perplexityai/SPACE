@@ -37,7 +37,7 @@ pub(crate) struct RuntimePaths {
 /// where publications come from.
 #[derive(Clone, Debug)]
 pub(crate) struct ArtifactStorePaths {
-    pub releases: std::collections::BTreeMap<pplx_space_common_core::types::RuntimeKind, PathBuf>,
+    pub releases: std::collections::BTreeMap<pplx_space_execution_spec::RuntimeKind, PathBuf>,
     pub kernels: PathBuf,
     /// The runtime manager's staging directory, read and never written.
     pub staging: PathBuf,
@@ -50,11 +50,11 @@ impl Default for ArtifactStorePaths {
         Self {
             releases: [
                 (
-                    pplx_space_common_core::types::RuntimeKind::Firecracker,
+                    pplx_space_execution_spec::RuntimeKind::Firecracker,
                     paths::NODE_FIRECRACKER_DIR.into(),
                 ),
                 (
-                    pplx_space_common_core::types::RuntimeKind::CloudHypervisor,
+                    pplx_space_execution_spec::RuntimeKind::CloudHypervisor,
                     paths::NODE_CLOUD_HYPERVISOR_DIR.into(),
                 ),
             ]
@@ -134,7 +134,7 @@ pub enum SelectionConfigurationError {
     #[error("cannot load execution catalog: {0}")]
     Catalog(#[from] pplx_space_node_runtime_core::catalog::CatalogError),
     #[error("unsupported host architecture: {0}")]
-    Architecture(#[from] pplx_space_common_core::types::ArchParseError),
+    Architecture(#[from] pplx_space_cpu_arch::ArchParseError),
 }
 
 fn execution_policy_from_env()
@@ -159,7 +159,7 @@ fn execution_policy_from_env()
 fn execution_policy_with_catalog(
     allowed: Option<&str>,
     default: Option<&str>,
-    architecture: pplx_space_common_core::types::Arch,
+    architecture: pplx_space_cpu_arch::Arch,
     catalog: Result<
         Vec<pplx_space_node_runtime_core::catalog::CompiledEnvironment>,
         pplx_space_node_runtime_core::catalog::CatalogError,

@@ -133,7 +133,7 @@ async fn create_checks_auto_lifecycle_authority_before_template_lookup(
         let mut request = Request::new(CreateRequest {
             template: "seed".into(),
             owner: "root@local".into(),
-            runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.into(),
+            runtime: pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.into(),
             boot_mode: BootMode::Cold as i32,
             sandbox_id: Some(SandboxId::new().to_string()),
             auto_lifecycle: Some(Default::default()),

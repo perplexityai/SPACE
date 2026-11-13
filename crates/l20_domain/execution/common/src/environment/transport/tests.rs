@@ -1,4 +1,5 @@
 use super::*;
+use pplx_space_execution_spec::ExecutionMetadata;
 use prost::Message;
 
 #[test]

@@ -18,7 +18,8 @@ use axum::{
     response::IntoResponse,
 };
 use pplx_space_build_mgr_client::proto::{self as build_proto, BuildState};
-use pplx_space_common_core::types::{RuntimeKind, TemplateName, TemplateTag, TemplateVisibility};
+use pplx_space_common_core::types::{TemplateName, TemplateTag, TemplateVisibility};
+use pplx_space_execution_spec::RuntimeKind;
 use serde::Deserialize;
 use uuid::Uuid;
 

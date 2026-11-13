@@ -45,10 +45,14 @@ pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-template-runtime = { workspace = true }
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
+pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-host-linux = { workspace = true }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
+pplx-space-guest-process = { workspace = true, features = ["serde"] }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-node-api-client = { workspace = true }

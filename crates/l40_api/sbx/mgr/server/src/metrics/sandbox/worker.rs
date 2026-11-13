@@ -16,9 +16,9 @@
 
 use std::{fmt, str::FromStr, time::Instant};
 
+use pplx_space_auto_lifecycle::AutoLifecycleIdleAction;
 use pplx_space_common_core::types::{
-    AutoLifecycleIdleAction, ExecutionReleaseDetachReason, ExecutionReleaseIntent,
-    QuarantineRecoveryNoProgressReason,
+    ExecutionReleaseDetachReason, ExecutionReleaseIntent, QuarantineRecoveryNoProgressReason,
 };
 
 use pplx_space_metrics_emit::{counter, distribution, elapsed_ms, gauge, tag, timing_ms};

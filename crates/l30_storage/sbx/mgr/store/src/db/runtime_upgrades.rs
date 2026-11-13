@@ -9,7 +9,7 @@
 //! work between them.
 
 use super::*;
-use pplx_space_common_core::types::EnvironmentReference;
+use pplx_space_execution_spec::EnvironmentReference;
 
 /// Caller-chosen identity of one upgrade; retries of the same upgrade reuse it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

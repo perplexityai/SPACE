@@ -2,8 +2,18 @@
 //! not approve an environment for execution or its memory-state operations.
 
 use pplx_space_common_core::types::*;
+use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_common::environment::{
     EnvironmentBindingError, EnvironmentDefinition, EnvironmentRequirementsError,
+};
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, ArtifactComponentRoleParseError, ArtifactFormatParseError, BootArtifact,
+    BootProfile, ComponentIdentity, EnvironmentDescriptorError, EnvironmentReference,
+    EnvironmentSpec, ExecutionCompatibilityProfile, ExecutionContractIdParseError,
+    ExecutionMetadata, FIRECRACKER_STATE_FORMAT, GuestOperatingSystem, GuestPlatform,
+    HostOperatingSystem, HostPlatform, HypervisorBackend, INITIAL_FIRECRACKER_STATE_FORMAT_VERSION,
+    IsolationClass, ManagedRuntimeRelease, RuntimeBinding, RuntimeKind, RuntimePayloadLayout,
+    StateFormatIdentity, StateFormatNameParseError, StateFormatVersionParseError,
 };
 
 use super::{CatalogError, InitialEnvironment, PinnedKernel, PinnedRelease, RuntimeCatalog};
@@ -221,15 +231,15 @@ enum QualifiedGuestImage {
 impl CompiledEnvironment {
     pub fn guest_agent_protocol(
         &self,
-        image: pplx_space_common_core::types::guest_image::GuestImageContract,
+        image: pplx_space_execution_spec::guest_image::GuestImageContract,
     ) -> crate::guest::QualifiedGuestAgent {
         match self.guest_image {
             QualifiedGuestImage::LinuxDirect => crate::guest::QualifiedGuestAgent::LinuxV1,
             QualifiedGuestImage::WindowsDhcpDisk => match image.agent() {
-                pplx_space_common_core::types::guest_image::GuestAgent::Absent => {
+                pplx_space_execution_spec::guest_image::GuestAgent::Absent => {
                     crate::guest::QualifiedGuestAgent::Absent
                 }
-                pplx_space_common_core::types::guest_image::GuestAgent::Spaced => {
+                pplx_space_execution_spec::guest_image::GuestAgent::Spaced => {
                     crate::guest::QualifiedGuestAgent::WindowsV1
                 }
             },
@@ -247,9 +257,9 @@ impl CompiledEnvironment {
     /// the guest OS or from firmware versus direct boot at each caller.
     pub fn supports_guest_image(
         &self,
-        image: pplx_space_common_core::types::guest_image::GuestImageContract,
+        image: pplx_space_execution_spec::guest_image::GuestImageContract,
     ) -> bool {
-        use pplx_space_common_core::types::guest_image::{
+        use pplx_space_execution_spec::guest_image::{
             GuestAgent, GuestDiskLayout, GuestNetwork, GuestReadiness,
         };
         match self.guest_image {

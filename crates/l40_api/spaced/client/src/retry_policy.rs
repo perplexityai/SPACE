@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use pplx_space_common_core::types::parse_grpc_timeout;
+use pplx_space_durations::parse_grpc_timeout;
 use tokio_util::sync::CancellationToken;
 
 pub const REQUEST_DEADLINE_EXCEEDED_MESSAGE: &str = "request deadline exceeded";

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use pplx_space_common_core::types::{
+use pplx_space_execution_spec::{
     EXECUTION_POLICY_APPLIED_SCHEMA_VERSION, EXECUTION_POLICY_SCHEMA_VERSION, EnvironmentReference,
     ExecutionPolicyObservation, ExecutionPolicyObservationError,
 };

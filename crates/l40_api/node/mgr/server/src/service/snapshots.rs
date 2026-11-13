@@ -317,7 +317,7 @@ impl NodeManagerService {
             // Only absent historical metadata selects Firecracker. Present but
             // invalid evidence cannot select a different control protocol.
             let runtime = execution.as_ref().map_or(
-                pplx_space_common_core::types::RuntimeKind::Firecracker,
+                pplx_space_execution_spec::RuntimeKind::Firecracker,
                 |execution| execution.runtime().kind,
             );
             let control = self
@@ -384,10 +384,10 @@ impl NodeManagerService {
             service.check_execution(&sandbox_id, fence.as_ref(), false)?;
             let execution = service.recorded_execution(sandbox_id.clone()).await?;
             let runtime = execution.as_ref().map_or(
-                pplx_space_common_core::types::RuntimeKind::Firecracker,
+                pplx_space_execution_spec::RuntimeKind::Firecracker,
                 |execution| execution.runtime().kind,
             );
-            if runtime == pplx_space_common_core::types::RuntimeKind::Firecracker {
+            if runtime == pplx_space_execution_spec::RuntimeKind::Firecracker {
                 let api_socket =
                     format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/firecracker.sock");
                 let client = crate::fc_api::FcApiClient::new(api_socket);
@@ -916,7 +916,7 @@ impl NodeManagerService {
         &self,
         lease: &SlotInfo,
         sandbox_id: &str,
-        rootfs_limiter: Option<&pplx_space_common_core::types::RateLimiter>,
+        rootfs_limiter: Option<&pplx_space_execution_spec::RateLimiter>,
         jail_root: &str,
         fc_snapshot_path: &str,
         fc_mem_file_path: &str,
@@ -1539,10 +1539,10 @@ fn validate_cache_artifact_path(local_path: &str) -> Result<(), Status> {
 
 fn drive_rate_limiter(
     limit: &pplx_space_node_mgr_client::proto::DriveRateLimit,
-) -> Result<pplx_space_common_core::types::RateLimiter, Status> {
+) -> Result<pplx_space_execution_spec::RateLimiter, Status> {
     let bucket = |bucket: Option<&pplx_space_node_mgr_client::proto::TokenBucket>, name: &str| {
         bucket
-            .map(|bucket| pplx_space_common_core::types::TokenBucket {
+            .map(|bucket| pplx_space_execution_spec::TokenBucket {
                 size: bucket.size,
                 refill_time_ms: bucket.refill_time_ms,
             })
@@ -1550,7 +1550,7 @@ fn drive_rate_limiter(
                 Status::invalid_argument(format!("rootfs_rate_limit.{name} is required"))
             })
     };
-    Ok(pplx_space_common_core::types::RateLimiter {
+    Ok(pplx_space_execution_spec::RateLimiter {
         bandwidth: bucket(limit.bandwidth.as_ref(), "bandwidth")?,
         operations: bucket(limit.operations.as_ref(), "operations")?,
     })
@@ -1766,11 +1766,11 @@ async fn wait_for_capture<T>(
 }
 
 fn snapshot_boot_source(
-    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+    execution: Option<&pplx_space_execution_spec::ExecutionMetadata>,
 ) -> Result<Option<pplx_space_node_runtime_core::boot::BootSource>, Status> {
     execution
         .filter(|execution| {
-            execution.runtime().kind == pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+            execution.runtime().kind == pplx_space_execution_spec::RuntimeKind::CloudHypervisor
         })
         .map(pplx_space_node_runtime_core::boot::BootSource::from_execution)
         .transpose()

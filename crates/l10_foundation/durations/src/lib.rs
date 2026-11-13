@@ -8,8 +8,7 @@
 //!
 //! None of it depends on the SPACE domain model, so it is its own crate rather
 //! than part of `pplx-space-common-core`: a crate that needs only these values
-//! can depend on it alone. common-core re-exports every item at its original
-//! paths.
+//! can depend on it alone. Import them from here.
 
 use std::{fmt, str::FromStr, time::Duration};
 

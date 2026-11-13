@@ -107,7 +107,7 @@ fn validate_template_name(name: &str) -> Result<(), Status> {
 }
 
 fn validate_content_hash(hash: &str) -> Result<(), Status> {
-    hash.parse::<pplx_space_common_core::types::Digest>()
+    hash.parse::<pplx_space_content_digest::Digest>()
         .map(|_| ())
         .map_err(|error| {
             Status::invalid_argument(format!("invalid content_hash '{hash}': {error}"))
@@ -321,7 +321,7 @@ fn environment_build_partition(
 ) -> Result<pplx_space_common_core::types::TemplateCachePartition, Status> {
     let environment = build
         .environment
-        .parse::<pplx_space_common_core::types::EnvironmentReference>()
+        .parse::<pplx_space_execution_spec::EnvironmentReference>()
         .map_err(|error| {
             Status::invalid_argument(format!(
                 "invalid environment_build.environment '{}': {error}",

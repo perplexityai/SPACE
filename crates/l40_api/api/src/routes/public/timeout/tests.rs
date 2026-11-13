@@ -5,10 +5,8 @@ use axum::{
     http::{Request, StatusCode},
 };
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::{
-    sql,
-    types::{AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakeSource, SandboxId},
-};
+use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakeSource};
+use pplx_space_common_core::{sql, types::SandboxId};
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDbResult, pg_test_db};
 use pplx_space_node_api_sim::SimWorkerHarness;
 use serde_json::{Value, json};
@@ -167,8 +165,7 @@ async fn timeout_validation_scope_and_policy_matrix() -> TestDbResult<()> {
         .values_mut()
         .next()
         .unwrap()
-        .activity_source =
-        Some(pplx_space_common_core::types::AutoLifecycleActivitySource::Command);
+        .activity_source = Some(pplx_space_auto_lifecycle::AutoLifecycleActivitySource::Command);
     let mut custom_wake = default.clone();
     custom_wake.wake.on = vec![AutoLifecycleWakeSource::Command];
     for (lifecycle, policy, expected) in [

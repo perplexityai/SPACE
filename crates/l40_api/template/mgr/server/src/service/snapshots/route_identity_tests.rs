@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn base_snapshot_create_and_start_delegate_direct_identity_to_sandbox_manager() {
     // Request construction preserves identity; admission owns capability checks.
-    for runtime in pplx_space_common_core::types::RuntimeKind::all() {
+    for runtime in pplx_space_execution_spec::RuntimeKind::all() {
         let create = base_snapshot_create_request(
             "seed",
             "sha256:test",

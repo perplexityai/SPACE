@@ -13,10 +13,12 @@ struct Environments {
 /// reference, which is what bind_runtime_upgrade_consumer checks against the
 /// upgrade's target.
 fn environments() -> Environments {
-    use pplx_space_common_core::types::{
-        Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
-        GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind, StateFormatIdentity,
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{
+        ArtifactComponentKind, ArtifactComponentMetadata, GuestOperatingSystem, GuestPlatform,
+        RuntimeIdentity, RuntimeKind, StateFormatIdentity,
     };
+    use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
     let bound = |hex: &str, runtime: &str, state_format: &str, kernel: &str, kernel_hex: &str| {
         let reference: EnvironmentReference = format!("sha256:{}", hex.repeat(64)).parse().unwrap();
         let execution = ExecutionMetadata::new(

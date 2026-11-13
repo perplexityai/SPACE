@@ -1,9 +1,8 @@
 //! Template releases as worker nodes report them in their inventory.
 
-use pplx_space_common_core::{
-    sql,
-    types::{MemorySize, RuntimeKind, TemplateName, VcpuCount},
-};
+use pplx_space_byte_size::MemorySize;
+use pplx_space_common_core::{sql, types::TemplateName};
+use pplx_space_execution_spec::{RuntimeKind, VcpuCount};
 use sqlx::PgExecutor;
 
 /// The VM shape a template release was built for, from its `metadata.json`.

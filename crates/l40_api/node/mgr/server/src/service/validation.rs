@@ -1,26 +1,23 @@
 use super::*;
-use pplx_space_common_core::types::{LinuxPid, LinuxUid};
+use pplx_space_linux_ids::{LinuxPid, LinuxUid};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ExpectedSpacedHostPeer {
     runtime_pid: LinuxPid,
     sandbox_uid: LinuxUid,
-    runtime: pplx_space_common_core::types::RuntimeKind,
-    guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+    runtime: pplx_space_execution_spec::RuntimeKind,
+    guest_agent: pplx_space_execution_spec::guest_image::QualifiedGuestAgent,
 }
 
 impl ExpectedSpacedHostPeer {
     pub(super) fn for_guest_agent(
         mut self,
-        agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+        agent: pplx_space_execution_spec::guest_image::QualifiedGuestAgent,
     ) -> Self {
         self.guest_agent = agent;
         self
     }
-    pub(super) fn for_runtime(
-        mut self,
-        runtime: pplx_space_common_core::types::RuntimeKind,
-    ) -> Self {
+    pub(super) fn for_runtime(mut self, runtime: pplx_space_execution_spec::RuntimeKind) -> Self {
         self.runtime = runtime;
         self
     }
@@ -28,12 +25,12 @@ impl ExpectedSpacedHostPeer {
     pub(super) const fn new(
         runtime_pid: LinuxPid,
         sandbox_uid: u32,
-        guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+        guest_agent: pplx_space_execution_spec::guest_image::QualifiedGuestAgent,
     ) -> Self {
         Self {
             runtime_pid,
             sandbox_uid: LinuxUid::new(sandbox_uid),
-            runtime: pplx_space_common_core::types::RuntimeKind::Firecracker,
+            runtime: pplx_space_execution_spec::RuntimeKind::Firecracker,
             guest_agent,
         }
     }
@@ -336,13 +333,13 @@ pub(super) fn prepare_sidecar_launch_args(
         ]);
         match expected_peer.guest_agent {
             // Old Linux spaced-host binaries do not accept the policy flag.
-            pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1 => {}
-            pplx_space_common_core::types::guest_image::QualifiedGuestAgent::WindowsV1 => prepared
+            pplx_space_execution_spec::guest_image::QualifiedGuestAgent::LinuxV1 => {}
+            pplx_space_execution_spec::guest_image::QualifiedGuestAgent::WindowsV1 => prepared
                 .extend([
                     "--guest-agent".to_owned(),
                     expected_peer.guest_agent.to_string(),
                 ]),
-            pplx_space_common_core::types::guest_image::QualifiedGuestAgent::Absent => {
+            pplx_space_execution_spec::guest_image::QualifiedGuestAgent::Absent => {
                 return Err(Status::failed_precondition(
                     "image has no qualified guest agent",
                 ));

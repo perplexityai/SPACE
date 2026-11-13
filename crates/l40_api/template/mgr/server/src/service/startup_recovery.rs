@@ -282,7 +282,7 @@ fn validate_partition_binding(
 fn binding_environment(
     manifest: &TemplateManifest,
     metadata: &TemplateMetadata,
-) -> Result<Option<pplx_space_common_core::types::EnvironmentReference>, DigestDirRejection> {
+) -> Result<Option<pplx_space_execution_spec::EnvironmentReference>, DigestDirRejection> {
     use pplx_space_template_manifest::{TemplateManifestSchemaError, TemplateMetadataSchemaError};
     let invalid = |reason: String, transient: bool| DigestDirRejection::ExecutionMetadataInvalid {
         reason,

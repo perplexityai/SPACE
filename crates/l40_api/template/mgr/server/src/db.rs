@@ -3,8 +3,8 @@ use std::path::Path;
 
 use rusqlite::{Connection, Result, params, types::Type};
 
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
 pub use pplx_space_policy_authority::PolicyAuthority;
 
@@ -139,7 +139,7 @@ pub struct BuildUpsert<'a> {
 impl BuildRow {
     /// The stored execution metadata; `None` when absent or unreadable,
     /// which is logged.
-    pub fn execution_metadata(&self) -> Option<pplx_space_common_core::types::ExecutionMetadata> {
+    pub fn execution_metadata(&self) -> Option<pplx_space_execution_spec::ExecutionMetadata> {
         let raw = self.execution_metadata_json.as_deref()?;
         serde_json::from_str(raw)
             .inspect_err(|error| {
@@ -154,7 +154,7 @@ impl BuildRow {
     }
 
     /// The environment the build is bound to.
-    pub fn environment(&self) -> Option<pplx_space_common_core::types::EnvironmentReference> {
+    pub fn environment(&self) -> Option<pplx_space_execution_spec::EnvironmentReference> {
         self.execution_metadata()?.environment()
     }
 }
@@ -299,11 +299,11 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
         .execution_metadata()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     if let Some(execution) = execution {
-        let runtime_matches = pplx_space_common_core::types::RuntimeKind::parse(b.runtime)
+        let runtime_matches = pplx_space_execution_spec::RuntimeKind::parse(b.runtime)
             .is_ok_and(|runtime| runtime == execution.runtime().kind);
         let arch_matches = b
             .arch
-            .parse::<pplx_space_common_core::types::Arch>()
+            .parse::<pplx_space_cpu_arch::Arch>()
             .is_ok_and(|arch| arch == execution.guest().architecture);
         if !runtime_matches || !arch_matches {
             return Err(invalid_build_upsert(

@@ -76,10 +76,11 @@ use std::collections::BTreeMap;
 
 use super::*;
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::{
+use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-    AutoLifecyclePolicy, AutoLifecycleStage, NodeGroupName,
+    AutoLifecyclePolicy, AutoLifecycleStage,
 };
+use pplx_space_common_core::types::NodeGroupName;
 
 const TEST_SANDBOX_ID: pplx_space_common_core::types::SandboxId =
     pplx_space_common_core::types::SandboxId::from_uuid(Uuid::from_u128(
@@ -1076,8 +1077,8 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     // `Start`. A stopped source upgraded in place on its node and left
     // stopped, the same source upgraded as it starts, and a suspended source
     // staged from its checkpoint elsewhere and upgraded as it resumes.
-    let upgrade_target = pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_common_core::types::Digest::sha256([7; 32]),
+    let upgrade_target = pplx_space_execution_spec::EnvironmentReference::new(
+        pplx_space_content_digest::Digest::sha256([7; 32]),
     );
     let runtime_upgrade = |target_state,
                            checkpoint_local_artifact_id: Option<
@@ -1668,7 +1669,7 @@ fn sandbox_pod_renders_local_policy_authorities_and_disk_io_limits() {
             runtime: SandboxRuntimePodMetadata {
                 auto_lifecycle_authority: PolicyAuthority::Local,
                 network_policy_authority: PolicyAuthority::Local,
-                disk_io_limits: pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200)
+                disk_io_limits: pplx_space_execution_spec::DiskIoLimits::try_new(5_000, 200)
                     .unwrap(),
                 ..test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json)
             },
@@ -3567,7 +3568,7 @@ fn cold_create_env_reaches_infra_pod_contract() {
             env = (0..256)
                 .map(|i| (format!("K{i:0127}"), "\u{1}".repeat(128)))
                 .collect();
-            pplx_space_common_core::types::EnvMap::try_from(env.clone()).unwrap();
+            pplx_space_guest_process::EnvMap::try_from(env.clone()).unwrap();
         }
         let runtime = test_runtime(&owner, &auto, &network);
         let common = test_common("space-sbx-env-g1", TEST_SANDBOX_ID, 1, &env);
@@ -3740,7 +3741,7 @@ fn render_stopped_re_placement(stopped_materialization: Option<StoppedMaterializ
 }
 
 fn environment_requirement(
-    reference: &pplx_space_common_core::types::EnvironmentReference,
+    reference: &pplx_space_execution_spec::EnvironmentReference,
 ) -> NodeSelectorRequirement {
     NodeSelectorRequirement {
         key: environment_label_key(reference),
@@ -3749,7 +3750,7 @@ fn environment_requirement(
     }
 }
 
-fn bound_environment() -> pplx_space_common_core::types::EnvironmentReference {
+fn bound_environment() -> pplx_space_execution_spec::EnvironmentReference {
     format!("sha256:{}", "e".repeat(64)).parse().unwrap()
 }
 

@@ -9,7 +9,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use pplx_space_common_core::types::{ExecutionMetadata, LocalArtifactId};
+use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_node_api_client::proto::{
     GetArtifactBackupLocationRequest, GetArtifactBackupLocationResponse,
     LocalArtifactBackupIdentity, backup_readiness_query::Artifact,

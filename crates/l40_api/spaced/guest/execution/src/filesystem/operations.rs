@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::types::{GuestUserName, IdempotencyKey};
+use pplx_space_guest_process::{GuestUserName, IdempotencyKey};
 use pplx_space_spaced_guest_protocol::proto::worker::{
     MutationResult, OperationFailure, mutation_result,
 };

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 use tokio::process::Command;
 use tonic::Status;
 

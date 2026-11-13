@@ -63,7 +63,9 @@ uuid = { workspace = true, features = ["v5", "v7"] }
 # internal
 pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-api-route = { workspace = true }
+pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-auto-lifecycle-receipt = { workspace = true }
+pplx-space-byte-size = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-template-runtime = { workspace = true }
 pplx-space-btrfs = { workspace = true }
@@ -76,6 +78,14 @@ pplx-space-file-io = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-lru-reaper = { workspace = true }
 pplx-space-env-vars = { workspace = true }
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
+pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
+pplx-space-durations = { workspace = true, features = ["serde"] }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
+pplx-space-guest-process = { workspace = true, features = ["serde"] }
+pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
+pplx-space-linux-ids = { workspace = true, features = ["serde"] }
+pplx-space-network-roles = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-credential-injection = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
@@ -89,6 +99,7 @@ pplx-space-grpc-server = { workspace = true }
 pplx-space-ingress-admission = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-local-health = { workspace = true }
+pplx-space-semver = { workspace = true, features = ["serde"] }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }

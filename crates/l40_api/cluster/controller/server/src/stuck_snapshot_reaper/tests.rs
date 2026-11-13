@@ -23,7 +23,7 @@ use pplx_space_common_core::types::{SandboxId, SnapshotId};
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use pplx_space_common_core::types::PositiveDuration;
+use pplx_space_durations::PositiveDuration;
 
 use super::*;
 

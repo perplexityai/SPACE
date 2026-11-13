@@ -3,12 +3,13 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-use pplx_space_common_core::types::{
-    ArtifactKind, AutoLifecycleActivitySource, AutoLifecycleConditionKind,
-    AutoLifecycleConditionRuntimeState, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
-    AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus,
-    AutoLifecycleTransition, AutoLifecycleWakeSource,
+use pplx_space_auto_lifecycle::{
+    AutoLifecycleActivitySource, AutoLifecycleConditionKind, AutoLifecycleConditionRuntimeState,
+    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
+    AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, AutoLifecycleTransition,
+    AutoLifecycleWakeSource,
 };
+use pplx_space_common_core::types::ArtifactKind;
 use tonic::Status;
 
 use pplx_space_sbx_mgr_protocol::proto;
@@ -26,7 +27,7 @@ pub const TEST_GUEST_ACTIVITY_HOLD_CAP: std::time::Duration =
 
 #[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::unwrap_used)]
-pub fn test_guest_activity_hold_cap() -> pplx_space_common_core::types::SimpleDuration {
+pub fn test_guest_activity_hold_cap() -> pplx_space_durations::SimpleDuration {
     TEST_GUEST_ACTIVITY_HOLD_CAP.try_into().unwrap()
 }
 

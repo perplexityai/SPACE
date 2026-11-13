@@ -1148,8 +1148,8 @@ fn sandbox_policy_apply_filter_applies_on_stale_gateway_state() {
 #[test]
 fn published_sandbox_state_uses_batched_enrichment() {
     let execution: pplx_space_execution_common::proto::ExecutionMetadata =
-        (&pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-            pplx_space_common_core::types::Arch::Aarch64,
+        (&pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
+            pplx_space_cpu_arch::Arch::Aarch64,
             vec![],
         ))
             .into();
@@ -1807,7 +1807,8 @@ async fn publish_statuses_from_a_real_channel_retry_only_transport_failures() {
 
 #[test]
 fn template_publication_prefers_each_name_s_legacy_build() {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference};
+    use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::EnvironmentReference;
     let initial =
         || Some(pplx_space_node_runtime_core::catalog::initial_environment_reference().to_string());
     let other = || Some(EnvironmentReference::new(Digest::sha256([2; 32])).to_string());

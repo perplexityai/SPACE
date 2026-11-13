@@ -2,8 +2,8 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::PositiveDuration;
 use pplx_space_common_core::types::{SandboxId, SnapshotId};
+use pplx_space_durations::PositiveDuration;
 use sqlx::PgPool;
 
 use super::{REAP_FAILURE_REASON, ReapedSnapshot, ReaperSink};

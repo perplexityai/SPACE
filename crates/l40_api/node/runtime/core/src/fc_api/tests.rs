@@ -149,7 +149,7 @@ async fn a_drive_rate_limiter_update_patches_the_drive() {
 
 #[test]
 fn balloon_device_json_matches_firecracker_contract_for_each_mode() {
-    use pplx_space_common_core::types::{BalloonConfig, BalloonDevice};
+    use pplx_space_execution_spec::{BalloonConfig, BalloonDevice};
     use std::num::NonZeroU32;
 
     let cases = [

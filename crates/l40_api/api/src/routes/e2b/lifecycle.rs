@@ -3,7 +3,8 @@ use pplx_space_accounts::OrgId;
 use pplx_space_common_core::types::ClientId;
 
 use super::*;
-use pplx_space_common_core::types::{AutoLifecyclePolicy, SandboxLifecycle};
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+use pplx_space_common_core::types::SandboxLifecycle;
 use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicSandboxId,
     SandboxLifecycleAction as PublicSandboxLifecycleAction,

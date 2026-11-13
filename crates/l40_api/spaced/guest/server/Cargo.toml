@@ -71,6 +71,7 @@ tokio-vsock = { workspace = true, features = ["tonic014"] }
 tower = { workspace = true }
 
 # internal
+pplx-space-guest-process = { workspace = true }
 pplx-space-service-host = { workspace = true, optional = true }
 pplx-space-service-lifecycle = { workspace = true, optional = true }
 pplx-space-spaced-guest-execution = { workspace = true }

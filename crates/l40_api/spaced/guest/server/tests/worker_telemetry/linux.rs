@@ -12,7 +12,8 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
-use pplx_space_common_core::types::{CLUSTER_ID_ENV, GuestUserName};
+use pplx_space_common_core::types::CLUSTER_ID_ENV;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     WriteBatchEntry, WriteBatchRequest, filesystem_client::FilesystemClient,
 };

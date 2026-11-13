@@ -8,18 +8,18 @@ use super::validation::{
     template_metadata_arch, template_metadata_spaced_compatibility, template_runtime_defaults,
 };
 use super::*;
-use pplx_space_common_core::types::{EnvMap, EnvSanitizationIssue};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, SandboxRestoreProvenance,
     emit_sandbox_event,
 };
+use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
 use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 
 pub(super) struct ResolvedTemplatePaths {
-    pub(super) guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    pub(super) guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
     pub(super) template_dir: String,
     pub(super) snapshot_dir: Option<String>,
-    pub(super) snapshot_vcpu: Option<pplx_space_common_core::types::VcpuCount>,
+    pub(super) snapshot_vcpu: Option<pplx_space_execution_spec::VcpuCount>,
     pub(super) content_hash: Option<String>,
     pub(super) default_auto_lifecycle: AutoLifecyclePolicy,
     pub(super) default_network_policy_authority: crate::db::PolicyAuthority,
@@ -28,14 +28,14 @@ pub(super) struct ResolvedTemplatePaths {
     pub(super) spaced_version: Option<String>,
     pub(super) spaced_compatibility_family: Option<String>,
     pub(super) runtime_defaults: TemplateRuntimeDefaults,
-    pub(super) execution: pplx_space_common_core::types::ExecutionMetadata,
+    pub(super) execution: pplx_space_execution_spec::ExecutionMetadata,
 }
 
 #[derive(Debug)]
 pub(super) struct SandboxPrepareSource {
     pub(super) template: Option<String>,
     pub(super) template_dir: Option<String>,
-    pub(super) execution: pplx_space_common_core::types::ExecutionMetadata,
+    pub(super) execution: pplx_space_execution_spec::ExecutionMetadata,
     pub(super) existing_artifact: bool,
 }
 
@@ -50,19 +50,19 @@ pub(super) struct RequestedSandboxCreateSpec<'a> {
     pub(super) auto_lifecycle: &'a AutoLifecyclePolicy,
     /// An explicit selection must match the row's saved binding. An
     /// unselected retry keeps the row's own binding.
-    pub(super) environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    pub(super) environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 }
 
 pub(super) struct CreateWithIdArgs<'a> {
-    pub(super) guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    pub(super) guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
     pub(super) req: &'a CreateRequest,
     pub(super) sandbox_owner: &'a SandboxOwner,
     pub(super) effective_mode: BootMode,
     pub(super) id: String,
     pub(super) template_dir: &'a str,
-    pub(super) execution: Option<&'a pplx_space_common_core::types::ExecutionMetadata>,
+    pub(super) execution: Option<&'a pplx_space_execution_spec::ExecutionMetadata>,
     pub(super) snapshot_dir_resolved: Option<&'a str>,
-    pub(super) snapshot_vcpu: Option<pplx_space_common_core::types::VcpuCount>,
+    pub(super) snapshot_vcpu: Option<pplx_space_execution_spec::VcpuCount>,
     pub(super) content_hash_resolved: Option<&'a str>,
     pub(super) auto_lifecycle: &'a AutoLifecyclePolicy,
     pub(super) auto_lifecycle_authority: crate::db::PolicyAuthority,
@@ -81,14 +81,14 @@ pub(super) fn validate_create_request(
     if req.runtime.is_empty() {
         return Err(Status::invalid_argument("runtime is required"));
     }
-    let runtime: pplx_space_common_core::types::RuntimeKind = req
+    let runtime: pplx_space_execution_spec::RuntimeKind = req
         .runtime
         .parse()
         .map_err(|e| Status::invalid_argument(format!("runtime: {e}")))?;
     if !matches!(
         runtime,
-        pplx_space_common_core::types::RuntimeKind::Firecracker
-            | pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+        pplx_space_execution_spec::RuntimeKind::Firecracker
+            | pplx_space_execution_spec::RuntimeKind::CloudHypervisor
     ) {
         return Err(Status::unimplemented(
             "runtime has no sandbox lifecycle adapter",
@@ -116,7 +116,7 @@ pub(super) fn validate_create_request_fields(
             Uuid::parse_str(id).map_err(|_| Status::invalid_argument("sandbox_id must be a UUID"))
         })
         .transpose()?;
-    pplx_space_common_core::types::DiskIoLimits::try_from_optional(
+    pplx_space_execution_spec::DiskIoLimits::try_from_optional(
         req.disk_io_max_operations_per_sec,
         req.disk_io_max_bandwidth_mib_per_sec,
     )
@@ -188,7 +188,7 @@ impl SandboxManagerService {
 #[derive(Clone, Copy)]
 pub(super) struct CreateTarget<'a> {
     pub(super) snapshot_dir: Option<&'a str>,
-    pub(super) execution: &'a pplx_space_common_core::types::ExecutionMetadata,
+    pub(super) execution: &'a pplx_space_execution_spec::ExecutionMetadata,
     /// The request selected its environment explicitly.
     pub(super) selected: bool,
 }
@@ -208,7 +208,7 @@ pub(super) struct RuntimeActivatedEvent<'a> {
     pub(super) vcpu: Option<u32>,
     pub(super) memory_mib: u32,
     pub(super) has_netns_path: bool,
-    pub(super) execution: &'a pplx_space_common_core::types::ExecutionMetadata,
+    pub(super) execution: &'a pplx_space_execution_spec::ExecutionMetadata,
     pub(super) execution_generation: Option<i64>,
     pub(super) restored_snapshot_storage_uri: Option<String>,
     pub(super) restored_snapshot_local_artifact_id: Option<String>,
@@ -776,7 +776,7 @@ pub(super) async fn resolve_template_paths(
         snapshot_dir: inner.snapshot_dir,
         snapshot_vcpu: inner
             .snapshot_vcpu
-            .map(pplx_space_common_core::types::VcpuCount::try_from_u32)
+            .map(pplx_space_execution_spec::VcpuCount::try_from_u32)
             .transpose()
             .map_err(|error| {
                 Status::failed_precondition(format!(
@@ -810,8 +810,8 @@ pub(super) async fn resolve_template_paths(
 /// record were captured under the initial environment.
 pub(super) fn read_base_snapshot_execution_metadata(
     source_dir: &std::path::Path,
-) -> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, Status> {
-    use pplx_space_common_core::types::{ExecutionMetadata, SnapshotExecutionMetadata};
+) -> Result<pplx_space_execution_spec::SnapshotExecutionMetadata, Status> {
+    use pplx_space_execution_spec::{ExecutionMetadata, SnapshotExecutionMetadata};
 
     let metadata = match std::fs::read(source_dir.join("metadata.json")) {
         Ok(bytes) => {
@@ -823,7 +823,7 @@ pub(super) fn read_base_snapshot_execution_metadata(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let architecture = std::env::consts::ARCH.parse().map_err(
-                |error: pplx_space_common_core::types::ArchParseError| {
+                |error: pplx_space_cpu_arch::ArchParseError| {
                     Status::failed_precondition(error.to_string())
                 },
             )?;
@@ -848,7 +848,7 @@ pub(super) fn read_base_snapshot_execution_metadata(
 pub(super) fn stage_base_snapshot_runtime_metadata(
     source_dir: &std::path::Path,
     destination_dir: &std::path::Path,
-    snapshot_vcpu: Option<pplx_space_common_core::types::VcpuCount>,
+    snapshot_vcpu: Option<pplx_space_execution_spec::VcpuCount>,
 ) -> Result<(), Status> {
     let metadata = read_base_snapshot_execution_metadata(source_dir)?;
     // Captured allocation wins; selected dimensions fill only legacy absence.
@@ -1095,21 +1095,21 @@ pub(super) async fn template_source_for_sandbox_prepare_in(
 /// remain fixed. Snapshot producer evidence is read separately from its manifest.
 fn bind_saved_execution(
     sandbox: &crate::db::SandboxRow,
-    observed: pplx_space_common_core::types::ExecutionMetadata,
-) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
+    observed: pplx_space_execution_spec::ExecutionMetadata,
+) -> Result<pplx_space_execution_spec::ExecutionMetadata, Status> {
     bind_disk_execution(sandbox.execution_metadata.as_ref(), observed)
 }
 
 pub(super) fn bind_disk_execution(
-    saved: Option<&pplx_space_common_core::types::ExecutionMetadata>,
-    observed: pplx_space_common_core::types::ExecutionMetadata,
-) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
+    saved: Option<&pplx_space_execution_spec::ExecutionMetadata>,
+    observed: pplx_space_execution_spec::ExecutionMetadata,
+) -> Result<pplx_space_execution_spec::ExecutionMetadata, Status> {
     let Some(saved) = saved.filter(|saved| saved.environment().is_some()) else {
         return Ok(observed);
     };
     // Only the Firecracker adapter currently declares cross-consumer raw-disk
     // compatibility. Other adapters must supply their own disk contract.
-    if saved.runtime().kind != pplx_space_common_core::types::RuntimeKind::Firecracker
+    if saved.runtime().kind != pplx_space_execution_spec::RuntimeKind::Firecracker
         && saved != &observed
     {
         return Err(Status::failed_precondition(
@@ -1128,8 +1128,8 @@ pub(super) fn bind_disk_execution(
 }
 
 fn matching_execution_components(
-    saved: &pplx_space_common_core::types::ExecutionMetadata,
-    observed: &pplx_space_common_core::types::ExecutionMetadata,
+    saved: &pplx_space_execution_spec::ExecutionMetadata,
+    observed: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> bool {
     observed.components().len() == saved.components().len()
         && saved.components().iter().all(|expected| {

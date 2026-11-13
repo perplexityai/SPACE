@@ -1,6 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::ExecutionMetadata;
-use pplx_space_common_core::types::{BalloonDevice, TokenBucket};
+use pplx_space_execution_spec::{BalloonDevice, ExecutionMetadata, TokenBucket};
 use serde_json::{Value, json};
 
 pub(crate) fn input() -> GuestBoot<'static> {
@@ -243,12 +242,12 @@ fn persisted_ch_state_rebinds_host_resources_but_preserves_guest_identity() {
             source_kind,
         )
         .unwrap();
-        let rate = pplx_space_common_core::types::RateLimiter {
-            bandwidth: pplx_space_common_core::types::TokenBucket {
+        let rate = pplx_space_execution_spec::RateLimiter {
+            bandwidth: pplx_space_execution_spec::TokenBucket {
                 size: 123456,
                 refill_time_ms: 1000,
             },
-            operations: pplx_space_common_core::types::TokenBucket {
+            operations: pplx_space_execution_spec::TokenBucket {
                 size: 123,
                 refill_time_ms: 1000,
             },
@@ -365,7 +364,7 @@ fn firmware_boot_keeps_linux_inputs_out_of_the_device_model() {
 
 #[test]
 fn image_policy_is_qualified_by_boot_contract() {
-    use pplx_space_common_core::types::guest_image::{
+    use pplx_space_execution_spec::guest_image::{
         GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
     };
     let catalog =
@@ -410,7 +409,7 @@ fn image_policy_is_qualified_by_boot_contract() {
 
 #[test]
 fn historical_arm_firecracker_resolves_without_qualifying_unknown_bindings() {
-    use pplx_space_common_core::types::{ArtifactComponentKind, ArtifactComponentMetadata};
+    use pplx_space_execution_spec::{ArtifactComponentKind, ArtifactComponentMetadata};
     let kernel = ArtifactComponentMetadata {
         kind: ArtifactComponentKind::Kernel,
         role: None,

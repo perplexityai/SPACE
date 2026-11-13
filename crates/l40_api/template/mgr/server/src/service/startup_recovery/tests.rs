@@ -1657,15 +1657,15 @@ async fn a_dir_skipped_for_want_of_a_permit_comes_first_next_tick() {
 
 fn twin_partition() -> crate::db::TemplateCachePartition {
     crate::db::TemplateCachePartition::Environment(
-        pplx_space_common_core::types::EnvironmentReference::new(
-            pplx_space_common_core::types::Digest::sha256([2; 32]),
+        pplx_space_execution_spec::EnvironmentReference::new(
+            pplx_space_content_digest::Digest::sha256([2; 32]),
         ),
     )
 }
 
 fn bind_manifest(manifest: &mut TemplateManifest, partition: crate::db::TemplateCachePartition) {
-    let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-        pplx_space_common_core::types::Arch::X86_64,
+    let execution = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
+        pplx_space_cpu_arch::Arch::X86_64,
         vec![],
     );
     // Name the architecture the binding is for, or registration takes the
@@ -1711,8 +1711,8 @@ fn partition_binding_rejects_a_dir_bound_elsewhere() {
     assert!(unbound.execution.is_none());
     let mut metadata = TemplateMetadata::default();
     metadata.set_execution_metadata(
-        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-            pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
+            pplx_space_cpu_arch::Arch::X86_64,
             vec![],
         )
         .with_environment(twin_partition().environment().unwrap()),
@@ -1846,7 +1846,7 @@ async fn recovery_registers_a_twin_dir_in_its_own_partition(#[case] in_metadata:
 #[tokio::test]
 async fn a_recovered_twin_bound_only_in_its_metadata_refreshes_in_place() {
     let catalog = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap();
     let execution = catalog
@@ -2608,9 +2608,9 @@ async fn a_held_invalid_build_is_checked_against_a_fresh_dependent_answer() {
 
 /// A real non-initial catalog environment: Firecracker 1.17.0 / Linux
 /// 6.1.155, the one nodes ran before partitions existed.
-fn e1_execution() -> pplx_space_common_core::types::ExecutionMetadata {
+fn e1_execution() -> pplx_space_execution_spec::ExecutionMetadata {
     pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .iter()

@@ -55,7 +55,7 @@ pub(super) fn base_snapshot_create_request(
     content_hash: &str,
     partition: crate::db::TemplateCachePartition,
     snapshot_rootfs_size_mb: Option<u32>,
-    runtime: pplx_space_common_core::types::RuntimeKind,
+    runtime: pplx_space_execution_spec::RuntimeKind,
 ) -> pplx_space_sbx_mgr_client::proto::CreateRequest {
     let (environment, template, runtime) = match partition.environment() {
         None => (None, template_name.to_string(), runtime.alias().to_string()),
@@ -552,7 +552,7 @@ impl TemplateManagerService {
                     .ok_or_else(|| Status::not_found("base snapshot template build disappeared"))?;
                 build
                     .runtime
-                    .parse::<pplx_space_common_core::types::RuntimeKind>()
+                    .parse::<pplx_space_execution_spec::RuntimeKind>()
                     .map_err(|error| Status::failed_precondition(error.to_string()))
             })
             .await
@@ -1259,7 +1259,7 @@ pub(super) fn snapshot_invalidates_pool_sandbox(
 pub(super) fn pool_sandbox_partition(
     execution: Option<&pplx_space_execution_common::proto::ExecutionMetadata>,
 ) -> Option<crate::db::TemplateCachePartition> {
-    let execution = pplx_space_common_core::types::ExecutionMetadata::try_from(execution?).ok()?;
+    let execution = pplx_space_execution_spec::ExecutionMetadata::try_from(execution?).ok()?;
     Some(pplx_space_node_runtime_core::catalog::template_cache_partition(execution.environment()))
 }
 

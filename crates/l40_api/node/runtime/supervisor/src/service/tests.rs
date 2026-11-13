@@ -629,7 +629,7 @@ async fn cpu_updates_require_execution_launch_evidence() {
             .code(),
         tonic::Code::NotFound
     );
-    let count = |value| pplx_space_common_core::types::VcpuCount::try_from_u32(value).unwrap();
+    let count = |value| pplx_space_execution_spec::VcpuCount::try_from_u32(value).unwrap();
     service
         .execution_store
         .record_cpu_budget(sandbox, execution, count(4))
@@ -694,7 +694,9 @@ async fn cpu_updates_require_execution_launch_evidence() {
 
 #[tokio::test]
 async fn authentication_failure_preserves_status_and_existing_cpu_budget() {
-    use pplx_space_common_core::types::{Arch, SandboxActivationAttemptId, VcpuCount};
+    use pplx_space_common_core::types::SandboxActivationAttemptId;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::VcpuCount;
     use pplx_space_node_runtime_core::{
         artifact_store::managed_release_directory, catalog::CompiledEnvironment,
     };
@@ -792,7 +794,7 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
             }),
             ..Default::default()
         };
-        request.set_runtime(pplx_space_common_core::types::RuntimeKind::Firecracker.into());
+        request.set_runtime(pplx_space_execution_spec::RuntimeKind::Firecracker.into());
         let input = request.verified_runtime.as_mut().unwrap();
         let expected = match invalid {
             Invalid::IdentityMismatch => {
@@ -816,7 +818,7 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
             Invalid::Layout => {
                 input.environment_reference =
                     pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                        pplx_space_common_core::types::Arch::X86_64,
+                        pplx_space_cpu_arch::Arch::X86_64,
                     )
                     .unwrap()[0]
                         .definition()
@@ -886,7 +888,7 @@ async fn resident_execution_adoption_does_not_require_current_catalog_or_sources
                             }),
                             ..Default::default()
                         };
-                        wire.set_runtime(pplx_space_common_core::types::RuntimeKind::Firecracker.into());
+                        wire.set_runtime(pplx_space_execution_spec::RuntimeKind::Firecracker.into());
                         wire.try_into().unwrap()
                     },
                     None,

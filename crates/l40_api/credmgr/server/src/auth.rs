@@ -37,9 +37,7 @@ use pplx_space_uds_peer_auth::UdsPeerAccount;
 use tonic::{Request, Status};
 use tower::{Layer, Service};
 
-use pplx_space_common_core::{
-    types::K8sNodeName, types::K8sNodeUid, types::PodName, types::PodUid,
-};
+use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid, PodName, PodUid};
 use pplx_space_uds_peer_auth::{
     PeerIdentity, UdsPeerAuthorizer, UdsPeerPrincipal, peer_identity_from_tonic_request,
 };

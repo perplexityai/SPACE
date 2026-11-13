@@ -3,7 +3,8 @@ use std::net::SocketAddr;
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use pplx_space_common_core::types::{LinuxPid, ProcessSignal};
+use pplx_space_guest_process::ProcessSignal;
+use pplx_space_linux_ids::LinuxPid;
 
 /// Check if a PID is alive.
 pub fn is_pid_alive(pid: u32) -> bool {
