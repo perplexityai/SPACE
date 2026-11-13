@@ -247,6 +247,16 @@ impl SandboxManager for SandboxManagerService {
         SandboxManagerService::get_runtime_upgrade(self, &request).map(Response::new)
     }
 
+    async fn abandon_runtime_upgrade(
+        &self,
+        request: Request<crate::proto::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<Response<crate::proto::AbandonRuntimeUpgradeResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
+        Err(Status::unimplemented(
+            "this sandbox-manager doesn't abandon runtime upgrades yet",
+        ))
+    }
+
     async fn kill(&self, request: Request<KillRequest>) -> Result<Response<KillResponse>, Status> {
         record_entry_sandbox_id(&request.get_ref().sandbox_id);
         SandboxManagerService::kill(self, request).await
