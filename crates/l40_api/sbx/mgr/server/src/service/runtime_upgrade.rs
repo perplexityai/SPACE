@@ -539,16 +539,28 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
 
     /// Refuse a request that names another sandbox, target or authorization
     /// than its operation's live row or recorded outcome does: a retry may
-    /// not turn an operation into another one.
+    /// not turn an operation into another one. The attempt's own final
+    /// outcome names its sandbox too, and outlives the other two when the
+    /// sandbox's row is deleted, so a request for another sandbox is told so
+    /// rather than given that attempt's outcome.
     pub(super) fn refuse_another_request(
         &self,
         request: &RuntimeUpgradeRequest,
     ) -> Result<(), Status> {
-        let recorded = crate::db::read::recorded_runtime_upgrade_request(
-            &*self.db()?,
-            request.operation_id,
-        )
-        .map_err(|error| Status::internal(format!("read runtime upgrade outcome: {error}")))?;
+        let (recorded, attempt_sandbox) = {
+            let db = self.db()?;
+            let read = |error| Status::internal(format!("read runtime upgrade outcome: {error}"));
+            (
+                crate::db::read::recorded_runtime_upgrade_request(&db, request.operation_id)
+                    .map_err(read)?,
+                crate::db::read::runtime_upgrade_attempt_sandbox(
+                    &db,
+                    request.operation_id,
+                    &request.attempt_id,
+                )
+                .map_err(read)?,
+            )
+        };
         let live = self
             .record(request.operation_id)?
             .map(|record| record.identity());
@@ -556,6 +568,7 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
             .into_iter()
             .chain(live)
             .any(|identity| identity != request.identity())
+            || attempt_sandbox.is_some_and(|sandbox_id| sandbox_id != request.sandbox_id)
         {
             return Err(request.names_another());
         }

@@ -1241,8 +1241,9 @@ fn the_report_names_the_attempt_each_outcome_was_recorded_for() {
 /// The operation's report keeps only its latest outcome, but each attempt
 /// keeps its own: a later attempt's rollback or refusal never erases an
 /// earlier attempt's, and an attempt's first final outcome stays. A row written
-/// before attempts were recorded adds nothing, and deleting the sandbox
-/// deletes the history.
+/// before attempts were recorded adds nothing. Deleting the sandbox keeps the
+/// history, which the lookup reads by operation and attempt alone, so it
+/// outlives the sandbox's row.
 #[test]
 fn each_attempts_rollback_or_refusal_is_kept_for_that_attempt() {
     let conn = test_conn();
@@ -1329,7 +1330,7 @@ fn each_attempts_rollback_or_refusal_is_kept_for_that_attempt() {
     );
 
     delete_sandbox(&conn, &id).unwrap();
-    assert_eq!(attempt_outcome("attempt-b"), None);
+    assert_eq!(attempt_outcome("attempt-b"), rolled_back("b's boot failed"));
 }
 
 #[test]
@@ -1639,7 +1640,7 @@ fn a_suspended_eviction_claim_waits_for_an_unretired_upgrade() {
 /// One still in progress, rolled back or refused, another sandbox's, or one
 /// the node never saw records nothing, since the operation's own report
 /// already says what happened to the attempt. The report names the latest
-/// attempt refused, and deleting the sandbox deletes the record.
+/// attempt refused, and deleting the sandbox keeps the record.
 #[test]
 fn a_refused_attempt_is_recorded_only_for_an_operation_that_reached_its_target() {
     let conn = test_conn();
@@ -1794,7 +1795,10 @@ fn a_refused_attempt_is_recorded_only_for_an_operation_that_reached_its_target()
     delete_sandbox(&conn, &other).unwrap();
     assert_eq!(
         crate::db::read::runtime_upgrade_refused_attempt(&conn, found, "attempt-a").unwrap(),
-        None
+        Some(RuntimeUpgradeRefusedAttempt {
+            attempt_id: "attempt-a".to_string(),
+            failure: Some("refused".to_string()),
+        })
     );
 }
 

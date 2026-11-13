@@ -1402,9 +1402,16 @@ const (
 	// whose refusal the node failed to write); or the sandbox was deleted from
 	// this node since, with its upgrade records. An abandonment is kept apart
 	// from those records and outlives the sandbox's row, so ABSENT may come with
-	// `abandoned` set. For a `GetRuntimeUpgrade` that names an attempt, ABSENT
-	// also stands in for another attempt's rollback or refusal: the named attempt
-	// has none recorded, but the operation may.
+	// `abandoned` set. Finality holds across the sandbox row's deletion too: an
+	// attempt's rollback, refusal or refused activation has no foreign key and
+	// survives `delete_sandbox_child_rows`, so a `GetRuntimeUpgrade` naming this
+	// sandbox and that attempt gets it instead: the rollback or refusal as the
+	// status, whatever report stands since, and the refused activation with
+	// ABSENT, through `refused_attempt_id`, while no report stands or a later
+	// attempt's hasn't reached the target. A request naming another sandbox for
+	// that attempt is refused with INVALID_ARGUMENT. For a `GetRuntimeUpgrade`
+	// that names an attempt, ABSENT also stands in for another attempt's rollback
+	// or refusal: the named attempt has none recorded, but the operation may.
 	RuntimeUpgradeStatus_RUNTIME_UPGRADE_STATUS_ABSENT RuntimeUpgradeStatus = 1
 	// The upgrade fences the sandbox, or its verified boot hasn't retired the
 	// old checkpoint yet. `phase` says which.
@@ -7329,8 +7336,12 @@ type GetRuntimeUpgradeRequest struct {
 	// attempt never changes what this one is told. IN_PROGRESS, UPGRADED and
 	// ALREADY_ON_TARGET describe the operation whichever attempt began them, with
 	// `attempt_id` naming that attempt, even when a later attempt's call settled
-	// or finished it, and are answered as they are unfiltered. They don't say the
-	// named attempt's sandbox runs: a caller settles that attempt on success only
+	// or finished it, and are answered as they are unfiltered, except that the
+	// named attempt's own rollback or refusal is answered in their place, and its
+	// refused activation, kept from before the sandbox's row was deleted, as
+	// ABSENT in place of IN_PROGRESS (see `RUNTIME_UPGRADE_STATUS_ABSENT`). They
+	// don't say the named attempt's sandbox runs: a caller settles that attempt on
+	// success only
 	// from its own answer (its `UpgradeRuntimeResponse`, or the sandbox running
 	// its execution), and on failure when `refused_attempt_id` names it. Unset,
 	// the answer is the operation's latest outcome, as before. A node that
@@ -7521,7 +7532,9 @@ type GetRuntimeUpgradeResponse struct {
 	AttemptId *string `protobuf:"bytes,5,opt,name=attempt_id,json=attemptId,proto3,oneof" json:"attempt_id,omitempty"`
 	// With UPGRADED or ALREADY_ON_TARGET: the latest attempt whose
 	// `UpgradeRuntime` for a STARTED target the node answered with an error after
-	// the operation reached that status, so the sandbox doesn't run for that
+	// the operation reached that status (with ABSENT, the named attempt's, kept
+	// from before the sandbox's row was deleted, when no report stands or a later
+	// attempt's hasn't reached either), so the sandbox doesn't run for that
 	// attempt (a Kubernetes pod's create fails, and the pod stays pending while
 	// kubelet retries it). Final for that attempt, as a rollback is: its retries
 	// get the recorded error back with FAILED_PRECONDITION, whatever code first

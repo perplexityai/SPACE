@@ -99,3 +99,14 @@ pub fn runtime_upgrade_attempt_outcome(
 ) -> Result<Option<RuntimeUpgradeAttemptOutcome>> {
     crate::db::runtime_upgrade_attempt_outcome(conn, operation_id, attempt_id)
 }
+
+/// The sandbox the attempt `attempt_id`'s final outcome under
+/// `operation_id` was recorded for, `None` without one: its rollback or
+/// refusal, or its refused activation. It outlives the sandbox's row.
+pub fn runtime_upgrade_attempt_sandbox(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    attempt_id: &str,
+) -> Result<Option<String>> {
+    crate::db::runtime_upgrade_attempt_sandbox(conn, operation_id, attempt_id)
+}

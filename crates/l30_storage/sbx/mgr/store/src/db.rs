@@ -572,17 +572,12 @@ fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
         "DELETE FROM sandbox_runtime_upgrade_outcomes WHERE sandbox_id = ?1",
         params![id],
     )?;
-    tx.execute(
-        "DELETE FROM sandbox_runtime_upgrade_refused_attempts WHERE sandbox_id = ?1",
-        params![id],
-    )?;
-    tx.execute(
-        "DELETE FROM sandbox_runtime_upgrade_attempt_outcomes WHERE sandbox_id = ?1",
-        params![id],
-    )?;
-    // `sandbox_runtime_upgrade_abandoned` is kept: a late call for an
-    // abandoned operation can stage the sandbox again, and must still be
-    // refused.
+    // `sandbox_runtime_upgrade_abandoned`,
+    // `sandbox_runtime_upgrade_refused_attempts` and
+    // `sandbox_runtime_upgrade_attempt_outcomes` are kept, and declare no
+    // foreign key: a late call for an abandoned operation, or a delayed retry
+    // of an attempt whose outcome is final, can find the sandbox staged again
+    // under the same id, and must still be refused.
     Ok(())
 }
 
