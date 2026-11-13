@@ -3,7 +3,9 @@
 
 Measures how long a sandbox takes to run its first guest command, for a cold
 create and for a warm wake after suspend. Runs are sequential so each sample
-is one sandbox on an otherwise idle cluster. Every sandbox is deleted after its
+is one sandbox on an otherwise idle cluster. A create can adopt a pre-booted
+warm-pool slot, so cold samples measure a cold boot only when the template has
+no warm pool for the requested shape. Every sandbox is deleted after its
 run, and the summary reports whether any are still present.
 
 The benchmark only talks to the API, so it can run from any host that reaches
@@ -85,17 +87,24 @@ def run_one(api: SpaceApi, args: argparse.Namespace, row: dict[str, Any]) -> Non
                 row["delete_error"] = str(error)[:300]
 
 
-def leftovers(api: SpaceApi, rows: list[dict[str, Any]]) -> list[str]:
-    """Sandbox IDs from this run that the API still reports as present."""
-    present = []
+def leftovers(api: SpaceApi, rows: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """Sandbox IDs from this run the API still reports, and those it could not check."""
+    present: list[str] = []
+    unchecked: list[str] = []
     for row in rows:
         sandbox_id = row.get("sandbox_id")
-        if sandbox_id and api.sandbox_state(sandbox_id) not in (None, "deleted"):
-            present.append(sandbox_id)
-    return present
+        if not sandbox_id:
+            continue
+        try:
+            if api.sandbox_state(sandbox_id) not in (None, "deleted"):
+                present.append(sandbox_id)
+        except ApiError as error:
+            print(f"cannot check sandbox {sandbox_id}: {error}", file=sys.stderr)
+            unchecked.append(sandbox_id)
+    return present, unchecked
 
 
-def summarize(rows: list[dict[str, Any]], remaining: list[str]) -> dict[str, Any]:
+def summarize(rows: list[dict[str, Any]], remaining: list[str], unchecked: list[str]) -> dict[str, Any]:
     ok = [row for row in rows if row["ok"]]
     summary: dict[str, Any] = {
         metric: stats(row[metric] for row in ok if metric in row) for metric in METRICS
@@ -104,6 +113,8 @@ def summarize(rows: list[dict[str, Any]], remaining: list[str]) -> dict[str, Any
     summary["succeeded"] = len(ok)
     summary["deleted"] = sum(1 for row in rows if row.get("deleted"))
     summary["leftover_sandboxes"] = remaining
+    # Sandboxes whose presence is unknown because the final check failed.
+    summary["unchecked_sandboxes"] = unchecked
     return summary
 
 
@@ -115,7 +126,7 @@ def print_table(summary: dict[str, Any]) -> None:
             print(f"{metric:<16} {s['count']:>3} {s['p50']:>7} {s['p95']:>7} {s['max']:>7}")
     print(
         f"succeeded {summary['succeeded']}/{summary['runs']}, deleted {summary['deleted']}/{summary['runs']}, "
-        f"leftover {len(summary['leftover_sandboxes'])}"
+        f"leftover {len(summary['leftover_sandboxes'])}, unchecked {len(summary['unchecked_sandboxes'])}"
     )
 
 
@@ -149,9 +160,12 @@ def main() -> int:
     if not token:
         raise SystemExit("ERROR: pass --token-file or set SPACE_API_TOKEN")
     # Operation polls share --poll-secs so op completion adds at most one interval to each sample.
-    api = SpaceApi(
-        args.api_url, args.data_plane_url, token, poll_secs=args.poll_secs, idempotency_prefix=IDEMPOTENCY_PREFIX
-    )
+    try:
+        api = SpaceApi(
+            args.api_url, args.data_plane_url, token, poll_secs=args.poll_secs, idempotency_prefix=IDEMPOTENCY_PREFIX
+        )
+    except ValueError as error:
+        raise SystemExit(f"ERROR: {error}") from error
     if args.output_dir:
         output_dir = args.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -178,13 +192,17 @@ def main() -> int:
                 print("interrupted; checking for leftovers", file=sys.stderr)
                 break
 
-    summary = summarize(rows, leftovers(api, rows))
+    summary = summarize(rows, *leftovers(api, rows))
     summary["interrupted"] = interrupted
     run = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k != "token_file"}
     (output_dir / "summary.json").write_text(json.dumps({"args": run, "summary": summary}, indent=2) + "\n")
     print_table(summary)
     print(f"results: {output_dir}")
-    clean = summary["succeeded"] == summary["deleted"] == len(rows) and not summary["leftover_sandboxes"]
+    clean = (
+        summary["succeeded"] == summary["deleted"] == len(rows)
+        and not summary["leftover_sandboxes"]
+        and not summary["unchecked_sandboxes"]
+    )
     return 130 if interrupted else 0 if clean else 1
 
 

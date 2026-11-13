@@ -586,7 +586,10 @@ class BalloonBenchmark:
                 token = Path(args.api_token_file).read_text().strip()
             if not token:
                 raise SystemExit("ERROR: API mode needs SPACE_API_TOKEN or --api-token-file")
-            self.api = SpaceApi(args.api_url, args.data_plane_url, token, idempotency_prefix=IDEMPOTENCY_PREFIX)
+            try:
+                self.api = SpaceApi(args.api_url, args.data_plane_url, token, idempotency_prefix=IDEMPOTENCY_PREFIX)
+            except ValueError as error:
+                raise SystemExit(f"ERROR: {error}") from error
             # The cluster resolves templates, so the prefix only governs the host probes.
             self.prefix = api_mode_sudo_prefix(args)
         else:

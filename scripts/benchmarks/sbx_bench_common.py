@@ -7,6 +7,7 @@ import argparse
 import base64
 import concurrent.futures
 import dataclasses
+import ipaddress
 import json
 import math
 import os
@@ -534,6 +535,28 @@ class ApiError(RuntimeError):
         self.status = status
 
 
+def require_token_safe_url(url: str) -> str:
+    """Return url if a bearer token may be sent to it, else raise ValueError.
+
+    HTTPS is always allowed. Plain HTTP is allowed only to a loopback name or a
+    private or loopback IP literal (for example a port-forward or a ClusterIP),
+    so the token never crosses a public network in cleartext.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme == "https" and parts.hostname:
+        return url
+    if parts.scheme == "http" and parts.hostname:
+        if parts.hostname == "localhost":
+            return url
+        try:
+            address = ipaddress.ip_address(parts.hostname)
+        except ValueError:
+            address = None
+        if address is not None and (address.is_loopback or address.is_private):
+            return url
+    raise ValueError(f"refusing to send the API token to {url!r}; use https, or http to a loopback or private IP")
+
+
 class SpaceApi:
     """Minimal stdlib client for the public SPACE API used by the benchmarks.
 
@@ -551,8 +574,8 @@ class SpaceApi:
         poll_secs: float = 0.25,
         idempotency_prefix: str = "bench",
     ) -> None:
-        self.api_url = api_url.rstrip("/")
-        self.data_plane_url = data_plane_url.rstrip("/")
+        self.api_url = require_token_safe_url(api_url).rstrip("/")
+        self.data_plane_url = require_token_safe_url(data_plane_url).rstrip("/") if data_plane_url else ""
         self.token = token
         self.poll_secs = poll_secs
         self.idempotency_prefix = idempotency_prefix
@@ -704,7 +727,10 @@ class SpaceApi:
         if self.data_plane_url:
             return self.data_plane_url + path
         if "://" in url:
-            return url
+            try:
+                return require_token_safe_url(url)
+            except ValueError as error:
+                raise ApiError(f"events: {error}") from error
         raise ApiError("the API returned a relative events URL; pass --data-plane-url")
 
     def run(self, sandbox_id: str, argv: Sequence[str], timeout: float) -> tuple[int, str]:
@@ -720,10 +746,14 @@ class SpaceApi:
         )
         chunks: list[bytes] = []
         exit_code: int | None = None
+        # The socket timeout resets on every keep-alive, so also bound the whole stream.
+        deadline = time.monotonic() + timeout + 30
         try:
             with _HTTP.open(req, timeout=timeout + 30) as response:
                 data: list[bytes] = []
                 for line in response:
+                    if time.monotonic() > deadline:
+                        raise ApiError(f"events: no process exit within {timeout + 30:.0f}s")
                     line = line.rstrip(b"\r\n")
                     if line:
                         field, _, value = line.partition(b":")
