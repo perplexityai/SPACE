@@ -741,9 +741,18 @@ impl NodeManagerService {
                 })
                 .await;
         }
+        if request.get_ref().cgroup_only {
+            let sandbox_id = request.into_inner().sandbox_id;
+            return self
+                .off_runtime("inspect sandbox cgroup", move || {
+                    let cgroup =
+                        SandboxCgroup::read(std::path::Path::new(SANDBOX_CGROUP_ROOT), &sandbox_id);
+                    Ok(Response::new(cgroup.into_response(sandbox_id)))
+                })
+                .await;
+        }
         let service = self.clone();
-        // Sandbox-manager's Stats RPC depends on this inspection for cgroup
-        // counters. Optional inventory work must not exhaust its admission.
+        // Optional inventory work must not exhaust the admission Stats uses.
         self.off_runtime("inspect sandbox", move || {
             service.inspect_sandbox_blocking(request)
         })
@@ -795,17 +804,7 @@ impl NodeManagerService {
         let vpeer = format!("vpeer-{uuid8}");
         let ns_up = net::ns_exists(&ns);
 
-        let cg_base = sandbox_cgroup_dir(
-            std::path::Path::new(pplx_space_node_runtime_core::cgroup_paths::CGROUP_BASE),
-            sandbox_id,
-        );
-        let cgroup_exists = cg_base.is_some();
-        let read_cgroup = |file: &str| -> String {
-            cg_base
-                .as_deref()
-                .map(|dir| read_cgroup_file(dir, file))
-                .unwrap_or_default()
-        };
+        let cgroup = SandboxCgroup::read(std::path::Path::new(SANDBOX_CGROUP_ROOT), sandbox_id);
 
         let run_dir = format!("{RUN_DIR}/{sandbox_id}");
         // Inspection reports filesystem presence, not execution authority.
@@ -864,37 +863,6 @@ impl NodeManagerService {
             ns_rp_filter_off: ns_up
                 && net::ns_sysctl_check(&ns, "net.ipv4.conf.tap0.rp_filter", "0")
                 && net::ns_sysctl_check(&ns, "net.ipv4.conf.all.rp_filter", "0"),
-            cgroup_exists,
-            cgroup_cpu_max: if cgroup_exists {
-                read_cgroup("cpu.max")
-            } else {
-                String::new()
-            },
-            cgroup_memory_max: if cgroup_exists {
-                read_cgroup("memory.max")
-            } else {
-                String::new()
-            },
-            cgroup_memory_current: if cgroup_exists {
-                read_cgroup("memory.current")
-            } else {
-                String::new()
-            },
-            cgroup_pids_max: if cgroup_exists {
-                read_cgroup("pids.max")
-            } else {
-                String::new()
-            },
-            cgroup_pids_current: if cgroup_exists {
-                read_cgroup("pids.current")
-            } else {
-                String::new()
-            },
-            cgroup_cpu_stat: if cgroup_exists {
-                read_cgroup("cpu.stat")
-            } else {
-                String::new()
-            },
             cache_dir_exists: std::path::Path::new(&format!("{CACHE_DIR}/{sandbox_id}")).exists(),
             run_dir_exists: std::path::Path::new(&run_dir).exists(),
             isolation_root_exists: jail_roots.iter().any(|root| root.exists()),
@@ -930,6 +898,7 @@ impl NodeManagerService {
             nft_ns_forward_drop_exists: ns_up && crate::firewall::ns_has_forward_drop(&ns),
             slot_allocated,
             template,
+            ..cgroup.into_response(sandbox_id.to_string())
         }))
     }
 
@@ -987,6 +956,53 @@ fn parse_cleanup_request(
     })?;
     request.sandbox_id = sandbox_id.to_string();
     Ok((sandbox_id, request))
+}
+
+const SANDBOX_CGROUP_ROOT: &str = "/sys/fs/cgroup/space";
+
+/// The sandbox cgroup files Stats reports, from the cgroup
+/// `sandbox_cgroup_dir` picks. Absent files read as empty.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SandboxCgroup {
+    exists: bool,
+    cpu_max: String,
+    memory_max: String,
+    memory_current: String,
+    pids_max: String,
+    pids_current: String,
+    cpu_stat: String,
+}
+
+impl SandboxCgroup {
+    fn read(root: &std::path::Path, sandbox_id: &str) -> Self {
+        let Some(base) = sandbox_cgroup_dir(root, sandbox_id) else {
+            return Self::default();
+        };
+        let read = |file: &str| read_cgroup_file(&base, file);
+        Self {
+            exists: true,
+            cpu_max: read("cpu.max"),
+            memory_max: read("memory.max"),
+            memory_current: read("memory.current"),
+            pids_max: read("pids.max"),
+            pids_current: read("pids.current"),
+            cpu_stat: read("cpu.stat"),
+        }
+    }
+
+    fn into_response(self, sandbox_id: String) -> InspectSandboxResponse {
+        InspectSandboxResponse {
+            sandbox_id,
+            cgroup_exists: self.exists,
+            cgroup_cpu_max: self.cpu_max,
+            cgroup_memory_max: self.memory_max,
+            cgroup_memory_current: self.memory_current,
+            cgroup_pids_max: self.pids_max,
+            cgroup_pids_current: self.pids_current,
+            cgroup_cpu_stat: self.cpu_stat,
+            ..Default::default()
+        }
+    }
 }
 
 #[cfg(test)]
