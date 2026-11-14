@@ -88,6 +88,14 @@ struct Fake {
     fail_retire: AtomicBool,
     /// Stop the sandbox behind the upgrade's back while it inspects the disk.
     stop_during_inspect: AtomicBool,
+    /// Fail the disk inspection as an unreachable node-manager would.
+    fail_inspect: AtomicBool,
+    /// Find no rootfs, as an activation that hasn't written it yet leaves.
+    missing_rootfs: AtomicBool,
+    unreadable_disk: AtomicBool,
+    /// Rebind the sandbox's execution behind the upgrade's back while it
+    /// inspects the disk, as a `Start`, which takes no upgrade lock, may.
+    rebind_during_inspect: Mutex<Option<ExecutionMetadata>>,
     calls: Mutex<Vec<&'static str>>,
 }
 
@@ -106,6 +114,10 @@ impl Fake {
             fail_restore: AtomicBool::new(false),
             fail_retire: AtomicBool::new(false),
             stop_during_inspect: AtomicBool::new(false),
+            fail_inspect: AtomicBool::new(false),
+            missing_rootfs: AtomicBool::new(false),
+            unreadable_disk: AtomicBool::new(false),
+            rebind_during_inspect: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -131,8 +143,31 @@ impl Fake {
 
 #[tonic::async_trait]
 impl RuntimeUpgradeEffects for Arc<Fake> {
-    async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Status> {
+    async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Refusal> {
         self.called("inspect");
+        if let Some(execution) = self.rebind_during_inspect.lock().unwrap().take() {
+            crate::db::upsert_sandbox_execution_metadata(
+                &self.db.lock().unwrap(),
+                &sandbox.id,
+                &execution,
+            )
+            .unwrap();
+        }
+        if self.fail_inspect.load(Ordering::SeqCst) {
+            return Err(Refusal::Retry(Status::unavailable(
+                "scripted node-manager outage",
+            )));
+        }
+        if self.missing_rootfs.load(Ordering::SeqCst) {
+            return Err(Refusal::Final(Status::failed_precondition(
+                "rootfs is missing",
+            )));
+        }
+        if self.unreadable_disk.load(Ordering::SeqCst) {
+            return Err(Refusal::Retry(Status::failed_precondition(
+                "inspect rootfs.ext4: Input/output error (os error 5)",
+            )));
+        }
         if self.stop_during_inspect.load(Ordering::SeqCst) {
             self.db
                 .lock()
@@ -452,6 +487,43 @@ impl Harness {
             checkpoint_local_artifact_id: self.checkpoint_artifact,
             attempt_id: crate::db::new_runtime_upgrade_attempt_id(),
         }
+    }
+
+    /// [`Self::request`] from a pod's shim, whose start names `pod_uid`.
+    fn request_for_attempt(
+        &self,
+        operation_id: RuntimeUpgradeOperationId,
+        attempt_id: &str,
+    ) -> RuntimeUpgradeRequest {
+        let mut request = self.request(operation_id, RuntimeUpgradeTargetState::Started);
+        request.attempt_id = attempt_id.to_string();
+        request
+    }
+
+    /// The node's report of `operation_id`: its status. The pod it names is
+    /// read apart ([`Self::report_names_attempt`]), so no assertion message that
+    /// formats the status ever carries a pod UID.
+    fn report_status(
+        &self,
+        operation_id: RuntimeUpgradeOperationId,
+    ) -> Option<crate::db::RuntimeUpgradeStatus> {
+        crate::db::read::runtime_upgrade_report(&self.db.lock().unwrap(), operation_id)
+            .unwrap()
+            .map(|report| report.status)
+    }
+
+    /// Whether the node's report of `operation_id` names the pod `pod_uid`,
+    /// compared here rather than handed back, so the UID is never formatted.
+    fn report_names_attempt(
+        &self,
+        operation_id: RuntimeUpgradeOperationId,
+        attempt_id: &str,
+    ) -> bool {
+        crate::db::read::runtime_upgrade_report(&self.db.lock().unwrap(), operation_id)
+            .unwrap()
+            .and_then(|report| report.attempt_id)
+            .as_deref()
+            == Some(attempt_id)
     }
 
     fn row(&self) -> SandboxRow {
@@ -2055,4 +2127,631 @@ mod service {
             assert_eq!(error.code(), tonic::Code::PermissionDenied);
         }
     }
+}
+
+/// A pod's attempt interrupted mid-boot is rolled back by the settle its own
+/// retry runs, and that rollback is final for the pod at once: the retry gets
+/// it back rather than fencing and booting again.
+#[tokio::test]
+async fn an_attempts_retry_that_settles_its_own_boot_gets_the_rollback() {
+    let h = harness(SandboxState::Suspended);
+    *h.fake.boot.lock().unwrap() = Boot::Hang;
+    let operation_id = operation();
+    let short = RuntimeUpgrader::new(h.db.clone(), Arc::clone(&h.fake))
+        .with_settle_timing(Duration::from_millis(20), Duration::from_millis(5));
+    let interrupted = short
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        interrupted.code(),
+        tonic::Code::Unavailable,
+        "{interrupted}"
+    );
+    let episode = crate::db::cleanup_episode(&h.db.lock().unwrap(), &h.sandbox_id)
+        .unwrap()
+        .unwrap();
+    roll_back_activation(&h.db, &h.sandbox_id, SandboxState::Suspended, episode.id);
+    assert_eq!(
+        h.record(operation_id).unwrap().phase,
+        RuntimeUpgradePhase::Booting
+    );
+    *h.fake.boot.lock().unwrap() = Boot::Succeed;
+    let boots = h.boots();
+
+    let retry = h
+        .upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(retry.code(), tonic::Code::FailedPrecondition, "{retry}");
+    assert!(
+        retry
+            .message()
+            .contains("rolled back for attempt attempt-a"),
+        "{retry}"
+    );
+    assert_eq!(h.boots(), boots, "the retry booted again");
+    assert_eq!(h.fence(), None);
+}
+
+/// Mixed versions: an upgrade an older sandbox-manager began and left
+/// interrupted mid-boot carries no attempt id on its live row. This
+/// release's retry settles it, rolling it back, but the rollback
+/// names no attempt, so it's final for none: the retry, under any attempt
+/// id, starts over and boots, rather than being refused on the strength of
+/// a row that proves nothing about it.
+#[tokio::test]
+async fn an_interrupted_upgrade_from_before_attempt_ids_is_final_for_no_attempt() {
+    let h = harness(SandboxState::Suspended);
+    *h.fake.boot.lock().unwrap() = Boot::Hang;
+    let operation_id = operation();
+    let short = RuntimeUpgrader::new(h.db.clone(), Arc::clone(&h.fake))
+        .with_settle_timing(Duration::from_millis(20), Duration::from_millis(5));
+    short
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+    let episode = crate::db::cleanup_episode(&h.db.lock().unwrap(), &h.sandbox_id)
+        .unwrap()
+        .unwrap();
+    roll_back_activation(&h.db, &h.sandbox_id, SandboxState::Suspended, episode.id);
+    // As an older release wrote it, before the column existed.
+    h.db.lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandbox_runtime_upgrades SET attempt_id = NULL WHERE operation_id = ?1",
+            crate::db::fixture::params![operation_id.to_string()],
+        )
+        .unwrap();
+    *h.fake.boot.lock().unwrap() = Boot::Succeed;
+    let boots = h.boots();
+
+    let outcome = h
+        .upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(outcome, RuntimeUpgradeOutcome::Upgraded),
+        "{outcome:?}"
+    );
+    assert!(h.boots() > boots, "the retry started over and booted");
+    assert!(
+        crate::db::read::runtime_upgrade_attempt_outcome(
+            &h.db.lock().unwrap(),
+            operation_id,
+            "attempt-a"
+        )
+        .unwrap()
+        .is_none(),
+        "a rollback that names no attempt is final for none"
+    );
+    assert!(h.report_names_attempt(operation_id, "attempt-a"));
+}
+
+/// An already-on-target outcome names the attempt that found it.
+#[tokio::test]
+async fn an_already_on_target_outcome_names_its_attempt() {
+    let h = harness(SandboxState::Stopped);
+    crate::db::upsert_sandbox_execution_metadata(
+        &h.db.lock().unwrap(),
+        &h.sandbox_id,
+        &h.envs.target,
+    )
+    .unwrap();
+
+    let named = operation();
+    let outcome = h
+        .upgrader
+        .upgrade(h.request_for_attempt(named, "attempt-a"))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, RuntimeUpgradeOutcome::AlreadyOnTarget));
+    assert!(h.report_names_attempt(named, "attempt-a"));
+}
+
+/// Kubelet retries a pod's failed create under the same pod UID, so a
+/// rollback is final for the pod that ran it: its retry gets the recorded
+/// rollback back without fencing or booting again. A retry from a new pod, or
+/// from a caller that names none, starts over.
+#[tokio::test]
+async fn a_rollback_is_final_for_the_attempt_that_ran_it() {
+    let h = harness(SandboxState::Stopped);
+    *h.fake.boot.lock().unwrap() = Boot::FailAfterWriting;
+    let operation_id = operation();
+    let first = h
+        .upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+    assert!(first.message().contains("rolled back"), "{first}");
+    let attempt = h.fake.calls();
+    assert_eq!(
+        h.report_status(operation_id),
+        Some(crate::db::RuntimeUpgradeStatus::RolledBack {
+            failure: Some("cold boot failed: guest never became ready".to_string())
+        })
+    );
+    assert!(
+        h.report_names_attempt(operation_id, "attempt-a"),
+        "the report names another attempt"
+    );
+
+    // Kubelet's retry of the same pod, even once the boot would succeed.
+    *h.fake.boot.lock().unwrap() = Boot::Succeed;
+    for _ in 0..2 {
+        let retry = h
+            .upgrader
+            .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+            .await
+            .unwrap_err();
+        assert_eq!(retry.code(), tonic::Code::FailedPrecondition, "{retry}");
+        assert!(
+            retry
+                .message()
+                .contains("rolled back for attempt attempt-a"),
+            "{retry}"
+        );
+        assert!(
+            retry.message().contains("guest never became ready"),
+            "{retry}"
+        );
+    }
+    assert_eq!(h.fake.calls(), attempt, "the retry fenced or booted again");
+    assert_eq!(h.fence(), None);
+    assert_eq!(h.fake.instance(), "old disk");
+    assert_eq!(h.row().execution_metadata, Some(h.envs.source.clone()));
+
+    // A new pod starts over, and boots.
+    h.upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-b"))
+        .await
+        .unwrap();
+    assert_eq!(h.boots(), 2);
+    assert_eq!(
+        h.record(operation_id).unwrap().phase,
+        RuntimeUpgradePhase::Retired
+    );
+
+    // A delayed retry from the first pod, after the new pod's attempt
+    // retired, still gets its own rollback back rather than the replay.
+    let late = h
+        .upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+    assert_eq!(late.code(), tonic::Code::FailedPrecondition, "{late}");
+    assert!(
+        late.message().contains("rolled back for attempt attempt-a"),
+        "{late}"
+    );
+    assert_eq!(h.boots(), 2);
+}
+
+/// A rollback is final only for the attempt it ran for: a fresh attempt
+/// starts over after it.
+#[tokio::test]
+async fn a_rollback_proves_nothing_to_a_fresh_attempt() {
+    let h = harness(SandboxState::Stopped);
+    *h.fake.boot.lock().unwrap() = Boot::FailAfterWriting;
+    let operation_id = operation();
+    h.upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+    *h.fake.boot.lock().unwrap() = Boot::Succeed;
+
+    h.upgrader
+        .upgrade(h.request(operation_id, RuntimeUpgradeTargetState::Started))
+        .await
+        .unwrap();
+
+    assert_eq!(h.boots(), 2);
+}
+
+/// A refusal before anything was fenced is recorded for the pod it refused,
+/// replacing an earlier pod's rollback, so the report never gives a newer
+/// pod's refusal an older attempt's reason. It's final for that pod as a
+/// rollback is; a new pod starts over.
+#[tokio::test]
+async fn a_refusal_before_the_fence_is_recorded_and_final_for_its_attempt() {
+    let h = harness(SandboxState::Suspended);
+    let operation_id = operation();
+    *h.fake.boot.lock().unwrap() = Boot::FailAfterWriting;
+    h.upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+    *h.fake.boot.lock().unwrap() = Boot::Succeed;
+
+    let mut refused = h.request_for_attempt(operation_id, "attempt-b");
+    refused.authorization.memory_loss = false;
+    let error = h.upgrader.upgrade(refused).await.unwrap_err();
+    assert!(error.message().contains("memory loss"), "{error}");
+    let status = h.report_status(operation_id).unwrap();
+    let crate::db::RuntimeUpgradeStatus::Refused { failure } = status else {
+        panic!("{status:?}");
+    };
+    assert!(failure.unwrap().contains("memory loss"));
+    assert!(
+        h.report_names_attempt(operation_id, "attempt-b"),
+        "the report names another attempt"
+    );
+
+    let calls = h.fake.calls();
+    let retry = h
+        .upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-b"))
+        .await
+        .unwrap_err();
+    assert_eq!(retry.code(), tonic::Code::FailedPrecondition, "{retry}");
+    assert!(
+        retry
+            .message()
+            .contains("was refused for attempt attempt-b"),
+        "{retry}"
+    );
+    assert_eq!(h.fake.calls(), calls, "the retry inspected or fenced again");
+
+    h.upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-c"))
+        .await
+        .unwrap();
+    assert_eq!(
+        h.record(operation_id).unwrap().phase,
+        RuntimeUpgradePhase::Retired
+    );
+}
+
+impl Harness {
+    fn boots(&self) -> usize {
+        self.fake
+            .calls()
+            .iter()
+            .filter(|call| **call == "boot")
+            .count()
+    }
+
+    /// The pod's request, refused for good before the fence: a suspended
+    /// sandbox's upgrade without consent to lose its memory.
+    fn refused_request_for_attempt(
+        &self,
+        operation_id: RuntimeUpgradeOperationId,
+        attempt_id: &str,
+    ) -> RuntimeUpgradeRequest {
+        let mut request = self.request_for_attempt(operation_id, attempt_id);
+        request.authorization.memory_loss = false;
+        request
+    }
+}
+
+/// A rollback is final for its pod even after a later pod's rollback
+/// replaces it as the operation's outcome: a delayed kubelet retry from the
+/// first pod gets its own rollback back and fences nothing, while the report
+/// still names the latest pod.
+#[tokio::test]
+async fn a_rollback_stays_final_for_its_attempt_after_a_later_attempts_rollback() {
+    let h = harness(SandboxState::Stopped);
+    *h.fake.boot.lock().unwrap() = Boot::FailAfterWriting;
+    let operation_id = operation();
+    for pod in ["attempt-a", "attempt-b"] {
+        h.upgrader
+            .upgrade(h.request_for_attempt(operation_id, pod))
+            .await
+            .unwrap_err();
+    }
+    assert_eq!(h.boots(), 2);
+    *h.fake.boot.lock().unwrap() = Boot::Succeed;
+    let calls = h.fake.calls();
+
+    let retry = h
+        .upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(retry.code(), tonic::Code::FailedPrecondition, "{retry}");
+    assert!(
+        retry
+            .message()
+            .contains("rolled back for attempt attempt-a"),
+        "{retry}"
+    );
+    assert_eq!(h.fake.calls(), calls, "the retry fenced or booted again");
+    assert_eq!(h.fence(), None);
+    assert_eq!(h.row().execution_metadata, Some(h.envs.source.clone()));
+    let status = h.report_status(operation_id).unwrap();
+    assert!(
+        matches!(status, crate::db::RuntimeUpgradeStatus::RolledBack { .. }),
+        "{status:?}"
+    );
+    assert!(
+        h.report_names_attempt(operation_id, "attempt-b"),
+        "the report names another attempt"
+    );
+}
+
+/// The same for refusals: a later pod's refusal replaces the first pod's as
+/// the operation's outcome, and the first pod's retry, which would now pass,
+/// still gets its own refusal back without inspecting or fencing.
+#[tokio::test]
+async fn a_refusal_stays_final_for_its_attempt_after_a_later_attempts_refusal() {
+    let h = harness(SandboxState::Suspended);
+    let operation_id = operation();
+    for pod in ["attempt-a", "attempt-b"] {
+        let refusal = h
+            .upgrader
+            .upgrade(h.refused_request_for_attempt(operation_id, pod))
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.code(), tonic::Code::FailedPrecondition, "{refusal}");
+    }
+    let calls = h.fake.calls();
+
+    let retry = h
+        .upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(retry.code(), tonic::Code::FailedPrecondition, "{retry}");
+    assert!(
+        retry
+            .message()
+            .contains("was refused for attempt attempt-a"),
+        "{retry}"
+    );
+    assert!(retry.message().contains("memory loss"), "{retry}");
+    assert_eq!(h.fake.calls(), calls, "the retry inspected or fenced again");
+    assert_eq!(h.record(operation_id), None);
+    let status = h.report_status(operation_id).unwrap();
+    assert!(
+        matches!(status, crate::db::RuntimeUpgradeStatus::Refused { .. }),
+        "{status:?}"
+    );
+    assert!(
+        h.report_names_attempt(operation_id, "attempt-b"),
+        "the report names another attempt"
+    );
+}
+
+/// A refusal a retry may not repeat (here the node-manager is unreachable
+/// while the disk is inspected) isn't recorded: the operation's report keeps
+/// an earlier pod's outcome, which the control plane doesn't settle the new
+/// pod on, and kubelet's retry from the same pod goes ahead and upgrades.
+#[tokio::test]
+async fn a_transient_refusal_is_not_final_for_its_attempt() {
+    let h = harness(SandboxState::Stopped);
+    *h.fake.boot.lock().unwrap() = Boot::FailAfterWriting;
+    let operation_id = operation();
+    h.upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+    *h.fake.boot.lock().unwrap() = Boot::Succeed;
+    h.fake.fail_inspect.store(true, Ordering::SeqCst);
+
+    let refusal = h
+        .upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-b"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(refusal.code(), tonic::Code::Unavailable, "{refusal}");
+    let status = h.report_status(operation_id).unwrap();
+    assert!(
+        matches!(status, crate::db::RuntimeUpgradeStatus::RolledBack { .. }),
+        "{status:?}"
+    );
+    assert!(
+        h.report_names_attempt(operation_id, "attempt-a"),
+        "the report names another attempt"
+    );
+
+    h.fake.fail_inspect.store(false, Ordering::SeqCst);
+    h.upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-b"))
+        .await
+        .unwrap();
+    assert_eq!(h.boots(), 2);
+    assert_eq!(
+        h.record(operation_id).unwrap().phase,
+        RuntimeUpgradePhase::Retired
+    );
+}
+
+/// A pod's upgrade can reach a sandbox another activation is still
+/// creating, before its rootfs is written. The disk inspection's refusal is
+/// then transient: it answers as it always did and records nothing, so a
+/// retry from the same pod inspects the disk again. The same refusal of a
+/// stopped sandbox, whose disk nothing is about to write, stays final for
+/// the pod.
+#[tokio::test]
+async fn a_disk_refusal_while_the_sandbox_is_mid_create_is_not_final_for_its_attempt() {
+    let h = harness(SandboxState::Creating);
+    h.fake.missing_rootfs.store(true, Ordering::SeqCst);
+    let operation_id = operation();
+
+    let refusal = h
+        .upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(refusal.code(), tonic::Code::FailedPrecondition, "{refusal}");
+    assert!(refusal.message().contains("rootfs is missing"), "{refusal}");
+    assert!(h.report_status(operation_id).is_none(), "nothing recorded");
+
+    let stopped = harness(SandboxState::Stopped);
+    stopped.fake.missing_rootfs.store(true, Ordering::SeqCst);
+    let operation_id = operation();
+    let refusal = stopped
+        .upgrader
+        .upgrade(stopped.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.code(), tonic::Code::FailedPrecondition, "{refusal}");
+    assert!(
+        matches!(
+            stopped.report_status(operation_id),
+            Some(crate::db::RuntimeUpgradeStatus::Refused { .. })
+        ),
+        "a stopped sandbox's refusal is final"
+    );
+}
+
+/// A sandbox that isn't stopped or suspended may still settle under another
+/// execution, so an edge refusal for it isn't final for the pod; the same
+/// refusal of a stopped sandbox is.
+#[tokio::test]
+async fn an_edge_refusal_is_final_only_for_a_sandbox_at_rest() {
+    for (state, recorded) in [
+        (SandboxState::Started, false),
+        (SandboxState::Stopped, true),
+    ] {
+        let h = harness(state);
+        let operation_id = operation();
+        let mut request = h.request_for_attempt(operation_id, "attempt-a");
+        request.target = reference(&h.envs.incompatible);
+
+        let refusal = h.upgrader.upgrade(request).await.unwrap_err();
+
+        assert_eq!(refusal.code(), tonic::Code::FailedPrecondition, "{refusal}");
+        assert!(
+            refusal.message().contains("not a certified upgrade edge"),
+            "{state}: {refusal}"
+        );
+        assert_eq!(h.report_status(operation_id).is_some(), recorded, "{state}");
+    }
+}
+
+/// A disk or edge refusal decided on a stopped sandbox that changed while its
+/// disk was inspected isn't final for the attempt: a `Start` takes no upgrade
+/// lock, so the sandbox may have rebound its execution meanwhile, and a retry
+/// decides again on the sandbox as it is then.
+#[tokio::test]
+async fn a_refusal_decided_on_a_sandbox_that_changed_meanwhile_is_not_final() {
+    for (case, missing_rootfs, uncertified_edge) in [("disk", true, false), ("edge", false, true)] {
+        let h = harness(SandboxState::Stopped);
+        h.fake
+            .missing_rootfs
+            .store(missing_rootfs, Ordering::SeqCst);
+        *h.fake.rebind_during_inspect.lock().unwrap() = Some(h.envs.incompatible.clone());
+        let operation_id = operation();
+        let request = || {
+            let mut request = h.request_for_attempt(operation_id, "attempt-a");
+            if uncertified_edge {
+                request.target = reference(&h.envs.incompatible);
+            }
+            request
+        };
+
+        let refusal = h.upgrader.upgrade(request()).await.unwrap_err();
+
+        assert_eq!(
+            refusal.code(),
+            tonic::Code::FailedPrecondition,
+            "{case}: {refusal}"
+        );
+        assert!(
+            h.report_status(operation_id).is_none(),
+            "{case}: nothing recorded"
+        );
+        let retry = h.upgrader.upgrade(request()).await.err();
+        assert!(
+            !retry
+                .as_ref()
+                .is_some_and(|error| error.message().contains("only a new attempt retries it")),
+            "{case}: the retry decides again: {retry:?}"
+        );
+    }
+}
+
+/// A suspended sandbox whose checkpoint on this node isn't the one the
+/// upgrade was decided from refuses every retry of the same request the same
+/// way, so the refusal is final for its pod.
+#[tokio::test]
+async fn a_checkpoint_refusal_is_final_for_its_attempt() {
+    let h = harness(SandboxState::Suspended);
+    let operation_id = operation();
+    let mut request = h.request_for_attempt(operation_id, "attempt-a");
+    request.checkpoint_local_artifact_id = Some(LocalArtifactId::new());
+
+    let refusal = h.upgrader.upgrade(request).await.unwrap_err();
+
+    assert_eq!(refusal.code(), tonic::Code::FailedPrecondition, "{refusal}");
+    assert!(refusal.message().contains("decided"), "{refusal}");
+    assert!(
+        matches!(
+            h.report_status(operation_id),
+            Some(crate::db::RuntimeUpgradeStatus::Refused { .. })
+        ),
+        "the checkpoint refusal is final"
+    );
+    assert!(h.report_names_attempt(operation_id, "attempt-a"));
+}
+
+/// A stopped sandbox's disk that can't be read, an I/O error rather than a
+/// missing file, may be readable on a retry: the refusal answers
+/// `FAILED_PRECONDITION` but isn't recorded for the attempt, so its
+/// retry inspects the disk again and upgrades.
+#[tokio::test]
+async fn an_unreadable_disk_is_not_final_for_its_attempt() {
+    let h = harness(SandboxState::Stopped);
+    h.fake.unreadable_disk.store(true, Ordering::SeqCst);
+    let operation_id = operation();
+
+    let refusal = h
+        .upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(refusal.code(), tonic::Code::FailedPrecondition, "{refusal}");
+    assert!(h.report_status(operation_id).is_none(), "nothing recorded");
+    h.fake.unreadable_disk.store(false, Ordering::SeqCst);
+    h.upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap();
+    assert_eq!(h.boots(), 1);
+}
+
+/// A sandbox in a state an upgrade can't start from, here one still running,
+/// may yet settle into one it can: the refusal isn't recorded for the pod, so
+/// kubelet's retry from the same pod upgrades once the sandbox has stopped.
+#[tokio::test]
+async fn a_refusal_of_the_sandboxs_state_is_not_final_for_its_attempt() {
+    let h = harness(SandboxState::Started);
+    let operation_id = operation();
+
+    let refusal = h
+        .upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(refusal.code(), tonic::Code::FailedPrecondition, "{refusal}");
+    assert!(
+        refusal
+            .message()
+            .contains("needs a stopped or suspended sandbox"),
+        "{refusal}"
+    );
+    assert!(h.report_status(operation_id).is_none(), "nothing recorded");
+    h.db.lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandboxes SET state = 'stopped' WHERE id = ?1",
+            crate::db::fixture::params![h.sandbox_id],
+        )
+        .unwrap();
+    h.upgrader
+        .upgrade(h.request_for_attempt(operation_id, "attempt-a"))
+        .await
+        .unwrap();
+    assert_eq!(h.boots(), 1);
 }
