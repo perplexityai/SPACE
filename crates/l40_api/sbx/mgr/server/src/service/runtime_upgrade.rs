@@ -7,9 +7,10 @@
 //! 1. **Fence.** A `sandbox_runtime_upgrades` row, inserted only while the
 //!    sandbox is stopped or suspended and owned by nothing else, refuses every
 //!    other activation until the boot is verified or the old pair is back.
-//! 2. **Preserve.** A read-only copy of the instance subvolume (rootfs, and
-//!    for encrypted sandboxes `cow.luks` and the suspend volume) is kept under
-//!    an internal snapshot name. The checkpoint directory is never touched.
+//! 2. **Preserve.** A read-only copy of the instance subvolume (the rootfs,
+//!    and for encrypted sandboxes `cow.luks` and the suspend volume; a staged
+//!    encrypted checkpoint's holds only `cow.luks`) is kept under an internal
+//!    snapshot name. The checkpoint directory is never touched.
 //! 3. **Select the consumer.** The target must keep the disk's guest,
 //!    kernel and components; its runtime and snapshot format may differ, since
 //!    no memory is loaded. It is saved as the sandbox's consumer. The
@@ -41,6 +42,7 @@ use crate::state::{SandboxState, SandboxStatus};
 
 mod node_effects;
 mod rpc;
+mod staged_disk;
 mod stale_copy;
 #[cfg(test)]
 mod tests;
@@ -139,6 +141,10 @@ pub(super) struct LocalDisk {
 /// The node and lifecycle work an upgrade performs between its phases.
 #[tonic::async_trait]
 pub(super) trait RuntimeUpgradeEffects: Send + Sync {
+    /// Finish a suspended checkpoint staged on this node into the disk a copy
+    /// suspended here has ([`staged_disk`]). The caller excludes disk
+    /// mutations.
+    async fn complete_staged_disk(&self, sandbox: &SandboxRow) -> Result<(), Status>;
     /// Read the local disk, refusing a sandbox without one: a cold start
     /// would otherwise boot a fresh template clone.
     async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Status>;
@@ -487,6 +493,7 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         {
             return self.already_on_target(&request);
         }
+        self.effects.complete_staged_disk(&sandbox).await?;
         let disk = self.effects.inspect_local_disk(&sandbox).await?;
         if sandbox.state.is_unowned(SandboxState::Suspended)
             && disk

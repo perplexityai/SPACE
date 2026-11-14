@@ -69,7 +69,9 @@ pub(super) struct StartFromCheckpointLaunch<'a> {
 /// kept `instance/` in place and whose publication dir was already reclaimed),
 /// `None` opens the canonical backing directly.
 async fn reconstruct_encrypted_restore_devices(
+    cache_root: &std::path::Path,
     sandbox_id: &str,
+    pinned: crate::rootfs_encryption::PinnedCheckpoint<'_>,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     snapshot_dir: &str,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
@@ -82,7 +84,9 @@ async fn reconstruct_encrypted_restore_devices(
     let snapshot_restore_source = restore_source_if_present("snapshot.luks");
 
     let rootfs_block_device_path = crate::rootfs_encryption::prepare_encrypted_rootfs(
+        cache_root,
         sandbox_id,
+        pinned,
         execution_fence,
         cow_source.as_deref(),
         node_manager,
@@ -1130,7 +1134,9 @@ impl SandboxManagerService {
         // sandboxes take the plaintext path with no service round-trip.
         let (rootfs_block_device_path, snapshot_volume_mount_dir) = if sandbox.volume_encryption {
             match reconstruct_encrypted_restore_devices(
+                cache_root,
                 id,
+                crate::rootfs_encryption::PinnedCheckpoint::of(sandbox),
                 execution_fence,
                 &snapshot_dir,
                 &self.node_manager,

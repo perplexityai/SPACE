@@ -2696,7 +2696,9 @@ impl SandboxManagerService {
         // — a device-layout choice, not an encryption decision.
         let rootfs_block_device_path = if sandbox.volume_encryption {
             match crate::rootfs_encryption::prepare_encrypted_rootfs(
+                self.cache_root(),
                 id,
+                crate::rootfs_encryption::PinnedCheckpoint::of(&sandbox),
                 execution_fence,
                 None,
                 &self.node_manager,
