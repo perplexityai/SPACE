@@ -467,6 +467,7 @@ async fn delete_sandbox_best_effort(
             sandbox_id: sandbox_id.to_string(),
             template_filter: None,
             blocking: true,
+            discard_retained_filesystem_reason: None,
         })
         .await
     {
@@ -1177,6 +1178,7 @@ impl TemplateBuilder {
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             })
             .await
             .map_err(|e| BuildError::message(format!("sandbox delete failed: {e}")))?;

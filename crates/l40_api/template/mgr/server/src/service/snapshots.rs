@@ -323,6 +323,7 @@ impl TemplateManagerService {
                             sandbox_id,
                             template_filter: None,
                             blocking: true,
+                            discard_retained_filesystem_reason: None,
                         })
                         .await;
                 }
@@ -642,6 +643,7 @@ impl TemplateManagerService {
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             }),
         )
         .await

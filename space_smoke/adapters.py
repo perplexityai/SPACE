@@ -5850,6 +5850,133 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return state
 
+    def pause_in_memory(self, sandbox_id: str) -> None:
+        """Native `:pause`: keep the VM resident, paused. Returns once accepted."""
+
+        self._require_isolated_kind("native pause")
+        public_id = f"sbx_{_sql_uuid(sandbox_id)}"
+        request = Request(
+            self.config.api_url.rstrip("/") + f"/v1/sandboxes/{quote(public_id, safe='')}:pause",
+            method="POST",
+            headers={
+                "Authorization": "Bearer " + self._admin_token(),
+                "Content-Type": "application/json",
+                "Idempotency-Key": f"space-smoke-pause-{secrets.token_hex(8)}",
+            },
+            data=b"{}",
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                response.read()
+        except HTTPError as error:
+            raise RuntimeError(f"native :pause returned HTTP {error.code}") from None
+        except (URLError, OSError):
+            raise RuntimeError("native :pause failed") from None
+
+    def native_sandbox_state(self, sandbox_id: str) -> str:
+        """The sandbox's control-plane `state` from the native `/v1` read."""
+
+        payload = self._admin_v1("GET", f"sandboxes/sbx_{quote(_sql_uuid(sandbox_id), safe='')}")
+        state = payload.get("state") if isinstance(payload, dict) else None
+        return str(state) if isinstance(state, str) else ""
+
+    def native_sandbox_present(self, sandbox_id: str) -> bool:
+        """Whether the native `/v1` read still finds the sandbox (False on 404)."""
+
+        self._require_isolated_kind("native sandbox read")
+        public_id = f"sbx_{_sql_uuid(sandbox_id)}"
+        request = Request(
+            self.config.api_url.rstrip("/") + f"/v1/sandboxes/{quote(public_id, safe='')}",
+            method="GET",
+            headers={"Authorization": "Bearer " + self._admin_token()},
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                response.read()
+                return True
+        except HTTPError as error:
+            if error.code == 404:
+                return False
+            raise RuntimeError(f"native sandbox read returned HTTP {error.code}") from None
+        except (URLError, OSError):
+            raise RuntimeError("native sandbox read failed") from None
+
+    def api_delete(self, sandbox_id: str) -> str:
+        """The public delete (`DELETE /v1/sandboxes/{id}`); returns its operation id."""
+
+        self._require_isolated_kind("native delete")
+        public_id = f"sbx_{_sql_uuid(sandbox_id)}"
+        request = Request(
+            self.config.api_url.rstrip("/") + f"/v1/sandboxes/{quote(public_id, safe='')}",
+            method="DELETE",
+            headers={
+                "Authorization": "Bearer " + self._admin_token(),
+                "Idempotency-Key": f"space-smoke-delete-{secrets.token_hex(8)}",
+            },
+        )
+        try:
+            with urlopen(request, timeout=60) as response:
+                payload = json.load(response)
+        except HTTPError as error:
+            raise RuntimeError(f"native delete returned HTTP {error.code}") from None
+        except (URLError, OSError, ValueError):
+            raise RuntimeError("native delete failed") from None
+        operation_id = payload.get("operation_id") if isinstance(payload, dict) else None
+        if not isinstance(operation_id, str) or not operation_id:
+            raise RuntimeError("native delete returned no operation_id")
+        return operation_id
+
+    def operation(self, operation_id: str) -> dict[str, Any]:
+        """The public operation's record (`GET /v1/operations/{id}`)."""
+
+        payload = self._admin_v1("GET", f"operations/{quote(operation_id, safe='')}")
+        return payload if isinstance(payload, dict) else {}
+
+    def hold_node_manager(self, node_name: str) -> None:
+        """Stop node-manager on the node (SIGSTOP), so its RPCs wait."""
+
+        result = self._node_shell_exec(node_name, _HOLD_NODE_MANAGER_SCRIPT, timeout=30)
+        _require_ok(result, f"hold node-manager on {node_name}")
+
+    def release_node_manager(self, node_name: str) -> None:
+        """Continue every node-manager on the node (SIGCONT)."""
+
+        result = self._node_shell_exec(node_name, _RELEASE_NODE_MANAGER_SCRIPT, timeout=30)
+        _require_ok(result, f"release node-manager on {node_name}")
+
+    def kill_sandbox_runtime(self, node_name: str, sandbox_id: str) -> str:
+        """SIGKILL the sandbox's Firecracker, found through its own `fc.pid` link, and
+        wait until it is reaped. Returns the script's report (pid, parent, reap time)."""
+
+        script = _KILL_SANDBOX_RUNTIME_SCRIPT.replace("__SANDBOX__", _sql_uuid(sandbox_id))
+        result = self._node_shell_exec(node_name, script, timeout=30)
+        return _require_ok(result, f"kill sandbox {sandbox_id}'s runtime on {node_name}").strip()
+
+    def node_sandbox_delete(
+        self, node_name: str, sandbox_id: str, *, discard_reason: str | None
+    ) -> CommandResult:
+        """`space-sbxmgr delete --blocking`, as root on the node; a discard with a reason."""
+
+        command = f"space-sbxmgr delete --blocking {_sql_uuid(sandbox_id)}"
+        if discard_reason is not None:
+            command += f" --discard-retained-filesystem --reason {shlex.quote(discard_reason)}"
+        return self._node_shell_exec(node_name, command, timeout=180)
+
+    def discard_attempt_window_seconds(self, node_name: str) -> int:
+        """The window the node's discard refuses within (`SPACE_SBX_DISCARD_ATTEMPT_WINDOW_SECS`).
+
+        Unset or unparsable is the six-hour recovery window, which no smoke can
+        wait out.
+        """
+
+        raw = str(
+            self._node_service_env(node_name, NODE_SANDBOX_MANAGER).get(
+                "SPACE_SBX_DISCARD_ATTEMPT_WINDOW_SECS"
+            )
+            or ""
+        ).strip()
+        return int(raw) if raw.isdigit() else 6 * 60 * 60
+
     def startup_recovery_log(self, node_name: str) -> list[str]:
         pod = self._node_service_pod(node_name, NODE_TEMPLATE_MANAGER)
         # Oldest attempt first: a failed startup restarts the container, and
@@ -7250,6 +7377,44 @@ sandboxes="$(/space/bin/space-sbxmgr list)"
 row="$(printf '%s\n' "$sandboxes" | grep -F '__SHORT_ID__' || true)"
 [ -n "$row" ] || exit 3
 printf '%s\n' "$row" | grep -oE '┆ *(__STATES__) *┆' | head -n 1 | tr -d '┆ '
+"""
+
+# Stops the node's one node-manager. Its RPCs then wait, so a suspend that
+# reached `suspending` can't capture while the scenario faults its runtime.
+_HOLD_NODE_MANAGER_SCRIPT = r"""set -eu
+pids=""
+for d in /proc/[0-9]*; do
+  [ "$(cat "$d/comm" 2>/dev/null)" = space-nodemgr-s ] && pids="$pids ${d#/proc/}"
+done
+set -- $pids
+[ "$#" -eq 1 ] || { echo "expected one node-manager, found [$pids]" >&2; exit 3; }
+kill -STOP "$1"
+"""
+_RELEASE_NODE_MANAGER_SCRIPT = r"""set -eu
+for d in /proc/[0-9]*; do
+  [ "$(cat "$d/comm" 2>/dev/null)" = space-nodemgr-s ] && kill -CONT "${d#/proc/}"
+done
+true
+"""
+# Kills only the process the sandbox's own `fc.pid` link names, and only if it
+# is Firecracker.
+_KILL_SANDBOX_RUNTIME_SCRIPT = r"""set -eu
+target="$(readlink /space/run/firecracker/sandboxes/__SANDBOX__/fc.pid)"
+pid="${target#/proc/}"
+case "$pid" in ''|*[!0-9]*) echo "fc.pid isn't a /proc link: $target" >&2; exit 3 ;; esac
+exe="$(basename "$(readlink "/proc/$pid/exe")")"
+[ "$exe" = firecracker ] || { echo "pid $pid is $exe, not firecracker" >&2; exit 4; }
+ppid="$(awk '/^PPid/{print $2}' "/proc/$pid/status")"
+echo "pid=$pid parent=$ppid:$(cat "/proc/$ppid/comm" 2>/dev/null)"
+kill -KILL "$pid"
+# Wait for the process to be reaped: until then `/proc/$pid` exists and the
+# sandbox's `fc.pid` link still resolves, which reads as a live runtime.
+for i in $(seq 100); do
+  [ -e "/proc/$pid" ] || { echo "reaped_after_ms=$((i * 100))"; exit 0; }
+  sleep 0.1
+done
+echo "not reaped after 10s, state $(awk '/^State/{print $2}' "/proc/$pid/status" 2>/dev/null)" >&2
+exit 5
 """
 
 _SANDBOX_MANAGER_ROW_STATES = (

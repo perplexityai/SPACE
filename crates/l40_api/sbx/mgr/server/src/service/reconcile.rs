@@ -548,6 +548,7 @@ impl SandboxManagerService {
                         sandbox_id: sandbox.id.clone(),
                         template_filter: None,
                         blocking: true,
+                        discard_retained_filesystem_reason: None,
                     }),
                     Some(
                         crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation {

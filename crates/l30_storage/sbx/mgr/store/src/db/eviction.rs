@@ -299,17 +299,45 @@ pub fn claim_failed_restoring_sandbox_for_eviction(
     Ok(changed == 1)
 }
 
+/// What [`claim_quarantined_sandbox_for_eviction`] did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuarantinedEvictionClaim {
+    /// The row is `deleting`; its `DeleteRow` cleanup erases it.
+    Claimed,
+    /// The row isn't `quarantined` at the version the eviction read.
+    Moved,
+    /// The shared retention policy holds the row
+    /// ([`SandboxEraseSafety::RetainedFilesystemOnlyCopy`]): its retained
+    /// filesystem may be the sandbox's only copy, so only an operator's
+    /// discard delete erases it. Nothing was written.
+    RetainedFilesystemOnlyCopy,
+}
+
 /// Claim quarantined local state after an authoritative cluster-deleted report.
 /// The caller checks platform ownership, pool exclusion, quiescence and holds
 /// the cleanup fence and staging lock. Re-checking the row version and state
 /// keeps a recovery that advanced the sandbox from losing its local resources.
 /// Artifact pins remain until the normal DeleteRow cleanup removes all children.
+///
+/// A cluster delete can reach the node without its node-local delete, which
+/// is what refuses a row the retention policy holds, so the claim applies the
+/// same erase-safety classification itself, in its own transaction, and
+/// refuses such a row.
 pub fn claim_quarantined_sandbox_for_eviction(
     conn: &Connection,
     id: &str,
     expected_updated_at: &str,
-) -> Result<bool> {
+) -> Result<QuarantinedEvictionClaim> {
     let tx = immediate_transaction(conn)?;
+    if get_sandbox(&tx, id)?.is_some_and(|row| {
+        matches!(
+            row.erase_safety(),
+            SandboxEraseSafety::RetainedFilesystemOnlyCopy
+        )
+    }) {
+        tx.commit()?;
+        return Ok(QuarantinedEvictionClaim::RetainedFilesystemOnlyCopy);
+    }
     let changed = tx.execute(
         "UPDATE sandboxes
          SET state = 'deleting', state_changed_at = ?1, updated_at = ?1
@@ -320,7 +348,11 @@ pub fn claim_quarantined_sandbox_for_eviction(
         teardown_jobs::fail_active(&tx, id, TeardownSuspendFailure::Deleting)?;
     }
     tx.commit()?;
-    Ok(changed == 1)
+    Ok(if changed == 1 {
+        QuarantinedEvictionClaim::Claimed
+    } else {
+        QuarantinedEvictionClaim::Moved
+    })
 }
 
 /// Reclaim retained stopped bytes only after an authoritative cluster deletion.

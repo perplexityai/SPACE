@@ -197,6 +197,7 @@ impl TemplateManagerService {
                             sandbox_id: sbx.sandbox_id.clone(),
                             template_filter: None,
                             blocking: true,
+                            discard_retained_filesystem_reason: None,
                         })
                         .await;
                     deleted_sandbox_ids.push(sbx.sandbox_id);

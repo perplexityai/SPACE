@@ -362,8 +362,8 @@ the Kind services with no crate's `test-hooks` feature enabled:
 - **Charts.** The Tiltfile renders every chart with `rustBuild=release`,
   which drops each hook the charts otherwise set on every
   run: sandbox-manager's `SPACE_SBX_GC_TARGET_FRACTION`,
-  `SPACE_SBX_GC_INTERVAL_SECS`, `SPACE_SBX_GC_GRACE_SECS` and
-  `SPACE_SBX_GC_IDLE_SECS`, template-manager's `SPACE_TEMPLATE_GC_INTERVAL_SECS`,
+  `SPACE_SBX_GC_INTERVAL_SECS`, `SPACE_SBX_GC_GRACE_SECS`,
+  `SPACE_SBX_GC_IDLE_SECS` and `SPACE_SBX_DISCARD_ATTEMPT_WINDOW_SECS`, template-manager's `SPACE_TEMPLATE_GC_INTERVAL_SECS`,
   `SPACE_TEMPLATE_GC_GRACE_SECS` and `SPACE_TEMPLATE_PREFETCH_LATEST_N`, and
   `SPACE_NODE_DISK_ADMISSION_ALLOCATION_RESERVATION_BYTES` on the services that
   admit cache allocations, the cluster-controller's `testHookEnv`, as well as

@@ -129,6 +129,22 @@ impl SandboxManagerService {
     }
 }
 
+/// What a suspend publication failure knows about this suspend's own capture
+/// when it quarantines the row. It decides only the failure reason the
+/// quarantine records, never whether or when the row quarantines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::service) enum CaptureEvidence {
+    /// Classification just found no usable capture of this suspend.
+    ClassifiedNone,
+    /// The failure keeps no capture of this suspend: it came before the
+    /// capture returned, or while the capture's staging was still set to be
+    /// discarded.
+    NoneKept,
+    /// The capture may be kept and nothing classified it since: it may be a
+    /// usable copy on disk.
+    Unclassified,
+}
+
 impl SandboxManagerService {
     pub(in crate::service) fn record_suspend_snapshot_publication_failure_after_begin(
         &self,
@@ -140,6 +156,24 @@ impl SandboxManagerService {
             sandbox_id,
             reason,
             runtime_live,
+            CaptureEvidence::Unclassified,
+        )
+    }
+
+    /// Record a failure that keeps no capture of this suspend: it came before
+    /// the capture returned, or while the capture's staging guard is armed,
+    /// so the staging is discarded on the way out.
+    pub(in crate::service) fn record_suspend_snapshot_publication_failure_without_capture(
+        &self,
+        sandbox_id: &str,
+        reason: &str,
+    ) -> SuspendSnapshotPublicationFailurePersistence {
+        let runtime_live = (self.sandbox_runtime_live)(sandbox_id);
+        self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
+            sandbox_id,
+            reason,
+            runtime_live,
+            CaptureEvidence::NoneKept,
         )
     }
 
@@ -148,6 +182,7 @@ impl SandboxManagerService {
         sandbox_id: &str,
         reason: &str,
         runtime_live: bool,
+        capture: CaptureEvidence,
     ) -> SuspendSnapshotPublicationFailurePersistence {
         if runtime_live {
             let rolled_back = {
@@ -185,11 +220,30 @@ impl SandboxManagerService {
             }
         }
 
+        // When the runtime is gone and no capture of this suspend is kept,
+        // the retained instance may hold the sandbox's only copy. That's what
+        // the failure reason then records: the shared retention policy reads
+        // it to refuse an ordinary delete and to admit an operator's discard,
+        // and the quarantine keeps the cause as its message. Any other failure
+        // records the cause, as before: its capture may be a usable copy, or,
+        // when a live runtime's rollback failed, the runtime still holds the
+        // sandbox.
         let quarantined = {
             let Ok(db) = self.db_conn() else {
                 return SuspendSnapshotPublicationFailurePersistence::PersistFailed;
             };
-            crate::db::mark_suspending_quarantined(&db, sandbox_id, reason)
+            match capture {
+                CaptureEvidence::ClassifiedNone | CaptureEvidence::NoneKept if !runtime_live => {
+                    crate::db::mark_suspending_quarantined_retaining_only_copy(
+                        &db, sandbox_id, reason,
+                    )
+                }
+                CaptureEvidence::ClassifiedNone
+                | CaptureEvidence::NoneKept
+                | CaptureEvidence::Unclassified => {
+                    crate::db::mark_suspending_quarantined(&db, sandbox_id, reason)
+                }
+            }
         };
         match quarantined {
             Ok(true) => {
@@ -395,7 +449,10 @@ impl SandboxManagerService {
         match decision {
             SuspendSnapshotPublicationDecision::RuntimeLiveWithoutUsableArtifact => {
                 self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
-                    sandbox_id, reason, true,
+                    sandbox_id,
+                    reason,
+                    true,
+                    CaptureEvidence::Unclassified,
                 );
                 SuspendSnapshotStagingDisposition::Cleanup
             }
@@ -468,7 +525,10 @@ impl SandboxManagerService {
             }
             SuspendSnapshotPublicationDecision::RuntimeGoneWithoutUsableArtifact => {
                 self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
-                    sandbox_id, reason, false,
+                    sandbox_id,
+                    reason,
+                    false,
+                    CaptureEvidence::ClassifiedNone,
                 );
                 SuspendSnapshotStagingDisposition::Cleanup
             }
@@ -531,7 +591,7 @@ impl SandboxManagerService {
                 create_started_at,
             );
             let error = format!("cannot connect to node-manager: {e}");
-            self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &error);
+            self.record_suspend_snapshot_publication_failure_without_capture(&sandbox.id, &error);
             emit_suspend_failed_event(
                 &sandbox.id,
                 &suspend_event_details,
@@ -550,7 +610,7 @@ impl SandboxManagerService {
             .await
         {
             let reason = format!("host rootfs sync failed: {e}");
-            self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+            self.record_suspend_snapshot_publication_failure_without_capture(&sandbox.id, &reason);
             crate::metrics::snapshot::create_failed(
                 create_kind,
                 create_codec,
@@ -604,7 +664,7 @@ impl SandboxManagerService {
             .await
         {
             let reason = format!("prepare local artifact directory failed: {e}");
-            self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+            self.record_suspend_snapshot_publication_failure_without_capture(&sandbox.id, &reason);
             record_artifact_stage_failure(&reason);
             return Err(Status::internal(reason));
         }
@@ -613,7 +673,7 @@ impl SandboxManagerService {
                 "create local artifact staging parent {} failed: {err}",
                 staging_parent.display()
             );
-            self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+            self.record_suspend_snapshot_publication_failure_without_capture(&sandbox.id, &reason);
             record_artifact_stage_failure(&reason);
             Status::internal(reason)
         })?;
@@ -622,7 +682,7 @@ impl SandboxManagerService {
                 "create local artifact staging directory {} failed: {err}",
                 staging_dir.display()
             );
-            self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
+            self.record_suspend_snapshot_publication_failure_without_capture(&sandbox.id, &reason);
             record_artifact_stage_failure(&reason);
             Status::internal(reason)
         })?;
@@ -651,7 +711,7 @@ impl SandboxManagerService {
                     Err(status) => {
                         let reason =
                             format!("local artifact metadata construction failed: {status}");
-                        self.record_suspend_snapshot_publication_failure_after_begin(
+                        self.record_suspend_snapshot_publication_failure_without_capture(
                             &sandbox.id,
                             &reason,
                         );
@@ -660,7 +720,7 @@ impl SandboxManagerService {
                 };
                 if let Err(error) = prepare_encrypted_capture_record(&staging_dir, &metadata) {
                     let reason = format!("record encrypted capture failed: {error}");
-                    self.record_suspend_snapshot_publication_failure_after_begin(
+                    self.record_suspend_snapshot_publication_failure_without_capture(
                         &sandbox.id,
                         &reason,
                     );
@@ -691,7 +751,7 @@ impl SandboxManagerService {
                     Err(error) => {
                         let status = encrypted_snapshot_prepare_error_status(error);
                         let reason = status.message().to_string();
-                        self.record_suspend_snapshot_publication_failure_after_begin(
+                        self.record_suspend_snapshot_publication_failure_without_capture(
                             &sandbox.id,
                             &reason,
                         );
@@ -753,10 +813,13 @@ impl SandboxManagerService {
                         staging_guard.disarm();
                     }
                 } else {
+                    // The plaintext capture's staging guard is armed, so a
+                    // failed capture keeps nothing of this suspend.
                     self.record_suspend_snapshot_publication_failure_after_begin_with_liveness(
                         &sandbox.id,
                         &reason,
                         (self.sandbox_runtime_live)(&sandbox.id),
+                        CaptureEvidence::NoneKept,
                     );
                 }
                 crate::metrics::snapshot::create_failed(
@@ -924,7 +987,7 @@ impl SandboxManagerService {
                         // If the runtime is still present, leave the caller
                         // a paused sandbox it can retry with `format=full`.
                         let reason = format!("btrfs-send encode failed: {status}");
-                        self.record_suspend_snapshot_publication_failure_after_begin(
+                        self.record_suspend_snapshot_publication_failure_without_capture(
                             &sandbox.id,
                             &reason,
                         );
@@ -985,7 +1048,7 @@ impl SandboxManagerService {
                     Err(status) => {
                         let reason =
                             format!("local artifact metadata construction failed: {status}");
-                        self.record_suspend_snapshot_publication_failure_after_begin(
+                        self.record_suspend_snapshot_publication_failure_without_capture(
                             &sandbox.id,
                             &reason,
                         );
@@ -999,7 +1062,7 @@ impl SandboxManagerService {
                     retained_rootfs_bytes,
                 ) {
                     let reason = format!("local artifact metadata creation failed: {error}");
-                    self.record_suspend_snapshot_publication_failure_after_begin(
+                    self.record_suspend_snapshot_publication_failure_without_capture(
                         &sandbox.id,
                         &reason,
                     );

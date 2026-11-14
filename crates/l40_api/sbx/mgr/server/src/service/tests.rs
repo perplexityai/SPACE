@@ -7507,7 +7507,7 @@ pub(crate) mod service_tests {
         request
     }
 
-    fn insert_platform_owned_sandbox(
+    pub(crate) fn insert_platform_owned_sandbox(
         conn: &crate::db::Connection,
         id: &str,
         state: SandboxState,
@@ -8257,19 +8257,28 @@ pub(crate) mod service_tests {
             .unwrap()
             .unwrap()
             .updated_at;
-        assert!(!crate::db::claim_quarantined_sandbox_for_eviction(&conn, &id, "0").unwrap());
+        assert_eq!(
+            crate::db::claim_quarantined_sandbox_for_eviction(&conn, &id, "0").unwrap(),
+            crate::db::QuarantinedEvictionClaim::Moved
+        );
         conn.execute(
             "UPDATE sandboxes SET state = 'suspended' WHERE id = ?1",
             [&id],
         )
         .unwrap();
-        assert!(!crate::db::claim_quarantined_sandbox_for_eviction(&conn, &id, &version).unwrap());
+        assert_eq!(
+            crate::db::claim_quarantined_sandbox_for_eviction(&conn, &id, &version).unwrap(),
+            crate::db::QuarantinedEvictionClaim::Moved
+        );
         conn.execute(
             "UPDATE sandboxes SET state = 'quarantined' WHERE id = ?1",
             [&id],
         )
         .unwrap();
-        assert!(crate::db::claim_quarantined_sandbox_for_eviction(&conn, &id, &version).unwrap());
+        assert_eq!(
+            crate::db::claim_quarantined_sandbox_for_eviction(&conn, &id, &version).unwrap(),
+            crate::db::QuarantinedEvictionClaim::Claimed
+        );
         assert_eq!(
             crate::db::get_sandbox(&conn, &id).unwrap().unwrap().state,
             SandboxStatus::from(SandboxState::Deleting)
@@ -11539,6 +11548,7 @@ pub(crate) mod service_tests {
 
         let error = service
             .delete(internal_request(DeleteRequest {
+                discard_retained_filesystem_reason: None,
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: false,
@@ -11580,6 +11590,7 @@ pub(crate) mod service_tests {
 
         let error = service
             .delete(internal_request(DeleteRequest {
+                discard_retained_filesystem_reason: None,
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: false,
@@ -11658,6 +11669,7 @@ pub(crate) mod service_tests {
 
         let error = service
             .delete(internal_request(DeleteRequest {
+                discard_retained_filesystem_reason: None,
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: false,
@@ -11689,6 +11701,7 @@ pub(crate) mod service_tests {
 
         let response = service
             .delete(internal_request(DeleteRequest {
+                discard_retained_filesystem_reason: None,
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: false,
@@ -11716,6 +11729,7 @@ pub(crate) mod service_tests {
         let delete = tokio::spawn(async move {
             delete_service
                 .delete(internal_request(DeleteRequest {
+                    discard_retained_filesystem_reason: None,
                     sandbox_id: delete_id,
                     template_filter: None,
                     blocking: false,
@@ -11816,6 +11830,7 @@ pub(crate) mod service_tests {
                 let code = if delete {
                     service
                         .delete(internal_request(DeleteRequest {
+                            discard_retained_filesystem_reason: None,
                             sandbox_id: selector.to_string(),
                             template_filter: Some("seed".to_string()),
                             blocking: false,
@@ -13989,6 +14004,122 @@ pub(crate) mod service_tests {
         );
     }
 
+    /// A suspend that fails with its runtime gone and keeps no capture of its
+    /// own (the failure came before the capture returned, or discarded its
+    /// staging) records the only-copy failure reason, so the shared retention
+    /// policy refuses an ordinary delete. A failure that may keep a usable
+    /// capture records its cause. Both quarantine at the same moment: the
+    /// evidence decides only the reason.
+    #[tokio::test]
+    async fn a_failure_that_keeps_no_capture_holds_the_only_copy() {
+        for keeps_none in [true, false] {
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new().to_string();
+            insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
+            let service = service_with_runtime_probe(conn, false);
+            let cause = "snapshot failed: firecracker exited";
+            if keeps_none {
+                service.record_suspend_snapshot_publication_failure_without_capture(
+                    &sandbox_id,
+                    cause,
+                );
+            } else {
+                service.record_suspend_snapshot_publication_failure_after_begin(&sandbox_id, cause);
+            }
+
+            let db = service.db.lock().expect("mutex poisoned");
+            let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
+            assert_eq!(
+                row.state,
+                SandboxStatus::from(SandboxState::Quarantined),
+                "{keeps_none}"
+            );
+            let (reason, safety) = if keeps_none {
+                (
+                    crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE,
+                    crate::db::SandboxEraseSafety::RetainedFilesystemOnlyCopy,
+                )
+            } else {
+                (cause, crate::db::SandboxEraseSafety::Safe)
+            };
+            assert_eq!(row.failure_reason.as_deref(), Some(reason), "{keeps_none}");
+            assert_eq!(row.erase_safety(), safety, "{keeps_none}");
+            if keeps_none {
+                let message: String = db
+                    .query_row(
+                        "SELECT reason_message FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
+                        [&sandbox_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(message, cause, "the quarantine keeps the cause");
+            }
+        }
+    }
+
+    /// A failure that keeps no capture while the runtime is still live, and
+    /// whose rollback to paused fails, quarantines under its cause, not the
+    /// only-copy reason: the runtime gone isn't what happened, and the live
+    /// runtime, not a retained filesystem, holds the sandbox.
+    #[tokio::test]
+    async fn a_live_runtime_whose_rollback_fails_keeps_its_cause() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
+        conn.raw()
+            .execute_batch(
+                "CREATE TRIGGER refuse_rollback BEFORE UPDATE OF state ON sandboxes
+                 WHEN NEW.state = 'paused'
+                 BEGIN SELECT RAISE(ABORT, 'injected rollback failure'); END;",
+            )
+            .unwrap();
+        let service = service_with_runtime_probe(conn, true);
+        let cause = "node-manager unreachable before the capture returned";
+        service.record_suspend_snapshot_publication_failure_without_capture(&sandbox_id, cause);
+
+        let db = service.db.lock().expect("mutex poisoned");
+        let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
+        assert_eq!(row.state, SandboxStatus::from(SandboxState::Quarantined));
+        assert_eq!(row.failure_reason.as_deref(), Some(cause));
+        assert_eq!(row.erase_safety(), crate::db::SandboxEraseSafety::Safe);
+    }
+
+    /// A plaintext suspend whose publication fails with its runtime gone and
+    /// whose classification finds no capture of its admitted attempt
+    /// quarantines, as before, under the only-copy failure reason.
+    #[tokio::test]
+    async fn a_classified_missing_capture_holds_the_only_copy() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
+        let attempt = LocalArtifactId::new();
+        assert!(crate::db::begin_suspend(&conn, &sandbox_id, attempt).unwrap());
+        let cache = tempfile::tempdir().unwrap();
+        let sandbox_dir = cache.path().join(&sandbox_id);
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        let staging = suspend_snapshot_staging_dir(&sandbox_dir, attempt);
+        let service = service_with_runtime_probe(conn, false);
+        service.record_suspend_snapshot_publication_failure_after_staging(
+            &sandbox_id,
+            &sandbox_dir,
+            &staging,
+            "local artifact publication failed: disk full",
+            &Default::default(),
+        );
+
+        let db = service.db.lock().expect("mutex poisoned");
+        let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
+        assert_eq!(row.state, SandboxStatus::from(SandboxState::Quarantined));
+        assert_eq!(
+            row.failure_reason.as_deref(),
+            Some(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
+        );
+        assert_eq!(
+            row.erase_safety(),
+            crate::db::SandboxEraseSafety::RetainedFilesystemOnlyCopy
+        );
+    }
+
     #[tokio::test]
     async fn suspend_snapshot_publication_failure_quarantines_when_runtime_is_gone() {
         let conn = crate::db::test_conn();
@@ -14696,6 +14827,7 @@ pub(crate) mod service_tests {
                 &rpc_service,
                 "/space.sandbox.manager.v1.SandboxManager/Delete",
                 internal_request(DeleteRequest {
+                    discard_retained_filesystem_reason: None,
                     sandbox_id: rpc_sandbox_id,
                     template_filter: None,
                     blocking: true,

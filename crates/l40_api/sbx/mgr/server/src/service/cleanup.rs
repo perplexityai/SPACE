@@ -111,6 +111,15 @@ pub(super) enum CleanupAdmissionError {
     RetainedFilesystemOnlyCopy {
         sandbox_id: SandboxId,
     },
+    DiscardNotApplicable {
+        sandbox_id: SandboxId,
+    },
+    /// A capture of this sandbox may still be finishing, so a discard could
+    /// race it: `reason` says which evidence is still open.
+    DiscardCaptureUnfinished {
+        sandbox_id: SandboxId,
+        reason: &'static str,
+    },
     Status(Status),
 }
 
@@ -158,6 +167,18 @@ impl CleanupAdmissionError {
             Self::RetainedFilesystemOnlyCopy { sandbox_id } => {
                 pplx_space_sbx_mgr_client::retained_filesystem_only_copy_status(format!(
                     "sandbox {sandbox_id} has no published suspend artifact; its retained filesystem may be the only copy; recover it before retrying the delete"
+                ))
+            }
+            Self::DiscardNotApplicable { sandbox_id } => Status::failed_precondition(format!(
+                "sandbox {sandbox_id}'s retained filesystem isn't held as its only copy; a discard \
+                 delete applies only to a row quarantined or failed with {} or {}",
+                crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE,
+                crate::db::SUSPEND_CAPTURE_UNRESOLVED
+            )),
+            Self::DiscardCaptureUnfinished { sandbox_id, reason } => {
+                Status::failed_precondition(format!(
+                    "sandbox {sandbox_id}'s capture may still be finishing ({reason}); a discard \
+                     delete waits until it can't race it"
                 ))
             }
             Self::Status(status) => status,
@@ -443,6 +464,10 @@ struct CleanupAdmissionSpec {
     persist_intent: bool,
     immediate_kill: bool,
     guest_flush: crate::db::cleanup_jobs::GuestFlush,
+    /// An operator's discard delete: admitted only for a row whose retained
+    /// filesystem may be its only copy, which every other delete refuses,
+    /// and refused for every other row.
+    discard_retained_filesystem: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -857,6 +882,7 @@ impl SandboxManagerService {
                 completion: CleanupCompletion::MarkStopped,
                 immediate_kill: true,
                 guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+                discard_retained_filesystem: false,
                 persist_intent: true,
             }, fence)?;
             service.ensure_cleanup_executor();
@@ -884,6 +910,7 @@ impl SandboxManagerService {
                 completion: claim.completion,
                 immediate_kill: Self::cleanup_immediate_kill(claim.completion),
                 guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+                discard_retained_filesystem: false,
                 persist_intent: claim.persist_intent,
             },
         )
@@ -921,6 +948,7 @@ impl SandboxManagerService {
                 completion: CleanupCompletion::MarkStopped,
                 immediate_kill: false,
                 guest_flush: crate::db::cleanup_jobs::GuestFlush::BeforeTermination,
+                discard_retained_filesystem: false,
                 persist_intent: false,
             },
         )
@@ -955,6 +983,7 @@ impl SandboxManagerService {
                 completion,
                 immediate_kill: Self::cleanup_immediate_kill(completion),
                 guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+                discard_retained_filesystem: false,
                 persist_intent,
             },
         )
@@ -977,6 +1006,7 @@ impl SandboxManagerService {
                 completion: CleanupCompletion::DeleteRow,
                 immediate_kill: false,
                 guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+                discard_retained_filesystem: false,
                 persist_intent: true,
             },
         )
@@ -1056,6 +1086,77 @@ impl SandboxManagerService {
                 persist_intent,
                 immediate_kill,
                 guest_flush,
+                discard_retained_filesystem: false,
+            },
+        )
+        .await
+    }
+
+    /// Why a capture of this retained sandbox may still be finishing, if it
+    /// may: its suspend attempt is inside the recovery window in which a
+    /// capture can still converge, a backup upload of its artifacts is
+    /// pending, running or cancelling, or its runtime is live or can't be read
+    /// to be gone. Past the window an unresolved receipt doesn't block: that
+    /// is the evidence the retention policy keeps for this operator recovery.
+    fn discard_capture_unfinished(
+        &self,
+        conn: &crate::db::Connection,
+        sandbox_id: &str,
+    ) -> Result<Option<&'static str>, Status> {
+        let read_error = |error: crate::db::Error| {
+            Status::internal(format!(
+                "inspect capture evidence during discard admission failed: {error}"
+            ))
+        };
+        if crate::db::read::suspend_attempt(conn, sandbox_id)
+            .map_err(read_error)?
+            .is_some_and(|attempt| {
+                crate::service::retained_filesystem_discard::attempt_inside_window(
+                    attempt.started_at,
+                    jiff::Timestamp::now().as_second(),
+                    crate::service::retained_filesystem_discard::discard_attempt_window(),
+                )
+            })
+        {
+            return Ok(Some("its suspend attempt is inside its recovery window"));
+        }
+        if crate::db::read::snapshot_upload_in_flight(conn, sandbox_id).map_err(read_error)? {
+            return Ok(Some("a backup upload of its artifacts is in flight"));
+        }
+        // The fallible probe: an unreadable runtime path isn't a confirmed exit.
+        Ok(match self.capture_runtime_observation(sandbox_id) {
+            crate::service::suspend_snapshot_publication::RuntimeObservation::Gone => None,
+            crate::service::suspend_snapshot_publication::RuntimeObservation::Live => {
+                Some("its runtime is live")
+            }
+            crate::service::suspend_snapshot_publication::RuntimeObservation::Unknown => {
+                Some("its runtime's liveness can't be read")
+            }
+        })
+    }
+
+    /// Admit an operator's discard delete of `sandbox_id`: the delete
+    /// [`Self::admit_selected_cleanup`] admits, except that it proceeds only
+    /// for a row whose retained filesystem may be its only copy and refuses
+    /// every other row with [`CleanupAdmissionError::DiscardNotApplicable`].
+    pub(super) async fn admit_retained_filesystem_discard(
+        &self,
+        sandbox_id: SandboxId,
+        persist_intent: bool,
+    ) -> Result<CleanupAdmission, CleanupAdmissionError> {
+        self.admit_lifecycle_cleanup_inner(
+            sandbox_id,
+            CleanupAdmissionSpec {
+                mode: CleanupAdmissionMode::Unfenced,
+                template_filter: None,
+                require_template_owner: false,
+                target_state: SandboxState::Deleting,
+                keep_filesystem: false,
+                completion: CleanupCompletion::DeleteRow,
+                persist_intent,
+                immediate_kill: false,
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+                discard_retained_filesystem: true,
             },
         )
         .await
@@ -1074,6 +1175,28 @@ impl SandboxManagerService {
         )
         .lock_owned()
         .await;
+        // A backup being admitted (`enqueue_artifact_backup`) holds the
+        // artifact lock from reading the row until its upload job is
+        // persisted, and the discard's upload check sees only a persisted job.
+        // So a discard is admitted under that lock too, taken after the fence
+        // and without waiting, as eviction takes it: a backup holding it
+        // refuses the discard, and one that waits for it finds the row
+        // `deleting` and refuses itself. Never waiting keeps the order free of
+        // cycles with a cleanup's finalization, which holds the fence and
+        // waits for this lock. The guard moves into the admission task with
+        // the fence, so a cancelled caller can't release it before the claim
+        // commits, and it's dropped before the cleanup runs.
+        let artifact_guard = if spec.discard_retained_filesystem {
+            let Ok(guard) = self.auto_lifecycle.artifact_lock(&id).try_lock_owned() else {
+                return Err(CleanupAdmissionError::DiscardCaptureUnfinished {
+                    sandbox_id,
+                    reason: "its artifacts are locked, as by a backup being admitted",
+                });
+            };
+            Some(guard)
+        } else {
+            None
+        };
         let permit = Arc::clone(&self.cleanup_io)
             .acquire_owned()
             .await
@@ -1085,6 +1208,7 @@ impl SandboxManagerService {
         let result = tokio::task::spawn_blocking(move || {
             let _entered = span.enter();
             let _permit = permit;
+            let _artifact = artifact_guard;
             let _writer = service.state_writer_lease("CleanupAdmission")?;
             // Ownership travels with the transaction if its caller disappears.
             let result = service.admit_lifecycle_cleanup_fenced(sandbox_id, spec, fence);
@@ -1125,15 +1249,22 @@ impl SandboxManagerService {
             persist_intent,
             immediate_kill,
             guest_flush,
+            discard_retained_filesystem,
         } = spec;
         // Fenced callers depend on readable generation lineage. Auto-lifecycle
         // deletion requires the lifecycle claim and intent write to be atomic;
         // observed-generation cleanup retains its best-effort local cleanup
         // fallback when those writes fail.
         let require_selection_check = template_filter.is_some() || require_template_owner;
-        let require_generation_inspection =
-            mode.requires_generation_inspection() || require_selection_check;
-        let require_atomic_admission = mode.requires_atomic_admission() || require_selection_check;
+        // A discard must reach the erase-safety check below or do nothing, so
+        // a persistence failure refuses it instead of admitting best-effort
+        // cleanup.
+        let require_generation_inspection = mode.requires_generation_inspection()
+            || require_selection_check
+            || discard_retained_filesystem;
+        let require_atomic_admission = mode.requires_atomic_admission()
+            || require_selection_check
+            || discard_retained_filesystem;
         let sandbox_id_string = sandbox_id.to_string();
         let db = self
             .db
@@ -1240,26 +1371,53 @@ impl SandboxManagerService {
                     ))
                 })?
                 .map(|row| (row.state, row.erase_safety()));
-            match erase_safety {
-                Some((state, crate::db::SandboxEraseSafety::SuspendPublicationPending)) => {
-                    tracing::info!(
-                        sandbox_id = %sandbox_id,
-                        state = %state,
-                        "deferring delete: suspend state awaits publication to the cluster"
-                    );
-                    return Err(CleanupAdmissionError::SuspendPublicationPending {
+            if discard_retained_filesystem {
+                // A discard is the one delete that may erase a retained only
+                // copy, and it erases nothing else.
+                if !matches!(
+                    erase_safety,
+                    Some((_, crate::db::SandboxEraseSafety::RetainedFilesystemOnlyCopy))
+                ) {
+                    return Err(CleanupAdmissionError::DiscardNotApplicable { sandbox_id });
+                }
+                // Nor may it race a capture that can still finish. The window
+                // and upload reads run in the admission transaction under the
+                // cleanup lock, and a retained row can't begin a new suspend or
+                // upload, so neither reopens once closed. The runtime probe
+                // reads the host, not the database; it refuses unless the
+                // runtime is confirmed gone.
+                if let Some(reason) =
+                    self.discard_capture_unfinished(&transaction, &sandbox_id_string)?
+                {
+                    return Err(CleanupAdmissionError::DiscardCaptureUnfinished {
                         sandbox_id,
-                        state,
+                        reason,
                     });
                 }
-                Some((_, crate::db::SandboxEraseSafety::RetainedFilesystemOnlyCopy)) => {
-                    tracing::warn!(
-                        sandbox_id = %sandbox_id,
-                        "deferring delete: failed suspend filesystem may be the only copy"
-                    );
-                    return Err(CleanupAdmissionError::RetainedFilesystemOnlyCopy { sandbox_id });
+            } else {
+                match erase_safety {
+                    Some((state, crate::db::SandboxEraseSafety::SuspendPublicationPending)) => {
+                        tracing::info!(
+                            sandbox_id = %sandbox_id,
+                            state = %state,
+                            "deferring delete: suspend state awaits publication to the cluster"
+                        );
+                        return Err(CleanupAdmissionError::SuspendPublicationPending {
+                            sandbox_id,
+                            state,
+                        });
+                    }
+                    Some((_, crate::db::SandboxEraseSafety::RetainedFilesystemOnlyCopy)) => {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id,
+                            "deferring delete: failed suspend filesystem may be the only copy"
+                        );
+                        return Err(CleanupAdmissionError::RetainedFilesystemOnlyCopy {
+                            sandbox_id,
+                        });
+                    }
+                    Some((_, crate::db::SandboxEraseSafety::Safe)) | None => {}
                 }
-                Some((_, crate::db::SandboxEraseSafety::Safe)) | None => {}
             }
         }
         let current_execution_generation =

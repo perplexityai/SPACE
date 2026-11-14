@@ -10354,6 +10354,7 @@ fn teardown_suspend_reconciliation_skips_healthy_and_retained_jobs_and_bounds_cl
 mod accepted_shapes_cleanup_episodes;
 mod accepted_shapes_quarantine;
 mod accepted_shapes_single_statement;
+mod cleanup_delete_receipt;
 mod cleanup_quarantine_refusal;
 mod cleanup_state_split;
 mod local_network_policy_clear;
