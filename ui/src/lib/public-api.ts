@@ -35,8 +35,9 @@ export function idempotencyKey(): string {
 }
 
 export async function getPublicPage<T>(path: string): Promise<T[]> {
-  const [pathname, query] = path.split('?', 2);
-  const params = new URLSearchParams(query);
+  const queryStart = path.indexOf('?');
+  const pathname = queryStart < 0 ? path : path.slice(0, queryStart);
+  const params = new URLSearchParams(queryStart < 0 ? '' : path.slice(queryStart + 1));
   if (!params.has('limit') || Number(params.get('limit')) > PUBLIC_LIST_PAGE_SIZE) {
     params.set('limit', String(PUBLIC_LIST_PAGE_SIZE));
   }

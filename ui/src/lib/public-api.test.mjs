@@ -28,6 +28,7 @@ hook.deregister();
 for (const [initialPath, firstPath, continuationPath] of [
   ['/templates?limit=2&cursor=start', '/templates?limit=2&cursor=start', '/templates?limit=2&cursor=next%2F%2B%3D'],
   ['/templates?limit=100000&cursor=start', '/templates?limit=1000&cursor=start', '/templates?limit=1000&cursor=next%2F%2B%3D'],
+  ['/templates?limit=2&label=a?b', '/templates?limit=2&label=a%3Fb', '/templates?limit=2&label=a%3Fb&cursor=next%2F%2B%3D'],
   ['/sandboxes/sbx_example/snapshots', '/sandboxes/sbx_example/snapshots?limit=1000', '/sandboxes/sbx_example/snapshots?limit=1000&cursor=next%2F%2B%3D'],
 ]) {
   test(`lists every page of ${initialPath}`, async (t) => {
