@@ -1279,7 +1279,12 @@ impl NodeManagerService {
             let sandbox = super::trusted_paths::open_directory(Path::new(&format!(
                 "{CACHE_DIR}/{sandbox_id}"
             )))?;
-            restore_instance_snapshot_in(&sandbox, &snapshot_name, gids::SPACE_CACHE_RW)?;
+            restore_instance_snapshot_in(
+                &sandbox,
+                &snapshot_name,
+                gids::SPACE_CACHE_RW,
+                super::artifact_fs::DiskState::Rootfs,
+            )?;
             let snapshots =
                 super::artifact_fs::directory(&sandbox, BTRFS_SNAPSHOTS_DIR_NAME.as_ref())
                     .map_err(super::artifact_fs::error)?;
@@ -1366,7 +1371,14 @@ impl NodeManagerService {
             let sandbox = super::trusted_paths::open_directory(Path::new(&format!(
                 "{CACHE_DIR}/{sandbox_id}"
             )))?;
-            restore_instance_snapshot_in(&sandbox, &snapshot_name, gids::SPACE_CACHE_RW)?;
+            // An upgrade's preserved copy of a staged encrypted checkpoint holds
+            // only its COW.
+            restore_instance_snapshot_in(
+                &sandbox,
+                &snapshot_name,
+                gids::SPACE_CACHE_RW,
+                super::artifact_fs::DiskState::RootfsOrCow,
+            )?;
             Ok(Response::new(RestoreInstanceSnapshotResponse {}))
         })
         .await
@@ -1408,12 +1420,13 @@ fn restore_instance_snapshot_in(
     sandbox: &std::fs::File,
     snapshot_name: &str,
     gid: u32,
+    accepted: super::artifact_fs::DiskState,
 ) -> Result<(), Status> {
     let snapshots = super::artifact_fs::directory(sandbox, BTRFS_SNAPSHOTS_DIR_NAME.as_ref())
         .map_err(super::artifact_fs::error)?;
     let source = super::artifact_fs::directory(&snapshots, snapshot_name.as_ref())
         .map_err(super::artifact_fs::error)?;
-    super::artifact_fs::rollback(sandbox, &source, gid)
+    super::artifact_fs::rollback(sandbox, &source, gid, accepted)
 }
 
 /// Try `btrfs subvolume delete` first, fall back to

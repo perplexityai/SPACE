@@ -16,8 +16,9 @@
 //! checkpoint's ready backup was captured by a later execution than the
 //! copy's. Without a capture generation on both backups nothing orders them,
 //! and the copy is refused, as every copy pinning another checkpoint was
-//! before replacement existed. An encrypted copy is left too, since an
-//! encrypted checkpoint staged here can't be cold-booted.
+//! before replacement existed. An encrypted copy is replaced the same way:
+//! the upgrade finishes the staged checkpoint's disk for its cold boot
+//! ([`super::staged_disk`]).
 
 use pplx_space_common_core::types::LocalArtifactId;
 use tonic::Status;
@@ -50,8 +51,8 @@ impl crate::service::SandboxManagerService {
     ///
     /// A copy that isn't replaced is refused before any node work:
     /// `FailedPrecondition` when nothing proves it backed, when nothing shows
-    /// the decided checkpoint was captured after it, when it's encrypted, or
-    /// when the sandbox holds a user snapshot no local artifact records,
+    /// the decided checkpoint was captured after it, or when the sandbox
+    /// holds a user snapshot no local artifact records,
     /// and `Unavailable` when the proof couldn't be had or another upgrade
     /// still owns the copy. So is a request whose stage would be refused for
     /// its form or route identity, and a retry of an activation the row
@@ -114,13 +115,6 @@ impl crate::service::SandboxManagerService {
             // loop finishes it.
             super::refuse_runtime_upgrade_fence_in(&db, sandbox_id)?;
             super::refuse_unretired_runtime_upgrade_in(&db, sandbox_id)?;
-            if sandbox.volume_encryption {
-                return Err(Status::failed_precondition(format!(
-                    "sandbox {sandbox_id}'s checkpoint on this node isn't the one its runtime \
-                     upgrade was decided from, and an encrypted checkpoint staged in its place \
-                     can't be cold-booted; refusing to replace it"
-                )));
-            }
             let evidence = crate::sandbox_eviction::gather_local_evidence(&db, sandbox_id)
                 .map_err(|error| {
                     Status::unavailable(format!(

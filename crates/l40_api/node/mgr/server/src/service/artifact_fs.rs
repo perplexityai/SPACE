@@ -177,18 +177,61 @@ pub(super) fn is_subvolume(path: &Path) -> Result<bool, Status> {
     btrfs::is_subvolume(&trusted_paths::open_directory(path)?).map_err(error)
 }
 
+/// What a rollback source must hold to replace an instance's disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DiskState {
+    /// A non-empty `rootfs.ext4`.
+    Rootfs,
+    /// A non-empty `rootfs.ext4`, or no rootfs and a non-empty encrypted COW:
+    /// an encrypted instance whose read-only origin is the template clone a
+    /// start makes when absent. A runtime upgrade preserves such an instance
+    /// for a checkpoint staged from its backup, whose guest writes are all in
+    /// the COW.
+    RootfsOrCow,
+}
+
+fn require_disk_state(dir: &File, what: &str, accepted: DiskState) -> Result<(), Status> {
+    let non_empty = |name: &str| -> Result<Option<bool>, Status> {
+        match nix::sys::stat::fstatat(dir, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Err(nix::errno::Errno::ENOENT) => Ok(None),
+            Err(errno) => Err(error(std::io::Error::from(errno))),
+            Ok(_) => Ok(Some(
+                trusted_paths::open_regular_file(dir, name.as_ref())?
+                    .metadata()
+                    .map_err(error)?
+                    .len()
+                    > 0,
+            )),
+        }
+    };
+    match non_empty("rootfs.ext4")? {
+        Some(true) => Ok(()),
+        Some(false) => Err(Status::failed_precondition(format!(
+            "cannot restore disk state: {what} rootfs.ext4 is empty; re-export with include_rootfs=true"
+        ))),
+        None if accepted == DiskState::RootfsOrCow
+            && non_empty(super::encrypted_volumes::ROOTFS_COW_FILE)? == Some(true) =>
+        {
+            Ok(())
+        }
+        None => Err(Status::failed_precondition(format!(
+            "cannot restore disk state: {what} has no rootfs.ext4"
+        ))),
+    }
+}
+
 /// A retry may discard the staging sibling: before exchange it is an
 /// incomplete replacement; afterwards it is the superseded instance. The
 /// canonical instance is never removed before a complete replacement exists.
-pub(super) fn rollback(parent: &File, source: &File, gid: u32) -> Result<(), Status> {
+pub(super) fn rollback(
+    parent: &File,
+    source: &File,
+    gid: u32,
+    accepted: DiskState,
+) -> Result<(), Status> {
     // Full memory-only snapshots cannot replace an instance's disk. Preserve
     // the completeness check for subvolumes as well as ordinary directories.
-    let rootfs = trusted_paths::open_regular_file(source, "rootfs.ext4".as_ref())?;
-    if rootfs.metadata().map_err(error)?.len() == 0 {
-        return Err(Status::failed_precondition(
-            "cannot restore disk state: rootfs.ext4 is empty; re-export with include_rootfs=true",
-        ));
-    }
+    require_disk_state(source, "the snapshot", accepted)?;
     let staging = OsStr::new(".instance-rollback");
     remove_at(parent, staging)?;
     if btrfs::is_subvolume(source).map_err(error)? {
@@ -208,10 +251,7 @@ pub(super) fn rollback(parent: &File, source: &File, gid: u32) -> Result<(), Sta
         stage.sync_all().map_err(error)?;
     }
     let stage = directory(parent, staging).map_err(error)?;
-    let rootfs = trusted_paths::open_regular_file(&stage, "rootfs.ext4".as_ref())?;
-    if rootfs.metadata().map_err(error)?.len() == 0 {
-        return Err(Status::failed_precondition("staged rootfs.ext4 is empty"));
-    }
+    require_disk_state(&stage, "the staged copy", accepted)?;
     // Keep normal cache permissions after publication, including setgid.
     trusted_paths::set_permissions(&stage, Some(gid), 0o2770)?;
     match directory(parent, "instance".as_ref()) {

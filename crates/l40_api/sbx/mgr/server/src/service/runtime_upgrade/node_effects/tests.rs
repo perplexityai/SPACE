@@ -113,6 +113,11 @@ impl Fixture {
         self.service.lookup_sandbox(&self.sandbox_id).unwrap()
     }
 
+    /// The sandbox's cache directory.
+    pub(in crate::service::runtime_upgrade) fn dir(&self) -> PathBuf {
+        self.cache.join(&self.sandbox_id)
+    }
+
     pub(in crate::service::runtime_upgrade) fn checkpoint(&self) -> PathBuf {
         self.cache.join(&self.sandbox_id).join("snapshot")
     }
@@ -246,6 +251,77 @@ async fn inspection_refuses_a_sandbox_without_its_local_disk() {
     let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("COW"), "{error}");
+}
+
+#[tokio::test]
+async fn an_encrypted_sandbox_needs_its_cow_and_a_template_digest_for_its_origin() {
+    // Its writes are all in the COW, over the template's rootfs, which the
+    // cold start clones when the instance has none, as a staged checkpoint's
+    // instance doesn't.
+    let f = fixture(SandboxState::Suspended, true, FakeNodeManager::default());
+    let set_digest = |digest: Option<&str>| {
+        f.service
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sandboxes SET template_hash = ?2 WHERE id = ?1",
+                crate::db::fixture::params![f.sandbox_id, digest],
+            )
+            .unwrap();
+    };
+    set_digest(Some(
+        "sha256:5e0f1d2c3b4a59687766554433221100ffeeddccbbaa99887766554433221100",
+    ));
+    std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4")).unwrap();
+    f.effects().inspect_local_disk(&f.row()).await.unwrap();
+
+    // One that doesn't parse names nothing either.
+    set_digest(Some("not a digest"));
+    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    assert!(error.message().contains("template digest"), "{error}");
+
+    // Without a digest, nothing names the bytes the COW was written over.
+    f.service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandboxes SET template_hash = NULL WHERE id = ?1",
+            crate::db::fixture::params![f.sandbox_id],
+        )
+        .unwrap();
+    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("template digest"), "{error}");
+
+    // An origin on disk needs no digest.
+    std::fs::write(
+        f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4"),
+        b"disk",
+    )
+    .unwrap();
+    f.effects().inspect_local_disk(&f.row()).await.unwrap();
+
+    // The COW must be a non-empty regular file, as the rollback of the
+    // preserved copy requires: not empty, and not a link to one that isn't.
+    let cow = f.cache.join(&f.sandbox_id).join("instance/cow.luks");
+    std::fs::write(&cow, b"").unwrap();
+    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(
+        error.message().contains("empty or not a regular file"),
+        "{error}"
+    );
+    let target = f.cache.join("elsewhere.luks");
+    std::fs::write(&target, b"cow").unwrap();
+    std::fs::remove_file(&cow).unwrap();
+    std::os::unix::fs::symlink(&target, &cow).unwrap();
+    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    assert!(
+        error.message().contains("empty or not a regular file"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -594,7 +670,10 @@ async fn a_stopped_sandbox_has_no_checkpoint_to_retire() {
     assert!(f.lane_garbage().is_empty());
 }
 
-fn set_execution(f: &Fixture, execution: SandboxActivationAttemptId) {
+pub(in crate::service::runtime_upgrade) fn set_execution(
+    f: &Fixture,
+    execution: SandboxActivationAttemptId,
+) {
     f.service
         .db
         .lock()

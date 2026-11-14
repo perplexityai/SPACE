@@ -801,7 +801,13 @@ fn instance_restore_replaces_only_the_instance() {
     }
     let sandbox = super::super::trusted_paths::open_directory(&root).unwrap();
 
-    restore_instance_snapshot_in(&sandbox, preserved, nix::unistd::getegid().as_raw()).unwrap();
+    restore_instance_snapshot_in(
+        &sandbox,
+        preserved,
+        nix::unistd::getegid().as_raw(),
+        crate::service::artifact_fs::DiskState::RootfsOrCow,
+    )
+    .unwrap();
 
     assert_eq!(
         std::fs::read_to_string(root.join("instance/rootfs.ext4")).unwrap(),
@@ -815,9 +821,14 @@ fn instance_restore_replaces_only_the_instance() {
         );
     }
     assert!(
-        restore_instance_snapshot_in(&sandbox, "missing", 0)
-            .unwrap_err()
-            .code()
+        restore_instance_snapshot_in(
+            &sandbox,
+            "missing",
+            0,
+            crate::service::artifact_fs::DiskState::RootfsOrCow,
+        )
+        .unwrap_err()
+        .code()
             != tonic::Code::Ok
     );
 }

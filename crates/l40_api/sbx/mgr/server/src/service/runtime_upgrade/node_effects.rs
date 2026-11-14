@@ -194,6 +194,10 @@ impl NodeRuntimeUpgradeEffects {
 
 #[tonic::async_trait]
 impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
+    async fn complete_staged_disk(&self, sandbox: &SandboxRow) -> Result<(), Status> {
+        self.service.complete_staged_upgrade_disk(sandbox).await
+    }
+
     async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Status> {
         let cache_root = self.service.cache_root();
         crate::service::create_support::repair_retained_instance_traversal(
@@ -205,10 +209,54 @@ impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
         let sandbox_dir = cache_root.join(&sandbox.id);
         let instance = sandbox_dir.join("instance");
         let rootfs = instance.join("rootfs.ext4");
-        required_file(&rootfs, "rootfs")?;
         if sandbox.volume_encryption {
-            // Without the COW the encrypted cold start has nothing to reopen.
-            required_file(&instance.join("cow.luks"), "encrypted rootfs COW")?;
+            // Without the COW the encrypted cold start has nothing to reopen,
+            // and an empty one the rollback of its preserved copy refuses
+            // after the fence, so it's refused here, before it.
+            let cow = instance.join(crate::rootfs_encryption::ROOTFS_COW_FILE);
+            match crate::rootfs_encryption::non_empty_regular_file(&cow) {
+                Ok(Some(true)) => {}
+                Ok(Some(false)) => {
+                    return Err(Status::failed_precondition(format!(
+                        "a runtime upgrade needs the sandbox's local encrypted rootfs COW; {} is \
+                         empty or not a regular file",
+                        cow.display()
+                    )));
+                }
+                Ok(None) => required_file(&cow, "encrypted rootfs COW")?,
+                Err(error) => {
+                    return Err(Status::failed_precondition(format!(
+                        "inspect {}: {error}",
+                        cow.display()
+                    )));
+                }
+            }
+            // The guest's writes are all in the COW. The rootfs is the
+            // read-only origin under it, which the cold start clones from the
+            // template when absent, as a restore staged on another node does
+            // (`template_source_for_sandbox_prepare_in`). Only the template's
+            // digest names the bytes the COW was written over.
+            if sandbox
+                .template_hash
+                .as_deref()
+                .and_then(|digest| {
+                    digest
+                        .parse::<pplx_space_content_digest::ContentHash>()
+                        .ok()
+                })
+                .is_none()
+                && !crate::rootfs_encryption::path_present(&rootfs).map_err(|error| {
+                    Status::failed_precondition(format!("inspect {}: {error}", rootfs.display()))
+                })?
+            {
+                return Err(Status::failed_precondition(format!(
+                    "a runtime upgrade needs the encrypted sandbox's rootfs origin; {} is absent \
+                     and no template digest names the bytes its COW was written over",
+                    rootfs.display()
+                )));
+            }
+        } else {
+            required_file(&rootfs, "rootfs")?;
         }
         let execution = sandbox_execution_metadata_in(cache_root, &sandbox.id)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;

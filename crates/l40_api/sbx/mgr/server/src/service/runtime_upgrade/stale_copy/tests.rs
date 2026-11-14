@@ -601,22 +601,18 @@ async fn a_copy_with_a_pending_upload_is_left_for_a_retry() {
     .await;
 }
 
-/// The upgrade refuses to replace the copy pinning `pin`, backed up as it
-/// is, saying `says`, before any node work.
-async fn assert_left_in_place(encrypted: bool, pin: &'static str, says: &str) {
-    let (f, cleanups) = stale_copy(encrypted, Some(pin));
-    let refused = f.pod_upgrade_error(operation()).await;
-    assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{refused}");
-    assert!(refused.message().contains(says), "{refused}");
-    f.assert_copy_untouched(Some(pin), &cleanups);
-}
-
-/// An encrypted copy stays, even backed up: an encrypted checkpoint staged
-/// in its place can't be cold-booted, so the upgrade would only fail later.
+/// A backed-up encrypted copy makes way for the decided checkpoint as an
+/// unencrypted one does: staging finishes the staged checkpoint's disk for
+/// the cold boot (`staged_disk`). The harness has no object store, so
+/// staging is what fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_encrypted_stale_copy_is_left_in_place() {
+async fn a_backed_up_encrypted_stale_copy_is_replaced() {
     with_cluster_api(BackupReadiness::backs(STALE), async || {
-        assert_left_in_place(true, STALE, "encrypted checkpoint").await;
+        let (f, cleanups) = stale_copy(true, Some(STALE));
+        let error = f.pod_upgrade_error(operation()).await;
+        assert!(!error.message().contains("decided from"), "{error}");
+        assert!(error.message().contains("stage"), "{error}");
+        f.assert_copy_evicted(&cleanups);
     })
     .await;
 }

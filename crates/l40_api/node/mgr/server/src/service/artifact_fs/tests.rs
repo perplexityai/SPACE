@@ -71,7 +71,7 @@ fn failed_rollback_preserves_instance_and_retry_commits_complete_replacement() {
     std::fs::create_dir(root.join("snapshot")).unwrap();
     let source = directory(&parent, "snapshot".as_ref()).unwrap();
     let gid = nix::unistd::getegid().as_raw();
-    rollback(&parent, &source, gid).unwrap_err();
+    rollback(&parent, &source, gid, DiskState::Rootfs).unwrap_err();
     assert_eq!(
         std::fs::read_to_string(root.join("instance/rootfs.ext4")).unwrap(),
         "current data"
@@ -79,18 +79,58 @@ fn failed_rollback_preserves_instance_and_retry_commits_complete_replacement() {
     std::fs::write(root.join("snapshot/rootfs.ext4"), "restored data").unwrap();
     // Fail part-way through staging, not only on the initial existence check.
     symlink("rootfs.ext4", root.join("snapshot/poison")).unwrap();
-    rollback(&parent, &source, gid).unwrap_err();
+    rollback(&parent, &source, gid, DiskState::Rootfs).unwrap_err();
     assert_eq!(
         std::fs::read_to_string(root.join("instance/rootfs.ext4")).unwrap(),
         "current data"
     );
     std::fs::remove_file(root.join("snapshot/poison")).unwrap();
-    rollback(&parent, &source, gid).unwrap();
+    rollback(&parent, &source, gid, DiskState::Rootfs).unwrap();
     assert_eq!(
         std::fs::read_to_string(root.join("instance/rootfs.ext4")).unwrap(),
         "restored data"
     );
     assert!(!root.join(".instance-rollback").exists());
+}
+
+/// An encrypted instance preserved before its first start here holds only its
+/// COW, over an origin the start clones from the template, and rolls back as
+/// one. A snapshot with neither disk file, or an empty COW, still restores
+/// nothing.
+#[test]
+fn an_encrypted_instance_without_its_origin_rolls_back_from_its_cow() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let parent = trusted_paths::open_directory(&root).unwrap();
+    std::fs::create_dir(root.join("instance")).unwrap();
+    std::fs::write(root.join("instance/rootfs.ext4"), "cloned origin").unwrap();
+    std::fs::write(root.join("instance/cow.luks"), "booted writes").unwrap();
+    std::fs::create_dir(root.join("snapshot")).unwrap();
+    let source = directory(&parent, "snapshot".as_ref()).unwrap();
+    let gid = nix::unistd::getegid().as_raw();
+
+    let error = rollback(&parent, &source, gid, DiskState::RootfsOrCow).unwrap_err();
+    assert!(error.message().contains("no rootfs"), "{error}");
+    std::fs::write(root.join("snapshot/cow.luks"), "").unwrap();
+    rollback(&parent, &source, gid, DiskState::RootfsOrCow).unwrap_err();
+    assert_eq!(
+        std::fs::read_to_string(root.join("instance/cow.luks")).unwrap(),
+        "booted writes"
+    );
+
+    std::fs::write(root.join("snapshot/cow.luks"), "preserved writes").unwrap();
+    // A user's disk snapshot restores only with its rootfs.
+    rollback(&parent, &source, gid, DiskState::Rootfs).unwrap_err();
+    assert_eq!(
+        std::fs::read_to_string(root.join("instance/cow.luks")).unwrap(),
+        "booted writes"
+    );
+    rollback(&parent, &source, gid, DiskState::RootfsOrCow).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("instance/cow.luks")).unwrap(),
+        "preserved writes"
+    );
+    assert!(!root.join("instance/rootfs.ext4").exists());
 }
 
 #[cfg(target_os = "linux")]
@@ -127,7 +167,13 @@ fn btrfs_pinned_operations_survive_path_replacement_and_nested_cleanup() {
     symlink("template", root.join("instance.ro")).unwrap();
     btrfs::send(&template, &snapshot, &stream).unwrap();
     assert!(stream.metadata().unwrap().len() > 16);
-    rollback(&parent, &snapshot, nix::unistd::getegid().as_raw()).unwrap();
+    rollback(
+        &parent,
+        &snapshot,
+        nix::unistd::getegid().as_raw(),
+        DiskState::Rootfs,
+    )
+    .unwrap();
     assert_eq!(
         std::fs::read_to_string(root.join("instance/rootfs.ext4")).unwrap(),
         "changed"

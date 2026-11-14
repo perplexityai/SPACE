@@ -131,6 +131,10 @@ impl Fake {
 
 #[tonic::async_trait]
 impl RuntimeUpgradeEffects for Arc<Fake> {
+    async fn complete_staged_disk(&self, _: &SandboxRow) -> Result<(), Status> {
+        Ok(())
+    }
+
     async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Status> {
         self.called("inspect");
         if self.stop_during_inspect.load(Ordering::SeqCst) {
