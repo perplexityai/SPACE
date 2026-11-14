@@ -8,8 +8,8 @@ pub const RETRY_AFTER_MS_METADATA: &str = "x-space-retry-after-ms";
 /// precondition: the node cannot make the desired state converge by retrying
 /// while cluster state is unchanged — the guest is unreachable because the
 /// sandbox is in a non-thawing state, or the auto-lifecycle target state is
-/// stuck (`Failed`/`CleanupRequired`/`CleanupFailed`/`Quarantined`). The reconcile-queue ref
-/// should complete until a lifecycle or cluster repair changes the state.
+/// stuck (`Failed` or `Quarantined`, or owned by a cleanup). The reconcile-queue
+/// ref should complete until a lifecycle or cluster repair changes the state.
 /// Absence means the failure is transient — a still-initializing guest (`guest_not_ready`),
 /// a mid-transition lifecycle state (`Starting`/`Resuming`/`Suspending`) — and
 /// the queue should re-drive it. The tonic `Code` alone can't carry this
