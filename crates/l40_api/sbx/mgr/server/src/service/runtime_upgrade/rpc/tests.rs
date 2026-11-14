@@ -20,9 +20,9 @@ use super::super::node_effects::tests::{
 use crate::db::{RuntimeUpgradeOperationId, RuntimeUpgradePhase};
 use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::proto::{
-    GetRuntimeUpgradeRequest, RuntimeUpgradeAuthorization, RuntimeUpgradeOutcome,
-    RuntimeUpgradeStatus, SandboxSubstrateKind, SpaceApiRouteIdentity, StartRequest,
-    UpgradeRuntimeRequest, WakeTargetState,
+    AbandonRuntimeUpgradeRequest, GetRuntimeUpgradeRequest, RuntimeUpgradeAuthorization,
+    RuntimeUpgradeOutcome, RuntimeUpgradeStatus, SandboxSubstrateKind, SpaceApiRouteIdentity,
+    StartRequest, UpgradeRuntimeRequest, WakeTargetState,
 };
 use crate::service::SandboxManagerService;
 use crate::service::activation_support::internal_request;
@@ -883,6 +883,45 @@ async fn an_absent_suspended_sandbox_is_staged_before_the_upgrade() {
     let error = upgrade(&service, staged).await.unwrap_err();
     assert_ne!(error.code(), tonic::Code::NotFound, "{error}");
     assert!(error.message().contains("stage"), "{error}");
+}
+
+/// An operation abandoned on a node that doesn't hold its sandbox stays
+/// abandoned: a call for it that was still on its way, carrying
+/// `stage_from`, is refused before it stages the sandbox.
+#[tokio::test]
+async fn an_abandon_before_the_sandbox_is_staged_refuses_the_stage() {
+    let (source, _) = environments();
+    let target = certified_target(&source);
+    let service = SandboxManagerService::new_with_options(
+        crate::db::test_conn(),
+        crate::service::SandboxManagerServiceOptions::for_test(),
+    );
+    let sandbox_id = SandboxId::new().to_string();
+    let operation_id = operation();
+
+    abandon(&service, &sandbox_id, operation_id)
+        .await
+        .expect("an operation for an absent sandbox is abandoned");
+
+    let mut late = pod_upgrade(&sandbox_id, &target, operation_id, WakeTargetState::Started);
+    late.checkpoint_local_artifact_id = Some(LocalArtifactId::new().to_string());
+    late.stage_from = Some(crate::proto::RuntimeUpgradeStageFrom {
+        suspend_restore_storage_uri: format!(
+            "s3://space-test/suspend/{sandbox_id}/{}?region=us-east-1",
+            uuid::Uuid::now_v7()
+        ),
+        suspend_restore_source_node: None,
+    });
+    let error = upgrade(&service, late).await.unwrap_err();
+
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("abandoned"), "{error}");
+    assert!(
+        crate::db::get_sandbox(&service.db.lock().unwrap(), &sandbox_id)
+            .unwrap()
+            .is_none(),
+        "nothing was staged"
+    );
 }
 
 /// A suspended sandbox is upgraded only from the checkpoint the upgrade was
@@ -2633,5 +2672,390 @@ async fn a_final_attempts_late_retry_never_replaces_the_latest_refused_attempt()
             .as_deref(),
         Some(OTHER_POD_UID),
         "the later pod stays the latest refused pod"
+    );
+}
+
+fn abandon(
+    service: &SandboxManagerService,
+    sandbox_id: &str,
+    operation_id: RuntimeUpgradeOperationId,
+) -> impl std::future::Future<Output = Result<crate::proto::AbandonRuntimeUpgradeResponse, Status>>
+{
+    let service = service.clone();
+    let request = internal_request(AbandonRuntimeUpgradeRequest {
+        sandbox_id: sandbox_id.to_string(),
+        operation_id: operation_id.to_string(),
+    });
+    async move { service.abandon_runtime_upgrade(request).await }
+}
+
+/// The control plane abandons an operation before it captures the stopped
+/// sandbox's disk. A call for it that was still on its way, from a pod the
+/// node never saw, then arrives: it's refused before it stages, fences or
+/// touches the disk, and the sandbox stays stopped on its old environment.
+/// Abandoning is idempotent, and an id that names another sandbox is
+/// refused.
+#[tokio::test]
+async fn a_call_for_an_abandoned_operation_never_touches_the_disk() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (source, _) = environments();
+    let target = certified_target(&source);
+    let f = fixture(
+        SandboxState::Stopped,
+        false,
+        node_reaching_the_boot(&target, &calls),
+    );
+    let operation_id = operation();
+
+    abandon(&f.service, &f.sandbox_id, operation_id)
+        .await
+        .expect("an unseen operation is abandoned");
+    abandon(&f.service, &f.sandbox_id, operation_id)
+        .await
+        .expect("abandoning again changes nothing");
+    let other = abandon(&f.service, &SandboxId::new().to_string(), operation_id)
+        .await
+        .expect_err("the id names this sandbox");
+    assert_eq!(other.code(), tonic::Code::InvalidArgument, "{other}");
+
+    let late = upgrade(
+        &f.service,
+        pod_upgrade(
+            &f.sandbox_id,
+            &target,
+            operation_id,
+            WakeTargetState::Stopped,
+        ),
+    )
+    .await
+    .expect_err("an abandoned operation is refused");
+
+    assert_eq!(late.code(), tonic::Code::FailedPrecondition, "{late}");
+    assert!(late.message().contains("abandoned"), "{late}");
+    // A late call naming another sandbox names another operation than the
+    // abandonment's, so it's refused as one that names another sandbox.
+    let elsewhere = upgrade(
+        &f.service,
+        pod_upgrade(
+            &SandboxId::new().to_string(),
+            &target,
+            operation_id,
+            WakeTargetState::Stopped,
+        ),
+    )
+    .await
+    .expect_err("an abandoned operation is refused");
+    assert_eq!(
+        elsewhere.code(),
+        tonic::Code::InvalidArgument,
+        "{elsewhere}"
+    );
+    assert!(elsewhere.message().contains("abandoned"), "{elsewhere}");
+    // It never began here and never will, which the report says.
+    let reported = report(&f.service, &f.sandbox_id, operation_id);
+    assert_eq!(reported.status, RuntimeUpgradeStatus::Absent as i32);
+    assert!(reported.abandoned, "{reported:?}");
+    let elsewhere = f
+        .service
+        .get_runtime_upgrade(&internal_request(GetRuntimeUpgradeRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            operation_id: operation_id.to_string(),
+            attempt_id: None,
+        }))
+        .expect_err("the abandonment names this sandbox");
+    assert_eq!(
+        elsewhere.code(),
+        tonic::Code::InvalidArgument,
+        "{elsewhere}"
+    );
+    assert!(calls.lock().unwrap().is_empty(), "{:?}", calls);
+    let row = f.row();
+    assert_eq!(
+        row.state,
+        crate::state::SandboxStatus::from(SandboxState::Stopped)
+    );
+    assert_eq!(
+        row.execution_metadata
+            .as_ref()
+            .and_then(ExecutionMetadata::environment),
+        f.source.environment()
+    );
+    assert_eq!(
+        crate::db::read::runtime_upgrade_fence(&f.service.db.lock().unwrap(), &f.sandbox_id)
+            .unwrap(),
+        None
+    );
+}
+
+/// Fence `operation_id` on the fixture's stopped sandbox for `target_state`,
+/// as an interrupted upgrade leaves it.
+fn fence_interrupted(
+    f: &Fixture,
+    operation_id: RuntimeUpgradeOperationId,
+    target_state: crate::db::RuntimeUpgradeTargetState,
+) {
+    let (source, _) = environments();
+    let target = certified_target(&source);
+    // `ObservedSandbox` borrows the row, so the row outlives it here.
+    let row = crate::db::get_sandbox(&f.service.db.lock().unwrap(), &f.sandbox_id)
+        .unwrap()
+        .unwrap();
+    let observed = crate::db::ObservedSandbox::of(&row);
+    let fenced = crate::db::begin_runtime_upgrade(
+        &f.service.db.lock().unwrap(),
+        crate::db::NewRuntimeUpgrade {
+            operation_id,
+            sandbox_id: &f.sandbox_id,
+            observed,
+            target_environment: target.environment().unwrap(),
+            target_state,
+            authorization: &crate::db::RuntimeUpgradeAuthorization {
+                id: "environment-block-e0".to_string(),
+                reason: "e0 runs a blocked runtime".to_string(),
+                memory_loss: false,
+            },
+            checkpoint_dir_identity: None,
+            previous_execution: &source,
+            attempt_id: POD_UID,
+        },
+    )
+    .unwrap();
+    assert!(matches!(fenced, crate::db::BeginRuntimeUpgrade::Fenced(_)));
+}
+
+/// A started target's operation that still fences the sandbox isn't
+/// settled by an abandon, which leaves it to its own retry or to recovery:
+/// it answers ABORTED and records nothing.
+#[tokio::test]
+async fn an_unsettled_started_operation_isnt_abandoned() {
+    let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+    let operation_id = operation();
+    fence_interrupted(
+        &f,
+        operation_id,
+        crate::db::RuntimeUpgradeTargetState::Started,
+    );
+
+    let refused = abandon(&f.service, &f.sandbox_id, operation_id)
+        .await
+        .expect_err("an unsettled started target isn't abandoned");
+
+    assert_eq!(refused.code(), tonic::Code::Aborted, "{refused}");
+    assert!(
+        !crate::db::read::runtime_upgrade_abandoned(&f.service.db.lock().unwrap(), operation_id)
+            .unwrap()
+    );
+}
+
+/// A late call for an abandoned operation whose sandbox is already on its
+/// target never reaches the fence: the check under the upgrade lock refuses
+/// it, and the already-on-target write would too, before it claims or runs
+/// the in-place start, and nothing is recorded for it.
+#[tokio::test]
+async fn an_abandoned_operation_never_starts_a_sandbox_on_its_target() {
+    let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+    let target = certified_target(&f.source);
+    f.put_on(&target);
+    let operation_id = operation();
+    abandon(&f.service, &f.sandbox_id, operation_id)
+        .await
+        .expect("an unseen operation is abandoned");
+
+    let late = upgrade(
+        &f.service,
+        pod_upgrade(
+            &f.sandbox_id,
+            &target,
+            operation_id,
+            WakeTargetState::Started,
+        ),
+    )
+    .await
+    .expect_err("an abandoned operation is refused");
+
+    assert_eq!(late.code(), tonic::Code::FailedPrecondition, "{late}");
+    assert!(late.message().contains("abandoned"), "{late}");
+    let reported = report(&f.service, &f.sandbox_id, operation_id);
+    assert_eq!(reported.status, RuntimeUpgradeStatus::Absent as i32);
+    assert!(reported.abandoned, "{reported:?}");
+    assert_eq!(
+        f.row().state,
+        crate::state::SandboxStatus::from(SandboxState::Stopped)
+    );
+}
+
+/// A rolled-back operation is settled for either target: its sandbox's disk
+/// is restored and its fence released, and what it still owes, deleting the
+/// preserved copy, never touches the sandbox. So the abandon records it as it
+/// stands, without finishing the rollback first, and recovery deletes the
+/// copy afterwards as it would have before.
+#[tokio::test]
+async fn a_rolled_back_operation_is_abandoned_as_it_stands() {
+    for target_state in [
+        crate::db::RuntimeUpgradeTargetState::Stopped,
+        crate::db::RuntimeUpgradeTargetState::Started,
+    ] {
+        let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+        let operation_id = operation();
+        fence_interrupted(&f, operation_id, target_state);
+        assert!(
+            crate::db::roll_back_runtime_upgrade(
+                &f.service.db.lock().unwrap(),
+                operation_id,
+                "boot failed"
+            )
+            .unwrap()
+        );
+
+        abandon(&f.service, &f.sandbox_id, operation_id)
+            .await
+            .unwrap_or_else(|error| panic!("{target_state:?}: {error}"));
+
+        let conn = f.service.db.lock().unwrap();
+        assert!(crate::db::read::runtime_upgrade_abandoned(&conn, operation_id).unwrap());
+        assert_eq!(
+            crate::db::read::runtime_upgrade(&conn, operation_id)
+                .unwrap()
+                .map(|record| record.phase),
+            Some(RuntimeUpgradePhase::RolledBack),
+            "{target_state:?}: the preserved copy is left to recovery"
+        );
+    }
+}
+
+/// An abandon is ordered against an `UpgradeRuntime` by the sandbox's upgrade
+/// lock, which the call holds from its abandoned check through staging,
+/// evicting a stale copy and the fence. A call that is still staging has no
+/// row yet, so only the lock keeps an abandon from answering OK while it goes
+/// on: the abandon waits behind it, records nothing while it waits, and gives
+/// up with UNAVAILABLE after the lock wait.
+#[tokio::test(start_paused = true)]
+async fn an_abandon_waits_behind_a_call_holding_the_upgrade_lock() {
+    let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+    let operation_id = operation();
+    let abandoned = |f: &Fixture| {
+        crate::db::read::runtime_upgrade_abandoned(&f.service.db.lock().unwrap(), operation_id)
+            .unwrap()
+    };
+
+    // A call that holds the lock past the wait: the abandon gives up.
+    let held = f
+        .service
+        .auto_lifecycle
+        .runtime_upgrade_lock(&f.sandbox_id)
+        .lock_owned()
+        .await;
+    let busy = abandon(&f.service, &f.sandbox_id, operation_id)
+        .await
+        .expect_err("the lock stays held");
+    assert_eq!(busy.code(), tonic::Code::Unavailable, "{busy}");
+    assert!(!abandoned(&f), "a refused abandon records nothing");
+
+    // A call that releases the lock within the wait: the abandon records the
+    // operation only once it has.
+    // The task owns its own handle to the service: `abandon`'s future borrows
+    // the one it's given.
+    let (service, sandbox_id) = (f.service.clone(), f.sandbox_id.clone());
+    let waiting = tokio::spawn(async move { abandon(&service, &sandbox_id, operation_id).await });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!waiting.is_finished());
+    assert!(
+        !abandoned(&f),
+        "nothing is recorded while the call holds the lock"
+    );
+    drop(held);
+    waiting
+        .await
+        .unwrap()
+        .expect("the abandon runs once the lock is free");
+    assert!(abandoned(&f));
+}
+
+/// An abandon that names another sandbox than the operation's never settles
+/// the operation: the stay-stopped upgrade it names stays fenced, for its own
+/// retry or the abandon that names its sandbox.
+#[tokio::test]
+async fn an_abandon_naming_another_sandbox_leaves_the_operation_alone() {
+    let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+    let operation_id = operation();
+    fence_interrupted(
+        &f,
+        operation_id,
+        crate::db::RuntimeUpgradeTargetState::Stopped,
+    );
+
+    let refused = abandon(&f.service, &SandboxId::new().to_string(), operation_id)
+        .await
+        .expect_err("the operation names another sandbox");
+
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused}");
+    let conn = f.service.db.lock().unwrap();
+    assert!(!crate::db::read::runtime_upgrade_abandoned(&conn, operation_id).unwrap());
+    assert!(
+        crate::db::read::runtime_upgrade_fence(&conn, &f.sandbox_id)
+            .unwrap()
+            .is_some(),
+        "the operation still fences its own sandbox"
+    );
+}
+
+/// A stay-stopped operation that hasn't settled is settled by the abandon
+/// first, as a retry of it would be, since its pod (whose kubelet retries
+/// would settle it) may be gone: an interrupted one rolls back, releasing
+/// its fence, and only then is it abandoned.
+#[tokio::test]
+async fn an_unsettled_stay_stopped_operation_is_settled_then_abandoned() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (source, _) = environments();
+    let target = certified_target(&source);
+    let f = fixture(
+        SandboxState::Stopped,
+        false,
+        node_reaching_the_boot(&target, &calls),
+    );
+    let operation_id = operation();
+    fence_interrupted(
+        &f,
+        operation_id,
+        crate::db::RuntimeUpgradeTargetState::Stopped,
+    );
+    let republished = |conn: &crate::db::Connection| {
+        crate::db::list_node_dirty_refs(conn, 100)
+            .unwrap()
+            .into_iter()
+            .any(|dirty| {
+                dirty.element_kind == "sandbox_inventory" && dirty.element_value == f.sandbox_id
+            })
+    };
+    assert!(!republished(&f.service.db.lock().unwrap()));
+
+    abandon(&f.service, &f.sandbox_id, operation_id)
+        .await
+        .expect("the interrupted operation is rolled back, then abandoned");
+
+    let conn = f.service.db.lock().unwrap();
+    assert!(republished(&conn), "the released fence is published again");
+    assert!(crate::db::read::runtime_upgrade_abandoned(&conn, operation_id).unwrap());
+    assert_eq!(
+        crate::db::read::runtime_upgrade_fence(&conn, &f.sandbox_id).unwrap(),
+        None
+    );
+    drop(conn);
+    let reported = report(&f.service, &f.sandbox_id, operation_id);
+    assert_eq!(reported.status, RuntimeUpgradeStatus::RolledBack as i32);
+    assert!(reported.abandoned, "{reported:?}");
+    // A caller waiting on an attempt reads the abandonment too, with that
+    // attempt's own rollback or with another attempt's left out.
+    let own = report_for_attempt(&f.service, &f.sandbox_id, operation_id, POD_UID);
+    assert_eq!(own.status, RuntimeUpgradeStatus::RolledBack as i32);
+    assert!(own.abandoned, "{own:?}");
+    let other = report_for_attempt(&f.service, &f.sandbox_id, operation_id, "another-attempt");
+    assert_eq!(other.status, RuntimeUpgradeStatus::Absent as i32);
+    assert!(other.abandoned, "{other:?}");
+    assert_eq!(
+        f.row().state,
+        crate::state::SandboxStatus::from(SandboxState::Stopped)
     );
 }
