@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	gatewaypb "github.com/perplexityai/SPACE/shim/proto/net/gateway/v1"
 	pb "github.com/perplexityai/SPACE/shim/proto/sandbox/manager/v1"
 )
 
@@ -188,10 +189,24 @@ func TestARuntimeUpgradePodRunsTheUpgradedExecution(t *testing.T) {
 			if start.GetRouteIdentity().GetPodUid() != upgradeTestPodUID || start.GetRouteIdentity().GetExecutionGeneration() != 4 {
 				t.Fatalf("the upgrade's start must carry the pod's route identity: %+v", start.GetRouteIdentity())
 			}
+			if request.AttemptId == nil || request.GetAttemptId() != upgradeTestPodUID {
+				t.Fatalf("the upgrade must run as the pod's attempt, named by its pod UID: %v", request.AttemptId)
+			}
 			if request.StageFrom != nil || request.CheckpointLocalArtifactId != nil {
 				t.Fatalf("a stopped source has nothing to stage or check: %+v", request)
 			}
 		})
+	}
+}
+
+// A start without a pod UID names no attempt, so sbx-manager runs it as a
+// fresh one; an empty attempt id is never sent.
+func TestARuntimeUpgradeWithoutAPodUIDNamesNoAttempt(t *testing.T) {
+	for _, identity := range []*gatewaypb.SpaceApiRouteIdentity{nil, {}, {PodUid: ptr("")}} {
+		request := runtimeUpgradeRequest(&pb.StartRequest{SandboxId: upgradeTestSandboxID, RouteIdentity: identity}, &runtimeUpgradeIntent{})
+		if request.AttemptId != nil {
+			t.Fatalf("identity %+v: attempt id = %q, want none", identity, request.GetAttemptId())
+		}
 	}
 }
 

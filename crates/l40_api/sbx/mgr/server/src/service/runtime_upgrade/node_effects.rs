@@ -13,7 +13,7 @@ use pplx_space_node_mgr_client::proto::{
 use tonic::metadata::MetadataMap;
 use tonic::{Extensions, Request, Status};
 
-use super::{LocalDisk, RuntimeUpgradeEffects};
+use super::{LocalDisk, Refusal, RuntimeUpgradeEffects};
 use crate::db::{RuntimeUpgradeOperationId, RuntimeUpgradeRecord, SandboxRow};
 use crate::local_artifacts::CheckoutError;
 use crate::proto::{StartRequest, StartResponse};
@@ -23,7 +23,9 @@ use crate::service::suspend_snapshot_publication::{
     canonical_suspend_snapshot_dir, garbage_suspend_snapshot_dir,
     suspend_snapshot_staging_parent_dir,
 };
-use crate::service::tail_support::{checkpoint_execution_metadata, sandbox_execution_metadata_in};
+use crate::service::tail_support::{
+    RuntimeArtifactReadError, checkpoint_execution_metadata, sandbox_execution_metadata_in,
+};
 use crate::state::SandboxState;
 
 /// How long retirement waits for a restore, export or publication holding the
@@ -110,17 +112,29 @@ fn directory_identity(path: &Path) -> std::io::Result<Option<String>> {
     }
 }
 
-fn required_file(path: &Path, what: &str) -> Result<(), Status> {
+/// An absent file is final for the attempt: nothing a retry does brings it
+/// back. One that can't be checked may be readable on a retry.
+fn required_file(path: &Path, what: &str) -> Result<(), Refusal> {
     match path.try_exists() {
         Ok(true) => Ok(()),
-        Ok(false) => Err(Status::failed_precondition(format!(
+        Ok(false) => Err(Refusal::Final(Status::failed_precondition(format!(
             "a runtime upgrade needs the sandbox's local {what}; {} is absent",
             path.display()
-        ))),
-        Err(error) => Err(Status::failed_precondition(format!(
+        )))),
+        Err(error) => Err(Refusal::Retry(Status::failed_precondition(format!(
             "inspect {}: {error}",
             path.display()
-        ))),
+        )))),
+    }
+}
+
+/// Runtime metadata that can't be read may be readable on a retry; metadata
+/// that reads but doesn't parse or validate answers every retry the same way.
+fn artifact_read_refusal(error: RuntimeArtifactReadError) -> Refusal {
+    let status = Status::failed_precondition(error.to_string());
+    match error {
+        RuntimeArtifactReadError::Read { .. } => Refusal::Retry(status),
+        _ => Refusal::Final(status),
     }
 }
 
@@ -194,7 +208,7 @@ impl NodeRuntimeUpgradeEffects {
 
 #[tonic::async_trait]
 impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
-    async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Status> {
+    async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Refusal> {
         let cache_root = self.service.cache_root();
         crate::service::create_support::repair_retained_instance_traversal(
             &self.service.node_manager,
@@ -211,18 +225,21 @@ impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
             required_file(&instance.join("cow.luks"), "encrypted rootfs COW")?;
         }
         let execution = sandbox_execution_metadata_in(cache_root, &sandbox.id)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            .map_err(artifact_read_refusal)?;
         // A stopped sandbox can keep the checkpoint of a suspend before its
         // stop, which a warm start would load over the disk the boot writes,
         // so its identity is recorded for retirement too.
         let checkpoint = canonical_suspend_snapshot_dir(&sandbox_dir);
         let checkpoint_dir_identity = directory_identity(&checkpoint).map_err(|error| {
-            Status::failed_precondition(format!("inspect {}: {error}", checkpoint.display()))
+            Refusal::Retry(Status::failed_precondition(format!(
+                "inspect {}: {error}",
+                checkpoint.display()
+            )))
         })?;
         let checkpoint_execution = if sandbox.state.is_unowned(SandboxState::Suspended) {
             Some(
                 checkpoint_execution_metadata(&checkpoint.to_string_lossy())
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?
+                    .map_err(artifact_read_refusal)?
                     .into_execution(),
             )
         } else {

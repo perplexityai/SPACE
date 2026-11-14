@@ -9,7 +9,13 @@
 //! suspended sandbox placed away from its checkpoint, upgrade, and for a
 //! started target hand back the running execution, activating a sandbox that
 //! was already on the target. The control plane can't see the response, so it
-//! reads the outcome from `GetRuntimeUpgrade`.
+//! reads the outcome from `GetRuntimeUpgrade`, which names the attempt each
+//! outcome was recorded for. A rollback or refusal is final for that attempt:
+//! a failed create leaves the pod pending, and kubelet's retries of it run as
+//! the same attempt, so they get the recorded failure back (see the parent
+//! module). So is a started target's refused activation once the operation
+//! reached its target: the node records the refusal for that attempt and
+//! reports it.
 
 use tonic::metadata::MetadataMap;
 use tonic::{Extensions, Request, Response, Status};
@@ -63,6 +69,23 @@ fn runs_for_caller(sandbox: &SandboxRow, start: &StartRequest) -> bool {
     !names_a_pod || names_the_running_pod(sandbox, start)
 }
 
+/// Whether staging's refusal is final for the attempt. Staging belongs to the
+/// restore path (`stage_missing_checkpoint`), which answers
+/// `FAILED_PRECONDITION` or `INVALID_ARGUMENT` when the start names
+/// something this node can't stage for it (another node or sandbox, a rootfs
+/// its policy refuses, a stopped materialization of another artifact) and
+/// any other code when it's busy or failing. That contract is read here, at
+/// the one call site, so a change to it changes upgrade finality in one
+/// visible place.
+fn staging_refusal(status: Status) -> super::Refusal {
+    match status.code() {
+        tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument => {
+            super::Refusal::Final(status)
+        }
+        _ => super::Refusal::Retry(status),
+    }
+}
+
 /// Whether `start` names the pod whose execution `sandbox` runs: the same pod
 /// UID and execution generation. Both must be present; an identity without
 /// them names no pod.
@@ -77,6 +100,20 @@ fn names_the_running_pod(sandbox: &SandboxRow, start: &StartRequest) -> bool {
         && running.execution_generation.is_some()
         && running.pod_uid == requested.pod_uid
         && running.execution_generation == requested.execution_generation
+}
+
+/// Whether `sandbox` runs a VM in the pod `start` names, at any execution
+/// generation: what decides whether the pod may still hold that VM, which a
+/// control plane that deleted the pod would take with it. Handing the pod a
+/// running execution also needs the generation ([`names_the_running_pod`]).
+fn runs_in_the_pod(sandbox: &SandboxRow, start: &StartRequest) -> bool {
+    let running = crate::service::activation_support::space_api_route_identity_to_wire(
+        &sandbox.space_api_route_identity,
+    );
+    let (Some(running), Some(requested)) = (running.as_ref(), start.route_identity.as_ref()) else {
+        return false;
+    };
+    running.pod_uid.is_some() && running.pod_uid == requested.pod_uid
 }
 
 impl crate::service::SandboxManagerService {
@@ -111,7 +148,28 @@ impl crate::service::SandboxManagerService {
         }
         let upgrade = parse_request(message)?;
         let sandbox_id = upgrade.sandbox_id.clone();
+        let operation_id = upgrade.operation_id;
+        // The attempt this call runs as, which a successful response names,
+        // and, for a started target, the start whose activation this call's
+        // error refuses.
+        let attempt_id = upgrade.attempt_id.clone();
+        let started = (upgrade.target_state == RuntimeUpgradeTargetState::Started)
+            .then(|| upgrade.start.clone());
         let _guard = self.runtime_upgrade_guard(&sandbox_id).await?;
+        let upgrader = self.caller_upgrader(metadata.clone(), extensions.clone());
+        // A request that names another sandbox, target or authorization than
+        // the operation's isn't one of its attempts, so its refusal is never
+        // recorded as the operation's refused activation.
+        upgrader.refuse_another_request(&upgrade)?;
+        // An attempt that already has a final outcome (its rollback, its
+        // refusal before the fence, or its activation refused after the
+        // operation reached its target) gets it back before anything records,
+        // evicts, stages or fences: its caller may already have settled on it
+        // and given it up, and a record made for it here would replace the
+        // latest refused attempt a caller waits on. Only a new attempt tries
+        // again. `RuntimeUpgrader::upgrade` checks again after it settles an
+        // interrupted boot, which can make one.
+        upgrader.refuse_settled_for_attempt(&upgrade)?;
         // Boxed: staging, the upgrade and an activation together are a large
         // future, which would otherwise sit on the stack of an unoptimized
         // build's RPC task.
@@ -122,8 +180,120 @@ impl crate::service::SandboxManagerService {
             stage_from.as_ref(),
         ))
         .await;
+        if let (Err(refusal), Some(start)) = (&response, &started) {
+            self.record_refused_attempt(operation_id, &attempt_id, start, refusal);
+        }
         crate::node_state_sync::mark_sandbox_dirty(&self.db, &sandbox_id);
-        response.map(Response::new)
+        response.map(|mut response| {
+            response.attempt_id = Some(attempt_id);
+            Response::new(response)
+        })
+    }
+
+    /// Record that this call's `refusal` refused the activation of the
+    /// attempt `attempt_id`, whose `start` asked for a started target, if the
+    /// operation reached its target: the node upgraded the sandbox, or found
+    /// it there, and the attempt doesn't run it. Otherwise the operation's
+    /// rollback or refusal is the attempt's report, or the node is still
+    /// working on it. A sandbox that may hold the VM of the pod `start` names,
+    /// anything but stopped or suspended while it runs in that pod (a start
+    /// that failed after its guest was ready, say, or a boot paused or being
+    /// suspended since), records nothing: a control plane that settled on the
+    /// refusal would delete the pod, and the VM with it. That's a substrate
+    /// fact, read from the start's route identity, not from the attempt id. A
+    /// sandbox another activation or stop is moving records nothing either,
+    /// whichever pod it runs for: it comes to rest on its own, and the
+    /// attempt's retry is answered afresh then, as the retryable refusal says.
+    /// The attempt's retry is answered with a started sandbox's execution; a
+    /// paused one's is refused again, so that attempt waits out its caller's
+    /// deadline while the VM and its memory stay as they are. Best effort: an
+    /// unrecorded refusal leaves the caller waiting on the attempt.
+    fn record_refused_attempt(
+        &self,
+        operation_id: crate::db::RuntimeUpgradeOperationId,
+        attempt_id: &str,
+        start: &StartRequest,
+        refusal: &Status,
+    ) {
+        let sandbox_id = start.sandbox_id.as_str();
+        // Anything but a sandbox at rest may still hold the pod's VM, in a
+        // lifecycle step (pausing, suspending, a checkpoint) or a cleanup as
+        // much as started or paused. A sandbox that can't be read may too,
+        // so it records nothing; only one the node no longer holds, or holds
+        // at rest, or settled for another pod, records the refusal.
+        let sandbox = self.db_conn().and_then(|db| {
+            crate::db::read::sandbox(&db, sandbox_id)
+                .map_err(|error| Status::internal(format!("read sandbox: {error}")))
+        });
+        let leave_unrecorded = match &sandbox {
+            Ok(Some(sandbox)) => {
+                // A sandbox `refuse_moving` refuses (a cleanup owns it, or
+                // another activation, stop or lifecycle step is moving it)
+                // comes to rest on its own, so a refusal of it is one the
+                // attempt's retry may not get: stopping or suspending for an
+                // earlier pod's deletion, say. And an activation writes its
+                // route identity only once it runs, so a row an activation is
+                // creating, starting or restoring, or a cleanup still owns or
+                // has quarantined or failed after it, may name an earlier pod
+                // while it holds this one's VM.
+                let in_flight = refuse_moving(sandbox).is_err()
+                    || matches!(
+                        sandbox.state.unowned(),
+                        Some(SandboxState::Quarantined | SandboxState::Failed)
+                    );
+                let at_rest = matches!(
+                    sandbox.state.unowned(),
+                    Some(SandboxState::Stopped | SandboxState::Suspended)
+                );
+                // At rest on the execution the operation's claimed start
+                // found, the start never began (admission or staging refused
+                // it first), and `activate_once` runs it again for a retry:
+                // the refusal is the retry's to answer, not final.
+                (!at_rest && (in_flight || runs_in_the_pod(sandbox, start)))
+                    || (at_rest && self.claimed_start_never_began(operation_id, sandbox))
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(
+                    sandbox_id,
+                    %operation_id,
+                    attempt_id,
+                    %error,
+                    "runtime upgrade refusal of the attempt's activation not recorded: the sandbox can't be read"
+                );
+                true
+            }
+        };
+        if leave_unrecorded {
+            return;
+        }
+        let recorded = self.db_conn().and_then(|db| {
+            crate::db::record_runtime_upgrade_refused_attempt(
+                &db,
+                operation_id,
+                sandbox_id,
+                attempt_id,
+                refusal.message(),
+            )
+            .map_err(|error| Status::internal(error.to_string()))
+        });
+        match recorded {
+            Ok(true) => tracing::info!(
+                sandbox_id,
+                %operation_id,
+                attempt_id,
+                refusal = refusal.message(),
+                "runtime upgrade reached its target but refused the attempt's activation; final for the attempt"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                sandbox_id,
+                %operation_id,
+                attempt_id,
+                %error,
+                "could not record the runtime upgrade's refusal of the attempt's activation"
+            ),
+        }
     }
 
     /// The RPC's work under the sandbox's upgrade lock.
@@ -142,6 +312,8 @@ impl crate::service::SandboxManagerService {
             // A backed-up suspended copy of another checkpoint makes way for
             // the decided one; an unproven one stays, and the upgrade's
             // checkpoint check refuses it.
+            // Its refusal isn't recorded for the attempt: some are transient (a
+            // copy whose backup isn't ready yet).
             let staging = staging_start(&upgrade.start, stage_from);
             self.evict_stale_checkpoint_copy(
                 &upgrade.sandbox_id,
@@ -153,7 +325,11 @@ impl crate::service::SandboxManagerService {
             .await?;
             // Leaves a present sandbox alone, in any state; the upgrade's
             // checkpoint check decides whether its copy may be upgraded.
-            self.stage_missing_checkpoint(staging).await?;
+            if let Err(refusal) = self.stage_missing_checkpoint(staging).await {
+                let refusal = staging_refusal(refusal);
+                upgrader.record_refusal(&upgrade, &refusal);
+                return Err(refusal.into_status());
+            }
         }
         let target_state = upgrade.target_state;
         let operation_id = upgrade.operation_id;
@@ -325,6 +501,32 @@ impl crate::service::SandboxManagerService {
         self.answer_after_activation(operation_id, &start)
     }
 
+    /// Whether the operation claimed the start of `sandbox`, at rest, and
+    /// nothing has started it since: it still has the execution the claim
+    /// recorded, so the claimed start never began, and `activate_once` runs
+    /// it again. A report that can't be read answers yes, so a refusal that
+    /// may be retryable isn't recorded as final.
+    fn claimed_start_never_began(
+        &self,
+        operation_id: crate::db::RuntimeUpgradeOperationId,
+        sandbox: &SandboxRow,
+    ) -> bool {
+        let report = self.db_conn().and_then(|db| {
+            crate::db::read::runtime_upgrade_report(&db, operation_id)
+                .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))
+        });
+        match report {
+            Ok(Some(report)) => matches!(
+                report.status,
+                RuntimeUpgradeStatus::AlreadyOnTarget {
+                    activation: Some(RuntimeUpgradeActivationClaim::Start { from_execution }),
+                } if from_execution == sandbox.node_execution_id
+            ),
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+
     /// Record how the operation claims its already-on-target activation;
     /// false when its activation is already claimed or no already-on-target
     /// outcome is recorded for the sandbox.
@@ -425,7 +627,17 @@ impl crate::service::SandboxManagerService {
         )?;
         let sandbox_id = parse_sandbox_id(&request.get_ref().sandbox_id)?;
         let operation_id = parse_operation_id(&request.get_ref().operation_id)?;
-        let report = crate::db::read::runtime_upgrade_report(&*self.db_conn()?, operation_id)
+        // A set attempt id is held to `UpgradeRuntime`'s rule: an empty,
+        // whitespace-only or oversized one is refused, not read as unset.
+        let attempt = request
+            .get_ref()
+            .attempt_id
+            .clone()
+            .map(|attempt_id| super::parse_attempt_id(Some(attempt_id)))
+            .transpose()?;
+        let attempt = attempt.as_deref();
+        let db = self.db_conn()?;
+        let report = crate::db::read::runtime_upgrade_report(&db, operation_id)
             .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?;
         let Some(report) = report else {
             return Ok(GetRuntimeUpgradeResponse {
@@ -438,7 +650,64 @@ impl crate::service::SandboxManagerService {
                 "runtime upgrade {operation_id} names another sandbox"
             )));
         }
-        let mut response = GetRuntimeUpgradeResponse::default();
+        // A caller waiting on an attempt gets that attempt's own answer, from
+        // its own row, so a later attempt never changes it.
+        let mut own_refused_activation = None;
+        if let Some(attempt) = attempt {
+            let settled =
+                crate::db::read::runtime_upgrade_attempt_outcome(&db, operation_id, attempt)
+                    .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?;
+            let status = settled.as_ref().and_then(|settled| match settled.outcome {
+                crate::db::RecordedAttemptOutcome::RolledBack => Some(Wire::RolledBack),
+                crate::db::RecordedAttemptOutcome::Refused => Some(Wire::Refused),
+                // Reported with the operation's outcome, below.
+                crate::db::RecordedAttemptOutcome::ActivationRefused => None,
+            });
+            match (status, settled) {
+                (Some(status), Some(settled)) => {
+                    return Ok(GetRuntimeUpgradeResponse {
+                        status: status as i32,
+                        failure: settled.failure,
+                        attempt_id: Some(attempt.to_owned()),
+                        ..Default::default()
+                    });
+                }
+                (None, Some(settled)) => own_refused_activation = Some(settled.failure),
+                (_, None) => {}
+            }
+            // Another attempt's rollback or refusal says nothing about this
+            // one. This attempt's own is reported below even before its
+            // history is written: a rollback whose disk discard failed stays on
+            // the live row until a retry or recovery finishes it.
+            if matches!(
+                report.status,
+                RuntimeUpgradeStatus::RolledBack { .. } | RuntimeUpgradeStatus::Refused { .. }
+            ) && report.attempt_id.as_deref() != Some(attempt)
+            {
+                return Ok(GetRuntimeUpgradeResponse {
+                    status: Wire::Absent as i32,
+                    ..Default::default()
+                });
+            }
+        }
+        drop(db);
+        // The named attempt's own refused activation, never another attempt's;
+        // unfiltered, the latest one.
+        let (refused_attempt_id, refused_attempt_failure) = match attempt {
+            Some(attempt) => own_refused_activation
+                .map(|failure| (Some(attempt.to_owned()), failure))
+                .unwrap_or_default(),
+            None => report
+                .refused_attempt
+                .map(|refused| (Some(refused.attempt_id), refused.failure))
+                .unwrap_or_default(),
+        };
+        let mut response = GetRuntimeUpgradeResponse {
+            attempt_id: report.attempt_id,
+            refused_attempt_id,
+            refused_attempt_failure,
+            ..Default::default()
+        };
         response.status = match report.status {
             RuntimeUpgradeStatus::InProgress(phase) => {
                 response.phase = match phase {
