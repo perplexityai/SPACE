@@ -383,18 +383,18 @@ pub(super) fn published_sandbox_state(
     policy: Option<&NetworkPolicyDetail>,
     snapshots: Vec<SnapshotDetail>,
 ) -> PublishedSandboxState {
-    let lifecycle = sandbox.observed_lifecycle();
-    if let Err(error) = &lifecycle {
+    let observed = sandbox.observed_status();
+    if let Err(error) = &observed {
         tracing::warn!(sandbox_id = %sandbox.sandbox_id, %error, "preserving cluster lifecycle after unknown node observation");
     }
     PublishedSandboxState {
         sandbox_id: sandbox.sandbox_id.clone(),
         present: true,
         template: sandbox.template.clone(),
-        status: lifecycle
+        status: observed
             .as_ref()
             .ok()
-            .map(|state| state.label().to_string()),
+            .map(|status| status.label().to_string()),
         content_hash: sandbox.image_hash.clone(),
         runtime: sandbox.runtime.clone(),
         created_at: sandbox.created_at.clone(),
@@ -412,11 +412,11 @@ pub(super) fn published_sandbox_state(
         failure_reason: sandbox.failure_reason.clone(),
         quarantine_reason_code: sandbox.quarantine_reason_code.clone(),
         transition_receipt: sandbox.transition_receipt.clone(),
-        state_degraded: sandbox.state_degraded || lifecycle.is_err(),
+        state_degraded: sandbox.state_degraded || observed.is_err(),
         current_local_artifact_id: sandbox.current_local_artifact_id.clone(),
         current_local_artifact_kind: sandbox.current_local_artifact_kind,
         current_local_artifact_origin: sandbox.current_local_artifact_origin,
-        state_changed_at: lifecycle.as_ref().ok().and(sandbox.state_changed_at),
+        state_changed_at: observed.as_ref().ok().and(sandbox.state_changed_at),
         quarantine_recovery: sandbox.quarantine_recovery.clone(),
         execution_generation: sandbox.execution_generation,
         pod_uid: sandbox.pod_uid.clone(),

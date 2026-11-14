@@ -533,8 +533,6 @@ fn only_a_resident_that_restores_or_starts_reserves_an_identity_before_waking() 
             | State::Checkpointing
             | State::Suspending
             | State::Restoring
-            | State::CleanupRequired
-            | State::CleanupFailed
             | State::Quarantined
             | State::Failed => false,
         };
@@ -544,7 +542,7 @@ fn only_a_resident_that_restores_or_starts_reserves_an_identity_before_waking() 
             "{state:?}"
         );
     }
-    assert_eq!(seen, 19, "every lifecycle state is covered");
+    assert_eq!(seen, 17, "every lifecycle state is covered");
     assert!(!resident_is_dormant(&resident(None)));
 }
 

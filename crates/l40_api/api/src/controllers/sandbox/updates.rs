@@ -165,8 +165,9 @@ pub(super) fn observed_access_idle_generation(
     if observed.sandbox_id != sandbox_id.to_string()
         || !response.missing_ids.is_empty()
         || observed.state_degraded
-        || observed.observed_lifecycle().ok()
-            != Some(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started)
+        || !observed.observed_status().is_ok_and(|status| {
+            status.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started)
+        })
     {
         return Err(unavailable());
     }
@@ -211,7 +212,11 @@ fn classify_deadline_execution(
     {
         return Err(tonic::Status::failed_precondition("access deadline execution changed").into());
     }
-    match observed.observed_lifecycle().ok() {
+    match observed
+        .observed_status()
+        .ok()
+        .and_then(|status| status.unowned())
+    {
         Some(SandboxLifecycleState::Started) => Ok(DeadlineExecutionReadiness::Ready),
         Some(
             SandboxLifecycleState::Creating

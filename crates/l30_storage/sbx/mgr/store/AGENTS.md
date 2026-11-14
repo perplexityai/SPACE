@@ -45,9 +45,9 @@ there, but not a build or dev dependency, nor `libsqlite3-sys`.
   result unknown, as under `NOT`. A write of a lifecycle state clears
   `cleanup_state`, and a cleanup write sets both in one statement; the
   triggers in `db/sandbox-manager/20261105142930_sandbox_cleanup_state.up.sql`
-  reject any other shape. The generated `legacy_state` stays for releases
-  that still read it: `20261109120000` dropped it and `20261113190000`
-  restores it, so a rollback still finds it; don't read it.
+  reject any other shape. The generated `legacy_state` is gone:
+  `20261109120000` dropped it, `20261113190000` restored it while the
+  rollback target still read it, and `20261114020000` drops it again.
 - Only some child tables declare `ON DELETE CASCADE`: register a new sandbox
   child table in `delete_sandbox_child_rows` (`src/db.rs`).
 - Fixtures that sbx-mgr's other test suites share live in `db::fixture` and

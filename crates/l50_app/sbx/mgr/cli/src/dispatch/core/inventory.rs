@@ -191,7 +191,7 @@ fn sandbox_list_row(
         sandbox_label(&sandbox.sandbox_id),
         sandbox.runtime.clone().unwrap_or_else(|| "fc".into()),
         sandbox
-            .observed_lifecycle()
+            .observed_status()
             .map(|state| state.label().to_string())
             .unwrap_or_else(|_| "unknown".into()),
         sandbox_health(sandbox),
@@ -239,11 +239,13 @@ fn template_hash_display(
 }
 
 fn sandbox_health(sandbox: &SandboxInfo) -> String {
-    if !sandbox.observed_lifecycle().is_ok_and(|state| {
+    if !sandbox.observed_status().is_ok_and(|status| {
         matches!(
-            state,
-            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started
-                | pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused
+            status.unowned(),
+            Some(
+                pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started
+                    | pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused
+            )
         )
     }) {
         return "-".into();
@@ -277,7 +279,7 @@ async fn handle_stats(client: &mut SandboxClient, sandbox_id: SandboxSelector) {
     println!(
         "Sandbox: {short_id}  ({})",
         sandbox
-            .observed_lifecycle()
+            .observed_status()
             .map(|state| state.label())
             .unwrap_or("unknown")
     );
