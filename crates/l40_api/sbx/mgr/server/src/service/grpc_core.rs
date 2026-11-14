@@ -17,7 +17,8 @@ use super::validation::{
 use super::*;
 
 use pplx_space_events::{
-    SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
+    SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
+    emit_sandbox_event,
 };
 use pplx_space_node_mgr_client::proto::{
     GetDiskUsageRequest as NodeGetDiskUsageRequest,
@@ -856,6 +857,25 @@ impl SandboxManagerService {
                 "auto-lifecycle delete requires a canonical sandbox id",
             ));
         }
+        let discard = match req.discard_retained_filesystem_reason.as_deref() {
+            Some(raw) => {
+                self.authorize_peer(
+                    &request,
+                    "Delete.discard_retained_filesystem",
+                    ALLOW_RETAINED_FILESYSTEM_DISCARD,
+                )?;
+                if expectation.is_some() || template_filter.is_some() {
+                    return Err(Status::invalid_argument(
+                        "a discard delete names one sandbox and takes no template filter",
+                    ));
+                }
+                Some(
+                    super::retained_filesystem_discard::DiscardReason::parse(raw)
+                        .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                )
+            }
+            None => None,
+        };
 
         let to_delete = self
             .resolve_lifecycle_target(
@@ -866,6 +886,13 @@ impl SandboxManagerService {
             )
             .await?;
 
+        if discard.is_some() && to_delete.is_none() {
+            // A discard names the row the operator inspected; one that isn't
+            // here is the wrong target, not a delete that already happened.
+            return Err(Status::not_found(format!(
+                "no sandbox {requested_id} on this node to discard"
+            )));
+        }
         let mut deleted_ids: Vec<String> = Vec::new();
 
         for (id, runtime_label) in to_delete.iter() {
@@ -888,6 +915,12 @@ impl SandboxManagerService {
                         .is_some_and(|status| status.is_unowned(SandboxState::Quarantined));
                 (episode, quarantined)
             };
+            if discard.is_some() && clone_disposal.is_some() {
+                return Err(
+                    super::cleanup::CleanupAdmissionError::DiscardNotApplicable { sandbox_id }
+                        .into_status(),
+                );
+            }
             if let Some(episode) = clone_disposal {
                 if episode.requested_at.is_none() && !quarantined {
                     return Err(Status::failed_precondition(
@@ -949,12 +982,27 @@ impl SandboxManagerService {
                 continue;
             }
             let completion = CleanupCompletion::DeleteRow;
-            let admission = match expectation {
-                Some(expectation) => {
+            if let Some(reason) = &discard {
+                // Logged before admission: admission commits the row's
+                // `deleting` state, which startup recovery finishes as a
+                // delete after a restart, so the reason is on record first.
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    discard_reason = %reason,
+                    "operator discard delete requested: erasing a retained filesystem that may \
+                     be the sandbox's only copy, if admitted"
+                );
+            }
+            let admission = match (expectation, &discard) {
+                (Some(expectation), _) => {
                     self.admit_auto_lifecycle_delete(sandbox_id, expectation)
                         .await
                 }
-                None => {
+                (None, Some(_)) => {
+                    self.admit_retained_filesystem_discard(sandbox_id, !blocking)
+                        .await
+                }
+                (None, None) => {
                     self.admit_selected_cleanup(
                         sandbox_id,
                         completion,
@@ -967,6 +1015,17 @@ impl SandboxManagerService {
                 }
             }
             .map_err(super::cleanup::CleanupAdmissionError::into_status)?;
+            if let Some(reason) = &discard {
+                emit_sandbox_event(
+                    id,
+                    SandboxEventType::DeleteRequested,
+                    SandboxEventSource::SbxManager,
+                    SandboxEventDetails::default()
+                        .trigger(SandboxEventTrigger::User)
+                        .operation(super::retained_filesystem_discard::DISCARD_OPERATION)
+                        .reason(reason.as_str()),
+                );
+            }
 
             // Admission owns the authoritative lifecycle row under the
             // per-sandbox cleanup lock. Monitoring is removed only after that

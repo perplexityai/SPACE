@@ -683,6 +683,82 @@ class TeardownRestartControl(PendingBackupControl, Protocol):
         ...
 
 
+class RetainedOnlyCopyControl(Protocol):
+    """Kind-only operations for an interrupted suspend that leaves the only copy.
+
+    The fault is a process fault, the one direct manipulation the scenario
+    needs: node-manager is held while the suspend sits in `suspending`, the
+    sandbox's Firecracker is killed, and node-manager is released, so the
+    suspend fails with its runtime gone and no capture kept. Everything else
+    goes through the public API and the product's `space-sbxmgr` on the node.
+    """
+
+    def sandbox_node_name(self, sandbox_id: str) -> str | None:
+        """The node the sandbox is placed on, from the admin API."""
+        ...
+
+    def pause_in_memory(self, sandbox_id: str) -> None:
+        """Native `:pause`; returns once accepted."""
+        ...
+
+    def suspend_without_waiting(self, sandbox_id: str) -> str:
+        """Native `:suspend`; returns its operation id without waiting."""
+        ...
+
+    def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None:
+        """The sandbox's row state in that node's sandbox-manager, or None without a row."""
+        ...
+
+    def native_sandbox_state(self, sandbox_id: str) -> str:
+        """The sandbox's control-plane state from the native API."""
+        ...
+
+    def hold_node_manager(self, node_name: str) -> None:
+        """Stop node-manager on the node, so its RPCs wait."""
+        ...
+
+    def release_node_manager(self, node_name: str) -> None:
+        """Continue node-manager on the node."""
+        ...
+
+    def kill_sandbox_runtime(self, node_name: str, sandbox_id: str) -> str:
+        """SIGKILL the sandbox's Firecracker and wait until it is reaped; returns a report."""
+        ...
+
+    def node_sandbox_delete(
+        self, node_name: str, sandbox_id: str, *, discard_reason: str | None
+    ) -> Any:
+        """`space-sbxmgr delete --blocking` on the node; a discard when a reason is given.
+
+        Returns the command result (`returncode`, `detail()`).
+        """
+        ...
+
+    def api_delete(self, sandbox_id: str) -> str:
+        """The public delete; returns its operation id."""
+        ...
+
+    def operation(self, operation_id: str) -> dict[str, Any]:
+        """The public operation's record."""
+        ...
+
+    def native_sandbox_present(self, sandbox_id: str) -> bool:
+        """Whether the native API still finds the sandbox."""
+        ...
+
+    def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]:
+        """The sandbox's execution pods as the apiserver shows them."""
+        ...
+
+    def sandbox_cache_dir_present(self, node_name: str, sandbox_id: str) -> bool:
+        """Whether the sandbox's cache directory, its retained filesystem, is on the node."""
+        ...
+
+    def discard_attempt_window_seconds(self, node_name: str) -> int:
+        """The window the node's discard refuses within, from the suspend attempt's start."""
+        ...
+
+
 @dataclass(frozen=True)
 class ReconcileQueueRef:
     """One `node_reconcile_queue` row: its node, facet and whether it is a dead letter."""

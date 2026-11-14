@@ -590,6 +590,13 @@ message DeleteRequest {
   // Require this template at cleanup admission; never expands the target set.
   optional string template_filter = 2;
   bool blocking = 3;          // If true, wait until the sandbox row is deleted
+  // Present only for an operator's discard delete, carrying the operator's
+  // reason. It deletes a sandbox whose retained filesystem may be its only
+  // copy (a row an interrupted suspend quarantined with no usable capture),
+  // which an ordinary delete refuses, and it is refused for every other row.
+  // Only root or the local operator role may send it; it can't be combined
+  // with template_filter.
+  optional string discard_retained_filesystem_reason = 4;
 }
 
 message DeleteResponse {

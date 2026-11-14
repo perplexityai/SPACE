@@ -1032,3 +1032,61 @@ fn inventory_keeps_a_quarantined_row_without_local_evidence() {
     assert_eq!(reconcile(&conn).changed_ids(), vec![stale]);
     assert_eq!(*fenced.lock().unwrap(), vec![stale.to_string()]);
 }
+
+/// A runtime that has exited but isn't reaped yet still has its `/proc/{pid}`
+/// entry, so its `fc.pid` link still resolves. It must read as exited: a
+/// failed capture asks exactly then, and a live verdict rolls an only copy back
+/// to an erasable `paused`.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_exited_unreaped_runtime_reads_as_gone() {
+    let run_dir = tempfile::tempdir().unwrap();
+    let sandbox_id = "01a0b0c9-b8a3-7473-9c12-3821a701bc28";
+    std::fs::create_dir_all(run_dir.path().join(sandbox_id)).unwrap();
+    assert!(
+        !runtime_alive_in(run_dir.path(), sandbox_id).unwrap(),
+        "no link"
+    );
+
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    std::os::unix::fs::symlink(
+        format!("/proc/{}", child.id()),
+        run_dir.path().join(sandbox_id).join("fc.pid"),
+    )
+    .unwrap();
+    assert!(
+        runtime_alive_in(run_dir.path(), sandbox_id).unwrap(),
+        "running"
+    );
+    assert!(is_sandbox_running_in(run_dir.path(), sandbox_id));
+
+    child.kill().unwrap();
+    // Not waited on: the child stays a zombie, its /proc entry still there.
+    let stat = format!("/proc/{}/stat", child.id());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !std::fs::read_to_string(&stat).unwrap().contains(") Z ") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never became a zombie"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        std::path::Path::new(&stat).exists(),
+        "the zombie keeps its /proc entry"
+    );
+    assert!(
+        !runtime_alive_in(run_dir.path(), sandbox_id).unwrap(),
+        "zombie"
+    );
+    assert!(!is_sandbox_running_in(run_dir.path(), sandbox_id));
+
+    child.wait().unwrap();
+    assert!(
+        !runtime_alive_in(run_dir.path(), sandbox_id).unwrap(),
+        "reaped"
+    );
+}

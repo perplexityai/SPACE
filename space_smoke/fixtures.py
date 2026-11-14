@@ -28,6 +28,7 @@ from space_smoke.capabilities import (
     NodeFenceControl,
     NodeSelectorExtrasControl,
     PendingBackupControl,
+    RetainedOnlyCopyControl,
     TeardownRestartControl,
     OrphanedRestorePodGcControl,
     ReconcileQueueGcControl,
@@ -110,6 +111,7 @@ from space_smoke.node_selector_extras import NodeSelectorExtrasAssertions
 from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
 from space_smoke.unanswered_template_eviction import UnansweredTemplateEvictionAssertions
 from space_smoke.pending_backup import PendingBackupAssertions
+from space_smoke.retained_only_copy import RetainedOnlyCopyAssertions
 from space_smoke.teardown_restart import TeardownRestartAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
 from space_smoke.template_build import TemplateBuildAssertions
@@ -3071,6 +3073,23 @@ class KindEcw(Ecw, KindAdmin):
                 self, self._pending_backup_control, self._context.scope
             )
         return self._pending_backup_assertions
+
+    _retained_only_copy_control: RetainedOnlyCopyControl | None = None
+    _retained_only_copy_assertions: RetainedOnlyCopyAssertions | None = None
+
+    @property
+    def retained_only_copy(self) -> RetainedOnlyCopyAssertions:
+        """Privileged assertions for an interrupted suspend that leaves the only copy."""
+
+        if self._retained_only_copy_control is None:
+            raise SmokeConfigurationError(
+                "retained only-copy control is only available on the kind backend"
+            )
+        if self._retained_only_copy_assertions is None:
+            self._retained_only_copy_assertions = RetainedOnlyCopyAssertions(
+                self, self._retained_only_copy_control, self._context.scope
+            )
+        return self._retained_only_copy_assertions
 
     _teardown_restart_control: TeardownRestartControl | None = None
     _teardown_restart_assertions: TeardownRestartAssertions | None = None

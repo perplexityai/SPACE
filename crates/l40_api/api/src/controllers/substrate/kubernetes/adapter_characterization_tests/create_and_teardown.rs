@@ -10,6 +10,7 @@ use super::super::tests::{
     insert_test_sandbox_row, node_with_network_slots, sandbox_pod_on_node,
     substrate_with_inventory_caches_and_pool, substrate_with_store_and_client,
     substrate_with_store_client_proxy_port_and_pod,
+    substrate_with_store_client_proxy_port_and_pods,
 };
 use super::*;
 use crate::controllers::substrate::{PodIdentityFence, RecordedExecution};
@@ -561,6 +562,75 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
         active_execution_count(&db.pool, sandbox_id).await?,
         1,
         "{case:?}: the execution must stay tracked for retry"
+    );
+    Ok(())
+}
+
+/// A dead VM can take its pod's network namespace with it while its node
+/// still answers: a runtime crash, or a quarantined sandbox an operator then
+/// discarded. A delete whose pod worker is unreachable reaches the same
+/// sbx-mgr through the node-api of the execution's node, so the delete is
+/// admitted and the teardown finishes instead of retrying it unadmitted.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_reaches_the_node_api_when_its_pod_worker_is_gone() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    let pod_name = "space-sbx-teardown-node-route-g1";
+    insert_test_sandbox_row(&db.pool, sandbox_id, "started").await?;
+    // The execution names its node, and its pod sits at an address nothing
+    // answers on.
+    insert_execution(
+        &db.pool,
+        sandbox_id,
+        ExecutionSeed::running(pod_name, "teardown-node-route-uid"),
+    )
+    .await?;
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new(std::iter::empty())).await?;
+    worker
+        .sim
+        .ensure_default_running(&sandbox_id.to_string())
+        .await?;
+    let (client, log) = teardown_kube_client();
+    let mut substrate = substrate_with_store_client_proxy_port_and_pods(
+        db.pool.clone(),
+        client,
+        DEFAULT_SANDBOX_PROXY_PORT,
+        vec![
+            sandbox_pod(
+                pod_name,
+                "teardown-node-route-uid",
+                sandbox_id,
+                1,
+                "Running",
+                Some(UNDIALED_POD_IP),
+            ),
+            super::hydration_and_suspend::node_api_pod(worker.port),
+        ],
+    );
+    // Only the node-api pod's advertised port reaches the worker.
+    substrate.k8s.node_api_port = 1;
+    substrate.budgets.teardown_worker_connect = Duration::from_millis(300);
+    substrate.budgets.teardown_node_delete_wait = Duration::from_millis(300);
+
+    substrate.delete_execution(sandbox_id).await?;
+
+    assert_eq!(
+        worker.received("WorkerApi/DeleteSandbox").len(),
+        1,
+        "the delete reached sbx-mgr through the node-api"
+    );
+    assert_eq!(
+        requests_matching(&log, &Method::DELETE).len(),
+        1,
+        "the admitted delete removes the pod"
+    );
+    assert_eq!(
+        active_execution_count(&db.pool, sandbox_id).await?,
+        0,
+        "the admitted delete releases the execution"
     );
     Ok(())
 }

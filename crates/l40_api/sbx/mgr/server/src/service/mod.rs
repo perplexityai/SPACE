@@ -261,6 +261,13 @@ const ALLOW_SANDBOX_OPERATOR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Role(LocalRole::Operator),
     UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
 ];
+/// A discard delete erases what may be a sandbox's only copy, so only root
+/// and the local operator role may send one: no service principal is
+/// admitted. Nothing in the tree sends it but the CLI.
+const ALLOW_RETAINED_FILESYSTEM_DISCARD: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(LocalRole::Operator),
+];
 const ALLOW_SANDBOX_AUTO_LIFECYCLE_OPERATOR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Operator),
@@ -1121,7 +1128,7 @@ impl Default for SandboxManagerServiceOptions {
             ),
             sandbox_runtime_live: Arc::new(is_sandbox_running),
             capture_runtime_probe: Some(Arc::new(|id| {
-                Path::new(RUN_DIR).join(id).join("fc.pid").try_exists()
+                cache_cleanup::runtime_alive_in(Path::new(RUN_DIR), id)
             })),
             sandbox_rootfs_present: Arc::new(|id: &str| {
                 create_support::sandbox_rootfs_exists_in(std::path::Path::new(CACHE_DIR), id)
@@ -2163,6 +2170,7 @@ mod ingress_protection;
 mod reconcile;
 mod recovery;
 mod recovery_cross_node;
+mod retained_filesystem_discard;
 #[cfg(test)]
 mod route_identity_tests;
 mod spaced_bridge;

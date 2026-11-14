@@ -8,18 +8,10 @@ pub struct QuarantineRecoveryFence {
     pub execution_generation: ExecutionGeneration,
 }
 
-pub const SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE: &str =
-    "suspend_publish_failed_no_artifact_runtime_gone";
-/// An admitted capture has no conclusive completion evidence. Its runtime may
-/// still be live; deleting its files is not a safe recovery action.
-pub const SUSPEND_CAPTURE_UNRESOLVED: &str = "suspend_capture_unresolved";
-
-fn suspend_evidence_requires_retention(reason: Option<&str>) -> bool {
-    matches!(
-        reason,
-        Some(SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE | SUSPEND_CAPTURE_UNRESOLVED)
-    )
-}
+pub use pplx_space_sbx_mgr_protocol::{
+    SUSPEND_CAPTURE_UNRESOLVED, SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE,
+    suspend_evidence_requires_retention,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompleteCleanupEpisodeError {
@@ -1062,7 +1054,7 @@ pub fn complete_cleanup_episode_for_job(
         let execution_generation = episode
             .execution_generation
             .or(runtime_execution_generation(&tx, sandbox_id)?);
-        record_execution_delete_receipt(&tx, sandbox_id, execution_generation)?;
+        record_cleanup_execution_delete_receipt(&tx, sandbox_id, execution_generation)?;
         delete_sandbox_child_rows(&tx, sandbox_id)?;
         tx.execute("DELETE FROM sandboxes WHERE id = ?1", params![sandbox_id])
             .map_err(auto_lifecycle_delete_receipts::map_pending_receipt_delete_error)?;
@@ -1355,7 +1347,7 @@ pub fn complete_row_intent_cleanup_for_job(
                 receipt.receipt_id,
             )?;
         }
-        record_execution_delete_receipt(
+        record_cleanup_execution_delete_receipt(
             &tx,
             sandbox_id,
             row.space_api_route_identity.execution_generation,
