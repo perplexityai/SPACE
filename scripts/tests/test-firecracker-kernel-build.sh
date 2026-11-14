@@ -6,6 +6,8 @@ kernel_dir="${repo_root}/templates/firecracker/kernel"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
+# shellcheck disable=SC2034 # read by the sourced build-kernel.sh
+VARIANT_DIR="${kernel_dir}/variants"
 # shellcheck source=/dev/null
 source "${kernel_dir}/build-kernel.sh"
 
@@ -163,6 +165,119 @@ fi
 if env CONFIG_FRAGMENT=missing-review-fixture.config PATH="${fake_bin}:${PATH}" \
     "${kernel_dir}/build.sh" >/dev/null 2>&1; then
   echo 'build.sh silently accepted a missing requested fragment' >&2
+  exit 1
+fi
+
+# In-repository variants. Each has a fragment, a required list and a disabled
+# list; a fragment only enables built-in symbols, and nothing is both required
+# and disabled.
+for fragment in "${kernel_dir}"/variants/*.config; do
+  variant="$(basename "$fragment" .config)"
+  for list in required disabled; do
+    [[ -f "${kernel_dir}/variants/${variant}.${list}" ]] || {
+      echo "variant ${variant} has no ${list} list" >&2; exit 1;
+    }
+  done
+  if variant_lines "$fragment" | grep -Ev '^CONFIG_[A-Z0-9_]+=y$' >&2; then
+    echo "variant ${variant} sets something other than a built-in symbol" >&2
+    exit 1
+  fi
+  grep -qx 'CONFIG_MODULES' "${kernel_dir}/variants/${variant}.disabled" || {
+    echo "variant ${variant} does not keep CONFIG_MODULES disabled" >&2; exit 1;
+  }
+  while IFS= read -r symbol; do
+    if { variant_lines "$fragment"; variant_lines "${kernel_dir}/variants/${variant}.required"; } |
+        grep -q "^${symbol}="; then
+      echo "variant ${variant} both requires and disables ${symbol}" >&2
+      exit 1
+    fi
+  done < <(variant_lines "${kernel_dir}/variants/${variant}.disabled")
+
+  # A config holding exactly the variant's promises passes; breaking any one
+  # of them fails.
+  variant_config="${tmp_dir}/${variant}-resolved.config"
+  {
+    variant_lines "$fragment"
+    variant_lines "${kernel_dir}/variants/${variant}.required"
+    variant_lines "${kernel_dir}/variants/${variant}.disabled" | sed 's/.*/# & is not set/'
+  } >"$variant_config"
+  verify_variant_config "$variant_config" "$variant"
+  first_symbol="$(variant_lines "$fragment" | head -n1)"
+  grep -vxF "$first_symbol" "$variant_config" >"${tmp_dir}/unresolved.config"
+  if verify_variant_config "${tmp_dir}/unresolved.config" "$variant" >/dev/null 2>&1; then
+    echo "verify_variant_config accepted an unresolved ${variant} symbol" >&2
+    exit 1
+  fi
+  sed 's/^# CONFIG_MODULES is not set$/CONFIG_MODULES=y/' "$variant_config" >"${tmp_dir}/modules.config"
+  if verify_variant_config "${tmp_dir}/modules.config" "$variant" >/dev/null 2>&1; then
+    echo "verify_variant_config accepted CONFIG_MODULES for ${variant}" >&2
+    exit 1
+  fi
+  cp "$variant_config" "${tmp_dir}/variant-modular.config"
+  printf '%s\n' 'CONFIG_TEST_MODULE=m' >>"${tmp_dir}/variant-modular.config"
+  if verify_variant_config "${tmp_dir}/variant-modular.config" "$variant" >/dev/null 2>&1; then
+    echo "verify_variant_config accepted a loadable module for ${variant}" >&2
+    exit 1
+  fi
+  # The bpf-modsig profile's own checks do not apply to a variant.
+  if verify_config "$variant_config" >/dev/null 2>&1; then
+    echo "the ${variant} fixture unexpectedly satisfies the bpf-modsig profile" >&2
+    exit 1
+  fi
+done
+
+# build-kernel.sh with a variant: the fragment comes from VARIANT_DIR, the
+# output is named after the variant, and the variant's lists decide success.
+fixture_variants="${tmp_dir}/variants"
+mkdir -p "$fixture_variants"
+printf 'CONFIG_FIXTURE_ON=y\n# CONFIG_FIXTURE_OFF is not set\n' >"${fixture_variants}/fixture.config"
+printf 'CONFIG_FIXTURE_ON=y\n' >"${fixture_variants}/fixture.required"
+printf 'CONFIG_FIXTURE_OFF\n' >"${fixture_variants}/fixture.disabled"
+cp "${fixture_variants}/fixture.config" "${fixture_variants}/broken.config"
+cp "${fixture_variants}/fixture.required" "${fixture_variants}/broken.required"
+printf 'CONFIG_FIXTURE_OFF\nCONFIG_FIXTURE_ABSENT\n' >"${fixture_variants}/broken.disabled"
+build_variant() {
+  env PATH="${fake_bin}:${PATH}" SOURCE_DIR="${tmp_dir}/linux" \
+    BASE_CONFIG="${tmp_dir}/base.config" KERNEL_VARIANT="$1" CONFIG_FRAGMENT="${2:-}" \
+    VARIANT_DIR="$fixture_variants" SOURCE_TIMESTAMP_FILE="${tmp_dir}/source-date-epoch" \
+    OUTPUT_DIR="${3:-}" bash "${kernel_dir}/build-kernel.sh" >"${tmp_dir}/variant-build.log" 2>&1
+}
+build_variant fixture "" "${tmp_dir}/variant-out" || { cat "${tmp_dir}/variant-build.log" >&2; exit 1; }
+cmp "${fixture_variants}/fixture.config" "${tmp_dir}/variant-out/config"
+if build_variant broken "" "${tmp_dir}/broken-out"; then
+  echo "build-kernel.sh accepted a variant whose disabled list did not resolve" >&2
+  exit 1
+fi
+if build_variant fixture "$valid_config" "${tmp_dir}/both-out"; then
+  echo "build-kernel.sh accepted both KERNEL_VARIANT and CONFIG_FRAGMENT" >&2
+  exit 1
+fi
+# The default output directory carries the variant's name, not bpf-modsig.
+default_output_dir() {
+  # SC2016: the nested shell expands $1 and OUTPUT_DIR.
+  # shellcheck disable=SC2016
+  env -u OUTPUT_DIR -u KERNEL_VARIANT -u CONFIG_FRAGMENT "$@" \
+    bash -c 'source "$1"; echo "$OUTPUT_DIR"' _ "${kernel_dir}/build-kernel.sh"
+}
+[[ "$(default_output_dir KERNEL_VARIANT=fixture)" == /output/vmlinux-6.1.155-fixture ]]
+[[ "$(default_output_dir CONFIG_FRAGMENT=custom.config)" == /output/vmlinux-6.1.155-bpf-modsig ]]
+[[ "$(default_output_dir)" == /output/vmlinux-6.1.155 ]]
+
+# build.sh forwards an in-repository variant and rejects anything else.
+env PATH="${fake_bin}:${PATH}" DOCKER_ARGS="$docker_args" OUTPUT_DIR="${tmp_dir}/output" \
+  KERNEL_VARIANT=nft "${kernel_dir}/build.sh" >"${tmp_dir}/build-sh.log"
+grep -Fxq 'KERNEL_VARIANT=nft' "$docker_args" || { echo 'build.sh did not forward KERNEL_VARIANT' >&2; exit 1; }
+grep -Fq 'vmlinux-6.1.155-nft' "${tmp_dir}/build-sh.log" || { echo 'build.sh did not name the nft output' >&2; exit 1; }
+for rejected in missing-variant bpf-modsig 'Nft' '../nft'; do
+  if env KERNEL_VARIANT="$rejected" PATH="${fake_bin}:${PATH}" DOCKER_ARGS="$docker_args" \
+      "${kernel_dir}/build.sh" >/dev/null 2>&1; then
+    echo "build.sh accepted KERNEL_VARIANT=${rejected}" >&2
+    exit 1
+  fi
+done
+if env KERNEL_VARIANT=nft CONFIG_FRAGMENT=build.sh PATH="${fake_bin}:${PATH}" DOCKER_ARGS="$docker_args" \
+    "${kernel_dir}/build.sh" >/dev/null 2>&1; then
+  echo 'build.sh accepted both KERNEL_VARIANT and CONFIG_FRAGMENT' >&2
   exit 1
 fi
 

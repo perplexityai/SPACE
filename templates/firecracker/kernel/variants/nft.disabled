@@ -1,0 +1,32 @@
+# Symbols the resolved config must leave unset. Each one is reachable from
+# guest userspace and has no consumer in this variant.
+# Loadable modules: the guest kernel stays monolithic.
+CONFIG_MODULES
+# Families other than ip, ip6 and inet. br_netfilter already passes bridged
+# traffic through the ip and ip6 hooks.
+CONFIG_NF_TABLES_ARP
+CONFIG_NF_TABLES_NETDEV
+CONFIG_NF_TABLES_BRIDGE
+CONFIG_BRIDGE_NF_EBTABLES
+# Flowtable offload, which has no hardware to offload to in a microVM.
+CONFIG_NF_FLOW_TABLE
+# Userspace queueing, logging and conntrack netlink.
+CONFIG_NETFILTER_NETLINK_QUEUE
+CONFIG_NETFILTER_NETLINK_LOG
+CONFIG_NF_CT_NETLINK
+# Expressions with no consumer.
+CONFIG_NFT_TPROXY
+CONFIG_NFT_SOCKET
+CONFIG_NFT_OSF
+CONFIG_NFT_TUNNEL
+CONFIG_NFT_XFRM
+CONFIG_NFT_SYNPROXY
+CONFIG_NFT_CONNLIMIT
+CONFIG_NFT_QUOTA
+CONFIG_NFT_DUP_IPV4
+CONFIG_NFT_DUP_IPV6
+CONFIG_NFT_NUMGEN
+CONFIG_NFT_HASH
+# ipset and IPVS: current Docker releases need neither.
+CONFIG_IP_SET
+CONFIG_IP_VS

@@ -42,6 +42,7 @@ ARG FIRECRACKER_CI_VERSION
 ARG KERNEL_SOURCE_COMMIT
 ARG BASE_CONFIG_SHA256
 ARG CONFIG_FRAGMENT
+ARG KERNEL_VARIANT
 
 WORKDIR /build
 RUN test -n "${KERNEL_VERSION}" \
@@ -75,9 +76,11 @@ ENV KBUILD_BUILD_USER=space \
     KERNEL_VERSION=${KERNEL_VERSION}
 
 COPY build-kernel.sh ./
+COPY variants/ ./variants/
 # Optional caller-supplied fragments stay in the input context, not the image.
 RUN --mount=type=bind,target=/inputs \
-    CONFIG_FRAGMENT="${CONFIG_FRAGMENT:+/inputs/${CONFIG_FRAGMENT}}" ./build-kernel.sh
+    CONFIG_FRAGMENT="${CONFIG_FRAGMENT:+/inputs/${CONFIG_FRAGMENT}}" \
+    KERNEL_VARIANT="${KERNEL_VARIANT}" ./build-kernel.sh
 
 FROM scratch AS export
 COPY --from=build /output/ /
