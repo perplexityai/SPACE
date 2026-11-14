@@ -292,12 +292,19 @@ impl SandboxManagerService {
         )))
     }
 
+    // End the span before the returned guard is used: measure acquisition,
+    // not the SQL work or the time the connection stays locked.
+    #[tracing::instrument(name = "sbxmgr.create.db_lock", skip_all, err)]
+    fn create_db_conn(&self) -> Result<crate::db::ConnectionGuard<'_>, Status> {
+        self.db_conn()
+    }
+
     pub(super) fn lookup_requested_sandbox(
         &self,
         requested_id: Uuid,
     ) -> Result<Option<crate::db::SandboxRow>, Status> {
         let requested_id_str = requested_id.to_string();
-        let db = self.db_conn()?;
+        let db = self.create_db_conn()?;
         crate::db::read::sandbox(&db, &requested_id_str)
             .map_err(|e| Status::internal(format!("db lookup failed: {e}")))
     }
@@ -410,7 +417,7 @@ impl SandboxManagerService {
 
         let create_cleanup_id = SandboxCleanupEpisodeId::new();
         {
-            let db = self.db_conn()?;
+            let db = self.create_db_conn()?;
             crate::db::insert_sandbox_with_cleanup_episode_and_route_evidence(
                 &db,
                 crate::db::InsertSandboxParams {
@@ -479,7 +486,7 @@ impl SandboxManagerService {
         }
 
         let update_result = {
-            let db = self.db_conn()?;
+            let db = self.create_db_conn()?;
             write_create_completed(&db, &id)
         };
         if let Err(status) = update_result {
@@ -595,7 +602,7 @@ impl SandboxManagerService {
 
             {
                 let update_result = {
-                    let db = self.db_conn()?;
+                    let db = self.create_db_conn()?;
                     write_base_snapshot_create_completed(&db, &id)
                 };
                 if let Err(status) = update_result {
@@ -609,7 +616,7 @@ impl SandboxManagerService {
         }
 
         let completed = {
-            let db = self.db_conn()?;
+            let db = self.create_db_conn()?;
             crate::db::complete_create(&db, &id, create_cleanup_id, !req.autostart)
                 .map_err(|error| Status::internal(format!("complete create: {error}")))?
         };
