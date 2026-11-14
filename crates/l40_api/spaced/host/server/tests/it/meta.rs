@@ -65,6 +65,7 @@ impl BridgeGuestMeta for ReadyWaitGuest {
                 })
                 .collect(),
             diagnostics_dropped: 0,
+            memory_used_bytes: None,
         }))
     }
 

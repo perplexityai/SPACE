@@ -22,6 +22,7 @@ fn guest_drain_is_bounded_whatever_the_guest_returns() {
     let response = PingResponse {
         diagnostics,
         diagnostics_dropped: u64::MAX,
+        memory_used_bytes: None,
     };
 
     let drain = summarize(&response);
@@ -51,10 +52,12 @@ fn first_drain_after_a_snapshot_restore_is_dropped() {
     let parent = PingResponse {
         diagnostics: vec![callsite("warn", 3, "parent")],
         diagnostics_dropped: 0,
+        memory_used_bytes: None,
     };
     let own = PingResponse {
         diagnostics: vec![callsite("warn", 1, "own")],
         diagnostics_dropped: 0,
+        memory_used_bytes: None,
     };
 
     restored.mark("sandbox");
