@@ -216,16 +216,57 @@ impl SandboxInventoryPresence {
 }
 
 /// Check if a sandbox's Firecracker process is alive via the fc.pid symlink.
-/// The symlink points to /proc/{pid} — if the target exists, the process is alive.
+/// An unreadable path reads as not running; callers that must tell it from a
+/// confirmed exit use [`runtime_alive_in`].
 pub(super) fn is_sandbox_running(sandbox_id: &str) -> bool {
     is_sandbox_running_in(Path::new(RUN_DIR), sandbox_id)
 }
 
 pub(super) fn is_sandbox_running_in(run_dir: &Path, sandbox_id: &str) -> bool {
-    let link_path = run_dir.join(sandbox_id).join("fc.pid");
-    // Follow the runtime's /proc link. Capture recovery uses its own fallible
-    // probe because it must distinguish an unreadable path from confirmed exit.
-    link_path.exists()
+    runtime_alive_in(run_dir, sandbox_id).unwrap_or(false)
+}
+
+/// Whether the process the sandbox's `fc.pid` link names (`/proc/{pid}`) is
+/// alive: `Ok(false)` once it has exited, `Err` when that can't be read.
+///
+/// A process that has exited keeps its `/proc/{pid}` entry until its parent
+/// reaps it, so the link alone still resolves for a few hundred milliseconds
+/// after a runtime dies. That window is exactly when a failed capture asks
+/// whether its runtime is gone, so a zombie (`Z`) or dead (`X`) process counts
+/// as exited.
+pub(super) fn runtime_alive_in(run_dir: &Path, sandbox_id: &str) -> std::io::Result<bool> {
+    let link = run_dir.join(sandbox_id).join("fc.pid");
+    let process = match std::fs::read_link(&link) {
+        Ok(process) => process,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let stat = match std::fs::read_to_string(process.join("stat")) {
+        Ok(stat) => stat,
+        // Gone between the two reads, or a target that isn't a /proc entry,
+        // whose existence alone is all the link can say.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return process.try_exists();
+        }
+        Err(error) => return Err(error),
+    };
+    // `pid (comm) state ...`; comm may itself hold parentheses, so the state
+    // follows the last one.
+    let state = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unparsable {}", process.join("stat").display()),
+            )
+        })?;
+    Ok(!matches!(state, "Z" | "X"))
 }
 
 fn rootfs_size_mb(cache_dir: &Path, sandbox_id: &str) -> Option<u32> {

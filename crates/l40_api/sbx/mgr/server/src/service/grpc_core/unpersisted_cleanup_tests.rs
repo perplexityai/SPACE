@@ -57,6 +57,7 @@ impl Rpc {
                         sandbox_id: id.to_owned(),
                         template_filter: None,
                         blocking,
+                        discard_retained_filesystem_reason: None,
                     });
                     request.extensions_mut().insert(peer);
                     service.delete(request).await.map(|_| ())

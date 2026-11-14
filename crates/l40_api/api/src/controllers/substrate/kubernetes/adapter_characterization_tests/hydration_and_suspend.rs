@@ -383,7 +383,7 @@ async fn suspend_artifact_id(
 }
 
 /// A ready worker node-api pod on [`WORKER_NODE`] that advertises `port`.
-fn node_api_pod(port: u16) -> Pod {
+pub(super) fn node_api_pod(port: u16) -> Pod {
     let mut pod = node_api_pod_on_node("space-worker-node-a", WORKER_NODE);
     pod.metadata.annotations = Some(BTreeMap::from([(
         "space.pplx.net/node-api-port".to_string(),

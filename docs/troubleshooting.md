@@ -89,6 +89,162 @@ This prints sandbox listings and the saved creation/deletion operations, sandbox
 
 Inspect a running process with `GET /v1/sandboxes/{sandbox_id}/processes/{process_id}`. An empty process list is expected after a command exits; use the saved event transcript to check its result. Keep a failed transcript for diagnosis, but review it for secrets before sharing it.
 
+## A sandbox quarantined after an interrupted suspend
+
+A suspend the node loses before its own capture is saved, to a host restart or
+a Firecracker exit, leaves no snapshot of the sandbox's last state. Its
+instance filesystem on the node may then be the only copy of that state.
+sandbox-manager keeps the filesystem and quarantines the sandbox with one of
+two failure reasons, the ones its retention policy keeps the filesystem for,
+and nothing recovers or deletes it automatically:
+
+- `suspend_publish_failed_no_artifact_runtime_gone`: the runtime is gone and
+  no usable capture of the suspend's admitted attempt is kept. That covers a
+  plaintext suspend whose attempt left no complete capture of its own, an
+  attempt whose only capture belongs to an earlier suspend, and a running
+  suspend that failed before its capture returned or while it was still set
+  to discard the capture.
+- `suspend_capture_unresolved`: an encrypted capture's evidence doesn't settle
+  it. The producer reported an error, refused with the runtime gone, left
+  receipts that contradict the attempt, or reached no outcome within the
+  attempt's six-hour window. With no receipt yet, the sandbox stays
+  `suspending` until that window ends.
+
+Startup and periodic recovery leave a sandbox `suspending` when they can't
+read its captures, for a later recovery pass to try again. On Kubernetes, when the
+interrupted suspend was the pod's teardown, the pod stays `Terminating`: the
+shim releases a task only once sbx-manager answers that the execution is
+durable, superseded or deleted, and a quarantined sandbox gets none of those
+answers.
+
+**Detect it.**
+
+- On the node, `space-sbxmgr list` shows the sandbox's `STATE` as
+  `quarantined`.
+- In the control plane, the admin API's
+  `GET /admin/api/v1/debug/sandbox/{sandbox_id}` returns the active quarantine
+  with `reason_code` `suspend_snapshot_publication_failed` and `next_action`
+  `requires_operator_attention`.
+- sandbox-manager emits a `sandbox_quarantined` sandbox event and, when its
+  recovery of the suspend (at startup, periodically, or from a teardown
+  retry) quarantines it, a `suspend_failed` event with the failure reason.
+  When a running
+  publication fails this way, the control plane receives only that failure
+  reason. The cause stays on the node, as the `reason_message` of
+  sandbox-manager's own quarantine record and, when the failing step emits a
+  `suspend_failed` event, in that event's `error` field.
+  internal-api emits another `sandbox_quarantined` event when the node's report
+  reaches the control plane.
+- The shim's `shim.kill` and `shim.delete` teardown spans keep failing for the
+  pod.
+
+**Alert on it.**
+
+- `space.sandbox.worker.quarantine.entered` with
+  `reason:suspend_snapshot_publication_failed` counts every sandbox that
+  enters this state. It also counts a suspend quarantined for a publication
+  failure that leaves the filesystem erasable as usual, which the discard
+  below refuses; the debug route's `reason_message` and the discard's own
+  check tell them apart.
+- `space.snapshot.create.recovery` with `kind:suspend` and
+  `outcome:quarantined_no_artifact_runtime_gone` counts the sandboxes that
+  recovery of the suspend quarantines for either reason, at startup,
+  periodically or from a teardown retry, not the ones a running publication
+  quarantines.
+
+`space.shim.operation.error` with `step:prepare_teardown_suspend` also rises,
+but it counts every retried teardown release too, so it makes a noisy alert.
+
+**Delete it.** An ordinary delete refuses the sandbox, because it would erase
+what may be the only copy, and a control-plane delete answers `409`. Once the
+filesystem is known to be expendable, an operator on the node discards it
+explicitly. The discard needs a cluster administrator's approval of the
+target, the blast radius, the rollback and the verification plan first. Deploy a sandbox-manager that supports the discard first: an older
+one ignores the flag and runs an ordinary delete, which refuses this sandbox
+but makes none of the checks below and records no reason.
+
+```bash
+space-sbxmgr delete <sandbox-uuid> --discard-retained-filesystem \
+    --reason "<why the filesystem can be discarded>" --blocking
+```
+
+The command takes the sandbox's full UUID and runs as root or as an account
+sandbox-manager grants its local operator role; a service account, such as
+node-api's, is refused. It's refused for every sandbox that isn't quarantined
+(or failed) with one of those two failure reasons, and for a sandbox that
+isn't on the node. The command reads the sandbox's state and failure reason
+before it sends anything, and sandbox-manager checks them again under the
+sandbox's cleanup lock. It also refuses while a capture could still finish:
+while the sandbox's suspend attempt is inside its six-hour window, while a
+backup of its artifacts is being admitted or its upload is pending, running
+or cancelling, and while its runtime is live or its liveness can't be read.
+A sandbox quarantined at once can therefore be discarded only once its
+attempt's window has passed. sandbox-manager logs the reason in a warning
+line before it admits the delete (a restart after admission still finishes
+it), then records it in a `delete_requested` event with operation
+`discard_retained_filesystem` and deletes the sandbox and its filesystem.
+
+**What releases the pod.** The delete records a receipt covering the
+highest execution generation it can read: the generation the pod's teardown
+waits on, from the teardown's record, and the row's last observed
+generation. The shim's next teardown poll is then answered as deleted and it
+releases the task, and Kubernetes finishes removing the pod. If a record
+doesn't decode, sandbox-manager logs `teardown suspend operation does not
+decode` or `retained route generation does not decode` and the receipt covers
+only the generations it could read. When those don't reach the generation the
+pod waits on, its poll isn't answered as deleted and the pod stays
+`Terminating`.
+
+**If the control plane deleted it first.** A Kubernetes teardown that has
+no runtime address for the pod, or no observed execution, deletes the
+control-plane sandbox without asking the node. The node then hears that the
+sandbox was deleted and node-ctl asks sandbox-manager to evict it, and the
+eviction refuses the only copy as a delete does: sandbox-manager logs
+`refusing cluster-deleted eviction`, node-ctl counts the eviction as deferred
+and retries it every 30 minutes, and the sandbox stays quarantined on the
+node. Discard it as above to release it.
+
+**Finish in the control plane.** The control-plane sandbox stays
+`quarantined` after the discard. Delete it with `DELETE /v1/sandboxes/{sandbox_id}`, or the admin
+API's force-delete, which now completes because the node no longer has the
+sandbox. With the orphaned-sandbox reconciler enabled, quarantine recovery may
+instead return it to `suspended`, but only when all of these hold: the
+reconciler runs live, not in dry run; the API server confirms the sandbox's
+pod is gone, before and after the node is asked, so a pod still `Terminating`
+holds it; the node reports the sandbox missing; and a ready suspend snapshot
+taken before the quarantine covers all of the sandbox's recorded activity. That
+snapshot doesn't include the writes the discarded filesystem held.
+
+## A sandbox whose pod is gone while its node still holds it
+
+When a Kubernetes sandbox's pod disappears, the cluster controller's
+orphaned-sandbox reconciler would normally return the sandbox to `suspended`
+from its last snapshot. The node the sandbox is placed on may still hold a
+newer copy, so the reconciler leaves the sandbox to that node in two ways.
+
+- Its candidate listing skips every sandbox whose active node has reported it.
+  Such a sandbox stays in its lifecycle without a pod until the node reports
+  it settled: a teardown suspend reports it `suspended`, a quarantine reports
+  it `quarantined`, or a census leaves it out. A healthy node whose pod
+  vanished without its teardown running may never do any of those, and
+  nothing bounds that wait.
+- A node's report can also land after the listing, for a sandbox the node
+  hadn't reported yet, such as one restored onto a node whose publishes there
+  failed. For a sandbox a recovery could restore, the plan then defers to the
+  node, whatever the age of its census, and the
+  recovery's own statement checks the node's report again before it writes.
+  While a snapshot of the sandbox is still being created, the plan defers
+  (reason `in_flight_snapshot`) before anything else. Otherwise a sandbox
+  with no snapshot the recovery accepts doesn't defer: it's quarantined, or
+  deleted if it never finished creating, as before. A report whose publish hasn't committed by
+  then still isn't seen. The next listing skips the sandbox while the node
+  keeps reporting it.
+
+**Detect it.** `space.sandbox.api.reconciler.rows_deferred` with
+`reason:node_reports_local_copy` counts each plan that deferred to the node.
+The listing's skip has no metric of its own: such a sandbox is one the node
+reports while the control plane has no pod for it.
+
 ## Timeouts mean different things
 
 A client deadline limits how long the client waits; it does not cancel a lifecycle operation or establish that a process stopped. Inspect the resource before retrying or issuing another command.

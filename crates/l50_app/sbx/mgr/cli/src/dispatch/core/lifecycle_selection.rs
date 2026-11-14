@@ -34,6 +34,7 @@ impl Mutation {
                 sandbox_id: id,
                 template_filter,
                 blocking,
+                discard_retained_filesystem_reason: None,
             }),
         }
     }

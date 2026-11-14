@@ -126,7 +126,12 @@ fn eviction_claims_move_the_row_to_deleting_and_close_its_teardown_job() {
     assert_accepts(
         "quarantined",
         &conn,
-        || assert!(claim_quarantined_sandbox_for_eviction(&conn, &quarantined, "1").unwrap()),
+        || {
+            assert_eq!(
+                claim_quarantined_sandbox_for_eviction(&conn, &quarantined, "1").unwrap(),
+                crate::db::QuarantinedEvictionClaim::Claimed
+            )
+        },
         teardown_job_failed(&quarantined, DELETING).sandbox(&quarantined, deleting_claimed()),
     );
 

@@ -527,7 +527,37 @@ impl KubernetesSubstrate {
             let node_name = fenced
                 .as_ref()
                 .and_then(|fenced| fenced.node_name.as_deref());
-            let worker = self.teardown_worker(pod_ip, stop_route, node_name).await;
+            let mut worker = self.teardown_worker(pod_ip, stop_route, node_name).await;
+            // A delete must reach sbx-mgr to be admitted. The pod's IP reaches
+            // it only through the pod's own network namespace, which a dead VM
+            // can take with it while the node itself answers (a runtime crash,
+            // or a quarantined sandbox an operator then discarded). The node's
+            // node-api, found by the execution's node name, still reaches the
+            // same sbx-mgr, which admits the delete or refuses it as before.
+            if worker.is_err()
+                && mode.sends_sandbox_delete()
+                && stop_route == RetireStopRoute::Execution
+            {
+                // A fenced teardown stays pinned to the node its fence read:
+                // asking what is active now could name a successor. Only an
+                // unfenced delete, which targets whatever execution backs the
+                // sandbox, reads the execution's node here.
+                let execution_node = match (&fenced, node_name) {
+                    (Some(_), node) => node.map(str::to_owned),
+                    (None, _) => self
+                        .store
+                        .active_execution_status(sandbox_id)
+                        .await?
+                        .and_then(|active| active.k8s_node_name),
+                };
+                if let Some(node) = execution_node.as_deref() {
+                    let unreachable = worker.as_ref().err().cloned().unwrap_or_default();
+                    worker = self
+                        .teardown_worker(pod_ip, RetireStopRoute::Node, Some(node))
+                        .await
+                        .map_err(|node_cause| format!("{unreachable}; {node_cause}"));
+                }
+            }
             if let Ok((endpoint_addr, mut client)) = worker {
                 if mode.sends_sandbox_stop() {
                     let stop_result = client
@@ -584,6 +614,7 @@ impl KubernetesSubstrate {
                             sandbox_id: sandbox_id.to_string(),
                             template_filter: None,
                             blocking: false,
+                            discard_retained_filesystem_reason: None,
                         }),
                     )
                     .await;

@@ -592,6 +592,7 @@ fn quarantine_blocks_cleanup(previous_state: Option<SandboxStatus>) -> bool {
     previous_state.is_some_and(|state| state.is_unowned(SandboxState::Quarantined))
 }
 
+/// Record that the sandbox's row was deleted at `execution_generation`.
 fn record_execution_delete_receipt(
     conn: &Connection,
     sandbox_id: &str,
@@ -600,6 +601,74 @@ fn record_execution_delete_receipt(
     let Some(execution_generation) = execution_generation else {
         return Ok(());
     };
+    write_execution_delete_receipt(conn, sandbox_id, execution_generation)
+}
+
+/// Record that a cleanup deleted the sandbox's row, covering the newest of
+/// `execution_generation`, the latest teardown suspend's generation, and the
+/// row's retained route high-water mark (`last_observed_execution_generation`,
+/// which nothing clears). A cleanup's quarantine clears the row's route, and
+/// sbx-mgr prunes a failed teardown job after its retention, so the high-water
+/// mark is what still names the generation of an old stranded teardown. The
+/// teardown poll answers DELETED only for a generation a receipt covers, so a
+/// row deleted under a pod whose teardown waits on it must cover that
+/// teardown's generation or the pod is never released. A teardown operation
+/// that doesn't decode can't name a generation: the delete records the others
+/// rather than failing on it. Call it before deleting the row.
+fn record_cleanup_execution_delete_receipt(
+    conn: &Connection,
+    sandbox_id: &str,
+    execution_generation: Option<ExecutionGeneration>,
+) -> Result<()> {
+    let teardown_generation = match teardown_suspend::latest_teardown_suspend_operation(
+        conn, sandbox_id,
+    ) {
+        Ok(operation) => operation.map(|operation| operation.execution_generation),
+        Err(error) if is_row_decode_error(error.raw()) => {
+            tracing::warn!(
+                sandbox_id,
+                error = %describe_error(&error),
+                "teardown suspend operation does not decode; delete receipt covers the row's generation"
+            );
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let retained_generation = match conn
+        .query_row(
+            "SELECT last_observed_execution_generation FROM sandboxes WHERE id = ?1",
+            params![sandbox_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+    {
+        Ok(value) => value
+            .flatten()
+            .and_then(|raw| ExecutionGeneration::new(raw).ok()),
+        Err(error) if is_row_decode_error(error.raw()) => {
+            tracing::warn!(
+                sandbox_id,
+                error = %describe_error(&error),
+                "retained route generation does not decode; delete receipt covers the others"
+            );
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    record_execution_delete_receipt(
+        conn,
+        sandbox_id,
+        execution_generation
+            .max(teardown_generation)
+            .max(retained_generation),
+    )
+}
+
+fn write_execution_delete_receipt(
+    conn: &Connection,
+    sandbox_id: &str,
+    execution_generation: ExecutionGeneration,
+) -> Result<()> {
     let deleted_at = now_epoch_i64()?;
     conn.execute(
         "DELETE FROM sandbox_execution_delete_receipts WHERE deleted_at < ?1",

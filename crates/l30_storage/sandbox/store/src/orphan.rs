@@ -19,6 +19,7 @@ use pplx_space_k8s_ids::PodUid;
 
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
+use pplx_space_sandbox_residency::node_observes_sandbox;
 use sqlx::{Postgres, Transaction};
 
 /// The classification guard a statement here re-checks, with the values it
@@ -73,7 +74,11 @@ impl OrphanResolution {
 ///
 /// Writes an **inference**: the reconciler concluding, from a missing pod and
 /// durable artifact evidence, that the sandbox is at rest. The statement
-/// re-checks the guard and the restart eligibility itself. Its first CTE locks
+/// re-checks the guard and the restart eligibility itself, and that the
+/// sandbox's active node hasn't reported it: that node's copy may hold writes
+/// the snapshot lacks, and a report its publish committed after the caller's
+/// plan read is visible to this statement. A publish that hasn't committed
+/// when this statement runs isn't. Its first CTE locks
 /// the sandbox row and, for [`OrphanGuard::PodName`], the matched execution
 /// (`FOR UPDATE OF`). The other rows its predicates read, such as `snapshots`
 /// and `snapshot_storage_locations`, are not locked; the statement reads them
@@ -90,6 +95,7 @@ pub async fn recover_orphan_to_suspended(
     let eligibility = orphan_recovery_revert_eligibility("s");
     let clear_marker = eligibility.clear_marker;
     let eligible = eligibility.eligible;
+    let node_observes = node_observes_sandbox("s", "s.active_node_id");
     let guard_sql = classify_guard_sql(guard);
     let guard_from_sql = classify_guard_from_sql(guard);
     let guard_lock_sql = classify_guard_lock_sql(guard);
@@ -104,6 +110,7 @@ pub async fn recover_orphan_to_suspended(
                 AND s.lifecycle <> ALL($2)
                 AND {guard_sql}
                 AND {eligible}
+                AND NOT {node_observes}
               FOR UPDATE OF {guard_lock_sql}
          ),
          updated_sandbox AS (

@@ -140,6 +140,19 @@ pub fn rows_classified(
     );
 }
 
+/// One row the reconciler deferred, by why. `reason` is bounded:
+/// `in_flight_snapshot`, `pod_cleanup_unconfirmed`, `node_reports_local_copy`.
+/// `node_reports_local_copy` counts a plan that saw a node's report land
+/// after the sweep listed the row; the next listing skips that row while the
+/// node keeps reporting it, so it usually counts once.
+pub fn rows_deferred(reason: &str, mode: Mode) {
+    counter(
+        "sandbox.api.reconciler.rows_deferred",
+        1,
+        &[tag("reason", reason), tag("mode", mode.as_str())],
+    );
+}
+
 /// `reason` is bounded: `pod_present`, `within_grace`, `rate_limited`,
 /// `pod_presence_unknown`.
 pub fn rows_skipped(reason: &str, count: u32) {

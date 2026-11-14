@@ -764,6 +764,261 @@ async fn candidate_scan_lists_legacy_deleting_row() -> TestResult {
     Ok(())
 }
 
+/// A paused row on `node_id` whose marker names a ready full snapshot taken
+/// after its last recorded activity: what a sandbox restored from that
+/// snapshot and paused looks like, and what the orphan revert can select.
+async fn insert_paused_sandbox_restored_from_snapshot(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    node_id: NodeId,
+) -> TestResult {
+    let artifact_id = Uuid::now_v7();
+    insert_started_sandbox_with_active_execution(pool, sandbox_id, node_id).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'paused',
+                current_local_artifact_id = $2,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend',
+                last_command_at = NOW() - INTERVAL '10 minutes',
+                last_access_at = NOW() - INTERVAL '10 minutes'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(artifact_id)
+    .execute(pool)
+    .await?;
+    insert_ready_full_snapshot(
+        pool,
+        sandbox_id,
+        artifact_id,
+        "NOW() - INTERVAL '5 minutes'",
+    )
+    .await
+}
+
+/// The guard for the generation-1 pod
+/// [`insert_started_sandbox_with_active_execution`] records, observed missing.
+fn missing_pod_guard(sandbox_id: SandboxId) -> ClassifyGuard {
+    ClassifyGuard::PodName {
+        name: format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple()),
+        uid: Some(
+            PodUid::parse(format!("{}-uid", sandbox_id.as_uuid().simple()))
+                .expect("a uuid-derived pod uid parses"),
+        ),
+    }
+}
+
+/// A `node_status_snapshots` row for `node_id` whose last accepted census was
+/// `census_age_secs` ago.
+async fn insert_census(pool: &PgPool, node_id: NodeId, census_age_secs: i64) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO node_status_snapshots
+            (node_id, observed_at, stale_after, reachable, services, updated_at,
+             sandbox_inventory_pruned_at)
+         VALUES ($1, NOW(), NOW() + INTERVAL '1 minute', TRUE, '[]'::JSONB, NOW(),
+                 NOW() - make_interval(secs => $2::BIGINT))"
+    ))
+    .bind(node_id)
+    .bind(census_age_secs)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A paused sandbox whose pod is gone keeps its VM and disk on its node, and
+/// its marker names the snapshot it was last restored from. Its activity
+/// clocks predate that snapshot, which is what lets the revert select it, but
+/// the sandbox may have written since without a command or access. While its
+/// active node reports it, whatever that node's census age, the revert waits
+/// for that node. Another node's report, or a
+/// census that leaves it out, doesn't hold the revert.
+#[tokio::test(flavor = "current_thread")]
+async fn classify_missing_pod_defers_while_its_node_reports_the_sandbox() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    // (case, census age on the placed node, who reports the sandbox, whether
+    // the revert waits)
+    enum Reporter {
+        PlacedNode,
+        OtherNode,
+        Nobody,
+    }
+    let cases = [
+        ("recent census", Some(0), Reporter::PlacedNode, true),
+        ("stale census", Some(600), Reporter::PlacedNode, true),
+        ("no census", None, Reporter::PlacedNode, true),
+        (
+            "another node reports it",
+            Some(0),
+            Reporter::OtherNode,
+            false,
+        ),
+        ("census leaves it out", Some(0), Reporter::Nobody, false),
+    ];
+    let sink = SubstrateActionSink::new_without_substrate(db.pool.clone());
+    for (case, census_age_secs, reporter, defers) in cases {
+        let node_id = NodeId::new();
+        let other_node_id = NodeId::new();
+        let sandbox_id = SandboxId::new();
+        insert_node(&db.pool, node_id).await?;
+        insert_node(&db.pool, other_node_id).await?;
+        insert_paused_sandbox_restored_from_snapshot(&db.pool, sandbox_id, node_id).await?;
+        if let Some(age) = census_age_secs {
+            insert_census(&db.pool, node_id, age).await?;
+        }
+        match reporter {
+            Reporter::PlacedNode => {
+                insert_observed_sandbox_state(&db.pool, sandbox_id, node_id, 0).await?
+            }
+            Reporter::OtherNode => {
+                insert_observed_sandbox_state(&db.pool, sandbox_id, other_node_id, 0).await?
+            }
+            Reporter::Nobody => {}
+        }
+
+        let outcome = sink
+            .classify_orphan(sandbox_id, missing_pod_guard(sandbox_id))
+            .await?;
+        let lifecycle: SandboxLifecycle =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+        if defers {
+            assert_eq!(
+                outcome,
+                ClassifyOutcome::Deferred {
+                    from_lifecycle: SandboxLifecycle::Paused,
+                    reason: OrphanDeferReason::NodeReportsLocalCopy,
+                },
+                "{case}"
+            );
+            assert_eq!(lifecycle, SandboxLifecycle::Paused, "{case}");
+        } else {
+            assert_eq!(
+                outcome,
+                ClassifyOutcome::RecoveredSuspended {
+                    from_lifecycle: SandboxLifecycle::Paused,
+                },
+                "{case}"
+            );
+            assert_eq!(lifecycle, SandboxLifecycle::Suspended, "{case}");
+        }
+    }
+    Ok(())
+}
+
+/// A pod probe that commits what the node's publish
+/// would: an accepted census and the sandbox's observed state. That lands the
+/// node's report between the sweep's candidate listing, which saw none, and
+/// the plan, which is the window the defer guards.
+struct PublishDuringProbe {
+    pool: PgPool,
+    sandbox_id: SandboxId,
+    node_id: NodeId,
+    publish: bool,
+}
+
+impl PodPresence for PublishDuringProbe {
+    async fn check_pod(&self, _pod_name: &str) -> PodPresenceStatus {
+        if self.publish {
+            insert_census(&self.pool, self.node_id, 0)
+                .await
+                .expect("census inserts");
+            insert_observed_sandbox_state(&self.pool, self.sandbox_id, self.node_id, 0)
+                .await
+                .expect("observed state inserts");
+        }
+        PodPresenceStatus::Missing
+    }
+}
+
+/// The candidate listing skips a row whose node reports it, so the plan sees
+/// the node's report only when the node's publish lands after the listing:
+/// a sandbox restored onto a node whose earlier publishes there failed. Main
+/// reverted such a row to the snapshot it was restored from, past the writes
+/// the node still holds; the defer keeps it. Without the publish the revert
+/// runs, as before.
+#[tokio::test(flavor = "current_thread")]
+async fn a_publish_landing_between_listing_and_plan_holds_the_revert() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    for publish in [true, false] {
+        let node_id = NodeId::new();
+        let sandbox_id = SandboxId::new();
+        insert_node(&db.pool, node_id).await?;
+        insert_paused_sandbox_restored_from_snapshot(&db.pool, sandbox_id, node_id).await?;
+        let presence = PublishDuringProbe {
+            pool: db.pool.clone(),
+            sandbox_id,
+            node_id,
+            publish,
+        };
+        let mut reconciler = Reconciler::new(
+            config(0, 1000, false),
+            presence,
+            SubstrateActionSink::new_without_substrate(db.pool.clone()),
+        );
+        let report = reconciler.tick(Instant::now()).await;
+        let lifecycle: SandboxLifecycle =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+        if publish {
+            assert_eq!(report.deferred, 1, "{report:?}");
+            assert_eq!(lifecycle, SandboxLifecycle::Paused);
+        } else {
+            assert_eq!(report.recovered_suspended, 1, "{report:?}");
+            assert_eq!(lifecycle, SandboxLifecycle::Suspended);
+        }
+    }
+    Ok(())
+}
+
+/// The recovery's own statement checks the node's report itself, so a
+/// caller that reaches it while the active node reports the sandbox, for
+/// instance with a report committed after that caller's plan read, is
+/// refused whatever the node's census age. Without a report it recovers.
+#[tokio::test(flavor = "current_thread")]
+async fn the_recovery_statement_refuses_while_the_node_reports_the_sandbox() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    // (case, census age on the active node, whether the node reports the
+    // sandbox, whether the recovery writes)
+    for (case, census_age_secs, reported, recovers) in [
+        ("fresh census", 0, true, false),
+        ("stale census", 600, true, false),
+        ("no report", 0, false, true),
+    ] {
+        let node_id = NodeId::new();
+        let sandbox_id = SandboxId::new();
+        insert_node(&db.pool, node_id).await?;
+        insert_paused_sandbox_restored_from_snapshot(&db.pool, sandbox_id, node_id).await?;
+        insert_census(&db.pool, node_id, census_age_secs).await?;
+        if reported {
+            insert_observed_sandbox_state(&db.pool, sandbox_id, node_id, 0).await?;
+        }
+        let guard = missing_pod_guard(sandbox_id);
+
+        let mut tx = db.pool.begin().await?;
+        let written = orphan::recover_orphan_to_suspended(
+            &mut tx,
+            sandbox_id,
+            ORPHAN_RECONCILER_STOP_LIFECYCLES,
+            &guard.store_guard(),
+        )
+        .await?;
+        tx.rollback().await?;
+        assert_eq!(written.is_some(), recovers, "{case}");
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn classify_missing_pod_with_current_artifact_recovers_to_suspended() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {

@@ -149,6 +149,7 @@ async fn delete_of_rowless_disk_sandbox_is_not_reported_deleted() {
                     sandbox_id: id.clone(),
                     template_filter: None,
                     blocking,
+                    discard_retained_filesystem_reason: None,
                 },
                 Some(root_peer()),
             ))
@@ -428,6 +429,7 @@ impl CleanupRpc {
                             sandbox_id: sandbox_id.to_owned(),
                             template_filter,
                             blocking,
+                            discard_retained_filesystem_reason: None,
                         },
                         peer,
                     ))
@@ -695,6 +697,7 @@ async fn nonblocking_cleanup_returns_once_admitted_and_honors_skip_node_publish(
                                     sandbox_id: id.clone(),
                                     template_filter: None,
                                     blocking: false,
+                                    discard_retained_filesystem_reason: None,
                                 },
                             ))
                             .await
@@ -929,6 +932,7 @@ async fn auto_lifecycle_delete_requires_one_canonical_id_and_the_expected_policy
                     sandbox_id: selector,
                     template_filter: case.template_filter.map(str::to_owned),
                     blocking: true,
+                    discard_retained_filesystem_reason: None,
                 },
                 Some(root_peer()),
             ),
@@ -1159,6 +1163,7 @@ async fn delete_of_a_pool_clone_disposal_requires_an_operator_after_quarantine()
                     sandbox_id: id.clone(),
                     template_filter: None,
                     blocking: case.blocking,
+                    discard_retained_filesystem_reason: None,
                 },
                 Some(peer),
             ),

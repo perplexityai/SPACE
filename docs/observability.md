@@ -428,7 +428,10 @@ unknown outcome, or a deadline before any `PENDING`. The
 `step:prepare_teardown_suspend`, so it counts every retried release. Watch a
 prolonged suspend through how long one sandbox's teardown spans keep recording
 `teardown.release=pending`, or through pods stuck `Terminating`, rather than
-through span errors.
+through span errors. A pod held because its sandbox was quarantined after an
+interrupted suspend doesn't recover by waiting; see
+[A sandbox quarantined after an interrupted suspend](troubleshooting.md#a-sandbox-quarantined-after-an-interrupted-suspend)
+for the alert and the operator's discard delete.
 
 A root that links to the context that caused it records that context's trace
 id as `origin_trace_id`, since a link is not searchable, and whether it was

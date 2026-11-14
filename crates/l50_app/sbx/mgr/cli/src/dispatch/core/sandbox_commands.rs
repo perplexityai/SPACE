@@ -66,7 +66,12 @@ pub(super) async fn handle(command: Commands, client: &mut SandboxClient) {
             all,
             template,
             blocking,
-        } => handle_delete(client, id, all, template, blocking).await,
+            discard_retained_filesystem,
+            reason,
+        } => match reason.filter(|_| discard_retained_filesystem) {
+            Some(reason) => handle_discard_delete(client, id, blocking, reason).await,
+            None => handle_delete(client, id, all, template, blocking).await,
+        },
         _ => unreachable!("command routed to wrong dispatch group"),
     }
 }
@@ -306,6 +311,93 @@ async fn handle_delete(
     if deleted == 0 {
         println!("No sandboxes deleted.");
     }
+}
+
+/// An operator's discard delete of one sandbox, by its full UUID: a single
+/// `Delete` carrying the reason, with no selection scan, so the request names
+/// exactly the sandbox the operator inspected.
+async fn handle_discard_delete(
+    client: &mut SandboxClient,
+    id: Option<SandboxSelector>,
+    blocking: bool,
+    reason: String,
+) {
+    let sandbox_id = discard_target(id).unwrap_or_else(|error| exit_error(error));
+    // Checked here as well as by sandbox-manager: one that predates the
+    // discard ignores the field and would run an ordinary delete.
+    let sandbox = client
+        .state(StateRequest {
+            sandbox_ids: vec![sandbox_id.to_string()],
+        })
+        .await
+        .unwrap_or_else(|status| {
+            exit_error(format!("read sandbox {sandbox_id}: {}", status.message()))
+        })
+        .into_inner()
+        .sandboxes
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| exit_error(format!("no sandbox {sandbox_id} on this node")));
+    discard_precheck(&sandbox).unwrap_or_else(|error| exit_error(error));
+    let deleted = client
+        .delete(DeleteRequest {
+            sandbox_id: sandbox_id.to_string(),
+            template_filter: None,
+            blocking,
+            discard_retained_filesystem_reason: Some(reason),
+        })
+        .await
+        .unwrap_or_else(|status| {
+            exit_error(format!("discard delete refused: {}", status.message()))
+        })
+        .into_inner()
+        .deleted_ids;
+    // Without `--blocking`, sandbox-manager answers once the discard is
+    // admitted; its cleanup erases the filesystem afterwards.
+    for id in &deleted {
+        if blocking {
+            println!("Deleted: {id} (retained filesystem discarded)");
+        } else {
+            println!(
+                "Discard requested: {id} (its retained filesystem is erased in the background)"
+            );
+        }
+    }
+}
+
+/// A discard applies only to a sandbox quarantined, or failed, with the
+/// failure reason that marks its retained filesystem as possibly its only
+/// copy.
+fn discard_precheck(sandbox: &SandboxInfo) -> Result<(), String> {
+    use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
+    let lifecycle = sandbox
+        .lifecycle
+        .and_then(|value| SandboxLifecycleState::try_from(value).ok());
+    let held = matches!(
+        lifecycle,
+        Some(SandboxLifecycleState::Quarantined | SandboxLifecycleState::Failed)
+    ) && pplx_space_sbx_mgr_client::suspend_evidence_requires_retention(
+        sandbox.failure_reason.as_deref(),
+    );
+    if held {
+        return Ok(());
+    }
+    Err(format!(
+        "sandbox {} is {} with failure reason {}; --discard-retained-filesystem applies only to a \
+         sandbox quarantined or failed with {} or {}",
+        sandbox.sandbox_id,
+        lifecycle.map_or("in an unknown lifecycle", |state| state.as_str_name()),
+        sandbox.failure_reason.as_deref().unwrap_or("none"),
+        pplx_space_sbx_mgr_client::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE,
+        pplx_space_sbx_mgr_client::SUSPEND_CAPTURE_UNRESOLVED
+    ))
+}
+
+fn discard_target(
+    id: Option<SandboxSelector>,
+) -> Result<pplx_space_common_core::types::SandboxId, &'static str> {
+    id.and_then(|id| id.to_string().parse().ok())
+        .ok_or("--discard-retained-filesystem takes the sandbox's full UUID")
 }
 
 fn id_prefix_for_selected_scope(

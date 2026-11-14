@@ -267,6 +267,7 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
                     sandbox_id: sbx.sandbox_id.clone(),
                     template_filter: None,
                     blocking: true,
+                    discard_retained_filesystem_reason: None,
                 })
                 .await
             {
@@ -547,6 +548,7 @@ async fn do_create_from_base(
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             })
             .await
         {
@@ -662,6 +664,7 @@ async fn do_clone_and_start(
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             })
             .await
         {

@@ -70,6 +70,14 @@ knownEgress:
 # grace period in disposable Kind clusters. The worker default is 600 seconds.
 clusterDeletedEvictionQuiescenceSecs: "10"
 
+# The window an operator's discard delete (`space-sbxmgr delete
+# --discard-retained-filesystem`) refuses within, from the suspend attempt's
+# start. A test hook: only a `test-hooks` build reads it, and only the discard
+# does, so recovery keeps its six-hour window. Production waits six hours;
+# `local.interrupted_suspend_keeps_only_copy_until_discard` needs to reach the
+# discard within its run. No other scenario sends a discard.
+discardAttemptWindowSecs: "120"
+
 # Cold-sandbox eviction — sandbox-manager's loop that removes a parked,
 # suspended sandbox's entire local presence (cache dir, instance subvolume,
 # node-local rows) once its state is provably restorable from a ready remote
