@@ -24,6 +24,22 @@
 //! Every phase is persisted, so a retry of the same operation, or the recovery
 //! loop after a restart, resumes from the row: an interrupted upgrade rolls
 //! back, and a verified one finishes its retirement.
+//!
+//! Each call runs as an attempt (`attempt_id`): one the caller names and
+//! keeps across its retries, or a fresh one the node generates. A Kubernetes
+//! substrate derives it from the pod UID, so kubelet's retries of a failed
+//! create are one attempt. A rollback, or a refusal before anything was
+//! fenced that no retry can change, is final for the attempt it was recorded
+//! for: a retry of that attempt gets the recorded failure back and never
+//! fences or boots again, even after a later attempt's outcome replaces it as
+//! the operation's reported one, and only a new attempt starts over. A
+//! transient refusal (the node busy or failing) is left unrecorded, so a retry
+//! of the same attempt tries again. A caller settles on such an outcome only
+//! when it names the attempt it's waiting on, then gives that attempt up, so
+//! its own retry is a new one. An upgraded or already-on-target outcome is
+//! answered to any attempt, but a started target's activation that fails
+//! after it is recorded as refused for that attempt, final for it the same
+//! way, unless the sandbox is still moving (see `rpc`).
 
 use std::time::Duration;
 
@@ -141,7 +157,7 @@ pub(super) struct LocalDisk {
 pub(super) trait RuntimeUpgradeEffects: Send + Sync {
     /// Read the local disk, refusing a sandbox without one: a cold start
     /// would otherwise boot a fresh template clone.
-    async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Status>;
+    async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Refusal>;
     /// Replace any copy named `name` with a read-only copy of the instance.
     async fn preserve_disk(&self, sandbox_id: &str, name: &str) -> Result<(), Status>;
     /// Replace the instance with the copy named `name`.
@@ -239,6 +255,46 @@ pub(super) fn require_decided_checkpoint(
     Ok(())
 }
 
+/// A refusal before the fence, and whether it's final for the attempt that sent
+/// it, decided where it's produced rather than read back from its code. The
+/// status is what the caller gets either way.
+#[derive(Debug)]
+pub(super) enum Refusal {
+    /// Every retry of the same request is answered the same way: it
+    /// contradicts what the node recorded or holds (the checkpoint, the edge,
+    /// the authorization, a disk that's missing or unreadable as written), or
+    /// names another operation. Recorded for the attempt, so its retries get it
+    /// back.
+    Final(Status),
+    /// The node was busy or failing, or the sandbox may yet change, so a
+    /// retry may be answered differently. Left unrecorded.
+    Retry(Status),
+}
+
+impl Refusal {
+    pub(super) fn into_status(self) -> Status {
+        match self {
+            Refusal::Final(status) | Refusal::Retry(status) => status,
+        }
+    }
+}
+
+/// An error nothing classified, a database read say, is one a retry may get
+/// past, so `?` leaves it unrecorded.
+impl From<Status> for Refusal {
+    fn from(status: Status) -> Self {
+        Refusal::Retry(status)
+    }
+}
+
+/// What [`RuntimeUpgrader::fence`] decided.
+enum Fence {
+    /// The sandbox is fenced for the boot, with what its disk recorded.
+    Fenced(Box<(RuntimeUpgradeRecord, LocalDisk)>),
+    /// The sandbox is already on the target; nothing was fenced.
+    AlreadyOnTarget,
+}
+
 /// How [`RuntimeUpgrader::settle`] left an upgrade.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Settled {
@@ -254,25 +310,31 @@ const SETTLE_POLL: Duration = Duration::from_millis(250);
 
 /// Refuse a move that isn't a certified cold-boot upgrade edge from the
 /// compiled environment `source` ran under.
+/// The edge is a property of the node's compiled catalog, so its absence is
+/// final; a catalog that can't be loaded may load on a retry.
 fn require_certified_upgrade_edge(
     source: &ExecutionMetadata,
     target: EnvironmentReference,
-) -> Result<(), Status> {
+) -> Result<(), Refusal> {
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     let catalog = CompiledEnvironment::cached_for_architecture(source.guest().architecture)
-        .map_err(|error| Status::failed_precondition(format!("compiled catalog: {error}")))?;
+        .map_err(|error| {
+            Refusal::Retry(Status::failed_precondition(format!(
+                "compiled catalog: {error}"
+            )))
+        })?;
     let from = CompiledEnvironment::of_execution(catalog, source).ok_or_else(|| {
-        Status::failed_precondition(
+        Refusal::Final(Status::failed_precondition(
             "the sandbox's execution belongs to no compiled environment, so no upgrade edge leaves it",
-        )
+        ))
     })?;
     if from.upgrade_targets().contains(&target) {
         Ok(())
     } else {
-        Err(Status::failed_precondition(format!(
+        Err(Refusal::Final(Status::failed_precondition(format!(
             "{} -> {target} is not a certified upgrade edge",
             from.definition().reference()
-        )))
+        ))))
     }
 }
 
@@ -408,6 +470,29 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
             .ok_or_else(|| sandbox_not_found(sandbox_id))
     }
 
+    /// `refusal`, final only while `sandbox` is still as `fence` read it. A
+    /// cold `Start` takes neither the upgrade lock nor the artifact lock
+    /// `fence` holds, and nothing is fenced until `begin_runtime_upgrade`, so
+    /// a stopped sandbox may have started or rebound its execution while the
+    /// disk was inspected; a refusal decided on the earlier read is then one a
+    /// retry decides again. Compares what `begin_runtime_upgrade` compares to
+    /// answer `SandboxChanged`. A row that can't be read is a retry too.
+    fn final_unless_changed(&self, sandbox: &SandboxRow, refusal: Refusal) -> Refusal {
+        let Refusal::Final(status) = refusal else {
+            return refusal;
+        };
+        match self.sandbox(&sandbox.id) {
+            Ok(Some(now))
+                if now.state == sandbox.state
+                    && now.current_local_artifact_id == sandbox.current_local_artifact_id
+                    && now.execution_metadata == sandbox.execution_metadata =>
+            {
+                Refusal::Final(status)
+            }
+            _ => Refusal::Retry(status),
+        }
+    }
+
     fn advance(
         &self,
         operation_id: RuntimeUpgradeOperationId,
@@ -456,16 +541,123 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         request: RuntimeUpgradeRequest,
     ) -> Result<RuntimeUpgradeOutcome, Status> {
         self.refuse_another_request(&request)?;
+        // An attempt whose rollback or refusal is final gets it back before it
+        // settles anything: a later attempt's live record isn't its own to
+        // settle, and a replay of that attempt mustn't answer it.
+        self.refuse_settled_for_attempt(&request)?;
         if let Some(record) = self.record(request.operation_id)? {
+            // The per-sandbox lock doesn't serialize two sandboxes, so another
+            // sandbox's call may have begun this operation since the check
+            // above; its record isn't this call's to settle.
+            if record.identity() != request.identity() {
+                return Err(request.names_another());
+            }
             // A retired upgrade already reached its lifecycle; the sandbox may
             // have moved on since, and a replay must not move it back.
             match self.settle(&record, true).await? {
                 Settled::Retired => return Ok(RuntimeUpgradeOutcome::Replayed),
-                // An interrupted attempt is back on its old pair; start over.
+                // An interrupted attempt is back on its old pair. A retry
+                // of the attempt it ran for gets its rollback back below; any
+                // other starts over.
                 Settled::RolledBack => {}
             }
+            // Settling may have just rolled back this attempt's own boot.
+            self.refuse_settled_for_attempt(&request)?;
         }
+        let (record, disk) = match self.fence(&request).await {
+            Ok(Fence::Fenced(fenced)) => *fenced,
+            Ok(Fence::AlreadyOnTarget) => return Ok(RuntimeUpgradeOutcome::AlreadyOnTarget),
+            Err(refusal) => {
+                self.record_refusal(&request, &refusal);
+                return Err(refusal.into_status());
+            }
+        };
+        self.run(&record, &disk, request.start).await?;
+        Ok(RuntimeUpgradeOutcome::Upgraded)
+    }
 
+    /// Answer a retry of an attempt with the final outcome recorded for it,
+    /// rather than activating, staging, fencing or booting again: its
+    /// rollback, its refusal before the fence, or its activation refused
+    /// after the operation reached its target. Its caller may already have
+    /// settled on that outcome and released its execution. The attempt's own
+    /// history decides, not the operation's latest outcome, which a later
+    /// attempt replaces. An attempt with no final outcome, a fresh one
+    /// included, starts over.
+    pub(super) fn refuse_settled_for_attempt(
+        &self,
+        request: &RuntimeUpgradeRequest,
+    ) -> Result<(), Status> {
+        let attempt_id = &request.attempt_id;
+        let Some(settled) = crate::db::read::runtime_upgrade_attempt_outcome(
+            &*self.db()?,
+            request.operation_id,
+            attempt_id,
+        )
+        .map_err(|error| Status::internal(format!("read runtime upgrade outcome: {error}")))?
+        else {
+            return Ok(());
+        };
+        let operation_id = request.operation_id;
+        let failure = settled.failure;
+        let failure = failure.as_deref().unwrap_or("no reason recorded");
+        Err(Status::failed_precondition(match settled.outcome {
+            crate::db::RecordedAttemptOutcome::RolledBack => format!(
+                "runtime upgrade {operation_id} rolled back for attempt {attempt_id}: \
+                 {failure}; only a new attempt retries it"
+            ),
+            crate::db::RecordedAttemptOutcome::Refused => format!(
+                "runtime upgrade {operation_id} was refused for attempt {attempt_id}: \
+                 {failure}; only a new attempt retries it"
+            ),
+            crate::db::RecordedAttemptOutcome::ActivationRefused => format!(
+                "runtime upgrade {operation_id} reached its target but refused attempt \
+                 {attempt_id}'s activation: {failure}; only a new attempt retries it"
+            ),
+        }))
+    }
+
+    /// Record a [`Refusal::Final`] that came before anything was fenced for
+    /// the request's attempt, so it's final for that attempt as a rollback
+    /// is. A [`Refusal::Retry`] (cleanup owns the sandbox, another operation
+    /// fences it, the sandbox changed while it was inspected or is in a state
+    /// an upgrade can't start from, a disk that can't be read, a node-manager
+    /// failure) stays unrecorded, so a retry of the same attempt tries again.
+    /// Best effort: an unrecorded refusal leaves the attempt's report as it
+    /// was, which its caller doesn't settle on.
+    pub(super) fn record_refusal(&self, request: &RuntimeUpgradeRequest, refusal: &Refusal) {
+        let Refusal::Final(refusal) = refusal else {
+            return;
+        };
+        let recorded = self.db().and_then(|db| {
+            crate::db::record_runtime_upgrade_refusal(
+                &db,
+                &request.identity(),
+                &request.attempt_id,
+                refusal.message(),
+            )
+            .map_err(|error| Status::internal(error.to_string()))
+        });
+        match recorded {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                sandbox_id = %request.sandbox_id,
+                operation_id = %request.operation_id,
+                "runtime upgrade refusal not recorded: the operation's record keeps its outcome"
+            ),
+            Err(error) => tracing::warn!(
+                sandbox_id = %request.sandbox_id,
+                operation_id = %request.operation_id,
+                %error,
+                "could not record the runtime upgrade's refusal"
+            ),
+        }
+    }
+
+    /// Everything before the boot: decide whether the sandbox is already on
+    /// the target, check the edge, and fence it. Every error here leaves
+    /// nothing fenced for this operation.
+    async fn fence(&self, request: &RuntimeUpgradeRequest) -> Result<Fence, Refusal> {
         // Snapshot rollback checks the fence under the same exclusion before
         // it rewrites the instance, so it either finishes before the fence or
         // sees it.
@@ -480,18 +672,36 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                 .map_err(|error| Status::internal(format!("read runtime upgrade fence: {error}")))?
             && other != request.operation_id
         {
-            return Err(Status::aborted(format!(
+            return Err(Refusal::Retry(Status::aborted(format!(
                 "runtime upgrade {other} already owns this sandbox"
-            )));
+            ))));
         }
         let sandbox = self.existing_sandbox(&request.sandbox_id)?;
-        require_decided_checkpoint(&sandbox, request.checkpoint_local_artifact_id)?;
+        require_decided_checkpoint(&sandbox, request.checkpoint_local_artifact_id)
+            .map_err(Refusal::Final)?;
         if !sandbox.state.is_unowned(SandboxState::Suspended)
             && saved_environment(&sandbox) == Some(request.target)
         {
-            return self.already_on_target(&request);
+            return self
+                .already_on_target(request)
+                .map(|()| Fence::AlreadyOnTarget);
         }
-        let disk = self.effects.inspect_local_disk(&sandbox).await?;
+        let disk = match self.effects.inspect_local_disk(&sandbox).await {
+            Ok(disk) => disk,
+            // A sandbox that isn't stopped or suspended may still settle, its
+            // disk written by the activation or stop that moves it, so no
+            // refusal of its disk is final for the attempt; a retry inspects it
+            // again.
+            Err(refusal)
+                if !matches!(
+                    sandbox.state.unowned(),
+                    Some(SandboxState::Stopped | SandboxState::Suspended)
+                ) =>
+            {
+                return Err(Refusal::Retry(refusal.into_status()));
+            }
+            Err(refusal) => return Err(self.final_unless_changed(&sandbox, refusal)),
+        };
         if sandbox.state.is_unowned(SandboxState::Suspended)
             && disk
                 .checkpoint_execution
@@ -499,7 +709,9 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                 .and_then(ExecutionMetadata::environment)
                 == Some(request.target)
         {
-            return self.already_on_target(&request);
+            return self
+                .already_on_target(request)
+                .map(|()| Fence::AlreadyOnTarget);
         }
         // An operation that already found its sandbox on the target never
         // boots: a replay after the sandbox moved to another environment
@@ -516,11 +728,11 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                     )
                 });
         if found_its_target {
-            return Err(Status::failed_precondition(format!(
+            return Err(Refusal::Final(Status::failed_precondition(format!(
                 "runtime upgrade {} found sandbox {} on its target before, and the sandbox \
                  moved since; a new attempt takes a new operation id",
                 request.operation_id, request.sandbox_id
-            )));
+            ))));
         }
         // What the sandbox ran under last: its checkpoint's producer when
         // suspended, otherwise its saved consumer or, unbound, its disk's.
@@ -529,7 +741,18 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
             _ => sandbox.execution_metadata.as_ref(),
         }
         .unwrap_or(&disk.execution);
-        require_certified_upgrade_edge(source, request.target)?;
+        // A sandbox that isn't stopped or suspended may still settle under
+        // another execution, so its edge refusal isn't final for the attempt.
+        require_certified_upgrade_edge(source, request.target).map_err(|refusal| {
+            if matches!(
+                sandbox.state.unowned(),
+                Some(SandboxState::Stopped | SandboxState::Suspended)
+            ) {
+                self.final_unless_changed(&sandbox, refusal)
+            } else {
+                Refusal::Retry(refusal.into_status())
+            }
+        })?;
 
         let begun = crate::db::begin_runtime_upgrade(
             &*self.db()?,
@@ -553,51 +776,51 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         let record = match begun {
             BeginRuntimeUpgrade::Fenced(record) => *record,
             BeginRuntimeUpgrade::SandboxMissing => {
-                return Err(sandbox_not_found(&request.sandbox_id));
+                return Err(Refusal::Retry(sandbox_not_found(&request.sandbox_id)));
             }
+            // The sandbox may still settle into a state an upgrade starts
+            // from, so a retry may succeed and the refusal isn't final.
             BeginRuntimeUpgrade::UnsupportedState(state) => {
-                return Err(Status::failed_precondition(format!(
+                return Err(Refusal::Retry(Status::failed_precondition(format!(
                     "a runtime upgrade needs a stopped or suspended sandbox, not {state}"
-                )));
+                ))));
             }
             BeginRuntimeUpgrade::CleanupActive => {
-                return Err(Status::unavailable(
+                return Err(Refusal::Retry(Status::unavailable(
                     "cleanup owns this sandbox; retry the runtime upgrade",
-                ));
+                )));
             }
             BeginRuntimeUpgrade::OtherOperation(other) => {
-                return Err(Status::aborted(format!(
+                return Err(Refusal::Retry(Status::aborted(format!(
                     "runtime upgrade {other} already owns this sandbox"
-                )));
+                ))));
             }
-            BeginRuntimeUpgrade::OperationNamesAnother => return Err(request.names_another()),
+            BeginRuntimeUpgrade::OperationNamesAnother => {
+                return Err(Refusal::Final(request.names_another()));
+            }
             BeginRuntimeUpgrade::OperationExists => {
-                return Err(Status::aborted(format!(
+                return Err(Refusal::Retry(Status::aborted(format!(
                     "runtime upgrade {} began concurrently",
                     request.operation_id
-                )));
+                ))));
             }
             BeginRuntimeUpgrade::MemoryLossUnauthorized => {
-                return Err(Status::failed_precondition(
+                return Err(Refusal::Final(Status::failed_precondition(
                     "upgrading a suspended sandbox discards its memory; the authorization must accept memory loss",
-                ));
+                )));
             }
             BeginRuntimeUpgrade::SandboxChanged => {
-                return Err(Status::aborted(
+                return Err(Refusal::Retry(Status::aborted(
                     "the sandbox changed while the runtime upgrade inspected it; retry",
-                ));
+                )));
             }
         };
-        self.run(&record, &disk, request.start).await?;
-        Ok(RuntimeUpgradeOutcome::Upgraded)
+        Ok(Fence::Fenced(Box::new((record, disk))))
     }
 
     /// Record that the upgrade fenced nothing, so a caller that lost this
     /// answer reads it from `GetRuntimeUpgrade`.
-    fn already_on_target(
-        &self,
-        request: &RuntimeUpgradeRequest,
-    ) -> Result<RuntimeUpgradeOutcome, Status> {
+    fn already_on_target(&self, request: &RuntimeUpgradeRequest) -> Result<(), Refusal> {
         // Recorded only if no other request reused the operation id first;
         // the per-sandbox upgrade lock doesn't serialize two sandboxes.
         let recorded = crate::db::record_runtime_upgrade_already_on_target(
@@ -607,9 +830,9 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         )
         .map_err(|error| Status::internal(format!("record runtime upgrade outcome: {error}")))?;
         if !recorded {
-            return Err(request.names_another());
+            return Err(Refusal::Final(request.names_another()));
         }
-        Ok(RuntimeUpgradeOutcome::AlreadyOnTarget)
+        Ok(())
     }
 
     async fn run(
