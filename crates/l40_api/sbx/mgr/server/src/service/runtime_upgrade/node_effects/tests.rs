@@ -950,6 +950,190 @@ async fn a_wake_upgrade_of_a_sandbox_already_on_its_target_wakes_it_as_usual() {
     );
 }
 
+/// Record `operation_id` abandoned for `sandbox_id`, as the control plane's
+/// `AbandonRuntimeUpgrade` does.
+fn abandon(service: &crate::service::SandboxManagerService, sandbox_id: &str, operation_id: &str) {
+    assert_eq!(
+        crate::db::abandon_runtime_upgrade(
+            &service.db.lock().unwrap(),
+            sandbox_id,
+            operation_id.parse().unwrap(),
+        )
+        .unwrap(),
+        crate::db::AbandonRuntimeUpgrade::Abandoned
+    );
+}
+
+/// A Wake carrying an upgrade the control plane abandoned on this node is
+/// refused, even for a sandbox already on its target, which the Wake would
+/// otherwise go on to start.
+#[tokio::test]
+async fn a_wake_carrying_an_abandoned_upgrade_never_wakes_the_sandbox() {
+    // Abandoned for this sandbox, or for another one, which the operation id
+    // then doesn't name.
+    for (for_this_sandbox, code) in [
+        (true, tonic::Code::FailedPrecondition),
+        (false, tonic::Code::InvalidArgument),
+    ] {
+        let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+        crate::db::upsert_sandbox_execution_metadata(
+            &f.service.db.lock().unwrap(),
+            &f.sandbox_id,
+            &f.target,
+        )
+        .unwrap();
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        let abandoned_for = if for_this_sandbox {
+            f.sandbox_id.clone()
+        } else {
+            SandboxId::new().to_string()
+        };
+        abandon(&f.service, &abandoned_for, &operation_id);
+
+        let error = f
+            .service
+            .wake(crate::service::activation_support::internal_request(
+                upgrade_wake(
+                    &f.sandbox_id,
+                    Some(wake_upgrade_to(&f.target, &operation_id)),
+                ),
+            ))
+            .await
+            .expect_err("an abandoned upgrade is refused");
+
+        assert_eq!(error.code(), code, "{error}");
+        assert!(error.message().contains("abandoned"), "{error}");
+        assert_eq!(
+            f.row().state,
+            crate::state::SandboxStatus::from(SandboxState::Stopped)
+        );
+        assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
+    }
+}
+
+/// A Wake carrying an abandoned operation that already retired is refused
+/// under the upgrade lock, before the upgrade answers it as a replay: a
+/// replay would have the Wake go on to start the sandbox. As in the RPC, one
+/// whose identity differs from the operation's is refused as naming another,
+/// and one matching it as abandoned.
+#[tokio::test]
+async fn a_wake_carrying_an_abandoned_retired_upgrade_never_wakes_the_sandbox() {
+    use crate::db::RuntimeUpgradePhase as Phase;
+    for (authorization_id, code, answered_by) in [
+        (
+            "environment-block",
+            tonic::Code::FailedPrecondition,
+            "abandoned",
+        ),
+        (
+            "another-authorization",
+            tonic::Code::InvalidArgument,
+            "names a different",
+        ),
+    ] {
+        let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        let parsed: crate::db::RuntimeUpgradeOperationId = operation_id.parse().unwrap();
+        {
+            let db = f.service.db.lock().unwrap();
+            // `ObservedSandbox` borrows the row, so the row outlives it here.
+            let row = crate::db::get_sandbox(&db, &f.sandbox_id).unwrap().unwrap();
+            // The Wake's own upgrade names "environment-block", so only the
+            // first case is this operation's replay.
+            let begun = crate::db::begin_runtime_upgrade(
+                &db,
+                crate::db::NewRuntimeUpgrade {
+                    operation_id: parsed,
+                    sandbox_id: &f.sandbox_id,
+                    observed: crate::db::ObservedSandbox::of(&row),
+                    target_environment: f.target.environment().unwrap(),
+                    target_state: crate::db::RuntimeUpgradeTargetState::Started,
+                    authorization: &crate::db::RuntimeUpgradeAuthorization {
+                        id: authorization_id.to_string(),
+                        reason: "the source environment is blocked".to_string(),
+                        memory_loss: true,
+                    },
+                    checkpoint_dir_identity: None,
+                    previous_execution: &f.source,
+                    attempt_id: "attempt-a",
+                },
+            )
+            .unwrap();
+            assert!(matches!(begun, crate::db::BeginRuntimeUpgrade::Fenced(_)));
+            for (from, to) in [
+                (Phase::Fenced, Phase::Preserved),
+                (Phase::Preserved, Phase::Booting),
+                (Phase::Booting, Phase::Verified),
+                (Phase::Verified, Phase::Retired),
+            ] {
+                assert!(crate::db::advance_runtime_upgrade(&db, parsed, from, to).unwrap());
+            }
+        }
+        abandon(&f.service, &f.sandbox_id, &operation_id);
+
+        let error = f
+            .service
+            .wake(crate::service::activation_support::internal_request(
+                upgrade_wake(
+                    &f.sandbox_id,
+                    Some(wake_upgrade_to(&f.target, &operation_id)),
+                ),
+            ))
+            .await
+            .expect_err("an abandoned upgrade is refused");
+
+        assert_eq!(error.code(), code, "{authorization_id}: {error}");
+        assert!(
+            error.message().contains(answered_by),
+            "{authorization_id}: {error}"
+        );
+        assert_eq!(
+            f.row().state,
+            crate::state::SandboxStatus::from(SandboxState::Stopped)
+        );
+        assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
+    }
+}
+
+/// A Wake carrying an abandoned upgrade for a sandbox the node doesn't hold
+/// is refused before it stages the sandbox from its checkpoint.
+#[tokio::test]
+async fn a_wake_carrying_an_abandoned_upgrade_stages_nothing() {
+    let service = crate::service::SandboxManagerService::for_test(crate::db::test_conn());
+    let sandbox_id = SandboxId::new().to_string();
+    let source = environments().0;
+    let target = certified_target(&source);
+    let operation_id = uuid::Uuid::now_v7().to_string();
+    abandon(&service, &sandbox_id, &operation_id);
+    let mut upgrade = wake_upgrade_to(&target, &operation_id);
+    upgrade.checkpoint_local_artifact_id = Some(LocalArtifactId::new().to_string());
+    let mut request = upgrade_wake(&sandbox_id, Some(upgrade));
+    request
+        .start_context
+        .as_mut()
+        .unwrap()
+        .suspend_restore_storage_uri = Some(format!(
+        "s3://space-test/suspend/{sandbox_id}/{}?region=us-east-1",
+        uuid::Uuid::now_v7()
+    ));
+
+    let error = service
+        .wake(crate::service::activation_support::internal_request(
+            request,
+        ))
+        .await
+        .expect_err("an abandoned upgrade is refused");
+
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("abandoned"), "{error}");
+    assert!(
+        crate::db::get_sandbox(&service.db.lock().unwrap(), &sandbox_id)
+            .unwrap()
+            .is_none(),
+        "nothing was staged"
+    );
+}
+
 #[tokio::test]
 async fn a_wake_upgrade_must_be_an_internal_blocking_started_wake() {
     let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());

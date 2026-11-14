@@ -35,6 +35,23 @@ pub fn stay_stopped_runtime_upgrade_awaiting_its_stop(
     crate::db::stay_stopped_runtime_upgrade_awaiting_its_stop(conn, sandbox_id)
 }
 
+/// Whether the control plane abandoned `operation_id` on this node.
+pub fn runtime_upgrade_abandoned(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+) -> Result<bool> {
+    crate::db::runtime_upgrade_abandoned(conn, operation_id)
+}
+
+/// The sandbox the control plane abandoned `operation_id` for on this node,
+/// if it did.
+pub fn runtime_upgrade_abandoned_sandbox(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+) -> Result<Option<String>> {
+    crate::db::runtime_upgrades::abandoned_runtime_upgrade_sandbox(conn, operation_id)
+}
+
 /// The upgrade that refuses other activations of `sandbox_id`, if one does.
 pub fn runtime_upgrade_fence(
     conn: &Connection,

@@ -227,14 +227,15 @@ async fn capture_time_marker_round_trips_and_reupgrades_as_not_comparable() {
     );
 }
 
-/// The two runtime-upgrade migrations: the attempt id and the attempt outcomes.
-const RUNTIME_UPGRADE_MIGRATIONS: [i64; 2] = [20261113200001, 20261113200002];
+/// The three runtime-upgrade migrations: the attempt id, the attempt outcomes
+/// and abandoned operations.
+const RUNTIME_UPGRADE_MIGRATIONS: [i64; 3] = [20261113200001, 20261113200002, 20261113200004];
 /// The newest sandbox-manager migration that shipped before them.
 const BEFORE_RUNTIME_UPGRADE_MIGRATIONS: i64 = 20261113190000;
 
 /// The runtime-upgrade migrations come after every migration that shipped
 /// before them, next to each other, so a database at that earlier head takes
-/// them as its next two and a `down` reverts them, newest first, before it
+/// them as its next three and a `down` reverts them, newest first, before it
 /// reaches any earlier migration. Up, down and up again round-trip; newer
 /// migrations are rolled back first.
 #[tokio::test]
@@ -297,7 +298,8 @@ async fn runtime_upgrade_migrations_follow_their_predecessors_and_round_trip() {
         let tables: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
-                     'sandbox_runtime_upgrade_attempt_outcomes'
+                     'sandbox_runtime_upgrade_attempt_outcomes',
+                     'sandbox_runtime_upgrade_abandoned'
                  )",
                 [],
                 |row| row.get(0),
@@ -317,6 +319,43 @@ async fn runtime_upgrade_migrations_follow_their_predecessors_and_round_trip() {
     }
 }
 
+/// The release before this one, which predates the abandoned-operations
+/// migration: an older sandbox-manager never reads an abandonment, so it would
+/// let a late call for an abandoned operation stage, fence and boot. It
+/// refuses a database whose history holds that migration, so a binary
+/// rollback can't run it over a node that may have recorded one.
+#[tokio::test]
+async fn a_release_without_the_abandoned_migration_refuses_its_database() {
+    static OLDER: std::sync::LazyLock<Migrator> = std::sync::LazyLock::new(|| {
+        Migrator::with_migrations(
+            pplx_space_sbx_mgr_store::db::migration::target()
+                .service
+                .migrations
+                .iter()
+                .filter(|migration| migration.version != RUNTIME_UPGRADE_MIGRATIONS[2])
+                .cloned()
+                .collect(),
+        )
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.sqlite");
+    let current = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
+    let older = SqliteDatabase {
+        migrator: &OLDER,
+        ..current
+    };
+
+    // A database the older release created takes this release's migration.
+    migrate_sqlite_up(older, &path).await.unwrap();
+    migrate_sqlite_up(current, &path).await.unwrap();
+
+    let refused = migrate_sqlite_up(older, &path).await.unwrap_err();
+    assert!(
+        format!("{refused:#}").contains(&RUNTIME_UPGRADE_MIGRATIONS[2].to_string()),
+        "{refused:#}"
+    );
+}
+
 /// Each runtime-upgrade down refuses while a row an older release would
 /// misread is recorded, leaves its migration applied, and goes through once
 /// the row is gone. A `rolled_back` outcome, which an older release reads,
@@ -331,7 +370,7 @@ async fn runtime_upgrade_downs_refuse_while_a_row_an_older_release_misreads_is_r
         .iter()
         .filter(|migration| {
             migration.migration_type.is_up_migration()
-                && migration.version > RUNTIME_UPGRADE_MIGRATIONS[1]
+                && migration.version > RUNTIME_UPGRADE_MIGRATIONS[2]
         })
         .count();
     let applied = || async {
@@ -353,6 +392,13 @@ async fn runtime_upgrade_downs_refuse_while_a_row_an_older_release_misreads_is_r
     }
     // Newest first: each down's guarded row, and the statement that clears it.
     let guarded = [
+        (
+            RUNTIME_UPGRADE_MIGRATIONS[2],
+            "INSERT INTO sandbox_runtime_upgrade_abandoned
+                 (operation_id, sandbox_id, recorded_at)
+             VALUES ('op', 'sandbox', '0')",
+            "DELETE FROM sandbox_runtime_upgrade_abandoned",
+        ),
         (
             RUNTIME_UPGRADE_MIGRATIONS[1],
             "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes

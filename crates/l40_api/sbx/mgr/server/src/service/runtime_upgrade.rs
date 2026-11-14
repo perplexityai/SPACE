@@ -58,6 +58,32 @@ use crate::state::{SandboxState, SandboxStatus};
 mod node_effects;
 mod rpc;
 mod stale_copy;
+/// The refusal a call for `operation_id` naming `sandbox_id` gets once the
+/// control plane abandoned the operation on this node, if it did: a call
+/// naming the abandonment's sandbox gets `FAILED_PRECONDITION`, and one naming
+/// another gets `INVALID_ARGUMENT`, as a report of it does, since an operation
+/// id names one sandbox.
+fn abandoned_refusal(
+    conn: &crate::db::Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    sandbox_id: &str,
+) -> Result<Option<Status>, Status> {
+    let abandoned_for = crate::db::read::runtime_upgrade_abandoned_sandbox(conn, operation_id)
+        .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?;
+    Ok(abandoned_for.map(|abandoned_for| {
+        if abandoned_for == sandbox_id {
+            Status::failed_precondition(format!(
+                "runtime upgrade {operation_id} was abandoned on this node; a new decision \
+                 names a new operation"
+            ))
+        } else {
+            Status::invalid_argument(format!(
+                "runtime upgrade {operation_id} was abandoned on this node for another sandbox"
+            ))
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -809,6 +835,21 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                     "upgrading a suspended sandbox discards its memory; the authorization must accept memory loss",
                 )));
             }
+            // Every later call is refused too, but by the abandonment, not
+            // by an outcome: recorded, this refusal would report a refused
+            // create where the operation was abandoned, so it stays
+            // unrecorded, like the check before the fence.
+            BeginRuntimeUpgrade::Abandoned => {
+                let refusal =
+                    abandoned_refusal(&*self.db()?, request.operation_id, &request.sandbox_id)?
+                        .unwrap_or_else(|| {
+                            Status::failed_precondition(format!(
+                                "runtime upgrade {} was abandoned on this node",
+                                request.operation_id
+                            ))
+                        });
+                return Err(Refusal::Retry(refusal));
+            }
             BeginRuntimeUpgrade::SandboxChanged => {
                 return Err(Refusal::Retry(Status::aborted(
                     "the sandbox changed while the runtime upgrade inspected it; retry",
@@ -830,6 +871,14 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         )
         .map_err(|error| Status::internal(format!("record runtime upgrade outcome: {error}")))?;
         if !recorded {
+            // An abandon naming another sandbox can land after this call's
+            // own check, under that sandbox's lock: the write refuses it as
+            // the fence does, and so does the answer, unrecorded.
+            if let Some(refusal) =
+                abandoned_refusal(&*self.db()?, request.operation_id, &request.sandbox_id)?
+            {
+                return Err(Refusal::Retry(refusal));
+            }
             return Err(Refusal::Final(request.names_another()));
         }
         Ok(())
@@ -1356,6 +1405,10 @@ pub(super) struct WakeRuntimeUpgrade {
 }
 
 impl WakeRuntimeUpgrade {
+    pub(super) const fn operation_id(&self) -> RuntimeUpgradeOperationId {
+        self.operation_id
+    }
+
     pub(super) const fn checkpoint_local_artifact_id(&self) -> Option<LocalArtifactId> {
         self.checkpoint_local_artifact_id
     }
@@ -1441,10 +1494,17 @@ impl super::SandboxManagerService {
     ) -> Result<RuntimeUpgradeOutcome, Status> {
         let sandbox_id = parsed.sandbox_id.clone();
         let _guard = self.runtime_upgrade_guard(&sandbox_id).await?;
-        let outcome = self
-            .caller_upgrader(metadata, extensions)
-            .upgrade(parsed)
-            .await;
+        let upgrader = self.caller_upgrader(metadata, extensions);
+        // The Wake's path to the upgrade, which never passes the RPC's
+        // checks, so it makes them here in the RPC's order: a request that
+        // names another identity than the operation's is refused as one, and
+        // an operation already abandoned when this check runs does nothing
+        // more, not even replay a retired upgrade or find the sandbox on its
+        // target and let the Wake start it. A Wake already past this check
+        // when an abandon lands still starts the sandbox (see the docs).
+        upgrader.refuse_another_request(&parsed)?;
+        self.refuse_abandoned_runtime_upgrade(parsed.operation_id, &parsed.sandbox_id)?;
+        let outcome = upgrader.upgrade(parsed).await;
         crate::node_state_sync::mark_sandbox_dirty(&self.db, &sandbox_id);
         outcome
     }
@@ -1475,6 +1535,31 @@ impl super::SandboxManagerService {
         )
         .await?
         .map_err(|_| Status::unavailable("another runtime upgrade step is running; retry"))
+    }
+
+    /// Refuse a call for an operation the control plane abandoned: it may
+    /// already have captured the sandbox's disk, which nothing for this
+    /// operation may change since.
+    pub(super) fn refuse_abandoned_runtime_upgrade(
+        &self,
+        operation_id: RuntimeUpgradeOperationId,
+        sandbox_id: &str,
+    ) -> Result<(), Status> {
+        match self.abandoned_runtime_upgrade_refusal(operation_id, sandbox_id)? {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
+        }
+    }
+
+    /// The refusal a call for `operation_id` naming `sandbox_id` gets because
+    /// the control plane abandoned the operation, if it did; an error is a
+    /// read that failed, not an abandonment. See [`abandoned_refusal`].
+    pub(super) fn abandoned_runtime_upgrade_refusal(
+        &self,
+        operation_id: RuntimeUpgradeOperationId,
+        sandbox_id: &str,
+    ) -> Result<Option<Status>, Status> {
+        abandoned_refusal(&*self.db_conn()?, operation_id, sandbox_id)
     }
 
     /// Refuse to stage or load a checkpoint while an upgrade still owes the
