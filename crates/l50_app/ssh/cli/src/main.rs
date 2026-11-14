@@ -100,7 +100,7 @@ async fn main() {
         });
 
     let lifecycle = sandbox
-        .observed_lifecycle()
+        .observed_status()
         .unwrap_or_else(|error| pplx_space_common_cli::exit_error(error));
     if !sandbox.pid.is_some_and(is_alive) {
         eprintln!(
