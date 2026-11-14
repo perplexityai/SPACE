@@ -297,18 +297,22 @@ type task struct {
 	sandboxDetached     bool   // sbx-manager released this execution; teardown never polls it again
 	materializedStopped bool   // the sandbox was staged stopped with no VM; nothing may wake it through this pod
 	legacyStopIssued    bool   // this task initiated the stop preceding legacy deletion
-	releasedAfterExit   bool   // release proof arrived after the VM exited; Kill re-announces the exit
-	containerID         string // OCI container type
-	pid                 int
-	podIP               string
-	netnsPath           string
-	status              tasktypes.Status
-	exitCode            uint32
-	exitedAt            time.Time
-	bundle              string
-	stdout              *os.File
-	stderr              *os.File
-	execs               map[string]*execProcess
+	// exitDeleteRefused records that a Delete of this stopped task ended
+	// without sbx-manager's release, refused or unreachable. containerd v2.1
+	// doesn't retry that exit-path Delete, so Kill retries its release instead.
+	exitDeleteRefused bool
+	releasedAfterExit bool   // release proof arrived after the VM exited; Kill re-announces the exit
+	containerID       string // OCI container type
+	pid               int
+	podIP             string
+	netnsPath         string
+	status            tasktypes.Status
+	exitCode          uint32
+	exitedAt          time.Time
+	bundle            string
+	stdout            *os.File
+	stderr            *os.File
+	execs             map[string]*execProcess
 }
 
 type execProcess struct {
@@ -852,6 +856,7 @@ type taskTeardownIdentity struct {
 	generationTeardown  bool
 	sandboxDetached     bool
 	legacyStopIssued    bool
+	exitDeleteRefused   bool
 }
 
 func (task *task) teardownIdentity() taskTeardownIdentity {
@@ -861,6 +866,7 @@ func (task *task) teardownIdentity() taskTeardownIdentity {
 		generationTeardown:  task.generationTeardown,
 		sandboxDetached:     task.sandboxDetached,
 		legacyStopIssued:    task.legacyStopIssued,
+		exitDeleteRefused:   task.exitDeleteRefused,
 	}
 }
 
@@ -1123,6 +1129,13 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 			recordStopIssued(identity.legacyStopIssued)
 		}
 	case "delete":
+		// A retried release only observes. The id-only Delete carries no
+		// execution, and by the retry the row may belong to a successor
+		// execution started in another pod, so the task waits for the row to
+		// go or be handed off instead.
+		if identity.exitDeleteRefused {
+			return false, status.Error(codes.FailedPrecondition, "sbx-manager still holds the sandbox; a retried exit release doesn't resend its delete")
+		}
 		_, err = client.Delete(ctx, &pb.DeleteRequest{SandboxId: identity.sandboxID})
 		// Durable deletion may finish after State observed the live sandbox.
 		if status.Code(err) == codes.NotFound {
@@ -1313,6 +1326,7 @@ func (s *spaceTaskService) waitForTaskTeardownRelease(
 	// when a pod sits in Terminating.
 	if err != nil {
 		logShim("%s: task %s keeps running because sbx-manager has not released it (%s); containerd will retry: %v", operation, taskID, identity.logContext(), err)
+		s.markExitDeleteUnreleased(operation, taskID, expected)
 	}
 	return detach, err
 }
@@ -1349,6 +1363,20 @@ func (s *spaceTaskService) sandboxManagerClient() (pb.SandboxManagerClient, io.C
 	return pb.NewSandboxManagerClient(conn), conn, nil
 }
 
+// markExitDeleteUnreleased records that a Delete of a stopped task ended
+// without sbx-manager's release, refused or unreachable, so a later Kill
+// retries the release that containerd won't.
+func (s *spaceTaskService) markExitDeleteUnreleased(operation, taskID string, expected *task) {
+	if operation != "delete" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current, ok := s.tasks[taskID]; ok && current == expected && current.status == tasktypes.Status_STOPPED {
+		current.exitDeleteRefused = true
+	}
+}
+
 func (s *spaceTaskService) mutateTaskAfterTeardownRelease(
 	ctx context.Context,
 	operation string,
@@ -1369,6 +1397,7 @@ func (s *spaceTaskService) mutateTaskAfterTeardownRelease(
 			identity := expected.teardownIdentity()
 			s.mu.Unlock()
 			logShim("%s: task %s keeps running because sbx-manager is unreachable (%s); containerd will retry: %v", operation, taskID, identity.logContext(), err)
+			s.markExitDeleteUnreleased(operation, taskID, expected)
 			return false, status.Errorf(codes.Unavailable, "connect to sbx-manager during task %s: %v", operation, err)
 		}
 		defer func() {
@@ -1535,9 +1564,11 @@ func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ 
 	needsTeardown := t.sandboxID != "" && !t.sandboxDetached
 	// A VM that exits stops its task without release proof. containerd's
 	// exit-path Delete can time out before a slow durable suspend finishes,
-	// and its retries arrive here first, so a stopped generation task still
-	// waits for the release. Legacy and released tasks have nothing to wait for.
-	if t.status == tasktypes.Status_STOPPED && !(needsTeardown && t.generationTeardown) {
+	// or be refused while sbx-manager still holds the sandbox, and its
+	// retries arrive here first, so a stopped generation task still waits for
+	// the release, as does a legacy one whose Delete was refused. Other legacy
+	// and released tasks have nothing to wait for.
+	if t.status == tasktypes.Status_STOPPED && !(needsTeardown && (t.generationTeardown || t.exitDeleteRefused)) {
 		// Until Delete removes the task, containerd has not finished handling
 		// its exit, and an earlier announcement may have been lost.
 		var exit *eventstypes.TaskExit
@@ -1550,8 +1581,21 @@ func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ 
 		}
 		return &ptypes.Empty{}, nil
 	}
+	operation := "kill"
 	if t.status == tasktypes.Status_STOPPED {
-		logShim("Kill: task %s stopped before sbx-manager released it; waiting for release", r.ID)
+		if t.generationTeardown {
+			logShim("Kill: task %s stopped before sbx-manager released it; waiting for release", r.ID)
+		} else {
+			// A legacy task's exit-path Delete is refused while sbx-manager
+			// holds the sandbox, such as a quarantined only copy, and
+			// containerd v2.1 doesn't retry it, so StopPodSandbox waits on a
+			// task nothing releases. Re-check that Delete's release here: a
+			// row that's gone (an operator discarded it) or handed off
+			// releases the task and its exit is re-announced; any other row
+			// keeps it, and the Delete isn't sent again.
+			logShim("Kill: legacy task %s stopped before sbx-manager released it; retrying its delete release", r.ID)
+			operation = "delete"
+		}
 	}
 	sandboxID := t.sandboxID
 	traceparent := t.traceparent
@@ -1574,7 +1618,7 @@ func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ 
 	// suspend or has been superseded. Any inconclusive outcome leaves the task
 	// running so containerd can retry without destroying guest state.
 	var exit *eventstypes.TaskExit
-	_, err := s.mutateTaskAfterTeardownRelease(ctx, "kill", r.ID, t, needsTeardown, func(current *task) {
+	_, err := s.mutateTaskAfterTeardownRelease(ctx, operation, r.ID, t, needsTeardown, func(current *task) {
 		if current.status == tasktypes.Status_STOPPED {
 			// Overlapping Kills of one exited task each reach this point and
 			// each announce the exit; containerd handles a repeated exit of a

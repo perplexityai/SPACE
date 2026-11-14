@@ -373,6 +373,16 @@ pub(super) enum Commands {
         /// Wait until matching rows are deleted
         #[arg(long)]
         blocking: bool,
+        /// Delete a sandbox an interrupted suspend quarantined with no usable
+        /// capture, discarding its retained filesystem, which may be its only
+        /// copy. Refused for every other sandbox. Takes the sandbox's full UUID
+        /// and needs --reason.
+        #[arg(long, requires = "reason", conflicts_with_all = ["all", "template"])]
+        discard_retained_filesystem: bool,
+        /// Why the retained filesystem is discarded, recorded in the
+        /// sandbox's event and in sandbox-manager's log
+        #[arg(long, requires = "discard_retained_filesystem")]
+        reason: Option<String>,
     },
     /// List all sandboxes
     List,

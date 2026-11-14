@@ -2678,6 +2678,125 @@ func TestLegacyKillThenDeleteStillCallsManagerDelete(t *testing.T) {
 	}
 }
 
+// A legacy task whose VM exited while sbx-manager held its sandbox (a
+// quarantined only copy) had its exit-path Delete refused, and containerd
+// v2.1 doesn't retry it. StopPodSandbox's Kill retries that Delete's release:
+// while the row is held it is still refused and the task is kept; once an
+// operator discarded the row, the task is released and its exit re-announced,
+// so containerd finishes stopping the pod.
+func TestLegacyKillOfExitedTaskRetriesItsDeleteRelease(t *testing.T) {
+	quarantined := sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_QUARANTINED.Enum()}}}}
+	discarded := sandboxStateResult{resp: &pb.StateResponse{}}
+	// containerd v2.1 doesn't retry the refused Delete; StopPodSandbox's Kill
+	// arrives instead.
+	client := &fakeSandboxManagerClient{
+		results:     []sandboxStateResult{quarantined, discarded},
+		deleteError: status.Error(codes.FailedPrecondition, "retained filesystem may be the only copy"),
+	}
+	publisher := &fakePublisher{}
+	service := &spaceTaskService{
+		tasks: map[string]*task{"task": {id: "task", sandboxID: "sbx", status: tasktypes.Status_STOPPED, pid: 42}},
+		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+			return client, fakeConn{}, nil
+		},
+		publisher: publisher,
+	}
+
+	// containerd's exit-path Delete, refused while the row is held.
+	if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err == nil {
+		t.Fatal("Delete() released a task whose sandbox sbx-manager still holds")
+	}
+	if client.deleteCalls != 1 || client.stopCalls != 0 || len(publisher.events) != 0 {
+		t.Fatalf("held row: delete:%d stop:%d events:%d, want 1, 0, 0", client.deleteCalls, client.stopCalls, len(publisher.events))
+	}
+	if _, ok := service.tasks["task"]; !ok {
+		t.Fatal("Delete() dropped a task sbx-manager refused to release")
+	}
+
+	if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
+		t.Fatalf("Kill() after the discard error = %v", err)
+	}
+	if client.deleteCalls != 1 || client.stopCalls != 0 {
+		t.Fatalf("discarded row: delete:%d stop:%d, want no further destructive call", client.deleteCalls, client.stopCalls)
+	}
+	if len(publisher.events) != 1 || publisher.topics[0] != "/tasks/exit" {
+		t.Fatalf("published %v %v, want the released task's exit", publisher.topics, publisher.events)
+	}
+	if exit, ok := publisher.events[0].(*eventstypes.TaskExit); !ok || exit.ID != "task" || exit.Pid != 42 {
+		t.Fatalf("published exit = %+v, want the task's exit", publisher.events[0])
+	}
+	if !service.tasks["task"].sandboxDetached {
+		t.Fatal("Kill() did not record the release")
+	}
+}
+
+// An exit-path Delete that can't reach sbx-manager leaves the release
+// unasked, just as a refused one does: the next Kill, with sbx-manager back
+// and the row gone, releases the task and re-announces its exit.
+func TestLegacyKillRetriesAnExitDeleteThatCouldNotReachTheManager(t *testing.T) {
+	client := &fakeSandboxManagerClient{results: []sandboxStateResult{{resp: &pb.StateResponse{}}}}
+	publisher := &fakePublisher{}
+	connections := 0
+	service := &spaceTaskService{
+		tasks: map[string]*task{"task": {id: "task", sandboxID: "sbx", status: tasktypes.Status_STOPPED, pid: 7}},
+		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+			connections++
+			if connections == 1 {
+				return nil, nil, status.Error(codes.Unavailable, "sbx-manager restarting")
+			}
+			return client, fakeConn{}, nil
+		},
+		publisher: publisher,
+	}
+
+	if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err == nil {
+		t.Fatal("Delete() released a task without reaching sbx-manager")
+	}
+	if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+	if connections != 2 || client.deleteCalls != 0 || client.stopCalls != 0 {
+		t.Fatalf("connections:%d delete:%d stop:%d, want 2, 0, 0", connections, client.deleteCalls, client.stopCalls)
+	}
+	if len(publisher.events) != 1 || !service.tasks["task"].sandboxDetached {
+		t.Fatalf("events:%d detached:%v, want the released task's exit", len(publisher.events), service.tasks["task"].sandboxDetached)
+	}
+}
+
+// A retried release never resends the id-only Delete. By the retry the row
+// may belong to a successor execution started in another pod, and the Delete
+// can't tell it from the one that exited, so the task stays until the row is
+// gone or handed off.
+func TestLegacyKillRetryNeverDeletesALiveRow(t *testing.T) {
+	quarantined := sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_QUARANTINED.Enum()}}}}
+	successor := sandboxStateResult{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}}
+	client := &fakeSandboxManagerClient{
+		results:     []sandboxStateResult{quarantined, successor},
+		deleteError: status.Error(codes.FailedPrecondition, "retained filesystem may be the only copy"),
+	}
+	publisher := &fakePublisher{}
+	service := &spaceTaskService{
+		tasks: map[string]*task{"task": {id: "task", sandboxID: "sbx", status: tasktypes.Status_STOPPED, pid: 42}},
+		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+			return client, fakeConn{}, nil
+		},
+		publisher: publisher,
+	}
+
+	if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err == nil {
+		t.Fatal("Delete() released a task whose sandbox sbx-manager still holds")
+	}
+	if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err == nil {
+		t.Fatal("Kill() released a task whose row is live")
+	}
+	if client.deleteCalls != 1 || client.stopCalls != 0 {
+		t.Fatalf("live row: delete:%d stop:%d, want only the exit-path delete", client.deleteCalls, client.stopCalls)
+	}
+	if task, ok := service.tasks["task"]; !ok || task.sandboxDetached || len(publisher.events) != 0 {
+		t.Fatalf("retained:%v events:%d, want the task kept and no exit", ok, len(publisher.events))
+	}
+}
+
 func TestLegacyDeleteAfterLiveStateHandlesManagerError(t *testing.T) {
 	for _, code := range []codes.Code{codes.NotFound, codes.Unavailable} {
 		t.Run(code.String(), func(t *testing.T) {

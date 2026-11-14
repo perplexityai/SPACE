@@ -3266,8 +3266,15 @@ type DeleteRequest struct {
 	// Require this template at cleanup admission; never expands the target set.
 	TemplateFilter *string `protobuf:"bytes,2,opt,name=template_filter,json=templateFilter,proto3,oneof" json:"template_filter,omitempty"`
 	Blocking       bool    `protobuf:"varint,3,opt,name=blocking,proto3" json:"blocking,omitempty"` // If true, wait until the sandbox row is deleted
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Present only for an operator's discard delete, carrying the operator's
+	// reason. It deletes a sandbox whose retained filesystem may be its only
+	// copy (a row an interrupted suspend quarantined with no usable capture),
+	// which an ordinary delete refuses, and it is refused for every other row.
+	// Only root or the local operator role may send it; it can't be combined
+	// with template_filter.
+	DiscardRetainedFilesystemReason *string `protobuf:"bytes,4,opt,name=discard_retained_filesystem_reason,json=discardRetainedFilesystemReason,proto3,oneof" json:"discard_retained_filesystem_reason,omitempty"`
+	unknownFields                   protoimpl.UnknownFields
+	sizeCache                       protoimpl.SizeCache
 }
 
 func (x *DeleteRequest) Reset() {
@@ -3319,6 +3326,13 @@ func (x *DeleteRequest) GetBlocking() bool {
 		return x.Blocking
 	}
 	return false
+}
+
+func (x *DeleteRequest) GetDiscardRetainedFilesystemReason() string {
+	if x != nil && x.DiscardRetainedFilesystemReason != nil {
+		return *x.DiscardRetainedFilesystemReason
+	}
+	return ""
 }
 
 type DeleteResponse struct {
@@ -14244,13 +14258,15 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x16\n" +
 	"\x06signal\x18\x02 \x01(\rR\x06signal\x12\x1a\n" +
 	"\bblocking\x18\x03 \x01(\bR\bblocking\"\x0e\n" +
-	"\fKillResponse\"\x8c\x01\n" +
+	"\fKillResponse\"\x85\x02\n" +
 	"\rDeleteRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12,\n" +
 	"\x0ftemplate_filter\x18\x02 \x01(\tH\x00R\x0etemplateFilter\x88\x01\x01\x12\x1a\n" +
-	"\bblocking\x18\x03 \x01(\bR\bblockingB\x12\n" +
-	"\x10_template_filter\"1\n" +
+	"\bblocking\x18\x03 \x01(\bR\bblocking\x12P\n" +
+	"\"discard_retained_filesystem_reason\x18\x04 \x01(\tH\x01R\x1fdiscardRetainedFilesystemReason\x88\x01\x01B\x12\n" +
+	"\x10_template_filterB%\n" +
+	"#_discard_retained_filesystem_reason\"1\n" +
 	"\x0eDeleteResponse\x12\x1f\n" +
 	"\vdeleted_ids\x18\x01 \x03(\tR\n" +
 	"deletedIds\"/\n" +

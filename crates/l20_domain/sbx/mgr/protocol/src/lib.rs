@@ -137,6 +137,29 @@ pub const RETAINED_FILESYSTEM_ONLY_COPY_REASON: &str = "retained_filesystem_only
 /// cluster's absent-row report remains the sole authority for that.
 pub const TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON: &str =
     "teardown_suspend_backup_permanently_failed";
+/// `failure_reason` sandbox-manager stamps on a sandbox it quarantined
+/// because a suspend lost its runtime without a usable capture of its own:
+/// the retained instance filesystem may be the sandbox's only copy.
+pub const SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE: &str =
+    "suspend_publish_failed_no_artifact_runtime_gone";
+/// `failure_reason` for an admitted capture with no conclusive completion
+/// evidence. Its runtime may still be live; deleting its files is not a safe
+/// recovery action.
+pub const SUSPEND_CAPTURE_UNRESOLVED: &str = "suspend_capture_unresolved";
+
+/// The shared retention policy for suspend evidence: whether a quarantined or
+/// failed sandbox with this `failure_reason` keeps its retained filesystem.
+/// An ordinary delete refuses such a row, and so does the eviction that
+/// follows a cluster-deleted report. Only an operator's discard delete
+/// (`DeleteRequest.discard_retained_filesystem_reason`) removes it.
+/// Here so the CLI checks a row by the same rule before it sends a discard,
+/// which an older sandbox-manager would run as an ordinary delete.
+pub fn suspend_evidence_requires_retention(failure_reason: Option<&str>) -> bool {
+    matches!(
+        failure_reason,
+        Some(SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE | SUSPEND_CAPTURE_UNRESOLVED)
+    )
+}
 pub const PROCESS_OUTPUT_CURSOR_HEALTH_SERVICE: &str =
     "space.sandbox-manager.capability.process-output-cursor.v1";
 /// Start can install the supplied cluster policy before runtime activation.

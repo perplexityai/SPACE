@@ -1875,6 +1875,7 @@ impl DirectSubstrate {
                 sandbox_id: sandbox_id.to_string(),
                 template_filter: None,
                 blocking: false,
+                discard_retained_filesystem_reason: None,
             })
             .await;
         // `NotFound`, or `FailedPrecondition` naming a delete already in
@@ -2683,6 +2684,7 @@ impl DirectSubstrate {
                 sandbox_id: sandbox_id.to_string(),
                 template_filter: None,
                 blocking: false,
+                discard_retained_filesystem_reason: None,
             })
             .await
         {
@@ -3544,6 +3546,7 @@ impl DirectSubstrate {
                                             sandbox_id: sandbox_id.to_string(),
                                             template_filter: None,
                                             blocking: false,
+                                            discard_retained_filesystem_reason: None,
                                         },
                                     )
                                     .await
@@ -4092,6 +4095,7 @@ impl DirectSubstrate {
                 sandbox_id: sandbox_id.to_string(),
                 template_filter: None,
                 blocking: false,
+                discard_retained_filesystem_reason: None,
             }),
         )
         .await;
@@ -4736,6 +4740,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 sandbox_id: claim.sandbox_id.to_string(),
                 template_filter: None,
                 blocking: false,
+                discard_retained_filesystem_reason: None,
             })
             .await
             && !is_idempotent_pool_rollback_delete(&err)
@@ -4885,6 +4890,7 @@ impl SubstrateAdapter for DirectSubstrate {
                             sandbox_id: sandbox_id.to_string(),
                             template_filter: None,
                             blocking: false,
+                            discard_retained_filesystem_reason: None,
                         })
                         .await
                     {
@@ -4952,6 +4958,7 @@ impl SubstrateAdapter for DirectSubstrate {
                         sandbox_id: sandbox_id.to_string(),
                         template_filter: None,
                         blocking: false,
+                        discard_retained_filesystem_reason: None,
                     })
                     .await
                 {
@@ -5010,6 +5017,7 @@ impl SubstrateAdapter for DirectSubstrate {
                         sandbox_id: sandbox_id.to_string(),
                         template_filter: None,
                         blocking: false,
+                        discard_retained_filesystem_reason: None,
                     })
                     .await
                 {
@@ -5061,6 +5069,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 sandbox_id: sandbox_id.to_string(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             })
             .await
             .map_err(|err| direct_delete_error(sandbox_id, err))?;

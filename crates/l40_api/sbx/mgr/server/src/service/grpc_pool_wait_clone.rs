@@ -615,6 +615,7 @@ impl SandboxManagerService {
             sandbox_id: id.to_string(),
             template_filter: None,
             blocking: false,
+            discard_retained_filesystem_reason: None,
         }))
         .await?;
         Ok(())

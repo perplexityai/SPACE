@@ -69,8 +69,10 @@
 //! naming *any* node as presence when `active_node_id IS NULL`. Both suit a
 //! sweeper whose action is deleting a sandbox row rather than releasing a node,
 //! and changing them would change what that sweeper deletes. Porting it onto
-//! these fragments is its own change, not a cleanup — until then, this module
-//! is the definition for node-release decisions only.
+//! these fragments is its own change, not a cleanup. The sweeper's plan and
+//! its recovery to `suspended` do use [`node_observes_sandbox`], to defer to a
+//! node whose report lands after that candidate listing; otherwise this
+//! module is the definition for node-release decisions.
 
 use pplx_space_common_core::types::SandboxLifecycle;
 use std::time::Duration;

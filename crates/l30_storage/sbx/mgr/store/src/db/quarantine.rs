@@ -522,10 +522,13 @@ pub fn mark_quarantined(
         conn,
         id,
         None,
-        source,
-        reason_code,
-        reason_message,
-        next_action,
+        QuarantineEntry {
+            source,
+            reason_code,
+            reason_message,
+            failure_reason: None,
+            next_action,
+        },
     )?;
     Ok(())
 }
@@ -784,24 +787,68 @@ pub fn mark_quarantined_from_state(
         conn,
         id,
         Some(expected_state.into()),
-        source,
-        reason_code,
-        reason_message,
-        next_action,
+        QuarantineEntry {
+            source,
+            reason_code,
+            reason_message,
+            failure_reason: None,
+            next_action,
+        },
     )
+}
+
+/// [`mark_quarantined_from_state`] for a suspend that lost its runtime
+/// without a capture of its own: the row records
+/// [`SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE`] as its failure, so erase
+/// safety holds its retained filesystem as possibly the only copy, while the
+/// quarantine keeps `cause` as its message.
+pub fn mark_suspending_quarantined_retaining_only_copy(
+    conn: &Connection,
+    id: &str,
+    cause: &str,
+) -> std::result::Result<bool, MarkQuarantinedError> {
+    mark_quarantined_inner(
+        conn,
+        id,
+        Some(SandboxState::Suspending.into()),
+        QuarantineEntry {
+            source: SandboxQuarantineSource::SbxManager,
+            reason_code: SandboxQuarantineReasonCode::SuspendSnapshotPublicationFailed,
+            reason_message: cause,
+            failure_reason: Some(SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE),
+            next_action: SandboxQuarantineNextAction::RequiresOperatorAttention,
+        },
+    )
+}
+
+/// What a quarantine records about why it was entered.
+struct QuarantineEntry<'a> {
+    source: SandboxQuarantineSource,
+    reason_code: SandboxQuarantineReasonCode,
+    reason_message: &'a str,
+    /// What the row records as its failure, which erase safety reads; `None`
+    /// records the reason message, as every quarantine but a suspend's
+    /// lost-runtime one does.
+    failure_reason: Option<&'a str>,
+    next_action: SandboxQuarantineNextAction,
 }
 
 fn mark_quarantined_inner(
     conn: &Connection,
     id: &str,
     expected_state: Option<SandboxStatus>,
-    source: SandboxQuarantineSource,
-    reason_code: SandboxQuarantineReasonCode,
-    reason_message: &str,
-    next_action: SandboxQuarantineNextAction,
+    entry: QuarantineEntry<'_>,
 ) -> std::result::Result<bool, MarkQuarantinedError> {
+    let QuarantineEntry {
+        source,
+        reason_code,
+        reason_message,
+        failure_reason,
+        next_action,
+    } = entry;
     let reason_message = reason_message.trim();
     let reason_message = (!reason_message.is_empty()).then_some(reason_message);
+    let failure_reason = failure_reason.or(reason_message);
     // One read: the episode records the status label it entered from, the
     // event the status or its stored text, and decisions read the status.
     let previous_read = current_status_or_text(conn, id)?;
@@ -848,7 +895,7 @@ fn mark_quarantined_inner(
          WHERE id = ?3
            AND (?4 IS NULL OR (state = ?4 AND cleanup_state IS ?5))",
         params![
-            reason_message,
+            failure_reason,
             ts,
             id,
             previous_status.map(|status| status.lifecycle().as_str()),
