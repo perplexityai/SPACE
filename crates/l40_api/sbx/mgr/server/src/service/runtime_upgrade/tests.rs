@@ -89,7 +89,15 @@ struct Fake {
     fail_retire: AtomicBool,
     /// Stop the sandbox behind the upgrade's back while it inspects the disk.
     stop_during_inspect: AtomicBool,
+    /// The checkpoint here names an artifact other than the row's pin.
+    unpinned_checkpoint: AtomicBool,
+    /// What finishing the disk leaves as the checkpoint's producer, which the
+    /// inspection after it reads.
+    finished_checkpoint: Mutex<Option<ExecutionMetadata>>,
     calls: Mutex<Vec<&'static str>>,
+    /// How often the upgrade asked to finish a staged disk, kept apart from
+    /// `calls` because it's a no-op for every disk this fake stands for.
+    completed: std::sync::atomic::AtomicUsize,
 }
 
 impl Fake {
@@ -107,7 +115,10 @@ impl Fake {
             fail_restore: AtomicBool::new(false),
             fail_retire: AtomicBool::new(false),
             stop_during_inspect: AtomicBool::new(false),
+            unpinned_checkpoint: AtomicBool::new(false),
+            finished_checkpoint: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
+            completed: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -132,6 +143,32 @@ impl Fake {
 
 #[tonic::async_trait]
 impl RuntimeUpgradeEffects for Arc<Fake> {
+    async fn complete_staged_disk(&self, _: &SandboxRow) -> Result<(), Status> {
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        if let Some(finished) = self.finished_checkpoint.lock().unwrap().clone() {
+            self.disk.lock().unwrap().checkpoint_execution = Some(finished);
+        }
+        Ok(())
+    }
+
+    async fn require_pinned_checkpoint(&self, _: &SandboxRow) -> Result<(), Status> {
+        if self.unpinned_checkpoint.load(Ordering::SeqCst) {
+            return Err(Status::failed_precondition(
+                "the checkpoint isn't the suspend checkpoint it pins",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn checkpoint_execution(&self, _: &SandboxRow) -> Result<ExecutionMetadata, Status> {
+        self.disk
+            .lock()
+            .unwrap()
+            .checkpoint_execution
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("no checkpoint"))
+    }
+
     async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Status> {
         self.called("inspect");
         if self.stop_during_inspect.load(Ordering::SeqCst) {
@@ -1039,9 +1076,17 @@ async fn only_a_certified_upgrade_edge_is_followed() {
             error.message().contains("not a certified upgrade edge"),
             "{error}"
         );
+        // A suspended sandbox's source is its checkpoint's producer, read
+        // before its staged disk is finished, so nothing on the node changes.
+        let expected: &[&str] = if state == SandboxState::Suspended {
+            &["exclude", "release unfenced"]
+        } else {
+            &["exclude", "inspect", "release unfenced"]
+        };
+        assert_eq!(h.fake.calls(), expected, "{state}");
         assert_eq!(
-            h.fake.calls(),
-            ["exclude", "inspect", "release unfenced"],
+            h.fake.completed.load(Ordering::SeqCst),
+            usize::from(state != SandboxState::Suspended),
             "{state}"
         );
         assert_eq!(h.record(operation_id), None);
@@ -1386,9 +1431,53 @@ async fn a_suspended_sandbox_needs_memory_loss_consent() {
 
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(error.message().contains("memory loss"), "{error}");
-    assert_eq!(h.fake.calls(), ["exclude", "inspect", "release unfenced"]);
+    // Refused before its staged disk is finished or read.
+    assert_eq!(h.fake.calls(), ["exclude", "release unfenced"]);
+    assert_eq!(h.fake.completed.load(Ordering::SeqCst), 0);
     assert_eq!(h.record(operation_id), None);
     h.assert_old_pair_restorable(SandboxState::Suspended);
+}
+
+/// A cleanup the fence refuses is refused before the staged disk is
+/// finished, whether the row records its completion or only an episode.
+#[tokio::test]
+async fn a_cleanup_is_refused_before_the_staged_disk_is_finished() {
+    let cleanups: [&str; 2] = [
+        "UPDATE sandboxes SET cleanup_completion = 'mark_suspended' WHERE id = ?1",
+        "INSERT INTO sandbox_cleanup_episodes (
+             sandbox_id, cleanup_id, completion, keep_filesystem, phase,
+             activation_state, created_at
+         ) VALUES (?1, ?2, 'mark_suspended', TRUE, 'armed', 'restoring', 0)",
+    ];
+    for (with_episode, cleanup) in cleanups.into_iter().enumerate() {
+        let h = harness(SandboxState::Suspended);
+        let episode_id = pplx_space_sandbox_model::SandboxCleanupEpisodeId::new().to_string();
+        let db = h.db.lock().unwrap();
+        if with_episode == 1 {
+            db.execute(
+                cleanup,
+                crate::db::fixture::params![h.sandbox_id, episode_id],
+            )
+        } else {
+            db.execute(cleanup, crate::db::fixture::params![h.sandbox_id])
+        }
+        .unwrap();
+        drop(db);
+        assert!(h.row().state.is_unowned(SandboxState::Suspended));
+        let operation_id = operation();
+
+        let error = h
+            .upgrader
+            .upgrade(h.request(operation_id, RuntimeUpgradeTargetState::Started))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
+        assert!(error.message().contains("cleanup owns"), "{error}");
+        assert_eq!(h.fake.calls(), ["exclude", "release unfenced"]);
+        assert_eq!(h.fake.completed.load(Ordering::SeqCst), 0);
+        assert_eq!(h.record(operation_id), None);
+    }
 }
 
 #[tokio::test]
@@ -1416,7 +1505,55 @@ async fn work_already_on_the_target_is_left_alone() {
         .await
         .unwrap();
     assert!(matches!(outcome, RuntimeUpgradeOutcome::AlreadyOnTarget));
-    assert_eq!(h.fake.calls(), ["exclude", "inspect", "release unfenced"]);
+    assert_eq!(h.fake.calls(), ["exclude", "release unfenced"]);
+    assert_eq!(h.fake.completed.load(Ordering::SeqCst), 0);
+}
+
+/// A suspended sandbox found on its target is recorded as such only from the
+/// checkpoint its row pins, whether the producer is read before the disk is
+/// finished or after. A refusal records nothing, so a retry after the
+/// checkpoint is repaired still answers.
+#[tokio::test]
+async fn a_suspended_sandbox_is_on_its_target_only_by_the_checkpoint_it_pins() {
+    for after_finishing in [false, true] {
+        let h = harness(SandboxState::Suspended);
+        if after_finishing {
+            *h.fake.finished_checkpoint.lock().unwrap() = Some(h.envs.target.clone());
+        } else {
+            h.fake.disk.lock().unwrap().checkpoint_execution = Some(h.envs.target.clone());
+        }
+        h.fake.unpinned_checkpoint.store(true, Ordering::SeqCst);
+        let operation_id = operation();
+
+        let error = h
+            .upgrader
+            .upgrade(h.request(operation_id, RuntimeUpgradeTargetState::Started))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+        assert!(error.message().contains("checkpoint it pins"), "{error}");
+        assert_eq!(
+            h.record(operation_id),
+            None,
+            "after finishing: {after_finishing}"
+        );
+        assert_eq!(
+            h.fake.completed.load(Ordering::SeqCst),
+            usize::from(after_finishing)
+        );
+
+        h.fake.unpinned_checkpoint.store(false, Ordering::SeqCst);
+        let outcome = h
+            .upgrader
+            .upgrade(h.request(operation_id, RuntimeUpgradeTargetState::Started))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, RuntimeUpgradeOutcome::AlreadyOnTarget),
+            "after finishing: {after_finishing}"
+        );
+    }
 }
 
 #[tokio::test]

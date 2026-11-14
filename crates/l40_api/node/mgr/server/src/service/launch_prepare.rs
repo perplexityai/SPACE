@@ -202,12 +202,22 @@ fn sandbox_metadata(
 }
 
 fn write_sandbox_metadata_atomic(path: &Path, contents: &[u8]) -> Result<(), Status> {
+    write_sandbox_metadata_with_group(path, contents, gids::SPACE_CACHE_RW)
+}
+
+/// Write `metadata.json` readable and writable by its group, as every
+/// sandbox-manager and the VM owner need it.
+pub(super) fn write_sandbox_metadata_with_group(
+    path: &Path,
+    contents: &[u8],
+    gid: u32,
+) -> Result<(), Status> {
     use std::io::Write;
     super::artifact_fs::write_atomic(path, |mut output| {
         output
             .write_all(contents)
             .map_err(super::artifact_fs::error)?;
-        super::trusted_paths::set_permissions(output, Some(gids::SPACE_CACHE_RW), 0o660)
+        super::trusted_paths::set_permissions(output, Some(gid), 0o660)
     })
     .map(|_| ())
 }

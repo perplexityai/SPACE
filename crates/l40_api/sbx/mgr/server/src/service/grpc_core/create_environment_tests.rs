@@ -656,6 +656,7 @@ async fn a_pool_clone_saves_and_admits_its_donors_binding() {
                 .unary("GetCloneCapabilities", |_: CloneCapabilitiesRequest| {
                     Ok(CloneCapabilitiesResponse {
                         prepared_clone_disposal: true,
+                        staged_checkpoint_disk: false,
                     })
                 })
                 .unary("CaptureVmState", move |request: CaptureVmStateRequest| {

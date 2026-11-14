@@ -1934,3 +1934,5 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
     );
     service.activation_seal.assert_quiesced();
 }
+
+mod encrypted_cold_start;
