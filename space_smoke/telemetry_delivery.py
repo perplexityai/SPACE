@@ -5,14 +5,16 @@ OTLP to the Collectors, which write them to Prometheus and Tempo, and Alloy
 ships every SPACE pod's stdout to Loki. Each leg can break on its own and stay
 silent: an exporter that cannot reach its Collector only retries, a Collector
 that cannot write drops, and Alloy's targets are a path glob. A passing
-lifecycle smoke proves none of it, so this reads each backend back for the
-scenario's own sandbox, never for whatever an earlier scenario left behind:
+lifecycle smoke proves none of it, so this reads each backend back for fresh
+evidence:
 
 - Tempo holds the sandbox's create trace with both space-api and shim spans,
   and the shim's create is a child of the API's pod materialization span;
 - Prometheus holds the shim's create latency from a shim process that started
   after the scenario did, on the node that trace names, and a space-api create
   count that grew after the scenario's start;
+- fresh guest-memory observations have a positive average for the sandbox's
+  template and node; another matching sandbox can contribute to this check;
 - Loki holds a SPACE pod log line that names the sandbox.
 
 Each check records what it read, at the scenario's start and at its last poll
@@ -28,6 +30,8 @@ about 11 s after its spans end.
 
 from __future__ import annotations
 
+import json
+import math
 import time
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
@@ -56,7 +60,7 @@ WINDOW_SLACK_SECONDS = 5
 
 
 class TelemetryDeliveryAssertions:
-    """Poll Tempo, Prometheus and Loki for the scenario's own sandbox."""
+    """Poll local backends for sandbox activity and template/node memory delivery."""
 
     def __init__(
         self, fixture: KindEcw, control: TelemetryBackendControl, *, since: float
@@ -252,6 +256,89 @@ class TelemetryDeliveryAssertions:
             bool(found),
             f"Loki holds no SPACE pod log line naming {sandbox_id}",
             failure_evidence=space_lines,
+        )
+
+    def expect_guest_memory_used(self) -> None:
+        """Fresh, positive memory observations arrive for this template and node.
+
+        The distribution has no sandbox-id label, so this proves delivery for
+        the selected population, not reporting by this particular sandbox.
+        """
+
+        metric = "space_sandbox_guest_mem_used_bytes"
+        self._fixture.verify(self._node is not None, "the shim's spans named no Kind node")
+        template = self._fixture.sandbox_template_name()
+        selector = (
+            f"{metric}{{template={json.dumps(template)},"
+            f"k8s_node_name={json.dumps(self._node)}}}"
+        )
+        queries = {
+            part: f"sum by (service_instance_id) (histogram_{part}({selector}))"
+            for part in ("count", "sum")
+        }
+
+        def read() -> dict[str, dict[str, float]]:
+            at = int(time.time())
+            values = {}
+            for part, query in queries.items():
+                values[part] = {
+                    str(sample["metric"].get("service_instance_id", "")): float(sample["value"][1])
+                    for sample in self._prometheus(query, at)
+                }
+            return {
+                instance: {part: values[part][instance] for part in queries}
+                for instance in values["count"].keys() & values["sum"].keys()
+            }
+
+        baseline = read()
+        effective_baseline = baseline.copy()
+        previous_counts = {instance: sample["count"] for instance, sample in baseline.items()}
+
+        def fresh(now: dict[str, dict[str, float]]) -> tuple[float, float]:
+            count = used = 0.0
+            for instance, current in now.items():
+                # A restarted process can reuse its instance ID. Remember a
+                # detected reset even after its count passes the old baseline;
+                # preserve the original readings separately as evidence.
+                if current["count"] < previous_counts.get(instance, 0.0):
+                    effective_baseline[instance] = {"count": 0.0, "sum": 0.0}
+                previous_counts[instance] = current["count"]
+                start = effective_baseline.get(instance, {"count": 0.0, "sum": 0.0})
+                # Only current reporters contribute; vanished series cannot
+                # subtract observations from reporters that are still present.
+                count += current["count"] - start["count"]
+                used += current["sum"] - start["sum"]
+            return count, used
+
+        # Require fresh observations, not merely a retained sample. Allow two
+        # 25-40 s probe intervals (including scheduler ticks), and exporter delay.
+        final = self._poll(
+            read,
+            lambda now: fresh(now)[0] >= 2,
+            budget=120.0,
+        )
+        count, used = fresh(final)
+        average = used / count if count > 0 else None
+        self._fixture.record(
+            "guest_memory_delivery",
+            {
+                "queries": queries,
+                "template": template,
+                "node": self._node,
+                "baseline": baseline,
+                "effective_baseline": effective_baseline,
+                "final": final,
+                "new_observations": count,
+                "average_used_bytes": average,
+            },
+        )
+        self._fixture.verify(
+            count >= 2,
+            "Prometheus did not receive two fresh guest-memory observations",
+        )
+        self._fixture.verify(
+            average is not None and math.isfinite(average) and average > 0,
+            "Fresh guest-memory observations do not have a finite, positive average",
         )
 
     def _prometheus(self, query: str, at: int) -> list[dict[str, Any]]:
