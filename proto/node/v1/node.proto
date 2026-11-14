@@ -300,6 +300,21 @@ service NodeManager {
   rpc BtrfsDeleteSandboxInstance(BtrfsDeleteSandboxInstanceRequest)
       returns (BtrfsDeleteSandboxInstanceResponse);
 
+  // Finish the disk of a suspend checkpoint staged on this node without a
+  // launch, so a runtime upgrade can cold-boot it as it would a copy
+  // suspended here. `metadata.json`, when absent, is written from the
+  // request, and a `metadata.json` already there is kept. For an encrypted
+  // sandbox `instance/` is created as a subvolume and the checkpoint's
+  // `snapshot/cow.luks` is laid over whatever `instance/cow.luks` holds, as
+  // a restore lays it, since a suspended sandbox's disk is its checkpoint.
+  // Idempotent; the response names what was written and what kept, and the
+  // checkpoint it laid. The staged `snapshot.json` must name the sandbox,
+  // the requested artifact and template. The caller validates the
+  // checkpoint too and holds its artifact lock. Only
+  // served when CloneCapabilitiesResponse.staged_checkpoint_disk is true.
+  rpc MaterializeStagedCheckpointDisk(MaterializeStagedCheckpointDiskRequest)
+      returns (MaterializeStagedCheckpointDiskResponse);
+
   // Create a sandbox's empty `instance/` as a btrfs subvolume, owned by
   // sandbox-manager, for a restore that writes the rootfs into it itself (the
   // Full codec). A plain directory there would work for the boot, but nothing
@@ -592,6 +607,11 @@ message NetworkPoolStatusRequest {}
 message CloneCapabilitiesRequest {}
 message CloneCapabilitiesResponse {
   bool prepared_clone_disposal = 1;
+  // MaterializeStagedCheckpointDisk is served, and RestoreInstanceSnapshot
+  // accepts an encrypted copy holding a COW and no rootfs. An older
+  // node-manager leaves this false, and sandbox-manager then refuses a
+  // runtime upgrade that would preserve such a copy before it fences.
+  bool staged_checkpoint_disk = 2;
 }
 
 message NetworkPoolStatusResponse {
@@ -1368,6 +1388,42 @@ message BtrfsCreateSandboxInstanceRequest {
   string sandbox_id = 1;
   InstanceTarget target = 2;
 }
+message MaterializeStagedCheckpointDiskRequest {
+  string sandbox_id = 1;
+  // Required; an execution fence, as for BtrfsCreateSandboxInstance.
+  InstanceTarget target = 2;
+  // The checkpoint the caller validated. The call refuses a staged
+  // checkpoint whose `snapshot.json` names another artifact or sandbox.
+  string local_artifact_id = 3;
+  // The `metadata.json` to write when the sandbox has none, naming the
+  // execution that wrote the disk. Empty writes none.
+  string metadata_json = 4;
+  // Lay the checkpoint's encrypted COW into `instance/`.
+  bool encrypted = 5;
+  // The template digest the checkpoint's `snapshot.json` names, which the
+  // caller checked against the row; empty when it names none, which only an
+  // unencrypted checkpoint may. The call refuses a checkpoint whose
+  // `snapshot.json` names another.
+  string template_digest = 6;
+}
+
+enum StagedDiskPart {
+  STAGED_DISK_PART_UNSPECIFIED = 0;
+  STAGED_DISK_PART_NOT_REQUESTED = 1;
+  STAGED_DISK_PART_WRITTEN = 2;
+  STAGED_DISK_PART_KEPT = 3;
+}
+
+message MaterializeStagedCheckpointDiskResponse {
+  StagedDiskPart metadata = 1;
+  StagedDiskPart cow = 2;
+  // The disk this call prepared, as the staged checkpoint's `snapshot.json`
+  // names it: its artifact and the template digest it was written over
+  // (empty when it names none).
+  string local_artifact_id = 3;
+  string template_digest = 4;
+}
+
 message BtrfsCreateSandboxInstanceResponse {
   // Whether `instance/` is now a btrfs subvolume: false for a plain directory
   // the call kept, or made on a filesystem that isn't btrfs.

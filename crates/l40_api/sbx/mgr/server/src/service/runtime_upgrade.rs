@@ -7,9 +7,10 @@
 //! 1. **Fence.** A `sandbox_runtime_upgrades` row, inserted only while the
 //!    sandbox is stopped or suspended and owned by nothing else, refuses every
 //!    other activation until the boot is verified or the old pair is back.
-//! 2. **Preserve.** A read-only copy of the instance subvolume (rootfs, and
-//!    for encrypted sandboxes `cow.luks` and the suspend volume) is kept under
-//!    an internal snapshot name. The checkpoint directory is never touched.
+//! 2. **Preserve.** A read-only copy of the instance subvolume (the rootfs,
+//!    and for encrypted sandboxes `cow.luks` and the suspend volume; a staged
+//!    encrypted checkpoint's holds only `cow.luks`) is kept under an internal
+//!    snapshot name. The checkpoint directory is never touched.
 //! 3. **Select the consumer.** The target must keep the disk's guest,
 //!    kernel and components; its runtime and snapshot format may differ, since
 //!    no memory is loaded. It is saved as the sandbox's consumer. The
@@ -42,6 +43,7 @@ use crate::state::{SandboxState, SandboxStatus};
 
 mod node_effects;
 mod rpc;
+mod staged_disk;
 mod stale_copy;
 #[cfg(test)]
 mod tests;
@@ -140,6 +142,15 @@ pub(super) struct LocalDisk {
 /// The node and lifecycle work an upgrade performs between its phases.
 #[tonic::async_trait]
 pub(super) trait RuntimeUpgradeEffects: Send + Sync {
+    /// Finish a suspended checkpoint staged on this node into the disk a copy
+    /// suspended here has ([`staged_disk`]). The caller excludes disk
+    /// mutations.
+    async fn complete_staged_disk(&self, sandbox: &SandboxRow) -> Result<(), Status>;
+    /// The producer of a suspended sandbox's checkpoint, which staging lays
+    /// down with it, read before [`Self::complete_staged_disk`] so the
+    /// upgrade refuses what it can before anything on the node changes.
+    async fn checkpoint_execution(&self, sandbox: &SandboxRow)
+    -> Result<ExecutionMetadata, Status>;
     /// Read the local disk, refusing a sandbox without one: a cold start
     /// would otherwise boot a fresh template clone.
     async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Status>;
@@ -492,6 +503,31 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         {
             return self.already_on_target(&request);
         }
+        // Every refusal that doesn't need the finished disk comes before
+        // finishing it, so a refused upgrade leaves the node as it found it.
+        // The same checks run again below against what the inspection reads.
+        if sandbox.state.is_unowned(SandboxState::Suspended) {
+            let checkpoint = self.effects.checkpoint_execution(&sandbox).await?;
+            if checkpoint.environment() == Some(request.target) {
+                return self.already_on_target(&request);
+            }
+            self.refuse_after_finding_its_target(&request)?;
+            require_certified_upgrade_edge(&checkpoint, request.target)?;
+            if !request.authorization.memory_loss {
+                return Err(memory_loss_unauthorized());
+            }
+        }
+        // The fence's transaction still decides this; reading it first only
+        // keeps a cleanup's refusal from following a finished disk.
+        if sandbox.cleanup_completion.is_some()
+            || crate::db::read::sandbox_view(&*self.db()?, &request.sandbox_id)
+                .cleanup_episode()
+                .present()
+                .map_err(|error| Status::internal(format!("read cleanup episode: {error}")))?
+        {
+            return Err(cleanup_active());
+        }
+        self.effects.complete_staged_disk(&sandbox).await?;
         let disk = self.effects.inspect_local_disk(&sandbox).await?;
         if sandbox.state.is_unowned(SandboxState::Suspended)
             && disk
@@ -502,27 +538,7 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         {
             return self.already_on_target(&request);
         }
-        // An operation that already found its sandbox on the target never
-        // boots: a replay after the sandbox moved to another environment
-        // would otherwise undo that move.
-        let found_its_target =
-            crate::db::read::runtime_upgrade_report(&*self.db()?, request.operation_id)
-                .map_err(|error| {
-                    Status::internal(format!("read runtime upgrade outcome: {error}"))
-                })?
-                .is_some_and(|report| {
-                    matches!(
-                        report.status,
-                        crate::db::RuntimeUpgradeStatus::AlreadyOnTarget { .. }
-                    )
-                });
-        if found_its_target {
-            return Err(Status::failed_precondition(format!(
-                "runtime upgrade {} found sandbox {} on its target before, and the sandbox \
-                 moved since; a new attempt takes a new operation id",
-                request.operation_id, request.sandbox_id
-            )));
-        }
+        self.refuse_after_finding_its_target(&request)?;
         // What the sandbox ran under last: its checkpoint's producer when
         // suspended, otherwise its saved consumer or, unbound, its disk's.
         let source = match sandbox.state.unowned() {
@@ -561,11 +577,7 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                     "a runtime upgrade needs a stopped or suspended sandbox, not {state}"
                 )));
             }
-            BeginRuntimeUpgrade::CleanupActive => {
-                return Err(Status::unavailable(
-                    "cleanup owns this sandbox; retry the runtime upgrade",
-                ));
-            }
+            BeginRuntimeUpgrade::CleanupActive => return Err(cleanup_active()),
             BeginRuntimeUpgrade::OtherOperation(other) => {
                 return Err(Status::aborted(format!(
                     "runtime upgrade {other} already owns this sandbox"
@@ -579,9 +591,7 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                 )));
             }
             BeginRuntimeUpgrade::MemoryLossUnauthorized => {
-                return Err(Status::failed_precondition(
-                    "upgrading a suspended sandbox discards its memory; the authorization must accept memory loss",
-                ));
+                return Err(memory_loss_unauthorized());
             }
             BeginRuntimeUpgrade::SandboxChanged => {
                 return Err(Status::aborted(
@@ -591,6 +601,34 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         };
         self.run(&record, &disk, request.start).await?;
         Ok(RuntimeUpgradeOutcome::Upgraded)
+    }
+
+    /// An operation that already found its sandbox on the target never
+    /// boots: a replay after the sandbox moved to another environment would
+    /// otherwise undo that move.
+    fn refuse_after_finding_its_target(
+        &self,
+        request: &RuntimeUpgradeRequest,
+    ) -> Result<(), Status> {
+        let found_its_target =
+            crate::db::read::runtime_upgrade_report(&*self.db()?, request.operation_id)
+                .map_err(|error| {
+                    Status::internal(format!("read runtime upgrade outcome: {error}"))
+                })?
+                .is_some_and(|report| {
+                    matches!(
+                        report.status,
+                        crate::db::RuntimeUpgradeStatus::AlreadyOnTarget { .. }
+                    )
+                });
+        if found_its_target {
+            return Err(Status::failed_precondition(format!(
+                "runtime upgrade {} found sandbox {} on its target before, and the sandbox \
+                 moved since; a new attempt takes a new operation id",
+                request.operation_id, request.sandbox_id
+            )));
+        }
+        Ok(())
     }
 
     /// Record that the upgrade fenced nothing, so a caller that lost this
@@ -1399,4 +1437,14 @@ impl super::SandboxManagerService {
             }
         }
     }
+}
+
+fn memory_loss_unauthorized() -> Status {
+    Status::failed_precondition(
+        "upgrading a suspended sandbox discards its memory; the authorization must accept memory loss",
+    )
+}
+
+fn cleanup_active() -> Status {
+    Status::unavailable("cleanup owns this sandbox; retry the runtime upgrade")
 }

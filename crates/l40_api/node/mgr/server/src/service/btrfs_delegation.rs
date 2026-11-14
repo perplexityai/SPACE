@@ -1579,6 +1579,9 @@ fn create_sandbox_instance_subvolume(
 #[path = "btrfs_delegation/create_instance_tests.rs"]
 mod create_instance_tests;
 
+#[path = "btrfs_delegation/staged_disk.rs"]
+mod staged_disk;
+
 fn delete_sandbox_instance_artifacts(
     sandbox_id: &str,
     sandbox_root: PathBuf,
