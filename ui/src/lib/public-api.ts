@@ -5,7 +5,8 @@ import { DEFAULT_LIST_LIMIT, parseSandboxRef, publicSandboxIdFromAny } from './s
 import { mergeOperationPages, type SandboxDebug } from './sandbox-debug';
 import { rollbackBody } from './rollback-targets';
 import { parseSandboxListResponse, type SandboxListResponse } from './sandbox-list';
-import {
+import { withTimeout } from './serial-reads';
+import type {
   PublicOperationRecord,
   PublicPage,
   PublicSnapshot,
@@ -19,6 +20,13 @@ import {
 const OPERATION_POLL_INTERVAL_MS = 800;
 const OPERATION_POLL_TIMEOUT_MS = 30_000;
 
+// Selector lists must finish within one read budget even if the server keeps
+// returning cursors. Request the API's maximum page size to limit round trips.
+export const PUBLIC_LIST_MAX_PAGES = 20;
+export const PUBLIC_LIST_MAX_ITEMS = 10_000;
+export const PUBLIC_LIST_PAGE_SIZE = 1_000;
+export const PUBLIC_LIST_TIMEOUT_MS = 30_000;
+
 export function idempotencyKey(): string {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
     return crypto.randomUUID();
@@ -27,8 +35,38 @@ export function idempotencyKey(): string {
 }
 
 export async function getPublicPage<T>(path: string): Promise<T[]> {
-  const page = await api.get<PublicPage<T>>(path);
-  return page.data;
+  const queryStart = path.indexOf('?');
+  const pathname = queryStart < 0 ? path : path.slice(0, queryStart);
+  const params = new URLSearchParams(queryStart < 0 ? '' : path.slice(queryStart + 1));
+  if (!params.has('limit') || Number(params.get('limit')) > PUBLIC_LIST_PAGE_SIZE) {
+    params.set('limit', String(PUBLIC_LIST_PAGE_SIZE));
+  }
+  const cursors = new Set<string>();
+  const initialCursor = params.get('cursor');
+  if (initialCursor) cursors.add(initialCursor);
+
+  return withTimeout(PUBLIC_LIST_TIMEOUT_MS, async (signal) => {
+    const items: T[] = [];
+    for (let pageIndex = 0; pageIndex < PUBLIC_LIST_MAX_PAGES; pageIndex += 1) {
+      signal.throwIfAborted();
+      const page = await api.get<PublicPage<T>>(`${pathname}?${params}`, { signal });
+      signal.throwIfAborted();
+      if (page.data.length > PUBLIC_LIST_PAGE_SIZE) {
+        throw new Error('The API returned a list page that is too large.');
+      }
+      if (items.length + page.data.length > PUBLIC_LIST_MAX_ITEMS) {
+        throw new Error('This list is too large to load in the console.');
+      }
+      items.push(...page.data);
+      if (!page.next_cursor) return items;
+      if (cursors.has(page.next_cursor)) {
+        throw new Error('The API returned a repeated pagination cursor.');
+      }
+      cursors.add(page.next_cursor);
+      params.set('cursor', page.next_cursor);
+    }
+    throw new Error('This list requires too many requests to load in the console.');
+  });
 }
 
 // The newest `limit` sandbox rows, across every org or for `orgId` only. The
