@@ -12,7 +12,7 @@ use uuid::Uuid;
 use super::{
     AutoLifecycleExecution, FieldPatch, SandboxDesiredStatePatch, SandboxMetadata,
     SandboxMetadataValue, UserSandboxRows, any_undescribed_artifact_owner, durably_restorable, get,
-    update_desired_state, user_sandbox_rows,
+    network_policy_inputs_placed_on, update_desired_state, user_sandbox_rows,
 };
 
 use super::sweeper::{EvacuationRestoreTarget, EvacuationRestoreTargetParseError};
@@ -1026,5 +1026,114 @@ async fn evacuation_restore_target_parses_exactly_what_its_column_admits() -> Te
         }
     }
     assert_eq!(parsed_values, ["started", "paused", "stopped"]);
+    Ok(())
+}
+
+/// Each placed sandbox carries its own override and its template's policy,
+/// sandboxes sharing a template each get it, a missing template reads as
+/// none, and a sandbox placed on another node is absent.
+#[tokio::test(flavor = "current_thread")]
+async fn network_policy_inputs_pair_each_placed_sandbox_with_its_template() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let this_node = NodeId::new();
+    let other_node = NodeId::new();
+    let custom = serde_json::json!({"egress": {"default_action": "allow"}, "version": "v1"});
+    let own = serde_json::json!({"egress": {"default_action": "deny"}, "version": "v1"});
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, network_policy_json)
+         VALUES ($1, 'np-custom', $2), ($3, 'np-plain', DEFAULT)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(&custom)
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    let (plain,) = sqlx::query_as::<_, (serde_json::Value,)>(sql!(
+        "SELECT network_policy_json FROM templates WHERE name = 'np-plain'"
+    ))
+    .fetch_one(pool)
+    .await?;
+
+    let place = |template: &'static str, active: NodeId, target: Option<NodeId>| async move {
+        let id = insert_sandbox(pool, None, "started").await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET template_id = $2, active_node_id = $3, target_node_id = $4
+              WHERE id = $1"
+        ))
+        .bind(id)
+        .bind(template)
+        .bind(active)
+        .bind(target)
+        .execute(pool)
+        .await?;
+        TestResult::Ok(id)
+    };
+    let first = place("np-custom", this_node, None).await?;
+    let second = place("np-custom", this_node, None).await?;
+    let arriving = place("np-plain", other_node, Some(this_node)).await?;
+    let orphaned = place("np-missing", this_node, None).await?;
+    let elsewhere = place("np-custom", other_node, None).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET network_policy_override_json = $2, network_policy_generation = 4
+          WHERE id = $1"
+    ))
+    .bind(arriving)
+    .bind(&own)
+    .execute(pool)
+    .await?;
+
+    let ids: Vec<SandboxId> = [first, second, arriving, orphaned, elsewhere]
+        .into_iter()
+        .map(SandboxId::from_uuid)
+        .collect();
+    let mut seen: Vec<_> = network_policy_inputs_placed_on(pool, this_node, &ids)
+        .await?
+        .into_iter()
+        .map(|row| {
+            (
+                row.sandbox_id,
+                row.template_id,
+                row.network_policy_json,
+                row.network_policy_generation,
+                row.template_network_policy_json,
+            )
+        })
+        .collect();
+    seen.sort_by_key(|row| row.0);
+    let mut expected = vec![
+        (
+            SandboxId::from_uuid(first),
+            Some("np-custom".to_string()),
+            None,
+            1,
+            Some(custom.clone()),
+        ),
+        (
+            SandboxId::from_uuid(second),
+            Some("np-custom".to_string()),
+            None,
+            1,
+            Some(custom),
+        ),
+        (
+            SandboxId::from_uuid(arriving),
+            Some("np-plain".to_string()),
+            Some(own),
+            4,
+            Some(plain),
+        ),
+        (
+            SandboxId::from_uuid(orphaned),
+            Some("np-missing".to_string()),
+            None,
+            1,
+            None,
+        ),
+    ];
+    expected.sort_by_key(|row| row.0);
+    assert_eq!(seen, expected);
     Ok(())
 }
