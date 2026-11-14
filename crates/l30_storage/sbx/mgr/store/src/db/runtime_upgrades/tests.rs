@@ -1381,8 +1381,11 @@ fn each_attempts_rollback_or_refusal_is_kept_for_that_attempt() {
     // The report is still the operation's latest outcome.
     assert_eq!(report_with_attempt(&conn, operation_id), refused_c);
 
+    // Each attempt's outcome outlives the sandbox's row, so a delayed retry
+    // of it is still refused after the sandbox is staged again.
     delete_sandbox(&conn, &id).unwrap();
-    assert_eq!(attempt_outcome("attempt-b"), None);
+    assert_eq!(attempt_outcome("attempt-b"), rolled_back("b's boot failed"));
+    assert_eq!(report_with_attempt(&conn, operation_id), None);
 }
 
 #[test]
@@ -1861,10 +1864,19 @@ fn a_refused_attempt_is_recorded_only_for_an_operation_that_reached_its_target()
     // Each operation reports its own latest, whichever recorded last.
     assert_eq!(refused_attempt(upgrading).as_deref(), Some("attempt-a"));
 
+    // The refused activation outlives the sandbox's row, as a rollback does.
     delete_sandbox(&conn, &other).unwrap();
     assert_eq!(
-        crate::db::read::runtime_upgrade_attempt_outcome(&conn, found, "attempt-a").unwrap(),
-        None
+        crate::db::read::runtime_upgrade_attempt_outcome(&conn, found, "attempt-a")
+            .unwrap()
+            .map(|outcome| outcome.outcome),
+        Some(RecordedAttemptOutcome::ActivationRefused)
+    );
+    assert_eq!(
+        crate::db::read::runtime_upgrade_attempt_sandbox(&conn, found, "attempt-a")
+            .unwrap()
+            .as_deref(),
+        Some(other.as_str())
     );
 }
 

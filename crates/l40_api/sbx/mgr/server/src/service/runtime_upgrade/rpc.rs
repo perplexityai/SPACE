@@ -714,33 +714,50 @@ impl crate::service::SandboxManagerService {
             }
             abandoned_for => abandoned_for.is_some(),
         };
-        let Some(report) = report else {
-            return Ok(GetRuntimeUpgradeResponse {
-                status: Wire::Absent as i32,
-                abandoned,
-                ..Default::default()
-            });
+        // The named attempt's own final outcome names its sandbox, and
+        // outlives the sandbox's row and the operation's report with it, as
+        // when another attempt's upgrade evicted a stale copy and staged the
+        // sandbox again. Its retries are still refused from it, so a caller
+        // waiting on that attempt gets it too, and one naming another sandbox
+        // is refused, as `UpgradeRuntime` refuses it.
+        let settled = match attempt {
+            None => None,
+            Some(attempt) => {
+                let read = |error| Status::internal(format!("read runtime upgrade: {error}"));
+                match crate::db::read::runtime_upgrade_attempt_sandbox(&db, operation_id, attempt)
+                    .map_err(read)?
+                {
+                    Some(recorded_for) if recorded_for != sandbox_id => {
+                        return Err(Status::invalid_argument(format!(
+                            "runtime upgrade {operation_id} names another sandbox"
+                        )));
+                    }
+                    _ => {}
+                }
+                crate::db::read::runtime_upgrade_attempt_outcome(&db, operation_id, attempt)
+                    .map_err(read)?
+            }
         };
-        if report.sandbox_id != sandbox_id {
+        if let Some(report) = &report
+            && report.sandbox_id != sandbox_id
+        {
             return Err(Status::invalid_argument(format!(
                 "runtime upgrade {operation_id} names another sandbox"
             )));
         }
         // A caller waiting on an attempt gets that attempt's own answer, from
-        // its own row, so a later attempt never changes it.
+        // its own row, so a later attempt never changes it: its rollback or
+        // refusal first, whatever report stands since.
         let mut own_refused_activation = None;
-        if let Some(attempt) = attempt {
-            let settled =
-                crate::db::read::runtime_upgrade_attempt_outcome(&db, operation_id, attempt)
-                    .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?;
-            let status = settled.as_ref().and_then(|settled| match settled.outcome {
+        if let (Some(attempt), Some(settled)) = (attempt, settled) {
+            let status = match settled.outcome {
                 crate::db::RecordedAttemptOutcome::RolledBack => Some(Wire::RolledBack),
                 crate::db::RecordedAttemptOutcome::Refused => Some(Wire::Refused),
                 // Reported with the operation's outcome, below.
                 crate::db::RecordedAttemptOutcome::ActivationRefused => None,
-            });
-            match (status, settled) {
-                (Some(status), Some(settled)) => {
+            };
+            match status {
+                Some(status) => {
                     return Ok(GetRuntimeUpgradeResponse {
                         status: status as i32,
                         failure: settled.failure,
@@ -749,23 +766,47 @@ impl crate::service::SandboxManagerService {
                         ..Default::default()
                     });
                 }
-                (None, Some(settled)) => own_refused_activation = Some(settled.failure),
-                (_, None) => {}
+                None => own_refused_activation = Some(settled.failure),
             }
+        }
+        // ABSENT, with the named attempt's refused activation when it has
+        // one: no report of the operation speaks for that attempt, but its
+        // refusal stays final for it.
+        let absent = |own_refused_activation: Option<Option<String>>| {
+            let (refused_attempt_id, refused_attempt_failure) = own_refused_activation
+                .map(|failure| (attempt.map(str::to_owned), failure))
+                .unwrap_or_default();
+            GetRuntimeUpgradeResponse {
+                status: Wire::Absent as i32,
+                abandoned,
+                refused_attempt_id,
+                refused_attempt_failure,
+                ..Default::default()
+            }
+        };
+        let Some(report) = report else {
+            return Ok(absent(own_refused_activation));
+        };
+        // Only a report that reached the target carries a refused activation.
+        // One recorded beside a report that hasn't was kept from before the
+        // sandbox's row was deleted, since an activation is refused only once
+        // the operation reached its target: it still speaks for its attempt,
+        // and the report, a later attempt's, doesn't.
+        let reached = matches!(
+            report.status,
+            RuntimeUpgradeStatus::Upgraded | RuntimeUpgradeStatus::AlreadyOnTarget { .. }
+        );
+        if let Some(attempt) = attempt {
             // Another attempt's rollback or refusal says nothing about this
             // one. This attempt's own is reported below even before its
             // history is written: a rollback whose disk discard failed stays on
             // the live row until a retry or recovery finishes it.
-            if matches!(
+            let others = matches!(
                 report.status,
                 RuntimeUpgradeStatus::RolledBack { .. } | RuntimeUpgradeStatus::Refused { .. }
-            ) && report.attempt_id.as_deref() != Some(attempt)
-            {
-                return Ok(GetRuntimeUpgradeResponse {
-                    status: Wire::Absent as i32,
-                    abandoned,
-                    ..Default::default()
-                });
+            ) && report.attempt_id.as_deref() != Some(attempt);
+            if others || (own_refused_activation.is_some() && !reached) {
+                return Ok(absent(own_refused_activation));
             }
         }
         drop(db);
@@ -777,6 +818,7 @@ impl crate::service::SandboxManagerService {
                 .unwrap_or_default(),
             None => report
                 .refused_attempt
+                .filter(|_| reached)
                 .map(|refused| (Some(refused.attempt_id), refused.failure))
                 .unwrap_or_default(),
         };

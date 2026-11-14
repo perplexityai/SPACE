@@ -1633,8 +1633,22 @@ sandbox. Each attempt's final outcome also stays in
 `sandbox_runtime_upgrade_attempt_outcomes`, one row per operation and attempt
 id, which the finality check reads: a later attempt's outcome replaces the
 earlier one in the report, but a delayed retry of the earlier attempt still
-gets its own outcome back and never fences again. An upgraded or
-already-on-target outcome is answered to any attempt, but for a started
+gets its own outcome back and never fences again. That finality survives
+the sandbox row's deletion: the table declares no foreign key and keeps its
+rows when the sandbox is deleted, as `sandbox_runtime_upgrade_abandoned`
+does, so an attempt refused for a stale suspended copy still gets its refusal
+back after a later attempt's eviction deleted the row and the sandbox was
+staged again under the same id. `GetRuntimeUpgrade` answers a caller that
+names that attempt and this sandbox from the same row, though the
+operation's report went with the deleted sandbox row: a rollback or refusal
+as its status, whatever report stands since, and a refused activation as
+`refused_attempt_id` with `ABSENT`, while no report stands or a later
+attempt's hasn't reached the target. Both RPCs refuse a request that names
+another sandbox for that attempt with `InvalidArgument`, and `UpgradeRuntime`
+refuses a stopped target's request for an attempt whose activation was
+refused the same way, as the operation's records did while they stood.
+Nothing prunes these rows yet. An upgraded or already-on-target outcome is
+answered to any attempt, but for a started
 target the attempt's start can still fail after it: the sandbox runs another
 pod's execution, moved off the execution the start was decided on, or the
 activation itself failed. The node records that refusal for the attempt
@@ -1663,8 +1677,8 @@ sandbox-manager recovery loop settles unfinished upgrades at startup and every
 minute without booting or stopping anything: it rolls back, or retires, and
 leaves a sandbox it can't settle yet for the next pass. An upgrade that must end
 stopped stays verified while its sandbox runs, until its caller's retry stops it
-or the sandbox stops some other way. Deleting the sandbox deletes its
-upgrade rows; evicting it removes the preserved copy with the rest of its local
+or the sandbox stops some other way. Deleting the sandbox deletes its live
+upgrade row and its outcome, but keeps each attempt's final outcome; evicting it removes the preserved copy with the rest of its local
 presence, and the upgrade fails at its next claim.
 
 ### Booting an upgrade in its pod
@@ -1739,8 +1753,10 @@ doesn't render it yet.
   refusal (`refused_attempt_id`, `refused_attempt_failure`). A request that
   names an attempt (`attempt_id`) gets that attempt's own answer instead, from
   its own rows: its rollback or refusal, or `ABSENT` in place of another
-  attempt's, and its own refused activation, never another attempt's, so a
-  later attempt never changes what the caller waiting on one reads. A set
+  attempt's, and its own refused activation, never another attempt's (with
+  `ABSENT` when it was kept from before the sandbox's row was deleted and no
+  report that reached the target stands), so a later attempt never changes
+  what the caller waiting on one reads. A set
   `attempt_id` that `UpgradeRuntime` would refuse (empty, whitespace-only or
   over 256 bytes) is refused here too, with `INVALID_ARGUMENT`. Node-api
   forwards it on `WorkerApiInternal` only for a caller with the control-plane
@@ -1853,8 +1869,10 @@ execution, and the shim fails the create.
 
 A sandbox-manager from this release applies the
 `sandbox_runtime_upgrade_outcomes`, `sandbox_runtime_upgrade_attempt_id`,
-`sandbox_runtime_upgrade_attempt_outcomes` and
-`sandbox_runtime_upgrade_abandoned` migrations at startup, and an
+`sandbox_runtime_upgrade_attempt_outcomes`,
+`sandbox_runtime_upgrade_abandoned` and
+`sandbox_runtime_upgrade_attempt_outcomes_outlive_sandbox` migrations at
+startup, and an
 older one refuses a database whose migration history holds a version it
 doesn't bundle. So a rollback build reverts the code but keeps those
 migrations, their files under `db/sandbox-manager/` and their entries in the
@@ -1876,7 +1894,18 @@ down migration refuses while an abandoned operation is recorded, since an
 older release would let a late call for it change a disk the control plane
 has already captured. Nothing prunes those records, so once a node has
 abandoned an operation, that down migration refuses until an operator
-deletes them.
+deletes them. The migration that drops the attempt outcomes' foreign key has
+a down migration that refuses while an outcome names a sandbox the node no
+longer holds, since the foreign key it restores can't keep that row, and
+dropping it would let that attempt's delayed retry fence, boot or activate
+the sandbox again. The older code also deletes an attempt's outcome with its
+sandbox again, so after a binary rollback a delayed retry that arrives once
+the sandbox is deleted and staged again runs as a fresh attempt. An outcome
+already kept from before the rollback still refuses its attempt's retries
+under the older code, from another sandbox too, with `FailedPrecondition`,
+but that code's `GetRuntimeUpgrade` answers `ABSENT` without it once no
+report stands, so a caller waiting on that attempt falls back to its own
+deadline.
 
 Before running a rollback build on a node that may have abandoned an
 operation, stop every caller of `AbandonRuntimeUpgrade`, and confirm that no
@@ -2047,7 +2076,9 @@ is stranded.
    until the backup lands), and a sandbox the
    operation already ran on (it upgraded, rolled back or found the target)
    is left to that record; an operation only refused before it fenced
-   anything never touched the copy, so a later attempt's eviction goes ahead.
+   anything never touched the copy, so a later attempt's eviction goes ahead,
+   and the refused attempt's own retries are still answered with its
+   refusal, which the eviction's delete of the row keeps.
    The check reads the operation's latest outcome, which a later attempt's
    refusal can replace, so after one an earlier rollback doesn't hold the
    copy back. Once the

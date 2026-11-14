@@ -1184,6 +1184,27 @@ impl FromStr for RecordedAttemptOutcome {
 }
 
 db_private_outside_tests! {
+    /// The sandbox the attempt `attempt_id`'s final outcome under
+    /// `operation_id` was recorded for, `None` without one. The row outlives
+    /// the sandbox's row; the operation's report doesn't.
+    fn runtime_upgrade_attempt_sandbox(
+        conn: &Connection,
+        operation_id: RuntimeUpgradeOperationId,
+        attempt_id: &str,
+    ) -> Result<Option<String>> {
+        conn.query_row(
+            "SELECT sandbox_id
+               FROM sandbox_runtime_upgrade_attempt_outcomes
+              WHERE operation_id = ?1
+                AND attempt_id = ?2",
+            params![operation_id.to_string(), attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+}
+
+db_private_outside_tests! {
     /// The final outcome of the attempt `attempt_id` under `operation_id`,
     /// `None` when none was recorded for it. Unlike the operation's report,
     /// which keeps only its latest outcome, this is the attempt's own,
@@ -1307,10 +1328,12 @@ pub fn record_runtime_upgrade_refused_attempt(
 }
 
 /// The latest attempt the operation refused after reaching its target,
-/// `None` without one. A row is never rewritten, and is deleted only
-/// with its sandbox, which takes every row of the operation with it, so the
-/// newest rowid is the latest recorded, however coarse or unsteady the clock
-/// that stamped `recorded_at`.
+/// `None` without one. A row is never rewritten or deleted, and the
+/// migration that dropped the table's foreign key copied its rows in rowid
+/// order (`ORDER BY rowid`), so the newest rowid is the latest recorded,
+/// however coarse or unsteady the clock that stamped `recorded_at`. A row
+/// kept from before its sandbox was deleted can be the latest; a caller
+/// reads it only beside a report that reached the target.
 fn latest_refused_attempt(
     conn: &Connection,
     operation_id: RuntimeUpgradeOperationId,
@@ -1433,7 +1456,10 @@ pub struct RuntimeUpgradeReport {
     /// The latest attempt the operation refused after it reached its target,
     /// so the sandbox doesn't run for that attempt; see
     /// [`record_runtime_upgrade_refused_attempt`]. Only an upgraded or
-    /// already-on-target operation refuses one.
+    /// already-on-target operation refuses one, but the row outlives its
+    /// sandbox's, so beside another status it was kept from before the
+    /// sandbox was deleted and says nothing of this report: read it only
+    /// beside an upgraded or already-on-target status.
     pub refused_attempt: Option<RuntimeUpgradeRefusedAttempt>,
 }
 

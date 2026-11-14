@@ -537,24 +537,44 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
     }
 
     /// Refuse a request that names another sandbox, target or authorization
-    /// than its operation's live row or recorded outcome does: a retry may
-    /// not turn an operation into another one.
+    /// than its operation's live row or recorded outcome does, or than its
+    /// attempt's final outcome does: a retry may not turn an operation into
+    /// another one.
     pub(super) fn refuse_another_request(
         &self,
         request: &RuntimeUpgradeRequest,
     ) -> Result<(), Status> {
-        let recorded = crate::db::read::recorded_runtime_upgrade_request(
-            &*self.db()?,
-            request.operation_id,
-        )
-        .map_err(|error| Status::internal(format!("read runtime upgrade outcome: {error}")))?;
+        let (recorded, attempt_sandbox, attempt_outcome) = {
+            let db = self.db()?;
+            let read = |error| Status::internal(format!("read runtime upgrade outcome: {error}"));
+            let operation_id = request.operation_id;
+            let attempt_id = &request.attempt_id;
+            (
+                crate::db::read::recorded_runtime_upgrade_request(&db, operation_id)
+                    .map_err(read)?,
+                crate::db::read::runtime_upgrade_attempt_sandbox(&db, operation_id, attempt_id)
+                    .map_err(read)?,
+                crate::db::read::runtime_upgrade_attempt_outcome(&db, operation_id, attempt_id)
+                    .map_err(read)?,
+            )
+        };
         let live = self
             .record(request.operation_id)?
             .map(|record| record.identity());
+        // The attempt's own final outcome outlives the other two when the
+        // sandbox's row is deleted, and still says what the attempt was: the
+        // sandbox it was recorded for, and, for a refused activation, a
+        // started target. A request that differs is told so rather than given
+        // that attempt's outcome.
         if recorded
             .into_iter()
             .chain(live)
             .any(|identity| identity != request.identity())
+            || attempt_sandbox.is_some_and(|sandbox_id| sandbox_id != request.sandbox_id)
+            || attempt_outcome.is_some_and(|settled| {
+                settled.outcome == crate::db::RecordedAttemptOutcome::ActivationRefused
+                    && request.target_state != crate::db::RuntimeUpgradeTargetState::Started
+            })
         {
             return Err(request.names_another());
         }

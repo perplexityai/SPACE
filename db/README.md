@@ -224,16 +224,27 @@ Sandbox-manager's `20261114030001_sandbox_runtime_upgrade_attempt_id` and
 upgrade attempt's final outcome. Their downs refuse, before they change the
 schema, while a row they'd lose is recorded: `20261114030002`'s while any attempt outcome is,
 and `20261114030001`'s while an operation's outcome is `refused`, which an
-older release can't parse. Every rollback of an upgrade begun under these
-migrations records its attempt's outcome, and those rows go only with their
-sandbox, so once a node has rolled back such an upgrade, its schema is
-forward-only until that sandbox is deleted.
+older release can't parse. `20261114030004_sandbox_runtime_upgrade_attempt_outcomes_outlive_sandbox`
+drops the attempt outcomes' foreign key, so an attempt's final outcome stays
+when its sandbox is deleted; its down refuses while an outcome names a
+sandbox the node no longer holds. Every rollback of an upgrade begun under
+these migrations records its attempt's outcome, and nothing deletes those
+rows, so once a node has rolled back such an upgrade, its schema is
+forward-only.
 Keep running a release that bundles the migrations on such a node. This
 read-only query counts the rows that block the reversal:
 
 ```sql
 SELECT (SELECT COUNT(*) FROM sandbox_runtime_upgrade_attempt_outcomes)
      + (SELECT COUNT(*) FROM sandbox_runtime_upgrade_outcomes WHERE outcome = 'refused');
+```
+
+Of those, this one counts the outcomes whose sandbox is gone, which block
+`20261114030004`'s down on its own:
+
+```sql
+SELECT COUNT(*) FROM sandbox_runtime_upgrade_attempt_outcomes AS outcome
+ WHERE NOT EXISTS (SELECT 1 FROM sandboxes WHERE id = outcome.sandbox_id);
 ```
 
 ## Console password provisioning
