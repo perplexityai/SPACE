@@ -1249,6 +1249,39 @@ disk sample and the disk distribution can count fewer calls than the vCPU and
 memory ones. A known disk size is recorded even when the vCPU and memory are
 not.
 
+## Guest memory in use
+
+Sandbox-manager records the memory each running sandbox's guest is using as
+the distribution `sandbox.guest.mem_used_bytes`: the guest's
+`MemTotal - MemAvailable` from one `/proc/meminfo` read, in bytes. The guest
+reports it on the bridge `Ping` the health probe already sends about every 25
+to 40 seconds, including scheduler rounding, so there is no separate schedule.
+
+Each sample carries the sandbox's `template` name, cached when the watchdog
+loads the sandbox's metadata from its database row. Recording the sample
+performs no additional database read or template lookup. Deployment dimensions
+such as `cluster_id` and `env` come from the metrics sink; no sandbox ID, host
+or `client_id` is attached explicitly.
+
+A sample is recorded once per probe whose result sandbox-manager accepts: a
+probe that crossed a lifecycle edge, or whose sandbox was removed, is
+discarded. Only `started` sandboxes contribute. Unclaimed, ready warm-pool
+members are normally paused and therefore excluded, as are other paused,
+quarantined and non-started sandboxes. This is a lifecycle filter, not a
+pool-membership filter: a pool-marked sandbox that is actually `started` can
+contribute, without a separate pool tag. A guest that predates the field,
+the Windows guest, a guest that cannot read or make sense of `/proc/meminfo`,
+and a failed `Ping` report nothing, and nothing is recorded for that probe;
+zero is a valid sample. A reading is never kept or repeated.
+
+Only diagnostic-draining Pings read memory; readiness and connection checks
+do not. The guest waits up to 100 ms for memory and skips it if another read
+is still outstanding. A timeout omits the sample without accumulating blocked
+readers. The value is telemetry, not health: a missing reading leaves the `Ping`
+successful, and high usage changes no health status. The guest is
+tenant-controlled, so the value is whatever it reports. The count of samples
+grows with running sandboxes and time, not with distinct sandboxes.
+
 ## Worker-local lifecycle populations
 
 Sandbox-manager emits `sandbox.worker.lifecycle.count` every 60 seconds from

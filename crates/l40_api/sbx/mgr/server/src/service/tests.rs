@@ -11510,6 +11510,7 @@ pub(crate) mod service_tests {
         service
             .watchdog
             .add_sandbox(crate::watchdog::SidecarInfo {
+                template: "seed".to_string(),
                 guest_image: Default::default(),
                 node_execution_id: None,
                 sandbox_id: sandbox_id.to_string(),

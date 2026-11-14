@@ -145,6 +145,7 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 fn restart_test_info(sandbox_id: &str) -> SidecarInfo {
     SidecarInfo {
+        template: "seed".to_string(),
         guest_image: Default::default(),
         node_execution_id: None,
         sandbox_id: sandbox_id.to_string(),
@@ -291,6 +292,7 @@ async fn clear_netgtw_probe_state_drops_cached_process_observations() {
     );
     watchdog
         .add_sandbox(SidecarInfo {
+            template: "seed".to_string(),
             guest_image: Default::default(),
             node_execution_id: None,
             sandbox_id: "0199c1e0-0000-7000-8000-000000000001".to_string(),
@@ -1314,8 +1316,10 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
             Some(crate::state::SandboxState::Started),
             0,
             ComposedProbeResult {
+                template: "seed".to_string(),
                 observations,
                 guest_status: None,
+                memory_used_bytes: None,
             },
         ))),
     )
@@ -1354,6 +1358,7 @@ async fn missing_guest_uptime_preserves_last_observation() {
             Some(crate::state::SandboxState::Started),
             0,
             ComposedProbeResult {
+                template: "seed".to_string(),
                 observations: std::array::from_fn(|_| sample(HealthProbeOutcome::Success)),
                 guest_status: Some(pplx_space_spaced_host_client::proto::GetStatusResponse {
                     ready: false,
@@ -1361,6 +1366,7 @@ async fn missing_guest_uptime_preserves_last_observation() {
                     host_version: None,
                     guest_version: None,
                 }),
+                memory_used_bytes: None,
             },
         ))),
     )
@@ -1476,6 +1482,7 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
                 Some(crate::state::SandboxState::Failed),
                 0,
                 ComposedProbeResult {
+                    template: "seed".to_string(),
                     observations: [
                         firecracker,
                         sample(HealthProbeOutcome::Success),
@@ -1488,6 +1495,7 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
                         host_version: None,
                         guest_version: None,
                     }),
+                    memory_used_bytes: None,
                 },
             ))),
         )
@@ -1644,6 +1652,7 @@ impl DeadGatewayFixture {
                 Some(crate::state::SandboxState::Started),
                 0,
                 ComposedProbeResult {
+                    template: "seed".to_string(),
                     observations: [
                         firecracker,
                         sample(HealthProbeOutcome::Success),
@@ -1651,6 +1660,7 @@ impl DeadGatewayFixture {
                         net_gateway,
                     ],
                     guest_status: None,
+                    memory_used_bytes: None,
                 },
             ))),
         )
