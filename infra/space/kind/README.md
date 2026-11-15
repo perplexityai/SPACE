@@ -2267,10 +2267,12 @@ these units, enabled in the image:
 | `space-layout.service` | the SPACE groups and service accounts; the `/space/run` skeleton and dependency-drain gates; the node's root-owned `/space/vendor`, copied from the host vendor tree on first boot; protected Firecracker copies under `/space/bin/runtime/firecracker` and `/space/bin/{firecracker,jailer}` links; `/space/etc/sandbox.toml`; `/var/run/netns` | 07-sysctl.sh accounts and directory skeleton, 04-firecracker.sh runtime installation |
 | `space-cache.service` | formats `/var/lib/space-cache.img` on every boot (sparse, 40 GiB), mounts it `nosuid,noatime` on `/space/cache` with loop autoclear and shared propagation, then creates the cache skeleton | 01-partitions.sh / 11-nvme-cache.sh |
 | `space-kind-vsock-jails.service` | long-running: mknods `/dev/vhost-vsock` into each Firecracker jail under `/space/cache/firecracker/jails` as it appears (the jailer does not) | the node image provides it; Kind-only |
+| `space-kind-fresh-instance.service` | only on a boot that finds `/etc/space/kind-fresh-instance`: removes the marker first, so it arms that boot only, then everything under `/space/run` (each node service's database, run directory and socket) and the node artifact store `/space/vendor/artifacts`, ordered before containerd, kubelet, `space-layout`, `space-cache` and the runtime supervisor; refuses to remove that state outside boot. It keeps what the dead instance's node-manager installed (the service binaries and releases under `/space/bin`, the env under `/space/config`, the enabled runtime-supervisor unit) and the kubelet's and containerd's state | part of a replacement instance's empty disk; Kind-only |
 
 They are ordered `Before=kubelet` and run on every boot of the node container,
 including after `docker restart`, which gives it a fresh `/dev`, mount table
-and cgroups; all but the vhost-vsock unit are oneshots. Nothing is installed
+and cgroups; all but the vhost-vsock unit are oneshots, and the fresh-instance
+unit runs only on a boot that asks for it. Nothing is installed
 when the cluster comes up. The sandbox workers and builders run this image
 (`kind-cluster.yaml.tmpl`); the control-plane and infra nodes run its
 base unchanged, as production's non-SPACE nodes carry no SPACE node layer, so
@@ -2367,6 +2369,25 @@ Diagnose a node with `docker exec <node> systemctl status 'space-*'` and
 `docker restart <node>`; for a new size, first add `SPACE_CACHE_SIZE_MB=<MiB>`
 to the node's `/etc/space/kind-node.env`. Recreating the cluster also starts
 clean.
+
+A stopped worker that comes back keeps its rootfs, and with it every node
+service's database and run directory, which a replacement instance would not
+have. To bring one back closer to a new instance, copy an empty
+`/etc/space/kind-fresh-instance` into the stopped container (`docker cp`)
+before starting it: on its next boot, `space-kind-fresh-instance.service`
+removes the marker, then that state and the node artifact store before the
+units its row names start, and leaves `/run/space-kind-node/fresh-instance.done`
+for that boot. The marker arms one boot only: a boot cut short is not retried,
+and leaves no done file. A failure after the marker is consumed does not leave
+the request armed; a failure before it can, and the harness says so: a
+container that never started keeps the marker, and its next start wipes it.
+Never copy the marker into a running container: its next ordinary reboot would
+wipe it. The smoke harness's `start_kind_worker(..., fresh_node_state=True)`
+does this, rewriting the kubelet's providerID first when it is given one, so a
+rewrite that fails copies no marker, and copying the marker only into a stopped
+container. It fails a boot that left no done file, and reports a container
+still stopped as not running, so no boot was checked, its copied marker still
+armed.
 
 **Clusters created before this image, or from an older build of it, must be
 recreated.** A kind node keeps the image it was created from, so such a

@@ -23,7 +23,9 @@ the fake EC2, so its heartbeat goes stale, the Node is gone from the
 reflector and from a direct GET, and EC2 lists its instance `terminated`.
 The worker is started again in the scenario's last phase, under a new
 providerID, as a same-name replacement would be; the start is armed as a
-compensation before the stop.
+compensation before the stop. It comes back with the disk it stopped with,
+unless the scenario asks it to boot without its node-local state
+(`kill_worker(fresh_node_state=True)`).
 
 The observables are state: the admin node listing's `dead_node_status`, the node
 row and the sandbox rows. The controller's log line per node is evidence
@@ -50,6 +52,7 @@ from space_smoke.capabilities import (
 from space_smoke.runtime import Compensation, ResourceScope
 
 if TYPE_CHECKING:
+    from space_smoke.capabilities import EcwSandbox
     from space_smoke.fixtures import KindEcw
 
 MODE_ENV = "SPACE_DEAD_NODE_MODE"
@@ -84,16 +87,20 @@ _COUNT_VALUE = re.compile(r"[1-9][0-9]{0,2}")
 
 # Sandbox actions the harness may ask the native API for.
 NATIVE_ACTIONS = frozenset({"suspend", "pause", "stop"})
+# The states a native operation ends in.
+TERMINAL_OPERATION_STATES = frozenset({"canceled", "expired", "failed", "succeeded"})
 
 # What the verb reports for a row of each state the scenario creates; the
 # rule itself is `dead_node::outcome::row_outcome`.
 STARTED = "started"
+STARTED_ONCE_SUSPENDED = "started, with a durable snapshot from an earlier suspend"
 PAUSED = "paused"
 STOPPED = "stopped"
 SUSPENDED_REMOTE = "suspended with a remote snapshot"
 SUSPENDING_LOCAL = "suspending with its upload blocked"
 EXPECTED_OUTCOME: Mapping[str, str] = {
     STARTED: "lost",
+    STARTED_ONCE_SUSPENDED: "lost_snapshot_retained",
     PAUSED: "lost",
     # A plain stop records no stop artifact, and none of these sandboxes has
     # a snapshot.
@@ -125,6 +132,7 @@ class LiveRow:
 # `pplx_space_sandbox_store::dead_node` and `::lost`.
 LIVE_ROW: Mapping[str, LiveRow] = {
     STARTED: LiveRow("failed", keeps_target=True),
+    STARTED_ONCE_SUSPENDED: LiveRow("failed", keeps_target=True),
     PAUSED: LiveRow("failed", keeps_target=True),
     STOPPED: LiveRow("failed", keeps_target=True),
     SUSPENDED_REMOTE: LiveRow("suspended", keeps_target=False),
@@ -261,6 +269,8 @@ class DeadNodeAssertions:
         self._store_back: Compensation | None = None
         self._restart: Compensation | None = None
         self._rows_before: list[SandboxRowState] | None = None
+        # Each sandbox's ready snapshots when the scenario noted them.
+        self._snapshots_before: dict[str, list[str]] = {}
         # The database clock just before the latest config was applied; only
         # an entry written after it judges that config.
         self._configured_at: datetime | None = None
@@ -472,11 +482,13 @@ class DeadNodeAssertions:
 
     # --- the fault ------------------------------------------------------------
 
-    def kill_worker(self) -> None:
+    def kill_worker(self, *, fresh_node_state: bool = False) -> None:
         """Stop the worker, delete its Node and mark its instance terminated in
         the fake EC2, its restart under a new providerID armed first with the
         Node's labels read before anything changes; then let uploads through
-        again, which the dead worker can no longer use."""
+        again, which the dead worker can no longer use. With
+        `fresh_node_state` the restart boots as a new instance, without the
+        node-local state the worker stopped with."""
 
         node = self.node
         others = [s.sandbox_id for s in self._sandboxes]
@@ -494,7 +506,11 @@ class DeadNodeAssertions:
 
         def restart() -> None:
             self._control.start_kind_worker(
-                node.k8s_node_name, labels, timeout=300, provider_id=provider_id
+                node.k8s_node_name,
+                labels,
+                timeout=300,
+                provider_id=provider_id,
+                fresh_node_state=fresh_node_state,
             )
             self._instances[node.k8s_node_name] = replacement
 
@@ -741,10 +757,218 @@ class DeadNodeAssertions:
                 self._fixture.wait(5)
 
 
+    # --- a replacement that is a new instance --------------------------------
+
+    def suspend_and_wake(self, sandbox: EcwSandbox, *, timeout: float = 300) -> None:
+        """Suspend the sandbox durably and wait for the suspend to end, then
+        wake it through the ECW API; it comes back `started` on the chosen
+        worker, stamped with its current instance. Call it with every other
+        worker cordoned."""
+
+        self.suspend_remote_settled(sandbox.sandbox_id, timeout=timeout)
+        self.wake_on_worker(sandbox, timeout=timeout)
+
+    def act_settled(
+        self, sandbox_id: str, action: str, lifecycle: str, *, timeout: float = 300
+    ) -> None:
+        """`act`, then wait for the native operation to end `succeeded`. The
+        row can reach `lifecycle` while the operation is still open, and an
+        attempt the operation requeues runs the action again over whatever
+        was done to the sandbox meanwhile: a suspend requeued past a wake
+        suspends the woken sandbox again. So the scenario's next action
+        waits until the operation has no attempt left. One `timeout` bounds
+        the request, the row and the operation."""
+
+        if action not in NATIVE_ACTIONS:
+            raise ValueError(f"refusing native action {action!r}")
+        deadline = time.monotonic() + timeout
+        operation = self._control.native_sandbox_action(sandbox_id, action)
+        self._fixture.record(f"{action}_operation_{sandbox_id}", operation)
+        self._await_lifecycle(sandbox_id, lifecycle, timeout=deadline - time.monotonic())
+        self._await_operation_succeeded(operation, sandbox_id, action, deadline=deadline)
+
+    def suspend_remote_settled(self, sandbox_id: str, *, timeout: float = 300) -> None:
+        """`suspend_remote`, with the suspend operation ended `succeeded`
+        before the API's portability predicate is read (`act_settled`)."""
+
+        deadline = time.monotonic() + timeout
+        self.act_settled(sandbox_id, "suspend", "suspended", timeout=timeout)
+        while not self._control.restore_portable(sandbox_id):
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "the suspended sandbox never had a durable snapshot",
+                sandbox_id=sandbox_id,
+            )
+            self._fixture.wait(3)
+
+    def _await_operation_succeeded(
+        self, operation: str, sandbox_id: str, action: str, *, deadline: float
+    ) -> None:
+        while True:
+            state = self._control.operation_state(operation)
+            if state == "succeeded":
+                return
+            self._fixture.verify(
+                state not in TERMINAL_OPERATION_STATES and time.monotonic() < deadline,
+                f"the {action} operation did not succeed",
+                sandbox_id=sandbox_id,
+                operation=operation,
+                operation_state=state or "unknown",
+            )
+            self._fixture.wait(2)
+
+    def wake_on_worker(self, sandbox: EcwSandbox, *, timeout: float = 300) -> None:
+        """Wake the sandbox through the ECW API and expect it `started` on
+        the chosen worker, stamped with the worker's current instance. Call
+        it with every other worker cordoned."""
+
+        sandbox.connect(timeout=int(timeout))
+        self._await_lifecycle(sandbox.sandbox_id, "started", timeout=timeout)
+        self._expect_placed_and_stamped(sandbox.sandbox_id)
+
+    def require_fresh_instance_support(self) -> None:
+        """Refuse a chosen worker whose node image can't boot as a new
+        instance, before anything is changed."""
+
+        self._control.require_kind_fresh_instance_unit(self.node.k8s_node_name)
+
+    def note_snapshots(self) -> None:
+        """Note each created sandbox's ready snapshots, for
+        `expect_snapshots_kept`; the started-once-suspended and the durably
+        suspended sandbox must each have one."""
+
+        self._snapshots_before = {
+            sandbox.sandbox_id: [
+                r.snapshot_id for r in self._control.ready_full_snapshots(sandbox.sandbox_id)
+            ]
+            for sandbox in self._sandboxes
+        }
+        self._fixture.record("ready_snapshots_before", self._snapshots_before)
+        without = {
+            sandbox.sandbox_id: sandbox.state
+            for sandbox in self._sandboxes
+            if sandbox.state in (STARTED_ONCE_SUSPENDED, SUSPENDED_REMOTE)
+            and not self._snapshots_before[sandbox.sandbox_id]
+        }
+        self._fixture.verify(
+            not without,
+            "a sandbox that was suspended durably has no ready snapshot",
+            without_snapshot=without,
+        )
+
+    def expect_no_tombstone(self) -> None:
+        """The verb deleted the dead worker's node row and left no tombstone."""
+
+        node = self.node
+        self._fixture.verify(
+            not self._control.node_row_exists(node.id)
+            and not self._control.node_tombstoned(node.id),
+            "the dead worker's node row is still there, or it was tombstoned",
+            node_row_exists=self._control.node_row_exists(node.id),
+            tombstoned=self._control.node_tombstoned(node.id),
+        )
+
+    def expect_snapshots_kept(self) -> None:
+        """Every sandbox keeps the ready snapshots `note_snapshots` noted,
+        each still with a durable storage location."""
+
+        records = {
+            sandbox_id: self._control.ready_full_snapshots(sandbox_id)
+            for sandbox_id in self._snapshots_before
+        }
+        after = {
+            sandbox_id: [r.snapshot_id for r in kept] for sandbox_id, kept in records.items()
+        }
+        unstored = {
+            sandbox_id: [r.snapshot_id for r in kept if r.storage_location_count < 1]
+            for sandbox_id, kept in records.items()
+        }
+        unstored = {sandbox_id: ids for sandbox_id, ids in unstored.items() if ids}
+        self._fixture.verify(
+            after == self._snapshots_before and not unstored,
+            "a sandbox lost a ready snapshot it had when the worker died, or its storage location",
+            before=self._snapshots_before,
+            after=after,
+            without_storage_location=unstored,
+        )
+
+    def expect_fresh_replacement(self) -> None:
+        """The replacement's sandbox-manager knows none of the dead worker's
+        sandboxes: it booted without the dead instance's node-local state."""
+
+        node = self.node
+        known = {
+            sandbox.sandbox_id: state
+            for sandbox in self._sandboxes
+            if (state := self._control.node_sandbox_state(node.k8s_node_name, sandbox.sandbox_id))
+            is not None
+        }
+        self._fixture.verify(
+            not known,
+            "the replacement's sandbox-manager holds rows of the dead instance's sandboxes",
+            worker=node.k8s_node_name,
+            rows=known,
+        )
+
+    def expect_nothing_lingers(self, *, kept: Sequence[str]) -> None:
+        """No worker's sandbox-manager holds a row of a sandbox the verb wrote
+        off or the scenario deleted, or a quarantined row of the scenario's
+        sandboxes; none of their control-plane rows is quarantined; and no
+        live control-plane row but `kept`'s, the replacement's and the
+        fixture's own is placed on or targets the node. (In the live phase the
+        rows the verb wrote off are `failed`, with the dead node as their last
+        target; the still-suspending one is then deleted.)"""
+
+        node = self.node
+        ids = [sandbox.sandbox_id for sandbox in self._sandboxes]
+        workers = self._control.sandbox_worker_nodes()
+        local = {
+            worker: {
+                sandbox_id: state
+                for sandbox_id in [*ids, *self._replacement_sandboxes]
+                if (state := self._control.node_sandbox_state(worker, sandbox_id)) is not None
+            }
+            for worker in workers
+        }
+        lingering = {
+            worker: {
+                sandbox_id: state
+                for sandbox_id, state in rows.items()
+                if state == "quarantined"
+                or (sandbox_id not in kept and sandbox_id not in self._replacement_sandboxes)
+            }
+            for worker, rows in local.items()
+        }
+        lingering = {worker: rows for worker, rows in lingering.items() if rows}
+        quarantined = [
+            row.sandbox_id
+            for row in self._control.sandbox_row_states([*ids, *self._replacement_sandboxes])
+            if row.lifecycle == "quarantined"
+        ]
+        foreign = self._control.other_live_rows_on_node(
+            node.id, [*kept, *self._replacement_sandboxes, self._fixture.sandbox.sandbox_id]
+        )
+        self._fixture.verify(
+            not lingering and not quarantined and not foreign,
+            "a row of the dead worker lingers on a worker or in the control plane",
+            node_local_rows=lingering,
+            quarantined=quarantined,
+            live_rows_on_node=foreign,
+        )
+
+
 def created_states() -> Sequence[str]:
     """The states the scenario creates, in creation order."""
 
     return (STARTED, PAUSED, STOPPED, SUSPENDED_REMOTE, SUSPENDING_LOCAL)
+
+
+def fresh_replacement_states() -> Sequence[str]:
+    """The states the new-instance scenario creates, in creation order: the
+    same as `created_states`, and a started sandbox with a snapshot from an
+    earlier suspend."""
+
+    return (STARTED, STARTED_ONCE_SUSPENDED, PAUSED, STOPPED, SUSPENDED_REMOTE, SUSPENDING_LOCAL)
 
 
 def _reconciled(row: SandboxRowState | None, expected: LiveRow, node_id: str) -> bool:

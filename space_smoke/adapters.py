@@ -152,6 +152,7 @@ from space_smoke.runtime import (
     CommandExecutor,
     CommandResult,
     REPO_ROOT,
+    ScenarioTimedOut,
     SmokeConfigurationError,
     run_concurrently,
 )
@@ -190,6 +191,21 @@ def _require_ok(result: CommandResult, action: str) -> str:
             f"{action} failed ({result.returncode}): {result.detail() or '<no output>'}"
         )
     return result.stdout
+
+
+def _systemctl_properties(shown: str) -> dict[str, str]:
+    """`systemctl show -p ...`'s `Name=value` lines."""
+
+    return dict(line.split("=", 1) for line in shown.splitlines() if "=" in line)
+
+
+def _leftover_marker_script(marker: str | os.PathLike[str]) -> str:
+    """Shell that removes `marker` if it is there: exit 3 when it removed
+    one, 0 when there was none, and anything else when it couldn't tell or
+    couldn't remove it."""
+
+    quoted = shlex.quote(os.fspath(marker))
+    return f"test ! -e {quoted} || {{ rm -f -- {quoted} && exit 3; }}"
 
 
 def parse_drain_node_sealed_epoch(output: str) -> int | None:
@@ -694,6 +710,11 @@ SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '
 # Where kubeadm keeps the kubelet's flags on a Kind node, `--provider-id`
 # among them.
 KIND_KUBELET_FLAGS = "/var/lib/kubelet/kubeadm-flags.env"
+# The node layer's ask for a new instance's boot, and what that boot leaves
+# (infra/space/kind/node/space-kind-node.sh, fresh_instance).
+KIND_FRESH_INSTANCE_MARKER = "/etc/space/kind-fresh-instance"
+KIND_FRESH_INSTANCE_DONE = "/run/space-kind-node/fresh-instance.done"
+KIND_FRESH_INSTANCE_UNIT = "space-kind-fresh-instance.service"
 DEAD_NODE_ROW_STATES_SQL = """\
 SELECT id, lifecycle, placement, coalesce(active_node_id::text, ''),
        coalesce(target_node_id::text, ''), updated_at
@@ -5948,34 +5969,232 @@ ON CONFLICT (key_hash) DO NOTHING;
         *,
         timeout: float,
         provider_id: str | None = None,
+        fresh_node_state: bool = False,
     ) -> None:
         self._require_isolated_kind("starting a Kind worker")
         container = self._kind_worker_container(node_name)
-        if provider_id is not None:
-            # A same-name replacement: the stopped container's kubelet starts
-            # under a new providerID, so it registers a new instance.
-            with tempfile.TemporaryDirectory() as scratch:
-                local = Path(scratch) / "kubeadm-flags.env"
-                _require_ok(
-                    self.executor.run(
-                        ["docker", "cp", f"{container}:{KIND_KUBELET_FLAGS}", str(local)],
-                        timeout=30,
-                    ),
-                    f"copy the kubelet flags out of {container}",
-                )
-                local.write_text(self._rewritten_kubelet_flags(local.read_text(), provider_id))
-                _require_ok(
-                    self.executor.run(
-                        ["docker", "cp", str(local), f"{container}:{KIND_KUBELET_FLAGS}"],
-                        timeout=30,
-                    ),
-                    f"copy the kubelet flags into {container}",
-                )
-        _require_ok(
-            self.executor.run(["docker", "start", container], timeout=120),
-            f"start Kind worker container {container}",
+        errors: list[str] = []
+        raised: list[Exception] = []
+        try:
+            if provider_id is not None:
+                # A same-name replacement: the stopped container's kubelet
+                # starts under a new providerID, so it registers a new
+                # instance. Rewritten before the marker goes in, so a rewrite
+                # that fails leaves no marker behind, and the container never
+                # starts under it.
+                self._rewrite_kind_kubelet_provider_id(container, provider_id)
+            # Only into a stopped container: in a running one the marker would
+            # wipe the node at its next ordinary reboot. A retry against the
+            # container its first attempt started copies nothing, and checks
+            # the boot that attempt asked for.
+            if fresh_node_state and not self._kind_container_running(container):
+                errors.extend(self._copy_fresh_instance_marker(container))
+            # A running container's start is a no-op.
+            _require_ok(
+                self.executor.run(["docker", "start", container], timeout=120),
+                f"start Kind worker container {container}",
+            )
+            self._await_reregistered(container, labels, timeout=timeout)
+        except Exception as error:
+            raised.append(error)
+            errors.append(str(error))
+        finally:
+            # Whatever readiness did: a boot that kept the old state, or left
+            # the marker armed, must not pass unseen. What the check found
+            # before an exception cut it short is kept with it.
+            if fresh_node_state:
+                try:
+                    self._check_fresh_boot(container, errors)
+                except Exception as error:
+                    raised.append(error)
+                    errors.append(f"its boot check stopped: {error}")
+        if not errors:
+            return
+        if len(errors) == 1 and raised:
+            raise raised[0]
+        message = "; ".join(errors)
+        if not message.startswith(f"Kind worker {container} "):
+            message = f"Kind worker {container}: {message}"
+        # A deadline that ran out is still one, with every other error beside it.
+        timed_out = next((error for error in raised if isinstance(error, ScenarioTimedOut)), None)
+        if timed_out is not None:
+            raise ScenarioTimedOut(message) from timed_out
+        raise RuntimeError(message) from (raised[0] if raised else None)
+
+    def _rewrite_kind_kubelet_provider_id(self, container: str, provider_id: str) -> None:
+        """Set the kubelet's `--provider-id` in the container's kubeadm flags
+        to `provider_id`; raises when it can't."""
+
+        with tempfile.TemporaryDirectory() as scratch:
+            local = Path(scratch) / "kubeadm-flags.env"
+            _require_ok(
+                self.executor.run(
+                    ["docker", "cp", f"{container}:{KIND_KUBELET_FLAGS}", str(local)],
+                    timeout=30,
+                ),
+                f"copy the kubelet flags out of {container}",
+            )
+            local.write_text(self._rewritten_kubelet_flags(local.read_text(), provider_id))
+            _require_ok(
+                self.executor.run(
+                    ["docker", "cp", str(local), f"{container}:{KIND_KUBELET_FLAGS}"],
+                    timeout=30,
+                ),
+                f"copy the kubelet flags into {container}",
+            )
+
+    def _copy_fresh_instance_marker(self, container: str) -> list[str]:
+        """Copy the marker that asks the container's next boot to start as a
+        new instance; the node layer's space-kind-fresh-instance unit consumes
+        it on that boot and removes the node-local state before anything
+        reads it. A copy that fails is returned, not raised: the worker is
+        started all the same, and comes back either way."""
+
+        with tempfile.TemporaryDirectory() as scratch:
+            marker = Path(scratch) / "kind-fresh-instance"
+            marker.write_text("")
+            copied = self.executor.run(
+                ["docker", "cp", str(marker), f"{container}:{KIND_FRESH_INSTANCE_MARKER}"],
+                timeout=30,
+            )
+        if copied.returncode == 0:
+            return []
+        return [
+            "the marker that asks its boot to start as a new instance didn't copy: "
+            f"{copied.detail() or f'exit {copied.returncode}'}"
+        ]
+
+    def _kind_container_running(self, container: str) -> bool:
+        inspected = _require_ok(
+            self.executor.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", container], timeout=30
+            ),
+            f"inspect Kind worker container {container}",
+        ).strip()
+        if inspected not in ("true", "false"):
+            raise RuntimeError(f"docker inspect {container} answered {inspected!r} for State.Running")
+        return inspected == "true"
+
+    def _read_fresh_instance_unit(self, container: str) -> CommandResult:
+        """The fresh-instance unit's load state, state, result and condition
+        on the container's current boot, as `systemctl show` prints them."""
+
+        return self.executor.run(
+            [
+                "docker", "exec", container, "systemctl", "show", KIND_FRESH_INSTANCE_UNIT,
+                "-p", "LoadState", "-p", "ActiveState", "-p", "Result", "-p", "ConditionResult",
+            ],
+            timeout=30,
         )
-        self._await_reregistered(container, labels, timeout=timeout)
+
+    def require_kind_fresh_instance_unit(self, node_name: str) -> None:
+        self._require_isolated_kind("probing a Kind worker's node image")
+        container = self._kind_worker_container(node_name)
+        shown = _require_ok(
+            self._read_fresh_instance_unit(container),
+            f"read {KIND_FRESH_INSTANCE_UNIT} on {container}",
+        )
+        load = _systemctl_properties(shown).get("LoadState", "")
+        if load != "loaded":
+            raise SmokeConfigurationError(
+                f"Kind worker {container} has no {KIND_FRESH_INSTANCE_UNIT} (LoadState "
+                f"{load or 'unknown'}): its node image predates it, so recreate the cluster"
+            )
+
+    def _check_fresh_boot(self, container: str, errors: list[str]) -> None:
+        """Append to `errors` what says the container's current boot didn't
+        start as a new instance, each as it is found, so what was found
+        survives an exception that cuts the check short. A container that
+        isn't running had no boot to check, and is reported as that alone.
+        A running one is checked for the done file, reported missing with the
+        fresh-instance unit's state and the tail of its journal, and then,
+        in its own `finally` so a deadline in the diagnostics can't skip it,
+        for a marker still there, which the backstop removes so the next
+        reboot keeps the node's state. Each step runs once, under its own
+        bound; nothing retries. Raises only what interrupts it."""
+
+        inspected = self.executor.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container], timeout=30
+        )
+        running = inspected.stdout.strip() if inspected.returncode == 0 else ""
+        if running == "false":
+            errors.append(
+                f"Kind worker {container} is not running, so no boot was checked; a marker "
+                "copied into it stays and arms its next start"
+            )
+            return
+        if running != "true":
+            errors.append(
+                f"couldn't read whether it is running, so no boot was checked; a marker copied "
+                f"into it may stay and arm its next start: "
+                f"{inspected.detail() or f'exit {inspected.returncode}'}"
+            )
+            return
+        try:
+            done = self.executor.run(
+                ["docker", "exec", container, "test", "-e", KIND_FRESH_INSTANCE_DONE], timeout=30
+            )
+            if done.returncode != 0:
+                missing = (
+                    f"its boot left no {KIND_FRESH_INSTANCE_DONE}, so it may still hold its old "
+                    "node-local state"
+                )
+                try:
+                    diagnostics = self._fresh_instance_diagnostics(container)
+                except BaseException:
+                    errors.append(missing)
+                    raise
+                errors.append(f"{missing}: {diagnostics}")
+        finally:
+            self._remove_leftover_marker(container, errors)
+
+    def _remove_leftover_marker(self, container: str, errors: list[str]) -> None:
+        """The backstop: remove a marker still in the running container, which
+        fails the check. The unit consumes the marker before anything else, so
+        one still here means the unit never ran on this boot."""
+
+        leftover = self.executor.run(
+            [
+                "docker", "exec", container, "sh", "-c",
+                _leftover_marker_script(KIND_FRESH_INSTANCE_MARKER),
+            ],
+            timeout=30,
+        )
+        if leftover.returncode == 3:
+            errors.append(
+                f"its boot left {KIND_FRESH_INSTANCE_MARKER} behind; removed it, so its next "
+                "reboot keeps its state"
+            )
+        elif leftover.returncode != 0:
+            errors.append(
+                f"couldn't check it for a leftover {KIND_FRESH_INSTANCE_MARKER}: "
+                f"{leftover.detail() or f'exit {leftover.returncode}'}"
+            )
+
+    def _fresh_instance_diagnostics(self, container: str) -> str:
+        """The fresh-instance unit's state on this boot, and its journal's tail."""
+
+        shown = self._read_fresh_instance_unit(container)
+        if shown.returncode != 0:
+            unit = f"{KIND_FRESH_INSTANCE_UNIT} couldn't be read: {shown.detail() or 'no output'}"
+        else:
+            properties = _systemctl_properties(shown.stdout)
+            unit = (
+                f"{KIND_FRESH_INSTANCE_UNIT} has LoadState {properties.get('LoadState')}, "
+                f"ActiveState {properties.get('ActiveState')}, Result {properties.get('Result')}, "
+                f"ConditionResult {properties.get('ConditionResult')}"
+            )
+            if properties.get("LoadState") != "loaded":
+                unit += " (its node image predates the unit: recreate the cluster)"
+        journal = self.executor.run(
+            [
+                "docker", "exec", container, "journalctl", "-b", "-u",
+                KIND_FRESH_INSTANCE_UNIT, "--no-pager", "-n", "20", "-o", "cat",
+            ],
+            timeout=30,
+        )
+        tail = (journal.stdout or journal.stderr or "").strip() or "nothing"
+        return f"{unit}; its journal on this boot ends: {tail}"
 
     def _await_reregistered(
         self, container: str, labels: Mapping[str, str], *, timeout: float

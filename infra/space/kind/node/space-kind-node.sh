@@ -19,21 +19,28 @@
 #   space-cache.service            btrfs /space/cache     (packer 01-partitions.sh,
 #                                                          11-nvme-cache.sh)
 #   space-kind-vsock-jails.service Kind-only vhost-vsock nodes in Firecracker jails
+#   space-kind-fresh-instance.service
+#                                  Kind-only, one boot: the node-local state a
+#                                  new instance boots without
 #
 # The node also runs space-runtime-supervisor.service, which node-manager's
 # init container installs and upgrades (scripts/k8s/node-manager-init.sh), as
 # on a production node.
 #
 # A container's /dev, mounts and cgroups do not survive `docker restart`, which
-# is why these are boot units and not a one-time setup. Each step is
-# idempotent within a boot, so re-running a unit by hand on a live node is
-# safe. The cache is the one step that does not carry state across boots: as on
-# a deployed node, every boot starts it as a fresh filesystem.
+# is why these are boot units and not a one-time setup. Every step but
+# fresh-instance is idempotent within a boot, so re-running its unit by hand on
+# a live node is safe; fresh-instance removes node-local state only while the
+# node boots: run by hand on a live node, it removes a marker it finds and
+# refuses the wipe, and without a marker it does nothing. The cache does not
+# carry state across boots: as on a deployed node, every boot starts it as a
+# fresh filesystem. A boot that finds the fresh-instance marker drops more (see
+# fresh_instance).
 #
 # Defaults are baked like the rest of the layer; /etc/space/kind-node.env, when
 # present, overrides SPACE_CACHE_SIZE_MB and SPACE_LOOP_DEVICE_TARGET.
 #
-# Usage: space-kind-node.sh loop-nodes|devices|cgroup|layout|cache|vsock-jails
+# Usage: space-kind-node.sh loop-nodes|devices|cgroup|layout|cache|vsock-jails|fresh-instance
 set -euo pipefail
 
 # Baked together into the Kind node image; the source= paths below are their
@@ -58,6 +65,12 @@ CACHE_SIZE_MB="${SPACE_CACHE_SIZE_MB:-40960}"
 # kind-cluster.yaml.tmpl, and the node's own copy of it (see stage_vendor).
 HOST_VENDOR_DIR=/opt/space-kind/host-vendor
 VENDOR_DIR=/space/vendor
+# Each node service's database, run directory and socket (see layout).
+NODE_RUN_DIR=/space/run
+# Asks the node's next boot to start as a new instance would (see
+# fresh_instance), and what that boot leaves to say it did.
+FRESH_INSTANCE_MARKER=/etc/space/kind-fresh-instance
+FRESH_INSTANCE_DONE="$CACHE_STATE_DIR/fresh-instance.done"
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -449,6 +462,49 @@ vsock_jails() {
   done
 }
 
+# ── a new instance's node-local state ────────────────────────────────────────
+# A replacement instance boots from the node image with nothing a dead
+# instance wrote. A Kind worker that comes back is the same container, so a
+# harness that wants it to come back as a new instance writes
+# FRESH_INSTANCE_MARKER while the container is stopped. Its next boot then
+# removes everything under /space/run (each node service's database, run
+# directory and socket) and the node artifact store, /space/vendor/artifacts.
+# The unit is ordered before containerd, kubelet, space-layout, space-cache and
+# space-runtime-supervisor, so none of them reads that state. It removes the
+# marker before anything else, so the marker arms one boot only: a boot cut
+# short, before the wipe or in it, is not retried by the next one, and leaves
+# no done file, which the harness that asked reports as a failed fresh boot.
+# A failure after the marker is consumed does not leave the request armed; a
+# failure before it can, and the harness says so: a container that never
+# started keeps the marker, and its next start wipes it.
+# The done file comes last. The cache needs nothing here: every boot formats
+# it afresh. Everything else the dead instance left stays, which a real new
+# instance would not have: what its node-manager installed (the service
+# binaries and releases under /space/bin, the env under /space/config, the
+# enabled space-runtime-supervisor unit), the rest of /space/vendor and
+# /space/etc, and the kubelet's and containerd's state.
+fresh_instance() {
+  [[ -e $FRESH_INSTANCE_MARKER ]] || return 0
+  rm -f -- "$FRESH_INSTANCE_MARKER"
+  # Only while the node boots: run by hand on a live node, it would remove the
+  # state its running services hold.
+  local system
+  system="$(systemctl is-system-running 2>/dev/null || true)"
+  [[ $system == starting ]] \
+    || die "fresh-instance runs only while the node boots (the system is ${system:-unknown})"
+  # -xdev: a boot has mounted nothing under these yet, and a mount is never
+  # crossed into.
+  if [[ -d $NODE_RUN_DIR ]]; then
+    find "$NODE_RUN_DIR" -xdev -mindepth 1 -delete
+  fi
+  if [[ -d $VENDOR_DIR/artifacts ]]; then
+    find "$VENDOR_DIR/artifacts" -xdev -delete
+  fi
+  install -d -m 0755 "$CACHE_STATE_DIR"
+  : >"$FRESH_INSTANCE_DONE"
+  log "node-local state removed: this boot starts as a new instance"
+}
+
 case "$STEP" in
   loop-nodes) loop_nodes ;;
   devices) devices ;;
@@ -456,5 +512,6 @@ case "$STEP" in
   layout) layout ;;
   cache) cache ;;
   vsock-jails) vsock_jails ;;
-  *) die "usage: $0 loop-nodes|devices|cgroup|layout|cache|vsock-jails" ;;
+  fresh-instance) fresh_instance ;;
+  *) die "usage: $0 loop-nodes|devices|cgroup|layout|cache|vsock-jails|fresh-instance" ;;
 esac

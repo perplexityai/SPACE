@@ -1,0 +1,15 @@
+# Baked into the Kind node image (infra/space/kind/node/Dockerfile) and enabled
+# there. See infra/space/kind/node/space-kind-node.sh.
+[Unit]
+Description=SPACE Kind node: start this boot as a new instance
+ConditionPathExists=/etc/space/kind-fresh-instance
+After=local-fs.target
+Before=containerd.service kubelet.service space-layout.service space-cache.service space-runtime-supervisor.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/space/kind-node/space-kind-node.sh fresh-instance
+
+[Install]
+WantedBy=multi-user.target
