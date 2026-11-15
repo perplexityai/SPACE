@@ -31,6 +31,7 @@ pub(super) async fn dispatch(
         | Commands::NetworkDebug { .. }
         | Commands::CycleNetGateway { .. }
         | Commands::Cleanup => admin::handle(command, client).await,
+        Commands::DrainNode { .. } => admin::handle(command, client).await,
         Commands::Pause { .. }
         | Commands::Resume { .. }
         | Commands::Suspend { .. }

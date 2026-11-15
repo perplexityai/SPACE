@@ -388,6 +388,17 @@ pub(super) enum Commands {
     List,
     /// Clean up dead sandboxes (mark as failed)
     Cleanup,
+    /// Drain this node under an epoch: seal its VM activations and make
+    /// every resident durable; prints the node's report, one `key=value` per
+    /// line
+    DrainNode {
+        /// Nonzero drain epoch; epochs only move forward
+        #[arg(long)]
+        epoch: u64,
+        /// Cancel the drain under this epoch instead, unsealing the node
+        #[arg(long)]
+        cancel: bool,
+    },
     /// Show per-sandbox resource stats (network, cgroup CPU/memory/PIDs)
     Stats {
         /// Sandbox ID, long UUID prefix, or short label

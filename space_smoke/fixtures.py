@@ -20,6 +20,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
+    DrainV2Control,
     ConcurrentRestoreControl,
     ConsoleControl,
     DrainGateControl,
@@ -32,6 +33,7 @@ from space_smoke.capabilities import (
     TeardownRestartControl,
     OrphanedRestorePodGcControl,
     ReconcileQueueGcControl,
+    DeadNodeControl,
     UnansweredTemplateEvictionControl,
     TemplateBuildControl,
     TemplateBuilder,
@@ -103,6 +105,7 @@ from space_smoke.adapters import (
     SUSPEND_ROOTFS_OBJECTS,
     template_received_uuid,
 )
+from space_smoke.drain_v2 import DrainV2Assertions
 from space_smoke.concurrent_restore import ConcurrentRestoreAssertions
 from space_smoke.node_drain import NodeDrainAssertions
 from space_smoke.node_groups import NodeGroupAssertions
@@ -114,6 +117,7 @@ from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.retained_only_copy import RetainedOnlyCopyAssertions
 from space_smoke.teardown_restart import TeardownRestartAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
+from space_smoke.dead_node import DeadNodeAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.console import ConsoleAssertions
 from space_smoke.drain_gate import DrainGateAssertions
@@ -948,6 +952,8 @@ class CommandSandboxFixture(ScenarioFixture):
     _local_cleanup_control: ColdEvictionControl | None = None
     _encrypted_resuspend_control: EncryptedResuspendControl | None = None
     _stopped_replacement_control: StoppedReplacementControl | None = None
+    _drain_v2_control: DrainV2Control | None = None
+    _create_sandbox: Callable[..., DurableLifecycleSandbox] | None = None
     _processes: ProcessSandbox | None = None
 
     fixture_name: ClassVar[str] = "command_sandbox"
@@ -992,6 +998,23 @@ class CommandSandboxFixture(ScenarioFixture):
             )
         return StoppedReplacementAssertions(
             self, self._stopped_replacement_control, self._context.scope
+        )
+
+    @property
+    def drain_v2(self) -> DrainV2Assertions:
+        """Drain the sandbox's worker with the v2 engine and judge what follows.
+
+        Each access builds fresh assertions that own the scenario's cordon,
+        drain and unseal compensations, so a scenario takes it once.
+        """
+
+        if self._drain_v2_control is None or self._create_sandbox is None:
+            raise SmokeConfigurationError(
+                "drain v2 control is only available on the kind backend "
+                "with a native sandbox collection"
+            )
+        return DrainV2Assertions(
+            self, self._drain_v2_control, self._create_sandbox, self._context.scope
         )
 
     def delete_sandbox(self, sandbox: CommandSandbox | None = None) -> int:
@@ -3141,6 +3164,23 @@ class KindEcw(Ecw, KindAdmin):
                 self, self._unanswered_template_control, self._context.scope
             )
         return self._unanswered_template_assertions
+
+    _dead_node_control: DeadNodeControl | None = None
+    _dead_node_assertions: DeadNodeAssertions | None = None
+
+    @property
+    def dead_node(self) -> DeadNodeAssertions:
+        """Privileged assertions for the cluster-controller's dead-node dry run."""
+
+        if self._dead_node_control is None:
+            raise SmokeConfigurationError(
+                "dead-node control is only available on the kind backend"
+            )
+        if self._dead_node_assertions is None:
+            self._dead_node_assertions = DeadNodeAssertions(
+                self, self._dead_node_control, self._context.scope
+            )
+        return self._dead_node_assertions
 
     _rate_limiter_control: RateLimiterControl | None = None
     _rate_limit_probe: RateLimitProbe | None = None

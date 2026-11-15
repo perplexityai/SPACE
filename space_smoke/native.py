@@ -121,15 +121,21 @@ class NativeSandboxFactory:
         return sandbox
 
     def create(
-        self, metadata: Mapping[str, str] | None = None
+        self,
+        metadata: Mapping[str, str] | None = None,
+        *,
+        idle_timeout: str | None = None,
     ) -> DurableLifecycleSandbox:
+        body: dict[str, object] = {
+            "template": self._config.template,
+            "metadata": dict(metadata or {}),
+        }
+        if idle_timeout is not None:
+            body["idle_timeout"] = idle_timeout
         response = self._json_request(
             "POST",
             "/v1/sandboxes",
-            body={
-                "template": self._config.template,
-                "metadata": dict(metadata or {}),
-            },
+            body=body,
             mutation="create",
             expected_status=202,
         )
@@ -451,6 +457,34 @@ class NativeSandboxFactory:
         )
         self._wait_sandbox_running(sandbox_id)
 
+    _LIFECYCLE_VERBS = frozenset({"wake", "resume", "restore", "start", "pause", "suspend"})
+
+    def request_lifecycle(self, sandbox_id: str, verb: str) -> str:
+        if verb not in self._LIFECYCLE_VERBS:
+            raise ValueError(f"unsupported lifecycle verb {verb!r}")
+        response = self._json_request(
+            "POST",
+            f"/v1/sandboxes/{quote(sandbox_id, safe='')}:{verb}",
+            mutation=verb,
+            expected_status=202,
+        )
+        return _required_string(response, "operation_id")
+
+    def operation(self, operation_id: str) -> dict[str, object]:
+        return self._json_request(
+            "GET",
+            f"/v1/operations/{quote(operation_id, safe='')}",
+            expected_status=200,
+        )
+
+    def state(self, sandbox_id: str) -> str:
+        response = self._json_request(
+            "GET",
+            f"/v1/sandboxes/{quote(sandbox_id, safe='')}",
+            expected_status=200,
+        )
+        return _required_string(response, "state")
+
     def _wait_operation(
         self,
         operation_id: str,
@@ -674,6 +708,15 @@ class _NativeSandbox:
 
     def start(self) -> None:
         self._factory.start(self.sandbox_id)
+
+    def request_lifecycle(self, verb: str) -> str:
+        return self._factory.request_lifecycle(self.sandbox_id, verb)
+
+    def operation(self, operation_id: str) -> dict[str, object]:
+        return self._factory.operation(operation_id)
+
+    def state(self) -> str:
+        return self._factory.state(self.sandbox_id)
 
     def start_background(self, command: str, *, timeout: int = 60) -> ProcessHandle:
         return self._factory.start_background(self.sandbox_id, command, timeout=timeout)

@@ -390,6 +390,7 @@ the Kind services with no crate's `test-hooks` feature enabled:
 | `local.retention_claim_finish_forward`, `local.retention_restore_source_guard` | the retention sweeper's dry-run, tick and minimum age, which they stage | a release sweeper ticks every 300 s and keeps snapshots younger than an hour |
 | `local.rate_limiters_enforce_and_fail_open` | `SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST`, which it shrinks to 2 | draining the release burst of 60 would take sixty real boots |
 | `local.leader_election_brownout_keeps_one_leader`, `local.leader_election_refusal_does_not_restart` | the cluster-controller's lease TTL and liveness budget, `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS` and `..._LEASE_FAILURE_GRACE_SECS` | at the release 60 s TTL and 600 s budget, a replica spends its budget long after the outage's bound |
+| `native.v2_drain_meets_user_calls` | `SPACE_DRAIN_RESTORE_TEST_HOLD_SECS`, which it sets on the cluster-controller with the v2 config to hold each drain restore it claims before node work | a release drain restore lands in seconds, before the scenario's wake can reach it while it holds the sandbox |
 | `native_recovery.inline_wake_survives_api_pod_kill`, `native_recovery.inline_fallback_at_one_permit_loses_no_operation`, `native_recovery.inline_load_survives_leader_failover` | `SPACE_NATIVE_INLINE_TEST_HOLD_SECS` and `SPACE_NATIVE_INLINE_TEST_RELEASE_FILE`, which hold each claimed inline operation `running`, renewing its claim, until the scenario releases it or the bounded hold expires | a release wake or create the API runs inline can end before the scenario kills its API pod, admits its next create, or brings a dispatcher back |
 
 The 40 GiB cache needs no replacement for the reservation hook: release
@@ -1589,7 +1590,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   ├── space-kind-key-broker (Deployment; Kind-only intermediate-key broker fixture behind the platform KEK)
 │   ├── space-data-plane      (Deployment, 2–3 replicas by HPA)
 │   ├── space-cluster-controller (Deployment, 2 replicas, one leader; materializes per-sandbox pods on the default (Kubernetes) lane)
-│   ├── space-kind-fake-ec2   (Deployment; Kind-only fake EC2 endpoint the reconcile-queue GC asks about non-ready nodes)
+│   ├── space-kind-fake-ec2   (Deployment; Kind-only fake EC2 endpoint the reconcile-queue GC asks about non-ready nodes, the dead-node verb about instance ids, and the `aws` node-drain terminator, through Auto Scaling, to terminate an instance)
 │   ├── metrics-server        (Deployment in kube-system; resource metrics for the HPAs)
 │   ├── space-seed-publish    (Job; publishes the locally built seed)
 │   └── space-ui              (Deployment)

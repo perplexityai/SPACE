@@ -36,6 +36,7 @@ async fn insert_stale_ready_k8s_node(
             NodeRole::Worker,
             Some("10.0.0.60"),
             NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            None,
         )
         .await?;
     let age_secs = i64::try_from(age.as_secs())?;
@@ -228,6 +229,7 @@ async fn inventory_upsert_writes_only_kubernetes_rows() -> TestResult {
                     NodeRole::Worker,
                     Some("10.0.0.62"),
                     NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                    None,
                 )
                 .await
         }

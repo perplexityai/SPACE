@@ -1,6 +1,7 @@
 //! Postgres registration of Kubernetes nodes.
 //!
-//! Registering a Kubernetes node ([`register_k8s_node`]), and the
+//! Registering a Kubernetes node ([`register_k8s_node`]), which also records
+//! the EC2 instance it runs on, and the
 //! registration check on `node_k8s`: whether a Kubernetes node name and UID
 //! map to a SPACE node. Other `node_k8s` reads stay with their callers.
 
@@ -34,3 +35,6 @@ pub async fn registered_node(
     .fetch_optional(executor)
     .await?)
 }
+
+#[cfg(test)]
+mod tests;

@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod cluster_reconciler;
 pub mod data_plane;
+pub mod dead_node;
 pub mod leader_election;
 pub mod node_drain;
 pub mod node_group_labeler;

@@ -1,4 +1,5 @@
 use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::NodeDrainEngine;
 
 use axum::{
     Extension, Json,
@@ -507,6 +508,9 @@ fn admin_node_response(
             .map(|raw| NodeDrainMode::from_column_str(Some(raw))),
         drain_started_at: format_optional_time(row.drain_started_at),
         drain_last_error: row.drain_last_error,
+        drain_engine: row.drain_engine,
+        drain_status: row.drain_status.map(|status| status.0),
+        dead_node_status: row.dead_node_status.map(|status| status.0),
         terminate_decrement_capacity: row.terminate_decrement_capacity,
         node_group_id: row.node_group_id,
         k8s_node_name: row.substrate_node_id,
@@ -1395,6 +1399,35 @@ async fn apply_drain_action(
     // recoverable: the node-drain reconciler observes `drain_phase` and
     // re-asserts cordon state, and `drain_last_error` captures the failure
     // for the operator.
+    // A v2 node's `:terminate` asks the node, under its stored report's
+    // epoch, before the row is locked: the call can take seconds, and the
+    // lock would hold the v2 loop's and registration's writes to the row
+    // that long. Under the lock below, the row must still carry that report.
+    let v2_probe = if matches!(action, DrainAction::Terminate) {
+        match node_store::drain_v2_columns(&state.pool, node_id).await {
+            Ok(None) => {
+                return api_error(StatusCode::NOT_FOUND, "Node not found").into_response();
+            }
+            Ok(Some(columns)) if columns.engine == NodeDrainEngine::V2 => {
+                match drain_v2_terminable(columns.status.as_ref()) {
+                    Some(epoch) => Some((
+                        epoch,
+                        state
+                            .v2_drain_probe
+                            .drain_node(&state, node_id, epoch)
+                            .await
+                            .is_ok_and(|fresh| fresh.done && fresh.sealed_epoch == Some(epoch)),
+                    )),
+                    None => None,
+                }
+            }
+            Ok(_) => None,
+            Err(err) => return db_error(err).into_response(),
+        }
+    } else {
+        None
+    };
+
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
@@ -1553,6 +1586,84 @@ async fn apply_drain_action(
             .into_response();
     }
 
+    // The drain v2 engine: refuse what it can't run, and decide its write,
+    // under the same lock as the phase write.
+    let v2_columns = match node_store::drain_v2_columns(&mut *tx, node_id).await {
+        Ok(Some(columns)) => columns,
+        // The row is locked above, so it can't be gone here.
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "Node not found").into_response(),
+        Err(err) => return db_error(err).into_response(),
+    };
+    let v2_write = match drain_v2_write(
+        action,
+        drain_request
+            .engine
+            .filter(|_| matches!(action, DrainAction::Drain)),
+        requested_mode,
+        current.managed_by,
+        v2_columns.engine,
+        v2_columns.recorded_instance,
+        transition_starts_a_drain(&transition),
+        state.drain_v2_enabled,
+    ) {
+        Ok(write) => write,
+        Err((status, message)) => {
+            audit::record(AdminAuditEntry {
+                actor: &actor,
+                action: action.label(),
+                node_id,
+                node_name: current.substrate_node_id.as_deref(),
+                from_phase: current.drain_phase.as_deref(),
+                to_phase: None,
+                from_drain_mode: mode_in_progress,
+                replace_after_terminate: requested_replace_after_terminate,
+                drain_mode: requested_mode,
+                success: false,
+                error: Some(message),
+                outcome_counts: None,
+            });
+            return (status, Json(serde_json::json!({ "error": message }))).into_response();
+        }
+    };
+    // A v2 node is terminable once it reports, under its drain's epoch, that
+    // everything on it is durable elsewhere: the stored report says so, and
+    // the fresh `DrainNode` call made before the lock said so again under
+    // the same epoch. Its rows don't gate it.
+    let v2_terminable =
+        if matches!(action, DrainAction::Terminate) && v2_columns.engine == NodeDrainEngine::V2 {
+            match (drain_v2_terminable(v2_columns.status.as_ref()), v2_probe) {
+                (Some(epoch), Some((probed, fresh_done))) => epoch == probed && fresh_done,
+                _ => false,
+            }
+        } else {
+            true
+        };
+    if !v2_terminable {
+        audit::record(AdminAuditEntry {
+            actor: &actor,
+            action: action.label(),
+            node_id,
+            node_name: current.substrate_node_id.as_deref(),
+            from_phase: current.drain_phase.as_deref(),
+            to_phase: None,
+            from_drain_mode: mode_in_progress,
+            replace_after_terminate: requested_replace_after_terminate,
+            drain_mode: requested_mode,
+            success: false,
+            error: Some("conflict: the node has not reported its drain done"),
+            outcome_counts: None,
+        });
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "the node has not reported, under its drain's epoch, that everything \
+                          on it is durable elsewhere",
+                "drain_status": v2_columns.status,
+            })),
+        )
+            .into_response();
+    }
+
     // Guard the destructive transition into `terminating`, on both halves of
     // occupancy. The check happens under the same `FOR UPDATE` lock as the phase
     // write, so it and the write agree on one snapshot.
@@ -1583,7 +1694,7 @@ async fn apply_drain_action(
     //   The sibling guard in `admin/node_groups.rs` also checks both halves,
     //   but reads `group_occupancy_in_tx`, which is not census-aware.
     //   Its refusal to move an organization can therefore count phantom rows.
-    if matches!(action, DrainAction::Terminate) {
+    if matches!(action, DrainAction::Terminate) && v2_columns.engine == NodeDrainEngine::V1 {
         let occupancy = match node_store::sandbox_occupancy_for_node_in_tx(
             &mut tx,
             node_id,
@@ -1666,6 +1777,14 @@ async fn apply_drain_action(
             }
         }
         DrainTransition::NoChange => {}
+    }
+    let v2_written = match v2_write {
+        DrainV2Write::None => Ok(()),
+        DrainV2Write::Start => node_store::start_v2_drain(&mut tx, node_id).await,
+        DrainV2Write::Cancel => node_store::mark_v2_drain_cancel(&mut tx, node_id).await,
+    };
+    if let Err(err) = v2_written {
+        return db_error(err).into_response();
     }
     let new_phase = phase_after(&transition, current.drain_phase.as_deref());
 
@@ -1956,7 +2075,15 @@ async fn apply_force_upload_local_snapshots(
         .map(NodeDrainPhase::parse)
         .transpose()
     {
-        Ok(phase) => NodeDrainState::from_columns(phase, node.drain_mode.as_deref()),
+        Ok(phase) => NodeDrainState::from_columns(phase, node.drain_mode.as_deref()).map(|state| {
+            state.awaiting_evacuation(
+                node.drain_status
+                    .as_ref()
+                    .and_then(|status| status.0.get("waiting"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            )
+        }),
         Err(err) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2190,6 +2317,172 @@ async fn apply_force_upload_local_snapshots(
 /// mutations there survive the whole pure-function suite in [`tests`].
 #[cfg(all(test, feature = "kubernetes"))]
 mod drain_handler_tests;
+
+/// The flag that lets `:drain` start a v2 drain.
+pub const DRAIN_V2_ENABLED_ENV: &str = "SPACE_DRAIN_V2_ENABLED";
+
+/// What a request does to the drain v2 columns, beside its phase write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainV2Write {
+    None,
+    /// Record the engine and the epoch of the drain this request starts.
+    Start,
+    /// Mark the epoch for the controller to cancel on the node.
+    Cancel,
+}
+
+/// Decide a request's drain v2 write, or refuse it. `starts_a_drain` is
+/// whether the transition starts a drain; `node_engine` is the engine the
+/// node's drain runs under; `recorded_instance` is whether the node's EC2
+/// instance is recorded.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one fact of the request or the locked row the decision reads"
+)]
+fn drain_v2_write(
+    action: DrainAction,
+    requested: Option<NodeDrainEngine>,
+    mode: Option<NodeDrainMode>,
+    managed_by: NodeManagedBy,
+    node_engine: NodeDrainEngine,
+    recorded_instance: bool,
+    starts_a_drain: bool,
+    enabled: bool,
+) -> Result<DrainV2Write, (StatusCode, &'static str)> {
+    match action {
+        DrainAction::Drain => match requested {
+            Some(NodeDrainEngine::V2) => {
+                if !enabled {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "drain engine v2 is not enabled on this cluster",
+                    ));
+                }
+                if managed_by != NodeManagedBy::Kubernetes {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "drain engine v2 drains Kubernetes nodes only",
+                    ));
+                }
+                if mode != Some(NodeDrainMode::Forced) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "drain engine v2 runs forced drains only; a gentle drain is :cordon",
+                    ));
+                }
+                if starts_a_drain && !recorded_instance {
+                    // A v2 drain's node that dies is the dead-node verb's,
+                    // which judges a node only by its recorded instance.
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "drain engine v2 needs the node's EC2 instance recorded: the dead-node \
+                         verb owns a v2 node that dies, and judges it by that instance",
+                    ));
+                }
+                if starts_a_drain {
+                    Ok(DrainV2Write::Start)
+                } else if node_engine == NodeDrainEngine::V2 {
+                    Ok(DrainV2Write::None)
+                } else {
+                    Err((StatusCode::CONFLICT, "a drain in flight keeps its engine"))
+                }
+            }
+            Some(NodeDrainEngine::V1) if !starts_a_drain && node_engine == NodeDrainEngine::V2 => {
+                Err((StatusCode::CONFLICT, "a drain in flight keeps its engine"))
+            }
+            // An undrained v2 drain whose cancel hasn't reached the node yet:
+            // a drain of another engine would inherit its epoch and cancel.
+            _ if starts_a_drain && node_engine == NodeDrainEngine::V2 => Err((
+                StatusCode::CONFLICT,
+                "the previous v2 drain is still being cancelled on the node; retry, or drain \
+                 with engine v2",
+            )),
+            _ => Ok(DrainV2Write::None),
+        },
+        DrainAction::Undrain if node_engine == NodeDrainEngine::V2 => Ok(DrainV2Write::Cancel),
+        _ => Ok(DrainV2Write::None),
+    }
+}
+
+/// The drain's epoch, when a v2 node's stored report lets it be terminated:
+/// the node reported `done` under the epoch its drain is sealed under.
+fn drain_v2_terminable(status: Option<&serde_json::Value>) -> Option<u64> {
+    let status = status?;
+    let epoch = status.get("epoch").and_then(serde_json::Value::as_u64)?;
+    let report = status.get("report")?;
+    let sealed_epoch = report
+        .get("sealed_epoch")
+        .and_then(serde_json::Value::as_u64);
+    let done = report.get("done").and_then(serde_json::Value::as_bool);
+    (sealed_epoch == Some(epoch) && done == Some(true)).then_some(epoch)
+}
+
+/// What a fresh `DrainNode` call reported, as `:terminate` reads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct V2DrainReport {
+    pub sealed_epoch: Option<u64>,
+    pub done: bool,
+}
+
+/// The `DrainNode` call `:terminate` makes of a v2 node under its drain's
+/// epoch, right before it lets the node go. Production calls the node through
+/// its node-api ([`NodeApiV2DrainProbe`]); tests script it.
+pub trait V2DrainProbe: Send + Sync {
+    fn drain_node<'a>(
+        &'a self,
+        state: &'a AppState,
+        node_id: NodeId,
+        epoch: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<V2DrainReport, String>> + Send + 'a>,
+    >;
+}
+
+/// [`V2DrainProbe`] through the node's internal node-api.
+pub struct NodeApiV2DrainProbe;
+
+/// How long `:terminate` waits for the node's answer; it answers without
+/// waiting for anything.
+const DRAIN_NODE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl V2DrainProbe for NodeApiV2DrainProbe {
+    fn drain_node<'a>(
+        &'a self,
+        state: &'a AppState,
+        node_id: NodeId,
+        epoch: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<V2DrainReport, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let target = node_store::node_api_target(&state.pool, node_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("node {node_id} not found"))?;
+            let mut client =
+                crate::controllers::substrate::connect_internal_node_api_client_for_target(
+                    state.sandbox_controller.substrate(),
+                    &target.as_target(),
+                    DRAIN_NODE_PROBE_TIMEOUT,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let response = client
+                .drain_node(pplx_space_sbx_mgr_client::proto::DrainNodeRequest {
+                    epoch,
+                    cancel: false,
+                    forget: Vec::new(),
+                })
+                .await
+                .map_err(|status| status.to_string())?
+                .into_inner();
+            Ok(V2DrainReport {
+                sealed_epoch: response.sealed_epoch,
+                done: response.done,
+            })
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests;

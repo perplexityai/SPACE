@@ -112,3 +112,36 @@ pub(crate) fn admit_user_lifecycle(
     recorded::record(sandbox_id, request);
     UserLifecycleAdmission::Admitted
 }
+
+/// Whether a user's lifecycle call `action` supersedes a drain restore of
+/// the sandbox, the same rule an operation's kind follows at admission
+/// ([`crate::public_operations::supersedes_drain_restore`]): it changes the
+/// lifecycle of a `suspended` sandbox, the only one a drain restore waits
+/// for, or asks for one.
+pub(crate) fn action_supersedes_drain_restore(action: SandboxAction) -> bool {
+    match action {
+        SandboxAction::Start
+        | SandboxAction::Wake
+        | SandboxAction::ImplicitWake(_)
+        | SandboxAction::Restore
+        | SandboxAction::Suspend
+        | SandboxAction::Stop
+        | SandboxAction::Kill => true,
+        // Both need a resident VM, which a suspended sandbox doesn't have:
+        // the call gets the answer it would get without a drain, and the
+        // restore brings back the VM it can act on.
+        SandboxAction::Resume | SandboxAction::Pause => false,
+        // A checkpoint answers unavailable on a suspended sandbox without
+        // waking it; the snapshot settings are metadata.
+        SandboxAction::Checkpoint
+        | SandboxAction::EnableSnapshots
+        | SandboxAction::DisableSnapshots => false,
+        // `action` refuses these; a rollback and an update run through their
+        // own operations, whose kinds are judged at admission.
+        SandboxAction::Stats
+        | SandboxAction::OpenPort
+        | SandboxAction::Rollback
+        | SandboxAction::Spaced
+        | SandboxAction::Update => false,
+    }
+}

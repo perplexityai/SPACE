@@ -16,7 +16,8 @@ pub(crate) use kubernetes_tests::{
     insert_test_sandbox_row, mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
     paused_restore_test_subject, running_pod_kubernetes_client,
     running_pod_kubernetes_client_with_create_barrier, sandbox_pod_on_node,
-    start_sequenced_wake_worker, substrate_with_inventory_caches_and_pool, substrate_with_store,
+    start_sequenced_wake_worker, substrate_with_failed_pod_creates,
+    substrate_with_inventory_caches_and_pool, substrate_with_store,
     substrate_with_store_and_client, substrate_with_store_client_pods_and_nodes,
     substrate_with_store_client_proxy_port_and_pod,
     substrate_with_store_client_proxy_port_and_pods, substrate_with_unreachable_store,
@@ -24,8 +25,10 @@ pub(crate) use kubernetes_tests::{
 };
 
 mod activating_client;
+mod drain_restore;
 pub(super) mod environment_placement;
 mod native_pod_failover;
+mod node_instance;
 mod runtime_upgrade_dispatch;
 mod slot_headroom;
 mod substrate_scope;
@@ -1995,6 +1998,16 @@ mod kubernetes_tests {
 
     #[tonic::async_trait]
     impl WorkerApiInternal for SequencedWakeWorker {
+        async fn drain_node(
+            &self,
+            _request: tonic::Request<pplx_space_sbx_mgr_client::proto::DrainNodeRequest>,
+        ) -> Result<
+            tonic::Response<pplx_space_sbx_mgr_client::proto::DrainNodeResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
         async fn get_runtime_upgrade(
             &self,
             _request: tonic::Request<pplx_space_sbx_mgr_client::proto::GetRuntimeUpgradeRequest>,
@@ -2059,6 +2072,9 @@ mod kubernetes_tests {
     // `SimWorkerHarness`.
     pub(crate) struct SequencedWakeWorkerHandle {
         pub(crate) port: u16,
+        /// The simulator behind the worker's public RPCs (`PauseSandbox`,
+        /// `SandboxState`), which a test seeds with the VM it expects.
+        pub(crate) sim_state: SimState,
         pub(crate) received:
             Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
         health_reporter: tonic_health::server::HealthReporter,
@@ -2104,7 +2120,7 @@ mod kubernetes_tests {
             dir.path().join("sandboxes"),
             "node-a".to_string(),
         );
-        let worker_service = SimWorkerApiService::new(sim_state);
+        let worker_service = SimWorkerApiService::new(sim_state.clone());
         let received = Arc::default();
         let service = SequencedWakeWorker {
             wake_attempts,
@@ -2143,6 +2159,7 @@ mod kubernetes_tests {
         });
         Ok(SequencedWakeWorkerHandle {
             port,
+            sim_state,
             received,
             health_reporter,
             shutdown,
@@ -4496,7 +4513,9 @@ mod kubernetes_tests {
         Ok(())
     }
 
-    fn substrate_with_failed_pod_creates(pool: PgPool) -> (KubernetesSubstrate, Arc<AtomicUsize>) {
+    pub(crate) fn substrate_with_failed_pod_creates(
+        pool: PgPool,
+    ) -> (KubernetesSubstrate, Arc<AtomicUsize>) {
         let request_count = Arc::new(AtomicUsize::new(0));
         let client = blocking_failed_pod_create_kubernetes_client(
             Arc::clone(&request_count),

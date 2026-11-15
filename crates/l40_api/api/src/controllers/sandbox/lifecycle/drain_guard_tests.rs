@@ -211,7 +211,11 @@ fn wake_entry_accepts_recoverable_states_and_rejects_teardown_states() {
 }
 
 fn state(phase: NodeDrainPhase, mode: NodeDrainMode) -> NodeDrainState {
-    NodeDrainState { phase, mode }
+    NodeDrainState {
+        phase,
+        mode,
+        awaiting_evacuation: false,
+    }
 }
 
 #[test]

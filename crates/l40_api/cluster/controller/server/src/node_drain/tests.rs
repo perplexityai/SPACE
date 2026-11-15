@@ -80,9 +80,6 @@
 //! - T8 `t8_db_error_on_set_state_during_terminate_error_record`
 //! - T9 `t9_db_error_on_set_state_during_advance_to_deleted`
 //!
-//! ## P — providerID parsing
-//! - P1 `p1_parse_instance_id_matrix`
-//!
 //! ## W — End-to-end workflows
 //! - W1 `w1_drain_started_sandboxes_completes_in_two_ticks`
 //! - W2 `w2_paused_evacuates_lifecycle_preserving` — paused sandboxes
@@ -1637,6 +1634,7 @@ fn config_enabled(max_per_node: usize, max_per_cluster: usize) -> ReconcilerConf
         tick: Duration::from_millis(1),
         max_per_node,
         max_per_cluster,
+        v2_max_evacuating_nodes: super::v2::DEFAULT_MAX_EVACUATING_NODES,
         evacuate_timeout: PositiveDuration::new_panic(Duration::from_secs(1)),
         // Use the real default here so existing tests exercise the
         // abandon-stuck-transient sweep on the same code path
@@ -4452,30 +4450,6 @@ async fn q6_cordon_stale_identity_skips_terminating_tick_without_terminate_call(
         last_error_writes.is_empty(),
         "stale-identity cordon failure must NOT write drain_last_error; got {last_error_writes:?}"
     );
-}
-
-// =================================================================
-// P — providerID parsing
-// =================================================================
-
-#[test]
-fn p1_parse_instance_id_matrix() {
-    // Valid AWS providerIDs.
-    assert_eq!(
-        aws::parse_instance_id("aws:///us-west-2a/i-0abc123def"),
-        Some("i-0abc123def")
-    );
-    assert_eq!(
-        aws::parse_instance_id("aws:///us-east-1c/i-0123456789abcdef0"),
-        Some("i-0123456789abcdef0")
-    );
-    // Wrong scheme.
-    assert_eq!(aws::parse_instance_id("gce://project/zone/instance"), None);
-    // AWS scheme but not an instance ID.
-    assert_eq!(aws::parse_instance_id("aws:///us-west-2a/not-an-id"), None);
-    // Empty / pathological.
-    assert_eq!(aws::parse_instance_id(""), None);
-    assert_eq!(aws::parse_instance_id("aws:///"), None);
 }
 
 // =================================================================

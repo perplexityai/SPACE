@@ -216,6 +216,22 @@ class StoppableLifecycleSandbox(CommandSandbox, Protocol):
     def start(self) -> None: ...
 
 
+class OperationLifecycleSandbox(CommandSandbox, Protocol):
+    """Command sandbox whose lifecycle calls are recorded operations a caller can follow."""
+
+    def request_lifecycle(self, verb: str) -> str:
+        """Ask for `verb` (`wake`, `resume`, ...) without waiting; the operation's id."""
+        ...
+
+    def operation(self, operation_id: str) -> dict[str, object]:
+        """The operation as `GET /v1/operations/{id}` answers it."""
+        ...
+
+    def state(self) -> str:
+        """The sandbox's state as the public API reports it."""
+        ...
+
+
 class ProcessHandle(Protocol):
     @property
     def process_id(self) -> str: ...
@@ -1641,6 +1657,7 @@ class AdminNodeView:
     drain_phase: str | None
     drain_mode: str | None
     sandboxes_active: int | None
+    drain_last_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1687,6 +1704,300 @@ class NodeDrainControl(NodeFaultControl, Protocol):
     def sandbox_residency(self, sandbox_id: str) -> SandboxResidency: ...
 
     def ready_full_snapshots(self, sandbox_id: str) -> list[SnapshotRecord]: ...
+
+
+@dataclass(frozen=True)
+class DeadNodeStatus:
+    """One node's `dead_node_status` in `GET /admin/api/v1/nodes`.
+
+    `observed_at` is when the controller wrote the entry, by the database
+    clock. `instances` maps each instance asked about to `dead`, `live` or
+    `unknown:<reason>`. `counts` maps each outcome to its row count,
+    `applied` each to the rows whose write committed (empty in a dry run),
+    and `samples` each to the sandbox ids the route lists for it.
+    """
+
+    node_id: str
+    observed_at: datetime
+    mode: str
+    verdict: str
+    reason: str
+    rows_truncated: bool
+    instances: Mapping[str, str]
+    counts: Mapping[str, int]
+    applied: Mapping[str, int]
+    samples: Mapping[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class SandboxRowState:
+    """The `sandboxes` columns a dead-node write would change, and `updated_at`.
+
+    `updated_at` is trigger-maintained: an update that changes any column
+    other than `last_used_at`, `last_access_at` and `last_command_at` moves it.
+    """
+
+    sandbox_id: str
+    lifecycle: str
+    placement: str
+    active_node_id: str | None
+    target_node_id: str | None
+    updated_at: str
+
+
+class DeadNodeControl(NodeDrainControl, Protocol):
+    """Kind-only operations for the dead-node scenarios.
+
+    The verb ships off and reads its config at startup, so a scenario
+    overrides the cluster-controller Deployment's `SPACE_DEAD_NODE_*` env
+    (closed key list, closed value vocabulary) under the controller-mutation
+    Lease, and puts the captured standing values back. A Kind worker gets a
+    fake AWS providerID by re-registering its Node with the kubelet's
+    `--provider-id` rewritten, so its EC2 instance is recorded and Kind's
+    fake EC2 can answer for it. The node fault is named: stop one Kind
+    worker's container, delete its Kubernetes Node and mark its instance
+    terminated in the fake EC2; then start the container again, under a new
+    providerID for a same-name replacement. The observables are the admin
+    node listing's `dead_node_status`, the node rows and the sandbox rows.
+    """
+
+    def acquire_controller_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible controller-deployment Lease; returns its release."""
+        ...
+
+    def dead_node_env(self) -> dict[str, str | None]:
+        """The literal value of every dead-node env key on the controller Deployment."""
+        ...
+
+    def set_dead_node_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply smoke overrides and await the controller rollout; refuses keys or values off the lists."""
+        ...
+
+    def restore_dead_node_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literals back (None unsets) and await the controller rollout."""
+        ...
+
+    def dead_node_statuses(self) -> list[DeadNodeStatus]:
+        """Each node's `dead_node_status` from `GET /admin/api/v1/nodes`."""
+        ...
+
+    def kind_node_provider_id(self, node_name: str) -> str:
+        """The Kind worker's Node `spec.providerID`."""
+        ...
+
+    def set_kind_worker_provider_id(
+        self, node_name: str, provider_id: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        """Re-register the running Kind worker's Node under `provider_id`, a
+        fake AWS providerID: rewrite the kubelet's `--provider-id`, delete the
+        Node, restart the kubelet, put back `labels`, and wait for the Node
+        and its node services to be Ready."""
+        ...
+
+    def fake_ec2_terminate(self, instance_id: str) -> None:
+        """Mark the instance terminated in Kind's fake EC2, through its loopback test control."""
+        ...
+
+    def node_recorded_instance(self, node_id: str) -> str | None:
+        """`node_k8s.instance_id` of the node, None when it records none or has no row."""
+        ...
+
+    def node_row_exists(self, node_id: str) -> bool: ...
+
+    def latest_execution_instance(self, sandbox_id: str) -> str | None:
+        """The sandbox's latest execution's `node_instance_id`."""
+        ...
+
+    def database_now(self) -> datetime:
+        """The stack's Postgres `NOW()`, the clock `observed_at` is stamped with."""
+        ...
+
+    def sandbox_worker_nodes(self) -> list[str]:
+        """The kube nodes of the sandbox worker pool."""
+        ...
+
+    def node_stack_pods(self, node_name: str) -> list[str]:
+        """`namespace/name` of every SPACE pod on the kube node that no DaemonSet
+        owns and that is not a sandbox pod: what stopping the node would take
+        down. Kubernetes' own replicated system pods are rescheduled once the
+        Node is deleted, so they are not listed."""
+        ...
+
+    def kind_node_labels(self, node_name: str) -> dict[str, str]:
+        """The Kind worker's Node labels, which deleting the Node discards."""
+        ...
+
+    def stop_kind_worker(self, node_name: str) -> None:
+        """Stop the Kind worker's container, then delete its Kubernetes Node."""
+        ...
+
+    def start_kind_worker(
+        self,
+        node_name: str,
+        labels: Mapping[str, str],
+        *,
+        timeout: float,
+        provider_id: str | None = None,
+    ) -> None:
+        """Start the Kind worker's container, under `provider_id` when given
+        (the kubelet's `--provider-id` rewritten while it is stopped), put
+        back the `labels` its re-registered Node lacks as soon as it exists,
+        then wait, each with the whole `timeout`, for the Node and the node
+        services on it to be Ready."""
+        ...
+
+    def native_sandbox_action(self, sandbox_id: str, action: str) -> str:
+        """`POST /v1/sandboxes/{id}:{action}` for `suspend`, `pause` or `stop`; the operation id."""
+        ...
+
+    def operation_state(self, operation_id: str) -> str: ...
+
+    def native_delete_sandbox(self, sandbox_id: str) -> None:
+        """`DELETE /v1/sandboxes/{id}`; an absent sandbox is success."""
+        ...
+
+    def restore_portable(self, sandbox_id: str) -> bool:
+        """The API's suspend-restore portability predicate for the sandbox."""
+        ...
+
+    def object_store_replicas(self) -> int: ...
+
+    def scale_object_store(self, replicas: int) -> int: ...
+
+    def wait_object_store_gone(self, *, timeout: float) -> None: ...
+
+    def wait_object_store_rollout(self, *, timeout: float) -> None: ...
+
+    def sandbox_row_states(self, sandbox_ids: Sequence[str]) -> list[SandboxRowState]: ...
+
+    def snapshot_states(self, sandbox_id: str) -> list[str]:
+        """The sandbox's full snapshots' states, oldest first."""
+        ...
+
+    def other_live_rows_on_node(self, node_id: str, sandbox_ids: Sequence[str]) -> list[str]:
+        """Ids of rows pinned to the node, outside `sandbox_ids`, that are not
+        `failed` or `deleted`."""
+        ...
+
+
+class DrainRestoreControl(Protocol):
+    """The drain restore operation's test hold and slot budget on Kind.
+
+    A scoped override of two cluster-controller env keys (closed key list,
+    bounded integers), under the controller-mutation Lease the retention, GC,
+    dead-node and stopped-replacement scenarios share.
+    """
+
+    def acquire_controller_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible controller-deployment Lease; returns its release."""
+        ...
+
+    def drain_restore_hold_env(self) -> dict[str, str | None]:
+        """The hold's and the slots' literals on the controller Deployment, None if unset."""
+        ...
+
+    def running_controller_drain_restore_hold_envs(self) -> list[dict[str, str | None]]:
+        """The same literals on every running, not-terminating controller pod."""
+        ...
+
+    def set_drain_restore_hold_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply the hold or the slots and await the controller rollout; refuses keys or values off the lists."""
+        ...
+
+    def restore_drain_restore_hold_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literals back (None unsets) and await the controller rollout."""
+        ...
+
+
+@dataclass(frozen=True)
+class DrainV2Status:
+    """`nodes.drain_engine` and `nodes.drain_status` of one node; `status` is the JSON object."""
+
+    engine: str | None
+    status: dict[str, Any] | None
+
+
+class DrainV2Control(DeadNodeControl, DrainRestoreControl, Protocol):
+    """Kind-only operations for the drain v2 scenarios, with the dead-node
+    verb's config, the drain restore hold, and the Kind worker's instance,
+    stop and replacement."""
+
+    def drain_node_v2(self, node_id: str) -> None:
+        """`POST :drain` with `mode: forced` and `engine: v2`."""
+        ...
+
+    def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
+        """The node's v2 drain columns; `None` once its row is gone."""
+        ...
+
+    def terminate_node(self, node_id: str) -> int:
+        """`POST :terminate`; the HTTP status it answered."""
+        ...
+
+    def seal_activations(self, node_name: str, epoch: int) -> int | None:
+        """`space-sbxmgr drain-node --epoch` on the worker, under the caller's
+        worker-cordon Lease; the epoch it answers sealed under.
+
+        The seal is recorded on the Lease before it is sent, and a successful
+        unseal clears it, so the Lease's next holder unseals a worker a killed
+        run left sealed.
+        """
+        ...
+
+    def node_drain_report(self, node_name: str, epoch: int) -> dict[str, Any]:
+        """`space-sbxmgr drain-node --epoch` on the worker, already sealed
+        under `epoch`, under the caller's worker-cordon Lease: the node's own
+        report, in `drain_status.report`'s shape, which no controller sees."""
+        ...
+
+    def unseal_activations(self, node_name: str, epoch: int) -> int | None:
+        """`space-sbxmgr drain-node --cancel` on the worker; the epoch it is
+        still sealed under, None once unsealed. An unsealed worker stays
+        unsealed."""
+        ...
+
+    def drain_restore_operations(self, sandbox_id: str) -> list[tuple[str, int]]:
+        """Each `drain_restore_sandbox` operation of the sandbox, oldest first:
+        its state and attempts."""
+        ...
+
+    def stopped_residency(self, sandbox_id: str) -> StoppedResidency: ...
+
+    def node_tombstoned(self, node_id: str) -> bool:
+        """Whether `node_k8s_tombstones` holds a tombstone for the node id."""
+        ...
+
+    def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None:
+        """The sandbox's row state in that node's sandbox-manager, or None without a row."""
+        ...
+
+    def restart_node_service(self, node_name: str, component: str, *, timeout: float) -> str:
+        """Delete that node service's pod and wait for its Ready replacement on the same node."""
+        ...
+
+    def block_node_traffic(self, node_name: str, path: str) -> None:
+        """Cut one node-local path on the Kind node (`object-store`: its pods'
+        and host processes' connections to the object store are reset;
+        `node-api`: connections to its node-api go unanswered)."""
+        ...
+
+    def unblock_node_traffic(self, node_name: str, path: str) -> None:
+        """Remove exactly the rules `block_node_traffic` added for `path`."""
+        ...
+
+    def restart_controller(self, *, timeout: float) -> list[str]:
+        """Kill every cluster-controller pod at once and await Ready
+        replacements; the killed pods' names."""
+        ...
+
+    def scale_controller(self, replicas: int, *, timeout: float) -> int:
+        """Scale the cluster-controller Deployment (0..2) under the caller's
+        controller-mutation Lease and await it; the replicas it had."""
+        ...
+
+    def sandbox_placements(self, sandbox_ids: Sequence[str]) -> dict[str, tuple[str, str | None]]:
+        """Each sandbox's lifecycle and active node id, by bare id, in one read."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -1978,6 +2289,19 @@ class ConcurrentRestoreControl(Protocol):
 
     def delete_sandbox_pod(self, pod_name: str) -> None:
         """Delete one sandbox execution pod out from under the API (kind-only fault)."""
+        ...
+
+
+class EcwLifecycleProbe(Protocol):
+    """One raw ECW `pause` or `resume` call, without the SDK's own handling.
+
+    The scenario judges the answer itself (a refusal is the expected outcome
+    while a restore holds the row), so it is returned rather than raised:
+    `status` is the HTTP status, 0 for a transport failure.
+    """
+
+    def lifecycle_request(self, action: str, *, timeout: float) -> RestoreCallerOutcome:
+        """`POST /sandboxes/{id}/<action>` with no body; `action` is `pause` or `resume`."""
         ...
 
 

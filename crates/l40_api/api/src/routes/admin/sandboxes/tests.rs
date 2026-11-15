@@ -801,7 +801,7 @@ async fn an_admin_create_reports_its_requester_apart_from_the_owner() -> TestRes
             org_id,
             actor_user_id: Some(owner),
             api_product: ApiProduct::Admin,
-            kind: OperationKind::CreateSandbox,
+            kind: OperationKind::CreateSandbox.into(),
             target_type: Some(OperationTargetType::Sandbox),
             target_id: Some(&older_target_id),
             payload_json: CreateSandboxOperationPayload {

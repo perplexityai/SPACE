@@ -1793,12 +1793,15 @@ fn inflight_snapshot_matches_current_suspend(sandbox_alias: &str) -> String {
 /// caller that deletes a local row without establishing the pin gets no
 /// protection here.
 ///
-/// ## Reaches nothing today
+/// ## What it reaches today
 ///
 /// One writer outside the suspend paths below now produces a `'stop'` marker:
 /// node drain's `record_stopped_evacuation_artifact`, on a Kubernetes row it
-/// has claimed for evacuation. Both callers of this fragment filter
-/// `managed_by` to the Space substrate, so neither reaches those rows.
+/// has claimed for evacuation. Its census callers in
+/// `pplx_space_sandbox_store::ingest` filter `managed_by` to the Space
+/// substrate, so they don't reach those rows. The cluster controller's
+/// dead-node dry run (`pplx_space_sandbox_store::dead_node`) reads it for both
+/// substrates, and only to report an outcome.
 ///
 /// Every current Postgres writer of a non-NULL marker is a suspend path, and
 /// four write `'suspend'` whenever they write an origin at all: `kubernetes/store/suspend.rs`'s

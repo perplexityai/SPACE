@@ -88,6 +88,14 @@ pub(crate) use responses::ResponseAdmissionError;
 mod response_reservations;
 pub(crate) use response_reservations::ResponseReservation;
 mod sandbox_quota;
+mod stored_kind;
+pub use stored_kind::StoredOperationKind;
+mod drain_restore_supersession;
+use drain_restore_supersession::{
+    DrainRestoreSupersededBy, cancel_drain_restores_superseded_tx,
+    cancel_superseded_drain_restore_tx, superseding_user_operation_tx,
+};
+pub use drain_restore_supersession::{DrainRestoreSupersession, supersedes_drain_restore};
 pub use sandbox_quota::{
     SandboxQuota, SandboxQuotaOutcome, SandboxQuotaRefusal, SubjectSandboxQuota,
 };
@@ -774,7 +782,7 @@ impl PublicOperationStore {
         let creation = CreationRecord {
             superseded,
             api_product: ApiProduct::Native,
-            kind,
+            kind: kind.into(),
             target_type: Some(OperationTargetType::Sandbox),
         };
         let CreatePublicOperationResult::Created(operation_id) = result else {
@@ -881,7 +889,7 @@ impl PublicOperationStore {
                 // missing actor; it keeps the snapshot-upload 409 for them.
                 actor_user_id: None,
                 api_product: ApiProduct::Native,
-                kind,
+                kind: kind.into(),
                 target_type: Some(OperationTargetType::Sandbox),
                 target_id: Some(target_id),
                 payload_json,
@@ -1056,6 +1064,30 @@ impl PublicOperationStore {
         fail_claimed_operation(&self.pool, input).await
     }
 
+    /// [`Self::fail_claimed_operation`], ending it `canceled`: an executor
+    /// found the work superseded, which is no failure.
+    pub async fn cancel_claimed_operation(
+        &self,
+        input: FailClaimedPublicOperation,
+    ) -> Result<bool, PublicOperationStoreError> {
+        end_claimed_operation(&self.pool, input, ClaimedOperationEnd::Canceled).await
+    }
+
+    /// Cancel the drain restores of `sandbox_id` that a user's lifecycle
+    /// call recording no operation supersedes: `action`, the call's verb.
+    /// See [`drain_restore_supersession`].
+    pub async fn cancel_drain_restores_for_action(
+        &self,
+        org_id: OrgId,
+        sandbox_id: SandboxId,
+        action: &'static str,
+    ) -> Result<DrainRestoreSupersession, PublicOperationStoreError> {
+        drain_restore_supersession::cancel_drain_restores_for_action(
+            &self.pool, org_id, sandbox_id, action,
+        )
+        .await
+    }
+
     /// Record an operation claimed for the first time as `expired` rather
     /// than run it: the terminal write [`Self::fail_claimed_operation`]
     /// makes, in the `expired` state, with an `operation.expired` event. The
@@ -1171,7 +1203,7 @@ pub struct CreatePublicOperation<'a> {
     pub org_id: OrgId,
     pub actor_user_id: Option<UserId>,
     pub api_product: ApiProduct,
-    pub kind: OperationKind,
+    pub kind: StoredOperationKind,
     pub target_type: Option<OperationTargetType>,
     pub target_id: Option<&'a str>,
     pub payload_json: serde_json::Value,
@@ -1270,7 +1302,7 @@ async fn claim_created_operation_tx(
         operation.id,
         PublicOperationEventType::Claimed,
         serde_json::json!({
-            "kind": operation.kind.as_str(),
+            "kind": operation.kind.public_kind().as_str(),
             "attempt": operation.attempts,
         }),
     )
@@ -1436,7 +1468,7 @@ enum JoinedOrInserted {
 struct CreationRecord {
     superseded: SupersededCreates,
     api_product: ApiProduct,
-    kind: OperationKind,
+    kind: StoredOperationKind,
     target_type: Option<OperationTargetType>,
 }
 
@@ -1792,7 +1824,7 @@ impl PublicOperationAdmission {
         input: &CreatePublicOperation<'_>,
     ) -> Result<Option<OperationId>, PublicOperationStoreError> {
         let request = (
-            input.kind,
+            input.kind.as_public(),
             input.target_id,
             input.actor_user_id,
             input.idempotency.as_ref(),
@@ -1800,23 +1832,27 @@ impl PublicOperationAdmission {
         debug_assert!(
             matches!(
                 request,
-                (OperationKind::WakeSandbox, Some(_), Some(_), Some(_))
+                (Some(OperationKind::WakeSandbox), Some(_), Some(_), Some(_))
             ),
             "only a caller's keyed sandbox wake can join one"
         );
-        let (OperationKind::WakeSandbox, Some(target_id), Some(actor_user_id), Some(idempotency)) =
-            request
+        let (
+            Some(kind @ OperationKind::WakeSandbox),
+            Some(target_id),
+            Some(actor_user_id),
+            Some(idempotency),
+        ) = request
         else {
             return Ok(None);
         };
         if !matches!(self.observation, ObservePublicOperationIdempotency::Missing) {
             return Ok(None);
         }
-        lock_active_sandbox_operation(&mut self.tx, input.org_id, input.kind, target_id).await?;
+        lock_active_sandbox_operation(&mut self.tx, input.org_id, kind, target_id).await?;
         let Some(joinable) = joinable_active_sandbox_operation(
             &mut self.tx,
             input.org_id,
-            input.kind,
+            kind,
             target_id,
             Some(actor_user_id),
         )
@@ -1985,6 +2021,12 @@ pub struct ClaimLimits {
     /// process that created it runs, is not counted. `None` sets no such
     /// limit.
     pub per_org_non_teardown: Option<OrgSlotLimit>,
+    /// The most drain restores ([`StoredOperationKind::DrainRestoreSandbox`])
+    /// that may run under a live claim at once, counting those already
+    /// running, across every dispatcher. They count as other work toward
+    /// the limits above as well. 0 claims none, which a dispatcher whose
+    /// executor doesn't run them sets.
+    pub drain_restores: u32,
 }
 
 /// How many operations other than teardowns one organization may have
@@ -2009,6 +2051,7 @@ impl ClaimLimits {
             non_teardown: total,
             teardown_while_other_due: total,
             per_org_non_teardown: None,
+            drain_restores: 0,
         }
     }
 }
@@ -2041,7 +2084,7 @@ pub struct ClaimedPublicOperation {
     pub org_id: OrgId,
     pub actor_user_id: Option<UserId>,
     pub api_product: ApiProduct,
-    pub kind: OperationKind,
+    pub kind: StoredOperationKind,
     pub target_type: Option<OperationTargetType>,
     pub target_id: Option<String>,
     pub payload: serde_json::Value,
@@ -2172,7 +2215,7 @@ pub struct OverdueQueuedPublicOperations<'a> {
 #[derive(Debug, Clone)]
 pub struct OverdueQueuedPublicOperation {
     pub id: OperationId,
-    pub kind: OperationKind,
+    pub kind: StoredOperationKind,
     pub attempts: i32,
     pub progress_message: String,
 }
@@ -2210,6 +2253,9 @@ pub enum ReleasedClaim {
     Requeued,
     /// A create canceled instead, superseded by this delete of its sandbox.
     Superseded { delete_id: OperationId },
+    /// A drain restore canceled instead, superseded by this user's operation
+    /// on its sandbox.
+    DrainRestoreSuperseded { by: OperationId },
     /// The claim was lost; the operation is unchanged.
     Lost,
 }
@@ -2366,7 +2412,7 @@ pub async fn create_operation_tx(
         operation_id,
         PublicOperationEventType::Created,
         serde_json::json!({
-                "kind": input.kind.as_str(),
+                "kind": input.kind.public_kind().as_str(),
                 "state": OperationState::Queued.as_str(),
         }),
     )
@@ -2380,6 +2426,18 @@ pub async fn create_operation_tx(
         superseded =
             cancel_creates_superseded_by_delete_tx(tx, input.org_id, target_id, operation_id)
                 .await?;
+    }
+    if supersedes_drain_restore(input.kind)
+        && let Some(target_id) =
+            sandbox_queue_key(input.target_type.as_ref(), input.kind, input.target_id)
+    {
+        cancel_drain_restores_superseded_tx(
+            tx,
+            input.org_id,
+            target_id,
+            DrainRestoreSupersededBy::Operation(operation_id),
+        )
+        .await?;
     }
 
     if let Some(idempotency) = input.idempotency.as_ref() {
@@ -2662,11 +2720,13 @@ fn outside_sandbox_queue_labels() -> Vec<&'static str> {
 /// [`OUTSIDE_SANDBOX_QUEUE_KINDS`].
 fn sandbox_queue_key<'a>(
     target_type: Option<&OperationTargetType>,
-    kind: OperationKind,
+    kind: StoredOperationKind,
     target_id: Option<&'a str>,
 ) -> Option<&'a str> {
     if target_type != Some(&OperationTargetType::Sandbox)
-        || OUTSIDE_SANDBOX_QUEUE_KINDS.contains(&kind)
+        || kind
+            .as_public()
+            .is_some_and(|kind| OUTSIDE_SANDBOX_QUEUE_KINDS.contains(&kind))
     {
         return None;
     }
@@ -2802,7 +2862,9 @@ async fn claim_operations(
     input: ClaimPublicOperations<'_>,
     mode: ClaimMode,
 ) -> Result<PublicOperationClaim, PublicOperationStoreError> {
-    if input.limits.total == 0 || input.claimable_kinds.is_empty() {
+    if input.limits.total == 0
+        || (input.claimable_kinds.is_empty() && input.limits.drain_restores == 0)
+    {
         return Ok(PublicOperationClaim {
             claim_token: new_claim_token(),
             operations: Vec::new(),
@@ -2811,11 +2873,18 @@ async fn claim_operations(
     }
 
     let claim_token = new_claim_token();
-    let kind_labels = input
+    let mut kind_labels = input
         .claimable_kinds
         .iter()
         .map(|kind| kind.as_str().to_string())
         .collect::<Vec<_>>();
+    if input.limits.drain_restores > 0 {
+        kind_labels.push(
+            StoredOperationKind::DrainRestoreSandbox
+                .as_str()
+                .to_string(),
+        );
+    }
 
     let teardown_labels = TEARDOWN_KINDS
         .iter()
@@ -2881,6 +2950,11 @@ async fn claim_operations(
     // that `$16` of the free slots open to other work stay free for work
     // another organization submits later. Organizations all at their limit
     // share that one budget.
+    // Drain restores (`$18`, claimed only while `$19` is above zero) are
+    // other work, and on top of those limits no more than `$19` of them run
+    // at once: `drain_slots` counts the ones running under a live claim and,
+    // in claim order, the ones this claim would add. One they hold back
+    // doesn't make the organization limit look like it held work back.
     // No more than `2 * $12` of an organization's due operations can be
     // admitted, so the rank reads only those: `due_other` reads every due
     // one once, an organization with more gets a top-N pass of its own, and
@@ -2969,9 +3043,19 @@ async fn claim_operations(
                AND kind <> ALL($14)
              GROUP BY org_id
          ),
+         drain_live AS (
+             SELECT COUNT(*) AS live
+             FROM public_operations
+             WHERE $19::BIGINT > 0
+               AND kind = $18
+               AND state = $5
+               AND claim_token <> ''
+               AND claimed_at > NOW() - make_interval(secs => $2::BIGINT)
+         ),
          due_other AS MATERIALIZED (
              SELECT candidate.operation_id,
                     candidate.org_id,
+                    candidate.kind,
                     candidate.next_attempt_at,
                     candidate.requested_at,
                     GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
@@ -3016,7 +3100,13 @@ async fn claim_operations(
                     COALESCE(org_live.live, 0) + ROW_NUMBER() OVER (
                         PARTITION BY org_first.org_id
                         ORDER BY org_first.next_attempt_at, org_first.requested_at, org_first.operation_id
-                    ) AS org_slots
+                    ) AS org_slots,
+                    CASE WHEN org_first.kind = $18 THEN
+                        (SELECT live FROM drain_live) + ROW_NUMBER() OVER (
+                            PARTITION BY org_first.kind = $18
+                            ORDER BY org_first.next_attempt_at, org_first.requested_at, org_first.operation_id
+                        )
+                    END AS drain_slots
              FROM org_first
              LEFT JOIN org_live ON org_live.org_id = org_first.org_id
          ),
@@ -3032,10 +3122,13 @@ async fn claim_operations(
                         ORDER BY other.next_attempt_at, other.requested_at, other.operation_id
                     ) AS admissible_rank
              FROM other_candidates other
-             WHERE $15::BIGINT = 0
-                OR other.org_slots <= $15
-                -- Past its limit only while no other organization waits.
-                OR (SELECT orgs FROM waiting) = CASE WHEN other.org_held < $15 THEN 1 ELSE 0 END
+             WHERE (other.drain_slots IS NULL OR other.drain_slots <= $19)
+               AND (
+                   $15::BIGINT = 0
+                   OR other.org_slots <= $15
+                   -- Past its limit only while no other organization waits.
+                   OR (SELECT orgs FROM waiting) = CASE WHEN other.org_held < $15 THEN 1 ELSE 0 END
+               )
          ),
          first_other AS (
              SELECT operation_id, next_attempt_at, requested_at, claimable_at, reclaimed, first_start
@@ -3136,7 +3229,11 @@ async fn claim_operations(
          FROM (
              SELECT $12::BIGINT > 0
                     AND NOT EXISTS (SELECT 1 FROM first_other)
-                    AND EXISTS (SELECT 1 FROM other_candidates) AS org_limit_held_back
+                    AND EXISTS (
+                        SELECT 1
+                        FROM other_candidates
+                        WHERE drain_slots IS NULL OR drain_slots <= $19
+                    ) AS org_limit_held_back
          ) summary
          LEFT JOIN claimed ON TRUE"
     ))
@@ -3172,6 +3269,8 @@ async fn claim_operations(
             .map_or(0, |limit| i64::from(limit.headroom)),
     )
     .bind(ADMISSION_CLAIM_TOKEN_PREFIX)
+    .bind(StoredOperationKind::DrainRestoreSandbox.as_str())
+    .bind(i64::from(input.limits.drain_restores))
     .fetch_all(&mut *tx)
     .await?;
 
@@ -3192,7 +3291,7 @@ async fn claim_operations(
             operation.id,
             PublicOperationEventType::Claimed,
             serde_json::json!({
-                "kind": operation.kind.as_str(),
+                "kind": operation.kind.public_kind().as_str(),
                 "attempt": operation.attempts,
             }),
         )
@@ -3273,6 +3372,39 @@ async fn fail_claimed_operation(
     pool: &PgPool,
     input: FailClaimedPublicOperation,
 ) -> Result<bool, PublicOperationStoreError> {
+    end_claimed_operation(pool, input, ClaimedOperationEnd::Failed).await
+}
+
+/// How [`end_claimed_operation`] ends a claimed operation.
+#[derive(Debug, Clone, Copy)]
+enum ClaimedOperationEnd {
+    Failed,
+    Canceled,
+}
+
+impl ClaimedOperationEnd {
+    const fn state(self) -> OperationState {
+        match self {
+            Self::Failed => OperationState::Failed,
+            Self::Canceled => OperationState::Canceled,
+        }
+    }
+
+    const fn event(self) -> PublicOperationEventType {
+        match self {
+            Self::Failed => PublicOperationEventType::Failed,
+            Self::Canceled => PublicOperationEventType::Canceled,
+        }
+    }
+}
+
+/// Record a claimed operation's terminal error and end it as `end` says,
+/// under its claim.
+async fn end_claimed_operation(
+    pool: &PgPool,
+    input: FailClaimedPublicOperation,
+    end: ClaimedOperationEnd,
+) -> Result<bool, PublicOperationStoreError> {
     let mut tx = pool.begin().await?;
     let updated = sqlx::query_scalar::<_, Uuid>(sql!(
         "UPDATE public_operations
@@ -3293,7 +3425,7 @@ async fn fail_claimed_operation(
     ))
     .bind(input.operation_id.as_uuid())
     .bind(&input.claim_token)
-    .bind(OperationState::Failed.as_str())
+    .bind(end.state().as_str())
     .bind(&input.progress_message)
     .bind(input.terminal_error_code.as_str())
     .bind(Json(input.terminal_error_json.clone()))
@@ -3305,9 +3437,9 @@ async fn fail_claimed_operation(
         append_operation_event_tx(
             &mut tx,
             input.operation_id,
-            PublicOperationEventType::Failed,
+            end.event(),
             serde_json::json!({
-                "state": OperationState::Failed.as_str(),
+                "state": end.state().as_str(),
                 "code": input.terminal_error_code.as_str(),
                 "error": input.terminal_error_json,
             }),
@@ -3519,6 +3651,19 @@ async fn release_claimed_operation(
             .await?;
         tx.commit().await?;
         return Ok(ReleasedClaim::Superseded { delete_id });
+    }
+    if input.cancel_if_superseded
+        && kind == StoredOperationKind::DrainRestoreSandbox.as_str()
+        && let Some(by) = superseding_user_operation_tx(&mut tx, input.operation_id).await?
+    {
+        cancel_superseded_drain_restore_tx(
+            &mut tx,
+            input.operation_id,
+            DrainRestoreSupersededBy::Operation(by),
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(ReleasedClaim::DrainRestoreSuperseded { by });
     }
     let updated = sqlx::query_scalar::<_, Uuid>(sql!(
         "UPDATE public_operations
@@ -3838,7 +3983,7 @@ pub struct AdminPublicOperationRecord {
     /// when the request ran, it does not record who the actor was.
     pub actor_email: Option<String>,
     pub api_product: ApiProduct,
-    pub kind: OperationKind,
+    pub kind: StoredOperationKind,
     pub state: OperationState,
     pub target_type: Option<OperationTargetType>,
     pub target_id: Option<String>,
@@ -3991,7 +4136,9 @@ impl TryFrom<PublicOperationRow> for PublicOperationRecord {
     fn try_from(row: PublicOperationRow) -> Result<Self, Self::Error> {
         Ok(Self {
             id: OperationId::from_uuid(row.operation_id),
-            kind: parse_stored_enum("kind", &row.kind)?,
+            // A client sees a system kind as the public kind it does the work
+            // of: the contract's kinds are frozen.
+            kind: parse_stored_enum::<StoredOperationKind>("kind", &row.kind)?.public_kind(),
             state: parse_stored_enum("state", &row.state)?,
             target_type: row
                 .target_type
@@ -4131,6 +4278,10 @@ fn duration_secs_i64(duration: Duration) -> i64 {
     i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
 
+#[cfg(test)]
+mod drain_restore_budget_tests;
+#[cfg(test)]
+mod drain_restore_surface_tests;
 #[cfg(test)]
 mod inline_org_limit_plan_tests;
 #[cfg(test)]

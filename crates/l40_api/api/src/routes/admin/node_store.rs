@@ -69,6 +69,9 @@ pub(super) struct AdminNodeRow {
     pub(super) drain_mode: Option<String>,
     pub(super) drain_started_at: Option<OffsetDateTime>,
     pub(super) drain_last_error: Option<String>,
+    pub(super) drain_engine: Option<String>,
+    pub(super) drain_status: Option<sqlx::types::Json<serde_json::Value>>,
+    pub(super) dead_node_status: Option<sqlx::types::Json<serde_json::Value>>,
     pub(super) terminate_decrement_capacity: bool,
     pub(super) node_group_id: Option<NodeGroupId>,
     pub(super) metadata: Option<sqlx::types::Json<serde_json::Value>>,
@@ -369,6 +372,9 @@ const ADMIN_NODE_SELECT: &str = "SELECT n.id,
        n.drain_mode,
        n.drain_started_at,
        n.drain_last_error,
+       n.drain_engine,
+       n.drain_status,
+       n.dead_node_status,
        n.terminate_decrement_capacity,
        n.node_group_id,
        nd.metadata,
@@ -1201,14 +1207,19 @@ pub(super) async fn is_node_wake_gate_closed(
     pool: &PgPool,
     node_id: NodeId,
 ) -> Result<bool, sqlx::Error> {
-    let row: Option<(Option<NodeDrainPhase>, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT drain_phase, drain_mode FROM nodes WHERE id = $1"
+    let row: Option<(Option<NodeDrainPhase>, Option<String>, bool)> = sqlx::query_as(sql!(
+        "SELECT drain_phase, drain_mode,
+                COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE)
+           FROM nodes WHERE id = $1"
     ))
     .bind(node_id)
     .fetch_optional(pool)
     .await?;
     Ok(row
-        .and_then(|(phase, mode)| NodeDrainState::from_columns(phase, mode.as_deref()))
+        .and_then(|(phase, mode, awaiting)| {
+            NodeDrainState::from_columns(phase, mode.as_deref())
+                .map(|state| state.awaiting_evacuation(awaiting))
+        })
         .is_some_and(NodeDrainState::blocks_placement))
 }
 
@@ -1385,3 +1396,117 @@ mod pinned_local_only_plan_tests;
 /// otherwise the agreement proves nothing.
 #[cfg(test)]
 pub(super) mod terminate_gate_agreement_tests;
+
+/// A node's drain v2 columns, read under the caller's row lock.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct DrainV2Columns {
+    pub(super) engine: pplx_space_common_core::types::NodeDrainEngine,
+    pub(super) status: Option<serde_json::Value>,
+    /// Whether `node_k8s` records the node's EC2 instance.
+    pub(super) recorded_instance: bool,
+}
+
+/// What resolves the node's node-api: its role, substrate and Kubernetes
+/// name. `None` when the row is gone.
+pub(super) async fn node_api_target(
+    pool: &sqlx::PgPool,
+    node_id: NodeId,
+) -> Result<Option<crate::controllers::substrate::OwnedNodeApiTarget>, sqlx::Error> {
+    type Row = (
+        pplx_space_common_core::types::NodeRole,
+        pplx_space_common_core::types::NodeManagedBy,
+        Option<String>,
+    );
+    let row: Option<Row> = sqlx::query_as(sql!(
+        "SELECT n.role, n.managed_by, nk.k8s_node_name
+           FROM nodes n
+           LEFT JOIN node_k8s nk ON nk.node_id = n.id
+          WHERE n.id = $1"
+    ))
+    .bind(node_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(role, managed_by, substrate_node_id)| {
+        crate::controllers::substrate::OwnedNodeApiTarget {
+            managed_by,
+            role,
+            direct_endpoint: None,
+            substrate_node_id,
+        }
+    }))
+}
+
+/// The node's v2 drain columns; `None` when there is no such node.
+pub(super) async fn drain_v2_columns(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+) -> Result<Option<DrainV2Columns>, sqlx::Error> {
+    let row: Option<(Option<String>, Option<serde_json::Value>, bool)> = sqlx::query_as(sql!(
+        "SELECT n.drain_engine, n.drain_status, k.instance_id IS NOT NULL
+           FROM nodes n
+           LEFT JOIN node_k8s k ON k.node_id = n.id
+          WHERE n.id = $1"
+    ))
+    .bind(node_id)
+    .fetch_optional(executor)
+    .await?;
+    Ok(
+        row.map(|(engine, status, recorded_instance)| DrainV2Columns {
+            engine: pplx_space_common_core::types::NodeDrainEngine::from_column(engine.as_deref()),
+            status,
+            recorded_instance,
+        }),
+    )
+}
+
+/// Start a v2 drain on a node `update_drain_phase` has just moved to
+/// `draining` in this transaction: record the engine and the epoch the node
+/// is sealed under, the drain's start in microseconds. A later drain starts
+/// later, so its epoch is larger: the node takes epochs only forward. The
+/// drain starts waiting for one of the cluster's evacuation slots
+/// (`waiting`), which the controller's v2 loop admits it to before it seals
+/// the node; until then the drain gate leaves the node's sandboxes open. A
+/// drain started over the cancel of an admitted one that hasn't finished
+/// starts admitted instead, in the slot that cancel holds: the node may
+/// still be sealed under the cancelled epoch, finishing its suspends, and
+/// this drain's first call takes over the seal and what it evacuated.
+pub(super) async fn start_v2_drain(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: NodeId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_engine = 'v2',
+                drain_status = jsonb_build_object(
+                    'epoch', (EXTRACT(EPOCH FROM drain_started_at) * 1000000)::BIGINT,
+                    'waiting', NOT COALESCE(
+                        drain_engine = 'v2'
+                            AND (drain_status->>'cancel')::BOOLEAN
+                            AND NOT COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE),
+                        FALSE
+                    )
+                )
+          WHERE id = $1 AND drain_phase = 'draining' AND drain_started_at IS NOT NULL"
+    ))
+    .bind(node_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Mark an undrained v2 node's epoch for cancel. The controller cancels it on
+/// the node, then clears the drain columns.
+pub(super) async fn mark_v2_drain_cancel(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: NodeId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_status = drain_status || jsonb_build_object('cancel', TRUE)
+          WHERE id = $1 AND drain_engine = 'v2' AND drain_status IS NOT NULL"
+    ))
+    .bind(node_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}

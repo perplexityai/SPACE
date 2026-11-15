@@ -203,12 +203,15 @@ impl K8sStore {
             .await?;
 
         // Clearing the pod UID stamps `pod_materialized_at` first if the row
-        // held one, so the record that a pod ran outlives the UID.
+        // held one, so the record that a pod ran outlives the UID. The node's
+        // instance goes with the UID: the new pod can land on a replacement
+        // Node under the same name, and its placement records that instance.
         let claimed = sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions
              SET state = CASE WHEN state = 'recovering' THEN state ELSE 'creating' END,
                  pod_uid = NULL,
                  pod_ip = NULL,
+                 node_instance_id = NULL,
                  pod_materialized_at = COALESCE(
                      pod_materialized_at,
                      CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
@@ -274,6 +277,7 @@ impl K8sStore {
         Ok(Some(resulting_state))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::controllers::substrate::kubernetes) async fn persist_pod_node_placement(
         &self,
         sandbox_id: SandboxId,
@@ -282,6 +286,7 @@ impl K8sStore {
         node_id: NodeId,
         role: NodeRole,
         address: Option<&str>,
+        instance_id: Option<&str>,
     ) -> Result<(), SubstrateError> {
         let mut tx = self
             .pool
@@ -298,6 +303,7 @@ impl K8sStore {
                 role,
                 address,
                 state: NodeStateWrite::InsertOnly(NodeLifecycleState::Registered),
+                instance_id,
             },
         )
         .await?;
@@ -306,7 +312,7 @@ impl K8sStore {
             Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await?;
         if sandbox_exists {
             let active_execution = self
-                .update_active_execution_node_name(&mut tx, sandbox_id, node_name)
+                .update_active_execution_node_name(&mut tx, sandbox_id, node_name, instance_id)
                 .await?;
 
             if active_execution {
@@ -356,9 +362,18 @@ impl K8sStore {
             node_id,
             role,
             address,
+            instance_id,
         } = placement;
         let result = self
-            .persist_pod_node_placement(sandbox_id, node_name, node_uid, node_id, role, address)
+            .persist_pod_node_placement(
+                sandbox_id,
+                node_name,
+                node_uid,
+                node_id,
+                role,
+                address,
+                instance_id,
+            )
             .await;
         match retry {
             PlacementRetryDisposition::RetryDuplicatesExecution => {

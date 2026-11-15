@@ -124,6 +124,11 @@ _DURATION_SECONDS = {
         "native.network_policy_live_update": 7,
         "native.resident_pause": 5,
         "native.stopped_restart_preserves_rootfs": 68,
+        # Not in the measured runs; estimates: a sealed worker's suspends,
+        # uploads and restores, and the drained edge or the undrain.
+        "native.v2_drain_evacuates_every_resident": 90,
+        "native.v2_drain_meets_user_calls": 90,
+        "native.v2_undrain_unseals_the_worker": 60,
         "native_concurrency.command_idempotency": 4,
         "native_concurrency.create_idempotency": 4,
         "native_concurrency.independent_commands": 4,

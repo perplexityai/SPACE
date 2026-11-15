@@ -9,7 +9,9 @@ publish.workspace = true
 
 [package.metadata.space.state]
 sqlite.sandbox-manager = [
+  "activation_seal",
   "auto_lifecycle_delete_outbox",
+  "drain_evacuations",
   "guest_update_operations",
   "guest_update_policy",
   "jobs",

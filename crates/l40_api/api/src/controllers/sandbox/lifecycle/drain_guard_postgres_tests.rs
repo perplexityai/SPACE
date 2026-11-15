@@ -407,6 +407,7 @@ async fn gentle_drain_does_not_block_access_or_placement_while_draining() -> Tes
         Some(NodeDrainState {
             phase: NodeDrainPhase::Draining,
             mode: NodeDrainMode::Gentle,
+            awaiting_evacuation: false,
         }),
         "the gate must read the mode off the node row, not assume forced"
     );
@@ -839,5 +840,250 @@ async fn missing_sandbox_has_no_drain_state() -> TestResult {
     assert_eq!(state, None);
     // No row, so no primary; the executions fallback still runs, as before.
     assert_eq!(statements.len(), 2, "{statements:#?}");
+    Ok(())
+}
+
+/// A stopped sandbox a drain released, unplaced with its disk pinned and
+/// stored, starts though the node it last ran on is drained: its start
+/// places it afresh. Without a stored disk it is still held there.
+#[tokio::test(flavor = "current_thread")]
+async fn a_released_stopped_sandbox_starts_off_its_drained_node() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_node(&db.pool, node_id, Some("drained")).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, 'worker-released')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    insert_sandbox(&db.pool, sandbox_id, "stopped", None, None).await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace,
+             k8s_node_name, state, active
+         )
+         VALUES ($1, 1, 'pod-before-the-drain', 'space', 'worker-released', 'terminated', false)"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let artifact = uuid::Uuid::now_v7();
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2, current_local_artifact_kind = 'disk',
+                current_local_artifact_origin = 'stop'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(artifact)
+    .execute(&db.pool)
+    .await?;
+    let snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, timestamp, local_artifact_id, artifact_kind,
+             artifact_origin
+         )
+         VALUES ($1, $2, 'disk', 'creating', NOW(), $3, 'disk', 'stop')"
+    ))
+    .bind(snapshot_id)
+    .bind(sandbox_id)
+    .bind(artifact)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+         VALUES ($1, $2)"
+    ))
+    .bind(snapshot_id)
+    .bind(format!("s3://test-bucket/{snapshot_id}"))
+    .execute(&db.pool)
+    .await?;
+
+    let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, SandboxAction::Start)
+        .await
+        .expect_err("a disk not yet stored keeps the drained node's hold");
+    assert_eq!(err.into_response().status(), StatusCode::CONFLICT);
+
+    sqlx::query(sql!("UPDATE snapshots SET state = 'ready' WHERE id = $1"))
+        .bind(snapshot_id)
+        .execute(&db.pool)
+        .await?;
+    ensure_resolved_node_not_draining(&db.pool, sandbox_id, SandboxAction::Start).await?;
+    Ok(())
+}
+
+/// Make `node_id`'s forced drain a v2 one with `status` as its
+/// `drain_status`.
+async fn set_v2_status(pool: &PgPool, node_id: NodeId, status: serde_json::Value) -> TestResult {
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_engine = 'v2', drain_status = $2 WHERE id = $1"
+    ))
+    .bind(node_id)
+    .bind(status)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A forced v2 drain still waiting for an evacuation slot blocks no wake or
+/// access on its node, whether the gate resolves the node through the
+/// sandbox's placement or its latest execution; it blocks once the
+/// controller admits it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_v2_drain_waiting_for_a_slot_blocks_nothing_until_admitted() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    let placed = SandboxId::new();
+    let by_execution = SandboxId::new();
+    let k8s_node_name = format!("waiting-node-{}", placed.as_uuid().simple());
+    insert_node(&db.pool, node_id, Some("draining")).await?;
+    set_v2_status(
+        &db.pool,
+        node_id,
+        serde_json::json!({"epoch": 1, "waiting": true}),
+    )
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
+    ))
+    .bind(node_id)
+    .bind(&k8s_node_name)
+    .execute(&db.pool)
+    .await?;
+    insert_sandbox(&db.pool, placed, "started", Some(node_id), Some(node_id)).await?;
+    insert_sandbox(&db.pool, by_execution, "suspended", None, None).await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace,
+             k8s_node_name, state, active
+         )
+         VALUES ($1, 1, 'pod-A', 'space', $2, 'terminated', false)"
+    ))
+    .bind(by_execution)
+    .bind(&k8s_node_name)
+    .execute(&db.pool)
+    .await?;
+
+    for (sandbox_id, action) in [
+        (placed, SandboxAction::Wake),
+        (placed, SandboxAction::Stats),
+        (by_execution, SandboxAction::Restore),
+    ] {
+        ensure_resolved_node_not_draining(&db.pool, sandbox_id, action).await?;
+    }
+
+    set_v2_status(
+        &db.pool,
+        node_id,
+        serde_json::json!({"epoch": 1, "waiting": false}),
+    )
+    .await?;
+    for (sandbox_id, action) in [
+        (placed, SandboxAction::Wake),
+        (placed, SandboxAction::Stats),
+        (by_execution, SandboxAction::Restore),
+    ] {
+        let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, action)
+            .await
+            .expect_err("an admitted v2 drain blocks");
+        assert_eq!(
+            err.clone().into_response().status(),
+            StatusCode::CONFLICT,
+            "{action:?}"
+        );
+    }
+    Ok(())
+}
+
+/// While the node's v2 drain reports a sandbox pending, or evacuated but not
+/// yet recorded, a wake, start or restore the gate refuses gets 503 with a
+/// `Retry-After`; another action, a sandbox the report doesn't list, and a
+/// v1 drain's sandbox still get the 409.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wake_the_v2_drain_still_makes_durable_is_told_to_retry() -> TestResult {
+    let db = pg_test_db().await?;
+    let v2 = NodeId::new();
+    let v1 = NodeId::new();
+    let pending = SandboxId::new();
+    let unrecorded = SandboxId::new();
+    let unlisted = SandboxId::new();
+    let on_v1 = SandboxId::new();
+    insert_node(&db.pool, v2, Some("draining")).await?;
+    insert_node(&db.pool, v1, Some("draining")).await?;
+    for (sandbox_id, node_id) in [(pending, v2), (unrecorded, v2), (unlisted, v2), (on_v1, v1)] {
+        insert_sandbox(
+            &db.pool,
+            sandbox_id,
+            "started",
+            Some(node_id),
+            Some(node_id),
+        )
+        .await?;
+    }
+    let report = serde_json::json!({
+        "epoch": 1,
+        "waiting": false,
+        "report": {
+            "sealed_epoch": 1,
+            "done": false,
+            "pending": [{"sandbox_id": pending.to_string(), "action": "queued"}],
+            "unrecorded": [{"sandbox_id": unrecorded.to_string(), "reason": "not yet"}],
+            "evacuated": [],
+            "blocked": [],
+        },
+    });
+    set_v2_status(&db.pool, v2, report.clone()).await?;
+    // A v1 drain's status never carries this report; one that did must not
+    // turn its 409 into a retry.
+    sqlx::query(sql!("UPDATE nodes SET drain_status = $2 WHERE id = $1"))
+        .bind(v1)
+        .bind(serde_json::json!({
+            "report": {"pending": [{"sandbox_id": on_v1.to_string(), "action": "queued"}]},
+        }))
+        .execute(&db.pool)
+        .await?;
+
+    for sandbox_id in [pending, unrecorded] {
+        for action in [
+            SandboxAction::Wake,
+            SandboxAction::Start,
+            SandboxAction::Restore,
+            SandboxAction::ImplicitWake(ExecutionActivityKind::Command),
+        ] {
+            let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, action)
+                .await
+                .expect_err("the drain still blocks it");
+            let response = err.clone().into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{action:?}"
+            );
+            assert!(
+                response
+                    .headers()
+                    .contains_key(axum::http::header::RETRY_AFTER),
+                "{action:?}"
+            );
+        }
+    }
+    for (sandbox_id, action) in [
+        (pending, SandboxAction::Resume),
+        (pending, SandboxAction::Stats),
+        (unlisted, SandboxAction::Wake),
+        (on_v1, SandboxAction::Wake),
+    ] {
+        let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, action)
+            .await
+            .expect_err("the drain still blocks it");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::CONFLICT,
+            "{sandbox_id} {action:?}"
+        );
+    }
     Ok(())
 }

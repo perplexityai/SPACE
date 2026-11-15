@@ -22,6 +22,7 @@ from space_smoke.adapters import (
     validate_loopback_environment,
 )
 from space_smoke.capabilities import (
+    DrainV2Control,
     ColdEvictionControl,
     CommandSandbox,
     CommandSandboxFactory,
@@ -432,6 +433,7 @@ class SmokeServices:
             fixture._retained_only_copy_control = cast(Any, kind)
             fixture._orphaned_restore_pod_gc_control = cast(Any, kind)
             fixture._reconcile_queue_gc_control = cast(Any, kind)
+            fixture._dead_node_control = cast(Any, kind)
             fixture._unanswered_template_control = cast(Any, kind)
             fixture._template_build_control = cast(Any, kind)
             fixture._template_builder = cast(Any, self.ecw)
@@ -512,6 +514,24 @@ class SmokeServices:
         context.record("sandbox_id", sandbox_ids[0])
         context.record("sandbox_ids", sandbox_ids)
         collection = _NativeScenarioSandboxes(native, tuple(sandboxes))
+
+        def create_owned_sandbox(*, idle_timeout: str | None = None) -> DurableLifecycleSandbox:
+            # Native create deletes a sandbox whose create failed; the delete
+            # of one that started is armed before it is handed out.
+            created = cast(
+                DurableLifecycleSandbox,
+                native.create(
+                    {**run_metadata, "space_smoke_instance": uuid.uuid4().hex},
+                    idle_timeout=idle_timeout,
+                ),
+            )
+            context.scope.defer(
+                f"delete Native sandbox {created.sandbox_id}",
+                partial(native.delete, created),
+                critical=True,
+            )
+            return created
+
         return CommandSandboxFixture(
             context,
             sandboxes[0],
@@ -528,6 +548,8 @@ class SmokeServices:
             _stopped_replacement_control=(
                 cast(StoppedReplacementControl, kind) if kind is not None else None
             ),
+            _drain_v2_control=(cast(DrainV2Control, kind) if kind is not None else None),
+            _create_sandbox=create_owned_sandbox,
             _processes=cast(ProcessSandbox, sandboxes[0]),
         )
 

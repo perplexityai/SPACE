@@ -193,6 +193,19 @@ impl SandboxManagerService {
         }
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
         let artifact_guard = artifact_lock.lock_for_capture().await;
+        // A caller's suspend (an ECW pause among them) takes the sandbox back
+        // from a node drain: the drain's record of the lifecycle to restore
+        // goes, under the wake lock its own suspend records it under, so the
+        // drain then reports a suspended sandbox with no prior and nothing
+        // restores it. The drain's own suspends don't come through here.
+        self.db_conn().and_then(|conn| {
+            crate::db::activation_seal::forget_drain_suspend(&conn, &sandbox.id).map_err(|error| {
+                Status::internal(format!(
+                    "forget the drain's record of {}: {error}",
+                    sandbox.id
+                ))
+            })
+        })?;
         // A blocking suspend commits the full artifact before replying. If the
         // caller loses the response or its control-plane marker write fails,
         // retrying must return that exact committed artifact instead of trying
@@ -247,8 +260,12 @@ impl SandboxManagerService {
             }
             result.map(|()| local_artifact_id)
         };
+        // Boxed so the test wrappers don't copy the work's state onto the
+        // stack.
         #[cfg(test)]
-        let work = super::pause_resume::inherit_guest_preparation(work);
+        let work = super::pause_resume::inherit_guest_preparation(
+            super::super::start_support::inherit_requested_vm_activations(Box::pin(work)),
+        );
         let publication =
             self.spawn_detached_state_writer("SuspendPublication", &task_sandbox_id, work)?;
         if !blocking {

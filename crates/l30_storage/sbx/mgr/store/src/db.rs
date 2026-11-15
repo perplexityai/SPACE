@@ -40,6 +40,7 @@ pub use handle::OptionalExtension;
 use handle::db_private_outside_tests;
 pub use handle::{Connection, ConnectionGuard, Error, Result, SharedConnection, Transaction};
 
+pub mod activation_seal;
 pub mod auto_lifecycle_delete_receipts;
 pub mod cleanup_jobs;
 pub mod cleanup_target_scan;
@@ -137,6 +138,7 @@ pub mod read {
     pub use suspend_attempt::*;
     mod guest_update;
     pub use guest_update::*;
+    mod activation_seal;
     mod cleanup_job;
     mod counts;
     mod eviction;
@@ -145,6 +147,7 @@ pub mod read {
     mod sandbox;
     mod sandbox_view;
     mod state_page;
+    pub use activation_seal::*;
     pub use cleanup_job::*;
     pub use counts::*;
     pub use eviction::*;
@@ -169,6 +172,7 @@ pub mod scan {
     mod eviction_candidates;
     mod list_page;
     mod local_artifacts;
+    mod local_only_artifacts;
     mod node_dirty_batch;
     mod pending_backups;
     mod pool_donor;
@@ -185,6 +189,7 @@ pub mod scan {
     pub use eviction_candidates::*;
     pub use list_page::*;
     pub use local_artifacts::*;
+    pub use local_only_artifacts::*;
     pub use node_dirty_batch::*;
     pub use pending_backups::*;
     pub use pool_donor::*;
@@ -553,6 +558,10 @@ fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
     )?;
     tx.execute(
         "DELETE FROM local_artifacts WHERE sandbox_id = ?1",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM drain_evacuations WHERE sandbox_id = ?1",
         params![id],
     )?;
     tx.execute(

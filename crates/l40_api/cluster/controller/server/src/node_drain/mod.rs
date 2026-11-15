@@ -211,6 +211,7 @@ pub mod kube_delete;
 pub mod noop;
 #[cfg(feature = "kubernetes")]
 pub mod store;
+pub mod v2;
 
 #[cfg(test)]
 mod tests;
@@ -758,6 +759,10 @@ pub struct ReconcilerConfig {
     /// API and the suspend/restore RPCs) can't exceed it regardless of how the
     /// work splits between suspending and restoring at any instant.
     pub max_per_cluster: usize,
+    /// How many v2 drains may evacuate their nodes at once
+    /// (`SPACE_DRAIN_V2_MAX_EVACUATING_NODES`, [`v2::DEFAULT_MAX_EVACUATING_NODES`]
+    /// by default); a later one waits, fenced but unsealed, for a slot.
+    pub v2_max_evacuating_nodes: usize,
     /// Per-attempt wake wait for the cohort restore
     /// (see [`DEFAULT_EVACUATE_TIMEOUT_SECS`]), clamped by the substrate's
     /// [`NODE_RPC_BLOCKING_BUDGET`] — see [`DEFAULT_EVACUATE_TIMEOUT_SECS`]
@@ -839,6 +844,9 @@ pub struct ReconcilerConfig {
     pub drain_evacuation_placement: Option<EvacuationPlacement>,
 }
 
+/// The ceiling of `SPACE_DRAIN_V2_MAX_EVACUATING_NODES`.
+const MAX_V2_EVACUATING_NODES: usize = 1024;
+
 impl Default for ReconcilerConfig {
     fn default() -> Self {
         Self {
@@ -850,6 +858,7 @@ impl Default for ReconcilerConfig {
             tick: DEFAULT_TICK,
             max_per_node: DEFAULT_MAX_PER_NODE,
             max_per_cluster: DEFAULT_MAX_PER_CLUSTER,
+            v2_max_evacuating_nodes: v2::DEFAULT_MAX_EVACUATING_NODES,
             evacuate_timeout: PositiveDuration::new_panic(Duration::from_secs(
                 DEFAULT_EVACUATE_TIMEOUT_SECS,
             )),
@@ -900,6 +909,11 @@ impl ReconcilerConfig {
             tick: default.tick,
             max_per_node: default.max_per_node,
             max_per_cluster: default.max_per_cluster,
+            v2_max_evacuating_nodes: config.bounded_usize(
+                "SPACE_DRAIN_V2_MAX_EVACUATING_NODES",
+                default.v2_max_evacuating_nodes,
+                MAX_V2_EVACUATING_NODES,
+            ),
             evacuate_timeout: default.evacuate_timeout,
             stale_abandon: default.stale_abandon,
             reupload_giveup_settle: default.reupload_giveup_settle,
@@ -918,10 +932,7 @@ impl ReconcilerConfig {
                 }),
             restore_backoff_base: default.restore_backoff_base,
             restore_backoff_cap: default.restore_backoff_cap,
-            drain_evacuation_placement: env_evacuation_placement(
-                env,
-                "SPACE_CLUSTER_CONTROLLER_DRAIN_EVACUATION_COHORT_VALUE",
-            ),
+            drain_evacuation_placement: drain_evacuation_placement(env),
         }
     }
 
@@ -938,6 +949,18 @@ impl ReconcilerConfig {
             && self.termination_blocking_gate
             && self.replace_stopped_evacuations
     }
+}
+
+/// The cohort evacuated sandboxes are restored into, when a node-group
+/// rollout names one: the drain's own restore sweep and the drain restore
+/// operation place by the same setting.
+pub(crate) fn drain_evacuation_placement(
+    env: &dyn pplx_space_env_vars::Environment,
+) -> Option<EvacuationPlacement> {
+    env_evacuation_placement(
+        env,
+        "SPACE_CLUSTER_CONTROLLER_DRAIN_EVACUATION_COHORT_VALUE",
+    )
 }
 
 /// Parse a target-cohort placement from a `(cohort_key, cohort_value)` pair

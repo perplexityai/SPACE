@@ -196,6 +196,59 @@ service SandboxManager {
   // cannot distinguish a short answer from a complete one.
   rpc ListPendingLocalBackups(ListPendingLocalBackupsRequest) returns (ListPendingLocalBackupsResponse);
 
+  // ── Node drain (node-local) ───────────────────────────────────────────────
+  //
+  // Drain this node under `epoch`. Each call first seals the node's VM
+  // activations under `epoch`: a sealed node refuses every new VM activation
+  // (the cold boot of a sandbox, the restore of one from a snapshot, and the
+  // resume of a paused VM held in memory) and keeps teardown and durability
+  // work running. The seal refuses at this node only; it does not stop
+  // placement. On the Kubernetes substrate a create or a restore starts its VM
+  // inside the pod's sandbox creation, so the refusal goes to the kubelet,
+  // which retries the pod. Stop placement on the node before draining it. The
+  // seal is persisted before the call answers and survives a restart of
+  // sandbox-manager.
+  //
+  // The call then walks every row: a started or paused VM is suspended with a
+  // full snapshot and uploaded, a stopped sandbox's disk is published, and the
+  // upload of every artifact without a durable copy, named snapshots
+  // included, is finished. That work runs after the call answers; a later call
+  // reports it. Idempotent: a call repeats nothing in progress or done. Work
+  // that keeps failing, and a row that sits in a transition the drain doesn't
+  // drive, are reported blocked after a bound. The call reads node-manager's
+  // orphan inventory within a deadline well under a minute, and reports it
+  // blocked when it runs out.
+  //
+  // Epochs only move forward: an epoch below the current one is refused with
+  // `FailedPrecondition`, and so is the epoch of a cancelled drain. With
+  // `cancel`, the call cancels `epoch` instead: it clears the seal if it is
+  // under `epoch` or an earlier one, and remembers `epoch`, so no seal at or
+  // below it is taken again, even by a call that arrives after the cancel. A
+  // cancel below the current seal's epoch is refused with
+  // `FailedPrecondition`. A cancel starts no suspend and stops none already
+  // running; it hands back what the drain suspended: each cancel call reports
+  // every sandbox the drain suspended that it still holds, `evacuated` once
+  // its snapshot is durable (its upload driven as the drain drives it),
+  // `pending` until then, or `blocked` with why when it can't get there: a
+  // failed cleanup, no durable snapshot, work that keeps failing, or a
+  // transition past the drain's bound. Once it is evacuated, the control
+  // plane can restore it to the lifecycle it had. The drain's record of a
+  // sandbox is kept until a cancel call names it in `forget`, or the sandbox
+  // leaves the node; a record whose sandbox is running again, stopped or
+  // failed is forgotten, with nothing to hand back. A cancel answers `done`
+  // once nothing is left to hand back.
+  //
+  // `done` means the node may be terminated: sealed under `epoch` from before
+  // this call's walk to its end, no activation in flight at the walk's first
+  // read, no VM, nothing pending or blocked, and every scan that can reveal a
+  // resident or an artifact (sandbox-manager's rows and artifact registry,
+  // node-manager's untracked processes, cache and run directories)
+  // succeeded. A sandbox the drain suspended is reported evacuated once its
+  // snapshot is durable, with the lifecycle it had; a stopped one once its
+  // disk is. A `failed` row is not reported, and blocks nothing once its
+  // artifacts are durable.
+  rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
+
   // Get the resolved effective network policy for a sandbox.
   rpc GetNetworkPolicy(GetNetworkPolicyRequest) returns (GetNetworkPolicyResponse);
 
@@ -2078,6 +2131,62 @@ message ListPendingLocalBackupsRequest {}
 
 message ListPendingLocalBackupsResponse {
   repeated PendingLocalBackup pending = 1;
+}
+
+message DrainNodeRequest {
+  // Nonzero, at most 2^63 - 1. Only moves forward (see `DrainNode`).
+  uint64 epoch = 1;
+  // Cancel `epoch` instead of draining.
+  bool cancel = 2;
+  // With `cancel`: the sandboxes whose evacuation the control plane has
+  // recorded since a cancel call reported it; the node forgets the drain's
+  // record of each before it reports.
+  repeated string forget = 3;
+}
+
+// The lifecycle a drained resident had, which the control plane restores it
+// to.
+enum DrainPrior {
+  DRAIN_PRIOR_UNSPECIFIED = 0;
+  DRAIN_PRIOR_STARTED = 1;
+  DRAIN_PRIOR_PAUSED = 2;
+  DRAIN_PRIOR_STOPPED = 3;
+}
+
+// A resident the drain made durable elsewhere.
+message DrainEvacuated {
+  string sandbox_id = 1;
+  DrainPrior prior = 2;
+  // The local artifact id of the durable full snapshot (started, paused) or
+  // disk (stopped) that holds it.
+  string artifact_id = 3;
+}
+
+// Work the drain is still doing or waiting for.
+message DrainPending {
+  string sandbox_id = 1;
+  // What it waits for: `suspend`, `publish_disk`, `upload`, `activation` for
+  // an activation admitted before the seal that is still in flight, or
+  // `settle:<state>` for a row in a transition the drain does not drive.
+  string action = 2;
+}
+
+// Something the drain cannot make durable, or could not inspect. Blocks
+// `done` until it is gone.
+message DrainBlocked {
+  // Unset for a node-level cause, such as a scan that failed.
+  optional string sandbox_id = 1;
+  string reason = 2;
+}
+
+message DrainNodeResponse {
+  // The epoch the node is sealed under after this call; unset once
+  // cancelled.
+  optional uint64 sealed_epoch = 1;
+  repeated DrainEvacuated evacuated = 2;
+  repeated DrainPending pending = 3;
+  repeated DrainBlocked blocked = 4;
+  bool done = 5;
 }
 
 // Node-local facts about the current legacy quarantine-recovery episode.
