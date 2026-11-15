@@ -17,6 +17,27 @@ export interface Ctx {
   shared: Record<string, string>;
 }
 
+// Every IPv4 address outside 127.0.0.0/8 in `text` as 127.0.0.<its last
+// octet>, so distinct hosts stay distinct.
+export function loopbackAddresses(text: string): string {
+  return text.replace(/\b(\d{1,3})\.\d{1,3}\.\d{1,3}\.(\d{1,3})\b/g, (address, first, last) => (first === '127' ? address : `127.0.0.${last}`));
+}
+
+// With --loopback-hosts: the JSON responses to the page's /admin/ and /api/
+// requests reach it with their IPv4 literals rewritten by `loopbackAddresses`
+// (a Kind node's address among them). Nothing else is: a hostname, an IPv6
+// address, any other response or an event stream reaches the screenshots and
+// videos as it is. A redirect is handed to the page unfollowed, as the
+// console would get it.
+export async function showLoopbackHostsOnly(context: BrowserContext): Promise<void> {
+  await context.route((url) => /^\/(admin|api)\//.test(url.pathname), async (route) => {
+    if ((route.request().headers().accept ?? '').includes('text/event-stream')) return route.fallback();
+    const response = await route.fetch({ maxRedirects: 0 });
+    if (!(response.headers()['content-type'] ?? '').includes('json')) return route.fulfill({ response });
+    return route.fulfill({ response, body: loopbackAddresses(await response.text()) });
+  });
+}
+
 export async function newContext(
   browser: Browser,
   { viewport = { width: 1440, height: 900 }, videoDir }: { viewport?: { width: number; height: number }; videoDir?: string } = {},

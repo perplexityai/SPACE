@@ -40,7 +40,9 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 
 use super::tests::enter_direct_test_process;
-use super::{DrainAction, V2DrainProbe, V2DrainReport, apply_drain_action};
+use super::{
+    DrainAction, DrainPreviewError, V2DrainPreview, V2DrainProbe, V2DrainReport, apply_drain_action,
+};
 use crate::controllers::sandbox::SandboxController;
 use crate::controllers::substrate::Substrate;
 use crate::controllers::substrate::kubernetes::tests::substrate_with_store_and_client;
@@ -88,6 +90,16 @@ impl V2DrainProbe for ScriptedProbe {
         Box<dyn std::future::Future<Output = Result<V2DrainReport, String>> + Send + 'a>,
     > {
         Box::pin(std::future::ready(self.0.clone()))
+    }
+
+    fn preview<'a>(
+        &'a self,
+        _state: &'a AppState,
+        _target: &'a crate::controllers::substrate::OwnedNodeApiTarget,
+    ) -> V2DrainPreview<'a> {
+        Box::pin(std::future::ready(Err(DrainPreviewError::Unreachable(
+            "no preview is scripted".into(),
+        ))))
     }
 }
 
@@ -1269,6 +1281,16 @@ impl V2DrainProbe for LockCheckingProbe {
                 done: true,
             })
         })
+    }
+
+    fn preview<'a>(
+        &'a self,
+        _state: &'a AppState,
+        _target: &'a crate::controllers::substrate::OwnedNodeApiTarget,
+    ) -> V2DrainPreview<'a> {
+        Box::pin(std::future::ready(Err(DrainPreviewError::Unreachable(
+            "no preview is scripted".into(),
+        ))))
     }
 }
 

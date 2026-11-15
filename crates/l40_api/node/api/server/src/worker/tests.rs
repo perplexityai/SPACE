@@ -180,6 +180,43 @@ async fn unimplemented_sandbox_manager() -> crate::clients::BackendClients {
     crate::clients::BackendClients::with_channel(channel)
 }
 
+/// A sandbox-manager that keeps the message of each request it is sent and
+/// answers every one with Unimplemented.
+async fn recording_sandbox_manager() -> (
+    crate::clients::BackendClients,
+    std::sync::Arc<std::sync::Mutex<Vec<bytes::Bytes>>>,
+) {
+    let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let backend = axum::Router::new().fallback({
+        let received = std::sync::Arc::clone(&received);
+        move |body: bytes::Bytes| async move {
+            // A gRPC frame: a compression flag and a 4-byte length, then
+            // the message.
+            received.lock().unwrap().push(body.slice(5..));
+            http::Response::builder()
+                .header("content-type", "application/grpc")
+                .header(
+                    "grpc-status",
+                    (tonic::Code::Unimplemented as i32).to_string(),
+                )
+                .body(axum::body::Body::empty())
+                .unwrap()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    (
+        crate::clients::BackendClients::with_channel(channel),
+        received,
+    )
+}
+
 async fn service_with_limiter(limiter: UdsPerSandboxLimiter) -> WorkerApiService {
     WorkerApiService {
         clients: unimplemented_sandbox_manager().await,
@@ -322,6 +359,7 @@ async fn the_internal_drain_is_forwarded_only_for_the_control_plane() {
             epoch: 7,
             cancel: false,
             forget: Vec::new(),
+            preview: false,
         })
     };
 
@@ -338,6 +376,35 @@ async fn the_internal_drain_is_forwarded_only_for_the_control_plane() {
         .await
         .unwrap_err();
     assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
+}
+
+/// A drain preview reaches sandbox-manager as the control plane sent it,
+/// `preview` and its zero epoch included.
+#[tokio::test]
+async fn the_internal_drain_relays_a_preview_intact() {
+    use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
+    use prost::Message as _;
+    let (clients, received) = recording_sandbox_manager().await;
+    let service = WorkerApiService {
+        clients,
+        ..service_with_limiter(UdsPerSandboxLimiter::for_tests_with_reserved(1, 1, 8)).await
+    };
+    let preview = proto::DrainNodeRequest {
+        epoch: 0,
+        cancel: false,
+        forget: Vec::new(),
+        preview: true,
+    };
+    let forwarded = WorkerApiInternal::drain_node(&service, Request::new(preview.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
+    let received = received.lock().unwrap().clone();
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        proto::DrainNodeRequest::decode(received[0].clone()).unwrap(),
+        preview
+    );
 }
 
 /// The outcome of a runtime upgrade a pod's shim ran is the control plane's

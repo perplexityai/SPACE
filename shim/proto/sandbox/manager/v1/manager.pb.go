@@ -13807,7 +13807,10 @@ type DrainNodeRequest struct {
 	// With `cancel`: the sandboxes whose evacuation the control plane has
 	// recorded since a cancel call reported it; the node forgets the drain's
 	// record of each before it reports.
-	Forget        []string `protobuf:"bytes,3,rep,name=forget,proto3" json:"forget,omitempty"`
+	Forget []string `protobuf:"bytes,3,rep,name=forget,proto3" json:"forget,omitempty"`
+	// Report what a v2 drain would find on this node now, changing nothing;
+	// `epoch` must be zero (see `DrainNode`).
+	Preview       bool `protobuf:"varint,4,opt,name=preview,proto3" json:"preview,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -13861,6 +13864,13 @@ func (x *DrainNodeRequest) GetForget() []string {
 		return x.Forget
 	}
 	return nil
+}
+
+func (x *DrainNodeRequest) GetPreview() bool {
+	if x != nil {
+		return x.Preview
+	}
+	return false
 }
 
 // A resident the drain made durable elsewhere.
@@ -13930,8 +13940,11 @@ func (x *DrainEvacuated) GetArtifactId() string {
 type DrainPending struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	SandboxId string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
-	// What it waits for: `suspend`, `publish_disk`, `upload`, `activation` for
-	// an activation admitted before the seal that is still in flight, or
+	// What it waits for: `suspend`, `publish_disk` or `upload` for the drain's
+	// own work, `queued` for a slot in the drain's window, `disk` for cache
+	// disk to hold a suspend's snapshot, `activation` for an activation
+	// admitted before the seal that is still in flight, `warm_pool_eviction`
+	// for a warm-pool VM the pool reconciler hasn't evicted yet, or
 	// `settle:<state>` for a row in a transition the drain does not drive.
 	Action        string `protobuf:"bytes,2,opt,name=action,proto3" json:"action,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -14040,12 +14053,16 @@ func (x *DrainBlocked) GetReason() string {
 type DrainNodeResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The epoch the node is sealed under after this call; unset once
-	// cancelled.
-	SealedEpoch   *uint64           `protobuf:"varint,1,opt,name=sealed_epoch,json=sealedEpoch,proto3,oneof" json:"sealed_epoch,omitempty"`
-	Evacuated     []*DrainEvacuated `protobuf:"bytes,2,rep,name=evacuated,proto3" json:"evacuated,omitempty"`
-	Pending       []*DrainPending   `protobuf:"bytes,3,rep,name=pending,proto3" json:"pending,omitempty"`
-	Blocked       []*DrainBlocked   `protobuf:"bytes,4,rep,name=blocked,proto3" json:"blocked,omitempty"`
-	Done          bool              `protobuf:"varint,5,opt,name=done,proto3" json:"done,omitempty"`
+	// cancelled. For a preview, the seal as it stands, which a preview leaves
+	// alone: unset when no drain holds the node.
+	SealedEpoch *uint64           `protobuf:"varint,1,opt,name=sealed_epoch,json=sealedEpoch,proto3,oneof" json:"sealed_epoch,omitempty"`
+	Evacuated   []*DrainEvacuated `protobuf:"bytes,2,rep,name=evacuated,proto3" json:"evacuated,omitempty"`
+	Pending     []*DrainPending   `protobuf:"bytes,3,rep,name=pending,proto3" json:"pending,omitempty"`
+	Blocked     []*DrainBlocked   `protobuf:"bytes,4,rep,name=blocked,proto3" json:"blocked,omitempty"`
+	// The node may be terminated (see `DrainNode`). For a preview, nothing is
+	// pending or blocked, so a drain would finish at once; it says nothing of
+	// a seal, which a preview never takes.
+	Done          bool `protobuf:"varint,5,opt,name=done,proto3" json:"done,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -15643,11 +15660,12 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\rartifact_kind\x18\x03 \x01(\x0e2&.space.sandbox.manager.v1.ArtifactKindR\fartifactKind\" \n" +
 	"\x1eListPendingLocalBackupsRequest\"i\n" +
 	"\x1fListPendingLocalBackupsResponse\x12F\n" +
-	"\apending\x18\x01 \x03(\v2,.space.sandbox.manager.v1.PendingLocalBackupR\apending\"X\n" +
+	"\apending\x18\x01 \x03(\v2,.space.sandbox.manager.v1.PendingLocalBackupR\apending\"r\n" +
 	"\x10DrainNodeRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x16\n" +
 	"\x06cancel\x18\x02 \x01(\bR\x06cancel\x12\x16\n" +
-	"\x06forget\x18\x03 \x03(\tR\x06forget\"\x8c\x01\n" +
+	"\x06forget\x18\x03 \x03(\tR\x06forget\x12\x18\n" +
+	"\apreview\x18\x04 \x01(\bR\apreview\"\x8c\x01\n" +
 	"\x0eDrainEvacuated\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12:\n" +

@@ -1317,7 +1317,9 @@ impl WorkerApiInternal for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::DrainNodeRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::DrainNodeResponse>, Status> {
-        // Seals the node and evacuates it: only the control plane drains.
+        // Seals the node and evacuates it: only the control plane drains. A
+        // preview changes nothing, but answers what a drain would find, and
+        // is relayed as it came under the same authority.
         require_policy_mutation_authority(&r)?;
         // Node-wide, so it takes no sandbox's permit; it changes the node's
         // seal, so it is replayed only with proof it never reached

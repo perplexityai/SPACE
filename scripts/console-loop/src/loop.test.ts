@@ -7,13 +7,17 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import { ApiError, type Api } from './api.ts';
-import { SECRET_PLACEHOLDER, carriesSecret, withoutSecret } from './browser.ts';
+import { SECRET_PLACEHOLDER, carriesSecret, loopbackAddresses, withoutSecret } from './browser.ts';
 import { loadConfig } from './config.ts';
 import { isSelected, parseSelection } from './loop.ts';
 import { normalizer, redact } from './recorder.ts';
 import {
   clean, cleanSandbox, isSeededOrg, readSeedState, seedStatePath, upsertCreated, writeSeedState, type CreatedObject, type SeedState,
 } from './seed.ts';
+import {
+  CONSOLE_PREVIEW_CONCURRENCY, CONSOLE_PREVIEW_TIMEOUT_MS, PREVIEW_WAIT_MARGIN_MS, everyPage, previewAllWaitMs, previewResultsMismatches,
+  previewVerdictIn, previewWaitMs, resultVerdictIn, type ResultVerdict,
+} from './nodes.ts';
 import { sameStack } from './stack.ts';
 
 const STEPS = [
@@ -38,6 +42,107 @@ test('--only and --skip refuse what is not a step name or tag', () => {
   assert.throws(() => parseSelection('sandbox', STEPS, 'only'), /no step or tag is named sandbox$/);
   assert.throws(() => parseSelection('.*', STEPS, 'skip'), /--skip: no step or tag/);
   assert.throws(() => parseSelection(',', STEPS, 'only'), /names no step or tag/);
+});
+
+test('previewVerdictIn reads the one verdict a preview names', () => {
+  assert.equal(previewVerdictIn('would finish'), 'finish');
+  assert.equal(previewVerdictIn('A drain would finish at once'), 'finish');
+  assert.equal(previewVerdictIn("would wait A drain would wait on 2 items that can turn into blockers"), 'wait');
+  assert.equal(previewVerdictIn('would block A drain would block: 1 blocker'), 'block');
+  assert.equal(previewVerdictIn('worker-a would wait 0 none'), 'wait');
+  assert.equal(previewVerdictIn('worker-a error unreachable'), null);
+  assert.equal(previewVerdictIn('would finish would block'), null, 'two verdicts are none');
+  assert.equal(previewVerdictIn('would waiting'), null);
+});
+
+test("the preview steps' budget is the console's", async () => {
+  // Loaded at run time: `ui/` is not a module package, so the typecheck
+  // can't follow a static import of it.
+  const consoleModule = '../../../ui/src/lib/drain-preview.ts';
+  const ui = await import(consoleModule);
+  assert.equal(CONSOLE_PREVIEW_TIMEOUT_MS, ui.DRAIN_PREVIEW_TIMEOUT_MS);
+  assert.equal(CONSOLE_PREVIEW_CONCURRENCY, ui.PREVIEW_ALL_CONCURRENCY);
+});
+
+test("the preview steps outwait the console's own wait for each round of previews", () => {
+  assert.equal(previewWaitMs(), CONSOLE_PREVIEW_TIMEOUT_MS + PREVIEW_WAIT_MARGIN_MS);
+  assert.ok(PREVIEW_WAIT_MARGIN_MS > 0);
+  const rounds: [number, number][] = [
+    [0, 0], [1, 1], [CONSOLE_PREVIEW_CONCURRENCY, 1], [CONSOLE_PREVIEW_CONCURRENCY + 1, 2], [3 * CONSOLE_PREVIEW_CONCURRENCY, 3],
+  ];
+  for (const [workers, n] of rounds) {
+    assert.equal(previewAllWaitMs(workers), n * CONSOLE_PREVIEW_TIMEOUT_MS + PREVIEW_WAIT_MARGIN_MS, `${workers} workers`);
+  }
+});
+
+// `rows` as a results table pages them, `pageSize` to a page: `read` gives
+// the page shown, `next` turns to the following one.
+function pagedTable(rows: { nodeId: string | null; verdict: string }[], pageSize: number) {
+  let page = 0;
+  const pages = Math.max(1, Math.ceil(rows.length / pageSize));
+  return {
+    read: async () => rows.slice(page * pageSize, (page + 1) * pageSize),
+    next: async () => (page + 1 < pages ? (page += 1, true) : false),
+  };
+}
+
+const VERDICT_CELL: Record<ResultVerdict, string> = {
+  finish: 'would finish', wait: 'would wait', block: 'would block', error: 'error unreachable',
+};
+const workerIds = (n: number) => Array.from({ length: n }, (_, i) => `node-${String(i).padStart(3, '0')}`);
+const verdictFor = (i: number): ResultVerdict => (['finish', 'wait', 'block', 'error'] as const)[i % 4];
+
+test("the bulk preview check reads every page of the results, past the console's 50 a page", async () => {
+  const ids = workerIds(120);
+  const shown = ids.map((nodeId, i) => ({ nodeId, verdict: VERDICT_CELL[verdictFor(i)] }));
+  const table = pagedTable(shown, 50);
+  const { rows, pages, complete } = await everyPage(table.read, table.next, ids.length + 1);
+  assert.equal(pages, 3);
+  assert.ok(complete);
+  assert.deepEqual(rows, shown);
+  const expected = new Map(ids.map((id, i) => [id, verdictFor(i)] as const));
+  assert.deepEqual(previewResultsMismatches(expected, rows), []);
+  // The first page alone, which is all a single read sees, misses 70 workers.
+  const firstPage = previewResultsMismatches(expected, shown.slice(0, 50));
+  assert.equal(firstPage.length, 70);
+  assert.ok(firstPage.includes('node-050 has no row on any page'), firstPage[0]);
+});
+
+test('everyPage stops at its bound and says the table is not complete', async () => {
+  let turned = 0;
+  const { pages, complete } = await everyPage(async () => [1], async () => (turned += 1, true), 4);
+  assert.equal(pages, 4);
+  assert.equal(complete, false);
+});
+
+test('a results row is checked against its own preview, and every worker has exactly one row', () => {
+  const expected = new Map<string, ResultVerdict | null>([
+    ['node-a', 'block'], ['node-b', 'finish'], ['node-c', 'error'], ['node-d', null],
+  ]);
+  assert.deepEqual(previewResultsMismatches(expected, [
+    { nodeId: 'node-a', verdict: 'would block' },
+    { nodeId: 'node-b', verdict: 'would finish' },
+    { nodeId: 'node-c', verdict: 'error unreachable' },
+  ]), ['node-d has no row on any page']);
+  assert.deepEqual(previewResultsMismatches(expected, [
+    { nodeId: 'node-a', verdict: 'would finish' },
+    { nodeId: 'node-b', verdict: 'would finish' },
+    { nodeId: 'node-b', verdict: 'would finish' },
+    { nodeId: 'node-c', verdict: 'would wait' },
+    { nodeId: 'node-d', verdict: 'would finish' },
+    { nodeId: 'node-e', verdict: 'would finish' },
+    { nodeId: null, verdict: 'would block' },
+  ]), [
+    'node-a shows finish, but its preview answered block',
+    'node-c shows wait, but its preview answered error',
+    'node-d has a row but the page asked no preview of it',
+    'node-e has a row but is not a listed worker',
+    'a row links to no node (would block)',
+    'node-b has 2 rows',
+  ]);
+  assert.equal(resultVerdictIn('error unreachable'), 'error');
+  assert.equal(resultVerdictIn('would wait'), 'wait');
+  assert.equal(resultVerdictIn('no verdict'), null);
 });
 
 test('normalizer replaces seeded names, IDs and numbers', () => {
@@ -217,4 +322,12 @@ test('clean keeps a sandbox whose create is still pending at the bound, fails, a
   } finally {
     fs.rmSync(out, { recursive: true, force: true });
   }
+});
+
+test('loopbackAddresses keeps loopback and turns every other IPv4 address into one', () => {
+  assert.equal(
+    loopbackAddresses('{"address":"172.18.0.4","node_api_endpoint":"10.0.0.12:9800","api":"127.0.0.1:8080"}'),
+    '{"address":"127.0.0.4","node_api_endpoint":"127.0.0.12:9800","api":"127.0.0.1:8080"}',
+  );
+  assert.equal(loopbackAddresses('fc 1.15.1 · linux/x86_64'), 'fc 1.15.1 · linux/x86_64');
 });

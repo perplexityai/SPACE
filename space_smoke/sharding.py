@@ -128,6 +128,7 @@ _DURATION_SECONDS = {
         # uploads and restores, and the drained edge or the undrain.
         "native.v2_drain_evacuates_every_resident": 90,
         "native.v2_drain_meets_user_calls": 90,
+        "native.v2_drain_preview_changes_nothing": 80,
         "native.v2_undrain_unseals_the_worker": 60,
         "native_concurrency.command_idempotency": 4,
         "native_concurrency.create_idempotency": 4,

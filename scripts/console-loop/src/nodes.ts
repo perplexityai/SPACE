@@ -113,3 +113,95 @@ export class KindNodes {
     return this.kubectl('get', 'node', name, '-o', 'jsonpath={.spec.unschedulable}').trim() === 'true';
   }
 }
+
+// The verdict a v2 drain preview's text or tag names, as the console shows
+// it (`previewVerdict` in `ui/src/lib/drain-preview.ts`): "would finish",
+// "would wait" or "would block"; null for text that names none, or more
+// than one.
+export function previewVerdictIn(text: string): 'finish' | 'wait' | 'block' | null {
+  const named = [...new Set([...text.matchAll(/\bwould (finish|wait|block)\b/g)].map((m) => m[1]))];
+  return named.length === 1 ? (named[0] as 'finish' | 'wait' | 'block') : null;
+}
+
+// The console's wait for one preview and its bound on the previews the nodes
+// list runs at once (`DRAIN_PREVIEW_TIMEOUT_MS` and `PREVIEW_ALL_CONCURRENCY`
+// in `ui/src/lib/drain-preview.ts`, which a unit test holds these to).
+export const CONSOLE_PREVIEW_TIMEOUT_MS = 75_000;
+export const CONSOLE_PREVIEW_CONCURRENCY = 4;
+
+// What the preview steps allow the page beyond the console's own waits, to
+// render an answer or a failure.
+export const PREVIEW_WAIT_MARGIN_MS = 15_000;
+
+// How long a step waits for one preview's answer: longer than the console
+// waits for it, so the console settles it first.
+export function previewWaitMs(): number {
+  return CONSOLE_PREVIEW_TIMEOUT_MS + PREVIEW_WAIT_MARGIN_MS;
+}
+
+// How long a step waits for the nodes list to preview `workers` nodes: one
+// console wait for each round of previews it runs at once.
+export function previewAllWaitMs(workers: number): number {
+  return Math.ceil(workers / CONSOLE_PREVIEW_CONCURRENCY) * CONSOLE_PREVIEW_TIMEOUT_MS + PREVIEW_WAIT_MARGIN_MS;
+}
+
+// A row of the nodes list's preview results as its verdict cell reads: a
+// preview's verdict, or "error" for a preview that failed.
+export type ResultVerdict = 'finish' | 'wait' | 'block' | 'error';
+
+// The verdict a results row's verdict cell shows (`verdictTag` in
+// `ui/src/components/drain-preview.tsx`), or null for a cell that shows none.
+export function resultVerdictIn(text: string): ResultVerdict | null {
+  return previewVerdictIn(text) ?? (/^error\b/.test(text.trim()) ? 'error' : null);
+}
+
+// Every row of a paginated table: `read` gives the rows of the page shown,
+// and `next` turns to the following one, answering false on the last page.
+// It reads at most `maxPages` pages; a table that has more is not complete.
+export async function everyPage<T>(
+  read: () => Promise<T[]>,
+  next: () => Promise<boolean>,
+  maxPages: number,
+): Promise<{ rows: T[]; pages: number; complete: boolean }> {
+  const rows: T[] = [];
+  for (let pages = 1; ; pages += 1) {
+    rows.push(...(await read()));
+    if (!(await next())) return { rows, pages, complete: true };
+    if (pages >= maxPages) return { rows, pages, complete: false };
+  }
+}
+
+// What the nodes list's results, read from every page, get wrong against
+// `expected`: each listed worker's verdict from the answer to the preview
+// the page asked of it, or null for a worker it asked nothing. Empty when
+// every worker has exactly one row, showing that verdict, and no other node
+// has one.
+export function previewResultsMismatches(
+  expected: ReadonlyMap<string, ResultVerdict | null>,
+  shown: readonly { nodeId: string | null; verdict: string }[],
+): string[] {
+  const mismatches: string[] = [];
+  const seen = new Map<string, number>();
+  for (const row of shown) {
+    if (row.nodeId === null) {
+      mismatches.push(`a row links to no node (${row.verdict || 'no verdict'})`);
+      continue;
+    }
+    seen.set(row.nodeId, (seen.get(row.nodeId) ?? 0) + 1);
+    if (!expected.has(row.nodeId)) {
+      mismatches.push(`${row.nodeId} has a row but is not a listed worker`);
+      continue;
+    }
+    const want = expected.get(row.nodeId) ?? null;
+    const got = resultVerdictIn(row.verdict);
+    if (want === null) mismatches.push(`${row.nodeId} has a row but the page asked no preview of it`);
+    else if (got !== want) mismatches.push(`${row.nodeId} shows ${got ?? `"${row.verdict}"`}, but its preview answered ${want}`);
+  }
+  for (const [nodeId, rows] of seen) {
+    if (rows > 1) mismatches.push(`${nodeId} has ${rows} rows`);
+  }
+  for (const nodeId of expected.keys()) {
+    if (!seen.has(nodeId)) mismatches.push(`${nodeId} has no row on any page`);
+  }
+  return mismatches;
+}

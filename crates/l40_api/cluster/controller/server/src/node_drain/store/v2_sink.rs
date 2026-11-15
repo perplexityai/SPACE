@@ -390,6 +390,7 @@ impl DrainV2Sink for SubstrateSink {
                 epoch,
                 cancel,
                 forget: forget.to_vec(),
+                preview: false,
             })
             .await
             .map(tonic::Response::into_inner)

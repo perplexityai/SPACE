@@ -3,10 +3,13 @@
 // attach it to the PR instead of committing it.
 //
 //   npm run capture -- --name NAME --route /dashboard/nodes [--route /dashboard/orgs …]
-//                      [--scroll] [--base-url URL] [--width 1280 --height 800]
+//                      [--click LABEL] [--scroll] [--loopback-hosts] [--base-url URL]
+//                      [--width 1280 --height 800]
 //
 // Signs in as the console account, then opens each route in turn, pausing
-// on each (and scrolling it with --scroll).
+// on each, clicking the button named LABEL where the page has one (for an
+// action whose result is the point, such as a preview), and scrolling it
+// with --scroll.
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -14,7 +17,7 @@ import { pathToFileURL } from 'node:url';
 
 import { chromium } from 'playwright';
 
-import { settle } from './browser.ts';
+import { settle, showLoopbackHostsOnly } from './browser.ts';
 import { flag, loadConfig, option } from './config.ts';
 
 function routes(args: string[]): string[] {
@@ -46,10 +49,19 @@ async function main(): Promise<void> {
   await signInContext.close();
 
   const context = await browser.newContext({ viewport: { width, height }, storageState, recordVideo: { dir: videoDir, size: { width, height } } });
+  if (flag(args, 'loopback-hosts')) await showLoopbackHostsOnly(context);
   const page = await context.newPage();
   for (const route of paths) {
     await page.goto(`${config.baseUrl}${route}`);
     await settle(page, 2000);
+    const click = option(args, 'click');
+    if (click) {
+      const button = page.getByRole('button', { name: click, exact: true });
+      if (await button.count()) {
+        await button.first().click();
+        await settle(page, 6000);
+      }
+    }
     if (flag(args, 'scroll')) {
       for (let i = 0; i < 3; i++) {
         await page.mouse.wheel(0, 600);

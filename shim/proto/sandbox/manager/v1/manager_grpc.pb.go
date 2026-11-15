@@ -310,6 +310,22 @@ type SandboxManagerClient interface {
 	// snapshot is durable, with the lifecycle it had; a stopped one once its
 	// disk is. A `failed` row is not reported, and blocks nothing once its
 	// artifacts are durable.
+	//
+	// With `preview`, the call reports what a v2 drain would find on this node
+	// now, and changes nothing: it runs the drain call's scans and planner, but
+	// never seals or unseals, starts no work and writes nothing, the drain's
+	// memory of earlier calls included. A row that has already sat in a
+	// transition the drain doesn't drive for over 15 minutes counts as blocked,
+	// as a drain would report it after waiting that long. A preview reads
+	// node-manager's orphan inventory as a drain call does. Node-manager
+	// serves one page of it at a time, answering a page asked meanwhile busy,
+	// and keeps up to 4 scans, evicting the least recently used one when
+	// another starts; the evicted scan's next page fails. So on a draining node
+	// a preview can delay a drain call's read, or cut it short: that call then
+	// reports the inventory blocked, and a later call reads it again. A preview
+	// takes no epoch, cancel or forget (`InvalidArgument` otherwise), so a
+	// sandbox-manager that predates it, which drops the field, refuses the
+	// zero epoch instead of sealing.
 	DrainNode(ctx context.Context, in *DrainNodeRequest, opts ...grpc.CallOption) (*DrainNodeResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(ctx context.Context, in *GetNetworkPolicyRequest, opts ...grpc.CallOption) (*GetNetworkPolicyResponse, error)
@@ -1524,6 +1540,22 @@ type SandboxManagerServer interface {
 	// snapshot is durable, with the lifecycle it had; a stopped one once its
 	// disk is. A `failed` row is not reported, and blocks nothing once its
 	// artifacts are durable.
+	//
+	// With `preview`, the call reports what a v2 drain would find on this node
+	// now, and changes nothing: it runs the drain call's scans and planner, but
+	// never seals or unseals, starts no work and writes nothing, the drain's
+	// memory of earlier calls included. A row that has already sat in a
+	// transition the drain doesn't drive for over 15 minutes counts as blocked,
+	// as a drain would report it after waiting that long. A preview reads
+	// node-manager's orphan inventory as a drain call does. Node-manager
+	// serves one page of it at a time, answering a page asked meanwhile busy,
+	// and keeps up to 4 scans, evicting the least recently used one when
+	// another starts; the evicted scan's next page fails. So on a draining node
+	// a preview can delay a drain call's read, or cut it short: that call then
+	// reports the inventory blocked, and a later call reads it again. A preview
+	// takes no epoch, cancel or forget (`InvalidArgument` otherwise), so a
+	// sandbox-manager that predates it, which drops the field, refuses the
+	// zero epoch instead of sealing.
 	DrainNode(context.Context, *DrainNodeRequest) (*DrainNodeResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error)

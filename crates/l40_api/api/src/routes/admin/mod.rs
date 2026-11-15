@@ -143,6 +143,10 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             get(node_maintenance::node_health),
         )
         .route(
+            "/nodes/{node_id}/drain-v2-preview",
+            get(nodes::preview_node_drain),
+        )
+        .route(
             "/nodes/{node_id}/network-policy:reconcile",
             axum::routing::post(node_maintenance::reconcile_node_network_policy),
         )
