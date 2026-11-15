@@ -1822,12 +1822,22 @@ class KindWorkerControl(NodeDrainControl, Protocol):
         *,
         timeout: float,
         provider_id: str | None = None,
+        fresh_node_state: bool = False,
     ) -> None:
         """Start the Kind worker's container, under `provider_id` when given
         (the kubelet's `--provider-id` rewritten while it is stopped), put
         back the `labels` its re-registered Node lacks as soon as it exists,
         then wait, each with the whole `timeout`, for the Node and the node
-        services on it to be Ready."""
+        services on it to be Ready. With `fresh_node_state` a stopped
+        container boots without the node-local state it stopped with (the
+        node layer's `space-kind-fresh-instance.service`); a running one, a
+        retry's, is not asked to. The providerID is rewritten before the
+        marker is copied, and a rewrite that fails copies and starts nothing.
+        Either way the boot is checked, whatever readiness did, and every
+        error is raised together, a deadline's as a `ScenarioTimedOut`. A
+        container left stopped is reported as that alone: a failure after
+        the marker is consumed does not leave the request armed; a failure
+        before it can, and the harness says so."""
         ...
 
     def sandbox_row_states(self, sandbox_ids: Sequence[str]) -> list[SandboxRowState]: ...
@@ -1902,6 +1912,11 @@ class DeadNodeControl(KindWorkerControl, Protocol):
         Node is deleted, so they are not listed."""
         ...
 
+    def require_kind_fresh_instance_unit(self, node_name: str) -> None:
+        """Refuse, as a configuration error, a Kind worker whose node image
+        lacks `space-kind-fresh-instance.service`. Only reads."""
+        ...
+
     def native_sandbox_action(self, sandbox_id: str, action: str) -> str:
         """`POST /v1/sandboxes/{id}:{action}` for `suspend`, `pause` or `stop`; the operation id."""
         ...
@@ -1931,6 +1946,14 @@ class DeadNodeControl(KindWorkerControl, Protocol):
     def other_live_rows_on_node(self, node_id: str, sandbox_ids: Sequence[str]) -> list[str]:
         """Ids of rows pinned to the node, outside `sandbox_ids`, that are not
         `failed` or `deleted`."""
+        ...
+
+    def node_tombstoned(self, node_id: str) -> bool:
+        """Whether `node_k8s_tombstones` holds a tombstone for the node id."""
+        ...
+
+    def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None:
+        """The sandbox's row state in that node's sandbox-manager, or None without a row."""
         ...
 
 
@@ -2018,14 +2041,6 @@ class DrainV2Control(KindWorkerControl, DrainRestoreControl, Protocol):
         ...
 
     def stopped_residency(self, sandbox_id: str) -> StoppedResidency: ...
-
-    def node_tombstoned(self, node_id: str) -> bool:
-        """Whether `node_k8s_tombstones` holds a tombstone for the node id."""
-        ...
-
-    def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None:
-        """The sandbox's row state in that node's sandbox-manager, or None without a row."""
-        ...
 
     def restart_node_service(self, node_name: str, component: str, *, timeout: float) -> str:
         """Delete that node service's pod and wait for its Ready replacement on the same node."""

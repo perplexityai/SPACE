@@ -54,6 +54,7 @@ INPUTS=(
   infra/space/kind/node/systemd/space-cache.service
   infra/space/kind/node/systemd/space-cgroup.service
   infra/space/kind/node/systemd/space-kind-devices.service
+  infra/space/kind/node/systemd/space-kind-fresh-instance.service
   infra/space/kind/node/systemd/space-kind-vsock-jails.service
   infra/space/kind/node/systemd/space-layout.service
   infra/space/kind/node/systemd/space-loop-nodes.service

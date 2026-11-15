@@ -58,13 +58,18 @@ RUN sed -i 's|^KUBELET_EXTRA_ARGS=|KUBELET_EXTRA_ARGS=--config-dir=/etc/kubernet
       grep -qxF "$want" /tmp/containerd-config || { echo "containerd config lacks: $want" >&2; exit 1; }; \
     done \
  && rm /tmp/containerd-config
-RUN systemctl enable \
+# /etc/space holds the node's own overrides (kind-node.env) and the marker
+# space-kind-fresh-instance.service reads; a harness copies the marker into a
+# stopped node, which needs the directory to exist.
+RUN install -d -m 0755 /etc/space \
+ && systemctl enable \
       space-loop-nodes.service \
       space-kind-devices.service \
       space-cgroup.service \
       space-layout.service \
       space-cache.service \
-      space-kind-vsock-jails.service
+      space-kind-vsock-jails.service \
+      space-kind-fresh-instance.service
 
 # The inputs tag, so a node can be matched against the tree that should have
 # built it (scripts/check-kind-node-image.sh). Containers inherit image labels.
