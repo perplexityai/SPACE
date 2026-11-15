@@ -38,6 +38,7 @@ import datetime
 import re
 import secrets
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
@@ -614,6 +615,63 @@ class DrainV2Assertions:
         if self._uncordon_other is not None:
             compensation, self._uncordon_other = self._uncordon_other, None
             compensation.release()
+
+    # --- the preview ----------------------------------------------------------
+
+    def preview(self) -> dict[str, Any]:
+        """The pinned worker's v2 drain preview, through the admin API."""
+
+        return self._control.drain_v2_preview(self.node_id)
+
+    def plant_quarantined_sandbox(self, *, timeout: float = 300) -> tuple[str, Compensation]:
+        """A sandbox the pinned worker quarantines: a cache directory named
+        for a sandbox no node or row knows, which sandbox-manager's
+        inventory makes a quarantined row of on its next pass. Waits for
+        that row. Its removal, row and directory, is armed before the
+        directory is made. Returns the sandbox id and the removal."""
+
+        node_name, sandbox_id = self.node_name, str(uuid.uuid4())
+        removal = self._scope.defer(
+            f"remove the planted cache directory on {node_name}",
+            lambda: self._control.remove_orphan_cache_dir(node_name, sandbox_id),
+            critical=True,
+        )
+        path = self._control.plant_orphan_cache_dir(node_name, sandbox_id)
+        self._fixture.record("planted_cache_dir", path)
+        planted = time.monotonic()
+        while (state := self._control.node_sandbox_state(node_name, sandbox_id)) != "quarantined":
+            self._fixture.verify(
+                time.monotonic() - planted < timeout,
+                "the worker never quarantined the planted sandbox directory",
+                path=path,
+                state=state,
+            )
+            self._fixture.wait(5)
+        self._fixture.record("seconds_to_quarantine", round(time.monotonic() - planted))
+        return sandbox_id, removal
+
+    def disk_snapshot_ids(self, sandbox_id: str) -> list[str]:
+        """The sandbox's disk snapshot ids."""
+
+        return self._control.disk_snapshot_ids(self.bare_id(sandbox_id))
+
+    def expect_node_lifecycles(self, expected: dict[str, str]) -> None:
+        """The pinned worker's sandbox-manager holds each sandbox's row in its
+        lifecycle now."""
+
+        observed = {
+            self.bare_id(sandbox_id): self._control.node_sandbox_state(
+                self.node_name, self.bare_id(sandbox_id)
+            )
+            for sandbox_id in expected
+        }
+        wanted = {self.bare_id(sandbox_id): lifecycle for sandbox_id, lifecycle in expected.items()}
+        self._fixture.verify(
+            observed == wanted,
+            "a resident's row on the pinned worker is not in its lifecycle",
+            observed=observed,
+            expected=wanted,
+        )
 
     # --- the drain ------------------------------------------------------------
 

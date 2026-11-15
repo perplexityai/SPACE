@@ -307,8 +307,9 @@ const ALLOW_LOCAL_BACKUP_INVENTORY: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
 ];
 // A drain seals the node and evacuates every resident, and its cancel
-// unseals it. node-api relays it for the control plane and authorizes that
-// caller first; root may drive it by hand.
+// unseals it. A preview changes nothing but answers what a drain would find
+// on the whole node. node-api relays both for the control plane and
+// authorizes that caller first; root may drive them by hand.
 const ALLOW_NODE_DRAIN: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),

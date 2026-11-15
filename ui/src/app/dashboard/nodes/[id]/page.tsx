@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { Alert, App, Button, Card, Descriptions, Result, Space, Table, Tag, Tooltip, Typography } from 'antd';
-import { ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons';
+import { ArrowLeftOutlined, EyeOutlined, ReloadOutlined } from '@ant-design/icons';
 
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
@@ -32,6 +32,15 @@ import {
   type AuditEventRow,
 } from '@/lib/node-drain';
 import { TypedConfirmModal } from '@/components/typed-confirm-modal';
+import { DrainPreviewPanel } from '@/components/drain-preview';
+import {
+  DRAIN_PREVIEW_TIMEOUT_MS,
+  PREVIEW_TOOLTIP,
+  previewFailure,
+  previewPath,
+  type DrainPreview,
+  type PreviewFailure,
+} from '@/lib/drain-preview';
 import { serialReads, withTimeout, type SerialReads } from '@/lib/serial-reads';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import type { AdminNodeResponse, NodeHealthStatus } from '@/lib/types';
@@ -119,6 +128,12 @@ export default function NodeDetailPage() {
   const [events, setEvents] = useState<AuditEventRow[] | null>(null);
   const [eventsError, setEventsError] = useState<string | null>(null);
   const busyRef = useRef(false);
+  // The last v2 drain preview of this node, which only the operator asks for.
+  const [preview, setPreview] = useState<DrainPreview | null>(null);
+  const [previewError, setPreviewError] = useState<PreviewFailure | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewedAt, setPreviewedAt] = useState<number | null>(null);
+  const previewRequest = useRef(0);
 
   // A poll tick skips while a read of the same kind is pending; any other
   // read waits for it.
@@ -234,6 +249,11 @@ export default function NodeDetailPage() {
     setEvents(null);
     setEventsError(null);
     setRefusal(null);
+    previewRequest.current += 1;
+    setPreview(null);
+    setPreviewError(null);
+    setPreviewing(false);
+    setPreviewedAt(null);
     void loadNode();
     void loadCounts();
     void loadEvents();
@@ -331,6 +351,26 @@ export default function NodeDetailPage() {
     }
   };
 
+  // Read-only on the node, so it asks no confirmation and leaves the node's
+  // own reads alone.
+  const runPreview = () => {
+    const request = ++previewRequest.current;
+    setPreviewing(true);
+    setPreviewError(null);
+    withTimeout(DRAIN_PREVIEW_TIMEOUT_MS, (signal) => adminApi.get<DrainPreview>(previewPath(id), { signal }))
+      .then((loaded) => {
+        if (request !== previewRequest.current) return;
+        setPreview(loaded);
+        setPreviewedAt(Date.now());
+      })
+      .catch((err: unknown) => {
+        if (request === previewRequest.current) setPreviewError(previewFailure(err));
+      })
+      .finally(() => {
+        if (request === previewRequest.current) setPreviewing(false);
+      });
+  };
+
   const runAction = (item: NodeAction) => {
     if (item.typed) {
       setTypedAction(item);
@@ -367,6 +407,8 @@ export default function NodeDetailPage() {
   const status = node.status;
   const health: NodeHealthStatus | null = status?.health ?? null;
   const hasHealth = node.role === 'worker' || node.role === 'builder';
+  // Only a worker's node-api serves a drain preview.
+  const previewable = node.role === 'worker';
   const cordoned = cordonedText(node.cordoned);
   const runtimeLines = runtimeInstallationLines(node.runtime_installations);
   const beat = heartbeat(node, nowMs);
@@ -392,6 +434,11 @@ export default function NodeDetailPage() {
               {item.label}
             </Button>
           ))}
+          {previewable ? (
+            <Tooltip title={PREVIEW_TOOLTIP}>
+              <Button icon={<EyeOutlined />} loading={previewing} onClick={runPreview}>Preview v2 drain</Button>
+            </Tooltip>
+          ) : null}
           <Button icon={<ReloadOutlined />} onClick={refreshAll} disabled={!!busy}>Refresh</Button>
         </Space>
       </Space>
@@ -522,6 +569,10 @@ export default function NodeDetailPage() {
             </Text>
           </Space>
         </Card>
+      ) : null}
+
+      {previewable && (preview || previewError || previewing) ? (
+        <DrainPreviewPanel preview={preview} failure={previewError} loading={previewing} previewedAt={previewedAt} />
       ) : null}
 
       <Card size="small" title="Node">

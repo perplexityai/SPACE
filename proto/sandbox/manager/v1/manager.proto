@@ -261,6 +261,26 @@ service SandboxManager {
   // anything, so a gentle drain never runs on it as a forced one.
   rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
 
+  // Report what a forced v2 drain would find on this node now, changing
+  // nothing: it runs a drain call's scans and planner, but never seals or
+  // unseals, starts no work and writes nothing, the drain's memory of earlier
+  // calls included. It plans as a forced drain. A gentle drain holds each
+  // started sandbox whose suspend is neither refused nor already running: it
+  // lists it `pending` with the action `hold`, whatever this preview lists
+  // for it (`suspend`, `queued`, `disk`, or blocked after repeated suspend
+  // failures), and the window slots that frees can start other work sooner.
+  // A row that has already sat in a transition the drain doesn't drive for
+  // over 15 minutes counts as blocked, as a drain would report it after
+  // waiting that long. A preview reads node-manager's orphan inventory as a
+  // drain call does. Node-manager serves one page of it at a time, answering
+  // a page asked meanwhile busy, and keeps up to 4 scans, evicting the least
+  // recently used one when another starts; the evicted scan's next page
+  // fails. So on a draining node a preview can delay a drain call's read, or
+  // cut it short: that call then reports the inventory blocked, and a later
+  // call reads it again. A sandbox-manager that predates this RPC answers
+  // `Unimplemented`.
+  rpc PreviewDrainNode(PreviewDrainNodeRequest) returns (PreviewDrainNodeResponse);
+
   // Get the resolved effective network policy for a sandbox.
   rpc GetNetworkPolicy(GetNetworkPolicyRequest) returns (GetNetworkPolicyResponse);
 
@@ -2181,8 +2201,11 @@ message DrainEvacuated {
 // Work the drain is still doing or waiting for.
 message DrainPending {
   string sandbox_id = 1;
-  // What it waits for: `suspend`, `publish_disk`, `upload`, `activation` for
-  // an activation admitted before the seal that is still in flight,
+  // What it waits for: `suspend`, `publish_disk` or `upload` for the drain's
+  // own work, `queued` for a slot in the drain's window, `disk` for cache
+  // disk to hold a suspend's snapshot, `activation` for an activation
+  // admitted before the seal that is still in flight, `warm_pool_eviction`
+  // for a warm-pool VM the pool reconciler hasn't evicted yet,
   // `settle:<state>` for a row in a transition the drain does not drive, or
   // `hold` for a running sandbox a gentle drain leaves running.
   string action = 2;
@@ -2205,11 +2228,29 @@ message DrainNodeResponse {
   repeated DrainEvacuated evacuated = 2;
   repeated DrainPending pending = 3;
   repeated DrainBlocked blocked = 4;
+  // The node may be terminated (see `DrainNode`).
   bool done = 5;
   // The request's `gentle_epoch`, once the node has drained gently under it;
   // unset for a forced call or a cancel. The control plane trusts a gentle
   // call's answer only with it.
   optional uint64 gentle_epoch = 6;
+}
+
+message PreviewDrainNodeRequest {}
+
+// What a forced v2 drain would find on the node now (see
+// `PreviewDrainNode`), in the items a `DrainNode` call reports.
+message PreviewDrainNodeResponse {
+  // The epoch the node is sealed under, which a preview leaves alone; unset
+  // when no drain holds the node.
+  optional uint64 sealed_epoch = 1;
+  repeated DrainEvacuated evacuated = 2;
+  repeated DrainPending pending = 3;
+  repeated DrainBlocked blocked = 4;
+  // Nothing is pending or blocked, so a drain would finish at once. Unlike
+  // `DrainNodeResponse.done`, it says nothing of a seal, which a preview
+  // never takes, so it never means the node may be terminated.
+  bool would_finish = 5;
 }
 
 // Node-local facts about the current legacy quarantine-recovery episode.

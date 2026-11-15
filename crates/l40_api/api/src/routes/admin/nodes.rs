@@ -34,7 +34,10 @@ use crate::middleware::auth::AuthUser;
 use crate::models::User;
 use crate::routes::AppState;
 
+mod drain_preview;
 mod read_state;
+pub use drain_preview::DrainPreviewError;
+pub(super) use drain_preview::preview_node_drain;
 use read_state::attach_node_read_state;
 
 /// Drain-phase states stored in `nodes.drain_phase`. NULL means the node is
@@ -2481,23 +2484,9 @@ fn drain_v2_write(
                         "drain engine v2 is not enabled on this cluster",
                     ));
                 }
-                if managed_by != NodeManagedBy::Kubernetes {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        "drain engine v2 drains Kubernetes nodes only",
-                    ));
-                }
-                if starts_a_drain && !recorded_instance {
-                    // The drain terminates exactly the recorded instance,
-                    // and asks EC2 about it to tell a node that died.
-                    return Err((
-                        StatusCode::CONFLICT,
-                        "drain engine v2 needs the node's EC2 instance recorded: the drain \
-                         terminates that instance, and asks EC2 about it when the node stops \
-                         answering",
-                    ));
-                }
+                drain_v2_drains_substrate(managed_by)?;
                 if starts_a_drain {
+                    drain_v2_needs_instance(recorded_instance)?;
                     let gentle_deadline = if gentle {
                         let deadline = deadline.ok_or((
                             StatusCode::BAD_REQUEST,
@@ -2590,6 +2579,50 @@ fn drain_v2_fenced(status: Option<&serde_json::Value>) -> bool {
     })
 }
 
+/// [`drain_v2_write`]'s refusal of a node a v2 drain can't run on by its
+/// substrate: it drains Kubernetes nodes only.
+fn drain_v2_drains_substrate(managed_by: NodeManagedBy) -> Result<(), (StatusCode, &'static str)> {
+    if managed_by == NodeManagedBy::Kubernetes {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::CONFLICT,
+            "drain engine v2 drains Kubernetes nodes only",
+        ))
+    }
+}
+
+/// [`drain_v2_write`]'s refusal to start a v2 drain on a node whose EC2
+/// instance isn't recorded.
+fn drain_v2_needs_instance(recorded_instance: bool) -> Result<(), (StatusCode, &'static str)> {
+    if recorded_instance {
+        Ok(())
+    } else {
+        // The drain terminates exactly the recorded instance, and asks EC2
+        // about it to tell a node that died.
+        Err((
+            StatusCode::CONFLICT,
+            "drain engine v2 needs the node's EC2 instance recorded: the drain terminates that \
+             instance, and asks EC2 about it when the node stops answering",
+        ))
+    }
+}
+
+/// Why `:drain` would refuse to start a v2 drain on a node whatever the
+/// request asks, from the rules [`drain_v2_write`] applies: the node's
+/// substrate and its recorded instance. Whether v2 is enabled is left out:
+/// that is the cluster's, not the node's.
+fn drain_v2_node_refusals(managed_by: NodeManagedBy, recorded_instance: bool) -> Vec<&'static str> {
+    [
+        drain_v2_drains_substrate(managed_by),
+        drain_v2_needs_instance(recorded_instance),
+    ]
+    .into_iter()
+    .filter_map(Result::err)
+    .map(|(_, reason)| reason)
+    .collect()
+}
+
 /// The drain's epoch, when a v2 node's stored report lets it be terminated:
 /// the node reported `done` under the epoch its drain is sealed under.
 fn drain_v2_terminable(status: Option<&serde_json::Value>) -> Option<u64> {
@@ -2610,9 +2643,23 @@ pub struct V2DrainReport {
     pub done: bool,
 }
 
+/// A node's answer to [`V2DrainProbe::preview`].
+pub type V2DrainPreview<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    pplx_space_sbx_mgr_client::proto::PreviewDrainNodeResponse,
+                    DrainPreviewError,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
+
 /// The `DrainNode` call `:terminate` makes of a v2 node under its drain's
-/// epoch, right before it lets the node go. Production calls the node through
-/// its node-api ([`NodeApiV2DrainProbe`]); tests script it.
+/// epoch, right before it lets the node go, and the `PreviewDrainNode` call
+/// the node page asks for. Production calls the node through its node-api
+/// ([`NodeApiV2DrainProbe`]); tests script it.
 pub trait V2DrainProbe: Send + Sync {
     fn drain_node<'a>(
         &'a self,
@@ -2622,13 +2669,23 @@ pub trait V2DrainProbe: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<V2DrainReport, String>> + Send + 'a>,
     >;
+
+    /// The node's answer to `PreviewDrainNode`: what a v2 drain would find
+    /// on it now, with nothing changed on the node. The preview handler
+    /// bounds it (`DRAIN_PREVIEW_DEADLINE` in `nodes/drain_preview.rs`).
+    fn preview<'a>(
+        &'a self,
+        state: &'a AppState,
+        target: &'a crate::controllers::substrate::OwnedNodeApiTarget,
+    ) -> V2DrainPreview<'a>;
 }
 
 /// [`V2DrainProbe`] through the node's internal node-api.
 pub struct NodeApiV2DrainProbe;
 
-/// How long `:terminate` waits for the node's answer; it answers without
-/// waiting for anything.
+/// How long the `DrainNode` and `PreviewDrainNode` calls wait for the node's
+/// answer, once connected; the node answers without waiting for anything.
+/// Both `:terminate`'s probe and the drain preview use it.
 const DRAIN_NODE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl V2DrainProbe for NodeApiV2DrainProbe {
@@ -2667,6 +2724,28 @@ impl V2DrainProbe for NodeApiV2DrainProbe {
                 sealed_epoch: response.sealed_epoch,
                 done: response.done,
             })
+        })
+    }
+
+    fn preview<'a>(
+        &'a self,
+        state: &'a AppState,
+        target: &'a crate::controllers::substrate::OwnedNodeApiTarget,
+    ) -> V2DrainPreview<'a> {
+        Box::pin(async move {
+            let mut client =
+                crate::controllers::substrate::connect_internal_node_api_client_for_target(
+                    state.sandbox_controller.substrate(),
+                    &target.as_target(),
+                    DRAIN_NODE_PROBE_TIMEOUT,
+                )
+                .await
+                .map_err(|error| DrainPreviewError::Unreachable(error.to_string()))?;
+            client
+                .preview_drain_node(pplx_space_sbx_mgr_client::proto::PreviewDrainNodeRequest {})
+                .await
+                .map(tonic::Response::into_inner)
+                .map_err(DrainPreviewError::from_status)
         })
     }
 }

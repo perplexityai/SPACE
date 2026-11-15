@@ -43,6 +43,19 @@
 //! a resume that was already in flight at the seal and finished `started`
 //! before the suspend ran is held, not suspended. A forced call under the
 //! same epoch continues the same drain and holds nothing.
+//!
+//! `PreviewDrainNode` ([`SandboxManagerService::finish_preview`]) reports
+//! what a forced v2 drain would find on this node now, without being one: it runs
+//! the drain call's scans and planner, but takes no seal, starts no work and
+//! writes nothing, the drain's memory of earlier calls included. A row that
+//! has already sat in a transition the drain doesn't drive for over 15
+//! minutes counts as blocked, as a drain would report it after waiting that
+//! long ([`SandboxManagerService::read_preview_plan`]). It plans as a forced
+//! drain. A gentle drain holds each started sandbox whose suspend is neither
+//! refused nor already running: it lists it `pending` with the action
+//! [`HOLD`], whatever this preview lists for it (`suspend`, `queued`, `disk`,
+//! or blocked after repeated suspend failures), and the window slots that
+//! frees can start other work sooner.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -55,7 +68,7 @@ use crate::activation_seal::ActivationSealStatus;
 use crate::db::activation_seal::{DrainEvacuation, DrainPrior};
 use crate::proto::{
     DrainBlocked, DrainEvacuated, DrainNodeRequest, DrainNodeResponse, DrainPending,
-    EnqueueArtifactBackupRequest,
+    EnqueueArtifactBackupRequest, PreviewDrainNodeRequest, PreviewDrainNodeResponse,
 };
 use pplx_space_events::SandboxEventTrigger;
 
@@ -82,6 +95,11 @@ pub(super) const MAX_ACTION_FAILURES: u32 = 3;
 /// `created`, and a failed restore's row stays `restoring`, with nothing
 /// moving them on.
 pub(super) const SETTLE_BOUND: Duration = Duration::from_secs(15 * 60);
+
+/// Whether a row that has waited `waited` has reached [`SETTLE_BOUND`].
+fn past_settle_bound(waited: Duration) -> bool {
+    waited >= SETTLE_BOUND
+}
 
 /// How many of the drain's suspends and disk publications may be in flight
 /// on the node at once, the uploads they leave pending included, unless
@@ -243,6 +261,16 @@ impl DrainActions {
         failures.1.clone()
     }
 
+    /// The counts under `epoch`, without forgetting another epoch's.
+    fn failures_under(&self, epoch: u64) -> DrainFailures {
+        let failures = lock(&self.failures);
+        if failures.0 == Some(epoch) {
+            failures.1.clone()
+        } else {
+            DrainFailures::new()
+        }
+    }
+
     /// Forget the failures of every sandbox the drain no longer works on.
     fn keep_failures_of(&self, working: &BTreeSet<String>) {
         lock(&self.failures)
@@ -271,11 +299,33 @@ impl DrainActions {
             if entry.0 != *state {
                 *entry = (*state, now);
             }
-            if now.saturating_duration_since(entry.1) >= SETTLE_BOUND {
+            if past_settle_bound(now.saturating_duration_since(entry.1)) {
                 unchanged.insert(sandbox_id.clone());
             }
         }
         unchanged
+    }
+
+    /// The rows a call under `epoch` would find unchanged since the bound
+    /// ([`Self::unchanged_since_bound`]) at `now`, without noting anything.
+    fn seen_unchanged_past_bound(
+        &self,
+        epoch: u64,
+        rows: &[(String, SandboxStatus)],
+        now: tokio::time::Instant,
+    ) -> BTreeSet<String> {
+        let guard = lock(&self.seen);
+        if guard.0 != Some(epoch) {
+            return BTreeSet::new();
+        }
+        rows.iter()
+            .filter(|(sandbox_id, state)| {
+                guard.1.get(sandbox_id).is_some_and(|(seen, since)| {
+                    seen == state && past_settle_bound(now.saturating_duration_since(*since))
+                })
+            })
+            .map(|(sandbox_id, _)| sandbox_id.clone())
+            .collect()
     }
 
     /// The rows that have waited for cache disk for [`SETTLE_BOUND`] or
@@ -288,7 +338,7 @@ impl DrainActions {
         guard
             .1
             .iter()
-            .filter(|(_, since)| now.saturating_duration_since(**since) >= SETTLE_BOUND)
+            .filter(|(_, since)| past_settle_bound(now.saturating_duration_since(**since)))
             .map(|(sandbox_id, _)| sandbox_id.clone())
             .collect()
     }
@@ -1033,8 +1083,35 @@ impl SandboxManagerService {
         }
         self.activation_seal.seal(&self.db, epoch)?;
         let first = self.activation_seal.status();
+        let scans = self.read_drain_scans().await;
+        Ok(Response::new(
+            self.finish_drain(epoch, gentle, &first, scans),
+        ))
+    }
+
+    pub(super) async fn preview_drain_node(
+        &self,
+        request: Request<PreviewDrainNodeRequest>,
+    ) -> Result<Response<PreviewDrainNodeResponse>, Status> {
+        // It changes nothing, but answers what a drain would find on the
+        // whole node, so it takes the drain's authority.
+        self.authorize_peer(&request, "PreviewDrainNode", ALLOW_NODE_DRAIN)?;
+        let PreviewDrainNodeRequest {} = request.into_inner();
+        if self.activation_seal.load_error().is_some() {
+            return Err(Status::internal("activation seal unreadable"));
+        }
+        // Tagged, so what the drain's scans log during a preview says it came
+        // from one.
+        let span = tracing::info_span!("drain_node_preview", preview = true);
+        let scans = self.read_drain_scans().instrument(span.clone()).await;
+        Ok(Response::new(span.in_scope(|| self.finish_preview(scans))))
+    }
+
+    /// What a drain call scans outside the rows: node-manager's orphan
+    /// inventory and the cache disk's headroom. Both only read.
+    async fn read_drain_scans(&self) -> DrainScans {
         let orphans = self.read_orphan_inventory().await;
-        let scans = DrainScans {
+        DrainScans {
             blocked: orphans
                 .blocked
                 .into_iter()
@@ -1042,10 +1119,7 @@ impl SandboxManagerService {
                 .collect(),
             orphan_dirs: orphans.dirs,
             disk_headroom: read_disk_headroom().await,
-        };
-        Ok(Response::new(
-            self.finish_drain(epoch, gentle, &first, scans),
-        ))
+        }
     }
 
     /// Plan from the rows, record and start what the plan asks for, and
@@ -1059,33 +1133,11 @@ impl SandboxManagerService {
         first: &ActivationSealStatus,
         scans: DrainScans,
     ) -> DrainNodeResponse {
-        let (mut plan, rows) = match self.read_drain_plan(epoch, gentle, scans.disk_headroom) {
-            Ok(read) => read,
-            Err(reason) => (
-                DrainPlan {
-                    blocked: vec![(None, reason)],
-                    ..DrainPlan::default()
-                },
-                BTreeSet::new(),
-            ),
-        };
+        let (mut plan, rows) = self
+            .read_drain_plan(epoch, gentle, scans.disk_headroom)
+            .unwrap_or_else(read_failed);
         self.start_actions(epoch, &mut plan);
-        let orphan_dirs = scans
-            .orphan_dirs
-            .into_iter()
-            .filter(|(sandbox_id, _)| !rows.contains(sandbox_id))
-            .map(|(sandbox_id, reason)| (Some(sandbox_id), reason));
-        plan.blocked
-            .splice(0..0, scans.blocked.into_iter().chain(orphan_dirs));
-        // An activation admitted before the seal can still launch or resume a
-        // VM until it settles.
-        plan.pending.splice(
-            0..0,
-            first
-                .in_flight
-                .iter()
-                .map(|sandbox_id| (sandbox_id.clone(), "activation".to_owned())),
-        );
+        fold_scans(&mut plan, &rows, scans, first);
 
         let last = self.activation_seal.status();
         // A cancelled epoch is never sealed again, so the same epoch at both
@@ -1097,6 +1149,36 @@ impl SandboxManagerService {
         DrainNodeResponse {
             gentle_epoch: gentle.then_some(epoch),
             ..report(first, plan, done)
+        }
+    }
+
+    /// What a forced v2 drain would find on this node now, changing nothing: the
+    /// plan [`Self::read_preview_plan`] makes, with what a drain would start
+    /// reported `pending` under its action's name and none of it started,
+    /// and the node's seal as it stands. `would_finish` when nothing is
+    /// pending or blocked: a drain would finish at once. A seal isn't needed
+    /// for that, since a preview takes none.
+    pub(super) fn finish_preview(&self, scans: DrainScans) -> PreviewDrainNodeResponse {
+        let seal = self.activation_seal.status();
+        let (mut plan, rows) = self
+            .read_preview_plan(seal.sealed_epoch, scans.disk_headroom)
+            .unwrap_or_else(read_failed);
+        fold_scans(&mut plan, &rows, scans, &seal);
+        let would_finish = plan.pending.is_empty() && plan.blocked.is_empty();
+        let DrainNodeResponse {
+            sealed_epoch,
+            evacuated,
+            pending,
+            blocked,
+            done: _,
+            gentle_epoch: _,
+        } = report(&seal, plan, would_finish);
+        PreviewDrainNodeResponse {
+            sealed_epoch,
+            evacuated,
+            pending,
+            blocked,
+            would_finish,
         }
     }
 
@@ -1206,7 +1288,7 @@ impl SandboxManagerService {
         let now = tokio::time::Instant::now();
         let (rows, inputs) = self.read_plan_inputs(epoch, disk_headroom, now)?;
         let inputs = PlanInputs { gentle, ..inputs };
-        let ids = rows.iter().map(|row| row.sandbox_id.clone()).collect();
+        let ids = row_ids(&rows);
         let plan = plan(&rows, &inputs);
         self.drain_actions
             .note_disk_waits(epoch, &plan.disk_waits, now);
@@ -1233,14 +1315,95 @@ impl SandboxManagerService {
         Ok((plan, ids))
     }
 
+    /// [`Self::read_drain_plan`]'s read and plan for a preview, which notes
+    /// nothing. The drain's memory is read as a call continuing the drain
+    /// the node is sealed under, `sealed`, would plan with it: the failures
+    /// it counted, how long it has watched each row in one lifecycle, and the
+    /// rows waiting for cache disk past the bound. A node not sealed has no
+    /// drain to continue, and a drain call there would start with none.
+    ///
+    /// Two verdicts turn on how long a row has sat unchanged, which a drain
+    /// learns by watching across calls. Where the store knows, a preview
+    /// takes it from there instead: the store stamps each write that changes
+    /// a row's status, its lifecycle or the cleanup that owns it
+    /// (`state_changed_at`), so a row outside the warm pool whose status
+    /// last changed [`SETTLE_BOUND`] or longer ago counts as unchanged that
+    /// long. A row in a transition the drain doesn't drive is
+    /// then blocked, as it would be once a drain had watched it that long,
+    /// unless it moves. A warm-pool member is not judged that way: its bound
+    /// is on the eviction the pool reconciler starts only once a drain
+    /// cordons the node, so its time in its lifecycle says nothing about it.
+    /// It is pending (`warm_pool_eviction`) unless the drain the node is
+    /// sealed under has watched it past the bound. A row without a stamp
+    /// counts as just changed.
+    fn read_preview_plan(
+        &self,
+        sealed: Option<u64>,
+        disk_headroom: Option<u64>,
+    ) -> Result<(DrainPlan, BTreeSet<String>), String> {
+        let now = tokio::time::Instant::now();
+        let (rows, mut inputs) = self.read_plan_reads(disk_headroom)?;
+        if let Some(epoch) = sealed {
+            inputs.failures = self.drain_actions.failures_under(epoch);
+            inputs.unchanged =
+                self.drain_actions
+                    .seen_unchanged_past_bound(epoch, &row_lifecycles(&rows), now);
+            inputs.disk_waits = self.drain_actions.disk_waits_past_bound(epoch, now);
+        }
+        let entered = self
+            .db_conn()
+            .map_err(|status| status.message().to_owned())
+            .and_then(|conn| {
+                crate::db::scan::status_entered_at(&conn)
+                    .map_err(|error| format!("status stamp scan failed: {error}"))
+            })?;
+        if let Ok(wall_now) = crate::db::now_epoch_i64() {
+            inputs.unchanged.extend(
+                rows.iter()
+                    .filter(|row| !row.pool_member)
+                    .filter(|row| {
+                        entered
+                            .get(&row.sandbox_id)
+                            .copied()
+                            .flatten()
+                            .is_some_and(|since| {
+                                past_settle_bound(Duration::from_secs(
+                                    wall_now.cast_unsigned().saturating_sub(since),
+                                ))
+                            })
+                    })
+                    .map(|row| row.sandbox_id.clone()),
+            );
+        }
+        Ok((plan(&rows, &inputs), row_ids(&rows)))
+    }
+
     /// Read every row, the artifacts without a durable copy and the
-    /// evacuation record, as the planners read them, at `now`. An error is
-    /// the scan that failed.
+    /// evacuation record, as the planners read them, at `now`, with the
+    /// drain's memory of earlier calls under `epoch`, which this notes. An
+    /// error is the scan that failed.
     fn read_plan_inputs(
         &self,
         epoch: u64,
         disk_headroom: Option<u64>,
         now: tokio::time::Instant,
+    ) -> Result<(Vec<DrainRow>, PlanInputs), String> {
+        let (rows, mut inputs) = self.read_plan_reads(disk_headroom)?;
+        inputs.failures = self.drain_actions.failures(epoch);
+        inputs.unchanged =
+            self.drain_actions
+                .unchanged_since_bound(epoch, &row_lifecycles(&rows), now);
+        inputs.disk_waits = self.drain_actions.disk_waits_past_bound(epoch, now);
+        Ok((rows, inputs))
+    }
+
+    /// The reads a drain call and a preview share: every row, the artifacts
+    /// without a durable copy, the evacuation record and the drain's work in
+    /// flight, as the planners read them, with none of the drain's memory of
+    /// earlier calls. Only reads. An error is the scan that failed.
+    fn read_plan_reads(
+        &self,
+        disk_headroom: Option<u64>,
     ) -> Result<(Vec<DrainRow>, PlanInputs), String> {
         let (sandboxes, local_only_rows, evacuations, pending_rows) = {
             let conn = self
@@ -1315,24 +1478,15 @@ impl SandboxManagerService {
             .into_iter()
             .map(|evacuation| (evacuation.sandbox_id.clone(), evacuation))
             .collect();
-        let lifecycles: Vec<_> = rows
-            .iter()
-            .map(|row| (row.sandbox_id.clone(), row.lifecycle))
-            .collect();
         let inputs = PlanInputs {
             pending_backups,
             local_only,
             evacuations,
             running: self.drain_actions.running(),
-            failures: self.drain_actions.failures(epoch),
-            unchanged: self
-                .drain_actions
-                .unchanged_since_bound(epoch, &lifecycles, now),
             window: self.drain_actions.window,
             disk_headroom,
             active_uploads,
-            disk_waits: self.drain_actions.disk_waits_past_bound(epoch, now),
-            gentle: false,
+            ..PlanInputs::default()
         };
         Ok((rows, inputs))
     }
@@ -1575,6 +1729,54 @@ async fn read_disk_headroom() -> Option<u64> {
             0
         }
     })
+}
+
+/// The plan of a call whose read of the rows failed with `reason`.
+fn read_failed(reason: String) -> (DrainPlan, BTreeSet<String>) {
+    (
+        DrainPlan {
+            blocked: vec![(None, reason)],
+            ..DrainPlan::default()
+        },
+        BTreeSet::new(),
+    )
+}
+
+fn row_ids(rows: &[DrainRow]) -> BTreeSet<String> {
+    rows.iter().map(|row| row.sandbox_id.clone()).collect()
+}
+
+fn row_lifecycles(rows: &[DrainRow]) -> Vec<(String, SandboxStatus)> {
+    rows.iter()
+        .map(|row| (row.sandbox_id.clone(), row.lifecycle))
+        .collect()
+}
+
+/// Put what the scans outside the rows found ahead of what the rows gave:
+/// each blocks, and an orphan directory only when no row in `rows` accounts
+/// for it. The activations in flight at `first` go ahead of the pending.
+fn fold_scans(
+    plan: &mut DrainPlan,
+    rows: &BTreeSet<String>,
+    scans: DrainScans,
+    first: &ActivationSealStatus,
+) {
+    let orphan_dirs = scans
+        .orphan_dirs
+        .into_iter()
+        .filter(|(sandbox_id, _)| !rows.contains(sandbox_id))
+        .map(|(sandbox_id, reason)| (Some(sandbox_id), reason));
+    plan.blocked
+        .splice(0..0, scans.blocked.into_iter().chain(orphan_dirs));
+    // An activation admitted before the seal can still launch or resume a
+    // VM until it settles.
+    plan.pending.splice(
+        0..0,
+        first
+            .in_flight
+            .iter()
+            .map(|sandbox_id| (sandbox_id.clone(), "activation".to_owned())),
+    );
 }
 
 fn report(status: &ActivationSealStatus, plan: DrainPlan, done: bool) -> DrainNodeResponse {
