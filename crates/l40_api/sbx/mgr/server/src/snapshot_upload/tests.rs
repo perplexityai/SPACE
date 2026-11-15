@@ -75,18 +75,27 @@ fn fixture_meta(rootfs_diff_format: Option<&str>) -> SnapshotMeta {
 }
 
 /// A deferred artifact as sandbox-manager sees it: VM state and a retained
-/// bundle it cannot traverse. Access is restored on drop for cleanup.
+/// bundle it cannot traverse, in its sandbox's directory of a cache. Access
+/// is restored on drop for cleanup.
 struct DeferredArtifact {
-    _temp: tempfile::TempDir,
+    cache: std::path::PathBuf,
     dir: std::path::PathBuf,
     source_id: uuid::Uuid,
+    _temp: Option<tempfile::TempDir>,
 }
 
 impl DeferredArtifact {
     fn new() -> Self {
-        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("snapshot");
+        let mut artifact = Self::in_cache(temp.path());
+        artifact._temp = Some(temp);
+        artifact
+    }
+
+    /// In `cache`, which the caller owns.
+    fn in_cache(cache: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = cache.join(fixture_meta(None).sandbox_id).join("snapshot");
         let bundle = dir.join(crate::retained_source::BUNDLE_DIRECTORY);
         std::fs::create_dir_all(bundle.join("source")).unwrap();
         std::fs::write(bundle.join("source/rootfs.ext4"), b"jail-owned rootfs").unwrap();
@@ -94,10 +103,15 @@ impl DeferredArtifact {
         std::fs::write(dir.join("memory"), b"memory").unwrap();
         std::fs::write(dir.join("vmstate"), b"state").unwrap();
         Self {
-            _temp: temp,
+            cache: cache.to_owned(),
             dir,
             source_id: uuid::Uuid::now_v7(),
+            _temp: None,
         }
+    }
+
+    fn sandbox_dir(&self) -> &Path {
+        self.dir.parent().unwrap()
     }
 
     fn meta(&self) -> SnapshotMeta {
@@ -149,9 +163,9 @@ impl DeferredArtifact {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 
-    fn remove_artifact_dir(&self) {
+    fn remove_sandbox_dir(&self) {
         self.restore_access();
-        std::fs::remove_dir_all(&self.dir).unwrap();
+        std::fs::remove_dir_all(self.sandbox_dir()).unwrap();
     }
 
     fn restore_access(&self) {
@@ -190,15 +204,273 @@ fn deferred_send_prepares_from_the_inspected_size_and_keeps_metadata_outside_the
     );
     assert!(prepared.job_ids.is_empty());
     let metadata = prepared.metadata_staging_dir.as_ref().unwrap();
-    assert!(!metadata.starts_with(&artifact.dir));
-    assert!(metadata.join(SNAPSHOT_METADATA_FILENAME).is_file());
+    assert!(!metadata.starts_with(artifact.sandbox_dir()));
     assert!(!artifact.dir.join(ROOTFS_BTRFS_SEND_FILENAME).exists());
-    // Teardown can remove the artifact after VM staging. The metadata
-    // worker must have a surviving, separately owned directory.
-    artifact.remove_artifact_dir();
-    assert!(metadata.is_dir());
+}
+
+#[test]
+fn deferred_metadata_staging_names_the_sandbox_it_was_built_for() {
+    let sandbox = SandboxId::new();
+    let staging = deferred_metadata_staging_dir(
+        &Path::new("/cache")
+            .join(sandbox.to_string())
+            .join("snapshot"),
+        &sandbox.to_string(),
+        &uuid::Uuid::now_v7().to_string(),
+    )
+    .unwrap();
+    assert_eq!(staging.parent(), Some(Path::new("/cache")));
+    assert_eq!(
+        deferred_metadata_staging_sandbox_id(staging.file_name().unwrap()),
+        Some(sandbox)
+    );
+}
+
+#[test]
+fn deferred_metadata_staging_refuses_a_name_its_parser_would_not_recognize() {
+    let sandbox = SandboxId::new().to_string();
+    let snapshot_dir = Path::new("/cache").join(&sandbox).join("snapshot");
+    let attempt = uuid::Uuid::now_v7().to_string();
+    assert!(matches!(
+        deferred_metadata_staging_dir(&snapshot_dir, "not-a-sandbox", &attempt),
+        Err(DeferredMetadataStagingDirError::SandboxId(_))
+    ));
+    assert!(matches!(
+        deferred_metadata_staging_dir(Path::new("/cache/other/snapshot"), &sandbox, &attempt),
+        Err(DeferredMetadataStagingDirError::OutsideSandboxDirectory { .. })
+    ));
+    assert!(matches!(
+        deferred_metadata_staging_dir(&snapshot_dir, &sandbox, "attempt"),
+        Err(DeferredMetadataStagingDirError::AttemptId(_))
+    ));
+}
+
+#[tokio::test]
+async fn teardown_before_deferred_metadata_does_not_recreate_the_sandbox_directory() {
+    let artifact = DeferredArtifact::new();
+    let prepared = artifact
+        .prepare(Some(artifact.retained(1000, true)))
+        .unwrap();
+    assert!(prepared.deferred_metadata);
+    // Teardown removes the sandbox's cache directory while volume-manager
+    // still uploads the VM artifacts from its own staged copies.
+    artifact.remove_sandbox_dir();
+    let metadata = stage_streamed_metadata(&prepared, 2000, 1000, nix::unistd::getegid())
+        .await
+        .unwrap();
+    assert!(metadata.is_file());
+    assert!(
+        !artifact.sandbox_dir().exists(),
+        "writing the deferred metadata recreated the sandbox's cache directory"
+    );
     cleanup_metadata_staging_dir(&prepared);
-    assert!(!metadata.exists());
+    let left: Vec<_> = std::fs::read_dir(&artifact.cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the finished upload left {left:?} in the cache"
+    );
+}
+
+/// The staging directory volume-manager reads deferred metadata through:
+/// `group`'s, passed on to what is created in it, with a `snapshot.json` it
+/// can read.
+fn assert_group_readable_staging(staging: &Path, group: nix::unistd::Gid) {
+    use std::os::unix::fs::MetadataExt;
+    let directory = std::fs::metadata(staging).unwrap();
+    assert_eq!(directory.gid(), group.as_raw());
+    assert_eq!(
+        directory.mode() & 0o2050,
+        0o2050,
+        "staging mode {:o} lacks setgid or group traversal",
+        directory.mode()
+    );
+    let file = std::fs::metadata(staging.join(SNAPSHOT_METADATA_FILENAME)).unwrap();
+    assert_eq!(file.gid(), group.as_raw());
+    assert_ne!(
+        file.mode() & 0o040,
+        0,
+        "snapshot.json mode {:o} is not group-readable",
+        file.mode()
+    );
+}
+
+#[tokio::test]
+async fn only_the_worker_creates_deferred_metadata_staging_under_a_restrictive_umask() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if !pplx_space_test_env::enter_test_process(&[]) {
+        return;
+    }
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+    // Unprivileged, the group is this process's own: this checks modes only.
+    let group = nix::unistd::getegid();
+    let artifact = DeferredArtifact::new();
+    // A cache that passes no group on to what is created in it.
+    std::fs::set_permissions(&artifact.cache, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        std::fs::metadata(&artifact.cache).unwrap().mode() & 0o2000,
+        0
+    );
+    let prepared = artifact
+        .prepare(Some(artifact.retained(1000, true)))
+        .unwrap();
+    let staging = prepared.metadata_staging_dir.clone().unwrap();
+    // Periodic inventory reclaims a staging directory while its sandbox has no
+    // upload job in flight, and the caller inserts this one only after prepare.
+    assert!(
+        !staging.exists(),
+        "prepare created {} before its upload job existed",
+        staging.display()
+    );
+    artifact.remove_sandbox_dir();
+    stage_streamed_metadata(&prepared, 2000, 1000, group)
+        .await
+        .unwrap();
+    assert_group_readable_staging(&staging, group);
+    cleanup_metadata_staging_dir(&prepared);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn volume_manager_reads_deferred_metadata_through_the_shared_cache_group() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::time::Duration;
+
+    use nix::unistd::{Gid, chown, geteuid};
+    use pplx_space_host_layout::identities::{groups, users};
+
+    const STAGE: &str = "SPACE_TEST_DEFERRED_METADATA_STAGE";
+    const CACHE: &str = "SPACE_TEST_DEFERRED_METADATA_CACHE";
+    const STAGING: &str = "SPACE_TEST_DEFERRED_METADATA_STAGING";
+    if let Ok(stage) = std::env::var(STAGE) {
+        match stage.as_str() {
+            "stage" => {
+                assert_eq!(geteuid().as_raw(), users::SPACE_SBXMGR.uid);
+                nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+                let group = crate::transfer_directory::shared_cache_group();
+                let cache = std::path::PathBuf::from(std::env::var_os(CACHE).unwrap());
+                let artifact = DeferredArtifact::in_cache(&cache);
+                let prepared = artifact
+                    .prepare(Some(artifact.retained(1000, true)))
+                    .unwrap();
+                let staging = prepared.metadata_staging_dir.clone().unwrap();
+                assert!(!staging.exists());
+                artifact.remove_sandbox_dir();
+                stage_streamed_metadata(&prepared, 2000, 1000, group)
+                    .await
+                    .unwrap();
+                assert_group_readable_staging(&staging, group);
+            }
+            "read" => {
+                assert_eq!(geteuid().as_raw(), users::SPACE_VOLMGR.uid);
+                let staging = std::path::PathBuf::from(std::env::var_os(STAGING).unwrap());
+                let staged: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(staging.join(SNAPSHOT_METADATA_FILENAME)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(staged["size_bytes"], 2000);
+            }
+            _ => panic!("unexpected test stage"),
+        }
+        println!("verified deferred metadata stage {stage}");
+        return;
+    }
+    if !pplx_space_test_env::root_or_skip("switch between two real service UIDs") {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Group-shared but not setgid: nothing created in it inherits the group.
+    let cache = root.path().join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    chown(
+        &cache,
+        None,
+        Some(Gid::from_raw(groups::SPACE_CACHE_RW.gid)),
+    )
+    .unwrap();
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let mut staging = None;
+    for (stage, uid, primary_gid, supplementary) in [
+        (
+            "stage",
+            users::SPACE_SBXMGR.uid,
+            groups::SPACE_SBXMGR.gid,
+            format!(
+                "{},{}",
+                groups::SPACE_SBXCLIENTS.gid,
+                groups::SPACE_CACHE_RW.gid
+            ),
+        ),
+        (
+            "read",
+            users::SPACE_VOLMGR.uid,
+            groups::SPACE_VOLMGR.gid,
+            format!(
+                "{},{},{}",
+                groups::SPACE_SBXCLIENTS.gid,
+                groups::SPACE_CACHE_RW.gid,
+                groups::SPACE_VOLCREDCLIENTS.gid
+            ),
+        ),
+    ] {
+        let mut command = Command::new("setpriv");
+        command
+            .arg(format!("--reuid={uid}"))
+            .arg(format!("--regid={primary_gid}"))
+            .arg(format!("--groups={supplementary}"))
+            .arg("--")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "snapshot_upload::tests::volume_manager_reads_deferred_metadata_through_the_shared_cache_group",
+                "--nocapture",
+            ])
+            .env(STAGE, stage)
+            .env(CACHE, &cache);
+        if let Some(staging) = &staging {
+            command.env(STAGING, staging);
+        }
+        let (_, output) =
+            pplx_space_test_env::run_command(&mut command, Duration::from_secs(30)).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout.contains(&format!("verified deferred metadata stage {stage}")),
+            "{stage}: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        staging = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find(|entry| deferred_metadata_staging_sandbox_id(&entry.file_name()).is_some())
+            .map(|entry| entry.path());
+    }
+}
+
+#[tokio::test]
+async fn deferred_metadata_persisted_inside_the_sandbox_directory_keeps_its_location() {
+    let artifact = DeferredArtifact::new();
+    let mut prepared = artifact
+        .prepare(Some(artifact.retained(1000, true)))
+        .unwrap();
+    // As an older version persisted it, after teardown removed the sandbox's
+    // directory.
+    let legacy = artifact
+        .sandbox_dir()
+        .join(format!(".artifact-metadata-{}", prepared.snapshot_id));
+    prepared.metadata_staging_dir = Some(legacy.clone());
+    artifact.remove_sandbox_dir();
+    let metadata = stage_streamed_metadata(&prepared, 2000, 1000, nix::unistd::getegid())
+        .await
+        .unwrap();
+    assert_eq!(metadata, legacy.join(SNAPSHOT_METADATA_FILENAME));
+    let staged: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(metadata).unwrap()).unwrap();
+    assert_eq!(staged["size_bytes"], 2000);
 }
 
 #[test]

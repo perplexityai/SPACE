@@ -106,12 +106,12 @@ test-group = "state-render"
 # Shared btrfs tests receive a disposable filesystem from the privileged CI
 # wrapper. Other opt-in tests keep their separate activation requirements.
 #
-# Root alone: clone_tree, transfer_directory, the credmgr volume-socket tests
-# and the spaced worker binaries switch between real service uids. The
-# router's descriptor reads use pidfd_getfd,
-# which Docker's default seccomp profile allows only with CAP_SYS_PTRACE. The
-# bootstrap-role tests each start a virgin Postgres container, and the
-# execution-record view pins share one.
+# Root alone: clone_tree, transfer_directory, snapshot_upload's deferred
+# metadata test, the credmgr volume-socket tests and the spaced worker binaries
+# switch between real service uids. The router's descriptor reads use
+# pidfd_getfd, which Docker's default seccomp profile allows only with
+# CAP_SYS_PTRACE. The bootstrap-role tests each start a virgin Postgres
+# container, and the execution-record view pins share one.
 #
 # Root halves of split tests, whose unprivileged halves run outside the group:
 # encrypted_volumes reads the published copy as uid 65534; permission_tree
@@ -165,6 +165,7 @@ or (package(pplx-space-node-mgr) and test(=service::btrfs_send_transport::tests:
 or (package(pplx-space-node-mgr) and test(=service::prepared_rootfs::tests::prepared_instance_and_clone_use_real_btrfs_subvolumes))
 or (package(pplx-space-node-mgr) and test(/::startup_containment::tests::linux::linux_containment_benchmark$/))
 or (package(pplx-space-sbx-mgr) and test(=transfer_directory::tests::distinct_service_uids_can_exchange_downloads))
+or (package(pplx-space-sbx-mgr) and test(=snapshot_upload::tests::volume_manager_reads_deferred_metadata_through_the_shared_cache_group))
 or (package(pplx-space-credmgr) and test(=run::tests::volume_socket::real_peers_obey_volume_listener_policy))
 or (package(pplx-space-credmgr) and test(=run::volume_socket::tests::preflight_checks_real_permissions_without_replacing_live_socket))
 or binary_id(pplx-space-spaced-guest-server::worker_subprocess)

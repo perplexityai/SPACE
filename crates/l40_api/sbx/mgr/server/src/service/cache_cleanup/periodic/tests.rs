@@ -118,9 +118,51 @@ async fn periodic_inventory_names_only_rowless_cache_directories_for_inspection(
     );
 }
 
+#[tokio::test]
+async fn periodic_inventory_reclaims_upload_metadata_staging_once_no_upload_needs_it() {
+    let cache = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let stage = |sandbox: SandboxId| {
+        let dir = crate::snapshot_upload::deferred_metadata_staging_dir(
+            &cache.path().join(sandbox.to_string()).join("snapshot"),
+            &sandbox.to_string(),
+            &uuid::Uuid::now_v7().to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    };
+    let (ended, uploading) = (SandboxId::new(), SandboxId::new());
+    let (ended_staging, uploading_staging) = (stage(ended), stage(uploading));
+    pplx_space_common_jobs::db::insert_job(
+        conn.raw(),
+        pplx_space_common_jobs::db::InsertJob {
+            job_id: &pplx_space_accounts::JobId::new(),
+            kind: crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+            payload: "{}",
+            subject_id: Some(&uploading.to_string()),
+            dedup_key: None,
+            max_attempts: 1,
+            traceparent: None,
+            priority: pplx_space_common_jobs::JobPriority::default(),
+        },
+    )
+    .unwrap();
+    let service = SandboxManagerService::for_test(conn);
+    // Neither directory is a sandbox's cache directory, so neither is an
+    // orphan candidate.
+    reconcile_one_periodic_page(
+        &service,
+        SandboxInventoryPaths::new(cache.path(), runtime.path()),
+    );
+    assert!(!ended_staging.exists());
+    assert!(uploading_staging.is_dir());
+}
+
 /// Discovers and reconciles one periodic page. The tests that use it create no
-/// cache directories, so the page has no orphan candidates whose retained
-/// sources would need inspecting.
+/// sandbox cache directories, so the page has no orphan candidates whose
+/// retained sources would need inspecting.
 fn reconcile_one_periodic_page(service: &SandboxManagerService, paths: SandboxInventoryPaths<'_>) {
     let batch = service
         .discover_periodic_inventory_in(
