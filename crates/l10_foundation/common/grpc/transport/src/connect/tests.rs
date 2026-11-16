@@ -120,6 +120,86 @@ async fn lazy_uds_channel_reconnects_after_socket_replacement() {
     successor_task.await.expect("join successor");
 }
 
+// A kept Unix-socket channel whose server restarts waits for the successor on
+// the next call: the redial retries while the stale socket refuses it, as a
+// restarting node-local server's does, instead of failing the call.
+#[tokio::test]
+async fn a_kept_uds_channel_waits_for_its_server_to_come_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("backend.sock");
+    let (stop, server) = serve_health(&socket_path).await;
+    let endpoint =
+        tonic::transport::Endpoint::try_from("http://[::]:50051").expect("static test endpoint");
+    let channel = super::connect_uds_channel_with_retrying_redials(
+        "test-backend",
+        &socket_path,
+        endpoint,
+        crate::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
+    )
+    .await
+    .expect("first dial");
+    let mut client = HealthClient::new(channel);
+    client.check(health_request()).await.expect("served");
+
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    let mut waiting = client.clone();
+    let call = tokio::spawn(async move {
+        let mut request = health_request();
+        request.set_timeout(Duration::from_secs(10));
+        waiting.check(request).await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !call.is_finished(),
+        "the call waits while the server is down"
+    );
+    std::fs::remove_file(&socket_path).expect("remove the stale socket");
+    let (stop, server) = serve_health(&socket_path).await;
+    call.await
+        .unwrap()
+        .expect("the redial reaches the successor");
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+// A redial that runs out of attempts fails its call as a refused dial, which
+// callers still read as proof that the call was never sent.
+#[tokio::test]
+async fn an_exhausted_uds_redial_is_a_client_connect_failure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("backend.sock");
+    let (stop, server) = serve_health(&socket_path).await;
+    let endpoint =
+        tonic::transport::Endpoint::try_from("http://[::]:50051").expect("static test endpoint");
+    let policy = crate::GrpcRetryPolicy {
+        max_elapsed: Duration::from_millis(200),
+        ..crate::DEFAULT_GRPC_CONNECT_RETRY_POLICY
+    };
+    let channel = super::connect_uds_channel_with_retrying_redials(
+        "test-backend",
+        &socket_path,
+        endpoint,
+        policy,
+    )
+    .await
+    .expect("first dial");
+    let mut client = HealthClient::new(channel);
+    client.check(health_request()).await.expect("served");
+
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    let status = client
+        .check(health_request())
+        .await
+        .expect_err("nothing listens");
+    assert_eq!(
+        crate::client_connect_failure_cause(&status),
+        Some(crate::ClientConnectFailureCause::Refused),
+        "{status:?}"
+    );
+}
+
 async fn serve_tcp_health(
     listener: tokio::net::TcpListener,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
