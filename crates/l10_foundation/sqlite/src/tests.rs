@@ -523,7 +523,8 @@ async fn embedded_migrations_accept_registered_revisions_and_preserve_history() 
             };
 
             for _ in 0..2 {
-                let result = migrate_once("test", &path, migrators, &checksums).await;
+                let result =
+                    migrate_once("test", &path, migrators, &checksums, &no_forward()).await;
 
                 assert_eq!(result.is_ok(), previous != Some(3), "{store}: {result:?}");
             }
@@ -778,4 +779,265 @@ async fn public_embedded_migrations_resume_after_common_schema_initialization() 
             .unwrap(),
         "intent"
     );
+}
+
+fn no_forward() -> ForwardCompatible {
+    ForwardCompatible::from_toml("migrations = []").unwrap()
+}
+
+fn forward(store: &str, version: i64, checksum: &[u8]) -> ForwardCompatible {
+    ForwardCompatible::from_toml(&format!(
+        "[[migrations]]\nstore = {store:?}\nversion = {version}\nchecksum = {:?}\nreason = 'the release before never names it'",
+        hex::encode(checksum)
+    ))
+    .unwrap()
+}
+
+/// The public test catalogs with one more migration in `store`'s catalog, as
+/// the next release ships them: a new service table, or a new shared column.
+struct NextRelease {
+    service: Migrator,
+    common: Migrator,
+    migration: Migration,
+}
+
+impl NextRelease {
+    fn new(store: &str) -> Self {
+        use sqlx::SqlSafeStr as _;
+        use sqlx::migrate::MigrationType;
+        use std::borrow::Cow;
+
+        let (service, common) = public_test_migrators();
+        let sql = if store == "common" {
+            "ALTER TABLE jobs ADD COLUMN next_release TEXT;"
+        } else {
+            "CREATE TABLE next_release (id INTEGER PRIMARY KEY);"
+        };
+        let migration = Migration::new(
+            crate::baselines::PUBLIC_SQLITE_BASELINE + 1,
+            Cow::Borrowed("next release"),
+            MigrationType::Simple,
+            sql.into_sql_str(),
+            false,
+        );
+        let with_next = |migrator: &Migrator, next: bool| {
+            let mut migrations = migrator.iter().cloned().collect::<Vec<_>>();
+            if next {
+                migrations.push(migration.clone());
+            }
+            Migrator::with_migrations(migrations)
+        };
+        Self {
+            service: with_next(service, store != "common"),
+            common: with_next(common, store == "common"),
+            migration,
+        }
+    }
+
+    fn migrators(&self) -> EmbeddedMigrators<'_> {
+        EmbeddedMigrators {
+            service: &self.service,
+            common: Some(&self.common),
+        }
+    }
+
+    /// A database the next release migrated and then wrote to.
+    async fn database(&self, path: &Path) {
+        migrate_embedded("test", path, self.migrators())
+            .await
+            .unwrap();
+        Connection::open(path)
+            .unwrap()
+            .execute("INSERT INTO jobs (job_id) VALUES ('retained')", [])
+            .unwrap();
+    }
+}
+
+type StoredState = (
+    Vec<(String, i64, bool, Vec<u8>)>,
+    Vec<(String, String)>,
+    Vec<String>,
+);
+
+fn stored_state(path: &Path) -> StoredState {
+    let conn = Connection::open(path).unwrap();
+    let jobs = conn
+        .prepare("SELECT job_id FROM jobs ORDER BY job_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    (
+        embedded_history(&conn),
+        public_application_schema(&conn).unwrap(),
+        jobs,
+    )
+}
+
+#[tokio::test]
+async fn a_rollback_keeps_a_listed_forward_compatible_migration_in_place() {
+    let (service, common) = public_test_migrators();
+    let current = EmbeddedMigrators {
+        service,
+        common: Some(common),
+    };
+    let checksums = AcceptedChecksums::from_toml("migrations = []").unwrap();
+    for store in ["test", "common"] {
+        let next = NextRelease::new(store);
+        let listed = forward(store, next.migration.version, &next.migration.checksum);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("database.sqlite");
+        next.database(&path).await;
+        let before = stored_state(&path);
+
+        for _ in 0..2 {
+            let result = migrate_once("test", &path, current, &checksums, &listed).await;
+
+            assert!(result.is_ok(), "{store}: {result:?}");
+            assert_eq!(stored_state(&path), before, "{store}");
+        }
+        migrate_embedded("test", &path, next.migrators())
+            .await
+            .unwrap();
+        assert_eq!(stored_state(&path), before, "{store}");
+    }
+}
+
+#[tokio::test]
+async fn a_rollback_refuses_a_newer_migration_unless_listed_with_its_checksum() {
+    let (service, common) = public_test_migrators();
+    let current = EmbeddedMigrators {
+        service,
+        common: Some(common),
+    };
+    let checksums = AcceptedChecksums::from_toml("migrations = []").unwrap();
+    for store in ["test", "common"] {
+        let next = NextRelease::new(store);
+        let version = next.migration.version;
+        let checksum = &next.migration.checksum;
+        let (other_store, history) = if store == "common" {
+            ("test", "_space_common_schema_migrations")
+        } else {
+            ("common", "_sqlx_migrations")
+        };
+        for (case, registry, failed) in [
+            ("unlisted", no_forward(), false),
+            ("edited", forward(store, version, &[0xab; 48]), false),
+            (
+                "listed for another store",
+                forward(other_store, version, checksum),
+                false,
+            ),
+            ("failed", forward(store, version, checksum), true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("database.sqlite");
+            next.database(&path).await;
+            if failed {
+                Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        &format!("UPDATE {history} SET success = FALSE WHERE version = ?1"),
+                        [version],
+                    )
+                    .unwrap();
+            }
+            let before = stored_state(&path);
+
+            let error = migrate_once("test", &path, current, &checksums, &registry)
+                .await
+                .unwrap_err();
+
+            assert!(
+                format!("{error:#}").contains(&format!("migration {version}")),
+                "{store}, {case}: {error:#}"
+            );
+            assert_eq!(stored_state(&path), before, "{store}, {case}");
+        }
+    }
+}
+
+#[test]
+fn every_listed_forward_migration_matches_the_catalog_that_bundles_it() {
+    let catalogs: [(&str, Migrator); 8] = [
+        ("build-manager", sqlx::migrate!("../../../db/build-manager")),
+        ("common", sqlx::migrate!("../../../db/common")),
+        ("node-ctl", sqlx::migrate!("../../../db/node-ctl")),
+        ("node-manager", sqlx::migrate!("../../../db/node-manager")),
+        (
+            "runtime-manager",
+            sqlx::migrate!("../../../db/runtime-manager"),
+        ),
+        (
+            "sandbox-manager",
+            sqlx::migrate!("../../../db/sandbox-manager"),
+        ),
+        (
+            "template-manager",
+            sqlx::migrate!("../../../db/template-manager"),
+        ),
+        (
+            "volume-manager",
+            sqlx::migrate!("../../../db/volume-manager"),
+        ),
+    ];
+    let registry = ForwardCompatible::embedded().unwrap();
+    for (store, version, checksum) in registry.entries() {
+        let Some((_, catalog)) = catalogs.iter().find(|(name, _)| *name == store) else {
+            panic!("{store}/{version} names no node store");
+        };
+        if let Some(bundled) = migrations_by_version(catalog).get(&version) {
+            assert_eq!(
+                bundled.checksum.as_ref(),
+                checksum,
+                "{store}/{version} is bundled with another checksum than the one listed"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_unlisted_row_recorded_after_validation_is_still_refused() {
+    let checksums = AcceptedChecksums::from_toml("migrations = []").unwrap();
+    let (service, _) = public_test_migrators();
+    let next = NextRelease::new("test");
+    let accepted = [(next.migration.version, next.migration.checksum.to_vec())];
+    let unlisted = next.migration.version + 1;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("database.sqlite");
+    next.database(&path).await;
+    // Validation accepted the listed row; another runner then records one
+    // nothing lists before this release runs its catalog.
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+             VALUES (?1, 'concurrent', TRUE, x'00', 0)",
+            [unlisted],
+        )
+        .unwrap();
+    let before = stored_state(&path);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(SqliteConnectOptions::new().filename(&path))
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+
+    let result = checksums
+        .run(
+            "test",
+            &with_forward_placeholders(service, &accepted),
+            &mut *conn,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(sqlx::migrate::MigrateError::VersionMissing(version)) if version == unlisted),
+        "{result:?}"
+    );
+    drop(conn);
+    pool.close().await;
+    assert_eq!(stored_state(&path), before);
 }
