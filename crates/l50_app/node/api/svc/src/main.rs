@@ -35,6 +35,12 @@ struct Cli {
     /// Maximum time to wait for in-flight gRPC requests after SIGTERM.
     #[arg(long, default_value_t = DEFAULT_SHUTDOWN_GRACE_SECS)]
     shutdown_grace_secs: u64,
+
+    /// Seconds file-watch and process event streams keep flowing after
+    /// SIGTERM before node-api ends them with its drain status. Unset, they
+    /// keep the whole shutdown grace.
+    #[arg(long)]
+    open_stream_drain_grace_secs: Option<u64>,
 }
 
 impl From<Cli> for NodeApiRunConfig {
@@ -44,6 +50,7 @@ impl From<Cli> for NodeApiRunConfig {
             role: cli.role,
             health_socket: cli.health_socket,
             shutdown_grace: Duration::from_secs(cli.shutdown_grace_secs),
+            open_stream_drain_grace: cli.open_stream_drain_grace_secs.map(Duration::from_secs),
         }
     }
 }

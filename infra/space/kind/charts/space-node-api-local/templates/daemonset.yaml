@@ -68,6 +68,9 @@ spec:
             - --role={{ $role }}
             - --listen=0.0.0.0:9800
             - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
+            {{- with .Values.openStreamDrainGraceSeconds }}
+            - --open-stream-drain-grace-secs={{ . | int }}
+            {{- end }}
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           ports:
             - name: grpc

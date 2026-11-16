@@ -46,13 +46,6 @@ const LIVENESS_SERVICE: &str = "liveness";
 /// Default ceiling on the post-SIGTERM drain, exposed so the binary's
 /// `--shutdown-grace-secs` default lives next to the code that spends it.
 pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 150;
-/// How long file-watch and process event streams keep flowing after SIGTERM
-/// before node-api ends them with its drain status. They have no natural end,
-/// and while any is open the drain cannot finish, the node refuses every new
-/// call, and the delete-first rollout cannot start the successor. Callers
-/// answer the drain status by reconnecting; a process keeps running in the
-/// guest and its output is resumed from the caller's cursor.
-const OPEN_STREAM_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 type LocalHealthServer = (HealthReporter, JoinHandle<()>);
 
 const SANDBOX_MANAGER_CAPABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
@@ -82,6 +75,14 @@ pub struct NodeApiRunConfig {
     pub health_socket: Option<PathBuf>,
     /// Maximum time to wait for in-flight gRPC requests after SIGTERM.
     pub shutdown_grace: std::time::Duration,
+    /// How long file-watch and process event streams keep flowing after
+    /// SIGTERM before node-api ends them with its drain status; `None` leaves
+    /// them the whole `shutdown_grace`. These streams have no natural end, and
+    /// while one is open the drain cannot finish: the node refuses every new
+    /// call, and the delete-first rollout cannot start the successor. Callers
+    /// answer the drain status by reconnecting; a process keeps running in the
+    /// guest and its output resumes from the caller's cursor.
+    pub open_stream_drain_grace: Option<std::time::Duration>,
 }
 
 /// Why [`run`] returned without a clean shutdown.
@@ -720,12 +721,16 @@ fn drain_before_shutdown(
     service_token
 }
 
-/// A token cancelled `grace` after `shutdown_token` is.
-fn cancel_after_shutdown(
+/// A token cancelled `grace` after `shutdown_token` is, or never without a
+/// grace.
+fn open_stream_drain_token(
     shutdown_token: &CancellationToken,
-    grace: std::time::Duration,
+    grace: Option<std::time::Duration>,
 ) -> CancellationToken {
     let token = CancellationToken::new();
+    let Some(grace) = grace else {
+        return token;
+    };
     tokio::spawn({
         let shutdown_token = shutdown_token.clone();
         let token = token.clone();
@@ -841,7 +846,7 @@ pub async fn run(
                 );
                 let resource_status_reader = crate::NodeResourceStatusReader::new();
                 let open_stream_drain_token =
-                    cancel_after_shutdown(&shutdown_token, OPEN_STREAM_DRAIN_GRACE);
+                    open_stream_drain_token(&shutdown_token, config.open_stream_drain_grace);
                 let svc = WorkerApiService::with_resource_status_reader_and_shutdown_token(
                     clients.clone(),
                     resource_status_reader.clone(),
