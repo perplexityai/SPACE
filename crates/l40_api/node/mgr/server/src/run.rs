@@ -935,7 +935,13 @@ pub async fn run(
             server_result
         };
 
-        if let Err(error) = drain_before_handoff(drain, DEFAULT_DRAIN_TIMEOUT).await {
+        // Admitted artifact work, such as a restore's receive, finishes inside
+        // the budget; past it, it is cancelled so the drain still ends within
+        // the pod's grace period.
+        let cancel_artifact_work = || service.cancel_admitted_artifact_work();
+        if let Err(error) =
+            drain_before_handoff(drain, DEFAULT_DRAIN_TIMEOUT, cancel_artifact_work).await
+        {
             tracing::warn!(%error, "node-manager gRPC server task ended unexpectedly");
         }
         Ok(())
@@ -943,13 +949,19 @@ pub async fn run(
     .await;
     shutdown_token.cancel();
     task_tracker.close();
-    drain_before_handoff(task_tracker.wait(), DEFAULT_DRAIN_TIMEOUT).await;
+    drain_before_handoff(task_tracker.wait(), DEFAULT_DRAIN_TIMEOUT, || {}).await;
     drop(service_mutex);
     active_result
 }
 
-/// A deadline signals escalation, never permission to release exclusion.
-async fn drain_before_handoff<F: std::future::Future>(drain: F, budget: Duration) -> F::Output {
+/// A deadline signals escalation, never permission to release exclusion. Once
+/// `budget` runs out, `on_budget_exhausted` asks the remaining work to stop,
+/// and the drain keeps waiting for it.
+async fn drain_before_handoff<F: std::future::Future>(
+    drain: F,
+    budget: Duration,
+    on_budget_exhausted: impl FnOnce(),
+) -> F::Output {
     tokio::pin!(drain);
     match tokio::time::timeout(budget, &mut drain).await {
         Ok(result) => result,
@@ -958,6 +970,7 @@ async fn drain_before_handoff<F: std::future::Future>(drain: F, budget: Duration
                 drain_timeout_secs = budget.as_secs(),
                 "drain budget exhausted; retaining service mutex until mutations stop; operator must verify child termination before forced handoff"
             );
+            on_budget_exhausted();
             drain.await
         }
     }

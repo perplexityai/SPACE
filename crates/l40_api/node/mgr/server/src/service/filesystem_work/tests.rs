@@ -188,3 +188,105 @@ async fn artifact_mutation_cancellation_retains_target_until_blocking_work_exits
         drop(target.try_lock().unwrap());
     }
 }
+
+/// Runs a two-section artifact mutation: the first section waits for
+/// `release`, the second records that it ran.
+fn gated_mutation(
+    service: &NodeManagerService,
+    id: String,
+    started: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    second_ran: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<Result<(), Status>> {
+    let service = service.clone();
+    tokio::spawn(async move {
+        service
+            .run_artifact_mutation(&id, |worker| async move {
+                worker
+                    .off_runtime("first section", move || {
+                        started.send(()).unwrap();
+                        release
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                        Ok(())
+                    })
+                    .await?;
+                worker
+                    .off_runtime("second section", move || {
+                        second_ran.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+            .await
+    })
+}
+
+// A restore's receive admitted before SIGTERM finishes during the drain: the
+// shutdown that stops new work does not cancel it.
+#[tokio::test]
+async fn shutdown_lets_admitted_artifact_work_finish() {
+    let service = super::super::tests::service_tests::service_for_unit_tests().await;
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let second_ran = Arc::new(AtomicBool::new(false));
+    let mutation = gated_mutation(
+        &service,
+        super::super::SandboxId::new().to_string(),
+        started,
+        released,
+        second_ran.clone(),
+    );
+    running.await.unwrap();
+    service.begin_cleanup_shutdown();
+    release.send(()).unwrap();
+    mutation.await.unwrap().expect("admitted work finishes");
+    assert!(second_ran.load(Ordering::SeqCst));
+}
+
+// Once the drain budget runs out, admitted work stops before its next phase.
+#[tokio::test]
+async fn an_exhausted_drain_cancels_admitted_artifact_work() {
+    let service = super::super::tests::service_tests::service_for_unit_tests().await;
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let second_ran = Arc::new(AtomicBool::new(false));
+    let mutation = gated_mutation(
+        &service,
+        super::super::SandboxId::new().to_string(),
+        started,
+        released,
+        second_ran.clone(),
+    );
+    running.await.unwrap();
+    service.cancel_admitted_artifact_work();
+    release.send(()).unwrap();
+    let status = mutation
+        .await
+        .unwrap()
+        .expect_err("cancelled before its next phase");
+    assert_eq!(status.code(), tonic::Code::Cancelled);
+    assert!(!second_ran.load(Ordering::SeqCst));
+}
+
+// Work whose last phase finished returns its result, even when cancellation
+// arrives before the mutation returns.
+#[tokio::test]
+async fn finished_artifact_work_is_not_reported_cancelled() {
+    let service = super::super::tests::service_tests::service_for_unit_tests().await;
+    let canceller = service.clone();
+    let result = service
+        .run_artifact_mutation(
+            &super::super::SandboxId::new().to_string(),
+            |worker| async move {
+                worker
+                    .off_runtime("last section", move || {
+                        canceller.cancel_admitted_artifact_work();
+                        Ok(7)
+                    })
+                    .await
+            },
+        )
+        .await;
+    assert_eq!(result.expect("finished work keeps its result"), 7);
+}
