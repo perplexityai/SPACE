@@ -30,8 +30,11 @@
 # to `space-sbxmgr cycle-net-gateway` (e.g. --min-age 2h, --max 20,
 # --sleep 5s). Default --max is 100000 so one run drains a node, and default
 # --sleep is 0.5s — the CLI's 2s pacing is what dominates a fleet sweep.
-# --hand-over-sockets, passed through the same way, keeps guest traffic sent
-# during each cycle (see docs/space/aws/net-gateway-cycle-runbook.md).
+# --hand-over-sockets, passed through the same way, keeps new guest traffic
+# sent during each cycle, DNS included, on nodes that support the handover;
+# other nodes stop and relaunch the gateway and drop it as without the flag.
+# Connections the old gateway already relays drop either way (see
+# docs/space/aws/net-gateway-cycle-runbook.md).
 # Exits nonzero if any node had a failed preview or cycle.
 # --node selects one exact host (including canary workers); without it the
 # existing regular-worker fleet scope is unchanged. --refresh-config selects
