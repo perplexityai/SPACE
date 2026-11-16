@@ -15,7 +15,6 @@ use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
 use serde::Deserialize;
-use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -896,10 +895,6 @@ pub async fn run(
                 tonic_health::ServingStatus::Serving,
             )
             .await;
-        let production_shutdown = {
-            let token = production_shutdown_token.clone();
-            async move { token.cancelled().await }
-        };
         let server_handle = tokio::spawn(
             pplx_space_grpc_server::grpc_server_builder_with_request_timeout(
                 CAPTURE_VM_STATE_RPC_BUDGET,
@@ -916,7 +911,15 @@ pub async fn run(
                 .layer(pplx_space_grpc_server::grpc_trace_layer())
                 .add_service(health_service)
                 .add_service(NodeManagerServer::new(service.clone()))
-                .serve_with_incoming_shutdown(UnixListenerStream::new(listener), production_shutdown),
+                .serve_with_incoming_shutdown(
+                    // Closed when the drain starts: connects are refused, not
+                    // queued until the drain ends.
+                    pplx_space_grpc_server::unix_incoming_until_shutdown(
+                        listener,
+                        production_shutdown_token.clone(),
+                    ),
+                    std::future::pending(),
+                ),
         );
 
         shutdown_token.cancelled().await;
