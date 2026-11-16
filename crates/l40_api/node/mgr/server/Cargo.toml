@@ -46,6 +46,8 @@ tonic = { workspace = true }
 tonic-health = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 zeroize = { workspace = true }
 
 # internal
