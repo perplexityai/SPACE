@@ -11111,10 +11111,16 @@ func (x *TemplateNetworkPolicyUpdatedResponse) GetApplyDecision() v11.NetworkPol
 }
 
 type CycleNetGatewayRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	// Hand the old gateway's listening sockets to its replacement, so guest
+	// traffic sent during the cycle waits for the new gateway instead of being
+	// dropped. Off unless set. When node-manager or its runtime supervisor
+	// predates the handover, the cycle stops and relaunches the gateway as it
+	// does without this field.
+	HandOverSockets bool `protobuf:"varint,2,opt,name=hand_over_sockets,json=handOverSockets,proto3" json:"hand_over_sockets,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *CycleNetGatewayRequest) Reset() {
@@ -11154,6 +11160,13 @@ func (x *CycleNetGatewayRequest) GetSandboxId() string {
 	return ""
 }
 
+func (x *CycleNetGatewayRequest) GetHandOverSockets() bool {
+	if x != nil {
+		return x.HandOverSockets
+	}
+	return false
+}
+
 type CycleNetGatewayResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Pid of the gateway process that was killed.
@@ -11163,8 +11176,11 @@ type CycleNetGatewayResponse struct {
 	// Build sha the old gateway last reported via stats probes, empty when it
 	// never reported one (pre-reporting binary or no successful probe).
 	OldBuildGitSha string `protobuf:"bytes,3,opt,name=old_build_git_sha,json=oldBuildGitSha,proto3" json:"old_build_git_sha,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Listening sockets the new gateway took over from the old one; zero when
+	// it bound fresh ones.
+	InheritedSockets uint32 `protobuf:"varint,4,opt,name=inherited_sockets,json=inheritedSockets,proto3" json:"inherited_sockets,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *CycleNetGatewayResponse) Reset() {
@@ -11216,6 +11232,13 @@ func (x *CycleNetGatewayResponse) GetOldBuildGitSha() string {
 		return x.OldBuildGitSha
 	}
 	return ""
+}
+
+func (x *CycleNetGatewayResponse) GetInheritedSockets() uint32 {
+	if x != nil {
+		return x.InheritedSockets
+	}
+	return 0
 }
 
 type AdoptPoolSandboxRequest struct {
@@ -15269,14 +15292,16 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"$TemplateNetworkPolicyUpdatedResponse\x12+\n" +
 	"\x11matched_sandboxes\x18\x01 \x01(\rR\x10matchedSandboxes\x12+\n" +
 	"\x11notified_gateways\x18\x02 \x01(\rR\x10notifiedGateways\x12V\n" +
-	"\x0eapply_decision\x18\x03 \x01(\x0e2/.space.net.policy.v1.NetworkPolicyApplyDecisionR\rapplyDecision\"7\n" +
+	"\x0eapply_decision\x18\x03 \x01(\x0e2/.space.net.policy.v1.NetworkPolicyApplyDecisionR\rapplyDecision\"c\n" +
 	"\x16CycleNetGatewayRequest\x12\x1d\n" +
 	"\n" +
-	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"v\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12*\n" +
+	"\x11hand_over_sockets\x18\x02 \x01(\bR\x0fhandOverSockets\"\xa3\x01\n" +
 	"\x17CycleNetGatewayResponse\x12\x17\n" +
 	"\aold_pid\x18\x01 \x01(\rR\x06oldPid\x12\x17\n" +
 	"\anew_pid\x18\x02 \x01(\rR\x06newPid\x12)\n" +
-	"\x11old_build_git_sha\x18\x03 \x01(\tR\x0eoldBuildGitSha\"\x82\t\n" +
+	"\x11old_build_git_sha\x18\x03 \x01(\tR\x0eoldBuildGitSha\x12+\n" +
+	"\x11inherited_sockets\x18\x04 \x01(\rR\x10inheritedSockets\"\x82\t\n" +
 	"\x17AdoptPoolSandboxRequest\x12\x1a\n" +
 	"\btemplate\x18\x01 \x01(\tR\btemplate\x12\x14\n" +
 	"\x05owner\x18\x02 \x01(\tR\x05owner\x12L\n" +

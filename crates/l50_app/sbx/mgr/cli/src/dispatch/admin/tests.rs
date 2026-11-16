@@ -157,3 +157,25 @@ fn explicit_cycle_selection_keeps_live_members_after_missing_or_stopped_members(
         }
     }
 }
+
+#[test]
+fn cycle_socket_handover_is_opt_in() {
+    for (args, expected) in [(vec![], false), (vec!["--hand-over-sockets"], true)] {
+        let cli = Cli::try_parse_from(
+            ["space-sbxmgr", "cycle-net-gateway", "--stale", "--execute"]
+                .into_iter()
+                .chain(args),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::CycleNetGateway { hand_over_sockets, .. } if hand_over_sockets == expected
+        ));
+    }
+    assert_eq!(handover_note(false, 0), "");
+    assert_eq!(handover_note(true, 2), " (2 sockets handed over)");
+    assert_eq!(
+        handover_note(true, 0),
+        " (sockets not handed over; stopped and relaunched)"
+    );
+}
