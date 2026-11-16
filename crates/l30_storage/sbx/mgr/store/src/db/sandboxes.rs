@@ -41,15 +41,21 @@ db_private_outside_tests! {
     }
 }
 
-/// Rows with one stored lifecycle, cleanup state and runtime. `cleanup_state`
-/// is the label of the cleanup that owns the rows (`required` or `failed`),
-/// absent when none does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxLifecycleCount {
+    pub state: SandboxStatus,
+    pub runtime: Option<RuntimeKind>,
+    pub runtime_version: Option<RuntimeVersion>,
+    pub count: u64,
+}
+
+/// Rows with one stored lifecycle and cleanup state. `cleanup_state` is the
+/// label of the cleanup that owns the rows (`required` or `failed`), absent
+/// when none does.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxStatusCount {
     pub state: SandboxState,
     pub cleanup_state: Option<&'static str>,
-    pub runtime: Option<RuntimeKind>,
-    pub runtime_version: Option<RuntimeVersion>,
     pub count: u64,
 }
 
@@ -153,11 +159,9 @@ pub enum InsertRecoveredSuspendedSandboxError {
 }
 
 db_private_outside_tests! {
-    /// Count every durable sandbox-manager row by its stored lifecycle,
-    /// cleanup state and runtime, retaining only those buckets rather than
-    /// collecting each sandbox's complete execution metadata. A label this
-    /// binary does not know fails the count rather than being dropped from it.
-    fn sandbox_status_counts(conn: &Connection) -> Result<Vec<SandboxStatusCount>> {
+    /// Aggregate durable rows in SQLite, retaining only lifecycle/runtime buckets
+    /// rather than collecting each sandbox's complete execution metadata.
+    fn sandbox_lifecycle_counts(conn: &Connection) -> Result<Vec<SandboxLifecycleCount>> {
         // Use the row reader's full serde decoder, not a second description of
         // its wire format in SQL. Only the validated runtime enters GROUP BY;
         // complete metadata is decoded one row at a time and then discarded.
@@ -178,12 +182,81 @@ db_private_outside_tests! {
             },
         )?;
         let mut statement = conn.prepare(sql!(
-            "SELECT state, cleanup_state, runtime,
+            "SELECT state, runtime,
                     sandbox_execution_runtime(execution_metadata_json) AS execution_runtime,
-                    COUNT(*)
+                    COUNT(*), cleanup_state
              FROM sandboxes
              GROUP BY state, cleanup_state, runtime, execution_runtime"
         ))?;
+        let rows = statement.query_map([], |row| {
+            let state_label: String = row.get(0)?;
+            let cleanup_label: Option<String> = row.get(4)?;
+            let state = SandboxStatus::from_columns(&state_label, cleanup_label.as_deref())
+                .ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        Type::Text,
+                        format!("unknown sandbox state '{state_label}', cleanup {cleanup_label:?}")
+                            .into(),
+                    )
+                })?;
+            // This legacy metric folds cleanup ownership across lifecycles.
+            // Normalize only its bucket key; status counts retain both columns.
+            let state = match state.cleanup() {
+                Some(cleanup) => SandboxStatus::owned(Teardown::Stopping, cleanup),
+                None => state,
+            };
+            let runtime_label: String = row.get(1)?;
+            let execution_runtime: Option<String> = row.get(2)?;
+            let identity = execution_runtime
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<RuntimeIdentity>(value).ok());
+            let runtime = identity
+                .as_ref()
+                .map(|identity| identity.kind)
+                .or_else(|| runtime_label.parse().ok());
+            let runtime_version = identity.map(|identity| identity.version);
+            let count = row.get::<_, SqliteU64>(3)?.0;
+            Ok(((state, runtime, runtime_version), count))
+        })?;
+        // Runtime aliases must share a bucket; absent or malformed metadata must
+        // not drop durable rows or invent a legacy runtime version.
+        let mut grouped = HashMap::new();
+        for row in rows {
+            let (key, count) = row?;
+            *grouped.entry(key).or_insert(0_u64) += count;
+        }
+        let mut counts: Vec<_> = grouped
+            .into_iter()
+            .map(|((state, runtime, runtime_version), count)| SandboxLifecycleCount {
+                state,
+                runtime,
+                runtime_version,
+                count,
+            })
+            .collect();
+        counts.sort_by(|left, right| {
+            (left.state.legacy_label(), left.runtime, &left.runtime_version).cmp(&(
+                right.state.legacy_label(),
+                right.runtime,
+                &right.runtime_version,
+            ))
+        });
+        Ok(counts)
+    }
+}
+
+db_private_outside_tests! {
+    /// Count every durable sandbox-manager row by its stored lifecycle and
+    /// cleanup state, unsummed. A label this binary does not know fails the
+    /// count rather than being dropped from it.
+    fn sandbox_status_counts(conn: &Connection) -> Result<Vec<SandboxStatusCount>> {
+        let mut statement = conn.prepare(
+            "SELECT state, cleanup_state, COUNT(*)
+           FROM sandboxes
+       GROUP BY state, cleanup_state
+       ORDER BY state, cleanup_state",
+        )?;
         let rows = statement.query_map([], |row| {
             let unknown = |column, label: &str| {
                 let kind = if column == 0 { "state" } else { "cleanup state" };
@@ -205,53 +278,14 @@ db_private_outside_tests! {
                         .ok_or_else(|| unknown(1, &label))
                 })
                 .transpose()?;
-            let runtime_label: String = row.get(2)?;
-            let execution_runtime: Option<String> = row.get(3)?;
-            let identity = execution_runtime
-                .as_deref()
-                .and_then(|value| serde_json::from_str::<RuntimeIdentity>(value).ok());
-            let runtime = identity
-                .as_ref()
-                .map(|identity| identity.kind)
-                .or_else(|| runtime_label.parse().ok());
-            let runtime_version = identity.map(|identity| identity.version);
-            let count = row.get::<_, SqliteU64>(4)?.0;
-            Ok(((state, cleanup_state, runtime, runtime_version), count))
+            let count = row.get::<_, SqliteU64>(2)?.0;
+            Ok(SandboxStatusCount {
+                state,
+                cleanup_state,
+                count,
+            })
         })?;
-        // Runtime aliases must share a bucket; absent or malformed metadata must
-        // not drop durable rows or invent a legacy runtime version.
-        let mut grouped = HashMap::new();
-        for row in rows {
-            let (key, count) = row?;
-            *grouped.entry(key).or_insert(0_u64) += count;
-        }
-        let mut counts: Vec<_> = grouped
-            .into_iter()
-            .map(
-                |((state, cleanup_state, runtime, runtime_version), count)| SandboxStatusCount {
-                    state,
-                    cleanup_state,
-                    runtime,
-                    runtime_version,
-                    count,
-                },
-            )
-            .collect();
-        counts.sort_by(|left, right| {
-            (
-                left.state.as_str(),
-                left.cleanup_state,
-                left.runtime,
-                &left.runtime_version,
-            )
-                .cmp(&(
-                    right.state.as_str(),
-                    right.cleanup_state,
-                    right.runtime,
-                    &right.runtime_version,
-                ))
-        });
-        Ok(counts)
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 }
 

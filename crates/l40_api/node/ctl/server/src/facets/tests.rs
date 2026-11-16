@@ -1320,43 +1320,6 @@ fn missing_or_unknown_lifecycle_preserves_cluster_state() {
     }
 }
 
-/// The control plane still reads a cleanup-owned row's status as
-/// `cleanup_required` or `cleanup_failed`, whichever teardown transition
-/// sandbox-manager publishes it under.
-#[test]
-fn a_cleanup_owned_row_publishes_its_cleanup_status() {
-    use pplx_space_sbx_mgr_client::proto::{
-        SandboxCleanup, SandboxCleanupState, SandboxLifecycleState,
-    };
-    for (cleanup, expected) in [
-        (SandboxCleanupState::Required, "cleanup_required"),
-        (SandboxCleanupState::Failed, "cleanup_failed"),
-    ] {
-        for lifecycle in [
-            SandboxLifecycleState::Stopping,
-            SandboxLifecycleState::Deleting,
-            SandboxLifecycleState::Suspending,
-        ] {
-            let sandbox = SandboxInfo {
-                sandbox_id: TEST_SANDBOX_ID.to_string(),
-                lifecycle: Some(lifecycle as i32),
-                cleanup: Some(SandboxCleanup {
-                    state: cleanup as i32,
-                    ..SandboxCleanup::default()
-                }),
-                ..Default::default()
-            };
-            let publication = published_sandbox_state(&sandbox, None, None, Vec::new());
-            assert_eq!(
-                publication.status.as_deref(),
-                Some(expected),
-                "{lifecycle:?}"
-            );
-            assert!(!publication.state_degraded);
-        }
-    }
-}
-
 #[test]
 fn recovered_suspended_published_sandbox_state_wire_shape() {
     let sandbox = pplx_space_sbx_mgr_client::test_support::with_suspend_artifact(

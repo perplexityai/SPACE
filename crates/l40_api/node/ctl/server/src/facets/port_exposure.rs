@@ -38,8 +38,8 @@ impl std::fmt::Display for PortExposureRpc {
 ///
 /// Terminal **only** when sbx-manager marks the status. sbx-manager answers
 /// `FailedPrecondition` for both terminal cases (guest unreachable in a
-/// settled non-reachable state; auto-lifecycle target stuck in `Failed` or
-/// `Quarantined`, or owned by a cleanup) and transient ones (a guest still
+/// settled non-reachable state; auto-lifecycle target stuck in
+/// `Failed`/`CleanupRequired`/`CleanupFailed`/`Quarantined`) and transient ones (a guest still
 /// initializing — `guest_not_ready`; a mid-transition lifecycle state that
 /// settles), and `NotFound` for both a gone row and the startup race where the
 /// local row has not appeared yet (`ApplyPortExposuresAndRetry`). Neither bare

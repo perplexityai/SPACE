@@ -9,18 +9,16 @@ pub(super) async fn handle(
             let sandbox = resolve_sandbox_state(client, &sandbox_id).await;
             let full_id = &sandbox.sandbox_id;
             let short_id = sandbox_label(full_id);
-            let status = sandbox
-                .observed_status()
+            let lifecycle = sandbox
+                .observed_lifecycle()
                 .unwrap_or_else(|error| exit_error(error));
-            println!("Doctor: {short_id}  ({})", status.label());
+            println!("Doctor: {short_id}  ({})", lifecycle.label());
             println!();
 
             if !matches!(
-                status.unowned(),
-                Some(
-                    pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started
-                        | pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused
-                )
+                lifecycle,
+                pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started
+                    | pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused
             ) {
                 println!("Sandbox is not running — nothing to diagnose.");
                 return;
@@ -173,7 +171,7 @@ pub(super) async fn handle(
             println!(
                 "Sandbox {} reached state: {}",
                 sandbox_label(&resp.sandbox_id),
-                resp.observed_status()
+                resp.observed_lifecycle()
                     .unwrap_or_else(|error| exit_error(error))
                     .label()
             );

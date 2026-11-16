@@ -448,13 +448,14 @@ pub fn write_status(conn: &Connection, id: &str, state: impl Into<SandboxStatus>
 /// A snapshot shows a `sandboxes` row's combined status as `state`, as rows
 /// stored it before cleanup ownership moved to its own column, so a write's
 /// expected diff names one status. The split columns are pinned by the
-/// migration and writer tests. `unowned_state` is generated from the two, so
-/// a snapshot leaves it out.
+/// migration and writer tests. `unowned_state` and `legacy_state` are
+/// generated from the two, so a snapshot leaves them out.
 fn fold_sandbox_status(table: &str, values: &mut Row) {
     if table != "sandboxes" {
         return;
     }
     values.remove("unowned_state");
+    values.remove("legacy_state");
     if let Some(Value::Text(cleanup)) = values.remove("cleanup_state") {
         values.insert(
             "state".to_owned(),

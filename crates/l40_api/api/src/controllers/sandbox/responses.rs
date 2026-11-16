@@ -746,7 +746,7 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         .and_then(|info| info.auto_lifecycle_status.as_ref())
         .and_then(|status| status_from_proto(status).ok());
     let live_lifecycle = live.map(|info| {
-        info.observed_status()
+        info.observed_lifecycle()
             .map(|state| state.label().to_string())
             .unwrap_or_else(|_| "unknown".into())
     });
