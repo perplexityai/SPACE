@@ -14,7 +14,6 @@ use pplx_space_host_layout::identities::group_names;
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
-use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::DB_PATH;
@@ -229,15 +228,12 @@ async fn run_service(
     // syncers don't yet accept a token and are dropped at process exit.
     service.spawn_startup_recovery(shutdown_token.clone());
 
-    // Production server runs under its own token so it keeps accepting
-    // traffic while the local health server drains on shutdown_token.
+    // The production server stops on its own token, which the drain below
+    // cancels; its listener closes then, so connects are refused rather than
+    // queued until the drain ends.
     let production_shutdown_token = CancellationToken::new();
 
     let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
-    let production_shutdown = {
-        let token = production_shutdown_token.clone();
-        async move { token.cancelled().await }
-    };
     let server_handle = tokio::spawn(
         pplx_space_grpc_server::grpc_server_builder()
             .timeout(crate::GRPC_REQUEST_TIMEOUT)
@@ -249,7 +245,13 @@ async fn run_service(
             .layer(pplx_space_grpc_server::grpc_trace_layer())
             .add_service(health_service)
             .add_service(TemplateManagerServer::new(service))
-            .serve_with_incoming_shutdown(UnixListenerStream::new(listener), production_shutdown),
+            .serve_with_incoming_shutdown(
+                pplx_space_grpc_server::unix_incoming_until_shutdown(
+                    listener,
+                    production_shutdown_token.clone(),
+                ),
+                std::future::pending(),
+            ),
     );
 
     shutdown_token.cancelled().await;
