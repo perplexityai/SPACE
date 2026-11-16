@@ -677,6 +677,72 @@ async fn persistent_route_identity_divergence_does_not_prevent_verification_key_
     );
 }
 
+/// A gateway launched before route identity or verification keys answers
+/// their push UNIMPLEMENTED until it is cycled. The policy still converges and
+/// the queue row completes rather than retrying a push that cannot succeed;
+/// any other push failure keeps the row pending.
+#[tokio::test]
+async fn a_gateway_older_than_route_security_completes_the_queued_reconcile() {
+    for (identity_push, key_push, unsupported, expected_operations) in [
+        (
+            Err(Status::unimplemented("")),
+            Ok(()),
+            true,
+            &["policy"][..],
+        ),
+        (
+            Ok(NetGatewayRouteIdentityPushOutcome::Applied {
+                identity_profile_version: 1,
+            }),
+            Err(Status::unimplemented("")),
+            true,
+            &["policy", "route_keys"][..],
+        ),
+        (
+            Err(Status::unavailable("net-gateway restarting")),
+            Ok(()),
+            false,
+            &["policy"][..],
+        ),
+        (
+            Ok(NetGatewayRouteIdentityPushOutcome::Applied {
+                identity_profile_version: 1,
+            }),
+            Err(Status::internal("verification-key push failed")),
+            false,
+            &["policy", "route_keys"][..],
+        ),
+    ] {
+        let operations = std::sync::Mutex::new(Vec::new());
+        let result = reconcile_policy_and_route_security(
+            SandboxState::Started,
+            &SpaceApiRouteIdentity::default(),
+            async { identity_push },
+            async {
+                operations.lock().unwrap().push("policy");
+                Ok(ApplyDecisionKind::Apply)
+            },
+            async |_| {
+                operations.lock().unwrap().push("route_keys");
+                key_push
+            },
+        )
+        .await;
+
+        assert_eq!(*operations.lock().unwrap(), expected_operations);
+        let error = result.expect_err("every case fails a route-security push");
+        assert_eq!(
+            matches!(error, NetworkPolicyReconcileError::UnsupportedGateway(_)),
+            unsupported,
+            "{error}"
+        );
+        assert_eq!(
+            queued_network_policy_result("sandbox-id", Err(error)).is_ok(),
+            unsupported
+        );
+    }
+}
+
 #[test]
 fn only_abandoned_network_policy_refresh_is_terminal() {
     let abandoned = NetworkPolicyReconcileError::from(NetworkPolicyRefreshError::Abandoned(

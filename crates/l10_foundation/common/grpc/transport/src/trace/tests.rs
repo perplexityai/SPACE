@@ -377,8 +377,9 @@ fn only_a_server_marked_not_ready_unavailable_is_not_an_error() {
 }
 
 /// A caller that marks a call's refusal as expected gets a success span for
-/// that code, in headers and trailers alike. The same call unmarked, another
-/// code, or a platform failure marked as expected all stay failures.
+/// that code, in headers and trailers alike, as does one that marks an older
+/// peer's UNIMPLEMENTED. The same call unmarked, another code, or a platform
+/// failure marked as expected all stay failures.
 #[test]
 fn caller_marked_status_is_expected_only_for_that_call() {
     let path = "/space.spaced.host.control.v1.HostControl/GetNetworkPolicy";
@@ -415,6 +416,9 @@ fn caller_marked_status_is_expected_only_for_that_call() {
         Some(tonic::Code::Unavailable),
         tonic::Code::Unavailable
     ));
+    let unimplemented = tonic::Code::Unimplemented;
+    assert!(classify(Some(unimplemented), unimplemented));
+    assert!(!classify(None, unimplemented));
 }
 
 /// tonic carries a request's extensions into the HTTP request the trace layer

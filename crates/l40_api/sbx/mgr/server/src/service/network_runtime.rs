@@ -946,7 +946,10 @@ fn finish_route_identity_push(
     record_route_security_push_span(
         span,
         Operation::Identity,
-        classified.as_ref().map(|outcome| outcome.metric_outcome()),
+        classified.as_ref().map_or_else(
+            NetGatewayRouteIdentityPushError::metric_outcome,
+            |outcome| outcome.metric_outcome(),
+        ),
         rejection.as_deref(),
     );
     match classified {
@@ -1041,7 +1044,7 @@ async fn set_route_identity_with_client(
     request: pplx_space_net_gateway_client::proto::SetRouteIdentityRequest,
 ) -> Result<u32, NetGatewayRouteIdentityPushError> {
     let response = client
-        .set_route_identity(request)
+        .set_route_identity(unsupported_by_older_gateway(request))
         .await
         .map_err(NetGatewayRouteIdentityPushError::Rpc)?;
     Ok(response.into_inner().identity_profile_version)
@@ -1181,7 +1184,7 @@ async fn set_route_verification_keys_with_client(
 ) -> Result<NetGatewayRouteVerificationKeyPushOutcome, NetGatewayRouteVerificationKeyPushError> {
     classify_route_verification_key_response(
         client
-            .set_route_verification_keys(request)
+            .set_route_verification_keys(unsupported_by_older_gateway(request))
             .await
             .map(tonic::Response::into_inner),
         expected_generation,
@@ -1220,7 +1223,10 @@ fn finish_route_verification_key_push(
     record_route_security_push_span(
         span,
         Operation::VerificationKeys,
-        result.as_ref().map(|outcome| outcome.metric_outcome()),
+        result.as_ref().map_or_else(
+            NetGatewayRouteVerificationKeyPushError::metric_outcome,
+            |outcome| outcome.metric_outcome(),
+        ),
         failure.as_deref(),
     );
     result.map_err(route_verification_key_push_status)
@@ -1246,19 +1252,29 @@ fn net_gateway_client_span(rpc_method: &'static str, sandbox_id: &str) -> tracin
     )
 }
 
+/// Send a route-security push expecting UNIMPLEMENTED: a gateway keeps the
+/// binary it was launched with, so one launched before these RPCs existed
+/// answers them so until it is cycled. Its client span does not record that
+/// answer as an error; the push records it as `unsupported`.
+fn unsupported_by_older_gateway<T>(message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    pplx_space_common_grpc::ExpectedGrpcStatus::new(tonic::Code::Unimplemented).mark(&mut request);
+    request
+}
+
 /// Record the outcome of a route-security RPC on its client span and emit the
 /// matching counter, so the span tag and the metric tag cannot drift when an
 /// RPC was attempted. Pre-RPC outcomes emit only the counter because no client
 /// span exists.
 ///
-/// Identity divergence is a classified outcome; unsupported RPCs remain errors.
-fn record_route_security_push_span<E>(
+/// Identity divergence and a gateway too old for the RPC are classified
+/// outcomes; every other failure is an error.
+fn record_route_security_push_span(
     span: &tracing::Span,
     operation: Operation,
-    outcome: Result<Outcome, &E>,
+    outcome: Outcome,
     failure: Option<&str>,
 ) {
-    let outcome = outcome.unwrap_or(Outcome::Failed);
     span.record("route_security.outcome", outcome.as_str());
     if outcome == Outcome::Failed {
         span.record("otel.status_code", "ERROR");
@@ -1303,6 +1319,11 @@ fn validate_route_verification_profile(
 }
 
 fn route_verification_key_push_status(error: NetGatewayRouteVerificationKeyPushError) -> Status {
+    if error.is_unsupported() {
+        return Status::unimplemented(
+            "net-gateway does not implement route verification keys; cycle the gateway",
+        );
+    }
     Status::internal(format!(
         "could not push route verification keys to netgtw: {error}"
     ))
@@ -1334,6 +1355,25 @@ enum NetGatewayRouteIdentityPushError {
     Rpc(#[source] Status),
 }
 
+impl NetGatewayRouteIdentityPushError {
+    /// The gateway predates the route identity this build pushes.
+    fn is_unsupported(&self) -> bool {
+        match self {
+            Self::UnsupportedProfile(_) => true,
+            Self::Rpc(status) => status.code() == tonic::Code::Unimplemented,
+            Self::Connect(_) => false,
+        }
+    }
+
+    fn metric_outcome(&self) -> Outcome {
+        if self.is_unsupported() {
+            Outcome::Unsupported
+        } else {
+            Outcome::Failed
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum NetGatewayRouteVerificationKeyPushError {
     #[error("netgtw connect failed: {0}")]
@@ -1344,6 +1384,21 @@ enum NetGatewayRouteVerificationKeyPushError {
         "netgtw route verification key generation mismatch: expected={expected}, applied={applied}"
     )]
     GenerationMismatch { expected: u64, applied: u64 },
+}
+
+impl NetGatewayRouteVerificationKeyPushError {
+    /// The gateway predates the verification-key RPC.
+    fn is_unsupported(&self) -> bool {
+        matches!(self, Self::Rpc(status) if status.code() == tonic::Code::Unimplemented)
+    }
+
+    fn metric_outcome(&self) -> Outcome {
+        if self.is_unsupported() {
+            Outcome::Unsupported
+        } else {
+            Outcome::Failed
+        }
+    }
 }
 
 fn route_identity_to_netgtw_proto(

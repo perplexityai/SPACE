@@ -202,7 +202,7 @@ impl tracing::field::Visit for SpanFieldGrabber {
 
 fn captured_route_security_push_span(
     operation: Operation,
-    outcome: Result<Outcome, &NetGatewayRouteVerificationKeyPushError>,
+    outcome: Outcome,
     failure: Option<&str>,
 ) -> SpanFieldCapture {
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -216,20 +216,63 @@ fn captured_route_security_push_span(
     capture
 }
 
+/// A gateway launched before route security answers its pushes UNIMPLEMENTED,
+/// or reports an older identity profile, until it is cycled. Those answers are
+/// the `unsupported` outcome, not failures; any other answer still fails.
 #[test]
-fn unsupported_verification_key_push_records_an_error_span() {
-    let error = NetGatewayRouteVerificationKeyPushError::Rpc(tonic::Status::unimplemented(
-        "gateway does not implement verification-key synchronization",
-    ));
-    let failure = error.to_string();
-    let capture =
-        captured_route_security_push_span(Operation::VerificationKeys, Err(&error), Some(&failure));
-
-    assert_eq!(capture.get("otel.status_code").as_deref(), Some("ERROR"));
-    assert_eq!(
-        capture.get("route_security.outcome").as_deref(),
-        Some("failed")
-    );
+fn a_gateway_older_than_route_security_is_unsupported_not_failed() {
+    let unimplemented = || tonic::Status::unimplemented("");
+    let identity = |error: NetGatewayRouteIdentityPushError, expected| {
+        (
+            Operation::Identity,
+            error.metric_outcome(),
+            error.to_string(),
+            expected,
+        )
+    };
+    let keys = |error: NetGatewayRouteVerificationKeyPushError, expected| {
+        (
+            Operation::VerificationKeys,
+            error.metric_outcome(),
+            error.to_string(),
+            expected,
+        )
+    };
+    for (operation, outcome, failure, expected) in [
+        identity(
+            NetGatewayRouteIdentityPushError::Rpc(unimplemented()),
+            "unsupported",
+        ),
+        identity(
+            NetGatewayRouteIdentityPushError::UnsupportedProfile(0),
+            "unsupported",
+        ),
+        keys(
+            NetGatewayRouteVerificationKeyPushError::Rpc(unimplemented()),
+            "unsupported",
+        ),
+        identity(
+            NetGatewayRouteIdentityPushError::Rpc(tonic::Status::unavailable("restarting")),
+            "failed",
+        ),
+        keys(
+            NetGatewayRouteVerificationKeyPushError::Rpc(tonic::Status::internal("failed")),
+            "failed",
+        ),
+    ] {
+        let capture = captured_route_security_push_span(operation, outcome, Some(&failure));
+        assert_eq!(
+            capture.get("route_security.outcome").as_deref(),
+            Some(expected),
+            "{failure}"
+        );
+        let status = if expected == "failed" { "ERROR" } else { "OK" };
+        assert_eq!(
+            capture.get("otel.status_code").as_deref(),
+            Some(status),
+            "{failure}"
+        );
+    }
 }
 
 // The same recorder serves the identity push, so acknowledged transport
@@ -238,7 +281,7 @@ fn unsupported_verification_key_push_records_an_error_span() {
 fn tolerated_identity_push_outcomes_record_ok_spans() {
     for outcome in [Outcome::Applied, Outcome::Absent, Outcome::Diverged] {
         let capture =
-            captured_route_security_push_span(Operation::Identity, Ok(outcome), Some("ignored"));
+            captured_route_security_push_span(Operation::Identity, outcome, Some("ignored"));
         assert_eq!(
             capture.get("otel.status_code").as_deref(),
             Some("OK"),
@@ -281,7 +324,7 @@ fn failed_verification_key_push_records_an_error_span() {
     let failure = error.to_string();
     let capture = captured_route_security_push_span(
         Operation::VerificationKeys,
-        Err(&error),
+        error.metric_outcome(),
         Some(failure.as_str()),
     );
 
