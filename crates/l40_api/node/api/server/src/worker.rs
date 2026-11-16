@@ -465,8 +465,9 @@ macro_rules! fwd_sbx {
 // wake the sandbox if needed and read guest state, so a replay answers the
 // same question again. Sandbox-manager interrupts reads still in flight when
 // it hands the socket over, so these replay that interruption once on the
-// successor instead of failing the caller. Never use this for a call that
-// changes or consumes guest state.
+// successor instead of failing the caller. They may wake the sandbox and
+// refresh its activity clock, as a client's retry would. Never use this for a
+// call that changes or consumes state its caller can observe.
 macro_rules! fwd_sbx_guest_read {
     ($service:expr, $budget:expr, $method:literal, $rpc:ident, $req:expr) => {
         $service
@@ -481,10 +482,9 @@ macro_rules! fwd_sbx_guest_read {
     };
 }
 
-// Only for SpacedKillProcess and SpacedSendSignal, and, as a guest read,
-// SpacedListProcesses (which also backs single-process reads): they stop or
-// inspect a sandbox's processes, so they take reserved permits that streams
-// and other calls cannot use up.
+// Only for SpacedKillProcess and SpacedSendSignal: they stop a sandbox's
+// processes, so they take reserved permits that streams and other calls
+// cannot use up.
 macro_rules! fwd_sbx_reserved {
     ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
         $service

@@ -58,10 +58,15 @@ pub(crate) enum RpcReplaySafety {
     /// The RPC is read-only and inherently replay-safe, so a
     /// transport-shaped failure (which may have executed) earns one
     /// fresh-connection probe in case the shared channel was the problem.
-    /// The drain-sized budget stays reserved for handoff proofs: a live
-    /// handler returning unmarked `UNAVAILABLE` (for example, a started
-    /// sandbox whose spaced-host socket is absent) must not be re-executed
-    /// in a loop. Never use this for an RPC with side effects.
+    /// That includes an `UNAVAILABLE` the server answered: sandbox-manager
+    /// ends every call still in flight with an unmarked one when it hands
+    /// its socket to a successor, and that interruption is an intended
+    /// trigger of the probe. The drain-sized budget stays reserved for
+    /// handoff proofs: a live handler returning unmarked `UNAVAILABLE` (for
+    /// example, a started sandbox whose spaced-host socket is absent) must
+    /// not be re-executed in a loop. Never use this for an RPC that changes
+    /// or consumes state its caller can observe; waking the sandbox or
+    /// refreshing its activity clock, as a client's retry would, is fine.
     ReadOnly,
 }
 
@@ -226,9 +231,11 @@ impl std::fmt::Display for RestartHandoffOutcome {
 /// the request never executed, so replay is safe for every RPC, idempotent
 /// or not. RPCs declared [`RpcReplaySafety::ReadOnly`] additionally earn a
 /// single fresh-connection probe on an ambiguous transport-shaped failure —
-/// enough to escape a dead pinned channel, without re-executing a live
-/// erroring handler for the drain-sized budget. Every other failure is
-/// returned unchanged because the RPC may have executed.
+/// enough to escape a dead pinned channel, or to reach the successor after
+/// sandbox-manager's handoff interrupted the call in flight with an unmarked
+/// `UNAVAILABLE`, without re-executing a live erroring handler for the
+/// drain-sized budget. Every other failure is returned unchanged because the
+/// RPC may have executed.
 ///
 /// Replays never reuse `client`; each one uses a fresh, uncached connection
 /// to reach whichever process currently owns the socket, because an
