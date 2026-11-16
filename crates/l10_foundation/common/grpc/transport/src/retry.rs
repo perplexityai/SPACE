@@ -190,7 +190,16 @@ pub fn client_connect_failure_cause(status: &Status) -> Option<ClientConnectFail
     if status.code() != Code::Unavailable {
         return None;
     }
-    let mut source = std::error::Error::source(status);
+    connect_failure_cause_in(std::error::Error::source(status))
+}
+
+/// The proof [`client_connect_failure_cause`] looks for, in `error` and its
+/// sources: the same walk for a local transport error that has not yet
+/// become a status.
+pub(crate) fn connect_failure_cause_in(
+    error: Option<&(dyn std::error::Error + 'static)>,
+) -> Option<ClientConnectFailureCause> {
+    let mut source = error;
     while let Some(error) = source {
         if error.is::<crate::ConnectPhaseError>() {
             return Some(ClientConnectFailureCause::ConnectPhase);
