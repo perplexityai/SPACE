@@ -1457,14 +1457,13 @@ const NODE_MANAGER_RETRY_MAX: Duration = Duration::from_secs(2);
 /// The ioctl requires CAP_SYS_ADMIN, so delegate to privileged
 /// node-manager.
 ///
-/// A plain directory is a permanent install: nothing converts it later, and
-/// a btrfs-send restore can never use it as its parent. So the fallback is
-/// taken only when node-manager predates the RPC (`Unimplemented`). On a
-/// non-btrfs cache node-manager itself makes a plain directory and answers
-/// OK, so any failure it reports is a fault (unreachable mid-restart, EROFS
-/// while its mounts are torn down, EACCES): it is retried for
-/// [`NODE_MANAGER_RESTART_GRACE`], then fails the pull retryably without
-/// creating the dir.
+/// node-manager always creates the build dir: a subvolume on a btrfs cache,
+/// a plain directory only on a non-btrfs one. template-mgr never creates it
+/// itself, since a plain directory on btrfs is a permanent install that no
+/// btrfs-send restore can use as its parent. Any failure is retried for
+/// [`NODE_MANAGER_RESTART_GRACE`] (node-manager unreachable mid-restart,
+/// EROFS while its mounts are torn down), then fails the pull retryably
+/// without creating the dir.
 async fn create_build_dir<F, Fut>(
     name: &str,
     content_hash: &str,
@@ -1477,8 +1476,6 @@ where
             Output = Result<PathBuf, crate::btrfs_via_nodemgr::BtrfsViaNodemgrError>,
         >,
 {
-    use crate::btrfs_via_nodemgr::BtrfsViaNodemgrError;
-
     let deadline = tokio::time::Instant::now() + NODE_MANAGER_RESTART_GRACE;
     let mut backoff = NODE_MANAGER_RETRY_INITIAL;
     loop {
@@ -1494,24 +1491,6 @@ where
             }
             Err(err) => err,
         };
-        let unsupported = matches!(
-            &err,
-            BtrfsViaNodemgrError::Rpc { status, .. } if status.code() == tonic::Code::Unimplemented
-        );
-        if unsupported {
-            tracing::info!(
-                template = name,
-                content_hash,
-                dir = %digest_dir,
-                error = %err,
-                "on-demand pull: node-manager lacks the subvolume RPC; falling back to plain directory"
-            );
-            if let Err(err) = tokio::fs::create_dir_all(digest_dir).await {
-                warn!(error = %err, template = name, content_hash, dir = %digest_dir, "create digest dir failed; falling through");
-                return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
-            }
-            return Ok(());
-        }
         let now = tokio::time::Instant::now();
         if now >= deadline {
             warn!(
@@ -2184,8 +2163,8 @@ async fn try_pull_from(
     //
     // FailedPrecondition from nodemgr (`needs subvolume`) is a
     // benign skip — the digest dir was installed as a plain dir
-    // (non-btrfs host or a node-manager without the create RPC; see
-    // `create_build_dir`);
+    // (a non-btrfs host, or a build left from before node-manager always
+    // created it; see `create_build_dir`);
     // those templates remain usable via the legacy create-and-
     // reflink + Full-codec paths, just without btrfs-send
     // portability. Any other status surfaces as a warn — the

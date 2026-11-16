@@ -1583,27 +1583,29 @@ async fn build_dir_fails_retryably_while_node_manager_stays_down() {
     assert!(!dir.exists(), "no plain-directory build was minted");
 }
 
-/// A node-manager that predates the subvolume RPC still gets a plain
-/// directory.
+/// A node-manager answering `Unimplemented` fails the pull retryably and
+/// leaves no directory behind: template-mgr never makes the build dir itself.
 #[tokio::test(start_paused = true)]
-async fn build_dir_falls_back_to_plain_directory_without_the_rpc() {
+async fn build_dir_never_falls_back_without_the_rpc() {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("sha256:abc");
     let mut fake = FakeSubvolumeCreate::new(
         dir.clone(),
-        [crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc {
+        std::iter::repeat_with(|| crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc {
             rpc: "BtrfsCreateTemplateSubvolume",
             status: Status::unimplemented("BtrfsCreateTemplateSubvolume"),
-        }],
+        })
+        .take(10_000),
     );
 
-    create_build_dir("base", "sha256:abc", dir.to_str().unwrap(), || fake.call())
-        .await
-        .unwrap();
+    let result =
+        create_build_dir("base", "sha256:abc", dir.to_str().unwrap(), || fake.call()).await;
 
-    assert_eq!(fake.calls, 1);
-    assert!(dir.is_dir());
-    assert!(!dir.join(FAKE_SUBVOLUME_MARKER).exists());
+    assert!(
+        matches!(result, Err(PullError::Retryable(_))),
+        "expected a retryable failure, got {result:?}"
+    );
+    assert!(!dir.exists(), "no plain-directory build was minted");
 }
 
 /// node-manager refusing the create (EROFS while its mounts are torn down on
