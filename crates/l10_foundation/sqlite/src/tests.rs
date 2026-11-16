@@ -996,3 +996,48 @@ fn every_listed_forward_migration_matches_the_catalog_that_bundles_it() {
         }
     }
 }
+
+#[tokio::test]
+async fn an_unlisted_row_recorded_after_validation_is_still_refused() {
+    let checksums = AcceptedChecksums::from_toml("migrations = []").unwrap();
+    let (service, _) = public_test_migrators();
+    let next = NextRelease::new("test");
+    let accepted = [(next.migration.version, next.migration.checksum.to_vec())];
+    let unlisted = next.migration.version + 1;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("database.sqlite");
+    next.database(&path).await;
+    // Validation accepted the listed row; another runner then records one
+    // nothing lists before this release runs its catalog.
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+             VALUES (?1, 'concurrent', TRUE, x'00', 0)",
+            [unlisted],
+        )
+        .unwrap();
+    let before = stored_state(&path);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(SqliteConnectOptions::new().filename(&path))
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+
+    let result = checksums
+        .run(
+            "test",
+            &with_forward_placeholders(service, &accepted),
+            &mut *conn,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(sqlx::migrate::MigrateError::VersionMissing(version)) if version == unlisted),
+        "{result:?}"
+    );
+    drop(conn);
+    pool.close().await;
+    assert_eq!(stored_state(&path), before);
+}

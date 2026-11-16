@@ -171,21 +171,44 @@ pub fn common_migrator(migrator: &Migrator) -> Migrator {
 }
 
 /// What one catalog's history table records.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct RecordedHistory {
     /// At least one migration.
     applied: bool,
-    /// A listed forward-compatible migration the catalog doesn't bundle, which
-    /// SQLx must then be told to leave in place.
-    forward: bool,
+    /// Listed forward-compatible migrations the catalog doesn't bundle, as
+    /// `(version, recorded checksum)`.
+    forward: Vec<(i64, Vec<u8>)>,
 }
 
-/// `migrator`, told to leave alone a recorded version it doesn't bundle. Only
-/// for a history whose every such version is listed forward-compatible.
-fn ignoring_unbundled(migrator: &Migrator) -> Migrator {
+/// Fails if SQLx ever applies it: a placeholder stands only for a history row
+/// already recorded with its checksum, which SQLx compares and leaves.
+const FORWARD_PLACEHOLDER_SQL: &str =
+    "SELECT forward_compatible_migration_recorded_by_a_newer_release_is_never_applied_here;";
+
+/// `migrator` plus a placeholder for each accepted forward-compatible row,
+/// carrying the recorded checksum. SQLx then leaves those rows alone and still
+/// refuses any other recorded version it doesn't bundle, such as one a
+/// concurrent runner recorded after validation.
+fn with_forward_placeholders(migrator: &Migrator, forward: &[(i64, Vec<u8>)]) -> Migrator {
+    use sqlx::SqlSafeStr as _;
+    use sqlx::migrate::MigrationType;
+
+    let mut migrations = migrator.migrations.to_vec();
+    for (version, checksum) in forward {
+        let mut placeholder = Migration::new(
+            *version,
+            "forward-compatible migration recorded by a newer release".into(),
+            MigrationType::Simple,
+            FORWARD_PLACEHOLDER_SQL.into_sql_str(),
+            false,
+        );
+        placeholder.checksum = checksum.clone().into();
+        migrations.push(placeholder);
+    }
+    migrations.sort_by_key(|migration| migration.version);
     Migrator {
-        migrations: migrator.migrations.clone(),
-        ignore_missing: true,
+        migrations: migrations.into(),
+        ignore_missing: migrator.ignore_missing,
         locking: migrator.locking,
         no_tx: migrator.no_tx,
         table_name: migrator.table_name.clone(),
@@ -244,7 +267,9 @@ fn validate_public_history(
                 }
                 None => {
                     let listed = forward.accepts(store, version, &checksum);
-                    history.forward |= listed;
+                    if listed {
+                        history.forward.push((version, checksum));
+                    }
                     listed
                 }
             };
@@ -258,12 +283,11 @@ fn validate_public_history(
     Ok(history)
 }
 
-/// Whether each catalog's history records a listed forward-compatible
-/// migration it doesn't bundle.
-#[derive(Clone, Copy, Debug, Default)]
+/// Each catalog's accepted forward-compatible rows, as `(version, checksum)`.
+#[derive(Clone, Debug, Default)]
 struct ForwardRecorded {
-    service: bool,
-    common: bool,
+    service: Vec<(i64, Vec<u8>)>,
+    common: Vec<(i64, Vec<u8>)>,
 }
 
 async fn validate_schema(
@@ -452,22 +476,15 @@ async fn migrate_once(
                 .await
                 .context("failed to acquire SQLite migration connection")?;
             if let Some(common) = migrators.common {
-                let mut common = common_migrator(common);
-                common.ignore_missing = recorded.common;
+                let common = with_forward_placeholders(&common_migrator(common), &recorded.common);
                 checksums
                     .run("common", &common, &mut *conn)
                     .await
                     .context("failed to apply common SQLite migrations")?;
             }
-            let ignoring;
-            let service = if recorded.service {
-                ignoring = ignoring_unbundled(migrators.service);
-                &ignoring
-            } else {
-                migrators.service
-            };
+            let service = with_forward_placeholders(migrators.service, &recorded.service);
             checksums
-                .run(db_name, service, &mut *conn)
+                .run(db_name, &service, &mut *conn)
                 .await
                 .with_context(|| format!("failed to apply {db_name} SQLite migrations"))?;
             Ok(())
