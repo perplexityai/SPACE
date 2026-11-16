@@ -26,12 +26,14 @@ async fn get_vm_state_inner(
     // Reuse the reconnecting channel; the outer read deadline also covers
     // channel readiness after a node-manager restart.
     let mut client = node_manager.lazy();
-    let response = client
-        .get_vm_state(GetVmStateRequest {
-            sandbox_id: sandbox_id.to_string(),
-        })
-        .await?
-        .into_inner();
+    // Every caller handles a failed read itself, as a health observation, a
+    // warning or another poll, so a dial that finds node-manager restarting
+    // is not also an error of its client trace.
+    let mut request = tonic::Request::new(GetVmStateRequest {
+        sandbox_id: sandbox_id.to_string(),
+    });
+    pplx_space_common_grpc::ExpectedConnectFailure.mark(&mut request);
+    let response = client.get_vm_state(request).await?.into_inner();
     match response.state() {
         WireVmState::NotStarted => Ok(VmState::NotStarted),
         WireVmState::Running => Ok(VmState::Running),

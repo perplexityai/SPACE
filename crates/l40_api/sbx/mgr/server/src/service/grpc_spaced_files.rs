@@ -222,7 +222,10 @@ impl SandboxManagerService {
                 .with_grpc_timeout_metadata(request.metadata()),
             || {
                 let mut client = node_manager.clone();
-                let inspect_request = inspect_request.clone();
+                // A dial node-manager never answers is reported below, once
+                // per node, rather than by each attempt's client trace.
+                let mut inspect_request = tonic::Request::new(inspect_request.clone());
+                pplx_space_common_grpc::ExpectedConnectFailure.mark(&mut inspect_request);
                 async move { client.inspect_sandbox(inspect_request).await }
             },
         )
