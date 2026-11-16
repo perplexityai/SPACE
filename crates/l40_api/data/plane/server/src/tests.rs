@@ -3449,6 +3449,16 @@ fn proxy_path_rewrite_preserves_tail_and_query() {
         .unwrap();
     assert_eq!(proxy_path_and_query(session_id, &uri).unwrap(), "/");
 
+    let uri = format!("/v1/sessions/{session_id}/proxy/")
+        .parse::<Uri>()
+        .unwrap();
+    assert_eq!(proxy_path_and_query(session_id, &uri).unwrap(), "/");
+
+    let uri = format!("/v1/sessions/{session_id}/proxy/?tab=1")
+        .parse::<Uri>()
+        .unwrap();
+    assert_eq!(proxy_path_and_query(session_id, &uri).unwrap(), "/?tab=1");
+
     let session_id = DataPlaneSessionId::Protocol(Default::default());
     let uri = format!("/v1/sessions/{session_id}/proxy/json/version")
         .parse::<Uri>()
