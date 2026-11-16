@@ -16,12 +16,13 @@ use pplx_space_api_route::{
     space_api_route_capability_presence, take_wait_ready_call_purpose, wait_ready_call_purpose,
 };
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_grpc::fwd_retry;
+use pplx_space_common_grpc::{GrpcRetryContext, GrpcRetryPolicy, fwd_retry};
 use pplx_space_node_mgr_client::{CacheDiskSchedulingEffect, NodeResourceStatusReader};
 use pplx_space_rpc_auth::{
     NetworkPolicyMutationAuthority, NodeApiAuthenticatedCaller, WaitReadyLifecycleAuthority,
 };
 use pplx_space_sandbox_grpc::record_sandbox_id;
+use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -661,6 +662,56 @@ fn allow_port_request_params(req: &pplx_space_node_mgr_client::proto::AllowPortR
         ("port", req.port.to_string()),
         ("protocol", protocol),
     ])
+}
+
+/// Retry budget for forwarding `AllowPort` and `ExposePort` across a
+/// node-manager restart. node-manager surges: on SIGTERM the predecessor
+/// stops accepting and drains for up to [`DEFAULT_DRAIN_TIMEOUT`] before it
+/// releases the service mutex, and only then does the successor finish
+/// starting and bind the socket, so dials in between are refused and calls
+/// on the old connection are cut. A caller's `grpc-timeout` still bounds the
+/// wait.
+const NODE_MANAGER_RESTART_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
+    max_retries: 128,
+    initial_delay: Duration::from_millis(50),
+    backoff_multiplier: 2.0,
+    max_delay: Duration::from_millis(500),
+    max_elapsed: DEFAULT_DRAIN_TIMEOUT.saturating_add(Duration::from_secs(5)),
+    jitter_factor: 0.2,
+    max_server_retry_after: Duration::from_secs(2),
+};
+
+/// Forward a port-exposure RPC to node-manager, waiting out its restart.
+///
+/// Only for `AllowPort` and `ExposePort`: each answers success when its rule
+/// is already installed, so replaying an attempt whose connection was cut
+/// after it may have run is safe.
+async fn forward_port_rpc_through_node_manager_restart<Req, Resp, F, Fut>(
+    command: &'static str,
+    request: Request<Req>,
+    mut call: F,
+) -> Result<Response<Resp>, Status>
+where
+    Req: Clone,
+    F: FnMut(Request<Req>) -> Fut,
+    Fut: Future<Output = Result<Response<Resp>, Status>>,
+{
+    let metadata = request.metadata().clone();
+    let message = request.into_inner();
+    let context = GrpcRetryContext::none().with_grpc_timeout_metadata(&metadata);
+    pplx_space_common_grpc::retry_grpc_status_with_context_if(
+        "node-manager",
+        command,
+        NODE_MANAGER_RESTART_RETRY_POLICY,
+        context,
+        pplx_space_common_grpc::is_client_transport_failure,
+        || {
+            let mut request = Request::new(message.clone());
+            *request.metadata_mut() = metadata.clone();
+            call(request)
+        },
+    )
+    .await
 }
 
 fn reject_public_netns_path(rpc: &'static str, netns_path: &Option<String>) -> Result<(), Status> {
@@ -1305,7 +1356,12 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_node_mgr_client::proto::ExposePortRequest>,
     ) -> Result<Response<pplx_space_node_mgr_client::proto::ExposePortResponse>, Status> {
-        fwd!(self.clients.node(), expose_port, r)
+        let client = self.clients.node();
+        forward_port_rpc_through_node_manager_restart("expose_port", r, |request| {
+            let mut client = client.clone();
+            async move { client.expose_port(request).await }
+        })
+        .await
     }
 
     async fn allow_port(
@@ -1314,7 +1370,12 @@ impl WorkerApi for WorkerApiService {
     ) -> Result<Response<pplx_space_node_mgr_client::proto::AllowPortResponse>, Status> {
         let request_params = allow_port_request_params(r.get_ref());
         pplx_space_grpc_server::record_safe_grpc_request_params(&request_params);
-        let result = self.clients.node().allow_port(r).await;
+        let client = self.clients.node();
+        let result = forward_port_rpc_through_node_manager_restart("allow_port", r, |request| {
+            let mut client = client.clone();
+            async move { client.allow_port(request).await }
+        })
+        .await;
         if let Err(status) = &result {
             pplx_space_grpc_server::log_failed_grpc_request_params(status, &request_params);
         }

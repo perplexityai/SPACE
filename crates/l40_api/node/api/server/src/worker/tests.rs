@@ -158,6 +158,21 @@ fn policy_mutation_requires_control_plane_authority() {
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
 }
 
+/// A backend that answers every call with `Unimplemented`, so a call node-api
+/// forwarded is told apart from one it refused at admission.
+fn unimplemented_backend() -> axum::Router {
+    axum::Router::new().fallback(|| async {
+        http::Response::builder()
+            .header("content-type", "application/grpc")
+            .header(
+                "grpc-status",
+                (tonic::Code::Unimplemented as i32).to_string(),
+            )
+            .body(axum::body::Body::empty())
+            .unwrap()
+    })
+}
+
 /// A sandbox-manager that answers every call with `Unimplemented`, so a call
 /// node-api forwarded is told apart from one it refused at admission.
 async fn unimplemented_sandbox_manager() -> crate::clients::BackendClients {
@@ -804,4 +819,89 @@ async fn guest_read_streams_pass_through_first_items_that_are_not_replayed() {
         assert!(items.next().await.is_none(), "{rpc} is not empty");
         assert_eq!(successor_calls.load(Ordering::SeqCst), 0, "{rpc}");
     }
+}
+
+fn service_with_clients(clients: crate::clients::BackendClients) -> WorkerApiService {
+    WorkerApiService {
+        clients,
+        uds_per_sandbox_limiter: UdsPerSandboxLimiter::for_tests_with_reserved(1, 1, 8),
+        service_port_ingress_limiter: shared_service_port_ingress_limiter(),
+        resource_status_reader: NodeResourceStatusReader::new(),
+        shutdown_token: CancellationToken::new(),
+        open_stream_drain_token: CancellationToken::new(),
+    }
+}
+
+/// A node-manager restarting as a deploy restarts it: its socket is unbound
+/// until the successor has started, which answers every call with
+/// `Unimplemented`. Holds the socket directory and the successor task.
+struct RestartingNodeManager {
+    _dir: tempfile::TempDir,
+    successor: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RestartingNodeManager {
+    fn drop(&mut self) {
+        self.successor.abort();
+    }
+}
+
+fn restarting_node_manager() -> (WorkerApiService, RestartingNodeManager) {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("node-manager.sock");
+    let clients = crate::clients::BackendClients::with_channel(
+        pplx_space_common_grpc::connect_uds_channel_lazy(
+            &socket,
+            tonic::transport::Endpoint::from_static("http://[::]:50051"),
+        ),
+    );
+    let successor = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        axum::serve(listener, unimplemented_backend())
+            .await
+            .unwrap();
+    });
+    (
+        service_with_clients(clients),
+        RestartingNodeManager {
+            _dir: dir,
+            successor,
+        },
+    )
+}
+
+// A port call waits for node-manager's successor instead of failing on the
+// refused dial.
+#[tokio::test]
+async fn allow_port_waits_for_a_restarting_node_manager() {
+    use pplx_space_node_mgr_client::proto::{AllowPortRequest, NetworkProtocol};
+    let (service, _node_manager) = restarting_node_manager();
+
+    let forwarded = service
+        .allow_port(Request::new(AllowPortRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            port: 8080,
+            protocol: NetworkProtocol::Tcp as i32,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
+}
+
+#[tokio::test]
+async fn expose_port_waits_for_a_restarting_node_manager() {
+    use pplx_space_node_mgr_client::proto::{ExposePortRequest, NetworkProtocol};
+    let (service, _node_manager) = restarting_node_manager();
+
+    let forwarded = service
+        .expose_port(Request::new(ExposePortRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            port: 8080,
+            protocol: NetworkProtocol::Tcp as i32,
+            guest_port: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
 }
