@@ -68,8 +68,8 @@ spec:
             - --role={{ $role }}
             - --listen=0.0.0.0:9800
             - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
-            {{- with .Values.openStreamDrainGraceSeconds }}
-            - --open-stream-drain-grace-secs={{ . | int }}
+            {{- if not (kindIs "invalid" .Values.openStreamDrainGraceSeconds) }}
+            - --open-stream-drain-grace-secs={{ .Values.openStreamDrainGraceSeconds | int }}
             {{- end }}
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           ports:

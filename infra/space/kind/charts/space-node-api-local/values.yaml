@@ -112,11 +112,11 @@ terminationGracePeriodSeconds: 180
 
 # Seconds file watches and process event streams keep flowing after SIGTERM
 # before node-api ends them with the drain status their callers reconnect on
-# (--open-stream-drain-grace-secs). Unset, they keep the whole budget above,
-# and one open stream keeps the node without a node-api that takes new calls
-# for all of it, since the successor starts only once this pod exits. Set, a
-# command still running when the grace ends loses its output stream unless
-# its caller's reconnect outlasts the restart.
+# (--open-stream-drain-grace-secs; 0 ends them at once). Unset, they keep the
+# whole budget above, and one open stream keeps the node without a node-api
+# that takes new calls for all of it, since the successor starts only once
+# this pod exits. Set, a command still running when the grace ends loses its
+# output stream unless its caller's reconnect outlasts the restart.
 openStreamDrainGraceSeconds: null
 
 # Builder role only: seconds node-api keeps serving after its pod starts
