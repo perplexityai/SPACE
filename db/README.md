@@ -30,11 +30,11 @@ migrations for every store.
 Postgres migrations under `db/postgres/` use SQLx numeric versions. Retired
 legacy migrations used `NNN_name.up.sql` / `NNN_name.down.sql` names through
 `093`. New Postgres migrations must use a UTC creation timestamp:
-`YYYYMMDDHHMMSS_name.up.sql` and `YYYYMMDDHHMMSS_name.down.sql`. The migration
-version guard only evaluates newly added Postgres files, requires their numeric
-prefix to be greater than the fixed legacy cutoff, and rejects a new timestamp
-that is not newer than the max Postgres migration version already on the base
-branch.
+`YYYYMMDDHHMMSS_name.up.sql` and `YYYYMMDDHHMMSS_name.down.sql`. For Postgres,
+the migration version guard evaluates only newly added files, including files
+moved or renamed into `db/postgres/`, requires their numeric prefix to be
+greater than the fixed legacy cutoff, and rejects a new timestamp that is not
+newer than the max Postgres migration version already on the base branch.
 
 Generate the version prefix with:
 
@@ -430,8 +430,16 @@ state-preserving recovery plan. Never edit history rows to bypass validation.
 
 For stores with shared jobs, `down` removes the greatest applied timestamp across
 both catalogs, choosing the service migration first when timestamps match.
-Migration timestamps must reflect release/dependency order. Baseline down
-migrations reject rollback below the supported schema floor.
+Migration timestamps must reflect release/dependency order. The migration
+version guard enforces this for SQLite catalogs too. An up migration added or
+moved directly into a service catalog `db/<store>/` must be newer than the
+newest version on the base branch in both that catalog and `db/common/`. One
+added or moved into `db/common/` must be newer than the newest version on the
+base branch in every SQLite catalog, not only the consumers. `history/`
+subdirectories are not part of a catalog, and a catalog absent from the base
+branch is not compared. A branch overtaken by a newer migration renumbers on
+rebase, as Postgres branches already do. Baseline down migrations reject
+rollback below the supported schema floor.
 
 The `jobs` table belongs to `db/common/`. Add shared tables, columns, and indexes
 there instead of copying jobs DDL into service directories. Service-owned
