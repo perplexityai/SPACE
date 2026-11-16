@@ -217,18 +217,25 @@ pub(super) fn reconcile_startup(
     Ok(())
 }
 
+/// `young_leases` are the startup leases still inside their handoff grace
+/// ([`query_startup_young_leases`]): a leased one without a runtime is left
+/// for startup validation, which rechecks it, instead of being dirtied here.
 pub(super) fn reconcile_runtime_state(
     conn: &mut Connection,
     config: &NetworkPoolConfig,
+    young_leases: &HashMap<LeaseKey, u64>,
 ) -> rusqlite::Result<()> {
     let records = query_records(conn, None)?;
-    let updates = runtime_reconcile_updates(records, lease_liveness);
+    let updates = runtime_reconcile_updates(records, lease_liveness, |record| {
+        LeaseKey::from_record(record).is_some_and(|key| young_leases.contains_key(&key))
+    });
     apply_runtime_reconcile_updates(conn, config, &updates)
 }
 
 pub(super) fn runtime_reconcile_updates(
     records: Vec<SlotRecord>,
     probe_liveness: impl Fn(&SlotInfo) -> LeaseLiveness,
+    is_young: impl Fn(&SlotRecord) -> bool,
 ) -> Vec<RuntimeReconcileUpdate> {
     let mut updates = Vec::new();
     for record in records {
@@ -263,7 +270,7 @@ pub(super) fn runtime_reconcile_updates(
                         slot_id: record.info.slot,
                         error: "leased slot has no sandbox id".to_string(),
                     });
-                } else if liveness == LeaseLiveness::Gone {
+                } else if liveness == LeaseLiveness::Gone && !is_young(&record) {
                     updates.push(RuntimeReconcileUpdate::DirtyLease {
                         slot_id: record.info.slot,
                         generation: record.info.generation,
@@ -625,6 +632,38 @@ pub(super) fn query_startup_leases(conn: &Connection) -> Result<HashSet<LeaseKey
         .filter(|record| matches!(record.state, SlotState::Leasing | SlotState::Leased))
         .filter_map(LeaseKey::from_record)
         .collect())
+}
+
+/// Startup leases last written within `grace` before `now`, each with the time
+/// its grace ends.
+pub(super) fn query_startup_young_leases(
+    conn: &Connection,
+    now: u64,
+    grace: Duration,
+) -> Result<HashMap<LeaseKey, u64>, SlotStoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT slot_id, generation, sandbox_id, updated_at FROM network_slots
+         WHERE state IN ('leasing', 'leased') AND sandbox_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            LeaseKey {
+                slot_id: row.get(0)?,
+                generation: row.get::<_, SqliteU64>(1)?.0,
+                sandbox_id: row.get(2)?,
+            },
+            row.get::<_, SqliteU64>(3)?.0,
+        ))
+    })?;
+    let mut young = HashMap::new();
+    for row in rows {
+        let (key, updated_at) = row?;
+        let grace_ends = updated_at.saturating_add(grace.as_secs());
+        if now < grace_ends {
+            young.insert(key, grace_ends);
+        }
+    }
+    Ok(young)
 }
 
 pub(super) fn apply_startup_leasing_evidence(
