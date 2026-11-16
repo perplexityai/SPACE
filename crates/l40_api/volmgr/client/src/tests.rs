@@ -336,3 +336,24 @@ async fn cancel_transfer_scope_waits_through_a_volume_manager_handoff() {
     assert_eq!(jobs.len(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
+
+#[tokio::test(start_paused = true)]
+async fn ensure_file_replica_gives_up_on_a_volume_manager_that_never_answers() {
+    let started = tokio::time::Instant::now();
+
+    let error = tokio::time::timeout(
+        VOLUME_MANAGER_RESTART_BUDGET + Duration::from_secs(60),
+        submit_pull_file_with_retry(
+            PullFileRequest::default(),
+            started,
+            Duration::from_secs(10_800),
+            |_| std::future::pending(),
+        ),
+    )
+    .await
+    .expect("an unanswered submission is bounded by the restart budget")
+    .unwrap_err();
+
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+    assert!(started.elapsed() >= VOLUME_MANAGER_RESTART_BUDGET);
+}

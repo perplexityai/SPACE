@@ -509,21 +509,29 @@ where
     let mut retry_index = 0;
     let mut unreachable_since: Option<tokio::time::Instant> = None;
     loop {
-        let status = match submit(request.clone()).await {
-            Ok(response) => return Ok(response.into_inner()),
-            Err(status) => status,
+        // An attempt that gets no answer counts towards the outage from when
+        // it started, so a volume-manager that accepts connections and never
+        // answers is given up on at the restart budget too.
+        let attempt_started = tokio::time::Instant::now();
+        let attempt_budget = VOLUME_MANAGER_RESTART_BUDGET
+            .saturating_sub(unreachable_since.map_or(Duration::ZERO, |since| since.elapsed()))
+            .min(max_total.saturating_sub(started_at.elapsed()));
+        let status = match tokio::time::timeout(attempt_budget, submit(request.clone())).await {
+            Ok(Ok(response)) => return Ok(response.into_inner()),
+            Ok(Err(status)) => status,
+            Err(_) => tonic::Status::deadline_exceeded(
+                "volume-manager did not answer the transfer submission",
+            ),
         };
-        // Admission refusals wait within the total budget. A refused or
-        // dropped connection, or a handoff refusal, is volume-manager
+        // Admission refusals wait within the total budget. A refused, dropped
+        // or unanswered connection, or a handoff refusal, is volume-manager
         // restarting; the submission is deduplicated, so it is replayed for up
         // to the restart budget.
         let retry = if status.code() == tonic::Code::ResourceExhausted {
             unreachable_since = None;
             true
         } else if pplx_space_common_grpc::should_reconnect_status(&status) {
-            unreachable_since
-                .get_or_insert_with(tokio::time::Instant::now)
-                .elapsed()
+            unreachable_since.get_or_insert(attempt_started).elapsed()
                 < VOLUME_MANAGER_RESTART_BUDGET
         } else {
             false
