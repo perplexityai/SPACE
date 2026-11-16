@@ -22,6 +22,8 @@ use pplx_space_sbx_mgr_client::{
     SandboxManagerGrpcClient, connect_fresh, is_restart_retry_on_successor,
 };
 
+use crate::clients::BackendClients;
+
 /// Retry budget spanning a full sandbox-manager restart handoff: the
 /// predecessor drains state writers for up to [`DEFAULT_DRAIN_TIMEOUT`]
 /// before it exits and the successor can bind the socket. The budget is a
@@ -227,7 +229,7 @@ pub(crate) async fn call_with_restart_handoff<Req, Resp, F, Fut>(
     method: &'static str,
     safety: RpcReplaySafety,
     request: Request<Req>,
-    client: SandboxManagerGrpcClient,
+    clients: &BackendClients,
     call: F,
 ) -> Result<Response<Resp>, Status>
 where
@@ -235,11 +237,31 @@ where
     F: Fn(SandboxManagerGrpcClient, Request<Req>) -> Fut + Send,
     Fut: Future<Output = Result<Response<Resp>, Status>> + Send,
 {
+    #[cfg(test)]
+    if let Some(successor) = clients.sbx_successor_for_tests() {
+        // Never the process-wide dialer: its shared result would hand one
+        // test's successor to another test running concurrently.
+        let dialer = RestartHandoffDialer::new(Duration::ZERO);
+        let dial = move || {
+            let successor = successor.clone();
+            async move { Ok(successor) }
+        };
+        return call_with_restart_handoff_via(
+            method,
+            safety,
+            request,
+            clients.sbx(),
+            &dialer,
+            dial,
+            call,
+        )
+        .await;
+    }
     call_with_restart_handoff_via(
         method,
         safety,
         request,
-        client,
+        clients.sbx(),
         production_dialer(),
         dial_fresh,
         call,

@@ -1,5 +1,7 @@
 use super::*;
 use pplx_space_sbx_mgr_client::proto;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[test]
 fn wait_ready_policy_requires_authenticated_authority_and_lifecycle_purpose() {
     for (authority, purpose, expected) in [
@@ -159,15 +161,28 @@ fn policy_mutation_requires_control_plane_authority() {
 /// A sandbox-manager that answers every call with `Unimplemented`, so a call
 /// node-api forwarded is told apart from one it refused at admission.
 async fn unimplemented_sandbox_manager() -> crate::clients::BackendClients {
-    let backend = axum::Router::new().fallback(|| async {
-        http::Response::builder()
-            .header("content-type", "application/grpc")
-            .header(
-                "grpc-status",
-                (tonic::Code::Unimplemented as i32).to_string(),
-            )
-            .body(axum::body::Body::empty())
-            .unwrap()
+    let (channel, _) = answering_sandbox_manager(tonic::Code::Unimplemented, "").await;
+    crate::clients::BackendClients::with_channel(channel)
+}
+
+/// A sandbox-manager that answers every call with `code` and `message`, and
+/// counts the calls that reach it.
+async fn answering_sandbox_manager(
+    code: tonic::Code,
+    message: &'static str,
+) -> (tonic::transport::Channel, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let backend = axum::Router::new().fallback(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async move {
+            http::Response::builder()
+                .header("content-type", "application/grpc")
+                .header("grpc-status", (code as i32).to_string())
+                .header("grpc-message", message)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        }
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -177,7 +192,7 @@ async fn unimplemented_sandbox_manager() -> crate::clients::BackendClients {
         .connect()
         .await
         .unwrap();
-    crate::clients::BackendClients::with_channel(channel)
+    (channel, calls)
 }
 
 async fn service_with_limiter(limiter: UdsPerSandboxLimiter) -> WorkerApiService {
@@ -338,4 +353,122 @@ async fn the_internal_runtime_upgrade_report_is_forwarded_only_for_the_control_p
         .await
         .unwrap_err();
     assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
+}
+
+/// Sandbox-manager keeps serving guest reads while it drains, then ends every
+/// call still in flight when it hands its socket to the successor. The status
+/// carries no drain marker, as the call may have run, so only a call that is
+/// safe to run twice may be replayed on the successor.
+#[tokio::test]
+async fn guest_reads_interrupted_by_a_handoff_are_answered_by_the_successor() {
+    let (predecessor, _) = answering_sandbox_manager(
+        tonic::Code::Unavailable,
+        "sandbox-manager handoff interrupted an in-flight RPC",
+    )
+    .await;
+    let (successor, successor_calls) =
+        answering_sandbox_manager(tonic::Code::NotFound, "answered by the successor").await;
+    let mut service =
+        service_with_limiter(UdsPerSandboxLimiter::for_tests_with_reserved(8, 8, 64)).await;
+    service.clients =
+        crate::clients::BackendClients::with_channel(predecessor).with_sbx_successor(successor);
+    let sandbox_id = || SandboxId::new().to_string();
+
+    let reads = [
+        (
+            "SpacedStat",
+            service
+                .spaced_stat(Request::new(proto::SpacedStatRequest {
+                    sandbox_id: sandbox_id(),
+                    ..Default::default()
+                }))
+                .await
+                .map(drop),
+        ),
+        (
+            "SpacedListProcesses",
+            service
+                .spaced_list_processes(Request::new(proto::SpacedListProcessesRequest {
+                    sandbox_id: sandbox_id(),
+                    ..Default::default()
+                }))
+                .await
+                .map(drop),
+        ),
+        (
+            "SpacedNormalizeWatchRoot",
+            service
+                .spaced_normalize_watch_root(Request::new(proto::SpacedNormalizeWatchRootRequest {
+                    sandbox_id: sandbox_id(),
+                    ..Default::default()
+                }))
+                .await
+                .map(drop),
+        ),
+        (
+            "SpacedGetModifiedFiles",
+            service
+                .spaced_get_modified_files(Request::new(proto::SpacedGetModifiedFilesRequest {
+                    sandbox_id: sandbox_id(),
+                    ..Default::default()
+                }))
+                .await
+                .map(drop),
+        ),
+    ];
+    for (method, result) in reads {
+        let status = result.unwrap_err();
+        assert_eq!(
+            (status.code(), status.message()),
+            (tonic::Code::NotFound, "answered by the successor"),
+            "{method} was not replayed on the successor"
+        );
+    }
+    assert_eq!(successor_calls.load(Ordering::SeqCst), 4);
+
+    // Calls that change or consume guest state may already have run.
+    let writes = [
+        (
+            "SpacedWriteBatch",
+            service
+                .spaced_write_batch(Request::new(proto::SpacedWriteBatchRequest {
+                    sandbox_id: sandbox_id(),
+                    ..Default::default()
+                }))
+                .await
+                .map(drop),
+        ),
+        (
+            "SpacedSendSignal",
+            service
+                .spaced_send_signal(Request::new(proto::SpacedSendSignalRequest {
+                    sandbox_id: sandbox_id(),
+                    ..Default::default()
+                }))
+                .await
+                .map(drop),
+        ),
+        (
+            "SpacedGetWatcherEvents",
+            service
+                .spaced_get_watcher_events(Request::new(proto::SpacedGetWatcherEventsRequest {
+                    sandbox_id: sandbox_id(),
+                    ..Default::default()
+                }))
+                .await
+                .map(drop),
+        ),
+    ];
+    for (method, result) in writes {
+        let status = result.unwrap_err();
+        assert_eq!(
+            (status.code(), status.message()),
+            (
+                tonic::Code::Unavailable,
+                "sandbox-manager handoff interrupted an in-flight RPC"
+            ),
+            "{method} must surface the interruption unchanged"
+        );
+    }
+    assert_eq!(successor_calls.load(Ordering::SeqCst), 4);
 }

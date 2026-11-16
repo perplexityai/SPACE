@@ -68,6 +68,7 @@ fn clients_with_channel(channel: tonic::transport::Channel) -> BackendClients {
         tmpl: TemplateManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
         build_mgr: pplx_space_build_mgr_client::client_with_token(channel, "stream-test-token")
             .unwrap(),
+        sbx_successor: None,
     }
 }
 fn wire_request(method: &str, body: tonic::body::Body) -> http::Request<tonic::body::Body> {

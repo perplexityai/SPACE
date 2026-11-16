@@ -50,6 +50,7 @@ async fn builder_limits_system_submissions_to_bundled_templates() {
         node: NodeManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
         tmpl: TemplateManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
         build_mgr: pplx_space_build_mgr_client::client_with_token(channel, "test-token").unwrap(),
+        sbx_successor: None,
     };
     let builder = BuilderApiService::new(clients, NodeId::new());
     let tenant = Some(OrgId::new().to_string());
@@ -124,6 +125,7 @@ async fn build_manager_rejection_of_gateway_credential_is_internal() {
         node: NodeManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
         tmpl: TemplateManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
         build_mgr: pplx_space_build_mgr_client::client_with_token(channel, "test-token").unwrap(),
+        sbx_successor: None,
     };
     let builder = BuilderApiService::new(clients.clone(), NodeId::new());
     let mut service = BuilderApiService::new(clients, NodeId::new())
