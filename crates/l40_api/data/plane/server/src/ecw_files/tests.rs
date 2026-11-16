@@ -1325,3 +1325,171 @@ async fn watch_stream_ends_unavailable_when_the_drain_deadline_passes() {
     drop(stream);
     assert_eq!(limiter.active_total(), 0);
 }
+
+/// node-api in front of a restarting sandbox-manager: it answers each of the
+/// first `refusals` writes with `refusal`, before reading its body, and every
+/// later write with the number of data bytes it received.
+struct WriteBackend {
+    endpoint: crate::BackendEndpoint,
+    writes: Arc<AtomicUsize>,
+    received: Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+async fn spawn_write_backend(refusals: usize, refusal: fn() -> tonic::Status) -> WriteBackend {
+    fn grpc_ok(message: impl prost::Message) -> axum::response::Response {
+        let encoded = message.encode_to_vec();
+        let mut frame = vec![0u8];
+        frame.extend_from_slice(&u32::try_from(encoded.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(&encoded);
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        let frames = stream::iter([
+            Ok::<_, Infallible>(http_body::Frame::data(Bytes::from(frame))),
+            Ok(http_body::Frame::trailers(trailers)),
+        ]);
+        axum::response::Response::builder()
+            .header(header::CONTENT_TYPE, "application/grpc")
+            .body(Body::new(http_body_util::StreamBody::new(frames)))
+            .unwrap()
+    }
+    let writes = Arc::new(AtomicUsize::new(0));
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (counted, recorded) = (Arc::clone(&writes), Arc::clone(&received));
+    let backend = axum::Router::new()
+        .route(
+            "/space.node.api.v1.WorkerApi/SpacedMkdir",
+            axum::routing::post(|| async { grpc_ok(spaced_ops::MkdirResponse::default()) }),
+        )
+        .route(
+            "/space.node.api.v1.WorkerApi/SpacedWrite",
+            axum::routing::post(move |body: Body| {
+                let write = counted.fetch_add(1, Ordering::SeqCst);
+                let recorded = Arc::clone(&recorded);
+                async move {
+                    if write < refusals {
+                        return refusal().into_http::<Body>();
+                    }
+                    let mut wire = body.collect().await.unwrap().to_bytes();
+                    let mut bytes = 0u64;
+                    while !wire.is_empty() {
+                        let len = u32::from_be_bytes(wire[1..5].try_into().unwrap()) as usize;
+                        let message = SpacedWriteRequest::decode(&wire[5..5 + len]).unwrap();
+                        if let Some(spaced_write_request::Message::Data(data)) =
+                            message.operation.and_then(|operation| operation.message)
+                        {
+                            bytes += data.len() as u64;
+                        }
+                        wire = wire.slice(5 + len..);
+                    }
+                    recorded.lock().unwrap().push(bytes);
+                    grpc_ok(spaced_ops::WriteResponse {
+                        bytes_written: bytes,
+                    })
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = crate::tests::backend_endpoint(&listener.local_addr().unwrap().to_string());
+    tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    WriteBackend {
+        endpoint,
+        writes,
+        received,
+    }
+}
+
+/// The restart drain's refusal, as node-api relays it from sandbox-manager.
+fn restart_drain_refusal() -> tonic::Status {
+    pplx_space_sbx_mgr_client::restart_retry_on_successor_status(
+        "sandbox-manager state changes are draining; retry on successor",
+    )
+}
+
+fn enter_insecure_internal_rpc_test() -> bool {
+    pplx_space_test_env::enter_test_process(&[
+        (
+            "SPACE_INTERNAL_RPC_INSECURE_DEV",
+            Some(std::ffi::OsStr::new("true")),
+        ),
+        ("SPACE_INTERNAL_TOKEN", Some(std::ffi::OsStr::new("test"))),
+    ])
+}
+
+/// A sandbox-manager restart refuses a write before dispatching it while its
+/// predecessor drains. The data plane holds the whole upload, so it sends it
+/// again until the successor accepts it.
+#[tokio::test]
+async fn a_held_upload_the_restart_drain_refused_is_resent_to_the_successor() {
+    if !enter_insecure_internal_rpc_test() {
+        return;
+    }
+    let backend = spawn_write_backend(2, restart_drain_refusal).await;
+    let state = crate::tests::test_data_plane_state().await;
+    let route = crate::tests::ecw_resolved_route(SandboxId::new(), 1, backend.endpoint.clone());
+    let content = vec![7u8; E2B_FILE_WRITE_CHUNK_BYTES + 11];
+
+    spaced_write_bytes(
+        &state,
+        route,
+        "/tmp/held".to_string(),
+        content.clone(),
+        None,
+    )
+    .await
+    .expect("the successor accepts the resent upload");
+
+    assert_eq!(backend.writes.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        *backend.received.lock().unwrap(),
+        [u64::try_from(content.len()).unwrap()]
+    );
+}
+
+/// A spooled upload is resent from the start of its part.
+#[tokio::test]
+async fn a_spooled_upload_the_restart_drain_refused_is_resent_from_its_start() {
+    if !enter_insecure_internal_rpc_test() {
+        return;
+    }
+    let backend = spawn_write_backend(1, restart_drain_refusal).await;
+    let state = crate::tests::test_data_plane_state().await;
+    let route = crate::tests::ecw_resolved_route(SandboxId::new(), 1, backend.endpoint.clone());
+    let content = (0..E2B_FILE_WRITE_CHUNK_BYTES * 2 + 5)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect::<Vec<_>>();
+    let mut spool = SpoolFiles::default();
+    let upload = spool_body_upload(chunked_body(vec![content.clone()]), &mut spool)
+        .await
+        .unwrap();
+
+    spaced_write_spooled(&state, route, "/tmp/spooled".to_string(), &upload, None)
+        .await
+        .expect("the successor accepts the whole resent part");
+
+    assert_eq!(backend.writes.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *backend.received.lock().unwrap(),
+        [u64::try_from(content.len()).unwrap()]
+    );
+}
+
+/// Any other refusal may follow a write that ran, so it is answered once.
+#[tokio::test]
+async fn an_upload_refused_without_the_restart_drain_marker_is_not_resent() {
+    if !enter_insecure_internal_rpc_test() {
+        return;
+    }
+    fn interrupted() -> tonic::Status {
+        tonic::Status::unavailable("sandbox-manager handoff interrupted an in-flight RPC")
+    }
+    let backend = spawn_write_backend(usize::MAX, interrupted).await;
+    let state = crate::tests::test_data_plane_state().await;
+    let route = crate::tests::ecw_resolved_route(SandboxId::new(), 1, backend.endpoint.clone());
+
+    spaced_write_bytes(&state, route, "/tmp/once".to_string(), vec![1, 2, 3], None)
+        .await
+        .expect_err("an unmarked refusal reaches the caller");
+
+    assert_eq!(backend.writes.load(Ordering::SeqCst), 1);
+    assert!(backend.received.lock().unwrap().is_empty());
+}
