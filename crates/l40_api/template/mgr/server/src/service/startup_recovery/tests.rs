@@ -2575,17 +2575,30 @@ async fn recovery_asks_for_dependent_sandboxes_once_per_pass() {
 /// A dir held during the startup scan is checked against a dependent-sandbox
 /// answer taken once its holder lets go, not the scan's: a sandbox that came
 /// to depend on the build during that unbounded wait keeps its dir.
+#[rstest::rstest]
+#[case::first_build_held(0)]
+#[case::second_build_held(1)]
 #[tokio::test]
-async fn a_held_invalid_build_is_checked_against_a_fresh_dependent_answer() {
+async fn a_held_invalid_build_is_checked_against_a_fresh_dependent_answer(
+    #[case] held_index: usize,
+) {
     let root = tempfile::tempdir().unwrap();
-    let builds = place_invalid_build_dirs(root.path(), 2);
-    let (scanned_hash, scanned_dir) = builds[0].clone();
-    let (held_hash, held_dir) = builds[1].clone();
+    let mut builds = place_invalid_build_dirs(root.path(), 2);
+    let (held_hash, held_dir) = builds.remove(held_index);
+    let (scanned_hash, scanned_dir) = builds.pop().unwrap();
     let depended = Arc::new(std::sync::Mutex::new(Vec::new()));
     let service =
         TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
             .unwrap()
             .with_dependent_sandboxes(dependent_sandboxes_of(Arc::clone(&depended), true));
+    // This build has a catalog row but no dir under the service's root.
+    // Its row is pruned only after the entire directory scan.
+    let scan_marker = write_digest_fixture(b"scan-marker-rootfs", b"zst-bytes");
+    insert_row(
+        &service.db.lock().unwrap(),
+        &scan_marker,
+        &canonical_manifest(&scan_marker),
+    );
     *service.pool_handle.lock().unwrap() = Some(tokio::spawn(async {}));
     let held = service
         .volume_puller
@@ -2596,14 +2609,16 @@ async fn a_held_invalid_build_is_checked_against_a_fresh_dependent_answer() {
         let service = service.clone();
         async move { service.run_startup_recovery().await }
     });
-    // The scan asks for dependents when it rejects the dir it can claim.
+    // Removing scanned_dir alone doesn't mean the scan has reached held_dir:
+    // releasing its claim then can send it through the scan's cached answer.
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while scanned_dir.exists() {
+        while registered(&service, &scan_marker) {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("the scan removes the invalid build nothing depends on");
+    .expect("catalog cleanup follows the complete directory scan");
+    assert!(!scanned_dir.exists());
     assert!(!recovery.is_finished());
     depended
         .lock()
