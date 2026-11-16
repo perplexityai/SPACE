@@ -451,10 +451,10 @@ impl VolumeManagerService {
         Ok(crate::staging::cleanup_orphans(self.staging.root(), &keep))
     }
 
-    /// Collect every `staged_path` referenced by a push job currently in
-    /// `pending` or `running`. Goes through the worker's SQLite connection
-    /// directly (rather than `worker.list_jobs`, which is bounded by a
-    /// caller-supplied limit) because the keep-set **must be complete**:
+    /// Collect every `staged_path` referenced by a push or artifact push job
+    /// currently in `pending` or `running`. Goes through the worker's SQLite
+    /// connection directly (rather than `worker.list_jobs`, which is bounded
+    /// by a caller-supplied limit) because the keep-set **must be complete**:
     /// if a single staged_path were missing, `cleanup_orphans` would
     /// delete a file the worker is about to re-execute, reproducing the
     /// exact "entity not found" failure this module exists to prevent.
@@ -462,19 +462,31 @@ impl VolumeManagerService {
         let conn = self.lock_db()?;
         let mut stmt = conn
             .prepare(
-                "SELECT payload FROM jobs
-                 WHERE kind = 'push' AND status IN ('pending', 'running')",
+                "SELECT kind, payload FROM jobs
+                 WHERE kind IN (?1, ?2) AND status IN ('pending', 'running')",
             )
             .map_err(|e| Status::internal(format!("prepare staged-paths query: {e}")))?;
         let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([PUSH_KIND, PUSH_ARTIFACT_KIND], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| Status::internal(format!("execute staged-paths query: {e}")))?;
 
         let mut out = HashSet::new();
         for row in rows {
-            let payload =
+            let (kind, payload) =
                 row.map_err(|e| Status::internal(format!("read staged-paths row: {e}")))?;
-            if let Ok(p) = serde_json::from_str::<TransferPayload>(&payload)
+            if kind == PUSH_ARTIFACT_KIND {
+                if let Ok(artifact) = serde_json::from_str::<ArtifactPayload>(&payload) {
+                    out.extend(
+                        artifact
+                            .entries
+                            .into_iter()
+                            .filter_map(|entry| entry.staged_path)
+                            .map(PathBuf::from),
+                    );
+                }
+            } else if let Ok(p) = serde_json::from_str::<TransferPayload>(&payload)
                 && let Some(staged) = p.staged_path
             {
                 out.insert(PathBuf::from(staged));

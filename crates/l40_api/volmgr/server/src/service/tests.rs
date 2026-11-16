@@ -418,6 +418,36 @@ async fn handing_off_persists_queued_submissions_for_the_successor() {
 }
 
 #[tokio::test]
+async fn staging_orphan_sweep_keeps_inputs_of_artifact_pushes_left_to_the_successor() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(&temp).await;
+    service.worker().stop_starting_jobs();
+    let staged = temp.path().join("staging").join("artifact-entry");
+    let orphan = temp.path().join("staging").join("orphan");
+    std::fs::write(&staged, b"entry").unwrap();
+    std::fs::write(&orphan, b"orphan").unwrap();
+    let mut artifact = sample_artifact();
+    artifact.entries[0].staged_path = Some(staged.to_string_lossy().into_owned());
+    service
+        .worker()
+        .submit(
+            PUSH_ARTIFACT_KIND,
+            &artifact.to_json(),
+            Some(&artifact.subject_id),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(service.cleanup_staging_orphans().unwrap(), 1);
+
+    assert!(
+        staged.exists(),
+        "a pending artifact push keeps its staged input"
+    );
+    assert!(!orphan.exists());
+}
+
+#[tokio::test]
 async fn rpc_authorization_rejects_group_members_and_separates_subject_kinds() {
     use pplx_space_host_layout::{identities::groups, identities::users};
 
