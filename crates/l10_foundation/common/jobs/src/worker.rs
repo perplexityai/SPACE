@@ -607,6 +607,37 @@ impl<E: JobExecutor> BackgroundWorker<E> {
         }
     }
 
+    /// Stop starting jobs, including jobs submitted from now on, and let
+    /// running executors finish. Jobs that have not started stay pending for
+    /// the next owner of the queue to recover, and so does a running job that
+    /// fails retriably.
+    pub fn stop_starting_jobs(&self) {
+        self.stopping.cancel();
+    }
+
+    /// Wait until no executor task remains, returning false at the deadline.
+    /// Unlike [`Self::shutdown`], pending jobs do not hold this open; pair it
+    /// with [`Self::stop_starting_jobs`].
+    pub async fn wait_for_executors(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let inflight = self.inflight();
+            if inflight == 0 {
+                self.log_permanent_failures();
+                return true;
+            }
+            if Instant::now() >= deadline {
+                tracing::error!(
+                    inflight,
+                    "executors were still running at the drain deadline"
+                );
+                self.log_permanent_failures();
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Waits for the durable queue and every spawned executor task to become
     /// quiescent, returning false when either remains at the deadline.
     async fn drain_until_quiescent(&self, timeout: Duration) -> bool {
