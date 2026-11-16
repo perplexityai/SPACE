@@ -357,3 +357,25 @@ async fn ensure_file_replica_gives_up_on_a_volume_manager_that_never_answers() {
     assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
     assert!(started.elapsed() >= VOLUME_MANAGER_RESTART_BUDGET);
 }
+
+#[tokio::test(start_paused = true)]
+async fn cancel_transfer_scope_gives_up_on_a_volume_manager_that_never_answers() {
+    let started = tokio::time::Instant::now();
+
+    let error = tokio::time::timeout(
+        VOLUME_MANAGER_RESTART_BUDGET + Duration::from_secs(60),
+        cancel_transfer_scope_with(
+            pplx_space_common_core::types::TransferScopeId::new(),
+            |_| std::future::pending(),
+        ),
+    )
+    .await
+    .expect("an unanswered cancellation is bounded by the restart budget")
+    .unwrap_err();
+
+    assert!(
+        matches!(&error, CancelTransferScopeError::Rpc(status) if status.code() == tonic::Code::DeadlineExceeded),
+        "{error:?}"
+    );
+    assert!(started.elapsed() >= VOLUME_MANAGER_RESTART_BUDGET);
+}

@@ -366,8 +366,8 @@ pub enum CancelTransferScopeError {
 ///
 /// The producer must be quiesced before calling this function. Cancellation
 /// does not permanently close the scope against future submissions, so it is
-/// repeated while volume-manager restarts, for up to
-/// [`VOLUME_MANAGER_RESTART_BUDGET`].
+/// repeated while volume-manager restarts. The whole call, including an
+/// attempt that gets no answer, is bounded by [`VOLUME_MANAGER_RESTART_BUDGET`].
 pub async fn cancel_transfer_scope(
     client: ConnectedVolumeManagerClient,
     scope: pplx_space_common_core::types::TransferScopeId,
@@ -396,7 +396,9 @@ where
         "volume-manager",
         "CancelTransfer",
         VOLUME_MANAGER_RESTART_RETRY_POLICY,
-        pplx_space_common_grpc::GrpcRetryContext::none(),
+        // Bounds an unanswered attempt too. A cancellation still waiting for
+        // its writers at the deadline fails, and the caller cancels again.
+        pplx_space_common_grpc::GrpcRetryContext::with_timeout(VOLUME_MANAGER_RESTART_BUDGET),
         || cancel(request.clone()),
     )
     .await?
