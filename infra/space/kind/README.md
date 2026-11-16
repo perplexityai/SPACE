@@ -1877,8 +1877,9 @@ service socket and build-manager on its gRPC health service.
 (`/space/run/<service>/service.mutex`) roll with `maxSurge: 1, maxUnavailable: 0`:
 the successor starts beside the predecessor, reports ready while passive, and
 takes over, sockets replaced by rename, when the predecessor drains and releases
-the lock. That covers node-manager, credential-manager, template-manager,
-sandbox-manager and node-ctl. volume-manager, runtime-manager, node-api and
+the lock (credential-manager's agent releases it as its drain starts, so the
+successor serves while it finishes accepted RPCs). That covers node-manager,
+credential-manager, template-manager, sandbox-manager and node-ctl. volume-manager, runtime-manager, node-api and
 build-manager delete first. volume-manager runs as `space-volmgr`; clusters
 created with a different volume-manager account must be recreated rather than
 upgraded in place. runtime-manager holds no mutex, so a successor would
