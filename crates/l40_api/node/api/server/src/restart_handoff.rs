@@ -470,11 +470,12 @@ where
 /// A response stream whose first item has been read.
 pub(crate) type HeldStream<Item> = Pin<Box<dyn Stream<Item = Result<Item, Status>> + Send>>;
 
-/// Read a stream's first item before handing the stream on, so that a stream
-/// the handoff ended before it delivered anything fails the attempt and is
-/// replayed under `safety`, like a unary call. Every other first item, an
-/// error included, is delivered unchanged, and nothing after the first item
-/// is ever replayed.
+/// Read a stream's first item before handing the stream on. If that item is
+/// an error `safety` would replay (sandbox-manager's handoff interruption is
+/// the intended case), the attempt fails and the handoff loop may replay it;
+/// such an error that outlasts the replay becomes the call's status. Any other
+/// first item is delivered unchanged, and nothing after the first item is
+/// replayed.
 pub(crate) async fn hold_first_item<Item, S>(
     safety: RpcReplaySafety,
     response: Response<S>,

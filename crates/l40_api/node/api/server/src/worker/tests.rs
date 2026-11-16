@@ -713,33 +713,95 @@ async fn guest_read_streams_interrupted_before_their_first_item_reach_the_succes
     assert_eq!(successor_calls.load(Ordering::SeqCst), 2);
 }
 
-/// Once a listing delivered an item, the successor would deliver it again, so
-/// an interruption after it reaches the caller unchanged.
-#[tokio::test]
-async fn a_guest_read_stream_that_delivered_an_item_is_never_replayed() {
-    const INTERRUPTED: &str = "sandbox-manager handoff interrupted an in-flight RPC";
-    let predecessor = streaming_sandbox_manager(1, tonic::Code::Unavailable, INTERRUPTED).await;
+/// The guest read streams `rpc` names, on `service`, as streams of unit items.
+async fn open_guest_read_stream(
+    service: &WorkerApiService,
+    rpc: &str,
+) -> Result<PinnedResponseStream<()>, Status> {
+    let sandbox_id = SandboxId::new().to_string();
+    Ok(match rpc {
+        "SpacedList" => pin_stream(
+            service
+                .spaced_list(Request::new(proto::SpacedListRequest {
+                    sandbox_id,
+                    ..Default::default()
+                }))
+                .await?
+                .into_inner()
+                .map(|item| item.map(drop)),
+        ),
+        "SpacedRead" => pin_stream(
+            service
+                .spaced_read(Request::new(proto::SpacedReadRequest {
+                    sandbox_id,
+                    ..Default::default()
+                }))
+                .await?
+                .into_inner()
+                .map(|item| item.map(drop)),
+        ),
+        _ => unreachable!("not a guest read stream: {rpc}"),
+    })
+}
+
+/// A guest read stream whose predecessor sends `items` items and then ends
+/// with `code`, behind a successor that answers every call `NotFound`.
+async fn guest_read_stream_service(
+    items: usize,
+    code: tonic::Code,
+    message: &'static str,
+) -> (WorkerApiService, Arc<AtomicUsize>) {
+    let predecessor = streaming_sandbox_manager(items, code, message).await;
     let (successor, successor_calls) =
         answering_sandbox_manager(tonic::Code::NotFound, "answered by the successor").await;
     let mut service =
         service_with_limiter(UdsPerSandboxLimiter::for_tests_with_reserved(8, 8, 64)).await;
     service.clients =
         crate::clients::BackendClients::with_channel(predecessor).with_sbx_successor(successor);
+    (service, successor_calls)
+}
 
-    let mut entries = service
-        .spaced_list(Request::new(proto::SpacedListRequest {
-            sandbox_id: SandboxId::new().to_string(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    entries.next().await.unwrap().unwrap();
-    let status = entries.next().await.unwrap().unwrap_err();
-    assert_eq!(
-        (status.code(), status.message()),
-        (tonic::Code::Unavailable, INTERRUPTED)
-    );
-    assert!(entries.next().await.is_none());
-    assert_eq!(successor_calls.load(Ordering::SeqCst), 0);
+/// Once a listing or a file read delivered an item, the successor would
+/// deliver it again, so an interruption after it reaches the caller unchanged.
+#[tokio::test]
+async fn a_guest_read_stream_that_delivered_an_item_is_never_replayed() {
+    const INTERRUPTED: &str = "sandbox-manager handoff interrupted an in-flight RPC";
+    for rpc in ["SpacedList", "SpacedRead"] {
+        let (service, successor_calls) =
+            guest_read_stream_service(1, tonic::Code::Unavailable, INTERRUPTED).await;
+
+        let mut items = open_guest_read_stream(&service, rpc).await.unwrap();
+        items.next().await.unwrap().unwrap();
+        let status = items.next().await.unwrap().unwrap_err();
+        assert_eq!(
+            (status.code(), status.message()),
+            (tonic::Code::Unavailable, INTERRUPTED),
+            "{rpc}"
+        );
+        assert!(items.next().await.is_none(), "{rpc}");
+        assert_eq!(successor_calls.load(Ordering::SeqCst), 0, "{rpc}");
+    }
+}
+
+/// A first item the read probe would not replay reaches the caller as the
+/// stream's first item, and a stream that ends with no items stays empty.
+#[tokio::test]
+async fn guest_read_streams_pass_through_first_items_that_are_not_replayed() {
+    for rpc in ["SpacedList", "SpacedRead"] {
+        let (service, successor_calls) =
+            guest_read_stream_service(0, tonic::Code::NotFound, "no such file").await;
+        let mut items = open_guest_read_stream(&service, rpc).await.unwrap();
+        let status = items.next().await.unwrap().unwrap_err();
+        assert_eq!(
+            (status.code(), status.message()),
+            (tonic::Code::NotFound, "no such file"),
+            "{rpc}"
+        );
+        assert_eq!(successor_calls.load(Ordering::SeqCst), 0, "{rpc}");
+
+        let (service, successor_calls) = guest_read_stream_service(0, tonic::Code::Ok, "").await;
+        let mut items = open_guest_read_stream(&service, rpc).await.unwrap();
+        assert!(items.next().await.is_none(), "{rpc} is not empty");
+        assert_eq!(successor_calls.load(Ordering::SeqCst), 0, "{rpc}");
+    }
 }
