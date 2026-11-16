@@ -18,6 +18,10 @@
 //! * Use [`connect_uds_channel_lazy`] for a cached Unix-socket channel that must
 //!   reconnect after the local server replaces its socket. Pair replay-safe
 //!   calls with [`retry_grpc_status_with_context`] to cover the replacement gap.
+//! * Use [`connect_uds_channel_with_retrying_redials`] for a connected
+//!   Unix-socket channel whose calls should wait out a local server restart:
+//!   its redials retry under the connect policy, for every RPC, since a failed
+//!   dial sends nothing.
 //! * Use [`RotatingChannel`] in place of a `tonic::transport::Channel` for any
 //!   long-lived client of a multi-replica TCP service. Retiring its connection
 //!   on an age is what stops a ClusterIP from pinning the client to whichever
@@ -66,7 +70,8 @@ pub use connect::{
     connect_tcp_channel_with_retry_observed, connect_tcp_channel_with_retry_watched,
     connect_tcp_channel_with_retrying_redials, connect_uds_channel, connect_uds_channel_lazy,
     connect_uds_channel_with_endpoint, connect_uds_channel_with_endpoint_with_retry,
-    connect_uds_channel_with_retry, retrying_redial_bound,
+    connect_uds_channel_with_retry, connect_uds_channel_with_retrying_redials,
+    retrying_redial_bound,
 };
 pub use context::GrpcRetryContext;
 #[doc(hidden)]

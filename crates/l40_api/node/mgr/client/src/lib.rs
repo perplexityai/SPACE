@@ -347,9 +347,13 @@ fn endpoint() -> Result<Endpoint, tonic::transport::Error> {
     Endpoint::try_from(LOCAL_ENDPOINT_URI)
 }
 
-/// Connect to the node-manager gRPC service over Unix socket.
+/// Connect to the node-manager gRPC service over Unix socket. The first dial,
+/// and every redial after the channel's connection drops, retry under the
+/// default connect policy, so a call made while node-manager hands over to its
+/// successor waits for the successor to listen instead of failing with the
+/// refused dial.
 pub async fn connect() -> Result<NodeManagerGrpcClient, ConnectError> {
-    let channel = pplx_space_common_grpc::connect_uds_channel_with_endpoint_with_retry(
+    let channel = pplx_space_common_grpc::connect_uds_channel_with_retrying_redials(
         "node-manager",
         std::path::Path::new(SOCKET_PATH),
         endpoint()?,
