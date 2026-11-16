@@ -30,10 +30,10 @@ use crate::middleware::auth::AuthUser;
 use crate::routes::AppState;
 
 /// The most rows one response lists. The counts cover every row.
-const NODE_HOLDS_LIMIT: NonZeroUsize = NonZeroUsize::new(500).expect("non-zero");
+pub(super) const NODE_HOLDS_LIMIT: NonZeroUsize = NonZeroUsize::new(500).expect("non-zero");
 
 #[derive(Debug, Serialize)]
-struct NodeHoldsResponse {
+pub(super) struct NodeHoldsResponse {
     node_id: NodeId,
     residency_evidence: &'static str,
     stuck_transient_after_secs: u64,
@@ -104,7 +104,7 @@ fn hold_entry(hold: NodeHold) -> NodeHoldEntry {
     }
 }
 
-fn holds_response(
+pub(super) fn holds_response(
     node_id: NodeId,
     residency: ResidencyEvidence,
     holds: NodeHolds,

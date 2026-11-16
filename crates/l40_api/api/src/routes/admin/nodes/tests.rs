@@ -12,6 +12,9 @@ use tower::ServiceExt;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{NodeAddress, NodeDrainMode, NodeManagedBy, NodeRole};
+use pplx_space_sandbox_store::node_holds;
+
+use super::holds::{NODE_HOLDS_LIMIT, holds_response};
 
 fn test_admin_node_row() -> AdminNodeRow {
     AdminNodeRow {
@@ -2971,8 +2974,10 @@ async fn node_reads_survive_a_failed_read_state_read() -> TestResult {
 
 /// The holds route's wire shape for one phantom row, and its refusals. The
 /// rows and terms are the store's and its agreement test's; this pins what
-/// the console reads. The process leaves the residency switch unset, so the
-/// response reports the default evidence mode.
+/// the console reads. The route reads the residency switch once per process,
+/// so the pinned body is rendered from the store under an explicit mode, and
+/// the route's body is checked against the same rendering under whatever mode
+/// this process holds.
 #[tokio::test]
 async fn node_holds_reports_each_row_with_its_gates_and_refuses_as_its_siblings() -> TestResult<()>
 {
@@ -3010,19 +3015,15 @@ async fn node_holds_reports_each_row_with_its_gates_and_refuses_as_its_siblings(
     .fetch_one(&db.pool)
     .await?;
 
-    let holds = |actor: User, node_id: NodeId| {
-        list_node_holds(
-            State(state.clone()),
-            Extension(AuthUser(actor)),
-            Path(node_id),
-        )
+    let pool = &db.pool;
+    let rendered = |residency: ResidencyEvidence| async move {
+        let holds = node_holds::list(pool, node_id, residency, NODE_HOLDS_LIMIT).await?;
+        TestResult::Ok(serde_json::to_value(holds_response(
+            node_id, residency, holds,
+        ))?)
     };
-    let response = holds(actor.clone(), node_id).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: serde_json::Value =
-        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 100_000).await?)?;
     assert_eq!(
-        body,
+        rendered(ResidencyEvidence::LifecycleOnly).await?,
         serde_json::json!({
             "node_id": node_id.to_string(),
             "residency_evidence": "lifecycle_only",
@@ -3057,6 +3058,18 @@ async fn node_holds_reports_each_row_with_its_gates_and_refuses_as_its_siblings(
         })
     );
 
+    let holds = |actor: User, node_id: NodeId| {
+        list_node_holds(
+            State(state.clone()),
+            Extension(AuthUser(actor)),
+            Path(node_id),
+        )
+    };
+    let response = holds(actor.clone(), node_id).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 100_000).await?)?;
+    assert_eq!(body, rendered(cluster_residency_evidence()).await?);
     assert_eq!(
         holds(actor.clone(), NodeId::new()).await.status(),
         StatusCode::NOT_FOUND
