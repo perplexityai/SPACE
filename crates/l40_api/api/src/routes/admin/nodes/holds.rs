@@ -23,7 +23,7 @@ use serde::Serialize;
 
 use super::super::node_store::AdminNodeStore;
 use super::super::support::{
-    api_error, db_error, format_optional_time, format_time, require_managing_org_admin,
+    api_error, format_optional_time, format_time, read_db_error, require_managing_org_admin,
 };
 use super::cluster_residency_evidence;
 use crate::middleware::auth::AuthUser;
@@ -136,11 +136,11 @@ pub(in crate::routes::admin) async fn list_node_holds(
     match AdminNodeStore::new(state.pool.clone()).fetch(node_id).await {
         Ok(Some(_)) => {}
         Ok(None) => return api_error(StatusCode::NOT_FOUND, "Node not found").into_response(),
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return read_db_error(err),
     }
     let residency = cluster_residency_evidence();
     match node_holds::list(&state.pool, node_id, residency, NODE_HOLDS_LIMIT).await {
         Ok(holds) => Json(holds_response(node_id, residency, holds)).into_response(),
-        Err(err) => db_error(err).into_response(),
+        Err(err) => read_db_error(err),
     }
 }
