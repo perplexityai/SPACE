@@ -547,3 +547,26 @@ async fn shutdown_releases_listener_while_accepted_connections_drain() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn open_stream_drain_starts_its_grace_at_shutdown() {
+    let shutdown_token = CancellationToken::new();
+    let grace = std::time::Duration::from_secs(10);
+    let drain = cancel_after_shutdown(&shutdown_token, grace);
+
+    tokio::time::sleep(grace * 2).await;
+    assert!(
+        !drain.is_cancelled(),
+        "the grace runs from shutdown, not from start"
+    );
+
+    shutdown_token.cancel();
+    tokio::time::sleep(grace - std::time::Duration::from_millis(1)).await;
+    assert!(
+        !drain.is_cancelled(),
+        "streams keep their grace after shutdown"
+    );
+    tokio::time::timeout(std::time::Duration::from_millis(2), drain.cancelled())
+        .await
+        .expect("the drain fires once the grace has passed");
+}

@@ -180,6 +180,105 @@ async fn unimplemented_sandbox_manager() -> crate::clients::BackendClients {
     crate::clients::BackendClients::with_channel(channel)
 }
 
+/// A sandbox-manager that opens every response stream and never sends on it,
+/// as an idle file watch or a long-running process does.
+async fn silent_stream_sandbox_manager() -> crate::clients::BackendClients {
+    let backend = axum::Router::new().fallback(|| async {
+        http::Response::builder()
+            .header("content-type", "application/grpc")
+            .body(axum::body::Body::from_stream(
+                futures_util::stream::pending::<Result<bytes::Bytes, std::io::Error>>(),
+            ))
+            .unwrap()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    crate::clients::BackendClients::with_channel(channel)
+}
+
+async fn assert_open<T: std::fmt::Debug>(method: &str, stream: &mut PinnedResponseStream<T>) {
+    let next = tokio::time::timeout(Duration::from_millis(100), stream.next()).await;
+    assert!(next.is_err(), "{method} ended early: {next:?}");
+}
+
+async fn assert_ended_by_drain<T: std::fmt::Debug>(
+    method: &str,
+    stream: &mut PinnedResponseStream<T>,
+) {
+    let status = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap_or_else(|_| panic!("{method} stayed open after the drain"))
+        .unwrap_or_else(|| panic!("{method} ended without the drain status"))
+        .expect_err("the drain ends the stream with a status");
+    assert!(
+        pplx_space_node_api_client::is_node_api_draining_status(&status),
+        "{method}: {status:?}"
+    );
+    assert!(
+        stream.next().await.is_none(),
+        "{method} continued after the drain status"
+    );
+}
+
+// Watches and process event streams have no natural end, so one held open
+// would keep node-api draining, refusing every new call on the node, until
+// its whole shutdown budget ran out. Bounded streams such as reads keep that
+// budget to finish.
+#[tokio::test]
+async fn open_ended_streams_end_with_the_drain_status_once_drained() {
+    let drain = CancellationToken::new();
+    let service = WorkerApiService::new(silent_stream_sandbox_manager().await)
+        .with_open_stream_drain_token(drain.clone());
+    let mut watch = service
+        .spaced_watch(Request::new(proto::SpacedWatchRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut start = service
+        .spaced_start_process(Request::new(proto::SpacedStartProcessRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut connect = service
+        .spaced_connect_process(Request::new(proto::SpacedConnectProcessRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut read = service
+        .spaced_read(Request::new(proto::SpacedReadRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_open("SpacedWatch", &mut watch).await;
+    assert_open("SpacedStartProcess", &mut start).await;
+    assert_open("SpacedConnectProcess", &mut connect).await;
+
+    drain.cancel();
+
+    assert_ended_by_drain("SpacedWatch", &mut watch).await;
+    assert_ended_by_drain("SpacedStartProcess", &mut start).await;
+    assert_ended_by_drain("SpacedConnectProcess", &mut connect).await;
+    assert_open("SpacedRead", &mut read).await;
+}
+
 async fn service_with_limiter(limiter: UdsPerSandboxLimiter) -> WorkerApiService {
     WorkerApiService {
         clients: unimplemented_sandbox_manager().await,
@@ -187,6 +286,7 @@ async fn service_with_limiter(limiter: UdsPerSandboxLimiter) -> WorkerApiService
         service_port_ingress_limiter: shared_service_port_ingress_limiter(),
         resource_status_reader: NodeResourceStatusReader::new(),
         shutdown_token: CancellationToken::new(),
+        open_stream_drain_token: CancellationToken::new(),
     }
 }
 

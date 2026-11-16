@@ -106,8 +106,11 @@ buildManagerEndpoint: ""
 
 # On SIGTERM node-api stops accepting connections and gives in-flight
 # requests --shutdown-grace-secs (150 s by default) to finish
-# (crates/l40_api/node/api/server/src/run.rs). The grace covers that budget, the
-# builders' preStop delay below and exit.
+# (crates/l40_api/node/api/server/src/run.rs). File watches and process event
+# streams, which have no natural end, get OPEN_STREAM_DRAIN_GRACE (10 s) and
+# then end with the drain status their callers reconnect on, so an open stream
+# does not hold the node without a node-api for the whole budget. The grace
+# covers that budget, the builders' preStop delay below and exit.
 terminationGracePeriodSeconds: 180
 
 # Builder role only: seconds node-api keeps serving after its pod starts
