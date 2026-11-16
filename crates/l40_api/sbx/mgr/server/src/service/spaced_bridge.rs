@@ -40,6 +40,7 @@ pub(super) async fn launch_spaced_host_via_node(
             uid,
             gid: uid,
             env: crate::sidecar_env::telemetry_env_for_service("space-spaced-host"),
+            replace_gateway_pid: None,
         })
         .instrument(tracing::info_span!(
             "sbxmgr.start.node.launch_spaced_host",
