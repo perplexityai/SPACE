@@ -731,10 +731,9 @@ impl SandboxStatus {
         self.cleanup().map_or("none", CleanupState::as_str)
     }
 
-    /// The status label that predates the split: `cleanup_required` or
-    /// `cleanup_failed` for a cleanup-owned row, otherwise the lifecycle.
-    /// Episodes store it as `entered_from_state`, and the not-running marker
-    /// and the net-gateway inventory tag still carry it.
+    /// The label `sandbox.worker.lifecycle.count` groups by, which predates
+    /// the split: `cleanup_required`/`cleanup_failed` for a cleanup-owned
+    /// row, otherwise the lifecycle.
     pub fn legacy_label(self) -> &'static str {
         match self {
             Self::Unowned(lifecycle) => lifecycle.as_str(),

@@ -69,10 +69,13 @@ fn a_listed_sandbox_state_no_longer_finds_keeps_its_cleanup() {
     };
     let info = listed_sandbox_info(&SandboxListElement {
         sandbox_id: "sbx".to_owned(),
-        lifecycle: Some(SandboxLifecycleState::Stopping as i32),
+        lifecycle: Some(SandboxLifecycleState::CleanupFailed as i32),
         cleanup: Some(cleanup),
         ..Default::default()
     });
-    assert_eq!(info.lifecycle, Some(SandboxLifecycleState::Stopping as i32));
+    assert_eq!(
+        info.lifecycle,
+        Some(SandboxLifecycleState::CleanupFailed as i32)
+    );
     assert_eq!(info.cleanup, Some(cleanup));
 }
