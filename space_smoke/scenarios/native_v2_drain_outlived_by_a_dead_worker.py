@@ -39,7 +39,7 @@ def v2_drain_outlived_by_a_dead_worker(test: smoke.CommandSandboxFixture) -> Non
 
     drain = test.drain_v2
 
-    with drain.v2_controller(terminating=True):
+    with drain.v2_controller():
         with test.phase("pin a suspended, a once-suspended started and a started resident"):
             drain.pin_to_resident_worker(away_from_fixture=True)
             drain.give_fake_instance()

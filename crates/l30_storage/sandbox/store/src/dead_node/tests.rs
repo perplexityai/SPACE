@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::*;
+use crate::drain_terminate::retire_source_execution;
 
 async fn insert_node(pool: &PgPool) -> TestResult<NodeId> {
     let node_id = NodeId::new();

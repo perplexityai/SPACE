@@ -2371,12 +2371,13 @@ fn drain_v2_write(
                     ));
                 }
                 if starts_a_drain && !recorded_instance {
-                    // A v2 drain's node that dies is the dead-node verb's,
-                    // which judges a node only by its recorded instance.
+                    // The drain terminates exactly the recorded instance,
+                    // and asks EC2 about it to tell a node that died.
                     return Err((
                         StatusCode::CONFLICT,
-                        "drain engine v2 needs the node's EC2 instance recorded: the dead-node \
-                         verb owns a v2 node that dies, and judges it by that instance",
+                        "drain engine v2 needs the node's EC2 instance recorded: the drain \
+                         terminates that instance, and asks EC2 about it when the node stops \
+                         answering",
                     ));
                 }
                 if starts_a_drain {

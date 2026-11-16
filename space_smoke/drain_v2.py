@@ -32,49 +32,147 @@ the terminate.
 
 from __future__ import annotations
 
+import re
+import secrets
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 from space_smoke.capabilities import (
     DrainV2Control,
     DurableLifecycleSandbox,
+    KindWorkerControl,
     ResidentLifecycleSandbox,
     SnapshotRecord,
     StoppableLifecycleSandbox,
 )
-from space_smoke.dead_node import (
-    ABSENCE_WINDOW_ENV,
-    DRAIN_V2_ENABLED_ENV,
-    DRAIN_V2_MAX_EVACUATING_ENV,
-    MODE_ENV,
-    TERMINATOR_KIND_ENV,
-    TICK_ENV,
-    UPLOAD_SETTLE_ENV,
-    await_recorded_instance,
-    fake_provider_id,
-    register_fake_instance,
-    scoped_dead_node_env,
-)
 from space_smoke.drain_restore import DRAIN_RESTORE_HOLD_ENV, DRAIN_RESTORE_SLOTS_ENV
 from space_smoke.runtime import Compensation, ResourceScope
 
-# The dead-node verb's tick and Node-absence window while a run terminates a
-# worker, shortened by their test hooks from five and ten minutes: the verb
-# judges a terminated v2 node as it judges any dead one.
-VERB_TICK_SECONDS = 5
-VERB_ABSENCE_WINDOW_SECONDS = 20
-# How long an upload from a dead node may stay quiet before the verb stops
-# waiting for it, shortened from ten minutes.
-VERB_UPLOAD_SETTLE_SECONDS = 30
+# The node-drain terminator: `aws` gives the v2 drain its terminate, and
+# EC2's answer for the instance, through Kind's fake EC2.
+TERMINATOR_KIND_ENV = "SPACE_NODE_DRAIN_TERMINATOR_KIND"
+# Whether `:drain` may start a v2 drain.
+DRAIN_V2_ENABLED_ENV = "SPACE_DRAIN_V2_ENABLED"
+# How many v2 drains may evacuate their nodes at once.
+DRAIN_V2_MAX_EVACUATING_ENV = "SPACE_DRAIN_V2_MAX_EVACUATING_NODES"
+
+# The only controller env a drain v2 scenario may touch, and the closed
+# vocabulary its overrides come from.
+DRAIN_V2_ENV_KEYS: tuple[str, ...] = (
+    TERMINATOR_KIND_ENV,
+    DRAIN_V2_ENABLED_ENV,
+    DRAIN_V2_MAX_EVACUATING_ENV,
+)
+_TERMINATOR_VALUES = frozenset({"aws", "kube-delete"})
+_FLAG_VALUES = frozenset({"true", "false"})
+_COUNT_VALUE = re.compile(r"[1-9][0-9]{0,2}")
+
 # The controller config every v2 run scopes to itself.
 V2_CONTROLLER_ENV = {
     DRAIN_V2_ENABLED_ENV: "true",
-    MODE_ENV: "live",
     TERMINATOR_KIND_ENV: "aws",
 }
 _FAKE_PROVIDER_PREFIX = "aws:///kind-a/"
+_FAKE_INSTANCE = re.compile(r"i-[0-9a-f]{17}")
+_FAKE_PROVIDER = re.compile(r"aws:///kind-a/(i-[0-9a-f]{17})")
+
+
+def validate_fake_instance_id(instance_id: str) -> None:
+    if _FAKE_INSTANCE.fullmatch(instance_id) is None:
+        raise ValueError(f"refusing instance id {instance_id!r}")
+
+
+def validate_fake_provider_id(provider_id: str) -> None:
+    if _FAKE_PROVIDER.fullmatch(provider_id) is None:
+        raise ValueError(f"refusing providerID {provider_id!r}")
+
+
+def fake_provider_id() -> tuple[str, str]:
+    """A new fake AWS providerID and the instance it names."""
+
+    instance_id = "i-" + secrets.token_hex(9)[:17]
+    return f"{_FAKE_PROVIDER_PREFIX}{instance_id}", instance_id
+
+
+def await_recorded_instance(
+    fixture: ScenarioFixture, control: KindWorkerControl, node_name: str, node_id: str, instance_id: str,
+    *, timeout: float,
+) -> None:
+    """Wait until the node's row records `instance_id`."""
+
+    deadline = time.monotonic() + timeout
+    while control.node_recorded_instance(node_id) != instance_id:
+        fixture.verify(
+            time.monotonic() < deadline,
+            "node registration never recorded the worker's fake instance",
+            worker=node_name,
+            expected=instance_id,
+            recorded=control.node_recorded_instance(node_id),
+        )
+        fixture.wait(3)
+
+
+def register_fake_instance(
+    fixture: ScenarioFixture, control: KindWorkerControl, node_name: str, node_id: str,
+    *, timeout: float = 300,
+) -> str:
+    """Re-register the worker under a new fake AWS providerID and wait until
+    its row records the instance; returns it. Re-registering deletes the
+    pods on the worker."""
+
+    provider_id, instance_id = fake_provider_id()
+    labels = control.kind_node_labels(node_name)
+    control.set_kind_worker_provider_id(node_name, provider_id, labels, timeout=timeout)
+    await_recorded_instance(fixture, control, node_name, node_id, instance_id, timeout=timeout)
+    return instance_id
+
+
+@contextmanager
+def scoped_drain_v2_env(
+    fixture: ScenarioFixture, control: KindWorkerControl, scope: ResourceScope
+) -> Iterator[Callable[[Mapping[str, str]], None]]:
+    """Hold the controller-mutation Lease, capture the standing drain v2 env,
+    and put it back when the body ends; yields the setter, so the body can
+    switch configs inside the scope."""
+
+    release = control.acquire_controller_mutation()
+    lease = scope.defer("release the controller mutation lease", release)
+    standing = control.drain_v2_env()
+    fixture.record("standing_drain_v2_env", standing)
+    restore = scope.defer(
+        "put the standing drain v2 env back",
+        lambda: control.restore_drain_v2_env(standing),
+        critical=True,
+    )
+    try:
+        yield control.set_drain_v2_env
+    finally:
+        with fixture.phase("put the standing drain v2 env back"):
+            restore.release()
+            lease.release()
+
+
+def validate_drain_v2_keys(values: Mapping[str, object]) -> None:
+    unknown = sorted(set(values) - set(DRAIN_V2_ENV_KEYS))
+    if unknown:
+        raise ValueError(f"refusing drain v2 env keys {unknown}")
+
+
+def validate_drain_v2_overrides(overrides: Mapping[str, str]) -> None:
+    validate_drain_v2_keys(overrides)
+    for key, value in overrides.items():
+        if key == TERMINATOR_KIND_ENV:
+            allowed = value in _TERMINATOR_VALUES
+        elif key == DRAIN_V2_MAX_EVACUATING_ENV:
+            allowed = _COUNT_VALUE.fullmatch(value) is not None
+        else:
+            allowed = value in _FLAG_VALUES
+        if not allowed:
+            raise ValueError(f"refusing {key}={value!r}")
+
+
 # The sandbox-manager row states in which a node may hold the sandbox's VM.
 _VM_STATES = frozenset({"started", "paused", "pausing", "resuming", "starting", "suspending"})
 # Guest memory a resident holds in tmpfs, random so its snapshot can't shrink it.
@@ -82,7 +180,7 @@ BALLAST = "/dev/shm/space-smoke-v2-ballast"
 BALLAST_DIGEST = f"md5sum {BALLAST} | cut -d' ' -f1"
 
 if TYPE_CHECKING:
-    from space_smoke.fixtures import CommandSandboxFixture
+    from space_smoke.fixtures import CommandSandboxFixture, ScenarioFixture
 
 
 class DrainV2Assertions:
@@ -203,16 +301,12 @@ class DrainV2Assertions:
     def v2_controller(
         self,
         *,
-        terminating: bool = False,
         hold_seconds: int | None = None,
         restore_slots: int | None = None,
         max_evacuating_nodes: int | None = None,
     ) -> Iterator[None]:
-        """Run the body with the controller's v2 loop on: the drain v2 flag,
-        the dead-node verb `live` and the `aws` terminator, against Kind's
-        fake EC2. With `terminating`, the verb ticks every few seconds,
-        reads a Node gone for seconds as absent, and waits seconds, not
-        minutes, for a dead node's quiet upload; with
+        """Run the body with the controller's v2 loop on: the drain v2 flag
+        and the `aws` terminator, against Kind's fake EC2. With
         `hold_seconds`, each claimed drain restore holds that long before its
         node work; with `restore_slots`, that many drain restores run at once
         instead of the dispatcher's default; with `max_evacuating_nodes`, at
@@ -222,11 +316,7 @@ class DrainV2Assertions:
         env = dict(V2_CONTROLLER_ENV)
         if max_evacuating_nodes is not None:
             env[DRAIN_V2_MAX_EVACUATING_ENV] = str(max_evacuating_nodes)
-        if terminating:
-            env[TICK_ENV] = str(VERB_TICK_SECONDS)
-            env[ABSENCE_WINDOW_ENV] = str(VERB_ABSENCE_WINDOW_SECONDS)
-            env[UPLOAD_SETTLE_ENV] = str(VERB_UPLOAD_SETTLE_SECONDS)
-        with scoped_dead_node_env(self._fixture, self._control, self._scope) as set_env:
+        with scoped_drain_v2_env(self._fixture, self._control, self._scope) as set_env:
             set_env(env)
             overrides: dict[str, str] = {}
             if hold_seconds is not None:
@@ -970,15 +1060,8 @@ class DrainV2Assertions:
         while self._control.drain_v2_status(node_id) is not None:
             self._fixture.verify(
                 time.monotonic() < deadline,
-                "the dead-node verb never deleted the terminated node's row",
-                status=next(
-                    (
-                        (entry.verdict, entry.reason, dict(entry.counts))
-                        for entry in self._control.dead_node_statuses()
-                        if entry.node_id == node_id
-                    ),
-                    None,
-                ),
+                "the terminated node's row was never deleted",
+                drain_status=self._control.drain_v2_status(node_id),
             )
             self._fixture.wait(3)
         self._fixture.verify(
@@ -1011,7 +1094,7 @@ class DrainV2Assertions:
         worker then comes back as a same-name replacement, unsealed. Returns
         the verb's statuses for the node as it reconciled it.
 
-        Runs inside `v2_controller(terminating=True)` after `give_fake_instance`.
+        Runs inside `v2_controller` after `give_fake_instance`.
         """
 
         node_name, node_id = self.node_name, self.node_id
@@ -1033,23 +1116,12 @@ class DrainV2Assertions:
         statuses: list[dict[str, Any]] = []
         deadline = time.monotonic() + timeout
         while self._control.drain_v2_status(node_id) is not None:
-            for entry in self._control.dead_node_statuses():
-                if entry.node_id == node_id:
-                    seen = {
-                        "verdict": entry.verdict,
-                        "reason": entry.reason,
-                        "counts": dict(entry.counts),
-                        "applied": dict(entry.applied),
-                    }
-                    if not statuses or statuses[-1] != seen:
-                        statuses.append(seen)
             self._fixture.verify(
                 time.monotonic() < deadline,
-                "the dead-node verb never deleted the dead v2 node's row",
-                statuses=statuses,
+                "the dead v2 node's row was never deleted",
+                drain_status=self._control.drain_v2_status(node_id),
             )
             self._fixture.wait(3)
-        self._fixture.record("dead_node_statuses", statuses)
         self._fixture.verify(
             not self._control.node_tombstoned(node_id), "the dead v2 node was tombstoned"
         )

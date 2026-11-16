@@ -350,64 +350,41 @@ async fn the_node_delete_refuses_when_anything_it_rests_on_moved() -> TestResult
     Ok(())
 }
 
-/// A v2 drain's node is judged in every phase, with the phase it was read
-/// in, so a node that died mid-drain has an owner; a v1 drain's node is
-/// not. Its delete holds that phase: one the v2 loop moved since is kept.
+/// A node in a v2 drain's phase is the drain's, in every phase, as a v1
+/// drain's node is; one undrained with its cancel still pending has no phase
+/// and is judged.
 #[tokio::test(flavor = "current_thread")]
-async fn a_v2_drains_node_is_judged_in_every_phase() -> TestResult {
+async fn a_v2_drains_node_is_judged_only_once_it_has_no_phase() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let pool = &db.pool;
     let k8s = SubstrateKind::Kubernetes;
     let store = DeadNodeDbStore::new(pool.clone());
-    let v1 = insert_node(
-        pool,
-        k8s,
-        Some("draining"),
-        Status::Missing,
-        Some("uid"),
-        Some(OWN),
-    )
-    .await?;
-    for phase in ["draining", "drained", "terminating"] {
-        let node_id = insert_node(
-            pool,
-            k8s,
-            Some(phase),
-            Status::Missing,
-            Some("uid"),
-            Some(OWN),
-        )
+    let mut drains = Vec::new();
+    for phase in [Some("draining"), Some("drained"), Some("terminating"), None] {
+        let node_id =
+            insert_node(pool, k8s, phase, Status::Missing, Some("uid"), Some(OWN)).await?;
+        sqlx::query(sql!(
+            "UPDATE nodes
+                SET drain_engine = 'v2',
+                    drain_status = jsonb_build_object('epoch', 1, 'cancel', drain_phase IS NULL)
+              WHERE id = $1"
+        ))
+        .bind(node_id)
+        .execute(pool)
         .await?;
-        sqlx::query(sql!("UPDATE nodes SET drain_engine = 'v2' WHERE id = $1"))
-            .bind(node_id)
-            .execute(pool)
-            .await?;
-        let node = candidate(pool, node_id).await?;
-        assert_eq!(node.v2_drain_phase.as_deref(), Some(phase));
-        if phase == "draining" {
-            sqlx::query(sql!(
-                "UPDATE nodes SET drain_phase = 'drained' WHERE id = $1"
-            ))
-            .bind(node_id)
-            .execute(pool)
-            .await?;
-            assert!(!store.delete_node(&node).await?, "the phase moved");
-            assert!(node_exists(pool, node_id).await?);
-        } else {
-            assert!(store.delete_node(&node).await?, "{phase}");
-            assert!(!node_exists(pool, node_id).await?, "{phase}");
-        }
+        drains.push((phase, node_id));
     }
-    assert!(
-        !store
-            .candidate_nodes(k8s, None, 1000)
-            .await?
-            .iter()
-            .any(|node| node.node_id == v1),
-        "a v1 drain's node is its own"
-    );
+    let judged: Vec<NodeId> = store
+        .candidate_nodes(k8s, None, 1000)
+        .await?
+        .into_iter()
+        .map(|node| node.node_id)
+        .collect();
+    for (phase, node_id) in drains {
+        assert_eq!(judged.contains(&node_id), phase.is_none(), "{phase:?}");
+    }
     Ok(())
 }
 

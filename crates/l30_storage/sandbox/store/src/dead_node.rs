@@ -5,7 +5,8 @@
 //! live mode applies that. Deciding is the controller's; this module supplies
 //! the facts each decision reads ([`rows_on_node`], [`row_on_node`]), the
 //! guarded writes of each outcome ([`lock_row`], [`release_from_node`],
-//! [`mark_lost`], [`retire_source_execution`]; a `deleting` row finishes
+//! [`mark_lost`], and the drain's
+//! [`crate::drain_terminate::retire_source_execution`]; a `deleting` row finishes
 //! through [`crate::delete::delete_with_dependents`] and a lost one is written
 //! off through [`crate::lost::write_off_lost_sandbox`]), and the verb's last
 //! result per node in `nodes.dead_node_status` ([`write_status`],
@@ -375,33 +376,6 @@ pub async fn mark_lost(
     .await?
     .rows_affected();
     Ok(flipped == 1)
-}
-
-/// Retire `execution_id`, the row's source execution, as `forgotten`, the
-/// pod-tracking write-off state: its pod died with the machine. Only that
-/// execution, and only while it is active; returns whether it changed.
-pub async fn retire_source_execution(
-    tx: &mut Transaction<'_, Postgres>,
-    sandbox_id: SandboxId,
-    execution_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    let retired = sqlx::query(sql!(
-        "UPDATE sandbox_k8s_executions
-            SET active = FALSE,
-                state = 'forgotten',
-                pod_ip = NULL,
-                terminated_at = COALESCE(terminated_at, NOW()),
-                updated_at = NOW()
-          WHERE id = $2
-            AND sandbox_id = $1
-            AND active"
-    ))
-    .bind(sandbox_id)
-    .bind(execution_id)
-    .execute(&mut **tx)
-    .await?
-    .rows_affected();
-    Ok(retired == 1)
 }
 
 /// One sampled row of a dead-node report.

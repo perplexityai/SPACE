@@ -39,7 +39,7 @@ def v2_drain_terminates_its_worker(test: smoke.CommandSandboxFixture) -> None:
 
     drain = test.drain_v2
 
-    with drain.v2_controller(terminating=True):
+    with drain.v2_controller():
         with test.phase("pin the worker the fixture is not on, under a fake AWS instance"):
             drain.pin_to_resident_worker(away_from_fixture=True)
             drain.give_fake_instance()

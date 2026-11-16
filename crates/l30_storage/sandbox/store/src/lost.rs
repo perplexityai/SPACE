@@ -185,7 +185,7 @@ pub async fn write_off_lost_sandbox(
     .execute(&mut **tx)
     .await?;
     if let Some(execution_id) = source_execution {
-        crate::dead_node::retire_source_execution(tx, sandbox_id, execution_id).await?;
+        crate::drain_terminate::retire_source_execution(tx, sandbox_id, execution_id).await?;
     }
     release_lost_placement(tx, &[sandbox_id]).await
 }

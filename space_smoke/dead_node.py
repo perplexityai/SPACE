@@ -33,7 +33,6 @@ only.
 from __future__ import annotations
 
 import re
-import secrets
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -47,6 +46,12 @@ from space_smoke.capabilities import (
     DeadNodeStatus,
     SandboxRowState,
 )
+from space_smoke.drain_v2 import (
+    TERMINATOR_KIND_ENV,
+    await_recorded_instance,
+    fake_provider_id,
+    register_fake_instance,
+)
 from space_smoke.runtime import Compensation, ResourceScope
 
 if TYPE_CHECKING:
@@ -56,31 +61,20 @@ MODE_ENV = "SPACE_DEAD_NODE_MODE"
 TICK_ENV = "SPACE_DEAD_NODE_TEST_TICK_SECS"
 ABSENCE_WINDOW_ENV = "SPACE_DEAD_NODE_TEST_ABSENCE_WINDOW_SECS"
 UPLOAD_SETTLE_ENV = "SPACE_DEAD_NODE_TEST_UPLOAD_SETTLE_SECS"
-# The node-drain terminator: `aws` gives the verb Kind's fake EC2 to judge by,
-# and the v2 drain its terminate.
-TERMINATOR_KIND_ENV = "SPACE_NODE_DRAIN_TERMINATOR_KIND"
-# The drain's v2, which the controller runs only with the verb `live` and the
-# `aws` terminator.
-DRAIN_V2_ENABLED_ENV = "SPACE_DRAIN_V2_ENABLED"
-# How many v2 drains may evacuate their nodes at once.
-DRAIN_V2_MAX_EVACUATING_ENV = "SPACE_DRAIN_V2_MAX_EVACUATING_NODES"
 
 # The only controller env this scenario may touch, and the closed vocabulary
-# its overrides come from.
+# its overrides come from. The node-drain terminator, `aws`, gives the verb
+# Kind's fake EC2 to judge by.
 DEAD_NODE_ENV_KEYS: tuple[str, ...] = (
     MODE_ENV,
     TICK_ENV,
     ABSENCE_WINDOW_ENV,
     UPLOAD_SETTLE_ENV,
     TERMINATOR_KIND_ENV,
-    DRAIN_V2_ENABLED_ENV,
-    DRAIN_V2_MAX_EVACUATING_ENV,
 )
 _MODE_VALUES = frozenset({"off", "dry-run", "live"})
 _TERMINATOR_VALUES = frozenset({"aws", "kube-delete"})
-_FLAG_VALUES = frozenset({"true", "false"})
 _SECONDS_VALUE = re.compile(r"[1-9][0-9]{0,3}")
-_COUNT_VALUE = re.compile(r"[1-9][0-9]{0,2}")
 
 # Sandbox actions the harness may ask the native API for.
 NATIVE_ACTIONS = frozenset({"suspend", "pause", "stop"})
@@ -131,59 +125,6 @@ LIVE_ROW: Mapping[str, LiveRow] = {
     SUSPENDING_LOCAL: LiveRow("failed", keeps_target=True),
 }
 
-_FAKE_INSTANCE = re.compile(r"i-[0-9a-f]{17}")
-_FAKE_PROVIDER = re.compile(r"aws:///kind-a/(i-[0-9a-f]{17})")
-
-
-def validate_fake_instance_id(instance_id: str) -> None:
-    if _FAKE_INSTANCE.fullmatch(instance_id) is None:
-        raise ValueError(f"refusing instance id {instance_id!r}")
-
-
-def validate_fake_provider_id(provider_id: str) -> None:
-    if _FAKE_PROVIDER.fullmatch(provider_id) is None:
-        raise ValueError(f"refusing providerID {provider_id!r}")
-
-
-def fake_provider_id() -> tuple[str, str]:
-    """A new fake AWS providerID and the instance it names."""
-
-    instance_id = "i-" + secrets.token_hex(9)[:17]
-    return f"aws:///kind-a/{instance_id}", instance_id
-
-
-def await_recorded_instance(
-    fixture: KindEcw, control: DeadNodeControl, node_name: str, node_id: str, instance_id: str,
-    *, timeout: float,
-) -> None:
-    """Wait until the node's row records `instance_id`."""
-
-    deadline = time.monotonic() + timeout
-    while control.node_recorded_instance(node_id) != instance_id:
-        fixture.verify(
-            time.monotonic() < deadline,
-            "node registration never recorded the worker's fake instance",
-            worker=node_name,
-            expected=instance_id,
-            recorded=control.node_recorded_instance(node_id),
-        )
-        fixture.wait(3)
-
-
-def register_fake_instance(
-    fixture: KindEcw, control: DeadNodeControl, node_name: str, node_id: str, *, timeout: float = 300
-) -> str:
-    """Re-register the worker under a new fake AWS providerID and wait until
-    its row records the instance; returns it. Re-registering deletes the
-    pods on the worker."""
-
-    provider_id, instance_id = fake_provider_id()
-    labels = control.kind_node_labels(node_name)
-    control.set_kind_worker_provider_id(node_name, provider_id, labels, timeout=timeout)
-    await_recorded_instance(fixture, control, node_name, node_id, instance_id, timeout=timeout)
-    return instance_id
-
-
 @contextmanager
 def scoped_dead_node_env(
     fixture: KindEcw, control: DeadNodeControl, scope: ResourceScope
@@ -220,12 +161,8 @@ def validate_dead_node_overrides(overrides: Mapping[str, str]) -> None:
     for key, value in overrides.items():
         if key == MODE_ENV:
             allowed = value in _MODE_VALUES
-        elif key == DRAIN_V2_ENABLED_ENV:
-            allowed = value in _FLAG_VALUES
         elif key == TERMINATOR_KIND_ENV:
             allowed = value in _TERMINATOR_VALUES
-        elif key == DRAIN_V2_MAX_EVACUATING_ENV:
-            allowed = _COUNT_VALUE.fullmatch(value) is not None
         else:
             allowed = _SECONDS_VALUE.fullmatch(value) is not None
         if not allowed:

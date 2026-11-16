@@ -1707,31 +1707,8 @@ class NodeDrainControl(NodeFaultControl, Protocol):
 
 
 @dataclass(frozen=True)
-class DeadNodeStatus:
-    """One node's `dead_node_status` in `GET /admin/api/v1/nodes`.
-
-    `observed_at` is when the controller wrote the entry, by the database
-    clock. `instances` maps each instance asked about to `dead`, `live` or
-    `unknown:<reason>`. `counts` maps each outcome to its row count,
-    `applied` each to the rows whose write committed (empty in a dry run),
-    and `samples` each to the sandbox ids the route lists for it.
-    """
-
-    node_id: str
-    observed_at: datetime
-    mode: str
-    verdict: str
-    reason: str
-    rows_truncated: bool
-    instances: Mapping[str, str]
-    counts: Mapping[str, int]
-    applied: Mapping[str, int]
-    samples: Mapping[str, tuple[str, ...]]
-
-
-@dataclass(frozen=True)
 class SandboxRowState:
-    """The `sandboxes` columns a dead-node write would change, and `updated_at`.
+    """The `sandboxes` columns a node cleanup would change, and `updated_at`.
 
     `updated_at` is trigger-maintained: an update that changes any column
     other than `last_used_at`, `last_access_at` and `last_command_at` moves it.
@@ -1745,40 +1722,34 @@ class SandboxRowState:
     updated_at: str
 
 
-class DeadNodeControl(NodeDrainControl, Protocol):
-    """Kind-only operations for the dead-node scenarios.
+class KindWorkerControl(NodeDrainControl, Protocol):
+    """Kind-only operations on a worker's instance and on the controller's env.
 
-    The verb ships off and reads its config at startup, so a scenario
-    overrides the cluster-controller Deployment's `SPACE_DEAD_NODE_*` env
-    (closed key list, closed value vocabulary) under the controller-mutation
-    Lease, and puts the captured standing values back. A Kind worker gets a
-    fake AWS providerID by re-registering its Node with the kubelet's
-    `--provider-id` rewritten, so its EC2 instance is recorded and Kind's
-    fake EC2 can answer for it. The node fault is named: stop one Kind
-    worker's container, delete its Kubernetes Node and mark its instance
-    terminated in the fake EC2; then start the container again, under a new
-    providerID for a same-name replacement. The observables are the admin
-    node listing's `dead_node_status`, the node rows and the sandbox rows.
+    A scenario overrides cluster-controller Deployment env (closed key list,
+    closed value vocabulary) under the controller-mutation Lease, and puts
+    the captured standing values back. A Kind worker gets a fake AWS
+    providerID by re-registering its Node with the kubelet's `--provider-id`
+    rewritten, so its EC2 instance is recorded and Kind's fake EC2 can answer
+    for it. The node fault is named: stop one Kind worker's container, delete
+    its Kubernetes Node or keep it, and mark its instance terminated in the
+    fake EC2; then start the container again, under a new providerID for a
+    same-name replacement.
     """
 
     def acquire_controller_mutation(self) -> Callable[[], None]:
         """Take the cluster-visible controller-deployment Lease; returns its release."""
         ...
 
-    def dead_node_env(self) -> dict[str, str | None]:
-        """The literal value of every dead-node env key on the controller Deployment."""
+    def drain_v2_env(self) -> dict[str, str | None]:
+        """The literal value of every drain v2 env key on the controller Deployment."""
         ...
 
-    def set_dead_node_env(self, overrides: Mapping[str, str]) -> None:
+    def set_drain_v2_env(self, overrides: Mapping[str, str]) -> None:
         """Apply smoke overrides and await the controller rollout; refuses keys or values off the lists."""
         ...
 
-    def restore_dead_node_env(self, standing: Mapping[str, str | None]) -> None:
+    def restore_drain_v2_env(self, standing: Mapping[str, str | None]) -> None:
         """Put the captured literals back (None unsets) and await the controller rollout."""
-        ...
-
-    def dead_node_statuses(self) -> list[DeadNodeStatus]:
-        """Each node's `dead_node_status` from `GET /admin/api/v1/nodes`."""
         ...
 
     def kind_node_provider_id(self, node_name: str) -> str:
@@ -1804,25 +1775,6 @@ class DeadNodeControl(NodeDrainControl, Protocol):
 
     def node_row_exists(self, node_id: str) -> bool: ...
 
-    def latest_execution_instance(self, sandbox_id: str) -> str | None:
-        """The sandbox's latest execution's `node_instance_id`."""
-        ...
-
-    def database_now(self) -> datetime:
-        """The stack's Postgres `NOW()`, the clock `observed_at` is stamped with."""
-        ...
-
-    def sandbox_worker_nodes(self) -> list[str]:
-        """The kube nodes of the sandbox worker pool."""
-        ...
-
-    def node_stack_pods(self, node_name: str) -> list[str]:
-        """`namespace/name` of every SPACE pod on the kube node that no DaemonSet
-        owns and that is not a sandbox pod: what stopping the node would take
-        down. Kubernetes' own replicated system pods are rescheduled once the
-        Node is deleted, so they are not listed."""
-        ...
-
     def kind_node_labels(self, node_name: str) -> dict[str, str]:
         """The Kind worker's Node labels, which deleting the Node discards."""
         ...
@@ -1846,6 +1798,78 @@ class DeadNodeControl(NodeDrainControl, Protocol):
         services on it to be Ready."""
         ...
 
+    def sandbox_row_states(self, sandbox_ids: Sequence[str]) -> list[SandboxRowState]: ...
+
+
+@dataclass(frozen=True)
+class DeadNodeStatus:
+    """One node's `dead_node_status` in `GET /admin/api/v1/nodes`.
+
+    `observed_at` is when the controller wrote the entry, by the database
+    clock. `instances` maps each instance asked about to `dead`, `live` or
+    `unknown:<reason>`. `counts` maps each outcome to its row count,
+    `applied` each to the rows whose write committed (empty in a dry run),
+    and `samples` each to the sandbox ids the route lists for it.
+    """
+
+    node_id: str
+    observed_at: datetime
+    mode: str
+    verdict: str
+    reason: str
+    rows_truncated: bool
+    instances: Mapping[str, str]
+    counts: Mapping[str, int]
+    applied: Mapping[str, int]
+    samples: Mapping[str, tuple[str, ...]]
+
+
+class DeadNodeControl(KindWorkerControl, Protocol):
+    """Kind-only operations for the dead-node scenarios.
+
+    The verb ships off and reads its config at startup, so a scenario
+    overrides the cluster-controller Deployment's `SPACE_DEAD_NODE_*` env
+    (closed key list, closed value vocabulary) under the controller-mutation
+    Lease, and puts the captured standing values back, as
+    [`KindWorkerControl`] does for the drain's. The observables are the admin
+    node listing's `dead_node_status`, the node rows and the sandbox rows.
+    """
+
+    def dead_node_env(self) -> dict[str, str | None]:
+        """The literal value of every dead-node env key on the controller Deployment."""
+        ...
+
+    def set_dead_node_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply smoke overrides and await the controller rollout; refuses keys or values off the lists."""
+        ...
+
+    def restore_dead_node_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literals back (None unsets) and await the controller rollout."""
+        ...
+
+    def dead_node_statuses(self) -> list[DeadNodeStatus]:
+        """Each node's `dead_node_status` from `GET /admin/api/v1/nodes`."""
+        ...
+
+    def latest_execution_instance(self, sandbox_id: str) -> str | None:
+        """The sandbox's latest execution's `node_instance_id`."""
+        ...
+
+    def database_now(self) -> datetime:
+        """The stack's Postgres `NOW()`, the clock `observed_at` is stamped with."""
+        ...
+
+    def sandbox_worker_nodes(self) -> list[str]:
+        """The kube nodes of the sandbox worker pool."""
+        ...
+
+    def node_stack_pods(self, node_name: str) -> list[str]:
+        """`namespace/name` of every SPACE pod on the kube node that no DaemonSet
+        owns and that is not a sandbox pod: what stopping the node would take
+        down. Kubernetes' own replicated system pods are rescheduled once the
+        Node is deleted, so they are not listed."""
+        ...
+
     def native_sandbox_action(self, sandbox_id: str, action: str) -> str:
         """`POST /v1/sandboxes/{id}:{action}` for `suspend`, `pause` or `stop`; the operation id."""
         ...
@@ -1867,8 +1891,6 @@ class DeadNodeControl(NodeDrainControl, Protocol):
     def wait_object_store_gone(self, *, timeout: float) -> None: ...
 
     def wait_object_store_rollout(self, *, timeout: float) -> None: ...
-
-    def sandbox_row_states(self, sandbox_ids: Sequence[str]) -> list[SandboxRowState]: ...
 
     def snapshot_states(self, sandbox_id: str) -> list[str]:
         """The sandbox's full snapshots' states, oldest first."""
@@ -1917,10 +1939,10 @@ class DrainV2Status:
     status: dict[str, Any] | None
 
 
-class DrainV2Control(DeadNodeControl, DrainRestoreControl, Protocol):
-    """Kind-only operations for the drain v2 scenarios, with the dead-node
-    verb's config, the drain restore hold, and the Kind worker's instance,
-    stop and replacement."""
+class DrainV2Control(KindWorkerControl, DrainRestoreControl, Protocol):
+    """Kind-only operations for the drain v2 scenarios, with the controller's
+    drain env, the drain restore hold, and the Kind worker's instance, stop
+    and replacement."""
 
     def drain_node_v2(self, node_id: str) -> None:
         """`POST :drain` with `mode: forced` and `engine: v2`."""

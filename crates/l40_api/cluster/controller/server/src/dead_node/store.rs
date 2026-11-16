@@ -1,10 +1,11 @@
 //! Postgres-backed [`super::DeadNodeSink`].
 //!
-//! The node reads, the node re-check and the node delete are written here
-//! because no store owns `nodes`; the sandbox reads, each outcome's write and
-//! the status go through `pplx_space_sandbox_store`'s `dead_node`, `lost` and
-//! `delete` modules, and a lost row's dead uploads through
-//! `pplx_space_snapshot_store::lost`.
+//! The node reads and the node re-check are written here because no store
+//! owns `nodes`; the node delete is the drain's guarded delete
+//! (`crate::node_drain::guarded_delete`); the sandbox reads, each outcome's
+//! write and the status go through `pplx_space_sandbox_store`'s `dead_node`,
+//! `drain_terminate`, `lost` and `delete` modules, and a lost row's dead
+//! uploads through `pplx_space_snapshot_store::lost`.
 //!
 //! A row's write runs in its own transaction, in the placement lock order:
 //! the node rows `FOR SHARE` ([`node_identity_holds`] and the recorded
@@ -25,6 +26,7 @@ use pplx_space_sandbox_residency::node_heartbeat_fresh;
 use pplx_space_sandbox_store::dead_node::{
     self as sandbox_dead_node, DeadNodeRow, DeadNodeStatusWrite, NodeRef,
 };
+use pplx_space_sandbox_store::drain_terminate::retire_source_execution;
 use pplx_space_sandbox_store::{delete as sandbox_delete, lost as sandbox_lost};
 use pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -33,6 +35,7 @@ use super::outcome::RowOutcome;
 use super::verdict::Heartbeat;
 use super::{CandidateNode, DeadNodeSink, ReferenceNode, RowWrite, WriteBasis, WriteResult};
 use crate::gone_node_write_off::node_identity_holds;
+use crate::node_drain::guarded_delete;
 
 pub struct DeadNodeDbStore {
     pool: PgPool,
@@ -45,10 +48,9 @@ impl DeadNodeDbStore {
 }
 
 /// `$1` = substrate, `$2` = cursor (exclusive, NULL from the start), `$3` =
-/// limit. Nodes outside any drain, or a v2 drain's node in any phase
-/// (nothing else reconciles it once it is dead: v1's give-ups skip it, and
-/// the v2 loop only asks the node),
-/// whose heartbeat is not fresh by the API's
+/// limit. Nodes outside any drain phase (a v2 drain's node, in any phase, is
+/// the drain's; one undrained with its cancel pending has no phase and is
+/// judged), whose heartbeat is not fresh by the API's
 /// node-status rule (no `node_status_snapshots` row, an unreachable one, or
 /// one past `stale_after`), or which a non-terminal row pins
 /// (`active_node_id` or `target_node_id`) whose latest execution ran on the
@@ -61,15 +63,11 @@ static CANDIDATE_NODES: LazyLock<String> = LazyLock::new(|| {
     sql!(
         format!(
             "SELECT n.id, k.k8s_node_name, k.k8s_node_uid, k.instance_id,
-                    {fresh} AS heartbeat_fresh,
-                    CASE WHEN n.drain_engine = 'v2' THEN n.drain_phase END AS v2_drain_phase
+                    {fresh} AS heartbeat_fresh
                FROM nodes n
                LEFT JOIN node_k8s k ON k.node_id = n.id
               WHERE n.managed_by = $1
-                AND (
-                    n.drain_phase IS NULL
-                    OR n.drain_engine = 'v2'
-                )
+                AND n.drain_phase IS NULL
                 AND ($2::UUID IS NULL OR n.id > $2)
                 AND (
                     NOT {fresh}
@@ -131,44 +129,6 @@ static HEARTBEAT_FRESH: LazyLock<String> = LazyLock::new(|| {
     sql!(format!("SELECT {fresh}").as_str())
 });
 
-/// `$1` = node id, `$2` = substrate, `$3` = the node's Kubernetes name, `$4`
-/// = the v2 drain phase the tick read (NULL outside any drain). The lost
-/// node's delete, run with the node row locked and its `node_k8s` row
-/// re-checked: still outside any drain (or still that v2 drain's node in
-/// that phase), its
-/// heartbeat still stale, and no
-/// non-terminal row pinning it and no active execution on its name left, as
-/// `orphaned_nodes` requires.
-static DELETE_NODE: LazyLock<String> = LazyLock::new(|| {
-    let fresh = node_heartbeat_fresh("$1");
-    sql!(
-        format!(
-            "DELETE FROM nodes n
-              WHERE n.id = $1
-                AND n.managed_by = $2
-                AND n.drain_phase IS NOT DISTINCT FROM $4::TEXT
-                AND ($4::TEXT IS NULL OR n.drain_engine = 'v2')
-                AND NOT {fresh}
-                AND NOT EXISTS (
-                    SELECT 1 FROM sandboxes
-                     WHERE active_node_id = $1
-                       AND lifecycle NOT IN ('failed', 'deleted')
-                )
-                AND NOT EXISTS (
-                    SELECT 1 FROM sandboxes
-                     WHERE target_node_id = $1
-                       AND lifecycle NOT IN ('failed', 'deleted')
-                )
-                AND NOT EXISTS (
-                    SELECT 1 FROM sandbox_k8s_executions
-                     WHERE active
-                       AND k8s_node_name = $3
-                )"
-        )
-        .as_str()
-    )
-});
-
 fn node_ref(node: &CandidateNode) -> NodeRef<'_> {
     NodeRef {
         node_id: node.node_id,
@@ -196,10 +156,8 @@ async fn recorded_instance_holds(
 }
 
 /// The node checks every row write rests on, under the node rows' shared
-/// locks: still outside any drain (or still the v2 drain's node in the phase
-/// the tick read)
-/// with the uid and instance the tick read,
-/// and, for a row the node's verdict selected, still without a fresh
+/// locks: still outside any drain phase with the uid and instance the tick
+/// read, and, for a row the node's verdict selected, still without a fresh
 /// heartbeat.
 async fn node_holds(
     tx: &mut Transaction<'_, Postgres>,
@@ -208,8 +166,7 @@ async fn node_holds(
 ) -> Result<bool, sqlx::Error> {
     // The verb runs on Kubernetes only: Direct nodes have no Node or
     // instance to judge.
-    let phase = node.v2_drain_phase.as_deref();
-    if !node_identity_holds(tx, node.node_id, phase, node.k8s_node_uid.as_deref()).await? {
+    if !node_identity_holds(tx, node.node_id, None, node.k8s_node_uid.as_deref()).await? {
         return Ok(false);
     }
     if !recorded_instance_holds(tx, node.node_id, node.instance_id.as_deref()).await? {
@@ -273,9 +230,7 @@ async fn apply(
             )
             .await?;
             let retired = match source {
-                Some(execution_id) => {
-                    sandbox_dead_node::retire_source_execution(tx, sandbox_id, execution_id).await?
-                }
+                Some(execution_id) => retire_source_execution(tx, sandbox_id, execution_id).await?,
                 None => false,
             };
             Ok(released || retired)
@@ -294,14 +249,7 @@ impl DeadNodeSink for DeadNodeDbStore {
         after: Option<NodeId>,
         limit: u32,
     ) -> Result<Vec<CandidateNode>, sqlx::Error> {
-        type Row = (
-            NodeId,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            bool,
-            Option<String>,
-        );
+        type Row = (NodeId, Option<String>, Option<String>, Option<String>, bool);
         let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(CANDIDATE_NODES.as_str()))
             .bind(managed_by)
             .bind(after)
@@ -311,20 +259,17 @@ impl DeadNodeSink for DeadNodeDbStore {
         Ok(rows
             .into_iter()
             .map(
-                |(node_id, k8s_node_name, k8s_node_uid, instance_id, fresh, v2_drain_phase)| {
-                    CandidateNode {
-                        node_id,
-                        managed_by,
-                        k8s_node_name,
-                        k8s_node_uid,
-                        instance_id,
-                        heartbeat: if fresh {
-                            Heartbeat::Fresh
-                        } else {
-                            Heartbeat::Stale
-                        },
-                        v2_drain_phase,
-                    }
+                |(node_id, k8s_node_name, k8s_node_uid, instance_id, fresh)| CandidateNode {
+                    node_id,
+                    managed_by,
+                    k8s_node_name,
+                    k8s_node_uid,
+                    instance_id,
+                    heartbeat: if fresh {
+                        Heartbeat::Fresh
+                    } else {
+                        Heartbeat::Stale
+                    },
                 },
             )
             .collect())
@@ -419,39 +364,38 @@ impl DeadNodeSink for DeadNodeDbStore {
 
     async fn delete_node(&self, node: &CandidateNode) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        // The exclusive lock holds a registration of a replacement off until
-        // this commits, or waits for one in flight and then reads what it
-        // committed; a moved uid or instance refuses.
-        let locked: Option<i32> =
-            sqlx::query_scalar(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR UPDATE"))
-                .bind(node.node_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if locked.is_none() {
+        if !guarded_delete::lock_node(&mut tx, node.node_id).await? {
             tx.rollback().await?;
             return Ok(false);
         }
-        let identity: Option<(Option<String>, Option<String>)> = sqlx::query_as(sql!(
-            "SELECT k8s_node_uid, instance_id FROM node_k8s WHERE node_id = $1 FOR SHARE"
+        // Still outside any drain phase, under the lock the delete holds.
+        let outside_drain: Option<i32> = sqlx::query_scalar(sql!(
+            "SELECT 1 FROM nodes WHERE id = $1 AND drain_phase IS NULL"
         ))
         .bind(node.node_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let (uid, instance_id) = identity.unwrap_or_default();
-        if uid != node.k8s_node_uid || instance_id != node.instance_id {
+        if outside_drain.is_none() {
             tx.rollback().await?;
             return Ok(false);
         }
-        let deleted = sqlx::query(sqlx::AssertSqlSafe(DELETE_NODE.as_str()))
-            .bind(node.node_id)
-            .bind(node.managed_by)
-            .bind(node.k8s_node_name.as_deref())
-            .bind(node.v2_drain_phase.as_deref())
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let deleted = guarded_delete::delete_locked_node(
+            &mut tx,
+            &guarded_delete::NodeIdentity {
+                node_id: node.node_id,
+                managed_by: node.managed_by,
+                k8s_node_name: node.k8s_node_name.as_deref(),
+                k8s_node_uid: node.k8s_node_uid.as_deref(),
+                instance_id: node.instance_id.as_deref(),
+            },
+        )
+        .await?;
+        if deleted != guarded_delete::GuardedDelete::Deleted {
+            tx.rollback().await?;
+            return Ok(false);
+        }
         tx.commit().await?;
-        Ok(deleted == 1)
+        Ok(true)
     }
 
     async fn write_status(&self, status: &DeadNodeStatusWrite<'_>) -> Result<bool, sqlx::Error> {

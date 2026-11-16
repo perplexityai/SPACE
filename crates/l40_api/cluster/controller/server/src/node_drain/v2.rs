@@ -56,8 +56,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Ec2InstanceTerminator, InstanceTerminator, TerminateError};
 
-/// The v2 loop's terminator: EC2, where a terminated node's row has an
-/// owner, or a refusal that leaves the node `terminating`.
+/// The v2 loop's terminator: EC2, with the `aws` terminator, or a refusal
+/// that leaves the node `terminating`.
 pub enum V2Terminator {
     Ec2(Ec2InstanceTerminator),
     Refuse,
@@ -68,8 +68,8 @@ impl InstanceTerminator for V2Terminator {
         match self {
             Self::Ec2(terminator) => terminator.terminate(node_id).await,
             Self::Refuse => Err(TerminateError::Provider(
-                "a v2 node is terminated only through the aws terminator with the dead-node \
-                 verb live, which deletes its row"
+                "a v2 node is terminated only through the aws terminator \
+                 (SPACE_NODE_DRAIN_TERMINATOR_KIND=aws)"
                     .to_owned(),
             )),
         }

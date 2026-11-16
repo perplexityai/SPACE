@@ -119,6 +119,11 @@ from space_smoke.dead_node import (
     NATIVE_ACTIONS,
     validate_dead_node_keys,
     validate_dead_node_overrides,
+)
+from space_smoke.drain_v2 import (
+    DRAIN_V2_ENV_KEYS,
+    validate_drain_v2_keys,
+    validate_drain_v2_overrides,
     validate_fake_instance_id,
     validate_fake_provider_id,
 )
@@ -5666,9 +5671,10 @@ ON CONFLICT (key_hash) DO NOTHING;
     def _apply_orphaned_restore_pod_gc_env(self, values: Mapping[str, str | None]) -> None:
         self._set_controller_env(values, "an orphaned-restore-pod GC controller deployment write")
 
-    # --- dead-node dry run ----------------------------------------------------
+    # --- controller env for the drain and the dead-node verb ------------------
     #
-    # The key/value lists and the verdicts live in `space_smoke.dead_node`.
+    # The key/value lists live in `space_smoke.drain_v2` and
+    # `space_smoke.dead_node`.
 
     def _set_controller_env(self, values: Mapping[str, str | None], purpose: str) -> None:
         """Write `values` (None unsets) to the cluster-controller Deployment and
@@ -5687,6 +5693,20 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         self._assert_lease_owned(ownership, purpose)
         self._set_deployment_env(self._controller_deployment(), values, timeout=180)
+
+    def drain_v2_env(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(self._controller_deployment(), DRAIN_V2_ENV_KEYS)
+
+    def set_drain_v2_env(self, overrides: Mapping[str, str]) -> None:
+        validate_drain_v2_overrides(overrides)
+        self._apply_drain_v2_env(overrides)
+
+    def restore_drain_v2_env(self, standing: Mapping[str, str | None]) -> None:
+        validate_drain_v2_keys(standing)
+        self._apply_drain_v2_env(standing)
+
+    def _apply_drain_v2_env(self, values: Mapping[str, str | None]) -> None:
+        self._set_controller_env(values, "a drain v2 controller deployment write")
 
     def dead_node_env(self) -> dict[str, str | None]:
         return self._deployment_env_literals(self._controller_deployment(), DEAD_NODE_ENV_KEYS)

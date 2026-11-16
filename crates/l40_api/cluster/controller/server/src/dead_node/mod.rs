@@ -35,11 +35,10 @@
 //!
 //! ## Which nodes
 //!
-//! Nodes of the running substrate outside any drain phase, or a v2 drain's
-//! node in any phase (judged by the same evidence: the drain's v2 needs this
-//! verb `live` to delete the row a terminate leaves, and to reconcile a node
-//! that died mid-drain, which nothing else does), whose heartbeat is
-//! stale by the API's node-status rule
+//! Nodes of the running substrate outside any drain phase (a v2 drain's
+//! node, in any phase, is the drain's to clean up or let go; one undrained
+//! with its cancel still pending has no phase and is judged here), whose
+//! heartbeat is stale by the API's node-status rule
 //! (`pplx_space_sandbox_residency::node_heartbeat_fresh`), or which hold a
 //! non-terminal row whose latest execution on the node is stamped with an
 //! instance other than the node's recorded one (a same-name replacement's
@@ -256,12 +255,6 @@ pub struct CandidateNode {
     /// reported.
     pub instance_id: Option<String>,
     pub heartbeat: Heartbeat,
-    /// A v2 drain's node, in the phase the tick read: once EC2 says it is
-    /// gone, its seal protects nothing, and this verb reconciles its rows
-    /// and deletes its row like any lost node's, whether the drain is
-    /// `draining`, `drained` or `terminating`. `None` for a node outside any
-    /// drain.
-    pub v2_drain_phase: Option<String>,
 }
 
 /// A fresh node that may serve as the instance lookup's reference.

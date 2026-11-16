@@ -498,7 +498,7 @@ pub async fn evacuate_v2_stopped(
     .bind(artifact)
     .execute(&mut **tx)
     .await?;
-    crate::dead_node::retire_source_execution(tx, sandbox_id, source).await?;
+    crate::drain_terminate::retire_source_execution(tx, sandbox_id, source).await?;
     Ok(V2StoppedEvacuation::Released)
 }
 

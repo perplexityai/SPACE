@@ -154,17 +154,16 @@ fn the_dead_node_verb_replaces_the_gone_node_loops_only_live_with_ec2() {
     }
 }
 
-/// New v2 drains are admitted only with the node drain running and the
-/// dead-node verb replacing the gone-node loops; off, nothing is refused.
+/// New v2 drains are admitted only with the node drain running; off,
+/// nothing is refused.
 #[test]
-fn the_drain_v2_runs_only_with_the_node_drain_and_the_dead_node_verb_live() {
+fn the_drain_v2_runs_only_with_the_node_drain() {
     let mut env = pplx_space_test_env::TestEnv::default();
-    for (flag, dead_node_live, node_drain, expected) in [
-        (None, false, false, Some(false)),
-        (Some("false"), false, false, Some(false)),
-        (Some("true"), false, true, None),
-        (Some("true"), true, false, None),
-        (Some("true"), true, true, Some(true)),
+    for (flag, node_drain, expected) in [
+        (None, false, Some(false)),
+        (Some("false"), false, Some(false)),
+        (Some("true"), false, None),
+        (Some("true"), true, Some(true)),
     ] {
         match flag {
             Some(flag) => env.set(
@@ -173,28 +172,26 @@ fn the_drain_v2_runs_only_with_the_node_drain_and_the_dead_node_verb_live() {
             ),
             None => env.remove(pplx_space_api::routes::admin::nodes::DRAIN_V2_ENABLED_ENV),
         }
-        let got = drain_v2_enabled(&env, dead_node_live, node_drain);
-        let case = format!("{flag:?} live={dead_node_live} node_drain={node_drain}");
+        let got = drain_v2_enabled(&env, node_drain);
+        let case = format!("{flag:?} node_drain={node_drain}");
         match expected {
             Some(enabled) => assert_eq!(got.ok(), Some(enabled), "{case}"),
             None => assert!(
-                matches!(got, Err(ReconcilerRuntimeError::DrainV2NeedsDeadNodeLive)),
+                matches!(got, Err(ReconcilerRuntimeError::DrainV2NeedsNodeDrain)),
                 "{case}"
             ),
         }
     }
 }
 
-/// The v2 loop terminates a node only through EC2 with the dead-node verb
-/// live, which then deletes its row.
+/// The v2 loop terminates a node only through EC2.
 #[test]
-fn the_v2_loop_terminates_only_through_ec2_with_the_verb_live() {
-    for (kind, live, terminates) in [
-        (TerminatorKind::Aws, true, true),
-        (TerminatorKind::Aws, false, false),
-        (TerminatorKind::KubeDelete, true, false),
-        (TerminatorKind::Noop, true, false),
+fn the_v2_loop_terminates_only_through_ec2() {
+    for (kind, terminates) in [
+        (TerminatorKind::Aws, true),
+        (TerminatorKind::KubeDelete, false),
+        (TerminatorKind::Noop, false),
     ] {
-        assert_eq!(v2_terminates(kind, live), terminates, "{kind:?} {live}");
+        assert_eq!(v2_terminates(kind), terminates, "{kind:?}");
     }
 }

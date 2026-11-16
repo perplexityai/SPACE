@@ -77,16 +77,11 @@ pub enum ReconcilerRuntimeError {
     InvalidTerminatorKind(String),
     #[error("invalid or missing SPACE API route signing configuration: {0}")]
     RouteSigningConfiguration(#[from] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
-    /// The drain's v2 runs in the node drain, and leaves a terminated
-    /// node's row to the dead-node verb, which only `live` mode with EC2 as
-    /// its authority deletes.
+    /// The drain's v2 runs in the node drain's loop.
     #[error(
-        "SPACE_DRAIN_V2_ENABLED needs SPACE_NODE_DRAIN_ENABLED, SPACE_DEAD_NODE_MODE=live and \
-         the aws terminator (SPACE_NODE_DRAIN_TERMINATOR_KIND=aws): the node drain runs the v2 \
-         loop, the dead-node verb deletes a v2-terminated node's row, and only EC2 can say the \
-         node is dead"
+        "SPACE_DRAIN_V2_ENABLED needs SPACE_NODE_DRAIN_ENABLED: the node drain runs the v2 loop"
     )]
-    DrainV2NeedsDeadNodeLive,
+    DrainV2NeedsNodeDrain,
 }
 
 /// How [`run_reconcilers`] wound down on a requested shutdown — whether every
@@ -180,13 +175,11 @@ fn dead_node_replaces_the_gone_node_loops(
 }
 
 /// Whether new v2 drains are admitted: `SPACE_DRAIN_V2_ENABLED`, refused
-/// unless the node drain runs (its v2 loop drives them) and the dead-node
-/// verb replaces the gone-node loops (it deletes a node a v2 drain
-/// terminated). The loop itself runs wherever the node drain does, flag or
-/// not, so a v2 drain already persisted still has an owner.
+/// unless the node drain runs, since its v2 loop drives them. The loop
+/// itself runs wherever the node drain does, flag or not, so a v2 drain
+/// already persisted still has an owner.
 fn drain_v2_enabled(
     env: &dyn pplx_space_env_vars::Environment,
-    dead_node_live: bool,
     node_drain_enabled: bool,
 ) -> Result<bool, ReconcilerRuntimeError> {
     let enabled = pplx_space_env_vars::env_flag(
@@ -195,17 +188,17 @@ fn drain_v2_enabled(
             .as_deref(),
         false,
     );
-    if enabled && !(dead_node_live && node_drain_enabled) {
-        return Err(ReconcilerRuntimeError::DrainV2NeedsDeadNodeLive);
+    if enabled && !node_drain_enabled {
+        return Err(ReconcilerRuntimeError::DrainV2NeedsNodeDrain);
     }
     Ok(enabled)
 }
 
 /// Whether the v2 loop terminates a node `:terminate` moved to
-/// `terminating`: only through EC2, and only where the dead-node verb then
-/// deletes the node's row. Elsewhere it refuses, and the node waits.
-fn v2_terminates(kind: TerminatorKind, dead_node_live: bool) -> bool {
-    kind == TerminatorKind::Aws && dead_node_live
+/// `terminating`: only through EC2, which also says when the instance is
+/// gone. Elsewhere it refuses, and the node waits for an operator.
+fn v2_terminates(kind: TerminatorKind) -> bool {
+    kind == TerminatorKind::Aws
 }
 
 #[derive(Clone)]
@@ -514,7 +507,6 @@ pub async fn run_reconcilers(
             // what a v2 drain needs.
             drain_v2_enabled(
                 &pplx_space_env_vars::ProcessEnvironment,
-                dead_node_live,
                 node_drain::ReconcilerConfig::from_env().enabled,
             )?;
             let environment_placement = substrate.environment_placement();
@@ -786,8 +778,7 @@ pub async fn run_reconcilers(
                 // `:drain {engine: v2}` marked, which v1's writers skip. It
                 // runs whether or not new v2 drains are admitted, so a
                 // persisted one is still drained or cancelled; it terminates
-                // a node only where the row then has an owner
-                // ([`v2_terminates`]).
+                // a node only through EC2 ([`v2_terminates`]).
                 let spawn_v2 = |handles: &mut Vec<_>, terminator: node_drain::v2::V2Terminator| {
                     handles.push(tokio::spawn(node_drain::v2::run(
                         node_drain::SubstrateSink::v2(pool.clone(), kube.clone()),
@@ -805,7 +796,7 @@ pub async fn run_reconcilers(
                             pplx_space_aws_client::autoscaling::Client::from_config(&aws_config);
                         spawn_v2(
                             &mut handles,
-                            if v2_terminates(kind, dead_node_live) {
+                            if v2_terminates(kind) {
                                 node_drain::v2::V2Terminator::Ec2(
                                     node_drain::Ec2InstanceTerminator::new(
                                         pool.clone(),
