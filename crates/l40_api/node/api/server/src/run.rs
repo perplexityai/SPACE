@@ -75,6 +75,14 @@ pub struct NodeApiRunConfig {
     pub health_socket: Option<PathBuf>,
     /// Maximum time to wait for in-flight gRPC requests after SIGTERM.
     pub shutdown_grace: std::time::Duration,
+    /// How long file-watch and process event streams keep flowing after
+    /// SIGTERM before node-api ends them with its drain status; `None` leaves
+    /// them the whole `shutdown_grace`. These streams have no natural end, and
+    /// while one is open the drain cannot finish: the node refuses every new
+    /// call, and the delete-first rollout cannot start the successor. Callers
+    /// answer the drain status by reconnecting; a process keeps running in the
+    /// guest and its output resumes from the caller's cursor.
+    pub open_stream_drain_grace: Option<std::time::Duration>,
 }
 
 /// Why [`run`] returned without a clean shutdown.
@@ -713,6 +721,28 @@ fn drain_before_shutdown(
     service_token
 }
 
+/// A token cancelled `grace` after `shutdown_token` is, or never without a
+/// grace.
+fn open_stream_drain_token(
+    shutdown_token: &CancellationToken,
+    grace: Option<std::time::Duration>,
+) -> CancellationToken {
+    let token = CancellationToken::new();
+    let Some(grace) = grace else {
+        return token;
+    };
+    tokio::spawn({
+        let shutdown_token = shutdown_token.clone();
+        let token = token.clone();
+        async move {
+            shutdown_token.cancelled().await;
+            tokio::time::sleep(grace).await;
+            token.cancel();
+        }
+    });
+    token
+}
+
 /// Run node-api until `shutdown_token` fires or a fatal condition ends it.
 /// Telemetry must already be initialized by the caller.
 pub async fn run(
@@ -815,16 +845,21 @@ pub async fn run(
                     shutdown_token.clone(),
                 );
                 let resource_status_reader = crate::NodeResourceStatusReader::new();
+                let open_stream_drain_token =
+                    open_stream_drain_token(&shutdown_token, config.open_stream_drain_grace);
                 let svc = WorkerApiService::with_resource_status_reader_and_shutdown_token(
                     clients.clone(),
                     resource_status_reader.clone(),
                     shutdown_token.clone(),
-                );
-                let internal_svc = WorkerApiService::with_resource_status_reader_and_shutdown_token(
-                    clients.clone(),
-                    resource_status_reader.clone(),
-                    shutdown_token.clone(),
-                );
+                )
+                .with_open_stream_drain_token(open_stream_drain_token.clone());
+                let internal_svc =
+                    WorkerApiService::with_resource_status_reader_and_shutdown_token(
+                        clients.clone(),
+                        resource_status_reader.clone(),
+                        shutdown_token.clone(),
+                    )
+                    .with_open_stream_drain_token(open_stream_drain_token);
                 let node_info = NodeInfoService::with_resource_status_reader(
                     NodeRole::Worker,
                     node_id.clone(),

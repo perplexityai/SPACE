@@ -32,6 +32,7 @@ pub struct WorkerApiService {
     service_port_ingress_limiter: UdsPerSandboxLimiter,
     resource_status_reader: NodeResourceStatusReader,
     shutdown_token: CancellationToken,
+    open_stream_drain_token: CancellationToken,
 }
 
 /// Reject policy-bearing requests from callers node-api did not classify as the
@@ -121,7 +122,15 @@ impl WorkerApiService {
             service_port_ingress_limiter: shared_service_port_ingress_limiter(),
             resource_status_reader,
             shutdown_token,
+            open_stream_drain_token: CancellationToken::new(),
         }
+    }
+
+    /// End the open-ended streams (file watches and process event streams)
+    /// once `token` is cancelled, so they cannot hold node-api's drain open.
+    pub fn with_open_stream_drain_token(mut self, token: CancellationToken) -> Self {
+        self.open_stream_drain_token = token;
+        self
     }
 
     /// The served `WorkerApi`. A reset `SpacedWrite` body is an interrupted
@@ -297,6 +306,29 @@ impl WorkerApiService {
         .await?;
         Ok(response.map(|stream| guard_stream(stream, permit)))
     }
+
+    /// [`Self::limited_sbx_server_stream`] for a stream with no natural end.
+    /// Once the open-stream drain token is cancelled the stream ends with the
+    /// drain status, which callers answer by reconnecting.
+    async fn open_ended_sbx_server_stream<Req, Item, S, F, Fut>(
+        &self,
+        method: &'static str,
+        request: Request<Req>,
+        call: F,
+    ) -> Result<Response<PinnedResponseStream<Item>>, Status>
+    where
+        Req: SandboxScopedRequest + Clone + Send + Sync + 'static,
+        Item: Send + 'static,
+        S: Stream<Item = Result<Item, Status>> + Send + 'static,
+        F: Fn(pplx_space_sbx_mgr_client::SandboxManagerGrpcClient, Request<Req>) -> Fut + Send,
+        Fut: Future<Output = Result<Response<S>, Status>> + Send,
+    {
+        let drain = self.open_stream_drain_token.clone();
+        let response = self
+            .limited_sbx_server_stream(method, request, call)
+            .await?;
+        Ok(response.map(|stream| end_stream_on_drain(stream, drain)))
+    }
 }
 
 type PinnedResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -327,6 +359,30 @@ where
         let _ = &held_permit;
         item
     }))
+}
+
+fn end_stream_on_drain<T: Send + 'static>(
+    stream: PinnedResponseStream<T>,
+    drain: CancellationToken,
+) -> PinnedResponseStream<T> {
+    pin_stream(futures_util::stream::unfold(
+        Some((stream, drain)),
+        |state| async move {
+            let (mut stream, drain) = state?;
+            tokio::select! {
+                // Checked first: a backend that always has another event
+                // ready would otherwise keep the stream open.
+                biased;
+                () = drain.cancelled() => Some((
+                    Err(Status::unavailable(
+                        pplx_space_node_api_client::NODE_API_DRAINING_MESSAGE,
+                    )),
+                    None,
+                )),
+                item = stream.next() => item.map(|item| (item, Some((stream, drain)))),
+            }
+        },
+    ))
 }
 
 fn pin_stream<T, S>(stream: S) -> PinnedResponseStream<T>
@@ -540,6 +596,16 @@ macro_rules! fwd_sbx_stream {
     ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
         $service
             .limited_sbx_server_stream($method, $req, |mut client, request| async move {
+                client.$rpc(request).await
+            })
+            .await
+    };
+}
+
+macro_rules! fwd_sbx_open_stream {
+    ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
+        $service
+            .open_ended_sbx_server_stream($method, $req, |mut client, request| async move {
                 client.$rpc(request).await
             })
             .await
@@ -921,7 +987,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedWatchRequest>,
     ) -> Result<Response<Self::SpacedWatchStream>, Status> {
-        fwd_sbx_stream!(self, "SpacedWatch", spaced_watch, r)
+        fwd_sbx_open_stream!(self, "SpacedWatch", spaced_watch, r)
     }
 
     async fn spaced_create_watcher(
@@ -1006,14 +1072,14 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedStartProcessRequest>,
     ) -> Result<Response<Self::SpacedStartProcessStream>, Status> {
-        fwd_sbx_stream!(self, "SpacedStartProcess", spaced_start_process, r)
+        fwd_sbx_open_stream!(self, "SpacedStartProcess", spaced_start_process, r)
     }
 
     async fn spaced_connect_process(
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedConnectProcessRequest>,
     ) -> Result<Response<Self::SpacedConnectProcessStream>, Status> {
-        fwd_sbx_stream!(self, "SpacedConnectProcess", spaced_connect_process, r)
+        fwd_sbx_open_stream!(self, "SpacedConnectProcess", spaced_connect_process, r)
     }
 
     async fn spaced_list_processes(
