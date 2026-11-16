@@ -1871,10 +1871,9 @@ async fn try_pull_from(
         return Err(PullError::Retryable(Status::unavailable(refusal)));
     }
     // Arm the cleanup guard before any subvolume create / file write
-    // touches the digest dir. Any error path below — including the
-    // create_subvolume fallback's plain-dir path, manifest parse failure,
-    // hash mismatch, and atomic write failure — drops the guard, which
-    // wipes the dir this pull created so a later pull starts clean.
+    // touches the digest dir. Any error path below (a manifest parse
+    // failure, a hash mismatch or an atomic write failure) drops the guard,
+    // which wipes the dir this pull created so a later pull starts clean.
     // Disarmed below right before the final `Ok(())` once the sqlite upsert
     // has committed.
     let cleanup_guard = PullCleanupGuard::new(name, content_hash, &digest_dir, cleanup);
