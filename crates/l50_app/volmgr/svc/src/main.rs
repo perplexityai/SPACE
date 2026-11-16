@@ -114,8 +114,9 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_SERVER_DRAIN_TIMEOUT_SECS)]
     server_drain_timeout_secs: u64,
 
-    /// How long to wait for outstanding transfers before the gRPC server stops, in seconds.
-    /// Interrupted transfers remain persisted and are re-queued on startup.
+    /// How long running transfers may take to finish after SIGTERM before the gRPC server
+    /// stops, in seconds. Transfers not started by then, and interrupted ones, remain
+    /// persisted and are re-queued on startup.
     #[arg(long, default_value_t = DEFAULT_TRANSFER_DRAIN_TIMEOUT_SECS)]
     drain_timeout_secs: u64,
 
