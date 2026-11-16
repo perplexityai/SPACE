@@ -248,3 +248,134 @@ async fn ensure_file_replica_stops_retrying_at_total_wait_budget() {
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn ensure_file_replica_replays_a_submission_cut_by_a_restart() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_submit = Arc::clone(&calls);
+
+    let response = submit_pull_file_with_retry(
+        PullFileRequest::default(),
+        tokio::time::Instant::now(),
+        Duration::from_secs(10_800),
+        move |_| {
+            let attempt = calls_for_submit.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    Err(tonic::Status::unknown("transport error"))
+                } else {
+                    Ok(tonic::Response::new(SubmitTransferResponse {
+                        job_id: "019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
+                    }))
+                }
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.job_id, "019d84bd-280d-7331-99c6-b63377f3a3a2");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ensure_file_replica_stops_waiting_for_an_unreachable_volume_manager() {
+    let started = tokio::time::Instant::now();
+
+    let error = submit_pull_file_with_retry(
+        PullFileRequest::default(),
+        started,
+        Duration::from_secs(10_800),
+        |_| async {
+            Err(tonic::Status::unavailable(
+                "Connection refused (os error 111)",
+            ))
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert!(started.elapsed() >= VOLUME_MANAGER_RESTART_BUDGET);
+    assert!(started.elapsed() < VOLUME_MANAGER_RESTART_BUDGET + Duration::from_secs(10));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_transfer_scope_waits_through_a_volume_manager_handoff() {
+    let scope = pplx_space_common_core::types::TransferScopeId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_cancel = Arc::clone(&calls);
+
+    let jobs = cancel_transfer_scope_with(scope, move |request| {
+        let attempt = calls_for_cancel.fetch_add(1, Ordering::SeqCst);
+        async move {
+            assert_eq!(
+                request.selector,
+                Some(proto::cancel_transfer_request::Selector::TransferScopeId(
+                    scope.to_string()
+                ))
+            );
+            if attempt < 2 {
+                Err(tonic::Status::unavailable(
+                    "volume-manager is handing off; retry transfer submission",
+                ))
+            } else {
+                Ok(tonic::Response::new(proto::CancelTransferResponse {
+                    jobs: vec![proto::TransferJob {
+                        job_id: "019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
+                        status: TransferJobStatus::Cancelled as i32,
+                        ..Default::default()
+                    }],
+                }))
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ensure_file_replica_gives_up_on_a_volume_manager_that_never_answers() {
+    let started = tokio::time::Instant::now();
+
+    let error = tokio::time::timeout(
+        VOLUME_MANAGER_RESTART_BUDGET + Duration::from_secs(60),
+        submit_pull_file_with_retry(
+            PullFileRequest::default(),
+            started,
+            Duration::from_secs(10_800),
+            |_| std::future::pending(),
+        ),
+    )
+    .await
+    .expect("an unanswered submission is bounded by the restart budget")
+    .unwrap_err();
+
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+    assert!(started.elapsed() >= VOLUME_MANAGER_RESTART_BUDGET);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_transfer_scope_gives_up_on_a_volume_manager_that_never_answers() {
+    let started = tokio::time::Instant::now();
+
+    let error = tokio::time::timeout(
+        VOLUME_MANAGER_RESTART_BUDGET + Duration::from_secs(60),
+        cancel_transfer_scope_with(
+            pplx_space_common_core::types::TransferScopeId::new(),
+            |_| std::future::pending(),
+        ),
+    )
+    .await
+    .expect("an unanswered cancellation is bounded by the restart budget")
+    .unwrap_err();
+
+    assert!(
+        matches!(&error, CancelTransferScopeError::Rpc(status) if status.code() == tonic::Code::DeadlineExceeded),
+        "{error:?}"
+    );
+    assert!(started.elapsed() >= VOLUME_MANAGER_RESTART_BUDGET);
+}

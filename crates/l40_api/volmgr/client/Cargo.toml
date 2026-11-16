@@ -35,3 +35,4 @@ tonic-prost-build = { workspace = true }
 [dev-dependencies]
 hex = { workspace = true }
 insta = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

@@ -618,9 +618,9 @@ impl SandboxManagerService {
             ));
         }
 
-        let client = pplx_space_volmgr_client::connect(pplx_space_volmgr_client::VOLMGR_SOCKET)
-            .await
-            .map_err(|error| Status::unavailable(format!("connect volume-manager: {error}")))?;
+        let client = pplx_space_volmgr_client::lazy(std::path::Path::new(
+            pplx_space_volmgr_client::VOLMGR_SOCKET,
+        ));
         pplx_space_volmgr_client::cancel_transfer_scope(client, transfer_scope_id)
             .await
             .map_err(|error| {
