@@ -1052,3 +1052,204 @@ async fn a_waiting_drain_is_admitted_once_under_its_epoch() -> TestResult {
     assert_eq!(status, serde_json::json!({"epoch": 5, "waiting": false}));
     Ok(())
 }
+
+/// A gentle v2 node under epoch 5 in `phase`, with `drain_mode` `mode` and
+/// `extra` in its status beside `gentle_epoch`.
+async fn gentle_node(
+    pool: &PgPool,
+    phase: Option<&str>,
+    mode: &str,
+    extra: serde_json::Value,
+) -> TestResult<NodeId> {
+    let mut status = serde_json::json!({"gentle_epoch": 5, "waiting": false});
+    status
+        .as_object_mut()
+        .ok_or("an object")?
+        .extend(extra.as_object().cloned().unwrap_or_default());
+    let node = v2_node(pool, phase, status).await?;
+    sqlx::query(sql!("UPDATE nodes SET drain_mode = $2 WHERE id = $1"))
+        .bind(node)
+        .bind(mode)
+        .execute(pool)
+        .await?;
+    Ok(node)
+}
+
+/// A gentle drain's epoch is `gentle_epoch`: the loop lists it gently, with
+/// its deadline, and a controller that predates gentle drains, which reads
+/// `epoch` alone, finds none. The report, the `drained` edge and the cancel
+/// match it, and the `drained` edge moves it to `epoch`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gentle_drain_is_found_by_its_gentle_epoch_only() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node = gentle_node(
+        pool,
+        Some("draining"),
+        "gentle",
+        serde_json::json!({"deadline": 4_102_444_800_i64}),
+    )
+    .await?;
+    let listed_node = listed(pool, node).await?;
+    assert_eq!(
+        (
+            listed_node.epoch,
+            listed_node.gentle,
+            listed_node.mode_forced,
+            listed_node.deadline
+        ),
+        (Some(5), true, false, Some(4_102_444_800))
+    );
+    // The epoch as the loop before gentle drains read it.
+    let before_gentle: Option<i64> = sqlx::query_scalar(sql!(
+        "SELECT (drain_status->>'epoch')::BIGINT FROM nodes WHERE id = $1"
+    ))
+    .bind(node)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(before_gentle, None);
+
+    assert!(
+        record_v2_report(
+            pool,
+            node,
+            5,
+            serde_json::json!({"sealed_epoch": 5, "done": true})
+        )
+        .await?
+    );
+    assert!(advance_v2_drained(pool, node, 5).await?);
+    let (phase, _, status, _) = columns(pool, node).await?;
+    let status = status.ok_or("a status")?;
+    assert_eq!(phase.as_deref(), Some("drained"));
+    assert_eq!(
+        (status.get("epoch"), status.get("gentle_epoch")),
+        (Some(&5.into()), None)
+    );
+    assert!(!listed(pool, node).await?.gentle);
+
+    let undrained = gentle_node(pool, None, "gentle", serde_json::json!({"cancel": true})).await?;
+    assert!(finish_v2_cancel(pool, undrained, 5).await?);
+    Ok(())
+}
+
+/// A gentle `draining` drain turns forced once its deadline has passed, by
+/// the database clock, or once an operator has set `drain_mode` forced:
+/// `drain_mode` forced, `epoch` for `gentle_epoch`, and why and when. Not
+/// before, not under another epoch, not twice, and not once `drained`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gentle_drain_turns_forced_only_when_due() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let future = serde_json::json!({"deadline": 4_102_444_800_i64});
+    let past = serde_json::json!({"deadline": 1_000});
+    let early = gentle_node(pool, Some("draining"), "gentle", future.clone()).await?;
+    let due = gentle_node(pool, Some("draining"), "gentle", past.clone()).await?;
+    let by_operator = gentle_node(pool, Some("draining"), "forced", future).await?;
+    let drained = gentle_node(pool, Some("drained"), "gentle", past).await?;
+
+    let early_before = columns(pool, early).await?;
+    assert!(!escalate_v2_drain(pool, early, 5).await?);
+    assert_eq!(columns(pool, early).await?, early_before);
+    let drained_before = columns(pool, drained).await?;
+    assert!(!escalate_v2_drain(pool, drained, 5).await?);
+    assert_eq!(columns(pool, drained).await?, drained_before);
+    assert!(!escalate_v2_drain(pool, due, 4).await?, "another epoch");
+
+    for (node, why) in [(due, "deadline"), (by_operator, "operator")] {
+        assert!(escalate_v2_drain(pool, node, 5).await?, "{why}");
+        let mode: Option<String> =
+            sqlx::query_scalar(sql!("SELECT drain_mode FROM nodes WHERE id = $1"))
+                .bind(node)
+                .fetch_one(pool)
+                .await?;
+        assert_eq!(mode.as_deref(), Some("forced"), "{why}");
+        let status = columns(pool, node).await?.2.ok_or("a status")?;
+        assert_eq!(status["epoch"], 5, "{why}: {status}");
+        assert_eq!(status.get("gentle_epoch"), None, "{why}: {status}");
+        assert_eq!(status["escalated"], why, "{why}: {status}");
+        assert!(status["escalated_at"].as_i64().is_some(), "{why}: {status}");
+        let listed_node = listed(pool, node).await?;
+        assert_eq!((listed_node.epoch, listed_node.gentle), (Some(5), false));
+        assert!(!escalate_v2_drain(pool, node, 5).await?, "{why}: twice");
+    }
+    Ok(())
+}
+
+/// The listing reads a gentle drain's deadline by the database's clock:
+/// one the database has reached is due, whatever the controller's clock
+/// says, and one ahead of it isn't. It reads the stored report as holding
+/// only when it is the gentle answer under the drain's epoch with nothing
+/// but holds left, and carries the report's unrecorded clocks.
+#[tokio::test(flavor = "current_thread")]
+async fn the_listing_reads_the_deadline_by_the_database_clock_and_the_holds() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let db_now: i64 = sqlx::query_scalar(sql!("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT"))
+        .fetch_one(pool)
+        .await?;
+    let holds = |sealed: i64, action: &str| {
+        serde_json::json!({
+            "sealed_epoch": sealed, "gentle": true, "done": false, "evacuated": [],
+            "pending": [{"sandbox_id": "a", "action": action}],
+            "blocked": [], "unrecorded": [],
+        })
+    };
+    for (case, deadline, report, due, holding) in [
+        ("reached", db_now - 1, holds(5, "hold"), true, true),
+        ("ahead", db_now + 600, holds(5, "hold"), false, true),
+        (
+            "a suspend left",
+            db_now + 600,
+            holds(5, "suspend"),
+            false,
+            false,
+        ),
+        (
+            "another epoch's report",
+            db_now + 600,
+            holds(4, "hold"),
+            false,
+            false,
+        ),
+    ] {
+        let node = gentle_node(
+            pool,
+            Some("draining"),
+            "gentle",
+            serde_json::json!({"deadline": deadline, "report": report}),
+        )
+        .await?;
+        let listed_node = listed(pool, node).await?;
+        assert_eq!(
+            (listed_node.deadline_due, listed_node.report_holds_only),
+            (due, holding),
+            "{case}"
+        );
+    }
+    let forced = v2_node(
+        pool,
+        Some("draining"),
+        serde_json::json!({
+            "epoch": 5,
+            "report": {"sealed_epoch": 5, "done": false, "unrecorded": [
+                {"sandbox_id": "a", "reason": "not projected", "since": 100},
+            ]},
+        }),
+    )
+    .await?;
+    let forced = listed(pool, forced).await?;
+    assert!(!forced.deadline_due, "no deadline");
+    assert_eq!(
+        forced.unrecorded_since,
+        std::collections::BTreeMap::from([("a".to_owned(), 100)]),
+        "the report's unrecorded clock"
+    );
+    Ok(())
+}

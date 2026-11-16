@@ -1,17 +1,34 @@
 //! The node drain's v2 loop.
 //!
-//! A v2 drain is a forced drain the admin route started with `engine: v2`
+//! A v2 drain is a drain the admin route started with `engine: v2`
 //! (`nodes.drain_engine = 'v2'`), which wrote the epoch the node is sealed
-//! under (`drain_status.epoch`) in the transaction that moved the phase,
-//! before any node call. The node does the work: sandbox-manager's
-//! `DrainNode` seals it and makes every resident durable elsewhere. This loop
-//! asks it, each tick, and records what it reports:
+//! under in the transaction that moved the phase, before any node call. The
+//! node does the work: sandbox-manager's `DrainNode` seals it and makes every
+//! resident durable elsewhere. This loop asks it, each tick, and records what
+//! it reports:
+//!
+//! - **gentle**: a gentle drain (`drain_mode` gentle) keeps its epoch in
+//!   `drain_status.gentle_epoch` rather than `epoch`, with the operator's
+//!   `deadline`, so a controller that predates gentle drains finds no epoch
+//!   and never calls the node for it. Its calls name the epoch in the
+//!   request's `gentle_epoch` with `epoch` 0, which a sandbox-manager or
+//!   node-api relay that predates gentle drains refuses before it seals
+//!   anything ([`drain_request`]); the node holds every `started` sandbox,
+//!   and the loop takes an answer only when it echoes `gentle_epoch`. At the
+//!   deadline, by the database clock (the listing's `deadline_due`), or
+//!   once an operator's `:drain` with `mode: forced` has set `drain_mode`, the loop turns the drain forced in one statement
+//!   (`drain_mode`, `epoch` for `gentle_epoch`, `escalated`), and calls
+//!   forced from then on, under the same epoch. A gentle drain that reaches
+//!   `drained` holds nothing, and its epoch moves to `epoch` in the same
+//!   statement, so everything from `drained` on reads it as a forced one's.
 //!
 //! - **`draining`, waiting**: the admin route starts every v2 drain waiting
 //!   for one of the cluster's evacuation slots (`drain_status.waiting`).
 //!   At most [`DEFAULT_MAX_EVACUATING_NODES`] nodes evacuate at once
 //!   (admitted and not yet `drained`, or undrained with their cancel not yet
-//!   finished); a waiting node whose heartbeat is fresh is admitted, oldest
+//!   finished; an admitted gentle drain not due to turn forced whose stored
+//!   report lists nothing but held sandboxes counts no slot while it does);
+//!   a waiting node whose heartbeat is fresh is admitted, oldest
 //!   drain first, once one frees. Until then it stays cordoned and gets no
 //!   `DrainNode` call, so it isn't sealed and the drain gate refuses no user
 //!   call on it.
@@ -81,14 +98,16 @@
 //! only retries sooner, and the nodes it listed, so a node that leaves its
 //! listing, however its row lost the drain, has its v2 gauges zeroed.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_k8s_node_id::Ec2InstanceId;
-use pplx_space_sbx_mgr_client::proto::{DrainEvacuated, DrainNodeResponse, DrainPrior};
+use pplx_space_sbx_mgr_client::proto::{
+    DrainEvacuated, DrainNodeRequest, DrainNodeResponse, DrainPrior,
+};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -235,8 +254,26 @@ impl V2InstanceAuthority for V2Terminator {
 pub struct V2Node {
     pub id: NodeId,
     pub phase: Option<String>,
-    /// `drain_status.epoch`; the admin route writes it with the phase.
+    /// `drain_status.epoch`, or `gentle_epoch` for a gentle drain; the admin
+    /// route writes it with the phase.
     pub epoch: Option<u64>,
+    /// The epoch is `drain_status.gentle_epoch`: a gentle drain not yet
+    /// turned forced, nor `drained`.
+    pub gentle: bool,
+    /// `drain_mode` is `forced`: on a gentle drain, an operator escalated it.
+    pub mode_forced: bool,
+    /// `drain_status.deadline`, in Unix seconds: when a gentle drain turns
+    /// forced.
+    pub deadline: Option<i64>,
+    /// The database clock has reached `deadline`. The loop decides a
+    /// deadline by this alone, the clock the escalation's own statement
+    /// reads, so a controller whose clock runs behind doesn't postpone it.
+    pub deadline_due: bool,
+    /// The stored report is the node's gentle answer under this epoch and
+    /// lists nothing but held sandboxes: every `pending` entry's action is
+    /// `hold`, and nothing is `blocked` or `unrecorded`
+    /// ([`report_holds_only`]).
+    pub report_holds_only: bool,
     /// `drain_status.cancel`: the drain was undrained.
     pub cancel: bool,
     /// Since when, in Unix seconds, each evacuation the last stored report
@@ -278,15 +315,28 @@ impl V2Node {
     /// Holding an evacuation slot: admitted and not yet `drained`, or
     /// undrained after its admission with its cancel not yet finished, which
     /// lets the node's running suspends and uploads finish. The slot frees
-    /// once the node leaves v2: its cancel finished, or its row deleted.
+    /// once the node leaves v2: its cancel finished, or its row deleted. An
+    /// admitted gentle drain frees it while it only holds
+    /// ([`Self::only_holding`]), and takes it again, whatever the other
+    /// drains hold, whenever its report lists anything else and once it is
+    /// due to turn forced or is escalated: until those finish the cluster
+    /// may evacuate more nodes than the cap, and admission admits none while
+    /// it does.
     fn evacuating(&self) -> bool {
         self.epoch.is_some()
             && !self.waiting
             && match self.phase.as_deref() {
-                Some("draining") => true,
+                Some("draining") => !self.only_holding(),
                 None => self.cancel,
                 Some(_) => false,
             }
+    }
+
+    /// A gentle drain that isn't due to turn forced, whose stored report
+    /// under its epoch lists only held sandboxes: the node suspends and
+    /// uploads nothing for it, so it needs no slot.
+    fn only_holding(&self) -> bool {
+        self.gentle && !self.mode_forced && !self.deadline_due && self.report_holds_only
     }
 
     /// [`Self::evacuating`], unless EC2 has said the node's instance is
@@ -311,6 +361,44 @@ impl V2Node {
     /// recorded instance.
     fn asked_instance(&self) -> Option<&str> {
         self.fenced().or(self.instance_id.as_deref())
+    }
+
+    /// A gentle `draining` drain due to turn forced: the database clock has
+    /// reached its deadline, or an operator escalated it.
+    fn escalation_due(&self) -> bool {
+        self.gentle
+            && self.phase.as_deref() == Some("draining")
+            && (self.mode_forced || self.deadline_due)
+    }
+}
+
+/// The `DrainNode` request of a drain call under `epoch`. A gentle one names
+/// the epoch in `gentle_epoch` alone and leaves `epoch` 0: a sandbox-manager
+/// that predates gentle drains, or a node-api relay that drops the field it
+/// doesn't know, reads epoch 0 and refuses the call before it seals or
+/// suspends anything, so no node runs a gentle drain as a forced one.
+pub fn drain_request(epoch: u64, gentle: bool) -> DrainNodeRequest {
+    if gentle {
+        DrainNodeRequest {
+            gentle_epoch: epoch,
+            ..DrainNodeRequest::default()
+        }
+    } else {
+        DrainNodeRequest {
+            epoch,
+            ..DrainNodeRequest::default()
+        }
+    }
+}
+
+/// The `DrainNode` request that cancels `epoch`, with the evacuations to
+/// forget.
+pub fn cancel_request(epoch: u64, forget: &[String]) -> DrainNodeRequest {
+    DrainNodeRequest {
+        epoch,
+        cancel: true,
+        forget: forget.to_vec(),
+        ..DrainNodeRequest::default()
     }
 }
 
@@ -440,6 +528,82 @@ impl EvacuationRecord {
     }
 }
 
+/// Why a `DrainNode` call failed: the gRPC status the node, or its
+/// node-api relay, answered with, or `None` for a failure before any answer
+/// (the endpoint lookup, the connection), and the error as the loop records
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrainCallError {
+    code: Option<tonic::Code>,
+    status_message: String,
+    text: String,
+}
+
+impl DrainCallError {
+    /// The status the call answered with.
+    pub fn status(status: &tonic::Status) -> Self {
+        Self {
+            code: Some(status.code()),
+            status_message: status.message().to_owned(),
+            text: status.to_string(),
+        }
+    }
+
+    /// A failure before the node answered.
+    pub fn other(text: impl Into<String>) -> Self {
+        Self {
+            code: None,
+            status_message: String::new(),
+            text: text.into(),
+        }
+    }
+
+    /// The refusal of a sandbox-manager that predates gentle drains, or of
+    /// one behind a node-api relay that drops `gentle_epoch`: it reads the
+    /// gentle call's `epoch` 0 and refuses it, before it seals or suspends
+    /// anything, with its epoch check's `InvalidArgument` "epoch must be
+    /// nonzero ...". A node with gentle drains never answers that to a
+    /// gentle call.
+    fn refused_by_an_older_node(&self) -> bool {
+        self.code == Some(tonic::Code::InvalidArgument)
+            && self.status_message.starts_with("epoch must be nonzero")
+    }
+}
+
+impl std::fmt::Display for DrainCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// The `pending` action a gentle drain's node reports for a sandbox it
+/// holds running.
+const HOLD_ACTION: &str = "hold";
+
+/// Whether `report`, a stored `drain_status.report`, is the node's gentle
+/// answer sealed under `epoch` that lists nothing but held sandboxes: every
+/// `pending` entry's action is `hold`, and `blocked` and `unrecorded` are
+/// empty. A report of any other shape, or none, isn't.
+pub fn report_holds_only(report: Option<&serde_json::Value>, epoch: Option<u64>) -> bool {
+    let Some(report) = report else {
+        return false;
+    };
+    let entries = |key: &str| report.get(key).and_then(serde_json::Value::as_array);
+    epoch.is_some()
+        && report
+            .get("sealed_epoch")
+            .and_then(serde_json::Value::as_u64)
+            == epoch
+        && report.get("gentle").and_then(serde_json::Value::as_bool) == Some(true)
+        && entries("blocked").is_some_and(Vec::is_empty)
+        && entries("unrecorded").is_some_and(Vec::is_empty)
+        && entries("pending").is_some_and(|pending| {
+            pending.iter().all(|entry| {
+                entry.get("action").and_then(serde_json::Value::as_str) == Some(HOLD_ACTION)
+            })
+        })
+}
+
 /// What the v2 loop reads and writes.
 pub trait DrainV2Sink: Send + Sync + 'static {
     fn list_v2_nodes(
@@ -457,15 +621,23 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         &self,
         node_id: NodeId,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
-    /// `forget`, with `cancel`: the evacuations recorded since a cancel call
-    /// reported them, for the node to forget.
+    /// Call the node's `DrainNode` with `request` ([`drain_request`],
+    /// [`cancel_request`]).
     fn drain_node(
         &self,
         node_id: NodeId,
+        request: DrainNodeRequest,
+    ) -> impl std::future::Future<Output = Result<DrainNodeResponse, DrainCallError>> + Send;
+    /// Turn the gentle `draining` drain under `epoch` forced, once its
+    /// deadline has passed or an operator set `drain_mode` forced:
+    /// `drain_mode` forced, the epoch moved from `gentle_epoch` to `epoch`,
+    /// and `escalated` recorded. False when the row is no longer that
+    /// epoch's gentle `draining` drain due to turn.
+    fn escalate(
+        &self,
+        node_id: NodeId,
         epoch: u64,
-        cancel: bool,
-        forget: &[String],
-    ) -> impl std::future::Future<Output = Result<DrainNodeResponse, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
     fn record_evacuation(
         &self,
         node_id: NodeId,
@@ -633,16 +805,25 @@ pub fn report_json(response: &DrainNodeResponse, recording: &Recording) -> serde
     };
     serde_json::json!({
         "sealed_epoch": response.sealed_epoch,
+        "gentle": response.gentle_epoch.is_some(),
         "done": response.done,
         "evacuated": response.evacuated.iter().map(|entry| serde_json::json!({
             "sandbox_id": entry.sandbox_id,
             "prior": prior(entry.prior),
             "artifact_id": entry.artifact_id,
         })).collect::<Vec<_>>(),
-        "pending": response.pending.iter().map(|entry| serde_json::json!({
-            "sandbox_id": entry.sandbox_id,
-            "action": entry.action,
-        })).collect::<Vec<_>>(),
+        "pending": response.pending.iter().map(|entry| if entry.reason.is_empty() {
+            serde_json::json!({
+                "sandbox_id": entry.sandbox_id,
+                "action": entry.action,
+            })
+        } else {
+            serde_json::json!({
+                "sandbox_id": entry.sandbox_id,
+                "action": entry.action,
+                "reason": entry.reason,
+            })
+        }).collect::<Vec<_>>(),
         "blocked": response.blocked.iter().map(|entry| serde_json::json!({
             "sandbox_id": entry.sandbox_id,
             "reason": entry.reason,
@@ -715,13 +896,24 @@ fn overdue_unblocked<'a>(
 }
 
 /// How many of the node's rows `response` and the loop's `recording` of it
-/// leave blocked and pending, each row counted once: blocked when the node
-/// reports it blocked or its evacuation is unrecorded past the bound, else
-/// pending when the node reports it pending, its window's `queued` and
-/// `disk` among the reasons, or its evacuation is unrecorded within the
-/// bound. A blocked entry that names no sandbox counts on its own.
-fn outstanding_rows(response: &DrainNodeResponse, recording: &Recording) -> (u64, u64) {
-    use std::collections::BTreeSet;
+/// leave blocked, pending and held, each row counted once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OutstandingRows {
+    /// The node reports the row blocked, or its evacuation is unrecorded
+    /// past the bound. A blocked entry that names no sandbox counts on its
+    /// own.
+    blocked: u64,
+    /// Not blocked, and the node reports it pending with work under way,
+    /// its window's `queued` and `disk` among the reasons, or its evacuation
+    /// is unrecorded within the bound.
+    pending: u64,
+    /// Not blocked, and every pending entry the node reports for it is a
+    /// gentle drain's `hold`: a running sandbox the drain waits for, with
+    /// nothing started for it.
+    held: u64,
+}
+
+fn outstanding_rows(response: &DrainNodeResponse, recording: &Recording) -> OutstandingRows {
     let mut blocked: BTreeSet<&str> = recording
         .overdue()
         .into_iter()
@@ -736,21 +928,38 @@ fn outstanding_rows(response: &DrainNodeResponse, recording: &Recording) -> (u64
             None => unnamed += 1,
         }
     }
-    let pending: BTreeSet<&str> = response
+    let working: BTreeSet<&str> = response
         .pending
         .iter()
+        .filter(|entry| entry.action != HOLD_ACTION)
         .map(|entry| entry.sandbox_id.as_str())
         .chain(recording.unrecorded().map(|(sandbox_id, _, _)| sandbox_id))
         .filter(|sandbox_id| !blocked.contains(sandbox_id))
         .collect();
-    (blocked.len() as u64 + unnamed, pending.len() as u64)
+    let held: BTreeSet<&str> = response
+        .pending
+        .iter()
+        .filter(|entry| entry.action == HOLD_ACTION)
+        .map(|entry| entry.sandbox_id.as_str())
+        .filter(|sandbox_id| !blocked.contains(sandbox_id) && !working.contains(sandbox_id))
+        .collect();
+    OutstandingRows {
+        blocked: blocked.len() as u64 + unnamed,
+        pending: working.len() as u64,
+        held: held.len() as u64,
+    }
 }
 
 /// Publish what `response` and the loop's `recording` of it leave to do,
 /// as [`outstanding_rows`] counts it.
 fn publish_report(node: &V2Node, response: &DrainNodeResponse, recording: &Recording) {
-    let (blocked, pending) = outstanding_rows(response, recording);
-    crate::metrics::node_drain::v2_report(&node.id.to_string(), blocked, pending);
+    let rows = outstanding_rows(response, recording);
+    crate::metrics::node_drain::v2_report(
+        &node.id.to_string(),
+        rows.blocked,
+        rows.pending,
+        rows.held,
+    );
 }
 
 /// How many v2 nodes one tick calls at once: each call waits on its node,
@@ -896,6 +1105,7 @@ async fn step<S: DrainV2Sink, A: V2InstanceAuthority>(
             .then_some(NodeStep::Cancelled),
         None => None,
         Some("draining") if node.waiting => {
+            escalate(sink, node, epoch).await;
             // Fenced, but not sealed: it waits for a slot.
             if let Err(error) = sink.ensure_cordon(node.id).await {
                 sink.record_error(node.id, &format!("cordon convergence failed: {error}"))
@@ -960,6 +1170,37 @@ async fn admit<S: DrainV2Sink>(
     admitted
 }
 
+/// Turn a gentle drain due to turn forced ([`V2Node::escalation_due`]).
+/// Returns whether the drain still runs gently.
+async fn escalate<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
+    if !node.escalation_due() {
+        return node.gentle;
+    }
+    match sink.escalate(node.id, epoch).await {
+        Ok(true) => {
+            tracing::info!(
+                node_id = %node.id,
+                epoch,
+                deadline = node.deadline,
+                by_operator = node.mode_forced,
+                "node_drain v2: the gentle drain turned forced"
+            );
+            false
+        }
+        // The row moved on: the next tick reads it again, and a call this
+        // tick stays gentle, which suspends no running sandbox.
+        Ok(false) => true,
+        Err(error) => {
+            sink.record_error(
+                node.id,
+                &format!("turning the gentle drain forced failed: {error}"),
+            )
+            .await;
+            true
+        }
+    }
+}
+
 /// Ask the node, record what it reports, and advance a `draining` node that
 /// is done. Returns whether the node moved to `drained`.
 async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
@@ -971,15 +1212,42 @@ async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
     if let Some(error) = &cordon_error {
         sink.record_error(node.id, error).await;
     }
-    let response = match sink.drain_node(node.id, epoch, false, &[]).await {
+    let gentle = escalate(sink, node, epoch).await;
+    let response = match sink.drain_node(node.id, drain_request(epoch, gentle)).await {
         Ok(response) => response,
         Err(error) => {
             crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
-            sink.record_error(node.id, &format!("DrainNode failed: {error}"))
-                .await;
+            let error = if gentle && error.refused_by_an_older_node() {
+                format!(
+                    "gentle DrainNode failed: {error}; the node's sandbox-manager, or its \
+                     node-api relay, predates gentle drains and refused the call before it \
+                     sealed anything: upgrade the node, or escalate the drain with mode forced"
+                )
+            } else if gentle {
+                format!("gentle DrainNode failed: {error}")
+            } else {
+                format!("DrainNode failed: {error}")
+            };
+            sink.record_error(node.id, &error).await;
             return false;
         }
     };
+    if gentle && response.gentle_epoch != Some(epoch) {
+        // Only a node that drained gently under the epoch says so; one that
+        // didn't may have suspended running sandboxes, and its report isn't
+        // the gentle drain's.
+        crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
+        sink.record_error(
+            node.id,
+            &format!(
+                "the node answered the gentle DrainNode under epoch {epoch} without \
+                 acknowledging it (gentle_epoch {:?}); the drain records nothing from it",
+                response.gentle_epoch
+            ),
+        )
+        .await;
+        return false;
+    }
     let recording = record_evacuations(sink, node, &response).await;
     publish_report(node, &response, &recording);
     let all_recorded = recording.all_recorded();
@@ -1036,7 +1304,9 @@ async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
 /// Returns whether the columns were cleared.
 async fn cancel<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
     let call = |forget: Vec<String>| async move {
-        let answer = sink.drain_node(node.id, epoch, true, &forget).await;
+        let answer = sink
+            .drain_node(node.id, cancel_request(epoch, &forget))
+            .await;
         if let Err(error) = &answer {
             crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
             sink.record_error(node.id, &format!("DrainNode cancel failed: {error}"))

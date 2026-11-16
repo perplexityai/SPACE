@@ -61,9 +61,7 @@ fn every_lifecycle_plans_as_the_drain_table_says() {
         let rows = [row("control", S::Started), row("subject", state)];
         let plan = plan(&rows, &PlanInputs::default());
         assert!(
-            plan.actions.contains(&PlannedAction::Suspend {
-                sandbox_id: "control".into(),
-            }),
+            plan.actions.contains(&suspend("control")),
             "{state}: the control is suspended"
         );
         let subject_pending: Vec<_> = plan
@@ -82,7 +80,7 @@ fn every_lifecycle_plans_as_the_drain_table_says() {
             .actions
             .iter()
             .filter(|action| match action {
-                PlannedAction::Suspend { sandbox_id }
+                PlannedAction::Suspend { sandbox_id, .. }
                 | PlannedAction::PublishDisk { sandbox_id }
                 | PlannedAction::Upload { sandbox_id, .. } => sandbox_id == "subject",
             })
@@ -90,13 +88,9 @@ fn every_lifecycle_plans_as_the_drain_table_says() {
             .collect();
         let (expect_pending, expect_blocked, expect_actions): (Vec<String>, Vec<&str>, Vec<_>) =
             match state {
-                Unowned(S::Started | S::Paused) => (
-                    vec!["suspend".into()],
-                    vec![],
-                    vec![PlannedAction::Suspend {
-                        sandbox_id: "subject".into(),
-                    }],
-                ),
+                Unowned(S::Started | S::Paused) => {
+                    (vec!["suspend".into()], vec![], vec![suspend("subject")])
+                }
                 Unowned(S::Stopped) => (
                     vec!["publish_disk".into()],
                     vec![],
@@ -352,12 +346,13 @@ fn sealed_service(epoch: u64) -> (SandboxManagerService, ActivationSealStatus) {
 #[tokio::test]
 async fn an_empty_sealed_node_is_done_unless_a_scan_failed() {
     let (service, first) = sealed_service(7);
-    let done = service.finish_drain(7, &first, DrainScans::default());
+    let done = service.finish_drain(7, false, &first, DrainScans::default());
     assert!(done.done, "{done:?}");
     assert_eq!(done.sealed_epoch, Some(7));
 
     let blocked = service.finish_drain(
         7,
+        false,
         &first,
         DrainScans {
             blocked: vec![(None, "can't scan the cache".into())],
@@ -377,19 +372,24 @@ async fn an_activation_in_flight_before_the_seal_keeps_done_false() {
     let token = service.activation_seal.admit("restore", "sbx-a").unwrap();
     service.activation_seal.seal(&service.db, 7).unwrap();
     let first = service.activation_seal.status();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, false, &first, DrainScans::default());
     assert!(!report.done);
     assert_eq!(
         report.pending,
         [DrainPending {
             sandbox_id: "sbx-a".into(),
             action: "activation".into(),
+            reason: String::new(),
         }]
     );
 
     drop(token);
     let first = service.activation_seal.status();
-    assert!(service.finish_drain(7, &first, DrainScans::default()).done);
+    assert!(
+        service
+            .finish_drain(7, false, &first, DrainScans::default())
+            .done
+    );
 }
 
 /// A seal that changed between the walk's first read and its end (another
@@ -399,10 +399,22 @@ async fn an_activation_in_flight_before_the_seal_keeps_done_false() {
 async fn done_needs_one_continuous_seal_under_the_calls_epoch() {
     let (service, first) = sealed_service(7);
     service.activation_seal.seal(&service.db, 8).unwrap();
-    assert!(!service.finish_drain(7, &first, DrainScans::default()).done);
+    assert!(
+        !service
+            .finish_drain(7, false, &first, DrainScans::default())
+            .done
+    );
     let first = service.activation_seal.status();
-    assert!(!service.finish_drain(7, &first, DrainScans::default()).done);
-    assert!(service.finish_drain(8, &first, DrainScans::default()).done);
+    assert!(
+        !service
+            .finish_drain(7, false, &first, DrainScans::default())
+            .done
+    );
+    assert!(
+        service
+            .finish_drain(8, false, &first, DrainScans::default())
+            .done
+    );
 }
 
 /// Under a cancel, each sandbox the drain suspended is handed back: one
@@ -681,6 +693,7 @@ async fn a_cancel_reports_an_evacuation_until_it_is_forgotten() {
             epoch: 7,
             cancel: true,
             forget,
+            gentle_epoch: 0,
         })
     };
     let handed_back = |report: &DrainNodeResponse| -> Vec<(String, i32)> {
@@ -748,7 +761,7 @@ async fn a_recorded_evacuation_survives_a_restart() {
     let service = SandboxManagerService::for_test(conn);
     service.activation_seal.seal(&service.db, 7).unwrap();
     let first = service.activation_seal.status();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, false, &first, DrainScans::default());
     let evacuated = |report: &DrainNodeResponse| -> Vec<(String, i32, String)> {
         report
             .evacuated
@@ -775,6 +788,7 @@ async fn a_recorded_evacuation_survives_a_restart() {
     // no row blocks.
     let report = service.finish_drain(
         7,
+        false,
         &first,
         DrainScans {
             orphan_dirs: vec![
@@ -802,7 +816,7 @@ async fn a_recorded_evacuation_survives_a_restart() {
     let restarted = SandboxManagerService::for_test(crate::db::Connection::open_at(&path).unwrap());
     let first = restarted.activation_seal.status();
     assert_eq!(first.sealed_epoch, Some(7), "the seal survives the restart");
-    let report = restarted.finish_drain(7, &first, DrainScans::default());
+    let report = restarted.finish_drain(7, false, &first, DrainScans::default());
     assert_eq!(evacuated(&report), expected);
 }
 
@@ -874,13 +888,14 @@ async fn a_local_only_named_snapshot_holds_done_until_it_is_durable() {
         (service, first)
     };
 
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, false, &first, DrainScans::default());
     assert!(!report.done, "{report:?}");
     assert_eq!(
         report.pending,
         [DrainPending {
             sandbox_id: "sbx-a".into(),
             action: "upload".into(),
+            reason: String::new(),
         }]
     );
     assert_eq!(report.evacuated.len(), 1, "{report:?}");
@@ -895,7 +910,7 @@ async fn a_local_only_named_snapshot_holds_done_until_it_is_durable() {
         )
         .unwrap();
     service.drain_actions.wait_idle().await;
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, false, &first, DrainScans::default());
     assert!(report.done, "{report:?}");
 }
 
@@ -950,9 +965,7 @@ fn a_persistent_failure_blocks_with_its_reason_and_is_still_retried() {
             },
         )
     };
-    let suspend = [PlannedAction::Suspend {
-        sandbox_id: "a".into(),
-    }];
+    let suspend = [suspend("a")];
 
     let below = plan_with(MAX_ACTION_FAILURES - 1, &[]);
     assert_eq!(below.pending, [("a".into(), "suspend".into())]);
@@ -1113,18 +1126,19 @@ async fn a_failed_record_write_blocks_the_suspend() {
         (service, first)
     };
     for _ in 0..MAX_ACTION_FAILURES {
-        let report = service.finish_drain(7, &first, DrainScans::default());
+        let report = service.finish_drain(7, false, &first, DrainScans::default());
         assert_eq!(
             report.pending,
             [DrainPending {
                 sandbox_id: id.clone(),
                 action: "suspend".into(),
+                reason: String::new(),
             }],
             "{report:?}"
         );
         service.drain_actions.wait_idle().await;
     }
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, false, &first, DrainScans::default());
     assert!(!report.done);
     assert_eq!(report.blocked.len(), 1, "{report:?}");
     assert!(
@@ -1170,6 +1184,7 @@ fn drain_request(epoch: u64, cancel: bool) -> Request<DrainNodeRequest> {
         epoch,
         cancel,
         forget: Vec::new(),
+        gentle_epoch: 0,
     })
 }
 
@@ -1292,6 +1307,7 @@ async fn only_root_and_node_api_drain_the_node() {
                 epoch: 7,
                 cancel: false,
                 forget: Vec::new(),
+                gentle_epoch: 0,
             },
         ))
         .await
@@ -1309,6 +1325,7 @@ async fn only_root_and_node_api_drain_the_node() {
                     epoch: 7,
                     cancel: false,
                     forget: Vec::new(),
+                    gentle_epoch: 0,
                 },
             ),
         )
@@ -1330,7 +1347,7 @@ async fn a_drain_action_runs_as_a_state_writer() {
     // The suspend waits on the wake lock this test holds.
     let wake_lock = service.auto_lifecycle.wake_lock(&id);
     let held = wake_lock.lock_owned().await;
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, false, &first, DrainScans::default());
     assert_eq!(report.pending.len(), 1, "{report:?}");
     assert!(
         service
@@ -1350,6 +1367,74 @@ async fn a_drain_action_runs_as_a_state_writer() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// A suspend the drain planned for a paused VM waits for the wake lock, as
+/// a resume that was already in flight at the seal holds it. When that
+/// resume finishes `started` first, a gentle drain's suspend leaves the
+/// sandbox running, with no record, and the next gentle call holds it; a
+/// forced drain's suspend still suspends it from `started`.
+#[tokio::test]
+async fn a_queued_gentle_suspend_leaves_a_sandbox_a_resume_started() {
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default().serve();
+    for gentle in [true, false] {
+        let conn = crate::db::test_conn();
+        let id = pplx_space_common_core::types::SandboxId::new().to_string();
+        crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Paused);
+        let service = service_with_node_manager(conn, &node_manager);
+        service.activation_seal.seal(&service.db, 7).unwrap();
+        let first = service.activation_seal.status();
+        // The resume in flight holds the wake lock while the drain plans.
+        let wake_lock = service.auto_lifecycle.wake_lock(&id);
+        let resume = wake_lock.lock_owned().await;
+        let report = service.finish_drain(7, gentle, &first, DrainScans::default());
+        assert_eq!(
+            service.drain_actions.running().get(&id),
+            Some(&DrainAction::Suspend),
+            "gentle: {gentle}: {report:?}"
+        );
+        let resumed = crate::db::update_state_from_states(
+            &service.db.lock().unwrap(),
+            &id,
+            crate::db::StateSet::of(&[SandboxState::Paused]),
+            SandboxState::Started,
+        )
+        .unwrap();
+        assert!(
+            matches!(resumed, crate::db::StateWriteOutcome::Applied { .. }),
+            "{resumed:?}"
+        );
+        drop(resume);
+        service.drain_actions.wait_idle().await;
+
+        // The fake node-manager fails every suspend the drain attempts, so
+        // an attempt shows as the suspend's failure.
+        let attempted = service
+            .drain_actions
+            .failures(7)
+            .contains_key(&(id.clone(), DrainAction::Suspend));
+        let records = crate::db::read::drain_evacuations(&service.db.lock().unwrap()).unwrap();
+        if gentle {
+            assert!(!attempted, "the gentle suspend left it running");
+            assert_eq!(records, []);
+            assert_eq!(
+                service.lookup_sandbox(&id).unwrap().state,
+                SandboxStatus::from(SandboxState::Started)
+            );
+            let next = service.finish_drain(7, true, &first, DrainScans::default());
+            assert_eq!(
+                next.pending,
+                [DrainPending {
+                    sandbox_id: id,
+                    action: HOLD.into(),
+                    reason: HOLD_REASON.into(),
+                }]
+            );
+            assert!(service.drain_actions.running().is_empty());
+        } else {
+            assert!(attempted, "the forced suspend suspends it from started");
+        }
+    }
 }
 
 fn sealed_service_with(
@@ -1380,7 +1465,10 @@ async fn a_drain_suspend_acts_only_on_its_own_resident_under_its_own_seal() {
         crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, state);
         let service = service_with_node_manager(conn, &node_manager);
         service.activation_seal.seal(&service.db, epoch).unwrap();
-        service.drain_suspend(7, &id).await.unwrap();
+        service
+            .drain_suspend(7, &id, SuspendFrom::StartedOrPaused)
+            .await
+            .unwrap();
         assert_eq!(records(&service), 0, "{state} under {epoch}");
         assert_eq!(
             service.lookup_sandbox(&id).unwrap().state,
@@ -1394,19 +1482,23 @@ async fn a_drain_suspend_acts_only_on_its_own_resident_under_its_own_seal() {
     crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Started);
     let service = service_with_node_manager(conn, &node_manager);
     service.activation_seal.seal(&service.db, 7).unwrap();
-    service.drain_suspend(7, &id).await.unwrap_err();
+    service
+        .drain_suspend(7, &id, SuspendFrom::StartedOrPaused)
+        .await
+        .unwrap_err();
     assert_eq!(records(&service), 0, "a failed suspend forgets its record");
     assert_eq!(
         service.lookup_sandbox(&id).unwrap().state,
         SandboxStatus::from(SandboxState::Started)
     );
     let first = service.activation_seal.status();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, false, &first, DrainScans::default());
     assert_eq!(
         report.pending,
         [DrainPending {
             sandbox_id: id,
             action: "suspend".into(),
+            reason: String::new(),
         }]
     );
 }
@@ -1424,7 +1516,10 @@ async fn a_drain_suspend_that_failed_after_its_pause_keeps_the_started_record() 
     crate::db::activation_seal::record_drain_suspend(&conn, &id, DrainPrior::Started).unwrap();
     let service = service_with_node_manager(conn, &node_manager);
     service.activation_seal.seal(&service.db, 7).unwrap();
-    service.drain_suspend(7, &id).await.unwrap_err();
+    service
+        .drain_suspend(7, &id, SuspendFrom::StartedOrPaused)
+        .await
+        .unwrap_err();
     assert_ne!(
         service.lookup_sandbox(&id).unwrap().state,
         SandboxStatus::from(SandboxState::Suspended)
@@ -1506,7 +1601,7 @@ async fn a_pending_upload_becomes_an_evacuation() {
     crate::db::activation_seal::record_drain_suspend(&conn, "sbx-a", DrainPrior::Paused).unwrap();
     let (service, first) = sealed_service_with(conn, 7);
 
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, false, &first, DrainScans::default());
     assert!(!report.done);
     assert!(report.evacuated.is_empty());
     assert_eq!(
@@ -1514,6 +1609,7 @@ async fn a_pending_upload_becomes_an_evacuation() {
         [DrainPending {
             sandbox_id: "sbx-a".into(),
             action: "upload".into(),
+            reason: String::new(),
         }]
     );
     service.drain_actions.wait_idle().await;
@@ -1522,7 +1618,7 @@ async fn a_pending_upload_becomes_an_evacuation() {
         .local_artifacts()
         .mark_backup_completed(FULL_ARTIFACT.parse().unwrap())
         .unwrap();
-    let report = service.finish_drain(7, &first, DrainScans::default());
+    let report = service.finish_drain(7, false, &first, DrainScans::default());
     assert_eq!(
         report.evacuated,
         [DrainEvacuated {
@@ -1565,9 +1661,11 @@ async fn a_busy_inventory_is_asked_again() {
 
 const MIB: u64 = 1024 * 1024;
 
+/// A forced drain's suspend of `id`.
 fn suspend(id: &str) -> PlannedAction {
     PlannedAction::Suspend {
         sandbox_id: id.into(),
+        from: SuspendFrom::StartedOrPaused,
     }
 }
 
@@ -1843,4 +1941,261 @@ fn the_disk_headroom_is_what_lies_above_the_admission_floor() {
     // The floor is the larger of 5 % of the disk (2 GiB) and 1 GiB.
     assert_eq!(drain_disk_headroom(config, measured(10 * GIB)), 8 * GIB);
     assert_eq!(drain_disk_headroom(config, measured(GIB)), 0);
+}
+
+/// A gentle drain's suspend of `id`, which suspends it only from `paused`.
+fn gentle_suspend(id: &str) -> PlannedAction {
+    PlannedAction::Suspend {
+        sandbox_id: id.into(),
+        from: SuspendFrom::Paused,
+    }
+}
+
+fn gentle(inputs: PlanInputs) -> PlanInputs {
+    PlanInputs {
+        gentle: true,
+        ..inputs
+    }
+}
+
+/// A gentle drain holds a started sandbox, reporting it pending with the
+/// action `hold`, and plans every other row as a forced drain does: the
+/// paused VM is suspended, the stopped disk published, the warm-pool member
+/// left to its eviction, the VM it can't make durable blocked, and the
+/// suspend already running waited for. A row in a transition settles into
+/// the hold once it is started. Planned forced, the same started sandbox is
+/// suspended.
+#[test]
+fn a_gentle_drain_holds_a_started_sandbox_and_plans_the_rest_as_forced() {
+    let mut member = row("member", SandboxState::Started);
+    member.pool_member = true;
+    let mut refused = row("refused", SandboxState::Started);
+    refused.suspend_refusal = Some("can't be made durable: no memory snapshots".into());
+    let rows = [
+        row("held", SandboxState::Started),
+        row("paused", SandboxState::Paused),
+        row("stopped", SandboxState::Stopped),
+        row("resuming", SandboxState::Resuming),
+        row("suspending", SandboxState::Started),
+        member,
+        refused,
+    ];
+    let inputs = PlanInputs {
+        running: BTreeMap::from([("suspending".to_owned(), DrainAction::Suspend)]),
+        ..PlanInputs::default()
+    };
+    let planned = plan(&rows, &gentle(inputs.clone()));
+    let pending: BTreeMap<_, _> = planned.pending.iter().cloned().collect();
+    assert_eq!(
+        pending,
+        BTreeMap::from([
+            ("held".to_owned(), HOLD.to_owned()),
+            ("paused".to_owned(), "suspend".to_owned()),
+            ("stopped".to_owned(), "publish_disk".to_owned()),
+            ("resuming".to_owned(), "settle:resuming".to_owned()),
+            ("suspending".to_owned(), "suspend".to_owned()),
+            ("member".to_owned(), "warm_pool_eviction".to_owned()),
+        ]),
+        "{planned:?}"
+    );
+    assert_eq!(
+        planned.actions,
+        [
+            gentle_suspend("paused"),
+            PlannedAction::PublishDisk {
+                sandbox_id: "stopped".into(),
+            },
+        ]
+    );
+    assert_eq!(
+        planned.blocked,
+        [(
+            Some("refused".into()),
+            "can't be made durable: no memory snapshots".into()
+        )]
+    );
+
+    let mut settled = rows.to_vec();
+    settled[3].lifecycle = SandboxState::Started.into();
+    let planned = plan(&settled, &gentle(inputs.clone()));
+    assert!(
+        planned
+            .pending
+            .contains(&("resuming".to_owned(), HOLD.to_owned())),
+        "{planned:?}"
+    );
+    assert!(!planned.actions.contains(&gentle_suspend("resuming")));
+
+    let forced = plan(&rows, &inputs);
+    assert!(forced.actions.contains(&suspend("held")), "{forced:?}");
+    assert!(!forced.pending.iter().any(|(_, action)| action == HOLD));
+}
+
+/// A sandbox that suspends on its own under a gentle drain has no drain
+/// record: its snapshot's upload is finished, and once it is durable the
+/// drain reports nothing for it, so the control plane restores it nowhere.
+/// The one the drain suspended is reported evacuated.
+#[test]
+fn a_self_suspended_sandbox_is_uploaded_and_never_reported_evacuated() {
+    let mut own = row("own", SandboxState::Suspended);
+    own.pin = Some((FULL_ARTIFACT.into(), ArtifactKind::Full));
+    let mut drained = own.clone();
+    drained.sandbox_id = "drained".into();
+    let uploading = plan(
+        &[own.clone()],
+        &gentle(PlanInputs {
+            pending_backups: pending("own", FULL_ARTIFACT),
+            ..PlanInputs::default()
+        }),
+    );
+    assert_eq!(uploading.pending, [("own".into(), "upload".into())]);
+    assert_eq!(
+        uploading.actions,
+        [PlannedAction::Upload {
+            sandbox_id: "own".into(),
+            artifact_id: FULL_ARTIFACT.into(),
+            kind: ArtifactKind::Full,
+        }]
+    );
+    assert!(uploading.evacuated.is_empty());
+
+    let durable = plan(
+        &[own, drained],
+        &gentle(PlanInputs {
+            evacuations: [evacuation("drained", DrainPrior::Started)]
+                .into_iter()
+                .collect(),
+            ..PlanInputs::default()
+        }),
+    );
+    assert_eq!(
+        durable.evacuated,
+        [(
+            "drained".to_owned(),
+            DrainPrior::Started,
+            FULL_ARTIFACT.to_owned()
+        )],
+        "{durable:?}"
+    );
+    assert!(durable.pending.is_empty() && durable.blocked.is_empty() && durable.actions.is_empty());
+}
+
+fn gentle_request(epoch: u64) -> Request<DrainNodeRequest> {
+    crate::service::activation_support::internal_request(DrainNodeRequest {
+        gentle_epoch: epoch,
+        ..DrainNodeRequest::default()
+    })
+}
+
+/// A gentle call seals the node under its `gentle_epoch`, leaves a started
+/// sandbox running, reports it held with why, and echoes the epoch; a
+/// forced call under the same epoch then suspends it, and echoes nothing.
+#[tokio::test]
+async fn a_gentle_call_seals_holds_and_says_so() {
+    let conn = crate::db::test_conn();
+    let id = pplx_space_common_core::types::SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Started);
+    let node_manager = orphan_inventory(Default::default());
+    let service = service_with_node_manager(conn, &node_manager);
+    let report = service
+        .drain_node(gentle_request(7))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (report.sealed_epoch, report.gentle_epoch, report.done),
+        (Some(7), Some(7), false)
+    );
+    assert_eq!(
+        report.pending,
+        [DrainPending {
+            sandbox_id: id.clone(),
+            action: HOLD.into(),
+            reason: "running; waits for the sandbox to go idle".into(),
+        }]
+    );
+    assert!(service.drain_actions.running().is_empty());
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxStatus::from(SandboxState::Started)
+    );
+
+    let forced = service
+        .drain_node(drain_request(7, false))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((forced.sealed_epoch, forced.gentle_epoch), (Some(7), None));
+    // Its suspend starts, or waits for the cache disk to have room.
+    assert!(
+        matches!(forced.pending[0].action.as_str(), "suspend" | "disk"),
+        "{forced:?}"
+    );
+    service.drain_actions.wait_idle().await;
+}
+
+/// The request as a node that predates gentle drains decodes it: fields 1
+/// to 3 only.
+#[derive(Clone, PartialEq, prost::Message)]
+struct DrainNodeRequestBeforeGentle {
+    #[prost(uint64, tag = "1")]
+    epoch: u64,
+    #[prost(bool, tag = "2")]
+    cancel: bool,
+    #[prost(string, repeated, tag = "3")]
+    forget: Vec<String>,
+}
+
+/// A gentle request, read by a node or relay that predates gentle drains,
+/// is a drain under epoch 0, which the node refuses before it seals or
+/// suspends anything; so is a gentle request that names a forced epoch too,
+/// or a cancel.
+#[tokio::test]
+async fn a_gentle_request_without_its_field_seals_and_suspends_nothing() {
+    use prost::Message as _;
+    let before = DrainNodeRequestBeforeGentle::decode(
+        DrainNodeRequest {
+            gentle_epoch: 7,
+            ..DrainNodeRequest::default()
+        }
+        .encode_to_vec()
+        .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(before.epoch, 0, "{before:?}");
+    // What a relay that predates the field forwards.
+    let relayed = DrainNodeRequest::decode(before.encode_to_vec().as_slice()).unwrap();
+    for request in [
+        relayed,
+        DrainNodeRequest {
+            epoch: 7,
+            gentle_epoch: 7,
+            ..DrainNodeRequest::default()
+        },
+        DrainNodeRequest {
+            cancel: true,
+            gentle_epoch: 7,
+            ..DrainNodeRequest::default()
+        },
+    ] {
+        let conn = crate::db::test_conn();
+        let id = pplx_space_common_core::types::SandboxId::new().to_string();
+        crate::service::tests::service_tests::insert_test_sandbox(
+            &conn,
+            &id,
+            SandboxState::Started,
+        );
+        let node_manager = orphan_inventory(Default::default());
+        let service = service_with_node_manager(conn, &node_manager);
+        let refused = service
+            .drain_node(crate::service::activation_support::internal_request(
+                request.clone(),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{request:?}");
+        assert_eq!(service.activation_seal.status().sealed_epoch, None);
+        assert!(service.drain_actions.running().is_empty());
+        assert_eq!(node_manager.calls(), Vec::<String>::new(), "{request:?}");
+    }
 }

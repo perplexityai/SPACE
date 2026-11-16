@@ -13807,7 +13807,11 @@ type DrainNodeRequest struct {
 	// With `cancel`: the sandboxes whose evacuation the control plane has
 	// recorded since a cancel call reported it; the node forgets the drain's
 	// record of each before it reports.
-	Forget        []string `protobuf:"bytes,3,rep,name=forget,proto3" json:"forget,omitempty"`
+	Forget []string `protobuf:"bytes,3,rep,name=forget,proto3" json:"forget,omitempty"`
+	// A gentle drain under this epoch, with `epoch` 0 and no `cancel` (see
+	// `DrainNode`). Nonzero, at most 2^63 - 1, like `epoch`; 0 for a forced drain
+	// or a cancel.
+	GentleEpoch   uint64 `protobuf:"varint,4,opt,name=gentle_epoch,json=gentleEpoch,proto3" json:"gentle_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -13861,6 +13865,13 @@ func (x *DrainNodeRequest) GetForget() []string {
 		return x.Forget
 	}
 	return nil
+}
+
+func (x *DrainNodeRequest) GetGentleEpoch() uint64 {
+	if x != nil {
+		return x.GentleEpoch
+	}
+	return 0
 }
 
 // A resident the drain made durable elsewhere.
@@ -13931,9 +13942,12 @@ type DrainPending struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	SandboxId string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
 	// What it waits for: `suspend`, `publish_disk`, `upload`, `activation` for
-	// an activation admitted before the seal that is still in flight, or
-	// `settle:<state>` for a row in a transition the drain does not drive.
-	Action        string `protobuf:"bytes,2,opt,name=action,proto3" json:"action,omitempty"`
+	// an activation admitted before the seal that is still in flight,
+	// `settle:<state>` for a row in a transition the drain does not drive, or
+	// `hold` for a running sandbox a gentle drain leaves running.
+	Action string `protobuf:"bytes,2,opt,name=action,proto3" json:"action,omitempty"`
+	// Why, for an operator, when the action alone doesn't say: set for `hold`.
+	Reason        string `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -13978,6 +13992,13 @@ func (x *DrainPending) GetSandboxId() string {
 func (x *DrainPending) GetAction() string {
 	if x != nil {
 		return x.Action
+	}
+	return ""
+}
+
+func (x *DrainPending) GetReason() string {
+	if x != nil {
+		return x.Reason
 	}
 	return ""
 }
@@ -14041,11 +14062,15 @@ type DrainNodeResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The epoch the node is sealed under after this call; unset once
 	// cancelled.
-	SealedEpoch   *uint64           `protobuf:"varint,1,opt,name=sealed_epoch,json=sealedEpoch,proto3,oneof" json:"sealed_epoch,omitempty"`
-	Evacuated     []*DrainEvacuated `protobuf:"bytes,2,rep,name=evacuated,proto3" json:"evacuated,omitempty"`
-	Pending       []*DrainPending   `protobuf:"bytes,3,rep,name=pending,proto3" json:"pending,omitempty"`
-	Blocked       []*DrainBlocked   `protobuf:"bytes,4,rep,name=blocked,proto3" json:"blocked,omitempty"`
-	Done          bool              `protobuf:"varint,5,opt,name=done,proto3" json:"done,omitempty"`
+	SealedEpoch *uint64           `protobuf:"varint,1,opt,name=sealed_epoch,json=sealedEpoch,proto3,oneof" json:"sealed_epoch,omitempty"`
+	Evacuated   []*DrainEvacuated `protobuf:"bytes,2,rep,name=evacuated,proto3" json:"evacuated,omitempty"`
+	Pending     []*DrainPending   `protobuf:"bytes,3,rep,name=pending,proto3" json:"pending,omitempty"`
+	Blocked     []*DrainBlocked   `protobuf:"bytes,4,rep,name=blocked,proto3" json:"blocked,omitempty"`
+	Done        bool              `protobuf:"varint,5,opt,name=done,proto3" json:"done,omitempty"`
+	// The request's `gentle_epoch`, once the node has drained gently under it;
+	// unset for a forced call or a cancel. The control plane trusts a gentle
+	// call's answer only with it.
+	GentleEpoch   *uint64 `protobuf:"varint,6,opt,name=gentle_epoch,json=gentleEpoch,proto3,oneof" json:"gentle_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -14113,6 +14138,13 @@ func (x *DrainNodeResponse) GetDone() bool {
 		return x.Done
 	}
 	return false
+}
+
+func (x *DrainNodeResponse) GetGentleEpoch() uint64 {
+	if x != nil && x.GentleEpoch != nil {
+		return *x.GentleEpoch
+	}
+	return 0
 }
 
 type QuarantineRecoveryObservation struct {
@@ -15643,33 +15675,37 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\rartifact_kind\x18\x03 \x01(\x0e2&.space.sandbox.manager.v1.ArtifactKindR\fartifactKind\" \n" +
 	"\x1eListPendingLocalBackupsRequest\"i\n" +
 	"\x1fListPendingLocalBackupsResponse\x12F\n" +
-	"\apending\x18\x01 \x03(\v2,.space.sandbox.manager.v1.PendingLocalBackupR\apending\"X\n" +
+	"\apending\x18\x01 \x03(\v2,.space.sandbox.manager.v1.PendingLocalBackupR\apending\"{\n" +
 	"\x10DrainNodeRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x16\n" +
 	"\x06cancel\x18\x02 \x01(\bR\x06cancel\x12\x16\n" +
-	"\x06forget\x18\x03 \x03(\tR\x06forget\"\x8c\x01\n" +
+	"\x06forget\x18\x03 \x03(\tR\x06forget\x12!\n" +
+	"\fgentle_epoch\x18\x04 \x01(\x04R\vgentleEpoch\"\x8c\x01\n" +
 	"\x0eDrainEvacuated\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12:\n" +
 	"\x05prior\x18\x02 \x01(\x0e2$.space.sandbox.manager.v1.DrainPriorR\x05prior\x12\x1f\n" +
 	"\vartifact_id\x18\x03 \x01(\tR\n" +
-	"artifactId\"E\n" +
+	"artifactId\"]\n" +
 	"\fDrainPending\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x16\n" +
-	"\x06action\x18\x02 \x01(\tR\x06action\"Y\n" +
+	"\x06action\x18\x02 \x01(\tR\x06action\x12\x16\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\"Y\n" +
 	"\fDrainBlocked\x12\"\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tH\x00R\tsandboxId\x88\x01\x01\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reasonB\r\n" +
-	"\v_sandbox_id\"\xac\x02\n" +
+	"\v_sandbox_id\"\xe5\x02\n" +
 	"\x11DrainNodeResponse\x12&\n" +
 	"\fsealed_epoch\x18\x01 \x01(\x04H\x00R\vsealedEpoch\x88\x01\x01\x12F\n" +
 	"\tevacuated\x18\x02 \x03(\v2(.space.sandbox.manager.v1.DrainEvacuatedR\tevacuated\x12@\n" +
 	"\apending\x18\x03 \x03(\v2&.space.sandbox.manager.v1.DrainPendingR\apending\x12@\n" +
 	"\ablocked\x18\x04 \x03(\v2&.space.sandbox.manager.v1.DrainBlockedR\ablocked\x12\x12\n" +
-	"\x04done\x18\x05 \x01(\bR\x04doneB\x0f\n" +
-	"\r_sealed_epoch\"\xf6\x02\n" +
+	"\x04done\x18\x05 \x01(\bR\x04done\x12&\n" +
+	"\fgentle_epoch\x18\x06 \x01(\x04H\x01R\vgentleEpoch\x88\x01\x01B\x0f\n" +
+	"\r_sealed_epochB\x0f\n" +
+	"\r_gentle_epoch\"\xf6\x02\n" +
 	"\x1dQuarantineRecoveryObservation\x12%\n" +
 	"\x0eschema_version\x18\x01 \x01(\rR\rschemaVersion\x12.\n" +
 	"\x13local_quarantine_id\x18\x02 \x01(\tR\x11localQuarantineId\x12`\n" +

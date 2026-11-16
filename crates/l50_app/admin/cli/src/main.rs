@@ -67,6 +67,9 @@ async fn main() {
                 // The engine stays the server's choice: a new drain runs on
                 // v1, and one in flight keeps its own.
                 engine: None,
+                // A deadline is a gentle v2 drain's, which this command
+                // doesn't start.
+                deadline: None,
             };
             client.post_drain(&node, &request).await
         }

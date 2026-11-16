@@ -138,6 +138,16 @@ impl SandboxController {
         })
     }
 
+    /// A spaced client for a runtime already reachable: it neither recovers
+    /// nor wakes the sandbox, and answers 503 when nothing is reachable.
+    ///
+    /// The drain gate still sees it as a `spaced` call, so under an admitted
+    /// gentle v2 drain it is refused on a sandbox that isn't `started`
+    /// although this connect activates nothing. That is on purpose: the
+    /// refusal names the caller's action as every other spaced call's does,
+    /// where another action's name would mislabel a forced drain's 409, and
+    /// the call it serves needs a running sandbox anyway. Its mid-stream
+    /// reconnect can recover a lost pod and passes the gate again.
     pub(super) async fn reachable_spaced_client(
         &self,
         pool: &PgPool,

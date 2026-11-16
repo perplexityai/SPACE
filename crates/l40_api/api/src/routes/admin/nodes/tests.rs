@@ -327,11 +327,15 @@ fn force_upload_local_snapshots_never_changes_drain_phase() {
 /// on the source is what gives this an oracle.
 #[test]
 fn force_upload_refusal_text_has_no_embedded_indentation() {
-    use pplx_space_common_core::types::{NodeDrainPhase, NodeDrainState};
+    use pplx_space_common_core::types::{NodeDrainEngine, NodeDrainPhase, NodeDrainState};
 
     let states = [
         None,
-        NodeDrainState::from_columns(Some(NodeDrainPhase::Draining), Some("gentle")),
+        NodeDrainState::from_columns(
+            Some(NodeDrainPhase::Draining),
+            Some("gentle"),
+            NodeDrainEngine::V1,
+        ),
     ];
     for state in states {
         let (error, detail) = super::force_upload_gate_open_message(state);
@@ -346,24 +350,31 @@ fn force_upload_refusal_text_has_no_embedded_indentation() {
 
 #[test]
 fn force_upload_requires_a_closed_wake_gate() {
-    use pplx_space_common_core::types::{NodeDrainMode, NodeDrainPhase, NodeDrainState};
+    use pplx_space_common_core::types::{
+        NodeDrainEngine, NodeDrainMode, NodeDrainPhase, NodeDrainState,
+    };
 
     // No drain at all: the gate is open, so the action is refused.
     assert!(
-        !NodeDrainState::from_columns(None, None).is_some_and(NodeDrainState::blocks_placement)
+        !NodeDrainState::from_columns(None, None, NodeDrainEngine::V1)
+            .is_some_and(NodeDrainState::blocks_placement)
     );
 
     // Gentle + draining: non-NULL phase, but the gate is deliberately open.
-    let gentle_draining =
-        NodeDrainState::from_columns(Some(NodeDrainPhase::Draining), Some("gentle"))
-            .expect("a phase was supplied");
+    let gentle_draining = NodeDrainState::from_columns(
+        Some(NodeDrainPhase::Draining),
+        Some("gentle"),
+        NodeDrainEngine::V1,
+    )
+    .expect("a phase was supplied");
     assert!(
         !gentle_draining.blocks_placement(),
         "a gentle drain must not satisfy the force-upload precondition"
     );
     // ...and the same is true when nobody set a mode, since that reads as gentle.
-    let unset_mode = NodeDrainState::from_columns(Some(NodeDrainPhase::Draining), None)
-        .expect("a phase was supplied");
+    let unset_mode =
+        NodeDrainState::from_columns(Some(NodeDrainPhase::Draining), None, NodeDrainEngine::V1)
+            .expect("a phase was supplied");
     assert!(!unset_mode.blocks_placement());
 
     // Forced draining, plus drained/terminating in either mode: gate closed, so
@@ -375,8 +386,9 @@ fn force_upload_requires_a_closed_wake_gate() {
         (NodeDrainPhase::Terminating, NodeDrainMode::Forced),
         (NodeDrainPhase::Terminating, NodeDrainMode::Gentle),
     ] {
-        let state = NodeDrainState::from_columns(Some(phase), Some(mode.as_str()))
-            .expect("a phase was supplied");
+        let state =
+            NodeDrainState::from_columns(Some(phase), Some(mode.as_str()), NodeDrainEngine::V1)
+                .expect("a phase was supplied");
         assert!(
             state.blocks_placement(),
             "{phase}/{mode} must satisfy the force-upload precondition"

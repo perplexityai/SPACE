@@ -10,8 +10,8 @@ use std::num::NonZeroUsize;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId, NodeManagedBy,
-    NodeRole, SandboxId,
+    NodeAddress, NodeDrainEngine, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId,
+    NodeManagedBy, NodeRole, SandboxId,
     admin::{AdminNodeCtlStatus, AdminNodeServiceHealth, ListAdminNodesFilters},
 };
 #[cfg(test)]
@@ -1205,18 +1205,24 @@ pub(super) async fn is_node_wake_gate_closed(
     pool: &PgPool,
     node_id: NodeId,
 ) -> Result<bool, sqlx::Error> {
-    let row: Option<(Option<NodeDrainPhase>, Option<String>, bool)> = sqlx::query_as(sql!(
+    type Row = (Option<NodeDrainPhase>, Option<String>, bool, Option<String>);
+    let row: Option<Row> = sqlx::query_as(sql!(
         "SELECT drain_phase, drain_mode,
-                COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE)
+                COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE),
+                drain_engine
            FROM nodes WHERE id = $1"
     ))
     .bind(node_id)
     .fetch_optional(pool)
     .await?;
     Ok(row
-        .and_then(|(phase, mode, awaiting)| {
-            NodeDrainState::from_columns(phase, mode.as_deref())
-                .map(|state| state.awaiting_evacuation(awaiting))
+        .and_then(|(phase, mode, awaiting, engine)| {
+            NodeDrainState::from_columns(
+                phase,
+                mode.as_deref(),
+                NodeDrainEngine::from_column(engine.as_deref()),
+            )
+            .map(|state| state.awaiting_evacuation(awaiting))
         })
         .is_some_and(NodeDrainState::blocks_placement))
 }
@@ -1468,25 +1474,38 @@ pub(super) async fn drain_v2_columns(
 /// starts admitted instead, in the slot that cancel holds: the node may
 /// still be sealed under the cancelled epoch, finishing its suspends, and
 /// this drain's first call takes over the seal and what it evacuated.
+///
+/// A gentle drain, with `gentle_deadline`, records its epoch as
+/// `gentle_epoch` rather than `epoch`, and the deadline, in Unix seconds:
+/// a cluster controller that predates gentle drains reads no epoch, so it
+/// never calls the node for one, which it would drain forced. The newer
+/// controller moves the epoch to `epoch` when the drain turns forced or
+/// reaches `drained`.
 pub(super) async fn start_v2_drain(
     tx: &mut Transaction<'_, Postgres>,
     node_id: NodeId,
+    gentle_deadline: Option<i64>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(sql!(
         "UPDATE nodes
             SET drain_engine = 'v2',
                 drain_status = jsonb_build_object(
-                    'epoch', (EXTRACT(EPOCH FROM drain_started_at) * 1000000)::BIGINT,
+                    CASE WHEN $2::BIGINT IS NULL THEN 'epoch' ELSE 'gentle_epoch' END,
+                    (EXTRACT(EPOCH FROM drain_started_at) * 1000000)::BIGINT,
                     'waiting', NOT COALESCE(
                         drain_engine = 'v2'
                             AND (drain_status->>'cancel')::BOOLEAN
                             AND NOT COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE),
                         FALSE
                     )
-                )
+                ) || CASE
+                    WHEN $2::BIGINT IS NULL THEN '{}'::JSONB
+                    ELSE jsonb_build_object('deadline', $2::BIGINT)
+                END
           WHERE id = $1 AND drain_phase = 'draining' AND drain_started_at IS NOT NULL"
     ))
     .bind(node_id)
+    .bind(gentle_deadline)
     .execute(&mut **tx)
     .await?;
     Ok(())

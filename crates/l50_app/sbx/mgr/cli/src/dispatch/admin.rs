@@ -529,6 +529,7 @@ pub(super) async fn handle(
                     epoch,
                     cancel,
                     forget: Vec::new(),
+                    gentle_epoch: 0,
                 })
                 .await
                 .unwrap_or_else(|e| exit_error(e))

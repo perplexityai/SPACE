@@ -2,7 +2,9 @@ use super::{
     NodeDrainState, SandboxAction, post_wake_lifecycle_allows_started_update,
     wake_lifecycle_allows_started_update,
 };
-use pplx_space_common_core::types::{NodeDrainMode, NodeDrainPhase, SandboxLifecycle};
+use pplx_space_common_core::types::{
+    NodeDrainEngine, NodeDrainMode, NodeDrainPhase, SandboxLifecycle,
+};
 
 #[test]
 fn placement_affecting_actions_match_design() {
@@ -215,6 +217,7 @@ fn state(phase: NodeDrainPhase, mode: NodeDrainMode) -> NodeDrainState {
         phase,
         mode,
         awaiting_evacuation: false,
+        engine: NodeDrainEngine::V1,
     }
 }
 
@@ -290,5 +293,35 @@ fn unknown_drain_phase_strings_are_rejected_rather_than_guessed() {
     NodeDrainPhase::parse("future-phase").unwrap_err();
     for phase in ["draining", "drained", "terminating"] {
         NodeDrainPhase::parse(phase).unwrap();
+    }
+}
+
+/// The gate answers with the candidate that blocks placement, wherever it
+/// came from; else one that refuses VM activations, the primary first; else
+/// the primary; else the first sibling.
+#[test]
+fn the_gate_prefers_a_blocking_candidate_then_a_refusing_one() {
+    let gentle = |engine| NodeDrainState {
+        engine,
+        ..state(NodeDrainPhase::Draining, NodeDrainMode::Gentle)
+    };
+    let v1 = gentle(NodeDrainEngine::V1);
+    let v2 = gentle(NodeDrainEngine::V2);
+    let forced = state(NodeDrainPhase::Draining, NodeDrainMode::Forced);
+    for (primary, siblings, expected) in [
+        (Some(v1), &[v2, forced][..], Some(forced)),
+        (Some(forced), &[v2][..], Some(forced)),
+        (Some(v1), &[v1, v2][..], Some(v2)),
+        (None, &[v1, v2][..], Some(v2)),
+        (Some(v2), &[v2][..], Some(v2)),
+        (Some(v1), &[v1][..], Some(v1)),
+        (None, &[v1][..], Some(v1)),
+        (None, &[][..], None),
+    ] {
+        assert_eq!(
+            super::drain_state_precedence(primary, siblings),
+            expected,
+            "{primary:?} with {siblings:?}"
+        );
     }
 }

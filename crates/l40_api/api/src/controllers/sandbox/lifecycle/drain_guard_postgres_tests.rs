@@ -408,6 +408,7 @@ async fn gentle_drain_does_not_block_access_or_placement_while_draining() -> Tes
             phase: NodeDrainPhase::Draining,
             mode: NodeDrainMode::Gentle,
             awaiting_evacuation: false,
+            engine: NodeDrainEngine::V1,
         }),
         "the gate must read the mode off the node row, not assume forced"
     );
@@ -1084,6 +1085,201 @@ async fn a_wake_the_v2_drain_still_makes_durable_is_told_to_retry() -> TestResul
             StatusCode::CONFLICT,
             "{sandbox_id} {action:?}"
         );
+    }
+    Ok(())
+}
+
+/// Under an admitted gentle v2 drain, whose node is sealed against VM
+/// activations, a started sandbox's calls, its wake included, and every
+/// sandbox's suspend, stop, pause and stats read pass. A start, wake,
+/// restore or resume of a sandbox that isn't running is refused as under a
+/// forced drain: 503 while the drain still makes it durable, 409 otherwise.
+/// Waiting for its slot, the drain seals nothing and refuses nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gentle_v2_drain_refuses_only_the_activations_its_seal_refuses() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    let running = SandboxId::new();
+    let paused = SandboxId::new();
+    let stopped = SandboxId::new();
+    insert_node_with_mode(
+        &db.pool,
+        node_id,
+        Some("draining"),
+        Some(NodeDrainMode::Gentle),
+    )
+    .await?;
+    for (sandbox_id, lifecycle) in [
+        (running, "started"),
+        (paused, "paused"),
+        (stopped, "stopped"),
+    ] {
+        insert_sandbox(
+            &db.pool,
+            sandbox_id,
+            lifecycle,
+            Some(node_id),
+            Some(node_id),
+        )
+        .await?;
+    }
+    let status = |waiting: bool| {
+        serde_json::json!({
+            "gentle_epoch": 1,
+            "deadline": 4_102_444_800_i64,
+            "waiting": waiting,
+            "report": {
+                "sealed_epoch": 1,
+                "done": false,
+                "pending": [
+                    {"sandbox_id": running.to_string(), "action": "hold"},
+                    {"sandbox_id": paused.to_string(), "action": "suspend"},
+                ],
+                "unrecorded": [],
+                "evacuated": [],
+                "blocked": [],
+            },
+        })
+    };
+    let open = [
+        (running, SandboxAction::Spaced),
+        (running, SandboxAction::Stats),
+        (running, SandboxAction::Wake),
+        (running, SandboxAction::Start),
+        (running, SandboxAction::Suspend),
+        (running, SandboxAction::Pause),
+        (running, SandboxAction::Stop),
+        (paused, SandboxAction::Suspend),
+        (paused, SandboxAction::Kill),
+        (paused, SandboxAction::Stats),
+        (stopped, SandboxAction::Kill),
+        (stopped, SandboxAction::Stats),
+    ];
+    let refused = [
+        (paused, SandboxAction::Wake, StatusCode::SERVICE_UNAVAILABLE),
+        (paused, SandboxAction::Resume, StatusCode::CONFLICT),
+        (
+            paused,
+            SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (stopped, SandboxAction::Start, StatusCode::CONFLICT),
+        (stopped, SandboxAction::Restore, StatusCode::CONFLICT),
+    ];
+
+    set_v2_status(&db.pool, node_id, status(true)).await?;
+    for (sandbox_id, action, _) in refused {
+        ensure_resolved_node_not_draining(&db.pool, sandbox_id, action).await?;
+    }
+
+    set_v2_status(&db.pool, node_id, status(false)).await?;
+    for (sandbox_id, action) in open {
+        ensure_resolved_node_not_draining(&db.pool, sandbox_id, action)
+            .await
+            .unwrap_or_else(|err| panic!("{action:?} on {sandbox_id}: {err:?}"));
+    }
+    for (sandbox_id, action, expected) in refused {
+        let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, action)
+            .await
+            .expect_err("the sealed node refuses it");
+        assert_eq!(
+            err.into_response().status(),
+            expected,
+            "{action:?} on {sandbox_id}"
+        );
+    }
+    Ok(())
+}
+
+/// Under an admitted gentle v2 drain, an access path whose runtime client
+/// would wake a dormant sandbox is refused on a suspended row whose snapshot
+/// isn't durable elsewhere, with the caller's own action in the 409: a
+/// `spaced` connect with an activity and a port open. A running sandbox's
+/// access passes the gate; past it, the test apiserver has no pod to give.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_gentle_v2_drain_refuses_access_that_would_wake_a_dormant_sandbox() -> TestResult {
+    use crate::controllers::substrate::Substrate;
+    use crate::controllers::substrate::kubernetes::tests::substrate_with_store;
+
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = NodeId::new();
+    let suspended = SandboxId::new();
+    let running = SandboxId::new();
+    insert_node_with_mode(pool, node_id, Some("draining"), Some(NodeDrainMode::Gentle)).await?;
+    insert_sandbox(pool, suspended, "suspended", Some(node_id), Some(node_id)).await?;
+    insert_sandbox(pool, running, "started", Some(node_id), Some(node_id)).await?;
+    set_v2_status(
+        pool,
+        node_id,
+        serde_json::json!({
+            "gentle_epoch": 1,
+            "deadline": 4_102_444_800_i64,
+            "waiting": false,
+            "report": {
+                "sealed_epoch": 1,
+                "done": false,
+                "pending": [{"sandbox_id": running.to_string(), "action": "hold"}],
+                "unrecorded": [],
+                "evacuated": [],
+                "blocked": [],
+            },
+        }),
+    )
+    .await?;
+    let controller = SandboxController::new(Substrate::from_kubernetes(substrate_with_store(
+        pool.clone(),
+    )));
+
+    for (sandbox_id, refused) in [(suspended, true), (running, false)] {
+        let sandbox = crate::controllers::sandbox::fetch_sandbox(pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        let spaced = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::controllers::sandbox::spaced::connect_spaced_runtime_client(
+                &controller.substrate,
+                None,
+                true,
+                pool,
+                &sandbox,
+                SandboxApiMetricIdentity::ecw("test"),
+                Some(ExecutionActivityKind::Access),
+            ),
+        )
+        .await
+        .map(|result| result.err());
+        let port = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            controller.ensure_sandbox_port_exposure_applied(pool, &sandbox, 8080, "test"),
+        )
+        .await
+        .map(|result| result.err());
+        for (call, error, action) in [("spaced", spaced, "spaced"), ("port", port, "open_port")] {
+            let drain_refusal = error
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .filter(|error| {
+                    error.status() == 409
+                        && error.to_string().contains("while its resident node is")
+                });
+            if refused {
+                let error = drain_refusal.unwrap_or_else(|| {
+                    panic!("{call} on the suspended row must be refused: {error:?}")
+                });
+                assert!(
+                    error.to_string().contains(&format!("cannot {action} ")),
+                    "{call}: {error}"
+                );
+            } else {
+                assert!(
+                    drain_refusal.is_none(),
+                    "{call} on the running row must pass the gate: {error:?}"
+                );
+            }
+        }
     }
     Ok(())
 }

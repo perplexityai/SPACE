@@ -322,6 +322,7 @@ async fn the_internal_drain_is_forwarded_only_for_the_control_plane() {
             epoch: 7,
             cancel: false,
             forget: Vec::new(),
+            gentle_epoch: 0,
         })
     };
 

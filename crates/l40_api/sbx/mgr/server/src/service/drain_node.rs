@@ -1,4 +1,4 @@
-//! `DrainNode`: the node's own half of a forced drain.
+//! `DrainNode`: the node's own half of a drain, forced or gentle.
 //!
 //! The control plane names an epoch; the node seals itself under it (see
 //! [`crate::activation_seal`]) and, on every call, makes each of its
@@ -31,6 +31,18 @@
 //! flight at its first read. Every row that keeps `done` false says why: work
 //! that keeps failing, and a row stuck in a transition the drain doesn't
 //! drive, turn from `pending` into `blocked` after a bound.
+//!
+//! A gentle call (`gentle_epoch`) plans the same way, except that it holds a
+//! sandbox in `started`: it reports it `pending` ([`HOLD`]) and suspends
+//! nothing for it, so it keeps running until the node's idle auto-lifecycle,
+//! or its user, moves it on. The seal refuses activations only, so that
+//! suspend, stop or delete goes ahead. A sandbox that suspends on its own has
+//! no drain record and is never reported evacuated; its upload is finished
+//! like any artifact without a durable copy. A gentle drain's suspend
+//! suspends a VM only from `paused`: it checks again under the wake lock, so
+//! a resume that was already in flight at the seal and finished `started`
+//! before the suspend ran is held, not suspended. A forced call under the
+//! same epoch continues the same drain and holds nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -46,6 +58,10 @@ use crate::proto::{
     EnqueueArtifactBackupRequest,
 };
 use pplx_space_events::SandboxEventTrigger;
+
+/// The pending action of a running sandbox a gentle drain holds, and why.
+pub(super) const HOLD: &str = "hold";
+const HOLD_REASON: &str = "running; waits for the sandbox to go idle";
 
 /// How long one call may spend reading node-manager's whole orphan
 /// inventory: well under the control plane's own timeout for the call, so
@@ -334,6 +350,10 @@ pub(super) struct DrainRow {
 pub(super) enum PlannedAction {
     Suspend {
         sandbox_id: String,
+        /// The lifecycles it may suspend from, checked again under the wake
+        /// lock: a row planned `paused` may be `started` by the time the
+        /// suspend runs.
+        from: SuspendFrom,
     },
     PublishDisk {
         sandbox_id: String,
@@ -343,6 +363,37 @@ pub(super) enum PlannedAction {
         artifact_id: String,
         kind: pplx_space_common_core::types::ArtifactKind,
     },
+}
+
+/// The lifecycles a drain suspend may suspend a VM from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SuspendFrom {
+    /// A forced drain's: `started` or `paused`.
+    StartedOrPaused,
+    /// A gentle drain's: `paused` only, since it holds a started sandbox.
+    Paused,
+}
+
+impl SuspendFrom {
+    fn for_drain(gentle: bool) -> Self {
+        if gentle {
+            Self::Paused
+        } else {
+            Self::StartedOrPaused
+        }
+    }
+
+    /// The prior to record for a row in `state`, or `None` when this
+    /// suspend doesn't apply to it.
+    fn prior(self, state: Option<SandboxState>) -> Option<DrainPrior> {
+        match (self, state?) {
+            (Self::StartedOrPaused, SandboxState::Started) => Some(DrainPrior::Started),
+            (Self::StartedOrPaused | Self::Paused, SandboxState::Paused) => {
+                Some(DrainPrior::Paused)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// What one call decided, from the rows it read.
@@ -400,6 +451,8 @@ pub(super) struct PlanInputs {
     /// The rows that have waited for cache disk for [`SETTLE_BOUND`] or
     /// longer.
     pub(super) disk_waits: BTreeSet<String>,
+    /// A gentle drain: hold every sandbox in `started`.
+    pub(super) gentle: bool,
 }
 
 impl Default for PlanInputs {
@@ -415,6 +468,7 @@ impl Default for PlanInputs {
             disk_headroom: None,
             active_uploads: BTreeSet::new(),
             disk_waits: BTreeSet::new(),
+            gentle: false,
         }
     }
 }
@@ -593,7 +647,7 @@ pub(super) enum WindowOrder {
 impl PlannedAction {
     fn target(&self) -> (&str, DrainAction) {
         match self {
-            Self::Suspend { sandbox_id } => (sandbox_id, DrainAction::Suspend),
+            Self::Suspend { sandbox_id, .. } => (sandbox_id, DrainAction::Suspend),
             Self::PublishDisk { sandbox_id } => (sandbox_id, DrainAction::PublishDisk),
             Self::Upload { sandbox_id, .. } => (sandbox_id, DrainAction::Upload),
         }
@@ -669,12 +723,18 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
             SandboxStatus::Unowned(SandboxState::Started | SandboxState::Paused) => {
                 let suspend = PlannedAction::Suspend {
                     sandbox_id: id.clone(),
+                    from: SuspendFrom::for_drain(inputs.gentle),
                 };
                 match &row.suspend_refusal {
                     Some(refusal) if !running => {
                         plan.blocked.push((Some(id.clone()), refusal.clone()));
                     }
                     _ if running => plan.drive(inputs, suspend),
+                    // A gentle drain leaves it running; once it leaves
+                    // `started` on its own, the row is planned from there.
+                    _ if inputs.gentle && row.lifecycle.is_unowned(SandboxState::Started) => {
+                        plan.pending.push((id.clone(), HOLD.to_owned()));
+                    }
                     _ => windowed.push((
                         if row.lifecycle.is_unowned(SandboxState::Paused) {
                             WindowOrder::PausedVm
@@ -948,7 +1008,9 @@ impl SandboxManagerService {
             epoch,
             cancel,
             forget,
+            gentle_epoch,
         } = request.into_inner();
+        let (epoch, gentle) = drain_epoch(epoch, cancel, gentle_epoch)?;
         if self.activation_seal.load_error().is_some() {
             return Err(Status::internal("activation seal unreadable"));
         }
@@ -968,20 +1030,23 @@ impl SandboxManagerService {
             orphan_dirs: orphans.dirs,
             disk_headroom: read_disk_headroom().await,
         };
-        Ok(Response::new(self.finish_drain(epoch, &first, scans)))
+        Ok(Response::new(
+            self.finish_drain(epoch, gentle, &first, scans),
+        ))
     }
 
     /// Plan from the rows, record and start what the plan asks for, and
-    /// report. `first` is the seal as the call read it right after sealing,
-    /// before its scans; `scans` are what the scans that ran outside the rows
-    /// found.
+    /// report. `gentle` holds the started rows. `first` is the seal as the
+    /// call read it right after sealing, before its scans; `scans` are what
+    /// the scans that ran outside the rows found.
     pub(super) fn finish_drain(
         &self,
         epoch: u64,
+        gentle: bool,
         first: &ActivationSealStatus,
         scans: DrainScans,
     ) -> DrainNodeResponse {
-        let (mut plan, rows) = match self.read_drain_plan(epoch, scans.disk_headroom) {
+        let (mut plan, rows) = match self.read_drain_plan(epoch, gentle, scans.disk_headroom) {
             Ok(read) => read,
             Err(reason) => (
                 DrainPlan {
@@ -1016,7 +1081,10 @@ impl SandboxManagerService {
         // Every row that may hold a VM is pending or blocked, so a node with
         // nothing pending or blocked holds none.
         let done = continuous && plan.pending.is_empty() && plan.blocked.is_empty();
-        report(first, plan, done)
+        DrainNodeResponse {
+            gentle_epoch: gentle.then_some(epoch),
+            ..report(first, plan, done)
+        }
     }
 
     /// Under a cancelled `epoch`: forget the records with nothing left to
@@ -1119,10 +1187,12 @@ impl SandboxManagerService {
     fn read_drain_plan(
         &self,
         epoch: u64,
+        gentle: bool,
         disk_headroom: Option<u64>,
     ) -> Result<(DrainPlan, BTreeSet<String>), String> {
         let now = tokio::time::Instant::now();
         let (rows, inputs) = self.read_plan_inputs(epoch, disk_headroom, now)?;
+        let inputs = PlanInputs { gentle, ..inputs };
         let ids = rows.iter().map(|row| row.sandbox_id.clone()).collect();
         let plan = plan(&rows, &inputs);
         self.drain_actions
@@ -1249,6 +1319,7 @@ impl SandboxManagerService {
             disk_headroom,
             active_uploads,
             disk_waits: self.drain_actions.disk_waits_past_bound(epoch, now),
+            gentle: false,
         };
         Ok((rows, inputs))
     }
@@ -1311,7 +1382,9 @@ impl SandboxManagerService {
             return Ok(());
         }
         match action {
-            PlannedAction::Suspend { sandbox_id } => self.drain_suspend(epoch, &sandbox_id).await,
+            PlannedAction::Suspend { sandbox_id, from } => {
+                self.drain_suspend(epoch, &sandbox_id, from).await
+            }
             PlannedAction::PublishDisk { sandbox_id } => self
                 .enqueue_artifact_backup_authorized(EnqueueArtifactBackupRequest {
                     sandbox_id,
@@ -1391,21 +1464,25 @@ impl SandboxManagerService {
             }))
     }
 
-    /// The idle auto-suspend's suspend of a started or paused VM, for the
-    /// drain under `epoch`: under the wake and artifact locks, with a full
-    /// snapshot published and its upload enqueued before the runtime is torn
-    /// down. The lifecycle it suspends from is recorded under the wake lock
-    /// first, and only while the node is still sealed under `epoch`; a row
-    /// something else moved on first keeps its own lifecycle, which the next
-    /// call plans from.
-    async fn drain_suspend(&self, epoch: u64, sandbox_id: &str) -> Result<(), Status> {
+    /// The idle auto-suspend's suspend of a VM in a lifecycle `from` allows,
+    /// for the drain under `epoch`: under the wake and artifact locks, with a
+    /// full snapshot published and its upload enqueued before the runtime is
+    /// torn down. The lifecycle it suspends from is checked against `from`
+    /// and recorded under the wake lock first, and only while the node is
+    /// still sealed under `epoch`; a row something else moved on first, a
+    /// gentle drain's paused row resumed meanwhile among them, keeps its own
+    /// lifecycle, which the next call plans from.
+    async fn drain_suspend(
+        &self,
+        epoch: u64,
+        sandbox_id: &str,
+        from: SuspendFrom,
+    ) -> Result<(), Status> {
         let wake_lock = self.auto_lifecycle.wake_lock(sandbox_id);
         let wake_guard = wake_lock.lock_owned().await;
         let sandbox = self.lookup_sandbox(sandbox_id)?;
-        let prior = match sandbox.state.unowned() {
-            Some(SandboxState::Started) => DrainPrior::Started,
-            Some(SandboxState::Paused) => DrainPrior::Paused,
-            _ => return Ok(()),
+        let Some(prior) = from.prior(sandbox.state.unowned()) else {
+            return Ok(());
         };
         let Some(recorded) =
             self.activation_seal
@@ -1502,7 +1579,15 @@ fn report(status: &ActivationSealStatus, plan: DrainPlan, done: bool) -> DrainNo
         pending: plan
             .pending
             .into_iter()
-            .map(|(sandbox_id, action)| DrainPending { sandbox_id, action })
+            .map(|(sandbox_id, action)| DrainPending {
+                sandbox_id,
+                reason: if action == HOLD {
+                    HOLD_REASON.to_owned()
+                } else {
+                    String::new()
+                },
+                action,
+            })
             .collect(),
         blocked: plan
             .blocked
@@ -1510,6 +1595,24 @@ fn report(status: &ActivationSealStatus, plan: DrainPlan, done: bool) -> DrainNo
             .map(|(sandbox_id, reason)| DrainBlocked { sandbox_id, reason })
             .collect(),
         done,
+        gentle_epoch: None,
+    }
+}
+
+/// The epoch a drain call names, and whether it drains gently: a gentle one
+/// names its epoch in `gentle_epoch` alone, with `epoch` 0 (which a node
+/// without gentle drains refuses before it seals) and no `cancel`.
+pub(super) fn drain_epoch(
+    epoch: u64,
+    cancel: bool,
+    gentle_epoch: u64,
+) -> Result<(u64, bool), Status> {
+    match (epoch, gentle_epoch) {
+        (_, 0) => Ok((epoch, false)),
+        (0, gentle_epoch) if !cancel => Ok((gentle_epoch, true)),
+        _ => Err(Status::invalid_argument(
+            "a gentle drain names its epoch in gentle_epoch alone, with epoch 0 and no cancel",
+        )),
     }
 }
 

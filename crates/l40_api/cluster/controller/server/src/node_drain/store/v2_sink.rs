@@ -17,7 +17,9 @@ use uuid::Uuid;
 
 use super::*;
 use crate::node_drain::guarded_delete::{self, GuardedDelete, NodeIdentity};
-use crate::node_drain::v2::{DrainV2Sink, EvacuationRecord, Fence, TerminatedDelete, V2Node};
+use crate::node_drain::v2::{
+    DrainCallError, DrainV2Sink, EvacuationRecord, Fence, TerminatedDelete, V2Node,
+};
 
 /// How long one `DrainNode` call may take; the node answers without waiting.
 const DRAIN_NODE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -59,9 +61,13 @@ struct V2NodeRow {
     id: NodeId,
     drain_phase: Option<String>,
     epoch: Option<i64>,
+    gentle: bool,
+    mode_forced: bool,
+    deadline: Option<i64>,
+    deadline_due: bool,
     cancel: bool,
     waiting: bool,
-    unrecorded: Option<serde_json::Value>,
+    report: Option<serde_json::Value>,
     k8s_node_name: Option<String>,
     k8s_node_uid: Option<String>,
     instance_id: Option<String>,
@@ -74,15 +80,26 @@ struct V2NodeRow {
 }
 
 /// Every v2 drain's node of the Kubernetes substrate, with its Kubernetes
-/// identity, recorded instance and heartbeat.
+/// identity, recorded instance and heartbeat. A gentle drain's epoch is
+/// `gentle_epoch` until it turns forced or reaches `drained`. Whether its
+/// deadline is due is read by the database clock, the one the escalation's
+/// statement reads.
 static LIST_V2_NODES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let fresh = pplx_space_sandbox_residency::node_heartbeat_fresh("n.id");
     sql!(format!(
         "SELECT n.id, n.drain_phase,
-                (n.drain_status->>'epoch')::BIGINT AS epoch,
+                COALESCE(n.drain_status->>'epoch', n.drain_status->>'gentle_epoch')::BIGINT
+                    AS epoch,
+                COALESCE(n.drain_status ? 'gentle_epoch', FALSE) AS gentle,
+                COALESCE(n.drain_mode = 'forced', FALSE) AS mode_forced,
+                (n.drain_status->>'deadline')::BIGINT AS deadline,
+                COALESCE(
+                    (n.drain_status->>'deadline')::BIGINT <= EXTRACT(EPOCH FROM NOW()),
+                    FALSE
+                ) AS deadline_due,
                 COALESCE((n.drain_status->>'cancel')::BOOLEAN, FALSE) AS cancel,
                 COALESCE((n.drain_status->>'waiting')::BOOLEAN, FALSE) AS waiting,
-                n.drain_status->'report'->'unrecorded' AS unrecorded,
+                n.drain_status->'report' AS report,
                 k.k8s_node_name, k.k8s_node_uid, k.instance_id,
                 {fresh} AS heartbeat_fresh,
                 {FENCE} AS fence,
@@ -104,22 +121,37 @@ pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Er
         .await?;
     Ok(rows
         .into_iter()
-        .map(|row| V2Node {
-            id: row.id,
-            phase: row.drain_phase,
-            epoch: row.epoch.and_then(|epoch| u64::try_from(epoch).ok()),
-            cancel: row.cancel,
-            waiting: row.waiting,
-            unrecorded_since: unrecorded_since(row.unrecorded.as_ref()),
-            k8s_node_name: row.k8s_node_name,
-            k8s_node_uid: row.k8s_node_uid,
-            instance_id: row.instance_id,
-            heartbeat_fresh: row.heartbeat_fresh,
-            fence: row.fence,
-            dispatched: row.dispatched,
-            dispatched_at: row.dispatched_at,
-            terminated_observed_at: row.terminated_observed_at,
-            decrement_capacity: row.decrement_capacity,
+        .map(|row| {
+            let epoch = row.epoch.and_then(|epoch| u64::try_from(epoch).ok());
+            V2Node {
+                id: row.id,
+                phase: row.drain_phase,
+                epoch,
+                gentle: row.gentle,
+                mode_forced: row.mode_forced,
+                deadline: row.deadline,
+                deadline_due: row.deadline_due,
+                report_holds_only: crate::node_drain::v2::report_holds_only(
+                    row.report.as_ref(),
+                    epoch,
+                ),
+                cancel: row.cancel,
+                waiting: row.waiting,
+                unrecorded_since: unrecorded_since(
+                    row.report
+                        .as_ref()
+                        .and_then(|report| report.get("unrecorded")),
+                ),
+                k8s_node_name: row.k8s_node_name,
+                k8s_node_uid: row.k8s_node_uid,
+                instance_id: row.instance_id,
+                heartbeat_fresh: row.heartbeat_fresh,
+                fence: row.fence,
+                dispatched: row.dispatched,
+                dispatched_at: row.dispatched_at,
+                terminated_observed_at: row.terminated_observed_at,
+                decrement_capacity: row.decrement_capacity,
+            }
         })
         .collect())
 }
@@ -157,7 +189,7 @@ pub(crate) async fn admit_v2_evacuation(
           WHERE id = $1
             AND drain_engine = 'v2'
             AND drain_phase = 'draining'
-            AND (drain_status->>'epoch')::BIGINT = $2
+            AND COALESCE(drain_status->>'epoch', drain_status->>'gentle_epoch')::BIGINT = $2
             AND COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE)"
     ))
     .bind(node_id)
@@ -403,7 +435,7 @@ static LET_GO_V2_NODE: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
                 drain_last_error = $5
           WHERE n.id = $1
             AND n.drain_engine = 'v2'
-            AND (n.drain_status->>'epoch')::BIGINT = $2
+            AND COALESCE(n.drain_status->>'epoch', n.drain_status->>'gentle_epoch')::BIGINT = $2
             AND n.drain_phase IS NOT DISTINCT FROM $3::TEXT
             AND {FENCE} IS NOT DISTINCT FROM $4::TEXT"
     ))
@@ -540,7 +572,7 @@ pub(crate) async fn record_v2_report(
                 drain_last_error = NULL
           WHERE id = $1
             AND drain_engine = 'v2'
-            AND (drain_status->>'epoch')::BIGINT = $2"
+            AND COALESCE(drain_status->>'epoch', drain_status->>'gentle_epoch')::BIGINT = $2"
     ))
     .bind(node_id)
     .bind(epoch)
@@ -552,7 +584,10 @@ pub(crate) async fn record_v2_report(
 }
 
 /// `draining -> drained` for the v2 drain under `epoch`, only with a stored
-/// report that is `done` under that same epoch.
+/// report that is `done` under that same epoch. A gentle drain's epoch moves
+/// to `epoch`: a `drained` node holds nothing, so from here on every reader,
+/// a controller that predates gentle drains included, drains it as a forced
+/// one.
 pub(crate) async fn advance_v2_drained(
     pool: &PgPool,
     node_id: NodeId,
@@ -560,11 +595,16 @@ pub(crate) async fn advance_v2_drained(
 ) -> Result<bool, sqlx::Error> {
     Ok(sqlx::query(sql!(
         "UPDATE nodes
-            SET drain_phase = 'drained'
+            SET drain_phase = 'drained',
+                drain_status = CASE
+                    WHEN drain_status ? 'gentle_epoch'
+                    THEN (drain_status - 'gentle_epoch') || jsonb_build_object('epoch', $2)
+                    ELSE drain_status
+                END
           WHERE id = $1
             AND drain_engine = 'v2'
             AND drain_phase = 'draining'
-            AND (drain_status->>'epoch')::BIGINT = $2
+            AND COALESCE(drain_status->>'epoch', drain_status->>'gentle_epoch')::BIGINT = $2
             AND (drain_status->'report'->>'sealed_epoch')::BIGINT = $2
             AND COALESCE((drain_status->'report'->>'done')::BOOLEAN, FALSE)"
     ))
@@ -590,8 +630,42 @@ pub(crate) async fn finish_v2_cancel(
           WHERE id = $1
             AND drain_engine = 'v2'
             AND drain_phase IS NULL
-            AND (drain_status->>'epoch')::BIGINT = $2
+            AND COALESCE(drain_status->>'epoch', drain_status->>'gentle_epoch')::BIGINT = $2
             AND COALESCE((drain_status->>'cancel')::BOOLEAN, FALSE)"
+    ))
+    .bind(node_id)
+    .bind(epoch)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
+/// Turn the gentle `draining` drain under `epoch` forced, once its deadline
+/// has passed by the database clock or an operator has set `drain_mode`
+/// forced: `drain_mode` forced, the epoch moved from `gentle_epoch` to
+/// `epoch`, and `escalated` (`deadline` or `operator`) with `escalated_at`, in
+/// Unix seconds. Returns false for a row that is no longer that epoch's
+/// gentle `draining` drain due to turn.
+pub(crate) async fn escalate_v2_drain(
+    pool: &PgPool,
+    node_id: NodeId,
+    epoch: i64,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_mode = 'forced',
+                drain_status = (drain_status - 'gentle_epoch') || jsonb_build_object(
+                    'epoch', $2,
+                    'escalated', CASE WHEN drain_mode = 'forced' THEN 'operator' ELSE 'deadline' END,
+                    'escalated_at', EXTRACT(EPOCH FROM NOW())::BIGINT
+                )
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND drain_phase = 'draining'
+            AND (drain_status->>'gentle_epoch')::BIGINT = $2
+            AND (drain_mode = 'forced'
+                 OR (drain_status->>'deadline')::BIGINT <= EXTRACT(EPOCH FROM NOW()))"
     ))
     .bind(node_id)
     .bind(epoch)
@@ -762,30 +836,26 @@ impl DrainV2Sink for SubstrateSink {
     async fn drain_node(
         &self,
         node_id: NodeId,
-        epoch: u64,
-        cancel: bool,
-        forget: &[String],
-    ) -> Result<DrainNodeResponse, String> {
+        request: DrainNodeRequest,
+    ) -> Result<DrainNodeResponse, DrainCallError> {
         let target = node_api_row(&self.pool, node_id)
             .await
-            .map_err(|error| format!("node endpoint lookup failed: {error}"))?
-            .ok_or_else(|| format!("node {node_id} not found"))?;
+            .map_err(|error| {
+                DrainCallError::other(format!("node endpoint lookup failed: {error}"))
+            })?
+            .ok_or_else(|| DrainCallError::other(format!("node {node_id} not found")))?;
         let mut client = connect_internal_node_api_client_for_target(
             self.substrate.kubernetes(),
             &target.as_target(),
             DRAIN_NODE_TIMEOUT,
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| DrainCallError::other(error.to_string()))?;
         client
-            .drain_node(DrainNodeRequest {
-                epoch,
-                cancel,
-                forget: forget.to_vec(),
-            })
+            .drain_node(request)
             .await
             .map(tonic::Response::into_inner)
-            .map_err(|status| status.to_string())
+            .map_err(|status| DrainCallError::status(&status))
     }
 
     async fn record_evacuation(
@@ -815,6 +885,12 @@ impl DrainV2Sink for SubstrateSink {
 
     async fn advance_drained(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
         advance_v2_drained(&self.pool, node_id, epoch_i64(epoch)?)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn escalate(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
+        escalate_v2_drain(&self.pool, node_id, epoch_i64(epoch)?)
             .await
             .map_err(|error| error.to_string())
     }

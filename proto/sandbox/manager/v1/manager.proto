@@ -247,6 +247,18 @@ service SandboxManager {
   // snapshot is durable, with the lifecycle it had; a stopped one once its
   // disk is. A `failed` row is not reported, and blocks nothing once its
   // artifacts are durable.
+  //
+  // A gentle drain names its epoch in `gentle_epoch` and leaves `epoch` 0. It
+  // seals the node and walks every row as a forced drain does, except that it
+  // holds a sandbox in `started`: it doesn't suspend it, and reports it
+  // `pending` with the action `hold` until it leaves `started` on its own (the
+  // node's idle auto-lifecycle, or a user's suspend, stop or delete). A row
+  // that suspends on its own is not the drain's: it is not reported
+  // evacuated, and its upload is finished like any other artifact without a
+  // durable copy. The answer echoes `gentle_epoch`. A forced call under the
+  // same epoch continues the same drain, holding nothing. A node that predates
+  // gentle drains reads `epoch` 0 and refuses the call before it seals
+  // anything, so a gentle drain never runs on it as a forced one.
   rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
 
   // Get the resolved effective network policy for a sandbox.
@@ -2142,6 +2154,10 @@ message DrainNodeRequest {
   // recorded since a cancel call reported it; the node forgets the drain's
   // record of each before it reports.
   repeated string forget = 3;
+  // A gentle drain under this epoch, with `epoch` 0 and no `cancel` (see
+  // `DrainNode`). Nonzero, at most 2^63 - 1, like `epoch`; 0 for a forced drain
+  // or a cancel.
+  uint64 gentle_epoch = 4;
 }
 
 // The lifecycle a drained resident had, which the control plane restores it
@@ -2166,9 +2182,12 @@ message DrainEvacuated {
 message DrainPending {
   string sandbox_id = 1;
   // What it waits for: `suspend`, `publish_disk`, `upload`, `activation` for
-  // an activation admitted before the seal that is still in flight, or
-  // `settle:<state>` for a row in a transition the drain does not drive.
+  // an activation admitted before the seal that is still in flight,
+  // `settle:<state>` for a row in a transition the drain does not drive, or
+  // `hold` for a running sandbox a gentle drain leaves running.
   string action = 2;
+  // Why, for an operator, when the action alone doesn't say: set for `hold`.
+  string reason = 3;
 }
 
 // Something the drain cannot make durable, or could not inspect. Blocks
@@ -2187,6 +2206,10 @@ message DrainNodeResponse {
   repeated DrainPending pending = 3;
   repeated DrainBlocked blocked = 4;
   bool done = 5;
+  // The request's `gentle_epoch`, once the node has drained gently under it;
+  // unset for a forced call or a cancel. The control plane trusts a gentle
+  // call's answer only with it.
+  optional uint64 gentle_epoch = 6;
 }
 
 // Node-local facts about the current legacy quarantine-recovery episode.
