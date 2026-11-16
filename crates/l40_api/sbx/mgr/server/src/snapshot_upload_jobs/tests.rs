@@ -134,6 +134,93 @@ async fn stalled_transfer_probe_is_bounded_without_cancelling_remote_work() {
     );
 }
 
+fn completed_transfer(bytes: u64) -> pplx_space_volmgr_client::proto::GetTransferJobResponse {
+    pplx_space_volmgr_client::proto::GetTransferJobResponse {
+        job: Some(pplx_space_volmgr_client::proto::TransferJob {
+            status: TransferJobStatus::Completed as i32,
+            bytes_transferred: bytes,
+            ..Default::default()
+        }),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn transfer_poll_waits_through_a_volume_manager_restart() {
+    let started = tokio::time::Instant::now();
+    let restart = Duration::from_secs(120);
+    let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let observation = poll_artifact_job_with(
+        "sandbox",
+        JobId::new(),
+        {
+            let probes = std::sync::Arc::clone(&probes);
+            move || {
+                probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let restarting = started.elapsed() < restart;
+                async move {
+                    if restarting {
+                        Err(tonic::Status::unavailable(
+                            "Connection refused (os error 111)",
+                        ))
+                    } else {
+                        Ok(completed_transfer(42))
+                    }
+                }
+            }
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect("the transfer completes once volume-manager is back");
+
+    assert_eq!(observation.bytes, 42);
+    assert!(started.elapsed() >= restart);
+    assert!(probes.load(std::sync::atomic::Ordering::SeqCst) > 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn transfer_poll_retries_the_upload_once_volume_manager_stays_unreachable() {
+    let started = tokio::time::Instant::now();
+
+    let error = poll_artifact_job_with(
+        "sandbox",
+        JobId::new(),
+        || async {
+            Err(tonic::Status::unavailable(
+                "Connection refused (os error 111)",
+            ))
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, JobError::Retriable(_)), "{error:?}");
+    assert!(started.elapsed() >= pplx_space_volmgr_client::VOLUME_MANAGER_RESTART_BUDGET);
+    assert!(
+        started.elapsed()
+            < pplx_space_volmgr_client::VOLUME_MANAGER_RESTART_BUDGET + Duration::from_secs(5)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn transfer_poll_treats_a_missing_volume_manager_socket_as_a_restart() {
+    let started = tokio::time::Instant::now();
+
+    let error = wait_for_artifact_job(
+        &absent_volume_manager_socket(),
+        "sandbox",
+        &JobId::new(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, JobError::Retriable(_)), "{error:?}");
+    assert!(started.elapsed() >= pplx_space_volmgr_client::VOLUME_MANAGER_RESTART_BUDGET);
+}
+
 #[test]
 fn refund_interrupted_running_attempts_only_touches_running_snapshot_upload_jobs() {
     let conn = crate::db::Connection::open_in_memory();
