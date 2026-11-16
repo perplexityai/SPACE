@@ -19,6 +19,7 @@
 #   cycle-fleet.sh --context <ctx>                       # show what would cycle
 #   cycle-fleet.sh --context <ctx> --execute
 #   cycle-fleet.sh --context <ctx> --execute --batch 10 --min-age 1h
+#   cycle-fleet.sh --context <ctx> --execute --hand-over-sockets
 #   cycle-fleet.sh --context <ctx> --node <node-name> --refresh-config
 #   cycle-fleet.sh --context <ctx> --node <node-name> --max 2 -- <sandbox-id> <sandbox-id>
 #   cycle-fleet.sh --context <ctx> --node <node-name> --refresh-config --export-ids <file>
@@ -29,6 +30,8 @@
 # to `space-sbxmgr cycle-net-gateway` (e.g. --min-age 2h, --max 20,
 # --sleep 5s). Default --max is 100000 so one run drains a node, and default
 # --sleep is 0.5s — the CLI's 2s pacing is what dominates a fleet sweep.
+# --hand-over-sockets, passed through the same way, keeps guest traffic sent
+# during each cycle (see docs/space/aws/net-gateway-cycle-runbook.md).
 # Exits nonzero if any node had a failed preview or cycle.
 # --node selects one exact host (including canary workers); without it the
 # existing regular-worker fleet scope is unchanged. --refresh-config selects

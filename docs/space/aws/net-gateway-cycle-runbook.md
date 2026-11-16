@@ -22,6 +22,22 @@ those explicit IDs. `--export-ids <file>` saves a cohort without cycling; use
 not describe Kubernetes node health. Inspect the preceding Job logs to find
 the actual failure.
 
+## Keep guest traffic during a cycle
+
+A cycle stops the old gateway before its replacement listens, and the sandbox
+firewall drops what the guest sends in between, DNS queries included. A lost
+DNS query costs the guest a full resolver retry, five seconds with glibc's
+defaults. Add `--hand-over-sockets` to hand the old gateway's listening sockets
+to its replacement: the runtime supervisor stops the old gateway and starts the
+new one on the same kernel sockets, so that traffic waits for the new gateway
+instead. Connections the old gateway already relays still drop.
+
+The flag is off unless given. Each cycled line reports whether the sockets
+were handed over. A node whose node-manager or runtime supervisor predates the
+handover stops and relaunches the gateway as without the flag, and the line
+says so. The host `space-sbxmgr` that `--execute` runs rejects the flag until
+the node's image includes it, so roll the node services out first.
+
 ## Protected control endpoint rollout
 
 Sandbox-manager clients connect directly to the isolated gateway listener under

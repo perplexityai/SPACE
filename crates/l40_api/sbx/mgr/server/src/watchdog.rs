@@ -1137,6 +1137,31 @@ impl SandboxWatchdog {
     /// relaunch entry point for callers outside the watchdog loop — the clear
     /// cannot be forgotten because it is not the caller's job.
     pub async fn relaunch_netgtw(&self, sandbox_id: &str, uid: u32) -> Result<u32, String> {
+        self.relaunch_netgtw_replacing(sandbox_id, uid, None)
+            .await
+            .map(|relaunch| relaunch.pid)
+    }
+
+    /// Replace the live net-gateway at `old_pid` in one node-manager launch
+    /// that hands its listening sockets to the replacement. A returned pid
+    /// equal to `old_pid` means the node predates the handover and left the
+    /// old gateway running; nothing is committed then.
+    pub async fn replace_netgtw(
+        &self,
+        sandbox_id: &str,
+        uid: u32,
+        old_pid: u32,
+    ) -> Result<NetGatewayRelaunch, String> {
+        self.relaunch_netgtw_replacing(sandbox_id, uid, Some(old_pid))
+            .await
+    }
+
+    async fn relaunch_netgtw_replacing(
+        &self,
+        sandbox_id: &str,
+        uid: u32,
+        replace_gateway_pid: Option<u32>,
+    ) -> Result<NetGatewayRelaunch, String> {
         let info = self
             .sidecars
             .lock()
@@ -1157,6 +1182,7 @@ impl SandboxWatchdog {
             &self.state,
             &self.feature_flags,
             &self.node_manager,
+            replace_gateway_pid,
         )
         .await
         .map_err(|error| error.to_string())
@@ -3401,6 +3427,7 @@ async fn restart_netgtw(
         state,
         feature_flags,
         node_manager,
+        None,
     )
     .await?;
     Ok(())
@@ -3415,6 +3442,18 @@ async fn restart_netgtw(
 /// launch succeeded but its PID was not committed, runtime-supervisor returns
 /// that live process and this call finishes the interrupted commit instead of
 /// forking a duplicate.
+/// A relaunched net-gateway, and how many listening sockets it took over
+/// from the gateway it replaced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetGatewayRelaunch {
+    pub pid: u32,
+    pub inherited_sockets: u32,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the watchdog's shared state is passed through unchanged"
+)]
 async fn relaunch_netgtw(
     info: &SidecarInfo,
     db: &crate::db::SharedConnection,
@@ -3423,7 +3462,8 @@ async fn relaunch_netgtw(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
     node_manager: &NodeManagerConnector,
-) -> Result<u32, NetGatewayRelaunchError> {
+    replace_gateway_pid: Option<u32>,
+) -> Result<NetGatewayRelaunch, NetGatewayRelaunchError> {
     let failed = NetGatewayRelaunchError::Failed;
     let sandbox_id = &info.sandbox_id;
     let uid = info
@@ -3450,11 +3490,20 @@ async fn relaunch_netgtw(
             uid: process_uid,
             gid: process_uid,
             env: crate::sidecar_env::net_gateway_env(),
-            replace_gateway_pid: None,
+            replace_gateway_pid,
         })
         .await
-        .map_err(NetGatewayRelaunchError::Launch)?;
-    let pid = resp.get_ref().pid;
+        .map_err(NetGatewayRelaunchError::Launch)?
+        .into_inner();
+    let relaunch = NetGatewayRelaunch {
+        pid: resp.pid,
+        inherited_sockets: resp.inherited_gateway_sockets,
+    };
+    if replace_gateway_pid == Some(relaunch.pid) {
+        // The node predates the handover and returned the live gateway.
+        return Ok(relaunch);
+    }
+    let pid = relaunch.pid;
 
     commit_netgtw_replacement(sandbox_id, uid, info.netgtw_pid, pid, db, sidecars, state)
         .await
@@ -3463,10 +3512,11 @@ async fn relaunch_netgtw(
     tracing::info!(
         sandbox_id = %sandbox_id,
         pid,
+        inherited_sockets = relaunch.inherited_sockets,
         "net-gateway restarted"
     );
     network_policy_reconcile_queue.enqueue(sandbox_id.to_string());
-    Ok(pid)
+    Ok(relaunch)
 }
 
 async fn commit_netgtw_replacement(

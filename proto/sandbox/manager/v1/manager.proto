@@ -1916,6 +1916,12 @@ message TemplateNetworkPolicyUpdatedResponse {
 
 message CycleNetGatewayRequest {
   string sandbox_id = 1;
+  // Hand the old gateway's listening sockets to its replacement, so guest
+  // traffic sent during the cycle waits for the new gateway instead of being
+  // dropped. Off unless set. When node-manager or its runtime supervisor
+  // predates the handover, the cycle stops and relaunches the gateway as it
+  // does without this field.
+  bool hand_over_sockets = 2;
 }
 
 message CycleNetGatewayResponse {
@@ -1926,6 +1932,9 @@ message CycleNetGatewayResponse {
   // Build sha the old gateway last reported via stats probes, empty when it
   // never reported one (pre-reporting binary or no successful probe).
   string old_build_git_sha = 3;
+  // Listening sockets the new gateway took over from the old one; zero when
+  // it bound fresh ones.
+  uint32 inherited_sockets = 4;
 }
 
 message AdoptPoolSandboxRequest {
