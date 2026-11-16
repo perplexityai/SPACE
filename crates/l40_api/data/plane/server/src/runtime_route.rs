@@ -109,7 +109,7 @@ pub(super) async fn resolve_ecw_route_uncached(
     timeout: StdDuration,
 ) -> Result<EcwResolvedRoute, EcwProxyError> {
     let target = &origin.target;
-    let mut request = Request::new(UnstableResolveSandboxServiceRouteRequest {
+    let message = UnstableResolveSandboxServiceRouteRequest {
         sandbox_id: target.sandbox_id.to_string(),
         port: target.port,
         route_kind: ecw_sandbox_service_route_kind(target) as i32,
@@ -119,14 +119,25 @@ pub(super) async fn resolve_ecw_route_uncached(
             origin.traffic_access_token_sha256.clone(),
             origin.api_key_sha256.clone(),
         ),
-    });
-    request.set_timeout(timeout);
+    };
 
-    let mut client = state.cluster_api.for_sandbox(&target.sandbox_id);
+    let client = state.cluster_api.for_sandbox(&target.sandbox_id);
+    let started_at = tokio::time::Instant::now();
+    let deadline = started_at + timeout;
     let route = bounded_ecw_route_resolve(
         target,
         timeout,
-        client.unstable_resolve_sandbox_service_route(request),
+        crate::cluster_api_retry::retry_cluster_api_transport(
+            ECW_ROUTE_RESOLVE_OPERATION,
+            deadline.min(started_at + crate::cluster_api_retry::CLUSTER_API_TRANSPORT_RETRY_WINDOW),
+            || {
+                let mut client = client.clone();
+                let mut request = Request::new(message.clone());
+                request
+                    .set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                async move { client.unstable_resolve_sandbox_service_route(request).await }
+            },
+        ),
     )
     .await
     .map_err(|error| match error {
