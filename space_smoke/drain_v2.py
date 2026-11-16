@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any, cast
 from space_smoke.capabilities import (
     CommandSandbox,
     DrainV2Control,
+    DrainV2Status,
     DurableLifecycleSandbox,
     KindWorkerControl,
     ResidentLifecycleSandbox,
@@ -175,6 +176,12 @@ def scoped_drain_v2_env(
         with fixture.phase("put the standing drain v2 env back"):
             restore.release()
             lease.release()
+
+
+def drain_status_evidence(status: DrainV2Status | None) -> dict[str, Any] | None:
+    """A node's drain v2 columns as evidence carries them."""
+
+    return None if status is None else {"engine": status.engine, "status": status.status}
 
 
 def validate_drain_v2_keys(values: Mapping[str, object]) -> None:
@@ -625,7 +632,7 @@ class DrainV2Assertions:
         self._fixture.verify(
             status is not None and status.engine == "v2" and isinstance(epoch, int),
             "a v2 :drain must record the engine and the epoch with the phase",
-            status=None if status is None else (status.engine, status.status),
+            drain_status=drain_status_evidence(status),
         )
         assert isinstance(epoch, int)
         self._epoch = epoch
@@ -1076,7 +1083,7 @@ class DrainV2Assertions:
             self._fixture.verify(
                 time.monotonic() < deadline,
                 "the controller never recorded the dispatch of the termination",
-                drain_status=record,
+                drain_status=drain_status_evidence(columns),
                 last_error=self.last_error(),
             )
             self._fixture.wait(2)
@@ -1119,7 +1126,7 @@ class DrainV2Assertions:
             self._fixture.verify(
                 time.monotonic() < deadline,
                 "the terminated node's row was never deleted",
-                drain_status=getattr(self._control.drain_v2_status(node_id), "status", None),
+                drain_status=drain_status_evidence(self._control.drain_v2_status(node_id)),
                 last_error=self.last_error(),
             )
             self._fixture.wait(3)
@@ -1198,7 +1205,7 @@ class DrainV2Assertions:
             self._fixture.verify(
                 time.monotonic() < deadline,
                 "the replacement's registration never took the fenced row",
-                drain_status=columns.status,
+                drain_status=drain_status_evidence(columns),
             )
             self._fixture.wait(2)
         old_state = self._control.fake_ec2_instance_state(old)
@@ -1235,18 +1242,19 @@ class DrainV2Assertions:
         # The controller's loops, past the old instance's `terminated`: the
         # row, the replacement's now, stays.
         self._fixture.wait(DELETE_SETTLE_SECONDS)
+        columns = self._control.drain_v2_status(node_id)
         after = {
             "created_at": self._control.node_created_at(node_id),
             "recorded": self._control.node_recorded_instance(node_id),
             "drain_phase": self.drain_phase(),
-            "drain_status": getattr(self._control.drain_v2_status(node_id), "status", None),
+            "drain_status": drain_status_evidence(columns),
             "tombstoned": self._control.node_tombstoned(node_id),
         }
         self._fixture.verify(
             after["created_at"] == created_at
             and after["recorded"] == replacement
             and after["drain_phase"] is None
-            and after["drain_status"] is None
+            and (columns is None or columns.status is None)
             and not after["tombstoned"],
             "the replacement's row was deleted, replaced or drained after the old instance terminated",
             **after,
@@ -1329,7 +1337,7 @@ class DrainV2Assertions:
             self._fixture.verify(
                 time.monotonic() < deadline,
                 "the drain never let the dead node go",
-                drain_status=None if columns is None else columns.status,
+                drain_status=drain_status_evidence(columns),
                 last_error=self.last_error(),
             )
             self._fixture.wait(3)
@@ -1376,7 +1384,7 @@ class DrainV2Assertions:
             self._fixture.verify(
                 time.monotonic() < deadline,
                 "the undrained node's epoch was never cancelled",
-                status=None if status is None else (status.engine, status.status),
+                drain_status=drain_status_evidence(status),
             )
             self._fixture.wait(2)
         # The controller clears the columns only once its cancel answered the
