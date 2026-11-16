@@ -33,6 +33,11 @@ enum NetworkPolicyReconcileError {
     Operation(#[from] Status),
     #[error("network policy reconcile task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
+    /// The gateway was launched before a route-security RPC this build pushes,
+    /// and answers it UNIMPLEMENTED until it is cycled. The policy was still
+    /// reconciled.
+    #[error(transparent)]
+    UnsupportedGateway(Status),
 }
 
 impl NetworkPolicyReconcileError {
@@ -41,6 +46,49 @@ impl NetworkPolicyReconcileError {
     /// sandbox becomes eligible again, but this queue row is complete.
     fn is_terminal(&self) -> bool {
         matches!(self, Self::Refresh(error) if error.is_abandoned())
+    }
+
+    /// A route-security push's error. Its UNIMPLEMENTED is only ever an older
+    /// gateway's answer (`route_identity_push_status`,
+    /// `route_verification_key_push_status`).
+    fn route_security(status: Status) -> Self {
+        if status.code() == tonic::Code::Unimplemented {
+            Self::UnsupportedGateway(status)
+        } else {
+            Self::Operation(status)
+        }
+    }
+}
+
+/// How one queued reconcile ends: `Ok` completes its queue row, an error
+/// retries it. An abandoned refresh and a gateway too old for route security
+/// complete it, since retrying the same gateway cannot change either; the
+/// periodic sweep, and cycling the gateway, queue the sandbox again.
+fn queued_network_policy_result(
+    sandbox_id: &str,
+    result: Result<ApplyDecisionKind, NetworkPolicyReconcileError>,
+) -> Result<(), NetworkPolicyReconcileError> {
+    match result {
+        Ok(ApplyDecisionKind::Conflict) => {
+            Err(Status::aborted("network policy reconcile returned conflict").into())
+        }
+        Ok(decision) => {
+            tracing::debug!(sandbox_id, ?decision, "network policy reconciled");
+            Ok(())
+        }
+        Err(error) if error.is_terminal() => {
+            tracing::info!(sandbox_id, %error, "network policy reconcile abandoned");
+            Ok(())
+        }
+        Err(NetworkPolicyReconcileError::UnsupportedGateway(status)) => {
+            tracing::info!(
+                sandbox_id,
+                error = %status.message(),
+                "network policy reconciled; the net-gateway predates route security"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -99,8 +147,12 @@ where
     // would leave the gateway on a stale policy until the retry.
     let identity_result = route_identity_push.await;
     let decision = policy_reconcile.await?;
-    let identity_profile_version = identity_result?.identity_profile_version();
-    route_security_push(identity_profile_version).await?;
+    let identity_profile_version = identity_result
+        .map_err(NetworkPolicyReconcileError::route_security)?
+        .identity_profile_version();
+    route_security_push(identity_profile_version)
+        .await
+        .map_err(NetworkPolicyReconcileError::route_security)?;
     Ok(decision)
 }
 
@@ -941,20 +993,10 @@ impl SandboxManagerService {
         sandbox_id: &str,
     ) -> Result<(), NetworkPolicyReconcileError> {
         let started_at = Instant::now();
-        let result = match self.reconcile_network_policy_for_sandbox(sandbox_id).await {
-            Ok(ApplyDecisionKind::Conflict) => {
-                Err(Status::aborted("network policy reconcile returned conflict").into())
-            }
-            Ok(decision) => {
-                tracing::debug!(sandbox_id, ?decision, "network policy reconciled");
-                Ok(())
-            }
-            Err(error) if error.is_terminal() => {
-                tracing::info!(sandbox_id, %error, "network policy reconcile abandoned");
-                Ok(())
-            }
-            Err(error) => Err(error),
-        };
+        let result = queued_network_policy_result(
+            sandbox_id,
+            self.reconcile_network_policy_for_sandbox(sandbox_id).await,
+        );
         if let Err(error) = &result {
             tracing::warn!(sandbox_id, %error, "network policy reconcile failed");
         }

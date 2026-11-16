@@ -352,8 +352,11 @@ on that one call with `ExpectedGrpcStatus`. A marked call records the code in
 pulls PERMISSION_DENIED until sandbox-manager has registered it: a pull sent
 before the owner's first control call, within ten seconds of launch, and short
 of the last pending attempt. A marked pull's refusal is always retried; the
-refusal that ends the wait is still an ERROR span. Platform codes such as
-UNAVAILABLE and INTERNAL stay errors even when marked.
+refusal that ends the wait is still an ERROR span. sandbox-manager marks its
+route identity and verification-key pushes UNIMPLEMENTED, the answer of a
+net-gateway launched from a binary older than those RPCs, and counts that
+answer as the push's `unsupported` outcome. Platform codes such as UNAVAILABLE
+and INTERNAL stay errors even when marked.
 
 ## S3 client spans
 

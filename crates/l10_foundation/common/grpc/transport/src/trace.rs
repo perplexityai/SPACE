@@ -62,7 +62,9 @@ pub fn trace_grpc_client_transport<S>(inner: S) -> GrpcClientTrace<S> {
 /// a request extension when only the caller knows the code is expected, as a
 /// poll that is refused until the callee is ready. That call's client span
 /// records the code as success. Codes that report a platform failure, such as
-/// UNAVAILABLE or INTERNAL, stay errors even when marked.
+/// UNAVAILABLE or INTERNAL, stay errors even when marked. UNIMPLEMENTED can be
+/// marked: a caller that handles a peer built before the RPC existed expects it
+/// from that peer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExpectedGrpcStatus(tonic::Code);
 
@@ -77,7 +79,8 @@ impl ExpectedGrpcStatus {
     }
 
     fn honored(self) -> Option<tonic::Code> {
-        (self.0 != tonic::Code::Ok && !grpc_status_is_error(self.0)).then_some(self.0)
+        let markable = self.0 == tonic::Code::Unimplemented || !grpc_status_is_error(self.0);
+        (self.0 != tonic::Code::Ok && markable).then_some(self.0)
     }
 }
 
