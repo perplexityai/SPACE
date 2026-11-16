@@ -1,6 +1,7 @@
 use super::*;
 use pplx_space_common_grpc::{
     DEFAULT_GRPC_CONNECT_RETRY_POLICY, DEFAULT_LOCAL_GRPC_RETRY_POLICY, GrpcRetryContext,
+    GrpcRetryPolicy,
 };
 use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 use pplx_space_credmgr_client::{
@@ -23,6 +24,23 @@ const CREDENTIAL_INJECTION_TIMEOUT: Duration = DEFAULT_GRPC_CONNECT_RETRY_POLICY
 // retries of fast transport failures; it must not bound one in-flight RPC.
 const NETWORK_CREDENTIAL_PULL_TIMEOUT: Duration =
     NETWORK_CREDENTIAL_RESOLUTION_TIMEOUT.saturating_add(Duration::from_secs(5));
+
+// While the node credential agent cannot be reached at all, as while it hands
+// its socket to a restarted copy, resolution keeps retrying for the standard
+// connect budget that CREDENTIAL_INJECTION_TIMEOUT already reserves. Statuses
+// the agent answers, UNAVAILABLE included, keep the local retry window. The
+// pull timeout and the caller's deadline still end every retry.
+const CREDENTIAL_AGENT_UNREACHABLE_RETRY_POLICY: GrpcRetryPolicy =
+    DEFAULT_GRPC_CONNECT_RETRY_POLICY;
+
+/// The client's own transport failed the call: its connect was refused, or
+/// the connection carrying it was lost before an answer. Such a call may have
+/// reached the agent, but ResolveNetworkCredentials only reads, so it is safe
+/// to repeat.
+fn credential_agent_unreachable(status: &Status) -> bool {
+    pplx_space_common_grpc::is_client_connect_failure(status)
+        || pplx_space_common_grpc::is_client_transport_failure(status)
+}
 
 fn credential_resolution_deadline<T>(request: &Request<T>) -> (tokio::time::Instant, bool) {
     let started = tokio::time::Instant::now();
@@ -105,24 +123,53 @@ impl SandboxManagerService {
             execution_generation: execution_generation.get(),
             effective_network_policy_ref: policy_ref.to_string(),
         };
-        let credentials = pplx_space_common_grpc::retry_grpc_status_with_context(
-            "credential-manager",
-            "ResolveNetworkCredentials",
-            DEFAULT_LOCAL_GRPC_RETRY_POLICY,
-            GrpcRetryContext::with_timeout(NETWORK_CREDENTIAL_PULL_TIMEOUT),
-            || {
-                let mut client = client.clone();
-                let request = request.clone();
-                async move {
-                    client
-                        .resolve_network_credentials(request)
-                        .await
-                        .map(Response::into_inner)
-                        .map(|mut response| std::mem::take(&mut response.credentials))
-                }
-            },
-        )
-        .await?;
+        let context = GrpcRetryContext::with_timeout(NETWORK_CREDENTIAL_PULL_TIMEOUT);
+        let started = tokio::time::Instant::now();
+        let mut unreachable_retries = 0;
+        let credentials = loop {
+            let attempt = pplx_space_common_grpc::retry_grpc_status_with_context(
+                "credential-manager",
+                "ResolveNetworkCredentials",
+                DEFAULT_LOCAL_GRPC_RETRY_POLICY,
+                context.clone(),
+                || {
+                    let mut client = client.clone();
+                    let request = request.clone();
+                    async move {
+                        client
+                            .resolve_network_credentials(request)
+                            .await
+                            .map(Response::into_inner)
+                            .map(|mut response| std::mem::take(&mut response.credentials))
+                    }
+                },
+            )
+            .await;
+            let status = match attempt {
+                Ok(credentials) => break credentials,
+                Err(status) if credential_agent_unreachable(&status) => status,
+                Err(status) => return Err(status),
+            };
+            let budget = CREDENTIAL_AGENT_UNREACHABLE_RETRY_POLICY
+                .max_elapsed
+                .saturating_sub(started.elapsed())
+                .min(context.remaining().unwrap_or(Duration::MAX));
+            let Some(delay) = CREDENTIAL_AGENT_UNREACHABLE_RETRY_POLICY
+                .backoff_delay(unreachable_retries)
+                .filter(|delay| *delay < budget)
+            else {
+                return Err(status);
+            };
+            unreachable_retries += 1;
+            tracing::debug!(
+                sandbox_id = %sandbox.id,
+                retry = unreachable_retries,
+                retry_in = ?delay,
+                error = %status,
+                "node credential agent unreachable; retrying network credential resolution"
+            );
+            tokio::time::sleep(delay).await;
+        };
         pull.finish(crate::metrics::reconcile::NetworkCredentialPullOutcome::Success);
         Ok(credentials)
     }
