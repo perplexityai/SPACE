@@ -90,6 +90,7 @@ use tonic::transport::{Channel, Endpoint};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+mod cluster_api_retry;
 mod drain;
 mod ecw_connect;
 mod ecw_files;

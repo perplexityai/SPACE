@@ -110,19 +110,19 @@ async fn resolve_session_route_with_cache(
         return Ok(attached);
     }
 
-    let mut client = state.cluster_api.for_session(&session_id);
-    let read = start_revocation_read(state);
-    let response = client
-        .resolve_data_plane_session_route(ResolveDataPlaneSessionRouteRequest {
+    let (read, response) = resolve_data_plane_session_route(
+        state,
+        session_id,
+        ResolveDataPlaneSessionRouteRequest {
             session_id: session_id.to_string(),
             protocol_session_id: protocol_session_id(session_id),
             token_sha256: Some(token_sha256),
             required_scope: Some(required_scope),
             requested_transport: Some(native_requested_transport(session_id.kind()) as i32),
-        })
-        .await
-        .map_err(|status| route_resolution_error(&status))?
-        .into_inner();
+        },
+    )
+    .await
+    .map_err(|status| route_resolution_error(&status))?;
 
     let mut attached = attached_session_from_route_response(
         response,
@@ -427,19 +427,19 @@ pub(super) async fn resolve_session_route_internal(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
 ) -> Result<AttachedSession, StreamBridgeError> {
-    let mut client = state.cluster_api.for_session(&session_id);
-    let read = start_revocation_read(state);
-    let response = client
-        .resolve_data_plane_session_route(ResolveDataPlaneSessionRouteRequest {
+    let (read, response) = resolve_data_plane_session_route(
+        state,
+        session_id,
+        ResolveDataPlaneSessionRouteRequest {
             session_id: session_id.to_string(),
             protocol_session_id: protocol_session_id(session_id),
             token_sha256: None,
             required_scope: None,
             requested_transport: Some(native_requested_transport(session_id.kind()) as i32),
-        })
-        .await
-        .map_err(StreamBridgeError::ClusterStatus)?
-        .into_inner();
+        },
+    )
+    .await
+    .map_err(StreamBridgeError::ClusterStatus)?;
 
     let attached = attached_session_from_route_response(
         response,
@@ -454,6 +454,31 @@ pub(super) async fn resolve_session_route_internal(
         read,
     );
     Ok(attached)
+}
+
+/// Ask ClusterApi for a session's route, sending the request again while this
+/// client's transport to it fails ([`crate::cluster_api_retry`]). The
+/// revocation read is dated from the attempt that answered.
+async fn resolve_data_plane_session_route(
+    state: &DataPlaneState,
+    session_id: DataPlaneSessionId,
+    message: ResolveDataPlaneSessionRouteRequest,
+) -> Result<(RevocationRead, ResolveDataPlaneSessionRouteResponse), tonic::Status> {
+    let client = state.cluster_api.for_session(&session_id);
+    crate::cluster_api_retry::retry_cluster_api_transport(
+        "resolve_data_plane_session_route",
+        tokio::time::Instant::now() + crate::cluster_api_retry::CLUSTER_API_TRANSPORT_RETRY_WINDOW,
+        || {
+            let mut client = client.clone();
+            let message = message.clone();
+            let read = start_revocation_read(state);
+            async move {
+                let response = client.resolve_data_plane_session_route(message).await?;
+                Ok((read, response.into_inner()))
+            }
+        },
+    )
+    .await
 }
 
 pub(super) fn attached_session_from_route_response(
