@@ -50,6 +50,9 @@ pub struct AppState {
     /// fresh replica does not receive traffic with a cold cache.
     pub readiness: crate::controllers::substrate::ReflectorReady,
     pub drain_signal: pplx_space_service_lifecycle::DrainSignal,
+    /// The API's task tracker: graceful shutdown waits for request work
+    /// spawned on it to finish, after its request is gone.
+    pub task_tracker: TaskTracker,
     /// Claimed operations this process executes itself instead of leaving
     /// them to the dispatcher. See [`crate::inline_operations`].
     pub inline_operations: crate::inline_operations::InlineOperations,
@@ -263,6 +266,7 @@ impl AppState {
             native_sandbox_limits,
             readiness,
             drain_signal,
+            task_tracker,
             inline_operations,
             inline_lifecycle,
             template_build_state,

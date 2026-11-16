@@ -65,7 +65,7 @@ pub(crate) fn scripted_kube_client(
 
 /// [`scripted_kube_client`] for replies that must first observe or change
 /// other test state, such as the database, at the moment a request arrives.
-pub(super) fn scripted_kube_client_async<F, Fut>(reply: F) -> (Client, KubeLog)
+pub(crate) fn scripted_kube_client_async<F, Fut>(reply: F) -> (Client, KubeLog)
 where
     F: Fn(KubeRequest) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = KubeReply> + Send + 'static,
