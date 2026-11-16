@@ -760,6 +760,26 @@ fn partition_migration_keeps_the_checksum_releases_reverse() {
     );
 }
 
+const DIRTY_REF_REVISIONS: i64 = 20261031050126;
+
+/// Releases that list the dirty-ref revision migration without bundling it
+/// reverse it at startup only when the recorded checksum is this one, so
+/// rolling back to them stays image-only. See db/README.md.
+#[test]
+fn dirty_ref_revision_migration_keeps_the_checksum_releases_reverse() {
+    let service = sqlx::migrate!("../../../../../db/template-manager");
+    let up = service
+        .iter()
+        .find(|migration| {
+            migration.version == DIRTY_REF_REVISIONS && migration.migration_type.is_up_migration()
+        })
+        .unwrap();
+    assert_eq!(
+        hex::encode(up.checksum.as_ref()),
+        "c92d51875e4001e0346e759fcf75c45b1f3929e9c5b719eda3a32d6af21651fdb37559a1deea96f86c262efe8c6264dd"
+    );
+}
+
 #[test]
 fn partition_migration_keeps_existing_rows_in_the_legacy_partition() {
     let conn = Connection::open_in_memory().unwrap();
