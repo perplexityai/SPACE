@@ -234,6 +234,13 @@ pub async fn connect_uds_channel_with_endpoint_with_retry(
 /// A redial whose attempts all fail fails its call with the last dial's
 /// [`std::io::Error`], which [`crate::is_client_connect_failure`] still reads
 /// as proof that the call was never sent.
+///
+/// The redial runs while the channel gets ready, before tonic starts a call's
+/// `grpc-timeout`, so that timeout does not count the wait: a call can take
+/// up to the policy's `max_elapsed` longer than it, and only while nothing
+/// listens on the socket. A caller that needs a hard deadline bounds the call
+/// future itself, with [`tokio::time::timeout`]; a call dropped while it waits
+/// for the redial is never sent.
 pub async fn connect_uds_channel_with_retrying_redials(
     service_name: &'static str,
     socket_path: &Path,
