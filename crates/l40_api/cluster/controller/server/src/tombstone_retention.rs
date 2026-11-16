@@ -45,6 +45,9 @@ pub struct TickReport {
     pub direct_nodes_deleted: u64,
     pub templates_deleted: u64,
     pub deleted_sandboxes_deleted: u64,
+    /// Snapshot storage locations the sandbox prune detached for the
+    /// snapshot-storage sweeper, which can delete their objects.
+    pub storage_locations_detached: u64,
     pub direct_node_tombstones: u64,
     pub template_tombstones: u64,
     pub deleted_sandbox_rows: u64,
@@ -158,12 +161,13 @@ impl RetentionSink for TombstoneRetentionStore {
         .await?
         .len() as u64;
 
-        let deleted_sandbox_ids =
+        let pruned_sandboxes =
             tombstone::prune_deleted_sandboxes(&mut *tx, retention_secs, max_records).await?;
         // Same rationale as the sandbox store's delete_with_dependents (this
         // reaper predates it): receipts are not foreign-keyed to `sandboxes`,
         // and an orphaned receipt is unreachable by the suspended-fossil drain.
-        let deleted_reservations = deleted_sandbox_ids
+        let deleted_reservations = pruned_sandboxes
+            .sandbox_ids
             .iter()
             .map(|id| SandboxId::from_uuid(*id))
             .collect::<Vec<_>>();
@@ -172,7 +176,8 @@ impl RetentionSink for TombstoneRetentionStore {
             &deleted_reservations,
         )
         .await?;
-        let deleted_sandboxes_deleted = deleted_sandbox_ids.len() as u64;
+        let deleted_sandboxes_deleted = pruned_sandboxes.sandbox_ids.len() as u64;
+        let storage_locations_detached = pruned_sandboxes.storage_locations_detached;
 
         let direct_node_tombstones_count = sqlx::query_scalar::<_, i64>(sql!(
             "SELECT COUNT(*)
@@ -209,6 +214,7 @@ impl RetentionSink for TombstoneRetentionStore {
             direct_nodes_deleted,
             templates_deleted,
             deleted_sandboxes_deleted,
+            storage_locations_detached,
             direct_node_tombstones,
             template_tombstones,
             deleted_sandbox_rows,
@@ -247,10 +253,14 @@ where
                 "sandbox",
                 report.deleted_sandboxes_deleted,
             );
+            crate::metrics::tombstone::retention_storage_locations_detached(
+                report.storage_locations_detached,
+            );
             tracing::info!(
                 direct_nodes_deleted = report.direct_nodes_deleted,
                 templates_deleted = report.templates_deleted,
                 deleted_sandboxes_deleted = report.deleted_sandboxes_deleted,
+                storage_locations_detached = report.storage_locations_detached,
                 "tombstone retention pruned expired rows"
             );
         }
@@ -285,6 +295,7 @@ where
                             direct_nodes_deleted = report.direct_nodes_deleted,
                             templates_deleted = report.templates_deleted,
                             deleted_sandboxes_deleted = report.deleted_sandboxes_deleted,
+                            storage_locations_detached = report.storage_locations_detached,
                             direct_node_tombstones = report.direct_node_tombstones,
                             template_tombstones = report.template_tombstones,
                             deleted_sandbox_rows = report.deleted_sandbox_rows,
