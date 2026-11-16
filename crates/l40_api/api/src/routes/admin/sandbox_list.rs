@@ -15,6 +15,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use pplx_space_accounts::{NodeId, OrgId, UserId};
 use pplx_space_common_core::types::{SandboxId, TemplateName};
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
@@ -22,8 +23,8 @@ use time::OffsetDateTime;
 use super::support::{self, ContentionScope, api_error, require_managing_org_admin};
 use crate::controllers::sandbox::SandboxPageCursor;
 use crate::controllers::sandbox::list_page::admin::{
-    AdminSandboxFilter, AdminStoredLifecycle, NodeAssignment, PageBudget, SandboxPrefix,
-    SandboxSearch, SpacedVersionCount,
+    AdminSandboxFilter, NodeAssignment, PageBudget, SandboxPrefix, SandboxSearch,
+    SpacedVersionCount,
 };
 use crate::middleware::auth::AuthUser;
 use crate::models::{Sandbox, SandboxResponse};
@@ -255,10 +256,10 @@ where
     }
 }
 
-fn parse_lifecycles(value: &str) -> Result<Vec<AdminStoredLifecycle>, QueryError> {
+fn parse_lifecycles(value: &str) -> Result<Vec<StoredSandboxLifecycle>, QueryError> {
     let mut lifecycles = Vec::new();
     for part in value.split(',') {
-        let lifecycle = AdminStoredLifecycle::from_str(part)
+        let lifecycle = StoredSandboxLifecycle::from_str(part)
             .map_err(|_| bad_request(format!("unknown lifecycle {part:?}")))?;
         if !lifecycles.contains(&lifecycle) {
             lifecycles.push(lifecycle);
