@@ -4826,8 +4826,8 @@ name = "pplx-space-accounts"
 version = "0.8.2"
 dependencies = [
  "pplx-space-job-id",
+ "pplx-space-sql-codec",
  "serde",
- "sqlx",
  "thiserror 2.0.20",
  "uuid",
 ]
@@ -5017,6 +5017,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "syn 2.0.119",
  "tempfile",
  "thiserror 2.0.20",
  "toml",
@@ -5441,10 +5442,10 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-rpc-contracts",
  "pplx-space-semver",
+ "pplx-space-sql-codec",
  "pplx-space-sql-locator",
  "serde",
  "serde_json",
- "sqlx",
  "thiserror 2.0.20",
  "tracing",
  "uuid",
@@ -6246,9 +6247,9 @@ dependencies = [
 name = "pplx-space-job-id"
 version = "0.8.2"
 dependencies = [
+ "pplx-space-sql-codec",
  "rusqlite",
  "serde",
- "sqlx",
  "thiserror 2.0.20",
  "uuid",
 ]
@@ -6257,8 +6258,8 @@ dependencies = [
 name = "pplx-space-k8s-ids"
 version = "0.8.2"
 dependencies = [
+ "pplx-space-sql-codec",
  "serde",
- "sqlx",
  "thiserror 2.0.20",
 ]
 
@@ -7823,9 +7824,9 @@ dependencies = [
 name = "pplx-space-semver"
 version = "0.8.2"
 dependencies = [
+ "pplx-space-sql-codec",
  "semver",
  "serde",
- "sqlx",
  "thiserror 2.0.20",
 ]
 
@@ -8291,6 +8292,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
+]
+
+[[package]]
+name = "pplx-space-sql-codec"
+version = "0.8.2"
+dependencies = [
+ "rusqlite",
+ "sqlx",
 ]
 
 [[package]]

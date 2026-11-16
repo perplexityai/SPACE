@@ -215,7 +215,8 @@ pub(super) fn rule_removed(ctx: &Context) -> Vec<Finding> {
 }
 
 /// Every difference of `[rules.layers]` from the base branch's copy,
-/// including `[rules.layers.state]`'s shared catalogs, added or removed
+/// including a codec facade or one of its exports added or removed,
+/// `[rules.layers.state]`'s shared catalogs, added or removed
 /// with or without databases, its co-writer grants and the state checks'
 /// modes. The stores' own declarations are in their
 /// manifests, which the base inputs don't include, so a change to them is
@@ -312,11 +313,13 @@ fn changes(base: Option<&LayersPolicy>, policy: &LayersPolicy) -> Vec<(usize, St
         ("allowed_edges", "allowed edges"),
         ("state.shared_catalogs", "databases"),
         ("state.co_writers", "co-writers"),
+        ("storage.codec_facades", "exports"),
     ] {
         let (old, new) = match key {
             "store_users" => (&base.store_users, &policy.store_users),
             "allowed_edges" => (&base.allowed_edges, &policy.allowed_edges),
             "state.shared_catalogs" => (&base.shared_catalogs, &policy.shared_catalogs),
+            "storage.codec_facades" => (&base.storage.codec_facades, &policy.storage.codec_facades),
             _ => (&base.co_writers, &policy.co_writers),
         };
         let packages: BTreeSet<&String> = old.entries.keys().chain(new.entries.keys()).collect();
@@ -324,6 +327,21 @@ fn changes(base: Option<&LayersPolicy>, policy: &LayersPolicy) -> Vec<(usize, St
             let old_items = old.entries.get(package).map(|(items, _)| items);
             let new_entry = new.entries.get(package);
             let entry_line = new_entry.map_or(new.line.unwrap_or(policy.line), |(_, line)| *line);
+            // A codec facade without exports still exempts its codecs'
+            // dependencies on it.
+            if key == "storage.codec_facades" {
+                match (old_items, new_entry) {
+                    (None, Some(_)) => changes.push((
+                        entry_line,
+                        format!(": `{package}` was added to {table} {key}."),
+                    )),
+                    (Some(_), None) => changes.push((
+                        entry_line,
+                        format!(": `{package}` was removed from {table} {key}."),
+                    )),
+                    _ => {}
+                }
+            }
             // A shared catalog is no database of its own even with no
             // database listed, so adding or removing one changes what the
             // state checks read, whatever its list.

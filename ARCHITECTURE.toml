@@ -450,8 +450,10 @@ pplx-space-template-mgr-store = ["pplx-space-template-mgr"]
 pplx-space-db-migrator = ["pplx-space-db-migrate"]
 
 # Nothing above l30_storage reaches a database or object storage directly,
-# l20_domain never does, and l10_foundation does only in a storage helper,
-# which names nothing SPACE-specific. `helpers` lists every helper: an
+# l10_foundation does only in a storage helper, which names nothing
+# SPACE-specific, and l20_domain and other l10_foundation crates hold at most
+# a codec, behind an optional dependency on a codec facade (`codec_facades`).
+# `helpers` lists every helper: an
 # l10_foundation crate with a required dependency on a driver that the list
 # lacks is a storage_access finding until it is added. The sqlx and SQLite
 # sub-crates are listed so that depending on one instead of the umbrella crate
@@ -484,6 +486,44 @@ helpers = [
   "pplx-space-s3-http-client",
   "pplx-space-sqlite",
   "pplx-space-valkey",
+]
+
+# The codec facades: l10_foundation crates that re-export only a driver's
+# codec items, the traits and types that encode a value and decode it back,
+# behind features. Storage helpers aside, an l10_foundation or l20_domain
+# crate may reach a driver only through an optional normal dependency on one,
+# under [dependencies] or a [target.'cfg(…)'.dependencies] table, with
+# today's exceptions baselined, so a facade's exports are what every
+# codec may use. Each facade's `exports` lists, by driver, the
+# paths below the driver's root that its `pub use` items may name, each
+# exactly; storage_access reads the facade's source with syn, a Rust parser,
+# and reports anything else in it, with no baseline entry to tolerate it. A listed path no file
+# re-exports, an empty list and a key for no driver the facade depends on are
+# stale_entries findings, so the lists only shrink. `policy_changed` reports a
+# facade or an export added or removed: list only what encoding and decoding
+# a value needs, never a query, pool, connection, executor, transaction or
+# row.
+[rules.layers.storage.codec_facades."pplx-space-sql-codec".exports]
+rusqlite = [
+  "Result",
+  "types::FromSql",
+  "types::FromSqlError",
+  "types::FromSqlResult",
+  "types::ToSql",
+  "types::ToSqlOutput",
+  "types::ValueRef",
+]
+sqlx = [
+  "Decode",
+  "Encode",
+  "Postgres",
+  "Type",
+  "encode::IsNull",
+  "error::BoxDynError",
+  "postgres::PgArgumentBuffer",
+  "postgres::PgHasArrayType",
+  "postgres::PgTypeInfo",
+  "postgres::PgValueRef",
 ]
 
 [rules.layers]
@@ -613,9 +653,13 @@ mode = "required"
 [rules.layers.dev_direction.stale_entries]
 mode = "required"
 
-# Only stores and storage helpers depend on a driver or a helper; an optional
-# dependency counts too, except a codec behind a feature in l10_foundation.
-# Today's exceptions are baselined in [layers.storage_access].
+# Only stores and storage helpers depend on a driver, a helper or a codec
+# facade; an optional dependency counts too, with two exceptions, each an
+# optional normal dependency (under [dependencies] or a
+# [target.'cfg(…)'.dependencies] table): an l10_foundation or l20_domain
+# crate's on a facade, and a facade's own on a driver. Today's exceptions are baselined in
+# [layers.storage_access]; what a facade's source holds beyond its exports
+# gets no entry.
 [rules.layers.storage_access.no_crossing]
 mode = "required"
 
@@ -627,7 +671,9 @@ mode = "required"
 
 # Only stores and storage helpers turn on another crate's driver feature, one
 # that enables its optional dependency on a driver or helper, such as a codec
-# for its types. Today's exceptions are baselined in [layers.codec_features].
+# for its types, and l10_foundation and l20_domain crates only behind a
+# feature of their own, itself a driver feature. Today's exceptions are
+# baselined in [layers.codec_features].
 [rules.layers.codec_features.no_crossing]
 mode = "required"
 

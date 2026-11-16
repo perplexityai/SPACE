@@ -70,30 +70,39 @@ impl TryFrom<String> for PodUid {
 }
 
 #[cfg(feature = "sqlx")]
-impl sqlx::Type<sqlx::Postgres> for PodUid {
-    fn type_info() -> sqlx::postgres::PgTypeInfo {
-        <str as sqlx::Type<sqlx::Postgres>>::type_info()
+impl pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres> for PodUid {
+    fn type_info() -> pplx_space_sql_codec::postgres::PgTypeInfo {
+        <str as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::type_info()
     }
 
-    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
-        <str as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    fn compatible(ty: &pplx_space_sql_codec::postgres::PgTypeInfo) -> bool {
+        <str as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::compatible(ty)
     }
 }
 
 #[cfg(feature = "sqlx")]
-impl<'q> sqlx::Encode<'q, sqlx::Postgres> for PodUid {
+impl<'q> pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres> for PodUid {
     fn encode_by_ref(
         &self,
-        buf: &mut sqlx::postgres::PgArgumentBuffer,
-    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
-        <&str as sqlx::Encode<'q, sqlx::Postgres>>::encode(self.as_str(), buf)
+        buf: &mut pplx_space_sql_codec::postgres::PgArgumentBuffer,
+    ) -> Result<pplx_space_sql_codec::encode::IsNull, pplx_space_sql_codec::error::BoxDynError>
+    {
+        <&str as pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres>>::encode(
+            self.as_str(),
+            buf,
+        )
     }
 }
 
 #[cfg(feature = "sqlx")]
-impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PodUid {
-    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
-        let raw = <&str as sqlx::Decode<'r, sqlx::Postgres>>::decode(value)?;
+impl<'r> pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres> for PodUid {
+    fn decode(
+        value: pplx_space_sql_codec::postgres::PgValueRef<'r>,
+    ) -> Result<Self, pplx_space_sql_codec::error::BoxDynError> {
+        let raw =
+            <&str as pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres>>::decode(
+                value,
+            )?;
         Self::from_str(raw).map_err(Into::into)
     }
 }
@@ -156,30 +165,39 @@ impl TryFrom<String> for PodName {
 }
 
 #[cfg(feature = "sqlx")]
-impl sqlx::Type<sqlx::Postgres> for PodName {
-    fn type_info() -> sqlx::postgres::PgTypeInfo {
-        <str as sqlx::Type<sqlx::Postgres>>::type_info()
+impl pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres> for PodName {
+    fn type_info() -> pplx_space_sql_codec::postgres::PgTypeInfo {
+        <str as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::type_info()
     }
 
-    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
-        <str as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    fn compatible(ty: &pplx_space_sql_codec::postgres::PgTypeInfo) -> bool {
+        <str as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::compatible(ty)
     }
 }
 
 #[cfg(feature = "sqlx")]
-impl<'q> sqlx::Encode<'q, sqlx::Postgres> for PodName {
+impl<'q> pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres> for PodName {
     fn encode_by_ref(
         &self,
-        buf: &mut sqlx::postgres::PgArgumentBuffer,
-    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
-        <&str as sqlx::Encode<'q, sqlx::Postgres>>::encode(self.as_str(), buf)
+        buf: &mut pplx_space_sql_codec::postgres::PgArgumentBuffer,
+    ) -> Result<pplx_space_sql_codec::encode::IsNull, pplx_space_sql_codec::error::BoxDynError>
+    {
+        <&str as pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres>>::encode(
+            self.as_str(),
+            buf,
+        )
     }
 }
 
 #[cfg(feature = "sqlx")]
-impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PodName {
-    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
-        let raw = <&str as sqlx::Decode<'r, sqlx::Postgres>>::decode(value)?;
+impl<'r> pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres> for PodName {
+    fn decode(
+        value: pplx_space_sql_codec::postgres::PgValueRef<'r>,
+    ) -> Result<Self, pplx_space_sql_codec::error::BoxDynError> {
+        let raw =
+            <&str as pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres>>::decode(
+                value,
+            )?;
         Self::from_str(raw).map_err(Into::into)
     }
 }
@@ -306,30 +324,39 @@ impl TryFrom<String> for K8sNodeName {
 }
 
 #[cfg(feature = "sqlx")]
-impl sqlx::Type<sqlx::Postgres> for K8sNodeName {
-    fn type_info() -> sqlx::postgres::PgTypeInfo {
-        <str as sqlx::Type<sqlx::Postgres>>::type_info()
+impl pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres> for K8sNodeName {
+    fn type_info() -> pplx_space_sql_codec::postgres::PgTypeInfo {
+        <str as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::type_info()
     }
 
-    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
-        <str as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    fn compatible(ty: &pplx_space_sql_codec::postgres::PgTypeInfo) -> bool {
+        <str as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::compatible(ty)
     }
 }
 
 #[cfg(feature = "sqlx")]
-impl<'q> sqlx::Encode<'q, sqlx::Postgres> for K8sNodeName {
+impl<'q> pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres> for K8sNodeName {
     fn encode_by_ref(
         &self,
-        buf: &mut sqlx::postgres::PgArgumentBuffer,
-    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
-        <&str as sqlx::Encode<'q, sqlx::Postgres>>::encode(self.as_str(), buf)
+        buf: &mut pplx_space_sql_codec::postgres::PgArgumentBuffer,
+    ) -> Result<pplx_space_sql_codec::encode::IsNull, pplx_space_sql_codec::error::BoxDynError>
+    {
+        <&str as pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres>>::encode(
+            self.as_str(),
+            buf,
+        )
     }
 }
 
 #[cfg(feature = "sqlx")]
-impl<'r> sqlx::Decode<'r, sqlx::Postgres> for K8sNodeName {
-    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
-        let raw = <&str as sqlx::Decode<'r, sqlx::Postgres>>::decode(value)?;
+impl<'r> pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres> for K8sNodeName {
+    fn decode(
+        value: pplx_space_sql_codec::postgres::PgValueRef<'r>,
+    ) -> Result<Self, pplx_space_sql_codec::error::BoxDynError> {
+        let raw =
+            <&str as pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres>>::decode(
+                value,
+            )?;
         Self::from_str(raw).map_err(Into::into)
     }
 }
@@ -392,30 +419,39 @@ impl TryFrom<String> for K8sNodeUid {
 }
 
 #[cfg(feature = "sqlx")]
-impl sqlx::Type<sqlx::Postgres> for K8sNodeUid {
-    fn type_info() -> sqlx::postgres::PgTypeInfo {
-        <str as sqlx::Type<sqlx::Postgres>>::type_info()
+impl pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres> for K8sNodeUid {
+    fn type_info() -> pplx_space_sql_codec::postgres::PgTypeInfo {
+        <str as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::type_info()
     }
 
-    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
-        <str as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    fn compatible(ty: &pplx_space_sql_codec::postgres::PgTypeInfo) -> bool {
+        <str as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::compatible(ty)
     }
 }
 
 #[cfg(feature = "sqlx")]
-impl<'q> sqlx::Encode<'q, sqlx::Postgres> for K8sNodeUid {
+impl<'q> pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres> for K8sNodeUid {
     fn encode_by_ref(
         &self,
-        buf: &mut sqlx::postgres::PgArgumentBuffer,
-    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
-        <&str as sqlx::Encode<'q, sqlx::Postgres>>::encode(self.as_str(), buf)
+        buf: &mut pplx_space_sql_codec::postgres::PgArgumentBuffer,
+    ) -> Result<pplx_space_sql_codec::encode::IsNull, pplx_space_sql_codec::error::BoxDynError>
+    {
+        <&str as pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres>>::encode(
+            self.as_str(),
+            buf,
+        )
     }
 }
 
 #[cfg(feature = "sqlx")]
-impl<'r> sqlx::Decode<'r, sqlx::Postgres> for K8sNodeUid {
-    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
-        let raw = <&str as sqlx::Decode<'r, sqlx::Postgres>>::decode(value)?;
+impl<'r> pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres> for K8sNodeUid {
+    fn decode(
+        value: pplx_space_sql_codec::postgres::PgValueRef<'r>,
+    ) -> Result<Self, pplx_space_sql_codec::error::BoxDynError> {
+        let raw =
+            <&str as pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres>>::decode(
+                value,
+            )?;
         Self::from_str(raw).map_err(Into::into)
     }
 }

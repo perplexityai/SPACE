@@ -360,6 +360,23 @@ pub struct StorageConfig {
     /// a required dependency on a driver must be listed.
     #[serde(default)]
     pub helpers: PackageSet,
+    /// The Foundation crates that re-export only a driver's codec items,
+    /// behind features, each with those items: the one way a Foundation or
+    /// Domain crate may reach a driver, by an optional normal dependency on
+    /// one.
+    #[serde(default)]
+    pub codec_facades: BTreeMap<String, CodecFacade>,
+}
+
+/// `[rules.layers.storage.codec_facades.<package>]`: what a codec facade
+/// may re-export.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodecFacade {
+    /// Each driver to the paths below its root, such as
+    /// `postgres::PgTypeInfo` for `sqlx`, that the facade's `pub use` items
+    /// may name: each exactly, not what is below it.
+    pub exports: BTreeMap<String, PackageSet>,
 }
 
 /// A [`PackageSet`] with at least one package, since without a driver the
@@ -407,7 +424,8 @@ pub struct EdgeBehaviours {
     pub stale_entries: BehaviourConfig,
 }
 
-/// Package names, or database names in `shared_catalogs`, each listed once.
+/// Package names, database names in `shared_catalogs`, or a codec facade's
+/// exports of a driver, each listed once.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(try_from = "Vec<String>")]
 pub struct PackageSet(BTreeSet<String>);
@@ -485,6 +503,8 @@ pub struct StoragePolicy {
     pub line: Option<usize>,
     pub drivers: BTreeMap<String, usize>,
     pub helpers: BTreeMap<String, usize>,
+    /// Each codec facade to its exports, each as `<driver>::<path>`.
+    pub codec_facades: Entries<BTreeMap<String, usize>>,
 }
 
 impl LayersPolicy {
@@ -569,6 +589,12 @@ struct PolicyCoWriters {
 struct PolicyStorage {
     drivers: Option<Vec<Spanned<String>>>,
     helpers: Option<Vec<Spanned<String>>>,
+    codec_facades: Option<BTreeMap<Spanned<String>, PolicyFacade>>,
+}
+
+#[derive(Deserialize)]
+struct PolicyFacade {
+    exports: Option<BTreeMap<String, Vec<Spanned<String>>>>,
 }
 
 #[derive(Deserialize)]
@@ -645,6 +671,35 @@ impl LayersPolicy {
                 line: header("storage"),
                 drivers: packages(storage.drivers),
                 helpers: packages(storage.helpers),
+                codec_facades: Entries {
+                    line: text
+                        .lines()
+                        .position(|line| {
+                            line.trim_start()
+                                .starts_with("[rules.layers.storage.codec_facades")
+                        })
+                        .map(|index| index + 1),
+                    entries: storage
+                        .codec_facades
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(facade, table)| {
+                            let at = line(facade.span());
+                            let exports = table
+                                .exports
+                                .unwrap_or_default()
+                                .into_iter()
+                                .flat_map(|(driver, paths)| {
+                                    paths.into_iter().map(move |path| {
+                                        let at = line(path.span());
+                                        (format!("{driver}::{}", path.into_inner()), at)
+                                    })
+                                })
+                                .collect();
+                            (facade.into_inner(), (exports, at))
+                        })
+                        .collect(),
+                },
             },
         };
         let legacy_line = match &table.legacy {

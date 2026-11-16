@@ -66,11 +66,6 @@ pplx-space-api = [
 pplx-space-cluster-controller-server = [
   "pplx-space-common-core/sqlx",
 ]
-pplx-space-common-core = [
-  "pplx-space-accounts/sqlx",
-  "pplx-space-k8s-ids/sqlx",
-  "pplx-space-semver/sqlx",
-]
 pplx-space-credmgr = [
   "pplx-space-common-core/sqlx",
 ]
@@ -93,9 +88,6 @@ pplx-space-common-core = [
 ]
 
 [layers.storage_access]
-pplx-space-accounts = [
-  "sqlx",
-]
 pplx-space-api = [
   "deadpool-redis",
   "redis",
@@ -112,9 +104,6 @@ pplx-space-cluster-controller-server = [
   "sqlx",
 ]
 pplx-space-cluster-reconciler = [
-  "sqlx",
-]
-pplx-space-common-core = [
   "sqlx",
 ]
 pplx-space-credmgr = [

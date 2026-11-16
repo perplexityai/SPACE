@@ -5716,6 +5716,12 @@ fn layers_policy_changed() {
     let storage = |drivers: &str, helpers: &str| {
         format!("[rules.layers.storage]\ndrivers = [\n  {drivers},\n]\nhelpers = [{helpers}]\n")
     };
+    let facade = |sqlx: &str| {
+        format!(
+            "{}[rules.layers.storage.codec_facades.\"pplx-space-g\".exports]\nsqlx = [\n{sqlx}]\n",
+            storage("\"sqlx\"", "")
+        )
+    };
     let legacy = |list: &str| {
         format!("[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\nlegacy = [{list}]\n")
     };
@@ -5821,6 +5827,33 @@ fn layers_policy_changed() {
                      helpers.",
                 ),
             ],
+        ),
+        (
+            "a codec facade added",
+            layers_config(&storage("\"sqlx\"", ""), "required"),
+            layers_config(&facade("  \"Type\",\n"), "required"),
+            &[
+                (
+                    "[rules.layers.storage.codec_facades",
+                    "ARCHITECTURE.toml: `pplx-space-g` was added to [rules.layers] \
+                     storage.codec_facades.",
+                ),
+                (
+                    "  \"Type\",",
+                    "ARCHITECTURE.toml: `sqlx::Type` was added to the exports of `pplx-space-g` \
+                     in [rules.layers] storage.codec_facades.",
+                ),
+            ],
+        ),
+        (
+            "a codec facade's export removed",
+            layers_config(&facade("  \"Pool\",\n  \"Type\",\n"), "required"),
+            layers_config(&facade("  \"Type\",\n"), "required"),
+            &[(
+                "[rules.layers.storage.codec_facades",
+                "ARCHITECTURE.toml: `sqlx::Pool` was removed from the exports of \
+                 `pplx-space-g` in [rules.layers] storage.codec_facades.",
+            )],
         ),
         (
             "legacy changed",
@@ -6571,9 +6604,10 @@ const STORAGE_TABLES: &str = "[rules.layers.unmoved]\nl10_foundation = [\"pplx-s
 ///
 /// - `f` and `conn` are the helpers `helpers` lists, `f` with a required
 ///   `sqlx` and `conn` without a driver dependency;
-/// - `g` and `h` are Foundation codec crates: optional `sqlx` behind a
-///   `sqlx` feature (`h`'s default), and `g`'s optional `redis` behind
-///   Cargo's implicit feature;
+/// - `g` and `h` are Foundation crates with codec features: optional `sqlx`
+///   behind a `sqlx` feature (`h`'s default), and `g`'s optional `redis`
+///   behind Cargo's implicit feature, which `codec_facades` doesn't list, so
+///   each optional driver dependency is a finding;
 /// - `k`, a Foundation codec crate too, reaches drivers only through `g`:
 ///   its implicit `kv` turns on an optional dependency on `g` that requests
 ///   `redis`, its `pg` forwards to `kv/sqlx`, and its `json` forwards to
@@ -6583,7 +6617,8 @@ const STORAGE_TABLES: &str = "[rules.layers.unmoved]\nl10_foundation = [\"pplx-s
 ///   it, which keeps it from being a helper, and it forwards its `codec`
 ///   feature to `g`'s `sqlx`;
 /// - `d` (Domain) has an optional `sqlx`, enables `g`'s `sqlx`, and its
-///   `hdb` turns on an optional dependency on `h` that requests `sqlx`;
+///   `hdb` turns on an optional dependency on `h` that requests `sqlx`,
+///   behind a feature of its own;
 /// - `a` (API) depends on `sqlx`, `f`, `conn` and the legacy crate, enables
 ///   the legacy crate's `codec`, and forwards its own `pg` to `g?/sqlx`;
 /// - `p` (App) depends on `redis` and enables `a`'s `pg`, `q` takes `h`'s
@@ -6769,6 +6804,8 @@ fn layers_storage_checks() {
     let manifest = |path: &str| fs::read_to_string(ws.path().join(path)).unwrap();
     let at = |path: &str, needle: &str| format!("{path}:{}", line_with(&manifest(path), needle));
     let d = "crates/l20_domain/d/Cargo.toml";
+    let g = "crates/l10_foundation/g/Cargo.toml";
+    let h = "crates/l10_foundation/h/Cargo.toml";
     let b = "crates/l40_api/b/client/Cargo.toml";
     let p = "crates/l50_app/p/Cargo.toml";
     let q = "crates/l50_app/q/Cargo.toml";
@@ -6797,9 +6834,10 @@ fn layers_storage_checks() {
                 "{a}: pplx-space-a (l40_api) depends on sqlx, a driver ([rules.layers.storage] \
                  drivers lists it), a normal dependency, but only l30_storage crates and storage \
                  helpers may: nothing above l30_storage reaches a database or object storage \
-                 directly, l20_domain never does, and l10_foundation does only in a helper that \
-                 names nothing SPACE-specific. Fix one of: move the code that uses it \
-                 (sqlx::PgPool) into a store in l30_storage that lists pplx-space-a in \
+                 directly, l10_foundation does only in a helper that names nothing \
+                 SPACE-specific, and l20_domain and other l10_foundation crates hold at most a \
+                 codec, behind an optional normal dependency on a codec facade. Fix one of: move \
+                 the code that uses it (sqlx::PgPool) into a store in l30_storage that lists pplx-space-a in \
                  [rules.layers] store_users, and call the store; or, for a generic mechanism \
                  that names nothing SPACE-specific, into a storage helper in l10_foundation that \
                  such a store calls. Moving it into a new storage helper does not let \
@@ -6815,8 +6853,10 @@ fn layers_storage_checks() {
                 "{b}: pplx-space-b-client (l40_api) depends on pplx-space-f, a storage helper (it \
                  has a required dependency on sqlx), a normal dependency, but only l30_storage \
                  crates and storage helpers may: nothing above l30_storage reaches a database or \
-                 object storage directly, l20_domain never does, and l10_foundation does only in \
-                 a helper that names nothing SPACE-specific. Fix: a client reaches state only \
+                 object storage directly, l10_foundation does only in a helper that names \
+                 nothing SPACE-specific, and l20_domain and other l10_foundation crates hold at \
+                 most a codec, behind an optional normal dependency on a codec facade. Fix: a \
+                 client reaches state only \
                  through its server's protocol, and never depends on a store: move the code that \
                  uses it into the server, behind a store, and add a call for it to the protocol. \
                  Moving it into a new storage helper does not let pplx-space-b-client depend on \
@@ -6831,12 +6871,41 @@ fn layers_storage_checks() {
                 "{d}: pplx-space-d (l20_domain) depends on sqlx, a driver ([rules.layers.storage] \
                  drivers lists it), a normal dependency (optional, so a feature turns it on), but \
                  only l30_storage crates and storage helpers may: nothing above l30_storage \
-                 reaches a database or object storage directly, l20_domain never does, and \
-                 l10_foundation does only in a helper that names nothing SPACE-specific. Fix: \
-                 move the code that uses it, such as a codec's impls, into the store that \
-                 persists these types"
+                 reaches a database or object storage directly, l10_foundation does only in a \
+                 helper that names nothing SPACE-specific, and l20_domain and other \
+                 l10_foundation crates hold at most a codec, behind an optional normal \
+                 dependency on a codec facade. Fix: move the code that uses it, such as a \
+                 codec's impls, into the store that persists these types"
             ),
             at(d, "sqlx = {"),
+        ),
+        // An optional driver dependency is no codec in l10_foundation either.
+        (
+            "layers.storage_access.no_crossing",
+            format!(
+                "{g}: pplx-space-g (l10_foundation) depends on redis, a driver \
+                 ([rules.layers.storage] drivers lists it), a normal dependency (optional, so a \
+                 feature turns it on), but only l30_storage crates and storage helpers may"
+            ),
+            at(g, "redis = {"),
+        ),
+        (
+            "layers.storage_access.no_crossing",
+            format!(
+                "{g}: pplx-space-g (l10_foundation) depends on sqlx, a driver \
+                 ([rules.layers.storage] drivers lists it), a normal dependency (optional, so a \
+                 feature turns it on)"
+            ),
+            at(g, "sqlx = {"),
+        ),
+        (
+            "layers.storage_access.no_crossing",
+            format!(
+                "{h}: pplx-space-h (l10_foundation) depends on sqlx, a driver \
+                 ([rules.layers.storage] drivers lists it), a normal dependency (optional, so a \
+                 feature turns it on)"
+            ),
+            at(h, "sqlx = {"),
         ),
         (
             "layers.storage_access.no_crossing",
@@ -6844,9 +6913,11 @@ fn layers_storage_checks() {
                 "{legacy}: pplx-space-legacy (l10_foundation) depends on sqlx, a driver \
                  ([rules.layers.storage] drivers lists it), a normal dependency, but only \
                  l30_storage crates and storage helpers may: nothing above l30_storage reaches \
-                 a database or object storage directly, l20_domain never does, and \
-                 l10_foundation does only in a helper that names nothing SPACE-specific. Fix: \
-                 move the code that uses it into a store or a storage helper, as splitting \
+                 a database or object storage directly, l10_foundation does only in a helper \
+                 that names nothing SPACE-specific, and l20_domain and other l10_foundation \
+                 crates hold at most a codec, behind an optional normal dependency on a codec \
+                 facade. Fix: move the code that uses it into a store or a storage helper, as \
+                 splitting \
                  pplx-space-legacy up would: [rules.layers] legacy lists it, so it is \
                  no storage helper itself. See crates/tools/archcheck/README.md#layers."
             ),
@@ -6859,8 +6930,10 @@ fn layers_storage_checks() {
                 "{p}: pplx-space-p (l50_app) depends on redis, a driver ([rules.layers.storage] \
                  drivers lists it), a normal dependency, but only l30_storage crates and storage \
                  helpers may: nothing above l30_storage reaches a database or object storage \
-                 directly, l20_domain never does, and l10_foundation does only in a helper that \
-                 names nothing SPACE-specific. Fix: an app reaches state only through the \
+                 directly, l10_foundation does only in a helper that names nothing \
+                 SPACE-specific, and l20_domain and other l10_foundation crates hold at most a \
+                 codec, behind an optional normal dependency on a codec facade. Fix: an app \
+                 reaches state only through the \
                  l40_api crate that owns it: move the code that uses it into that crate, or a \
                  store it uses, and call the API crate. Moving it into a new storage helper does \
                  not let pplx-space-p depend on that helper: layers.storage_access checks that \
@@ -6874,7 +6947,8 @@ fn layers_storage_checks() {
                 "{a}: pplx-space-a (l40_api) enables the `sqlx` feature of pplx-space-g, by \
                  forwarding \"pplx-space-g?/sqlx\" from its own feature `pg`, which turns on its \
                  optional dependency on sqlx, but only l30_storage crates and storage helpers may \
-                 turn on a driver feature. Fix: drop the feature, move the code that needs it, \
+                 turn on a driver feature, directly or through a feature of an l10_foundation or \
+                 l20_domain crate's own that forwards to it. Fix: drop the feature, move the code that needs it, \
                  such as a codec or a client, into a store in l30_storage (which may enable the \
                  feature itself) or a storage helper, and reach the data through that. See \
                  crates/tools/archcheck/README.md#layers."
@@ -6926,15 +7000,6 @@ fn layers_storage_checks() {
                  features = [\"sqlx\"]"
             ),
             at(d, "pplx-space-g ="),
-        ),
-        (
-            "layers.codec_features.no_crossing",
-            format!(
-                "{d}: pplx-space-d (l20_domain) enables the `sqlx` feature of pplx-space-h, with \
-                 features = [\"sqlx\"] on a normal dependency, which turns on its optional \
-                 dependency on sqlx"
-            ),
-            at(d, "pplx-space-h ="),
         ),
         (
             "layers.codec_features.no_crossing",
@@ -7019,6 +7084,9 @@ fn layers_storage_checks() {
         ("pplx-space-a", "sqlx"),
         ("pplx-space-b-client", "pplx-space-f"),
         ("pplx-space-d", "sqlx"),
+        ("pplx-space-g", "redis"),
+        ("pplx-space-g", "sqlx"),
+        ("pplx-space-h", "sqlx"),
         ("pplx-space-legacy", "sqlx"),
         ("pplx-space-p", "redis"),
     ];
@@ -7029,7 +7097,6 @@ fn layers_storage_checks() {
         ("pplx-space-b-client", "pplx-space-k/json"),
         ("pplx-space-b-client", "pplx-space-k/kv"),
         ("pplx-space-d", "pplx-space-g/sqlx"),
-        ("pplx-space-d", "pplx-space-h/sqlx"),
         ("pplx-space-p", "pplx-space-a/pg"),
         ("pplx-space-q", "pplx-space-d/hdb"),
         ("pplx-space-q", "pplx-space-h/default"),
@@ -7050,7 +7117,7 @@ fn layers_storage_checks() {
     let kept: Vec<(&str, &str)> = codecs
         .iter()
         .copied()
-        .filter(|&(from, to)| from != "pplx-space-q" && to != "pplx-space-h/sqlx")
+        .filter(|&(from, _)| from != "pplx-space-q")
         .collect();
     let ws = storage_workspace(
         STORAGE_TABLES,
@@ -7106,8 +7173,9 @@ fn layers_storage_checks() {
         "{f}: pplx-space-f (l10_foundation) depends on sqlx, a driver ([rules.layers.storage] \
          drivers lists it), a normal dependency, but only l30_storage crates and storage helpers \
          may: nothing above l30_storage reaches a database or object storage directly, \
-         l20_domain never does, and l10_foundation does only in a helper that names nothing \
-         SPACE-specific. Fix one of: [rules.layers.storage] helpers in ARCHITECTURE.toml lists \
+         l10_foundation does only in a helper that names nothing SPACE-specific, and l20_domain \
+         and other l10_foundation crates hold at most a codec, behind an optional normal \
+         dependency on a codec facade. Fix one of: [rules.layers.storage] helpers in ARCHITECTURE.toml lists \
          every storage helper, and a required driver dependency makes pplx-space-f one, but the \
          list lacks it: if pplx-space-f names nothing SPACE-specific, add it to helpers; \
          layers.policy_changed reports the change for review. Otherwise move the code that uses \
@@ -7152,8 +7220,10 @@ fn layers_storage_stale_entries() {
         ("pplx-space-a", "sqlx"),
         ("pplx-space-b-client", "pplx-space-f"),
         ("pplx-space-d", "sqlx"),
+        ("pplx-space-g", "redis"),
         ("pplx-space-g", "sqlx"),
         ("pplx-space-gone", "sqlx"),
+        ("pplx-space-h", "sqlx"),
         ("pplx-space-legacy", "sqlx"),
         ("pplx-space-p", "redis"),
         ("pplx-space-s-store", "sqlx"),
@@ -7207,20 +7277,14 @@ fn layers_storage_stale_entries() {
             "storage_access",
             "pplx-space-a",
             "pplx-space-x",
-            "pplx-space-x is neither a driver in [rules.layers.storage] nor a storage helper",
+            "pplx-space-x is neither a driver in [rules.layers.storage], a storage helper nor a \
+             codec facade",
         ),
         stale(
             "storage_access",
             "pplx-space-a",
             "redis",
             "pplx-space-a has no normal or build dependency on redis",
-        ),
-        stale(
-            "storage_access",
-            "pplx-space-g",
-            "sqlx",
-            "pplx-space-g's dependency on sqlx is optional in an l10_foundation crate, a codec \
-             behind a feature, whose enabling layers.codec_features checks",
         ),
         stale(
             "storage_access",
@@ -7251,6 +7315,13 @@ fn layers_storage_stale_entries() {
             "pplx-space-d",
             "pplx-space-g/serde",
             "`serde` of pplx-space-g does not turn on a driver or storage helper",
+        ),
+        stale(
+            "codec_features",
+            "pplx-space-d",
+            "pplx-space-h/sqlx",
+            "pplx-space-d enables it only behind a feature of its own in an l20_domain crate, a \
+             codec, whose enabling layers.codec_features checks",
         ),
         stale(
             "codec_features",
@@ -7433,6 +7504,9 @@ fn layers_storage_base_comparison_and_write_baseline() {
             line("pplx-space-a (l40_api) -> pplx-space-conn"),
             line("pplx-space-a (l40_api) -> pplx-space-f"),
             line("pplx-space-b-client (l40_api) -> pplx-space-f"),
+            line("pplx-space-g (l10_foundation) -> redis"),
+            line("pplx-space-g (l10_foundation) -> sqlx"),
+            line("pplx-space-h (l10_foundation) -> sqlx"),
             line("pplx-space-legacy (l10_foundation) -> sqlx"),
             line("pplx-space-p (l50_app) -> redis"),
         ],
@@ -7475,11 +7549,819 @@ fn layers_storage_base_comparison_and_write_baseline() {
              helpers, which layers.policy_changed reports for review; otherwise fix the \
              dependency (cargo arch says how). An entry added by hand fails \
              layers.storage_access.no_new_entries",
+            &line("pplx-space-g (l10_foundation) -> redis"),
+            &line("pplx-space-g (l10_foundation) -> sqlx"),
+            &line("pplx-space-h (l10_foundation) -> sqlx"),
             &line("pplx-space-legacy (l10_foundation) -> sqlx"),
             &line("pplx-space-p (l50_app) -> redis"),
         ],
         "{}",
         write.stdout
+    );
+}
+
+/// `[rules.layers]` tables for [`layers_codec_facades`]: three drivers, a
+/// helper, and a codec facade that may re-export two items of sqlx and one
+/// of rusqlite.
+const FACADE_TABLES: &str = "[rules.layers.storage]\n\
+                             drivers = [\"redis\", \"rusqlite\", \"sqlx\"]\n\
+                             helpers = [\"pplx-space-f\"]\n\
+                             [rules.layers.storage.codec_facades.\"pplx-space-codec\".exports]\n\
+                             rusqlite = [\"types::ToSql\"]\n\
+                             sqlx = [\"Type\", \"postgres::PgTypeInfo\"]\n";
+
+/// The codec facade's manifest in [`layers_codec_facades`], with `extra`
+/// after its dependencies: its library is `src/lib.rs`.
+fn facade_manifest(extra: &str) -> String {
+    format!(
+        "[package]\nname = \"pplx-space-codec\"\n\
+         [features]\npostgres = [\"dep:sqlx\"]\nsqlite = [\"dep:rusqlite\"]\n\
+         [dependencies]\nsqlx = {{ version = \"1\", optional = true }}\n\
+         rusqlite = {{ version = \"1\", optional = true }}\n{extra}"
+    )
+}
+
+/// The facade's source in [`layers_codec_facades`]: only listed exports, in
+/// every form the facade may write them.
+const FACADE_LIB: &str = "//! Codec items.\n\n\
+                          /* The Postgres ones. */\n\
+                          #[cfg(feature = \"postgres\")]\n\
+                          pub use sqlx::Type;\n\n\
+                          /// sqlx's Postgres items.\n\
+                          #[cfg(all(feature = \"postgres\", not(test)))]\n\
+                          pub mod postgres {\n    \
+                          pub use sqlx::{postgres::{PgTypeInfo,},};\n}\n\n\
+                          #[cfg(feature = \"sqlite\")]\n\
+                          #[doc = \"rusqlite's items.\"]\n\
+                          pub mod sqlite {\n    \
+                          pub use rusqlite::types::ToSql; // the trait\n}\n";
+
+/// A Foundation or Domain crate reaches a driver only through an optional
+/// normal dependency on a codec facade, a codec behind a feature whose
+/// enabling `codec_features` checks; an optional driver dependency, a
+/// required or build dependency on a facade, and an API crate's dependency
+/// on one are `storage_access` findings. A facade may have optional normal
+/// dependencies on drivers, nothing else, and its source may re-export only
+/// its listed exports, with no baseline entry to tolerate anything more.
+#[test]
+fn layers_codec_facades() {
+    const D: &str = "crates/l20_domain/d/Cargo.toml";
+    const G: &str = "crates/l10_foundation/g/Cargo.toml";
+    const A: &str = "crates/l40_api/a/server/Cargo.toml";
+    const STORE: &str = "crates/l30_storage/s/store/Cargo.toml";
+    const FACADE: &str = "crates/l10_foundation/codec/Cargo.toml";
+    const LIB: &str = "crates/l10_foundation/codec/src/lib.rs";
+    let manifest = |name: &str, body: &str| format!("{}{body}", package(name));
+    let file = |path: &str, name: &str, body: &str| (path.to_owned(), manifest(name, body));
+    let facade_dependency = |up: &str, extra: &str| {
+        format!("pplx-space-codec = {{ path = \"{up}l10_foundation/codec\"{extra} }}\n")
+    };
+    let lib = |extra: &str| (LIB.to_owned(), format!("{FACADE_LIB}{extra}"));
+    // `d`'s codec, against the facade.
+    let codec = file(
+        D,
+        "pplx-space-d",
+        &format!(
+            "[features]\nsqlx = [\"dep:pplx-space-codec\", \"pplx-space-codec/postgres\"]\n\
+             [dependencies]\n{}",
+            facade_dependency("../../", ", optional = true")
+        ),
+    );
+    let access = "layers.storage_access.no_crossing";
+    let codecs = "layers.codec_features.no_crossing";
+    let optional_only = "Fix: a codec facade is a codec's only behind a feature: make \
+                         pplx-space-codec an optional normal dependency";
+    let source = |reason: &str| {
+        format!(
+            "{LIB}: pplx-space-codec is a codec facade ([rules.layers.storage] codec_facades \
+             lists it), whose source holds only `pub mod` blocks of re-exports and `pub use` \
+             items of drivers it depends on, each an export that \
+             [rules.layers.storage.codec_facades.\"pplx-space-codec\"] lists, with `cfg` and \
+             `doc` attributes and comments, since what it re-exports every codec may use; \
+             {reason}. No baseline entry tolerates this."
+        )
+    };
+    // Each case: what it is, its files, and each storage finding as its
+    // code, the parts of its message, joined by " … ", and the file it is
+    // shown in.
+    type Case<'a> = (
+        &'a str,
+        Vec<(String, String)>,
+        Vec<(&'a str, String, &'a str)>,
+    );
+    let cases: Vec<Case> = vec![
+        ("the facade itself", vec![], vec![]),
+        (
+            "a Domain codec on the facade, and a Domain crate forwarding to it",
+            vec![
+                codec.clone(),
+                file(
+                    "crates/l20_domain/e/Cargo.toml",
+                    "pplx-space-e",
+                    "[features]\nsqlx = [\"pplx-space-d/sqlx\"]\n[dependencies]\n\
+                     pplx-space-d = { path = \"../d\" }\n",
+                ),
+            ],
+            vec![],
+        ),
+        (
+            "a Domain codec on the driver",
+            vec![file(
+                D,
+                "pplx-space-d",
+                "[features]\nsqlx = [\"dep:sqlx\"]\n[dependencies]\n\
+                 sqlx = { version = \"1\", optional = true }\n",
+            )],
+            vec![(
+                access,
+                "Fix: depend on pplx-space-codec (optional, behind your codec feature) for \
+                 encode/decode impls; anything else belongs in a store"
+                    .to_owned(),
+                D,
+            )],
+        ),
+        (
+            "a Foundation codec on the driver",
+            vec![file(
+                G,
+                "pplx-space-g",
+                "[features]\nsqlx = [\"dep:sqlx\"]\n[dependencies]\n\
+                 sqlx = { version = \"1\", optional = true }\n",
+            )],
+            vec![(
+                access,
+                "Fix one of: depend on pplx-space-codec (optional, behind your codec feature) \
+                 for encode/decode impls; if pplx-space-g names nothing SPACE-specific"
+                    .to_owned(),
+                G,
+            )],
+        ),
+        // No facade exports redis, so none is offered.
+        (
+            "a Domain crate on a driver no facade exports",
+            vec![file(
+                D,
+                "pplx-space-d",
+                "[dependencies]\nredis = { version = \"1\", optional = true }\n",
+            )],
+            vec![(
+                access,
+                "Fix: move the code that uses it, such as a codec's impls, into the store"
+                    .to_owned(),
+                D,
+            )],
+        ),
+        (
+            "an optional build-dependency on the facade",
+            vec![file(
+                D,
+                "pplx-space-d",
+                &format!(
+                    "[features]\nsqlx = [\"dep:pplx-space-codec\"]\n[build-dependencies]\n{}",
+                    facade_dependency("../../", ", optional = true")
+                ),
+            )],
+            vec![(access, optional_only.to_owned(), D)],
+        ),
+        (
+            "an optional build-dependency on the driver",
+            vec![file(
+                G,
+                "pplx-space-g",
+                "[features]\nsqlx = [\"dep:sqlx\"]\n[build-dependencies]\n\
+                 sqlx = { version = \"1\", optional = true }\n",
+            )],
+            vec![(
+                access,
+                "pplx-space-g (l10_foundation) depends on sqlx, a driver ([rules.layers.storage] \
+                 drivers lists it), a build-dependency (optional"
+                    .to_owned(),
+                G,
+            )],
+        ),
+        (
+            "a required dependency on the facade",
+            vec![file(
+                D,
+                "pplx-space-d",
+                &format!("[dependencies]\n{}", facade_dependency("../../", "")),
+            )],
+            vec![(access, optional_only.to_owned(), D)],
+        ),
+        (
+            "an API crate enabling the facade's driver feature and a Domain codec's",
+            vec![
+                codec.clone(),
+                file(
+                    A,
+                    "pplx-space-a",
+                    &format!(
+                        "[dependencies]\n{}\
+                         pplx-space-d = {{ path = \"../../../l20_domain/d\", features = \
+                         [\"sqlx\"] }}\n",
+                        facade_dependency("../../../", ", features = [\"postgres\"]")
+                    ),
+                ),
+            ],
+            vec![
+                (
+                    access,
+                    "pplx-space-a (l40_api) depends on pplx-space-codec, a codec facade \
+                     ([rules.layers.storage] codec_facades lists it), a normal dependency"
+                        .to_owned(),
+                    A,
+                ),
+                (
+                    codecs,
+                    "pplx-space-a (l40_api) enables the `postgres` feature of pplx-space-codec, \
+                     with features = [\"postgres\"] on a normal dependency, which turns on its \
+                     optional dependency on sqlx"
+                        .to_owned(),
+                    A,
+                ),
+                (
+                    codecs,
+                    "pplx-space-a (l40_api) enables the `sqlx` feature of pplx-space-d, with \
+                     features = [\"sqlx\"] on a normal dependency, which reaches sqlx through \
+                     pplx-space-codec/postgres"
+                        .to_owned(),
+                    A,
+                ),
+            ],
+        ),
+        (
+            "a store enabling them",
+            vec![
+                codec.clone(),
+                file(
+                    STORE,
+                    "pplx-space-s-store",
+                    &format!(
+                        "[dependencies]\n{}\
+                         pplx-space-d = {{ path = \"../../../l20_domain/d\", features = \
+                         [\"sqlx\"] }}\n",
+                        facade_dependency("../../../", ", features = [\"postgres\"]")
+                    ),
+                ),
+            ],
+            vec![],
+        ),
+        (
+            "the facade's build-dependency on a driver",
+            vec![(
+                FACADE.to_owned(),
+                facade_manifest(
+                    "[build-dependencies]\nredis = { version = \"1\", optional = true }\n",
+                ),
+            )],
+            vec![(
+                access,
+                "pplx-space-codec (l10_foundation) depends on redis, a driver \
+                 ([rules.layers.storage] drivers lists it), a build-dependency (optional … \
+                 Fix: a codec facade reaches a driver only through an optional normal \
+                 dependency behind its own features, and never becomes a store or a storage \
+                 helper: if redis is a driver, make it an optional normal dependency behind \
+                 the facade's features; otherwise drop it."
+                    .to_owned(),
+                FACADE,
+            )],
+        ),
+        // A facade re-exports drivers' items; a helper's are no codec's.
+        (
+            "the facade's optional dependency on a helper",
+            vec![(
+                FACADE.to_owned(),
+                facade_manifest("pplx-space-f = { path = \"../f\", optional = true }\n"),
+            )],
+            vec![(
+                access,
+                "pplx-space-codec (l10_foundation) depends on pplx-space-f, a storage helper \
+                 ([rules.layers.storage] helpers lists it), a normal dependency (optional … \
+                 Fix: a codec facade reaches a driver only through an optional normal \
+                 dependency behind its own features, and never becomes a store or a storage \
+                 helper: if pplx-space-f is a driver, make it an optional normal dependency \
+                 behind the facade's features; otherwise drop it."
+                    .to_owned(),
+                FACADE,
+            )],
+        ),
+        (
+            "the facade's library elsewhere",
+            vec![(
+                FACADE.to_owned(),
+                facade_manifest("[lib]\npath = \"lib.rs\"\n"),
+            )],
+            vec![(
+                access,
+                format!(
+                    "{FACADE}: pplx-space-codec is a codec facade ([rules.layers.storage] \
+                     codec_facades lists it)"
+                ),
+                FACADE,
+            )],
+        ),
+        (
+            "an unlisted re-export",
+            vec![lib("pub use rusqlite::Connection;\n")],
+            vec![(
+                access,
+                source(
+                    "it re-exports rusqlite::Connection, which its exports do not list for \
+                     rusqlite",
+                ),
+                LIB,
+            )],
+        ),
+        (
+            "an unlisted item in a group",
+            vec![lib("pub use sqlx::{Type, Pool};\n")],
+            vec![(
+                access,
+                source("it re-exports sqlx::Pool, which its exports do not list for sqlx"),
+                LIB,
+            )],
+        ),
+        (
+            "a function",
+            vec![lib("pub fn pool() {}\n")],
+            vec![(
+                access,
+                source(
+                    "`pub fn pool` at the file's top level is neither a `pub mod` block nor a \
+                     `pub use` item",
+                ),
+                LIB,
+            )],
+        ),
+        (
+            "a rename",
+            vec![lib("pub use sqlx::Pool as Type;\n")],
+            vec![(
+                access,
+                source("it re-exports sqlx::Pool as `Type`, and a re-export doesn't rename"),
+                LIB,
+            )],
+        ),
+        (
+            "a glob",
+            vec![lib("pub mod all {\n    pub use sqlx::postgres::*;\n}\n")],
+            vec![(
+                access,
+                source("it re-exports sqlx::postgres::*, and a re-export doesn't glob"),
+                LIB,
+            )],
+        ),
+        (
+            "a `self` in a group",
+            vec![lib("pub use sqlx::postgres::{self, PgTypeInfo};\n")],
+            vec![(
+                access,
+                source(
+                    "it re-exports sqlx::postgres::self, and a re-export names an item, not \
+                     `self`",
+                ),
+                LIB,
+            )],
+        ),
+        (
+            "a re-export of another crate",
+            vec![lib("pub use uuid::Uuid;\n")],
+            vec![(
+                access,
+                source("it re-exports from `uuid`, which is no driver it depends on"),
+                LIB,
+            )],
+        ),
+        (
+            "a re-export of the driver itself",
+            vec![lib("pub use sqlx;\n")],
+            vec![(
+                access,
+                source("`pub use sqlx` at the file's top level does not start with `<driver>::`"),
+                LIB,
+            )],
+        ),
+        (
+            "a re-export from the extern prelude",
+            vec![lib("pub use ::sqlx::Type;\n")],
+            vec![(
+                access,
+                source(
+                    "`pub use ::sqlx::…` at the file's top level does not start with \
+                     `<driver>::`",
+                ),
+                LIB,
+            )],
+        ),
+        (
+            "a renamed driver",
+            vec![lib("pub use sqlx as db;\n")],
+            vec![(
+                access,
+                source(
+                    "`pub use sqlx as db` at the file's top level does not start with \
+                     `<driver>::`",
+                ),
+                LIB,
+            )],
+        ),
+        (
+            "a module in another file",
+            vec![lib("pub mod more;\n")],
+            vec![(
+                access,
+                source("`pub mod more;` at the file's top level is no `pub mod` block"),
+                LIB,
+            )],
+        ),
+        (
+            "a `pub(crate)` re-export in a module",
+            vec![lib("pub mod inner {\n    pub(crate) use sqlx::Type;\n}\n")],
+            vec![(
+                access,
+                source(
+                    "`pub(crate) use sqlx::…` in `inner` is neither a `pub mod` block nor a \
+                     `pub use` item",
+                ),
+                LIB,
+            )],
+        ),
+        (
+            "a macro",
+            vec![lib("macro_rules! query {\n    () => {};\n}\n")],
+            vec![(
+                access,
+                source(
+                    "`macro_rules! query` at the file's top level is neither a `pub mod` block \
+                     nor a `pub use` item",
+                ),
+                LIB,
+            )],
+        ),
+        (
+            "a `cfg_attr`",
+            vec![lib("#[cfg_attr(test, doc = \"x\")]\npub use sqlx::Type;\n")],
+            vec![(
+                access,
+                source(
+                    "`pub use sqlx::…` at the file's top level has a `cfg_attr` attribute that is \
+                     neither `cfg(…)` nor `doc = \"…\"`",
+                ),
+                LIB,
+            )],
+        ),
+        (
+            "a doc that is no string",
+            vec![lib(
+                "#[doc = include_str!(\"README.md\")]\npub use sqlx::Type;\n",
+            )],
+            vec![(
+                access,
+                source(
+                    "`pub use sqlx::…` at the file's top level has a `doc` attribute that is neither \
+                     `cfg(…)` nor `doc = \"…\"`",
+                ),
+                LIB,
+            )],
+        ),
+        // rustc ends the raw string at its `"`, so the `pub use sqlx::query`
+        // after it is code, and syn reads it as rustc does: a reader that
+        // took `\"` for an escape would see it inside a string that ends on
+        // the `//` line.
+        (
+            "a raw string in a cfg",
+            vec![lib(
+                "#[cfg(all(feature = \"postgres\", not(hide = r\"\\\")))]\n\
+                 pub use sqlx::query;\n// \")))]\n#[cfg(feature = \"postgres\")]\n\
+                 pub use sqlx::Type;\n",
+            )],
+            vec![(
+                access,
+                source("it re-exports sqlx::query, which its exports do not list for sqlx"),
+                LIB,
+            )],
+        ),
+        // Its code can name a normal dependency only.
+        (
+            "a re-export of a build-dependency",
+            vec![
+                (
+                    FACADE.to_owned(),
+                    facade_manifest("[build-dependencies]\nredis = \"1\"\n"),
+                ),
+                lib("pub use redis::Thing;\n"),
+            ],
+            vec![
+                (
+                    access,
+                    "pplx-space-codec (l10_foundation) depends on redis, a driver \
+                     ([rules.layers.storage] drivers lists it), a build-dependency"
+                        .to_owned(),
+                    FACADE,
+                ),
+                (
+                    access,
+                    source("it re-exports from `redis`, which is no driver it depends on"),
+                    LIB,
+                ),
+            ],
+        ),
+        (
+            "a file that doesn't parse",
+            vec![lib("pub use sqlx::Type<u8>;\n")],
+            vec![(
+                access,
+                source("it can't be read as Rust: expected `;`"),
+                LIB,
+            )],
+        ),
+    ];
+    let build = |files: &[(String, String)], tables: &str, baseline: Option<String>| {
+        let mut all = vec![
+            (FACADE.to_owned(), facade_manifest("")),
+            (LIB.to_owned(), FACADE_LIB.to_owned()),
+        ];
+        all.extend(files.iter().cloned());
+        all.extend(baseline.map(|text| ("architecture-baseline.toml".to_owned(), text)));
+        Layered {
+            extra: &[
+                ("crates/l10_foundation/codec", "pplx-space-codec"),
+                ("crates/l20_domain/e", "pplx-space-e"),
+            ],
+            tables,
+            files: all
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.clone()))
+                .collect(),
+            ..Layered::default()
+        }
+        .build()
+    };
+    for (name, files, expected) in cases {
+        let ws = build(&files, FACADE_TABLES, None);
+        let found = storage_findings(&load(ws.path(), None));
+        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+        for ((code, message, at), (want_code, want, path)) in found.iter().zip(&expected) {
+            assert_eq!(code, want_code, "{name}: {message}");
+            assert!(
+                want.split(" … ").all(|part| message.contains(part)),
+                "{name}: {message}"
+            );
+            assert!(at.starts_with(&format!("{path}:")), "{name}: {at}");
+        }
+    }
+
+    // A source finding takes no baseline entry: one for the facade, as for
+    // an edge, leaves it reported, and is stale.
+    let baseline = storage_baseline(&[("pplx-space-codec", "sqlx")], &[]);
+    let ws = build(
+        &[lib("pub fn pool() {}\n")],
+        FACADE_TABLES,
+        Some(baseline.clone()),
+    );
+    let codes: Vec<String> = storage_findings(&load(ws.path(), None))
+        .into_iter()
+        .map(|(code, _, at)| format!("{code} {at}"))
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            format!(
+                "layers.storage_access.stale_entries architecture-baseline.toml:{}",
+                line_with(&baseline, "\"pplx-space-codec\" = ")
+            ),
+            format!("layers.storage_access.no_crossing {LIB}:1"),
+        ]
+    );
+
+    // An entry for a codec is stale, with the reason.
+    let ws = build(
+        std::slice::from_ref(&codec),
+        FACADE_TABLES,
+        Some(storage_baseline(
+            &[
+                ("pplx-space-codec", "sqlx"),
+                ("pplx-space-d", "pplx-space-codec"),
+            ],
+            &[],
+        )),
+    );
+    let stale: Vec<String> = storage_findings(&load(ws.path(), None))
+        .into_iter()
+        .map(|(code, message, _)| format!("{code} {message}"))
+        .collect();
+    assert_eq!(
+        stale,
+        [
+            "layers.storage_access.stale_entries pplx-space-codec -> sqlx: is in \
+             [layers.storage_access] in architecture-baseline.toml, but pplx-space-codec is a \
+             codec facade, and its dependency on sqlx is optional and normal: a driver \
+             feature, whose enabling layers.codec_features checks. Remove the entry (cargo \
+             arch --write-baseline=layers.storage_access).",
+            "layers.storage_access.stale_entries pplx-space-d -> pplx-space-codec: is in \
+             [layers.storage_access] in architecture-baseline.toml, but pplx-space-d's \
+             dependency on pplx-space-codec, a codec facade, is optional and normal in an \
+             l20_domain crate: a codec behind a feature, whose enabling \
+             layers.codec_features checks. Remove the entry (cargo arch \
+             --write-baseline=layers.storage_access).",
+        ]
+    );
+
+    // An export that allows nothing is stale, so the lists only shrink: a
+    // path no file re-exports, an empty list and a key for no driver the
+    // facade depends on. A driver with an empty list gets no hint to use the
+    // facade.
+    let tables = "[rules.layers.storage]\ndrivers = [\"redis\", \"rusqlite\", \"sqlx\"]\n\
+                  [rules.layers.storage.codec_facades.\"pplx-space-codec\".exports]\n\
+                  nodb = [\"Thing\"]\nredis = []\nrusqlite = [\"types::ToSql\"]\n\
+                  sqlx = [\n  \"Pool\",\n  \"Type\",\n  \"postgres::PgTypeInfo\",\n]\n";
+    let ws = build(
+        &[
+            (
+                FACADE.to_owned(),
+                facade_manifest("redis = { version = \"1\", optional = true }\n"),
+            ),
+            file(
+                D,
+                "pplx-space-d",
+                "[dependencies]\nredis = { version = \"1\", optional = true }\n",
+            ),
+        ],
+        tables,
+        None,
+    );
+    let config = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let ctx = load(ws.path(), None);
+    let table = "[rules.layers.storage.codec_facades.\"pplx-space-codec\"] exports in \
+                 ARCHITECTURE.toml";
+    let stale: Vec<(String, String)> = layer_findings(&ctx)
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.stale_entries")
+        .map(|(_, message, at)| (message, at))
+        .collect();
+    let at = |needle: &str| format!("ARCHITECTURE.toml:{}", line_with(&config, needle));
+    assert_eq!(
+        stale,
+        [
+            (
+                format!(
+                    "pplx-space-codec: {table} has an entry for nodb, but pplx-space-codec has no \
+                     normal dependency on nodb that [rules.layers.storage] drivers lists, so it \
+                     allows nothing. Remove the entry."
+                ),
+                at("nodb = "),
+            ),
+            (
+                format!(
+                    "pplx-space-codec: {table} lists nothing for redis, which allows nothing. \
+                     Remove the entry."
+                ),
+                at("codec_facades.\"pplx-space-codec\""),
+            ),
+            (
+                format!(
+                    "pplx-space-codec: {table} lists sqlx::Pool, but no file of \
+                     pplx-space-codec's src/ re-exports it. Remove it."
+                ),
+                at("  \"Pool\","),
+            ),
+        ]
+    );
+    let hint: Vec<String> = storage_findings(&ctx)
+        .into_iter()
+        .map(|(_, message, _)| message)
+        .collect();
+    assert_eq!(hint.len(), 1, "{hint:#?}");
+    assert!(
+        hint[0].starts_with(&format!("{D}: pplx-space-d (l20_domain) depends on redis"))
+            && !hint[0].contains("pplx-space-codec"),
+        "{}",
+        hint[0]
+    );
+
+    // With a file it can't read, it can't tell which listed paths no file
+    // re-exports, so only the other two are stale.
+    let ws = build(
+        &[
+            (
+                FACADE.to_owned(),
+                facade_manifest("redis = { version = \"1\", optional = true }\n"),
+            ),
+            lib("pub fn pool() {}\n"),
+        ],
+        tables,
+        None,
+    );
+    let unread: Vec<String> = layer_findings(&load(ws.path(), None))
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.stale_entries")
+        .map(|(_, message, _)| message)
+        .collect();
+    assert_eq!(
+        unread,
+        [stale[0].0.clone(), stale[1].0.clone()],
+        "{unread:#?}"
+    );
+
+    // Nor does a driver the facade lists but has no normal dependency on.
+    let tables = FACADE_TABLES.replace("rusqlite = ", "redis = [\"Thing\"]\nrusqlite = ");
+    let ws = build(
+        &[file(
+            D,
+            "pplx-space-d",
+            "[dependencies]\nredis = { version = \"1\", optional = true }\n",
+        )],
+        &tables,
+        None,
+    );
+    let hint: Vec<String> = storage_findings(&load(ws.path(), None))
+        .into_iter()
+        .map(|(_, message, _)| message)
+        .collect();
+    assert_eq!(hint.len(), 1, "{hint:#?}");
+    assert!(!hint[0].contains("pplx-space-codec"), "{}", hint[0]);
+
+    // --write-baseline's advice keeps a facade a facade: a required driver
+    // dependency is no reason to list it in helpers.
+    let ws = build(
+        &[(FACADE.to_owned(), facade_manifest("redis = \"1\"\n"))],
+        FACADE_TABLES,
+        None,
+    );
+    let write = run(ws.path(), &["--write-baseline=layers.storage_access"]);
+    assert_eq!(write.code, 0, "{}", write.stderr);
+    let not_added: Vec<&str> = write
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("not added: "))
+        .collect();
+    assert_eq!(
+        not_added,
+        [
+            "not added: pplx-space-codec (l10_foundation) -> redis in [layers.storage_access]; a \
+             codec facade reaches a driver only through an optional normal dependency behind its \
+             own features, and never becomes a store or a storage helper: fix the dependency \
+             (cargo arch says how). An entry added by hand fails \
+             layers.storage_access.no_new_entries"
+        ],
+        "{}",
+        write.stdout
+    );
+
+    // A codec_facades entry outside l10_foundation, for a legacy crate, for
+    // a helper or for no crate does nothing.
+    let entry_table = |package: &str| {
+        format!("[rules.layers.storage.codec_facades.\"{package}\".exports]\nsqlx = []\n")
+    };
+    let tables = format!(
+        "[rules.layers.storage]\ndrivers = [\"sqlx\"]\nhelpers = [\"pplx-space-f\"]\n{}{}{}{}\
+         [rules.layers]\nlegacy = [\"pplx-space-g\"]\n",
+        entry_table("pplx-space-d"),
+        entry_table("pplx-space-f"),
+        entry_table("pplx-space-g"),
+        entry_table("pplx-space-gone"),
+    );
+    let ws = Layered {
+        tables: &tables,
+        ..Layered::default()
+    }
+    .build();
+    let config = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let stale: Vec<(String, String)> = layer_findings(&load(ws.path(), None))
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.stale_entries")
+        .map(|(_, message, at)| (message, at))
+        .collect();
+    let entry = |package: &str, reason: &str| {
+        (
+            format!(
+                "{package}: is in [rules.layers.storage] codec_facades in ARCHITECTURE.toml, but \
+                 {reason}. Remove it."
+            ),
+            format!(
+                "ARCHITECTURE.toml:{}",
+                line_with(&config, &format!("codec_facades.\"{package}\""))
+            ),
+        )
+    };
+    assert_eq!(
+        stale,
+        [
+            entry(
+                "pplx-space-d",
+                "a codec facade is an l10_foundation crate, and its layer is l20_domain"
+            ),
+            entry(
+                "pplx-space-f",
+                "helpers lists it too, and a storage helper may reach storage already"
+            ),
+            entry(
+                "pplx-space-g",
+                "[rules.layers] legacy lists it too, which keeps a crate from being a codec \
+                 facade"
+            ),
+            entry("pplx-space-gone", "no workspace member has this name"),
+        ]
     );
 }
 

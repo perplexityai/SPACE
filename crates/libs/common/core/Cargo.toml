@@ -27,10 +27,10 @@ pplx-space-linux-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-rpc-contracts = { workspace = true }
 pplx-space-semver = { workspace = true }
+pplx-space-sql-codec = { workspace = true, optional = true }
 pplx-space-sql-locator = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
-sqlx = { workspace = true, features = ["postgres", "uuid"], optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }
@@ -58,7 +58,8 @@ serde = [
     "pplx-space-linux-ids/serde",
 ]
 sqlx = [
-    "dep:sqlx",
+    "dep:pplx-space-sql-codec",
+    "pplx-space-sql-codec/postgres",
     "pplx-space-semver/sqlx",
     "pplx-space-k8s-ids/sqlx",
     "pplx-space-accounts/sqlx",
