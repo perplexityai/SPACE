@@ -1,6 +1,7 @@
-//! Template-manager's cache-partition migration (20261026220935) has an entry
-//! here for releases that don't bundle it. This release bundles it, so the
-//! runner skips that entry. A rollout can migrate a node's
+//! Template-manager's cache-partition migration (20261026220935) and node dirty
+//! ref revision migration (20261031050126) have entries here for releases that
+//! don't bundle them. This release bundles both, so the runner skips those
+//! entries. A rollout can migrate a node's
 //! database from an init container while the previous template-manager still
 //! serves, so a schema change must be readable by the release before it, and a
 //! rollback must not need anything beyond the image.
@@ -12,7 +13,10 @@
 //! only when the migration's check finds no data worth keeping that reversing
 //! would drop; each entry says what reversing discards. Otherwise migration
 //! stops before any write. A catalog that bundles the version applies it
-//! normally.
+//! normally. A migration ships only in a release after one that lists it, so
+//! the image a rollback returns to can reverse it. 20261031050126 ships that
+//! way, and its check never refuses, so rolling back from the release that
+//! bundles it to the one that lists it is image-only.
 
 use rusqlite::{OptionalExtension as _, TransactionBehavior};
 use sqlx::SqlSafeStr as _;
@@ -54,7 +58,9 @@ const RETIRED_PARTITIONS: Unbundled = Unbundled {
     reversed: "reversed retired template cache partition migration; every row was in the legacy partition",
 };
 
-/// The next release's migration, reversed when its image is rolled back.
+/// Bundled from this release on. The release before it lists the same up SQL
+/// and reverses the migration when this image is rolled back, so the bundled
+/// file must keep that checksum.
 const DIRTY_REF_REVISIONS: Unbundled = Unbundled {
     version: 20261031050126,
     description: "node dirty ref revisions",

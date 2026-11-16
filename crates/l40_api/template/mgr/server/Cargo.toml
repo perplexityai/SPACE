@@ -84,6 +84,7 @@ pplx-space-policy-authority = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-template-manifest = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
+pplx-space-template-mgr-store = { workspace = true }
 pplx-space-test-hooks = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }

@@ -12,3 +12,9 @@ sqlite.template-manager = ["node_dirty_ref_revision"]
 
 [lints]
 workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
+
+# internal
+pplx-space-sql-locator = { workspace = true }
