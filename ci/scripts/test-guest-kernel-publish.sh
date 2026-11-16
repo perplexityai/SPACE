@@ -186,6 +186,59 @@ chmod +x "${tmp_dir}/docker"
 PATH="${tmp_dir}:${PATH}" "${KERNEL_DIR}/smoke-boot.sh" \
   "${artifact_dir}/vmlinux.bin" "$KERNEL_VERSION" >/dev/null
 
+# A variant with boot-log expectations boots with initcall_debug and must show
+# each expected initcall; the default profile boots without it.
+variant_bin="${tmp_dir}/variant-bin"
+mkdir -p "$variant_bin"
+cat >"${variant_bin}/docker" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "create" ]]; then
+  printf '%s\n' "$*" >"$SMOKE_CREATE_ARGS"
+  printf '%s\n' smoke-container-id
+elif [[ "$1" == "start" ]]; then
+  printf '%s\n' 'Linux version 6.1.155 (space@kernel-builder)'
+  if [[ -n "${SMOKE_INITCALLS:-}" ]]; then
+    for initcall in nf_tables_module_init nft_compat_module_init iptable_raw_init ip6table_raw_init state_mt_init; do
+      printf '[    0.9] initcall %s+0x0/0xe8 returned 0 after 4 usecs\n' "$initcall"
+    done
+  fi
+  printf '%s\n' 'Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(254,0)'
+  exit 124
+fi
+EOF
+chmod +x "${variant_bin}/docker"
+create_args="${tmp_dir}/smoke-create-args"
+SMOKE_INITCALLS=1 SMOKE_CREATE_ARGS="$create_args" PATH="${variant_bin}:${PATH}" \
+  "${KERNEL_DIR}/smoke-boot.sh" "${artifact_dir}/vmlinux.bin" "$KERNEL_VERSION" nft >/dev/null
+grep -Fq 'initcall_debug ignore_loglevel' "$create_args"
+if SMOKE_CREATE_ARGS="$create_args" PATH="${variant_bin}:${PATH}" \
+    "${KERNEL_DIR}/smoke-boot.sh" "${artifact_dir}/vmlinux.bin" "$KERNEL_VERSION" nft >/dev/null 2>&1; then
+  echo "smoke-boot accepted an nft boot without nf_tables" >&2
+  exit 1
+fi
+SMOKE_CREATE_ARGS="$create_args" PATH="${variant_bin}:${PATH}" \
+  "${KERNEL_DIR}/smoke-boot.sh" "${artifact_dir}/vmlinux.bin" "$KERNEL_VERSION" >/dev/null
+if grep -Fq initcall_debug "$create_args"; then
+  echo "smoke-boot added initcall_debug to the default profile" >&2
+  exit 1
+fi
+if SMOKE_CREATE_ARGS="$create_args" PATH="${variant_bin}:${PATH}" \
+    "${KERNEL_DIR}/smoke-boot.sh" "${artifact_dir}/vmlinux.bin" "$KERNEL_VERSION" missing-variant >/dev/null 2>&1; then
+  echo "smoke-boot accepted an unknown variant" >&2
+  exit 1
+fi
+
+# The artifact version follows the variant; a caller fragment stays bpf-modsig.
+artifact_version_for() {
+  # SC2016: the nested shell expands $1 and ARTIFACT_VERSION.
+  # shellcheck disable=SC2016
+  env -u KERNEL_VARIANT -u CONFIG_FRAGMENT "$@" \
+    bash -c 'source "$1"; echo "$ARTIFACT_VERSION"' _ "$publish_script"
+}
+[[ "$(artifact_version_for KERNEL_VARIANT=nft)" == vmlinux-6.1.155-nft ]]
+[[ "$(artifact_version_for CONFIG_FRAGMENT=custom.config)" == vmlinux-6.1.155-bpf-modsig ]]
+[[ "$(artifact_version_for)" == vmlinux-6.1.155 ]]
+
 fake_bin="${tmp_dir}/bin"
 calls="${tmp_dir}/publish-calls"
 mkdir -p "$fake_bin"

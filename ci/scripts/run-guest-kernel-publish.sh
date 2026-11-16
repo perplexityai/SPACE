@@ -9,7 +9,14 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 KERNEL_DIR="${REPO_ROOT}/templates/firecracker/kernel"
 
 KERNEL_VERSION="${KERNEL_VERSION:-6.1.155}"
-ARTIFACT_VERSION="vmlinux-${KERNEL_VERSION}${CONFIG_FRAGMENT:+-bpf-modsig}"
+KERNEL_VARIANT="${KERNEL_VARIANT:-}"
+# An in-repository variant names itself; a caller-supplied fragment is the
+# bpf-modsig profile (templates/firecracker/kernel/README.md).
+if [[ -n "$KERNEL_VARIANT" ]]; then
+  ARTIFACT_VERSION="vmlinux-${KERNEL_VERSION}-${KERNEL_VARIANT}"
+else
+  ARTIFACT_VERSION="vmlinux-${KERNEL_VERSION}${CONFIG_FRAGMENT:+-bpf-modsig}"
+fi
 AWS_REGION="${AWS_REGION:-us-east-1}"
 WORK_DIR=""
 S3_ACCESS_KEY_ID=""
@@ -42,7 +49,7 @@ build_kernel() {
   local output_root="$1"
   echo "--- :docker: Waiting for the agent Docker daemon"
   wait_for_docker || die "Docker daemon is not available on this agent"
-  OUTPUT_DIR="$output_root" KERNEL_VERSION="$KERNEL_VERSION" \
+  OUTPUT_DIR="$output_root" KERNEL_VERSION="$KERNEL_VERSION" KERNEL_VARIANT="$KERNEL_VARIANT" \
     "${KERNEL_DIR}/build.sh"
 }
 
@@ -244,7 +251,7 @@ main() {
   write_manifest "$artifact_dir"
 
   echo "--- :fire: Smoke-booting ${ARTIFACT_VERSION}"
-  "${KERNEL_DIR}/smoke-boot.sh" "${artifact_dir}/vmlinux.bin" "$KERNEL_VERSION"
+  "${KERNEL_DIR}/smoke-boot.sh" "${artifact_dir}/vmlinux.bin" "$KERNEL_VERSION" "$KERNEL_VARIANT"
 
   unset AWS_PROFILE AWS_DEFAULT_PROFILE
   digest="$(sha256sum "${artifact_dir}/vmlinux.bin" | awk '{print $1}')"

@@ -1,0 +1,8 @@
+# Extended regular expressions the smoke boot log must match for this variant.
+# smoke-boot.sh boots a variant that has this file with initcall_debug, so
+# each built-in subsystem the variant adds reports its own initcall result.
+initcall nf_tables_module_init\+0x[0-9a-f]+/0x[0-9a-f]+ returned 0 after
+initcall nft_compat_module_init\+0x[0-9a-f]+/0x[0-9a-f]+ returned 0 after
+initcall iptable_raw_init\+0x[0-9a-f]+/0x[0-9a-f]+ returned 0 after
+initcall ip6table_raw_init\+0x[0-9a-f]+/0x[0-9a-f]+ returned 0 after
+initcall state_mt_init\+0x[0-9a-f]+/0x[0-9a-f]+ returned 0 after

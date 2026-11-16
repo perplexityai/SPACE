@@ -1,13 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly KERNEL_IMAGE="${1:?usage: smoke-boot.sh KERNEL_IMAGE KERNEL_VERSION}"
-readonly KERNEL_VERSION="${2:?usage: smoke-boot.sh KERNEL_IMAGE KERNEL_VERSION}"
+readonly KERNEL_IMAGE="${1:?usage: smoke-boot.sh KERNEL_IMAGE KERNEL_VERSION [KERNEL_VARIANT]}"
+readonly KERNEL_VERSION="${2:?usage: smoke-boot.sh KERNEL_IMAGE KERNEL_VERSION [KERNEL_VARIANT]}"
+# A variant may list extended regular expressions its boot log must match in
+# variants/<name>.boot-log. Such a variant boots with initcall_debug so that
+# every built-in subsystem it adds reports its initcall result.
+readonly KERNEL_VARIANT="${3:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
+readonly BOOT_LOG_EXPECTATIONS="${SCRIPT_DIR}/variants/${KERNEL_VARIANT}.boot-log"
+KERNEL_CMDLINE='console=ttyS0 root=/dev/vda reboot=t panic=1'
+if [[ -n "$KERNEL_VARIANT" && -f "$BOOT_LOG_EXPECTATIONS" ]]; then
+  KERNEL_CMDLINE+=' initcall_debug ignore_loglevel'
+fi
+readonly KERNEL_CMDLINE
 SMOKE_IMAGE="space-guest-kernel-smoke:$(sha256sum "${SCRIPT_DIR}/Dockerfile" | cut -c1-16)"
 readonly SMOKE_IMAGE
 
+if [[ -n "$KERNEL_VARIANT" && ! -f "${SCRIPT_DIR}/variants/${KERNEL_VARIANT}.config" ]]; then
+  echo "ERROR: unknown kernel variant: ${KERNEL_VARIANT}" >&2
+  exit 1
+fi
 if [[ ! -f "$KERNEL_IMAGE" ]]; then
   echo "ERROR: guest kernel does not exist: ${KERNEL_IMAGE}" >&2
   exit 1
@@ -42,7 +56,7 @@ container_id="$(docker create \
       -display none \
       -serial stdio \
       -kernel /tmp/vmlinux.bin \
-      -append 'console=ttyS0 root=/dev/vda reboot=t panic=1')"
+      -append "$KERNEL_CMDLINE")"
 docker cp "$KERNEL_IMAGE" "${container_id}:/tmp/vmlinux.bin"
 
 status=0
@@ -62,4 +76,13 @@ if ! grep -Fq 'Kernel panic - not syncing: VFS: Unable to mount root fs' "$boot_
   exit 1
 fi
 
-echo "Guest kernel ${KERNEL_VERSION} reached the VFS handoff under QEMU"
+if [[ -n "$KERNEL_VARIANT" && -f "$BOOT_LOG_EXPECTATIONS" ]]; then
+  while IFS= read -r expected; do
+    if ! grep -Eq -- "$expected" "$boot_log"; then
+      echo "ERROR: the ${KERNEL_VARIANT} boot log does not match: ${expected}" >&2
+      exit 1
+    fi
+  done < <(grep -Ev '^[[:space:]]*(#|$)' "$BOOT_LOG_EXPECTATIONS" || true)
+fi
+
+echo "Guest kernel ${KERNEL_VERSION}${KERNEL_VARIANT:+ (${KERNEL_VARIANT})} reached the VFS handoff under QEMU"
