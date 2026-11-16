@@ -103,6 +103,15 @@ pub fn lazy(socket_path: &Path) -> ConnectedVolumeManagerClient {
 /// server for 10 s before the successor starts and recovers every persisted
 /// transfer, so a deploy leaves the socket refused or missing for a while.
 pub const VOLUME_MANAGER_RESTART_BUDGET: Duration = Duration::from_secs(180);
+const VOLUME_MANAGER_RESTART_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
+    max_retries: usize::MAX,
+    initial_delay: Duration::from_millis(100),
+    backoff_multiplier: 2.0,
+    max_delay: Duration::from_secs(2),
+    max_elapsed: VOLUME_MANAGER_RESTART_BUDGET,
+    jitter_factor: 0.2,
+    max_server_retry_after: Duration::ZERO,
+};
 
 pub const VOLMGR_SOCKET: &str = pplx_space_host_layout::paths::VOLUME_MANAGER_SOCKET;
 pub const RESTORE_PRIORITY: i32 = 100;
@@ -299,7 +308,8 @@ impl Future for EnsureFileReplicaFuture {
 }
 
 /// Submit an ensure-file-replica job and wait for its terminal status.
-/// Queue-admission rejection is retried within the configured total wait.
+/// Queue-admission rejection is retried within the configured total wait, and
+/// a volume-manager restart for up to [`VOLUME_MANAGER_RESTART_BUDGET`].
 ///
 /// ```no_run
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -355,19 +365,42 @@ pub enum CancelTransferScopeError {
 /// Cancel currently-submitted pulls for `scope` and await their writer barrier.
 ///
 /// The producer must be quiesced before calling this function. Cancellation
-/// does not permanently close the scope against future submissions.
+/// does not permanently close the scope against future submissions, so it is
+/// repeated while volume-manager restarts, for up to
+/// [`VOLUME_MANAGER_RESTART_BUDGET`].
 pub async fn cancel_transfer_scope(
-    mut client: ConnectedVolumeManagerClient,
+    client: ConnectedVolumeManagerClient,
     scope: pplx_space_common_core::types::TransferScopeId,
 ) -> Result<Vec<proto::TransferJob>, CancelTransferScopeError> {
-    let response = client
-        .cancel_transfer(proto::CancelTransferRequest {
-            selector: Some(proto::cancel_transfer_request::Selector::TransferScopeId(
-                scope.to_string(),
-            )),
-        })
-        .await?
-        .into_inner();
+    cancel_transfer_scope_with(scope, move |request| {
+        let mut client = client.clone();
+        async move { client.cancel_transfer(request).await }
+    })
+    .await
+}
+
+async fn cancel_transfer_scope_with<F, Fut>(
+    scope: pplx_space_common_core::types::TransferScopeId,
+    mut cancel: F,
+) -> Result<Vec<proto::TransferJob>, CancelTransferScopeError>
+where
+    F: FnMut(proto::CancelTransferRequest) -> Fut,
+    Fut: Future<Output = Result<tonic::Response<proto::CancelTransferResponse>, tonic::Status>>,
+{
+    let request = proto::CancelTransferRequest {
+        selector: Some(proto::cancel_transfer_request::Selector::TransferScopeId(
+            scope.to_string(),
+        )),
+    };
+    let response = pplx_space_common_grpc::retry_grpc_status_with_context(
+        "volume-manager",
+        "CancelTransfer",
+        VOLUME_MANAGER_RESTART_RETRY_POLICY,
+        pplx_space_common_grpc::GrpcRetryContext::none(),
+        || cancel(request.clone()),
+    )
+    .await?
+    .into_inner();
     for job in &response.jobs {
         let terminal = matches!(
             proto::TransferJobStatus::try_from(job.status).ok(),
@@ -474,28 +507,39 @@ where
     Fut: Future<Output = Result<tonic::Response<SubmitTransferResponse>, tonic::Status>>,
 {
     let mut retry_index = 0;
+    let mut unreachable_since: Option<tokio::time::Instant> = None;
     loop {
-        match submit(request.clone()).await {
+        let status = match submit(request.clone()).await {
             Ok(response) => return Ok(response.into_inner()),
-            Err(status)
-                if matches!(
-                    status.code(),
-                    tonic::Code::ResourceExhausted | tonic::Code::Unavailable
-                ) =>
-            {
-                let Some(delay) = ENSURE_FILE_REPLICA_RETRY_POLICY.backoff_delay(retry_index)
-                else {
-                    return Err(status);
-                };
-                let remaining = max_total.saturating_sub(started_at.elapsed());
-                if delay >= remaining {
-                    return Err(status);
-                }
-                retry_index += 1;
-                tokio::time::sleep(delay).await;
-            }
-            Err(status) => return Err(status),
+            Err(status) => status,
+        };
+        // Admission refusals wait within the total budget. A refused or
+        // dropped connection, or a handoff refusal, is volume-manager
+        // restarting; the submission is deduplicated, so it is replayed for up
+        // to the restart budget.
+        let retry = if status.code() == tonic::Code::ResourceExhausted {
+            unreachable_since = None;
+            true
+        } else if pplx_space_common_grpc::should_reconnect_status(&status) {
+            unreachable_since
+                .get_or_insert_with(tokio::time::Instant::now)
+                .elapsed()
+                < VOLUME_MANAGER_RESTART_BUDGET
+        } else {
+            false
+        };
+        if !retry {
+            return Err(status);
         }
+        let Some(delay) = ENSURE_FILE_REPLICA_RETRY_POLICY.backoff_delay(retry_index) else {
+            return Err(status);
+        };
+        let remaining = max_total.saturating_sub(started_at.elapsed());
+        if delay >= remaining {
+            return Err(status);
+        }
+        retry_index += 1;
+        tokio::time::sleep(delay).await;
     }
 }
 

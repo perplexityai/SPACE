@@ -2336,23 +2336,9 @@ async fn pull_artifact_inner(
             .local_path(local_path_str.clone())
             .object_uri(s3_uri.clone()),
     );
-    let volmgr = match pplx_space_volmgr_client::connect(VOLMGR_SOCKET).await {
-        Ok(volmgr) => volmgr,
-        Err(error) => {
-            emit_sandbox_event(
-                sandbox_id,
-                SandboxEventType::SnapshotArtifactPullFailed,
-                SandboxEventSource::SbxManager,
-                SandboxEventDetails::default()
-                    .artifact(file_name)
-                    .local_path(local_path_str.clone())
-                    .object_uri(s3_uri)
-                    .reason("vol_mgr_connect")
-                    .error(error.to_string()),
-            );
-            return Err(RestoreError::Other(format!("vol-mgr connect: {error}")));
-        }
-    };
+    // Dialed by the first request, so a volume-manager that is restarting is
+    // waited for by the submission's retry rather than a separate connect.
+    let volmgr = pplx_space_volmgr_client::lazy(std::path::Path::new(VOLMGR_SOCKET));
     let output = match ensure_file_replica_with_config(
         volmgr,
         PullFileRequest {
