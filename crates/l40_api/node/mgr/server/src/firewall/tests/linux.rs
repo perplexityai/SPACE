@@ -181,7 +181,7 @@ fn incremental_writers_leave_markers_alone() {
     let stamped = markers(&namespace);
     ensure_guest_dhcp_bootstrap(ns).unwrap();
     allow_guest_port(ns, VPEER, 8080, "tcp").unwrap();
-    constrain_direct_inbound_reply_path(ns).unwrap();
+    constrain_direct_inbound_reply_path(ns, None).unwrap();
     deny_guest_port(ns, PortSelector::All, "tcp").unwrap();
     assert_eq!(markers(&namespace), stamped);
 }

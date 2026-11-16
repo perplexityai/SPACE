@@ -205,5 +205,5 @@ fn containment_checks_and_repairs_the_state_its_own_writes_leave() {
         "{proxy:?}"
     );
     // The contained namespace needs no further repair.
-    assert!(!firewall::constrain_direct_inbound_reply_path_from(&snapshot, &namespace).unwrap());
+    assert!(!firewall::constrain_direct_inbound_reply_path(&namespace, Some(&snapshot)).unwrap());
 }

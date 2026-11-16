@@ -86,11 +86,11 @@ pub(super) fn contain_namespace(namespace: &str) -> Result<bool, PoolOpenError> 
             l2_ingress.map_err(Into::into).and_then(|()| {
                 firewall::validate_installed_guest_l2_ingress_policy(&snapshot, namespace)
             }),
-            firewall::constrain_direct_inbound_reply_path_from(&snapshot, namespace).map(|_| ()),
+            firewall::constrain_direct_inbound_reply_path(namespace, Some(&snapshot)).map(|_| ()),
         ),
         Err(read) => (
             l2_ingress.and(Err(read)).map_err(Into::into),
-            firewall::constrain_direct_inbound_reply_path(namespace),
+            firewall::constrain_direct_inbound_reply_path(namespace, None).map(|_| ()),
         ),
     };
     if let Err(source) = l2_ingress {

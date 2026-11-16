@@ -667,7 +667,7 @@ pub fn ns_has_snat(ns: &str) -> bool {
     try_ns_has_snat(ns).unwrap_or(false)
 }
 
-pub fn try_ns_has_snat(ns: &str) -> Result<bool, FirewallError> {
+fn try_ns_has_snat(ns: &str) -> Result<bool, FirewallError> {
     Ok(
         nft_chain_output(Some(ns), "ip", SANDBOX_TABLE, "postrouting")?
             .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains("snat")),
@@ -679,7 +679,7 @@ pub fn ns_has_dnat(ns: &str) -> bool {
     try_ns_has_dnat(ns).unwrap_or(false)
 }
 
-pub fn try_ns_has_dnat(ns: &str) -> Result<bool, FirewallError> {
+fn try_ns_has_dnat(ns: &str) -> Result<bool, FirewallError> {
     Ok(
         nft_chain_output(Some(ns), "ip", SANDBOX_TABLE, "prerouting")?
             .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains("dnat")),
@@ -1476,30 +1476,26 @@ fn local_service_reply_rule_updates(
 
 /// Remove direct forwarding replies while retaining only the local service
 /// ingress return path. All changes use one namespace-local nft transaction.
-pub fn constrain_direct_inbound_reply_path(ns: &str) -> FirewallResult<()> {
-    let forward = nft_chain_json(Some(ns), "ip", SANDBOX_TABLE, "forward")?;
-    let proxy = nft_chain_json(Some(ns), "ip", PROXY_TABLE, "prerouting")?;
-    constrain_inbound_reply_chains(ns, forward.as_ref(), proxy.as_ref()).map(|_| ())
-}
-
-/// [`constrain_direct_inbound_reply_path`] from chains in a snapshot. Returns
-/// whether it changed the namespace, which makes the snapshot stale.
-pub fn constrain_direct_inbound_reply_path_from(
-    snapshot: &RulesetSnapshot,
+/// Reads both chains from `snapshot` when given, otherwise from `ns`. Returns
+/// whether it changed the namespace, which makes that snapshot stale.
+pub fn constrain_direct_inbound_reply_path(
     ns: &str,
+    snapshot: Option<&RulesetSnapshot>,
 ) -> FirewallResult<bool> {
-    constrain_inbound_reply_chains(
-        ns,
-        snapshot.chain("ip", SANDBOX_TABLE, "forward"),
-        snapshot.chain("ip", PROXY_TABLE, "prerouting"),
-    )
-}
-
-fn constrain_inbound_reply_chains(
-    ns: &str,
-    forward: Option<&serde_json::Value>,
-    proxy: Option<&serde_json::Value>,
-) -> FirewallResult<bool> {
+    let listed;
+    let (forward, proxy) = match snapshot {
+        Some(snapshot) => (
+            snapshot.chain("ip", SANDBOX_TABLE, "forward"),
+            snapshot.chain("ip", PROXY_TABLE, "prerouting"),
+        ),
+        None => {
+            listed = (
+                nft_chain_json(Some(ns), "ip", SANDBOX_TABLE, "forward")?,
+                nft_chain_json(Some(ns), "ip", PROXY_TABLE, "prerouting")?,
+            );
+            (listed.0.as_ref(), listed.1.as_ref())
+        }
+    };
     let mut removals = inbound_reply_rule_removals(forward)?;
     removals.extend(local_service_reply_rule_updates(proxy)?);
     if removals.is_empty() {
