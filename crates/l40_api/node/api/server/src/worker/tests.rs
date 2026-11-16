@@ -832,21 +832,23 @@ fn service_with_clients(clients: crate::clients::BackendClients) -> WorkerApiSer
     }
 }
 
-/// A node-manager restarting as a deploy restarts it: its socket is unbound
-/// until the successor has started, which answers every call with
-/// `Unimplemented`. Holds the socket directory and the successor task.
-struct RestartingNodeManager {
+/// A fake node-manager on a Unix socket: holds the socket directory and the
+/// server task.
+struct FakeNodeManager {
     _dir: tempfile::TempDir,
-    successor: tokio::task::JoinHandle<()>,
+    server: tokio::task::JoinHandle<()>,
 }
 
-impl Drop for RestartingNodeManager {
+impl Drop for FakeNodeManager {
     fn drop(&mut self) {
-        self.successor.abort();
+        self.server.abort();
     }
 }
 
-fn restarting_node_manager() -> (WorkerApiService, RestartingNodeManager) {
+/// A node-manager restarting as a deploy restarts it: its socket is unbound
+/// until the successor has started, which answers every call with
+/// `Unimplemented`.
+fn restarting_node_manager() -> (WorkerApiService, FakeNodeManager) {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("node-manager.sock");
     let clients = crate::clients::BackendClients::with_channel(
@@ -864,11 +866,91 @@ fn restarting_node_manager() -> (WorkerApiService, RestartingNodeManager) {
     });
     (
         service_with_clients(clients),
-        RestartingNodeManager {
+        FakeNodeManager {
             _dir: dir,
-            successor,
+            server: successor,
         },
     )
+}
+
+/// A running node-manager that answers its first call with `code` and
+/// `message`, and every later one with `Unimplemented`. Counts the calls.
+fn node_manager_answering_once(
+    code: tonic::Code,
+    message: &'static str,
+) -> (
+    WorkerApiService,
+    FakeNodeManager,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("node-manager.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let clients = crate::clients::BackendClients::with_channel(
+        pplx_space_common_grpc::connect_uds_channel_lazy(
+            &socket,
+            tonic::transport::Endpoint::from_static("http://[::]:50051"),
+        ),
+    );
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let backend = axum::Router::new().fallback(move || {
+        let call = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async move {
+            let (code, message) = if call == 0 {
+                (code, message)
+            } else {
+                (tonic::Code::Unimplemented, "")
+            };
+            http::Response::builder()
+                .header("content-type", "application/grpc")
+                .header("grpc-status", (code as i32).to_string())
+                .header("grpc-message", message)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        }
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    (
+        service_with_clients(clients),
+        FakeNodeManager { _dir: dir, server },
+        calls,
+    )
+}
+
+fn allow_port_request() -> Request<pplx_space_node_mgr_client::proto::AllowPortRequest> {
+    Request::new(pplx_space_node_mgr_client::proto::AllowPortRequest {
+        sandbox_id: SandboxId::new().to_string(),
+        port: 8080,
+        protocol: pplx_space_node_mgr_client::proto::NetworkProtocol::Tcp as i32,
+    })
+}
+
+// An `Unavailable` that node-manager answers for a reason of its own goes back
+// to the caller as sent, not replayed until the restart budget runs out.
+#[tokio::test]
+async fn a_port_call_returns_an_unavailable_answer_after_one_attempt() {
+    const BUSY: &str = "sandbox cleanup or reset is in progress; retry";
+    let (service, _node_manager, calls) =
+        node_manager_answering_once(tonic::Code::Unavailable, BUSY);
+
+    let status = service.allow_port(allow_port_request()).await.unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+    assert_eq!(status.message(), BUSY);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+// A draining node-manager's refusal is the restart, so the call is replayed.
+#[tokio::test]
+async fn a_port_call_retries_a_shutting_down_node_manager() {
+    let (service, _node_manager, calls) =
+        node_manager_answering_once(tonic::Code::Unavailable, NODE_MANAGER_SHUTTING_DOWN);
+
+    let status = service.allow_port(allow_port_request()).await.unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::Unimplemented, "{status}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 // A port call waits for node-manager's successor instead of failing on the

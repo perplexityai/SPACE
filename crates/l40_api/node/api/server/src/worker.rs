@@ -681,11 +681,27 @@ const NODE_MANAGER_RESTART_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
     max_server_retry_after: Duration::from_secs(2),
 };
 
+/// The answer node-manager gives a call it admitted after its shutdown began,
+/// in the window before its graceful server shutdown stops taking calls on
+/// open connections. node-manager marks it no other way, so it is matched by
+/// its text, which every released node-manager sends.
+const NODE_MANAGER_SHUTTING_DOWN: &str = "node-manager is shutting down";
+
+/// True when `status` is what a restarting node-manager produces: the client
+/// failed to dial it or lost the connection mid-call, or the draining
+/// predecessor refused the call.
+fn is_node_manager_restart(status: &Status) -> bool {
+    pplx_space_common_grpc::is_client_transport_failure(status)
+        || (status.code() == tonic::Code::Unavailable
+            && status.message() == NODE_MANAGER_SHUTTING_DOWN)
+}
+
 /// Forward a port-exposure RPC to node-manager, waiting out its restart.
 ///
 /// Only for `AllowPort` and `ExposePort`: each answers success when its rule
 /// is already installed, so replaying an attempt whose connection was cut
-/// after it may have run is safe.
+/// after it may have run is safe. Any other answer, `Unavailable` included,
+/// goes back to the caller after one attempt.
 async fn forward_port_rpc_through_node_manager_restart<Req, Resp, F, Fut>(
     command: &'static str,
     request: Request<Req>,
@@ -700,19 +716,27 @@ where
     let message = request.into_inner();
     let context = GrpcRetryContext::with_timeout(NODE_MANAGER_RESTART_RETRY_POLICY.max_elapsed)
         .with_grpc_timeout_metadata(&metadata);
+    // The helper retries its standard statuses whatever the predicate says,
+    // so an answer that must not be retried leaves it as `Ok`.
     pplx_space_common_grpc::retry_grpc_status_with_context_if(
         "node-manager",
         command,
         NODE_MANAGER_RESTART_RETRY_POLICY,
         context,
-        pplx_space_common_grpc::is_client_transport_failure,
+        is_node_manager_restart,
         || {
             let mut request = Request::new(message.clone());
             *request.metadata_mut() = metadata.clone();
-            call(request)
+            let response = call(request);
+            async move {
+                match response.await {
+                    Err(status) if is_node_manager_restart(&status) => Err(status),
+                    response => Ok(response),
+                }
+            }
         },
     )
-    .await
+    .await?
 }
 
 fn reject_public_netns_path(rpc: &'static str, netns_path: &Option<String>) -> Result<(), Status> {
