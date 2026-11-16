@@ -115,6 +115,8 @@ struct RestartHandoffDialer<C> {
 
 struct DialerState<C> {
     epoch: u64,
+    /// When the dial behind `result` began.
+    started_at: Option<tokio::time::Instant>,
     dialed_at: Option<tokio::time::Instant>,
     result: Option<Result<C, Status>>,
 }
@@ -125,6 +127,7 @@ impl<C: Clone> RestartHandoffDialer<C> {
             ttl,
             state: tokio::sync::Mutex::new(DialerState {
                 epoch: 0,
+                started_at: None,
                 dialed_at: None,
                 result: None,
             }),
@@ -133,6 +136,9 @@ impl<C: Clone> RestartHandoffDialer<C> {
 
     /// Returns the shared dial result for an epoch newer than `seen_epoch`,
     /// dialing at most once per TTL window across all concurrent callers.
+    /// With `not_before`, a cached result counts only if its dial began at or
+    /// after that instant: an earlier dial may have reached the process whose
+    /// failure the caller is replaying.
     /// The lock is held across the dial deliberately: queued callers wake to
     /// the cached result instead of dialing themselves. Each dial attempt is
     /// itself bounded by the TTL, so a stalled connect (for example, one
@@ -141,7 +147,12 @@ impl<C: Clone> RestartHandoffDialer<C> {
     /// blocking every follower behind one dead generation. Callers remain
     /// bounded by their own deadlines and cancellation — dropping a queued
     /// or dialing caller releases the lock.
-    async fn fresh_client<D, DFut>(&self, seen_epoch: u64, dial: &D) -> (u64, Result<C, Status>)
+    async fn fresh_client<D, DFut>(
+        &self,
+        seen_epoch: u64,
+        not_before: Option<tokio::time::Instant>,
+        dial: &D,
+    ) -> (u64, Result<C, Status>)
     where
         D: Fn() -> DFut,
         DFut: Future<Output = Result<C, Status>>,
@@ -150,9 +161,13 @@ impl<C: Clone> RestartHandoffDialer<C> {
         if state.epoch > seen_epoch
             && let Some(result) = &state.result
             && matches!(state.dialed_at, Some(at) if at.elapsed() < self.ttl)
+            && not_before.is_none_or(
+                |not_before| matches!(state.started_at, Some(started) if started >= not_before),
+            )
         {
             return (state.epoch, result.clone());
         }
+        let started_at = tokio::time::Instant::now();
         let result = match tokio::time::timeout(self.ttl, dial()).await {
             Ok(result) => result,
             Err(_) => Err(Status::unavailable(format!(
@@ -161,6 +176,7 @@ impl<C: Clone> RestartHandoffDialer<C> {
             ))),
         };
         state.epoch += 1;
+        state.started_at = Some(started_at);
         state.dialed_at = Some(tokio::time::Instant::now());
         state.result = Some(result.clone());
         (state.epoch, result)
@@ -348,9 +364,16 @@ where
     // wording cannot enter here), or — for read-only RPCs — one
     // fresh-connection probe on an ambiguous transport-shaped failure.
     let mut probes_remaining = safety.probe_allowance();
+    // A read probe must reach a connection dialed after the failure it
+    // replays, never a shared dial from before it, which can still lead to
+    // the process that failed the read. Proof replays keep sharing dials.
+    let mut probe_not_before = None;
     match safety.classify(&status) {
         ReplayClass::Proof => {}
-        ReplayClass::ReadProbe => probes_remaining -= 1,
+        ReplayClass::ReadProbe => {
+            probes_remaining -= 1;
+            probe_not_before = Some(tokio::time::Instant::now());
+        }
         ReplayClass::Fatal => return Err(status),
     }
 
@@ -379,7 +402,11 @@ where
         attempts += 1;
         pplx_space_grpc_metrics::client_retry("sandbox-manager", method, "rpc", "restart_handoff");
         let budget = attempt_budget(&context, handoff_deadline);
-        let shared_dial = async { Ok(dialer.fresh_client(seen_epoch, &dial).await) };
+        let shared_dial = async {
+            Ok(dialer
+                .fresh_client(seen_epoch, probe_not_before, &dial)
+                .await)
+        };
         let (epoch, dialed) = match run_within(budget, method, shared_dial).await {
             Ok(shared) => shared,
             Err(deadline_status) => {
@@ -416,6 +443,7 @@ where
                 }
                 ReplayClass::ReadProbe if probes_remaining > 0 => {
                     probes_remaining -= 1;
+                    probe_not_before = Some(tokio::time::Instant::now());
                     last_status = status;
                 }
                 ReplayClass::ReadProbe | ReplayClass::Fatal => {
