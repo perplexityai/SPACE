@@ -937,7 +937,7 @@ impl NetworkPool {
     ) -> Result<ClaimedSlotAllocation, AllocateSlotError> {
         if self.shutdown_token.is_cancelled() {
             return Err(AllocateSlotError::InProgress(
-                "node-manager is shutting down".into(),
+                pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE.into(),
             ));
         }
         if self.is_draining()? {

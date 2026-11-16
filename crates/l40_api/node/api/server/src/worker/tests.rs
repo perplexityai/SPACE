@@ -944,8 +944,10 @@ async fn a_port_call_returns_an_unavailable_answer_after_one_attempt() {
 // A draining node-manager's refusal is the restart, so the call is replayed.
 #[tokio::test]
 async fn a_port_call_retries_a_shutting_down_node_manager() {
-    let (service, _node_manager, calls) =
-        node_manager_answering_once(tonic::Code::Unavailable, NODE_MANAGER_SHUTTING_DOWN);
+    let (service, _node_manager, calls) = node_manager_answering_once(
+        tonic::Code::Unavailable,
+        pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE,
+    );
 
     let status = service.allow_port(allow_port_request()).await.unwrap_err();
 
@@ -1015,7 +1017,7 @@ async fn a_stalled_port_call_is_bounded_by_the_restart_budget() {
 
     assert_eq!(status.code(), tonic::Code::DeadlineExceeded, "{status}");
     assert!(
-        started_at.elapsed() <= NODE_MANAGER_RESTART_RETRY_POLICY.max_elapsed,
+        started_at.elapsed() <= PEER_RESTART_RETRY_POLICY.max_elapsed,
         "gave up after {:?}",
         started_at.elapsed()
     );

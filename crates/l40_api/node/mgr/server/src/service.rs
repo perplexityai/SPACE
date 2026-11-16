@@ -609,7 +609,9 @@ impl NodeManagerService {
 
     fn adopt_validated_lease(&self, sandbox_id: &str, expected: &SlotInfo) -> Result<(), Status> {
         if self.pool.shutdown_token.is_cancelled() {
-            return Err(Status::unavailable("node-manager is shutting down"));
+            return Err(Status::unavailable(
+                pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE,
+            ));
         }
         self.pool
             .adopt_lease(sandbox_id, expected)
@@ -731,7 +733,9 @@ impl NodeManagerService {
         self.peer_authorizer
             .authorize_request(request, operation, allowed)?;
         if self.pool.shutdown_token.is_cancelled() {
-            return Err(Status::unavailable("node-manager is shutting down"));
+            return Err(Status::unavailable(
+                pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE,
+            ));
         }
         Ok(())
     }

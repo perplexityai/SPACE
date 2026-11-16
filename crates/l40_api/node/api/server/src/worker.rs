@@ -3,7 +3,7 @@ use crate::node_ctl;
 use crate::proto::worker_api_internal_server::WorkerApiInternal;
 use crate::proto::worker_api_server::WorkerApi;
 use crate::proto::{TriggerStateReconciliationRequest, TriggerStateReconciliationResponse};
-use crate::restart_handoff::RpcReplaySafety;
+use crate::restart_handoff::{PEER_RESTART_RETRY_POLICY, RpcReplaySafety};
 use crate::uds_per_sandbox_limiter::{SandboxBudget, UdsPerSandboxLimiter, UdsPerSandboxPermit};
 use std::future::Future;
 use std::pin::Pin;
@@ -16,13 +16,12 @@ use pplx_space_api_route::{
     space_api_route_capability_presence, take_wait_ready_call_purpose, wait_ready_call_purpose,
 };
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_grpc::{GrpcRetryContext, GrpcRetryPolicy, fwd_retry};
+use pplx_space_common_grpc::{GrpcRetryContext, fwd_retry};
 use pplx_space_node_mgr_client::{CacheDiskSchedulingEffect, NodeResourceStatusReader};
 use pplx_space_rpc_auth::{
     NetworkPolicyMutationAuthority, NodeApiAuthenticatedCaller, WaitReadyLifecycleAuthority,
 };
 use pplx_space_sandbox_grpc::record_sandbox_id;
-use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -664,47 +663,33 @@ fn allow_port_request_params(req: &pplx_space_node_mgr_client::proto::AllowPortR
     ])
 }
 
-/// Retry budget for forwarding `AllowPort` and `ExposePort` across a
-/// node-manager restart. node-manager surges: on SIGTERM the predecessor
-/// stops accepting and drains, and it releases the service mutex only once
-/// its drain ends; only then does the successor finish starting and bind the
-/// socket, so dials in between are refused and calls on the old connection
-/// are cut. [`DEFAULT_DRAIN_TIMEOUT`] is when the predecessor escalates, not
-/// a bound: it can keep the mutex until it is killed. This budget covers a
-/// drain that finishes within [`DEFAULT_DRAIN_TIMEOUT`], plus about 5 s for
-/// the successor to start. `max_elapsed` also bounds the attempt in flight,
-/// and a caller's `grpc-timeout` can only shorten the wait.
-const NODE_MANAGER_RESTART_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
-    max_retries: 128,
-    initial_delay: Duration::from_millis(50),
-    backoff_multiplier: 2.0,
-    max_delay: Duration::from_millis(500),
-    max_elapsed: DEFAULT_DRAIN_TIMEOUT.saturating_add(Duration::from_secs(5)),
-    jitter_factor: 0.2,
-    max_server_retry_after: Duration::from_secs(2),
-};
-
-/// The answer node-manager gives a call it admitted after its shutdown began,
-/// in the window before its graceful server shutdown stops taking calls on
-/// open connections. node-manager marks it no other way, so it is matched by
-/// its text, which every released node-manager sends.
-const NODE_MANAGER_SHUTTING_DOWN: &str = "node-manager is shutting down";
-
 /// True when `status` is what a restarting node-manager produces: the client
 /// failed to dial it or lost the connection mid-call, or the draining
 /// predecessor refused the call.
 fn is_node_manager_restart(status: &Status) -> bool {
     pplx_space_common_grpc::is_client_transport_failure(status)
         || (status.code() == tonic::Code::Unavailable
-            && status.message() == NODE_MANAGER_SHUTTING_DOWN)
+            && status.message() == pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE)
 }
 
 /// Forward a port-exposure RPC to node-manager, waiting out its restart.
+///
+/// node-manager surges: on SIGTERM the predecessor stops accepting and
+/// drains, and it releases the service mutex only once its drain ends; only
+/// then does the successor finish starting and bind the socket, so dials in
+/// between are refused and calls on the old connection are cut.
+/// [`DEFAULT_DRAIN_TIMEOUT`] is when the predecessor escalates, not a bound:
+/// it can keep the mutex until it is killed. [`PEER_RESTART_RETRY_POLICY`]
+/// covers a drain that finishes within [`DEFAULT_DRAIN_TIMEOUT`], plus about
+/// 5 s for the successor to start. Its `max_elapsed` also bounds the attempt
+/// in flight, and a caller's `grpc-timeout` can only shorten the wait.
 ///
 /// Only for `AllowPort` and `ExposePort`: each answers success when its rule
 /// is already installed, so replaying an attempt whose connection was cut
 /// after it may have run is safe. Any other answer, `Unavailable` included,
 /// goes back to the caller after one attempt.
+///
+/// [`DEFAULT_DRAIN_TIMEOUT`]: pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT
 async fn forward_port_rpc_through_node_manager_restart<Req, Resp, F, Fut>(
     command: &'static str,
     request: Request<Req>,
@@ -717,14 +702,14 @@ where
 {
     let metadata = request.metadata().clone();
     let message = request.into_inner();
-    let context = GrpcRetryContext::with_timeout(NODE_MANAGER_RESTART_RETRY_POLICY.max_elapsed)
+    let context = GrpcRetryContext::with_timeout(PEER_RESTART_RETRY_POLICY.max_elapsed)
         .with_grpc_timeout_metadata(&metadata);
     // The helper retries its standard statuses whatever the predicate says,
     // so an answer that must not be retried leaves it as `Ok`.
     pplx_space_common_grpc::retry_grpc_status_with_context_if(
         "node-manager",
         command,
-        NODE_MANAGER_RESTART_RETRY_POLICY,
+        PEER_RESTART_RETRY_POLICY,
         context,
         is_node_manager_restart,
         || {

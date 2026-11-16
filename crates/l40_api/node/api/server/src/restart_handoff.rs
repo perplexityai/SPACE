@@ -27,13 +27,14 @@ use pplx_space_sbx_mgr_client::{
 
 use crate::clients::BackendClients;
 
-/// Retry budget spanning a full sandbox-manager restart handoff: the
-/// predecessor drains state writers for up to [`DEFAULT_DRAIN_TIMEOUT`]
-/// before it exits and the successor can bind the socket. The budget is a
-/// hard deadline covering backoff sleeps, fresh dials, and in-flight
-/// replays — not just the decision to retry. Callers with a tighter
-/// `grpc-timeout` deadline are still bounded by it.
-const RESTART_HANDOFF_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
+/// Retry budget spanning a restart of a node-local peer, sandbox-manager or
+/// node-manager: the predecessor drains for up to [`DEFAULT_DRAIN_TIMEOUT`]
+/// before the successor can bind the socket, and the extra 5 s covers the
+/// successor's startup. The budget is a hard deadline covering backoff
+/// sleeps, fresh dials, and in-flight replays — not just the decision to
+/// retry. Callers with a tighter `grpc-timeout` deadline are still bounded
+/// by it.
+pub(crate) const PEER_RESTART_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
     max_retries: 128,
     initial_delay: Duration::from_millis(50),
     backoff_multiplier: 2.0,
@@ -315,7 +316,7 @@ where
     let message = request.into_inner();
     retry_restart_handoff(
         method,
-        RESTART_HANDOFF_RETRY_POLICY,
+        PEER_RESTART_RETRY_POLICY,
         safety,
         metadata,
         message,

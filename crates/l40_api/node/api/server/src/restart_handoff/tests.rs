@@ -707,17 +707,17 @@ async fn handoff_stops_all_work_when_the_caller_drops_the_future() {
 
 #[test]
 fn handoff_retry_budget_spans_a_full_predecessor_drain() {
-    assert!(RESTART_HANDOFF_RETRY_POLICY.max_elapsed > DEFAULT_DRAIN_TIMEOUT);
+    assert!(PEER_RESTART_RETRY_POLICY.max_elapsed > DEFAULT_DRAIN_TIMEOUT);
 
     let mut worst_case = Duration::ZERO;
-    for retry_index in 0..RESTART_HANDOFF_RETRY_POLICY.max_retries {
-        let Some(delay) = RESTART_HANDOFF_RETRY_POLICY.backoff_delay(retry_index) else {
+    for retry_index in 0..PEER_RESTART_RETRY_POLICY.max_retries {
+        let Some(delay) = PEER_RESTART_RETRY_POLICY.backoff_delay(retry_index) else {
             break;
         };
         worst_case += delay;
     }
     assert!(
-        worst_case > RESTART_HANDOFF_RETRY_POLICY.max_elapsed,
+        worst_case > PEER_RESTART_RETRY_POLICY.max_elapsed,
         "retry count must exhaust after max_elapsed, not before: {worst_case:?}"
     );
 }
