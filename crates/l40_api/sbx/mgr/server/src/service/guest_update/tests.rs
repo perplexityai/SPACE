@@ -665,7 +665,11 @@ impl Drop for ObservedCaptures {
 async fn refused_endpoint_attestation_waits_for_a_spaced_host_relaunch() {
     let observed =
         ObservedCaptures::start(|| Status::failed_precondition("scripted endpoint proof refusal"));
-    while observed.after(Duration::from_millis(10)).await == 0 {}
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while observed.after(Duration::from_millis(10)).await == 0 {}
+    })
+    .await
+    .expect("the observer requests a first endpoint proof");
     assert_eq!(
         observed
             .after(3 * super::observation::SPACED_HOST_RELAUNCH_POLL)
