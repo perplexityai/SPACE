@@ -108,6 +108,14 @@ pub(super) fn pin_current_process() -> Result<ProcessHandle, ProcessHandleError>
     })
 }
 
+/// Non-Linux hosts have no network namespaces.
+pub fn require_network_namespace(_namespace: &std::fs::File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "network namespaces require Linux",
+    ))
+}
+
 impl ProcessHandle {
     /// Non-Linux hosts cannot duplicate another process's descriptors.
     pub fn duplicate_listening_socket(

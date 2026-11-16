@@ -1029,9 +1029,18 @@ async fn replaced_gateway_without_every_listener_still_stops_and_hands_over_none
     let specs = listener_specs(udp.local_addr().unwrap(), tcp.local_addr().unwrap());
     let mut not_transparent = specs.clone();
     not_transparent[0].transparent = true;
+    // A network namespace other than the one holding the sockets.
+    let other_namespace = gateway_handover::tests::spawn_ready(
+        std::process::Command::new("unshare")
+            .arg("--net")
+            .arg("sh")
+            .arg("-c")
+            .arg(gateway_handover::tests::ready_script("true")),
+    );
+    let other_ns_path = format!("/proc/{}/ns/net", other_namespace.id());
     for (specs, ns_path) in [
         (not_transparent, "/proc/self/ns/net"),
-        (specs, "/proc/self/ns/uts"),
+        (specs.clone(), other_ns_path.as_str()),
     ] {
         let sandbox_id = SandboxId::new();
         let mut holder = spawn_socket_holder(sandbox_id, vec![udp.as_raw_fd(), tcp.as_raw_fd()]);
@@ -1042,25 +1051,52 @@ async fn replaced_gateway_without_every_listener_still_stops_and_hands_over_none
         assert!(inherited.is_empty(), "{ns_path}");
         assert_eq!(holder.wait().unwrap().signal(), Some(libc::SIGTERM));
     }
+
+    // A path that is no network namespace fails the launch, so the old
+    // gateway is left running.
+    let sandbox_id = SandboxId::new();
+    let mut holder = spawn_socket_holder(sandbox_id, vec![udp.as_raw_fd(), tcp.as_raw_fd()]);
+    let status = service
+        .retire_replaced_gateway(sandbox_id, holder.id(), "/proc/self/ns/uts", &specs)
+        .await
+        .expect_err("a non-network namespace must be refused");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+    assert!(
+        holder.try_wait().unwrap().is_none(),
+        "the old gateway keeps running"
+    );
 }
 
 #[tokio::test]
 async fn an_unlaunchable_replacement_is_refused_before_anything_changes() {
     let service = RuntimeSupervisorService::default();
-    let status = service
-        .launch_sidecar_owned(
-            LaunchSidecarRequest {
-                sandbox_id: SandboxId::new().to_string(),
-                program: pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN.to_string(),
-                env: std::collections::HashMap::from([("BAD=KEY".to_string(), "x".to_string())]),
-                replace_pid: Some(4242),
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .expect_err("an invalid environment must be refused");
-    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
+    let bad_env = LaunchSidecarRequest {
+        env: std::collections::HashMap::from([("BAD=KEY".to_string(), "x".to_string())]),
+        ..Default::default()
+    };
+    let bad_fd_arg = LaunchSidecarRequest {
+        pre_exec_sockets: vec![pplx_space_node_runtime_core::proto::PreExecSocket {
+            bind_addr: "0.0.0.0:15002".to_string(),
+            fd_arg: "--udp-fd\0".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    for request in [bad_env, bad_fd_arg] {
+        let status = service
+            .launch_sidecar_owned(
+                LaunchSidecarRequest {
+                    sandbox_id: SandboxId::new().to_string(),
+                    program: pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN.to_string(),
+                    replace_pid: Some(4242),
+                    ..request
+                },
+                None,
+            )
+            .await
+            .expect_err("a request the launcher would reject must be refused");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
+    }
 }
 
 #[test]

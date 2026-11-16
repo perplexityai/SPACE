@@ -805,7 +805,17 @@ impl RuntimeSupervisorService {
         let replace_pid = req.replace_pid.filter(|_| is_gateway);
         // Before anything irreversible: a replacement stops the old gateway
         // before the launcher could reject these.
-        launch::validate_sidecar_launch_strings(&req.program, &req.args, &req.env)
+        let exec_args = req
+            .args
+            .iter()
+            .cloned()
+            .chain(
+                req.pre_exec_sockets
+                    .iter()
+                    .map(|socket| socket.fd_arg.clone()),
+            )
+            .collect::<Vec<_>>();
+        launch::validate_sidecar_launch_strings(&req.program, &exec_args, &req.env)
             .map_err(Status::invalid_argument)?;
         let program_filename = sidecar_program_filename(&req.program)?;
         let pid_filename = sidecar_pid_filename(&req.program)?;
@@ -1037,9 +1047,14 @@ impl RuntimeSupervisorService {
         }
         // The replacement launches into this namespace; one that cannot be
         // opened fails the launch, so keep the old gateway running.
-        let namespace = std::fs::File::open(ns_path).map_err(|error| {
-            Status::failed_precondition(format!("open network namespace {ns_path}: {error}"))
-        })?;
+        let namespace = std::fs::File::open(ns_path)
+            .and_then(|namespace| {
+                launch::require_network_namespace(&namespace)?;
+                Ok(namespace)
+            })
+            .map_err(|error| {
+                Status::failed_precondition(format!("network namespace {ns_path}: {error}"))
+            })?;
         let slot = self.acquire_blocking_slot().await?;
         let sockets = sockets.to_vec();
         let (process, duplicated) = tokio::task::spawn_blocking(move || {

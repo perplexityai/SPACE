@@ -197,6 +197,23 @@ impl ProcessHandle {
     }
 }
 
+/// Fail unless `namespace` is a network namespace, the kind a sidecar launch
+/// joins with `setns(CLONE_NEWNET)`.
+pub fn require_network_namespace(namespace: &std::fs::File) -> std::io::Result<()> {
+    // SAFETY: NS_GET_NSTYPE reads no argument and returns the namespace type.
+    let kind = unsafe { libc::ioctl(namespace.as_raw_fd(), libc::NS_GET_NSTYPE) };
+    if kind < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if kind != libc::CLONE_NEWNET {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a network namespace",
+        ));
+    }
+    Ok(())
+}
+
 fn listening_socket_matches(
     socket: &OwnedFd,
     expected: &PreExecSocket,
