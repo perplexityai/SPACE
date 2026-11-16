@@ -666,11 +666,14 @@ fn allow_port_request_params(req: &pplx_space_node_mgr_client::proto::AllowPortR
 
 /// Retry budget for forwarding `AllowPort` and `ExposePort` across a
 /// node-manager restart. node-manager surges: on SIGTERM the predecessor
-/// stops accepting and drains for up to [`DEFAULT_DRAIN_TIMEOUT`] before it
-/// releases the service mutex, and only then does the successor finish
-/// starting and bind the socket, so dials in between are refused and calls
-/// on the old connection are cut. `max_elapsed` also bounds the attempt in
-/// flight, and a caller's `grpc-timeout` can only shorten the wait.
+/// stops accepting and drains, and it releases the service mutex only once
+/// its drain ends; only then does the successor finish starting and bind the
+/// socket, so dials in between are refused and calls on the old connection
+/// are cut. [`DEFAULT_DRAIN_TIMEOUT`] is when the predecessor escalates, not
+/// a bound: it can keep the mutex until it is killed. This budget covers a
+/// drain that finishes within [`DEFAULT_DRAIN_TIMEOUT`], plus about 5 s for
+/// the successor to start. `max_elapsed` also bounds the attempt in flight,
+/// and a caller's `grpc-timeout` can only shorten the wait.
 const NODE_MANAGER_RESTART_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
     max_retries: 128,
     initial_delay: Duration::from_millis(50),
