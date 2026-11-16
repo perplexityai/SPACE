@@ -10,6 +10,7 @@ use pplx_space_public_api::{
     SandboxLifecycleAction as PublicSandboxLifecycleAction,
 };
 use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
+use tracing::Instrument as _;
 
 use crate::controllers::sandbox::lifecycle::user_admission::{
     UserLifecycleRequest, admit_user_lifecycle,
@@ -349,10 +350,10 @@ pub(super) async fn create_sandbox(
     crate::e2b::E2bJson(req): crate::e2b::E2bJson<CreateSandboxRequestE2b>,
 ) -> Result<impl IntoResponse, E2bApiError> {
     let actor = actor.ok_or_else(E2bApiError::unauthorized)?;
-    // Reserve a per-client concurrency slot before doing any control-plane work.
-    // Held for the whole handler; released on return.
+    // Reserve a per-client concurrency slot before doing any control-plane
+    // work. The create task holds it until the create ends.
     let client_id = request_client_id(&headers);
-    let _client_slot = acquire_client_slot(
+    let client_slot = acquire_client_slot(
         &state,
         crate::metrics::sandbox::api::client_limit::Operation::Create,
         client_id.as_deref(),
@@ -365,33 +366,60 @@ pub(super) async fn create_sandbox(
         .select_egress_profiles(&headers, federated_owner.is_some())
         .map_err(|error| E2bApiError::bad_request(error.to_string()))?;
     let federated_service_grant = request_federated_service_grant(&headers, federated_owner)?;
-    let translated = translate_create_request(req)?;
-    let federated_create =
-        FederatedSandboxCreateContext::new(federated_owner, federated_service_grant.as_ref())
-            .with_egress_profiles(Some(&egress_profiles));
-    let native = match state
-        .sandbox_controller
-        .create(
-            &state.pool,
-            &actor,
-            &translated.native,
-            SandboxApiMetricIdentity::ecw("create"),
-            federated_create,
-            request_activation_client(client_id.as_deref()),
-        )
-        .await
-    {
-        Ok(native) => native,
-        Err(err) => return Err(controller_error(err)),
-    };
-    record_ecw_sandbox_span_tag(native.id);
-
-    let template_name = translated
-        .native
+    let CreateSandboxTranslation {
+        native: request,
+        template_id,
+    } = translate_create_request(req)?;
+    let template_name = request
         .template
         .as_ref()
         .map(|template| template.name().as_str().to_owned())
-        .unwrap_or_else(|| translated.template_id.clone());
+        .unwrap_or_else(|| template_id.clone());
+    let activating_client = request_activation_client(client_id.as_deref());
+
+    // The create runs in its own task, so a client that disconnects drops
+    // only the wait for it. Run in the request future, a disconnect would
+    // cancel the create mid-flight and skip its failure arm, leaving the
+    // sandbox row behind for the sweepers. A connected client still gets
+    // exactly the create's answer.
+    let create = {
+        let state = state.clone();
+        async move {
+            let _client_slot = client_slot;
+            let federated_create = FederatedSandboxCreateContext::new(
+                federated_owner_ref(&federated),
+                federated_service_grant.as_ref(),
+            )
+            .with_egress_profiles(Some(&egress_profiles));
+            state
+                .sandbox_controller
+                .create(
+                    &state.pool,
+                    &actor,
+                    &request,
+                    SandboxApiMetricIdentity::ecw("create"),
+                    federated_create,
+                    activating_client,
+                )
+                .await
+        }
+    };
+    let native = state
+        .task_tracker
+        .spawn(
+            crate::metrics::sandbox::api::scope_request_client_id(
+                crate::metrics::sandbox::api::request_client_id(),
+                create,
+            )
+            .in_current_span(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "ECW create task stopped before it answered");
+            E2bApiError::internal("Internal server error")
+        })?
+        .map_err(controller_error)?;
+    record_ecw_sandbox_span_tag(native.id);
 
     Ok((
         StatusCode::CREATED,
@@ -400,7 +428,7 @@ pub(super) async fn create_sandbox(
         Json(build_sandbox_response(
             &state.ecw_credential_keyring,
             &native,
-            translated.template_id,
+            template_id,
             Some(ecw_host_pair.host),
             pplx_space_common_core::types::EcwCredentialEpoch::new(1)
                 .expect("initial ECW credential epoch is valid"),

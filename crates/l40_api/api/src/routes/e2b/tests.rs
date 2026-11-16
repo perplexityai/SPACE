@@ -6818,3 +6818,220 @@ async fn ecw_fork_is_admitted_for_its_source_before_it_is_recorded() -> TestResu
     assert_eq!(admitted(source), [UserLifecycleRequest::Fork]);
     Ok(())
 }
+
+/// A create whose client disconnects while the create waits for its pod still
+/// runs its failure arm when the wait fails: the pod is deleted, its
+/// execution retired and the sandbox row removed, so the sandbox does not sit
+/// `creating` until a sweep finds it.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn ecw_create_cleans_up_a_failed_create_after_its_client_disconnects() -> TestResult {
+    use crate::controllers::substrate::kubernetes::scripted_test_doubles::{
+        KubeReply, kube_status, pod_reply, scripted_kube_client_async,
+    };
+    const PODS_PATH: &str = "/api/v1/namespaces/space/pods";
+    const EVENTS_PATH: &str = "/api/v1/namespaces/space/events";
+    // How a node words a sandbox it refuses as invalid.
+    const REFUSAL: &str = "Failed to create pod sandbox: sbx-manager Wake \
+        [space-err=InvalidArgument]: prepare sandbox failed";
+
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pg_test_db().await?;
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, visibility) VALUES ($1, 'seed', 'generic')"
+    ))
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, 'seed', 'fc', 'sha256:ecw-create-disconnect')"
+    ))
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+         VALUES ($1, 'seed', 'latest')"
+    ))
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+    let (org, actor) = seed_ecw_caller(&db.pool).await?;
+
+    let pod_name: Arc<Mutex<Option<String>>> = Arc::default();
+    // Signalled when the create waits on its pod's events; the refusal is
+    // answered only once the test has disconnected the client.
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let refuse = Arc::new(tokio::sync::Notify::new());
+    let (client, log) = {
+        let pod_name = Arc::clone(&pod_name);
+        let waiting = Arc::clone(&waiting);
+        let refuse = Arc::clone(&refuse);
+        scripted_kube_client_async(move |request| {
+            let pod_name = Arc::clone(&pod_name);
+            let waiting = Arc::clone(&waiting);
+            let refuse = Arc::clone(&refuse);
+            async move {
+                let pending = |name: &str| {
+                    pod_reply(&Pod {
+                        metadata: kube::api::ObjectMeta {
+                            name: Some(name.to_string()),
+                            namespace: Some("space".to_string()),
+                            uid: Some(format!("{name}-uid")),
+                            ..Default::default()
+                        },
+                        status: Some(PodStatus {
+                            phase: Some("Pending".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })
+                };
+                let name = pod_name.lock().unwrap().clone();
+                let at_pod = name.as_deref().map(|name| format!("{PODS_PATH}/{name}"));
+                match request.method {
+                    Method::POST if request.path == PODS_PATH => {
+                        let name = request
+                            .body
+                            .as_ref()
+                            .and_then(|pod| pod.pointer("/metadata/name"))
+                            .and_then(serde_json::Value::as_str)
+                            .expect("a pod create names its pod")
+                            .to_string();
+                        *pod_name.lock().unwrap() = Some(name.clone());
+                        pending(&name)
+                    }
+                    // The pod never reports an IP.
+                    Method::GET if request.path == PODS_PATH => KubeReply::Hang,
+                    Method::GET if Some(&request.path) == at_pod.as_ref() => {
+                        pending(name.as_deref().expect("the pod was created"))
+                    }
+                    Method::GET if request.path == EVENTS_PATH => {
+                        let name = name.expect("events are watched after the pod is created");
+                        waiting.notify_one();
+                        refuse.notified().await;
+                        KubeReply::WatchEvents(vec![json!({
+                            "type": "ADDED",
+                            "object": {
+                                "apiVersion": "v1",
+                                "kind": "Event",
+                                "metadata": { "name": format!("{name}.1"), "namespace": "space" },
+                                "involvedObject": {
+                                    "kind": "Pod",
+                                    "name": name,
+                                    "uid": format!("{name}-uid"),
+                                },
+                                "reason": "FailedCreatePodSandBox",
+                                "message": REFUSAL,
+                                "type": "Warning",
+                            },
+                        })])
+                    }
+                    Method::DELETE if Some(&request.path) == at_pod.as_ref() => {
+                        kube_status(StatusCode::OK, "Success")
+                    }
+                    _ => kube_status(StatusCode::BAD_REQUEST, "BadRequest"),
+                }
+            }
+        })
+    };
+    let kubernetes =
+        crate::controllers::substrate::kubernetes::tests::substrate_with_store_and_client(
+            db.pool.clone(),
+            client,
+        );
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    configure_test_ecw_credential_keyring(&mut state);
+    state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
+        crate::controllers::substrate::Substrate::from_kubernetes(kubernetes),
+    );
+    let app = e2b_api_routes()
+        .layer(Extension(AuthEcwActor(Some(actor))))
+        .layer(Extension(AuthOrg(org)))
+        .layer(Extension(test_ecw_host_config()))
+        .with_state(state);
+
+    let create = app.clone().oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/sandboxes")
+            .header(header::HOST, TEST_ECW_API_HOST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"templateID":"seed"}"#))?,
+    );
+    tokio::select! {
+        answered = create => {
+            return Err(format!("the create answered before it waited: {:?}", answered?.status()).into());
+        }
+        waited = tokio::time::timeout(Duration::from_secs(30), waiting.notified()) => waited?,
+    }
+    // The create future is dropped above, as the server drops a handler whose
+    // client disconnected.
+    let sandbox_id: SandboxId = sqlx::query_scalar(sql!("SELECT id FROM sandboxes"))
+        .fetch_one(&db.pool)
+        .await?;
+    refuse.notify_one();
+
+    let removed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let rows: i64 =
+                sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes WHERE id = $1"))
+                    .bind(sandbox_id)
+                    .fetch_one(&db.pool)
+                    .await?;
+            if rows == 0 {
+                return TestResult::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let lifecycle: Option<String> =
+        sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_optional(&db.pool)
+            .await?;
+    assert!(
+        removed.is_ok(),
+        "the failed create's sandbox row survived its client, as {lifecycle:?}"
+    );
+    removed??;
+
+    let pod_name = pod_name
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("the pod was created")?;
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.method == Method::DELETE
+                && request.path == format!("{PODS_PATH}/{pod_name}")),
+        "the failed create deleted its pod"
+    );
+    let active_executions: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        active_executions, 0,
+        "the failed create retired its execution"
+    );
+    let get = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/sandboxes/{sandbox_id}"))
+                .header(header::HOST, TEST_ECW_API_HOST)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
