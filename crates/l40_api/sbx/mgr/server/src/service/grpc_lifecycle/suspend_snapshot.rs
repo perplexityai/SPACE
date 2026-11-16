@@ -854,6 +854,20 @@ impl SandboxManagerService {
             // carried to durable storage as opaque blobs; reflink keeps the copy
             // instant and sparse. The plaintext rootfs codec branch below is skipped
             // for encrypted snapshots (there is no plaintext `rootfs.ext4` to diff).
+            if encrypted_capture_metadata.is_some() {
+                match commit_capture_for_receiptless_producer(&staging_dir) {
+                    Ok(true) => tracing::info!(
+                        sandbox_id = %sandbox.id,
+                        "node-manager predates capture receipts; committed the capture record on its reply"
+                    ),
+                    Ok(false) => {}
+                    Err(error) => tracing::error!(
+                        sandbox_id = %sandbox.id,
+                        %error,
+                        "cannot commit encrypted capture record; a failed seal will not be recoverable"
+                    ),
+                }
+            }
             if let Some(metadata) = &encrypted_capture_metadata
                 && let Err(error) = self
                     .seal_encrypted_capture(&sandbox, &staging_dir, metadata)
