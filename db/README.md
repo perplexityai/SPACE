@@ -83,6 +83,41 @@ This is not a mechanism for changing schema or data behavior: those
 changes still require a new migration. Rollbacks to versions predating a registry
 entry can reject a database created with the revised SQL.
 
+## Forward-compatible migrations
+
+A node service rolled back by image alone finds its database recording the
+newer release's migrations, which its catalog doesn't bundle. Without more, it
+refuses that history before any write and does not start until the newer image
+returns. `db/forward-compatible-migrations.toml` lists the newer node-store
+migrations a release can run against instead. Each entry names the store (its
+`db/` directory, or `common` for the shared catalog), the version, the SHA-384
+of the up migration exactly as the bundling release ships it, and why the
+listing release keeps working on that schema.
+
+When every recorded migration a catalog doesn't bundle is listed with the
+recorded checksum, startup and `space-db-migrator <store> up` leave those
+history rows and their schema as they are, apply the release's own pending
+migrations, and continue. They still refuse, before any write, a recorded
+migration that is unlisted, listed for another store or with another checksum,
+or failed. A listing changes nothing for a database that doesn't record the
+migration. `down` and `status` don't consult the list.
+
+List a migration one release before the release that bundles it, and only if
+it is additive for the listing release: it adds tables, nullable or defaulted
+columns, or indexes that release never trips over, and every read and write
+that release makes stays valid with it applied. The bundling release must ship
+the same up SQL byte for byte, comments included, because the listing release
+accepts only that checksum; `every_listed_forward_migration_matches_the_catalog_that_bundles_it`
+checks it once both are in the tree. Never list a migration that isn't additive
+for the release before it. Rolling back across such a migration stays refused,
+so stage it with expand/contract instead.
+
+Only a release that carries this support and lists a migration can roll back
+over it: an image from before the listing still refuses the database. Listing
+doesn't apply to PostgreSQL, which no service migrates at startup.
+Template-manager reverses the migrations its runner lists, below, before this
+check runs.
+
 ## Unbundled template-manager migrations
 
 A rollout can migrate template-manager's node-local database from an init
@@ -373,9 +408,11 @@ Public-catalog startup validates both service and shared histories before
 writes, then applies common schema before service schema. Failed, modified,
 missing, or unbundled applied versions are rejected without recreating the
 database. A binary rollback therefore requires a catalog compatible with the
-complete applied history, even for an otherwise backward-compatible schema.
-Use expand/contract sequencing and retain verified backups. Template-manager's
-exceptions are described under 'Unbundled template-manager migrations'.
+complete applied history, even for an otherwise backward-compatible schema,
+unless the release it returns to lists the newer migrations as described under
+'Forward-compatible migrations'. Use expand/contract sequencing and retain
+verified backups. Template-manager's exceptions are described under 'Unbundled
+template-manager migrations'.
 
 The migrator never adopts untracked schemas, repairs rejected history, or
 recreates a database after a migration failure. Baseline history conversion is

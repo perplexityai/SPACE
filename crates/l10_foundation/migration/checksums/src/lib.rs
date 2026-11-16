@@ -11,9 +11,17 @@
 //! rewritten: fresh databases record the bundled SQL's checksum, while upgrades
 //! accept any listed historical checksum without replaying an applied migration.
 //!
+//! [`ForwardCompatible`] is the second manifest: the next release's
+//! migrations that a node-store runner may find recorded without bundling them,
+//! after an image rollback, and leave in place.
+//!
 //! It is its own crate because it depends only on serde, hex, toml and SQLx's
 //! `migrate` support, so a migration runner such as `pplx-space-sqlite` or
 //! `pplx-space-db-migrate` can use it directly.
+
+mod forward;
+
+pub use forward::ForwardCompatible;
 
 use std::collections::BTreeSet;
 
@@ -56,6 +64,17 @@ pub enum ManifestError {
     DuplicateMigration { store: String, version: i64 },
     #[error("{store}/{version} must have a nonempty list of distinct SHA-384 checksums")]
     Checksums { store: String, version: i64 },
+    #[error("{store}/{version} must say why the release before it can use its schema")]
+    Reason { store: String, version: i64 },
+}
+
+/// A store is named by its `db/` directory, and a version is positive.
+fn valid_identity(store: &str, version: i64) -> bool {
+    version > 0
+        && !store.is_empty()
+        && store
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
 }
 
 impl AcceptedChecksums {
@@ -63,13 +82,7 @@ impl AcceptedChecksums {
         let registry: Self = toml::from_str(source)?;
         let mut identities = BTreeSet::new();
         for entry in &registry.migrations {
-            if entry.version <= 0
-                || entry.store.is_empty()
-                || !entry
-                    .store
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
-            {
+            if !valid_identity(&entry.store, entry.version) {
                 return Err(ManifestError::Identity {
                     store: entry.store.clone(),
                     version: entry.version,

@@ -11,7 +11,7 @@ pub mod baselines;
 pub mod runtime_manager;
 mod template_manager;
 
-use pplx_space_migration_checksums::AcceptedChecksums;
+use pplx_space_migration_checksums::{AcceptedChecksums, ForwardCompatible};
 use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 use std::error::Error as StdError;
@@ -138,6 +138,9 @@ pub struct EmbeddedMigrators<'a> {
 }
 
 /// Apply shared schema and service migrations after validating both histories.
+/// A recorded migration neither catalog bundles is refused unless
+/// `db/forward-compatible-migrations.toml` lists it with that checksum; a
+/// listed one stays as it is.
 ///
 /// Daemons call this after acquiring their database ownership mutex.
 pub async fn migrate_embedded(
@@ -146,7 +149,9 @@ pub async fn migrate_embedded(
     migrators: EmbeddedMigrators<'_>,
 ) -> SqliteResult<()> {
     let checksums = AcceptedChecksums::embedded().context("invalid migration checksum manifest")?;
-    migrate_once(db_name, db_path, migrators, &checksums)
+    let forward =
+        ForwardCompatible::embedded().context("invalid forward-compatible migration manifest")?;
+    migrate_once(db_name, db_path, migrators, &checksums, &forward)
         .await
         .with_context(|| {
             format!(
@@ -165,13 +170,37 @@ pub fn common_migrator(migrator: &Migrator) -> Migrator {
     }
 }
 
+/// What one catalog's history table records.
+#[derive(Clone, Copy, Debug, Default)]
+struct RecordedHistory {
+    /// At least one migration.
+    applied: bool,
+    /// A listed forward-compatible migration the catalog doesn't bundle, which
+    /// SQLx must then be told to leave in place.
+    forward: bool,
+}
+
+/// `migrator`, told to leave alone a recorded version it doesn't bundle. Only
+/// for a history whose every such version is listed forward-compatible.
+fn ignoring_unbundled(migrator: &Migrator) -> Migrator {
+    Migrator {
+        migrations: migrator.migrations.clone(),
+        ignore_missing: true,
+        locking: migrator.locking,
+        no_tx: migrator.no_tx,
+        table_name: migrator.table_name.clone(),
+        create_schemas: migrator.create_schemas.clone(),
+    }
+}
+
 fn validate_public_history(
     store: &str,
     conn: &Connection,
     migrator: &Migrator,
     common: bool,
     checksums: &AcceptedChecksums,
-) -> SqliteResult<bool> {
+    forward: &ForwardCompatible,
+) -> SqliteResult<RecordedHistory> {
     let table = if common {
         "_space_common_schema_migrations"
     } else {
@@ -185,7 +214,7 @@ fn validate_public_history(
         )
         .context("failed to inspect public migration history")?;
     if !exists {
-        return Ok(false);
+        return Ok(RecordedHistory::default());
     }
     let query = if common {
         "SELECT version, success, checksum FROM _space_common_schema_migrations"
@@ -205,21 +234,36 @@ fn validate_public_history(
         })
         .context("failed to query public migration history")?;
     let bundled = migrations_by_version(migrator);
-    let mut applied = false;
+    let mut history = RecordedHistory::default();
     for row in rows {
         let (version, success, checksum) = row.context("invalid public migration history")?;
-        if !success
-            || bundled.get(&version).is_none_or(|migration| {
-                !checksums.accepts(store, version, &migration.checksum, &checksum)
-            })
-        {
+        let compatible = success
+            && match bundled.get(&version) {
+                Some(migration) => {
+                    checksums.accepts(store, version, &migration.checksum, &checksum)
+                }
+                None => {
+                    let listed = forward.accepts(store, version, &checksum);
+                    history.forward |= listed;
+                    listed
+                }
+            };
+        if !compatible {
             return Err(SqliteError::message(format!(
                 "{table} has failed, modified, or unbundled migration {version}; see db/README.md"
             )));
         }
-        applied = true;
+        history.applied = true;
     }
-    Ok(applied)
+    Ok(history)
+}
+
+/// Whether each catalog's history records a listed forward-compatible
+/// migration it doesn't bundle.
+#[derive(Clone, Copy, Debug, Default)]
+struct ForwardRecorded {
+    service: bool,
+    common: bool,
 }
 
 async fn validate_schema(
@@ -227,14 +271,17 @@ async fn validate_schema(
     db_path: &Path,
     migrators: EmbeddedMigrators<'_>,
     checksums: &AcceptedChecksums,
-) -> SqliteResult<()> {
+    forward: &ForwardCompatible,
+) -> SqliteResult<ForwardRecorded> {
     let conn = Connection::open(db_path).context("failed to open SQLite database")?;
-    let service_applied =
-        validate_public_history(db_name, &conn, migrators.service, false, checksums)?;
-    let common_applied = match migrators.common {
-        Some(common) => validate_public_history("common", &conn, common, true, checksums)?,
-        None => false,
+    let service =
+        validate_public_history(db_name, &conn, migrators.service, false, checksums, forward)?;
+    let common = match migrators.common {
+        Some(common) => validate_public_history("common", &conn, common, true, checksums, forward)?,
+        None => RecordedHistory::default(),
     };
+    let service_applied = service.applied;
+    let common_applied = common.applied;
     if service_applied && migrators.common.is_some() && !common_applied {
         return Err(SqliteError::message(
             "SQLite service history is present but shared history is missing; explicit repair is required",
@@ -267,7 +314,10 @@ async fn validate_schema(
             ));
         }
     }
-    Ok(())
+    Ok(ForwardRecorded {
+        service: service.forward,
+        common: common.forward,
+    })
 }
 
 fn public_application_schema(conn: &Connection) -> SqliteResult<Vec<(String, String)>> {
@@ -355,6 +405,7 @@ async fn migrate_once(
     db_path: &Path,
     migrators: EmbeddedMigrators<'_>,
     checksums: &AcceptedChecksums,
+    forward: &ForwardCompatible,
 ) -> SqliteResult<()> {
     checksums
         .validate(db_name, migrators.service)
@@ -395,19 +446,28 @@ async fn migrate_once(
             if db_name == template_manager::STORE {
                 template_manager::reverse_unbundled(db_path, migrators.service)?;
             }
-            validate_schema(db_name, db_path, migrators, checksums).await?;
+            let recorded = validate_schema(db_name, db_path, migrators, checksums, forward).await?;
             let mut conn = pool
                 .acquire()
                 .await
                 .context("failed to acquire SQLite migration connection")?;
             if let Some(common) = migrators.common {
+                let mut common = common_migrator(common);
+                common.ignore_missing = recorded.common;
                 checksums
-                    .run("common", &common_migrator(common), &mut *conn)
+                    .run("common", &common, &mut *conn)
                     .await
                     .context("failed to apply common SQLite migrations")?;
             }
+            let ignoring;
+            let service = if recorded.service {
+                ignoring = ignoring_unbundled(migrators.service);
+                &ignoring
+            } else {
+                migrators.service
+            };
             checksums
-                .run(db_name, migrators.service, &mut *conn)
+                .run(db_name, service, &mut *conn)
                 .await
                 .with_context(|| format!("failed to apply {db_name} SQLite migrations"))?;
             Ok(())
