@@ -652,6 +652,46 @@ fn a_routine_concurrent_rollout_does_not_fail_open() {
     );
 }
 
+/// Kubernetes rounds each wave's 10% budget up to whole nodes, so on 12
+/// workers each default component may take two at once. Three disjoint waves
+/// leave half the fleet not-ready, above the fractional threshold, and that is
+/// still a rollout to publish rather than a reason to fail open.
+#[test]
+fn rounded_up_rollout_budgets_do_not_fail_open() {
+    let components = ReconcilerConfig::default().components;
+    let nodes: Vec<NodeLabelState> = (0..12)
+        .map(|index| node(&format!("worker-{index}"), Some("true")))
+        .collect();
+    // Workers 0-5 each miss one component, two workers per component.
+    let pods: Vec<ServicePod> = (0..12)
+        .flat_map(|index| {
+            let name = format!("worker-{index}");
+            let missing = (index < 6).then(|| components[index / 2]);
+            components
+                .iter()
+                .filter(move |component| Some(**component) != missing)
+                .map(move |component| pod(&name, *component))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let plan = plan_label_changes(
+        &nodes,
+        &pods,
+        &components,
+        default_max_not_ready_fraction(components.len()),
+    );
+
+    assert!(!plan.failed_open, "three rounded-up waves are a rollout");
+    assert_eq!(plan.not_ready, 6);
+    assert_eq!(plan.changes.len(), 6);
+    assert!(
+        plan.changes
+            .iter()
+            .all(|change| change.desired == NodeServicesReady::NotReady)
+    );
+}
+
 /// The threshold has to widen with the component list: Helm doesn't serialize
 /// DaemonSet updates, so N watched components can leave ~10·N% not-ready at
 /// once. A fixed threshold would make every rollout fail open once the list
