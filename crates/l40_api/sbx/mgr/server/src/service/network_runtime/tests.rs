@@ -3,7 +3,8 @@ use super::{
     NetGatewayLaunchConfig, NetGatewayRouteIdentityPushError, NetGatewayRouteIdentityPushOutcome,
     NetGatewayRouteVerificationKeyPushError, NetGatewayRouteVerificationKeyPushOutcome, Operation,
     Outcome, RefreshAbandonReason, classify_route_identity_push,
-    classify_route_verification_key_response, known_egress_domains_from_assignment,
+    classify_route_verification_key_response, finish_route_identity_push,
+    finish_route_verification_key_push, known_egress_domains_from_assignment,
     local_known_egress_domains, net_gateway_client_span, net_gateway_launch_config_with,
     netgtw_launch_args, network_policy_refresh_error_to_status, push_route_identity,
     record_route_security_push_span, require_local_authority_peer,
@@ -217,62 +218,45 @@ fn captured_route_security_push_span(
 }
 
 /// A gateway launched before route security answers its pushes UNIMPLEMENTED,
-/// or reports an older identity profile, until it is cycled. Those answers are
-/// the `unsupported` outcome, not failures; any other answer still fails.
+/// or reports an older identity profile, until it is cycled. Both pushes answer
+/// that with UNIMPLEMENTED, which the reconcile completes on; any other failure
+/// stays INTERNAL, which it retries.
 #[test]
-fn a_gateway_older_than_route_security_is_unsupported_not_failed() {
+fn a_gateway_older_than_route_security_answers_unimplemented() {
     let unimplemented = || tonic::Status::unimplemented("");
-    let identity = |error: NetGatewayRouteIdentityPushError, expected| {
-        (
-            Operation::Identity,
-            error.metric_outcome(),
-            error.to_string(),
-            expected,
-        )
+    let identity = |push: Result<u32, NetGatewayRouteIdentityPushError>| {
+        finish_route_identity_push("sandbox-id", &tracing::Span::none(), push)
+            .expect_err("the push failed")
+            .code()
     };
-    let keys = |error: NetGatewayRouteVerificationKeyPushError, expected| {
-        (
-            Operation::VerificationKeys,
-            error.metric_outcome(),
-            error.to_string(),
-            expected,
-        )
+    let keys = |error: NetGatewayRouteVerificationKeyPushError| {
+        finish_route_verification_key_push(&tracing::Span::none(), Err(error))
+            .expect_err("the push failed")
+            .code()
     };
-    for (operation, outcome, failure, expected) in [
-        identity(
-            NetGatewayRouteIdentityPushError::Rpc(unimplemented()),
-            "unsupported",
-        ),
-        identity(
-            NetGatewayRouteIdentityPushError::UnsupportedProfile(0),
-            "unsupported",
-        ),
-        keys(
-            NetGatewayRouteVerificationKeyPushError::Rpc(unimplemented()),
-            "unsupported",
-        ),
-        identity(
-            NetGatewayRouteIdentityPushError::Rpc(tonic::Status::unavailable("restarting")),
-            "failed",
-        ),
-        keys(
-            NetGatewayRouteVerificationKeyPushError::Rpc(tonic::Status::internal("failed")),
-            "failed",
-        ),
-    ] {
-        let capture = captured_route_security_push_span(operation, outcome, Some(&failure));
-        assert_eq!(
-            capture.get("route_security.outcome").as_deref(),
-            Some(expected),
-            "{failure}"
-        );
-        let status = if expected == "failed" { "ERROR" } else { "OK" };
-        assert_eq!(
-            capture.get("otel.status_code").as_deref(),
-            Some(status),
-            "{failure}"
-        );
-    }
+    let older_profile = pplx_space_net_gateway_client::IDENTITY_PROFILE_VERSION - 1;
+
+    assert_eq!(
+        identity(Err(NetGatewayRouteIdentityPushError::Rpc(unimplemented()))),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(identity(Ok(older_profile)), tonic::Code::Unimplemented);
+    assert_eq!(
+        keys(NetGatewayRouteVerificationKeyPushError::Rpc(unimplemented())),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(
+        identity(Err(NetGatewayRouteIdentityPushError::Rpc(
+            tonic::Status::unavailable("restarting")
+        ))),
+        tonic::Code::Internal
+    );
+    assert_eq!(
+        keys(NetGatewayRouteVerificationKeyPushError::Rpc(
+            tonic::Status::unavailable("restarting")
+        )),
+        tonic::Code::Internal
+    );
 }
 
 // The same recorder serves the identity push, so acknowledged transport
