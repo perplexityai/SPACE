@@ -592,3 +592,113 @@ fn installed_authority_must_match_the_current_promotion_and_authorization() {
     policy.promotion.maximum_guest = "0.8.3".parse().unwrap();
     assert!(!policy::authorizes(&policy, &action));
 }
+
+/// Counts endpoint-proof captures while one observer runs against a sandbox
+/// whose node-manager answers every capture with `refusal`.
+struct ObservedCaptures {
+    service: SandboxManagerService,
+    id: String,
+    captures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    observer: tokio::task::JoinHandle<()>,
+}
+
+impl ObservedCaptures {
+    fn start(refusal: fn() -> Status) -> Self {
+        use crate::service::tests::service_tests::{
+            complete_runtime_endpoint_identity, insert_test_sandbox_with_runtime,
+        };
+        use pplx_space_node_mgr_client::proto::{
+            CaptureSandboxEndpointProofRequest, SandboxEndpointProof,
+        };
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox_with_runtime(&conn, &id, SandboxState::Started);
+        complete_runtime_endpoint_identity(&conn, &id);
+        let execution = crate::db::read::sandbox(&conn, &id)
+            .unwrap()
+            .unwrap()
+            .node_execution_id
+            .unwrap();
+        let captures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+            .unary("CaptureSandboxEndpointProof", {
+                let captures = std::sync::Arc::clone(&captures);
+                move |_: CaptureSandboxEndpointProofRequest| {
+                    captures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err::<SandboxEndpointProof, _>(refusal())
+                }
+            })
+            .serve();
+        let service =
+            crate::service::tests::node_manager_transport_tests::service_with_node_manager(
+                conn,
+                node_manager.connector(),
+            );
+        let observer = tokio::spawn({
+            let (service, id) = (service.clone(), id.clone());
+            async move {
+                let _node_manager = node_manager;
+                service.observe_guest_configuration(&id, execution).await
+            }
+        });
+        Self {
+            service,
+            id,
+            captures,
+            observer,
+        }
+    }
+
+    async fn after(&self, wait: Duration) -> usize {
+        tokio::time::sleep(wait).await;
+        self.captures.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for ObservedCaptures {
+    fn drop(&mut self) {
+        self.observer.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn refused_endpoint_attestation_waits_for_a_spaced_host_relaunch() {
+    let observed =
+        ObservedCaptures::start(|| Status::failed_precondition("scripted endpoint proof refusal"));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while observed.after(Duration::from_millis(10)).await == 0 {}
+    })
+    .await
+    .expect("the observer requests a first endpoint proof");
+    assert_eq!(
+        observed
+            .after(3 * super::observation::SPACED_HOST_RELAUNCH_POLL)
+            .await,
+        1,
+        "an unchanged launch is not re-attested"
+    );
+    crate::db::update_spaced_host_pid(
+        &observed.service.db_conn().unwrap(),
+        &observed.id,
+        10000,
+        Some(10001),
+        10003,
+    )
+    .unwrap();
+    assert_eq!(
+        observed
+            .after(super::observation::SPACED_HOST_RELAUNCH_POLL + Duration::from_secs(1))
+            .await,
+        2,
+        "a relaunch is attested again"
+    );
+}
+
+#[tokio::test]
+async fn unavailable_endpoint_proof_keeps_reconnecting() {
+    let observed = ObservedCaptures::start(|| Status::unavailable("node-manager restarting"));
+    assert!(
+        observed.after(Duration::from_secs(3)).await >= 4,
+        "transient failures retry within a second"
+    );
+}
