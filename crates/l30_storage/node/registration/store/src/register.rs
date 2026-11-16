@@ -34,6 +34,8 @@ pub enum K8sNodeRegistrationStep {
     UpsertNode,
     /// The ownership re-check after an upsert that returned no row.
     RecheckOwnership,
+    /// The check of a v2 drain's fence before a new Node UID takes the row.
+    CheckFence,
     /// Clearing drain state when the Kubernetes Node UID changed.
     ClearDrain,
     /// The `node_k8s` upsert.
@@ -48,6 +50,7 @@ impl K8sNodeRegistrationStep {
             Self::CheckTombstone => "check tombstone",
             Self::UpsertNode => "upsert node",
             Self::RecheckOwnership => "re-check ownership",
+            Self::CheckFence => "check the drain's fence",
             Self::ClearDrain => "clear drain state",
             Self::UpsertNodeK8s => "upsert node_k8s",
             Self::RecheckTombstone => "re-check tombstone",
@@ -75,6 +78,12 @@ pub enum K8sNodeRegistrationError {
     /// The node id belongs to a node another substrate manages.
     #[error("node id belongs to a non-Kubernetes node")]
     NotKubernetes,
+    /// A Node under a new UID that reports no instance would take the row of
+    /// a v2 drain that fenced its instance for termination. Deferred, as a
+    /// tombstoned node is refused: the next registration retries, once the
+    /// Node reports its `providerID`.
+    #[error("node's v2 drain fenced its instance, and the new Node reports none yet")]
+    AwaitingInstance,
     #[error("Kubernetes node registration failed to {step}: {source}")]
     Query {
         step: K8sNodeRegistrationStep,
@@ -197,6 +206,34 @@ pub async fn register_k8s_node(
         }
     };
 
+    // After the fence, a v2 drain's node is the fenced instance: a Node under
+    // a new UID is that machine again only if it reports the same instance,
+    // and a replacement only if it reports another. One that reports none
+    // yet is deferred, under the row lock the upsert above took, so the next
+    // sync decides once the Node's `providerID` names its instance. A Node's
+    // `providerID` never changes once set, so without a UID change the
+    // instance can't change either.
+    let awaiting_instance = instance_id.is_none()
+        && sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM nodes n
+                   JOIN node_k8s k ON k.node_id = n.id
+                  WHERE n.id = $1
+                    AND n.drain_engine = 'v2'
+                    AND n.drain_status ? 'terminate_instance'
+                    AND k.k8s_node_uid IS DISTINCT FROM $2
+             )"
+        ))
+        .bind(node_id)
+        .bind(node_uid)
+        .fetch_one(&mut *conn)
+        .await
+        .step(K8sNodeRegistrationStep::CheckFence)?;
+    if awaiting_instance {
+        return Err(K8sNodeRegistrationError::AwaitingInstance);
+    }
+
     // Detect same-name kube Node UID replacement BEFORE the upsert
     // below overwrites `node_k8s.k8s_node_uid`. If a replacement
     // node arrives and we leave `nodes.drain_phase` intact, the
@@ -219,8 +256,10 @@ pub async fn register_k8s_node(
     // machine re-created its Node (a `kubectl delete node`, a kubelet
     // restart), and its sandbox-manager is still sealed under the drain's
     // epoch, which only that drain's undrain or terminate settles. Both
-    // instances must be known and equal; an unreported one counts as a
-    // replacement.
+    // instances must be known and equal: the fenced one once the drain
+    // fenced it, else the recorded one. An unreported one counts as a
+    // replacement on a row without a fence, and was deferred above on one
+    // with a fence.
     let drain_cleared = sqlx::query(sql!(
         "UPDATE nodes n
              SET drain_phase = NULL,
@@ -234,7 +273,8 @@ pub async fn register_k8s_node(
                AND k.node_id = n.id
                AND k.k8s_node_uid IS DISTINCT FROM $2
                AND NOT COALESCE(
-                 n.drain_engine = 'v2' AND k.instance_id = $3::TEXT,
+                 n.drain_engine = 'v2'
+                   AND COALESCE(n.drain_status->>'terminate_instance', k.instance_id) = $3::TEXT,
                  FALSE
                )"
     ))

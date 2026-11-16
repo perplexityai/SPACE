@@ -16,52 +16,86 @@ use pplx_space_sbx_mgr_client::proto::{
 use uuid::Uuid;
 
 use super::*;
-use crate::node_drain::v2::{DrainV2Sink, EvacuationRecord, V2Node};
+use crate::node_drain::guarded_delete::{self, GuardedDelete, NodeIdentity};
+use crate::node_drain::v2::{DrainV2Sink, EvacuationRecord, Fence, TerminatedDelete, V2Node};
 
 /// How long one `DrainNode` call may take; the node answers without waiting.
 const DRAIN_NODE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A v2 node's id, phase, epoch, cancel, terminated and waiting flags, and
-/// its stored report's unrecorded evacuations.
-type V2NodeRow = (
-    NodeId,
-    Option<String>,
-    Option<i64>,
-    bool,
-    bool,
-    bool,
-    Option<serde_json::Value>,
-);
+/// How long the direct Kubernetes Node GET may take.
+const NODE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Every v2 drain's node of the Kubernetes substrate.
-pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Error> {
-    let rows: Vec<V2NodeRow> = sqlx::query_as(sql!(
-        "SELECT id, drain_phase,
-                (drain_status->>'epoch')::BIGINT,
-                COALESCE((drain_status->>'cancel')::BOOLEAN, FALSE),
-                COALESCE((drain_status->>'terminated')::BOOLEAN, FALSE),
-                COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE),
-                drain_status->'report'->'unrecorded'
-           FROM nodes
-          WHERE drain_engine = 'v2' AND managed_by = $1
-          ORDER BY id"
+/// How long an active execution owns a restore: the drain restore claim's
+/// window, which the release reads as a restore in flight.
+fn execution_ownership_ttl_secs() -> i64 {
+    i64::try_from(
+        pplx_space_common_core::restore_ownership::RESTORE_EXECUTION_OWNERSHIP_TTL.as_secs(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+/// One v2 node as [`list_v2_nodes`] reads it.
+#[derive(sqlx::FromRow)]
+struct V2NodeRow {
+    id: NodeId,
+    drain_phase: Option<String>,
+    epoch: Option<i64>,
+    cancel: bool,
+    waiting: bool,
+    unrecorded: Option<serde_json::Value>,
+    k8s_node_name: Option<String>,
+    k8s_node_uid: Option<String>,
+    instance_id: Option<String>,
+    heartbeat_fresh: bool,
+    fence: Option<String>,
+    dispatched_at: Option<i64>,
+    decrement_capacity: bool,
+}
+
+/// Every v2 drain's node of the Kubernetes substrate, with its Kubernetes
+/// identity, recorded instance and heartbeat.
+static LIST_V2_NODES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let fresh = pplx_space_sandbox_residency::node_heartbeat_fresh("n.id");
+    sql!(format!(
+        "SELECT n.id, n.drain_phase,
+                (n.drain_status->>'epoch')::BIGINT AS epoch,
+                COALESCE((n.drain_status->>'cancel')::BOOLEAN, FALSE) AS cancel,
+                COALESCE((n.drain_status->>'waiting')::BOOLEAN, FALSE) AS waiting,
+                n.drain_status->'report'->'unrecorded' AS unrecorded,
+                k.k8s_node_name, k.k8s_node_uid, k.instance_id,
+                {fresh} AS heartbeat_fresh,
+                n.drain_status->>'terminate_instance' AS fence,
+                (n.drain_status->>'dispatched_at')::BIGINT AS dispatched_at,
+                n.terminate_decrement_capacity AS decrement_capacity
+           FROM nodes n
+           LEFT JOIN node_k8s k ON k.node_id = n.id
+          WHERE n.drain_engine = 'v2' AND n.managed_by = $1
+          ORDER BY n.id"
     ))
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_all(pool)
-    .await?;
+});
+
+pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Error> {
+    let rows: Vec<V2NodeRow> = sqlx::query_as(sqlx::AssertSqlSafe(LIST_V2_NODES.as_str()))
+        .bind(SubstrateKind::Kubernetes)
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
-        .map(
-            |(id, phase, epoch, cancel, terminated, waiting, unrecorded)| V2Node {
-                id,
-                phase,
-                epoch: epoch.and_then(|epoch| u64::try_from(epoch).ok()),
-                cancel,
-                terminated,
-                waiting,
-                unrecorded_since: unrecorded_since(unrecorded.as_ref()),
-            },
-        )
+        .map(|row| V2Node {
+            id: row.id,
+            phase: row.drain_phase,
+            epoch: row.epoch.and_then(|epoch| u64::try_from(epoch).ok()),
+            cancel: row.cancel,
+            waiting: row.waiting,
+            unrecorded_since: unrecorded_since(row.unrecorded.as_ref()),
+            k8s_node_name: row.k8s_node_name,
+            k8s_node_uid: row.k8s_node_uid,
+            instance_id: row.instance_id,
+            heartbeat_fresh: row.heartbeat_fresh,
+            fence: row.fence,
+            dispatched_at: row.dispatched_at,
+            decrement_capacity: row.decrement_capacity,
+        })
         .collect())
 }
 
@@ -109,29 +143,298 @@ pub(crate) async fn admit_v2_evacuation(
         == 1)
 }
 
-/// Record that the terminator acted on the terminating v2 node under
-/// `epoch`, so the loop doesn't call it again. Returns whether it was
-/// recorded: false for a row no longer that epoch's terminating v2 node.
-pub(crate) async fn record_v2_terminated(
+/// The locked node's v2 state, as the terminate transaction and the
+/// delete read it under the row lock.
+#[derive(sqlx::FromRow)]
+struct LockedV2Node {
+    drain_engine: Option<String>,
+    drain_phase: Option<String>,
+    epoch: Option<i64>,
+    report_done: bool,
+    fence: Option<String>,
+    dispatched: bool,
+    k8s_node_name: Option<String>,
+    instance_id: Option<String>,
+}
+
+/// Lock `node_id`'s row `FOR UPDATE` and read its v2 state; `None` when the
+/// row is gone.
+async fn lock_v2_node(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    node_id: NodeId,
+) -> Result<Option<LockedV2Node>, sqlx::Error> {
+    if !guarded_delete::lock_node(tx, node_id).await? {
+        return Ok(None);
+    }
+    sqlx::query_as(sql!(
+        "SELECT n.drain_engine, n.drain_phase,
+                (n.drain_status->>'epoch')::BIGINT AS epoch,
+                COALESCE(
+                    (n.drain_status->'report'->>'sealed_epoch')::BIGINT
+                        = (n.drain_status->>'epoch')::BIGINT
+                    AND (n.drain_status->'report'->>'done')::BOOLEAN,
+                    FALSE
+                ) AS report_done,
+                n.drain_status->>'terminate_instance' AS fence,
+                COALESCE(n.drain_status ? 'dispatched_at', FALSE) AS dispatched,
+                k.k8s_node_name, k.instance_id
+           FROM nodes n
+           LEFT JOIN node_k8s k ON k.node_id = n.id
+          WHERE n.id = $1"
+    ))
+    .bind(node_id)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+impl LockedV2Node {
+    fn is_v2(&self, phase: &str, epoch: i64) -> bool {
+        self.drain_engine.as_deref() == Some("v2")
+            && self.drain_phase.as_deref() == Some(phase)
+            && self.epoch == Some(epoch)
+    }
+}
+
+/// Release the durably suspended rows that name the `drained` v2 node under
+/// `epoch`, in one transaction under the node's row lock, while its report
+/// is `done` under that epoch. Returns the ids released; none for a row
+/// that is no longer that epoch's `drained` node with its report `done`.
+pub(crate) async fn release_v2_suspended(
     pool: &PgPool,
     node_id: NodeId,
     epoch: i64,
+) -> Result<Vec<SandboxId>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(node) = lock_v2_node(&mut tx, node_id).await? else {
+        return Ok(Vec::new());
+    };
+    if !node.is_v2("drained", epoch) || !node.report_done {
+        return Ok(Vec::new());
+    }
+    let released = pplx_space_sandbox_store::drain_terminate::release_durable_suspended(
+        &mut tx,
+        node_id,
+        node.k8s_node_name.as_deref(),
+        execution_ownership_ttl_secs(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(released)
+}
+
+/// The terminate transaction of the v2 node under `epoch`, under its row
+/// lock: it must still be that epoch's `terminating` node, unfenced, with
+/// its report `done`; the durably suspended rows naming it are released
+/// again; nothing may name it any more (the require-empty predicate,
+/// [`pplx_space_sandbox_store::drain_terminate::node_references`]); and then
+/// `drain_status.terminate_instance` records `node_k8s.instance_id`, the
+/// instance to terminate. A refusal of the predicate records what holds the
+/// node in `drain_last_error` and commits the release.
+pub(crate) async fn fence_v2_node(
+    pool: &PgPool,
+    node_id: NodeId,
+    epoch: i64,
+) -> Result<Fence, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(node) = lock_v2_node(&mut tx, node_id).await? else {
+        return Ok(Fence::Moved);
+    };
+    if !node.is_v2("terminating", epoch) || node.fence.is_some() || !node.report_done {
+        return Ok(Fence::Moved);
+    }
+    let Some(instance_id) = node.instance_id else {
+        return Ok(Fence::NoInstance);
+    };
+    pplx_space_sandbox_store::drain_terminate::release_durable_suspended(
+        &mut tx,
+        node_id,
+        node.k8s_node_name.as_deref(),
+        execution_ownership_ttl_secs(),
+    )
+    .await?;
+    let references = pplx_space_sandbox_store::drain_terminate::node_references(
+        &mut *tx,
+        node_id,
+        node.k8s_node_name.as_deref(),
+        guarded_delete::REFERENCE_SAMPLE,
+    )
+    .await?;
+    if !references.is_empty() {
+        let held = format!("terminate held: {references}");
+        sqlx::query(sql!("UPDATE nodes SET drain_last_error = $2 WHERE id = $1"))
+            .bind(node_id)
+            .bind(&held)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(Fence::Held(held));
+    }
+    sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_status = drain_status || jsonb_build_object('terminate_instance', $2::TEXT),
+                drain_last_error = NULL
+          WHERE id = $1"
+    ))
+    .bind(node_id)
+    .bind(&instance_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Fence::Fenced(instance_id))
+}
+
+/// Record that Auto Scaling accepted the termination of the fenced
+/// `instance_id`, by the database clock in Unix seconds, so the loop never
+/// dispatches it again. False for a row that is no longer that epoch's
+/// `terminating` node fenced on that instance with no dispatch recorded.
+pub(crate) async fn record_v2_dispatched(
+    pool: &PgPool,
+    node_id: NodeId,
+    epoch: i64,
+    instance_id: &str,
 ) -> Result<bool, sqlx::Error> {
     Ok(sqlx::query(sql!(
         "UPDATE nodes
-            SET drain_status = drain_status || jsonb_build_object('terminated', TRUE),
+            SET drain_status = drain_status
+                    || jsonb_build_object('dispatched_at', EXTRACT(EPOCH FROM NOW())::BIGINT),
                 drain_last_error = NULL
           WHERE id = $1
             AND drain_engine = 'v2'
             AND drain_phase = 'terminating'
-            AND (drain_status->>'epoch')::BIGINT = $2"
+            AND (drain_status->>'epoch')::BIGINT = $2
+            AND drain_status->>'terminate_instance' = $3
+            AND NOT drain_status ? 'dispatched_at'"
     ))
     .bind(node_id)
     .bind(epoch)
+    .bind(instance_id)
     .execute(pool)
     .await?
     .rows_affected()
         == 1)
+}
+
+/// The let-go statement: clear the phase and the v2 columns of the v2 node
+/// under `epoch` in `phase` with fence `fence`, as the caller read them,
+/// and record `trace`. Writes no sandbox row. Returns whether it matched.
+async fn let_go_v2_node(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    epoch: i64,
+    phase: Option<&str>,
+    fence: Option<&str>,
+    trace: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_phase = NULL,
+                drain_mode = NULL,
+                drain_started_at = NULL,
+                drain_engine = NULL,
+                drain_status = NULL,
+                drain_last_error = $5
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND (drain_status->>'epoch')::BIGINT = $2
+            AND drain_phase IS NOT DISTINCT FROM $3::TEXT
+            AND drain_status->>'terminate_instance' IS NOT DISTINCT FROM $4::TEXT"
+    ))
+    .bind(node_id)
+    .bind(epoch)
+    .bind(phase)
+    .bind(fence)
+    .bind(trace)
+    .execute(executor)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
+/// Let go of the v2 node under `epoch`, in the phase and with the fence
+/// the tick read, under its row lock.
+pub(crate) async fn let_go_v2(
+    pool: &PgPool,
+    node_id: NodeId,
+    epoch: i64,
+    phase: Option<&str>,
+    fence: Option<&str>,
+    trace: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !guarded_delete::lock_node(&mut tx, node_id).await? {
+        return Ok(false);
+    }
+    let cleared = let_go_v2_node(&mut *tx, node_id, epoch, phase, fence, trace).await?;
+    tx.commit().await?;
+    Ok(cleared)
+}
+
+/// Delete the row of the `terminating` v2 node under `epoch` whose fenced
+/// instance `fence` EC2 says is terminated, its Node gone: under the row
+/// lock, the row must still carry that fence with a dispatch recorded and
+/// record that instance; then the guarded delete runs, holding the uid the
+/// tick read, a stale heartbeat and that nothing names the node
+/// ([`guarded_delete::delete_locked_node`]). A row or execution guard that
+/// refuses lets the node go in the same transaction instead.
+pub(crate) async fn delete_v2_terminated(
+    pool: &PgPool,
+    node: &V2Node,
+    epoch: i64,
+    fence: &str,
+) -> Result<TerminatedDelete, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(locked) = lock_v2_node(&mut tx, node.id).await? else {
+        return Ok(TerminatedDelete::Wait("the row is gone".to_owned()));
+    };
+    if locked.fence.as_deref() != Some(fence) {
+        return Ok(if locked.fence.is_none() {
+            TerminatedDelete::Unfenced
+        } else {
+            TerminatedDelete::Wait("the row carries another fence".to_owned())
+        });
+    }
+    if !locked.is_v2("terminating", epoch) || !locked.dispatched {
+        return Ok(TerminatedDelete::Wait(
+            "the row is no longer the epoch's dispatched terminating node".to_owned(),
+        ));
+    }
+    let deleted = guarded_delete::delete_locked_node(
+        &mut tx,
+        &NodeIdentity {
+            node_id: node.id,
+            managed_by: SubstrateKind::Kubernetes,
+            k8s_node_name: locked.k8s_node_name.as_deref(),
+            k8s_node_uid: node.k8s_node_uid.as_deref(),
+            instance_id: Some(fence),
+        },
+    )
+    .await?;
+    match deleted {
+        GuardedDelete::Deleted => {
+            tx.commit().await?;
+            Ok(TerminatedDelete::Deleted)
+        }
+        GuardedDelete::Referenced(references) => {
+            let trace = format!("v2 drain let go after terminating {fence}: {references}");
+            let_go_v2_node(
+                &mut *tx,
+                node.id,
+                epoch,
+                Some("terminating"),
+                Some(fence),
+                &trace,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(TerminatedDelete::LetGo(trace))
+        }
+        GuardedDelete::HeartbeatFresh => Ok(TerminatedDelete::Wait(
+            "the node's heartbeat is fresh".to_owned(),
+        )),
+        GuardedDelete::IdentityMoved => Ok(TerminatedDelete::Wait(
+            "the node's Kubernetes uid or recorded instance moved".to_owned(),
+        )),
+    }
 }
 
 /// Store the node's report under `epoch`. Returns false when the row is no
@@ -440,10 +743,69 @@ impl DrainV2Sink for SubstrateSink {
         tracing::warn!(node_id = %node_id, error = message, "node_drain v2");
     }
 
-    async fn record_terminated(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
-        record_v2_terminated(&self.pool, node_id, epoch_i64(epoch)?)
+    async fn release_suspended(
+        &self,
+        node_id: NodeId,
+        epoch: u64,
+    ) -> Result<Vec<SandboxId>, String> {
+        release_v2_suspended(&self.pool, node_id, epoch_i64(epoch)?)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn fence(&self, node_id: NodeId, epoch: u64) -> Result<Fence, String> {
+        fence_v2_node(&self.pool, node_id, epoch_i64(epoch)?)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn record_dispatched(
+        &self,
+        node_id: NodeId,
+        epoch: u64,
+        instance_id: &str,
+    ) -> Result<bool, String> {
+        record_v2_dispatched(&self.pool, node_id, epoch_i64(epoch)?, instance_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn node_exists(&self, k8s_node_name: &str) -> Result<bool, String> {
+        let nodes: kube::Api<k8s_openapi::api::core::v1::Node> =
+            kube::Api::all(self.substrate.kubernetes().k8s.client.clone());
+        match tokio::time::timeout(NODE_LOOKUP_TIMEOUT, nodes.get_opt(k8s_node_name)).await {
+            Ok(Ok(node)) => Ok(node.is_some()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err("the Node lookup timed out".to_owned()),
+        }
+    }
+
+    async fn delete_terminated(
+        &self,
+        node: &V2Node,
+        epoch: u64,
+        fence: &str,
+    ) -> Result<TerminatedDelete, String> {
+        delete_v2_terminated(&self.pool, node, epoch_i64(epoch)?, fence)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn let_go(&self, node: &V2Node, epoch: u64, trace: &str) -> Result<bool, String> {
+        let fence = node
+            .fence
+            .as_deref()
+            .filter(|_| node.phase.as_deref() == Some("terminating"));
+        let_go_v2(
+            &self.pool,
+            node.id,
+            epoch_i64(epoch)?,
+            node.phase.as_deref(),
+            fence,
+            trace,
+        )
+        .await
+        .map_err(|error| error.to_string())
     }
 }
 

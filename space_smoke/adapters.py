@@ -5761,6 +5761,19 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"terminate {instance_id} in the fake EC2",
         )
 
+    def set_fake_ec2_terminate_delay(self, seconds: int) -> None:
+        self._require_isolated_kind("setting the fake EC2's termination delay")
+        if not 0 <= seconds <= 3600:
+            raise ValueError(f"refusing a termination delay of {seconds}s")
+        _require_ok(
+            self.kubectl(
+                "exec", "deployment/space-kind-fake-ec2", "--",
+                "space-kind-fake-ec2", "delay", str(seconds),
+                timeout=30,
+            ),
+            f"set the fake EC2's termination delay to {seconds}s",
+        )
+
     def node_recorded_instance(self, node_id: str) -> str | None:
         out = self._psql(
             f"SELECT coalesce(instance_id, '') FROM node_k8s WHERE node_id = '{_sql_uuid(node_id)}';",
@@ -5787,14 +5800,41 @@ ON CONFLICT (key_hash) DO NOTHING;
         labels = json.loads(_require_ok(listed, f"read the labels of {container}") or "{}")
         return {str(key): str(value) for key, value in labels.items()}
 
-    def stop_kind_worker(self, node_name: str) -> None:
+    def stop_kind_worker(self, node_name: str, *, keep_node: bool = False) -> None:
         self._require_isolated_kind("stopping a Kind worker")
         container = self._kind_worker_container(node_name)
         stopped = self.executor.run(["docker", "stop", container], timeout=120)
         _require_ok(stopped, f"stop Kind worker container {container}")
+        if keep_node:
+            return
         _require_ok(
             self.kubectl("delete", "node", container, "--wait=true", timeout=120),
             f"delete the Kubernetes Node {container}",
+        )
+
+    def kube_node_uid(self, node_name: str) -> str | None:
+        container = self._kind_worker_container(node_name)
+        listed = self.kubectl(
+            "get", "node", container, "--ignore-not-found", "-o", "jsonpath={.metadata.uid}",
+            timeout=15,
+        )
+        return _require_ok(listed, f"read the uid of {container}").strip() or None
+
+    def delete_kube_node(self, node_name: str, *, uid: str) -> None:
+        self._require_isolated_kind("deleting a Kind worker's Node")
+        container = self._kind_worker_container(node_name)
+        if not re.fullmatch(r"[0-9a-f-]{36}", uid):
+            raise ValueError(f"refusing Node uid {uid!r}")
+        body = json.dumps(
+            {"kind": "DeleteOptions", "apiVersion": "v1", "preconditions": {"uid": uid}}
+        )
+        _require_ok(
+            self.kubectl(
+                "delete", "--raw", f"/api/v1/nodes/{container}", "-f", "-",
+                input_text=body,
+                timeout=60,
+            ),
+            f"delete the Kubernetes Node {container} with uid {uid}",
         )
 
     def start_kind_worker(

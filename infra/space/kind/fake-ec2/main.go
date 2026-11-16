@@ -18,7 +18,9 @@
 // A Node's instance is the ID its AWS providerID names, or, without one, an
 // ID derived from the Node's UID. Its state:
 //
-//   - terminated once the Auto Scaling terminate or the test control named it;
+//   - shutting-down once the Auto Scaling terminate or the test control
+//     named it, for the delay the test control set before it (none by
+//     default), then terminated;
 //   - running when its Node's Ready condition is True;
 //   - stopped for any other Node (NotReady, Unknown);
 //   - no instance otherwise, as EC2 answers once a terminated instance has
@@ -30,8 +32,10 @@
 // memory, so a restart of the fixture forgets them.
 //
 // The test control listens on loopback only, in plain HTTP, so only a
-// process in the pod reaches it: `space-kind-fake-ec2 terminate <id>...`,
-// run through `kubectl exec`, posts to it.
+// process in the pod reaches it: `space-kind-fake-ec2 terminate <id>...` and
+// `space-kind-fake-ec2 delay <seconds>`, run through `kubectl exec`, post to
+// it. The delay applies to the terminations marked after it is set, so a
+// scenario sets it for itself and puts 0 back.
 //
 // It checks that a request is signed for EC2, or for Auto Scaling, in the
 // cluster's region, but not the signature itself, and refuses every other action, parameter and
@@ -87,9 +91,12 @@ const defaultControl = "127.0.0.1:8081"
 
 func main() {
 	var err error
-	if len(os.Args) > 1 && os.Args[1] == "terminate" {
+	switch {
+	case len(os.Args) > 1 && os.Args[1] == "terminate":
 		err = terminateCommand(os.Args[2:])
-	} else {
+	case len(os.Args) > 1 && os.Args[1] == "delay":
+		err = delayCommand(os.Args[2:])
+	default:
 		err = run(os.Args[1:])
 	}
 	if err != nil {
@@ -122,6 +129,33 @@ func terminateCommand(args []string) error {
 	return nil
 }
 
+// maxDelay bounds the delay before a terminated instance reads terminated.
+const maxDelay = time.Hour
+
+// delayCommand asks the running fixture's test control to keep each
+// instance it marks terminated from now on shutting-down for that many
+// seconds first.
+func delayCommand(args []string) error {
+	fs := flag.NewFlagSet("space-kind-fake-ec2 delay", flag.ExitOnError)
+	control := fs.String("control", defaultControl, "the running fixture's test control address")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		return errors.New("usage: space-kind-fake-ec2 delay [-control addr] <seconds>")
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.PostForm("http://"+*control+"/delay", url.Values{"seconds": {fs.Arg(0)}})
+	if err != nil {
+		return err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("delay %s: HTTP %d: %s", fs.Arg(0), resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	fmt.Printf("terminations now wait %ss before terminated\n", fs.Arg(0))
+	return nil
+}
+
 func run(args []string) error {
 	fs := flag.NewFlagSet("space-kind-fake-ec2", flag.ExitOnError)
 	listen := fs.String("listen", ":8443", "listen address (HTTPS), the cluster-controller's AWS_ENDPOINT_URL_EC2")
@@ -148,6 +182,7 @@ func run(args []string) error {
 	fake := &fakeEC2{region: *region, nodes: nodes, list: list, log: logger, state: newInstances()}
 	controlMux := http.NewServeMux()
 	controlMux.HandleFunc("POST /terminate", fake.controlTerminate)
+	controlMux.HandleFunc("POST /delay", fake.controlDelay)
 	controlSrv := &http.Server{Addr: *control, Handler: controlMux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := controlSrv.ListenAndServe(); err != nil {
@@ -258,31 +293,49 @@ func inClusterNodes() (nodeGetter, nodeLister, error) {
 }
 
 // instances is what the fixture remembers: the instances it was told are
-// terminated.
+// terminated, each with when it reads terminated, and the delay the next
+// ones wait.
 type instances struct {
 	mu         sync.Mutex
-	terminated map[string]bool
+	terminated map[string]time.Time
+	delay      time.Duration
 }
 
 func newInstances() *instances {
-	return &instances{terminated: map[string]bool{}}
+	return &instances{terminated: map[string]time.Time{}}
 }
 
-// terminate marks id terminated, returning its state before.
+func (s *instances) setDelay(delay time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.delay = delay
+}
+
+// marked is a terminated instance's state: shutting-down until its delay
+// has passed, then terminated; false when the instance was never marked.
+func (s *instances) marked(id string) (instanceState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at, ok := s.terminated[id]
+	if !ok {
+		return instanceState{}, false
+	}
+	if time.Now().Before(at) {
+		return instanceState{Code: 32, Name: "shutting-down"}, true
+	}
+	return instanceState{Code: 48, Name: "terminated"}, true
+}
+
+// terminate marks id terminated after the current delay, returning its
+// state before. A mark already made stays as it was.
 func (s *instances) terminate(id string, before string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.terminated[id] {
-		before = "terminated"
+	if _, ok := s.terminated[id]; ok {
+		return "terminated"
 	}
-	s.terminated[id] = true
+	s.terminated[id] = time.Now().Add(s.delay)
 	return before
-}
-
-func (s *instances) isTerminated(id string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.terminated[id]
 }
 
 type fakeEC2 struct {
@@ -490,8 +543,8 @@ func (f *fakeEC2) describeByInstanceID(w http.ResponseWriter, form url.Values, r
 			matched = append(matched, inst)
 		}
 	}
-	if len(matched) == 0 && f.state.isTerminated(id) {
-		matched = append(matched, instance{InstanceID: id, InstanceState: instanceState{Code: 48, Name: "terminated"}})
+	if st, ok := f.state.marked(id); ok && len(matched) == 0 {
+		matched = append(matched, instance{InstanceID: id, InstanceState: st})
 	}
 	resp := describeInstancesResponse{Xmlns: ec2NS, RequestID: reqID}
 	answer := make([]string, 0, len(matched))
@@ -541,6 +594,20 @@ func (f *fakeEC2) controlTerminate(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "%s terminated\n", id)
 }
 
+// controlDelay is the test control's delay: how long each instance marked
+// terminated from now on reads shutting-down first.
+func (f *fakeEC2) controlDelay(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	seconds, err := strconv.Atoi(r.FormValue("seconds"))
+	if err != nil || seconds < 0 || time.Duration(seconds)*time.Second > maxDelay {
+		http.Error(w, "seconds must be 0 to 3600", http.StatusBadRequest)
+		return
+	}
+	f.state.setDelay(time.Duration(seconds) * time.Second)
+	f.log.Info("termination delay set by test control", "seconds", seconds)
+	_, _ = fmt.Fprintf(w, "delay %ds\n", seconds)
+}
+
 // instanceOf is the instance behind n: its AWS providerID's instance, or one
 // derived from its UID, terminated once marked.
 func (f *fakeEC2) instanceOf(n *node) instance {
@@ -549,8 +616,8 @@ func (f *fakeEC2) instanceOf(n *node) instance {
 		id = instanceID(n.Metadata.UID)
 	}
 	st := state(n)
-	if f.state.isTerminated(id) {
-		st = instanceState{Code: 48, Name: "terminated"}
+	if marked, ok := f.state.marked(id); ok {
+		st = marked
 	}
 	return instance{InstanceID: id, InstanceState: st, PrivateDNSName: n.Metadata.Name}
 }

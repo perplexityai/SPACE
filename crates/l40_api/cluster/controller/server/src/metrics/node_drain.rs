@@ -47,14 +47,28 @@ pub fn clear_v2_gauges(node_id: &str) {
     }
 }
 
-/// The v2 loop's terminator failed to terminate a `terminating` node; the
-/// node stays `terminating` and the next tick tries again.
+/// Auto Scaling refused, or gave no answer to, the termination of a fenced
+/// node's instance; the node stays `terminating`, and the loop asks again
+/// on its dispatch backoff.
 pub fn v2_terminate_failure(node_id: &str) {
     counter(
         "node_drain.v2.terminate_failures",
         1,
         &[tag("node", node_id)],
     );
+}
+
+/// The v2 loop deleted the row of a node whose fenced instance EC2 says is
+/// terminated.
+pub fn v2_node_deleted() {
+    counter("node_drain.v2.nodes_deleted", 1, &[]);
+}
+
+/// The v2 loop let a node go, `reason` being why: its instance terminated
+/// outside the drain, a fenced instance terminated with no dispatch
+/// confirmed, or a guard refused the delete of a terminated node's row.
+pub fn v2_let_go(reason: &str) {
+    counter("node_drain.v2.let_go", 1, &[tag("reason", reason)]);
 }
 
 /// Transition between two `nodes.drain_phase` values (driven by the reconciler).

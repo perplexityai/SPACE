@@ -166,8 +166,9 @@ fn drain_v2_enabled(
 }
 
 /// Whether the v2 loop terminates a node `:terminate` moved to
-/// `terminating`: only through EC2, which also says when the instance is
-/// gone. Elsewhere it refuses, and the node waits for an operator.
+/// `terminating`: only through EC2 and Auto Scaling, and EC2 also says when
+/// a v2 node's instance is gone. Elsewhere it never fences, and the node
+/// waits for an operator, who may still undrain it.
 fn v2_terminates(kind: TerminatorKind) -> bool {
     kind == TerminatorKind::Aws
 }
@@ -737,13 +738,12 @@ pub async fn run_reconcilers(
                         spawn_v2(
                             &mut handles,
                             if v2_terminates(kind) {
-                                node_drain::v2::V2Terminator::Ec2(
-                                    node_drain::Ec2InstanceTerminator::new(
-                                        pool.clone(),
-                                        kube.k8s.client.clone(),
-                                        autoscaling_client.clone(),
+                                node_drain::v2::V2Terminator::Ec2 {
+                                    ec2: pplx_space_aws_client::ec2::Client::from_config(
+                                        &aws_config,
                                     ),
-                                )
+                                    autoscaling: autoscaling_client.clone(),
+                                }
                             } else {
                                 node_drain::v2::V2Terminator::Refuse
                             },

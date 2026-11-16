@@ -1119,18 +1119,6 @@ async fn terminate_of_a_v2_node_needs_a_done_report_for_its_epoch() -> TestResul
         let mut state = kubernetes_state(&db.pool).await?;
         state.v2_drain_probe = std::sync::Arc::new(ScriptedProbe(probe));
         let node_id = insert_k8s_node(&db.pool, Some("drained"), Some("v2"), Some(status)).await?;
-        let sandbox_id = pplx_space_common_core::types::SandboxId::new();
-        crate::controllers::substrate::kubernetes::tests::insert_test_sandbox_row(
-            &db.pool, sandbox_id, "started",
-        )
-        .await?;
-        sqlx::query(sql!(
-            "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
-        ))
-        .bind(sandbox_id)
-        .bind(node_id)
-        .execute(&db.pool)
-        .await?;
         let answer = post_drain(
             &state,
             &actor,
@@ -1322,5 +1310,129 @@ async fn terminate_of_an_unknown_node_is_not_found() -> TestResult {
     )
     .await;
     assert_eq!(answer, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// A v2 `:terminate` with a done report is refused, writing nothing, while
+/// anything still names the node: a row outside `failed` and `deleted`
+/// naming it active or target, or an execution active on its name. The
+/// answer names what holds it. A terminal row holds nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn terminate_of_a_v2_node_needs_nothing_naming_it() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let actor = managing_org_admin(&db.pool).await?;
+    let done = serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": true}});
+    for (case, lifecycle, column, held) in [
+        ("active", "started", "active_node_id", true),
+        ("target", "suspended", "target_node_id", true),
+        ("execution", "started", "", true),
+        ("terminal", "failed", "target_node_id", false),
+    ] {
+        let mut state = kubernetes_state(&db.pool).await?;
+        state.v2_drain_probe = std::sync::Arc::new(ScriptedProbe(Ok(V2DrainReport {
+            sealed_epoch: Some(42),
+            done: true,
+        })));
+        let node_id =
+            insert_k8s_node(&db.pool, Some("drained"), Some("v2"), Some(done.clone())).await?;
+        let sandbox_id = pplx_space_common_core::types::SandboxId::new();
+        crate::controllers::substrate::kubernetes::tests::insert_test_sandbox_row(
+            &db.pool, sandbox_id, lifecycle,
+        )
+        .await?;
+        if column.is_empty() {
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_k8s_executions
+                    (sandbox_id, generation, pod_name, pod_namespace, k8s_node_name, state, active)
+                 VALUES ($1, 1, 'space-sbx-synthetic', 'sandboxes', $2, 'running', TRUE)"
+            ))
+            .bind(sandbox_id)
+            .bind(format!("ip-10-0-0-46-{node_id}"))
+            .execute(&db.pool)
+            .await?;
+        } else {
+            sqlx::query(sqlx::AssertSqlSafe(sql!(format!(
+                "UPDATE sandboxes SET {column} = $2 WHERE id = $1"
+            ))))
+            .bind(sandbox_id)
+            .bind(node_id)
+            .execute(&db.pool)
+            .await?;
+        }
+        let (status, body) = post_drain_response(
+            &state,
+            &actor,
+            node_id,
+            DrainAction::Terminate,
+            DrainRequest::default(),
+        )
+        .await?;
+        let phase = v2_columns(&db.pool, node_id).await?.0;
+        if held {
+            assert_eq!(status, StatusCode::CONFLICT, "{case}: {body}");
+            assert_eq!(phase.as_deref(), Some("drained"), "{case}");
+            assert!(
+                body["held_by"]
+                    .as_str()
+                    .is_some_and(|held_by| held_by.contains(&sandbox_id.to_string())),
+                "{case}: {body}"
+            );
+        } else {
+            assert_eq!(phase.as_deref(), Some("terminating"), "{case}: {body}");
+        }
+    }
+    Ok(())
+}
+
+/// `:undrain` of a v2 node in `terminating` moves it to no phase and marks
+/// its epoch for cancel, as any v2 undrain does, until the controller fences
+/// its instance; a fenced one is refused and left as it was. A v1 node in
+/// `terminating` is refused as before.
+#[tokio::test(flavor = "current_thread")]
+async fn undrain_of_a_terminating_v2_node_runs_only_before_the_fence() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = kubernetes_state(&db.pool).await?;
+    let actor = managing_org_admin(&db.pool).await?;
+    let unfenced = serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": true}});
+    let mut fenced = unfenced.clone();
+    fenced["terminate_instance"] = serde_json::json!("i-0a1b2c3d");
+    for (case, engine, status, undrains) in [
+        ("unfenced v2", Some("v2"), Some(unfenced.clone()), true),
+        ("fenced v2", Some("v2"), Some(fenced.clone()), false),
+        ("v1", None, None, false),
+    ] {
+        let node_id =
+            insert_k8s_node(&db.pool, Some("terminating"), engine, status.clone()).await?;
+        let answer = post_drain(
+            &state,
+            &actor,
+            node_id,
+            DrainAction::Undrain,
+            DrainRequest::default(),
+        )
+        .await;
+        let (phase, stored_engine, stored, _) = v2_columns(&db.pool, node_id).await?;
+        if undrains {
+            assert_eq!(phase, None, "{case}: {answer}");
+            assert_eq!(stored_engine.as_deref(), Some("v2"), "{case}");
+            let mut cancelled = unfenced.clone();
+            cancelled["cancel"] = serde_json::json!(true);
+            assert_eq!(stored, Some(cancelled), "{case}");
+        } else {
+            assert_eq!(answer, StatusCode::CONFLICT, "{case}");
+            assert_eq!(phase.as_deref(), Some("terminating"), "{case}");
+            assert_eq!(stored, status, "{case}");
+        }
+    }
     Ok(())
 }

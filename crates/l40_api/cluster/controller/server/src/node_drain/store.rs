@@ -5250,8 +5250,8 @@ async fn connect_restore_listener(
 /// clears the tombstone.
 ///
 /// A v1 writer: a v2 drain's node is never deleted here and gets no
-/// tombstone. The dead-node verb deletes it once the controller has
-/// terminated it (`node_drain::v2`).
+/// tombstone. The v2 loop deletes it, with none, once EC2 says the instance
+/// it fenced is terminated and its Node is gone (`node_drain::v2`).
 pub(crate) async fn delete_terminating_node_and_record_tombstone(
     pool: &PgPool,
     node_id: NodeId,

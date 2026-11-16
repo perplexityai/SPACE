@@ -168,8 +168,7 @@ impl Writer {
 }
 
 /// Each v1 writer takes the v1 node and leaves the v2 node in the same phase:
-/// a v2 node's row stays, with no tombstone, for the v2 loop and the
-/// dead-node verb.
+/// a v2 node's row stays, with no tombstone, for the v2 loop.
 #[tokio::test(flavor = "current_thread")]
 async fn every_v1_writer_skips_a_v2_node() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {

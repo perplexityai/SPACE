@@ -1,4 +1,4 @@
-"""A drained v2 worker is terminated through its instance, and its row goes with no tombstone."""
+"""A drained v2 worker is terminated through its instance, and the drain deletes its row with no tombstone."""
 
 import shlex
 
@@ -9,12 +9,14 @@ PATH = "/tmp/space-smoke-v2-terminate.txt"
 
 # `native.v2_drain_evacuates_every_resident` is the drain. This is what follows
 # it, as production runs it (`space_smoke.drain_v2`): `:terminate` checks the
-# node's `done` report with a fresh `DrainNode` call, the controller's `aws`
-# terminator terminates the instance through Kind's fake EC2 and flags it, the
-# harness stops the worker, and the dead-node verb, `live`, judges the node
-# lost by its instance and deletes its row, with no tombstone. The worker
-# comes back as a same-name replacement; what it found is recorded as
-# `after_terminate`. It stops a worker, so it runs only by name.
+# node's `done` report with a fresh `DrainNode` call and that nothing names the
+# node; the controller fences the instance, and its `aws` terminator asks
+# Kind's fake EC2 to terminate exactly it and records the dispatch. The harness
+# then stops the worker and deletes its Node; once EC2 says the instance is
+# terminated and a GET finds the Node gone, the drain deletes the node's row,
+# with no tombstone. The worker comes back as a same-name replacement; what it
+# found is recorded as `after_terminate`. It stops a worker, so it runs only by
+# name.
 @smoke.scenario(
     "native.v2_drain_terminates_its_worker",
     api_surfaces=("native",),
@@ -22,20 +24,17 @@ PATH = "/tmp/space-smoke-v2-terminate.txt"
     # A re-registration, one suspend and restore, the drained edge, the
     # terminate and the replacement on a slow KVM bench.
     timeout_minutes=45,
-    test_hooks=(
-        "SPACE_DEAD_NODE_TEST_TICK_SECS and SPACE_DEAD_NODE_TEST_ABSENCE_WINDOW_SECS, which "
-        "shorten the dead-node verb's tick and Node-absence window to seconds"
-    ),
     tier="manual",
     manual_reason="stops a Kind worker and replaces it, too invasive for the per-merge set",
 )
 def v2_drain_terminates_its_worker(test: smoke.CommandSandboxFixture) -> None:
     """A worker under a fake AWS instance, v2-drained of a started resident
-    that comes back on the other worker, is `:terminate`d: its instance is
-    terminated through the fake EC2 and the termination flagged under the
-    drain's epoch; once the worker is stopped the dead-node verb deletes the
-    node's row with no tombstone. The worker comes back under the same name
-    with a new instance. The resident's file is intact."""
+    that comes back on the other worker, is `:terminate`d: the controller
+    fences its instance and records the dispatch of its termination through
+    the fake EC2; once the worker is stopped and EC2 says the instance is
+    terminated, the drain deletes the node's row with no tombstone. The
+    worker comes back under the same name with a new instance. The resident's
+    file is intact."""
 
     drain = test.drain_v2
 
@@ -58,7 +57,7 @@ def v2_drain_terminates_its_worker(test: smoke.CommandSandboxFixture) -> None:
             drain.expect_drained()
             drain.expect_back_elsewhere(resident.sandbox_id, "started")
 
-        with test.phase(":terminate: the instance goes, the verb deletes the row, a replacement returns"):
+        with test.phase(":terminate: the instance goes, the drain deletes the row, a replacement returns"):
             drain.terminate()
 
         with test.phase("the resident's file survived"):

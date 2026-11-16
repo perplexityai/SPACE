@@ -290,3 +290,75 @@ async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
     }
     Ok(())
 }
+
+/// After a v2 drain fences its instance, a registration under a new UID is
+/// decided by the instance it reports: none yet is deferred, as a tombstone
+/// refuses, writing nothing; the fenced instance is the same machine, which
+/// keeps the fence and the drain; any other is a replacement, which takes
+/// the row and clears both. Without a UID change nothing is deferred.
+#[tokio::test]
+async fn a_fenced_rows_new_uid_is_decided_by_its_instance() -> TestDbResult<()> {
+    let db = db().await?;
+    let mut conn = db.pool.acquire().await?;
+    let fenced_status = r#"{"epoch": 7, "terminate_instance": "i-0a"}"#;
+    for (case, uid, instance_id, outcome) in [
+        ("unknown", "uid-2", None, "deferred"),
+        ("the fenced instance", "uid-2", Some("i-0a"), "kept"),
+        ("another instance", "uid-2", Some("i-0b"), "cleared"),
+        ("same uid, no instance", "uid-1", None, "kept"),
+    ] {
+        let node_id = NodeId::new();
+        registered(&db.pool, registration(node_id, "uid-1", Some("i-0a"))).await?;
+        sqlx::query(sql!(
+            "UPDATE nodes
+             SET drain_phase = 'terminating', drain_mode = 'forced',
+                 drain_started_at = NOW(), drain_engine = 'v2',
+                 drain_status = $2::JSONB
+             WHERE id = $1"
+        ))
+        .bind(node_id)
+        .bind(fenced_status)
+        .execute(&mut *conn)
+        .await?;
+        let before = node_k8s(&mut conn, node_id).await?.unwrap();
+
+        let result = register(&db.pool, registration(node_id, uid, instance_id)).await?;
+        let drain: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(sql!(
+            "SELECT drain_phase, drain_engine, drain_status::TEXT FROM nodes WHERE id = $1"
+        ))
+        .bind(node_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        let after = node_k8s(&mut conn, node_id).await?.unwrap();
+        match outcome {
+            "deferred" => {
+                assert!(
+                    matches!(result, Err(K8sNodeRegistrationError::AwaitingInstance)),
+                    "{case}: {result:?}"
+                );
+                assert_eq!(after, before, "{case}");
+            }
+            "kept" => {
+                assert!(result.is_ok(), "{case}: {result:?}");
+                assert_eq!(after.k8s_node_uid.as_deref(), Some(uid), "{case}");
+                assert_eq!(after.instance_id.as_deref(), Some("i-0a"), "{case}");
+            }
+            _ => {
+                assert!(result.is_ok(), "{case}: {result:?}");
+                assert_eq!(after.k8s_node_uid.as_deref(), Some(uid), "{case}");
+                assert_eq!(after.instance_id.as_deref(), Some("i-0b"), "{case}");
+            }
+        }
+        let expected = if outcome == "cleared" {
+            (None, None, None)
+        } else {
+            (
+                Some("terminating".to_owned()),
+                Some("v2".to_owned()),
+                Some(fenced_status.to_owned()),
+            )
+        };
+        assert_eq!(drain, expected, "{case}");
+    }
+    Ok(())
+}

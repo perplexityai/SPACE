@@ -1769,6 +1769,12 @@ class KindWorkerControl(NodeDrainControl, Protocol):
         """Mark the instance terminated in Kind's fake EC2, through its loopback test control."""
         ...
 
+    def set_fake_ec2_terminate_delay(self, seconds: int) -> None:
+        """How long each instance Kind's fake EC2 marks terminated from now on
+        reads `shutting-down` first (0 to 3600), through its loopback test
+        control; 0 puts the default back."""
+        ...
+
     def node_recorded_instance(self, node_id: str) -> str | None:
         """`node_k8s.instance_id` of the node, None when it records none or has no row."""
         ...
@@ -1779,8 +1785,19 @@ class KindWorkerControl(NodeDrainControl, Protocol):
         """The Kind worker's Node labels, which deleting the Node discards."""
         ...
 
-    def stop_kind_worker(self, node_name: str) -> None:
-        """Stop the Kind worker's container, then delete its Kubernetes Node."""
+    def stop_kind_worker(self, node_name: str, *, keep_node: bool = False) -> None:
+        """Stop the Kind worker's container, then delete its Kubernetes Node
+        unless `keep_node`, which leaves the Node behind its machine as a
+        cloud controller that lags would."""
+        ...
+
+    def kube_node_uid(self, node_name: str) -> str | None:
+        """The uid of the Kubernetes Node of that name, None when there is none."""
+        ...
+
+    def delete_kube_node(self, node_name: str, *, uid: str) -> None:
+        """Delete the Kubernetes Node of that name with a uid precondition, so
+        a replacement under the same name is never the one deleted."""
         ...
 
     def start_kind_worker(
@@ -1806,7 +1823,7 @@ class DrainRestoreControl(Protocol):
 
     A scoped override of two cluster-controller env keys (closed key list,
     bounded integers), under the controller-mutation Lease the retention, GC,
-    dead-node and stopped-replacement scenarios share.
+    drain and stopped-replacement scenarios share.
     """
 
     def acquire_controller_mutation(self) -> Callable[[], None]:

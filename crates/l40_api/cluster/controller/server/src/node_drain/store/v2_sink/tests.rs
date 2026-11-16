@@ -349,42 +349,459 @@ async fn the_cancel_clears_only_an_undrained_row_of_its_epoch() -> TestResult {
     Ok(())
 }
 
-/// The termination is flagged on a terminating node of the row's epoch, so
-/// the loop doesn't terminate it again; any other row is left as it was.
+const INSTANCE: &str = "i-0000000000000d0d0";
+
+/// The node's Kubernetes identity: name, uid `uid`, and [`INSTANCE`] unless
+/// `instance` says otherwise.
+async fn identity(pool: &PgPool, node_id: NodeId, instance: Option<&str>) -> TestResult<String> {
+    let name = format!("worker-{}.synthetic.internal", node_id.as_uuid().simple());
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid, instance_id)
+         VALUES ($1, $2, 'uid', $3)"
+    ))
+    .bind(node_id)
+    .bind(&name)
+    .bind(instance)
+    .execute(pool)
+    .await?;
+    Ok(name)
+}
+
+async fn heartbeat(pool: &PgPool, node_id: NodeId) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO node_status_snapshots
+            (node_id, observed_at, stale_after, reachable, services, updated_at)
+         VALUES ($1, NOW(), NOW() + INTERVAL '1 minute', TRUE, '[]'::JSONB, NOW())"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A done report for `epoch`, and anything else in `extra`.
+fn done(epoch: i64, extra: serde_json::Value) -> serde_json::Value {
+    let mut status = serde_json::json!({
+        "epoch": epoch,
+        "report": {"sealed_epoch": epoch, "done": true},
+    });
+    if let (Some(status), Some(extra)) = (status.as_object_mut(), extra.as_object()) {
+        status.extend(extra.clone());
+    }
+    status
+}
+
+/// A durable full snapshot of the row, taken now.
+async fn durable(pool: &PgPool, id: SandboxId) -> TestResult {
+    catalog(pool, id, Uuid::now_v7(), "full", "ready").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET placement_changed_at = NOW() - INTERVAL '1 hour' WHERE id = $1"
+    ))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn columns(pool: &PgPool, node_id: NodeId) -> TestResult<NodeColumns> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT drain_phase, drain_engine, drain_status, drain_last_error
+           FROM nodes WHERE id = $1"
+    ))
+    .bind(node_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// `(drain_phase, drain_engine, drain_status, drain_last_error)`.
+type NodeColumns = (
+    Option<String>,
+    Option<String>,
+    Option<serde_json::Value>,
+    Option<String>,
+);
+
+async fn listed(pool: &PgPool, node_id: NodeId) -> TestResult<V2Node> {
+    Ok(list_v2_nodes(pool)
+        .await?
+        .into_iter()
+        .find(|node| node.id == node_id)
+        .ok_or("listed")?)
+}
+
+/// The release runs only on a `drained` node of its epoch whose report is
+/// `done`, and releases a durably suspended row naming it.
 #[tokio::test(flavor = "current_thread")]
-async fn the_termination_is_flagged_on_its_epochs_terminating_node() -> TestResult {
+async fn the_release_runs_only_on_its_epochs_drained_done_node() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let pool = &db.pool;
-    let status = serde_json::json!({"epoch": 7});
-    for (case, phase, epoch, flagged) in [
-        ("flagged", Some("terminating"), 7, true),
-        ("another epoch", Some("terminating"), 8, false),
-        ("still drained", Some("drained"), 7, false),
+    for (case, phase, status, epoch, releases) in [
+        (
+            "drained",
+            "drained",
+            done(7, serde_json::json!({})),
+            7,
+            true,
+        ),
+        (
+            "another epoch",
+            "drained",
+            done(7, serde_json::json!({})),
+            8,
+            false,
+        ),
+        (
+            "not done",
+            "drained",
+            serde_json::json!({"epoch": 7, "report": {"sealed_epoch": 7, "done": false}}),
+            7,
+            false,
+        ),
+        (
+            "draining",
+            "draining",
+            done(7, serde_json::json!({})),
+            7,
+            false,
+        ),
     ] {
-        let node_id = v2_node(pool, phase, status.clone()).await?;
-        assert_eq!(
-            record_v2_terminated(pool, node_id, epoch).await?,
-            flagged,
-            "{case}"
-        );
-        let stored: serde_json::Value =
-            sqlx::query_scalar(sql!("SELECT drain_status FROM nodes WHERE id = $1"))
+        let node_id = v2_node(pool, Some(phase), status).await?;
+        identity(pool, node_id, Some(INSTANCE)).await?;
+        let id = sandbox(pool, "suspended", Some(node_id)).await?;
+        durable(pool, id).await?;
+        let released = release_v2_suspended(pool, node_id, epoch).await?;
+        assert_eq!(released == [id], releases, "{case}: {released:?}");
+    }
+    Ok(())
+}
+
+/// The terminate transaction fences only its epoch's unfenced
+/// `terminating` node with a `done` report and a recorded instance, after
+/// releasing the durably suspended rows naming it; a row or execution that
+/// still names it holds the fence, recorded in `drain_last_error`, while the
+/// release it ran commits.
+#[tokio::test(flavor = "current_thread")]
+async fn the_terminate_transaction_fences_only_an_empty_node() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    for case in [
+        "fenced",
+        "released then fenced",
+        "another epoch",
+        "not done",
+        "already fenced",
+        "drained",
+        "no instance",
+        "held by a row",
+        "held by an execution",
+    ] {
+        let (phase, status) = match case {
+            "not done" => (
+                "terminating",
+                serde_json::json!({"epoch": 7, "report": {"sealed_epoch": 7, "done": false}}),
+            ),
+            "already fenced" => (
+                "terminating",
+                done(
+                    7,
+                    serde_json::json!({"terminate_instance": "i-0000000000000e0e0"}),
+                ),
+            ),
+            "drained" => ("drained", done(7, serde_json::json!({}))),
+            _ => ("terminating", done(7, serde_json::json!({}))),
+        };
+        let node_id = v2_node(pool, Some(phase), status.clone()).await?;
+        let name = identity(pool, node_id, (case != "no instance").then_some(INSTANCE)).await?;
+        let epoch = if case == "another epoch" { 8 } else { 7 };
+        let mut releasable = None;
+        let mut holder = None;
+        match case {
+            "released then fenced" | "held by a row" => {
+                let id = sandbox(pool, "suspended", Some(node_id)).await?;
+                durable(pool, id).await?;
+                releasable = Some(id);
+                if case == "held by a row" {
+                    holder = Some(sandbox(pool, "suspended", Some(node_id)).await?);
+                }
+            }
+            "held by an execution" => {
+                let id = sandbox(pool, "started", None).await?;
+                sqlx::query(sql!(
+                    "INSERT INTO sandbox_k8s_executions
+                        (sandbox_id, generation, pod_name, pod_namespace, k8s_node_name, state,
+                         active)
+                     VALUES ($1, 1, 'space-sbx-synthetic', 'sandboxes', $2, 'running', TRUE)"
+                ))
+                .bind(id)
+                .bind(&name)
+                .execute(pool)
+                .await?;
+                holder = Some(id);
+            }
+            _ => {}
+        }
+        let fence = fence_v2_node(pool, node_id, epoch).await?;
+        let (_, _, stored, last_error) = columns(pool, node_id).await?;
+        let fenced = stored
+            .as_ref()
+            .and_then(|status| status.get("terminate_instance"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        match case {
+            "fenced" | "released then fenced" => {
+                assert_eq!(fence, Fence::Fenced(INSTANCE.to_owned()), "{case}");
+                assert_eq!(fenced.as_deref(), Some(INSTANCE), "{case}");
+                assert_eq!(
+                    listed(pool, node_id).await?.fence.as_deref(),
+                    Some(INSTANCE)
+                );
+            }
+            "no instance" => {
+                assert_eq!(fence, Fence::NoInstance, "{case}");
+                assert_eq!(stored.as_ref(), Some(&status), "{case}");
+            }
+            "held by a row" | "held by an execution" => {
+                let Fence::Held(held) = fence else {
+                    panic!("{case}: {fence:?}");
+                };
+                let holder = holder.ok_or("holder")?;
+                assert!(held.contains(&holder.to_string()), "{case}: {held}");
+                assert_eq!(last_error.as_deref(), Some(held.as_str()), "{case}");
+                assert_eq!(fenced, None, "{case}");
+            }
+            _ => {
+                assert_eq!(fence, Fence::Moved, "{case}");
+                assert_eq!(stored.as_ref(), Some(&status), "{case}");
+            }
+        }
+        if let Some(id) = releasable {
+            let (active, target): (Option<NodeId>, Option<NodeId>) = sqlx::query_as(sql!(
+                "SELECT active_node_id, target_node_id FROM sandboxes WHERE id = $1"
+            ))
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+            assert_eq!((active, target), (None, None), "{case}: released");
+        }
+    }
+    Ok(())
+}
+
+/// The dispatch is recorded once, on the fenced instance of its epoch's
+/// `terminating` node, by the database clock; listing reads it back.
+#[tokio::test(flavor = "current_thread")]
+async fn the_dispatch_is_recorded_once_on_the_fenced_instance() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node_id = v2_node(
+        pool,
+        Some("terminating"),
+        done(7, serde_json::json!({"terminate_instance": INSTANCE})),
+    )
+    .await?;
+    identity(pool, node_id, Some(INSTANCE)).await?;
+    assert!(!record_v2_dispatched(pool, node_id, 7, "i-0000000000000e0e0").await?);
+    assert!(!record_v2_dispatched(pool, node_id, 8, INSTANCE).await?);
+    assert!(record_v2_dispatched(pool, node_id, 7, INSTANCE).await?);
+    assert!(!record_v2_dispatched(pool, node_id, 7, INSTANCE).await?);
+    let node = listed(pool, node_id).await?;
+    assert_eq!(node.fence.as_deref(), Some(INSTANCE));
+    assert!(node.dispatched_at.is_some_and(|at| at > 0));
+
+    let unfenced = v2_node(pool, Some("terminating"), done(7, serde_json::json!({}))).await?;
+    assert!(!record_v2_dispatched(pool, unfenced, 7, INSTANCE).await?);
+    Ok(())
+}
+
+/// The delete of a terminated node's row needs the row to still carry the
+/// fence with a dispatch, the identity the tick read, a stale heartbeat and
+/// nothing naming the node; it leaves no tombstone. A row a registration
+/// took has no fence left; a fresh heartbeat or a moved identity waits; a
+/// row that names the node lets it go instead, with the trace, writing no
+/// sandbox row.
+#[tokio::test(flavor = "current_thread")]
+async fn the_terminated_delete_holds_its_guards_and_lets_go_on_a_reference() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let dispatched = || {
+        done(
+            7,
+            serde_json::json!({"terminate_instance": INSTANCE, "dispatched_at": 1}),
+        )
+    };
+    for case in [
+        "deleted",
+        "unfenced",
+        "not dispatched",
+        "heartbeat fresh",
+        "uid moved",
+        "instance moved",
+        "referenced",
+    ] {
+        let status = match case {
+            "unfenced" => done(7, serde_json::json!({})),
+            "not dispatched" => done(7, serde_json::json!({"terminate_instance": INSTANCE})),
+            _ => dispatched(),
+        };
+        let node_id = v2_node(pool, Some("terminating"), status.clone()).await?;
+        let recorded = if case == "instance moved" {
+            "i-0000000000000e0e0"
+        } else {
+            INSTANCE
+        };
+        identity(pool, node_id, Some(recorded)).await?;
+        if case == "heartbeat fresh" {
+            heartbeat(pool, node_id).await?;
+        }
+        let holder = if case == "referenced" {
+            Some(sandbox(pool, "suspended", Some(node_id)).await?)
+        } else {
+            None
+        };
+        let mut node = listed(pool, node_id).await?;
+        if case == "uid moved" {
+            node.k8s_node_uid = Some("uid-before".to_owned());
+        }
+        let outcome = delete_v2_terminated(pool, &node, 7, INSTANCE).await?;
+        let exists: bool =
+            sqlx::query_scalar(sql!("SELECT EXISTS (SELECT 1 FROM nodes WHERE id = $1)"))
                 .bind(node_id)
                 .fetch_one(pool)
                 .await?;
-        let listed = list_v2_nodes(pool)
-            .await?
-            .into_iter()
-            .find(|node| node.id == node_id)
-            .expect("listed");
-        assert_eq!(listed.terminated, flagged, "{case}");
-        if flagged {
-            assert_eq!(stored, serde_json::json!({"epoch": 7, "terminated": true}));
-        } else {
-            assert_eq!(stored, status, "{case}: wrote");
+        match case {
+            "deleted" => {
+                assert_eq!(outcome, TerminatedDelete::Deleted);
+                assert!(!exists);
+                let tombstoned: bool = sqlx::query_scalar(sql!(
+                    "SELECT EXISTS (SELECT 1 FROM node_k8s_tombstones WHERE node_id = $1)"
+                ))
+                .bind(node_id)
+                .fetch_one(pool)
+                .await?;
+                assert!(!tombstoned);
+            }
+            "unfenced" => {
+                assert_eq!(outcome, TerminatedDelete::Unfenced);
+                assert!(exists);
+            }
+            "referenced" => {
+                let holder = holder.ok_or("holder")?;
+                let trace = format!(
+                    "v2 drain let go after terminating {INSTANCE}: target_node_id held by {holder}; \
+                     active_node_id held by {holder}"
+                );
+                let TerminatedDelete::LetGo(got) = &outcome else {
+                    panic!("{case}: {outcome:?}");
+                };
+                assert!(
+                    got.starts_with(&format!("v2 drain let go after terminating {INSTANCE}: "))
+                        && got.contains(&format!("held by {holder}")),
+                    "{got} vs {trace}"
+                );
+                assert_eq!(
+                    columns(pool, node_id).await?,
+                    (None, None, None, Some(got.clone()))
+                );
+                let (active, target): (Option<NodeId>, Option<NodeId>) = sqlx::query_as(sql!(
+                    "SELECT active_node_id, target_node_id FROM sandboxes WHERE id = $1"
+                ))
+                .bind(holder)
+                .fetch_one(pool)
+                .await?;
+                assert_eq!((active, target), (Some(node_id), Some(node_id)));
+            }
+            _ => {
+                assert!(
+                    matches!(outcome, TerminatedDelete::Wait(_)),
+                    "{case}: {outcome:?}"
+                );
+                assert!(exists, "{case}");
+                assert_eq!(columns(pool, node_id).await?.2, Some(status), "{case}");
+            }
         }
+    }
+    Ok(())
+}
+
+/// The let-go clears the phase and the v2 columns of the node in the epoch,
+/// phase and fence the tick read, records the trace, and writes no sandbox
+/// row; a row that moved on is left as it was.
+#[tokio::test(flavor = "current_thread")]
+async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    for (case, phase, fence, epoch, read_phase, clears) in [
+        ("drained", Some("drained"), None, 7, Some("drained"), true),
+        ("cancel pending", None, None, 7, None, true),
+        (
+            "fenced",
+            Some("terminating"),
+            Some(INSTANCE),
+            7,
+            Some("terminating"),
+            true,
+        ),
+        (
+            "another epoch",
+            Some("drained"),
+            None,
+            8,
+            Some("drained"),
+            false,
+        ),
+        (
+            "phase moved",
+            Some("terminating"),
+            None,
+            7,
+            Some("drained"),
+            false,
+        ),
+    ] {
+        let mut status = done(7, serde_json::json!({}));
+        if let Some(fence) = fence {
+            status["terminate_instance"] = serde_json::json!(fence);
+        }
+        if phase.is_none() {
+            status["cancel"] = serde_json::json!(true);
+        }
+        let node_id = v2_node(pool, phase, status.clone()).await?;
+        let pinned = sandbox(pool, "started", Some(node_id)).await?;
+        let cleared = let_go_v2(pool, node_id, epoch, read_phase, fence, "the trace").await?;
+        assert_eq!(cleared, clears, "{case}");
+        let (stored_phase, engine, stored, last_error) = columns(pool, node_id).await?;
+        if clears {
+            assert_eq!(
+                (stored_phase, engine, stored, last_error),
+                (None, None, None, Some("the trace".to_owned())),
+                "{case}"
+            );
+            let mode: Option<String> =
+                sqlx::query_scalar(sql!("SELECT drain_mode FROM nodes WHERE id = $1"))
+                    .bind(node_id)
+                    .fetch_one(pool)
+                    .await?;
+            assert_eq!(mode, None, "{case}");
+        } else {
+            assert_eq!(stored, Some(status), "{case}");
+        }
+        let lifecycle: (String, Option<NodeId>) = sqlx::query_as(sql!(
+            "SELECT lifecycle, active_node_id FROM sandboxes WHERE id = $1"
+        ))
+        .bind(pinned)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(lifecycle, ("started".to_owned(), Some(node_id)), "{case}");
     }
     Ok(())
 }
