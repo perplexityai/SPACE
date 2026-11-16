@@ -321,6 +321,7 @@ async fn the_internal_runtime_upgrade_report_is_forwarded_only_for_the_control_p
         Request::new(proto::GetRuntimeUpgradeRequest {
             sandbox_id: SandboxId::new().to_string(),
             operation_id: uuid::Uuid::now_v7().to_string(),
+            attempt_id: None,
         })
     };
 

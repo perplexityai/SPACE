@@ -1520,6 +1520,7 @@ fn requests_are_parsed_strictly() {
         target_state: WakeTargetState::Stopped as i32,
         stage_from: None,
         checkpoint_local_artifact_id: None,
+        attempt_id: None,
     };
     let parsed = parse_request(valid()).unwrap();
     assert_eq!(parsed.target_state, RuntimeUpgradeTargetState::Stopped);
