@@ -310,7 +310,7 @@ type SandboxManagerClient interface {
 	ServicePortIngress(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[v11.ServicePortIngressFrame, v11.ServicePortIngressFrame], error)
 	// Internal: find a paused pool sandbox, reassign to user, resume it.
 	AdoptPoolSandbox(ctx context.Context, in *AdoptPoolSandboxRequest, opts ...grpc.CallOption) (*AdoptPoolSandboxResponse, error)
-	// Wait for stopped, failed, cleanup_failed, suspended, or quarantined, or time out.
+	// Wait for stopped, failed, suspended, quarantined, or a failed cleanup, or time out.
 	// Quarantine completes the wait without implying that runtime or files were removed.
 	Wait(ctx context.Context, in *WaitRequest, opts ...grpc.CallOption) (*WaitResponse, error)
 	// Clone a paused donor sandbox to create a new sandbox (for pool cloning).
@@ -1462,7 +1462,7 @@ type SandboxManagerServer interface {
 	ServicePortIngress(grpc.BidiStreamingServer[v11.ServicePortIngressFrame, v11.ServicePortIngressFrame]) error
 	// Internal: find a paused pool sandbox, reassign to user, resume it.
 	AdoptPoolSandbox(context.Context, *AdoptPoolSandboxRequest) (*AdoptPoolSandboxResponse, error)
-	// Wait for stopped, failed, cleanup_failed, suspended, or quarantined, or time out.
+	// Wait for stopped, failed, suspended, quarantined, or a failed cleanup, or time out.
 	// Quarantine completes the wait without implying that runtime or files were removed.
 	Wait(context.Context, *WaitRequest) (*WaitResponse, error)
 	// Clone a paused donor sandbox to create a new sandbox (for pool cloning).
