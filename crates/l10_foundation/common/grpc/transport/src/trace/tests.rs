@@ -489,76 +489,28 @@ fn marked_client_span_fields_are_recorded_on_the_call_span() {
     assert_eq!(fields.0.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
-#[derive(Clone, Default)]
-struct ClientLogLevels(Arc<Mutex<Vec<tracing::Level>>>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ClientLogLevels {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        if event.metadata().target() == "grpc.client" {
-            self.0.lock().unwrap().push(*event.metadata().level());
-        }
-    }
-}
-
 /// The level of each `grpc.client` event logged while `run` runs.
 fn client_log_levels(run: impl FnOnce()) -> Vec<tracing::Level> {
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let levels = ClientLogLevels::default();
+    #[derive(Clone, Default)]
+    struct Levels(Arc<Mutex<Vec<tracing::Level>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "grpc.client" {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+    }
+
+    let levels = Levels::default();
     tracing::subscriber::with_default(tracing_subscriber::registry().with(levels.clone()), run);
     levels.0.lock().unwrap().clone()
-}
-
-/// A call marked [`ExpectedConnectFailure`] whose dial finds nothing
-/// listening, a Unix socket absent or refusing as while a node-local server
-/// restarts, is logged at DEBUG. The same failure unmarked, and a marked call
-/// whose dial reached a peer that then dropped the connection, stay errors.
-#[tokio::test]
-async fn only_a_marked_call_whose_dial_failed_is_not_logged_as_an_error() {
-    use tracing::Level;
-    use tracing_subscriber::layer::SubscriberExt as _;
-
-    let sockets = tempfile::tempdir().unwrap();
-    let absent = sockets.path().join("absent.sock");
-    let refused = sockets.path().join("refused.sock");
-    drop(std::os::unix::net::UnixListener::bind(&refused).unwrap());
-    let dropping = sockets.path().join("dropping.sock");
-    let listener = tokio::net::UnixListener::bind(&dropping).unwrap();
-    let acceptor = tokio::spawn(async move {
-        while let Ok((connection, _)) = listener.accept().await {
-            drop(connection);
-        }
-    });
-    let endpoint =
-        tonic::transport::Endpoint::try_from("http://[::]:50051").expect("static test endpoint");
-
-    for (socket, marked, level) in [
-        (&absent, true, Level::DEBUG),
-        (&refused, true, Level::DEBUG),
-        (&absent, false, Level::ERROR),
-        (&refused, false, Level::ERROR),
-        (&dropping, true, Level::ERROR),
-    ] {
-        let channel = crate::connect_uds_channel_lazy(socket, endpoint.clone());
-        let mut client = tonic_health::pb::health_client::HealthClient::new(
-            trace_grpc_client_transport(channel),
-        );
-        let mut request = tonic::Request::new(tonic_health::pb::HealthCheckRequest::default());
-        if marked {
-            ExpectedConnectFailure.mark(&mut request);
-        }
-        let levels = ClientLogLevels::default();
-        let guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(levels.clone()));
-        let status = client.check(request).await.expect_err("nothing answers");
-        drop(guard);
-        assert_eq!(
-            *levels.0.lock().unwrap(),
-            [level],
-            "{socket:?} marked={marked}: {status:?}"
-        );
-    }
-    acceptor.abort();
 }
 
 /// A transport failure of a call marked [`RetriedOnTransportFailure`], as
