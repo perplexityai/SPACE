@@ -472,3 +472,25 @@ fn jailer_timeout_reports_its_output_without_waiting_for_its_descendants() {
         error.len()
     );
 }
+
+#[test]
+fn launcher_keeps_an_inherited_socket_instead_of_binding_its_address() {
+    use std::os::fd::AsRawFd;
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let cfg = super::PreExecSocket {
+        bind_addr: socket.local_addr().unwrap(),
+        tcp: false,
+        transparent: false,
+        recvorigdstaddr: false,
+        fd_arg: "--udp-fd".to_string(),
+        inherited_fd: Some(socket.as_raw_fd()),
+    };
+    // The address is in use, so binding it again would fail.
+    assert_eq!(super::pre_exec_socket_fd(&cfg).unwrap(), socket.as_raw_fd());
+    let flags = nix::fcntl::fcntl(&socket, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+    assert_eq!(
+        flags & libc::FD_CLOEXEC,
+        0,
+        "the sidecar keeps the socket across exec"
+    );
+}

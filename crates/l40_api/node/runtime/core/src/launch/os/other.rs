@@ -176,6 +176,9 @@ pub struct PreExecSocket {
     pub recvorigdstaddr: bool,
     /// CLI arg name to pass the FD number (e.g., "--tcp-fd")
     pub fd_arg: String,
+    /// An already-bound socket the launcher inherited for this entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_fd: Option<i32>,
 }
 
 #[derive(Deserialize, Serialize)]

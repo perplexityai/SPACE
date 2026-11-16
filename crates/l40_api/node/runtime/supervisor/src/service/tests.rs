@@ -928,3 +928,123 @@ async fn resident_execution_adoption_does_not_require_current_catalog_or_sources
         }
     }
 }
+
+/// A stand-in gateway for `sandbox_id`: a shell that names the sandbox in its
+/// command line, as a gateway's `--sandbox-id` does, and holds `sockets`.
+fn spawn_socket_holder(sandbox_id: SandboxId, sockets: Vec<i32>) -> std::process::Child {
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg("echo ready; while :; do sleep 0.1; done")
+        .arg(sandbox_id.to_string())
+        .stdout(std::process::Stdio::piped());
+    let inherit = move || {
+        for socket in &sockets {
+            // SAFETY: fcntl(2) on a descriptor this test keeps open until the
+            // spawn returns.
+            if unsafe { libc::fcntl(*socket, libc::F_SETFD, 0) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    };
+    // SAFETY: the closure calls only fcntl(2) and allocates nothing.
+    unsafe {
+        command.pre_exec(inherit);
+    }
+    let mut child = command.spawn().expect("spawn socket holder");
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.as_mut().expect("piped stdout"))
+        .read_line(&mut line)
+        .expect("read readiness");
+    assert_eq!(line, "ready\n");
+    child
+}
+
+fn listener_specs(
+    udp: std::net::SocketAddr,
+    tcp: std::net::SocketAddr,
+) -> Vec<launch::PreExecSocket> {
+    [(udp, false, "--udp-fd"), (tcp, true, "--tcp-fd")]
+        .into_iter()
+        .map(|(bind_addr, tcp, fd_arg)| launch::PreExecSocket {
+            bind_addr,
+            tcp,
+            transparent: false,
+            recvorigdstaddr: false,
+            fd_arg: fd_arg.to_string(),
+            inherited_fd: None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn replaced_gateway_hands_its_listening_sockets_to_its_replacement() {
+    use std::os::unix::process::ExitStatusExt;
+    if !pplx_space_test_env::root_or_skip("duplicate another process's sockets") {
+        return;
+    }
+    let service = RuntimeSupervisorService::default();
+    let sandbox_id = SandboxId::new();
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let (udp_addr, tcp_addr) = (udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+    let mut holder = spawn_socket_holder(sandbox_id, vec![udp.as_raw_fd(), tcp.as_raw_fd()]);
+    // From here only the holder has the sockets.
+    drop((udp, tcp));
+
+    let mut inherited = service
+        .retire_replaced_gateway(
+            sandbox_id,
+            holder.id(),
+            "/proc/self/ns/net",
+            &listener_specs(udp_addr, tcp_addr),
+        )
+        .await
+        .unwrap();
+    assert_eq!(holder.wait().unwrap().signal(), Some(libc::SIGTERM));
+    assert_eq!(inherited.len(), 2);
+
+    // What arrives after the holder is gone waits on the same sockets.
+    let listener = std::net::TcpListener::from(inherited.pop().unwrap());
+    let receiver = std::net::UdpSocket::from(inherited.pop().unwrap());
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .send_to(b"query", udp_addr)
+        .unwrap();
+    let _client = std::net::TcpStream::connect(tcp_addr).unwrap();
+    receiver.set_nonblocking(false).unwrap();
+    let mut datagram = [0; 16];
+    assert_eq!(receiver.recv(&mut datagram).unwrap(), 5);
+    listener.set_nonblocking(false).unwrap();
+    listener.accept().unwrap();
+}
+
+#[tokio::test]
+async fn replaced_gateway_without_every_listener_still_stops_and_hands_over_none() {
+    use std::os::unix::process::ExitStatusExt;
+    if !pplx_space_test_env::root_or_skip("duplicate another process's sockets") {
+        return;
+    }
+    let service = RuntimeSupervisorService::default();
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let specs = listener_specs(udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+    let mut not_transparent = specs.clone();
+    not_transparent[0].transparent = true;
+    for (specs, ns_path) in [
+        (not_transparent, "/proc/self/ns/net"),
+        (specs, "/proc/self/ns/uts"),
+    ] {
+        let sandbox_id = SandboxId::new();
+        let mut holder = spawn_socket_holder(sandbox_id, vec![udp.as_raw_fd(), tcp.as_raw_fd()]);
+        let inherited = service
+            .retire_replaced_gateway(sandbox_id, holder.id(), ns_path, &specs)
+            .await
+            .unwrap();
+        assert!(inherited.is_empty(), "{ns_path}");
+        assert_eq!(holder.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+}
