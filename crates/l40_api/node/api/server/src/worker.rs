@@ -235,7 +235,7 @@ impl WorkerApiService {
             method,
             safety,
             request,
-            self.clients.sbx(),
+            &self.clients,
             call,
         )
         .await
@@ -244,6 +244,7 @@ impl WorkerApiService {
     async fn limited_sbx_unary<Req, Resp, F, Fut>(
         &self,
         budget: SandboxBudget,
+        safety: RpcReplaySafety,
         method: &'static str,
         request: Request<Req>,
         call: F,
@@ -262,9 +263,9 @@ impl WorkerApiService {
             .await?;
         crate::restart_handoff::call_with_restart_handoff(
             method,
-            RpcReplaySafety::RequiresProof,
+            safety,
             request,
-            self.clients.sbx(),
+            &self.clients,
             call,
         )
         .await
@@ -285,13 +286,12 @@ impl WorkerApiService {
     {
         let sandbox_id = request.get_ref().sandbox_id().to_owned();
         record_sandbox_id(&tracing::Span::current(), &sandbox_id);
-        let client = self.clients.sbx();
         let permit = self.acquire_sbx_permit(method, &sandbox_id).await?;
         let response = crate::restart_handoff::call_with_restart_handoff(
             method,
             RpcReplaySafety::RequiresProof,
             request,
-            client,
+            &self.clients,
             call,
         )
         .await?;
@@ -452,6 +452,7 @@ macro_rules! fwd_sbx {
         $service
             .limited_sbx_unary(
                 SandboxBudget::Shared,
+                RpcReplaySafety::RequiresProof,
                 $method,
                 $req,
                 |mut client, request| async move { client.$rpc(request).await },
@@ -460,14 +461,36 @@ macro_rules! fwd_sbx {
     };
 }
 
-// Only for SpacedKillProcess, SpacedSendSignal and SpacedListProcesses (which
-// also backs single-process reads): they stop or inspect a sandbox's processes,
-// so they take reserved permits that streams and other calls cannot use up.
+// For guest reads that sandbox-manager keeps serving while it drains: they
+// wake the sandbox if needed and read guest state, so a replay answers the
+// same question again. Sandbox-manager interrupts reads still in flight when
+// it hands the socket over, so these replay that interruption once on the
+// successor instead of failing the caller. They may wake the sandbox and
+// refresh its activity clock, as a client's retry would. Never use this for a
+// call that changes or consumes state its caller can observe.
+macro_rules! fwd_sbx_guest_read {
+    ($service:expr, $budget:expr, $method:literal, $rpc:ident, $req:expr) => {
+        $service
+            .limited_sbx_unary(
+                $budget,
+                RpcReplaySafety::ReadOnly,
+                $method,
+                $req,
+                |mut client, request| async move { client.$rpc(request).await },
+            )
+            .await
+    };
+}
+
+// Only for SpacedKillProcess and SpacedSendSignal: they stop a sandbox's
+// processes, so they take reserved permits that streams and other calls
+// cannot use up.
 macro_rules! fwd_sbx_reserved {
     ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
         $service
             .limited_sbx_unary(
                 SandboxBudget::Reserved,
+                RpcReplaySafety::RequiresProof,
                 $method,
                 $req,
                 |mut client, request| async move { client.$rpc(request).await },
@@ -770,13 +793,12 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedGetStatusRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedGetStatusResponse>, Status> {
         let sandbox_id = r.get_ref().sandbox_id.clone();
-        let client = self.clients.sbx();
         self.limited_sbx_operation("SpacedGetStatus", &sandbox_id, move || {
             crate::restart_handoff::call_with_restart_handoff(
                 "SpacedGetStatus",
                 RpcReplaySafety::ReadOnly,
                 r,
-                client,
+                &self.clients,
                 |mut client, request| async move { client.spaced_get_status(request).await },
             )
         })
@@ -789,13 +811,12 @@ impl WorkerApi for WorkerApiService {
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedWaitReadyResponse>, Status> {
         prepare_wait_ready_forward(&mut r);
         let sandbox_id = r.get_ref().sandbox_id.clone();
-        let client = self.clients.sbx();
         self.limited_sbx_operation("SpacedWaitReady", &sandbox_id, move || {
             crate::restart_handoff::call_with_restart_handoff(
                 "SpacedWaitReady",
                 RpcReplaySafety::ReadOnly,
                 r,
-                client,
+                &self.clients,
                 |mut client, request| async move { client.spaced_wait_ready(request).await },
             )
         })
@@ -806,7 +827,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedStatRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedStatResponse>, Status> {
-        fwd_sbx!(self, "SpacedStat", spaced_stat, r)
+        fwd_sbx_guest_read!(self, SandboxBudget::Shared, "SpacedStat", spaced_stat, r)
     }
 
     async fn spaced_list(
@@ -916,8 +937,9 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedNormalizeWatchRootRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedNormalizeWatchRootResponse>, Status>
     {
-        fwd_sbx!(
+        fwd_sbx_guest_read!(
             self,
+            SandboxBudget::Shared,
             "SpacedNormalizeWatchRoot",
             spaced_normalize_watch_root,
             r
@@ -971,7 +993,13 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedGetModifiedFilesRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedGetModifiedFilesResponse>, Status>
     {
-        fwd_sbx!(self, "SpacedGetModifiedFiles", spaced_get_modified_files, r)
+        fwd_sbx_guest_read!(
+            self,
+            SandboxBudget::Shared,
+            "SpacedGetModifiedFiles",
+            spaced_get_modified_files,
+            r
+        )
     }
 
     async fn spaced_start_process(
@@ -993,7 +1021,13 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedListProcessesRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedListProcessesResponse>, Status>
     {
-        fwd_sbx_reserved!(self, "SpacedListProcesses", spaced_list_processes, r)
+        fwd_sbx_guest_read!(
+            self,
+            SandboxBudget::Reserved,
+            "SpacedListProcesses",
+            spaced_list_processes,
+            r
+        )
     }
 
     async fn spaced_send_signal(

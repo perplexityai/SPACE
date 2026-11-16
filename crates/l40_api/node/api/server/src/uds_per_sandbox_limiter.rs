@@ -77,8 +77,8 @@ impl SandboxSlots {
 pub enum SandboxBudget {
     /// Streams and every unary call not on the reserved budget.
     Shared,
-    /// Calls that stop or inspect a sandbox's processes, routed through
-    /// `fwd_sbx_reserved!` in `worker.rs`.
+    /// Calls that stop or inspect a sandbox's processes, so that streams and
+    /// other calls cannot use up the permits they need.
     Reserved,
 }
 
