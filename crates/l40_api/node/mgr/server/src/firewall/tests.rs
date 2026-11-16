@@ -961,7 +961,7 @@ fn proxy_reply_repair_ignores_the_proxy_marker() {
 }
 
 #[test]
-fn unusable_packaged_policy_fails_installation_before_nft_runs() {
+fn unusable_namespace_rules_fail_installation_before_nft_runs() {
     // The namespace does not exist, so reaching nft would fail otherwise. An
     // empty policy is well-formed but splices into an invalid ruleset.
     for policy in ["", "{ \"add\": "] {
@@ -978,6 +978,19 @@ fn unusable_packaged_policy_fails_installation_before_nft_runs() {
             "{policy:?}: {error}"
         );
     }
+    // Valid policy must not be blamed when rendering the namespace fails.
+    let error = install_namespace_rules(
+        "space-test-never-created",
+        "vpeer-\"",
+        "10.12.0.1",
+        crate::net::GUEST_IP,
+        packaged_pre_tproxy_guardrails_policy(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, FirewallError::RenderedRuleset(_)),
+        "{error}"
+    );
 }
 
 #[test]

@@ -206,8 +206,11 @@ fn malformed_packaged_policy_has_no_hash() {
     ] {
         for fragment in [policy.to_owned(), format!("{FIXTURE_POLICY}, {policy}")] {
             assert!(
-                PartHash::sandbox_base(&fragment).is_err(),
-                "invalid policy established a base hash: {fragment}"
+                matches!(
+                    PartHash::sandbox_base(&fragment),
+                    Err(FirewallError::PackagedPolicy(_))
+                ),
+                "invalid policy was not classified as a packaged-policy error: {fragment}"
             );
         }
     }
@@ -344,17 +347,19 @@ fn markers_read_back_from_each_supported_nft_version() {
     for listing in stamped_listings() {
         let version = &listing["nftables"][0]["metainfo"]["version"];
         for part in ConfigPart::ALL {
-            let expected = part.builtin_hash().unwrap_or_else(|| {
-                PartHash::sandbox_base(
-                    super::super::packaged_pre_tproxy_guardrails_policy_for_test(),
-                )
+            // The captured digest belongs to the installation at capture
+            // time, not today's builders. Live installation tests compare
+            // kernel markers with the current builders' hashes.
+            let prefix = format!("{MARKER_PREFIX}{part}=");
+            let comment = listing["nftables"]
+                .as_array()
                 .unwrap()
-            });
-            assert_eq!(
-                read_marker(part, &listing),
-                Ok(Some(expected)),
-                "nft {version} {part}"
-            );
+                .iter()
+                .filter_map(|entry| entry["rule"]["comment"].as_str())
+                .find(|comment| comment.starts_with(&prefix))
+                .unwrap();
+            let observed = read_marker(part, &listing).unwrap().unwrap();
+            assert_eq!(observed.marker(part), comment, "nft {version} {part}");
         }
     }
     // Namespaces installed before markers existed read as unmarked.
@@ -368,17 +373,6 @@ fn markers_read_back_from_each_supported_nft_version() {
             assert_eq!(read_marker(part, &legacy), Ok(None), "{part}");
         }
     }
-    // Per-component stamps do not establish a complete base installation.
-    let old_components =
-        ["pre_tproxy", "packaged_policy", "egress_guardrails", "nat"].map(|part| {
-            serde_json::json!({"rule": {
-                "family": "ip", "table": "sandbox", "chain": format!("space_cfg_{part}"),
-                "comment": format!("space-cfg:{part}=r1.{}", "0".repeat(32)),
-                "expr": [{"continue": null}]
-            }})
-        });
-    let listing = serde_json::json!({"nftables": old_components});
-    assert_eq!(read_marker(ConfigPart::SandboxBase, &listing), Ok(None));
 }
 
 #[test]

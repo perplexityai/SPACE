@@ -345,7 +345,9 @@ fn classify_firewall_setup_error(error: crate::firewall::FirewallError) -> Netwo
         error @ crate::firewall::FirewallError::RenderedRuleset(_) => {
             NetworkOpError::permanent(error.to_string())
         }
-        // Every namespace on the node fails alike until the image is fixed.
+        // Setup cannot complete with a malformed image policy; retrying the
+        // same image cannot fix it. Validation separately fences and retries
+        // an existing namespace without treating its rules as corrupt.
         crate::firewall::FirewallError::PackagedPolicy(error) => {
             NetworkOpError::permanent(format!("{error}: {}", error.0))
         }

@@ -168,10 +168,11 @@ pub enum FirewallValidationError {
 /// The image-baked guardrails policy could not be parsed.
 ///
 /// This is a host fault, not namespace drift. It fails identically for every
-/// namespace on the node and rebuilding one cannot repair it, so callers fence
-/// the slot and retry rather than quarantining a healthy namespace. Keeping the
-/// `serde_json::Error` as the source preserves the line and column an operator
-/// needs to find the bad edit.
+/// namespace on the node and rebuilding one cannot repair it. Validation fences
+/// and retries an existing namespace rather than treating its rules as corrupt.
+/// Setup treats the malformed image as a permanent configuration failure and
+/// quarantines the attempted slot. Keeping `serde_json::Error` as the source
+/// preserves the line and column an operator needs to find the bad edit.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "packaged pre-TPROXY guardrails policy at {} is malformed",
@@ -292,7 +293,7 @@ fn install_namespace_rules(
         &namespace_rules_json(vpeer, vpeer_ip, guest_ip, pre_tproxy_guardrail_rules),
         markers,
     )
-    .map_err(PackagedPolicyError)?;
+    .map_err(FirewallError::RenderedRuleset)?;
     // Guest L2 filtering first, so the TAP drops VLAN frames before the
     // namespace's routing and NAT rules exist.
     apply_nft_script(&guest_l2_ingress_policy_script(), Some(ns))?;

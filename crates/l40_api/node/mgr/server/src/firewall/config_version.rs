@@ -14,7 +14,7 @@
 use serde::de::Error as _;
 use sha2::Digest;
 
-use super::PackagedPolicyError;
+use super::{FirewallError, FirewallResult, PackagedPolicyError};
 
 /// The marker comment prefix: `space-cfg:<part>=r<revision>.<digest>`.
 pub const MARKER_PREFIX: &str = "space-cfg:";
@@ -120,7 +120,7 @@ pub struct PartHash([u8; DIGEST_BYTES]);
 impl PartHash {
     /// Hash the complete sandbox base transaction, including the image policy
     /// (comma-separated nft JSON add-rule commands), with fixed slot inputs.
-    pub fn sandbox_base(policy: &str) -> Result<Self, PackagedPolicyError> {
+    pub fn sandbox_base(policy: &str) -> FirewallResult<Self> {
         let packaged: Vec<serde_json::Value> =
             serde_json::from_str(&format!("[{policy}]")).map_err(PackagedPolicyError)?;
         // Check the command envelope before hashing arbitrary JSON as policy.
@@ -142,12 +142,13 @@ impl PartHash {
         {
             return Err(PackagedPolicyError(serde_json::Error::custom(
                 "expected nonempty add-rule policy with family, table, chain and expr",
-            )));
+            ))
+            .into());
         }
         let rendered =
             super::namespace_rules_json(SLOT_VPEER, SLOT_VPEER_IP, crate::net::GUEST_IP, policy);
         let ruleset: super::NftRuleset =
-            serde_json::from_str(&rendered).map_err(PackagedPolicyError)?;
+            serde_json::from_str(&rendered).map_err(FirewallError::RenderedRuleset)?;
         Ok(Self::of_commands(
             ConfigPart::SandboxBase,
             &ruleset.nftables,
