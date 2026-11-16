@@ -341,9 +341,13 @@ through the page see the same rewritten answers. The tool's own requests
 outside the browser (the seed, `clean` and the stack identity check) are not
 rewritten.
 
-`--click LABEL` clicks the button named LABEL on each route that has one and
+`--click LABEL` clicks the button LABEL names on each route that has one and
 records what it shows, for an action whose result is the point, such as
-`--click 'Preview v2 drain'` on a node page.
+`--click 'Preview v2 drain'` on a node page. LABEL is the button's visible
+text, or its whole accessible name, which an icon's label leads ("eye Preview
+v2 drain"); either must match exactly, so a label never picks a longer button.
+A LABEL that more than one button on a page matches stops the capture with
+the buttons it matched.
 
 A new API key's secret is shown once, in a dialog. The API-key step sends
 every POST through `page.route`: it fetches the answer without following a

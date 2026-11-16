@@ -7,7 +7,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import { ApiError, type Api } from './api.ts';
-import { SECRET_PLACEHOLDER, carriesSecret, loopbackAddresses, withoutSecret } from './browser.ts';
+import { SECRET_PLACEHOLDER, carriesSecret, clickTarget, loopbackAddresses, withoutSecret } from './browser.ts';
 import { loadConfig } from './config.ts';
 import { isSelected, parseSelection } from './loop.ts';
 import { normalizer, redact } from './recorder.ts';
@@ -330,4 +330,33 @@ test('loopbackAddresses keeps loopback and turns every other IPv4 address into o
     '{"address":"127.0.0.4","node_api_endpoint":"127.0.0.12:9800","api":"127.0.0.1:8080"}',
   );
   assert.equal(loopbackAddresses('fc 1.15.1 · linux/x86_64'), 'fc 1.15.1 · linux/x86_64');
+});
+
+// The node page's and the nodes list's buttons as the console renders them:
+// an icon's label leads each icon button's accessible name.
+const NODE_PAGE_BUTTONS = [
+  { text: 'Cordon', name: 'Cordon' },
+  { text: 'Forced drain', name: 'Forced drain' },
+  { text: 'Preview v2 drain', name: 'eye Preview v2 drain' },
+  { text: 'Refresh', name: 'reload Refresh' },
+];
+const NODES_LIST_BUTTONS = [
+  { text: 'Preview v2 drain on all workers', name: 'eye Preview v2 drain on all workers' },
+  { text: 'Refresh', name: 'reload Refresh' },
+];
+
+test('clickTarget finds a button by its visible text when an icon label leads its name', () => {
+  assert.equal(clickTarget(NODE_PAGE_BUTTONS, 'Preview v2 drain'), 2);
+  assert.equal(clickTarget(NODE_PAGE_BUTTONS, '  Preview  v2 drain '), 2);
+  assert.equal(clickTarget(NODE_PAGE_BUTTONS, 'eye Preview v2 drain'), 2, 'the whole accessible name still works');
+  assert.equal(clickTarget(NODES_LIST_BUTTONS, 'Preview v2 drain on all workers'), 0);
+  assert.equal(clickTarget(NODES_LIST_BUTTONS, 'Preview v2 drain'), null, 'a label never picks a longer button');
+  assert.equal(clickTarget(NODE_PAGE_BUTTONS, 'Undrain'), null);
+});
+
+test('clickTarget refuses a label more than one button shows', () => {
+  assert.throws(
+    () => clickTarget([...NODE_PAGE_BUTTONS, { text: 'Refresh', name: 'Refresh' }], 'Refresh'),
+    /--click "Refresh" matches 2 buttons: "Refresh", "Refresh"/,
+  );
 });

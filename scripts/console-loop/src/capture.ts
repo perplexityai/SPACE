@@ -7,9 +7,10 @@
 //                      [--width 1280 --height 800]
 //
 // Signs in as the console account, then opens each route in turn, pausing
-// on each, clicking the button named LABEL where the page has one (for an
-// action whose result is the point, such as a preview), and scrolling it
-// with --scroll.
+// on each, clicking the button LABEL names where the page has one (for an
+// action whose result is the point, such as a preview; see `clickTarget`),
+// and scrolling it with --scroll. A LABEL that names more than one button
+// stops the capture.
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -17,7 +18,7 @@ import { pathToFileURL } from 'node:url';
 
 import { chromium } from 'playwright';
 
-import { settle, showLoopbackHostsOnly } from './browser.ts';
+import { buttonCandidates, clickTarget, settle, showLoopbackHostsOnly } from './browser.ts';
 import { flag, loadConfig, option } from './config.ts';
 
 function routes(args: string[]): string[] {
@@ -56,9 +57,12 @@ async function main(): Promise<void> {
     await settle(page, 2000);
     const click = option(args, 'click');
     if (click) {
-      const button = page.getByRole('button', { name: click, exact: true });
-      if (await button.count()) {
-        await button.first().click();
+      const buttons = await buttonCandidates(page);
+      const target = clickTarget(buttons.map((button) => button.candidate), click);
+      if (target === null) {
+        console.log(`click: no button ${JSON.stringify(click)} on ${route}`);
+      } else {
+        await buttons[target].locator.click();
         await settle(page, 6000);
       }
     }
