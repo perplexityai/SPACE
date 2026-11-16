@@ -661,14 +661,17 @@ impl Drop for ObservedCaptures {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn refused_endpoint_attestation_waits_for_a_spaced_host_relaunch() {
     let observed =
         ObservedCaptures::start(|| Status::failed_precondition("scripted endpoint proof refusal"));
+    while observed.after(Duration::from_millis(10)).await == 0 {}
     assert_eq!(
-        observed.after(Duration::from_secs(3)).await,
+        observed
+            .after(3 * super::observation::SPACED_HOST_RELAUNCH_POLL)
+            .await,
         1,
-        "a refused launch is not re-attested"
+        "an unchanged launch is not re-attested"
     );
     crate::db::update_spaced_host_pid(
         &observed.service.db_conn().unwrap(),
@@ -680,7 +683,7 @@ async fn refused_endpoint_attestation_waits_for_a_spaced_host_relaunch() {
     .unwrap();
     assert_eq!(
         observed
-            .after(super::observation::SPACED_HOST_RELAUNCH_POLL)
+            .after(super::observation::SPACED_HOST_RELAUNCH_POLL + Duration::from_secs(1))
             .await,
         2,
         "a relaunch is attested again"

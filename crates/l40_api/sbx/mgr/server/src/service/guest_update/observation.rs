@@ -59,8 +59,10 @@ impl SandboxManagerService {
             }
             let client = match self.connect_spaced_host(&row).await {
                 Err(error) if error.code() == tonic::Code::PermissionDenied => {
-                    // node-manager attests the spaced-host launch, so its
-                    // refusal stands until a relaunch records a new pid.
+                    // Every PermissionDenied from connect_spaced_host (node-manager's
+                    // refusal, a stored-proof, UDS-peer or socket-owner mismatch) is
+                    // bound to this spaced-host launch, so it stands until a relaunch
+                    // records a new pid.
                     tracing::info!(sandbox_id = id, %error, "guest configuration observation awaits a spaced-host relaunch");
                     if !self
                         .await_spaced_host_relaunch(id, execution, row.spaced_host_pid)
