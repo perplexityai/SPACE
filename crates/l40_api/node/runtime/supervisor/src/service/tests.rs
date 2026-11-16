@@ -931,15 +931,16 @@ async fn resident_execution_adoption_does_not_require_current_catalog_or_sources
 
 /// A stand-in gateway for `sandbox_id`: a shell that names the sandbox in its
 /// command line, as a gateway's `--sandbox-id` does, and holds `sockets`.
-fn spawn_socket_holder(sandbox_id: SandboxId, sockets: Vec<i32>) -> std::process::Child {
-    use std::io::BufRead;
+fn spawn_socket_holder(
+    sandbox_id: SandboxId,
+    sockets: Vec<i32>,
+) -> gateway_handover::tests::ReapedChild {
     use std::os::unix::process::CommandExt;
     let mut command = std::process::Command::new("sh");
     command
         .arg("-c")
-        .arg("echo ready; while :; do sleep 0.1; done")
-        .arg(sandbox_id.to_string())
-        .stdout(std::process::Stdio::piped());
+        .arg(gateway_handover::tests::ready_script("true"))
+        .arg(sandbox_id.to_string());
     let inherit = move || {
         for socket in &sockets {
             // SAFETY: fcntl(2) on a descriptor this test keeps open until the
@@ -954,13 +955,7 @@ fn spawn_socket_holder(sandbox_id: SandboxId, sockets: Vec<i32>) -> std::process
     unsafe {
         command.pre_exec(inherit);
     }
-    let mut child = command.spawn().expect("spawn socket holder");
-    let mut line = String::new();
-    std::io::BufReader::new(child.stdout.as_mut().expect("piped stdout"))
-        .read_line(&mut line)
-        .expect("read readiness");
-    assert_eq!(line, "ready\n");
-    child
+    gateway_handover::tests::spawn_ready(&mut command)
 }
 
 fn listener_specs(
@@ -1047,4 +1042,54 @@ async fn replaced_gateway_without_every_listener_still_stops_and_hands_over_none
         assert!(inherited.is_empty(), "{ns_path}");
         assert_eq!(holder.wait().unwrap().signal(), Some(libc::SIGTERM));
     }
+}
+
+#[tokio::test]
+async fn an_unlaunchable_replacement_is_refused_before_anything_changes() {
+    let service = RuntimeSupervisorService::default();
+    let status = service
+        .launch_sidecar_owned(
+            LaunchSidecarRequest {
+                sandbox_id: SandboxId::new().to_string(),
+                program: pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN.to_string(),
+                env: std::collections::HashMap::from([("BAD=KEY".to_string(), "x".to_string())]),
+                replace_pid: Some(4242),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("an invalid environment must be refused");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
+}
+
+#[test]
+fn a_gateway_without_launch_evidence_is_returned_rather_than_replaced() {
+    let unrecorded = || Err(Status::failed_precondition("no launch evidence"));
+    assert_eq!(
+        live_sidecar_decision(7, Some(7), Ok(())).unwrap(),
+        LiveSidecar::Replace
+    );
+    // Replacing it is declined, so the caller stops and relaunches it.
+    assert_eq!(
+        live_sidecar_decision(7, Some(7), unrecorded()).unwrap(),
+        LiveSidecar::Keep
+    );
+    // Without a replacement request it is still refused, never adopted.
+    assert_eq!(
+        live_sidecar_decision(7, None, unrecorded())
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        live_sidecar_decision(7, Some(8), unrecorded())
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        live_sidecar_decision(7, Some(8), Ok(())).unwrap(),
+        LiveSidecar::Keep
+    );
 }

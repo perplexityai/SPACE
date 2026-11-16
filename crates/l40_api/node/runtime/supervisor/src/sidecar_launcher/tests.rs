@@ -117,6 +117,7 @@ async fn contained_launch_requires_actual_runtime_identity_and_confirmed_exec() 
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn only_the_prepared_child_inherits_its_descriptors() {
     let file = std::fs::File::open("/dev/null").expect("open test descriptor");

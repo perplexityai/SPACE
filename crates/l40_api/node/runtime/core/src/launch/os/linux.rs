@@ -439,6 +439,7 @@ pub fn prepare_sidecar_launch(
     use nix::unistd::{Gid, Uid};
     use std::ffi::CString;
 
+    super::validate_sidecar_launch_strings(&program, &args, &env)?;
     let ns_file = std::fs::File::open(&ns_path)
         .map_err(|e| format!("failed to open namespace {ns_path}: {e}"))?;
     let c_program =
@@ -447,9 +448,6 @@ pub fn prepare_sidecar_launch(
     let c_env: Vec<(CString, CString)> = env
         .into_iter()
         .map(|(key, value)| {
-            if key.is_empty() || key.contains('=') {
-                return Err("invalid env key: must be nonempty and contain no '='".into());
-            }
             Ok((
                 CString::new(key).map_err(|e| format!("invalid env key: {e}"))?,
                 CString::new(value).map_err(|e| format!("invalid env value: {e}"))?,

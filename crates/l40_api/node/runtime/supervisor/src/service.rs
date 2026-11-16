@@ -803,6 +803,10 @@ impl RuntimeSupervisorService {
         validate_sidecar_program(&req.program)?;
         let is_gateway = req.program == pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN;
         let replace_pid = req.replace_pid.filter(|_| is_gateway);
+        // Before anything irreversible: a replacement stops the old gateway
+        // before the launcher could reject these.
+        launch::validate_sidecar_launch_strings(&req.program, &req.args, &req.env)
+            .map_err(Status::invalid_argument)?;
         let program_filename = sidecar_program_filename(&req.program)?;
         let pid_filename = sidecar_pid_filename(&req.program)?;
         let launch_key = (sandbox_id, req.program.clone());
@@ -821,10 +825,12 @@ impl RuntimeSupervisorService {
             if let Some(pid) = live_runtime_pid(&sandbox_id, &pid_filename)?
                 && require_sidecar_identity(pid, &req.program, req.uid, req.gid)?
             {
-                if is_gateway {
-                    require_recorded_gateway(self, sandbox_id, pid, req.uid).await?;
-                }
-                if replace_pid == Some(pid) {
+                let recorded = if is_gateway {
+                    require_recorded_gateway(self, sandbox_id, pid, req.uid).await
+                } else {
+                    Ok(())
+                };
+                if live_sidecar_decision(pid, replace_pid, recorded)? == LiveSidecar::Replace {
                     replaced = Some(pid);
                 } else {
                     tracing::info!(
@@ -844,10 +850,12 @@ impl RuntimeSupervisorService {
                 && let Some(pid) = live_sidecar_pid_from_cgroup(&sandbox_id, &program_filename)?
                 && require_sidecar_identity(pid, &req.program, req.uid, req.gid)?
             {
-                if is_gateway {
-                    require_recorded_gateway(self, sandbox_id, pid, req.uid).await?;
-                }
-                if replace_pid == Some(pid) {
+                let recorded = if is_gateway {
+                    require_recorded_gateway(self, sandbox_id, pid, req.uid).await
+                } else {
+                    Ok(())
+                };
+                if live_sidecar_decision(pid, replace_pid, recorded)? == LiveSidecar::Replace {
                     replaced = Some(pid);
                 } else {
                     write_pid_symlink(&sandbox_id, &pid_filename, pid)?;
@@ -1027,13 +1035,17 @@ impl RuntimeSupervisorService {
             }
             launch::ProcessOwnership::Owned => {}
         }
+        // The replacement launches into this namespace; one that cannot be
+        // opened fails the launch, so keep the old gateway running.
+        let namespace = std::fs::File::open(ns_path).map_err(|error| {
+            Status::failed_precondition(format!("open network namespace {ns_path}: {error}"))
+        })?;
         let slot = self.acquire_blocking_slot().await?;
-        let ns_path = ns_path.to_owned();
         let sockets = sockets.to_vec();
         let (process, duplicated) = tokio::task::spawn_blocking(move || {
             let _slot = slot;
             let duplicated =
-                gateway_handover::duplicate_listening_sockets(&process, &sockets, &ns_path);
+                gateway_handover::duplicate_listening_sockets(&process, &sockets, &namespace);
             (process, duplicated)
         })
         .await
@@ -1245,6 +1257,38 @@ impl RuntimeSupervisorService {
 }
 
 /// Refuse adoption when an existing gateway lacks its original launch evidence.
+/// What a launch does with the live sidecar it found.
+#[derive(Debug, PartialEq, Eq)]
+enum LiveSidecar {
+    /// Return it to the caller unchanged.
+    Keep,
+    /// Stop it and launch its replacement on its listening sockets.
+    Replace,
+}
+
+/// A live gateway without valid launch evidence is never adopted. Asked to
+/// replace one, the launch instead returns it unchanged, as a supervisor
+/// without replacement does, so the caller stops and relaunches it: such a
+/// gateway is one an operator cycles.
+fn live_sidecar_decision(
+    pid: u32,
+    replace_pid: Option<u32>,
+    recorded: Result<(), Status>,
+) -> Result<LiveSidecar, Status> {
+    match (replace_pid == Some(pid), recorded) {
+        (true, Ok(())) => Ok(LiveSidecar::Replace),
+        (true, Err(status)) => {
+            tracing::info!(
+                pid,
+                reason = status.message(),
+                "not replacing a net-gateway in place; its caller stops and relaunches it"
+            );
+            Ok(LiveSidecar::Keep)
+        }
+        (false, recorded) => recorded.map(|()| LiveSidecar::Keep),
+    }
+}
+
 async fn require_recorded_gateway(
     service: &RuntimeSupervisorService,
     sandbox_id: SandboxId,

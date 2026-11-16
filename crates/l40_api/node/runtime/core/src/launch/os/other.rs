@@ -109,6 +109,18 @@ pub(super) fn pin_current_process() -> Result<ProcessHandle, ProcessHandleError>
 }
 
 impl ProcessHandle {
+    /// Non-Linux hosts cannot duplicate another process's descriptors.
+    pub fn duplicate_listening_socket(
+        &self,
+        _expected: &PreExecSocket,
+        _network_namespace: &std::fs::File,
+    ) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "socket handover requires Linux pidfds",
+        ))
+    }
+
     pub fn open(pid: u32) -> Result<Self, ProcessHandleError> {
         validate_process_pid(pid).map_err(ProcessHandleError::InvalidPid)?;
         Ok(Self { pid })

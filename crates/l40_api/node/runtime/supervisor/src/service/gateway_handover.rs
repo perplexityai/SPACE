@@ -25,15 +25,13 @@ const REPLACED_GATEWAY_EXIT_POLL: Duration = Duration::from_millis(5);
 pub(super) fn duplicate_listening_sockets(
     process: &launch::ProcessHandle,
     sockets: &[launch::PreExecSocket],
-    ns_path: &str,
+    namespace: &std::fs::File,
 ) -> Result<Vec<OwnedFd>, String> {
-    let namespace = std::fs::File::open(ns_path)
-        .map_err(|error| format!("open network namespace {ns_path}: {error}"))?;
     sockets
         .iter()
         .map(|socket| {
             process
-                .duplicate_listening_socket(socket, &namespace)
+                .duplicate_listening_socket(socket, namespace)
                 .map_err(|error| format!("duplicate {} socket: {error}", socket.bind_addr))?
                 .ok_or_else(|| {
                     format!(
@@ -79,4 +77,4 @@ pub(super) async fn terminate(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
