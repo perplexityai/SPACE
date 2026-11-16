@@ -205,5 +205,8 @@ fn containment_checks_and_repairs_the_state_its_own_writes_leave() {
         "{proxy:?}"
     );
     // The contained namespace needs no further repair.
-    assert!(!firewall::constrain_direct_inbound_reply_path(&namespace, Some(&snapshot)).unwrap());
+    firewall::constrain_direct_inbound_reply_path(&namespace, Some(&snapshot)).unwrap();
+    let repeated = firewall::RulesetSnapshot::read(&namespace).unwrap();
+    assert_eq!(rule_comments(&repeated, "sandbox", "forward"), forward);
+    assert_eq!(rule_comments(&repeated, "proxy", "prerouting"), proxy);
 }

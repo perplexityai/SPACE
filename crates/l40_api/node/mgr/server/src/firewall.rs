@@ -115,10 +115,13 @@ pub fn validate_installed_guest_l2_ingress_policy(
 /// namespace, take a new one rather than checking the result against it.
 #[derive(Debug)]
 pub struct RulesetSnapshot {
-    /// Each chain by family, table and name, as `nft -j list chain` would
-    /// render it: the chain object, then its rules in order.
-    chains: HashMap<String, HashMap<String, HashMap<String, serde_json::Value>>>,
+    /// Each chain, as `nft -j list chain` would render it: the chain object,
+    /// then its rules in order.
+    chains: HashMap<ChainKey, serde_json::Value>,
 }
+
+/// A chain's family, table and name.
+type ChainKey = (String, String, String);
 
 impl RulesetSnapshot {
     pub fn read(ns: &str) -> FirewallResult<Self> {
@@ -135,39 +138,34 @@ impl RulesetSnapshot {
     }
 
     fn from_listing(listing: serde_json::Value) -> Self {
-        let names = |object: &serde_json::Value, name: &str| {
+        let key = |object: &serde_json::Value, name: &str| {
             let field = |field: &str| object.get(field)?.as_str().map(str::to_string);
             Some((field("family")?, field("table")?, field(name)?))
         };
-        let mut chains: HashMap<String, HashMap<String, HashMap<String, serde_json::Value>>> =
-            HashMap::new();
-        let entries = listing
-            .get("nftables")
-            .and_then(serde_json::Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        for entry in entries {
-            if let Some(chain) = entry.get("chain")
-                && let Some((family, table, name)) = names(chain, "name")
-            {
-                chains
-                    .entry(family)
-                    .or_default()
-                    .entry(table)
-                    .or_default()
-                    .insert(name, serde_json::json!({ "nftables": [entry] }));
+        let entries = match listing {
+            serde_json::Value::Object(mut listing) => match listing.remove("nftables") {
+                Some(serde_json::Value::Array(entries)) => entries,
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        // Chains first, so each rule finds its chain wherever it is listed.
+        let (chain_entries, entries): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|entry| entry.get("chain").is_some());
+        let mut chains = HashMap::new();
+        for entry in chain_entries {
+            if let Some(key) = entry.get("chain").and_then(|chain| key(chain, "name")) {
+                chains.insert(key, serde_json::json!({ "nftables": [entry] }));
             }
         }
         for entry in entries {
-            if let Some(rule) = entry.get("rule")
-                && let Some((family, table, name)) = names(rule, "chain")
+            if let Some(key) = entry.get("rule").and_then(|rule| key(rule, "chain"))
                 && let Some(serde_json::Value::Array(chain)) = chains
-                    .get_mut(&family)
-                    .and_then(|tables| tables.get_mut(&table))
-                    .and_then(|chains| chains.get_mut(&name))
-                    .map(|chain| &mut chain["nftables"])
+                    .get_mut(&key)
+                    .and_then(|chain| chain.get_mut("nftables"))
             {
-                chain.push(entry.clone());
+                chain.push(entry);
             }
         }
         Self { chains }
@@ -176,7 +174,8 @@ impl RulesetSnapshot {
     /// The chain and its rules, or `None` when the chain or its table is
     /// absent.
     pub fn chain(&self, family: &str, table: &str, chain: &str) -> Option<&serde_json::Value> {
-        self.chains.get(family)?.get(table)?.get(chain)
+        self.chains
+            .get(&(family.to_string(), table.to_string(), chain.to_string()))
     }
 
     /// Whether the namespace's SNAT and DNAT rules are present.
@@ -1476,12 +1475,12 @@ fn local_service_reply_rule_updates(
 
 /// Remove direct forwarding replies while retaining only the local service
 /// ingress return path. All changes use one namespace-local nft transaction.
-/// Reads both chains from `snapshot` when given, otherwise from `ns`. Returns
-/// whether it changed the namespace, which makes that snapshot stale.
+/// Reads both chains from `snapshot` when given, otherwise from `ns`; any
+/// change makes that snapshot stale.
 pub fn constrain_direct_inbound_reply_path(
     ns: &str,
     snapshot: Option<&RulesetSnapshot>,
-) -> FirewallResult<bool> {
+) -> FirewallResult<()> {
     let listed;
     let (forward, proxy) = match snapshot {
         Some(snapshot) => (
@@ -1499,7 +1498,7 @@ pub fn constrain_direct_inbound_reply_path(
     let mut removals = inbound_reply_rule_removals(forward)?;
     removals.extend(local_service_reply_rule_updates(proxy)?);
     if removals.is_empty() {
-        return Ok(false);
+        return Ok(());
     }
     let nftables = removals
         .into_iter()
@@ -1513,8 +1512,7 @@ pub fn constrain_direct_inbound_reply_path(
 ] }}"#
         ),
         Some(ns),
-    )?;
-    Ok(true)
+    )
 }
 
 fn owned_rule_removals(
