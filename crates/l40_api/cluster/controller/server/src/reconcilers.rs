@@ -19,11 +19,13 @@ use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_cluster_reconciler::{
     TriggerEndpointResolver, TriggerFanoutConfig, TriggerNodeApiTarget, metrics, trigger_fanout,
 };
+use pplx_space_common_core::types::SubstrateKind;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use crate::admin_audit_retention;
 use crate::data_plane_session_retention;
+use crate::dead_node;
 use crate::drained_node_terminator;
 use crate::environment_edge_recompute;
 use crate::failed_restorable_repair;
@@ -143,6 +145,33 @@ impl TerminatorKind {
             Self::Noop => "noop",
         }
     }
+}
+
+/// The dead-node verb's instance authority for the cluster's terminator kind,
+/// `None` being a kind that did not parse: only `aws` asks EC2. `kube-delete`,
+/// `noop` and a kind that did not parse name no authority, so an unexpected
+/// death reads unknown.
+fn dead_node_authority_kind(terminator: Option<TerminatorKind>) -> dead_node::AuthorityKind {
+    match terminator {
+        Some(TerminatorKind::Aws) => dead_node::AuthorityKind::Ec2,
+        Some(TerminatorKind::KubeDelete | TerminatorKind::Noop) | None => {
+            dead_node::AuthorityKind::None
+        }
+    }
+}
+
+/// Whether the dead-node verb takes over from `orphaned_nodes` and
+/// `lost_started_sandboxes`: only `live`, and only where it has EC2 to judge
+/// by. Without an authority it judges every node unknown, so those loops,
+/// which ask EC2 whatever the terminator, keep running. Even where it takes
+/// over, they keep the nodes with no recorded instance, which the verb can
+/// only judge unknown.
+fn dead_node_replaces_the_gone_node_loops(
+    config: Option<&dead_node::ReconcilerConfig>,
+    authority: dead_node::AuthorityKind,
+) -> bool {
+    config.is_some_and(dead_node::ReconcilerConfig::is_live)
+        && authority == dead_node::AuthorityKind::Ec2
 }
 
 /// Whether new v2 drains are admitted: `SPACE_DRAIN_V2_ENABLED`, refused
@@ -482,9 +511,37 @@ pub async fn run_reconcilers(
 
     match kube {
         None => {
+            // Direct nodes have no Kubernetes Node or instance authority, so
+            // the dead-node verb, which could only judge them unknown, isn't
+            // run there.
             tracing::info!("skipping Kubernetes-only reconcilers on direct substrate");
         }
         Some(kube) => {
+            // Read once: in `live`, with EC2 to judge by, the verb replaces
+            // `lost_started_sandboxes` and `orphaned_nodes`, and
+            // `orphaned_sandboxes` leaves it the rows on nodes it reconciles.
+            // The verb reads the terminator kind only when it is on, so its
+            // default leaves startup exactly as it was; and a kind that does
+            // not parse judges every node unknown instead of failing it.
+            let dead_node_config = dead_node::ReconcilerConfig::from_env();
+            let dead_node_authority = match dead_node_config {
+                None => dead_node::AuthorityKind::None,
+                Some(_) => dead_node_authority_kind(match TerminatorKind::from_env() {
+                    Ok(kind) => Some(kind),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "dead-node verb: SPACE_NODE_DRAIN_TERMINATOR_KIND is not \
+                             recognized; judging every node unknown"
+                        );
+                        None
+                    }
+                }),
+            };
+            let dead_node_live = dead_node_replaces_the_gone_node_loops(
+                dead_node_config.as_ref(),
+                dead_node_authority,
+            );
             // Admission is the API's; here the flag is only checked against
             // what a v2 drain needs.
             drain_v2_enabled(
@@ -533,7 +590,10 @@ pub async fn run_reconcilers(
             handles.push(tokio::spawn(orphaned_sandboxes::run(
                 pool.clone(),
                 kube.clone(),
-                orphaned_sandboxes::ReconcilerConfig::from_env(),
+                orphaned_sandboxes::ReconcilerConfig {
+                    leave_dead_node_rows: dead_node_live,
+                    ..orphaned_sandboxes::ReconcilerConfig::from_env()
+                },
                 shutdown_token.child_token(),
             )));
 
@@ -863,11 +923,24 @@ pub async fn run_reconcilers(
             // don't intend to use this path.
             let orphaned_nodes_config = orphaned_nodes::ReconcilerConfig::from_env();
             if orphaned_nodes_config.enabled {
+                if dead_node_live {
+                    tracing::info!(
+                        variable = dead_node::MODE_ENV,
+                        "the dead-node verb runs live and deletes the rows of dead nodes it \
+                         has an instance for; the orphaned-nodes reconciler keeps only nodes \
+                         with no recorded instance"
+                    );
+                }
                 let aws_config =
                     aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                 let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
                 let lookup = orphaned_nodes::Ec2InstanceLookup::new(Arc::new(ec2_client));
                 let sink = orphaned_nodes::NodeDbStore::new(pool.clone());
+                let sink = if dead_node_live {
+                    sink.only_unrecorded_instance()
+                } else {
+                    sink
+                };
                 handles.push(tokio::spawn(orphaned_nodes::run(
                     orphaned_nodes_config,
                     sink,
@@ -888,11 +961,24 @@ pub async fn run_reconcilers(
             // only initialized when it's enabled, like `orphaned_nodes`.
             let lost_started_config = lost_started_sandboxes::ReconcilerConfig::from_env();
             if lost_started_config.enabled {
+                if dead_node_live {
+                    tracing::info!(
+                        variable = dead_node::MODE_ENV,
+                        "the dead-node verb runs live and writes off the rows of dead nodes it \
+                         has an instance for; lost_started_sandboxes keeps only rows of nodes \
+                         with no recorded instance"
+                    );
+                }
                 let aws_config =
                     aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                 let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
                 let lookup = orphaned_nodes::Ec2InstanceLookup::new(Arc::new(ec2_client));
                 let sink = lost_started_sandboxes::LostStartedDbStore::new(pool.clone());
+                let sink = if dead_node_live {
+                    sink.only_unrecorded_instance()
+                } else {
+                    sink
+                };
                 let presence = reconcile_queue_gc::SubstrateKubeNodePresence::new(kube.clone());
                 handles.push(tokio::spawn(lost_started_sandboxes::run(
                     lost_started_config,
@@ -905,6 +991,32 @@ pub async fn run_reconcilers(
                 tracing::info!(
                     "lost_started_sandboxes is disabled \
                      (SPACE_LOST_STARTED_SANDBOXES_ENABLED unset); skipping AWS SDK init"
+                );
+            }
+
+            if let Some(dead_node_config) = dead_node_config {
+                let authority = match dead_node_authority {
+                    dead_node::AuthorityKind::Ec2 => {
+                        let aws_config =
+                            aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                        dead_node::InstanceAuthority::Ec2(Arc::new(
+                            pplx_space_aws_client::ec2::Client::from_config(&aws_config),
+                        ))
+                    }
+                    dead_node::AuthorityKind::None => dead_node::InstanceAuthority::None,
+                };
+                handles.push(tokio::spawn(dead_node::run(
+                    dead_node_config,
+                    dead_node::DeadNodeDbStore::new(pool.clone()),
+                    dead_node::KubeNodeMembership::new(kube.clone()),
+                    authority,
+                    SubstrateKind::Kubernetes,
+                    shutdown_token.child_token(),
+                )));
+            } else {
+                tracing::info!(
+                    variable = dead_node::MODE_ENV,
+                    "dead-node verb is off; not starting it"
                 );
             }
 

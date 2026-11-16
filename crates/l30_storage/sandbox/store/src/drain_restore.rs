@@ -505,8 +505,8 @@ pub async fn evacuate_v2_stopped(
 /// Whether row `s` is an unplaced stopped sandbox whose next start
 /// materializes its disk on any node: `stopped` with no marker, no placement
 /// and no active execution, pinning a `disk` artifact with a ready, stored
-/// snapshot. What a v2 drain's release ([`evacuate_v2_stopped`]) leaves. A
-/// drain phase on the node it last ran on doesn't
+/// snapshot. What a v2 drain's release ([`evacuate_v2_stopped`]) or the
+/// dead-node verb's leaves. A drain phase on the node it last ran on doesn't
 /// hold such a row, as a stored snapshot doesn't hold a suspended one.
 pub fn materializable_unplaced_stopped(s: &str) -> String {
     format!(

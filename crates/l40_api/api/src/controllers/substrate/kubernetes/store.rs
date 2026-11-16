@@ -78,7 +78,8 @@ pub(super) struct PodNodePlacement<'a> {
     pub role: NodeRole,
     pub address: Option<&'a str>,
     /// The EC2 instance the Node's `providerID` names; `None` leaves the
-    /// node's recorded instance alone.
+    /// node's recorded instance alone, and the execution's while it names the
+    /// same node.
     pub instance_id: Option<&'a str>,
 }
 

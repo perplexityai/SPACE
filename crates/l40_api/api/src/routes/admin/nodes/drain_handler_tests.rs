@@ -1206,16 +1206,22 @@ async fn a_drain_over_a_pending_v2_cancel_runs_under_v2_only() -> TestResult {
     Ok(())
 }
 
-/// A node's listing carries its drain engine and the drain's status, as the
-/// columns hold them.
+/// A node's listing carries its drain engine, the drain's status and the
+/// dead-node verb's last result, as the columns hold them.
 #[tokio::test(flavor = "current_thread")]
-async fn a_node_reads_back_its_drain_engine_and_status() -> TestResult {
+async fn a_node_reads_back_its_drain_engine_status_and_dead_node_result() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let status = serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": true}});
+    let verdict = serde_json::json!({"verdict": "alive"});
     let node_id =
         insert_k8s_node(&db.pool, Some("drained"), Some("v2"), Some(status.clone())).await?;
+    sqlx::query(sql!("UPDATE nodes SET dead_node_status = $2 WHERE id = $1"))
+        .bind(node_id)
+        .bind(&verdict)
+        .execute(&db.pool)
+        .await?;
     let row = super::AdminNodeStore::new(db.pool.clone())
         .fetch(node_id)
         .await?
@@ -1223,6 +1229,7 @@ async fn a_node_reads_back_its_drain_engine_and_status() -> TestResult {
     let response = super::admin_node_response(row, None, None);
     assert_eq!(response.drain_engine.as_deref(), Some("v2"));
     assert_eq!(response.drain_status, Some(status));
+    assert_eq!(response.dead_node_status, Some(verdict));
     Ok(())
 }
 

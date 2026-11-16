@@ -1400,8 +1400,9 @@ impl KubernetesSubstrate {
     }
 
     /// Place an unplaced stopped sandbox whose pinned disk is durable on a
-    /// node before its start boots it: what a v2 drain's release leaves. It
-    /// marks the row a pending stopped re-placement
+    /// node before its start boots it: what a v2 drain's release, or the
+    /// dead-node verb's, leaves. It marks the row a pending stopped
+    /// re-placement
     /// ([`pplx_space_sandbox_store::drain_restore::mark_unplaced_stopped_for_materialization`])
     /// and runs v1's stopped re-placement ([`Self::restore_evacuated_execution`]
     /// toward `stopped`, on any node, from the disk's exact URI): the node

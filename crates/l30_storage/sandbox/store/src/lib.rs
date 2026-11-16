@@ -71,6 +71,11 @@
 //! * **Aggregate reads are modules too.** [`stuck`] counts the rows in each
 //!   transient lifecycle by age for a gauge; it reads the row's own clock and
 //!   writes nothing.
+//! * **One column besides the row.** [`dead_node`] reads the facts the
+//!   cluster controller's dead-node verb decides each row's outcome from, and
+//!   writes `nodes.dead_node_status`, the verb's last result per node, which
+//!   the admin API reads. The status is about these rows, and both its writer
+//!   and its reader already use this crate; no store owns `nodes`.
 //!
 //! # Fact kinds
 //!
@@ -114,6 +119,7 @@ pub mod admin_occupancy;
 pub mod artifact_marker;
 pub mod attribute_runtime;
 pub mod create;
+pub mod dead_node;
 pub mod delete;
 pub mod direct;
 pub mod drain;

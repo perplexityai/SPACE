@@ -961,8 +961,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 )
                 .await;
         }
-        // A stopped sandbox a drain released is on no node: its disk is
-        // materialized first.
+        // A stopped sandbox a drain released, or the dead-node verb kept
+        // `stopped`, is on no node: its disk is materialized first.
         let sandbox = if normalize_lifecycle(&sandbox.lifecycle) == "stopped" {
             self.materialize_unplaced_stopped(metric_identity, sandbox, options)
                 .await?
@@ -2560,7 +2560,15 @@ impl SubstrateAdapter for KubernetesSubstrate {
         request: &PooledExecutionClaimRequest<'_>,
         claim: &PooledExecutionClaim,
     ) -> Result<(), ControllerError> {
-        pool::persist_pooled_execution_claim(tx, request, claim).await
+        // The reflector only: no apiserver call inside the claim's
+        // transaction. A Node it hasn't seen leaves the instance unknown.
+        pool::persist_pooled_execution_claim(tx, request, claim, |node_name| {
+            self.k8s
+                .caches
+                .node_by_name(node_name)
+                .and_then(|node| k8s_node_instance_id(&node))
+        })
+        .await
     }
 
     async fn rollback_pooled_execution_claim(

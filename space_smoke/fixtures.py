@@ -33,6 +33,7 @@ from space_smoke.capabilities import (
     TeardownRestartControl,
     OrphanedRestorePodGcControl,
     ReconcileQueueGcControl,
+    DeadNodeControl,
     UnansweredTemplateEvictionControl,
     TemplateBuildControl,
     TemplateBuilder,
@@ -116,6 +117,7 @@ from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.retained_only_copy import RetainedOnlyCopyAssertions
 from space_smoke.teardown_restart import TeardownRestartAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
+from space_smoke.dead_node import DeadNodeAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.console import ConsoleAssertions
 from space_smoke.drain_gate import DrainGateAssertions
@@ -3162,6 +3164,23 @@ class KindEcw(Ecw, KindAdmin):
                 self, self._unanswered_template_control, self._context.scope
             )
         return self._unanswered_template_assertions
+
+    _dead_node_control: DeadNodeControl | None = None
+    _dead_node_assertions: DeadNodeAssertions | None = None
+
+    @property
+    def dead_node(self) -> DeadNodeAssertions:
+        """Privileged assertions for the cluster-controller's dead-node dry run."""
+
+        if self._dead_node_control is None:
+            raise SmokeConfigurationError(
+                "dead-node control is only available on the kind backend"
+            )
+        if self._dead_node_assertions is None:
+            self._dead_node_assertions = DeadNodeAssertions(
+                self, self._dead_node_control, self._context.scope
+            )
+        return self._dead_node_assertions
 
     _rate_limiter_control: RateLimiterControl | None = None
     _rate_limit_probe: RateLimitProbe | None = None
