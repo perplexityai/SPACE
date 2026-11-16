@@ -42,7 +42,6 @@ fn test_admin_node_row() -> AdminNodeRow {
         drain_last_error: None,
         drain_engine: None,
         drain_status: None,
-        dead_node_status: None,
         terminate_decrement_capacity: false,
         node_group_id: None,
         metadata: None,

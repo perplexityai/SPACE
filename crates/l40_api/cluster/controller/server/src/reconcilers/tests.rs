@@ -1,8 +1,7 @@
 use super::{
-    ReconcilerRuntimeError, Supervision, TerminatorKind, build_if_enabled,
-    dead_node_replaces_the_gone_node_loops, drain_v2_enabled, supervise_reconcilers, v2_terminates,
+    ReconcilerRuntimeError, Supervision, TerminatorKind, build_if_enabled, drain_v2_enabled,
+    supervise_reconcilers, v2_terminates,
 };
-use crate::dead_node::{self, AuthorityKind};
 use std::future::Future;
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
@@ -127,31 +126,6 @@ fn terminator_kind_rejects_unrecognized_value() {
         err,
         ReconcilerRuntimeError::InvalidTerminatorKind(ref value) if value == "kube_delete"
     ));
-}
-
-/// The dead-node verb takes over from the loops it replaces only `live`, and
-/// only with EC2 to judge by: a verb that can only answer unknown leaves them
-/// running.
-#[test]
-fn the_dead_node_verb_replaces_the_gone_node_loops_only_live_with_ec2() {
-    let mut env = pplx_space_test_env::TestEnv::default();
-    for (mode, authority, replaces) in [
-        (None, AuthorityKind::Ec2, false),
-        (Some("dry-run"), AuthorityKind::Ec2, false),
-        (Some("live"), AuthorityKind::None, false),
-        (Some("live"), AuthorityKind::Ec2, true),
-    ] {
-        match mode {
-            Some(mode) => env.set(dead_node::MODE_ENV, mode),
-            None => env.remove(dead_node::MODE_ENV),
-        }
-        let config = dead_node::ReconcilerConfig::from_environment(&env);
-        assert_eq!(
-            dead_node_replaces_the_gone_node_loops(config.as_ref(), authority),
-            replaces,
-            "{mode:?} {authority:?}"
-        );
-    }
 }
 
 /// New v2 drains are admitted only with the node drain running; off,

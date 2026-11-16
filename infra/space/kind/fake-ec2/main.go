@@ -7,10 +7,10 @@
 //     reconcile-queue GC's Ec2Detector asks for the instance behind a
 //     non-ready node's Kubernetes name (on EKS, the instance's private DNS
 //     name);
-//   - DescribeInstances filtered on instance-id, with paging, which the
-//     dead-node verb asks for the exact instances a node's rows ran on. Kind
-//     workers carry a fake AWS providerID (aws:///<zone>/i-<17 hex>), set by
-//     the stack's bring-up, so their instances have IDs to ask about;
+//   - DescribeInstances filtered on one instance-id, which the v2 node drain
+//     asks for the instance a node's row records. Kind workers carry a fake
+//     AWS providerID (aws:///<zone>/i-<17 hex>), set by the stack's bring-up,
+//     so their instances have IDs to ask about;
 //   - Auto Scaling's TerminateInstanceInAutoScalingGroup, which the
 //     node-drain `aws` terminator calls through AWS_ENDPOINT_URL_AUTO_SCALING
 //     (the same listener) for the instance behind a Node's providerID.
@@ -20,16 +20,14 @@
 //
 //   - terminated once the Auto Scaling terminate or the test control named it;
 //   - running when its Node's Ready condition is True;
-//   - stopped for any other Node (NotReady, Unknown), and for an instance the
-//     fixture has seen on a Node that is gone and that nobody terminated: the
-//     machine may still exist;
+//   - stopped for any other Node (NotReady, Unknown);
 //   - no instance otherwise, as EC2 answers once a terminated instance has
 //     aged out of DescribeInstances;
 //   - a Kubernetes API error is an EC2 error (Unavailable, HTTP 503).
 //
 // TerminateInstanceInAutoScalingGroup only marks the instance terminated: the harness stops the worker's container itself,
-// once it sees the termination the controller recorded. The marks and the instances seen
-// live in memory, so a restart of the fixture forgets them.
+// once it sees the termination the controller recorded. The marks live in
+// memory, so a restart of the fixture forgets them.
 //
 // The test control listens on loopback only, in plain HTTP, so only a
 // process in the pod reaches it: `space-kind-fake-ec2 terminate <id>...`,
@@ -64,7 +62,6 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -149,7 +146,6 @@ func run(args []string) error {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	fake := &fakeEC2{region: *region, nodes: nodes, list: list, log: logger, state: newInstances()}
-	go fake.rememberInstances(5 * time.Second)
 	controlMux := http.NewServeMux()
 	controlMux.HandleFunc("POST /terminate", fake.controlTerminate)
 	controlSrv := &http.Server{Addr: *control, Handler: controlMux, ReadHeaderTimeout: 5 * time.Second}
@@ -261,22 +257,15 @@ func inClusterNodes() (nodeGetter, nodeLister, error) {
 	return getter, lister, nil
 }
 
-// instances is what the fixture remembers: the instances it has seen on a
-// Node, and those it was told are terminated.
+// instances is what the fixture remembers: the instances it was told are
+// terminated.
 type instances struct {
 	mu         sync.Mutex
-	seen       map[string]bool
 	terminated map[string]bool
 }
 
 func newInstances() *instances {
-	return &instances{seen: map[string]bool{}, terminated: map[string]bool{}}
-}
-
-func (s *instances) see(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.seen[id] = true
+	return &instances{terminated: map[string]bool{}}
 }
 
 // terminate marks id terminated, returning its state before.
@@ -286,7 +275,6 @@ func (s *instances) terminate(id string, before string) string {
 	if s.terminated[id] {
 		before = "terminated"
 	}
-	s.seen[id] = true
 	s.terminated[id] = true
 	return before
 }
@@ -295,12 +283,6 @@ func (s *instances) isTerminated(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.terminated[id]
-}
-
-func (s *instances) wasSeen(id string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.seen[id]
 }
 
 type fakeEC2 struct {
@@ -332,7 +314,6 @@ type describeInstancesResponse struct {
 	Xmlns        string        `xml:"xmlns,attr"`
 	RequestID    string        `xml:"requestId"`
 	Reservations []reservation `xml:"reservationSet>item"`
-	NextToken    string        `xml:"nextToken,omitempty"`
 }
 
 type errorResponse struct {
@@ -475,82 +456,54 @@ func (f *fakeEC2) describeByPrivateDNS(w http.ResponseWriter, form url.Values, r
 	writeXML(w, http.StatusOK, resp)
 }
 
-// describeByInstanceID answers a filter on instance IDs, one page of
-// MaxResults at a time, ordered by ID, with NextToken the index of the next.
+// describeByInstanceID answers a filter on one instance ID from the Nodes
+// and the instances marked terminated.
 func (f *fakeEC2) describeByInstanceID(w http.ResponseWriter, form url.Values, reqID string, entry []any, fail failFunc) {
-	ids, ok := indexedValues(form, "Filter.1.Value.")
-	if !ok || len(ids) == 0 || len(ids) > 200 {
-		fail(http.StatusBadRequest, "InvalidParameterValue", "an instance-id filter takes 1 to 200 values, numbered from 1")
-		return
-	}
+	id := form.Get("Filter.1.Value.1")
 	for param := range form {
-		switch {
-		case param == "Action", param == "Version", param == "Filter.1.Name", param == "MaxResults", param == "NextToken":
-		case strings.HasPrefix(param, "Filter.1.Value."):
+		switch param {
+		case "Action", "Version", "Filter.1.Name", "Filter.1.Value.1", "MaxResults":
 		default:
-			fail(http.StatusBadRequest, "InvalidParameterValue", "unsupported parameter "+param)
+			fail(http.StatusBadRequest, "InvalidParameterValue", "this fake answers only a filter on one instance-id, unsupported parameter "+param)
 			return
 		}
 	}
-	pageSize := 1000
+	if !instanceIDForm.MatchString(id) {
+		fail(http.StatusBadRequest, "InvalidParameterValue", "not an instance ID: "+id)
+		return
+	}
 	if raw := form.Get("MaxResults"); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 5 || n > 1000 {
 			fail(http.StatusBadRequest, "InvalidParameterValue", "MaxResults must be 5 to 1000")
 			return
 		}
-		pageSize = n
-	}
-	start := 0
-	if raw := form.Get("NextToken"); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 0 {
-			fail(http.StatusBadRequest, "InvalidParameterValue", "unknown NextToken")
-			return
-		}
-		start = n
 	}
 	nodes, err := f.list()
 	if err != nil {
 		fail(http.StatusServiceUnavailable, "Unavailable", "the Kubernetes API did not answer: "+err.Error())
 		return
 	}
-	byID := map[string]instance{}
-	for i := range nodes {
-		inst := f.instanceOf(&nodes[i])
-		byID[inst.InstanceID] = inst
-	}
 	var matched []instance
-	for _, id := range dedupe(ids) {
-		if inst, ok := byID[id]; ok {
+	for i := range nodes {
+		if inst := f.instanceOf(&nodes[i]); inst.InstanceID == id {
 			matched = append(matched, inst)
-			continue
-		}
-		switch {
-		case f.state.isTerminated(id):
-			matched = append(matched, instance{InstanceID: id, InstanceState: instanceState{Code: 48, Name: "terminated"}})
-		case f.state.wasSeen(id):
-			matched = append(matched, instance{InstanceID: id, InstanceState: instanceState{Code: 80, Name: "stopped"}})
 		}
 	}
-	sort.Slice(matched, func(i, j int) bool { return matched[i].InstanceID < matched[j].InstanceID })
+	if len(matched) == 0 && f.state.isTerminated(id) {
+		matched = append(matched, instance{InstanceID: id, InstanceState: instanceState{Code: 48, Name: "terminated"}})
+	}
 	resp := describeInstancesResponse{Xmlns: ec2NS, RequestID: reqID}
-	if start > len(matched) {
-		start = len(matched)
-	}
-	end := min(start+pageSize, len(matched))
-	for _, inst := range matched[start:end] {
+	answer := make([]string, 0, len(matched))
+	for _, inst := range matched {
 		resp.Reservations = append(resp.Reservations, reservation{ReservationID: "r-" + inst.InstanceID[2:], Instances: []instance{inst}})
+		answer = append(answer, inst.InstanceState.Name)
 	}
-	if end < len(matched) {
-		resp.NextToken = strconv.Itoa(end)
+	if len(answer) == 0 {
+		answer = append(answer, "no instance")
 	}
-	answer := make([]string, 0, end-start)
-	for _, inst := range matched[start:end] {
-		answer = append(answer, inst.InstanceID+"="+inst.InstanceState.Name)
-	}
-	f.log.Info("answered", append(entry, "status", http.StatusOK, "instance_ids", strings.Join(ids, ","),
-		"answer", strings.Join(answer, ","), "next_token", resp.NextToken)...)
+	f.log.Info("answered", append(entry, "status", http.StatusOK, "instance_id", id,
+		"answer", strings.Join(answer, ","))...)
 	writeXML(w, http.StatusOK, resp)
 }
 
@@ -588,22 +541,6 @@ func (f *fakeEC2) controlTerminate(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "%s terminated\n", id)
 }
 
-// rememberInstances lists the Nodes every interval and remembers each
-// instance seen, so an instance whose Node is gone, and which nobody
-// terminated, still reads as a stopped machine.
-func (f *fakeEC2) rememberInstances(interval time.Duration) {
-	for {
-		if nodes, err := f.list(); err == nil {
-			for i := range nodes {
-				f.state.see(f.instanceOf(&nodes[i]).InstanceID)
-			}
-		} else {
-			f.log.Warn("listing nodes failed", "error", err.Error())
-		}
-		time.Sleep(interval)
-	}
-}
-
 // instanceOf is the instance behind n: its AWS providerID's instance, or one
 // derived from its UID, terminated once marked.
 func (f *fakeEC2) instanceOf(n *node) instance {
@@ -611,7 +548,6 @@ func (f *fakeEC2) instanceOf(n *node) instance {
 	if id == "" {
 		id = instanceID(n.Metadata.UID)
 	}
-	f.state.see(id)
 	st := state(n)
 	if f.state.isTerminated(id) {
 		st = instanceState{Code: 48, Name: "terminated"}
@@ -631,38 +567,6 @@ func providerInstanceID(providerID string) string {
 		return ""
 	}
 	return id
-}
-
-// indexedValues reads prefix1, prefix2, ... in order; false when the
-// numbering has a gap.
-func indexedValues(form url.Values, prefix string) ([]string, bool) {
-	count := 0
-	for param := range form {
-		if strings.HasPrefix(param, prefix) {
-			count++
-		}
-	}
-	values := make([]string, 0, count)
-	for i := 1; i <= count; i++ {
-		v, ok := form[prefix+strconv.Itoa(i)]
-		if !ok || len(v) != 1 {
-			return nil, false
-		}
-		values = append(values, v[0])
-	}
-	return values, true
-}
-
-func dedupe(values []string) []string {
-	seen := map[string]bool{}
-	out := values[:0:0]
-	for _, v := range values {
-		if !seen[v] {
-			seen[v] = true
-			out = append(out, v)
-		}
-	}
-	return out
 }
 
 // state maps the Node's Ready condition onto an EC2 instance state.

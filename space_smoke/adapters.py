@@ -57,7 +57,6 @@ from space_smoke.capabilities import (
     TemplateRecipe,
     SandboxPodRender,
     AdminNodeView,
-    DeadNodeStatus,
     SandboxResidency,
     SandboxRowState,
     StoppedResidency,
@@ -114,12 +113,6 @@ from space_smoke.capabilities import (
     WarmPoolSelection,
 )
 from space_smoke.credmgr_socket import exchange_token, relay_argv
-from space_smoke.dead_node import (
-    DEAD_NODE_ENV_KEYS,
-    NATIVE_ACTIONS,
-    validate_dead_node_keys,
-    validate_dead_node_overrides,
-)
 from space_smoke.drain_v2 import (
     DRAIN_V2_ENV_KEYS,
     validate_drain_v2_keys,
@@ -699,17 +692,10 @@ SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '
 # Where kubeadm keeps the kubelet's flags on a Kind node, `--provider-id`
 # among them.
 KIND_KUBELET_FLAGS = "/var/lib/kubelet/kubeadm-flags.env"
-DEAD_NODE_ROW_STATES_SQL = """\
+SANDBOX_ROW_STATES_SQL = """\
 SELECT id, lifecycle, placement, coalesce(active_node_id::text, ''),
        coalesce(target_node_id::text, ''), updated_at
   FROM sandboxes WHERE id = ANY('{{{sandbox_ids}}}'::uuid[]) ORDER BY id;
-"""
-DEAD_NODE_OTHER_LIVE_ROWS_SQL = """\
-SELECT id FROM sandboxes
- WHERE (active_node_id = '{node_id}'::uuid OR target_node_id = '{node_id}'::uuid)
-   AND lifecycle NOT IN ('failed', 'deleted')
-   AND NOT (id = ANY('{{{sandbox_ids}}}'::uuid[]))
- ORDER BY id;
 """
 STOPPED_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, ''), placement, coalesce(evacuation_restore_target, '')
@@ -5671,10 +5657,9 @@ ON CONFLICT (key_hash) DO NOTHING;
     def _apply_orphaned_restore_pod_gc_env(self, values: Mapping[str, str | None]) -> None:
         self._set_controller_env(values, "an orphaned-restore-pod GC controller deployment write")
 
-    # --- controller env for the drain and the dead-node verb ------------------
+    # --- controller env for the drain ---------------------------------------
     #
-    # The key/value lists live in `space_smoke.drain_v2` and
-    # `space_smoke.dead_node`.
+    # The key/value lists live in `space_smoke.drain_v2`.
 
     def _set_controller_env(self, values: Mapping[str, str | None], purpose: str) -> None:
         """Write `values` (None unsets) to the cluster-controller Deployment and
@@ -5707,68 +5692,6 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def _apply_drain_v2_env(self, values: Mapping[str, str | None]) -> None:
         self._set_controller_env(values, "a drain v2 controller deployment write")
-
-    def dead_node_env(self) -> dict[str, str | None]:
-        return self._deployment_env_literals(self._controller_deployment(), DEAD_NODE_ENV_KEYS)
-
-    def set_dead_node_env(self, overrides: Mapping[str, str]) -> None:
-        validate_dead_node_overrides(overrides)
-        self._apply_dead_node_env(overrides)
-
-    def restore_dead_node_env(self, standing: Mapping[str, str | None]) -> None:
-        validate_dead_node_keys(standing)
-        self._apply_dead_node_env(standing)
-
-    def _apply_dead_node_env(self, values: Mapping[str, str | None]) -> None:
-        self._set_controller_env(values, "a dead-node controller deployment write")
-
-    def dead_node_statuses(self) -> list[DeadNodeStatus]:
-        listing = self._admin("GET", "nodes", expect=(200,))
-        if not isinstance(listing, list):
-            raise RuntimeError("admin nodes listing was not an array")
-        entries = [
-            {**node["dead_node_status"], "node_id": node.get("id")}
-            for node in listing
-            if isinstance(node, dict) and isinstance(node.get("dead_node_status"), dict)
-        ]
-        statuses = []
-        for item in entries:
-            if not isinstance(item, dict):
-                continue
-            samples = item.get("samples") or {}
-            observed_epoch = _kube_epoch(item.get("observed_at"))
-            if observed_epoch is None:
-                raise RuntimeError("a dead-node status entry has no observed_at")
-
-            def counts(key: str, entry: dict[str, Any] = item) -> dict[str, int]:
-                values = entry.get(key) or {}
-                return {str(k): int(v) for k, v in values.items() if isinstance(v, int)}
-
-            statuses.append(
-                DeadNodeStatus(
-                    node_id=str(item.get("node_id", "")),
-                    observed_at=datetime.fromtimestamp(observed_epoch, UTC),
-                    mode=str(item.get("mode", "")),
-                    verdict=str(item.get("verdict", "")),
-                    reason=str(item.get("reason", "")),
-                    rows_truncated=item.get("rows_truncated") is True,
-                    instances={
-                        str(k): str(v) for k, v in (item.get("instances") or {}).items()
-                    },
-                    counts=counts("counts"),
-                    applied=counts("applied"),
-                    samples={
-                        str(outcome): tuple(
-                            str(row.get("sandbox_id", ""))
-                            for row in rows
-                            if isinstance(row, dict)
-                        )
-                        for outcome, rows in samples.items()
-                        if isinstance(rows, list)
-                    },
-                )
-            )
-        return statuses
 
     def kind_node_provider_id(self, node_name: str) -> str:
         node = _kube_node_name(node_name)
@@ -5851,37 +5774,6 @@ ON CONFLICT (key_hash) DO NOTHING;
             action="read the node row",
         )
         return out.strip() == "1"
-
-    def latest_execution_instance(self, sandbox_id: str) -> str | None:
-        out = self._psql(
-            "SELECT coalesce(node_instance_id, '') FROM sandbox_k8s_executions"
-            f" WHERE sandbox_id = '{_sql_uuid(sandbox_id)}'"
-            " ORDER BY generation DESC LIMIT 1;",
-            action="read the sandbox's latest execution stamp",
-        )
-        return out.strip() or None
-
-    def database_now(self) -> datetime:
-        out = self._psql("SELECT EXTRACT(EPOCH FROM NOW());", action="read the database clock")
-        return datetime.fromtimestamp(float(out), UTC)
-
-    def node_stack_pods(self, node_name: str) -> list[str]:
-        node = _kube_node_name(node_name)
-        result = self.kubectl(
-            "get", "pods", "-A", "--field-selector", f"spec.nodeName={node}", "-o", "json", timeout=30
-        )
-        _require_ok(result, f"list pods on {node}")
-        pods = []
-        for pod in json.loads(result.stdout or "{}").get("items", []):
-            metadata = pod.get("metadata") or {}
-            owners = metadata.get("ownerReferences") or []
-            if any(owner.get("kind") == "DaemonSet" for owner in owners):
-                continue
-            namespace = str(metadata.get("namespace", ""))
-            if namespace in (KIND_SANDBOX_NAMESPACE, "kube-system", "local-path-storage"):
-                continue
-            pods.append(f"{namespace}/{metadata.get('name', '')}")
-        return pods
 
     def _kind_worker_container(self, node_name: str) -> str:
         container = self._kind_node_container(_kube_node_name(node_name))
@@ -5997,59 +5889,10 @@ ON CONFLICT (key_hash) DO NOTHING;
                 raise RuntimeError(f"Kind worker {container} never advertised network slots")
             time.sleep(2)
 
-    def native_sandbox_action(self, sandbox_id: str, action: str) -> str:
-        self._require_isolated_kind(f"native {action}")
-        if action not in NATIVE_ACTIONS:
-            raise ValueError(f"refusing native action {action!r}")
-        public_id = f"sbx_{_sql_uuid(sandbox_id)}"
-        request = Request(
-            self.config.api_url.rstrip("/")
-            + f"/v1/sandboxes/{quote(public_id, safe='')}:{action}",
-            method="POST",
-            headers={
-                "Authorization": "Bearer " + self._admin_token(),
-                "Content-Type": "application/json",
-                "Idempotency-Key": f"space-smoke-{action}-{secrets.token_hex(8)}",
-            },
-            data=b"{}",
-        )
-        try:
-            with urlopen(request, timeout=20) as response:
-                payload = json.load(response)
-        except HTTPError as error:
-            raise RuntimeError(f"native :{action} returned HTTP {error.code}") from None
-        except (URLError, OSError, ValueError):
-            raise RuntimeError(f"native :{action} failed") from None
-        operation_id = payload.get("operation_id") if isinstance(payload, dict) else None
-        if not isinstance(operation_id, str) or not operation_id:
-            raise RuntimeError(f"native :{action} returned no operation_id")
-        return operation_id
-
-    def native_delete_sandbox(self, sandbox_id: str) -> None:
-        self._require_isolated_kind("native delete")
-        public_id = f"sbx_{_sql_uuid(sandbox_id)}"
-        request = Request(
-            self.config.api_url.rstrip("/") + f"/v1/sandboxes/{quote(public_id, safe='')}",
-            method="DELETE",
-            headers={
-                "Authorization": "Bearer " + self._admin_token(),
-                "Idempotency-Key": f"space-smoke-delete-{secrets.token_hex(8)}",
-            },
-        )
-        try:
-            with urlopen(request, timeout=20):
-                return
-        except HTTPError as error:
-            if error.code == 404:
-                return
-            raise RuntimeError(f"native delete returned HTTP {error.code}") from None
-        except (URLError, OSError):
-            raise RuntimeError("native delete failed") from None
-
     def sandbox_row_states(self, sandbox_ids: Sequence[str]) -> list[SandboxRowState]:
         ids = ",".join(_sql_uuid(sandbox_id) for sandbox_id in sandbox_ids)
         out = self._psql(
-            DEAD_NODE_ROW_STATES_SQL.format(sandbox_ids=ids), action="read sandbox row states"
+            SANDBOX_ROW_STATES_SQL.format(sandbox_ids=ids), action="read sandbox row states"
         )
         rows = []
         for line in out.splitlines():
@@ -6068,14 +5911,6 @@ ON CONFLICT (key_hash) DO NOTHING;
                 )
             )
         return rows
-
-    def other_live_rows_on_node(self, node_id: str, sandbox_ids: Sequence[str]) -> list[str]:
-        ids = ",".join(_sql_uuid(sandbox_id) for sandbox_id in sandbox_ids)
-        out = self._psql(
-            DEAD_NODE_OTHER_LIVE_ROWS_SQL.format(node_id=_sql_uuid(node_id), sandbox_ids=ids),
-            action="read other live rows on the node",
-        )
-        return [line.strip() for line in out.splitlines() if line.strip()]
 
     def controller_log_records(self, *, since_time: str) -> list[dict[str, Any]]:
         listing = self.kubectl(

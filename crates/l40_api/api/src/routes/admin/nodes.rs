@@ -510,7 +510,6 @@ fn admin_node_response(
         drain_last_error: row.drain_last_error,
         drain_engine: row.drain_engine,
         drain_status: row.drain_status.map(|status| status.0),
-        dead_node_status: row.dead_node_status.map(|status| status.0),
         terminate_decrement_capacity: row.terminate_decrement_capacity,
         node_group_id: row.node_group_id,
         k8s_node_name: row.substrate_node_id,
