@@ -669,8 +669,8 @@ fn allow_port_request_params(req: &pplx_space_node_mgr_client::proto::AllowPortR
 /// stops accepting and drains for up to [`DEFAULT_DRAIN_TIMEOUT`] before it
 /// releases the service mutex, and only then does the successor finish
 /// starting and bind the socket, so dials in between are refused and calls
-/// on the old connection are cut. A caller's `grpc-timeout` still bounds the
-/// wait.
+/// on the old connection are cut. `max_elapsed` also bounds the attempt in
+/// flight, and a caller's `grpc-timeout` can only shorten the wait.
 const NODE_MANAGER_RESTART_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
     max_retries: 128,
     initial_delay: Duration::from_millis(50),
@@ -698,7 +698,8 @@ where
 {
     let metadata = request.metadata().clone();
     let message = request.into_inner();
-    let context = GrpcRetryContext::none().with_grpc_timeout_metadata(&metadata);
+    let context = GrpcRetryContext::with_timeout(NODE_MANAGER_RESTART_RETRY_POLICY.max_elapsed)
+        .with_grpc_timeout_metadata(&metadata);
     pplx_space_common_grpc::retry_grpc_status_with_context_if(
         "node-manager",
         command,

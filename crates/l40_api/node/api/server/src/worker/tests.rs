@@ -905,3 +905,36 @@ async fn expose_port_waits_for_a_restarting_node_manager() {
         .unwrap_err();
     assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
 }
+
+// An attempt that stalls after refused dials gives up when the restart budget
+// runs out, not at a longer caller deadline.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_port_call_is_bounded_by_the_restart_budget() {
+    let mut request = Request::new(());
+    request
+        .metadata_mut()
+        .insert("grpc-timeout", "120S".parse().unwrap());
+    let started_at = tokio::time::Instant::now();
+    let refused_until = started_at + Duration::from_secs(20);
+
+    let status =
+        forward_port_rpc_through_node_manager_restart("allow_port", request, |_| async move {
+            if tokio::time::Instant::now() < refused_until {
+                let mut refused = Status::unknown("transport error");
+                refused.set_source(std::sync::Arc::new(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionRefused,
+                )));
+                return Err(refused);
+            }
+            std::future::pending::<Result<Response<()>, Status>>().await
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::DeadlineExceeded, "{status}");
+    assert!(
+        started_at.elapsed() <= NODE_MANAGER_RESTART_RETRY_POLICY.max_elapsed,
+        "gave up after {:?}",
+        started_at.elapsed()
+    );
+}
