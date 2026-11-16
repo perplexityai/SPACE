@@ -5,7 +5,7 @@ expression: sorted_json(actual)
 {
   "nftables": [
     {
-      "add": {
+      "create": {
         "table": {
           "family": "ip",
           "name": "sandbox"

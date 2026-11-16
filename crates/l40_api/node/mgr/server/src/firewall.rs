@@ -283,6 +283,9 @@ fn namespace_rules_json(
     // "inet" would require "snat ip" qualifier which the JSON API doesn't support cleanly.
     let namespace_guardrail_rules =
         platform_guardrail_drop_rules_json("ip", SANDBOX_TABLE, "guardrails", "tap0");
+    // Create, not add: these commands only append, so over a table that a
+    // best-effort teardown left behind they would duplicate its rules. The
+    // whole transaction fails instead, and the caller rebuilds the namespace.
     // These rules must precede the packaged policy's established/related return.
     // A guest can otherwise forge the reverse tuple of a gateway-owned socket,
     // inherit its conntrack state, and reach the local socket without TPROXY.
@@ -291,7 +294,7 @@ fn namespace_rules_json(
     // listener speaks MPTCP, so guest TCP is unaffected; non-TCP never matches.
     format!(
         r#"{{ "nftables": [
-  {{ "add": {{ "table": {{ "family": "ip", "name": "{SANDBOX_TABLE}" }} }} }},
+  {{ "create": {{ "table": {{ "family": "ip", "name": "{SANDBOX_TABLE}" }} }} }},
   {{ "add": {{ "chain": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "name": "{PRE_TPROXY_GUARDRAILS_CHAIN}",
     "type": "filter", "hook": "prerouting", "prio": {PRE_TPROXY_GUARDRAILS_PRIO} }} }} }},
   {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "{PRE_TPROXY_GUARDRAILS_CHAIN}",
