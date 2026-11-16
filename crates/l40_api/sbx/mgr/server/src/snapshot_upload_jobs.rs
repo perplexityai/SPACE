@@ -1088,10 +1088,13 @@ struct ArtifactTransferObservation {
 }
 
 /// Observe a durable transfer until terminal, bounded by the worker's overall
-/// attempt deadline. Connect and individual read-only probes each have a
-/// ten-second budget; transport failures retry the upload job, while permanent
-/// transfer failure remains terminal. Cancellation yields without cancelling
-/// remote work, and re-polling terminal transfers is safe.
+/// attempt deadline. Each read-only probe has a ten-second budget. A
+/// volume-manager that refuses the connection or drops it, as it does while it
+/// restarts, is polled again for up to
+/// [`pplx_space_volmgr_client::VOLUME_MANAGER_RESTART_BUDGET`]; past that, or
+/// on a stalled probe, the upload job retries. Permanent transfer failure
+/// remains terminal. Cancellation yields without cancelling remote work, and
+/// re-polling terminal transfers is safe.
 async fn wait_for_artifact_job(
     volume_manager_socket: &std::path::Path,
     sandbox_id: &str,
@@ -1101,18 +1104,7 @@ async fn wait_for_artifact_job(
     // One reconnecting channel per artifact attempt, not a fresh connection
     // on every poll. These are observation-only requests: timing out does not
     // abandon the durable volume-manager transfer or cancel remote mutation.
-    let volume_manager_socket = volume_manager_socket.to_string_lossy();
-    let client = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart),
-        result = tokio::time::timeout(
-            TRANSFER_PROBE_TIMEOUT,
-            pplx_space_volmgr_client::connect(&volume_manager_socket),
-        ) => {
-            result.map_err(|_| JobError::retriable(format!("vol-mgr connect timed out ({job_id})")))?
-                .map_err(|e| JobError::retriable(format!("vol-mgr connect ({job_id}): {e}")))?
-        }
-    };
+    let client = pplx_space_volmgr_client::lazy(volume_manager_socket);
     poll_artifact_job(sandbox_id, *job_id, client, cancellation).await
 }
 
@@ -1128,23 +1120,80 @@ fn next_artifact_poll_interval(interval: Duration) -> Duration {
     (interval * 2).min(ARTIFACT_POLL_MAX)
 }
 
+/// Probe interval while volume-manager cannot be reached.
+const UNREACHABLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 async fn poll_artifact_job(
     sandbox_id: &str,
     job_id: JobId,
-    mut client: pplx_space_volmgr_client::ConnectedVolumeManagerClient,
+    client: pplx_space_volmgr_client::ConnectedVolumeManagerClient,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<ArtifactTransferObservation, JobError> {
+    poll_artifact_job_with(
+        sandbox_id,
+        job_id,
+        move || {
+            let mut client = client.clone();
+            async move {
+                client
+                    .get_transfer_job(GetTransferJobRequest {
+                        job_id: job_id.to_string(),
+                    })
+                    .await
+                    .map(tonic::Response::into_inner)
+            }
+        },
+        cancellation,
+    )
+    .await
+}
+
+async fn poll_artifact_job_with<Probe, ProbeFuture>(
+    sandbox_id: &str,
+    job_id: JobId,
+    mut probe: Probe,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<ArtifactTransferObservation, JobError>
+where
+    Probe: FnMut() -> ProbeFuture,
+    ProbeFuture: std::future::Future<
+            Output = Result<pplx_space_volmgr_client::proto::GetTransferJobResponse, tonic::Status>,
+        >,
+{
     let mut interval = ARTIFACT_POLL_INITIAL;
+    let mut unreachable_since: Option<tokio::time::Instant> = None;
     loop {
-        let resp = tokio::select! {
+        let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart),
-            response = tokio::time::timeout(TRANSFER_PROBE_TIMEOUT, client.get_transfer_job(GetTransferJobRequest {
-                job_id: job_id.to_string(),
-            })) => response
-                .map_err(|_| JobError::retriable(format!("get_transfer_job timed out ({job_id})")))?
-                .map_err(|e| JobError::retriable(format!("get_transfer_job ({job_id}): {e}")))?
-                .into_inner(),
+            response = tokio::time::timeout(TRANSFER_PROBE_TIMEOUT, probe()) => response
+                .map_err(|_| JobError::retriable(format!("get_transfer_job timed out ({job_id})")))?,
+        };
+        let resp = match response {
+            Ok(resp) => {
+                unreachable_since = None;
+                resp
+            }
+            Err(status) if pplx_space_common_grpc::should_reconnect_status(&status) => {
+                let since = *unreachable_since.get_or_insert_with(tokio::time::Instant::now);
+                if since.elapsed() >= pplx_space_volmgr_client::VOLUME_MANAGER_RESTART_BUDGET {
+                    return Err(JobError::retriable(format!(
+                        "get_transfer_job ({job_id}): volume-manager unreachable for {}s: {status}",
+                        since.elapsed().as_secs()
+                    )));
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart),
+                    _ = tokio::time::sleep(UNREACHABLE_POLL_INTERVAL) => {}
+                }
+                continue;
+            }
+            Err(status) => {
+                return Err(JobError::retriable(format!(
+                    "get_transfer_job ({job_id}): {status}"
+                )));
+            }
         };
 
         let job = resp.job.ok_or_else(|| {

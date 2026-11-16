@@ -86,6 +86,24 @@ pub async fn connect(socket_path: &str) -> Result<ConnectedVolumeManagerClient, 
     Ok(VolumeManagerClient::new(wrap_grpc_client_channel(channel)))
 }
 
+/// A cached, reconnecting channel for callers that bound their own RPCs.
+/// Dialing happens on the first RPC, so a socket that is missing while
+/// volume-manager restarts fails that RPC instead of a separate connect budget.
+pub fn lazy(socket_path: &Path) -> ConnectedVolumeManagerClient {
+    let channel = pplx_space_common_grpc::connect_uds_channel_lazy(
+        socket_path,
+        tonic::transport::Endpoint::from_static("http://tonic"),
+    );
+    VolumeManagerClient::new(wrap_grpc_client_channel(channel))
+}
+
+/// How long a caller keeps waiting for a node's volume-manager that it cannot
+/// reach before treating the outage as a failure. Volume-manager restarts
+/// delete-first: the predecessor drains transfers for up to 100 s and its RPC
+/// server for 10 s before the successor starts and recovers every persisted
+/// transfer, so a deploy leaves the socket refused or missing for a while.
+pub const VOLUME_MANAGER_RESTART_BUDGET: Duration = Duration::from_secs(180);
+
 pub const VOLMGR_SOCKET: &str = pplx_space_host_layout::paths::VOLUME_MANAGER_SOCKET;
 pub const RESTORE_PRIORITY: i32 = 100;
 pub const VERIFIED_REPLICA_PROVENANCE_VERSION: u32 = 1;
