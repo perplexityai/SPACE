@@ -55,6 +55,50 @@ the same release do not count. If that cannot be verified, stop and request
 maintainer confirmation before recommending merge. Stage new customer-affecting
 automation behind a default-off switch unless a maintainer approves otherwise.
 
+## Boundary changes and human review
+
+Scale review depth to reversibility. Protobuf/RPC contracts, persisted formats,
+storage semantics, and schema/data migrations require explicit boundary review,
+including semantic changes without a `.proto` or SQL diff. Additive does not
+mean reversible. Keep routine, genuinely reversible changes lightweight.
+
+Before requesting review, give a human reader a concise explanation of:
+
+- The problem, before/after behavior, and invariant being protected, with one
+  concrete request or state-transition example. Explain why each boundary
+  change is necessary and why a boundary-preserving alternative is insufficient.
+- Affected producers, consumers, readers, and writers; old/new combinations;
+  and persisted or in-flight state. For protobuf, cover field/tag and enum
+  evolution, absent/default/unknown values, unsupported RPCs, and retry identity
+  or idempotency where relevant. Wire-decodable is not behaviorally compatible.
+- Deployment order, prerequisites, failure detection, and recovery. For
+  migrations, explain locking and data-volume assumptions, backfill/restart
+  behavior where applicable, and how old code handles newly written state.
+  Distinguish a binary revert, a rollback build retaining migrations, and schema
+  or data reversal. Name any point of no return and what happens when a down
+  migration refuses; its guard is not itself a recovery plan.
+- Focused evidence for the compatibility and recovery claims, and unvalidated
+  assumptions. Link existing evidence rather than adding redundant tests or
+  requiring an irrelevant test matrix.
+
+Keep each PR independently understandable. For stacks, distinguish this PR's
+delta from its base and later behavior; state which guarantees hold at each
+deployable intermediate step. Keep the description and risk assessment current
+after material revisions. A follow-up does not establish a guarantee now.
+
+Automated reviewers must apply this lens to boundary changes, not only test
+changes. Flag a missing explanation or contradictory safety claim as a review
+blocker with a specific question and the code or evidence needed to resolve it;
+do not demand more prose when the answer is already clear. Use the owning
+storage and language review guidance for implementation details.
+
+Passing CI, generated-code checks, and AI approval do not establish human
+understanding. Before recommending merge, require review by a human who owns
+the affected boundary and can explain the invariant, mixed-version behavior,
+and recovery path. Agents must not attest to that understanding on a human's
+behalf. If it is unclear, request clarification or a walkthrough, not a stamp.
+This instruction does not configure GitHub approval or branch-protection rules.
+
 ## Public-safe reproductions
 
 Treat this repository as upstream when investigating a problem from a private
