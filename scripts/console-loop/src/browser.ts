@@ -38,6 +38,40 @@ export async function showLoopbackHostsOnly(context: BrowserContext): Promise<vo
   });
 }
 
+// A button on the page: its visible text, whitespace collapsed, and its
+// accessible name. An icon inside a button lends the name its label, so the
+// name of a button showing "Preview v2 drain" is "eye Preview v2 drain".
+export interface ButtonCandidate {
+  text: string;
+  name: string;
+}
+
+// The index of the one button `label` names: by its visible text, or by its
+// whole accessible name, either exactly, so a label never picks a longer
+// button that only starts with it. Null when no button matches; an error
+// when more than one does, since clicking the first would be a guess.
+export function clickTarget(buttons: ButtonCandidate[], label: string): number | null {
+  const wanted = label.trim().replace(/\s+/g, ' ');
+  const matches = buttons.flatMap((button, index) => (button.text === wanted || button.name === wanted ? [index] : []));
+  if (matches.length > 1) {
+    throw new Error(`--click ${JSON.stringify(label)} matches ${matches.length} buttons: ${matches.map((i) => JSON.stringify(buttons[i].text || buttons[i].name)).join(', ')}`);
+  }
+  return matches.length ? matches[0] : null;
+}
+
+// The page's visible buttons as `clickTarget` reads them.
+export async function buttonCandidates(page: Page): Promise<{ locator: Locator; candidate: ButtonCandidate }[]> {
+  const found = [];
+  for (const locator of await page.getByRole('button').all()) {
+    const text = (await locator.innerText().catch(() => '')).trim().replace(/\s+/g, ' ');
+    const snapshot = await locator.ariaSnapshotJSON({ depth: 1 }).catch(() => null);
+    const node = Array.isArray(snapshot) ? snapshot[0] : null;
+    const name = node && typeof node === 'object' && !Array.isArray(node) && typeof node.name === 'string' ? node.name : text;
+    found.push({ locator, candidate: { text, name } });
+  }
+  return found;
+}
+
 export async function newContext(
   browser: Browser,
   { viewport = { width: 1440, height: 900 }, videoDir }: { viewport?: { width: number; height: number }; videoDir?: string } = {},
