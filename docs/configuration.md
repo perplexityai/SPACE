@@ -79,7 +79,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_DRAINED_NODE_TERMINATOR_ENABLED` | off | |
 | `SPACE_CLUSTER_CONTROLLER_DRAIN_EVACUATION_COHORT_VALUE` | unset | Unset disables the rollout-cohort feature. |
 | `SPACE_NODE_GROUP_LABELER_ENABLED`, `SPACE_NODE_GROUP_MIRROR_ENABLED` | off | |
-| `SPACE_NODE_SERVICE_READINESS_ENABLED` | off | |
+| `SPACE_NODE_SERVICE_READINESS_ENABLED` | off | Label each sandbox worker Node `space.pplx.net/node-services-ready=false` while its node-ctl, volume-manager or node-api pod is missing, terminating or not Ready, and `true` otherwise; on a fleet of 10 or more nodes, it labels every node `true` when more read not-ready than concurrent DaemonSet rollouts explain. |
 | `SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED` | off | |
 | `SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN` | off | When on, the sweeper scans and reports what it would prune, but deletes nothing. Set it with `ENABLED` to observe a new environment before pruning. Accepts `true`/`1`/`yes`/`on` and their negations, ignoring case and surrounding spaces; any other value, empty included, keeps dry run on and logs a warning. |
 | `SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N`, `SPACE_SNAPSHOT_RETENTION_SWEEPER_MAX_PER_TICK` | built-in | |

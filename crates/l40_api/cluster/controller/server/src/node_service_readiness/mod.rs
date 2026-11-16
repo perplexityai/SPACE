@@ -34,11 +34,11 @@
 //!   longer matches any DaemonSet degrades to "no bias", not to "no placement".
 //!
 //! Known limitation: a serving pod is matched on `(node, component)` only, not
-//! on the release it belongs to. Worker and builder releases both ship a
-//! `node-ctl` DaemonSet, so in a dev cluster where the two land on the *same*
-//! node the builder's pod can satisfy the worker's verdict. Disjoint
-//! `nodeSelector`s avoid that ambiguity. Without them, matching only the
-//! component can produce a false ready verdict.
+//! on the release it belongs to. Worker and builder releases both ship
+//! `node-ctl` and `node-api` DaemonSets, so in a dev cluster where the two
+//! land on the *same* node the builder's pod can satisfy the worker's verdict.
+//! Disjoint `nodeSelector`s avoid that ambiguity. Without them, matching only
+//! the component can produce a false ready verdict.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -235,7 +235,8 @@ pub struct ReconcilerConfig {
 /// DaemonSet specs: doing so would need a DaemonSet lister plus new read RBAC,
 /// and the charts pin the value. If a chart's budget changes, this constant and
 /// the derived fail-open threshold have to move with it.
-const DAEMONSET_MAX_UNAVAILABLE_FRACTION: f64 = 0.10;
+const DAEMONSET_MAX_UNAVAILABLE_PERCENT: usize = 10;
+const DAEMONSET_MAX_UNAVAILABLE_FRACTION: f64 = DAEMONSET_MAX_UNAVAILABLE_PERCENT as f64 / 100.0;
 
 /// Headroom above the rollout union bound for nodes that are genuinely
 /// unhealthy (a wedged daemon, a node mid-registration) while a wave is in
@@ -264,14 +265,27 @@ fn default_max_not_ready_fraction(component_count: usize) -> f64 {
     (union_bound + NOT_READY_FRACTION_HEADROOM).min(MAX_NOT_READY_FRACTION_CEILING)
 }
 
+/// Most nodes `component_count` concurrent DaemonSet waves can leave not-ready
+/// on a fleet of `fleet_size` nodes. Kubernetes rounds each wave's
+/// `maxUnavailable` percentage up to whole nodes, so just above
+/// [`MIN_FLEET_FOR_FAIL_OPEN`] the waves' union is a larger share than the
+/// fractional threshold allows: three components on 12 nodes can take 6.
+fn rollout_union_bound_nodes(component_count: usize, fleet_size: usize) -> usize {
+    component_count * (fleet_size * DAEMONSET_MAX_UNAVAILABLE_PERCENT).div_ceil(100)
+}
+
 impl Default for ReconcilerConfig {
     fn default() -> Self {
-        // The two daemons a sandbox create actually blocks on: node-ctl
-        // (template presence / node placement state) and volume-manager
-        // (rootfs and snapshot volumes).
+        // The daemons a sandbox create actually blocks on: node-ctl
+        // (template presence / node placement state), volume-manager (rootfs
+        // and snapshot volumes) and node-api, which answers on every sandbox
+        // pod's runtime port. node-api rolls delete-first, so a create placed
+        // on its node waits through the old pod's drain and the
+        // replacement's start.
         let components = vec![
             NodeLocalComponent::NodeCtl,
             NodeLocalComponent::VolumeManager,
+            NodeLocalComponent::NodeApi,
         ];
         Self {
             max_not_ready_fraction: default_max_not_ready_fraction(components.len()),
@@ -382,7 +396,8 @@ fn plan_label_changes(
         .count();
 
     let failed_open = nodes.len() >= MIN_FLEET_FOR_FAIL_OPEN
-        && (not_ready as f64) > max_not_ready_fraction * nodes.len() as f64;
+        && (not_ready as f64) > max_not_ready_fraction * nodes.len() as f64
+        && not_ready > rollout_union_bound_nodes(components.len(), nodes.len());
     let changes = verdicts
         .into_iter()
         .filter_map(|(node, verdict)| {
