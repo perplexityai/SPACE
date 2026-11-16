@@ -1826,9 +1826,11 @@ impl SandboxController {
         // sweep may flip the row to `failed`, which must not be resurrected.
         // `command_ready_pending` records "reported started before the guest
         // command API was confirmed ready" — set when the substrate preserved a
-        // slow create (`command_ready == false`). The access path confirms and
-        // clears it on first use; until then data-plane ops get the
-        // SDK-recoverable `sandbox_timeout`.
+        // slow create (`command_ready == false`). The node's activation-completion
+        // receipt for this create's attempt clears it once the guest passes its
+        // readiness gate, and the access path confirms and clears it on first
+        // use; until then data-plane ops get the SDK-recoverable
+        // `sandbox_timeout`.
         let finalized = finalize_created_sandbox(
             pool,
             outcome.sandbox_id,

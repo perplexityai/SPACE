@@ -2433,6 +2433,55 @@ async fn crp3_disabled_reaper_is_a_noop() {
     assert!(reconciler.sink.cleanup_calls().is_empty());
 }
 
+/// CRP3b — `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_COMMAND_READY_PENDING_ENABLED`
+/// turns the phase on with its built-in ages, and it then heals and reaps by
+/// the probe as CRP1 and CRP2 do. Unset, or any value other than a `true`
+/// spelling, keeps it off and the tick touches no candidate.
+#[tokio::test(flavor = "current_thread")]
+async fn crp3b_the_environment_switch_enables_the_phase_and_defaults_off() {
+    const SWITCH: &str = "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_COMMAND_READY_PENDING_ENABLED";
+    let config_for = |value: Option<&str>| {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        if let Some(value) = value {
+            env.set(SWITCH, value);
+        }
+        ReconcilerConfig::from_environment(&env)
+    };
+    let tick = |config: ReconcilerConfig| async move {
+        let sink = FakeSink::new();
+        let (ready, wedged) = (SandboxId::new(), SandboxId::new());
+        sink.enqueue_command_ready_pending(vec![ready, wedged]);
+        sink.set_probe_outcome(ready, CommandReadyProbe::Ready);
+        sink.set_probe_outcome(wedged, CommandReadyProbe::Wedged);
+        let reconciler = Reconciler::new(config, sink);
+        reconciler.tick().await;
+        (
+            (ready, wedged),
+            reconciler.sink.heal_calls(),
+            reconciler.sink.reap_calls(),
+        )
+    };
+
+    for value in [None, Some("false"), Some("0"), Some("on"), Some("")] {
+        let config = config_for(value);
+        assert!(!config.command_ready_pending_enabled, "{value:?}");
+        let (_, healed, reaped) = tick(config).await;
+        assert!(healed.is_empty() && reaped.is_empty(), "{value:?}");
+    }
+
+    let config = config_for(Some("true"));
+    assert!(config.command_ready_pending_enabled);
+    assert_eq!(
+        (
+            config.command_ready_pending_age.get(),
+            config.command_ready_pending_terminal_age.get()
+        ),
+        (Duration::from_secs(900), Duration::from_secs(3600))
+    );
+    let ((ready, wedged), healed, reaped) = tick(config).await;
+    assert_eq!((healed, reaped), (vec![ready], vec![wedged]));
+}
+
 /// CRP4 — when the reap CAS reports "not claimed" (a concurrent access healed
 /// the row or transitioned it out of `started` between probe and CAS), no
 /// cleanup runs and the row is not counted as reaped.

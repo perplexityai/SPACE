@@ -194,6 +194,9 @@ reconcilers:
   #   them.
   # - Failed-sandbox cleanup (retrying the teardown of `failed` rows that
   #   still hold an active execution) ships on; rendered explicitly.
+  # - The command-ready-pending phase (heal or reap a `started` row whose
+  #   create returned before its guest answered) ships off, and its switch
+  #   (`..._COMMAND_READY_PENDING_ENABLED`) is unset here, so it stays off.
   # At these ages a row a scenario legitimately holds mid-transition is never
   # old enough to sweep; one that is swept was stuck past what a deployment
   # tolerates.
