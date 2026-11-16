@@ -22,16 +22,14 @@
 //! first page holds every row. So a search reads the rows it matches and
 //! sorts those (`search_plan_tests`).
 
-use std::str::FromStr;
 use std::sync::LazyLock;
 
 use pplx_space_accounts::{NodeId, OrgId, UserId};
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{
-    SandboxId, SandboxLifecycle, SandboxLifecycleParseError, TemplateName,
-};
+use pplx_space_common_core::types::{SandboxId, TemplateName};
 use pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX;
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_semver::SemVer;
 use serde::Serialize;
 use sqlx::PgPool;
@@ -47,42 +45,6 @@ use crate::models::{Sandbox, SandboxResourceType};
 
 const DELETED_LIFECYCLE: &str = "deleted";
 
-/// The `sandboxes.lifecycle` values outside [`SandboxLifecycle`].
-const TOMBSTONE_LIFECYCLES: [&str; 1] = [DELETED_LIFECYCLE];
-
-/// A stored lifecycle (`sandboxes.lifecycle`) the admin list filters on: a
-/// [`SandboxLifecycle`] state or a tombstone, in the column's form.
-///
-/// `pplx-space-sandbox-store`'s `StoredSandboxLifecycle` names the same values
-/// and normalizes them the same way; the tests pin this parse to it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AdminStoredLifecycle(&'static str);
-
-impl AdminStoredLifecycle {
-    pub const fn as_str(self) -> &'static str {
-        self.0
-    }
-}
-
-impl FromStr for AdminStoredLifecycle {
-    type Err = SandboxLifecycleParseError;
-
-    /// Normalizes case and surrounding whitespace, as `StoredSandboxLifecycle`
-    /// does.
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let normalized = value.trim().to_ascii_lowercase();
-        if let Some(tombstone) = TOMBSTONE_LIFECYCLES
-            .into_iter()
-            .find(|tombstone| *tombstone == normalized)
-        {
-            return Ok(Self(tombstone));
-        }
-        normalized
-            .parse::<SandboxLifecycle>()
-            .map(|lifecycle| Self(lifecycle.as_str()))
-    }
-}
-
 /// What the admin sandbox list narrows to. Every field that is set must
 /// match; an unset field matches every row.
 #[derive(Debug, Clone, Default)]
@@ -91,7 +53,7 @@ pub struct AdminSandboxFilter {
     /// The stored lifecycle (`sandboxes.lifecycle`), any of these. No
     /// response field shows it: `lifecycle` and `status` report the node's
     /// observed status when there is one. Never empty.
-    pub lifecycles: Option<Vec<AdminStoredLifecycle>>,
+    pub lifecycles: Option<Vec<StoredSandboxLifecycle>>,
     /// The row's own template (`sandboxes.template_id`), not the fallbacks
     /// the response's `template` resolves when the row has none.
     pub template: Option<TemplateName>,

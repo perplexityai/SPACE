@@ -343,6 +343,64 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
     Ok(())
 }
 
+/// An unknown lifecycle answers 400 naming the item as the caller sent it,
+/// spaces and case included; a stored lifecycle is accepted in any case.
+#[tokio::test]
+async fn the_lifecycle_filter_refuses_an_unknown_value_by_name() -> TestDbResult<()> {
+    let Some(harness) = harness().await? else {
+        return Ok(());
+    };
+    for (query, item) in [
+        ("lifecycle=started,napping", "napping"),
+        ("lifecycle=%20Started%20,%20NAPPING%20", " NAPPING "),
+        (
+            "cursor=&lifecycle=deleted,cleanup-required",
+            "cleanup-required",
+        ),
+        ("lifecycle=started,", ""),
+    ] {
+        let (status, body) = harness.get(&format!("/sandboxes?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(
+            body,
+            json!({"error": format!("unknown lifecycle {item:?}")}),
+            "{query}"
+        );
+    }
+    let owner = seed_owner(&harness.pool).await?;
+    let mut matching = Vec::new();
+    for lifecycle in ["started", "stopped", "deleted", "suspended"] {
+        let id = seed_sandbox(
+            &harness.pool,
+            owner,
+            SeedSandbox {
+                lifecycle: Some(lifecycle),
+                ..SeedSandbox::default()
+            },
+        )
+        .await?;
+        if matches!(lifecycle, "started" | "deleted") {
+            matching.push(id.to_string());
+        }
+    }
+    matching.reverse();
+    for query in [
+        "lifecycle=%20STARTED%20,Deleted",
+        "cursor=&lifecycle=%20STARTED%20,Deleted",
+    ] {
+        let (status, body) = harness.get(&format!("/sandboxes?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        let listed = if query.starts_with("cursor=") {
+            ids(&body["sandboxes"])
+        } else {
+            ids(&body)
+        };
+        assert_eq!(listed, matching, "{query}");
+    }
+    harness.pool.close().await;
+    Ok(())
+}
+
 /// An empty filter parameter is unset, paged or not: the unpaged list ignored
 /// these names before they were filters.
 #[rstest::rstest]
