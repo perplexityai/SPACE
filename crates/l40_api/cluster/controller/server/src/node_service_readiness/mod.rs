@@ -34,11 +34,11 @@
 //!   longer matches any DaemonSet degrades to "no bias", not to "no placement".
 //!
 //! Known limitation: a serving pod is matched on `(node, component)` only, not
-//! on the release it belongs to. Worker and builder releases both ship a
-//! `node-ctl` DaemonSet, so in a dev cluster where the two land on the *same*
-//! node the builder's pod can satisfy the worker's verdict. Disjoint
-//! `nodeSelector`s avoid that ambiguity. Without them, matching only the
-//! component can produce a false ready verdict.
+//! on the release it belongs to. Worker and builder releases both ship
+//! `node-ctl` and `node-api` DaemonSets, so in a dev cluster where the two
+//! land on the *same* node the builder's pod can satisfy the worker's verdict.
+//! Disjoint `nodeSelector`s avoid that ambiguity. Without them, matching only
+//! the component can produce a false ready verdict.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -266,12 +266,16 @@ fn default_max_not_ready_fraction(component_count: usize) -> f64 {
 
 impl Default for ReconcilerConfig {
     fn default() -> Self {
-        // The two daemons a sandbox create actually blocks on: node-ctl
-        // (template presence / node placement state) and volume-manager
-        // (rootfs and snapshot volumes).
+        // The daemons a sandbox create actually blocks on: node-ctl
+        // (template presence / node placement state), volume-manager (rootfs
+        // and snapshot volumes) and node-api, which answers on every sandbox
+        // pod's runtime port. node-api rolls delete-first, so a create placed
+        // on its node waits through the old pod's drain and the
+        // replacement's start.
         let components = vec![
             NodeLocalComponent::NodeCtl,
             NodeLocalComponent::VolumeManager,
+            NodeLocalComponent::NodeApi,
         ];
         Self {
             max_not_ready_fraction: default_max_not_ready_fraction(components.len()),

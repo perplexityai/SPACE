@@ -142,6 +142,34 @@ fn node_missing_a_component_pod_is_not_ready() {
     );
 }
 
+/// node-api rolls delete-first and answers on every sandbox pod's runtime
+/// port, so a node whose node-api pod is gone must not attract new sandboxes
+/// even while its other watched daemons serve.
+#[test]
+fn default_components_hold_a_node_without_node_api_not_ready() {
+    let components = ReconcilerConfig::default().components;
+    let nodes = vec![node("worker-a", Some("true"))];
+    let pods = vec![
+        pod("worker-a", NodeLocalComponent::NodeCtl),
+        pod("worker-a", NodeLocalComponent::VolumeManager),
+    ];
+
+    let plan = plan_label_changes(
+        &nodes,
+        &pods,
+        &components,
+        default_max_not_ready_fraction(components.len()),
+    );
+
+    assert_eq!(
+        plan.changes,
+        vec![NodeLabelChange {
+            node_name: "worker-a".to_string(),
+            desired: NodeServicesReady::NotReady,
+        }]
+    );
+}
+
 /// A pod serving on one node must never make a *different* node read as
 /// serviced.
 #[test]
@@ -204,6 +232,7 @@ async fn live_run_patches_changed_nodes_only() {
             pod("worker-a", NodeLocalComponent::NodeCtl),
             pod("worker-b", NodeLocalComponent::NodeCtl),
             pod("worker-b", NodeLocalComponent::VolumeManager),
+            pod("worker-b", NodeLocalComponent::NodeApi),
         ],
     );
 
@@ -881,7 +910,7 @@ mod pod_classification {
         let selector = component_selector(&ReconcilerConfig::default());
         assert_eq!(
             selector,
-            "app.kubernetes.io/component in (node-ctl,volume-manager)"
+            "app.kubernetes.io/component in (node-ctl,volume-manager,node-api)"
         );
     }
 }
