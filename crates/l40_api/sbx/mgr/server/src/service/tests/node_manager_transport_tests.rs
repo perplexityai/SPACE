@@ -400,6 +400,73 @@ async fn complete_staged_capture_publishes_past_an_older_unsealed_record() {
     assert_eq!(row.current_local_artifact_id, Some(newer));
 }
 
+/// A node-manager from before capture receipts answers a finished encrypted
+/// capture `Ok` and leaves the staging as sandbox-manager wrote it: the intent
+/// alone, no claim. When the seal after it fails, as it does if that
+/// node-manager restarts for its own upgrade, recovery must still seal and
+/// publish the capture instead of holding the row until it quarantines.
+#[tokio::test]
+async fn capture_answered_by_a_receiptless_node_manager_publishes_after_a_failed_seal() {
+    use crate::service::suspend_snapshot_publication as publication;
+    let node_manager = sealing_node_manager(0);
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    let cache = tempfile::tempdir().unwrap();
+    let (capture, staging) =
+        record_encrypted_capture(&conn, cache.path(), &id, std::time::Duration::ZERO, false);
+    let service = service_with_node_manager(conn, node_manager.connector());
+
+    assert!(publication::commit_capture_for_receiptless_producer(&staging).unwrap());
+    assert_eq!(
+        service.record_suspend_snapshot_publication_failure_after_staging(
+            &id,
+            &cache.path().join(&id),
+            &staging,
+            "seal/stage encrypted snapshot volume failed: node-manager unavailable",
+            &Default::default(),
+        ),
+        crate::service::grpc_lifecycle::SuspendSnapshotStagingDisposition::Preserve
+    );
+    recover_batch(&service, cache.path(), &id).await;
+    recover_batch(&service, cache.path(), &id).await;
+
+    assert_eq!(node_manager.calls(), ["ReleaseEncryptedVolume"]);
+    let row = service.lookup_sandbox(&id).unwrap();
+    assert_eq!(
+        row.state,
+        SandboxStatus::owned(crate::state::Teardown::Suspending, CleanupState::Required)
+    );
+    assert_eq!(row.current_local_artifact_id, Some(capture));
+}
+
+/// A node-manager that claimed the attempt owns its outcome: sandbox-manager
+/// never commits an intent it claimed, nor replaces a receipt it committed.
+#[test]
+fn a_claimed_capture_is_never_committed_by_sandbox_manager() {
+    use crate::service::suspend_snapshot_publication as publication;
+    use pplx_space_node_mgr_client::capture_receipt::{CLAIMED, INTENT};
+    for committed in [false, true] {
+        let cache = tempfile::tempdir().unwrap();
+        let id = SandboxId::new().to_string();
+        let (_, staging) =
+            record_encrypted_capture_in(cache.path(), &id, std::time::Duration::ZERO, committed);
+        std::fs::write(staging.join(CLAIMED), b"").unwrap();
+        let before = std::fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(!publication::commit_capture_for_receiptless_producer(&staging).unwrap());
+
+        let after = std::fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(after, before, "committed: {committed}");
+        assert_eq!(staging.join(INTENT).exists(), !committed);
+    }
+}
+
 #[tokio::test]
 async fn uncommitted_encrypted_capture_record_is_never_sealed() {
     // The capture never finished: only the record written before it exists.

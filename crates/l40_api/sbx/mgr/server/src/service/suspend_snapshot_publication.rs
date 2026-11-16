@@ -90,10 +90,28 @@ pub(super) fn prepare_encrypted_capture_record(
     Ok(())
 }
 
+/// Commit the record after the capture RPC answered `Ok`, when the producer
+/// predates capture receipts: a node-manager that claims an attempt leaves
+/// `CLAIMED` beside the intent and commits its own receipt before answering,
+/// while an older one leaves only the intent. Its `Ok` means the capture
+/// finished and the runtime stopped, the evidence sandbox-manager committed
+/// on before receipts, so a later failed seal stays recoverable during a
+/// rollout that upgrades sandbox-manager first. Returns whether it committed.
+pub(super) fn commit_capture_for_receiptless_producer(staging_dir: &Path) -> std::io::Result<bool> {
+    use pplx_space_node_mgr_client::capture_receipt::CLAIMED;
+    for owned in [CLAIMED, ENCRYPTED_CAPTURE_RECORD] {
+        match std::fs::symlink_metadata(staging_dir.join(owned)) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    commit_encrypted_capture_record(staging_dir).map(|()| true)
+}
+
 /// Mark the capture finished: a same-directory rename of the already
 /// durable record, then a directory sync. It writes no data, so it can fail
 /// only if the staging filesystem itself is failing.
-#[cfg(test)]
 pub(super) fn commit_encrypted_capture_record(staging_dir: &Path) -> std::io::Result<()> {
     std::fs::rename(
         staging_dir.join(ENCRYPTED_CAPTURE_INTENT),

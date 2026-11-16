@@ -17,8 +17,9 @@ use super::network_runtime::*;
 use super::recovery::SuspendSnapshotPublicationRecoveryOrigin;
 use super::suspend_snapshot_publication::{
     RecordedPublicationError, SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
-    prepare_encrypted_capture_record, publish_recorded_suspend_snapshot_dir,
-    read_encrypted_capture_record, remove_encrypted_capture_record, suspend_snapshot_staging_dir,
+    commit_capture_for_receiptless_producer, prepare_encrypted_capture_record,
+    publish_recorded_suspend_snapshot_dir, read_encrypted_capture_record,
+    remove_encrypted_capture_record, suspend_snapshot_staging_dir,
     suspend_snapshot_staging_parent_dir,
 };
 use super::tail_support::*;
