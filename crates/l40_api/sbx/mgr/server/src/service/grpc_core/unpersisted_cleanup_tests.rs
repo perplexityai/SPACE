@@ -315,3 +315,93 @@ async fn unpersisted_admission_preserves_flush_qualification_after_row_loss() {
         );
     }
 }
+
+/// Durable deletion can remove the row while an unpersisted Stop's cleanup
+/// runs, so the cleanup's execution-fence read finds no row. That Stop
+/// reports NOT_FOUND, which the shim takes as released. A rowless sandbox
+/// whose cache directory remains, and a fence read that fails while the row
+/// exists, stay UNAVAILABLE so the caller retries.
+#[tokio::test]
+async fn unpersisted_stop_of_a_sandbox_deleted_during_cleanup_reports_not_found() {
+    if !crate::service::tests::enter_route_test_process(&[
+        ("EPPO_SDK_KEY", None),
+        ("SPACE_FLAGD_ENABLED", None),
+    ]) {
+        return;
+    }
+    for (row_deleted, cache_remains, want) in [
+        (true, false, tonic::Code::NotFound),
+        (true, true, tonic::Code::Unavailable),
+        (false, false, tonic::Code::Unavailable),
+    ] {
+        let context = format!("row_deleted={row_deleted} cache_remains={cache_remains}");
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        let id = sandbox_id.to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::Started);
+        refuse_lifecycle_claims(&conn);
+        let run_dir = tempfile::tempdir().unwrap();
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions {
+                node_manager: FakeNodeManager::default().serve().connector(),
+                ..SandboxManagerServiceOptions::for_test_in(run_dir.path())
+            },
+        );
+        let cache_root = tempfile::tempdir().unwrap();
+        *service.cleanup_executor.cache_dir.lock().unwrap() = Some(cache_root.path().to_owned());
+        if cache_remains {
+            std::fs::create_dir_all(cache_root.path().join(&id)).unwrap();
+        }
+
+        let admission = service
+            .admit_selected_cleanup(
+                sandbox_id,
+                CleanupCompletion::MarkStopped,
+                true,
+                true,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            admission.is_unpersisted_for_sandbox(sandbox_id).unwrap(),
+            "{context}"
+        );
+        let error = service
+            .run_cleanup_after_persistence_failure_with_node_dispatch(
+                SynchronousCleanupRequest {
+                    sandbox_id: &id,
+                    uuid8: &id,
+                    keep_filesystem: true,
+                    context: "cleanup after unpersisted stop",
+                    completion: CleanupCompletion::MarkStopped,
+                    published_artifact: None,
+                    immediate_kill: true,
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Forbidden,
+                },
+                &admission,
+                || async {
+                    if row_deleted {
+                        // Durable deletion completes during the dispatch, and
+                        // the dispatch reads the fence as node cleanup does.
+                        let db = service.db_conn().unwrap();
+                        db.raw()
+                            .execute("DELETE FROM sandboxes WHERE id = ?1", [&id])
+                            .unwrap();
+                        drop(db);
+                        crate::service::cleanup_support::read_node_execution_fence(&service.db, &id)
+                            .map(|_| ())
+                    } else {
+                        Err(Status::unavailable(
+                            "read node execution authority: database is locked",
+                        ))
+                    }
+                },
+            )
+            .await
+            .expect_err("no cleanup completed");
+        assert_eq!(error.code(), want, "{context}: {error}");
+    }
+}

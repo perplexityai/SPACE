@@ -2808,6 +2808,34 @@ func TestLegacyKillRetryNeverDeletesALiveRow(t *testing.T) {
 	}
 }
 
+// Durable deletion can remove the row while Kill's Stop runs. The Stop then
+// answers NotFound, which releases the task as Delete's NotFound does; any
+// other failure keeps it for containerd's retry.
+func TestLegacyKillAfterLiveStateReleasesADeletedSandbox(t *testing.T) {
+	for _, code := range []codes.Code{codes.NotFound, codes.Unavailable} {
+		t.Run(code.String(), func(t *testing.T) {
+			client := &fakeSandboxManagerClient{
+				results: []sandboxStateResult{
+					{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}},
+				},
+				stopErrors: []error{status.Error(code, "stop raced with deletion")},
+			}
+			identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 1}
+			detached, err := releaseLegacyTaskTeardown(context.Background(), client, "kill", identity, func(bool) {})
+			if code == codes.NotFound {
+				if err != nil || !detached {
+					t.Fatalf("deleted sandbox was not released: detached=%v err=%v", detached, err)
+				}
+			} else if err == nil || detached {
+				t.Fatalf("unavailable manager must keep the task: detached=%v err=%v", detached, err)
+			}
+			if client.calls != 1 || client.stopCalls != 1 || client.deleteCalls != 0 {
+				t.Fatalf("manager calls = state:%d stop:%d delete:%d, want state:1 stop:1 delete:0", client.calls, client.stopCalls, client.deleteCalls)
+			}
+		})
+	}
+}
+
 func TestLegacyDeleteAfterLiveStateHandlesManagerError(t *testing.T) {
 	for _, code := range []codes.Code{codes.NotFound, codes.Unavailable} {
 		t.Run(code.String(), func(t *testing.T) {
