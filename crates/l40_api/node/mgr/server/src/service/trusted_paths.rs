@@ -20,6 +20,18 @@ fn path_error(error: impl std::fmt::Display) -> Status {
     Status::failed_precondition(format!("unsafe or unavailable privileged path: {error}"))
 }
 
+fn absent() -> Status {
+    Status::not_found("privileged directory component is absent")
+}
+
+fn component_error(error: nix::errno::Errno) -> Status {
+    if error == nix::errno::Errno::ENOENT {
+        absent()
+    } else {
+        path_error(error)
+    }
+}
+
 fn require_path(actual: &str, expected: PathBuf) -> Result<(), Status> {
     // Compare the spelling too: Path equality normalizes some degenerate forms.
     if actual != expected.to_string_lossy() {
@@ -75,7 +87,14 @@ fn open_beneath_installation(root: &Path, relative: &Path, owner: u32) -> Result
     // point it into the administrator's persistent directory. Trust that fixed
     // root-owned entry, not caller-supplied symlinks beneath it. Cache children
     // are intentionally group-writable and are walked with O_NOFOLLOW.
-    let entry = std::fs::symlink_metadata(root).map_err(path_error)?;
+    // A root that is absent is a missing component like any other. A dangling
+    // root symlink is not: its target may be restored, so it stays
+    // unavailable rather than reading as absent.
+    let entry = match std::fs::symlink_metadata(root) {
+        Ok(entry) => entry,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(absent()),
+        Err(error) => return Err(path_error(error)),
+    };
     if entry.uid() != owner || (!entry.is_symlink() && entry.mode() & 0o022 != 0) {
         return Err(path_error("installation root is not administrator-owned"));
     }
@@ -95,15 +114,8 @@ fn walk_directory(mut directory: File, relative: &Path) -> Result<File, Status> 
         match component {
             Component::Normal(name) => {
                 directory = File::from(
-                    openat(&directory, Path::new(name), DIRECTORY, Mode::empty()).map_err(
-                        |error| {
-                            if error == nix::errno::Errno::ENOENT {
-                                Status::not_found("privileged directory component is absent")
-                            } else {
-                                path_error(error)
-                            }
-                        },
-                    )?,
+                    openat(&directory, Path::new(name), DIRECTORY, Mode::empty())
+                        .map_err(component_error)?,
                 );
             }
             _ => {
