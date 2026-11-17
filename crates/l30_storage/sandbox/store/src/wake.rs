@@ -15,8 +15,8 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{SandboxId, SubstrateKind};
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_routability::routable_execution_or_non_k8s;
+use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
 /// Flip a woken sandbox to `started`/`on_node`. Returns whether the row

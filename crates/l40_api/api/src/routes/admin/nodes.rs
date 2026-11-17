@@ -2378,9 +2378,9 @@ async fn apply_force_upload_local_snapshots(
                 // operator-facing outcomes once the on-node RPC starts
                 // emitting both strings.
                 let outcome_tag = if err.contains(
-                    pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER,
+                    pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER,
                 ) || err.contains(
-                    pplx_space_common_core::node_drain_signals::REUPLOAD_SANDBOX_UNKNOWN_MARKER,
+                    pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_SANDBOX_UNKNOWN_MARKER,
                 ) {
                     "failed_artifact_missing"
                 } else {

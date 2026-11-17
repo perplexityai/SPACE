@@ -1,7 +1,7 @@
 //! Postgres operations for organization-scoped API keys.
 
 use pplx_space_accounts::{ApiKeyId, OrgId, UserId};
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use sqlx::{FromRow, PgExecutor};
 use time::OffsetDateTime;
 

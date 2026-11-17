@@ -7,7 +7,8 @@
 //! rollback, a template delete) and when no node owns it any more (a sandbox
 //! recovered to suspended, quarantined, or recovered from quarantine).
 
-use pplx_space_common_core::{sql, types::SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_sql_locator::sql;
 
 use pplx_space_state_reconciliation::{NetworkPolicyTarget, ReconcileElementRef};
 

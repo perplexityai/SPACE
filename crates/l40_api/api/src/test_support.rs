@@ -101,7 +101,7 @@ pub(crate) async fn start_a_request_blocked_on_operations<T: Send + 'static>(
     lock: &mut sqlx::PgConnection,
     request: impl std::future::Future<Output = T> + Send + 'static,
 ) -> pplx_space_db_test_fixtures::TestDbResult<tokio::task::JoinHandle<T>> {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
 
     sqlx::query(sql!(
         "LOCK TABLE public_operations IN ACCESS EXCLUSIVE MODE"
@@ -136,7 +136,7 @@ pub(crate) async fn start_a_request_blocked_on_operations<T: Send + 'static>(
 pub(crate) async fn wait_until_blocked_by(
     holder: &mut sqlx::PgConnection,
 ) -> pplx_space_db_test_fixtures::TestDbResult<()> {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -166,7 +166,7 @@ pub(crate) async fn record_the_row_and_succeed(
     create: pplx_space_public_api::OperationId,
     sandbox_id: pplx_space_public_api::PublicSandboxId,
 ) -> pplx_space_db_test_fixtures::TestDbResult<()> {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
 
     sqlx::query(sql!(
         "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, network_policy_override_json,

@@ -1,8 +1,8 @@
 use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_common_core::types::NodeGroupId;
 
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeGroupName, NodeGroupTemplatePolicy};
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 use uuid::Uuid;
 

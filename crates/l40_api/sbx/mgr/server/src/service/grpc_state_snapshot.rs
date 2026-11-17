@@ -11,7 +11,7 @@ use super::template_snapshot_support::{
 };
 use super::validation::{canonical_batched_sandbox_ids, snapshot_type_from_proto};
 use super::*;
-use pplx_space_common_core::inventory::InventoryBudget;
+use pplx_space_rpc_contracts::inventory::InventoryBudget;
 
 fn state_publication_metric_field(
     field: crate::db::SandboxStatePublicationMetadataField,
@@ -549,12 +549,12 @@ impl SandboxManagerService {
             return Err(Status::invalid_argument("sandbox_ids is required"));
         }
 
-        use pplx_space_common_core::inventory::{MAX_ITEMS, MAX_RAW_BYTES};
+        use pplx_space_rpc_contracts::inventory::{MAX_ITEMS, MAX_RAW_BYTES};
         // Release SQLite between batches without resetting the RPC's budgets.
         let mut raw_budget = InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES);
         let mut metadata_budget = InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES);
         let mut response = StateResponse::default();
-        for batch in sandbox_ids.chunks(pplx_space_common_core::inventory::READ_BATCH_ITEMS) {
+        for batch in sandbox_ids.chunks(pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS) {
             let (batch, remaining_raw, remaining_metadata) = self
                 .state_batch(batch.to_vec(), raw_budget, metadata_budget)
                 .await?;

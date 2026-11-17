@@ -53,9 +53,9 @@
 
 use pplx_space_accounts::NodeId;
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sandbox_teardown::delete_reconcile_state_for_elements;
+use pplx_space_sql_locator::sql;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

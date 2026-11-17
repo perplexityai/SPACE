@@ -976,7 +976,7 @@ impl FilesystemHandle {
         let task = self.tasks.spawn(async move {
             let _permit = permit;
             let budget =
-                pplx_space_common_core::operation_budget::RuntimeOperationBudget::FilesystemMetadata
+                pplx_space_rpc_contracts::operation_budget::RuntimeOperationBudget::FilesystemMetadata
                     .timeout();
             let result = tokio::select! {
                 biased;
@@ -1213,7 +1213,7 @@ impl Filesystem for FilesystemHandle {
             filesystem_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
-        if request.entries.len() > pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES {
+        if request.entries.len() > pplx_space_guest_process::MAX_WRITE_BATCH_ENTRIES {
             return Err(Status::invalid_argument("too many write_batch entries"));
         }
         let user = self.effective_user(request.user)?;

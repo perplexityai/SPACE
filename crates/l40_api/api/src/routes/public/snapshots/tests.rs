@@ -142,7 +142,7 @@ async fn public_snapshot_queries_hide_fork_origin_rows() -> TestResult {
     let db = pg_test_db().await?;
     let org_id = SEED_ORG_ID;
     let sandbox_id = SandboxId::new();
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO sandboxes (
              id, user_id, org_id, lifecycle, placement, managed_by,
              network_policy_override_json, network_policy_generation
@@ -161,7 +161,7 @@ async fn public_snapshot_queries_hide_fork_origin_rows() -> TestResult {
     let public_snapshot_id = SnapshotId::new();
     let fork_snapshot_id = SnapshotId::new();
     for (id, origin) in [(public_snapshot_id, "snapshot"), (fork_snapshot_id, "fork")] {
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO snapshots (
                  id, sandbox_id, type, state, local_artifact_id,
                  artifact_kind, artifact_origin,
@@ -206,7 +206,7 @@ async fn public_snapshot_queries_hide_deleting_rows() -> TestResult {
     let db = pg_test_db().await?;
     let org_id = SEED_ORG_ID;
     let sandbox_id = SandboxId::new();
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO sandboxes (
              id, user_id, org_id, lifecycle, placement, managed_by,
              network_policy_override_json, network_policy_generation
@@ -228,7 +228,7 @@ async fn public_snapshot_queries_hide_deleting_rows() -> TestResult {
         (ready_snapshot_id, "ready"),
         (deleting_snapshot_id, "deleting"),
     ] {
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO snapshots (
                  id, sandbox_id, type, state, local_artifact_id,
                  artifact_kind, artifact_origin, artifact_snapshot_name

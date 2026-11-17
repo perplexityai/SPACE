@@ -1,6 +1,6 @@
 use pplx_space_accounts::{OrgId, UserId};
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
 use crate::metrics::sandbox::api::{SandboxApiMetricIdentity, scope_request_client_id};

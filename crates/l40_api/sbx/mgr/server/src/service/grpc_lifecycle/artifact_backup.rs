@@ -186,13 +186,13 @@ pub(super) fn current_instance_backup_precondition(
         Some(SandboxState::Restoring) if expected_kind == ArtifactKind::Full => {
             return Err(Status::failed_precondition(format!(
                 "cannot back up current instance: {}",
-                pplx_space_common_core::node_drain_signals::REUPLOAD_SANDBOX_RESTORING_MARKER
+                pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_SANDBOX_RESTORING_MARKER
             )));
         }
         Some(SandboxState::Failed) => {
             return Err(Status::failed_precondition(format!(
                 "cannot back up current instance: {}",
-                pplx_space_common_core::artifact_backup_signals::CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER
+                pplx_space_rpc_contracts::artifact_backup_signals::CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER
             )));
         }
         // Being deleted, or quarantined, which only recovery or deletion moves
@@ -238,7 +238,7 @@ pub(super) fn current_instance_backup_precondition(
     let message = if state.is_unowned(SandboxState::Suspended) {
         format!(
             "requested {expected_kind} backup but {}",
-            pplx_space_common_core::artifact_backup_signals::CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER
+            pplx_space_rpc_contracts::artifact_backup_signals::CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER
         )
     } else {
         format!(
@@ -252,7 +252,7 @@ pub(super) fn artifact_backup_lookup_error(status: Status, full_current_instance
     if full_current_instance && status.code() == tonic::Code::NotFound {
         Status::failed_precondition(format!(
             "cannot back up current instance: {}",
-            pplx_space_common_core::node_drain_signals::REUPLOAD_SANDBOX_UNKNOWN_MARKER
+            pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_SANDBOX_UNKNOWN_MARKER
         ))
     } else {
         status
@@ -273,7 +273,7 @@ pub(super) enum BackupFilesPolicy {
 
 impl BackupFilesPolicy {
     fn missing(self, path: &str) -> Status {
-        use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
+        use pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
         match self {
             Self::Backup {
                 full_current_instance: true,
@@ -297,7 +297,7 @@ impl BackupFilesPolicy {
     }
 
     fn unusable(self, detail: &str) -> Status {
-        use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
+        use pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
         match self {
             Self::Backup {
                 full_current_instance: true,
@@ -1140,7 +1140,7 @@ impl SandboxManagerService {
                     "cannot reupload snapshot: {marker} for sandbox_id={sandbox_id} \
                      — sbx-mgr has no record of this sandbox on this node",
                     marker =
-                        pplx_space_common_core::node_drain_signals::REUPLOAD_SANDBOX_UNKNOWN_MARKER,
+                        pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_SANDBOX_UNKNOWN_MARKER,
                 ))
                     } else {
                         status
@@ -1164,7 +1164,7 @@ impl SandboxManagerService {
             let msg = if sandbox.state.is_unowned(SandboxState::Restoring) {
                 format!(
                     "cannot reupload snapshot: {}",
-                    pplx_space_common_core::node_drain_signals::REUPLOAD_SANDBOX_RESTORING_MARKER,
+                    pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_SANDBOX_RESTORING_MARKER,
                 )
             } else {
                 format!(
@@ -1400,7 +1400,7 @@ fn capture_generation_from_record(
 /// before taking it, while another artifact operation or host mutation holds
 /// the sandbox, such as the network-slot reset that follows its cleanup. That
 /// refusal carries
-/// [`NODE_MANAGER_SANDBOX_BUSY_MARKER`](pplx_space_common_core::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER)
+/// [`NODE_MANAGER_SANDBOX_BUSY_MARKER`](pplx_space_rpc_contracts::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER)
 /// and passes through as `Unavailable` for the caller to retry. Any other
 /// failure is internal, a transport `Unavailable` and node-manager's other
 /// `Unavailable` answers included.
@@ -1408,7 +1408,7 @@ fn stopped_disk_adoption_status(error: Status) -> Status {
     let message = format!("adopt stopped disk artifact: {error}");
     let node_manager_refused = error.code() == tonic::Code::Unavailable
         && error.message().contains(
-            pplx_space_common_core::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER,
+            pplx_space_rpc_contracts::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER,
         );
     if node_manager_refused {
         Status::unavailable(message)

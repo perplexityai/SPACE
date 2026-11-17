@@ -7,7 +7,6 @@ use pplx_space_accounts::{Email, NodeId, OrgId};
 #[cfg(test)]
 use pplx_space_auto_lifecycle::AutoLifecycleRuntimeState;
 use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, SandboxAutoLifecyclePatch};
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     DEFAULT_TEMPLATE_TAG, NodePoolName, SandboxId, SandboxLifecycle, TemplateDesiredState,
     TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
@@ -38,6 +37,7 @@ use pplx_space_sbx_mgr_client::proto::{
     TouchAutoLifecycleResponse, UpdateRequest, WakeRequest,
 };
 use pplx_space_semver::SemVer;
+use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{NetworkPolicyTarget, ReconcileFacet};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;

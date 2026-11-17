@@ -7,9 +7,8 @@
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use pplx_space_common_core::types::{
-    ClusterId, SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_ENV, process_cluster_id,
-};
+use pplx_space_cluster_id::{ClusterId, process_cluster_id};
+use pplx_space_common_core::types::SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_ENV;
 use pplx_space_feature_flags::{FeatureFlagClient, JsonFlag};
 use pplx_space_snapshot_retention::backend::StorageBackendRegistry;
 use tokio_util::sync::CancellationToken;

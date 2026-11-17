@@ -4,10 +4,10 @@ use axum::{
     body::Body,
     http::{HeaderMap, Method, Request, StatusCode},
 };
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, TestDb, TestDbResult, pg_test_db};
 use pplx_space_feature_flags::{AttributeValue, FeatureFlagProvider, ProviderState, Unresolved};
 use pplx_space_public_api::{PublicSandboxId, routes::NATIVE_V1_OPERATIONS};
+use pplx_space_sql_locator::sql;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::env::VarError;

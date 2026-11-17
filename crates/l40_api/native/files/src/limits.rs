@@ -1,7 +1,7 @@
 //! The size limits of Native file requests. A server that answers them uses
 //! these, so a request accepted by one is accepted by every other.
 
-use pplx_space_common_core::spaced::{MAX_MESSAGE_BYTES, MAX_WRITE_BATCH_ENTRIES};
+use pplx_space_guest_process::{MAX_MESSAGE_BYTES, MAX_WRITE_BATCH_ENTRIES};
 
 pub const MAX_FILE_LIST_ENTRIES: usize = 10_000;
 pub const MAX_FILE_WRITE_BYTES: usize = 16 * 1024 * 1024;

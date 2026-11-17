@@ -695,8 +695,7 @@ mode = "required"
 [rules.layers.domain_dependencies.stale_entries]
 mode = "required"
 
-# No model depends on a protocol. Today's exceptions are baselined in
-# [layers.model_protocol]: common-core, which is legacy, until it is deleted.
+# No model depends on a protocol.
 [rules.layers.model_protocol.no_crossing]
 mode = "required"
 

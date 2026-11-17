@@ -5,13 +5,13 @@
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{TestDb, insert_ready_worker_node, try_pg_test_db};
 use pplx_space_node_api_client::node_status_freshness::{
     DEFAULT_NODE_CTL_POLL_INTERVAL, DEFAULT_NODE_STATUS_FRESHNESS, NODE_STATUS_OUTBOUND_RECONCILER,
     node_status_freshness,
 };
 use pplx_space_sandbox_residency::node_heartbeat_fresh;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 
 use crate::ClusterApiService;

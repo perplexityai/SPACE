@@ -11,9 +11,9 @@ use pplx_space_accounts::OrgId;
 
 use std::collections::HashMap;
 
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::NodeGroupId;
 use pplx_space_common_core::types::{NodeGroupName, NodeGroupTemplatePolicy, TemplateVisibility};
+use pplx_space_sql_locator::sql;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 

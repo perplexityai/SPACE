@@ -2,8 +2,8 @@
 
 use crate::db::db_private_outside_tests;
 use crate::db::{Connection, Result};
-use pplx_space_common_core::inventory::{InventoryBudget, MAX_RAW_BYTES};
-use pplx_space_common_core::sql;
+use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_RAW_BYTES};
+use pplx_space_sql_locator::sql;
 use rusqlite::params;
 
 use super::inventory_read::{InventoryReadError, check_row};

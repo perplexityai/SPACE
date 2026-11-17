@@ -1184,11 +1184,11 @@ async fn t14_dry_run_counts_would_prune_without_side_effects() {
 
 #[cfg(test)]
 mod postgres {
-    use pplx_space_common_core::sql;
     use pplx_space_common_core::types::{SandboxId, SnapshotId};
     use pplx_space_db_test_fixtures::{
         SEED_ORG_ID as SEEDED_ORG_ID, SEED_USER_ID as SEEDED_USER_ID, try_pg_test_db,
     };
+    use pplx_space_sql_locator::sql;
     use sqlx::PgPool;
     use uuid::Uuid;
 

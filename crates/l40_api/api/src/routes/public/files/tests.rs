@@ -178,9 +178,9 @@ async fn a_full_sandbox_disk_is_not_a_retryable_rate_limit() {
     let mut storage_full =
         tonic::Status::resource_exhausted("No space left on device (os error 28)");
     storage_full.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::GUEST_STORAGE_FULL,
+            pplx_space_guest_process::status::GUEST_STORAGE_FULL,
         ),
     );
     let (status, full) = envelope(storage_full).await;
@@ -431,10 +431,10 @@ mod batch_body_limits {
         body::Body,
         http::{Method, Request},
     };
-    use pplx_space_common_core::sql;
     use pplx_space_db_test_fixtures::{
         SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db,
     };
+    use pplx_space_sql_locator::sql;
     use serde_json::{Value, json};
     use tower::ServiceExt;
     use uuid::Uuid;
@@ -680,8 +680,8 @@ mod key_binding {
         body::Body,
         http::{Method, Request},
     };
-    use pplx_space_common_core::sql;
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDbResult};
+    use pplx_space_sql_locator::sql;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 

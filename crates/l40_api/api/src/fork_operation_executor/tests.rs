@@ -6,9 +6,10 @@ use super::*;
 #[cfg(feature = "kubernetes")]
 #[tokio::test]
 async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_env::TestResult {
-    use pplx_space_common_core::{sql, types::SubstrateKind};
+    use pplx_space_common_core::types::SubstrateKind;
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
     use pplx_space_public_api::{OperationKind, OperationTargetType};
+    use pplx_space_sql_locator::sql;
 
     use crate::public_operations::{
         ApiProduct, ClaimLimits, ClaimPublicOperations, CreateClaimedPublicOperationResult,
@@ -118,12 +119,10 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
 #[tokio::test]
 async fn ready_capture_completes_in_one_claim_but_pending_upload_still_yields()
 -> pplx_space_test_env::TestResult {
-    use pplx_space_common_core::{
-        sql,
-        types::{LocalArtifactId, SubstrateKind},
-    };
+    use pplx_space_common_core::types::{LocalArtifactId, SubstrateKind};
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
     use pplx_space_public_api::{OperationKind, OperationTargetType};
+    use pplx_space_sql_locator::sql;
 
     use crate::fork_operations::ForkSandboxPayload;
     use crate::public_operations::{
@@ -729,7 +728,7 @@ mod cold_copy_tests {
             return;
         };
         let node_id = NodeId::new();
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO nodes (id, address, role, managed_by, state)
              VALUES ($1, '127.0.0.1', 'worker', 'space', 'registered')"
         ))
@@ -737,7 +736,7 @@ mod cold_copy_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO node_direct (node_id, node_api_endpoint)
              VALUES ($1, 'http://127.0.0.1:9802')"
         ))
@@ -753,7 +752,7 @@ mod cold_copy_tests {
             .await
             .unwrap_err();
 
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO node_status_snapshots (
                  node_id, observed_at, stale_after, reachable, role,
                  scheduling_status, services, updated_at
@@ -771,7 +770,7 @@ mod cold_copy_tests {
             .await
             .unwrap_err();
 
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE node_status_snapshots
              SET stale_after = NOW() + INTERVAL '1 hour', reachable = FALSE
              WHERE node_id = $1"
@@ -785,7 +784,7 @@ mod cold_copy_tests {
             .await
             .unwrap_err();
 
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE node_status_snapshots
              SET reachable = TRUE, scheduling_status = 'draining'
              WHERE node_id = $1"
@@ -799,7 +798,7 @@ mod cold_copy_tests {
             .await
             .unwrap_err();
 
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE node_status_snapshots
              SET scheduling_status = 'ready'
              WHERE node_id = $1"
@@ -832,7 +831,7 @@ mod cold_copy_tests {
         let sandbox_id = SandboxId::new();
         let snapshot_id = SnapshotId::new();
         let storage_location_id = uuid::Uuid::now_v7();
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)"
         ))
         .bind(org_id)
@@ -844,7 +843,7 @@ mod cold_copy_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
              VALUES ($1, $2, 'unused', 'Fork copy retirement', $3, 'member')"
         ))
@@ -854,7 +853,7 @@ mod cold_copy_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO sandboxes (
                  id, user_id, org_id, lifecycle, placement, network_policy_generation
              ) VALUES ($1, $2, $3, 'suspended', 'unplaced', 1)"
@@ -865,7 +864,7 @@ mod cold_copy_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO snapshots (
                  id, sandbox_id, type, state, artifact_kind, artifact_origin, org_id
              ) VALUES ($1, $2, 'disk', 'ready', 'disk', 'fork', $3)"
@@ -876,7 +875,7 @@ mod cold_copy_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO snapshot_storage_locations (
                  id, snapshot_id, storage_connection_string
              ) VALUES ($1, $2, 's3://fork-copy-retirement/artifact')"
@@ -892,14 +891,14 @@ mod cold_copy_tests {
             .await
             .unwrap();
 
-        let snapshot_exists: bool = sqlx::query_scalar(pplx_space_common_core::sql!(
+        let snapshot_exists: bool = sqlx::query_scalar(pplx_space_sql_locator::sql!(
             "SELECT EXISTS (SELECT 1 FROM snapshots WHERE id = $1)"
         ))
         .bind(snapshot_id)
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        let location_orphaned: bool = sqlx::query_scalar(pplx_space_common_core::sql!(
+        let location_orphaned: bool = sqlx::query_scalar(pplx_space_sql_locator::sql!(
             "SELECT orphaned_at IS NOT NULL
              FROM snapshot_storage_locations WHERE id = $1"
         ))

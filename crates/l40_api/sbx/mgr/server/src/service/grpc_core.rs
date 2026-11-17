@@ -49,7 +49,7 @@ fn sandbox_list_element(row: &crate::db::SandboxListRow) -> SandboxListElement {
 const MAX_LIST_PAGE_TOKEN_BYTES: usize = 256;
 
 /// List page size when the request leaves `page_size` unset (zero).
-const DEFAULT_LIST_PAGE_SIZE: usize = pplx_space_common_core::inventory::READ_BATCH_ITEMS;
+const DEFAULT_LIST_PAGE_SIZE: usize = pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS;
 
 /// Assemble one List page within the encoded budget. A page that fits
 /// continues where the store's page did; one the budget splits continues after
@@ -61,7 +61,7 @@ fn list_page_response(
     template_manager_peer: bool,
 ) -> Result<Response<ListResponse>, Status> {
     use crate::db::inventory_read::ListPageRow;
-    use pplx_space_common_core::inventory::{InventoryLimitExceeded, MAX_ENCODED_BYTES};
+    use pplx_space_rpc_contracts::inventory::{InventoryLimitExceeded, MAX_ENCODED_BYTES};
 
     // Leave room for the cursor field beside the elements.
     let element_budget = MAX_ENCODED_BYTES - (MAX_LIST_PAGE_TOKEN_BYTES + 8);
@@ -1131,7 +1131,7 @@ impl SandboxManagerService {
             0 => DEFAULT_LIST_PAGE_SIZE,
             size => usize::try_from(size)
                 .unwrap_or(usize::MAX)
-                .min(pplx_space_common_core::inventory::MAX_ITEMS),
+                .min(pplx_space_rpc_contracts::inventory::MAX_ITEMS),
         };
         let scope = if pool_members_only {
             crate::db::inventory_read::ListPageScope::PoolMembers
@@ -1195,7 +1195,7 @@ impl SandboxManagerService {
         }
 
         let mut response = GetDiskUsageResponse::default();
-        for batch in sandbox_ids.chunks(pplx_space_common_core::inventory::READ_BATCH_ITEMS) {
+        for batch in sandbox_ids.chunks(pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS) {
             let batch = self.disk_usage_batch(batch.to_vec()).await?;
             response.usage_bytes.extend(batch.usage_bytes);
             response.missing_ids.extend(batch.missing_ids);

@@ -28,7 +28,7 @@ async fn cycle_state_collection_retries_oversized_batches_without_losing_order()
 
     // The trailing three-ID batch forces an odd split; the one-ID limit also
     // exercises the two-ID boundary before collection can succeed.
-    let ids = (0..pplx_space_common_core::inventory::READ_BATCH_ITEMS + 3)
+    let ids = (0..pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS + 3)
         .map(|index| format!("019d84bd-280d-7331-99c6-{index:012x}"))
         .collect::<Vec<_>>();
     let mut reader = SizeLimitedReader {

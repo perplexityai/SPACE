@@ -14,21 +14,17 @@ workspace = true
 aws-lc-rs = { workspace = true, optional = true }
 pplx-space-accounts = { workspace = true }
 pplx-space-byte-size = { workspace = true }
-pplx-space-cluster-id = { workspace = true }
 pplx-space-content-digest = { workspace = true }
 pplx-space-durations = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
-pplx-space-guest-process = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-job-id = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-linux-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
-pplx-space-rpc-contracts = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-sql-codec = { workspace = true, optional = true }
-pplx-space-sql-locator = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
@@ -37,6 +33,7 @@ uuid = { workspace = true, features = ["v5", "v7"] }
 
 [dev-dependencies]
 pplx-space-cpu-arch = { workspace = true }
+pplx-space-guest-process = { workspace = true, features = ["serde"] }
 serde_json = { workspace = true }
 
 [features]
@@ -51,8 +48,6 @@ serde = [
     "uuid/serde",
     "pplx-space-semver/serde",
     "pplx-space-k8s-ids/serde",
-    "pplx-space-cluster-id/serde",
-    "pplx-space-guest-process/serde",
     "pplx-space-accounts/serde",
     "pplx-space-execution-spec/serde",
     "pplx-space-linux-ids/serde",

@@ -10,8 +10,7 @@
 //! single Datadog org can slice telemetry per cluster.
 //!
 //! It is its own crate so that code can name the cluster identity without
-//! depending on `pplx-space-common-core`. `pplx-space-common-core` re-exports
-//! it from `types::cluster`.
+//! depending on `pplx-space-common-core`: import it from here.
 
 use std::fmt;
 use std::str::FromStr;

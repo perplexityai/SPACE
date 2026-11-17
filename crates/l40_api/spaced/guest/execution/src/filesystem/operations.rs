@@ -299,7 +299,7 @@ pub(super) fn operation_failure(status: &Status) -> OperationFailure {
         message: status.message().to_owned(),
         reason: status
             .metadata()
-            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
             .and_then(|reason| reason.to_str().ok())
             .unwrap_or_default()
             .to_owned(),
@@ -312,7 +312,7 @@ fn failure_status(failure: OperationFailure) -> Status {
         && !failure.reason.is_empty()
     {
         status.metadata_mut().insert(
-            pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+            pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
             reason,
         );
     }

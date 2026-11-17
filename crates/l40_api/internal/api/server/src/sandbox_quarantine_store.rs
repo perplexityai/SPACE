@@ -4,7 +4,6 @@ use pplx_space_accounts::NodeId;
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     ExecutionGeneration, LocalArtifactId, QuarantineRecoveryPlanRejectionCause,
     SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxLifecycle,
@@ -23,6 +22,7 @@ use pplx_space_sandbox_portability::{
     suspended_projection_lifecycle_eligible_with_node_evidence,
 };
 use pplx_space_sandbox_store::ingest::TRANSITION_RECEIPT_RECORD_COLUMNS;
+use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
 use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;

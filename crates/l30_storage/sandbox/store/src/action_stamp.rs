@@ -128,8 +128,8 @@
 //! `suspending` bullets).
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_sql_locator::sql;
 
 /// How a start's substrate handles a `suspended` row, as far as its stamp
 /// is concerned.

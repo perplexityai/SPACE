@@ -8,7 +8,8 @@
 //! `template_build_base_grants` honours for the same submission.
 
 use pplx_space_accounts::{NodeId, OrgId, TenantPublicationGrantId};
-use pplx_space_common_core::{sql, types::TemplateName};
+use pplx_space_common_core::types::TemplateName;
+use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
 
 #[derive(Debug, thiserror::Error)]

@@ -51,7 +51,6 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, inflight_suspend_upload_from_node_exists,
@@ -61,6 +60,7 @@ use pplx_space_sandbox_residency::{
     RESIDENT_LIFECYCLES, ResidencyEvidence, active_resident_predicate, node_proves_sandbox_absent,
     non_resident_lifecycle_exclusion, occupies_node_predicate, resident_lifecycle,
 };
+use pplx_space_sql_locator::sql;
 use serde::Serialize;
 use time::OffsetDateTime;
 

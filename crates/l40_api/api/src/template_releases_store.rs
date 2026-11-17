@@ -1,13 +1,11 @@
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::{
-    sql,
-    types::{
-        TemplateArtifactDigest, TemplateArtifactDigestPrefix, TemplateDesiredState, TemplateName,
-        TemplateReference, TemplateSelector, TemplateTag, TemplateVisibility,
-    },
+use pplx_space_common_core::types::{
+    TemplateArtifactDigest, TemplateArtifactDigestPrefix, TemplateDesiredState, TemplateName,
+    TemplateReference, TemplateSelector, TemplateTag, TemplateVisibility,
 };
 use pplx_space_content_digest::{ContentHash, HashAlg};
 use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
 use uuid::Uuid;
 

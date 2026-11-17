@@ -3,10 +3,10 @@
 //! boots.
 
 use pplx_space_accounts::{NodeId, SandboxOwner};
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, insert_ready_worker_node};
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_sql_locator::sql;
 
 use super::*;
 use crate::controllers::substrate::environment_placement::EnvironmentPlacementGate;

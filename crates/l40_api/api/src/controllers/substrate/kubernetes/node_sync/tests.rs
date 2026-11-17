@@ -159,9 +159,9 @@ async fn sync_binds_a_registered_builder_to_its_node_uid() -> pplx_space_test_en
     use crate::controllers::substrate::kubernetes::tests::substrate_with_store_client_pods_and_nodes;
     use axum::http::{Method, Request, Response, StatusCode};
     use kube::client::{Body, ClientBuilder};
-    use pplx_space_common_core::sql;
     use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
     use pplx_space_node_registration_store::registered_node;
+    use pplx_space_sql_locator::sql;
 
     type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 

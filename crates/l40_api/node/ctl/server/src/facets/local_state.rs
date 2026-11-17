@@ -263,7 +263,7 @@ where
     Fut: Future<Output = Result<SbxStateResponse, tonic::Status>>,
 {
     let mut response = SbxStateResponse::default();
-    for ids in ids.chunks(pplx_space_common_core::inventory::READ_BATCH_ITEMS) {
+    for ids in ids.chunks(pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS) {
         let batch = fetch(ids.to_vec())
             .await
             .map_err(|error| format!("get sandbox state: {error}"))?;
@@ -360,7 +360,7 @@ pub(super) async fn fetch_sandbox_disk_usage(
         return BTreeMap::new();
     }
     let mut usage = BTreeMap::new();
-    for sandbox_ids in sandbox_ids.chunks(pplx_space_common_core::inventory::READ_BATCH_ITEMS) {
+    for sandbox_ids in sandbox_ids.chunks(pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS) {
         match client
             .get_disk_usage(Request::new(SbxGetDiskUsageRequest {
                 sandbox_ids: sandbox_ids.to_vec(),

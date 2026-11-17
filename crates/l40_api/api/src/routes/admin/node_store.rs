@@ -4,7 +4,7 @@
 //! state-machine, and audit logging; the SQL strings, row structs, and
 //! transaction-bound helpers live here.
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 

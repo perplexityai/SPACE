@@ -619,7 +619,7 @@ async fn resolve_fork_replay_org_id(
         return Ok(Some(api_key_org_id));
     };
 
-    sqlx::query_scalar(pplx_space_common_core::sql!(
+    sqlx::query_scalar(pplx_space_sql_locator::sql!(
         "SELECT id
          FROM organizations
          WHERE owner_source = 'federated_identity'

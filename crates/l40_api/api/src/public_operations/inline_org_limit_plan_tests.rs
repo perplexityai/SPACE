@@ -18,9 +18,9 @@
 //! [`super::plan_explain`].
 
 use pplx_space_accounts::{OrgId, UserId};
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_public_api::OperationState;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 

@@ -4,9 +4,9 @@ use std::path::Path;
 use rusqlite::{Connection, Result, params, types::Type};
 
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::sql;
 use pplx_space_net_common::NetworkPolicyV1;
 pub use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sql_locator::sql;
 use pplx_space_template_mgr_store::node_dirty_refs::{self, NodeDirtyRefRow};
 
 pub const DB_PATH: &str = pplx_space_host_layout::paths::TEMPLATE_MANAGER_DB;

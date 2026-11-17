@@ -14,7 +14,7 @@
 use std::cell::RefCell;
 
 use pplx_space_accounts::JobId;
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use rusqlite::params;
 
 use super::{Connection, OptionalExtension as _, Result};

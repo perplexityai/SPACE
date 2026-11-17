@@ -4,9 +4,9 @@ use pplx_space_common_core::types::{SandboxId, SubstrateKind};
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
 use pplx_space_sandbox_residency::ResidencyEvidence;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 

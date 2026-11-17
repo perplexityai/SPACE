@@ -1,7 +1,7 @@
 use pplx_space_accounts::NodeId;
 
 use super::*;
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 /// Reconcile a node's complete sandbox census against the cluster's own state,
 /// through [`pplx_space_sandbox_store::ingest::prune_census_absent_sandboxes`].

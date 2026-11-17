@@ -6,9 +6,9 @@ use axum::{
     Json,
     extract::{Query, State},
 };
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::NodeDrainMode;
 use pplx_space_public_api::{OperationId, PublicSandboxId};
+use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;

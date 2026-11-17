@@ -116,8 +116,8 @@
 //! refuses it with `FailedPrecondition` on a node without cluster-api wiring
 //! and otherwise takes a btrfs snapshot of the stopped sandbox.
 
-use pplx_space_common_core::sql;
 use pplx_space_postgres_pool::contention;
+use pplx_space_sql_locator::sql;
 use std::{fmt, sync::LazyLock, time::Duration};
 
 use pplx_space_accounts::NodeId;

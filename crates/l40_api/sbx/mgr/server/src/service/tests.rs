@@ -282,9 +282,10 @@ pub(crate) mod service_tests {
     use pplx_space_auto_lifecycle::{
         AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
     };
+    use pplx_space_cluster_id::ClusterId;
     use pplx_space_common_core::types::{
-        ArtifactKind, ArtifactOrigin, ClusterId, ExecutionGeneration, LocalArtifactId,
-        NodeManagedBy, RouteGeneration, SandboxActivationAttemptId, SandboxQuarantineHistoryAction,
+        ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeManagedBy,
+        RouteGeneration, SandboxActivationAttemptId, SandboxQuarantineHistoryAction,
         SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
         SandboxRouteIdentity, SpaceApiRouteIdentity,
     };
@@ -4377,7 +4378,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn paged_list_splits_at_the_encoded_budget_and_degrades_undecodable_rows() {
-        use pplx_space_common_core::inventory::MAX_ENCODED_BYTES;
+        use pplx_space_rpc_contracts::inventory::MAX_ENCODED_BYTES;
         let conn = crate::db::test_conn();
         let mut ids = (0..3)
             .map(|_| {
@@ -4444,7 +4445,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn an_encoded_budget_split_continues_a_pool_member_page_after_its_last_listed_member() {
-        use pplx_space_common_core::inventory::MAX_ENCODED_BYTES;
+        use pplx_space_rpc_contracts::inventory::MAX_ENCODED_BYTES;
         let window = crate::db::inventory_read::POOL_MEMBER_WINDOW_ROWS;
         let conn = crate::db::test_conn();
         let mut ids = (0..=window)
@@ -4501,7 +4502,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn unary_build_referencing_list_reports_rather_than_rejects_an_over_budget_inventory() {
-        use pplx_space_common_core::inventory::MAX_RAW_BYTES;
+        use pplx_space_rpc_contracts::inventory::MAX_RAW_BYTES;
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &id, SandboxState::Started);
@@ -4532,7 +4533,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn inventory_limits_are_errors_not_partial_or_degraded_success() {
-        use pplx_space_common_core::inventory::{MAX_ITEMS, MAX_RAW_BYTES};
+        use pplx_space_rpc_contracts::inventory::{MAX_ITEMS, MAX_RAW_BYTES};
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &id, SandboxState::Started);
@@ -7014,7 +7015,7 @@ pub(crate) mod service_tests {
     #[tokio::test]
     async fn inventory_requests_keep_all_ids_across_internal_batches() {
         let service = service_for_teardown_test(crate::db::test_conn());
-        let ids = (0..=pplx_space_common_core::inventory::READ_BATCH_ITEMS)
+        let ids = (0..=pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS)
             .map(|_| Uuid::now_v7().to_string())
             .collect::<Vec<_>>();
         assert_eq!(canonical_batched_sandbox_ids(&ids).unwrap(), ids);
@@ -7046,7 +7047,7 @@ pub(crate) mod service_tests {
 
     #[test]
     fn canonical_batched_sandbox_ids_bounds_raw_work_before_deduplication() {
-        use pplx_space_common_core::inventory::{MAX_ENCODED_BYTES, MAX_ITEMS};
+        use pplx_space_rpc_contracts::inventory::{MAX_ENCODED_BYTES, MAX_ITEMS};
         let id = Uuid::now_v7().to_string();
         assert_eq!(
             canonical_batched_sandbox_ids(&vec![id.clone(); MAX_ITEMS]).unwrap(),
@@ -7066,7 +7067,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn state_raw_budget_is_not_reset_between_internal_batches() {
-        use pplx_space_common_core::inventory::{MAX_RAW_BYTES, READ_BATCH_ITEMS};
+        use pplx_space_rpc_contracts::inventory::{MAX_RAW_BYTES, READ_BATCH_ITEMS};
         let conn = crate::db::test_conn();
         let mut ids = Vec::new();
         // Valid, padded JSON consumes raw-read budget but produces a tiny wire
@@ -18199,7 +18200,7 @@ pub(crate) mod service_tests {
                             network_context
                                 .expect_err("Kubernetes wake requires a network namespace")
                                 .message(),
-                            pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER
+                            pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER
                         );
                     }
                 }
@@ -22636,7 +22637,7 @@ pub(crate) mod service_tests {
     /// a transient cluster-api blip as terminal.
     mod reupload_cluster_api_env {
         use super::super::grpc_lifecycle::reupload_precondition_for_cluster_api_env;
-        use pplx_space_common_core::node_drain_signals::{
+        use pplx_space_rpc_contracts::node_drain_signals::{
             REUPLOAD_ARTIFACT_MISSING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
         };
 

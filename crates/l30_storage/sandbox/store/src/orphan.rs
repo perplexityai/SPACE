@@ -17,9 +17,9 @@ use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_k8s_ids::PodUid;
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
 use pplx_space_sandbox_residency::node_observes_sandbox;
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// The classification guard a statement here re-checks, with the values it

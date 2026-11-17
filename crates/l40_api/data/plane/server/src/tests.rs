@@ -12,8 +12,9 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519KeyId, ed25519::SpaceApiRouteEd25519Signer,
     ed25519::SpaceApiRouteEd25519Token,
 };
+use pplx_space_cluster_id::ClusterId;
 use pplx_space_common_core::types::{
-    ClusterId, ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
     SandboxRouteIdentity, SpaceApiRouteIdentity,
 };
 use pplx_space_durations::SimpleDuration;
@@ -5139,8 +5140,8 @@ fn ecw_answers_refusals_with_retry_after_and_full_disks_by_reason() {
 
     let mut quota = tonic::Status::resource_exhausted("Disk quota exceeded (os error 122)");
     quota.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
-        pplx_space_common_core::spaced::GUEST_STORAGE_FULL
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::GUEST_STORAGE_FULL
             .parse()
             .unwrap(),
     );

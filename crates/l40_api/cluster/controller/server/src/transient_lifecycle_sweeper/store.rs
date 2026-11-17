@@ -1,6 +1,6 @@
 //! Production [`SweepSink`] backed by Postgres and the substrate.
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

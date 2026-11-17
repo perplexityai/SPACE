@@ -4,10 +4,10 @@ use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_core::types::SubstrateKind;
 
-use pplx_space_common_core::sql;
 use pplx_space_durations::PositiveDuration;
 use pplx_space_sandbox_portability::failed_repair_revert_eligibility;
 use pplx_space_sandbox_store::repair;
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
 use super::{ApplyOutcome, RepairCandidate};

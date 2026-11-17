@@ -537,7 +537,7 @@ pub(crate) const DEFAULT_REUPLOAD_GIVEUP_SETTLE_SECS: u64 = 600;
 /// window is how long the substrate itself lets a pod-less generation be
 /// materializing.
 pub(crate) const MIN_POD_LESS_GIVEUP_STALE: Duration =
-    pplx_space_common_core::restore_ownership::RESTORE_EXECUTION_OWNERSHIP_TTL;
+    pplx_space_rpc_contracts::restore_ownership::RESTORE_EXECUTION_OWNERSHIP_TTL;
 /// The longest window the environment may set; a larger value clamps down to
 /// it, so a typo can't overflow the SQL interval and fail every tick.
 pub(crate) const MAX_POD_LESS_GIVEUP_STALE: Duration = Duration::from_secs(24 * 60 * 60);

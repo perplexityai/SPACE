@@ -678,9 +678,9 @@ fn ingress_iface_error_status(error: &crate::net::DefaultIfaceError) -> Status {
                 "pod network namespace is gone; the sandbox allocation is stale: {error}"
             ));
             status.metadata_mut().insert(
-                pplx_space_common_core::port_exposure_signals::EXPOSE_TERMINAL_REASON_METADATA_KEY,
+                pplx_space_rpc_contracts::port_exposure_signals::EXPOSE_TERMINAL_REASON_METADATA_KEY,
                 tonic::metadata::MetadataValue::from_static(
-                    pplx_space_common_core::port_exposure_signals::EXPOSE_TERMINAL_REASON_STALE_POD_NETNS,
+                    pplx_space_rpc_contracts::port_exposure_signals::EXPOSE_TERMINAL_REASON_STALE_POD_NETNS,
                 ),
             );
             status

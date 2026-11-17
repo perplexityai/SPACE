@@ -16,9 +16,9 @@ fn the_inline_wait_defaults_and_is_capped() {
 mod postgres {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use pplx_space_common_core::sql;
     use pplx_space_db_test_fixtures::TestDbResult;
     use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicErrorCode};
+    use pplx_space_sql_locator::sql;
     use tokio::sync::Notify;
 
     use pplx_space_service_lifecycle::DrainSignal;

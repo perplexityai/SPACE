@@ -70,7 +70,6 @@ mod kubernetes_tests {
         ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV,
         ed25519::SpaceApiRouteEd25519Authority,
     };
-    use pplx_space_common_core::sql;
     use pplx_space_common_core::types::{
         ArtifactKind, ArtifactOrigin, ExecutionGeneration, NodeAddress, NodeGroup, NodeGroupName,
         NodeGroupPolicy, NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole,
@@ -95,6 +94,7 @@ mod kubernetes_tests {
         operations as spaced_ops,
         proto::{SpacedStartProcessRequest, spaced_process_event},
     };
+    use pplx_space_sql_locator::sql;
 
     use sqlx::{PgPool, postgres::PgPoolOptions};
     use tokio::sync::Semaphore;
@@ -2061,7 +2061,7 @@ mod kubernetes_tests {
                 .is_none_or(|succeed_after| attempt < succeed_after)
             {
                 return Err(tonic::Status::failed_precondition(
-                    pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER,
+                    pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER,
                 ));
             }
             Ok(tonic::Response::new(
@@ -11522,7 +11522,7 @@ mod kubernetes_tests {
     /// still-stopping row) and must keep the execution active for retry.
     #[test]
     fn retire_skips_backup_for_missing_source_or_terminal_refusal() {
-        use pplx_space_common_core::artifact_backup_signals::{
+        use pplx_space_rpc_contracts::artifact_backup_signals::{
             CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER,
             CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER,
         };
@@ -14610,7 +14610,7 @@ mod kubernetes_tests {
         use super::super::support::{WakeRpcErrorDisposition, classify_wake_rpc_error};
 
         let error = tonic::Status::failed_precondition(
-            pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER,
+            pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER,
         );
 
         let disposition = classify_wake_rpc_error(&error);

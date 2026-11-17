@@ -17,7 +17,6 @@ use axum::http::StatusCode;
 use pplx_space_accounts::NodeId;
 use pplx_space_api_route::wait_ready_lifecycle_request;
 use pplx_space_cluster_pool::WarmPoolStore;
-use pplx_space_common_core::sql;
 use pplx_space_events::{
     CreateShapeSource, SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger,
     SandboxEventType,
@@ -26,6 +25,7 @@ use pplx_space_execution_spec::DiskIoLimits;
 use pplx_space_net_common::TlsInterception;
 use pplx_space_public_api::OperationId;
 use pplx_space_sandbox_store::{self as sandbox_store, delete::delete_with_dependents};
+use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::ReconcileReason;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{

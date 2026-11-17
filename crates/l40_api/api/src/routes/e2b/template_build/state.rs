@@ -18,7 +18,8 @@
 //!   sizing).
 //!
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::{sql, types::TemplateName};
+use pplx_space_common_core::types::TemplateName;
+use pplx_space_sql_locator::sql;
 use std::sync::Arc;
 
 use sqlx::PgPool;

@@ -1,9 +1,7 @@
 use super::{NetworkPolicyV1, TemplateRow};
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::{
-    sql,
-    types::{TemplateDesiredState, TemplateId, TemplateVisibility},
-};
+use pplx_space_common_core::types::{TemplateDesiredState, TemplateId, TemplateVisibility};
+use pplx_space_sql_locator::sql;
 use sqlx::{PgExecutor, types::Json};
 
 pub(super) async fn insert(

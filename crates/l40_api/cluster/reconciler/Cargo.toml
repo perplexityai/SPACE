@@ -28,6 +28,7 @@ pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-reconcile-metrics = { workspace = true }
+pplx-space-sql-locator = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 
 [dev-dependencies]

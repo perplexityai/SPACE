@@ -5,9 +5,10 @@ use pplx_space_api_route::ed25519::{
     SPACE_API_ROUTE_ED25519_ISSUER_ENV, SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
     SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV, SpaceApiRouteEd25519Authority,
 };
-use pplx_space_common_core::{sql, types::SandboxId};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db};
 use pplx_space_node_api_sim::{SimProcessSpec, SimWorkerHarness};
+use pplx_space_sql_locator::sql;
 use serde_json::json;
 use tokio_stream::StreamExt as _;
 use tower::ServiceExt as _;

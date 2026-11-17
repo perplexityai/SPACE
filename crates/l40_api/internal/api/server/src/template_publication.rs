@@ -1,9 +1,7 @@
 use super::{ClusterApiService, adapter::TemplateOrg};
 use pplx_space_accounts::{NodeId, OrgId, SystemPublicationGrantId, TenantPublicationGrantId};
-use pplx_space_common_core::{
-    sql,
-    types::{TemplateDesiredState, TemplateName},
-};
+use pplx_space_common_core::types::{TemplateDesiredState, TemplateName};
+use pplx_space_sql_locator::sql;
 use std::collections::BTreeSet;
 use tonic::Status;
 

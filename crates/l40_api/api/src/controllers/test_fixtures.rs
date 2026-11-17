@@ -1,8 +1,6 @@
-use pplx_space_common_core::{
-    sql,
-    types::{TemplateId, TemplateVisibility},
-};
+use pplx_space_common_core::types::{TemplateId, TemplateVisibility};
 use pplx_space_db_test_fixtures::TestDbResult;
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 use uuid::Uuid;
 

@@ -755,7 +755,7 @@ impl Harness {
     /// The execution the node publishes for the sandbox: the one the State
     /// RPC reads.
     fn published_execution(&self) -> Option<ExecutionMetadata> {
-        use pplx_space_common_core::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+        use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
         let mut budgets = crate::db::read::StateBudgets {
             raw: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
             metadata: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),

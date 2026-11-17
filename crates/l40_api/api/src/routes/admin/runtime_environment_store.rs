@@ -7,7 +7,7 @@
 //! Every read here is observational. Nothing takes a lock, and a count can be
 //! stale by the time the caller acts on it.
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 
 /// Sandboxes grouped by their environment binding and lifecycle.

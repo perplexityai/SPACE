@@ -30,7 +30,7 @@ mod readiness_stub {
 #[cfg(not(feature = "kubernetes"))]
 pub use readiness_stub::ReflectorReady;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::{
     collections::{BTreeMap, HashMap},
     future::Future,

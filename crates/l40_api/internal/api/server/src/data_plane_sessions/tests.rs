@@ -229,7 +229,7 @@ async fn rest_sandbox(
     lifecycle: SandboxLifecycle,
     operation: Option<(&str, &str)>,
 ) -> Result<(), sqlx::Error> {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
     let target_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string();
     sqlx::query(sql!(
         "UPDATE sandboxes
@@ -329,7 +329,7 @@ async fn a_route_is_at_rest_only_when_nothing_is_about_to_place_the_sandbox()
 #[tokio::test]
 async fn a_wake_finishing_after_the_route_row_was_read_leaves_the_route_retryable()
 -> pplx_space_db_test_fixtures::TestDbResult<()> {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     let pool = &db.pool;
     let node_id = NodeId::new();
@@ -446,8 +446,8 @@ fn a_reattach_asks_for_the_wake_the_node_would_allow() {
 #[tokio::test]
 async fn a_service_route_reset_is_fenced_by_the_current_route_generation()
 -> pplx_space_db_test_fixtures::TestDbResult<()> {
-    use pplx_space_common_core::sql;
     use pplx_space_common_core::types::SubstrateKind;
+    use pplx_space_sql_locator::sql;
     const PORT: u16 = 8080;
     const GENERATION: i64 = 3;
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
@@ -620,7 +620,7 @@ impl crate::ingress_activation::IngressActivation for QueuingOwner {
 #[tokio::test(flavor = "current_thread")]
 async fn a_reattach_wakes_an_unplaced_sandbox_whatever_its_direct_route_names()
 -> pplx_space_test_env::TestResult {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
         return Ok(());
     };

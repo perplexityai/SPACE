@@ -11,8 +11,8 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::SandboxId;
 
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use std::time::Duration;

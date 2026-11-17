@@ -38,11 +38,11 @@
 //! [`super::ResolvedPlacement::Unprovisioned`].
 
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy, NodeGroupTemplatePolicy,
     TemplateCompatSpec, TemplateName, TemplateVisibility,
 };
+use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
 /// A template's compatibility slice together with the cluster's node groups —

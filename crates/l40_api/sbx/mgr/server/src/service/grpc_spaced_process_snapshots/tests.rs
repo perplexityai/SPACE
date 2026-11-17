@@ -3,7 +3,7 @@ use crate::db::test_fixtures::state_write_fixtures::{admit_stop, complete_stop};
 
 #[test]
 fn snapshot_inventory_does_not_return_partial_success_for_oversized_sidecars() {
-    use pplx_space_common_core::inventory::MAX_ENCODED_BYTES;
+    use pplx_space_rpc_contracts::inventory::MAX_ENCODED_BYTES;
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("f-large");
     std::fs::create_dir(&directory).unwrap();

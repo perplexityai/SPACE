@@ -69,6 +69,7 @@ pplx-space-api = { workspace = true }
 pplx-space-api-route = { workspace = true }
 pplx-space-aws-client = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
+pplx-space-cluster-id = { workspace = true }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-cluster-reconciler = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["sqlx"] }
@@ -80,6 +81,7 @@ pplx-space-grpc-server = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
+pplx-space-rpc-contracts = { workspace = true }
 pplx-space-sandbox-pod = { workspace = true, optional = true }
 pplx-space-postgres-pool = { workspace = true }
 pplx-space-sandbox-quarantine-store = { workspace = true }
@@ -98,6 +100,7 @@ pplx-space-node-api-client = { workspace = true }
 pplx-space-public-api = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
+pplx-space-sql-locator = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-test-hooks = { workspace = true }
 

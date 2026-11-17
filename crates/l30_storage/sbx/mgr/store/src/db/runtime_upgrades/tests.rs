@@ -1369,7 +1369,7 @@ fn the_unretired_phase_list_is_the_fencing_phases_and_verified() {
 fn a_fencing_upgrades_retained_execution_is_charged_to_the_page_budget() {
     use crate::db::inventory_read::InventoryReadError;
     use crate::db::read::{StateBudgets, StatePageError, state_page};
-    use pplx_space_common_core::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+    use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
 
     let conn = test_conn();
     let envs = environments();
@@ -1420,7 +1420,7 @@ fn a_fencing_upgrades_retained_execution_is_charged_to_the_page_budget() {
 #[test]
 fn the_earliest_fencing_upgrade_is_the_one_published() {
     use crate::db::read::{StateBudgets, StatePageRow, state_page};
-    use pplx_space_common_core::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+    use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
 
     let conn = test_conn();
     let envs = environments();
@@ -1473,7 +1473,7 @@ fn the_earliest_fencing_upgrade_is_the_one_published() {
 #[test]
 fn an_unbound_sandbox_publishes_its_disks_execution_from_the_fence() {
     use crate::db::read::{StateBudgets, StatePageRow, state_page};
-    use pplx_space_common_core::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+    use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
 
     let conn = test_conn();
     let envs = environments();
@@ -1518,7 +1518,7 @@ fn an_unbound_sandbox_publishes_its_disks_execution_from_the_fence() {
 #[test]
 fn an_undecodable_retained_execution_degrades_only_its_own_sandbox() {
     use crate::db::read::{StateBudgets, StatePageRow, state_page};
-    use pplx_space_common_core::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+    use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
 
     let budgets = || StateBudgets {
         raw: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),

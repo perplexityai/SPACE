@@ -9,8 +9,7 @@
 //! must name the same constant, never restate the literal.
 //!
 //! It is its own crate so that services can share these contracts without
-//! depending on `pplx-space-common-core`. `pplx-space-common-core` re-exports
-//! each module at its old path.
+//! depending on `pplx-space-common-core`: import them from here.
 
 pub mod inventory;
 pub mod operation_budget;

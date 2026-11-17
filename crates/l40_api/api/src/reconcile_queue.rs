@@ -1,6 +1,7 @@
 use pplx_space_accounts::NodeId;
 
-use pplx_space_common_core::{sql, types::SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_sql_locator::sql;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 

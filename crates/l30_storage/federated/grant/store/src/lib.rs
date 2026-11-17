@@ -4,7 +4,7 @@ use pplx_space_accounts::OrgId;
 use pplx_space_common_core::types::SandboxId;
 
 use pplx_space_accounts::SandboxOwnerSource;
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use sqlx::{PgPool, Postgres};
 use time::OffsetDateTime;
 use uuid::Uuid;

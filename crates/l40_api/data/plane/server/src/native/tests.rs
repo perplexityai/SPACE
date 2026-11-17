@@ -402,8 +402,8 @@ async fn full_guest_storage_is_named_and_not_retryable() {
 
     let mut status = tonic::Status::resource_exhausted("No space left on device (os error 28)");
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
-        pplx_space_common_core::spaced::GUEST_STORAGE_FULL
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::GUEST_STORAGE_FULL
             .parse()
             .unwrap(),
     );
@@ -2198,7 +2198,7 @@ fn end(code: tonic::Code) -> FakeReply {
 
 fn with_reason(mut status: tonic::Status, reason: &'static str) -> tonic::Status {
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(reason),
     );
     status
@@ -2208,7 +2208,7 @@ fn with_reason(mut status: tonic::Status, reason: &'static str) -> tonic::Status
 fn cursor_ahead() -> FakeReply {
     FakeReply::End(with_reason(
         tonic::Status::out_of_range("fake"),
-        pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD,
+        pplx_space_guest_process::status::PROCESS_OUTPUT_CURSOR_AHEAD,
     ))
 }
 
@@ -2217,13 +2217,13 @@ fn cursor_ahead() -> FakeReply {
 fn lagged(first_retained: Option<u64>) -> FakeReply {
     let mut status = with_reason(
         tonic::Status::resource_exhausted(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED_MESSAGE,
         ),
-        pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED,
+        pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED,
     );
     if let Some(first_retained) = first_retained {
         status.metadata_mut().insert(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
             first_retained.into(),
         );
     }
@@ -2233,7 +2233,7 @@ fn lagged(first_retained: Option<u64>) -> FakeReply {
 /// Ends the stream as a guest older than the lag reason does on eviction.
 fn untagged_lagged() -> FakeReply {
     FakeReply::End(tonic::Status::resource_exhausted(
-        pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE,
+        pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED_MESSAGE,
     ))
 }
 

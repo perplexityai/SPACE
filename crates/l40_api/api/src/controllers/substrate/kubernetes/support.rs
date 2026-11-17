@@ -865,7 +865,7 @@ pub(super) fn classify_wake_rpc_error(error: &tonic::Status) -> WakeRpcErrorDisp
     if error.code() == Code::FailedPrecondition
         && error
             .message()
-            .contains(pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER)
+            .contains(pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER)
     {
         return WakeRpcErrorDisposition::ReadinessPoll("missing_runtime_context");
     }
@@ -988,7 +988,7 @@ pub(super) fn retire_can_skip_backup_enqueue_error(err: &SubstrateError) -> bool
         // (e.g. a still-stopping row, which sbx-mgr answers `Aborted`)
         // keeps the execution tracked for retry.
         SubstrateError::Conflict { message } => {
-            use pplx_space_common_core::artifact_backup_signals::{
+            use pplx_space_rpc_contracts::artifact_backup_signals::{
                 CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER,
                 CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER,
             };

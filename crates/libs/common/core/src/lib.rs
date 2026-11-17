@@ -27,11 +27,6 @@ pub mod types;
 pub mod archive;
 
 pub mod guest;
-pub use pplx_space_rpc_contracts::{
-    artifact_backup_signals, inventory, node_drain_signals, operation_budget,
-    port_exposure_signals, restore_ownership, wake_signals,
-};
-pub use pplx_space_sql_locator::sql;
 
 /// Legacy sandbox ID string helpers.
 ///
@@ -134,19 +129,6 @@ pub mod ids {
 
     #[cfg(test)]
     mod tests;
-}
-
-/// Constants shared with spaced host and guest components.
-pub mod spaced {
-    /// Maximum entries sent in one write batch.
-    pub use pplx_space_guest_process::MAX_WRITE_BATCH_ENTRIES;
-    /// Largest gRPC message the sandbox manager and the guest filesystem
-    /// decode; the node API's worker server enforces the same 4 MiB through
-    /// tonic's default. A write batch travels as one message, so it must fit;
-    /// streamed writes are split into smaller messages.
-    pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
-
-    pub use pplx_space_guest_process::status::*;
 }
 
 #[cfg(test)]

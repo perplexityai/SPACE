@@ -1,7 +1,5 @@
-use pplx_space_common_core::{
-    sql,
-    types::{SandboxId, SubstrateKind},
-};
+use pplx_space_common_core::types::{SandboxId, SubstrateKind};
+use pplx_space_sql_locator::sql;
 use std::time::{Duration, Instant};
 
 use pplx_space_sandbox_store::tombstone;

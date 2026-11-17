@@ -1,11 +1,9 @@
 //! Kubernetes registrations for node inventory, not direct-node template polling.
 
 use super::NodeRow;
-use pplx_space_common_core::{
-    sql,
-    types::{NodeRole, SubstrateKind},
-};
+use pplx_space_common_core::types::{NodeRole, SubstrateKind};
 use pplx_space_node_api_client::DEFAULT_PORT;
+use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
 
 pub(super) async fn list_kubernetes(

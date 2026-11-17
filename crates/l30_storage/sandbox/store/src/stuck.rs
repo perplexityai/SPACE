@@ -10,7 +10,7 @@ use pplx_space_common_core::types::SandboxLifecycle;
 
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 /// The census of one transient lifecycle.
 #[derive(Clone, Debug, PartialEq)]

@@ -19,8 +19,8 @@
 
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SubstrateKind};
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_routability::routable_execution_or_non_k8s;
+use pplx_space_sql_locator::sql;
 use sqlx::{PgExecutor, Postgres, Transaction};
 use uuid::Uuid;
 

@@ -13,10 +13,10 @@ use axum::{
 use base64::Engine;
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{Pod, PodIP, PodStatus};
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, pg_test_db};
 use pplx_space_node_api_sim::{SimWorkerHarness, state::status};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_sql_locator::sql;
 use rstest::{fixture, rstest};
 use serde::Deserialize;
 use serde_json::json;
@@ -1078,7 +1078,7 @@ async fn template_build_create_persists_authenticated_org(
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
-    let (name, org): (String, Option<OrgId>) = sqlx::query_as(pplx_space_common_core::sql!(
+    let (name, org): (String, Option<OrgId>) = sqlx::query_as(pplx_space_sql_locator::sql!(
         "SELECT template_id, org_id FROM template_build_jobs WHERE build_id = $1"
     ))
     .bind(body["buildID"].as_str().unwrap())
@@ -6018,7 +6018,7 @@ async fn template_build_rejects_another_orgs_inputs(
     #[case] body: &str,
 ) -> TestResult {
     let fixture = template_alias_fixture.await?;
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO template_build_jobs (template_id, build_id, daemon_job_id, org_id)
          VALUES ('tenant-inputs', 'foreign', $1, $2)"
     ))

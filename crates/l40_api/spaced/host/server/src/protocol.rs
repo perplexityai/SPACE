@@ -90,7 +90,7 @@ pub(super) fn map_write_request(request: WriteRequest) -> Result<WriteRequest, S
 pub(super) fn bridge_write_batch_request(
     request: WriteBatchRequest,
 ) -> Result<WriteBatchRequest, Status> {
-    if request.entries.len() > pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES {
+    if request.entries.len() > pplx_space_guest_process::MAX_WRITE_BATCH_ENTRIES {
         return Err(Status::invalid_argument("too many write_batch entries"));
     }
     request

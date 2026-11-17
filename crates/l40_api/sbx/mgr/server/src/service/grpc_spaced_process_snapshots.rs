@@ -910,7 +910,7 @@ impl SandboxManagerService {
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
         self.authorize_peer(&request, "ListSnapshots", ALLOW_SANDBOX_OBSERVER)?;
         let req = request.get_ref();
-        use pplx_space_common_core::inventory::{InventoryBudget, MAX_ENCODED_BYTES, MAX_ITEMS};
+        use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ENCODED_BYTES, MAX_ITEMS};
         use prost::Message as _;
         let mut request_budget = InventoryBudget::new(MAX_ITEMS, MAX_ENCODED_BYTES);
         for id in &req.sandbox_ids {
@@ -1036,7 +1036,7 @@ fn project_snapshot_inventory(
     btrfs: Vec<pplx_space_node_mgr_client::proto::BtrfsSnapshotInfo>,
     publications: Vec<crate::local_artifacts::NamedArtifactPublication>,
 ) -> Result<Vec<SnapshotDetail>, Status> {
-    use pplx_space_common_core::inventory::{
+    use pplx_space_rpc_contracts::inventory::{
         InventoryBudget, InventoryLimitExceeded, MAX_ENCODED_BYTES, MAX_ITEMS, MAX_RAW_BYTES,
     };
     use prost::Message as _;

@@ -176,7 +176,7 @@ pub fn lazy() -> SandboxManagerGrpcClient {
 
 /// Sandboxes requested per `List` page: one inventory-client round trip.
 const LIST_PAGE_SIZE: u32 = {
-    let size = pplx_space_common_core::inventory::READ_BATCH_ITEMS;
+    let size = pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS;
     assert!(size <= u32::MAX as usize);
     size as u32
 };

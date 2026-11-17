@@ -128,11 +128,11 @@ Reach for `Mutex<HashMap<_, _>>` or `RwLock<HashMap<_, _>>` only when you genuin
 ## SQL statements: wrap in the `sql!` locator macro
 
 Every SQL statement handed to `sqlx::query*` is wrapped in
-`pplx_space_sql_locator::sql!` (re-exported as `pplx_space_common_core::sql!`),
-which prepends a `/*module_path:line*/` comment to the statement:
+`pplx_space_sql_locator::sql!`, which prepends a `/*module_path:line*/`
+comment to the statement:
 
 ```rust
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 // Static SQL: expands to a `&'static str` via `concat!` — drop-in.
 sqlx::query(sql!("SELECT drain_phase FROM nodes WHERE id = $1"))
@@ -166,7 +166,8 @@ names that value and encodes as the column's text, so new code binds it as a
 parameter instead of spelling the literal:
 
 ```rust
-use pplx_space_common_core::{sql, types::SubstrateKind};
+use pplx_space_common_core::types::SubstrateKind;
+use pplx_space_sql_locator::sql;
 
 sqlx::query_scalar::<_, NodeId>(sql!(
     "SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = $2"

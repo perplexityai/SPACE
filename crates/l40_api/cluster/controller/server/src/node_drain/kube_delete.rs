@@ -28,7 +28,7 @@
 use pplx_space_accounts::NodeId;
 
 use kube::api::{DeleteParams, Preconditions};
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
 use super::{InstanceTerminator, TerminateError};

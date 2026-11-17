@@ -38,7 +38,6 @@ use pplx_space_durations::PositiveDuration;
 use std::fmt;
 use std::str::FromStr;
 
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{SandboxActivationAttemptId, SandboxLifecycleParseError};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_portability::{
@@ -49,6 +48,7 @@ use pplx_space_sandbox_portability::{
 use pplx_space_sandbox_routability::{
     routable_execution_or_non_k8s, routable_k8s_execution_exists,
 };
+use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
 
 /// SQL expression naming the lifecycle write a sweep just made.

@@ -65,7 +65,7 @@ async fn ghost_fanout_fixture() -> TestDbResult<GhostFanoutFixture> {
     let live_node_id = NodeId::new();
     let ghost_node_id = NodeId::new();
     for (node_id, node_name) in [(live_node_id, "live-node"), (ghost_node_id, "ghost-node")] {
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO nodes (id, role, managed_by, state)
              VALUES ($1, $2, $3, 'registered')"
         ))
@@ -74,7 +74,7 @@ async fn ghost_fanout_fixture() -> TestDbResult<GhostFanoutFixture> {
         .bind(NodeManagedBy::Kubernetes)
         .execute(&db.pool)
         .await?;
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
         ))
         .bind(node_id)
@@ -144,7 +144,7 @@ async fn fanout_resolves_live_nodes_once_and_dead_letters_ghosts_without_resolvi
         *resolver.resolved_node_names.lock().await,
         vec!["live-node".to_string()]
     );
-    let states = sqlx::query_as::<_, (NodeId, bool, String)>(pplx_space_common_core::sql!(
+    let states = sqlx::query_as::<_, (NodeId, bool, String)>(pplx_space_sql_locator::sql!(
         "SELECT node_id, dead_at IS NOT NULL, dead_reason
          FROM node_reconcile_triggers
          WHERE node_id = ANY($1)"

@@ -2,7 +2,7 @@ use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::SnapshotId;
 use pplx_space_common_core::types::SubstrateKind;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};

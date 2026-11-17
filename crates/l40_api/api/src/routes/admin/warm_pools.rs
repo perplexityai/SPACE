@@ -4,8 +4,8 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use pplx_space_common_core::sql;
 use pplx_space_execution_spec::DiskIoLimits;
+use pplx_space_sql_locator::sql;
 use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;

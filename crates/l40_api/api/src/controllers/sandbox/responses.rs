@@ -1,9 +1,9 @@
 use pplx_space_common_core::types::SandboxId;
 
 use super::*;
-use pplx_space_common_core::sql;
 use pplx_space_net_common::NetworkPolicy;
 use pplx_space_sandbox_store as sandbox_store;
+use pplx_space_sql_locator::sql;
 
 use super::lifecycle::SandboxAction;
 

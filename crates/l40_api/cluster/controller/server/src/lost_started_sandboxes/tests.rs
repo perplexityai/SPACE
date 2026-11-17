@@ -544,9 +544,9 @@ async fn t12_absence_must_last_the_grace_and_restarts_on_return() {
 // -----------------------------------------------------------------
 
 mod postgres_backed {
-    use pplx_space_common_core::sql;
     use pplx_space_common_core::types::SnapshotId;
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+    use pplx_space_sql_locator::sql;
     use pplx_space_test_env::TestResult;
     use sqlx::PgPool;
 

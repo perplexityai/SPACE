@@ -470,9 +470,9 @@ fn guest_missing() -> Reply {
 fn storage_full() -> Reply {
     let mut status = Status::resource_exhausted("No space left on device (os error 28)");
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::GUEST_STORAGE_FULL,
+            pplx_space_guest_process::status::GUEST_STORAGE_FULL,
         ),
     );
     failed_stat(status)

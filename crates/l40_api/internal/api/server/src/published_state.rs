@@ -1,7 +1,7 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{SnapshotId, SubstrateKind};
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::types::Json;
