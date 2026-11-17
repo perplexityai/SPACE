@@ -271,6 +271,13 @@ impl NodeManagerService {
         self.cleanup_operations.stop_admitting();
     }
 
+    /// Ask admitted artifact mutations to stop before their next phase. The
+    /// drain calls this once its budget runs out, so the process still exits
+    /// within its grace period.
+    pub fn cancel_admitted_artifact_work(&self) {
+        self.artifact_work_cancel.cancel();
+    }
+
     pub(super) async fn cleanup_sandbox(
         &self,
         request: Request<CleanupSandboxRequest>,

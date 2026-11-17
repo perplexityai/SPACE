@@ -715,6 +715,7 @@ pub(super) mod service_tests {
             send_source_locks: Default::default(),
             send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             artifact_work: None,
+            artifact_work_cancel: tokio_util::sync::CancellationToken::new(),
             device_op_tasks: tokio_util::task::TaskTracker::new(),
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,

@@ -205,6 +205,9 @@ pub struct NodeManagerService {
     send_source_locks: SandboxCgroupFamilyLocks,
     send_source_slots: std::sync::Arc<tokio::sync::Semaphore>,
     artifact_work: Option<std::sync::Arc<filesystem_work::ArtifactWork>>,
+    /// Cancels admitted artifact mutations. Shutdown leaves them running and
+    /// cancels them only once the drain budget runs out.
+    artifact_work_cancel: tokio_util::sync::CancellationToken,
     /// Shared drain ownership for detached mutations and lifecycle permits.
     device_op_tasks: tokio_util::task::TaskTracker,
     blocking_probe_slots: std::sync::Arc<tokio::sync::Semaphore>,
@@ -423,6 +426,7 @@ impl NodeManagerService {
             send_source_locks: Default::default(),
             send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             artifact_work: None,
+            artifact_work_cancel: tokio_util::sync::CancellationToken::new(),
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,
             )),

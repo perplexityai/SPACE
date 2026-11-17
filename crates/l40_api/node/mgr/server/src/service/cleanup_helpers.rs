@@ -91,14 +91,12 @@ impl NodeManagerService {
         let span = tracing::Span::current();
         self.device_op_tasks
             .spawn_blocking(move || {
+                // Cancellation stops work before a section, never discards the
+                // result of one that ran.
                 if let Some(owner) = &owner {
                     owner.check()?;
                 }
-                let result = span.in_scope(section);
-                if let Some(owner) = &owner {
-                    owner.check()?;
-                }
-                result
+                span.in_scope(section)
             })
             .await
             .map_err(|error| {
