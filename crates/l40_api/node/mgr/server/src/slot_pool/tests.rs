@@ -144,7 +144,7 @@ mod slot_pool_tests {
             query_startup_leases(&pool.db.lock().unwrap()).unwrap();
         for _ in 0..=MAX_SLOT_TRANSIENT_VALIDATION_RETRIES {
             let ValidationTaskResult::RuntimeUnknown(update) =
-                validate_startup_runtime(info.clone(), false, LeaseLiveness::Live)
+                validate_startup_runtime(info.clone(), false, LeaseLiveness::Live, false)
             else {
                 panic!("host readiness must defer rather than validate the missing namespace");
             };
@@ -337,6 +337,170 @@ mod slot_pool_tests {
         assert!(record(&pool, 0).memory_reservation_mib.is_some());
     }
 
+    /// A leased slot with no runtime, as an activation leaves it between its
+    /// allocation and its launch, last written `age` before now.
+    fn runtimeless_startup_lease(age: Duration) -> std::sync::Arc<NetworkPool> {
+        let config = NetworkPoolConfig::new(1);
+        let mut pool = test_pool(config.clone());
+        let leases = {
+            let mut conn = pool.db.lock().unwrap();
+            conn.execute(
+                "UPDATE network_slots SET state = 'leased', sandbox_id = ?1, generation = 7,
+                     pid = NULL, memory_reservation_mib = 8320, health = 'healthy',
+                     last_error = NULL, updated_at = ?2
+                 WHERE slot_id = 0",
+                rusqlite::params![
+                    SandboxId::new().to_string(),
+                    SqliteU64(now_secs() - age.as_secs())
+                ],
+            )
+            .unwrap();
+            // The startup steps NetworkPool::open runs on it.
+            let young =
+                query_startup_young_leases(&conn, now_secs(), STARTUP_YOUNG_LEASE_GRACE).unwrap();
+            reconcile_runtime_state(&mut conn, &config, &young).unwrap();
+            (query_startup_leases(&conn).unwrap(), young)
+        };
+        let mutable_pool = std::sync::Arc::get_mut(&mut pool).unwrap();
+        mutable_pool.startup_leases = Mutex::new(leases.0);
+        mutable_pool.startup_young_leases = leases.1;
+        pool
+    }
+
+    // The runtime reconcile at open leaves a young lease without a runtime for
+    // startup validation, and dirties one older than the grace as before.
+    #[test]
+    fn startup_reconcile_leaves_a_young_runtimeless_lease_leased() {
+        let young = runtimeless_startup_lease(Duration::from_secs(1));
+        assert_eq!(record(&young, 0).state, SlotState::Leased);
+        let old = runtimeless_startup_lease(STARTUP_YOUNG_LEASE_GRACE + Duration::from_secs(1));
+        assert_eq!(record(&old, 0).state, SlotState::Dirty);
+    }
+
+    // A lease the predecessor allocated moments before this process started
+    // belongs to an activation that has not launched yet: startup validation
+    // keeps it for that activation instead of resetting the slot under it, and
+    // the activation launches on it after the grace ends.
+    #[tokio::test]
+    async fn startup_validation_keeps_a_lease_allocated_just_before_startup() {
+        let mut pool = runtimeless_startup_lease(Duration::from_secs(1));
+        assert!(
+            validate_live_leased_slots(pool.clone()).await.unwrap(),
+            "a young lease is rechecked later"
+        );
+        let row = record(&pool, 0);
+        assert_eq!(row.state, SlotState::Leased);
+        assert_eq!(row.memory_reservation_mib, Some(8320));
+        // The recheck writes nothing: a successor's grace is still fixed by the
+        // allocation, and the lease keeps the allocation's health.
+        assert_eq!(row.health, SlotHealth::Healthy);
+        assert_eq!(row.last_error, None);
+        let regranted = {
+            let conn = pool.db.lock().unwrap();
+            query_startup_young_leases(&conn, now_secs(), STARTUP_YOUNG_LEASE_GRACE).unwrap()
+        };
+        let pid = std::process::id() + 1;
+        pool.set_pid(&row.info.sandbox_id, pid).unwrap();
+        // The grace was fixed when the pool opened; let it run out.
+        let mutable_pool = std::sync::Arc::get_mut(&mut pool).unwrap();
+        assert_eq!(regranted, mutable_pool.startup_young_leases);
+        for grace_ends in mutable_pool.startup_young_leases.values_mut() {
+            *grace_ends = now_secs();
+        }
+        assert!(!validate_live_leased_slots(pool.clone()).await.unwrap());
+        let row = record(&pool, 0);
+        assert_eq!(row.state, SlotState::Leased);
+        assert_eq!(row.info.pid, Some(pid));
+        assert_eq!(row.memory_reservation_mib, Some(8320));
+    }
+
+    // Inside its grace a lease without live runtime evidence is rechecked
+    // without a write, whether the evidence says gone or cannot tell, so no
+    // write renews the grace a successor computes. Live evidence is validated
+    // as before.
+    #[test]
+    fn startup_validation_rechecks_a_young_lease_without_a_write_unless_it_is_live() {
+        let pool = runtimeless_startup_lease(Duration::from_secs(1));
+        let info = record(&pool, 0).info;
+        for evidence in [LeaseLiveness::Gone, LeaseLiveness::Unknown] {
+            assert!(matches!(
+                validate_startup_runtime(info.clone(), true, evidence, true),
+                ValidationTaskResult::Deferred
+            ));
+        }
+        assert!(matches!(
+            validate_startup_runtime(info.clone(), false, LeaseLiveness::Live, true),
+            ValidationTaskResult::RuntimeUnknown(_)
+        ));
+        // Once the grace ends the same evidence is recorded and acted on.
+        assert!(matches!(
+            validate_startup_runtime(info.clone(), true, LeaseLiveness::Unknown, false),
+            ValidationTaskResult::RuntimeUnknown(_)
+        ));
+        assert!(matches!(
+            validate_startup_runtime(info, true, LeaseLiveness::Gone, false),
+            ValidationTaskResult::Update(StartupLeaseUpdate::Gone(_))
+        ));
+    }
+
+    // Once its grace ends, a lease that still has no runtime is an orphan and
+    // is reset, as one older than the grace is at once.
+    #[tokio::test]
+    async fn startup_validation_resets_a_runtimeless_lease_once_its_grace_ends() {
+        let old = runtimeless_startup_lease(STARTUP_YOUNG_LEASE_GRACE + Duration::from_secs(1));
+        assert!(!validate_live_leased_slots(old.clone()).await.unwrap());
+        assert_eq!(record(&old, 0).state, SlotState::Dirty);
+
+        let mut young = runtimeless_startup_lease(Duration::from_secs(1));
+        assert!(validate_live_leased_slots(young.clone()).await.unwrap());
+        // The grace was fixed when the pool opened; let it run out.
+        for grace_ends in std::sync::Arc::get_mut(&mut young)
+            .unwrap()
+            .startup_young_leases
+            .values_mut()
+        {
+            *grace_ends = now_secs();
+        }
+        assert!(!validate_live_leased_slots(young.clone()).await.unwrap());
+        assert_eq!(record(&young, 0).state, SlotState::Dirty);
+    }
+
+    #[test]
+    fn only_leases_written_within_the_grace_are_young() {
+        let pool = test_pool(NetworkPoolConfig::new(5));
+        let conn = pool.db.lock().unwrap();
+        let now = now_secs();
+        let pid = std::process::id() + 1;
+        for (slot, age, state, pid) in [
+            (0, 10, "leased", None),
+            (1, 91, "leased", None),
+            (2, 10, "ready", None),
+            // Launched: a missing runtime means it died, not that it is pending.
+            (3, 10, "leased", Some(pid)),
+            // Interrupted mid-setup: its allocation failed, so it is repaired.
+            (4, 10, "leasing", None),
+        ] {
+            conn.execute(
+                "UPDATE network_slots SET state = ?1, sandbox_id = ?2, pid = ?3, updated_at = ?4
+                 WHERE slot_id = ?5",
+                rusqlite::params![
+                    state,
+                    format!("sandbox-{slot}"),
+                    pid,
+                    SqliteU64(now - age),
+                    slot
+                ],
+            )
+            .unwrap();
+        }
+        let young = query_startup_young_leases(&conn, now, STARTUP_YOUNG_LEASE_GRACE).unwrap();
+        let slots: Vec<_> = young
+            .iter()
+            .map(|(key, ends)| (key.slot_id, *ends))
+            .collect();
+        assert_eq!(slots, vec![(0, now - 10 + 90)]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn startup_health_recovery_retries_uncertainty_without_releasing_ownership() {
         for resolution in ["gone", "generation", "release"] {
@@ -509,7 +673,7 @@ mod slot_pool_tests {
                     assert_lease_process_stopped_with(&record.info, liveness).is_ok(),
                     liveness == LeaseLiveness::Gone
                 );
-                let updates = runtime_reconcile_updates(vec![record], |_| liveness);
+                let updates = runtime_reconcile_updates(vec![record], |_| liveness, |_| false);
                 match (state, liveness) {
                     (_, LeaseLiveness::Gone) => assert!(matches!(
                         updates.as_slice(),
@@ -1562,7 +1726,7 @@ mod slot_pool_tests {
             .unwrap();
 
             reconcile_startup(&conn, &config).unwrap();
-            reconcile_runtime_state(&mut conn, &config).unwrap();
+            reconcile_runtime_state(&mut conn, &config, &HashMap::new()).unwrap();
         }
 
         let stale = record(&pool, 0);
@@ -1603,7 +1767,7 @@ mod slot_pool_tests {
             .unwrap();
 
             reconcile_startup(&conn, &config).unwrap();
-            reconcile_runtime_state(&mut conn, &config).unwrap();
+            reconcile_runtime_state(&mut conn, &config, &HashMap::new()).unwrap();
         }
 
         let stale = record(&pool, 0);
@@ -1632,7 +1796,7 @@ mod slot_pool_tests {
             memory_reservation_mib: Some(8320),
         };
 
-        let updates = runtime_reconcile_updates(vec![record], |_| LeaseLiveness::Live);
+        let updates = runtime_reconcile_updates(vec![record], |_| LeaseLiveness::Live, |_| false);
 
         assert!(matches!(
             updates.as_slice(),
@@ -1710,7 +1874,7 @@ mod slot_pool_tests {
             memory_reservation_mib: Some(8320),
         };
 
-        let updates = runtime_reconcile_updates(vec![record], |_| LeaseLiveness::Live);
+        let updates = runtime_reconcile_updates(vec![record], |_| LeaseLiveness::Live, |_| false);
 
         assert!(matches!(
             updates.as_slice(),
