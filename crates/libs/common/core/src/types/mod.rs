@@ -16,6 +16,7 @@
 //! # use pplx_space_common_core::types::*;
 //! # use pplx_space_execution_spec::{ComputeShape, CpuLimit};
 //! # use pplx_space_byte_size::MemorySize;
+//! # use pplx_space_template_model::TemplateName;
 //! let sandbox_id = SandboxId::new();
 //! let template = TemplateName::parse("seed").unwrap();
 //! let memory = MemorySize::gib(4).unwrap();
@@ -40,7 +41,6 @@ pub mod sandbox;
 pub mod sandbox_artifact;
 pub mod snapshot;
 pub mod subject;
-pub mod template;
 
 #[cfg(feature = "serde")]
 pub use admin::*;
@@ -56,14 +56,3 @@ pub use sandbox::*;
 pub use sandbox_artifact::*;
 pub use snapshot::*;
 pub use subject::{SubjectId, SubjectIdParseError, SubjectKind};
-pub use template::{
-    BuildRunId, BuildRunIdParseError, DEFAULT_TEMPLATE_TAG, ORPHANED_SANDBOX_TEMPLATE, OwnerType,
-    ResolvedTemplateReference, ResolvedTemplateVariant, RuntimeScopedTemplateReference,
-    SystemTemplate, SystemTemplateParseError, TemplateArtifactDigest, TemplateArtifactDigestPrefix,
-    TemplateBuildId, TemplateBuildJobState, TemplateBuildJobStateParseError, TemplateBuildState,
-    TemplateCachePartition, TemplateDesiredState, TemplateDesiredStateParseError, TemplateId,
-    TemplateIndexDigest, TemplateIndexDigestPrefix, TemplateName, TemplateParseError,
-    TemplateReference, TemplateReferenceParseError, TemplateReferenceResolveError,
-    TemplateSelector, TemplateTag, TemplateTagParseError, TemplateVisibility,
-    TemplateVisibilityParseError,
-};

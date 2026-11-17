@@ -21,7 +21,7 @@ use pplx_space_accounts::NodeId;
 use serde::{Deserialize, Serialize};
 
 use crate::types::node_group::{NodeGroupName, NodeGroupTemplatePolicy};
-use crate::types::template::{TemplateName, TemplateVisibility};
+use pplx_space_template_model::{TemplateName, TemplateVisibility};
 
 /// Response shape for `GET /admin/api/v1/nodes` (each element) and
 /// `GET /admin/api/v1/nodes/{node}`.

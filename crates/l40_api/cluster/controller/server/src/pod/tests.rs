@@ -12,8 +12,7 @@ use pplx_space_accounts::SandboxOwner;
 use pplx_space_byte_size::MemorySize;
 use pplx_space_cluster_pool::{PoolSlot, PoolSlotState};
 use pplx_space_common_core::types::{
-    NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy, TemplateCompatSpec, TemplateName,
-    TemplateVisibility,
+    NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy, TemplateCompatSpec,
 };
 use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_execution_spec::VcpuCount;
@@ -28,6 +27,7 @@ use pplx_space_sandbox_pod::{
     SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_ROLE_WARM, SANDBOX_POOL_SLOT_ID_KEY,
     SANDBOX_TEMPLATE_ANNOTATION, SANDBOX_VCPU_ANNOTATION, SandboxRuntimePodMetadata,
 };
+use pplx_space_template_model::{TemplateName, TemplateVisibility};
 use time::OffsetDateTime;
 
 use super::*;

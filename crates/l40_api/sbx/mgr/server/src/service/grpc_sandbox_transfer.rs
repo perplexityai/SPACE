@@ -680,7 +680,7 @@ async fn write_imported_sandbox_metadata(
     let parsed_sandbox_id = sandbox_id
         .parse::<SandboxId>()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let template = pplx_space_common_core::types::TemplateName::parse(&header.template_id)
+    let template = pplx_space_template_model::TemplateName::parse(&header.template_id)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let content_hash = header
         .content_hash

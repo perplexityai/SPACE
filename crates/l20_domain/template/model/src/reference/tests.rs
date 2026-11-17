@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::template::hash::Digest;
+use crate::hash::Digest;
 
 const ARTIFACT_HEX_A: &str =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";

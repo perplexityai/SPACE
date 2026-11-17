@@ -1,8 +1,8 @@
 use super::*;
-use pplx_space_common_core::types::TemplateName;
 use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_template_mgr_client::proto::RegisterTemplateResponse;
+use pplx_space_template_model::TemplateName;
 
 fn hash() -> String {
     format!("sha256:{}", "a".repeat(64))

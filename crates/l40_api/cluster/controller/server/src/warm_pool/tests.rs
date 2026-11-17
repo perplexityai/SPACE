@@ -24,7 +24,6 @@ use kube::{
 };
 use pplx_space_api::controllers::substrate::direct::DirectSubstrate;
 use pplx_space_byte_size::MemorySize;
-use pplx_space_common_core::types::TemplateName;
 use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
 use pplx_space_execution_spec::VcpuCount;
@@ -36,6 +35,7 @@ use pplx_space_sandbox_pod::{
     SANDBOX_NODE_SELECTOR_VALUE_ENV, SANDBOX_POD_IMAGE_ENV, SANDBOX_POOL_CONFIG_ID_KEY,
     SANDBOX_POOL_ROLE_KEY,
 };
+use pplx_space_template_model::TemplateName;
 
 use time::OffsetDateTime;
 use tokio::{net::TcpListener, sync::oneshot};

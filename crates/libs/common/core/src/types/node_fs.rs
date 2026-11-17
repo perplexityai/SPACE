@@ -21,8 +21,8 @@ use std::path::{Component, Path, PathBuf};
 
 use super::sandbox::SandboxId;
 use super::snapshot::SnapshotName;
-use super::template::TemplateBuildId;
 use pplx_space_host_layout::paths::{SANDBOX_CACHE_DIR, SANDBOX_RUN_DIR, TEMPLATE_DIR};
+use pplx_space_template_model::TemplateBuildId;
 
 /// Directory name used under a sandbox cache directory for snapshots.
 pub const SNAPSHOT_DIR_NAME: &str = "snapshots";
@@ -39,7 +39,7 @@ pub const TEMPLATE_ROOTFS_ZSTD_LEVEL: i32 = 3;
 pub fn template_build_dir(
     template: &str,
     content_hash: &str,
-    partition: crate::types::TemplateCachePartition,
+    partition: pplx_space_template_model::TemplateCachePartition,
 ) -> String {
     let build = partition.build_dir_name(content_hash);
     format!("{TEMPLATE_DIR}/{template}/{build}")
@@ -49,7 +49,7 @@ pub fn template_build_dir(
 pub fn template_snapshot_dir(
     template: &str,
     content_hash: &str,
-    partition: crate::types::TemplateCachePartition,
+    partition: pplx_space_template_model::TemplateCachePartition,
     vcpu: u32,
     memory_mib: u32,
 ) -> String {
@@ -185,6 +185,7 @@ impl NodeSandboxRunDir {
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_template_model::{TemplateBuildId, TemplateName};
 /// # use pplx_space_content_digest::{ContentHash, Digest};
 /// let root = NodeSpacePath::parse("/space")?;
 /// let template = TemplateName::parse("seed")?;
@@ -205,6 +206,7 @@ impl NodeTemplateRootfsPath {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_template_model::{TemplateBuildId, TemplateName};
     /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let root = NodeSpacePath::parse("/space")?;
     /// let template = TemplateName::parse("seed")?;
@@ -230,6 +232,7 @@ impl NodeTemplateRootfsPath {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_template_model::{TemplateBuildId, TemplateName};
     /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let root = NodeSpacePath::parse("/space")?;
     /// let template = TemplateName::parse("seed")?;

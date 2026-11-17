@@ -70,6 +70,7 @@ pplx-space-cluster-id = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-rpc-contracts = { workspace = true }
 pplx-space-template-runtime = { workspace = true }
+pplx-space-template-model = { workspace = true }
 pplx-space-btrfs = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-host-linux = { workspace = true }

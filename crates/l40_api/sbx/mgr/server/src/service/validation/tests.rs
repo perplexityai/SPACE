@@ -445,7 +445,7 @@ fn memory_state_support_follows_complete_environment_identity() {
 /// environment), and otherwise only the binding's own partition.
 #[test]
 fn a_capture_publishes_under_the_partition_template_manager_names() {
-    use pplx_space_common_core::types::TemplateCachePartition;
+    use pplx_space_template_model::TemplateCachePartition;
     let hash = format!("sha256:{}", "a".repeat(64));
     let initial = pplx_space_node_runtime_core::catalog::initial_environment_reference();
     let twin = EnvironmentReference::new(pplx_space_content_digest::Digest::sha256([2; 32]));

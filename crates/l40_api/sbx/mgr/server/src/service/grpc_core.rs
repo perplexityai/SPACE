@@ -1336,7 +1336,7 @@ fn project_template_catalog(
         pplx_space_template_mgr_client::proto::TemplateFullInfo,
     >::new();
     for build in builds {
-        pplx_space_common_core::types::TemplateName::parse(&build.name).map_err(|error| {
+        pplx_space_template_model::TemplateName::parse(&build.name).map_err(|error| {
             Status::data_loss(format!("invalid template catalog name: {error}"))
         })?;
         let hash = build.content_hash.as_deref().ok_or_else(|| {
@@ -1369,7 +1369,7 @@ fn project_template_catalog(
             // sends none, and all its builds are legacy. The partition only
             // locates supplemental metadata, so an unreadable one reads the
             // legacy dir rather than failing the whole listing.
-            use pplx_space_common_core::types::TemplateCachePartition;
+            use pplx_space_template_model::TemplateCachePartition;
             let partition = match build.cache_partition.as_deref() {
                 None => TemplateCachePartition::Legacy,
                 Some(key) => TemplateCachePartition::from_key(key).unwrap_or_else(|error| {

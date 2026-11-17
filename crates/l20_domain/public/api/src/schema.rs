@@ -136,7 +136,7 @@ pub(crate) fn page_cursor(generator: &mut SchemaGenerator) -> Schema {
 pub(crate) fn template_reference(generator: &mut SchemaGenerator) -> Schema {
     // `name` is bounded at 255 bytes and a tag at 128 by the parser, so the
     // longest reference is `name:tag`. Those two bounds are literals in
-    // `pplx_space_common_core::types::template`, so
+    // `pplx_space_template_model`, so
     // `sandbox_create_schema_tracks_public_wire_parsing` is what keeps this
     // honest.
     const MAX_TEMPLATE_REFERENCE_BYTES: usize = 255 + 1 + 128;

@@ -7,7 +7,7 @@ fn payload() -> StampPayload {
     StampPayload::new(
         "seed",
         "sha256:deadbeef",
-        pplx_space_common_core::types::TemplateCachePartition::Legacy,
+        pplx_space_template_model::TemplateCachePartition::Legacy,
     )
 }
 
@@ -17,7 +17,7 @@ fn stamp_payload_written_before_partitions_is_a_legacy_job() {
         serde_json::from_str(r#"{"name":"seed","content_hash":"sha256:deadbeef"}"#).unwrap();
     assert_eq!(
         payload.partition(),
-        pplx_space_common_core::types::TemplateCachePartition::Legacy
+        pplx_space_template_model::TemplateCachePartition::Legacy
     );
     assert_eq!(payload.dedup_key(), "seed@sha256:deadbeef");
     // Legacy payloads serialize exactly as before, so older binaries read them.
@@ -29,9 +29,9 @@ fn stamp_payload_written_before_partitions_is_a_legacy_job() {
 
 #[test]
 fn stamp_payload_round_trips_an_environment_partition() {
-    use pplx_space_common_core::types::TemplateCachePartition;
     use pplx_space_content_digest::Digest;
     use pplx_space_execution_spec::EnvironmentReference;
+    use pplx_space_template_model::TemplateCachePartition;
     let environment = EnvironmentReference::new(Digest::sha256([9; 32]));
     let payload = StampPayload::new(
         "seed",

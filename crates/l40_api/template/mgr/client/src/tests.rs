@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use pplx_space_common_core::types::TemplateReference;
+use pplx_space_template_model::TemplateReference;
 
 use super::proto::TemplateRef;
 

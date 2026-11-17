@@ -4,7 +4,7 @@ use uuid::Uuid;
 use pplx_space_accounts::{
     NodeId, OrgId, UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId, UserId,
 };
-use pplx_space_common_core::types::{SnapshotId, TemplateReference};
+use pplx_space_common_core::types::SnapshotId;
 use pplx_space_db_test_fixtures::{
     insert_suspended_sandbox, insert_uploading_snapshot, pg_test_db,
 };
@@ -13,6 +13,7 @@ use pplx_space_public_api::{
     OperationId, OperationTargetType, PublicSandboxMetadataValue,
     SandboxResources as PublicSandboxResources,
 };
+use pplx_space_template_model::TemplateReference;
 
 use super::*;
 

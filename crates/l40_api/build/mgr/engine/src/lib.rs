@@ -27,7 +27,6 @@ use std::time::{Duration, Instant};
 
 pub use crate::metrics::TemplateBuildErrorKind;
 use pplx_space_accounts::BUILDER_SANDBOX_OWNER;
-use pplx_space_common_core::types::{DEFAULT_TEMPLATE_TAG, TemplateBuildId};
 use pplx_space_content_digest::ContentHash;
 use pplx_space_guest_process::DEFAULT_GUEST_USER;
 use pplx_space_host_layout::identities::group_names;
@@ -43,6 +42,7 @@ use pplx_space_sbx_mgr_client::proto::{CreateRequest, DeleteRequest, StartReques
 use pplx_space_template_mgr_client::proto::{
     DeleteTemplateBuildRequest, ListTemplatesRequest, RegisterTemplateRequest, TemplateRef,
 };
+use pplx_space_template_model::{DEFAULT_TEMPLATE_TAG, TemplateBuildId};
 use tempfile::TempDir;
 use tracing::Instrument as _;
 
@@ -758,7 +758,7 @@ impl TemplateBuilder {
                     "GetTemplate for base '{base_raw}' returned no template"
                 ))
             })?;
-            let base_name = pplx_space_common_core::types::TemplateName::parse(
+            let base_name = pplx_space_template_model::TemplateName::parse(
                 resolved_template.name,
             )
             .map_err(|error| {

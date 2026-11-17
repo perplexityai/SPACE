@@ -1,6 +1,6 @@
 use super::*;
-use crate::types::template::TemplateName;
 use pplx_space_content_digest::Digest;
+use pplx_space_template_model::TemplateName;
 
 fn fixture_hash() -> ContentHash {
     ContentHash::new(Digest::sha256([0xab; 32]))

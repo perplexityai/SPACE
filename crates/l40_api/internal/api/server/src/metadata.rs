@@ -7,7 +7,7 @@ use crate::metrics::template::{
     VisibilityLookupCacheOutcome, VisibilityLookupDegradation, visibility_lookup_cache,
     visibility_lookup_degraded,
 };
-use pplx_space_common_core::types::TemplateVisibility as CoreTemplateVisibility;
+use pplx_space_template_model::TemplateVisibility as CoreTemplateVisibility;
 
 use crate::template_visibility_cache::TemplateVisibilityCache;
 
@@ -357,7 +357,7 @@ pub(super) fn proto_network_policy_target_to_storage(
 ) -> Result<String, Status> {
     match target.target {
         Some(network_policy_target_ref::Target::Template(template)) => {
-            let template = pplx_space_common_core::types::TemplateName::parse(template)
+            let template = pplx_space_template_model::TemplateName::parse(template)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
             Ok(NetworkPolicyTarget::template(template).as_element_string())
         }
@@ -560,9 +560,10 @@ fn visibility_degraded_with(
 /// never by a conversion.
 ///
 /// A free function rather than a `From` impl because it has to be: both types
-/// are foreign to this crate (`CoreTemplateVisibility` from `common-core`, the
-/// proto enum re-exported from `pplx-space-node-api-client` at `lib.rs`'s
-/// `pub use … ::proto`), so an impl here would violate Rust's orphan rule.
+/// are foreign to this crate (`CoreTemplateVisibility` from
+/// `pplx-space-template-model`, the proto enum re-exported from
+/// `pplx-space-node-api-client` at `lib.rs`'s `pub use … ::proto`), so an impl
+/// here would violate Rust's orphan rule.
 const fn proto_visibility(visibility: CoreTemplateVisibility) -> TemplateVisibility {
     match visibility {
         CoreTemplateVisibility::Generic => TemplateVisibility::Generic,

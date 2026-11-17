@@ -74,7 +74,7 @@ mod kubernetes_tests {
         ArtifactKind, ArtifactOrigin, ExecutionGeneration, NodeAddress, NodeGroup, NodeGroupName,
         NodeGroupPolicy, NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole,
         SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
-        TemplateCompatSpec, TemplateName, TemplateVisibility,
+        TemplateCompatSpec,
     };
     use pplx_space_internal_api_server::publish_sandbox_states;
     use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
@@ -95,6 +95,7 @@ mod kubernetes_tests {
         proto::{SpacedStartProcessRequest, spaced_process_event},
     };
     use pplx_space_sql_locator::sql;
+    use pplx_space_template_model::{TemplateName, TemplateVisibility};
 
     use sqlx::{PgPool, postgres::PgPoolOptions};
     use tokio::sync::Semaphore;

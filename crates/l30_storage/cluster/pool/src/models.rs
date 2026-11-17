@@ -1,9 +1,9 @@
 use pplx_space_common_core::types::SandboxId;
 
 use pplx_space_byte_size::MemorySize;
-use pplx_space_common_core::types::TemplateName;
 use pplx_space_content_digest::ContentHash;
 use pplx_space_execution_spec::{DiskIoLimits, VcpuCount};
+use pplx_space_template_model::TemplateName;
 use time::OffsetDateTime;
 use uuid::Uuid;
 

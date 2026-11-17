@@ -532,9 +532,9 @@ fn is_legacy_template_build(
     // doesn't parse keeps the pre-partition behavior: publish.
     match template.cache_partition.as_deref() {
         None => true,
-        Some(key) => pplx_space_common_core::types::TemplateCachePartition::from_key(key)
+        Some(key) => pplx_space_template_model::TemplateCachePartition::from_key(key)
             .map_or(true, |partition| {
-                partition == pplx_space_common_core::types::TemplateCachePartition::Legacy
+                partition == pplx_space_template_model::TemplateCachePartition::Legacy
             }),
     }
 }

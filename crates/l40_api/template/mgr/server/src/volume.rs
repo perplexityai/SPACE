@@ -65,9 +65,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::{
-    StorageUri, SubjectId, TEMPLATE_ROOTFS_FILE, TemplateCachePartition, TemplateName,
-};
+use pplx_space_common_core::types::{StorageUri, SubjectId, TEMPLATE_ROOTFS_FILE};
 use pplx_space_common_grpc::GrpcClientTrace;
 use pplx_space_content_digest::ContentHash;
 use pplx_space_host_layout::paths::{TEMPLATE_CACHE_DIR_MODE, TEMPLATE_CACHE_FILE_MODE};
@@ -80,6 +78,7 @@ use pplx_space_template_cache_permissions::{
     normalize_template_cache_tree, set_template_cache_permissions,
 };
 use pplx_space_template_manifest::ZSTD_FILENAME_SUFFIX;
+use pplx_space_template_model::{TemplateCachePartition, TemplateName};
 use pplx_space_volmgr_client::{
     RESTORE_PRIORITY, VOLMGR_SOCKET, VolumeManagerClient,
     proto::{ExistingFilePolicy, PullFileRequest, SnapshotArtifact},
@@ -1531,7 +1530,7 @@ async fn do_pull(
     backing_policy: RootfsBackingPolicy,
 ) -> Result<PullWrite, PullError> {
     // Validate name + hash once — both are URI-independent.
-    pplx_space_common_core::types::TemplateName::parse(name.to_string()).map_err(|err| {
+    pplx_space_template_model::TemplateName::parse(name.to_string()).map_err(|err| {
         warn!(error = %err, name, "invalid template name; volume pull skipped");
         PullError::Failure(PullFailure::InvalidTemplateName)
     })?;

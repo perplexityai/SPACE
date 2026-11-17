@@ -17,7 +17,7 @@ const TEMPLATE_VISIBILITY_ORG_SPECIFIC: &str = "org_specific";
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::TemplateVisibility;
+/// # use pplx_space_template_model::TemplateVisibility;
 /// assert!(TemplateVisibility::from_str("public").is_err());
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -38,7 +38,7 @@ pub struct TemplateVisibilityParseError(String);
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::TemplateVisibility;
+/// # use pplx_space_template_model::TemplateVisibility;
 /// let visibility = TemplateVisibility::parse("org_specific").unwrap();
 /// assert_eq!(visibility, TemplateVisibility::OrgSpecific);
 /// assert_eq!(visibility.to_string(), "org_specific");
@@ -59,7 +59,7 @@ impl TemplateVisibility {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::TemplateVisibility;
+    /// # use pplx_space_template_model::TemplateVisibility;
     /// assert_eq!(TemplateVisibility::Generic.as_str(), "generic");
     /// assert_eq!(TemplateVisibility::OrgSpecific.as_str(), "org_specific");
     /// ```
@@ -75,7 +75,7 @@ impl TemplateVisibility {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::TemplateVisibility;
+    /// # use pplx_space_template_model::TemplateVisibility;
     /// assert_eq!(
     ///     TemplateVisibility::parse("generic").unwrap(),
     ///     TemplateVisibility::Generic,
@@ -103,7 +103,7 @@ impl TemplateVisibility {
     ///
     /// ```rust
     /// # use pplx_space_accounts::OrgId;
-    /// # use pplx_space_common_core::types::TemplateVisibility;
+    /// # use pplx_space_template_model::TemplateVisibility;
     /// let owner = OrgId::new();
     /// let stranger = OrgId::new();
     /// assert!(TemplateVisibility::Generic.permits(None, stranger));
@@ -147,9 +147,10 @@ impl From<TemplateVisibility> for String {
     }
 }
 
-// sqlx codecs: the operator node-group surface decodes `templates.visibility`
-// into this enum (`CompatTemplateRow` / `TemplateVisibilityRow` in
-// `routes/admin/`), so the type binds directly against the TEXT column.
+// sqlx codecs: `pplx-space-api` decodes `templates.visibility` into this enum
+// (`CompatTemplateRow` / `TemplateVisibilityRow` in its `routes/admin/`, and
+// its node-group store, `node_group_placement/store.rs`), so the type binds
+// directly against the TEXT column.
 #[cfg(feature = "sqlx")]
 impl pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres> for TemplateVisibility {
     fn type_info() -> pplx_space_sql_codec::postgres::PgTypeInfo {

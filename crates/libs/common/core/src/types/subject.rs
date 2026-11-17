@@ -12,7 +12,8 @@ use std::str::FromStr;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::types::{SandboxId, SandboxIdParseError, TemplateName, TemplateParseError};
+use crate::types::{SandboxId, SandboxIdParseError};
+use pplx_space_template_model::{TemplateName, TemplateParseError};
 
 /// Principal on whose behalf a credential exchange or transfer runs.
 ///

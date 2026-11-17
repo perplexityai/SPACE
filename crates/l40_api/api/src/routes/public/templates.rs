@@ -8,12 +8,12 @@ use axum::{
     Extension, Json,
     extract::{Path, Query, State},
 };
-use pplx_space_common_core::types::{TemplateName, TemplateVisibility};
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_public_api::{
     PageCursor, PublicPage, PublicTemplate, PublicTemplateSnapshot, PublicTemplateVariant,
     SandboxResources,
 };
+use pplx_space_template_model::{TemplateName, TemplateVisibility};
 use serde::Deserialize;
 use sqlx::{FromRow, PgPool, types::Json as SqlJson};
 use time::OffsetDateTime;

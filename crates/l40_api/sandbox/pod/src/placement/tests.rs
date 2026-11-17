@@ -4,9 +4,9 @@ use uuid::Uuid;
 
 use super::*;
 use pplx_space_common_core::types::{
-    NodeGroupId, NodeGroupPolicy, NodeGroupTemplatePolicy, TemplateCompatSpec, TemplateName,
-    TemplateVisibility,
+    NodeGroupId, NodeGroupPolicy, NodeGroupTemplatePolicy, TemplateCompatSpec,
 };
+use pplx_space_template_model::{TemplateName, TemplateVisibility};
 
 const TEST_ORG_ID: OrgId = OrgId::from_uuid(Uuid::from_u128(0x2));
 const OTHER_ORG_ID: OrgId = OrgId::from_uuid(Uuid::from_u128(0x3));

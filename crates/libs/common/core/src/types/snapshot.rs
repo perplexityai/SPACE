@@ -49,9 +49,9 @@ pub fn snapshot_sweeper_grace_seconds(
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use super::template::TemplateArtifactDigest;
 use pplx_space_byte_size::{DiskSize, MemorySize};
 use pplx_space_execution_spec::compute::{ComputeShape, VcpuCount};
+use pplx_space_template_model::TemplateArtifactDigest;
 
 const MAX_SNAPSHOT_NAME_BYTES: usize = 255;
 

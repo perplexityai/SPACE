@@ -10,7 +10,7 @@ use pplx_space_accounts::{
 use pplx_space_common_core::types::template_build_dir;
 use pplx_space_common_core::types::{
     StorageUri, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL,
-    TemplateArtifact, TemplateName, template_object_key, template_object_prefix,
+    TemplateArtifact, template_object_key, template_object_prefix,
 };
 use pplx_space_content_digest::ContentHash;
 use pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS;
@@ -27,6 +27,7 @@ use pplx_space_object_store::{
     ObjectCredentials, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
 };
 use pplx_space_page_cache as page_cache;
+use pplx_space_template_model::TemplateName;
 use serde::{Deserialize, Serialize};
 use tonic::Code;
 
@@ -99,7 +100,7 @@ pub enum PublishError {
     #[error("invalid system publication grant returned by ClusterApi: {0}")]
     InvalidSystemGrant(#[source] AuthIdParseError),
     #[error(transparent)]
-    InvalidTemplateName(#[from] pplx_space_common_core::types::TemplateParseError),
+    InvalidTemplateName(#[from] pplx_space_template_model::TemplateParseError),
     #[error(transparent)]
     InvalidContentHash(#[from] pplx_space_content_digest::DigestParseError),
     #[error(transparent)]

@@ -35,6 +35,7 @@ pplx-space-metrics-emit = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-sbx-mgr-protocol = { workspace = true }
+pplx-space-template-model = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

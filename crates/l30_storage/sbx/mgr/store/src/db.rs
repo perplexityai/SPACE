@@ -13,11 +13,10 @@ use pplx_space_accounts::{ORPHANED_SANDBOX_OWNER, SandboxOwner};
 use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleRuntimeState};
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeManagedBy,
-    ORPHANED_SANDBOX_TEMPLATE, SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId,
-    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
-    SandboxQuarantineSource, SandboxRuntimeLabel, SandboxTransitionReceipt,
-    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
-    SandboxTransitionTargetState, SnapshotName,
+    SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineHistoryAction,
+    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
+    SandboxRuntimeLabel, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
+    SandboxTransitionReceiptKind, SandboxTransitionTargetState, SnapshotName,
 };
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -30,6 +29,7 @@ use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::{NetworkPolicy, proto::NetworkPolicySource};
 pub use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sqlite::SqliteU64;
+use pplx_space_template_model::ORPHANED_SANDBOX_TEMPLATE;
 use rusqlite::types::Type;
 
 use pplx_space_sql_locator::sql;

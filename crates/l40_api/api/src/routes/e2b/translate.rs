@@ -2,12 +2,13 @@ use super::*;
 use crate::metrics::sandbox::api::{
     SandboxApiMetricIdentity, TemplateSelectorKind, TemplateSelectorRequest, TemplateTagShape,
 };
-use pplx_space_common_core::types::{SandboxId, TemplateReference, TemplateSelector};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_net_common::{
     DomainName, EgressDefaultAction, EgressDestinationV1, EgressPolicyV1, IpCidr, NetworkPolicyV1,
     NetworkPolicyVersion, TlsInterception, WildcardDomainName,
 };
 use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
+use pplx_space_template_model::{TemplateReference, TemplateSelector};
 use std::net::IpAddr;
 
 use crate::controllers::ControllerError;

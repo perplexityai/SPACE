@@ -1,0 +1,28 @@
+[package]
+name = "pplx-space-template-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pplx-space-accounts = { workspace = true }
+pplx-space-content-digest = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
+pplx-space-sql-codec = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default = []
+serde = ["dep:serde", "pplx-space-execution-spec/serde"]
+sqlx = ["dep:pplx-space-sql-codec", "pplx-space-sql-codec/postgres"]

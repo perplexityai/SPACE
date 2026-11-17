@@ -561,7 +561,7 @@ async fn compat_replace_and_policy_switch_clear() -> TestResult {
 /// hard cross-org rule violated with no database constraint to catch it.
 #[tokio::test(flavor = "current_thread")]
 async fn compat_validation_serializes_against_concurrent_narrowing() -> TestResult {
-    use pplx_space_common_core::types::TemplateVisibility;
+    use pplx_space_template_model::TemplateVisibility;
 
     use crate::routes::admin::template_store;
 

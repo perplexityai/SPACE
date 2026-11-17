@@ -10,7 +10,7 @@ use axum::{
 use futures_util::{StreamExt, stream};
 use pplx_space_accounts::NodeId;
 use pplx_space_bearer_token::SpaceBearerToken;
-use pplx_space_common_core::types::{NodeManagedBy, NodeRole, SubstrateKind, TemplateName};
+use pplx_space_common_core::types::{NodeManagedBy, NodeRole, SubstrateKind};
 use pplx_space_node_api_client::proto::{
     GetNodeInfoRequest, NodeRole as ProtoNodeRole, NodeSource, PullTemplateRequest, TransferSource,
     node_info_client::NodeInfoClient, transfer_source::Source,
@@ -20,6 +20,7 @@ use pplx_space_state_reconciliation::{FACET_NETWORK_POLICY, ReconcileFacet, Reco
 use pplx_space_template_mgr_client::proto::{
     DeleteTemplateBuildRequest, DeleteTemplateRequest, TemplateRef,
 };
+use pplx_space_template_model::TemplateName;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sqlx::FromRow;
 use time::OffsetDateTime;

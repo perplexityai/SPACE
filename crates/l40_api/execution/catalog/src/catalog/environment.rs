@@ -1,7 +1,6 @@
 //! Compiled environment definitions. Artifact installation approval alone does
 //! not approve an environment for execution or its memory-state operations.
 
-use pplx_space_common_core::types::*;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_common::environment::{
     EnvironmentBindingError, EnvironmentDefinition, EnvironmentRequirementsError,
@@ -15,6 +14,7 @@ use pplx_space_execution_spec::{
     IsolationClass, ManagedRuntimeRelease, RuntimeBinding, RuntimeKind, RuntimePayloadLayout,
     StateFormatIdentity, StateFormatNameParseError, StateFormatVersionParseError,
 };
+use pplx_space_template_model::TemplateCachePartition;
 
 use super::{CatalogError, InitialEnvironment, PinnedKernel, PinnedRelease, RuntimeCatalog};
 

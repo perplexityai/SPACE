@@ -16,7 +16,7 @@ use super::identity::TemplateName;
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::BuildRunId;
+/// # use pplx_space_template_model::BuildRunId;
 /// assert!(BuildRunId::from_str("not-a-uuid").is_err());
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -30,7 +30,7 @@ pub enum BuildRunIdParseError {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::{TemplateBuildId, TemplateName};
+/// # use pplx_space_template_model::{TemplateBuildId, TemplateName};
 /// # use pplx_space_content_digest::{ContentHash, Digest};
 /// let template = TemplateName::parse("seed").unwrap();
 /// let hash = ContentHash::new(Digest::sha256([0xab; 32]));
@@ -49,7 +49,7 @@ impl TemplateBuildId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::{TemplateBuildId, TemplateName};
+    /// # use pplx_space_template_model::{TemplateBuildId, TemplateName};
     /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let template = TemplateName::parse("seed").unwrap();
     /// let hash = ContentHash::new(Digest::sha256([0xab; 32]));
@@ -76,7 +76,7 @@ impl TemplateBuildId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::{TemplateBuildId, TemplateName};
+    /// # use pplx_space_template_model::{TemplateBuildId, TemplateName};
     /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let template = TemplateName::parse("seed").unwrap();
     /// let build = TemplateBuildId::new(template, ContentHash::new(Digest::sha256([0xab; 32])));
@@ -96,7 +96,7 @@ impl TemplateBuildId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::{TemplateBuildId, TemplateName};
+    /// # use pplx_space_template_model::{TemplateBuildId, TemplateName};
     /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let hash = ContentHash::new(Digest::sha256([0xab; 32]));
     /// let build = TemplateBuildId::new(TemplateName::parse("seed").unwrap(), hash);
@@ -112,7 +112,7 @@ impl TemplateBuildId {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::BuildRunId;
+/// # use pplx_space_template_model::BuildRunId;
 /// let run = BuildRunId::new();
 /// assert_eq!(run.to_string().len(), 36);
 /// ```
@@ -127,7 +127,7 @@ impl BuildRunId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::BuildRunId;
+    /// # use pplx_space_template_model::BuildRunId;
     /// let run = BuildRunId::new();
     /// assert_eq!(run.as_uuid().get_version_num(), 7);
     /// ```
@@ -140,7 +140,7 @@ impl BuildRunId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::BuildRunId;
+    /// # use pplx_space_template_model::BuildRunId;
     /// # use uuid::Uuid;
     /// let uuid = Uuid::nil();
     /// assert_eq!(BuildRunId::from_uuid(uuid).as_uuid(), uuid);
@@ -154,7 +154,7 @@ impl BuildRunId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::BuildRunId;
+    /// # use pplx_space_template_model::BuildRunId;
     /// let run = BuildRunId::new();
     /// assert_eq!(run.as_uuid(), run.as_uuid());
     /// ```
@@ -210,7 +210,7 @@ impl From<BuildRunId> for String {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::TemplateBuildState;
+/// # use pplx_space_template_model::TemplateBuildState;
 /// let state = TemplateBuildState::Queued;
 /// assert!(matches!(state, TemplateBuildState::Queued));
 /// ```
@@ -228,7 +228,7 @@ pub enum TemplateBuildState {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::OwnerType;
+/// # use pplx_space_template_model::OwnerType;
 /// assert!(matches!(OwnerType::System, OwnerType::System));
 /// ```
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

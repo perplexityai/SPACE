@@ -4,10 +4,9 @@ use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 use super::metadata::*;
 use super::status::*;
 use super::*;
-use pplx_space_common_core::types::{
-    BaseSnapshotShape, TemplateDesiredState as DomainTemplateDesiredState,
-};
+use pplx_space_common_core::types::BaseSnapshotShape;
 use pplx_space_sql_locator::sql;
+use pplx_space_template_model::TemplateDesiredState as DomainTemplateDesiredState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TemplateOrg {
     System,

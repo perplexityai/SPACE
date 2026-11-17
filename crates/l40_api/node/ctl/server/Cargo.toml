@@ -71,6 +71,7 @@ pplx-space-policy-authority = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
+pplx-space-template-model = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
 prost-types = { workspace = true }

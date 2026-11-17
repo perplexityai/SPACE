@@ -9,12 +9,12 @@ use pplx_space_api_route::{
     ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
     ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV, ed25519::SpaceApiRouteEd25519Authority,
 };
-use pplx_space_common_core::types::{TemplateId, TemplateReference};
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_public_api::{
     OperationId, OperationTargetType, PublicOperationEventType, PublicSandboxId, SandboxResources,
 };
 use pplx_space_sql_locator::sql;
+use pplx_space_template_model::{TemplateId, TemplateReference};
 use pplx_space_test_env::TestResult;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

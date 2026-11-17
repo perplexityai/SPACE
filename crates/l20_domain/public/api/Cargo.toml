@@ -18,6 +18,7 @@ pplx-space-durations = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
 pplx-space-guest-process = { workspace = true }
 pplx-space-net-common = { workspace = true }
+pplx-space-template-model = { workspace = true }
 regex = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
@@ -31,4 +32,4 @@ uuid = { workspace = true, features = ["v7"] }
 [features]
 default = []
 schema = ["dep:regex", "dep:schemars", "serde"]
-serde = ["dep:serde", "pplx-space-common-core/serde", "pplx-space-content-digest/serde", "pplx-space-execution-spec/serde", "pplx-space-durations/serde", "pplx-space-guest-process/serde", "pplx-space-auto-lifecycle/serde", "pplx-space-net-common/serde"]
+serde = ["dep:serde", "pplx-space-common-core/serde", "pplx-space-content-digest/serde", "pplx-space-execution-spec/serde", "pplx-space-durations/serde", "pplx-space-guest-process/serde", "pplx-space-auto-lifecycle/serde", "pplx-space-net-common/serde", "pplx-space-template-model/serde"]

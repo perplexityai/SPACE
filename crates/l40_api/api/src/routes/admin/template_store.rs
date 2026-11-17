@@ -8,9 +8,9 @@
 
 use pplx_space_accounts::OrgId;
 
-use pplx_space_common_core::types::{TemplateDesiredState, TemplateName, TemplateVisibility};
 use pplx_space_sandbox_portability::failed_repair_revert_eligibility;
 use pplx_space_sql_locator::sql;
+use pplx_space_template_model::{TemplateDesiredState, TemplateName, TemplateVisibility};
 use sqlx::{FromRow, Postgres, Transaction};
 use time::OffsetDateTime;
 

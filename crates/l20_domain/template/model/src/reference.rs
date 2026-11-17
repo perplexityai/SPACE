@@ -21,7 +21,7 @@ use super::identity::{
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::TemplateReference;
+/// # use pplx_space_template_model::TemplateReference;
 /// assert!(TemplateReference::from_str("seed:latest").is_ok());
 /// assert!(TemplateReference::from_str("seed:v1@sha256:abc").is_err());
 /// ```
@@ -63,7 +63,7 @@ pub enum TemplateReferenceResolveError {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::{TemplateSelector, TemplateTag};
+/// # use pplx_space_template_model::{TemplateSelector, TemplateTag};
 /// let selector = TemplateSelector::Tag(TemplateTag::latest());
 /// assert_eq!(selector.to_string(), "latest");
 /// ```
@@ -85,7 +85,7 @@ impl TemplateSelector {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::TemplateSelector;
+    /// # use pplx_space_template_model::TemplateSelector;
     /// assert_eq!(TemplateSelector::latest().to_string(), "latest");
     /// ```
     pub fn latest() -> Self {
@@ -198,7 +198,7 @@ impl From<TemplateSelector> for String {
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::TemplateReference;
+/// # use pplx_space_template_model::TemplateReference;
 /// assert_eq!(
 ///     TemplateReference::from_str("seed").unwrap().to_string(),
 ///     "seed:latest",
@@ -224,7 +224,7 @@ impl TemplateReference {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::{TemplateName, TemplateReference};
+    /// # use pplx_space_template_model::{TemplateName, TemplateReference};
     /// let reference = TemplateReference::latest(TemplateName::parse("seed").unwrap());
     /// assert_eq!(reference.to_string(), "seed:latest");
     /// ```

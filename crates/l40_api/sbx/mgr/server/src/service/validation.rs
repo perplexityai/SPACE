@@ -573,7 +573,7 @@ fn initial_environment_reference(
 /// misses fall back through their existing lineage checks.
 pub(crate) fn sandbox_template_partition(
     execution: Option<&pplx_space_execution_spec::ExecutionMetadata>,
-) -> pplx_space_common_core::types::TemplateCachePartition {
+) -> pplx_space_template_model::TemplateCachePartition {
     pplx_space_node_runtime_core::catalog::template_cache_partition(
         execution.and_then(|execution| execution.environment()),
     )
@@ -585,7 +585,7 @@ pub(crate) fn sandbox_template_partition(
 pub(crate) fn template_base_snapshot_dir(
     template: &str,
     content_hash: &str,
-    partition: pplx_space_common_core::types::TemplateCachePartition,
+    partition: pplx_space_template_model::TemplateCachePartition,
     vcpu: u32,
     memory_mib: u32,
 ) -> String {
@@ -607,8 +607,8 @@ pub(crate) fn template_base_snapshot_dir(
 pub(crate) fn template_snapshot_partition(
     requested: Option<&str>,
     execution: Option<&pplx_space_execution_spec::ExecutionMetadata>,
-) -> Result<pplx_space_common_core::types::TemplateCachePartition, tonic::Status> {
-    use pplx_space_common_core::types::TemplateCachePartition;
+) -> Result<pplx_space_template_model::TemplateCachePartition, tonic::Status> {
+    use pplx_space_template_model::TemplateCachePartition;
     let Some(requested) = requested else {
         return Ok(TemplateCachePartition::Legacy);
     };
@@ -633,7 +633,7 @@ pub(super) fn is_non_default_execution(
     execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> bool {
     sandbox_template_partition(Some(execution))
-        != pplx_space_common_core::types::TemplateCachePartition::Legacy
+        != pplx_space_template_model::TemplateCachePartition::Legacy
 }
 
 /// Bound environments require qualified memory-state support before any

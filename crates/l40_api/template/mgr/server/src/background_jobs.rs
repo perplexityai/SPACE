@@ -71,7 +71,7 @@ impl StampPayload {
     pub fn new(
         name: &str,
         content_hash: &str,
-        partition: pplx_space_common_core::types::TemplateCachePartition,
+        partition: pplx_space_template_model::TemplateCachePartition,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -80,8 +80,8 @@ impl StampPayload {
         }
     }
 
-    pub fn partition(&self) -> pplx_space_common_core::types::TemplateCachePartition {
-        use pplx_space_common_core::types::TemplateCachePartition;
+    pub fn partition(&self) -> pplx_space_template_model::TemplateCachePartition {
+        use pplx_space_template_model::TemplateCachePartition;
         self.partition_environment.map_or(
             TemplateCachePartition::Legacy,
             TemplateCachePartition::Environment,

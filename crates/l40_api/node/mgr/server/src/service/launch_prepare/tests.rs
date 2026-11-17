@@ -468,10 +468,11 @@ async fn launch_sandbox_refuses_invalid_requests_before_touching_the_jail() {
 #[tokio::test]
 async fn prepare_sandbox_refuses_invalid_requests_before_touching_the_cache() {
     use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
-    use pplx_space_common_core::types::{SandboxArtifactMetadata, TemplateName};
+    use pplx_space_common_core::types::SandboxArtifactMetadata;
     use pplx_space_content_digest::ContentHash;
     use pplx_space_execution_common::proto::ExecutionSelectionMode as Mode;
     use pplx_space_node_runtime_core::runtime_inventory::RuntimeInventoryError;
+    use pplx_space_template_model::TemplateName;
     use std::str::FromStr;
     use tonic::Code;
 

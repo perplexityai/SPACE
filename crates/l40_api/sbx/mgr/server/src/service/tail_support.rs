@@ -145,7 +145,7 @@ pub(super) fn activation_metadata_json(
         execution,
         sandbox
             .template
-            .parse::<pplx_space_common_core::types::TemplateName>()
+            .parse::<pplx_space_template_model::TemplateName>()
             .map_err(|error| invalid(error.to_string()))?,
         sandbox
             .template_hash

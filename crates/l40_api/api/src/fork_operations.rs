@@ -11,13 +11,14 @@ use pplx_space_common_core::types::{
     BackupAttemptId, EcwCredentialEpoch, LocalArtifactId,
     SANDBOX_FORK_SNAPSHOT_RETENTION_DEFAULT_GRACE_SECONDS,
     SNAPSHOT_STORAGE_SWEEPER_DEFAULT_MIN_AGE_SECONDS, SandboxId, SandboxLifecycle,
-    SandboxLifecycleParseError, TemplateReference,
+    SandboxLifecycleParseError,
 };
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_public_api::{
     OperationId, OperationKind, OperationTargetType, PublicApiParseError, RequestFingerprint,
 };
+use pplx_space_template_model::TemplateReference;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;

@@ -1,4 +1,5 @@
-//! Template references, digests, build IDs, and architecture identifiers.
+//! Template identifiers, references, digests, builds, visibility, desired
+//! state, system templates, and cache partitions.
 //!
 //! SPACE keeps runtime selection separate from template reference strings. The
 //! user-facing template grammar is OCI-like:
@@ -14,7 +15,7 @@
 //!
 //! ```rust
 //! # use std::str::FromStr;
-//! # use pplx_space_common_core::types::*;
+//! # use pplx_space_template_model::*;
 //! # use pplx_space_execution_spec::RuntimeKind;
 //! let input = TemplateReference::from_str("seed").unwrap();
 //! assert_eq!(input.to_string(), "seed:latest");

@@ -743,7 +743,7 @@ fn the_key_cap_clears_the_template_name_validator() {
         assert!(
             MAX_KEY_LEN > 255,
             "MAX_KEY_LEN must exceed the 255-byte template-name limit enforced at \
-             common/core/src/types/template/identity.rs, or valid names silently \
+             l20_domain/template/model/src/identity.rs, or valid names silently \
              stop being cached"
         );
     }

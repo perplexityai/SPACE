@@ -156,10 +156,9 @@ fn sandbox_metadata(
 ) -> Result<pplx_space_common_core::types::SandboxArtifactMetadata, Status> {
     use std::str::FromStr;
 
-    use pplx_space_common_core::types::{
-        ORPHANED_SANDBOX_TEMPLATE, SandboxArtifactMetadata, SandboxId, TemplateName,
-    };
+    use pplx_space_common_core::types::{SandboxArtifactMetadata, SandboxId};
     use pplx_space_content_digest::ContentHash;
+    use pplx_space_template_model::{ORPHANED_SANDBOX_TEMPLATE, TemplateName};
 
     let sandbox_id = SandboxId::from_str(&req.sandbox_id)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;

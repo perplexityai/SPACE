@@ -107,7 +107,7 @@ fn parse_policy_authority(value: &str, column: usize) -> Result<PolicyAuthority>
 // no partition get every partition of a hash and prefer the legacy one, which
 // sorts first because its key is the empty string.
 
-pub use pplx_space_common_core::types::TemplateCachePartition;
+pub use pplx_space_template_model::TemplateCachePartition;
 
 #[derive(Debug)]
 pub struct BuildRow {
