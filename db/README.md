@@ -19,7 +19,7 @@ service and shared SQLite histories use the public baselines. Account for
 retained and offline databases too; successful startup of active services alone
 does not establish that the transition is complete.
 
-The PostgreSQL migrator ignores `goose_db_version`, whether present or absent.
+The PostgreSQL migrator ignores the `goose_db_version` table, whether present or absent.
 
 SQLx records migration checksums. Editing an applied migration makes the bundled
 checksum diverge from the checksum stored in the database, which correctly stops
