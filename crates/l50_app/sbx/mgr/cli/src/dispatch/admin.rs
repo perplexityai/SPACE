@@ -329,6 +329,7 @@ pub(super) async fn handle(
             max,
             sleep,
             min_age,
+            hand_over_sockets,
         } => {
             // State requires explicit ids (empty is rejected server-side), so
             // enumerate the node's sandboxes via List first.
@@ -486,14 +487,17 @@ pub(super) async fn handle(
                 match client
                     .cycle_net_gateway(CycleNetGatewayRequest {
                         sandbox_id: sandbox.sandbox_id.clone(),
+                        hand_over_sockets,
                     })
                     .await
                 {
                     Ok(response) => {
                         let response = response.into_inner();
                         println!(
-                            "cycled {sandbox_id}: pid {} -> {}",
-                            response.old_pid, response.new_pid
+                            "cycled {sandbox_id}: pid {} -> {}{}",
+                            response.old_pid,
+                            response.new_pid,
+                            handover_note(hand_over_sockets, response.inherited_sockets)
                         );
                     }
                     Err(error) => {
@@ -573,6 +577,16 @@ async fn collect_cycle_state<R: CycleStateReader>(
         }
     }
     Ok(sandboxes)
+}
+
+/// What a cycle line adds about socket handover: nothing unless it was
+/// requested, then whether the node performed it.
+fn handover_note(requested: bool, inherited_sockets: u32) -> String {
+    match (requested, inherited_sockets) {
+        (false, _) => String::new(),
+        (true, 0) => " (sockets not handed over; stopped and relaunched)".to_string(),
+        (true, sockets) => format!(" ({sockets} sockets handed over)"),
+    }
 }
 
 fn bulk_cycle_candidates(sandboxes: Vec<SandboxInfo>, refresh_config: bool) -> Vec<SandboxInfo> {
