@@ -178,7 +178,6 @@ postgres = [
   "node_runtime_state_formats",
   "node_template_components",
   "node_template_inventory",
-  "nodes",
   "org_branching_keys",
   "org_credentials",
   "org_master_keys",
