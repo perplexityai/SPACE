@@ -221,6 +221,17 @@ impl ClusterApiService {
             || current.activation_attempt_id != Some(execution.attempt)
             || ![current.active_node_id, current.target_node_id].contains(&Some(execution.node))
         {
+            tracing::warn!(
+                sandbox_id = %execution.sandbox,
+                requested_generation = execution.generation.get(),
+                requested_attempt = %execution.attempt,
+                requested_node = %execution.node,
+                current_generation = ?current.execution_generation,
+                current_attempt = ?current.activation_attempt_id,
+                active_node = ?current.active_node_id,
+                target_node = ?current.target_node_id,
+                "retained block-volume execution rejected"
+            );
             return Err(refused());
         }
         Ok(tx)
@@ -239,6 +250,14 @@ impl ClusterApiService {
             .map_err(database)?
             .ok_or_else(refused)?;
         if !fence.owns(&row) {
+            tracing::warn!(
+                sandbox_id = %fence.execution.sandbox,
+                requested_attempt = %fence.execution.attempt,
+                requested_epoch = fence.epoch,
+                current_attempt = ?row.execution_id,
+                current_epoch = row.attachment_epoch,
+                "retained block-volume ownership rejected"
+            );
             return Err(refused());
         }
         Ok((tx, row))
@@ -389,6 +408,12 @@ impl ClusterApiService {
         .await
         .map_err(database)?
         {
+            tracing::warn!(
+                sandbox_id = %fence.execution.sandbox,
+                activation_id = %req.activation_id,
+                checkpoint_id = ?req.checkpoint_id,
+                "retained block-volume activation rejected"
+            );
             return Err(refused());
         }
         let row = store::get(&mut *tx, fence.execution.sandbox)
