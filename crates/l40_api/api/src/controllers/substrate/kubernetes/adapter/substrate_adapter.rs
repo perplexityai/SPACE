@@ -2913,6 +2913,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                         )));
                                     }
                                 }
+                                WakeRpcErrorDisposition::CallerUnauthenticated => {
+                                    return Err(ControllerError::service_unavailable(format!(
+                                        "worker node-api did not accept this API process's credential: {error}"
+                                    )));
+                                }
                                 WakeRpcErrorDisposition::Fail => {
                                     return Err(ControllerError::conflict(format!(
                                         "sandbox wake failed: {error}"

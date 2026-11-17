@@ -415,6 +415,7 @@ pub(super) async fn start_scripted_worker(
             succeed_after_attempt: Some(config.wake_succeeds_from_attempt),
             echo_route_identity: true,
             received: Arc::default(),
+            rejection: Arc::default(),
         }),
         replies: Arc::clone(&replies),
         observers: Arc::clone(&observers),
