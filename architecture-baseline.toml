@@ -227,19 +227,6 @@ postgres = [
   "jobs",
   "operation_results",
 ]
-"sqlite.template-manager" = [
-  "jobs",
-  "node_dirty_refs",
-  "pools",
-  "template_build_components",
-  "template_builds",
-  "template_local_policy_sequence",
-  "template_network_policy_notifications",
-  "template_pinned_releases",
-  "template_pinned_tags",
-  "template_settings",
-  "template_snapshots",
-]
 "sqlite.volume-manager" = [
   "jobs",
   "volume_attachments",
