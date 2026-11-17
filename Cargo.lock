@@ -7086,11 +7086,14 @@ name = "pplx-space-node-registration-store"
 version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
  "pplx-space-k8s-ids",
+ "pplx-space-k8s-node-id",
  "pplx-space-node-model",
  "pplx-space-sql-locator",
  "sqlx",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

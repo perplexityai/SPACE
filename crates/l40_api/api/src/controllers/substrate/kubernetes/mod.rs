@@ -26,7 +26,7 @@ use kube::{
 };
 use pplx_space_artifact_model::StorageUri;
 use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
-use pplx_space_k8s_node_id::space_k8s_node_id;
+use pplx_space_k8s_node_id::{Ec2InstanceId, space_k8s_node_id};
 use pplx_space_node_api_client::{
     NodeApiClient, WorkerApiClient as RetryingWorkerApiClient,
     WorkerApiInternalClient as RetryingWorkerApiInternalClient,
