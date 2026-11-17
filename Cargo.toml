@@ -63,6 +63,7 @@ members = [
     "crates/l40_api/sbx/mgr/server",
     "crates/l30_storage/sbx/mgr/store",
     "crates/l10_foundation/rustls/provider",
+    "crates/l10_foundation/sql/codec",
     "crates/l10_foundation/sql/locator",
     "crates/l10_foundation/service/lifecycle",
     "crates/l10_foundation/service/mutex",
@@ -334,6 +335,7 @@ socket2 = "0.6"
 # The published SQLx 0.9 bounds libsqlite3-sys below the patched SQLite release.
 # Pin upstream's compatibility fix until a registry release includes it.
 sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c", default-features = false }
+syn = { version = "2", default-features = false }
 tempfile = "3"
 tar = "0.4.46"
 flate2 = "1"
@@ -504,6 +506,7 @@ pplx-space-sbx-mgr-store = { path = "crates/l30_storage/sbx/mgr/store" }
 pplx-space-postgres-pool = { path = "crates/l30_storage/postgres/pool" }
 pplx-space-rustls-provider = { path = "crates/l10_foundation/rustls/provider" }
 pplx-space-semver = { path = "crates/l10_foundation/semver" }
+pplx-space-sql-codec = { path = "crates/l10_foundation/sql/codec" }
 pplx-space-sql-locator = { path = "crates/l10_foundation/sql/locator" }
 pplx-space-service-lifecycle = { path = "crates/l10_foundation/service/lifecycle" }
 pplx-space-state-reconciliation = { path = "crates/l20_domain/state/reconciliation" }

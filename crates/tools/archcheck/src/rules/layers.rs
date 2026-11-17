@@ -21,8 +21,10 @@
 //! - `store_edges`: an API or Storage crate depends on a store only if the
 //!   store lists it as a user.
 //! - `storage_access` and `codec_features`: only stores and storage helpers
-//!   depend on a database or object storage driver, or turn on another
-//!   crate's driver feature; each with a baseline table ([`storage`]).
+//!   depend on a database or object storage driver, but for a Foundation or
+//!   Domain codec's optional dependency on a codec facade, or turn on
+//!   another crate's driver feature; each with a baseline table
+//!   ([`storage`]).
 //! - `domain_dependencies` and `model_protocol`: no Domain crate depends on
 //!   a package that does I/O, and no model on a protocol; each with a
 //!   baseline table ([`domain`]).
@@ -37,6 +39,7 @@
 //! layer directory leaves them alone.
 
 mod domain;
+mod facade;
 mod graph;
 mod policy;
 mod sql;
@@ -53,7 +56,7 @@ use graph::{
 };
 
 use domain::{DOMAIN_DEPENDENCIES, Domain, MODEL_PROTOCOL};
-use storage::{CODEC_FEATURES, STORAGE_ACCESS, Storage};
+use storage::{CODEC_FEATURES, FACADE_FIX, STORAGE_ACCESS, Storage};
 
 use crate::{
     baseline::{BASELINE_FILE, BaseBaseline, BaseLayersTable, BaseSkip, Baseline, EdgeTable},
@@ -270,6 +273,7 @@ impl Rule for Layers {
         }
         findings.extend(policy::stale_entries(ctx, config, &graph, verdicts));
         findings.extend(storage::stale_entries(ctx, config, &graph));
+        findings.extend(checked.storage.facade_exports(ctx, config, &graph));
         findings.extend(domain::stale_entries(
             ctx,
             config,
@@ -366,6 +370,21 @@ impl Rule for Layers {
             for ((from, to), crossing) in checked.crossings(check) {
                 if existing.is_some_and(|existing| existing.contains(&from, &to)) {
                     table.insert(&from, &to);
+                    continue;
+                }
+                if matches!(check, STORAGE_ACCESS | CODEC_FEATURES)
+                    && checked.storage.is_facade(&from)
+                {
+                    not_added.push(NotAdded {
+                        table: format!("{RULE}.{check}"),
+                        entry: None,
+                        line: format!(
+                            "not added: {} in [{RULE}.{check}]; {FACADE_FIX}: fix the dependency \
+                             (cargo arch says how). An entry added by hand fails \
+                             {RULE}.{check}.no_new_entries",
+                            crossing.summary
+                        ),
+                    });
                     continue;
                 }
                 if check == STORAGE_ACCESS && checked.storage.lacks_helper(&from, &to) {

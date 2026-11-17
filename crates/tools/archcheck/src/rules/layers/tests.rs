@@ -150,6 +150,7 @@ fn features_with_implicit_ones() {
     let krate = Crate {
         name: "x".to_owned(),
         lib: None,
+        lib_path: None,
         member: "crates/x".to_owned(),
         name_line: 1,
         lib_name_line: None,
@@ -243,6 +244,7 @@ fn items_used_through_a_dependency() {
     let krate = Crate {
         name: "pplx-space-member".to_owned(),
         lib: Some("pplx_space_member".to_owned()),
+        lib_path: None,
         member: "member".to_owned(),
         name_line: 2,
         lib_name_line: None,
