@@ -2,8 +2,11 @@
 
 import space_smoke as smoke
 
-# Long enough for a controller restart to land while claimed restores hold.
-HOLD_SECONDS = 45
+# Long enough for a controller restart to land while claimed restores hold:
+# the restart is asked for one poll after a held restore is seen running and
+# kills the pods at once. Each restore's attempt after the restart holds
+# again; the restores run at the same time, so that costs one hold.
+HOLD_SECONDS = 20
 
 
 # The loop's idempotence is crate tests: a replayed report enqueues one
@@ -13,7 +16,9 @@ HOLD_SECONDS = 45
 # seal with nothing evacuated while the controller restarts; the controller
 # is then down while the node makes every resident durable, so no restore is
 # enqueued until it is back; and it restarts again while the drain
-# restores, held, run.
+# restores, held, run. Most of the run is that last seam: each reclaimed
+# restore waits, re-reading the row, until what the killed attempt left on
+# it settles, and only then lands.
 @smoke.scenario(
     "native.v2_drain_survives_controller_restarts",
     api_surfaces=("native",),

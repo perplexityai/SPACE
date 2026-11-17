@@ -11,6 +11,12 @@ import space_smoke as smoke
 # uploads fail until the backup worker gives up on them three times, the
 # node reports each resident `blocked` with the failure, the drain holds,
 # and once the path is back the same epoch finishes.
+#
+# The wait for `blocked` is backoff, not timeouts. One counted failure is an
+# upload job the backup worker gave up on: five attempts with 5, 30, 120 and
+# 300 s of backoff between them (the jobs worker's retry schedule), so the
+# bound of three costs three of those, about 23 minutes. The path is cut with
+# a TCP reset, so each attempt fails at once rather than at a timeout.
 @smoke.scenario(
     "native.v2_drain_waits_out_blocked_uploads",
     api_surfaces=("native",),
