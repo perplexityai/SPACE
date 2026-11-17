@@ -905,6 +905,14 @@ impl WorkerApi for SimWorkerApiService {
         request: Request<sbx::UpdateRequest>,
     ) -> Result<Response<sbx::UpdateResponse>, Status> {
         let req = request.into_inner();
+        if (req.vcpu.is_some() || req.memory_mib.is_some() || req.pids_max.is_some())
+            && let Some(code) = self
+                .state
+                .take_resource_update_refusal(&req.sandbox_id)
+                .await
+        {
+            return Err(Status::new(code, "resource update refused"));
+        }
         if !req.replace_process_env && !req.process_env.is_empty() {
             return Err(Status::invalid_argument(
                 "replace_process_env must be true when process_env is provided",

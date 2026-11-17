@@ -108,5 +108,8 @@ pub(crate) fn cgroup_update_error_to_status(error: cgroup::CgroupUpdateError) ->
         cgroup::CgroupUpdateError::Invalid(_) => Status::invalid_argument(error.to_string()),
         cgroup::CgroupUpdateError::Read { .. } => Status::unavailable(error.to_string()),
         cgroup::CgroupUpdateError::Write { .. } => Status::internal(error.to_string()),
+        cgroup::CgroupUpdateError::MemoryBelowCurrentLimit { .. } => {
+            Status::failed_precondition(error.to_string())
+        }
     }
 }

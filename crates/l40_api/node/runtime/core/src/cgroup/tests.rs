@@ -316,6 +316,52 @@ fn invalid_combined_update_leaves_all_cgroup_limits_unchanged() {
     }
 }
 
+/// A live memory update raises a VM's `memory.max` or writes the same limit
+/// again, but never lowers it, and a refused update writes no limit at all:
+/// the guest keeps the memory it booted with and can touch all of it.
+#[test]
+fn memory_update_never_lowers_a_running_vm_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let mib: u64 = 1024 * 1024;
+    let read = |name: &str| fs::read_to_string(root.path().join(name)).unwrap();
+    // As launch leaves a 1 GiB guest: its memory plus 128 MiB headroom.
+    fs::write(root.path().join("cpu.max"), "200000 100000").unwrap();
+    fs::write(
+        root.path().join("memory.max"),
+        ((1024 + 128) * mib).to_string(),
+    )
+    .unwrap();
+    fs::write(root.path().join("pids.max"), "64").unwrap();
+
+    assert!(matches!(
+        update_cgroup_at(root.path(), Some(1), Some(512 + 128), Some(32)),
+        Err(CgroupUpdateError::MemoryBelowCurrentLimit {
+            requested_mib: 640,
+            current_mib: 1152,
+        })
+    ));
+    assert_eq!(read("cpu.max"), "200000 100000");
+    assert_eq!(read("memory.max"), (1152 * mib).to_string());
+    assert_eq!(read("pids.max"), "64");
+
+    update_cgroup_at(root.path(), None, Some(1152), None).unwrap();
+    assert_eq!(read("memory.max"), (1152 * mib).to_string());
+
+    update_cgroup_at(root.path(), None, Some(2048 + 128), None).unwrap();
+    assert_eq!(read("memory.max"), (2176 * mib).to_string());
+    assert!(matches!(
+        update_cgroup_at(root.path(), None, Some(1152), None),
+        Err(CgroupUpdateError::MemoryBelowCurrentLimit { .. })
+    ));
+    assert_eq!(read("memory.max"), (2176 * mib).to_string());
+
+    fs::write(root.path().join("memory.max"), "max\n").unwrap();
+    assert!(matches!(
+        update_cgroup_at(root.path(), None, Some(2176), None),
+        Err(CgroupUpdateError::MemoryBelowCurrentLimit { .. })
+    ));
+}
+
 #[test]
 fn cpu_budget_comes_from_resolved_launch_limits() {
     for requested in [None, Some(1), Some(8)] {

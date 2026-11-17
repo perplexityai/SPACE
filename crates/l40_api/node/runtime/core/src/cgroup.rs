@@ -213,6 +213,17 @@ pub enum CgroupUpdateError {
         #[source]
         source: std::io::Error,
     },
+    /// The update would put a running VM's memory limit below the one it
+    /// runs under. The guest keeps the memory it booted with and can touch
+    /// all of it, so the lower limit would get the VM's process killed.
+    #[error(
+        "memory.max of {requested_mib} MiB is below the running VM's {current_mib} MiB; \
+         a running sandbox's memory can only be raised"
+    )]
+    MemoryBelowCurrentLimit {
+        requested_mib: u64,
+        current_mib: u64,
+    },
 }
 
 /// Default resource limits for a sandbox cgroup.
@@ -570,6 +581,10 @@ fn update_cgroup_at(
     if !cgroup_path.exists() {
         return Err(CgroupUpdateError::NotFound(cgroup_path.to_owned()));
     }
+    // Checked before any limit is written, so a refused update changes none.
+    if let Some(memory_mib) = memory_mib {
+        refuse_memory_below_current_limit(cgroup_path, memory_mib)?;
+    }
 
     if let Some(vcpu_count) = vcpu_count {
         let cpu_max = format!("{} 100000", vcpu_count as u64 * 100_000);
@@ -585,6 +600,32 @@ fn update_cgroup_at(
         write_cgroup_file_typed(cgroup_path, "pids.max", &pids_max.to_string())?;
     }
 
+    Ok(())
+}
+
+/// Refuse a `memory.max` below the one the VM runs under. Launch sets it from
+/// the guest's memory plus headroom, and a live update cannot shrink the
+/// guest, so only a raise, or the same limit again, is safe.
+fn refuse_memory_below_current_limit(
+    cgroup_path: &Path,
+    memory_mib: u64,
+) -> Result<(), CgroupUpdateError> {
+    let path = cgroup_path.join("memory.max");
+    let current =
+        fs::read_to_string(&path).map_err(|source| CgroupUpdateError::Read { path, source })?;
+    // An unlimited VM ("max") has no safe lower limit.
+    let current_bytes = match current.trim() {
+        "max" => u64::MAX,
+        value => value
+            .parse()
+            .map_err(|_| CgroupUpdateError::Invalid("invalid current memory.max".into()))?,
+    };
+    if memory_mib * MIB_BYTES < current_bytes {
+        return Err(CgroupUpdateError::MemoryBelowCurrentLimit {
+            requested_mib: memory_mib,
+            current_mib: current_bytes / MIB_BYTES,
+        });
+    }
     Ok(())
 }
 
