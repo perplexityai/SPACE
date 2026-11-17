@@ -50,11 +50,17 @@ async fn unsupported_envd_surfaces_return_explicit_ecw_errors() {
         return;
     }
 
-    let app = router(test_data_plane_state().await);
+    let app = router(test_data_plane_state_with_ecw_hosts().await);
+    let envd_host = format!("{ECW_ENVD_PORT}-{}.example.test", SandboxId::new());
     for endpoint in ["/metrics", "/envs", "/files/compose"] {
         let response = app
             .clone()
-            .oneshot(Request::get(endpoint).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get(endpoint)
+                    .header(header::HOST, &envd_host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{endpoint}");
@@ -70,6 +76,102 @@ async fn unsupported_envd_surfaces_return_explicit_ecw_errors() {
     }
 }
 
+/// A request that names no ECW sandbox host is a Native client's: when it
+/// matches no route, the envd-only paths included, uses a method a Native
+/// route does not serve, or asks to attach without a WebSocket upgrade, it is
+/// answered in the Native data-plane envelope.
+#[tokio::test]
+async fn unmatched_native_requests_answer_in_the_native_envelope() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+
+    let app = router(test_data_plane_state_with_ecw_hosts().await).layer(
+        axum::extract::connect_info::MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))),
+    );
+    let session_id = DataPlaneSessionId::Process(Default::default());
+    for (method, path, status, code) in [
+        (
+            "GET",
+            "/v1/nope".to_string(),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            "GET",
+            format!("/v1/sessions/{session_id}/unknown"),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            "GET",
+            "/nope".to_string(),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            "GET",
+            "/metrics".to_string(),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            "POST",
+            format!("/v1/sessions/{session_id}/events"),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_request",
+        ),
+        (
+            "DELETE",
+            format!("/v1/sessions/{session_id}/attach"),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_request",
+        ),
+        (
+            "GET",
+            format!("/v1/sessions/{session_id}/attach"),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&path)
+                    .header(header::HOST, "data-plane.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{method} {path}");
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            assert_eq!(
+                response.headers().get(header::ALLOW).unwrap(),
+                "GET,HEAD",
+                "{method} {path}"
+            );
+        }
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(body["error"]["code"], code, "{method} {path}: {body}");
+        assert_eq!(body["error"]["retryable"], false, "{method} {path}: {body}");
+    }
+}
+
+async fn test_data_plane_state_with_ecw_hosts() -> DataPlaneState {
+    let mut state = test_data_plane_state().await;
+    state.ecw_hosts = Arc::new(EcwHostConfig::from_env_value(Some(
+        r#"[{"host":"example.test"}]"#,
+    )));
+    state
+}
+
 #[tokio::test]
 async fn routed_requests_record_latency_by_route_template() {
     if !pplx_space_test_env::enter_test_process(&[(
@@ -80,8 +182,16 @@ async fn routed_requests_record_latency_by_route_template() {
     }
 
     let capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
-    let response = router(test_data_plane_state().await)
-        .oneshot(Request::get("/files/compose").body(Body::empty()).unwrap())
+    let response = router(test_data_plane_state_with_ecw_hosts().await)
+        .oneshot(
+            Request::get("/files/compose")
+                .header(
+                    header::HOST,
+                    format!("{ECW_ENVD_PORT}-{}.example.test", SandboxId::new()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
@@ -148,7 +258,7 @@ async fn proxy_session_routes_extract_path_parameters() {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
         assert_eq!(
-            body["message"], "data-plane token is required",
+            body["error"]["message"], "data-plane token is required",
             "proxy{route}"
         );
     }
@@ -1716,6 +1826,7 @@ fn ecw_sandbox_service_route_repair_cooldown_coalesces_and_expires() {
     );
 }
 
+/// The proxy answers in the data-plane envelope the events stream uses.
 #[tokio::test]
 async fn native_route_resolution_error_response_shape_is_stable() {
     let cases = [
@@ -1772,9 +1883,11 @@ async fn native_route_resolution_error_response_shape_is_stable() {
         assert_eq!(
             body,
             serde_json::json!({
-                "code": code,
-                "message": message,
-                "retryable": retryable,
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "retryable": retryable,
+                }
             })
         );
     }
