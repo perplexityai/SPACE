@@ -65,6 +65,30 @@ pub(super) fn restore_placement_sample(
     }
 }
 
+/// Whether [`KubernetesSubstrate::ensure_pod_exists`] materializes a pod for
+/// a sandbox it was asked about in `requested` and finds in `materialization`.
+/// A pod placed in one of these lifecycles is the sandbox's, so
+/// [`pplx_space_sandbox_store::wake::POD_PLACEABLE_LIFECYCLES`] lists each,
+/// with `suspending` and `stopping`; a test pins the two together.
+pub(in crate::controllers::substrate::kubernetes) fn lifecycle_is_materializable(
+    requested: SandboxLifecycle,
+    materialization: SandboxLifecycle,
+) -> bool {
+    matches!(
+        materialization,
+        SandboxLifecycle::Created
+            | SandboxLifecycle::Creating
+            | SandboxLifecycle::Starting
+            | SandboxLifecycle::Started
+            | SandboxLifecycle::Restoring
+            | SandboxLifecycle::Pausing
+            | SandboxLifecycle::Paused
+            | SandboxLifecycle::Resuming
+            | SandboxLifecycle::Suspended
+            | SandboxLifecycle::Checkpointing
+    ) || (requested == SandboxLifecycle::Stopped && materialization == SandboxLifecycle::Stopped)
+}
+
 impl KubernetesSubstrate {
     pub(in crate::controllers::substrate::kubernetes) async fn require_observed_create_claim_in_flight(
         &self,
@@ -275,20 +299,8 @@ impl KubernetesSubstrate {
         if materialization_lifecycle == SandboxLifecycle::Suspending {
             return Err(SubstrateError::suspend_in_flight(sandbox_id));
         }
-        let lifecycle_is_materializable = matches!(
-            materialization_lifecycle,
-            SandboxLifecycle::Created
-                | SandboxLifecycle::Creating
-                | SandboxLifecycle::Starting
-                | SandboxLifecycle::Started
-                | SandboxLifecycle::Restoring
-                | SandboxLifecycle::Pausing
-                | SandboxLifecycle::Paused
-                | SandboxLifecycle::Resuming
-                | SandboxLifecycle::Suspended
-                | SandboxLifecycle::Checkpointing
-        ) || (requested_lifecycle == SandboxLifecycle::Stopped
-            && materialization_lifecycle == SandboxLifecycle::Stopped);
+        let lifecycle_is_materializable =
+            lifecycle_is_materializable(requested_lifecycle, materialization_lifecycle);
         let lifecycle_refresh_is_valid = requested_lifecycle == materialization_lifecycle
             || (requested_lifecycle == SandboxLifecycle::Started
                 && materialization_lifecycle == SandboxLifecycle::Restoring);

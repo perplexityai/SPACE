@@ -51,18 +51,17 @@ impl RegistrationCaller {
                     .await
                     .map(drop)
             }
-            Self::PodPlacement => {
-                store
-                    .persist_pod_node_placement(
-                        sandbox_id,
-                        node_name,
-                        "uid-registration",
-                        node_id,
-                        NodeRole::Worker,
-                        address,
-                    )
-                    .await
-            }
+            Self::PodPlacement => store
+                .persist_active_pod_node_placement(
+                    sandbox_id,
+                    node_name,
+                    "uid-registration",
+                    node_id,
+                    NodeRole::Worker,
+                    address,
+                )
+                .await
+                .map(drop),
         }
     }
 }

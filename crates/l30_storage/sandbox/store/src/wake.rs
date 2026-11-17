@@ -4,7 +4,8 @@
 //! access confirms the guest's command API is up; and, on Kubernetes, renewing
 //! a restore's lease while it claims the active execution and recording the
 //! node a sandbox's pod was scheduled on. That placement write runs wherever a
-//! pod is created or resolved, cold creates included, not only on a wake.
+//! pod is created or resolved, cold creates included, not only on a wake, and
+//! is guarded by the execution generation the pod backs.
 //!
 //! The callers keep everything around them: the sandbox and execution row
 //! locks (`SELECT ... FOR UPDATE`), the transactions, the execution writes
@@ -13,7 +14,9 @@
 //! passes, so it composes into the caller's transaction when there is one.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{SandboxId, SubstrateKind};
+use pplx_space_common_core::types::{
+    ExecutionGeneration, SandboxId, SandboxLifecycle, SubstrateKind,
+};
 
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_routability::routable_execution_or_non_k8s;
@@ -169,35 +172,117 @@ pub async fn renew_restore_lease_for_execution_claim(
     Ok(renewed.is_some())
 }
 
+/// What [`record_pod_node_placement`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PodNodePlacementWrite {
+    /// The row now names `on_node` as its active and target node, and
+    /// `placement_changed_at` was bumped.
+    Placed,
+    /// The row already named `on_node`, `on_node`, `on_node`: nothing
+    /// changed.
+    AlreadyPlaced,
+    /// The execution is the active one, but the row is in `lifecycle`, which
+    /// no pod places; its placement is unchanged.
+    LifecycleRefused { lifecycle: String },
+    /// No sandbox row, or `generation` is not its active Kubernetes
+    /// execution: nothing changed.
+    NotActive,
+}
+
+/// Lifecycles in which a pod backs the sandbox, so its node is the sandbox's
+/// placement: those in which `ensure_pod_exists` materializes one (`created`,
+/// `creating`, `starting`, `started`, `restoring`, `pausing`, `paused`,
+/// `resuming`, `suspended`, `checkpointing`, and `stopped` for a start), and
+/// `suspending` and `stopping`, while the pod a suspend or a stop acts on is
+/// still the sandbox's. The Kubernetes substrate's tests pin this list
+/// against `ensure_pod_exists`'s own.
+pub const POD_PLACEABLE_LIFECYCLES: &[SandboxLifecycle] = &[
+    SandboxLifecycle::Created,
+    SandboxLifecycle::Creating,
+    SandboxLifecycle::Starting,
+    SandboxLifecycle::Started,
+    SandboxLifecycle::Restoring,
+    SandboxLifecycle::Pausing,
+    SandboxLifecycle::Paused,
+    SandboxLifecycle::Resuming,
+    SandboxLifecycle::Suspending,
+    SandboxLifecycle::Suspended,
+    SandboxLifecycle::Stopping,
+    SandboxLifecycle::Stopped,
+    SandboxLifecycle::Checkpointing,
+];
+
 /// Record the node a sandbox's Kubernetes pod was scheduled on as its active
 /// and target node, `on_node`, bumping `placement_changed_at`. A row already
 /// placed there is left untouched.
 ///
-/// Writes an **observed projection**: the pod's node as Kubernetes reported
-/// it. No lifecycle predicate of its own; it relies on the caller's sandbox
-/// row lock and on the caller having just recorded the node on a still-active
-/// execution in the same transaction.
+/// Writes an **observed projection**: the node of the pod that backs the
+/// execution at `generation`, as Kubernetes reported it. The `WHERE` guards it
+/// with what it projects:
+///
+/// * the execution. `generation` must still be the sandbox's active
+///   Kubernetes execution. A late write for a pod whose execution a suspend,
+///   an evacuation, a lost-node write-off or a replacement has since retired
+///   leaves the row alone.
+/// * the lifecycles a pod can back the sandbox in,
+///   [`POD_PLACEABLE_LIFECYCLES`]. `deleting`, `failed`, `quarantined`, the
+///   tombstones and any value outside the stored vocabulary are refused:
+///   nothing places a row that is being torn down for good.
+///
+/// The caller holds the sandbox row lock and has just recorded the node on
+/// that execution in the same transaction.
 pub async fn record_pod_node_placement(
     executor: impl sqlx::PgExecutor<'_>,
     sandbox_id: SandboxId,
     node_id: NodeId,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE sandboxes
-                     SET active_node_id = $1,
-                         target_node_id = $1,
-                         placement = 'on_node',
-                         placement_changed_at = NOW()
-                     WHERE id = $2
-                       AND (
-                         active_node_id IS DISTINCT FROM $1
-                         OR target_node_id IS DISTINCT FROM $1
-                         OR placement IS DISTINCT FROM 'on_node'
-                       )"
+    generation: ExecutionGeneration,
+) -> Result<PodNodePlacementWrite, sqlx::Error> {
+    let placeable: Vec<&str> = POD_PLACEABLE_LIFECYCLES
+        .iter()
+        .map(|lifecycle| lifecycle.as_str())
+        .collect();
+    let found = sqlx::query_as::<_, (String, bool, bool)>(sql!(
+        "WITH guarded AS (
+             SELECT s.id, s.lifecycle, s.lifecycle = ANY ($4) AS placeable
+               FROM sandboxes s
+              WHERE s.id = $2
+                AND EXISTS (
+                    SELECT 1
+                      FROM sandbox_k8s_executions e
+                     WHERE e.sandbox_id = s.id
+                       AND e.active
+                       AND e.generation = $3
+                )
+         ),
+         placed AS (
+             UPDATE sandboxes s
+                SET active_node_id = $1,
+                    target_node_id = $1,
+                    placement = 'on_node',
+                    placement_changed_at = NOW()
+               FROM guarded
+              WHERE s.id = guarded.id
+                AND guarded.placeable
+                AND (
+                    s.active_node_id IS DISTINCT FROM $1
+                    OR s.target_node_id IS DISTINCT FROM $1
+                    OR s.placement IS DISTINCT FROM 'on_node'
+                )
+             RETURNING s.id
+         )
+         SELECT guarded.lifecycle, guarded.placeable, EXISTS (SELECT 1 FROM placed)
+           FROM guarded"
     ))
     .bind(node_id)
     .bind(sandbox_id)
-    .execute(executor)
+    .bind(generation.get())
+    .bind(&placeable)
+    .fetch_optional(executor)
     .await?;
-    Ok(())
+    Ok(match found {
+        None => PodNodePlacementWrite::NotActive,
+        Some((lifecycle, false, _)) => PodNodePlacementWrite::LifecycleRefused { lifecycle },
+        Some((_, true, true)) => PodNodePlacementWrite::Placed,
+        Some((_, true, false)) => PodNodePlacementWrite::AlreadyPlaced,
+    })
 }

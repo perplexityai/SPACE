@@ -1079,7 +1079,7 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
     // A pod lands on the node.
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_active_pod_node_placement(
             sandbox_id,
             &node_name,
             "uid-ready",
@@ -1104,7 +1104,7 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
     // state.
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_active_pod_node_placement(
             sandbox_id,
             &node_name,
             "uid-ready",
@@ -1135,7 +1135,7 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
     insert_sandbox(&fixture.pool, fresh_sandbox, "started").await?;
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_active_pod_node_placement(
             fresh_sandbox,
             &fresh_name,
             "uid-fresh",
@@ -1504,6 +1504,7 @@ mod k8s_store_postgres_behaviors {
         forget_pod_tracking_keeps_started_without_current_suspend_backup,
         unchanged_pod_metadata_does_not_touch_execution_row,
         unchanged_pod_node_placement_does_not_touch_current_rows,
+        a_replaced_executions_pod_placement_records_nothing,
         finishing_active_execution_preserves_active_node_for_replacement,
         finishing_active_execution_rolls_back_port_observation_failure,
         finish_suspended_execution_rejects_uncommitted_running_execution,
@@ -1945,7 +1946,7 @@ async fn concurrent_pod_placement_and_cleanup_do_not_deadlock() -> TestResult {
     let placement_store = fixture.store.clone();
     let placement = tokio::spawn(async move {
         placement_store
-            .persist_pod_node_placement(
+            .persist_active_pod_node_placement(
                 sandbox_id,
                 "worker-node-placement-race",
                 "worker-node-placement-race-uid",
@@ -2034,7 +2035,7 @@ async fn pod_placement_survives_concurrent_insert_of_same_node() -> TestResult {
     let placement_name = node_name.clone();
     let placement = tokio::spawn(async move {
         placement_store
-            .persist_pod_node_placement(
+            .persist_active_pod_node_placement(
                 sandbox_id,
                 &placement_name,
                 "uid-race",
@@ -3365,7 +3366,7 @@ async fn failed_started_recovery_with_node_placement_stays_started(
     };
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_active_pod_node_placement(
             sandbox_id,
             "placed-recovery-node",
             "placed-recovery-node-uid",
@@ -5559,7 +5560,7 @@ async fn forget_pod_tracking_recovers_started_suspended_by_node_after_current_ba
         .await?;
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_active_pod_node_placement(
             sandbox_id,
             "worker-node-a",
             "worker-node-a-uid",
@@ -5803,7 +5804,7 @@ async fn unchanged_pod_node_placement_does_not_touch_current_rows(
 
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_active_pod_node_placement(
             sandbox_id,
             &node_name,
             "node-uid",
@@ -5831,7 +5832,7 @@ async fn unchanged_pod_node_placement_does_not_touch_current_rows(
 
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_active_pod_node_placement(
             sandbox_id,
             &node_name,
             "node-uid",
@@ -5859,6 +5860,130 @@ async fn unchanged_pod_node_placement_does_not_touch_current_rows(
     .await?;
     assert!(execution_unchanged);
     assert!(sandbox_unchanged);
+    Ok(())
+}
+
+/// A late placement of the pod of an execution a newer one replaced records
+/// nothing: neither the new execution's node name nor the sandbox's node
+/// change, and the write reports there was nothing to record. The active
+/// execution's own pod is then recorded, a repeat finds it already placed,
+/// and once the sandbox is being deleted only the execution's node name is
+/// written, as the outcome reports.
+async fn a_replaced_executions_pod_placement_records_nothing(
+    fixture: &PostgresStore,
+) -> TestResult {
+    let sandbox_id = SandboxId::new();
+    let left_node = NodeId::new();
+    let current_node = NodeId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
+    let first = fixture
+        .store
+        .ensure_active_execution_row(sandbox_id)
+        .await?;
+    fixture
+        .store
+        .finish_active_execution_if_generation(sandbox_id, first.generation, "replaced")
+        .await?;
+    let second = fixture
+        .store
+        .ensure_active_execution_row(sandbox_id)
+        .await?;
+    let placed = || {
+        sqlx::query_as::<_, (Option<NodeId>, Option<String>)>(sql!(
+            "SELECT s.active_node_id, e.k8s_node_name
+               FROM sandboxes s
+               JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id AND e.active
+              WHERE s.id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&fixture.pool)
+    };
+
+    let recorded = fixture
+        .store
+        .persist_pod_node_placement(
+            sandbox_id,
+            &first.pod_name,
+            "left-node",
+            "left-node-uid",
+            left_node,
+            NodeRole::Worker,
+            Some("10.0.0.41"),
+        )
+        .await?;
+    assert_eq!(
+        recorded,
+        PodNodePlacementOutcome::NotActivePod,
+        "the replaced execution's pod records nothing"
+    );
+    assert_eq!(placed().await?, (None, None));
+
+    let recorded = fixture
+        .store
+        .persist_pod_node_placement(
+            sandbox_id,
+            &second.pod_name,
+            "current-node",
+            "current-node-uid",
+            current_node,
+            NodeRole::Worker,
+            Some("10.0.0.42"),
+        )
+        .await?;
+    assert_eq!(
+        recorded,
+        PodNodePlacementOutcome::Placed,
+        "the active execution's pod is recorded"
+    );
+    assert_eq!(
+        placed().await?,
+        (Some(current_node), Some("current-node".to_owned()))
+    );
+    let again = fixture
+        .store
+        .persist_pod_node_placement(
+            sandbox_id,
+            &second.pod_name,
+            "current-node",
+            "current-node-uid",
+            current_node,
+            NodeRole::Worker,
+            Some("10.0.0.42"),
+        )
+        .await?;
+    assert_eq!(again, PodNodePlacementOutcome::AlreadyPlaced);
+
+    // Torn down for good: the execution still records where its pod runs,
+    // for its teardown, and says so; the sandbox keeps its placement.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'deleting' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+    let deleting = fixture
+        .store
+        .persist_pod_node_placement(
+            sandbox_id,
+            &second.pod_name,
+            "left-node",
+            "left-node-uid",
+            left_node,
+            NodeRole::Worker,
+            Some("10.0.0.41"),
+        )
+        .await?;
+    assert_eq!(
+        deleting,
+        PodNodePlacementOutcome::ExecutionOnly {
+            lifecycle: "deleting".to_owned()
+        }
+    );
+    assert_eq!(
+        placed().await?,
+        (Some(current_node), Some("left-node".to_owned())),
+        "the execution's node name is written, the sandbox's placement is not"
+    );
     Ok(())
 }
 
@@ -9844,6 +9969,7 @@ async fn placement_retryability_follows_the_operation_not_the_statement() -> Tes
         store.persist_pod_node_placement_after_pod_exists(
             PodNodePlacement {
                 sandbox_id,
+                pod_name: "space-test-placement-pod",
                 node_name: "ip-10-0-0-1.ec2.internal",
                 node_uid: "11111111-1111-1111-1111-111111111111",
                 node_id,

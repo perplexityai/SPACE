@@ -1,10 +1,10 @@
 use crate::client_live_cap::LiveReservation;
 use crate::controllers::substrate::{
     ActivationAttribution, ActivationClient, AdoptionLabelOutcome, AdoptionLabelTransient,
-    CapPolicy, RecoveryCharge,
+    CapPolicy, CreateExecutionOutcome, RecoveryCharge,
 };
 use pplx_space_accounts::{OrgId, UserId};
-use pplx_space_common_core::types::{ClientId, SandboxId};
+use pplx_space_common_core::types::{ClientId, ExecutionGeneration, SandboxId};
 
 use super::*;
 use crate::controllers::substrate::{
@@ -53,6 +53,12 @@ const POOLED_PREPARE_RECLAIMABLE_ERROR_FRAGMENTS: &[&str] = &[
     "transport is closing",
 ];
 
+/// [`sandbox_store::create::finish_created`] in a transaction of its own.
+/// Restore operations pass their lease token as an [`OperationId`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the row key, the reported outcome and the create's identities are all distinct"
+)]
 async fn finalize_created_sandbox(
     pool: &PgPool,
     sandbox_id: SandboxId,
@@ -61,17 +67,24 @@ async fn finalize_created_sandbox(
     active_node_id: Option<NodeId>,
     command_ready: bool,
     restore_operation_id: Option<OperationId>,
-) -> Result<bool, sqlx::Error> {
-    sandbox_store::create::finalize_created(
-        pool,
-        sandbox_id,
-        lifecycle,
-        placement,
-        active_node_id,
-        command_ready,
-        restore_operation_id.map(|operation_id| operation_id.as_uuid()),
+    execution_generation: Option<ExecutionGeneration>,
+) -> Result<sandbox_store::create::CreatedFinish, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let finish = sandbox_store::create::finish_created(
+        &mut tx,
+        sandbox_store::create::CreatedOutcome {
+            sandbox_id,
+            lifecycle,
+            placement,
+            active_node_id,
+            command_ready,
+            restore_operation_id: restore_operation_id.map(|operation_id| operation_id.as_uuid()),
+            execution_generation,
+        },
     )
-    .await
+    .await?;
+    tx.commit().await?;
+    Ok(finish)
 }
 
 struct PooledCreateInput<'a> {
@@ -1650,10 +1663,16 @@ impl SandboxController {
         let mut lifecycle = outcome.initial_lifecycle;
         let mut placement = outcome.initial_placement;
 
+        // A Direct create records its node now: its runtime client, which
+        // the file-change setup below dials, resolves the worker from it. A
+        // Kubernetes create's node is recorded with its lifecycle, under the
+        // sandbox row lock, in `finish_cold_create`; its runtime client
+        // resolves the pod from the execution row.
         if restore_operation_id.is_none()
+            && outcome.execution_generation.is_none()
             && let Some(active_node_id) = outcome.active_node_id
         {
-            sandbox_store::create::record_created_placement(
+            let recorded = sandbox_store::create::record_created_placement(
                 pool,
                 outcome_sandbox_uuid,
                 active_node_id,
@@ -1668,6 +1687,17 @@ impl SandboxController {
                 // irreversible work — see `db_contention_error`'s exception.
                 internal_error("Sandbox started but DB placement update failed", err)
             })?;
+            if !recorded {
+                // The sandbox left the create's lifecycles (deleted, failed,
+                // quarantined) before its placement was recorded.
+                // `finish_cold_create` below decides what the create answers.
+                tracing::info!(
+                    sandbox_id = %outcome_sandbox_uuid,
+                    active_node_id = %active_node_id,
+                    "sandbox left the create's lifecycles before its create recorded the \
+                     placement; nothing to record"
+                );
+            }
         }
 
         // A budget-exhausted slow create is preserved before the guest is
@@ -1818,52 +1848,15 @@ impl SandboxController {
             }
         }
 
-        // The finalizer owns `creating -> started`, but a matching durable
-        // activation-completion receipt may converge the same execution to
-        // `started` while this request is still waiting for command readiness.
-        // Accept that exact started/on-node/same-node state as idempotent.
-        // Every other transition remains a CAS loss: in particular, a drain
-        // sweep may flip the row to `failed`, which must not be resurrected.
-        // `command_ready_pending` records "reported started before the guest
-        // command API was confirmed ready" — set when the substrate preserved a
-        // slow create (`command_ready == false`). The node's activation-completion
-        // receipt for this create's attempt clears it once the guest passes its
-        // readiness gate, and the access path confirms and clears it on first
-        // use; until then data-plane ops get the SDK-recoverable
-        // `sandbox_timeout`.
-        let finalized = finalize_created_sandbox(
+        self.finish_cold_create(
             pool,
-            outcome.sandbox_id,
+            &outcome,
             lifecycle,
             placement,
-            outcome.active_node_id,
-            outcome.command_ready,
             restore_operation_id,
+            create_event_details(),
         )
-        .await
-        // Not classified: post-side-effect, as above.
-        .map_err(|err| internal_error("Sandbox started but DB update failed", err))?;
-
-        if !finalized {
-            tracing::warn!(
-                sandbox_id = %outcome.sandbox_id,
-                "sandbox create lost the lifecycle CAS — the drain abandon-stuck-creating \
-                 sweep (or another supervisor) flipped the row out of 'creating' while \
-                 this create was in flight; rolling back substrate-side state"
-            );
-            emit_create_sandbox_event(
-                outcome.sandbox_id,
-                SandboxEventType::CreateFailed,
-                create_event_details()
-                    .error("lifecycle CAS lost during create")
-                    .logged_by_caller(),
-            );
-            self.rollback_created_sandbox(pool, outcome.sandbox_id)
-                .await;
-            return Err(ControllerError::service_unavailable(
-                "sandbox create was abandoned while in flight (node likely draining); retry",
-            ));
-        }
+        .await?;
 
         // The substrate's readiness return precedes lifecycle publication.
         // Release only this request's completed lease now; otherwise an
@@ -1898,6 +1891,90 @@ impl SandboxController {
         create_path.mark_request_succeeded();
         crate::metrics::sandbox::api::sandbox_created(tls_interception_on);
         Ok(sandbox_to_response(&sandbox, None))
+    }
+
+    /// Record a cold create's outcome on its row, and roll the create back
+    /// when the row is no longer its to finish.
+    ///
+    /// The finalizer owns `creating -> started`, but a matching durable
+    /// activation-completion receipt may converge the same execution to
+    /// `started` while this request is still waiting for command readiness.
+    /// That exact started/on-node/same-node state is accepted as idempotent.
+    /// A Kubernetes create whose execution something replaced in the
+    /// meantime, as a recovering runtime client's started recovery does once
+    /// the pod is lost, has succeeded: the sandbox runs on its successor, so
+    /// the create records nothing of its own node and answers success rather
+    /// than tearing the successor down (see
+    /// [`sandbox_store::create::CreatedFinish::Superseded`]). Every other
+    /// transition remains a CAS loss and is rolled back: in particular, a
+    /// drain sweep may flip the row to `failed`, which must not be
+    /// resurrected. `command_ready_pending` records "reported started before
+    /// the guest command API was confirmed ready", set when the substrate
+    /// preserved a slow create (`command_ready == false`). The node's
+    /// activation-completion receipt for the execution's attempt clears it
+    /// once the guest passes its readiness gate, and the access path confirms
+    /// and clears it on first use; until then data-plane ops get the
+    /// SDK-recoverable `sandbox_timeout`. `event_details` are the create's
+    /// event details, for its `create_failed` event.
+    pub(super) async fn finish_cold_create(
+        &self,
+        pool: &PgPool,
+        outcome: &CreateExecutionOutcome,
+        lifecycle: &str,
+        placement: &str,
+        restore_operation_id: Option<OperationId>,
+        event_details: SandboxEventDetails,
+    ) -> Result<(), ControllerError> {
+        let finish = finalize_created_sandbox(
+            pool,
+            outcome.sandbox_id,
+            lifecycle,
+            placement,
+            outcome.active_node_id,
+            outcome.command_ready,
+            restore_operation_id,
+            outcome.execution_generation,
+        )
+        .await
+        // Not classified: post-side-effect. `create` mints a fresh
+        // `SandboxId` per request with no idempotency key, so a retryable
+        // answer here would provision a second sandbox.
+        .map_err(|err| internal_error("Sandbox started but DB update failed", err))?;
+
+        match finish {
+            sandbox_store::create::CreatedFinish::Finalized => Ok(()),
+            sandbox_store::create::CreatedFinish::Superseded { active_generation } => {
+                tracing::info!(
+                    sandbox_id = %outcome.sandbox_id,
+                    create_execution_generation = ?outcome.execution_generation,
+                    active_execution_generation = ?active_generation,
+                    active_node_id = ?outcome.active_node_id,
+                    "another execution replaced the create's before it finished; the sandbox \
+                     runs on it, so the create succeeds without recording its own node"
+                );
+                Ok(())
+            }
+            sandbox_store::create::CreatedFinish::Lost => {
+                tracing::warn!(
+                    sandbox_id = %outcome.sandbox_id,
+                    "sandbox create lost the lifecycle CAS — the drain abandon-stuck-creating \
+                     sweep (or another supervisor) flipped the row out of 'creating' while \
+                     this create was in flight; rolling back substrate-side state"
+                );
+                emit_create_sandbox_event(
+                    outcome.sandbox_id,
+                    SandboxEventType::CreateFailed,
+                    event_details
+                        .error("lifecycle CAS lost during create")
+                        .logged_by_caller(),
+                );
+                self.rollback_created_sandbox(pool, outcome.sandbox_id)
+                    .await;
+                Err(ControllerError::service_unavailable(
+                    "sandbox create was abandoned while in flight (node likely draining); retry",
+                ))
+            }
+        }
     }
 
     async fn try_create_from_pool(

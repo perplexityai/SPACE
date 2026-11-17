@@ -516,6 +516,14 @@ pub struct CreateExecutionOutcome {
     pub initial_lifecycle: &'static str,
     pub initial_placement: &'static str,
     pub active_node_id: Option<NodeId>,
+    /// The generation of the Kubernetes execution the create started: the
+    /// create records its node and lifecycle only while that execution is
+    /// still the active one, and succeeds without recording its node once
+    /// another replaced it (see
+    /// `pplx_space_sandbox_store::create::finish_created`). Always `Some` on
+    /// Kubernetes. `None` on Direct, whose route identity the create's
+    /// records do not read, so its lifecycle alone guards them.
+    pub execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
     /// Whether the runtime reached command-readiness before create returned.
     /// `false` on the slow-tail path where the readiness wait exhausted its
     /// ALB-aware budget: the pod is left running and the sandbox is reported

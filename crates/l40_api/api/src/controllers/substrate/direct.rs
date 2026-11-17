@@ -4875,6 +4875,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 initial_lifecycle: "started",
                 initial_placement: "on_node",
                 active_node_id: Some(node.id),
+                execution_generation: None,
                 command_ready: true,
             });
         }
@@ -4935,6 +4936,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 initial_lifecycle: "started",
                 initial_placement: "on_node",
                 active_node_id: Some(node.id),
+                execution_generation: None,
                 command_ready: true,
             });
         }
@@ -5060,6 +5062,7 @@ impl SubstrateAdapter for DirectSubstrate {
             initial_lifecycle: "started",
             initial_placement: "on_node",
             active_node_id: Some(node.id),
+            execution_generation: None,
             command_ready: true,
         })
     }

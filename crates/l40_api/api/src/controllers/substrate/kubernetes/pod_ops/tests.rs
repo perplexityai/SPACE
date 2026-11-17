@@ -958,7 +958,7 @@ mod stopped_restore_plan_tests {
             .await?;
         substrate
             .store
-            .persist_pod_node_placement(
+            .persist_active_pod_node_placement(
                 evacuated,
                 "since-terminated-node",
                 "since-terminated-node-uid",
@@ -1107,7 +1107,7 @@ mod stopped_restore_plan_tests {
             .await?;
         substrate
             .store
-            .persist_pod_node_placement(
+            .persist_active_pod_node_placement(
                 sandbox_id,
                 "drained-node",
                 "drained-node-uid",
@@ -1343,7 +1343,7 @@ mod stopped_restore_plan_tests {
             .await?;
         substrate
             .store
-            .persist_pod_node_placement(
+            .persist_active_pod_node_placement(
                 sandbox_id,
                 "drained-node",
                 "drained-node-uid",
@@ -1616,4 +1616,27 @@ async fn pod_worker_channel_verifies_tls_for_raw_pod_ips() {
         .expect("listener shutdown must remain bounded")
         .unwrap()
         .unwrap();
+}
+
+/// The lifecycles the placement writer records a pod's node in are exactly
+/// those `ensure_pod_exists` materializes a pod in, with `suspending` and
+/// `stopping`, in which the pod a suspend or a stop acts on is still the
+/// sandbox's. A lifecycle added to one and not the other fails here.
+#[test]
+fn pod_placeable_lifecycles_are_the_materializable_ones_and_the_teardowns_of_a_live_pod() {
+    use pplx_space_common_core::types::SandboxLifecycle;
+    use pplx_space_sandbox_store::wake::POD_PLACEABLE_LIFECYCLES;
+
+    for &lifecycle in SandboxLifecycle::all() {
+        let materializable = super::ensure_pod::lifecycle_is_materializable(lifecycle, lifecycle);
+        let tearing_down_a_live_pod = matches!(
+            lifecycle,
+            SandboxLifecycle::Suspending | SandboxLifecycle::Stopping
+        );
+        assert_eq!(
+            POD_PLACEABLE_LIFECYCLES.contains(&lifecycle),
+            materializable || tearing_down_a_live_pod,
+            "{lifecycle}"
+        );
+    }
 }

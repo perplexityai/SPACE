@@ -183,10 +183,12 @@ impl KubernetesSubstrate {
             ),
         })?;
 
-        self.store
+        let recorded = self
+            .store
             .persist_pod_node_placement_after_pod_exists(
                 PodNodePlacement {
                     sandbox_id,
+                    pod_name: pod.name(),
                     node_name,
                     node_uid,
                     node_id,
@@ -196,6 +198,33 @@ impl KubernetesSubstrate {
                 retry,
             )
             .await?;
+        match recorded {
+            PodNodePlacementOutcome::Placed | PodNodePlacementOutcome::AlreadyPlaced => {}
+            PodNodePlacementOutcome::ExecutionOnly { lifecycle } => {
+                // The sandbox is being torn down for good: the execution
+                // records its pod's node for that teardown, and the row keeps
+                // its own placement.
+                tracing::info!(
+                    %sandbox_id,
+                    pod_name = pod.name(),
+                    node_name,
+                    lifecycle,
+                    "recorded the pod's node on its execution; the sandbox's lifecycle keeps its \
+                     placement"
+                );
+            }
+            PodNodePlacementOutcome::NotActivePod => {
+                // A late observation of a pod whose execution was retired or
+                // replaced: the row has moved on and keeps its own placement.
+                tracing::info!(
+                    %sandbox_id,
+                    pod_name = pod.name(),
+                    node_name,
+                    "pod no longer backs the sandbox's active execution; nothing to record for \
+                     its node placement"
+                );
+            }
+        }
         Ok(Some(node_id))
     }
 

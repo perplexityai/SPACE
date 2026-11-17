@@ -5,6 +5,18 @@ use super::*;
 use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
 use pplx_space_common_core::types::SubstrateKind;
 
+/// The generation of the Kubernetes execution a create started, for its
+/// outcome. The store only ever holds positive generations, so another value
+/// is an error, never an outcome without a generation, which would read as a
+/// Direct create and skip the placement guard. It is a `Failed`, a 500 that
+/// does not invite a retry: the pod already exists, and a retried create
+/// would provision a second sandbox.
+fn created_execution_generation(generation: i64) -> Result<ExecutionGeneration, SubstrateError> {
+    ExecutionGeneration::new(generation).map_err(|error| SubstrateError::Failed {
+        message: format!("invalid created Kubernetes execution generation {generation}: {error}"),
+    })
+}
+
 impl SubstrateAdapter for KubernetesSubstrate {
     fn managed_by(&self) -> &'static str {
         "k8s"
@@ -208,6 +220,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     initial_lifecycle: "started",
                     initial_placement: "on_node",
                     active_node_id: Some(active_node_id),
+                    execution_generation: Some(created_execution_generation(execution.generation)?),
                 });
             }
             Err(error) => return Err(error),
@@ -580,6 +593,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         initial_lifecycle: "started",
                         initial_placement: "on_node",
                         active_node_id: Some(node_id),
+                        execution_generation: Some(created_execution_generation(
+                            execution.generation,
+                        )?),
                         command_ready: false,
                     });
                 }
@@ -730,6 +746,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             initial_lifecycle,
             initial_placement,
             active_node_id,
+            execution_generation: Some(created_execution_generation(execution.generation)?),
             command_ready: true,
         })
     }

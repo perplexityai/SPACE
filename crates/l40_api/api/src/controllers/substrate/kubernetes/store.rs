@@ -46,6 +46,7 @@ mod environment_placement;
 mod execution_rows;
 mod node_inventory;
 mod pod_placement;
+pub(super) use pod_placement::PodNodePlacementOutcome;
 mod pod_tracking;
 mod restore_lease;
 mod restore_source;
@@ -72,6 +73,9 @@ pub(super) struct K8sStore {
 /// proxy-reachability wait.
 pub(super) struct PodNodePlacement<'a> {
     pub sandbox_id: SandboxId,
+    /// The pod that landed; its placement is recorded only while it backs
+    /// the sandbox's active execution.
+    pub pod_name: &'a str,
     pub node_name: &'a str,
     pub node_uid: &'a str,
     pub node_id: NodeId,

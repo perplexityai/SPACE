@@ -80,8 +80,8 @@ use cancel_rate_tracker::CancelRateTracker;
 use restore_waiters::RestoreWaiters;
 use store::{
     ActiveExecutionState, K8sStore, NodeLifecycleState, NodeStateWrite, PlacementClock,
-    PreparedWakeSandbox, RestoreClaim, RestoreClaimRevert, RestoreSnapshotChoice,
-    SandboxExecutionRow, StartedRecoveryClaim, StartedRecoveryCompletion,
+    PodNodePlacementOutcome, PreparedWakeSandbox, RestoreClaim, RestoreClaimRevert,
+    RestoreSnapshotChoice, SandboxExecutionRow, StartedRecoveryClaim, StartedRecoveryCompletion,
     StartedRecoveryObservation, UserRestoreObservation,
 };
 

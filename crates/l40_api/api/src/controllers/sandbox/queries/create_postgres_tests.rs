@@ -91,6 +91,31 @@ async fn insert_node(pool: &PgPool, node_id: NodeId) -> TestResult {
     insert_ready_worker_node(pool, node_id).await
 }
 
+/// [`finalize_created_sandbox`] for a create that reports no Kubernetes
+/// execution generation, as on Direct: whether the row took the outcome.
+async fn finalized_without_generation(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    lifecycle: &str,
+    placement: &str,
+    active_node_id: Option<NodeId>,
+    command_ready: bool,
+    restore_operation_id: Option<OperationId>,
+) -> Result<bool, sqlx::Error> {
+    Ok(finalize_created_sandbox(
+        pool,
+        sandbox_id,
+        lifecycle,
+        placement,
+        active_node_id,
+        command_ready,
+        restore_operation_id,
+        None,
+    )
+    .await?
+        == pplx_space_sandbox_store::create::CreatedFinish::Finalized)
+}
+
 /// Create finalization moves a row to `started` on its node only out of the
 /// lifecycle its create owns: a plain create out of `creating`, whether the
 /// row is still unplaced or a receipt already placed it there, and also out
@@ -153,7 +178,7 @@ async fn create_finalization_finalizes_only_the_lifecycle_its_create_owns() -> T
             .execute(&db.pool)
             .await?;
 
-            let finalized = finalize_created_sandbox(
+            let finalized = finalized_without_generation(
                 &db.pool,
                 sandbox_id,
                 "started",
@@ -202,7 +227,7 @@ async fn create_finalization_accepts_receipt_converged_started_state() -> TestRe
     .execute(&db.pool)
     .await?;
 
-    let finalized = finalize_created_sandbox(
+    let finalized = finalized_without_generation(
         &db.pool,
         sandbox_id,
         "started",
@@ -227,6 +252,119 @@ async fn create_finalization_accepts_receipt_converged_started_state() -> TestRe
         !command_ready_pending,
         "idempotent finalization must not restore a cleared readiness marker"
     );
+    Ok(())
+}
+
+/// A Kubernetes create whose execution a started recovery replaced while it
+/// waited for command readiness. Its substrate reported generation 2 on
+/// `create_node`; the row, already `started` (a receipt converged it) or
+/// still `creating`, now runs generation 3 on `successor_node`. The create
+/// answers success, records nothing of its own node, and does not tear the
+/// successor down: the row, its successor execution and its node stay.
+#[tokio::test(flavor = "current_thread")]
+async fn a_create_whose_execution_was_replaced_succeeds_without_touching_the_successor()
+-> TestResult {
+    let db = pg_test_db().await?;
+    let actor = insert_actor(&db.pool).await?;
+    let create_node = NodeId::new();
+    let successor_node = NodeId::new();
+    insert_node(&db.pool, create_node).await?;
+    insert_node(&db.pool, successor_node).await?;
+    let controller = direct_sandbox_controller(&db.pool);
+
+    for stored in ["started", "creating"] {
+        let sandbox_id = SandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (
+                 id, user_id, org_id, managed_by, lifecycle, placement, active_node_id,
+                 target_node_id, placement_changed_at, network_policy_generation
+             )
+             VALUES ($1, $2, $3, 'k8s', $4, 'on_node', $5, $5,
+                     TIMESTAMPTZ '2026-01-02 03:04:05+00', 1)"
+        ))
+        .bind(sandbox_id)
+        .bind(actor.id)
+        .bind(actor.org_id)
+        .bind(stored)
+        .bind(successor_node)
+        .execute(&db.pool)
+        .await?;
+        for (generation, active, state) in [(2, false, "replaced"), (3, true, "running")] {
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_k8s_executions
+                     (sandbox_id, generation, pod_name, pod_namespace, state, active)
+                 VALUES ($1, $2, $3, 'space', $4, $5)"
+            ))
+            .bind(sandbox_id)
+            .bind(generation)
+            .bind(format!(
+                "space-sbx-{}-g{generation}",
+                sandbox_id.as_uuid().simple()
+            ))
+            .bind(state)
+            .bind(active)
+            .execute(&db.pool)
+            .await?;
+        }
+        let outcome = crate::controllers::substrate::CreateExecutionOutcome {
+            lease_completion: None,
+            sandbox_id,
+            binding: None,
+            initial_lifecycle: "started",
+            initial_placement: "on_node",
+            active_node_id: Some(create_node),
+            execution_generation: Some(ExecutionGeneration::new(2)?),
+            command_ready: true,
+        };
+
+        controller
+            .finish_cold_create(
+                &db.pool,
+                &outcome,
+                "started",
+                "on_node",
+                None,
+                SandboxEventDetails::default(),
+            )
+            .await
+            .map_err(|error| format!("{stored}: the create succeeds: {error}"))?;
+
+        let row: Option<(String, Option<NodeId>, String, bool)> = sqlx::query_as(sql!(
+            "SELECT lifecycle, active_node_id, placement_changed_at::TEXT,
+                    command_ready_pending
+               FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_optional(&db.pool)
+        .await?;
+        let (lifecycle, active_node_id, placement_changed_at, command_ready_pending) =
+            row.ok_or_else(|| format!("{stored}: the successor's row survives"))?;
+        assert_eq!(
+            (lifecycle.as_str(), active_node_id),
+            ("started", Some(successor_node)),
+            "{stored}: published, on the successor's node"
+        );
+        assert_eq!(
+            placement_changed_at, "2026-01-02 03:04:05+00",
+            "{stored}: the create did not record a placement"
+        );
+        assert_eq!(
+            command_ready_pending,
+            stored == "creating",
+            "{stored}: nobody confirmed the successor's command API"
+        );
+        let active: Vec<i64> = sqlx::query_scalar(sql!(
+            "SELECT generation FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .fetch_all(&db.pool)
+        .await?;
+        assert_eq!(
+            active,
+            [3],
+            "{stored}: the successor execution stays active"
+        );
+    }
     Ok(())
 }
 
@@ -256,7 +394,7 @@ async fn create_finalization_accepts_operation_leased_restoring_state() -> TestR
     .execute(&db.pool)
     .await?;
 
-    let wrong_owner_finalized = finalize_created_sandbox(
+    let wrong_owner_finalized = finalized_without_generation(
         &db.pool,
         sandbox_id,
         "started",
@@ -271,7 +409,7 @@ async fn create_finalization_accepts_operation_leased_restoring_state() -> TestR
         "a different operation lease must not finalize the restoring row"
     );
 
-    let finalized = finalize_created_sandbox(
+    let finalized = finalized_without_generation(
         &db.pool,
         sandbox_id,
         "started",
@@ -392,7 +530,7 @@ async fn restore_finalization_requires_the_receipt_converged_node_binding() -> T
 
     let other_node_id = NodeId::new();
     insert_node(&db.pool, other_node_id).await?;
-    let mismatched = finalize_created_sandbox(
+    let mismatched = finalized_without_generation(
         &db.pool,
         sandbox_id,
         "started",
@@ -414,7 +552,7 @@ async fn restore_finalization_requires_the_receipt_converged_node_binding() -> T
         "a losing receipt must not stamp placement freshness"
     );
 
-    let finalized = finalize_created_sandbox(
+    let finalized = finalized_without_generation(
         &db.pool,
         sandbox_id,
         "started",
@@ -465,7 +603,7 @@ async fn create_finalization_records_operation_leased_restore_failure() -> TestR
     .execute(&db.pool)
     .await?;
 
-    let finalized = finalize_created_sandbox(
+    let finalized = finalized_without_generation(
         &db.pool,
         sandbox_id,
         "failed",

@@ -3,7 +3,9 @@ use pplx_space_accounts::NodeId;
 use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::LocalArtifactId;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SubstrateKind};
+use pplx_space_common_core::types::{
+    ExecutionGeneration, SandboxId, SandboxLifecycle, SubstrateKind,
+};
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
@@ -20,6 +22,7 @@ use super::sweeper::{EvacuationRestoreTarget, EvacuationRestoreTargetParseError}
 mod activity_tests;
 mod create_finish_tests;
 mod insert_unplaced_tests;
+mod pod_placement_tests;
 
 /// The three desired-state columns, read back raw.
 async fn read_desired_state(
@@ -88,6 +91,32 @@ async fn insert_sandbox(pool: &PgPool, name: Option<&str>, lifecycle: &str) -> T
     .execute(pool)
     .await?;
     Ok(id)
+}
+
+fn generation(value: i64) -> ExecutionGeneration {
+    ExecutionGeneration::new(value).expect("test generations are positive")
+}
+
+/// Insert `sandbox_id`'s Kubernetes execution at `generation`.
+async fn insert_k8s_execution(
+    pool: &PgPool,
+    sandbox_id: Uuid,
+    generation: i64,
+    active: bool,
+) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, state, active)
+         VALUES ($1, $2, $3, 'space-test', $4, $5)"
+    ))
+    .bind(sandbox_id)
+    .bind(generation)
+    .bind(format!("space-sbx-{}-g{generation}", sandbox_id.simple()))
+    .bind(if active { "running" } else { "suspended" })
+    .bind(active)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// `FieldPatch::default()` must be available for every `T`, not just the

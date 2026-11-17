@@ -248,32 +248,43 @@ impl K8sStore {
             .transpose()
     }
 
+    /// Record `node_name` on the active execution whose pod is `pod_name`, and
+    /// return that execution's generation. `None` when the pod no longer backs
+    /// the sandbox's active execution: a newer generation replaced it, or
+    /// none is active. Nothing is written then.
     pub(super) async fn update_active_execution_node_name(
         &self,
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
+        pod_name: &str,
         node_name: &str,
-    ) -> Result<bool, SubstrateError> {
-        sqlx::query_scalar::<_, bool>(sql!(
+    ) -> Result<Option<ExecutionGeneration>, SubstrateError> {
+        let generation = sqlx::query_scalar::<_, i64>(sql!(
             "WITH updated AS (
                 UPDATE sandbox_k8s_executions
                 SET k8s_node_name = $1::TEXT,
                     updated_at = CASE WHEN state = 'recovering' THEN updated_at ELSE NOW() END
-                WHERE sandbox_id = $2 AND active
+                WHERE sandbox_id = $2 AND active AND pod_name = $3
                   AND k8s_node_name IS DISTINCT FROM $1::TEXT
                 RETURNING 1
              )
-             SELECT EXISTS (
-                SELECT 1
-                FROM sandbox_k8s_executions
-                WHERE sandbox_id = $2 AND active
-             )"
+             SELECT generation
+             FROM sandbox_k8s_executions
+             WHERE sandbox_id = $2 AND active AND pod_name = $3"
         ))
         .bind(node_name)
         .bind(sandbox_id)
-        .fetch_one(conn)
+        .bind(pod_name)
+        .fetch_optional(conn)
         .await
-        .db_context("failed to persist sandbox pod node name")
+        .db_context("failed to persist sandbox pod node name")?;
+        generation
+            .map(|generation| {
+                ExecutionGeneration::new(generation).map_err(|error| SubstrateError::Failed {
+                    message: format!("invalid active Kubernetes execution generation: {error}"),
+                })
+            })
+            .transpose()
     }
 
     pub(super) async fn finish_active_execution_in(

@@ -2,6 +2,26 @@
 
 use super::*;
 use pplx_space_common_core::types::ClientId;
+use pplx_space_sandbox_store::wake::PodNodePlacementWrite;
+
+/// What [`K8sStore::persist_pod_node_placement`] recorded for a pod that
+/// landed on a node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::controllers::substrate::kubernetes) enum PodNodePlacementOutcome {
+    /// The pod backs the active execution: its node name is on the execution,
+    /// and the sandbox now names the node as its placement.
+    Placed,
+    /// As [`Self::Placed`], with the sandbox already placed on that node, so
+    /// only the execution's node name was written.
+    AlreadyPlaced,
+    /// The pod backs the active execution, whose node name was written, but
+    /// the sandbox is in `lifecycle`, which no pod places, so its placement
+    /// is unchanged.
+    ExecutionOnly { lifecycle: String },
+    /// The pod does not back the sandbox's active execution, or the sandbox
+    /// is gone: nothing was written but the node's role row.
+    NotActivePod,
+}
 
 impl K8sStore {
     /// Persist pod metadata onto the active execution row of `generation`.
@@ -274,15 +294,29 @@ impl K8sStore {
         Ok(Some(resulting_state))
     }
 
+    /// Record that `pod_name` landed on `node_name`: on the execution it
+    /// backs, and as the sandbox's placement. The node's role row is upserted
+    /// whatever the outcome.
+    ///
+    /// The execution's `k8s_node_name` is written whenever the pod backs the
+    /// sandbox's active execution, even when the sandbox is in a lifecycle no
+    /// pod places ([`pplx_space_sandbox_store::wake::POD_PLACEABLE_LIFECYCLES`]):
+    /// the pod still runs on that node, and the execution's teardown finds it
+    /// there. The outcome says which of the two writes happened.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the row key, the pod and the node's identity columns are all distinct"
+    )]
     pub(in crate::controllers::substrate::kubernetes) async fn persist_pod_node_placement(
         &self,
         sandbox_id: SandboxId,
+        pod_name: &str,
         node_name: &str,
         node_uid: &str,
         node_id: NodeId,
         role: NodeRole,
         address: Option<&str>,
-    ) -> Result<(), SubstrateError> {
+    ) -> Result<PodNodePlacementOutcome, SubstrateError> {
         let mut tx = self
             .pool
             .begin()
@@ -304,27 +338,64 @@ impl K8sStore {
 
         let sandbox_exists =
             Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await?;
-        if sandbox_exists {
-            let active_execution = self
-                .update_active_execution_node_name(&mut tx, sandbox_id, node_name)
-                .await?;
-
-            if active_execution {
-                pplx_space_sandbox_store::wake::record_pod_node_placement(
-                    &mut *tx, sandbox_id, node_id,
-                )
-                .await
-                // Classified like every sibling in this transaction; the
-                // post-side-effect demotion is applied to the whole function's
-                // result below.
-                .db_context("failed to persist sandbox Kubernetes placement")?;
-            }
+        let mut outcome = PodNodePlacementOutcome::NotActivePod;
+        if sandbox_exists
+            && let Some(generation) = self
+                .update_active_execution_node_name(&mut tx, sandbox_id, pod_name, node_name)
+                .await?
+        {
+            let written = pplx_space_sandbox_store::wake::record_pod_node_placement(
+                &mut *tx, sandbox_id, node_id, generation,
+            )
+            .await
+            // Classified like every sibling in this transaction; the
+            // post-side-effect demotion is applied to the whole function's
+            // result below.
+            .db_context("failed to persist sandbox Kubernetes placement")?;
+            outcome = match written {
+                PodNodePlacementWrite::Placed => PodNodePlacementOutcome::Placed,
+                PodNodePlacementWrite::AlreadyPlaced => PodNodePlacementOutcome::AlreadyPlaced,
+                PodNodePlacementWrite::LifecycleRefused { lifecycle } => {
+                    PodNodePlacementOutcome::ExecutionOnly { lifecycle }
+                }
+                // Not expected: the execution was just found active under
+                // the sandbox row lock.
+                PodNodePlacementWrite::NotActive => PodNodePlacementOutcome::NotActivePod,
+            };
         }
 
         tx.commit()
             .await
             .db_context("failed to commit pod node placement transaction")?;
-        Ok(())
+        Ok(outcome)
+    }
+
+    /// [`Self::persist_pod_node_placement`] for the pod of the sandbox's active
+    /// execution, as the pod that execution created would report it, for
+    /// tests that place a sandbox without naming its pod. With no active
+    /// execution, a pod no execution tracks.
+    #[cfg(test)]
+    pub(in crate::controllers::substrate::kubernetes) async fn persist_active_pod_node_placement(
+        &self,
+        sandbox_id: SandboxId,
+        node_name: &str,
+        node_uid: &str,
+        node_id: NodeId,
+        role: NodeRole,
+        address: Option<&str>,
+    ) -> Result<PodNodePlacementOutcome, SubstrateError> {
+        let pod_name: Option<String> = sqlx::query_scalar(sql!(
+            "SELECT pod_name FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to read the active execution's pod")?;
+        let pod_name = pod_name.unwrap_or_else(|| "space-test-untracked-pod".to_owned());
+        self.persist_pod_node_placement(
+            sandbox_id, &pod_name, node_name, node_uid, node_id, role, address,
+        )
+        .await
     }
 
     /// [`Self::persist_pod_node_placement`], demoting the whole result when the
@@ -348,9 +419,10 @@ impl K8sStore {
         &self,
         placement: PodNodePlacement<'_>,
         retry: PlacementRetryDisposition,
-    ) -> Result<(), SubstrateError> {
+    ) -> Result<PodNodePlacementOutcome, SubstrateError> {
         let PodNodePlacement {
             sandbox_id,
+            pod_name,
             node_name,
             node_uid,
             node_id,
@@ -358,7 +430,9 @@ impl K8sStore {
             address,
         } = placement;
         let result = self
-            .persist_pod_node_placement(sandbox_id, node_name, node_uid, node_id, role, address)
+            .persist_pod_node_placement(
+                sandbox_id, pod_name, node_name, node_uid, node_id, role, address,
+            )
             .await;
         match retry {
             PlacementRetryDisposition::RetryDuplicatesExecution => {
