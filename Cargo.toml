@@ -333,7 +333,7 @@ subtle = "2"
 socket2 = "0.6"
 # The published SQLx 0.9 bounds libsqlite3-sys below the patched SQLite release.
 # Pin upstream's compatibility fix until a registry release includes it.
-sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c", default-features = false }
+sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "55abaf4a3a4db83888c0ec31a01954357d7f385c", default-features = false }
 tempfile = "3"
 tar = "0.4.46"
 flate2 = "1"
