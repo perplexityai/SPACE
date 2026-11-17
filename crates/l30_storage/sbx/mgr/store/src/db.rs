@@ -11,13 +11,7 @@ use std::time::Duration;
 
 use pplx_space_accounts::{ORPHANED_SANDBOX_OWNER, SandboxOwner};
 use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleRuntimeState};
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, SandboxActivationAttemptId,
-    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineHistoryAction,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxRuntimeLabel, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
-    SandboxTransitionReceiptKind, SandboxTransitionTargetState, SnapshotName,
-};
+use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotName};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
@@ -29,6 +23,13 @@ use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::{NetworkPolicy, proto::NetworkPolicySource};
 use pplx_space_node_model::NodeManagedBy;
 pub use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId,
+    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxRuntimeLabel, SandboxTransitionReceipt,
+    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
+    SandboxTransitionTargetState,
+};
 use pplx_space_sqlite::SqliteU64;
 use pplx_space_template_model::ORPHANED_SANDBOX_TEMPLATE;
 use rusqlite::types::Type;
@@ -64,8 +65,8 @@ use crate::state::{
     CleanupState, SandboxState, SandboxStatus, SandboxStatusEventDetails, StateTransitionError,
     Teardown,
 };
-use pplx_space_common_core::types::{RouteGeneration, SpaceApiRouteIdentity};
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::{RouteGeneration, SpaceApiRouteIdentity};
 
 const DB_PATH: &str = pplx_space_host_layout::paths::SANDBOX_MANAGER_DB;
 
@@ -123,11 +124,11 @@ pub use teardown_suspend::*;
 // Most of the no-progress vocabulary is durable: its rendered form is persisted
 // into `sandbox_quarantine_state.last_error`. Pre-claim reasons and a detached
 // task failure are metric-only, but share the same bounded classification so one
-// pass does not invent a second reason type. It therefore belongs in common-core
+// pass does not invent a second reason type. It therefore belongs in pplx-space-sandbox-model
 // rather than in sbx-mgr's `metrics::sandbox::worker`, whose tag it also happens
 // to be. Re-exported here so
 // `crate::db::QuarantineRecoveryNoProgressReason` stays the name callers use.
-pub use pplx_space_common_core::types::QuarantineRecoveryNoProgressReason;
+pub use pplx_space_sandbox_model::QuarantineRecoveryNoProgressReason;
 
 /// Typed reads: one sandbox's whole row, the narrow views that keep working
 /// without one, a State RPC batch, one local artifact, one cleanup job and
@@ -846,7 +847,7 @@ pub mod fixture {
 
     use pplx_space_accounts::SandboxOwner;
     use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-    use pplx_space_common_core::types::{SandboxId, SandboxRuntimeLabel};
+    use pplx_space_sandbox_model::{SandboxId, SandboxRuntimeLabel};
 
     use crate::state::SandboxStatus;
 

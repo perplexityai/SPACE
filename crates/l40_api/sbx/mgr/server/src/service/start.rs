@@ -59,10 +59,7 @@ use crate::{
     state::{SandboxState, SandboxStatus, SandboxStatusEventDetails},
 };
 use pplx_space_accounts::SandboxOwnerKind;
-use pplx_space_common_core::types::{
-    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
-    StorageUri,
-};
+use pplx_space_common_core::types::StorageUri;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
@@ -75,6 +72,9 @@ use pplx_space_node_mgr_client::{
     },
 };
 use pplx_space_sandbox_metrics::admission::AdmissionPermitOutcome;
+use pplx_space_sandbox_model::{
+    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::{Response, Status};
@@ -96,8 +96,7 @@ fn resolve_missing_checkpoint_restore_route_identity(
 
 struct StartSandboxContext {
     activation_auto_lifecycle: Option<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
-    operation_activation_attempt_id:
-        Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    operation_activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     checkpoint: String,
     suspend_restore_storage_uri: Option<String>,
     restore_placement: SuspendRestorePlacement,
@@ -113,8 +112,8 @@ struct StartSandboxContext {
     restore_target: CrossNodeRestoreTarget,
     req_vcpu: Option<u32>,
     req_memory_mib: Option<u32>,
-    execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
-    space_api_route_identity: pplx_space_common_core::types::SpaceApiRouteIdentity,
+    execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+    space_api_route_identity: pplx_space_sandbox_model::SpaceApiRouteIdentity,
     route_identity_provenance: crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
     open_activation_claim_eligible: bool,
     restore_artifact_as_new: Option<RestoreArtifactAsNewContext>,
@@ -124,8 +123,7 @@ struct StartSandboxContext {
     runtime_upgrade: Option<crate::db::RuntimeUpgradeOperationId>,
     /// Set only by the runtime upgrade operation, never from the wire; see
     /// [`StartAdmission::expected_node_execution`].
-    expected_node_execution:
-        Option<Option<pplx_space_common_core::types::SandboxActivationAttemptId>>,
+    expected_node_execution: Option<Option<pplx_space_sandbox_model::SandboxActivationAttemptId>>,
 }
 
 /// What a `Start` from inside sandbox-manager may claim beyond the wire
@@ -137,7 +135,7 @@ pub(super) struct StartAdmission {
     /// The node execution the caller decided to start the sandbox on. The
     /// claim refuses a sandbox another activation moved off it since.
     pub(super) expected_node_execution:
-        Option<Option<pplx_space_common_core::types::SandboxActivationAttemptId>>,
+        Option<Option<pplx_space_sandbox_model::SandboxActivationAttemptId>>,
 }
 
 struct StartSandboxLookup {
@@ -580,8 +578,8 @@ async fn prepare_suspend_restore_dir(
     owner: &pplx_space_accounts::SandboxOwner,
     sandbox_id: String,
     storage_uri: Option<String>,
-    execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
-    activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+    activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
 ) -> Result<crate::snapshot_restore::RestorePrepared, crate::snapshot_restore::RestoreError> {
     let retire_scope = |
         transfer_scope_id: pplx_space_common_core::types::TransferScopeId,

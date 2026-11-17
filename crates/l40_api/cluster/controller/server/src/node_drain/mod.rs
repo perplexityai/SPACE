@@ -176,7 +176,7 @@
 //! new 2-variant enums introduced.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -184,9 +184,9 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::node_drain as node_drain_metrics;
 use pplx_space_api::controllers::substrate::NODE_RPC_BLOCKING_BUDGET;
-use pplx_space_common_core::types::SandboxLifecycle;
 use pplx_space_durations::PositiveDuration;
 use pplx_space_node_model::NodeDrainMode;
+use pplx_space_sandbox_model::SandboxLifecycle;
 use pplx_space_sandbox_pod::EvacuationPlacement;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;

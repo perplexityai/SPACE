@@ -1,6 +1,6 @@
 use super::*;
-use pplx_space_common_core::types::SandboxActivationAttemptId;
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
 use pplx_space_template_model::TemplateId;
 
 mod activation_timeout_tests {
@@ -202,7 +202,7 @@ mod touch_auto_lifecycle_tests {
 
 mod policy_tests {
 
-    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_sandbox_model::SandboxId;
     use std::collections::BTreeMap;
 
     use pplx_space_auto_lifecycle::{
@@ -349,18 +349,18 @@ mod policy_tests {
     #[test]
     fn sandbox_port_exposure_admission_enforces_guest_listener_budget() {
         super::ports::enforce_sandbox_port_exposure_capacity(
-            pplx_space_common_core::types::MAX_SANDBOX_PORT_EXPOSURES as i64 - 1,
+            pplx_space_sandbox_model::MAX_SANDBOX_PORT_EXPOSURES as i64 - 1,
             false,
         )
         .unwrap();
         let error = super::ports::enforce_sandbox_port_exposure_capacity(
-            pplx_space_common_core::types::MAX_SANDBOX_PORT_EXPOSURES as i64,
+            pplx_space_sandbox_model::MAX_SANDBOX_PORT_EXPOSURES as i64,
             false,
         )
         .unwrap_err();
         assert_eq!(error.status(), axum::http::StatusCode::CONFLICT);
         super::ports::enforce_sandbox_port_exposure_capacity(
-            pplx_space_common_core::types::MAX_SANDBOX_PORT_EXPOSURES as i64,
+            pplx_space_sandbox_model::MAX_SANDBOX_PORT_EXPOSURES as i64,
             true,
         )
         .expect("existing desired-open exposure remains idempotent above the new admission limit");
@@ -1465,8 +1465,8 @@ mod response_tests {
         ed25519::SpaceApiRouteEd25519Authority,
         ed25519::decode_unverified_space_api_route_ed25519_claims,
     };
-    use pplx_space_common_core::types::SandboxId;
     use pplx_space_node_model::NodeManagedBy;
+    use pplx_space_sandbox_model::SandboxId;
 
     use sqlx::types::Json;
 
@@ -1497,7 +1497,7 @@ mod response_tests {
             active_execution_generation: None,
             active_pod_uid: None,
             active_activation_attempt_id: None,
-            ecw_credential_epoch: pplx_space_common_core::types::EcwCredentialEpoch::new(1)
+            ecw_credential_epoch: pplx_space_sandbox_model::EcwCredentialEpoch::new(1)
                 .expect("credential epoch is valid"),
             target_node_id: None,
             placement_changed_at: None,

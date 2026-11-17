@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::uds_per_sandbox_limit_exceeded_status;
+use pplx_space_sandbox_model::SandboxId;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::timeout;
 use tonic::{Code, Status};

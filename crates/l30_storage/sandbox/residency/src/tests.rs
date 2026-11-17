@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 /// The kill switch is production wiring, so pin every path through it: the
 /// default with the var unset, an explicit disable, each truthy spelling the

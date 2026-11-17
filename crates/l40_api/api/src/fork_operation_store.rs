@@ -3,8 +3,9 @@ use pplx_space_common_core::types::SnapshotId;
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
+use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_public_api::{OperationId, OperationState};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::no_newer_full_snapshot;
 use pplx_space_sql_locator::sql;
 use sqlx::{PgPool, types::Json};

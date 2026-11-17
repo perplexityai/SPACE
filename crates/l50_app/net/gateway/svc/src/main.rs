@@ -2,12 +2,12 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use pplx_space_common_core::types::{SandboxId, SpaceApiRouteIdentity};
 use pplx_space_net_common::DomainName;
 use pplx_space_net_gateway::InitialPolicyState;
 use pplx_space_net_gateway::tcp_proxy::TcpDomainAuthorizationMode;
 use pplx_space_net_gateway::{NetGatewayRunConfig, SERVICE_NAME};
 use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::{SandboxId, SpaceApiRouteIdentity};
 
 #[derive(Parser)]
 #[command(

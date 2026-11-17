@@ -3,10 +3,6 @@ use super::spaced_bridge::cleanup_restored_snapshot_dir_async;
 use super::start_support::ActivationCleanupGuard;
 use super::*;
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{
-    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxQuarantineReasonCode,
-    SpaceApiRouteIdentity,
-};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
@@ -15,6 +11,10 @@ use pplx_space_k8s_ids::PodUid;
 use pplx_space_k8s_node_id::space_node_id;
 use pplx_space_node_model::NodeRole as SpaceNodeRole;
 use pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxQuarantineReasonCode,
+    SpaceApiRouteIdentity,
+};
 
 const NODE_ID_PATH: &str = "/space/etc/node-id";
 
@@ -326,7 +326,7 @@ pub(super) fn fresh_runtime_activation_identity(
 /// The open-claim identity a cluster-fenced activation records, or `None`
 /// when the activation isn't eligible to hold one.
 pub(super) fn open_route_activation_claim(
-    space_api_route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    space_api_route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
     route_identity_provenance: crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
     open_activation_claim_eligible: bool,
 ) -> Option<crate::db::route_activation_claims::OpenRouteActivationClaim> {

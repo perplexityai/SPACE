@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
-use pplx_space_common_core::types::{ExecutionGeneration, SandboxActivationAttemptId, SandboxId};
 use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
 use pplx_space_node_mgr_protocol::proto::{
     ProcessEndpointIdentity as WireProcessEndpointIdentity,
     SandboxEndpointProof as WireSandboxEndpointProof,
     VsockEndpointIdentity as WireVsockEndpointIdentity,
 };
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxActivationAttemptId, SandboxId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]

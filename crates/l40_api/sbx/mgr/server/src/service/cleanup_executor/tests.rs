@@ -353,7 +353,7 @@ async fn lifecycle_and_job_completion_commit_together_and_recover(
     use crate::db::ActivationKind::Restore;
     use crate::service::tests::service_tests::register_full_suspend_artifact;
     use CleanupCompletion::Quarantine;
-    use pplx_space_common_core::types::SandboxActivationAttemptId;
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
     let subject = sandbox_id.to_string();

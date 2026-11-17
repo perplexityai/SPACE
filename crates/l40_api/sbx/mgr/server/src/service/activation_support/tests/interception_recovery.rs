@@ -2,7 +2,6 @@ use super::*;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use pplx_space_common_core::types::{ExecutionGeneration, RouteGeneration};
 use pplx_space_credmgr::node_ca::NodeCa;
 use pplx_space_credmgr_client::proto::{
     IssueIntermediateCertificateRequest, IssueIntermediateCertificateResponse,
@@ -22,6 +21,7 @@ use pplx_space_net_gateway::state::{
     GatewayNetworkState, NetworkCredentialSnapshot, PolicyLoader, PolicyNotReady,
     PulledNetworkPolicy, TrafficPolicy,
 };
+use pplx_space_sandbox_model::{ExecutionGeneration, RouteGeneration};
 use pplx_space_spaced_protocol::proto::host_control::host_control_server::HostControlServer;
 
 use rcgen::{

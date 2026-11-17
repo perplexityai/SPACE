@@ -373,7 +373,7 @@ impl crate::service::SandboxManagerService {
         extensions: Extensions,
         mut start: StartRequest,
         state: SandboxState,
-        from_execution: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        from_execution: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     ) -> Result<StartResponse, Status> {
         if state == SandboxState::Suspended {
             start.checkpoint = Some(crate::service::create_support::SUSPEND_CHECKPOINT.to_string());

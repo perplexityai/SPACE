@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::SandboxActivationAttemptId;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
 
 #[tokio::test]
 async fn completed_restart_receipt_survives_later_lifecycle_changes() {

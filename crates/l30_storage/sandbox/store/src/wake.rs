@@ -13,8 +13,8 @@
 //! passes, so it composes into the caller's transaction when there is one.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_sandbox_routability::routable_execution_or_non_k8s;
 use pplx_space_sql_locator::sql;

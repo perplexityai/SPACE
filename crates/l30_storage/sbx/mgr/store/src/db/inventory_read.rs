@@ -281,7 +281,7 @@ db_private_outside_tests! {
         while let Some(row) = rows.next()? {
             check_row(row, &mut budget)?;
             let id: String = row.get(0)?;
-            if pplx_space_common_core::ids::sandbox_id_matches(&id, selector) {
+            if pplx_space_sandbox_model::ids::sandbox_id_matches(&id, selector) {
                 if matched.is_some() {
                     return Err(InventoryReadError::Ambiguous);
                 }

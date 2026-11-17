@@ -6,7 +6,8 @@
 //! fixture.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{LocalArtifactId, SandboxActivationAttemptId, SandboxId};
+use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
 
 use super::*;
 

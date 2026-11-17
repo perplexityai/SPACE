@@ -1,5 +1,5 @@
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_node_mgr_client::proto::{GetVmStateRequest, VmState as WireVmState};
+use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_node_runtime_core::vm_state::VmState;
 use std::time::Duration;

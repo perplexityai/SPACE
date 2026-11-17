@@ -55,7 +55,7 @@ fn operation_snapshot_plan_keeps_started_and_paused_sources_in_place() {
 fn operation_snapshot_replay_uses_the_server_generated_artifact_identity() {
     let sandbox_id = SandboxId::new().to_string();
     let request_id = Uuid::now_v7();
-    let execution_generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
+    let execution_generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
     let local_artifact_id = disk_operation_snapshot_artifact_id(
         &sandbox_id,
         request_id,
@@ -85,7 +85,7 @@ fn operation_snapshot_replay_uses_the_server_generated_artifact_identity() {
         disk_operation_snapshot_artifact_id(
             &sandbox_id,
             request_id,
-            pplx_space_common_core::types::ExecutionGeneration::new(8).unwrap(),
+            pplx_space_sandbox_model::ExecutionGeneration::new(8).unwrap(),
             SandboxState::Paused,
         ),
         &sandbox_id,

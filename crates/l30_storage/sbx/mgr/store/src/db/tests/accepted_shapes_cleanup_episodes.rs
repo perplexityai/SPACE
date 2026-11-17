@@ -10,9 +10,9 @@
 //! arming after activation writes nothing here; other tests cover arming.
 
 use crate::db::Connection;
-use pplx_space_common_core::types::{
-    LocalArtifactId, SandboxActivationAttemptId, SandboxCleanupEpisodeId,
-    SandboxQuarantineReasonCode,
+use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_sandbox_model::{
+    SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxQuarantineReasonCode,
 };
 use rusqlite::params;
 

@@ -1,7 +1,7 @@
 use super::retention::{
     KEEP_D_1M, KEEP_D_5M, KEEP_F_1H, KEEP_F_6H, KEEP_F_10M, retention_candidate,
 };
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use crate::state::SandboxStatus;

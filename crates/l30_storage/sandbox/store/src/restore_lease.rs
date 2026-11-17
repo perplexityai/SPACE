@@ -17,8 +17,8 @@
 //! decides from the gate reads. A claim or completion that matches no row is
 //! an outcome, not an error.
 
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
 use pplx_space_sandbox_routability::routable_execution_or_non_k8s;
 use pplx_space_sql_locator::sql;

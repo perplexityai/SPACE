@@ -7,13 +7,13 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::metrics::operations::ClaimAttempt;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     OperationId, OperationKind, OperationState, OperationTargetType, PublicErrorCode,
     PublicOperationEvent, PublicOperationEventType, PublicOperationRecord, PublicOperationResult,
     RequestFingerprint,
 };
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store as sandbox_store;
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool, Postgres, Row, Transaction, types::Json};

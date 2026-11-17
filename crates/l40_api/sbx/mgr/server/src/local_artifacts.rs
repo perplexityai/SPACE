@@ -389,7 +389,7 @@ impl LocalArtifacts {
     pub fn publish_stopped(
         &self,
         sandbox_id: &str,
-        expected_execution: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        expected_execution: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
         local_artifact_id: LocalArtifactId,
         local_path: &str,
     ) -> crate::db::Result<()> {

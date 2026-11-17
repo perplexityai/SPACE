@@ -82,12 +82,12 @@ use pplx_space_auto_lifecycle::{
 };
 use pplx_space_node_model::NodeGroupName;
 
-const TEST_SANDBOX_ID: pplx_space_common_core::types::SandboxId =
-    pplx_space_common_core::types::SandboxId::from_uuid(Uuid::from_u128(
+const TEST_SANDBOX_ID: pplx_space_sandbox_model::SandboxId =
+    pplx_space_sandbox_model::SandboxId::from_uuid(Uuid::from_u128(
         0x019de67463d77ef0a5888e106a878093,
     ));
-const TEST_POOL_SANDBOX_ID: pplx_space_common_core::types::SandboxId =
-    pplx_space_common_core::types::SandboxId::from_uuid(Uuid::from_u128(
+const TEST_POOL_SANDBOX_ID: pplx_space_sandbox_model::SandboxId =
+    pplx_space_sandbox_model::SandboxId::from_uuid(Uuid::from_u128(
         0x019e5f38cd2e7400b3c8e33ae36692d7,
     ));
 const TEST_USER_ID: pplx_space_accounts::UserId =
@@ -524,7 +524,7 @@ fn test_runtime<'a>(
 /// from. See [`test_runtime`] for why this isn't a `Default` impl.
 fn test_common<'a>(
     pod_name: &'a str,
-    sandbox_id: pplx_space_common_core::types::SandboxId,
+    sandbox_id: pplx_space_sandbox_model::SandboxId,
     execution_generation: i64,
     env: &'a BTreeMap<String, String>,
 ) -> SandboxPodCommon<'a> {
@@ -894,10 +894,9 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         memory_mib: Some(8192),
         ..runtime
     };
-    let activation_attempt_id =
-        pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(Uuid::from_u128(
-            0x019f80000000700080000000000000aa,
-        ));
+    let activation_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
+        Uuid::from_u128(0x019f80000000700080000000000000aa),
+    );
     let common = |pod_name, sandbox_id, execution_generation| SandboxPodCommon {
         activation_attempt_id: Some(activation_attempt_id),
         ..test_common(pod_name, sandbox_id, execution_generation, &env)

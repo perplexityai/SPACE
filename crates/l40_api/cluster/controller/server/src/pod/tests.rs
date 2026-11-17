@@ -1,6 +1,6 @@
 use pplx_space_accounts::OrgId;
 use pplx_space_accounts::UserId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use uuid::Uuid;
 
 use std::collections::{BTreeMap, BTreeSet};

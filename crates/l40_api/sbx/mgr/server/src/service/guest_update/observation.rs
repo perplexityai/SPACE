@@ -46,7 +46,7 @@ impl SandboxManagerService {
     pub(super) async fn observe_guest_configuration(
         &self,
         id: &str,
-        execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+        execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) {
         let mut delay = Duration::from_millis(100);
         loop {
@@ -147,7 +147,7 @@ impl SandboxManagerService {
     async fn await_spaced_host_relaunch(
         &self,
         id: &str,
-        execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+        execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
         refused: Option<u32>,
     ) -> bool {
         loop {

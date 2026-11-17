@@ -1,5 +1,5 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 /// What the admin response's `lifecycle` and `status` and the ECW sandbox
 /// state are rendered from: the row's stored lifecycle and the status its node

@@ -8,7 +8,7 @@
 //! merge their assertions or `.snap` files; it only removes the duplicated
 //! construction.
 
-use pplx_space_common_core::types::SandboxQuarantineReasonCode;
+use pplx_space_sandbox_model::SandboxQuarantineReasonCode;
 
 use crate::proto::{ArtifactKind, ArtifactOrigin, SandboxInfo, TransitionReceipt};
 

@@ -1,6 +1,6 @@
 use crate::db::Connection;
 use crate::db::fixture::params;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 

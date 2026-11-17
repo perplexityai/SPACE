@@ -1,6 +1,6 @@
 use super::*;
-use pplx_space_common_core::types::SandboxActivationAttemptId;
 use pplx_space_node_mgr_client::execution_fence::ExecutionFence;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
 
 impl NetworkPool {
     pub(crate) fn execution_fence(

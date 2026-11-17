@@ -462,14 +462,14 @@ pub(super) fn insert_pool_donor(conn: &crate::db::Connection, build: &str) -> St
     crate::db::update_space_api_route_identity(
         conn,
         donor,
-        &pplx_space_common_core::types::SpaceApiRouteIdentity {
+        &pplx_space_sandbox_model::SpaceApiRouteIdentity {
             sandbox_id: Some(donor),
-            route_generation: Some(pplx_space_common_core::types::RouteGeneration::new(1).unwrap()),
+            route_generation: Some(pplx_space_sandbox_model::RouteGeneration::new(1).unwrap()),
             current_node_id: Some(pplx_space_accounts::NodeId::new()),
             substrate_kind: Some(NodeManagedBy::Space),
             execution_generation: Some(ExecutionGeneration::new(1).unwrap()),
             activation_attempt_id: Some(
-                pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+                pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             ),
             ..Default::default()
         },

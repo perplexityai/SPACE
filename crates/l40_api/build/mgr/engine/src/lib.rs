@@ -215,7 +215,7 @@ pub enum BuildError {
         source: semver::Error,
     },
     #[error(transparent)]
-    InvalidSandboxId(#[from] pplx_space_common_core::ids::InvalidSandboxId),
+    InvalidSandboxId(#[from] pplx_space_sandbox_model::ids::InvalidSandboxId),
     #[error(transparent)]
     TemplateRef(#[from] pplx_space_template_mgr_client::TemplateRefFromReferenceError),
     #[error("{0}")]
@@ -973,7 +973,7 @@ impl TemplateBuilder {
         println!(
             "Booting build VM in namespace {} (sandbox {})...",
             start_resp.namespace,
-            pplx_space_common_core::ids::sandbox_label(&sandbox_id)?,
+            pplx_space_sandbox_model::ids::sandbox_label(&sandbox_id)?,
         );
 
         // Wait for SSH

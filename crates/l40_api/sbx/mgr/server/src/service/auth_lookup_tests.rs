@@ -14,12 +14,12 @@ use pplx_space_api_route::{
     ed25519::insert_space_api_route_ed25519_token,
 };
 use pplx_space_cluster_id::ClusterId;
-use pplx_space_common_core::types::{
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::{
     ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
     SandboxRouteIdentity, SpaceApiRouteIdentity,
 };
-use pplx_space_k8s_ids::PodUid;
-use pplx_space_node_model::NodeManagedBy;
 
 use std::sync::Arc;
 use tonic::Code;

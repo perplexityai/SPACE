@@ -5,9 +5,9 @@ use pplx_space_api_route::ed25519::{
     SPACE_API_ROUTE_ED25519_ISSUER_ENV, SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
     SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV, SpaceApiRouteEd25519Authority,
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db};
 use pplx_space_node_api_sim::{SimProcessSpec, SimWorkerHarness};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use serde_json::json;
 use tokio_stream::StreamExt as _;
@@ -520,8 +520,8 @@ async fn processes_of_guests_that_keep_assigned_ids_answer_as_before() -> TestDb
 #[tokio::test]
 async fn a_sandbox_at_rest_answers_with_the_command_refusal_details() {
     use http_body_util::BodyExt;
-    use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
     use pplx_space_public_api::{PublicErrorCode, PublicErrorEnvelope};
+    use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
     async fn envelope(error: ControllerError) -> PublicErrorEnvelope {
         let response = controller_error(error).into_response();

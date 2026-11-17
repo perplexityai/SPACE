@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
+use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use crate::service::tests::service_tests::service_with_runtime_probe;
@@ -223,14 +224,14 @@ async fn exchanged_restore_cleanup_failure_retains_scope_until_retry() {
         [&sandbox_id],
     )
     .unwrap();
-    let generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
-    let attempt_a = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
+    let attempt_a = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000001").unwrap(),
     );
-    let attempt_b = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let attempt_b = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000002").unwrap(),
     );
-    let attempt_c = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let attempt_c = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000003").unwrap(),
     );
     let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
@@ -1348,7 +1349,7 @@ async fn claimed_operation_gives_up_after_repeated_renewal_failures() {
 fn a_superseded_recovery_claim_leaves_no_adopted_row() {
     let conn = crate::db::test_conn();
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
     let candidate = crate::db::scan_quarantine_recovery_candidates(&conn)
@@ -1392,11 +1393,11 @@ fn a_superseded_recovery_claim_leaves_no_adopted_row() {
     )
     .expect("the fixture URI should parse");
     let plan = crate::snapshot_restore::QuarantineRecoveryPlan {
-        recovery_id: pplx_space_common_core::types::SandboxCleanupEpisodeId::new(),
+        recovery_id: pplx_space_sandbox_model::SandboxCleanupEpisodeId::new(),
         snapshot_id: SnapshotId::new(),
         storage_uri: "s3://bucket/snapshots/orphan/vmstate?region=us-east-1".to_string(),
         local_artifact_id: None,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap(),
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap(),
         reason_code,
     };
     let recovery = super::QuarantineRecoveryContext {
@@ -1531,7 +1532,7 @@ fn an_ordinary_cross_node_retry_takes_no_write_lock() {
 fn a_sandbox_that_left_an_activatable_state_is_refused_before_adoption() {
     let conn = crate::db::test_conn();
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
     let candidate = crate::db::scan_quarantine_recovery_candidates(&conn)
@@ -1562,11 +1563,11 @@ fn a_sandbox_that_left_an_activatable_state_is_refused_before_adoption() {
     )
     .expect("the fixture URI should parse");
     let plan = crate::snapshot_restore::QuarantineRecoveryPlan {
-        recovery_id: pplx_space_common_core::types::SandboxCleanupEpisodeId::new(),
+        recovery_id: pplx_space_sandbox_model::SandboxCleanupEpisodeId::new(),
         snapshot_id: SnapshotId::new(),
         storage_uri: "s3://bucket/snapshots/orphan/vmstate?region=us-east-1".to_string(),
         local_artifact_id: None,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap(),
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap(),
         reason_code,
     };
     let recovery = super::QuarantineRecoveryContext {
@@ -1800,15 +1801,15 @@ fn the_only_unfenced_staging_failure_write_is_the_no_claim_arm() {
 // the host either.
 // ---------------------------------------------------------------------------
 
-fn attempt(sequence: u8) -> pplx_space_common_core::types::SandboxActivationAttemptId {
-    pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+fn attempt(sequence: u8) -> pplx_space_sandbox_model::SandboxActivationAttemptId {
+    pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str(&format!("019c0000-0000-7000-8000-0000000000{sequence:02x}"))
             .unwrap(),
     )
 }
 
-fn generation(value: i64) -> pplx_space_common_core::types::ExecutionGeneration {
-    pplx_space_common_core::types::ExecutionGeneration::new(value).unwrap()
+fn generation(value: i64) -> pplx_space_sandbox_model::ExecutionGeneration {
+    pplx_space_sandbox_model::ExecutionGeneration::new(value).unwrap()
 }
 
 /// A staging path that `remote_restore_metadata_staging_dir` never produces, so
@@ -2287,7 +2288,7 @@ fn claim_orphan_episode(
 ) -> (SandboxId, crate::db::ClaimedQuarantineRecoveryCandidate) {
     let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         conn,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
     );
     let candidate = crate::db::scan_quarantine_recovery_candidates(conn)
         .unwrap()
@@ -2306,10 +2307,10 @@ fn claim_orphan_episode(
 }
 
 fn orphan_plan(
-    reason_code: pplx_space_common_core::types::SandboxQuarantineReasonCode,
+    reason_code: pplx_space_sandbox_model::SandboxQuarantineReasonCode,
 ) -> crate::snapshot_restore::QuarantineRecoveryPlan {
     crate::snapshot_restore::QuarantineRecoveryPlan {
-        recovery_id: pplx_space_common_core::types::SandboxCleanupEpisodeId::new(),
+        recovery_id: pplx_space_sandbox_model::SandboxCleanupEpisodeId::new(),
         snapshot_id: SnapshotId::new(),
         storage_uri: "s3://bucket/snapshots/orphan/vmstate?region=us-east-1".to_string(),
         local_artifact_id: None,
@@ -2319,8 +2320,8 @@ fn orphan_plan(
 }
 
 /// Fails to compile when a reason code is added, until the sweep below lists it.
-fn _all_reasons_listed(reason: pplx_space_common_core::types::SandboxQuarantineReasonCode) {
-    use pplx_space_common_core::types::SandboxQuarantineReasonCode as Reason;
+fn _all_reasons_listed(reason: pplx_space_sandbox_model::SandboxQuarantineReasonCode) {
+    use pplx_space_sandbox_model::SandboxQuarantineReasonCode as Reason;
     match reason {
         Reason::Unspecified
         | Reason::RuntimeProbeInconsistent
@@ -2361,7 +2362,7 @@ fn _all_reasons_listed(reason: pplx_space_common_core::types::SandboxQuarantineR
 /// refusal before probing the canonical cache root.
 #[tokio::test]
 async fn orphan_restore_declines_a_plan_for_a_different_quarantine_reason() {
-    use pplx_space_common_core::types::SandboxQuarantineReasonCode as Reason;
+    use pplx_space_sandbox_model::SandboxQuarantineReasonCode as Reason;
     // Written out because the enum has no `all()`; `_all_reasons_listed` keeps
     // the list complete. `OrphanedSandboxRowMissing` is excluded because it is the
     // plan reason that proceeds.
@@ -2447,7 +2448,7 @@ async fn orphan_restore_declines_a_row_that_now_holds_a_local_artifact() {
         .run_quarantined_orphan_restore(
             &claimed,
             &orphan_plan(
-                pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
+                pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
             ),
         )
         .await

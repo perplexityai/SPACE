@@ -18,8 +18,8 @@ use pplx_space_spaced_protocol::proto::host_control::{
 
 use super::credentials::{InvalidNetworkCredentialSnapshot, NetworkCredentialSnapshot};
 use crate::stats::ProxyStats;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::ExpectedGrpcStatus;
+use pplx_space_sandbox_model::SandboxId;
 
 pub type PolicyLoader = Arc<
     dyn Fn() -> Pin<

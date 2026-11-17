@@ -1,10 +1,10 @@
 //! `cleanup_*` sandbox-event emission for the GC. Maps a per-candidate outcome
 //! to the matching [`SandboxEventType`] and populates the shared event details.
 
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::SandboxId;
 
 use super::classify::PodSnapshot;
 

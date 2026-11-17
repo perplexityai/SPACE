@@ -365,8 +365,8 @@ fn verification_key_response_requires_matching_generation_and_supported_rpc() {
 #[tokio::test(start_paused = true)]
 async fn refresh_waits_for_delayed_readiness_but_bounds_pending_and_hung_requests() {
     use super::super::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::SandboxId;
     use pplx_space_net_gateway_client::proto::{NetworkState, RefreshNetworkPolicyResponse};
+    use pplx_space_sandbox_model::SandboxId;
 
     use std::time::Duration;
 
@@ -448,8 +448,8 @@ async fn refresh_waits_for_delayed_readiness_but_bounds_pending_and_hung_request
 #[tokio::test(start_paused = true)]
 async fn refresh_rechecks_deletion_after_rpc_and_honors_a_shorter_caller_deadline() {
     use super::super::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::SandboxId;
     use pplx_space_net_gateway_client::proto::{NetworkState, RefreshNetworkPolicyResponse};
+    use pplx_space_sandbox_model::SandboxId;
 
     use std::time::Duration;
 
@@ -526,8 +526,8 @@ async fn refresh_abandons_schedule_when_sandbox_row_is_gone() {
 }
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{ExecutionGeneration, RouteGeneration, SpaceApiRouteIdentity};
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::{ExecutionGeneration, RouteGeneration, SpaceApiRouteIdentity};
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
@@ -796,10 +796,10 @@ fn a_known_egress_object_with_the_wrong_keys_is_rejected() {
 #[tokio::test(start_paused = true)]
 async fn unavailable_interception_dependencies_still_converge_the_start_gate() {
     use super::super::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::SandboxId;
     use pplx_space_net_gateway_client::proto::{
         InterceptionReadiness, NetworkState, RefreshNetworkPolicyResponse,
     };
+    use pplx_space_sandbox_model::SandboxId;
 
     use std::time::Duration;
 
@@ -860,8 +860,8 @@ async fn unavailable_interception_dependencies_still_converge_the_start_gate() {
 async fn interception_recheck_answers_for_the_registered_gateway_only() {
     use super::super::tests::service_tests::insert_test_sandbox;
     use super::InterceptionRecheck;
-    use pplx_space_common_core::types::SandboxId;
     use pplx_space_net_gateway_client::proto::{GetNetworkStateResponse, InterceptionReadiness};
+    use pplx_space_sandbox_model::SandboxId;
 
     #[derive(Clone, Copy, Debug)]
     enum During {

@@ -238,7 +238,7 @@ fn disk_operation_snapshot_paths(
 fn disk_operation_snapshot_artifact_id(
     sandbox_id: &str,
     request_id: Uuid,
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
     source_state: SandboxState,
 ) -> LocalArtifactId {
     let identity = format!(
@@ -448,7 +448,7 @@ fn operation_snapshot_next_step(
 
 fn live_sandbox_namespace(
     pid_alive: bool,
-    runtime_label: &pplx_space_common_core::types::SandboxRuntimeLabel,
+    runtime_label: &pplx_space_sandbox_model::SandboxRuntimeLabel,
 ) -> Option<String> {
     pid_alive.then(|| format!("sns-{runtime_label}"))
 }
@@ -1411,12 +1411,11 @@ impl SandboxManagerService {
         let precondition = current_snapshot_precondition(req)?;
         let request_id = Uuid::parse_str(&identity.request_id)
             .map_err(|error| Status::invalid_argument(format!("invalid request_id: {error}")))?;
-        let expected_generation = pplx_space_common_core::types::ExecutionGeneration::new(
-            precondition.execution_generation,
-        )
-        .map_err(|error| {
-            Status::invalid_argument(format!("invalid execution_generation: {error}"))
-        })?;
+        let expected_generation =
+            pplx_space_sandbox_model::ExecutionGeneration::new(precondition.execution_generation)
+                .map_err(|error| {
+                Status::invalid_argument(format!("invalid execution_generation: {error}"))
+            })?;
         let expected_state =
             match crate::proto::SnapshotSourceLifecycle::try_from(precondition.lifecycle) {
                 Ok(crate::proto::SnapshotSourceLifecycle::Started) => SandboxState::Started,

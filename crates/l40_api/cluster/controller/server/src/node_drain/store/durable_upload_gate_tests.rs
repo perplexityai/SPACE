@@ -1,5 +1,6 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
+use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
+use pplx_space_sandbox_model::SandboxId;
 use uuid::Uuid;
 
 use pplx_space_db_test_fixtures::try_pg_test_db;

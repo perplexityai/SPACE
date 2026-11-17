@@ -75,7 +75,7 @@ mod document {
                 // Do not read it as replacing that log.
                 tracing::debug!(
                     %error,
-                    sandbox_id = %pplx_space_common_core::types::SandboxId::from(sandbox_id),
+                    sandbox_id = %pplx_space_sandbox_model::SandboxId::from(sandbox_id),
                     "failed to load sandbox for network policy"
                 );
                 database_error(error)

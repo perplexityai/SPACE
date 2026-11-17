@@ -24,7 +24,7 @@ pub struct SnapshotPages {
 }
 
 impl SnapshotPages {
-    pub fn new(sandbox: pplx_space_common_core::types::SandboxId, measure: bool) -> Self {
+    pub fn new(sandbox: pplx_space_sandbox_model::SandboxId, measure: bool) -> Self {
         Self {
             request: Some(proto::ListBtrfsSnapshotsRequest {
                 sandbox_id: sandbox.to_string(),

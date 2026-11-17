@@ -5,10 +5,10 @@
 
 use super::*;
 
-use pplx_space_common_core::types::{RouteGeneration, SandboxActivationAttemptId};
 use pplx_space_node_api_client::proto::{
     ExecutionCurrency, GetExecutionCurrencyRequest, GetExecutionCurrencyResponse,
 };
+use pplx_space_sandbox_model::{RouteGeneration, SandboxActivationAttemptId};
 
 /// A cluster-api stub whose `GetExecutionCurrency` answers `currency` for
 /// every execution.
@@ -68,7 +68,7 @@ fn begun_restore() -> (
     SandboxManagerService,
     String,
     crate::db::route_activation_claims::OpenRouteActivationClaim,
-    pplx_space_common_core::types::SpaceApiRouteIdentity,
+    pplx_space_sandbox_model::SpaceApiRouteIdentity,
 ) {
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
@@ -90,10 +90,10 @@ fn begin_restore(
 ) -> (
     crate::db::route_activation_claims::OpenRouteActivationClaim,
     crate::db::CleanupEpisode,
-    pplx_space_common_core::types::SpaceApiRouteIdentity,
+    pplx_space_sandbox_model::SpaceApiRouteIdentity,
 ) {
     let attempt = SandboxActivationAttemptId::new();
-    let route = pplx_space_common_core::types::SpaceApiRouteIdentity {
+    let route = pplx_space_sandbox_model::SpaceApiRouteIdentity {
         sandbox_id: Some(id.parse().unwrap()),
         route_generation: Some(RouteGeneration::new(GENERATION as u64).unwrap()),
         execution_generation: Some(generation(GENERATION)),
@@ -148,7 +148,7 @@ fn rolled_back_restore(
         &conn,
         &id,
         episode.id,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed,
         "restore prepare failed",
     )
     .unwrap();
@@ -284,7 +284,7 @@ async fn a_retried_checkpoint_restore_of_a_retired_execution_is_refused_before_s
                 &db,
                 &id,
                 episode.id,
-                pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed,
+                pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed,
                 "restore prepare failed",
             )
             .unwrap();
@@ -477,7 +477,7 @@ async fn a_retry_waiting_on_a_rollback_cleanup_sees_its_receipt() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use pplx_space_accounts::SandboxOwner;
     use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-    use pplx_space_common_core::types::{SandboxArtifactMetadata, SandboxRuntimeLabel};
+    use pplx_space_common_core::types::SandboxArtifactMetadata;
     use pplx_space_content_digest::ContentHash;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
@@ -486,6 +486,7 @@ async fn a_retry_waiting_on_a_rollback_cleanup_sees_its_receipt() {
         NetworkPoolStatusResponse, ResolveExecutionEnvironmentRequest,
         ResolveExecutionEnvironmentResponse,
     };
+    use pplx_space_sandbox_model::SandboxRuntimeLabel;
     let unknown = CurrencyClusterApi {
         currency: ExecutionCurrency::Unspecified,
     };
@@ -564,7 +565,7 @@ async fn a_retry_waiting_on_a_rollback_cleanup_sees_its_receipt() {
             &conn,
             &id,
             episode.id,
-            pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed,
+            pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed,
             "restore prepare failed",
         )
         .unwrap();

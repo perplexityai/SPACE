@@ -4,7 +4,8 @@ use crate::controllers::substrate::{
     CapPolicy, RecoveryCharge,
 };
 use pplx_space_accounts::{OrgId, UserId};
-use pplx_space_common_core::types::{ClientId, SandboxId};
+use pplx_space_common_core::types::ClientId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use crate::controllers::substrate::{
@@ -664,7 +665,7 @@ async fn resolve_cold_create_resources(
 
 fn validate_inherited_pool_disk(disk_mib: Option<u32>) -> Result<(), ControllerError> {
     if let Some(disk_mib) = disk_mib {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(disk_mib).map_err(|error| {
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(disk_mib).map_err(|error| {
             ControllerError::conflict(format!(
                 "configured warm-pool disk_mib is unsupported: {error}; an administrator must update or disable the pool configuration"
             ))
@@ -1170,7 +1171,7 @@ impl SandboxController {
         mode: SandboxCreateExecutionMode<'_>,
     ) -> Result<SandboxResponse, ControllerError> {
         if let Some(size_mib) = req.disk_mib {
-            pplx_space_common_core::sandbox_storage::validate_rootfs_mib(size_mib)
+            pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(size_mib)
                 .map_err(|error| ControllerError::bad_request(format!("disk_mib: {error}")))?;
         }
         let SandboxCreateExecutionMode {

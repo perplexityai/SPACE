@@ -7,7 +7,7 @@ impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn begin_activation_execution_row(
         &self,
         sandbox_id: SandboxId,
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
         target_state: SandboxTransitionTargetState,
     ) -> Result<SandboxExecutionRow, SubstrateError> {
         let sandbox_uuid = sandbox_id;
@@ -39,9 +39,9 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
         target_state: SandboxTransitionTargetState,
-    ) -> Result<pplx_space_common_core::types::SandboxActivationAttemptId, SubstrateError> {
+    ) -> Result<pplx_space_sandbox_model::SandboxActivationAttemptId, SubstrateError> {
         let mut tx = self
             .pool
             .begin()
@@ -175,7 +175,7 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) -> Result<bool, SubstrateError> {
         let changed = sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions execution
@@ -204,7 +204,7 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) {
         if let Err(error) = self
             .complete_activation_attempt(sandbox_id, generation, activation_attempt_id)
@@ -306,7 +306,7 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) -> Result<bool, SubstrateError> {
         let changed = sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions execution
@@ -334,7 +334,7 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) {
         if let Err(error) = self
             .abandon_activation_attempt_superseded_by_suspend(
@@ -358,10 +358,10 @@ impl K8sStore {
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
         generation: i64,
-        requested_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        requested_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
         target_state: SandboxTransitionTargetState,
         route_publication: ActivationRoutePublication,
-    ) -> Result<pplx_space_common_core::types::SandboxActivationAttemptId, SubstrateError> {
+    ) -> Result<pplx_space_sandbox_model::SandboxActivationAttemptId, SubstrateError> {
         let current_attempt =
             sqlx::query_as::<_, (Option<Uuid>, Option<String>, f64, Option<Uuid>)>(sql!(
                 "SELECT activation_attempt_id,
@@ -397,10 +397,9 @@ impl K8sStore {
                 ),
                 lease_remaining: Duration::from_secs_f64(lease_remaining_secs),
                 same_target: current_target.as_deref() == Some(target_state.as_str()),
-                owner_attempt_id:
-                    pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
-                        owner_attempt_id,
-                    ),
+                owner_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
+                    owner_attempt_id,
+                ),
             });
         }
         if route_publication == ActivationRoutePublication::PreserveExisting
@@ -421,18 +420,14 @@ impl K8sStore {
         let activation_attempt_id = match allocation_floor {
             Some(route_owner) => {
                 let route_owner =
-                    pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
-                        route_owner,
-                    );
+                    pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(route_owner);
                 if requested_attempt_id > route_owner {
                     requested_attempt_id
                 } else {
-                    pplx_space_common_core::types::SandboxActivationAttemptId::new_after(
-                        route_owner,
-                    )
-                    .ok_or_else(|| SubstrateError::Failed {
-                        message: "activation attempt identity space exhausted".to_string(),
-                    })?
+                    pplx_space_sandbox_model::SandboxActivationAttemptId::new_after(route_owner)
+                        .ok_or_else(|| SubstrateError::Failed {
+                            message: "activation attempt identity space exhausted".to_string(),
+                        })?
                 }
             }
             None => requested_attempt_id,
@@ -526,7 +521,7 @@ impl K8sStore {
             }
             .to_string(),
         })?;
-        Ok(pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(assigned))
+        Ok(pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(assigned))
     }
 
     /// CAS-clear the `command_ready_pending` marker once an access has confirmed

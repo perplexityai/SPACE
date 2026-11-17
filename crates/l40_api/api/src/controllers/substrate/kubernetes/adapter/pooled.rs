@@ -10,14 +10,14 @@ pub(in crate::controllers::substrate::kubernetes) fn pooled_route_identity_adopt
     let pool_slot_id = pooled_route_activation_id(claim)?;
     pooled_wake_request(
         claim,
-        pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(pool_slot_id),
+        pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(pool_slot_id),
         pplx_space_sbx_mgr_client::proto::WakeTargetState::Paused,
     )
 }
 
 pub(super) fn pooled_wake_request(
     claim: &PooledExecutionClaim,
-    activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+    activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     target_state: pplx_space_sbx_mgr_client::proto::WakeTargetState,
 ) -> Result<pplx_space_sbx_mgr_client::proto::WakeRequest, ControllerError> {
     let pod_uid = claim.pod_uid.as_ref().ok_or_else(|| {

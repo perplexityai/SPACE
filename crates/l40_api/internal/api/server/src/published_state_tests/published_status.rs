@@ -11,8 +11,8 @@
 //! whatever the database collation would lower-case it to.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{SandboxId, SandboxQuarantineReasonCode};
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db};
+use pplx_space_sandbox_model::{SandboxId, SandboxQuarantineReasonCode};
 use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{
     FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_LOCAL_SUSPEND_KEY,

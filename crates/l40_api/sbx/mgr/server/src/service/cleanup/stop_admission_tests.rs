@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_uds_peer_auth::PeerIdentity;
 use tonic::Request;
 
@@ -504,7 +504,7 @@ async fn exited_runtime_recovery_requires_death_and_the_current_execution() {
         let mut observed = service.lookup_sandbox(&id.to_string()).unwrap();
         if stale {
             observed.node_execution_id =
-                Some(pplx_space_common_core::types::SandboxActivationAttemptId::new());
+                Some(pplx_space_sandbox_model::SandboxActivationAttemptId::new());
         }
         if exited {
             child.kill().unwrap();

@@ -64,7 +64,7 @@ async fn different_proofs_do_not_share_a_call() {
     let proof = endpoint_proof(1);
     // Same endpoint, next activation: node-manager is asked about each.
     let next_activation = SpacedEndpointProof {
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
         ..proof.clone()
     };
     // Same activation, but spaced-host restarted in place.

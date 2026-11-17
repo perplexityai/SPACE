@@ -838,10 +838,11 @@ fn row_commit_failure_after_the_rename_is_finished_by_startup_recovery() {
 #[tokio::test]
 async fn named_delete_failing_partway_leaves_staging_for_the_orphan_sweep() {
     use crate::local_artifacts::NamedSnapshotDelete;
-    use pplx_space_common_core::types::{ArtifactKind, SandboxId, SnapshotName};
+    use pplx_space_common_core::types::{ArtifactKind, SnapshotName};
     use pplx_space_node_mgr_client::proto::{
         DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
     };
+    use pplx_space_sandbox_model::SandboxId;
 
     const NAME: &str = "d-user-partial";
     let root = TempDir::new().unwrap();

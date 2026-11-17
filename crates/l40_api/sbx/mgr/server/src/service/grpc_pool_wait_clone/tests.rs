@@ -465,10 +465,10 @@ async fn pool_clone_restart_preserves_disposal_ownership() {
             &db,
             &id.to_string(),
             SandboxState::Creating,
-            pplx_space_common_core::types::SandboxQuarantineSource::SbxManager,
+            pplx_space_sandbox_model::SandboxQuarantineSource::SbxManager,
             SandboxQuarantineReasonCode::CreateInterrupted,
             "operator hold during publication",
-            pplx_space_common_core::types::SandboxQuarantineNextAction::RequiresOperatorAttention,
+            pplx_space_sandbox_model::SandboxQuarantineNextAction::RequiresOperatorAttention,
         )
         .unwrap()
     );

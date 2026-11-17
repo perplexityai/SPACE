@@ -611,7 +611,7 @@ pub(crate) fn prepared_upload_requires_begin(payload: &SnapshotUploadJobs) -> bo
 #[derive(Debug)]
 pub(crate) struct BeginRefusal {
     pub(crate) error: JobError,
-    pub(crate) superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    pub(crate) superseded_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
     /// See [`registration_refusal_is_final`].
     pub(crate) refuses_artifact: bool,
 }
@@ -662,7 +662,7 @@ pub(crate) async fn begin_prepared_upload_naming_supersession(
 /// starts after such a failure.
 fn registration_refusal_is_final(
     code: tonic::Code,
-    superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    superseded_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
 ) -> bool {
     code == tonic::Code::InvalidArgument || superseded_generation.is_some()
 }
@@ -682,7 +682,7 @@ pub(crate) fn record_failure_scope(
 pub(crate) enum RegistrationProbe {
     /// The control plane refused the registration because it superseded this
     /// generation.
-    Superseded(pplx_space_common_core::types::ExecutionGeneration),
+    Superseded(pplx_space_sandbox_model::ExecutionGeneration),
     /// The control plane ran the generation fence on the verdict-only
     /// registration and admitted it, so the fence would admit a fresh attempt
     /// too.
@@ -1359,7 +1359,7 @@ pub(crate) struct BeginArtifactBackup<'a> {
     pub(crate) backup_attempt_id: &'a str,
     pub(crate) storage_uri: &'a str,
     pub(crate) execution: &'a pplx_space_execution_spec::SnapshotExecutionMetadata,
-    pub(crate) execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    pub(crate) execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
     /// `execution_generation` is the capturing execution's by evidence.
     pub(crate) execution_generation_names_capture: bool,
     /// Ask for the registration's verdict without persisting the attempt.
@@ -1375,7 +1375,7 @@ pub(crate) enum BeginArtifactBackupError {
         code: tonic::Code,
         message: String,
         /// The generation a refusal says the control plane retired.
-        superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        superseded_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
     },
 }
 
@@ -1439,7 +1439,7 @@ fn begin_artifact_backup_request(
             .map(|host_cpu| host_cpu.as_str().to_owned()),
         execution_generation: request
             .execution_generation
-            .map(pplx_space_common_core::types::ExecutionGeneration::get),
+            .map(pplx_space_sandbox_model::ExecutionGeneration::get),
         execution_generation_names_capture: request.execution_generation_names_capture,
         fence_verdict_only: request.fence_verdict_only,
     }

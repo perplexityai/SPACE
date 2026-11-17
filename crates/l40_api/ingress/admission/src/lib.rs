@@ -2,7 +2,7 @@
 //!
 //! It is its own crate so ingress callers can share the per-process waiter
 //! limits without depending on the rest of the service host.
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use std::{
     collections::BTreeMap,
     sync::{Mutex, OnceLock},

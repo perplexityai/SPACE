@@ -1,11 +1,12 @@
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
+use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use crate::db::CleanupCompletion;
 use crate::service::recovery::tests::{insert_suspended_test_sandbox, recovery_test_service};
 use crate::service::suspend_snapshot_publication::LOCAL_SNAPSHOT_DIR;
 use crate::state::SandboxStatus;
-use pplx_space_common_core::types::ExecutionGeneration;
+use pplx_space_sandbox_model::ExecutionGeneration;
 
 // A cold boot and a snapshot load give a sandbox the same rootfs limiter,
 // sized by its row's assignment, with both buckets holding the configured
@@ -49,8 +50,8 @@ async fn rootfs_rate_limiter_uses_the_assignment_and_configured_burst() {
     assert_eq!(service.rootfs_rate_limiter(true, limits), None);
 }
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{RouteGeneration, SandboxActivationAttemptId};
 use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::{RouteGeneration, SandboxActivationAttemptId};
 
 fn restore_artifact_as_new_request() -> StartRequest {
     let source_sandbox_id = SandboxId::new();
@@ -300,7 +301,7 @@ async fn restore_rootfs_policy_failure_is_permanent_not_a_retry_response() {
         &mut provenance,
         |_, _| async {
             Err(crate::snapshot_restore::RestoreError::RootfsPolicy(
-                pplx_space_common_core::sandbox_storage::RootfsSizeError::TooLarge {
+                pplx_space_sandbox_model::sandbox_storage::RootfsSizeError::TooLarge {
                     requested_bytes: u64::MAX,
                     maximum_bytes: 128 * 1024 * 1024 * 1024,
                 },

@@ -7,7 +7,6 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_core::types::admin::{
     AdminExecutionInventoryObservation, AdminNodeDrainability, AdminNodeHealthStatus,
     AdminNodeNetworkSlots, AdminNodeResponse, AdminNodeSchedulingStatus, AdminNodeSort,
@@ -15,6 +14,7 @@ use pplx_space_common_core::types::admin::{
     GetAdminNodeFilters, ListAdminNodesFilters,
 };
 use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeManagedBy};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_sandbox_store::node_placements::{

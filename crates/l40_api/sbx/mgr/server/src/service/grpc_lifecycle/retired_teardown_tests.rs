@@ -6,9 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_accounts::JobId;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, SandboxId,
-};
+use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sbx_mgr_client::proto::{
     SuspendSnapshotFormat, TeardownSuspendAction, TeardownSuspendOutcome,
 };

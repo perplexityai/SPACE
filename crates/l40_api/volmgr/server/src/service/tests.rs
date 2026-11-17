@@ -5,10 +5,7 @@ async fn copy_jobs_deduplicate_live_work_without_claiming_a_pull_writer_barrier(
     let temp = tempfile::tempdir().unwrap();
     let service = test_service(&temp).await;
     let request = crate::proto::CopyObjectRequest {
-        subject_id: format!(
-            "sandbox:{}",
-            pplx_space_common_core::types::SandboxId::new()
-        ),
+        subject_id: format!("sandbox:{}", pplx_space_sandbox_model::SandboxId::new()),
         source_s3_uri: "s3://example-artifacts/source?region=us-east-1".into(),
         destination_s3_uri: "s3://example-artifacts/destination?region=us-east-1".into(),
     };

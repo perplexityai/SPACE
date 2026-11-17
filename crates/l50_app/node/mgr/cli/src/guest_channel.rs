@@ -5,7 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(clap::Args)]
 pub(super) struct Args {
-    sandbox_id: pplx_space_common_core::types::SandboxId,
+    sandbox_id: pplx_space_sandbox_model::SandboxId,
     /// Guest TCP service. Omit for the serial console.
     #[arg(long)]
     port: Option<NonZeroU16>,

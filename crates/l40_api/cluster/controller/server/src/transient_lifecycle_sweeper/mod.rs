@@ -204,12 +204,12 @@ use pplx_space_api::controllers::substrate::{
     AbandonedRestoreRetirement, CommandReadyProbe, PodFenceMismatch, RetireExecutionOutcome,
     RetireFence, RetireStopRoute, Substrate,
 };
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource,
     SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 

@@ -11,7 +11,6 @@ use std::task::{Context, Poll};
 use futures_util::Stream;
 use pplx_space_accounts::OrgId;
 use pplx_space_api_route::ed25519::SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY as ROUTE_TOKEN_METADATA;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_node_api_client::proto::{
     AuthorizeNativeFileRequestRequest, AuthorizeNativeFileRequestResponse,
     DataPlaneBackendEndpoint, NativeFileAuthorization, NativeFileRequest, NativeFileRouteGrant,
@@ -20,6 +19,7 @@ use pplx_space_node_api_client::proto::{
     native_file_access_api_server::{NativeFileAccessApi, NativeFileAccessApiServer},
     prepare_native_file_call_response,
 };
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::operations::{
     DisableFileChangesResponse, EnableFileChangesResponse, FileChunk, FileInfo,
     GetModifiedFilesResponse, MkdirResponse, RemoveResponse, RenameResponse, StatResponse,

@@ -165,7 +165,7 @@ impl RuntimeControl for crate::fc_api::FcApiClient {
 /// The shared control trait does not require a socket-backed implementation.
 pub fn socket_path(
     runtime: RuntimeKind,
-    sandbox_id: pplx_space_common_core::types::SandboxId,
+    sandbox_id: pplx_space_sandbox_model::SandboxId,
 ) -> Result<PathBuf, ControlError> {
     let filename = match runtime {
         RuntimeKind::Firecracker => "firecracker.sock",

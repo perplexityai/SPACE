@@ -1428,7 +1428,7 @@ db_private_outside_tests! {
         let mut matches = Vec::new();
         while let Some(row) = rows.next()? {
             let id = row.get::<_, String>(0)?;
-            if pplx_space_common_core::ids::sandbox_id_matches(&id, prefix) {
+            if pplx_space_sandbox_model::ids::sandbox_id_matches(&id, prefix) {
                 matches.push(id);
                 if matches.len() == 2 {
                     break;

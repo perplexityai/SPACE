@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::SandboxActivationAttemptId;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
 
 #[rstest::rstest]
 #[case::adopted(true, false, false)]

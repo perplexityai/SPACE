@@ -3,11 +3,11 @@ use std::str::FromStr;
 
 use crate::db::{Connection, Error, OptionalExtension};
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
-use pplx_space_common_core::types::{
-    AutoLifecycleDeleteReceiptId, ExecutionGeneration, SandboxActivationAttemptId, SandboxId,
-};
 use pplx_space_node_model::{NodeManagedBy, NodeRole};
 use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{
+    AutoLifecycleDeleteReceiptId, ExecutionGeneration, SandboxActivationAttemptId, SandboxId,
+};
 use pplx_space_sqlite::SqliteU64;
 use rusqlite::{params, types::Type};
 
@@ -40,7 +40,7 @@ pub struct PendingReceiptSupersession {
 impl RouteIdentityAdoptionMetadata {
     pub fn is_current(
         self,
-        identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+        identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
         provenance: RouteIdentityProvenance,
     ) -> bool {
         if self.current_provenance != Some(provenance) {

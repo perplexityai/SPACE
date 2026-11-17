@@ -1,7 +1,6 @@
 use super::cleanup_helpers::*;
 use super::validation::*;
 use super::*;
-use pplx_space_common_core::sandbox_storage::{validate_rootfs_bytes, validate_rootfs_mib};
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_host_layout::paths;
 use pplx_space_host_layout::paths::{FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO};
@@ -9,6 +8,7 @@ use pplx_space_node_runtime_core::proto::{ArtifactIntegrityRequirement, Verified
 use pplx_space_node_runtime_core::runtime_inventory::{
     ExecutionSelectionMode, ExecutionSourceIntegrity, RuntimeFileRole, boot_component_role,
 };
+use pplx_space_sandbox_model::sandbox_storage::{validate_rootfs_bytes, validate_rootfs_mib};
 
 struct PreparationOwnership {
     lease: SlotInfo,
@@ -156,8 +156,9 @@ fn sandbox_metadata(
 ) -> Result<pplx_space_common_core::types::SandboxArtifactMetadata, Status> {
     use std::str::FromStr;
 
-    use pplx_space_common_core::types::{SandboxArtifactMetadata, SandboxId};
+    use pplx_space_common_core::types::SandboxArtifactMetadata;
     use pplx_space_content_digest::ContentHash;
+    use pplx_space_sandbox_model::SandboxId;
     use pplx_space_template_model::{ORPHANED_SANDBOX_TEMPLATE, TemplateName};
 
     let sandbox_id = SandboxId::from_str(&req.sandbox_id)

@@ -33,7 +33,7 @@
 //! - R11 `r11_direct_rows_do_not_bound_the_sweep_or_get_listed`
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::BTreeMap;
 use std::sync::Mutex as StdMutex;
@@ -575,8 +575,9 @@ mod postgres_backed {
     use super::*;
     use crate::suspended_execution_reaper::store::ExecutionDbStore;
     use pplx_space_accounts::NodeId;
-    use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
+    use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+    use pplx_space_sandbox_model::SandboxId;
     use sqlx::PgPool;
 
     use pplx_space_test_env::TestResult;

@@ -39,10 +39,10 @@ use std::time::Duration;
 
 use crate::metrics::sandbox::api::{WakeCompletionAction, WakeCompletionRedriveOutcome};
 use futures_util::future::BoxFuture;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store as sandbox_store;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;

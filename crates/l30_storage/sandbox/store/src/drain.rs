@@ -31,11 +31,10 @@
 //! directly. Production code calls the function here that binds each one.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, SandboxId, SandboxLifecycle,
-};
+use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 use pplx_space_durations::PositiveDuration;
 use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
 use std::sync::LazyLock;
 use std::time::Duration;

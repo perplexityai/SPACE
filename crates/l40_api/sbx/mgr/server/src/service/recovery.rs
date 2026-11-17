@@ -17,12 +17,12 @@ use crate::metrics::sandbox::worker::{
 };
 use futures_util::{StreamExt, stream};
 use orphan_dispatch::AdmittedRecoveryKind;
-use pplx_space_common_core::types::{
-    SandboxId, SandboxIdParseError, SandboxQuarantineNextAction, SandboxQuarantineSource,
-};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
+};
+use pplx_space_sandbox_model::{
+    SandboxId, SandboxIdParseError, SandboxQuarantineNextAction, SandboxQuarantineSource,
 };
 
 const SUSPEND_RECOVERY_KIND: &str = "suspend";
@@ -962,7 +962,7 @@ impl SandboxManagerService {
         sandbox_dir: std::path::PathBuf,
         decision: SuspendSnapshotPublicationDecision,
         origin: SuspendSnapshotPublicationRecoveryOrigin,
-        teardown_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        teardown_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
         verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError> {
         let refused = matches!(decision, SuspendSnapshotPublicationDecision::CaptureRefused);
@@ -1195,7 +1195,7 @@ impl SandboxManagerService {
     fn stage_recovered_teardown_artifact(
         &self,
         row: crate::db::SandboxRow,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         local_artifact_id: LocalArtifactId,
         snapshot_dir: std::path::PathBuf,
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError> {

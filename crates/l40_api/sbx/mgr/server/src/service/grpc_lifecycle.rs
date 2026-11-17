@@ -28,11 +28,12 @@ use super::*;
 use crate::guest_filesystem_flush::{
     GuestSnapshotPreparationBudget, prepare_guest_for_vm_snapshot_via_spaced_host,
 };
-use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, SandboxId};
+use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
 use pplx_space_events::{
     SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger,
     SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_sandbox_model::SandboxId;
 
 mod artifact_backup;
 mod auto_lifecycle_policy;
@@ -201,7 +202,7 @@ pub(super) struct SuspendSnapshotPublicationContext {
 enum SuspendDurability {
     NodeLocal,
     RemoteBeforeTeardown {
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
     },
 }
 
@@ -210,9 +211,7 @@ impl SuspendDurability {
         matches!(self, Self::RemoteBeforeTeardown { .. })
     }
 
-    const fn execution_generation(
-        self,
-    ) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+    const fn execution_generation(self) -> Option<pplx_space_sandbox_model::ExecutionGeneration> {
         match self {
             Self::NodeLocal => None,
             Self::RemoteBeforeTeardown {
@@ -292,7 +291,7 @@ impl SuspendRequestContext {
 
     pub(super) fn for_teardown(
         sandbox_id: String,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
     ) -> Self {
         let mut context = Self::new(
             sandbox_id,
@@ -319,7 +318,7 @@ struct ArtifactBackupSubmission<'a> {
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
     handoff: ArtifactBackupHandoff,
     /// The teardown suspend's execution, for `BeginArtifactBackup`'s fence.
-    execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
     /// The caller holds evidence that `execution_generation` is the
     /// capturing execution's: the capture was just taken by it, or an earlier
     /// upload of the same bytes recorded it so. Without that, the capture's
@@ -353,7 +352,7 @@ enum ArtifactBackupSubmissionError {
     Begin {
         #[source]
         error: pplx_space_common_jobs::JobError,
-        superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        superseded_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
     },
     #[error(transparent)]
     RetainedUpload(#[from] suspend_snapshot::RetainedUploadError),
@@ -387,7 +386,7 @@ pub(super) fn artifact_backup_fence_status(error: String) -> Status {
 }
 
 struct TeardownSuspendBackup<'a> {
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
     artifact: &'a crate::db::LocalArtifactRow,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
     origin: TeardownBackupOrigin,
@@ -396,9 +395,7 @@ struct TeardownSuspendBackup<'a> {
 impl TeardownSuspendBackup<'_> {
     /// The generation the backup registers under: only this execution's own
     /// capture carries it to the control plane's fence.
-    fn registration_generation(
-        &self,
-    ) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+    fn registration_generation(&self) -> Option<pplx_space_sandbox_model::ExecutionGeneration> {
         match self.origin {
             TeardownBackupOrigin::Captured => Some(self.execution_generation),
             TeardownBackupOrigin::PreviouslySuspended => None,
@@ -416,7 +413,7 @@ impl TeardownSuspendBackup<'_> {
 /// unfenced.
 fn node_local_registration_generation(
     sandbox: &crate::db::SandboxRow,
-) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+) -> Option<pplx_space_sandbox_model::ExecutionGeneration> {
     let route = &sandbox.space_api_route_identity;
     (route.effective_substrate_kind() == Some(pplx_space_node_model::NodeManagedBy::Kubernetes))
         .then_some(route.execution_generation)

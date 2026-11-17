@@ -5,10 +5,10 @@ use std::{
 };
 
 use pplx_space_byte_size::MemorySize;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_execution_spec::{
     DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC, DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC, VcpuCount,
 };
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_template_model::TemplateName;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -35,7 +35,7 @@ const AUTOSCALE_LOOKBACK: Duration = Duration::from_secs(24 * 60 * 60);
 const AUTOSCALE_DEFAULT_VCPU: i32 = 2;
 const AUTOSCALE_DEFAULT_MEMORY_MIB: i32 = 1024;
 const MAX_ROOTFS_MIB: i64 =
-    (pplx_space_common_core::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES / (1024 * 1024)) as i64;
+    (pplx_space_sandbox_model::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES / (1024 * 1024)) as i64;
 // A full sizing bucket is also the admission threshold for a release outside
 // the proactive retained window. That keeps one-off exact releases from each
 // allocating the policy floor while preserving the existing sizing ratio once

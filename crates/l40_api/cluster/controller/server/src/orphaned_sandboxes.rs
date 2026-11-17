@@ -63,15 +63,15 @@ use std::time::{Duration, Instant};
 use crate::metrics::sandbox::reconciler::{
     self as reconciler_metrics, ClassificationOutcome, ClassificationReason, PodEvidence,
 };
-use pplx_space_common_core::types::{
-    SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
-    SandboxQuarantineReasonCode, SandboxQuarantineSource,
-};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{
+    SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource,
+};
 use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
 use pplx_space_sandbox_quarantine_store::{
     quarantine_history_insert_columns, quarantine_state_conflict_assignments,

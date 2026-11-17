@@ -14,13 +14,13 @@
 //! [`ProbeVerdict::Inconclusive`] (defer) and roll to the next tick; the
 //! candidate select's `ORDER BY random()` keeps that rollover fair.
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use pplx_space_api::controllers::substrate::{RetireFence, SubstrateError};
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 use super::SweepSink;
 use super::classify::{ProbeObservation, ProbeVerdict};

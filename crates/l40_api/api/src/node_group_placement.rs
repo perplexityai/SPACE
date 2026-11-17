@@ -55,7 +55,7 @@
 //!
 //! [`SANDBOX_NODE_GROUP_PLACEMENT_ENV`]: pplx_space_sandbox_pod::SANDBOX_NODE_GROUP_PLACEMENT_ENV
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

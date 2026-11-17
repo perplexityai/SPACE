@@ -10,9 +10,11 @@
 
 use crate::db::Connection;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, SandboxCleanupEpisodeId, SandboxId,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    TransferScopeId,
+    ArtifactKind, ArtifactOrigin, LocalArtifactId, TransferScopeId,
+};
+use pplx_space_sandbox_model::{
+    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource,
 };
 use rusqlite::params;
 

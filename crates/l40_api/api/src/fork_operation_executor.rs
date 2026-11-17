@@ -8,15 +8,15 @@ use std::{
 };
 
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
-use pplx_space_common_core::types::{
-    ArtifactKind, BackupAttemptId, BackupSource, EcwCredentialEpoch, ExecutionGeneration,
-    SandboxId, SandboxLifecycle, SnapshotState,
-};
+use pplx_space_common_core::types::{ArtifactKind, BackupAttemptId, BackupSource, SnapshotState};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicForkOperationResult, PublicOperationResult,
+};
+use pplx_space_sandbox_model::{
+    EcwCredentialEpoch, ExecutionGeneration, SandboxId, SandboxLifecycle,
 };
 use sqlx::PgPool;
 

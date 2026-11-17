@@ -55,7 +55,7 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     use std::ffi::OsStr;
 
     // The parent serves while the isolated child exercises environment-based
@@ -179,7 +179,7 @@ async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
 #[tokio::test]
 async fn failed_teardown_defers_repeated_polls_without_holding_driver_capacity() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let conn = crate::db::test_conn();
     let sandbox = SandboxId::new();
     let generation = ExecutionGeneration::new(7).unwrap();
@@ -222,8 +222,8 @@ async fn teardown_retry_seals_publishes_backs_up_and_completes_the_same_capture(
         record_encrypted_capture_in, sealing_node_manager_builder,
     };
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
     use pplx_space_node_mgr_client::proto::{CleanupSandboxRequest, CleanupSandboxResponse};
+    use pplx_space_sandbox_model::ExecutionGeneration;
     use std::ffi::OsStr;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -586,7 +586,7 @@ async fn node_local_handoff(
     upload_retry_secs: Option<u64>,
 ) -> NodeLocalHandoff {
     use crate::service::tests::service_tests::{insert_test_sandbox, runtime_fields};
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     let conn = crate::db::test_conn();
     let id = sandbox_id.to_string();
@@ -644,7 +644,7 @@ async fn suspended_after_node_local_upload(
     volume_manager: &FakeVolumeManager,
     scratch: &std::path::Path,
 ) -> NodeLocalSuspended {
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     let sandbox_id = match upload {
         NodeLocalUpload::RegistrationRefused => SandboxId::from_uuid(REFUSED_SANDBOX),
@@ -762,8 +762,8 @@ async fn teardown_after_node_local_suspend_shares_its_upload_or_settles_its_fail
 /// row isn't marked as finished failing until that attempt fails too.
 async fn captured_upload_failing_twice() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
     use pplx_space_common_jobs::JobStatus;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     let generation = ExecutionGeneration::new(GENERATION).unwrap();
     let volume_manager = FakeVolumeManager::serve(Transfers::Failed);
@@ -843,8 +843,8 @@ async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {
     use crate::proto::enqueue_artifact_backup_request::Source;
     use crate::service::activation_support::internal_request;
     use crate::service::tests::service_tests::prepare_teardown_suspend_request;
-    use pplx_space_common_core::types::ExecutionGeneration;
     use pplx_space_common_jobs::JobStatus;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     let generation = ExecutionGeneration::new(GENERATION).unwrap();
     let volume_manager = FakeVolumeManager::serve(match upload {

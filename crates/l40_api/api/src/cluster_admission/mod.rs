@@ -30,7 +30,8 @@ use crate::controllers::substrate::{
     ActivationAdmissionRejection, ActivationRejectionKind, GATEWAY_RETRY_AFTER, LiveCapFuture,
     NetworkSlotHeadroom, Substrate,
 };
-use pplx_space_common_core::types::{ClientId, SandboxId};
+use pplx_space_common_core::types::ClientId;
+use pplx_space_sandbox_model::SandboxId;
 
 mod redis_bucket;
 #[cfg(test)]

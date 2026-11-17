@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_guest_process::ProcessSignal;
 use pplx_space_node_runtime_core::cgroup::{self, CgroupLimits};
 use pplx_space_node_runtime_core::launch;
@@ -19,6 +18,7 @@ use pplx_space_node_runtime_core::proto::{
     StopProcessResponse, StopSandboxRuntimeRequest, StopSandboxRuntimeResponse,
     UpdateCgroupRequest, UpdateCgroupResponse,
 };
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_uds_peer_auth::{UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -588,7 +588,7 @@ impl RuntimeSupervisorService {
     async fn prepare_firecracker_launch(
         &self,
         sandbox_id: SandboxId,
-        execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+        execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
         budget: pplx_space_execution_spec::VcpuCount,
         sealed_launch: Option<crate::verified_launch::VerifiedLaunch>,
     ) -> Result<Option<crate::verified_launch::OpenedRuntime>, Status> {

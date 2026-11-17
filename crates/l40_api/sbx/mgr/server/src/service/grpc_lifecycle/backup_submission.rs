@@ -781,7 +781,7 @@ impl SandboxManagerService {
         local_artifact_id: LocalArtifactId,
         snapshot_dir: &str,
         format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
-        registration_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        registration_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
         capture_vouched: bool,
     ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
         let request_override = match self.resolve_org_snapshot_upload_config(&sandbox.id).await {

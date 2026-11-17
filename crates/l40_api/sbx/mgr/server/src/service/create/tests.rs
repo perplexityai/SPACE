@@ -1,5 +1,5 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 
@@ -149,7 +149,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
     consumer_definition: pplx_space_execution_common::environment::EnvironmentDefinition,
 ) {
     use crate::node_manager_transport::fake::FakeNodeManager;
-    use pplx_space_common_core::types::{SandboxArtifactMetadata, SandboxRuntimeLabel};
+    use pplx_space_common_core::types::SandboxArtifactMetadata;
     use pplx_space_content_digest::ContentHash;
     use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
     use pplx_space_node_mgr_client::proto::{
@@ -157,6 +157,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
         ReleaseResponse, ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
         resolve_execution_environment_request::Compatible,
     };
+    use pplx_space_sandbox_model::SandboxRuntimeLabel;
     let consumer = consumer_definition.execution_requirements().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let cache = directory.path().join("cache");
@@ -323,7 +324,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
 #[tokio::test]
 async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation() {
     use crate::node_manager_transport::fake::FakeNodeManager;
-    use pplx_space_common_core::types::{SandboxArtifactMetadata, SandboxRuntimeLabel};
+    use pplx_space_common_core::types::SandboxArtifactMetadata;
     use pplx_space_content_digest::ContentHash;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
@@ -331,6 +332,7 @@ async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation(
         AllocateResponse, ExecutionEnvironmentSelection, NetworkPoolStatusResponse,
         ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
     };
+    use pplx_space_sandbox_model::SandboxRuntimeLabel;
     if !crate::service::tests::enter_route_test_process(&[
         ("EPPO_SDK_KEY", None),
         ("SPACE_FLAGD_ENABLED", None),
@@ -510,7 +512,7 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use crate::service::start_support::{ActivationAdmissionKind, REQUESTED_VM_ACTIVATIONS};
     use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-    use pplx_space_common_core::types::{SandboxArtifactMetadata, SandboxRuntimeLabel};
+    use pplx_space_common_core::types::SandboxArtifactMetadata;
     use pplx_space_content_digest::ContentHash;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
@@ -519,6 +521,7 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
         NetworkPoolStatusRequest, NetworkPoolStatusResponse, PrepareSandboxResponse,
         ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
     };
+    use pplx_space_sandbox_model::SandboxRuntimeLabel;
 
     let compiled =
         pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)

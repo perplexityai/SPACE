@@ -72,7 +72,7 @@ pub(super) struct SynchronousCleanupRequest<'a> {
 pub(super) enum CleanupAdmission {
     Persisted {
         sandbox_id: SandboxId,
-        expected_execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        expected_execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
         dispatch_job_id: Option<JobId>,
         auto_lifecycle_delete_receipt:
             Option<crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt>,
@@ -80,7 +80,7 @@ pub(super) enum CleanupAdmission {
     },
     Unpersisted {
         sandbox_id: SandboxId,
-        expected_execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        expected_execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
         persistence_error: Option<String>,
         // A known image exclusion survives a later loss of database access.
         guest_flush_forbidden: bool,
@@ -195,7 +195,7 @@ impl From<Status> for CleanupAdmissionError {
 impl CleanupAdmission {
     pub(super) fn persisted(
         sandbox_id: SandboxId,
-        expected_execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        expected_execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
         auto_lifecycle_delete_receipt: Option<
             crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt,
         >,
@@ -212,7 +212,7 @@ impl CleanupAdmission {
 
     fn unpersisted(
         sandbox_id: SandboxId,
-        expected_execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        expected_execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
         persistence_error: Option<String>,
         guest_flush_forbidden: bool,
         fence: OwnedCleanupFenceGuard,
@@ -299,7 +299,7 @@ impl CleanupAdmission {
     pub(super) fn expected_execution_generation(
         &self,
         sandbox_id: SandboxId,
-    ) -> Result<Option<pplx_space_common_core::types::ExecutionGeneration>, Status> {
+    ) -> Result<Option<pplx_space_sandbox_model::ExecutionGeneration>, Status> {
         match self {
             Self::Persisted {
                 sandbox_id: admitted_sandbox_id,
@@ -375,7 +375,7 @@ enum QuarantineRecoveryArtifactError {
     #[error("quarantine recovery episode is missing its artifact/generation fence")]
     MissingRecoveryFence,
     #[error(transparent)]
-    InvalidSandboxId(#[from] pplx_space_common_core::types::SandboxIdParseError),
+    InvalidSandboxId(#[from] pplx_space_sandbox_model::SandboxIdParseError),
     #[error(transparent)]
     Inspection(#[from] super::suspend_snapshot_publication::CanonicalSuspendSnapshotRecoveryError),
     #[error("quarantine recovery artifact changed from {expected} to {observed}")]
@@ -451,7 +451,7 @@ pub(super) struct ObservedCleanupClaim {
     pub(super) completion: CleanupCompletion,
     pub(super) persist_intent: bool,
     pub(super) observed_execution_generation:
-        Option<Option<pplx_space_common_core::types::ExecutionGeneration>>,
+        Option<Option<pplx_space_sandbox_model::ExecutionGeneration>>,
 }
 
 struct CleanupAdmissionSpec {
@@ -475,16 +475,16 @@ enum CleanupAdmissionMode {
     Unfenced,
     ObservedState {
         state: SandboxStatus,
-        execution_generation: Option<Option<pplx_space_common_core::types::ExecutionGeneration>>,
+        execution_generation: Option<Option<pplx_space_sandbox_model::ExecutionGeneration>>,
     },
     ObservedExecution {
-        execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
     },
     /// Only while the sandbox is in `state` and still running the node
     /// execution `execution` began: a later activation is someone else's.
     ObservedActivation {
         state: SandboxState,
-        execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+        execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
     },
     AutoLifecycleDelete {
         expectation: crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation,
@@ -504,7 +504,7 @@ impl CleanupAdmissionMode {
 
     const fn observed_activation(
         self,
-    ) -> Option<pplx_space_common_core::types::SandboxActivationAttemptId> {
+    ) -> Option<pplx_space_sandbox_model::SandboxActivationAttemptId> {
         match self {
             Self::ObservedActivation { execution, .. } => Some(execution),
             Self::Unfenced
@@ -516,7 +516,7 @@ impl CleanupAdmissionMode {
 
     const fn observed_execution_generation(
         self,
-    ) -> Option<Option<pplx_space_common_core::types::ExecutionGeneration>> {
+    ) -> Option<Option<pplx_space_sandbox_model::ExecutionGeneration>> {
         match self {
             Self::ObservedState {
                 execution_generation,
@@ -924,7 +924,7 @@ impl SandboxManagerService {
         &self,
         sandbox_id: SandboxId,
         state: impl Into<SandboxStatus>,
-        execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+        execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) -> Result<CleanupAdmission, CleanupAdmissionError> {
         // The claim checks that the sandbox is still in `state`, so admitting
         // only a running state leaves an execution already at rest, such as
@@ -963,7 +963,7 @@ impl SandboxManagerService {
         completion: CleanupCompletion,
         persist_intent: bool,
         observed_execution_generation: Option<
-            Option<pplx_space_common_core::types::ExecutionGeneration>,
+            Option<pplx_space_sandbox_model::ExecutionGeneration>,
         >,
     ) -> Result<CleanupAdmission, CleanupAdmissionError> {
         let mode = observed_execution_generation.map_or(
@@ -1669,7 +1669,7 @@ impl SandboxManagerService {
                     let receipt = match crate::db::auto_lifecycle_delete_receipts::insert_pending_receipt(
                             &transaction,
                             crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
-                            receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+                            receipt_id: pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate(),
                             sandbox_id,
                             execution_generation: evidence.execution_generation,
                         route_activation_id: evidence.activation_attempt_id,
@@ -1795,7 +1795,7 @@ impl SandboxManagerService {
     pub(super) async fn dispatch_cleanup_if_generation_current<F, Fut>(
         db: &crate::db::SharedConnection,
         sandbox_id: &str,
-        expected_execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        expected_execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
         cleanup_fence: &(impl CleanupFenceAuthorization + ?Sized),
         dispatch: F,
     ) -> Result<CleanupDispatchDisposition, Status>
@@ -2247,7 +2247,7 @@ impl SandboxManagerService {
         db: &crate::db::SharedConnection,
         sandbox_id: &str,
         completion: CleanupCompletion,
-        expected_execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        expected_execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
         auto_lifecycle_delete_receipt: Option<
             crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt,
         >,
@@ -2268,7 +2268,7 @@ impl SandboxManagerService {
         db: &crate::db::SharedConnection,
         sandbox_id: &str,
         completion: CleanupCompletion,
-        expected_execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        expected_execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
         auto_lifecycle_delete_receipt: Option<
             crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt,
         >,
@@ -3272,7 +3272,7 @@ impl SandboxManagerService {
 #[derive(Debug, thiserror::Error)]
 pub(super) enum StopFlushError {
     #[error("invalid sandbox id: {0}")]
-    SandboxId(#[source] pplx_space_common_core::types::SandboxIdParseError),
+    SandboxId(#[source] pplx_space_sandbox_model::SandboxIdParseError),
     #[error("the VM is not running")]
     VmNotRunning,
     #[error("cannot read the execution fence: {0}")]

@@ -51,7 +51,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, inflight_suspend_upload_from_node_exists,
     snapshot_durable_for_source_release,

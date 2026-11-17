@@ -24,9 +24,9 @@ use tokio_util::task::TaskTracker;
 use crate::metrics::sandbox::worker::{
     NetGatewayRouteVerificationStatus, NetGatewayTlsInterceptionMode,
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_linux_ids::LinuxPid;
 use pplx_space_node_runtime_core::vm_state::VmState;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_semver::SemVer;
 
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
@@ -287,7 +287,7 @@ struct GuestHealthGaugeValue {
 #[derive(Clone)]
 pub struct SidecarInfo {
     pub guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
-    pub node_execution_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    pub node_execution_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub sandbox_id: String,
     pub template: String,
     pub uid: Option<u32>,

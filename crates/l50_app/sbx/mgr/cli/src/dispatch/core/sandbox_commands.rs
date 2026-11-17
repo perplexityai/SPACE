@@ -396,7 +396,7 @@ fn discard_precheck(sandbox: &SandboxInfo) -> Result<(), String> {
 
 fn discard_target(
     id: Option<SandboxSelector>,
-) -> Result<pplx_space_common_core::types::SandboxId, &'static str> {
+) -> Result<pplx_space_sandbox_model::SandboxId, &'static str> {
     id.and_then(|id| id.to_string().parse().ok())
         .ok_or("--discard-retained-filesystem takes the sandbox's full UUID")
 }

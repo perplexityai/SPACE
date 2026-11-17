@@ -837,7 +837,7 @@ fn new_payload_round_trips_metadata_job_flag() {
 /// persisted before the field existed reads back unfenced.
 #[test]
 fn payload_round_trips_execution_generation() {
-    let generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
+    let generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
     let jobs = SnapshotUploadJobs {
         meta: fixture_meta(None),
         snapshot_id: "snap-1".to_string(),

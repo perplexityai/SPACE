@@ -27,20 +27,20 @@ pub(super) struct StartFromCheckpointLaunch<'a> {
     pub(super) vcpu: Option<u32>,
     pub(super) activation_auto_lifecycle: Option<&'a AutoLifecyclePolicy>,
     pub(super) operation_activation_attempt_id:
-        Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub(super) sandbox: &'a crate::db::SandboxRow,
     pub(super) blocking: bool,
     pub(super) netns_path: Option<String>,
     pub(super) target_state: SandboxState,
-    pub(super) execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
-    pub(super) space_api_route_identity: pplx_space_common_core::types::SpaceApiRouteIdentity,
+    pub(super) execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+    pub(super) space_api_route_identity: pplx_space_sandbox_model::SpaceApiRouteIdentity,
     pub(super) route_identity_provenance:
         crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
     pub(super) open_activation_claim_eligible: bool,
     pub(super) restored_snapshot: RestoredSnapshotProvenance,
     /// See [`super::start::StartAdmission::expected_node_execution`].
     pub(super) expected_node_execution:
-        Option<Option<pplx_space_common_core::types::SandboxActivationAttemptId>>,
+        Option<Option<pplx_space_sandbox_model::SandboxActivationAttemptId>>,
 }
 
 /// BYOK restore: rebuild the encrypted rootfs from the suspended `cow.luks` and
@@ -1539,7 +1539,7 @@ pub(super) fn autostart_request(
     sandbox_id: String,
     from_warm: bool,
     blocking: bool,
-    create_route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    create_route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
 ) -> StartRequest {
     StartRequest {
         sandbox_id,
@@ -1554,7 +1554,7 @@ pub(super) fn autostart_request(
 }
 
 pub(super) fn create_route_evidence_before_start(
-    identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
     provenance: crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
     autostart: bool,
 ) -> Option<crate::auto_lifecycle_delete_receipts::RouteEvidence> {

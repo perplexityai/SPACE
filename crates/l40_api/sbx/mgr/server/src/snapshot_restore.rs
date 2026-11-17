@@ -29,13 +29,13 @@ use std::time::Duration;
 
 use futures_util::future::{BoxFuture, join_all};
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExactStorageUri, LocalArtifactId, SandboxCleanupEpisodeId,
-    SandboxId, SnapshotArtifact,
+    ArtifactKind, ArtifactOrigin, ExactStorageUri, LocalArtifactId, SnapshotArtifact,
 };
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 use pplx_space_host_layout::paths;
+use pplx_space_sandbox_model::{SandboxCleanupEpisodeId, SandboxId};
 use pplx_space_volmgr_client::{
     EnsureFileReplicaError, EnsureFileReplicaWaitConfig, RESTORE_PRIORITY, VOLMGR_SOCKET,
     ensure_file_replica_with_config, proto::PullFileRequest, read_verified_replica_provenance,
@@ -151,7 +151,7 @@ pub enum RestoreError {
     InvalidSandboxId {
         value: String,
         #[source]
-        source: pplx_space_common_core::types::SandboxIdParseError,
+        source: pplx_space_sandbox_model::SandboxIdParseError,
     },
     #[error("invalid restore source URI {uri}: {source}")]
     InvalidRestoreSource {
@@ -200,7 +200,7 @@ pub enum RestoreError {
     #[error("artifact snapshot is missing sandbox ownership metadata")]
     MissingSandboxOwnershipMetadata,
     #[error("restored rootfs capacity is not permitted: {0}")]
-    RootfsPolicy(#[source] pplx_space_common_core::sandbox_storage::RootfsSizeError),
+    RootfsPolicy(#[source] pplx_space_sandbox_model::sandbox_storage::RootfsSizeError),
     #[error("create directory {path}: {source}")]
     CreateDirectory {
         path: PathBuf,
@@ -571,8 +571,8 @@ pub(crate) struct QuarantineRecoveryPlan {
     pub(crate) snapshot_id: SnapshotId,
     pub(crate) local_artifact_id: Option<LocalArtifactId>,
     pub(crate) storage_uri: String,
-    pub(crate) execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-    pub(crate) reason_code: pplx_space_common_core::types::SandboxQuarantineReasonCode,
+    pub(crate) execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
+    pub(crate) reason_code: pplx_space_sandbox_model::SandboxQuarantineReasonCode,
 }
 
 fn parse_recovery_local_artifact_id(value: &str) -> Result<Option<LocalArtifactId>, RestoreError> {
@@ -677,8 +677,8 @@ pub(crate) fn write_canonical_restore_exchange_receipt(
     stage: &RestoreMetadataStaged,
     sandbox_id: SandboxId,
     transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-    activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
+    activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     old_source: &ExactStorageUri,
     replacement_source: &ExactStorageUri,
 ) -> Result<(), RestoreError> {
@@ -712,8 +712,8 @@ pub(crate) fn canonical_restore_exchange_old_source_at(
     canonical_sandbox_dir: &Path,
     sandbox_id: SandboxId,
     transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-    activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
+    activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     replacement_source: &ExactStorageUri,
 ) -> Result<Option<ExactStorageUri>, RestoreError> {
     let path = canonical_sandbox_dir.join(CANONICAL_RESTORE_EXCHANGE_RECEIPT_FILENAME);
@@ -735,13 +735,13 @@ pub(crate) fn canonical_restore_exchange_old_source_at(
             ))
         })?;
     let receipt_generation =
-        pplx_space_common_core::types::ExecutionGeneration::try_from(receipt.execution_generation)
+        pplx_space_sandbox_model::ExecutionGeneration::try_from(receipt.execution_generation)
             .map_err(|source| {
                 RestoreError::Other(format!(
                     "canonical-root exchange receipt has an invalid execution generation for {sandbox_id}: {source}"
                 ))
             })?;
-    let receipt_attempt: pplx_space_common_core::types::SandboxActivationAttemptId = receipt
+    let receipt_attempt: pplx_space_sandbox_model::SandboxActivationAttemptId = receipt
         .activation_attempt_id
         .parse()
         .map_err(|source| {
@@ -1643,7 +1643,7 @@ pub(crate) fn resolve_quarantine_recovery_plan_response(
         }
     };
     let execution_generation =
-        match pplx_space_common_core::types::ExecutionGeneration::new(plan.execution_generation) {
+        match pplx_space_sandbox_model::ExecutionGeneration::new(plan.execution_generation) {
             Ok(value) => value,
             Err(error) => {
                 return Ok(malformed(&format!(
@@ -1652,7 +1652,7 @@ pub(crate) fn resolve_quarantine_recovery_plan_response(
                 )));
             }
         };
-    let reason_code: pplx_space_common_core::types::SandboxQuarantineReasonCode =
+    let reason_code: pplx_space_sandbox_model::SandboxQuarantineReasonCode =
         match plan.reason_code.parse() {
             Ok(value) => value,
             Err(error) => {
@@ -2036,7 +2036,7 @@ pub async fn restore_pull_rootfs(
         InstanceTarget::RestoreScope,
     );
     if let Some(size_mib) = stage.meta.source.rootfs_size_mib {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(size_mib)
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(size_mib)
             .map_err(RestoreError::RootfsPolicy)?;
     }
     let sandbox_id = stage.meta.sandbox_id.as_str();
@@ -2615,7 +2615,7 @@ async fn stage_full_codec_artifacts(
             "restored rootfs must be a regular file".to_string(),
         ));
     }
-    pplx_space_common_core::sandbox_storage::validate_rootfs_bytes(rootfs_metadata.len())
+    pplx_space_sandbox_model::sandbox_storage::validate_rootfs_bytes(rootfs_metadata.len())
         .map_err(RestoreError::RootfsPolicy)?;
     // Retained instances are root-owned after execution cleanup. Replace them
     // through their fenced owner only after every source artifact is staged and

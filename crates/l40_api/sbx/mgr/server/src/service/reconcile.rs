@@ -3,11 +3,11 @@ use super::cleanup_support::{StateWriteRejected, state_write_result};
 use super::grpc_lifecycle::SuspendRequestContext;
 use super::network_runtime::*;
 use super::*;
-use pplx_space_common_core::types::SandboxRouteIdentityInvariantError;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
 };
+use pplx_space_sandbox_model::SandboxRouteIdentityInvariantError;
 
 const ROUTE_VERIFICATION_BUNDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const AUTO_LIFECYCLE_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);

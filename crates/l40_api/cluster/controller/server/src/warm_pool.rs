@@ -34,7 +34,7 @@ use pplx_space_cluster_pool::{
     AutoscaleRun, InvalidPoolConfigRow, NewPoolSlot, PoolConfig, PoolConfigRead, PoolSlot,
     PoolSlotCounts, PoolSlotState, WarmPoolStore,
 };
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_pod::{
     DEFAULT_SANDBOX_PROXY_PORT, NodeGroupPlacement, PodEnvironment, SANDBOX_POOL_ROLE_WARM,
     SandboxPodConfigValues, TEMPLATE_PRESENT_LABEL_VALUE, template_build_presence_label_key,

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::cluster_reconciler as metrics;
 use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::SandboxId;
 use tokio_util::sync::CancellationToken;
 
 use super::backend::{DeleteOutcome, GcBackend, KubernetesGcBackend};

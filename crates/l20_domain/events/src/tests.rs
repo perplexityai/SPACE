@@ -395,7 +395,7 @@ fn emitted_fields(
     event_type: SandboxEventType,
     details: SandboxEventDetails,
 ) -> Vec<(String, String)> {
-    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_sandbox_model::SandboxId;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::layer::SubscriberExt;
 

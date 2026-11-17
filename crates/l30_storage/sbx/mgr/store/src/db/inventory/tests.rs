@@ -1,7 +1,7 @@
 use super::*;
 use crate::db::fixture::insert_test_sandbox;
 use crate::state::SandboxState;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 #[test]
 fn orphan_scope_sweep_bounds_discovery_and_progresses_past_retained_rows() {

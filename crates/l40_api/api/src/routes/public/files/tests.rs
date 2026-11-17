@@ -1,5 +1,4 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_guest_process::GuestUserName;
 use pplx_space_native_files::limits::{
     FILE_WRITE_CHUNK_BYTES, MAX_FILE_READ_BYTES, MAX_FILE_WRITE_BYTES,
@@ -9,6 +8,7 @@ use pplx_space_native_files::{
     spaced_mkdir_request, write_parent_directory,
 };
 use pplx_space_public_api::{FileEventKind, FileType, PublicSandboxId};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::{SpacedFileInfo, SpacedFileType, spaced_write_request};
 
 use super::*;
@@ -211,8 +211,8 @@ async fn a_full_sandbox_disk_is_not_a_retryable_rate_limit() {
 async fn a_sandbox_at_rest_answers_with_the_command_refusal_details() {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use pplx_space_common_core::types::SandboxLifecycle;
     use pplx_space_public_api::{PublicErrorCode, PublicErrorEnvelope};
+    use pplx_space_sandbox_model::SandboxLifecycle;
 
     let sandbox_id = SandboxId::new();
     let refusal = || {

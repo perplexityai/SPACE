@@ -17,6 +17,7 @@ tonic-prost = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 
 [build-dependencies]

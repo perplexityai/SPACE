@@ -5,7 +5,7 @@
 //! large. Driven from `k8s_store_postgres_behaviors` against the parent's
 //! fixture.
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 

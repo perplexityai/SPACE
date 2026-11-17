@@ -20,10 +20,10 @@ use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSetId, AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage,
     AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
 };
-use pplx_space_common_core::types::{EcwCredentialEpoch, SandboxId};
 use pplx_space_ecw_credential::{EcwCredentialKeyring, EcwCredentialKind};
 use pplx_space_net_common::{EgressDestinationV1, IpCidr};
 use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
+use pplx_space_sandbox_model::{EcwCredentialEpoch, SandboxId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;

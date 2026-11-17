@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 fn policy_row(
     own: Option<pplx_space_net_common::NetworkPolicy>,

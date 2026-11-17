@@ -63,7 +63,7 @@
 //! defer each candidate, and only the deleted-node-row arm can act.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};

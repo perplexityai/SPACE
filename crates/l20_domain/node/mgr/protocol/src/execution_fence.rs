@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxActivationAttemptId;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
 
 /// Response header older sandbox managers require from `InspectSandbox` before
 /// startup admission. Current sandbox managers do not read it.

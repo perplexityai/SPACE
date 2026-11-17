@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use crate::client_live_cap::{LiveHandoff, LiveReservation};
@@ -158,7 +158,7 @@ fn fork_in_progress_conflict() -> ControllerError {
 async fn begin_delete_against_active_fork(
     pool: &PgPool,
     sandbox_id: SandboxId,
-) -> Result<Option<pplx_space_common_core::types::SandboxLifecycle>, ControllerError> {
+) -> Result<Option<pplx_space_sandbox_model::SandboxLifecycle>, ControllerError> {
     let mut guard = pool.begin().await.map_err(|error| {
         // Classified like the advisory-lock acquisition on the next line,
         // which would otherwise be unreachable on a contended `begin`. A
@@ -192,7 +192,7 @@ async fn begin_delete_against_active_fork(
     .map_err(|error| db_contention_error("failed to read sandbox lifecycle before delete", &error))?
     .map(|lifecycle| {
         lifecycle
-            .parse::<pplx_space_common_core::types::SandboxLifecycle>()
+            .parse::<pplx_space_sandbox_model::SandboxLifecycle>()
             .map_err(|error| {
                 tracing::error!(%sandbox_id, %error, "sandbox has invalid lifecycle before delete");
                 ControllerError::internal("sandbox has invalid lifecycle")
@@ -212,7 +212,7 @@ async fn begin_delete_against_active_fork(
 async fn restore_lifecycle_after_failed_delete(
     pool: &PgPool,
     sandbox_id: SandboxId,
-    lifecycle: pplx_space_common_core::types::SandboxLifecycle,
+    lifecycle: pplx_space_sandbox_model::SandboxLifecycle,
 ) -> Result<(), ControllerError> {
     let restored = restore_lifecycle_from_deleting(pool, sandbox_id, lifecycle)
         .await
@@ -238,7 +238,7 @@ async fn restore_lifecycle_after_failed_delete(
 async fn restore_lifecycle_after_failed_finalize_delete(
     pool: &PgPool,
     sandbox_id: SandboxId,
-    previous_lifecycle: Option<pplx_space_common_core::types::SandboxLifecycle>,
+    previous_lifecycle: Option<pplx_space_sandbox_model::SandboxLifecycle>,
 ) -> Result<(), ControllerError> {
     let Some(previous_lifecycle) = previous_lifecycle else {
         return Ok(());

@@ -421,7 +421,7 @@ async fn main() -> anyhow::Result<()> {
         let sandbox = args
             .next()
             .context("sandbox ID required")?
-            .parse::<pplx_space_common_core::types::SandboxId>()?;
+            .parse::<pplx_space_sandbox_model::SandboxId>()?;
         (
             pplx_space_host_layout::paths::spaced_host_socket(&sandbox.to_string()),
             "--host".to_owned(),

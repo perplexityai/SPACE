@@ -1,5 +1,5 @@
 use pplx_space_accounts::{OrgId, UserId};
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use crate::api_surface::ApiSurface;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -12,12 +12,12 @@ use pplx_space_accounts::{NodeId, SandboxOwnerSource};
 use pplx_space_auto_lifecycle::{
     AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, SandboxAutoLifecyclePatch,
 };
-use pplx_space_common_core::types::{EcwCredentialEpoch, SandboxActivationAttemptId};
 use pplx_space_content_digest::Digest;
 use pplx_space_execution_spec::ArtifactVersion;
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
 use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodePoolName, NodeRole};
+use pplx_space_sandbox_model::{EcwCredentialEpoch, SandboxActivationAttemptId};
 use pplx_space_semver::SemVer;
 use pplx_space_template_model::TemplateReference;
 

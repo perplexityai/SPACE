@@ -1,8 +1,8 @@
 //! `BeginArtifactBackup`'s execution-generation fence: the registration of a
 //! capture whose runtime the control plane superseded is refused.
 
-use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
 use pplx_space_node_api_client::cluster::backup_execution_superseded_status;
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_portability::execution_supersession::{
     ExecutionSupersessionRow, execution_generation_superseded,
 };

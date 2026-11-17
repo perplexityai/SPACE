@@ -4,8 +4,8 @@ use pplx_space_node_model::SubstrateKind;
 
 use pplx_space_sql_locator::sql;
 
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, snapshot_durable_for_source_release,
 };

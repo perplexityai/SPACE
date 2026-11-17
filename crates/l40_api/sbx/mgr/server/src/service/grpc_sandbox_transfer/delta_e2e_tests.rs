@@ -341,7 +341,7 @@ async fn export_phase(
 ) -> Exported {
     let template_path = template_rootfs(scenario);
     let base = std::fs::read(&template_path).expect("the registered template rootfs");
-    let source_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let source_id = pplx_space_sandbox_model::SandboxId::new().to_string();
     let source_rootfs = changed(&base, 0x5a);
     client
         .import_sandbox(tokio_stream::iter(sandbox_import(
@@ -471,7 +471,7 @@ async fn import_phase(
     exported: &Exported,
 ) {
     let header = &exported.sandbox_header;
-    let target_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let target_id = pplx_space_sandbox_model::SandboxId::new().to_string();
     let target = ImportSandboxHeader {
         sandbox_id: target_id.clone(),
         template_id: header.template_id.clone(),
@@ -534,7 +534,7 @@ async fn import_phase(
     );
 
     if scenario.expect == Expect::Full {
-        let refused_id = pplx_space_common_core::types::SandboxId::new().to_string();
+        let refused_id = pplx_space_sandbox_model::SandboxId::new().to_string();
         let status = client
             .import_sandbox(tokio_stream::iter(sandbox_import(
                 ImportSandboxHeader {

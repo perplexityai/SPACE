@@ -83,6 +83,7 @@ members = [
     "crates/l40_api/node/mgr/client",
     "crates/l20_domain/node/mgr/protocol",
     "crates/l20_domain/node/model",
+    "crates/l20_domain/sandbox/model",
     "crates/l40_api/node/mgr/server",
     "crates/l30_storage/node/registration/store",
     "crates/l40_api/node/runtime/core",
@@ -452,6 +453,7 @@ pplx-space-metrics-emit = { path = "crates/l10_foundation/metrics/emit" }
 pplx-space-grpc-metrics = { path = "crates/l10_foundation/grpc/metrics" }
 pplx-space-reconcile-metrics = { path = "crates/l10_foundation/reconcile/metrics" }
 pplx-space-sandbox-metrics = { path = "crates/l40_api/sandbox/metrics" }
+pplx-space-sandbox-model = { path = "crates/l20_domain/sandbox/model" }
 pplx-space-observability = { path = "crates/l10_foundation/observability", default-features = false }
 pplx-space-internal-api-server = { path = "crates/l40_api/internal/api/server" }
 pplx-space-internal-api-svc = { path = "crates/l50_app/internal/api/svc" }

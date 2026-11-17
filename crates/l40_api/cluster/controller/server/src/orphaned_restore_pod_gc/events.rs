@@ -5,10 +5,10 @@
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::SandboxId;
 
 use super::classify::RestorePodSnapshot;
 

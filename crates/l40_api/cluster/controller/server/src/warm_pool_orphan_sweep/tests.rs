@@ -3,7 +3,7 @@
 //! carry the load-bearing correctness (never delete a live/adopted pod) and run
 //! with plain values, no kube client or Postgres.
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::HashSet;
 

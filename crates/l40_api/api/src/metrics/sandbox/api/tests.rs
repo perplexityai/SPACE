@@ -4,8 +4,8 @@ use super::{
     ClientIdTag, SandboxApiMetricIdentity, lifecycle_error, route_outcome, sandbox_created,
     scope_request_client_id,
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_metrics_emit::test_capture::{CapturedCounter, capture_counters_guard};
+use pplx_space_sandbox_model::SandboxId;
 
 fn client_id_tags(counter: &CapturedCounter) -> Vec<&str> {
     counter

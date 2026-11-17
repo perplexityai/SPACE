@@ -4,7 +4,7 @@
 
 use std::net::IpAddr;
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use tonic::{Request, Response, Status};
 
 pub mod metrics;

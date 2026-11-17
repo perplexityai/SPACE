@@ -6,7 +6,7 @@
 //! # Examples
 //!
 //! ```rust
-//! # use pplx_space_common_core::types::{SandboxId, SandboxSelector};
+//! # use pplx_space_sandbox_model::{SandboxId, SandboxSelector};
 //! let id = SandboxId::new();
 //! let selector = SandboxSelector::parse(id.label().to_string())?;
 //! assert!(selector.matches_id(id));
@@ -584,7 +584,7 @@ const fn max_decimal_value_for_width(width: usize) -> u32 {
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::SandboxId;
+/// # use pplx_space_sandbox_model::SandboxId;
 /// assert!(SandboxId::from_str("not-a-uuid").is_err());
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -601,7 +601,7 @@ pub enum SandboxIdParseError {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::SandboxId;
+/// # use pplx_space_sandbox_model::SandboxId;
 /// let id = SandboxId::new();
 /// assert_eq!(id.to_string().len(), 36);
 /// ```
@@ -616,7 +616,7 @@ impl SandboxId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxId;
+    /// # use pplx_space_sandbox_model::SandboxId;
     /// let id = SandboxId::new();
     /// assert_eq!(id.as_uuid().get_version_num(), 7);
     /// ```
@@ -629,7 +629,7 @@ impl SandboxId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxId;
+    /// # use pplx_space_sandbox_model::SandboxId;
     /// # use uuid::Uuid;
     /// let uuid = Uuid::nil();
     /// let id = SandboxId::from_uuid(uuid);
@@ -644,7 +644,7 @@ impl SandboxId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxId;
+    /// # use pplx_space_sandbox_model::SandboxId;
     /// let id = SandboxId::new();
     /// let uuid = id.as_uuid();
     /// assert_eq!(uuid, id.as_uuid());
@@ -659,7 +659,7 @@ impl SandboxId {
     ///
     /// ```rust
     /// # use std::str::FromStr;
-    /// # use pplx_space_common_core::types::SandboxId;
+    /// # use pplx_space_sandbox_model::SandboxId;
     /// let id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3a3a2")?;
     /// assert_eq!(id.label().to_string(), "77f3a3a2");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1328,7 +1328,7 @@ impl<'r> pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres> for Sa
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::SandboxSelector;
+/// # use pplx_space_sandbox_model::SandboxSelector;
 /// assert!(SandboxSelector::parse("abc").is_err());
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -1352,7 +1352,7 @@ pub enum SandboxSelectorParseError {
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::{SandboxId, SandboxSelector};
+/// # use pplx_space_sandbox_model::{SandboxId, SandboxSelector};
 /// let id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3a3a2")?;
 /// let selector = SandboxSelector::parse("77f3")?;
 /// assert!(selector.matches_id(id));
@@ -1368,7 +1368,7 @@ pub struct SandboxSelector(String);
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::OneOrMany;
+/// # use pplx_space_sandbox_model::OneOrMany;
 /// let result = OneOrMany::Many(vec!["a", "b"]);
 /// assert!(matches!(result, OneOrMany::Many(items) if items.len() == 2));
 /// ```
@@ -1384,7 +1384,7 @@ impl SandboxSelector {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxSelector;
+    /// # use pplx_space_sandbox_model::SandboxSelector;
     /// let selector = SandboxSelector::parse("AB-cd")?;
     /// assert_eq!(selector.as_str(), "abcd");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1404,7 +1404,7 @@ impl SandboxSelector {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxSelector;
+    /// # use pplx_space_sandbox_model::SandboxSelector;
     /// let selector = SandboxSelector::parse("AB-cd")?;
     /// assert_eq!(selector.as_str(), "abcd");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1419,7 +1419,7 @@ impl SandboxSelector {
     ///
     /// ```rust
     /// # use std::str::FromStr;
-    /// # use pplx_space_common_core::types::{SandboxId, SandboxSelector};
+    /// # use pplx_space_sandbox_model::{SandboxId, SandboxSelector};
     /// let id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3a3a2")?;
     /// assert!(SandboxSelector::parse("77f3")?.matches_id(id));
     /// assert!(SandboxSelector::parse("019d84bd-280d")?.matches_id(id));
@@ -1439,7 +1439,7 @@ impl SandboxSelector {
     ///
     /// ```rust
     /// # use std::str::FromStr;
-    /// # use pplx_space_common_core::types::{OneOrMany, SandboxId, SandboxSelector};
+    /// # use pplx_space_sandbox_model::{OneOrMany, SandboxId, SandboxSelector};
     /// let ids = [
     ///     SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3a3a2")?,
     ///     SandboxId::from_str("019d84bd-280d-7331-99c6-b63300112233")?,
@@ -1510,7 +1510,7 @@ impl From<SandboxSelector> for String {
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::SandboxId;
+/// # use pplx_space_sandbox_model::SandboxId;
 /// let id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3a3a2")?;
 /// assert_eq!(id.label().to_string(), "77f3a3a2");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1524,7 +1524,7 @@ impl SandboxLabel {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxLabel;
+    /// # use pplx_space_sandbox_model::SandboxLabel;
     /// # use uuid::Uuid;
     /// let uuid = Uuid::parse_str("019d84bd-280d-7331-99c6-b63377f3a3a2")?;
     /// assert_eq!(SandboxLabel::from_uuid(uuid).to_string(), "77f3a3a2");
@@ -1629,7 +1629,7 @@ impl AsRef<str> for SandboxRuntimeLabel {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::SandboxName;
+/// # use pplx_space_sandbox_model::SandboxName;
 /// assert!(SandboxName::parse("").is_err());
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -1644,7 +1644,7 @@ pub struct SandboxTextParseError(&'static str);
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::SandboxName;
+/// # use pplx_space_sandbox_model::SandboxName;
 /// let name = SandboxName::parse("analysis-run")?;
 /// assert_eq!(name.expose(), "analysis-run");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1660,7 +1660,7 @@ impl SandboxName {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxName;
+    /// # use pplx_space_sandbox_model::SandboxName;
     /// assert!(SandboxName::parse("customer run").is_ok());
     /// assert!(SandboxName::parse("").is_err());
     /// ```
@@ -1675,7 +1675,7 @@ impl SandboxName {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxName;
+    /// # use pplx_space_sandbox_model::SandboxName;
     /// let name = SandboxName::parse("customer run")?;
     /// assert_eq!(name.expose(), "customer run");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1721,7 +1721,7 @@ impl From<SandboxName> for String {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::SandboxMetadataKey;
+/// # use pplx_space_sandbox_model::SandboxMetadataKey;
 /// let key = SandboxMetadataKey::parse("ticket")?;
 /// assert_eq!(key.expose(), "ticket");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1737,7 +1737,7 @@ impl SandboxMetadataKey {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxMetadataKey;
+    /// # use pplx_space_sandbox_model::SandboxMetadataKey;
     /// assert!(SandboxMetadataKey::parse("customer").is_ok());
     /// assert!(SandboxMetadataKey::parse("").is_err());
     /// ```
@@ -1752,7 +1752,7 @@ impl SandboxMetadataKey {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxMetadataKey;
+    /// # use pplx_space_sandbox_model::SandboxMetadataKey;
     /// let key = SandboxMetadataKey::parse("ticket")?;
     /// assert_eq!(key.expose(), "ticket");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1798,7 +1798,7 @@ impl From<SandboxMetadataKey> for String {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::SandboxMetadataString;
+/// # use pplx_space_sandbox_model::SandboxMetadataString;
 /// let value = SandboxMetadataString::parse("abc")?;
 /// assert_eq!(value.expose(), "abc");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1814,7 +1814,7 @@ impl SandboxMetadataString {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxMetadataString;
+    /// # use pplx_space_sandbox_model::SandboxMetadataString;
     /// assert!(SandboxMetadataString::parse("abc").is_ok());
     /// assert!(SandboxMetadataString::parse("").is_err());
     /// ```
@@ -1829,7 +1829,7 @@ impl SandboxMetadataString {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxMetadataString;
+    /// # use pplx_space_sandbox_model::SandboxMetadataString;
     /// let value = SandboxMetadataString::parse("abc")?;
     /// assert_eq!(value.expose(), "abc");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1872,7 +1872,7 @@ impl From<SandboxMetadataString> for String {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::SandboxMetadataValue;
+/// # use pplx_space_sandbox_model::SandboxMetadataValue;
 /// let value = SandboxMetadataValue::string("abc")?;
 /// let SandboxMetadataValue::String(value) = value else { unreachable!() };
 /// assert_eq!(value.expose(), "abc");
@@ -1892,7 +1892,7 @@ impl SandboxMetadataValue {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxMetadataValue;
+    /// # use pplx_space_sandbox_model::SandboxMetadataValue;
     /// assert!(SandboxMetadataValue::string("abc").is_ok());
     /// assert!(SandboxMetadataValue::string("").is_err());
     /// ```
@@ -1930,7 +1930,7 @@ impl fmt::Debug for SandboxMetadataValue {
 ///
 /// ```rust
 /// # use std::collections::BTreeMap;
-/// # use pplx_space_common_core::types::{SandboxMetadata, SandboxMetadataKey, SandboxMetadataValue};
+/// # use pplx_space_sandbox_model::{SandboxMetadata, SandboxMetadataKey, SandboxMetadataValue};
 /// let mut values = BTreeMap::new();
 /// values.insert(SandboxMetadataKey::parse("ticket")?, SandboxMetadataValue::string("S-123")?);
 /// let metadata = SandboxMetadata::new(values)?;
@@ -1952,7 +1952,7 @@ impl SandboxMetadata {
     ///
     /// ```rust
     /// # use std::collections::BTreeMap;
-    /// # use pplx_space_common_core::types::{SandboxMetadata, SandboxMetadataKey, SandboxMetadataValue};
+    /// # use pplx_space_sandbox_model::{SandboxMetadata, SandboxMetadataKey, SandboxMetadataValue};
     /// let mut values = BTreeMap::new();
     /// values.insert(SandboxMetadataKey::parse("ticket")?, SandboxMetadataValue::Integer(7));
     /// assert!(SandboxMetadata::new(values).is_ok());
@@ -1978,7 +1978,7 @@ impl SandboxMetadata {
     ///
     /// ```rust
     /// # use std::collections::BTreeMap;
-    /// # use pplx_space_common_core::types::SandboxMetadata;
+    /// # use pplx_space_sandbox_model::SandboxMetadata;
     /// let metadata = SandboxMetadata::new(BTreeMap::new())?;
     /// assert!(metadata.expose().is_empty());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -2037,7 +2037,7 @@ impl<'de> Deserialize<'de> for SandboxMetadata {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::SandboxLifecycle;
+/// # use pplx_space_sandbox_model::SandboxLifecycle;
 /// assert!(SandboxLifecycle::Starting.is_transient());
 /// assert!(SandboxLifecycle::Started.is_active_runtime());
 /// ```
@@ -2083,7 +2083,7 @@ impl SandboxLifecycle {
     /// matrix — then silently stops covering the new value.
     ///
     /// So: **when you add a variant, add it here.** Mirrors
-    /// [`crate::types::SnapshotState::all`], which has the same shape and the
+    /// `pplx_space_common_core::types::SnapshotState::all`, which has the same shape and the
     /// same limitation.
     ///
     /// Not every value `sandboxes.lifecycle` can hold: `deleted` is a tombstone
@@ -2120,7 +2120,7 @@ impl SandboxLifecycle {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxLifecycle;
+    /// # use pplx_space_sandbox_model::SandboxLifecycle;
     /// assert!(SandboxLifecycle::Creating.is_transient());
     /// assert!(!SandboxLifecycle::Started.is_transient());
     /// ```
@@ -2144,7 +2144,7 @@ impl SandboxLifecycle {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxLifecycle;
+    /// # use pplx_space_sandbox_model::SandboxLifecycle;
     /// assert!(SandboxLifecycle::Started.is_active_runtime());
     /// assert!(SandboxLifecycle::Paused.is_active_runtime());
     /// assert!(!SandboxLifecycle::Stopped.is_active_runtime());
@@ -2158,7 +2158,7 @@ impl SandboxLifecycle {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SandboxLifecycle;
+    /// # use pplx_space_sandbox_model::SandboxLifecycle;
     /// assert!(SandboxLifecycle::Suspended.is_crash_recovery_target());
     /// assert!(!SandboxLifecycle::Failed.is_crash_recovery_target());
     /// ```

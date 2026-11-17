@@ -1,9 +1,9 @@
 use super::*;
 use futures_util::StreamExt as _;
-use pplx_space_common_core::types::{
+use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
+use pplx_space_sandbox_model::{
     ExecutionGeneration, SandboxActivationAttemptId, SandboxId, SpaceApiRouteIdentity,
 };
-use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
 
 pub(super) fn endpoint_proof(start_time_ticks: u64) -> crate::endpoint_proof::SpacedEndpointProof {
     crate::endpoint_proof::SpacedEndpointProof {

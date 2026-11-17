@@ -3757,13 +3757,10 @@ async fn an_at_rest_route_answers_as_the_node_refusal_does() {
     let public_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id);
     for (lifecycle, action) in [
         (
-            pplx_space_common_core::types::SandboxLifecycle::Suspended,
+            pplx_space_sandbox_model::SandboxLifecycle::Suspended,
             "wake",
         ),
-        (
-            pplx_space_common_core::types::SandboxLifecycle::Stopped,
-            "start",
-        ),
+        (pplx_space_sandbox_model::SandboxLifecycle::Stopped, "start"),
     ] {
         let at_rest =
             RouteResolutionError::SessionAtRest(pplx_space_sandbox_grpc::SessionRouteAtRest {
@@ -3958,7 +3955,7 @@ fn a_route_refusal_marked_at_rest_is_not_a_route_that_is_coming() {
         RouteResolutionError::SessionNotReady
     );
     let sandbox_id = SandboxId::new();
-    let suspended = pplx_space_common_core::types::SandboxLifecycle::Suspended;
+    let suspended = pplx_space_sandbox_model::SandboxLifecycle::Suspended;
     let at_rest = pplx_space_sandbox_grpc::mark_session_route_at_rest(plain, sandbox_id, suspended);
     assert_eq!(
         route_resolution_error(&at_rest),

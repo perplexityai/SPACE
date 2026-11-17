@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::execution_supersession::ExecutionSupersessionRow;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;

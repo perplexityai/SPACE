@@ -13,7 +13,7 @@ use axum::{
     response::IntoResponse,
 };
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_residency::ResidencyEvidence;
 use pplx_space_sandbox_store::node_holds::{
     self, NodeHold, NodeHoldPlacement, NodeHoldReason, NodeHoldTermCounts, NodeHoldTerms,

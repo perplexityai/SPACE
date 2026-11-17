@@ -8,7 +8,7 @@ use super::{
     DmCryptError, ReleaseDevice, blockdev_sectors, dm_exists, luks_format_args, run, run_with_stdin,
 };
 use crate::device_backing::{self, Backing, LoopDevice};
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
@@ -43,7 +43,7 @@ pub(crate) async fn stage(
         // Bound work even if a staged object has malformed lengths.
         if size
             > super::cow_backing_size_bytes(
-                pplx_space_common_core::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES,
+                pplx_space_sandbox_model::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES,
             )
         {
             return Err(std::io::Error::new(

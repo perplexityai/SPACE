@@ -116,7 +116,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             )
             .await?;
 
-        let requested_attempt_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+        let requested_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
         let execution = match self
             .store
             .begin_activation_execution_row(
@@ -1009,7 +1009,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // (capped at `CREATE_READY_BUDGET`), so the caller's effective
         // readiness wait is never shortened by the margin.
         let (wait_budget, phase_deadline) = ready_wait_bounds(options.ready_timeout);
-        let requested_attempt_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+        let requested_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             SandboxTransitionTargetState::Started,
@@ -1277,7 +1277,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             options,
             RestoreIntent::user(
                 charge,
-                WakeTarget::Explicit(pplx_space_common_core::types::SandboxLifecycle::Started),
+                WakeTarget::Explicit(pplx_space_sandbox_model::SandboxLifecycle::Started),
             ),
         )
         .await
@@ -2548,8 +2548,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             )
             .map_err(ControllerError::from)?;
         } else {
-            let requested_attempt_id =
-                pplx_space_common_core::types::SandboxActivationAttemptId::new();
+            let requested_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
             let execution_generation = i64::try_from(claim.execution_generation)
                 .map_err(|_| ControllerError::internal("pool execution generation exceeds i64"))?;
             let (activation_attempt_id, joined_attempt_id) = match self
@@ -2619,7 +2618,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     }
                     let mut wake_request = pooled_wake_request(
                         claim,
-                        pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+                        pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
                             pooled_route_activation_id(claim)?,
                         ),
                         pplx_space_sbx_mgr_client::proto::WakeTargetState::Unspecified,

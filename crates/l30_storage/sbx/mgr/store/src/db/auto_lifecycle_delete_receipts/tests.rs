@@ -7,13 +7,13 @@ use pplx_space_auto_lifecycle::{
     AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy,
 };
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
-use pplx_space_common_core::types::{
-    AutoLifecycleDeleteReceiptId, ExecutionGeneration, SandboxActivationAttemptId, SandboxId,
-    SandboxRuntimeLabel, SpaceApiRouteIdentity,
-};
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_node_model::{NodeManagedBy, NodeRole};
 use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{
+    AutoLifecycleDeleteReceiptId, ExecutionGeneration, SandboxActivationAttemptId, SandboxId,
+    SandboxRuntimeLabel, SpaceApiRouteIdentity,
+};
 
 use super::*;
 use crate::auto_lifecycle_delete_receipts::*;

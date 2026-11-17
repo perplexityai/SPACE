@@ -317,7 +317,7 @@ async fn deleted_sandbox_replay_is_authorized_by_its_retained_operation(
             Method::DELETE,
             format!(
                 "/v1/sandboxes/{}",
-                PublicSandboxId::from(pplx_space_common_core::types::SandboxId::new())
+                PublicSandboxId::from(pplx_space_sandbox_model::SandboxId::new())
             ),
             owner.clone(),
         ),

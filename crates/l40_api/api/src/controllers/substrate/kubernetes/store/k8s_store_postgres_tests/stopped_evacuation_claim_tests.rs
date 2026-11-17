@@ -6,7 +6,7 @@
 //! `k8s_store_postgres_behaviors`.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
 use super::*;
 

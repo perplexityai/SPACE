@@ -1,5 +1,5 @@
 use pplx_space_accounts::{NodeId, OrgId, UserId};
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,10 +32,10 @@ use pplx_space_accounts::SandboxOwnerSource;
 use pplx_space_auto_lifecycle::{
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
 };
-use pplx_space_common_core::types::SandboxLifecycle;
 #[cfg(feature = "kubernetes")]
 use pplx_space_common_core::types::SnapshotId;
 use pplx_space_ecw_credential::EcwCredentialKeyring;
+use pplx_space_sandbox_model::SandboxLifecycle;
 #[cfg(feature = "kubernetes")]
 use pplx_space_sandbox_pod::SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION;
 use pplx_space_template_model::{DEFAULT_TEMPLATE_TAG, TemplateVisibility};
@@ -758,7 +758,7 @@ fn test_sandbox() -> Sandbox {
         active_execution_generation: None,
         active_pod_uid: None,
         active_activation_attempt_id: None,
-        ecw_credential_epoch: pplx_space_common_core::types::EcwCredentialEpoch::new(1)
+        ecw_credential_epoch: pplx_space_sandbox_model::EcwCredentialEpoch::new(1)
             .expect("credential epoch is valid"),
         target_node_id: None,
         placement_changed_at: None,
@@ -3344,7 +3344,7 @@ fn sandbox_response_uses_ecw_host_domain() {
         &native,
         "seed".to_string(),
         Some(TEST_ECW_HOST.to_string()),
-        pplx_space_common_core::types::EcwCredentialEpoch::new(1).unwrap(),
+        pplx_space_sandbox_model::EcwCredentialEpoch::new(1).unwrap(),
     );
 
     assert_eq!(response.domain.as_deref(), Some(TEST_ECW_HOST));
@@ -3365,7 +3365,7 @@ fn ecw_host_alias_selects_alias_response_domain() {
         &native,
         "seed".to_string(),
         Some(pair.host),
-        pplx_space_common_core::types::EcwCredentialEpoch::new(1).unwrap(),
+        pplx_space_sandbox_model::EcwCredentialEpoch::new(1).unwrap(),
     );
     assert_eq!(response.domain.as_deref(), Some(TEST_ECW_ALIAS_HOST));
 }

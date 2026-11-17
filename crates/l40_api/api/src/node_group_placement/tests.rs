@@ -7,7 +7,7 @@
 //! an absent `templates` row. A fake store would assert neither.
 
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::BTreeSet;
 

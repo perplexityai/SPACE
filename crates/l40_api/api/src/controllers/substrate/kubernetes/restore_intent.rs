@@ -5,7 +5,7 @@
 use super::RestoreSnapshotChoice;
 use super::execution::WakeTarget;
 use crate::controllers::substrate::{ActivationAttribution, ChargeState, RecoveryCharge};
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 use pplx_space_sandbox_pod::EvacuationPlacement;
 
 /// How a restore claims the sandbox row, and what it does when the claim is

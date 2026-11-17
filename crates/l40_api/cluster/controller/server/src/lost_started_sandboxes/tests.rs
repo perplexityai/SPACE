@@ -32,7 +32,7 @@
 //! - P11 `p11_flip_rechecks_placement_drain_lifecycle_and_substrate`
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};

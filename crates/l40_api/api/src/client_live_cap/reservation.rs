@@ -3,7 +3,8 @@
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::{ClientId, SandboxId};
+use pplx_space_common_core::types::ClientId;
+use pplx_space_sandbox_model::SandboxId;
 use tokio::task::JoinHandle;
 
 use super::pending_set::{Member, PendingSet, PendingTiming};

@@ -22,4 +22,5 @@ uuid = { workspace = true }
 # internal
 pplx-space-accounts = { workspace = true, features = ["sqlx"] }
 pplx-space-common-core = { workspace = true, features = ["sqlx"] }
+pplx-space-sandbox-model = { workspace = true, features = ["sqlx"] }
 pplx-space-sql-locator = { workspace = true }

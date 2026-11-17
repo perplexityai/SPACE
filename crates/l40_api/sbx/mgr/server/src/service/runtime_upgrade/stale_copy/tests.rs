@@ -541,7 +541,7 @@ async fn a_request_that_cant_stage_leaves_the_copy() {
             request
         };
         let misbound = with_identity(&|identity| {
-            identity.sandbox_id = Some(pplx_space_common_core::types::SandboxId::new().to_string());
+            identity.sandbox_id = Some(pplx_space_sandbox_model::SandboxId::new().to_string());
         });
         let elsewhere = with_identity(&|identity| {
             identity.current_node_id = Some(uuid::Uuid::now_v7().to_string());
@@ -780,14 +780,14 @@ impl Fixture {
     /// cleanup rolled the row back to `suspended` with its pin, recorded the
     /// rollback receipt, and kept the activation's claim open, so kubelet's
     /// retry of the same pod matches it. Returns that pod's route identity.
-    fn roll_back_a_restore(&self) -> pplx_space_common_core::types::SpaceApiRouteIdentity {
-        use pplx_space_common_core::types::{
+    fn roll_back_a_restore(&self) -> pplx_space_sandbox_model::SpaceApiRouteIdentity {
+        use pplx_space_node_model::NodeManagedBy;
+        use pplx_space_sandbox_model::{
             ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId,
         };
-        use pplx_space_node_model::NodeManagedBy;
         let generation = ExecutionGeneration::new(4).unwrap();
         let attempt = SandboxActivationAttemptId::new();
-        let route = pplx_space_common_core::types::SpaceApiRouteIdentity {
+        let route = pplx_space_sandbox_model::SpaceApiRouteIdentity {
             sandbox_id: Some(self.sandbox_id.parse().unwrap()),
             route_generation: Some(RouteGeneration::new(4).unwrap()),
             execution_generation: Some(generation),
@@ -825,7 +825,7 @@ impl Fixture {
             &db,
             &self.sandbox_id,
             episode.id,
-            pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed,
+            pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed,
             "restore prepare failed",
         )
         .unwrap();
@@ -841,7 +841,7 @@ impl Fixture {
     /// The pod's upgrade, retried under `route`.
     async fn retried_pod_upgrade(
         &self,
-        route: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+        route: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
     ) -> Status {
         let mut request = staged_pod_upgrade(self, &self.target_environment(), operation());
         request.start.as_mut().unwrap().route_identity =
@@ -891,12 +891,12 @@ async fn a_retry_of_a_rolled_back_activation_never_replaces_the_copy() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_activation_after_a_rollback_replaces_the_copy() {
     with_cluster_api(BackupReadiness::backs(STALE), async || {
-        use pplx_space_common_core::types::{
+        use pplx_space_sandbox_model::{
             ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId,
         };
         let (f, cleanups) = stale_copy(false, Some(STALE));
         let rolled_back = f.roll_back_a_restore();
-        let route = pplx_space_common_core::types::SpaceApiRouteIdentity {
+        let route = pplx_space_sandbox_model::SpaceApiRouteIdentity {
             route_generation: Some(RouteGeneration::new(5).unwrap()),
             execution_generation: Some(ExecutionGeneration::new(5).unwrap()),
             activation_attempt_id: Some(SandboxActivationAttemptId::new()),

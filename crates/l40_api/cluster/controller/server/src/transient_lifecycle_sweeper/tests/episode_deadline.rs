@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_api::controllers::substrate::{AbandonedRestoreRetirement, Substrate};
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
 use pplx_space_durations::PositiveDuration;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::{TestEnv, TestResult};
 use sqlx::PgPool;

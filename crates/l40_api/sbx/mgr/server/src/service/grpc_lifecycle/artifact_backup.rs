@@ -1319,7 +1319,7 @@ impl SandboxManagerService {
         sandbox: &crate::db::SandboxRow,
         artifact: &crate::db::LocalArtifactRow,
         previous_job: Option<&pplx_space_common_jobs::Job>,
-    ) -> Result<Option<pplx_space_common_core::types::ExecutionGeneration>, Status> {
+    ) -> Result<Option<pplx_space_sandbox_model::ExecutionGeneration>, Status> {
         if let Some(generation) = capture_generation_from_record(artifact)? {
             return Ok(Some(generation));
         }
@@ -1361,7 +1361,7 @@ impl SandboxManagerService {
 /// as the capturing execution's, so a re-upload under it may order captures.
 pub(super) fn earlier_upload_vouches(
     previous_job: Option<&pplx_space_common_jobs::Job>,
-    generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
 ) -> bool {
     generation.is_some()
         && previous_job
@@ -1382,7 +1382,7 @@ pub(super) fn earlier_upload_vouches(
 /// rather than registering unfenced.
 fn capture_generation_from_record(
     artifact: &crate::db::LocalArtifactRow,
-) -> Result<Option<pplx_space_common_core::types::ExecutionGeneration>, Status> {
+) -> Result<Option<pplx_space_sandbox_model::ExecutionGeneration>, Status> {
     let artifact_dir = &artifact.local_path;
     crate::capture_record::read(
         std::path::Path::new(artifact_dir),

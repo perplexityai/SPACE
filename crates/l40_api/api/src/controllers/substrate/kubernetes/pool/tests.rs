@@ -1,6 +1,6 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_execution_spec::DiskIoLimits;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use std::collections::BTreeMap;

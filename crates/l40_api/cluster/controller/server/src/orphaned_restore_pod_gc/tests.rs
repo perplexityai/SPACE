@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_durations::PositiveDuration;
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use uuid::Uuid;
 
 use super::*;
@@ -1820,8 +1820,8 @@ async fn terminating_pod_seen_after_restart_is_tracked_for_stuck_teardown() {
 // ---------------------------------------------------------------------------
 
 mod postgres_backed {
-    use pplx_space_common_core::types::SandboxId;
     use pplx_space_db_test_fixtures::try_pg_test_db;
+    use pplx_space_sandbox_model::SandboxId;
     use pplx_space_sql_locator::sql;
     use sqlx::PgPool;
     use uuid::Uuid;
@@ -1829,7 +1829,7 @@ mod postgres_backed {
     use crate::orphaned_restore_pod_gc::RowLifecycle;
     use crate::orphaned_restore_pod_gc::backend::SandboxStore;
     use crate::orphaned_restore_pod_gc::store::SandboxDbStore;
-    use pplx_space_common_core::types::SandboxLifecycle;
+    use pplx_space_sandbox_model::SandboxLifecycle;
     use pplx_space_sandbox_portability::execution_supersession::ExecutionSupersessionRow;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;

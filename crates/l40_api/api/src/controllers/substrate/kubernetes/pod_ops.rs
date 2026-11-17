@@ -1,6 +1,7 @@
 use crate::controllers::substrate::{KeyResolution, RecoveryCharge};
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{ClientId, LocalArtifactId, SandboxId};
+use pplx_space_common_core::types::{ClientId, LocalArtifactId};
+use pplx_space_sandbox_model::SandboxId;
 
 use super::support::*;
 use super::*;
@@ -15,9 +16,6 @@ use crate::node_group_placement::{
     check_local_restore_source,
 };
 use pplx_space_accounts::SandboxOwner;
-use pplx_space_common_core::types::{
-    ExecutionGeneration, SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
-};
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
     SandboxRestoreProvenance,
@@ -25,6 +23,9 @@ use pplx_space_events::{
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::NodeRole as SpaceNodeRole;
 use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
+};
 use pplx_space_sandbox_pod::{
     EvacuationPlacement, NodeGroupPlacement, PodEnvironment, PodToleration,
 };

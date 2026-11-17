@@ -902,14 +902,12 @@ async fn auto_lifecycle_delete_requires_one_canonical_id_and_the_expected_policy
         crate::db::update_space_api_route_identity(
             &conn,
             sandbox_id,
-            &pplx_space_common_core::types::SpaceApiRouteIdentity {
-                route_generation: Some(
-                    pplx_space_common_core::types::RouteGeneration::new(7).unwrap(),
-                ),
+            &pplx_space_sandbox_model::SpaceApiRouteIdentity {
+                route_generation: Some(pplx_space_sandbox_model::RouteGeneration::new(7).unwrap()),
                 current_node_id: Some(pplx_space_accounts::NodeId::new()),
                 execution_generation: Some(ExecutionGeneration::new(7).unwrap()),
                 activation_attempt_id: Some(
-                    pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+                    pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
                 ),
                 substrate_kind: Some(NodeManagedBy::Kubernetes),
                 pod_uid: Some(pplx_space_k8s_ids::PodUid::parse("pod-uid-7").unwrap()),
@@ -1128,10 +1126,10 @@ async fn delete_of_a_pool_clone_disposal_requires_an_operator_after_quarantine()
                     &conn,
                     &id,
                     SandboxState::Creating,
-                    pplx_space_common_core::types::SandboxQuarantineSource::SbxManager,
+                    pplx_space_sandbox_model::SandboxQuarantineSource::SbxManager,
                     SandboxQuarantineReasonCode::CreateInterrupted,
                     "operator hold during publication",
-                    pplx_space_common_core::types::SandboxQuarantineNextAction::RequiresOperatorAttention,
+                    pplx_space_sandbox_model::SandboxQuarantineNextAction::RequiresOperatorAttention,
                 )
                 .unwrap()
             );

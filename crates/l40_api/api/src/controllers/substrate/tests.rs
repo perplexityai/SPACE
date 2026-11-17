@@ -1,6 +1,6 @@
 use super::*;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_node_api_sim::SimWorkerHarness;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto as sbx_proto;
 
 #[test]

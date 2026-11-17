@@ -4,12 +4,12 @@ use pplx_space_common_core::types::ClientId;
 
 use super::*;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::SandboxLifecycle;
 use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicSandboxId,
     SandboxLifecycleAction as PublicSandboxLifecycleAction,
 };
 use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
+use pplx_space_sandbox_model::SandboxLifecycle;
 use tracing::Instrument as _;
 
 use crate::controllers::sandbox::lifecycle::user_admission::{
@@ -430,7 +430,7 @@ pub(super) async fn create_sandbox(
             &native,
             template_id,
             Some(ecw_host_pair.host),
-            pplx_space_common_core::types::EcwCredentialEpoch::new(1)
+            pplx_space_sandbox_model::EcwCredentialEpoch::new(1)
                 .expect("initial ECW credential epoch is valid"),
         )),
     ))

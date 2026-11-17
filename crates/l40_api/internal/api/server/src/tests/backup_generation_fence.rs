@@ -3,10 +3,10 @@
 
 use super::*;
 
-use pplx_space_common_core::types::{
+use pplx_space_node_api_client::cluster::backup_execution_superseded_generation;
+use pplx_space_sandbox_model::{
     AbandonedRestoreRetirement, ExecutionGeneration, SandboxQuarantineReasonCode,
 };
-use pplx_space_node_api_client::cluster::backup_execution_superseded_generation;
 
 fn teardown_backup_request(
     sandbox_id: SandboxId,

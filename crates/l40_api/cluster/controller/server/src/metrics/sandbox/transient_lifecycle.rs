@@ -16,7 +16,7 @@
 //! on every tick, zeros included, so a missing series always means no
 //! report rather than no rows. No sandbox, node or org is ever a tag.
 
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 use std::time::{Duration, Instant};
 

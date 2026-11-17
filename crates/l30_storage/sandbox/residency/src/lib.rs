@@ -74,7 +74,7 @@
 //! node whose report lands after that candidate listing; otherwise this
 //! module is the definition for node-release decisions.
 
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 use std::time::Duration;
 
 /// Env var selecting [`ResidencyEvidence`], read **once** by the

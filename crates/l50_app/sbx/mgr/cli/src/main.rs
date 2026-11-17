@@ -5,11 +5,11 @@ use pplx_space_auto_lifecycle::{
     AutoLifecyclePolicy, AutoLifecycleStageChain, AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
 };
 use pplx_space_common_cli::{exit_error, exit_message, unwrap_or_exit};
-use pplx_space_common_core::ids::sandbox_label_or_id as sandbox_label;
-use pplx_space_common_core::types::{SandboxId, SandboxSelector};
 use pplx_space_durations::SimpleDuration;
 use pplx_space_guest_process::GuestUserName;
 use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::ids::sandbox_label_or_id as sandbox_label;
+use pplx_space_sandbox_model::{SandboxId, SandboxSelector};
 use prost_types::Timestamp;
 use std::collections::{BTreeMap, HashMap};
 

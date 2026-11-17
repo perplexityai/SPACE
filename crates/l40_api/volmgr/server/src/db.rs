@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{SandboxId, SandboxIdParseError};
+use pplx_space_sandbox_model::{SandboxId, SandboxIdParseError};
 use rusqlite::{Connection, params};
 use std::{fmt, str::FromStr};
 

@@ -27,8 +27,9 @@
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::{LocalArtifactId, SandboxActivationAttemptId};
+use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
 use tonic::Status;
 
 use crate::db::{
@@ -958,7 +959,7 @@ fn required_text(value: &str, field: &str, max_bytes: usize) -> Result<String, S
 
 fn parse_sandbox_id(sandbox_id: &str) -> Result<String, Status> {
     sandbox_id
-        .parse::<pplx_space_common_core::types::SandboxId>()
+        .parse::<pplx_space_sandbox_model::SandboxId>()
         .map(|id| id.to_string())
         .map_err(|error| Status::invalid_argument(format!("invalid sandbox_id: {error}")))
 }

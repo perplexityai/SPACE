@@ -1,8 +1,9 @@
 //! Production [`ReaperSink`] backed by Postgres.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{SandboxId, SnapshotId};
+use pplx_space_common_core::types::SnapshotId;
 use pplx_space_durations::PositiveDuration;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 

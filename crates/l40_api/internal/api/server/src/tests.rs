@@ -25,7 +25,6 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Token,
     ed25519::decode_unverified_space_api_route_ed25519_claims,
 };
-use pplx_space_common_core::types::{EcwCredentialEpoch, ExecutionGeneration, SandboxId};
 use pplx_space_common_grpc::SandboxServiceRouteNotReady;
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID as SEEDED_ORG_ID, SEED_USER_ID as SEEDED_USER_ID, TestDb, insert_ready_worker_node,
@@ -34,6 +33,7 @@ use pplx_space_db_test_fixtures::{
 use pplx_space_ecw_credential::{EcwCredentialKeyring, EcwCredentialKind};
 use pplx_space_network_roles::GuestPort;
 use pplx_space_node_api_sim::SimWorkerHarness;
+use pplx_space_sandbox_model::{EcwCredentialEpoch, ExecutionGeneration, SandboxId};
 use pplx_space_sql_locator::sql;
 use sha2::{Digest, Sha256};
 use tonic::Code;

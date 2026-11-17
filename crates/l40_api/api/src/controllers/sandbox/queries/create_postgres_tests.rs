@@ -1,5 +1,5 @@
 use pplx_space_accounts::{NodeId, OrgId, UserId};
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use crate::controllers::substrate::{

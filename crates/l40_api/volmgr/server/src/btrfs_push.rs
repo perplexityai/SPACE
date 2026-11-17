@@ -67,7 +67,8 @@ impl crate::service::VolumeManagerService {
     {
         use crate::executor::PullExistingPolicy;
         use crate::materialization::MaterializationMode;
-        use pplx_space_common_core::types::{SandboxId, SnapshotArtifact};
+        use pplx_space_common_core::types::SnapshotArtifact;
+        use pplx_space_sandbox_model::SandboxId;
         let sandbox_id: SandboxId = req
             .sandbox_id
             .parse()

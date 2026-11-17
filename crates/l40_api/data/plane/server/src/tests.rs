@@ -13,10 +13,6 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Token,
 };
 use pplx_space_cluster_id::ClusterId;
-use pplx_space_common_core::types::{
-    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
-    SandboxRouteIdentity, SpaceApiRouteIdentity,
-};
 use pplx_space_durations::SimpleDuration;
 use pplx_space_guest_process::EnvMap;
 use pplx_space_k8s_ids::PodUid;
@@ -31,6 +27,10 @@ use pplx_space_node_api_client::proto::{
     UnstableResolveSandboxServiceRouteRequest, UnstableResolveSandboxServiceRouteResponse,
 };
 use pplx_space_node_disk_admission::CacheDiskAdmissionReason;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
+    SandboxRouteIdentity, SpaceApiRouteIdentity,
+};
 use pplx_space_sbx_mgr_client::proto::{
     SpacedProcessExit, SpacedProcessExited, SpacedProcessOutput, SpacedProcessSignaled,
     SpacedProcessTimedOut, SpacedProcessUnknown, spaced_process_event, spaced_process_exit,

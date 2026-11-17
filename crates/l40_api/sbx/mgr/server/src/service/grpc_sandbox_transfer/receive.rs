@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use pplx_space_common_core::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES;
+use pplx_space_sandbox_model::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES;
 
 use sha2::Digest;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};

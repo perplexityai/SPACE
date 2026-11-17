@@ -1,8 +1,9 @@
 //! Postgres-backed [`super::LostStartedSink`].
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{SandboxId, SnapshotId};
+use pplx_space_common_core::types::SnapshotId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::sync::LazyLock;
 

@@ -9,11 +9,6 @@ use pplx_space_auto_lifecycle::{
     AutoLifecyclePolicy, AutoLifecycleStage,
 };
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
-use pplx_space_common_core::types::{
-    AbandonedRestoreRetirement, AutoLifecycleDeleteReceiptId, SandboxActivationAttemptId,
-    SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
-    SandboxQuarantineReasonCode, SandboxQuarantineSource,
-};
 use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 use pplx_space_cpu_arch::Arch;
 use pplx_space_db_test_fixtures::{
@@ -31,6 +26,11 @@ use pplx_space_internal_api_server::{
 };
 use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{
+    AbandonedRestoreRetirement, AutoLifecycleDeleteReceiptId, SandboxActivationAttemptId,
+    SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource,
+};
 use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, NetworkPolicyTarget,

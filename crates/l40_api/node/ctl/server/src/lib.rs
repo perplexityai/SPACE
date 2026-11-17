@@ -2220,7 +2220,7 @@ fn claimed_ref_sandbox_id(reference: &ProtoFacetRef) -> Option<String> {
         facet_ref::Element::Template(_) => return None,
     };
     sandbox_id
-        .parse::<pplx_space_common_core::types::SandboxId>()
+        .parse::<pplx_space_sandbox_model::SandboxId>()
         .ok()
         .map(|sandbox_id| sandbox_id.to_string())
 }

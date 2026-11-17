@@ -21,10 +21,11 @@ use crate::service::suspend_snapshot_publication::write_full_suspend_artifact;
 use crate::state::{SandboxState, SandboxStatus};
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SandboxRuntimeLabel};
+use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_events::SandboxEventTrigger;
 use pplx_space_execution_spec::HostCpu;
 use pplx_space_node_runtime_core::vm_state::VmState;
+use pplx_space_sandbox_model::{SandboxId, SandboxRuntimeLabel};
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
 use std::collections::BTreeMap;
 use tokio::sync::oneshot;
@@ -1275,7 +1276,8 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
     use crate::service::tests::service_tests::{
         insert_stranded_teardown_suspend_sandbox, prepare_teardown_suspend_request,
     };
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, ExecutionGeneration};
+    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     for (failure, expected_marker) in [
         (pplx_space_common_jobs::JobFailure::Retriable, None),
@@ -1450,7 +1452,7 @@ async fn teardown_suspend_terminal_driver_failures_stop_polling_without_release_
     use crate::service::tests::service_tests::{
         insert_test_sandbox, prepare_teardown_suspend_request,
     };
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     // A deleting sandbox keeps polling for its delete receipt; see
     // `teardown_suspend_keeps_polling_until_a_deleting_sandbox_commits_its_delete`.
     for state in [Some(SandboxState::Quarantined), None] {
@@ -1506,9 +1508,9 @@ async fn teardown_suspend_terminal_driver_failures_stop_polling_without_release_
 /// Deleting by the production transition, which closes that job.
 fn deleting_sandbox_with_closed_teardown_suspend(
     conn: &crate::db::Connection,
-) -> (String, pplx_space_common_core::types::ExecutionGeneration) {
+) -> (String, pplx_space_sandbox_model::ExecutionGeneration) {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let sandbox_id = SandboxId::new();
     let id = sandbox_id.to_string();
     let generation = ExecutionGeneration::new(7).unwrap();
@@ -1517,7 +1519,7 @@ fn deleting_sandbox_with_closed_teardown_suspend(
     crate::db::update_space_api_route_identity(
         conn,
         sandbox_id,
-        &pplx_space_common_core::types::SpaceApiRouteIdentity {
+        &pplx_space_sandbox_model::SpaceApiRouteIdentity {
             execution_generation: Some(generation),
             ..Default::default()
         },
@@ -1588,7 +1590,7 @@ async fn observed_teardown_outcome(
 async fn observe_only_answers_each_generation_from_the_nodes_own_record() {
     use crate::proto::TeardownSuspendOutcome;
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
     let id = sandbox_id.to_string();
@@ -1596,7 +1598,7 @@ async fn observe_only_answers_each_generation_from_the_nodes_own_record() {
     crate::db::update_space_api_route_identity(
         &conn,
         sandbox_id,
-        &pplx_space_common_core::types::SpaceApiRouteIdentity {
+        &pplx_space_sandbox_model::SpaceApiRouteIdentity {
             execution_generation: Some(ExecutionGeneration::new(2).unwrap()),
             ..Default::default()
         },
@@ -1747,7 +1749,7 @@ async fn teardown_suspend_terminal_decision_releases_a_delete_committed_after_th
         service
             .close_terminal_teardown_suspend(
                 &id,
-                pplx_space_common_core::types::ExecutionGeneration::new(8).unwrap()
+                pplx_space_sandbox_model::ExecutionGeneration::new(8).unwrap()
             )
             .unwrap(),
         super::TerminalTeardownSuspend::Open
@@ -1757,7 +1759,7 @@ async fn teardown_suspend_terminal_decision_releases_a_delete_committed_after_th
 #[tokio::test]
 async fn teardown_suspend_preserves_retryable_and_superseded_driver_work() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
     let generation = ExecutionGeneration::new(7).unwrap();
@@ -1825,7 +1827,7 @@ async fn teardown_suspend_preserves_retryable_and_superseded_driver_work() {
 #[tokio::test]
 async fn teardown_suspend_registration_failure_closes_only_the_requested_generation() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
     let generation = ExecutionGeneration::new(7).unwrap();
@@ -2008,7 +2010,7 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
     use crate::service::tests::service_tests::{
         insert_test_sandbox, prepare_teardown_suspend_request,
     };
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     for target in [
         crate::db::PauseFailedRecoveryTarget::Started,
@@ -2022,7 +2024,7 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
         crate::db::update_space_api_route_identity(
             &conn,
             sandbox_id,
-            &pplx_space_common_core::types::SpaceApiRouteIdentity {
+            &pplx_space_sandbox_model::SpaceApiRouteIdentity {
                 execution_generation: Some(generation),
                 ..Default::default()
             },
@@ -2042,10 +2044,10 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
             &conn,
             &id,
             SandboxState::Pausing,
-            pplx_space_common_core::types::SandboxQuarantineSource::SbxManager,
-            pplx_space_common_core::types::SandboxQuarantineReasonCode::PauseFailed,
+            pplx_space_sandbox_model::SandboxQuarantineSource::SbxManager,
+            pplx_space_sandbox_model::SandboxQuarantineReasonCode::PauseFailed,
             "ambiguous pause response",
-            pplx_space_common_core::types::SandboxQuarantineNextAction::RequiresOperatorAttention,
+            pplx_space_sandbox_model::SandboxQuarantineNextAction::RequiresOperatorAttention,
         )
         .unwrap();
         let service = SandboxManagerService::for_test(conn);
@@ -2368,7 +2370,7 @@ async fn suspend_refuses_rows_that_are_neither_started_nor_paused() {
 #[tokio::test]
 async fn paused_suspend_admission_requires_a_free_row_and_the_owning_generation() {
     use crate::service::cleanup_support::CleanupLockTryResult;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     enum Admission {
         NodeLocal,
@@ -2481,7 +2483,7 @@ async fn paused_suspend_admission_requires_a_free_row_and_the_owning_generation(
 async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
     use crate::service::cleanup_support::CleanupLockTryResult;
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::{ExecutionGeneration, SpaceApiRouteIdentity};
+    use pplx_space_sandbox_model::{ExecutionGeneration, SpaceApiRouteIdentity};
 
     #[derive(Debug)]
     enum Supersession {
@@ -2614,7 +2616,7 @@ async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
 #[tokio::test]
 async fn suspend_publication_failure_persists_only_against_the_suspending_row() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::SandboxQuarantineReasonCode;
+    use pplx_space_sandbox_model::SandboxQuarantineReasonCode;
 
     let reject_state = |conn: &crate::db::Connection, state: SandboxState| {
         conn.execute_batch(&format!(
@@ -2867,7 +2869,7 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
 #[tokio::test]
 async fn teardown_suspend_driver_completes_a_generation_whose_artifact_is_already_durable() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
@@ -2934,7 +2936,7 @@ async fn teardown_suspend_driver_completes_a_generation_whose_artifact_is_alread
 #[tokio::test]
 async fn teardown_suspend_without_a_capture_quarantines_as_an_only_copy() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
     let generation = ExecutionGeneration::new(7).unwrap();
@@ -2981,7 +2983,7 @@ async fn teardown_suspend_without_a_capture_quarantines_as_an_only_copy() {
 #[tokio::test]
 async fn teardown_suspend_waits_while_a_stay_stopped_upgrade_runs() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_sandbox_model::ExecutionGeneration;
     let execution = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
         pplx_space_cpu_arch::Arch::X86_64,
     )

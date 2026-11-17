@@ -1,12 +1,13 @@
 //! Postgres retention store: page fresh work and durable claims, claim under
 //! the sandbox lock, then finalize only after the object-store reap.
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
-use pplx_space_common_core::types::{SandboxLifecycle, SnapshotId};
+use pplx_space_common_core::types::SnapshotId;
+use pplx_space_sandbox_model::SandboxLifecycle;
 use pplx_space_sandbox_portability::{
     snapshot_is_current_local_artifact, snapshot_is_live_restore_source,
 };

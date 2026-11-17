@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 pplx-space-auto-lifecycle = { workspace = true }
 pplx-space-common-core = { workspace = true }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-content-digest = { workspace = true }
 pplx-space-durations = { workspace = true }
 pplx-space-execution-spec = { workspace = true }

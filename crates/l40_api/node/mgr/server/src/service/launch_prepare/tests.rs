@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_spec::{ExecutionMetadata, RuntimeKind};
@@ -496,7 +496,7 @@ async fn prepare_sandbox_refuses_invalid_requests_before_touching_the_cache() {
     ))
     .unwrap();
     let rootfs_size = |mib| {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(mib)
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(mib)
             .unwrap_err()
             .to_string()
     };

@@ -9,7 +9,6 @@ use axum::{
     response::IntoResponse,
 };
 use pplx_space_accounts::{OrgId, UserId};
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_env_vars::env_flag_var;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_node_model::NodePoolName;
@@ -19,6 +18,7 @@ use pplx_space_public_api::{
     SandboxLifecycleAction, SandboxOperationResponse,
     UpdateSandboxRequest as PublicUpdateSandboxRequest,
 };
+use pplx_space_sandbox_model::SandboxId;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 

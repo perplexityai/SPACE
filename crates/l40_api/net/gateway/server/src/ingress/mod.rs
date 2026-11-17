@@ -15,10 +15,6 @@ use pplx_space_api_route::{
     ed25519::space_api_route_ed25519_token_from_metadata,
 };
 use pplx_space_common_core::guest::linux::network::IPV4_ADDR as GUEST_IPV4_ADDR;
-use pplx_space_common_core::types::{
-    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
-    SpaceApiRouteIdentity,
-};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_gateway_client::SERVICE_PORT_INGRESS_START_TIMEOUT;
 use pplx_space_net_gateway_client::proto::{
@@ -28,6 +24,10 @@ use pplx_space_net_gateway_client::proto::{
 use pplx_space_network_roles::GuestPort;
 use pplx_space_node_model::NodeManagedBy;
 use pplx_space_sandbox_grpc::SandboxTraceContext;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
+    SpaceApiRouteIdentity,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};

@@ -7,12 +7,12 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::PublicErrorCode;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::{AppState, E2bApiError, MatchedEcwHost, acquire_client_slot, request_client_id};
 use crate::controllers::sandbox::lifecycle::user_admission::{

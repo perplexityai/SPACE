@@ -116,7 +116,7 @@ pub(super) fn validate_create_request_fields(
         Status::invalid_argument(format!("unknown boot_mode value {}", req.boot_mode))
     })?;
     if let Some(size_mib) = req.rootfs_size_mb {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(size_mib)
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(size_mib)
             .map_err(|error| Status::invalid_argument(format!("rootfs_size_mb: {error}")))?;
     }
     let requested_id = req

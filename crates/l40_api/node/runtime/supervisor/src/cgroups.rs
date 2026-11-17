@@ -1,7 +1,7 @@
 use std::{fs, sync::Arc, time::Duration};
 
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_node_runtime_core::cgroup;
+use pplx_space_sandbox_model::SandboxId;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
 
