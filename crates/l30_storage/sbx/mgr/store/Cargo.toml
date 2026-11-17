@@ -14,6 +14,7 @@ sqlite.sandbox-manager = [
   "guest_update_policy",
   "jobs",
   "local_artifacts",
+  "network_policy_reconcile_queue",
   "node_dirty_ref_revision",
   "node_dirty_refs",
   "sandbox_cleanup_episodes",

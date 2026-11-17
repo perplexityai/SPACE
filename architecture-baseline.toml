@@ -239,9 +239,6 @@ postgres = [
   "jobs",
   "operation_results",
 ]
-"sqlite.sandbox-manager" = [
-  "network_policy_reconcile_queue",
-]
 "sqlite.template-manager" = [
   "jobs",
   "node_dirty_refs",
