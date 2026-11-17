@@ -41,11 +41,32 @@ fn create_size_is_limited_to_what_the_create_stores() {
     // i32::MAX, the largest size a sandbox row stores.
     let largest = 2_147_483_647_u32;
     assert_eq!(
-        create_size(&resources(largest, largest)),
-        Some((largest, largest))
+        create_size(&resources(largest, 1024)),
+        Some((largest, 1024))
     );
     assert_eq!(create_size(&resources(largest + 1, 1024)), None);
     assert_eq!(create_size(&resources(2, largest + 1)), None);
+}
+
+/// Memory past the most a create admits records that bound, so a sandbox
+/// stored before the bound, which may hold up to the column's range, does not
+/// skew the distributions when it activates or resumes.
+#[test]
+fn memory_past_the_admission_bound_records_that_bound() {
+    use pplx_space_public_api::limits::MAX_SANDBOX_MEMORY_MIB as MAX;
+    let bound = i32::try_from(MAX).unwrap();
+    for (stored, recorded) in [
+        (1024, 1024),
+        (bound, MAX),
+        (bound + 1, MAX),
+        (i32::MAX, MAX),
+    ] {
+        assert_eq!(
+            effective(Some(2), Some(stored)),
+            Some((2, recorded)),
+            "{stored} MiB"
+        );
+    }
 }
 
 /// Which errors count as admission refusals is pinned where they are built
