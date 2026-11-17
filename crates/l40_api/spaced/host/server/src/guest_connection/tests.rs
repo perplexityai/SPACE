@@ -36,6 +36,12 @@ fn historical_omission_and_explicit_platforms_have_distinct_admission() {
         assert_eq!(parsed.is_ok(), admitted, "{version} {os:?}");
         if admitted {
             let platform = parsed.unwrap();
+            assert!(
+                platform
+                    .require(GuestOperation::BlockVolumeMount, None)
+                    .is_err(),
+                "a historical guest or an empty descriptor must not gain a new mount RPC"
+            );
             if os.is_some() {
                 platform.require(GuestOperation::Process, None).unwrap_err();
             } else {
@@ -64,6 +70,7 @@ fn windows_operations_require_trusted_os_and_advertised_capabilities() {
             let mut operations = vec![
                 GuestOperation::Process as i32,
                 GuestOperation::ProcessEnvironment as i32,
+                GuestOperation::BlockVolumeMount as i32,
             ];
             if memory_lifecycle {
                 operations.extend([GuestOperation::Flush as i32, GuestOperation::Resume as i32]);
@@ -97,8 +104,43 @@ fn windows_operations_require_trusted_os_and_advertised_capabilities() {
                         .require(GuestOperation::ProcessEnvironment, None)
                         .is_err()
                 );
+                assert!(
+                    platform
+                        .require(GuestOperation::BlockVolumeMount, None)
+                        .is_err(),
+                    "Windows image policy must reject a claimed Linux block mount"
+                );
             }
         }
+    }
+}
+
+#[test]
+fn block_mount_requires_an_explicit_linux_capability() {
+    for advertised in [false, true] {
+        let response = BridgeGuestWaitReadyResponse {
+            version: "0.8.2".into(),
+            compatibility_family: "0.8".into(),
+            platform: Some(
+                pplx_space_spaced_guest_protocol::proto::platform::GuestPlatformDescriptor {
+                    os: GuestOs::Linux as i32,
+                    operations: if advertised {
+                        vec![GuestOperation::BlockVolumeMount as i32]
+                    } else {
+                        vec![]
+                    },
+                },
+            ),
+            ..Default::default()
+        };
+        let observation =
+            GuestPlatformObservation::parse(&response, QualifiedGuestAgent::LinuxV1).unwrap();
+        assert_eq!(
+            observation
+                .require(GuestOperation::BlockVolumeMount, None)
+                .is_ok(),
+            advertised
+        );
     }
 }
 
@@ -109,6 +151,18 @@ struct ChangingGuest {
 }
 #[tonic::async_trait]
 impl pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_server::Meta for ChangingGuest {
+    async fn mount_data_drive(
+        &self,
+        _: Request<pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveRequest>,
+    ) -> Result<
+        Response<pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented(
+            "legacy guest has no block-volume mount RPC",
+        ))
+    }
+
     async fn wait_ready(
         &self,
         _: Request<BridgeGuestWaitReadyRequest>,

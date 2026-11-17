@@ -25,10 +25,46 @@ pub(crate) fn input() -> GuestBoot<'static> {
         }),
         network_rate: None,
         balloon: None,
+        data_drive: None,
         huge_pages: false,
         console: false,
         builder: false,
         source: BootSource::LinuxDirect,
+    }
+}
+
+#[test]
+fn data_drive_has_stable_topology_and_host_enforced_permissions() {
+    use pplx_space_execution_spec::{BlockVolumePermissions, GuestDataDrive};
+    for permissions in [
+        BlockVolumePermissions::ReadOnly,
+        BlockVolumePermissions::ReadWrite,
+    ] {
+        let mut input = input();
+        input.data_drive = Some(GuestDataDrive { permissions });
+        let config: Value =
+            serde_json::from_str(&configuration(RuntimeKind::Firecracker, &input).unwrap())
+                .unwrap();
+        assert_eq!(config["drives"].as_array().unwrap().len(), 2);
+        assert_eq!(config["drives"][0]["path_on_host"], "/rootfs.ext4");
+        assert_eq!(
+            config["drives"][1],
+            json!({
+                "drive_id": "data0",
+                "path_on_host": "/block-volumes/data0",
+                "is_root_device": false,
+                "is_read_only": permissions == BlockVolumePermissions::ReadOnly,
+                "cache_type": "Writeback",
+                "io_engine": "Sync"
+            })
+        );
+        assert!(matches!(
+            configuration(RuntimeKind::CloudHypervisor, &input),
+            Err(BootConfigError::UnsupportedFeature {
+                feature: "block data drive",
+                ..
+            })
+        ));
     }
 }
 

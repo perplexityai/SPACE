@@ -1,7 +1,9 @@
 use crate::bridge_host::{BridgeHostFixture, connect_bridge_host};
 use crate::duration::duration_from_millis;
 use crate::fixture::HostFixture;
-use crate::mock_bridge_guest::start_mock_bridge_guest;
+use crate::mock_bridge_guest::{
+    MockBridgeGuest, start_mock_bridge_guest, start_mock_bridge_guest_with_service,
+};
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_server::{
     Meta as BridgeGuestMeta, MetaServer as BridgeGuestMetaServer,
 };
@@ -42,6 +44,59 @@ struct ReadyWaitGuest {
 
 struct ActiveWaitReadyCall(Arc<AtomicUsize>);
 
+#[tokio::test]
+async fn data_mount_is_forwarded_exactly_once_only_to_an_explicitly_capable_guest() {
+    use pplx_space_spaced_guest_protocol::proto::platform::{
+        GuestOperation, GuestOs, GuestPlatformDescriptor,
+    };
+    for advertised in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("guest.sock");
+        let guest = MockBridgeGuest {
+            version: "0.8.2",
+            platform: Some(GuestPlatformDescriptor {
+                os: GuestOs::Linux as i32,
+                operations: if advertised {
+                    vec![GuestOperation::BlockVolumeMount as i32]
+                } else {
+                    vec![]
+                },
+            }),
+            ..Default::default()
+        };
+        let calls = guest.mount_requests.clone();
+        let task = start_mock_bridge_guest_with_service(socket.clone(), guest).await;
+        let fixture = HostFixture::start(Some(socket)).await;
+        let client = fixture.client().await;
+        let request = pplx_space_spaced_protocol::proto::host::MountDataDriveRequest {
+            topology_version: 1,
+            mount: "/data/example".into(),
+            read_only: true,
+            filesystem_uuid: "00000000-0000-7000-8000-000000000001".into(),
+        };
+        let result = client.mount_data_drive(request).await;
+        if advertised {
+            assert_eq!(result.unwrap().topology_version, 1);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![
+                    pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveRequest {
+                        topology_version: 1,
+                        mount: "/data/example".into(),
+                        read_only: true,
+                        filesystem_uuid: "00000000-0000-7000-8000-000000000001".into(),
+                    }
+                ]
+            );
+        } else {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+            assert!(calls.lock().unwrap().is_empty());
+        }
+        fixture.stop().await;
+        task.abort();
+    }
+}
+
 impl Drop for ActiveWaitReadyCall {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
@@ -50,6 +105,18 @@ impl Drop for ActiveWaitReadyCall {
 
 #[tonic::async_trait]
 impl BridgeGuestMeta for ReadyWaitGuest {
+    async fn mount_data_drive(
+        &self,
+        _: Request<pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveRequest>,
+    ) -> Result<
+        Response<pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented(
+            "legacy guest has no block-volume mount RPC",
+        ))
+    }
+
     async fn ping(
         &self,
         _request: Request<BridgeGuestPingRequest>,

@@ -27,7 +27,19 @@ service Meta {
   rpc ConfigureProcessEnv(ConfigureProcessEnvRequest) returns (ConfigureProcessEnvResponse);
   rpc NotifyResume(NotifyResumeRequest) returns (NotifyResumeResponse);
   rpc FlushFilesystems(FlushFilesystemsRequest) returns (FlushFilesystemsResponse);
+  rpc MountDataDrive(MountDataDriveRequest) returns (MountDataDriveResponse);
 }
+
+// Topology v1 has exactly one non-root virtio-blk device at /dev/vdb.
+// The host has already verified, initialized, and fenced the backing device.
+// This RPC never formats a filesystem or accepts a host/device path.
+message MountDataDriveRequest {
+  uint32 topology_version = 1;
+  string mount = 2;
+  bool read_only = 3;
+  string filesystem_uuid = 4;
+}
+message MountDataDriveResponse { uint32 topology_version = 1; }
 
 service Process {
   rpc Start(space.spaced.operations.v1.StartRequest) returns (stream space.spaced.operations.v1.ProcessEvent);

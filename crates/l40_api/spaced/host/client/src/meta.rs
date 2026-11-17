@@ -4,6 +4,19 @@
 use super::*;
 
 impl SpacedHostClient {
+    /// Mount an already initialized topology-v1 data disk. Mount effects are
+    /// single-attempt; callers may retry only the same filesystem identity.
+    pub async fn mount_data_drive(
+        &self,
+        request: proto::MountDataDriveRequest,
+    ) -> Result<proto::MountDataDriveResponse, tonic::Status> {
+        self.call_meta_once("mount_data_drive", |mut client| {
+            let request = request.clone();
+            async move { client.mount_data_drive(request).await }
+        })
+        .await
+    }
+
     pub async fn ping(&self) -> Result<proto::PingResponse, tonic::Status> {
         self.call_meta("ping", |mut client| async move {
             client.ping(PingRequest {}).await

@@ -4,6 +4,30 @@ use crate::protocol::*;
 
 #[tonic::async_trait]
 impl Meta for SpacedHostService {
+    async fn mount_data_drive(
+        &self,
+        request: Request<proto::MountDataDriveRequest>,
+    ) -> Result<Response<proto::MountDataDriveResponse>, Status> {
+        let request = request.into_inner();
+        let response = self.call_bridge_guest_once(
+            "bridge_guest_mount_data_drive",
+            Requirement::Operations(&[GuestOperation::BlockVolumeMount]),
+            BridgeGuestOperationBudget::RuntimeMetadata,
+            |mut client| {
+                let request = pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveRequest {
+                    topology_version: request.topology_version,
+                    mount: request.mount.clone(),
+                    read_only: request.read_only,
+                    filesystem_uuid: request.filesystem_uuid.clone(),
+                };
+                async move { client.mount_data_drive(request).await }
+            },
+        ).await?;
+        Ok(Response::new(proto::MountDataDriveResponse {
+            topology_version: response.topology_version,
+        }))
+    }
+
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         tracing::debug!(command = "ping", "spaced host grpc command succeeded");
         Ok(Response::new(PingResponse {}))

@@ -29,6 +29,15 @@ pub(super) fn service(
 
 #[tonic::async_trait]
 impl meta_server::Meta for Meta {
+    async fn mount_data_drive(
+        &self,
+        _: Request<MountDataDriveRequest>,
+    ) -> Result<Response<MountDataDriveResponse>, Status> {
+        Err(super::unsupported(
+            "block-volume mounts require a Linux guest",
+        ))
+    }
+
     async fn ping(&self, _: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse {
             diagnostics: vec![],

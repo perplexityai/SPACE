@@ -211,7 +211,7 @@ impl<T: QueryTransport> AwsQueryClient<T> {
         &self,
         action: &'static str,
         version: &'static str,
-        params: Vec<(&'static str, String)>,
+        params: Vec<(&str, String)>,
     ) -> Result<String, AwsClientError> {
         let mut all_params = Vec::with_capacity(params.len() + 2);
         all_params.push(("Action", action.to_string()));

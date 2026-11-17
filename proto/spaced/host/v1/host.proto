@@ -38,7 +38,16 @@ service Meta {
   // and invalidating cached host-to-guest bridge connections before returning.
   // Callers must not also invoke FlushGuestFilesystems for the same snapshot.
   rpc PrepareSuspend(PrepareSuspendRequest) returns (PrepareSuspendResponse);
+  rpc MountDataDrive(MountDataDriveRequest) returns (MountDataDriveResponse);
 }
+
+message MountDataDriveRequest {
+  uint32 topology_version = 1;
+  string mount = 2;
+  bool read_only = 3;
+  string filesystem_uuid = 4;
+}
+message MountDataDriveResponse { uint32 topology_version = 1; }
 
 service Process {
   rpc Start(space.spaced.operations.v1.StartRequest) returns (stream space.spaced.operations.v1.ProcessEvent);

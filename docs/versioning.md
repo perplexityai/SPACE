@@ -48,6 +48,29 @@ workspace releases. Until serialized allocation and immutable publication are
 in place, same-version development builds cannot authorize automatic guest
 upgrades. Do not independently pick patch versions in concurrent feature PRs.
 
+## Optional data-drive protocol
+
+`MountDataDrive` is additive to the host and guest Meta services. It requires
+an explicitly advertised Linux `BLOCK_VOLUME_MOUNT` operation, intersected with
+the trusted image policy. Historical capability defaults do not grant it;
+Windows image policy rejects it even when a peer claims support.
+
+Topology version 1 keeps the root disk first and adds one Firecracker data
+drive named `data0`, exposed as `/dev/vdb`. Its guest mount request contains a
+validated mountpoint, read-only policy, and the expected ext4 filesystem UUID,
+never a host device path. The guest checks the filesystem identity before
+mounting and never formats a disk. The host is responsible for initializing
+and fencing the backing device before exposing it.
+
+Filesystem flushing covers both root and mounted data filesystems. Data mounts
+are rediscovered from the kernel mount table, so restarting the guest agent
+does not lose the flush target. A present but unmounted data device fails the
+flush rather than silently producing an incomplete checkpoint.
+
+These runtime and guest protocol primitives do not expose a public volume API,
+provision storage, or add data-disk snapshots. A lifecycle integration must
+persist the disk dependency and restore its topology before loading VM memory.
+
 ## Service contracts
 
 At 1.0, backward compatibility throughout 1.x covers:

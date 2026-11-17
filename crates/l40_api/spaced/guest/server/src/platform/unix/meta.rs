@@ -33,6 +33,7 @@ fn flush_guest_filesystems() -> Result<(), Status> {
             nix::unistd::syncfs(root).map_err(Into::into)
         })
         .map_err(|error| Status::internal(format!("syncfs / failed: {error}")))?;
+        block_volume::flush_data_drive()?;
         Ok(())
     }
 
@@ -211,6 +212,27 @@ fn require_activity_state(state: LocalActivityState) -> Result<LocalActivityStat
 
 #[tonic::async_trait]
 impl BridgeGuestMeta for SpacedGuestService {
+    async fn mount_data_drive(
+        &self,
+        request: Request<
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveRequest,
+        >,
+    ) -> Result<
+        Response<pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveResponse>,
+        Status,
+    > {
+        let request = request.into_inner();
+        run_filesystem_flush(self.inner.filesystem_flush_slots.clone(), move || {
+            block_volume::mount_data_drive(request)
+        })
+        .await?;
+        Ok(Response::new(
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveResponse {
+                topology_version: 1,
+            },
+        ))
+    }
+
     async fn ping(
         &self,
         request: Request<BridgeGuestPingRequest>,
@@ -330,3 +352,5 @@ use pplx_space_spaced_guest_protocol::{validate_optional_reason, validate_timeou
 
 #[cfg(test)]
 mod tests;
+
+mod block_volume;

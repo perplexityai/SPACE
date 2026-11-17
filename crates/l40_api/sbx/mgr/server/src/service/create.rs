@@ -1036,6 +1036,7 @@ impl SandboxManagerService {
                     disk_rate: self.rootfs_rate_limiter(builder, sandbox.disk_io_limits),
                     network_rate: (!builder).then_some(super::start::NET_RATE_LIMITER),
                     balloon: None,
+                    data_drive: None,
                     huge_pages: self.config.hugepages,
                     console: false,
                     builder,

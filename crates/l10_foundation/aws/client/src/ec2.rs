@@ -5,6 +5,9 @@ use crate::query::{
     AwsClientError, AwsQueryClient, AwsQueryService, QueryTransport, ReqwestTransport,
 };
 
+mod volumes;
+pub use volumes::{CreateEncryptedGp3Volume, Volume, VolumeAttachment, VolumePage};
+
 const DESCRIBE_INSTANCES_ACTION: &str = "DescribeInstances";
 const EC2_API_VERSION: &str = "2016-11-15";
 const DESCRIBE_PAGE_SIZE: &str = "1000";

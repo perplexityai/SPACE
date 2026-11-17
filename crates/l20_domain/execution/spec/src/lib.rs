@@ -17,6 +17,7 @@ use pplx_space_cpu_arch::Arch;
 use pplx_space_k8s_ids::{LabelValue, LabelValueParseError};
 
 pub mod balloon;
+pub mod block_volume;
 pub mod compute;
 pub mod disk_io;
 pub mod environment;
@@ -26,6 +27,7 @@ pub mod host_cpu;
 pub mod runtime;
 
 pub use balloon::*;
+pub use block_volume::*;
 pub use compute::*;
 pub use disk_io::*;
 pub use environment::*;

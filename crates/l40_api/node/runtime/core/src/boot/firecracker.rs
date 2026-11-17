@@ -23,6 +23,18 @@ pub(super) fn configuration(input: &GuestBoot<'_>) -> Value {
     if let Some(rate) = input.disk_rate {
         drive.insert("rate_limiter".into(), super::token_buckets(&rate));
     }
+    let mut drives = vec![Value::Object(drive)];
+    if let Some(data) = input.data_drive {
+        use pplx_space_execution_spec::GuestDataDrive;
+        drives.push(json!({
+            "drive_id": GuestDataDrive::DRIVE_ID,
+            "path_on_host": GuestDataDrive::JAIL_PATH,
+            "is_root_device": false,
+            "is_read_only": data.permissions.is_read_only(),
+            "cache_type": "Writeback",
+            "io_engine": "Sync"
+        }));
+    }
     let mut net = object([
         (
             "iface_id",
@@ -48,7 +60,7 @@ pub(super) fn configuration(input: &GuestBoot<'_>) -> Value {
             "boot-source",
             json!({"kernel_image_path": "/vmlinux.bin", "boot_args": super::command_line(input, &devices, &uart, "ttyS0")}),
         ),
-        ("drives", json!([drive])),
+        ("drives", json!(drives)),
         ("machine-config", json!(machine)),
         ("network-interfaces", json!([net])),
         (

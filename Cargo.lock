@@ -8059,6 +8059,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-connection-admission",
+ "pplx-space-execution-spec",
  "pplx-space-grpc-metrics",
  "pplx-space-guest-capability",
  "pplx-space-guest-process",

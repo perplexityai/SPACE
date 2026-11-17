@@ -46,6 +46,11 @@ pub(crate) struct MockBridgeGuest {
     pub(crate) list_body_error: bool,
     pub(crate) read_continue: Option<Arc<tokio::sync::Notify>>,
     pub(crate) flush_calls: Arc<AtomicUsize>,
+    pub(crate) mount_requests: Arc<
+        std::sync::Mutex<
+            Vec<pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveRequest>,
+        >,
+    >,
     pub(crate) env_reply_failure: Option<(Arc<AtomicUsize>, tonic::Code)>,
     pub(crate) lost_reply_calls: Option<Arc<AtomicUsize>>,
 }
@@ -65,6 +70,7 @@ impl Default for MockBridgeGuest {
             list_body_error: false,
             read_continue: None,
             flush_calls: Arc::default(),
+            mount_requests: Arc::default(),
             lost_reply_calls: None,
             env_reply_failure: None,
         }
@@ -554,6 +560,25 @@ impl Process for MockBridgeGuest {
 
 #[tonic::async_trait]
 impl Meta for MockBridgeGuest {
+    async fn mount_data_drive(
+        &self,
+        request: Request<
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveRequest,
+        >,
+    ) -> Result<
+        Response<pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveResponse>,
+        Status,
+    > {
+        let request = request.into_inner();
+        let topology_version = request.topology_version;
+        self.mount_requests.lock().unwrap().push(request);
+        Ok(Response::new(
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveResponse {
+                topology_version,
+            },
+        ))
+    }
+
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse::default()))
     }

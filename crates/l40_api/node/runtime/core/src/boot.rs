@@ -25,6 +25,7 @@ pub struct GuestBoot<'a> {
     pub console: bool,
     pub builder: bool,
     pub source: BootSource,
+    pub data_drive: Option<pplx_space_execution_spec::GuestDataDrive>,
 }
 
 pub use pplx_space_execution_catalog::guest::{BootSource, GuestProfile, GuestShutdown};
@@ -69,6 +70,12 @@ pub fn configuration(
     runtime: RuntimeKind,
     input: &GuestBoot<'_>,
 ) -> Result<String, BootConfigError> {
+    if input.data_drive.is_some() && runtime != RuntimeKind::Firecracker {
+        return Err(BootConfigError::UnsupportedFeature {
+            runtime,
+            feature: "block data drive",
+        });
+    }
     match (input.source, input.guest.os, input.guest.architecture) {
         (BootSource::LinuxDirect, GuestOperatingSystem::Linux, _) => {}
         (BootSource::Uefi, _, Arch::X86_64)
