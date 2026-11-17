@@ -414,6 +414,9 @@ pub struct SandboxManagerService {
     /// Node-wide admission for Firecracker process launches. Cold starts and
     /// restores share one capacity bucket.
     activation_admission_limiter: Arc<ActivationAdmissionLimiter>,
+    /// Refuses every VM activation while the node is sealed, and tracks the
+    /// activation work in flight, which a drain reports as pending.
+    activation_seal: Arc<crate::activation_seal::ActivationSeal>,
     /// At most one in-process driver may advance a persisted teardown suspend
     /// for a sandbox. The durable operation itself lives in SQLite; this map
     /// only bounds concurrent reattachment attempts from shim polling.
@@ -1779,7 +1782,15 @@ impl SandboxManagerService {
                 ),
             }
         }
+        // Read before anything is spawned that could admit an activation.
+        let activation_seal = Arc::new(crate::activation_seal::ActivationSeal::load(&conn));
         let db = crate::db::SharedConnection::new(conn);
+        // A startup read that failed refuses activations until this reads it.
+        activation_seal.spawn_recovery(
+            db.clone(),
+            options.shutdown_token.clone(),
+            &options.task_tracker,
+        );
         let auto_lifecycle = AutoLifecycleCoordinator::default();
         let network_policy_reconcile_queue = NetworkPolicyReconcileQueue::default();
         let feature_flags = pplx_space_feature_flags::FeatureFlagClient::from_env();
@@ -1878,6 +1889,7 @@ impl SandboxManagerService {
                 recovery::QUARANTINE_RECOVERY_ORPHAN_RESTORE_PERMITS,
             )),
             activation_admission_limiter: Arc::new(ActivationAdmissionLimiter::from_env()),
+            activation_seal,
             teardown_suspend_drivers: Arc::new(dashmap::DashMap::new()),
             teardown_suspend_driver_sem: Arc::new(tokio::sync::Semaphore::new(
                 teardown_suspend_driver_concurrency,

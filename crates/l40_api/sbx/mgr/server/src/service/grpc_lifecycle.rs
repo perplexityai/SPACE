@@ -57,6 +57,8 @@ pub(super) use self::artifact_backup::{
 use self::backup_submission::suspend_artifact_metadata;
 pub(super) use self::backup_submission::suspend_snapshot_metadata;
 #[cfg(test)]
+pub(super) use self::pause_resume::{GUEST_PREPARATION, GuestPreparation};
+#[cfg(test)]
 use self::pause_resume::{PauseReconciliationOutcome, pause_reconciliation_outcome};
 use self::pause_resume::{pause_with_reconciliation, prepare_guest_for_pause};
 #[cfg(test)]
