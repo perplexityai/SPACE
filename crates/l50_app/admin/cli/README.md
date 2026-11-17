@@ -26,6 +26,13 @@ space-admin-cli runtime env default <environment> --reason TEXT [--strand] [--if
 space-admin-cli runtime env state <environment> <allowed|deprecated|blocked> --reason TEXT [--strand] [--if-generation N] [--json]
 space-admin-cli runtime env nodes [--after NODE_ID | --all] [--json]
 space-admin-cli runtime env population [--json]
+space-admin-cli runtime campaign start --kind <templates|sandboxes> --from <environment> --to <environment> \
+  --wave-size N --failure-budget N --reason TEXT [--canary-size 0|1] [--per-node N] [--include-running] [--json]
+space-admin-cli runtime campaign pause <campaign> --reason TEXT [--if-generation N] [--json]
+space-admin-cli runtime campaign resume <campaign> --reason TEXT [--retry-failed] [--if-generation N] [--json]
+space-admin-cli runtime campaign abort <campaign> --reason TEXT [--if-generation N] [--json]
+space-admin-cli runtime campaign show <campaign> [--json]
+space-admin-cli runtime campaign list [--unfinished] [--json]
 ```
 
 `<node>` accepts a full UUID or a unique short prefix (≥4 chars). Prefix
@@ -49,6 +56,50 @@ takes the generation `runtime env list` showed and refuses the write if the
 policy has changed since, so a write from a stale read can't undo someone
 else's, such as re-allowing an environment another operator just blocked. See "Cluster desired policy" in
 [Execution environments](../../../../docs/execution-environments.md).
+
+`runtime campaign` starts and steers runtime upgrade campaigns through
+`/admin/api/v1/runtime-upgrade-campaigns`. A campaign moves one kind of subject,
+template releases or sandboxes, from the `--from` environment to the `--to`
+environment. `--wave-size` caps the items in flight across the cluster and
+`--per-node` caps them on any one node (default 1, at most the wave size). `--include-running` asks a
+sandbox campaign to take running and paused sandboxes too; the sandbox driver
+gives it its meaning, and a template campaign refuses it. A campaign starts in
+`canary`: it upgrades one subject at a time until one is done, then waits until
+you resume it. A canary whose items all fail or are skipped, under the failure
+budget, doesn't wait: it completes once its plan moves and a pass begins and
+ends with nothing pending or in flight and leases nothing. `--canary-size 0` starts the campaign
+`rolling` instead (only 0 and 1 are accepted). When its failed items reach
+`--failure-budget`, it pauses itself. An invalid `start` is refused with 400;
+a valid one is refused with 409 while no driver moves the kind yet or a
+conflicting campaign exists.
+
+Every write needs `--reason`, and the audit log records it. A start's is also
+recorded with you on the campaign.
+`pause` stops a `canary` or `rolling` campaign from leasing anything new;
+items already in flight finish under their leases. `resume` continues a paused
+campaign, or moves a canary whose item is done on to `rolling`. A resume goes
+to `rolling` once any item is done; with no done item it goes back to `canary`,
+whichever phase the campaign started in, so it upgrades one subject and waits
+again. A campaign at its failure budget isn't resumed as it is, since it would
+pause again on the next tick: `--retry-failed` returns its failed items to
+pending, with their attempts reset, so the budget counts only new failures.
+`abort` ends a `canary`, `rolling` or `paused` campaign for good. Nothing
+already upgraded is undone. Items in flight stop at their next lease renewal
+and go back to pending when their leases lapse; until then no other campaign
+upgrades those subjects. An upgrade that finishes before that renewal still
+records its outcome. A new campaign for the same source can start at once.
+`--if-generation` takes the generation `runtime campaign show` printed and
+refuses the change with 412 if the campaign has moved since. A change the
+campaign's phase doesn't allow is refused with 409, and that check comes
+first: pausing a campaign that has since paused itself answers 409, not 412.
+
+`show` prints a campaign's settings, phase, generation and item counts
+(pending, in flight, done, failed, skipped). For a sandbox campaign it also
+prints how many pending items are stranded: ones the campaign can't move
+because the catalog certifies no upgrade edge from the source environment to
+the target. A finished campaign moves nothing more and shows 0. `list` follows every page in creation order; `--unfinished` keeps
+only `canary`, `rolling` and `paused` campaigns, and `--json` prints every
+page's campaigns in one `campaigns` array.
 
 ## Install
 
