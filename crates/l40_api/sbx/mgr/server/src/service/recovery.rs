@@ -769,7 +769,10 @@ impl SandboxManagerService {
     /// so it must not hold up this periodic pass. The task keeps the row's
     /// wake, artifact and cleanup fences until it finishes, so a later pass
     /// neither starts a second seal nor classifies the row mid-seal. Once the
-    /// seal succeeds, the next pass publishes the staged capture.
+    /// seal succeeds, the next pass publishes the staged capture. A task is
+    /// spawned only for a capture that still needs its seal: one holding the
+    /// fences with nothing to seal would race this pass's own classification
+    /// and could keep deferring the publication of a sealed capture.
     pub(super) fn spawn_encrypted_capture_seal(
         &self,
         cache_dir: &Path,
@@ -807,19 +810,27 @@ impl SandboxManagerService {
                 return;
             }
         };
-        let (service, cache_dir) = (self.clone(), cache_dir.to_path_buf());
+        let capture = match self.recorded_encrypted_capture_to_seal(&row, cache_dir) {
+            Ok(Some(capture)) => capture,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    sandbox_id = %row.id,
+                    %error,
+                    "cannot admit unsealed encrypted capture for seal; recovery will retry"
+                );
+                return;
+            }
+        };
+        let service = self.clone();
         self.task_tracker.spawn(async move {
             let _fences = (wake, artifact, cleanup);
-            match service
-                .seal_recorded_encrypted_capture(&row, &cache_dir)
-                .await
-            {
-                Ok(Some(capture)) => tracing::info!(
+            match service.seal_admitted_encrypted_capture(&row, capture).await {
+                Ok(capture) => tracing::info!(
                     sandbox_id = %row.id,
                     local_artifact_id = %capture,
                     "sealed interrupted encrypted suspend capture"
                 ),
-                Ok(None) => {}
                 Err(error) => tracing::warn!(
                     sandbox_id = %row.id,
                     %error,

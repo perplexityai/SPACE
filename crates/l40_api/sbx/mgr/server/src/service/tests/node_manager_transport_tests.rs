@@ -299,7 +299,7 @@ async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed()
     // Once the holder exits, the next pass seals it. That pass's own
     // classification skips the row while the seal task holds its locks, but
     // can run after a fast seal finishes and publish the capture at once;
-    // otherwise the pass after it does.
+    // otherwise the pass after it, with nothing left to seal, does.
     recover_batch(&service, cache.path(), &id).await;
     assert_eq!(
         node_manager.calls(),
@@ -384,6 +384,14 @@ async fn complete_staged_capture_publishes_past_an_older_unsealed_record() {
             .await
             .unwrap(),
         Some(newer),
+    );
+    // spawn_encrypted_capture_seal must not hold the row's locks for a capture
+    // with nothing left to seal: a task holding them would make the pass's own
+    // classification skip it.
+    service.spawn_encrypted_capture_seal(cache.path(), &service.lookup_sandbox(&id).unwrap());
+    assert!(
+        service.auto_lifecycle.wake_lock(&id).try_lock().is_ok(),
+        "no seal task holds a sealed capture's row"
     );
     recover_batch(&service, cache.path(), &id).await;
 

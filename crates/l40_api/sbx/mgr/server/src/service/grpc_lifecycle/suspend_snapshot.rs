@@ -25,6 +25,14 @@ pub(in crate::service) enum SuspendSnapshotStagingDisposition {
     Cleanup,
 }
 
+/// An admitted encrypted capture whose record still awaits its seal.
+#[must_use]
+pub(in crate::service) struct RecordedEncryptedCapture {
+    artifact_id: LocalArtifactId,
+    staging_dir: std::path::PathBuf,
+    metadata: crate::snapshot_upload::SnapshotMeta,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(in crate::service) enum EncryptedCaptureSealError {
     #[error("capture record does not belong to the admitted attempt")]
@@ -301,14 +309,45 @@ impl SandboxManagerService {
             .map_err(EncryptedCaptureSealError::RemoveRecord)
     }
 
-    /// Seal only the admitted capture, within its fixed retry window and with
-    /// runtime evidence consistent with the producer's confirmed stop. Both
-    /// periodic and teardown callers hold the row's lifecycle/cleanup guards.
+    /// Admit and seal the row's recorded encrypted capture, if one needs it.
+    /// Callers must hold the row's lifecycle and cleanup guards across both
+    /// admission and seal; the teardown caller does, and periodic recovery
+    /// calls the two halves under the fences it moves into its task.
     pub(in crate::service) async fn seal_recorded_encrypted_capture(
         &self,
         sandbox: &crate::db::SandboxRow,
         cache_dir: &std::path::Path,
     ) -> Result<Option<LocalArtifactId>, EncryptedCaptureSealError> {
+        let Some(capture) = self.recorded_encrypted_capture_to_seal(sandbox, cache_dir)? else {
+            return Ok(None);
+        };
+        self.seal_admitted_encrypted_capture(sandbox, capture)
+            .await
+            .map(Some)
+    }
+
+    /// Seal a capture that `recorded_encrypted_capture_to_seal` admitted,
+    /// under the same guards that were held when it was admitted.
+    pub(in crate::service) async fn seal_admitted_encrypted_capture(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        capture: RecordedEncryptedCapture,
+    ) -> Result<LocalArtifactId, EncryptedCaptureSealError> {
+        self.seal_encrypted_capture(sandbox, &capture.staging_dir, &capture.metadata)
+            .await?;
+        Ok(capture.artifact_id)
+    }
+
+    /// The admitted capture that still needs a seal, if any: only the admitted
+    /// capture, within its fixed retry window and with runtime evidence
+    /// consistent with the producer's confirmed stop. This is every check
+    /// before the node-manager call, so callers can tell without waiting on a
+    /// seal whether one is needed at all.
+    pub(in crate::service) fn recorded_encrypted_capture_to_seal(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        cache_dir: &std::path::Path,
+    ) -> Result<Option<RecordedEncryptedCapture>, EncryptedCaptureSealError> {
         if !sandbox.volume_encryption {
             return Ok(None);
         }
@@ -356,9 +395,11 @@ impl SandboxManagerService {
         {
             return Err(EncryptedCaptureSealError::RecordIdentityMismatch);
         }
-        self.seal_encrypted_capture(sandbox, &staging_dir, &metadata)
-            .await?;
-        Ok(Some(attempt.artifact_id))
+        Ok(Some(RecordedEncryptedCapture {
+            artifact_id: attempt.artifact_id,
+            staging_dir,
+            metadata,
+        }))
     }
 
     pub(in crate::service) fn record_suspend_snapshot_publication_failure_after_staging(
