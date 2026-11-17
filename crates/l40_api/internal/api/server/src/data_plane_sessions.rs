@@ -21,7 +21,7 @@ use pplx_space_common_core::types::{
     EcwCredentialEpoch, ExecutionGeneration, NodeManagedBy, RouteGeneration,
     SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
 };
-use pplx_space_common_grpc::sandbox_service_route_not_ready_status;
+use pplx_space_common_grpc::{RetryableNotReady, sandbox_service_route_not_ready_status};
 use pplx_space_ecw_credential::{EcwCredentialKeyring, EcwCredentialKind, EcwCredentialMatch};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_network_roles::GuestPort;
@@ -105,13 +105,16 @@ fn activation_may_repair(ingress: bool, error: &Status) -> bool {
 /// execution and deletes its pod, discarding whatever it served. The
 /// resolvers turn this refusal into a wait on the restore through the
 /// activation owner, then retry, and return it (retryable `Unavailable`)
-/// when the restore didn't reach `started` in their budget.
+/// when the restore didn't reach `started` in their budget. That answer is
+/// by design while a restore runs, so it is marked [`RetryableNotReady`] and
+/// the gRPC trace layers on both sides log it below error.
 fn refuse_restoring_route(lifecycle: SandboxLifecycle) -> Result<(), Status> {
     if lifecycle == SandboxLifecycle::Restoring {
-        Err(sandbox_service_route_not_ready_status(
+        let refusal = sandbox_service_route_not_ready_status(
             Code::Unavailable,
             "sandbox is restoring; retry once the restore completes",
-        ))
+        );
+        Err(RetryableNotReady.mark(refusal))
     } else {
         Ok(())
     }
