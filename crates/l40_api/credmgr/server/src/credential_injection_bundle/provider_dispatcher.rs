@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use pplx_space_credential_injection_core::secret_arn::SecretArn;
+use pplx_space_credential_injection::secret_arn::SecretArn;
 use uuid::Uuid;
 
 use super::ResolvedCredentialValue;
@@ -13,7 +13,7 @@ use crate::aws_secrets_manager::ResolvedAwsSecret;
 use crate::credential_provider::{
     CredentialProviderResolver, DestinationMatcher, ResolutionContext, ResolutionError,
 };
-use pplx_space_credential_injection_core::validation::ValidatedCredentialReference;
+use pplx_space_credential_injection::validation::ValidatedCredentialReference;
 
 type AwsSecretsManagerProvider =
     dyn CredentialProviderResolver<Reference = SecretArn, Material = ResolvedAwsSecret>;

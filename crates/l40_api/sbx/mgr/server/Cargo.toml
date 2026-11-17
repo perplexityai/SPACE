@@ -62,11 +62,11 @@ pplx-space-api-route = { workspace = true }
 pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-common-io = { workspace = true }
+pplx-space-file-io = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
-pplx-space-common-lru-reaper = { workspace = true }
+pplx-space-lru-reaper = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }
-pplx-space-credential-injection-core = { workspace = true }
+pplx-space-credential-injection = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-dependency-drain = { workspace = true }
 pplx-space-events = { workspace = true }

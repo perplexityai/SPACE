@@ -130,7 +130,7 @@ async fn credential_provider_with_material(
     crate::state::GatewayNetworkState,
     crate::certificates::CertificateProvider,
 ) {
-    use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
+    use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
     use pplx_space_net_common::{
         CredentialHeaderBindingV1, NetworkCredentialDestinationV1, NetworkCredentialHttpMethodV1,
         NetworkCredentialRuleV1, TlsInterception,

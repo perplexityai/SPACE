@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pplx_space_common_connection_admission::ConnectionAdmissionFailure;
 use pplx_space_common_core::{host::linux::identities::user_names, host::linux::identities::users};
+use pplx_space_connection_admission::ConnectionAdmissionFailure;
 use pplx_space_spaced_common::proto::bridge_guest::filesystem_client::FilesystemClient as BridgeGuestFilesystemClient;
 use pplx_space_spaced_common::proto::bridge_guest::meta_client::MetaClient as BridgeGuestClient;
 use pplx_space_spaced_common::proto::bridge_guest::networking_client::NetworkingClient as BridgeGuestNetworkingClient;

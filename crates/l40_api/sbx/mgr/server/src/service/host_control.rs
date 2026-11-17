@@ -2,7 +2,7 @@ use super::*;
 use pplx_space_common_grpc::{
     DEFAULT_GRPC_CONNECT_RETRY_POLICY, DEFAULT_LOCAL_GRPC_RETRY_POLICY, GrpcRetryContext,
 };
-use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
+use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 use pplx_space_credmgr_client::{
     NETWORK_CREDENTIAL_RESOLUTION_TIMEOUT, proto::ResolveNetworkCredentialsRequest,
 };

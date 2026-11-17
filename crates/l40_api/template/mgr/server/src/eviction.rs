@@ -1,7 +1,7 @@
 //! LRU eviction loop for the on-node template cache.
 //!
 //! The pure planner — the `(items, pinned, active, cfg) → candidates`
-//! decision — lives in [`pplx_space_common_lru_reaper`] and is shared
+//! decision — lives in [`pplx_space_lru_reaper`] and is shared
 //! with the snapshot-artifact reaper in sandbox-manager. This module
 //! owns the *template-specific* wrapper: reading `template_builds`,
 //! the UNION of `template_pinned_tags` and `template_pinned_releases`,
@@ -43,7 +43,7 @@
 //!   handed out via `GetTemplate` before sandbox-manager's row
 //!   becomes visible to `sbx-mgr.List()`.
 //!
-//! See the crate-level docs of `pplx-space-common-lru-reaper` for the
+//! See the crate-level docs of `pplx-space-lru-reaper` for the
 //! full rationale on protected sets, headroom semantics, and the
 //! deterministic LRU tiebreak.
 
@@ -51,12 +51,12 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pplx_space_common_lru_reaper::{self as lru_reaper, EvictionInput};
+use pplx_space_lru_reaper::{self as lru_reaper, EvictionInput};
 use rusqlite::{Connection, params};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-pub(crate) use pplx_space_common_lru_reaper::EvictionConfig;
+pub(crate) use pplx_space_lru_reaper::EvictionConfig;
 
 use crate::db::TemplateCachePartition;
 

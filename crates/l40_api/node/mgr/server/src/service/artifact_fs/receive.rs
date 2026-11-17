@@ -173,7 +173,7 @@ impl ValidatedStream {
             )
             .map_err(error)?,
         );
-        pplx_space_common_io::reflink::preserve_nocow(source, &stream).map_err(error)?;
+        pplx_space_file_io::reflink::preserve_nocow(source, &stream).map_err(error)?;
         // Both files live on the cache btrfs filesystem. Do not silently turn
         // failure into a potentially unbounded byte copy under the mutation lock.
         rustix::fs::ioctl_ficlone(&stream, source).map_err(error)?;

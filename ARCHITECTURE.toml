@@ -230,7 +230,7 @@ mode = "required"
 [rules.pattern_ratchet.sandbox_writes.stale_entries]     # entries with fewer matches, none, or gone
 mode = "required"
 
-# Rootfs copies must preserve NoCoW and sparse extents through common-io's
+# Rootfs copies must preserve NoCoW and sparse extents through file-io's
 # reflink helper. A line matcher cannot infer a path variable's contents, so
 # conservatively fence all new plain filesystem copies and cp launches.
 # Existing non-rootfs, non-Linux and deferred builder paths are counted
@@ -242,7 +242,7 @@ patterns = [
   '\bfs\s*::\s*copy\s*\(',
   '\buse\s+(?:std|tokio)\s*::\s*fs\s*::[^;]*\bcopy\b',
 ]
-allow = ["crates/l10_foundation/common/io/src/reflink.rs"]
+allow = ["crates/l10_foundation/file/io/src/reflink.rs"]
 
 [rules.pattern_ratchet.rootfs_copy.no_crossing]
 mode = "required"
@@ -496,7 +496,7 @@ legacy = ["pplx-space-common-core"]
 # lists it; every other one is a model, which never depends on a protocol.
 # These five are protocols without such a name. The mixed crates, which hold
 # model and wire code until they are split, count as models: api-route,
-# credential-injection-core, net-common and spaced-common.
+# credential-injection, net-common and spaced-common.
 protocols = [
   "pplx-space-auto-lifecycle-receipt",
   "pplx-space-events",

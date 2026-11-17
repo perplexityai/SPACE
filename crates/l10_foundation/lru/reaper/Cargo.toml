@@ -1,5 +1,5 @@
 [package]
-name = "pplx-space-common-lru-reaper"
+name = "pplx-space-lru-reaper"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

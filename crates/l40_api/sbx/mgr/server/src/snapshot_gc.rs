@@ -25,7 +25,7 @@
 //!    lifecycle transition that opens the artifact's `local_path`,
 //!    so an artifact that hasn't been touched for a day is genuinely
 //!    cold.
-//! 4. **Outside the grace period.** Per [`pplx_space_common_lru_reaper`]'s
+//! 4. **Outside the grace period.** Per [`pplx_space_lru_reaper`]'s
 //!    grace rule: `now - max(created_at, last_touched_at) >= grace`.
 //!    The grace period (default 1800 s, floor 60 s) defends against
 //!    the create/touch race where a sandbox has just produced an
@@ -63,7 +63,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pplx_space_common_core::types::LocalArtifactId;
-use pplx_space_common_lru_reaper::{self as lru_reaper, EvictionInput};
+use pplx_space_lru_reaper::{self as lru_reaper, EvictionInput};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 

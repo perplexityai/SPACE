@@ -47,9 +47,9 @@ zstd = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true, features = ["serde"] }
-pplx-space-common-io = { workspace = true, features = ["reflink"] }
+pplx-space-file-io = { workspace = true, features = ["reflink"] }
 pplx-space-common-jobs = { workspace = true }
-pplx-space-common-lru-reaper = { workspace = true }
+pplx-space-lru-reaper = { workspace = true }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-local-health = { workspace = true }
