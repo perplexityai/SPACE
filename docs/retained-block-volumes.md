@@ -89,7 +89,7 @@ deployment-specific accounts, organizations, node names or AWS resource IDs.
 | Variable | Consumer | Contract |
 | --- | --- | --- |
 | `SPACE_EBS_ADMISSION_POLICY` | API | JSON with `organization_ids` and `availability_zone`; absent denies new disk requests |
-| `SPACE_EBS_PLACEMENT_POLICY` | API | JSON with `availability_zone` and one or two qualified Kubernetes `node_names`; intersects every existing required affinity alternative |
+| `SPACE_EBS_PLACEMENT_POLICY` | API | JSON with `availability_zone` and one or two qualified Kubernetes `node_names`; intersects every existing required affinity alternative. Optional `tolerations` admit explicitly isolated worker pools. Optional `hold_for_placement: true` adds the `space.pplx.net/block-volume-placement` scheduling gate, allowing an authorized fixture to add a narrower hostname selector before removing that gate. Both options default off/empty; neither replaces existing CPU or AZ constraints. A missing fixture leaves the pod unscheduled, not placed elsewhere. |
 | `SPACE_EBS_EXPERIMENT_POLICY` | Cluster controller | JSON with `account_id`, `region`, `availability_zone`, `cluster`, `experiment` and one or two permitted `instance_ids`; absent disables cloud reconciliation |
 | `SPACE_EBS_NODE_BINDINGS` | Internal API | Explicit registered-node to instance/AZ bindings, validated against the authenticated request origin |
 | `SPACE_EBS_NODE_ID` | Worker disk consumers | Explicit registered node identity and worker opt-in; must agree with the fixed control-plane bindings |

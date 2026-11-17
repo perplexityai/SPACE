@@ -110,6 +110,10 @@ pub(crate) fn admit(
 struct Placement {
     availability_zone: String,
     node_names: BTreeSet<String>,
+    #[serde(default)]
+    hold_for_placement: bool,
+    #[serde(default)]
+    tolerations: Vec<k8s_openapi::api::core::v1::Toleration>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -157,6 +161,18 @@ pub(crate) fn constrain_pod(
     {
         return Err(PlacementError::Unqualified);
     }
+    // A scheduling gate lets an authorized operator narrow this pod's target
+    // without changing fleet availability or replacing CPU/AZ constraints.
+    if policy.hold_for_placement {
+        spec.scheduling_gates.get_or_insert_default().push(
+            k8s_openapi::api::core::v1::PodSchedulingGate {
+                name: "space.pplx.net/block-volume-placement".to_string(),
+            },
+        );
+    }
+    spec.tolerations
+        .get_or_insert_default()
+        .extend(policy.tolerations);
     let required = spec
         .affinity
         .get_or_insert_default()
@@ -185,102 +201,4 @@ pub(crate) fn constrain_pod(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use pplx_space_test_env::TestEnv;
-
-    #[test]
-    fn block_volume_admission_is_opt_in_and_owner_scoped() {
-        let owner = OrgId::new();
-        let other = OrgId::new();
-        let mounts: Vec<BlockVolumeMount> = serde_json::from_value(serde_json::json!([{
-            "type": "ebs", "size_gib": 128, "permissions": "read_write", "mount": "/data"
-        }]))
-        .unwrap();
-        let mut env = TestEnv::default();
-        admit(&env, &mounts, owner, RuntimeKind::Firecracker, false).unwrap_err();
-        assert!(
-            admit(&env, &[], owner, RuntimeKind::Firecracker, false)
-                .unwrap()
-                .is_none()
-        );
-        env.set(
-            POLICY_ENV,
-            serde_json::json!({
-                "organization_ids": [owner], "availability_zone": "test-region-1a"
-            })
-            .to_string(),
-        );
-        assert!(
-            admit(&env, &mounts, owner, RuntimeKind::Firecracker, false)
-                .unwrap()
-                .is_some()
-        );
-        admit(&env, &mounts, other, RuntimeKind::Firecracker, false).unwrap_err();
-        admit(&env, &mounts, owner, RuntimeKind::Firecracker, true).unwrap_err();
-        admit(
-            &env,
-            &[mounts[0].clone(), mounts[0].clone()],
-            owner,
-            RuntimeKind::Firecracker,
-            false,
-        )
-        .unwrap_err();
-    }
-
-    #[cfg(feature = "kubernetes")]
-    #[test]
-    fn block_volume_placement_intersects_every_affinity_alternative() {
-        use k8s_openapi::api::core::v1::Pod;
-        let mut env = TestEnv::default();
-        env.set(
-            "SPACE_EBS_PLACEMENT_POLICY",
-            serde_json::json!({
-                "availability_zone": "test-region-1a", "node_names": ["worker-a", "worker-b"]
-            })
-            .to_string(),
-        );
-        let mut pod: Pod = serde_json::from_value(serde_json::json!({
-            "spec": {"containers": [], "affinity": {"nodeAffinity": {
-                "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [
-                    {"matchExpressions": [{"key": "existing", "operator": "In", "values": ["first"]}]},
-                    {"matchExpressions": [{"key": "existing", "operator": "In", "values": ["second"]}]}
-                ]}
-            }}}
-        })).unwrap();
-        constrain_pod(&mut pod, "test-region-1a", &env).unwrap();
-        let terms = &pod
-            .spec
-            .as_ref()
-            .unwrap()
-            .affinity
-            .as_ref()
-            .unwrap()
-            .node_affinity
-            .as_ref()
-            .unwrap()
-            .required_during_scheduling_ignored_during_execution
-            .as_ref()
-            .unwrap()
-            .node_selector_terms;
-        for (term, original) in terms.iter().zip(["first", "second"]) {
-            let expressions = term.match_expressions.as_ref().unwrap();
-            assert_eq!(expressions.len(), 3);
-            assert_eq!(
-                expressions[0].values.as_deref(),
-                Some(&[original.to_string()][..])
-            );
-            assert_eq!(
-                expressions[1].values.as_deref(),
-                Some(&["test-region-1a".to_string()][..])
-            );
-            assert_eq!(
-                expressions[2].values.as_deref(),
-                Some(&["worker-a".to_string(), "worker-b".to_string()][..])
-            );
-        }
-        constrain_pod(&mut pod, "test-region-1b", &env).unwrap_err();
-        pod.spec.as_mut().unwrap().node_name = Some("worker-c".to_string());
-        constrain_pod(&mut pod, "test-region-1a", &env).unwrap_err();
-    }
-}
+mod tests;
