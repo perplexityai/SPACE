@@ -928,3 +928,204 @@ async fn resident_execution_adoption_does_not_require_current_catalog_or_sources
         }
     }
 }
+
+/// A stand-in gateway for `sandbox_id`: a shell that names the sandbox in its
+/// command line, as a gateway's `--sandbox-id` does, and holds `sockets`.
+fn spawn_socket_holder(
+    sandbox_id: SandboxId,
+    sockets: Vec<i32>,
+) -> gateway_handover::tests::ReapedChild {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(gateway_handover::tests::ready_script("true"))
+        .arg(sandbox_id.to_string());
+    let inherit = move || {
+        for socket in &sockets {
+            // SAFETY: fcntl(2) on a descriptor this test keeps open until the
+            // spawn returns.
+            if unsafe { libc::fcntl(*socket, libc::F_SETFD, 0) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    };
+    // SAFETY: the closure calls only fcntl(2) and allocates nothing.
+    unsafe {
+        command.pre_exec(inherit);
+    }
+    gateway_handover::tests::spawn_ready(&mut command)
+}
+
+fn listener_specs(
+    udp: std::net::SocketAddr,
+    tcp: std::net::SocketAddr,
+) -> Vec<launch::PreExecSocket> {
+    [(udp, false, "--udp-fd"), (tcp, true, "--tcp-fd")]
+        .into_iter()
+        .map(|(bind_addr, tcp, fd_arg)| launch::PreExecSocket {
+            bind_addr,
+            tcp,
+            transparent: false,
+            recvorigdstaddr: false,
+            fd_arg: fd_arg.to_string(),
+            inherited_fd: None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn replaced_gateway_hands_its_listening_sockets_to_its_replacement() {
+    use std::os::unix::process::ExitStatusExt;
+    if !pplx_space_test_env::root_or_skip("duplicate another process's sockets") {
+        return;
+    }
+    let service = RuntimeSupervisorService::default();
+    let sandbox_id = SandboxId::new();
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let (udp_addr, tcp_addr) = (udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+    let mut holder = spawn_socket_holder(sandbox_id, vec![udp.as_raw_fd(), tcp.as_raw_fd()]);
+    // From here only the holder has the sockets.
+    drop((udp, tcp));
+
+    let mut inherited = service
+        .retire_replaced_gateway(
+            sandbox_id,
+            holder.id(),
+            "/proc/self/ns/net",
+            &listener_specs(udp_addr, tcp_addr),
+        )
+        .await
+        .unwrap();
+    assert_eq!(holder.wait().unwrap().signal(), Some(libc::SIGTERM));
+    assert_eq!(inherited.len(), 2);
+
+    // What arrives after the holder is gone waits on the same sockets.
+    let listener = std::net::TcpListener::from(inherited.pop().unwrap());
+    let receiver = std::net::UdpSocket::from(inherited.pop().unwrap());
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .send_to(b"query", udp_addr)
+        .unwrap();
+    let _client = std::net::TcpStream::connect(tcp_addr).unwrap();
+    receiver.set_nonblocking(false).unwrap();
+    let mut datagram = [0; 16];
+    assert_eq!(receiver.recv(&mut datagram).unwrap(), 5);
+    listener.set_nonblocking(false).unwrap();
+    listener.accept().unwrap();
+}
+
+#[tokio::test]
+async fn replaced_gateway_without_every_listener_still_stops_and_hands_over_none() {
+    use std::os::unix::process::ExitStatusExt;
+    if !pplx_space_test_env::root_or_skip("duplicate another process's sockets") {
+        return;
+    }
+    let service = RuntimeSupervisorService::default();
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let specs = listener_specs(udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+    let mut not_transparent = specs.clone();
+    not_transparent[0].transparent = true;
+    // A network namespace other than the one holding the sockets.
+    let other_namespace = gateway_handover::tests::spawn_ready(
+        std::process::Command::new("unshare")
+            .arg("--net")
+            .arg("sh")
+            .arg("-c")
+            .arg(gateway_handover::tests::ready_script("true")),
+    );
+    let other_ns_path = format!("/proc/{}/ns/net", other_namespace.id());
+    for (specs, ns_path) in [
+        (not_transparent, "/proc/self/ns/net"),
+        (specs.clone(), other_ns_path.as_str()),
+    ] {
+        let sandbox_id = SandboxId::new();
+        let mut holder = spawn_socket_holder(sandbox_id, vec![udp.as_raw_fd(), tcp.as_raw_fd()]);
+        let inherited = service
+            .retire_replaced_gateway(sandbox_id, holder.id(), ns_path, &specs)
+            .await
+            .unwrap();
+        assert!(inherited.is_empty(), "{ns_path}");
+        assert_eq!(holder.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    // A path that is no network namespace fails the launch, so the old
+    // gateway is left running.
+    let sandbox_id = SandboxId::new();
+    let mut holder = spawn_socket_holder(sandbox_id, vec![udp.as_raw_fd(), tcp.as_raw_fd()]);
+    let status = service
+        .retire_replaced_gateway(sandbox_id, holder.id(), "/proc/self/ns/uts", &specs)
+        .await
+        .expect_err("a non-network namespace must be refused");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+    assert!(
+        holder.try_wait().unwrap().is_none(),
+        "the old gateway keeps running"
+    );
+}
+
+#[tokio::test]
+async fn an_unlaunchable_replacement_is_refused_before_anything_changes() {
+    let service = RuntimeSupervisorService::default();
+    let bad_env = LaunchSidecarRequest {
+        env: std::collections::HashMap::from([("BAD=KEY".to_string(), "x".to_string())]),
+        ..Default::default()
+    };
+    let bad_fd_arg = LaunchSidecarRequest {
+        pre_exec_sockets: vec![pplx_space_node_runtime_core::proto::PreExecSocket {
+            bind_addr: "0.0.0.0:15002".to_string(),
+            fd_arg: "--udp-fd\0".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    for request in [bad_env, bad_fd_arg] {
+        let status = service
+            .launch_sidecar_owned(
+                LaunchSidecarRequest {
+                    sandbox_id: SandboxId::new().to_string(),
+                    program: pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN.to_string(),
+                    replace_pid: Some(4242),
+                    ..request
+                },
+                None,
+            )
+            .await
+            .expect_err("a request the launcher would reject must be refused");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
+    }
+}
+
+#[test]
+fn a_gateway_without_launch_evidence_is_returned_rather_than_replaced() {
+    let unrecorded = || Err(Status::failed_precondition("no launch evidence"));
+    assert_eq!(
+        live_sidecar_decision(7, Some(7), Ok(())).unwrap(),
+        LiveSidecar::Replace
+    );
+    // Replacing it is declined, so the caller stops and relaunches it.
+    assert_eq!(
+        live_sidecar_decision(7, Some(7), unrecorded()).unwrap(),
+        LiveSidecar::Keep
+    );
+    // Without a replacement request it is still refused, never adopted.
+    assert_eq!(
+        live_sidecar_decision(7, None, unrecorded())
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        live_sidecar_decision(7, Some(8), unrecorded())
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        live_sidecar_decision(7, Some(8), Ok(())).unwrap(),
+        LiveSidecar::Keep
+    );
+}

@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = []
-host-runtime = ["dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zeroize", "dep:pplx-space-transparent-proxy-socket", "dep:pplx-space-metrics-emit", "dep:pplx-space-uds-peer-auth"]
+host-runtime = ["dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zeroize", "dep:pplx-space-transparent-proxy-socket", "dep:pplx-space-metrics-emit", "dep:pplx-space-uds-peer-auth", "dep:socket2"]
 # The node's root-owned store of runtime releases and guest kernels, which
 # node-manager publishes into.
 artifact-store = ["dep:rustix", "rustix/fs"]
@@ -26,6 +26,7 @@ libc = { workspace = true }
 rustix = { workspace = true, features = ["process", "thread"], optional = true }
 nix = { workspace = true, features = ["fs", "sched", "process", "resource", "signal", "user", "poll"], optional = true }
 serde = { workspace = true, features = ["derive"] }
+socket2 = { workspace = true, features = ["all"], optional = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "http1"] }

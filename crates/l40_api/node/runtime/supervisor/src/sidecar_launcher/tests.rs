@@ -116,3 +116,22 @@ async fn contained_launch_requires_actual_runtime_identity_and_confirmed_exec() 
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn only_the_prepared_child_inherits_its_descriptors() {
+    let file = std::fs::File::open("/dev/null").expect("open test descriptor");
+    let fd = file.as_raw_fd();
+    let holds = |command: &mut Command| {
+        command
+            .arg("-c")
+            .arg(format!("test -e /proc/self/fd/{fd}"))
+            .status()
+            .expect("run test child")
+            .success()
+    };
+    let mut inheriting = launcher_command("/bin/sh");
+    inherit_descriptors(&mut inheriting, vec![fd]);
+    assert!(holds(&mut inheriting));
+    assert!(!holds(&mut launcher_command("/bin/sh")));
+}

@@ -684,6 +684,7 @@ impl NodeManagerService {
                     transparent: true,
                     recvorigdstaddr: false,
                     fd_arg: "--tcp-fd".to_string(),
+                    inherited_fd: None,
                 },
                 launch::PreExecSocket {
                     bind_addr: format!("0.0.0.0:{}", crate::firewall::NETGTW_UDP_PORT)
@@ -698,6 +699,7 @@ impl NodeManagerService {
                     transparent: true,
                     recvorigdstaddr: true,
                     fd_arg: "--udp-fd".to_string(),
+                    inherited_fd: None,
                 },
             ]
         } else {
@@ -732,6 +734,7 @@ impl NodeManagerService {
                     )
                     .collect(),
                 grant_cap_net_admin: grant_cap,
+                replace_pid: None,
             })
             .await
             .map_err(|error| {

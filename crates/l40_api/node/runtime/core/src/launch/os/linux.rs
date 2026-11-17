@@ -149,6 +149,114 @@ impl ProcessHandle {
     }
 }
 
+impl ProcessHandle {
+    /// Duplicate the listening socket `expected` describes from the pinned
+    /// process, if it holds one in `network_namespace`.
+    ///
+    /// The duplicate is the same kernel socket, not a copy: datagrams and
+    /// connections queued on it, or arriving after the process stops reading
+    /// or exits, wait for whoever holds it next. Requires ptrace access to the
+    /// process and `CAP_NET_ADMIN` over the socket's network namespace.
+    pub fn duplicate_listening_socket(
+        &self,
+        expected: &PreExecSocket,
+        network_namespace: &std::fs::File,
+    ) -> std::io::Result<Option<OwnedFd>> {
+        let namespace = file_identity(network_namespace)?;
+        for entry in std::fs::read_dir(format!("/proc/{}/fd", self.pid))? {
+            let entry = entry?;
+            let Some(target) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if !std::fs::read_link(entry.path())
+                .is_ok_and(|link| link.as_os_str().as_encoded_bytes().starts_with(b"socket:"))
+            {
+                continue;
+            }
+            // The pidfd, not the listed pid, names the process: if the pid now
+            // belongs to another process this fails instead of reading it.
+            let socket = match rustix::process::pidfd_getfd(
+                &self.pidfd,
+                target,
+                rustix::process::PidfdGetfdFlags::empty(),
+            ) {
+                Ok(socket) => socket,
+                // Closed between listing and duplication.
+                Err(rustix::io::Errno::BADF) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if listening_socket_matches(&socket, expected, namespace)? {
+                return Ok(Some(socket));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Fail unless `namespace` is a network namespace, the kind a sidecar launch
+/// joins with `setns(CLONE_NEWNET)`.
+pub fn require_network_namespace(namespace: &std::fs::File) -> std::io::Result<()> {
+    // SAFETY: NS_GET_NSTYPE reads no argument and returns the namespace type.
+    let kind = unsafe { libc::ioctl(namespace.as_raw_fd(), libc::NS_GET_NSTYPE) };
+    if kind < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if kind != libc::CLONE_NEWNET {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a network namespace",
+        ));
+    }
+    Ok(())
+}
+
+fn listening_socket_matches(
+    socket: &OwnedFd,
+    expected: &PreExecSocket,
+    network_namespace: (u64, u64),
+) -> std::io::Result<bool> {
+    let reference = socket2::SockRef::from(socket);
+    let (kind, protocol) = if expected.tcp {
+        (socket2::Type::STREAM, socket2::Protocol::TCP)
+    } else {
+        (socket2::Type::DGRAM, socket2::Protocol::UDP)
+    };
+    if reference.domain()? != socket2::Domain::for_address(expected.bind_addr)
+        || reference.r#type()? != kind
+        || reference.protocol()? != Some(protocol)
+        || reference.local_addr()?.as_socket() != Some(expected.bind_addr)
+        || (expected.tcp && !reference.is_listener()?)
+        || (expected.transparent && !reference.ip_transparent_v4()?)
+    {
+        return Ok(false);
+    }
+    Ok(socket_network_namespace(socket)? == network_namespace)
+}
+
+fn socket_network_namespace(socket: &OwnedFd) -> std::io::Result<(u64, u64)> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: SIOCGSKNS reads no argument and returns a new close-on-exec
+    // descriptor for the socket's network namespace, owned below.
+    let namespace = unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGSKNS as _) };
+    if namespace < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `namespace` is a descriptor this call just received and nothing
+    // else owns.
+    let namespace = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(namespace) });
+    file_identity(&namespace)
+}
+
+fn file_identity(file: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
 pub(super) fn pin_current_process() -> Result<ProcessHandle, ProcessHandleError> {
     let pid = nix::unistd::getpid().as_raw();
     open_process_handle(pid.cast_unsigned(), pid)
@@ -264,6 +372,12 @@ pub struct PreExecSocket {
     pub recvorigdstaddr: bool,
     /// CLI arg name to pass the FD number (e.g., "--tcp-fd")
     pub fd_arg: String,
+    /// An already-bound socket the launcher inherited for this entry, used
+    /// instead of binding a fresh one. A replacement takes over its
+    /// predecessor's socket this way, so what is queued on it while neither
+    /// process reads it is delivered rather than dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_fd: Option<i32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -342,6 +456,7 @@ pub fn prepare_sidecar_launch(
     use nix::unistd::{Gid, Uid};
     use std::ffi::CString;
 
+    super::validate_sidecar_launch_strings(&program, &args, &env)?;
     let ns_file = std::fs::File::open(&ns_path)
         .map_err(|e| format!("failed to open namespace {ns_path}: {e}"))?;
     let c_program =
@@ -350,9 +465,6 @@ pub fn prepare_sidecar_launch(
     let c_env: Vec<(CString, CString)> = env
         .into_iter()
         .map(|(key, value)| {
-            if key.is_empty() || key.contains('=') {
-                return Err("invalid env key: must be nonempty and contain no '='".into());
-            }
             Ok((
                 CString::new(key).map_err(|e| format!("invalid env key: {e}"))?,
                 CString::new(value).map_err(|e| format!("invalid env value: {e}"))?,
@@ -367,7 +479,7 @@ pub fn prepare_sidecar_launch(
     crate::cgroup::join_cgroup(&cgroup_path)?;
 
     for sock_cfg in &pre_exec_sockets {
-        let fd = create_pre_exec_socket(sock_cfg)
+        let fd = pre_exec_socket_fd(sock_cfg)
             .map_err(|e| format!("sidecar socket creation failed: {e}"))?;
         full_args.push(sock_cfg.fd_arg.clone());
         full_args.push(fd.to_string());
@@ -474,6 +586,31 @@ fn grant_ambient_cap_net_admin() -> Result<(), String> {
             .map_err(|error| format!("raise ambient capability {cap:?}: {error}"))?;
     }
     Ok(())
+}
+
+/// The descriptor the sidecar receives for `cfg`: its inherited socket when
+/// it has one, otherwise a freshly bound one.
+/// Called in the child process after setns() but before setuid().
+fn pre_exec_socket_fd(cfg: &PreExecSocket) -> Result<i32, String> {
+    match cfg.inherited_fd {
+        Some(fd) => adopt_inherited_socket(fd, cfg),
+        None => create_pre_exec_socket(cfg),
+    }
+}
+
+/// Keep a socket the supervisor passed for `cfg`, reapplying its options.
+fn adopt_inherited_socket(fd: i32, cfg: &PreExecSocket) -> Result<i32, String> {
+    if fd < 0 {
+        return Err(format!("invalid inherited socket fd {fd}"));
+    }
+    // SAFETY: the supervisor passes this launcher the descriptor for this
+    // entry alone, and it stays open until the sidecar's exec. Borrowing it
+    // takes no ownership.
+    let socket = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    fcntl(socket, FcntlArg::F_GETFD)
+        .map_err(|error| format!("inherited socket fd {fd} is not open: {error}"))?;
+    configure_pre_exec_socket(&socket, cfg)?;
+    Ok(fd)
 }
 
 /// Create a socket with the specified options. Returns the raw FD.
