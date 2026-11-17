@@ -6,7 +6,7 @@ FROM ${SPACE_RUST_BUILD_IMAGE} AS rust-build
 # either failed the build or, piped into sh, left the stage without uv. An image
 # is a registry pull like the bases, which the Kind bring-up retries
 # (infra/space/kind/scripts/pull-base-images.sh).
-FROM ghcr.io/astral-sh/uv:0.9.9@sha256:f6e3549ed287fee0ddde2460a2a74a2d74366f84b04aaa34c1f19fec40da8652 AS uv
+FROM ghcr.io/astral-sh/uv:0.9.9@sha256:8d18be5445134779b8527749513e336ede5646cb880a9d9f492f362f3f1c6b6a AS uv
 
 # The smoke suites' Python environment, resolved once here so the in-cluster
 # smoke Job needs no package index at run time — a post-deploy gate must not be
