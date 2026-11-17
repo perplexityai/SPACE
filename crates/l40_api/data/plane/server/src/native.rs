@@ -1235,12 +1235,16 @@ async fn record_process_exit(
         let Err(status) = result else {
             return;
         };
+        // The record is idempotent, so a refusal that may be temporary is
+        // worth repeating: the cluster API answers Internal when its database
+        // write fails.
         let retryable = matches!(
             status.code(),
             tonic::Code::Unavailable
                 | tonic::Code::DeadlineExceeded
                 | tonic::Code::ResourceExhausted
                 | tonic::Code::Aborted
+                | tonic::Code::Internal
         );
         if !retryable || attempt == PROCESS_EXIT_RECORD_ATTEMPTS {
             tracing::warn!(

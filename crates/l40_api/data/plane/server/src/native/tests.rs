@@ -804,9 +804,10 @@ async fn an_unanswered_exit_record_does_not_hold_back_the_exit() {
     );
 }
 
-/// An exit record the cluster API could not take for now is sent again
-/// after the stream has reported the exit, so the session still closes
-/// although no client reattaches.
+/// An exit record the cluster API could not take for now, because it was
+/// unavailable or its database write failed, is sent again after the stream
+/// has reported the exit, so the session still closes although no client
+/// reattaches.
 #[tokio::test]
 async fn an_exit_record_the_cluster_api_refused_for_now_is_retried() {
     if !binding_fake_test_process() {
@@ -819,7 +820,7 @@ async fn an_exit_record_the_cluster_api_refused_for_now_is_retried() {
         Arc::new(|_, open| journal_replay(&JOURNAL, open)),
     )
     .await;
-    fake.exit_record_refusals.store(1, Ordering::SeqCst);
+    fake.exit_record_refusals.store(2, Ordering::SeqCst);
     let mut state = fake_state(&fake.endpoint).await;
     state.process_exit_record_retry_delay = Duration::from_millis(10);
     let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
@@ -828,7 +829,7 @@ async fn an_exit_record_the_cluster_api_refused_for_now_is_retried() {
     let mut seen = String::new();
     read_until(&mut chunks, &mut seen, "process_exited").await;
     tokio::time::timeout(Duration::from_secs(5), async {
-        while fake.exited_process_ids.lock().unwrap().len() < 2 {
+        while fake.exited_process_ids.lock().unwrap().len() < 3 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -842,7 +843,7 @@ async fn an_exit_record_the_cluster_api_refused_for_now_is_retried() {
     assert_eq!(fake.exit_record_refusals.load(Ordering::SeqCst), 0);
     assert_eq!(
         *fake.exited_process_ids.lock().unwrap(),
-        [process_id.clone(), process_id]
+        [process_id.clone(), process_id.clone(), process_id]
     );
 }
 
@@ -2572,7 +2573,9 @@ struct ProcessFake {
     exited_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
     /// Set to take exit records without ever answering them.
     exit_records_unanswered: Arc<AtomicBool>,
-    /// How many exit records still to refuse as unavailable before taking one.
+    /// How many exit records still to refuse before taking one: the last
+    /// refusal answers Internal, as a failed database write does, and any
+    /// before it Unavailable.
     exit_record_refusals: Arc<AtomicUsize>,
     calls: Arc<std::sync::Mutex<Vec<String>>>,
     started_stdin: Arc<std::sync::Mutex<Vec<bool>>>,
@@ -2723,9 +2726,15 @@ async fn spawn_process_fake(
                     std::future::pending::<()>().await;
                 }
                 // A stream sends its records one at a time.
-                if exit_record_refusals.load(Ordering::SeqCst) > 0 {
+                let left = exit_record_refusals.load(Ordering::SeqCst);
+                if left > 0 {
                     exit_record_refusals.fetch_sub(1, Ordering::SeqCst);
-                    return tonic::Status::unavailable("cluster API restarting").into_http();
+                    let refusal = if left == 1 {
+                        tonic::Status::internal("database write failed")
+                    } else {
+                        tonic::Status::unavailable("cluster API restarting")
+                    };
+                    return refusal.into_http();
                 }
                 return crate::tests::grpc_test_response(Vec::new());
             }
