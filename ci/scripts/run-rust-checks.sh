@@ -332,13 +332,11 @@ run_sbxmgr_production_checks() {
         sbxmgr_assert_direct_dependents pplx-space-sqlite "${sbxmgr_feature_args[@]}" -- \
             pplx-space-sbx-mgr-store
         # rusqlite enters only through the store, the helpers it depends on,
-        # and four shared crates whose rusqlite use hands no connection out:
-        # common-jobs' functions take a connection in, and common-core,
-        # accounts and job-id only implement rusqlite's value conversion
-        # traits for their types.
+        # and two shared crates whose rusqlite use hands no connection out:
+        # common-jobs' functions take a connection in, and job-id only
+        # implements rusqlite's value conversion traits for its type.
         sbxmgr_assert_direct_dependents rusqlite "${sbxmgr_feature_args[@]}" -- \
-            pplx-space-sbx-mgr-store pplx-space-sqlite pplx-space-common-jobs pplx-space-common-core \
-            pplx-space-accounts pplx-space-job-id
+            pplx-space-sbx-mgr-store pplx-space-sqlite pplx-space-common-jobs pplx-space-job-id
     done
 }
 
@@ -403,18 +401,18 @@ run_clippy_checks() {
     # --all-features builds and this loop compile its Postgres impls, and only
     # this loop compiles them without serde and rusqlite.
     echo "--- :rust: Running account and job identity clippy with each feature alone"
-    local identity_crate identity_feature
-    for identity_crate in pplx-space-accounts pplx-space-job-id; do
-        for identity_feature in serde sqlx rusqlite; do
-            CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-                --locked \
-                -p "${identity_crate}" \
-                --no-default-features \
-                --features "${identity_feature}" \
-                --all-targets \
-                -- \
-                -D warnings
-        done
+    local identity_build
+    for identity_build in \
+        pplx-space-accounts/serde pplx-space-accounts/sqlx \
+        pplx-space-job-id/serde pplx-space-job-id/sqlx pplx-space-job-id/rusqlite; do
+        CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+            --locked \
+            -p "${identity_build%/*}" \
+            --no-default-features \
+            --features "${identity_build#*/}" \
+            --all-targets \
+            -- \
+            -D warnings
     done
 
     # The libraries that reach common-core at most directly, and those its

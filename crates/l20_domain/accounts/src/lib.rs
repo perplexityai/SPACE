@@ -11,8 +11,6 @@
 
 pub mod auth;
 pub mod federated_identity;
-#[cfg(feature = "rusqlite")]
-mod sqlite;
 
 pub use auth::*;
 pub use federated_identity::*;

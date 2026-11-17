@@ -37,7 +37,6 @@ pplx-space-pii = { workspace = true }
 pplx-space-rpc-contracts = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
-rusqlite = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
@@ -81,7 +80,6 @@ sqlx = [
     "pplx-space-k8s-ids/sqlx",
     "pplx-space-accounts/sqlx",
 ]
-rusqlite = ["dep:rusqlite", "pplx-space-accounts/rusqlite"]
 # Compiles in the test-only environment overrides (see `env::test_hook`). Only
 # kind and smoke images and test builds enable it; release binaries cannot read
 # these variables, so they are not part of the public configuration surface.
