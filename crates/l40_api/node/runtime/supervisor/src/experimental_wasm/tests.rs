@@ -63,6 +63,49 @@ fn lifecycle_round_trip_does_not_require_kvm_or_launch_a_process() {
         "operation":"download", "sandbox_id":id, "path":"/tmp/answer.txt"
     }));
     assert_eq!(downloaded["content"], "5050\n");
+    request(serde_json::json!({
+        "operation":"upload_binary", "sandbox_id":id, "path":"/workspace/input.xlsx",
+        "content_base64":"AP+AUEs="
+    }));
+    for (content_base64, oversized) in [
+        ("%%%".to_owned(), false),
+        (BASE64.encode(vec![0; MAX_BINARY_BYTES as usize + 1]), true),
+    ] {
+        let error = run_request(
+            WasmConfig {
+                root: root.path().to_path_buf(),
+                tools: tools.path().to_path_buf(),
+                module: tools.path().join("module.wasm"),
+                preopens: BTreeMap::new(),
+            },
+            serde_json::to_vec(&serde_json::json!({
+                "operation":"upload_binary", "sandbox_id":id, "path":"/workspace/input.xlsx",
+                "content_base64":content_base64
+            }))
+            .expect("request")
+            .as_slice(),
+            Vec::new(),
+        )
+        .expect_err("invalid upload");
+        assert!(
+            matches!(
+                (error, oversized),
+                (WasmRequestError::Base64(_), false)
+                    | (
+                        WasmRequestError::Invalid("binary upload exceeds 500 KiB"),
+                        true
+                    )
+            ),
+            "invalid binary data must be rejected before publishing"
+        );
+    }
+    assert_eq!(
+        request(serde_json::json!({
+            "operation":"download_binary", "sandbox_id":id, "path":"/workspace/input.xlsx"
+        }))["content_base64"],
+        "AP+AUEs=",
+        "binary inputs must preserve non-UTF-8 bytes"
+    );
     request(serde_json::json!({"operation":"stop", "sandbox_id":id}));
     assert_eq!(
         request(serde_json::json!({"operation":"inspect", "sandbox_id":id}))["state"],

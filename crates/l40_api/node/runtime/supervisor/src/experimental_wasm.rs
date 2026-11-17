@@ -15,6 +15,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use pplx_space_common_core::types::SandboxLifecycle;
@@ -24,6 +26,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const MAX_BYTES: u64 = 1_048_576;
+// Leave room for base64 and response metadata inside the 1 MiB wire budget.
+const MAX_BINARY_BYTES: u64 = 512_000;
 
 #[derive(Debug, Error)]
 pub enum WasmRequestError {
@@ -31,6 +35,8 @@ pub enum WasmRequestError {
     Io(#[from] std::io::Error),
     #[error("invalid Wasm runtime request: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid base64 file payload: {0}")]
+    Base64(#[from] base64::DecodeError),
     #[error("Wasm request rejected: {0}")]
     Invalid(&'static str),
     #[error("Wasm runtime is busy or could not be locked: {0}")]
@@ -86,6 +92,15 @@ enum Request {
         sandbox_id: Uuid,
         path: String,
     },
+    UploadBinary {
+        sandbox_id: Uuid,
+        path: String,
+        content_base64: String,
+    },
+    DownloadBinary {
+        sandbox_id: Uuid,
+        path: String,
+    },
     Delete {
         sandbox_id: Uuid,
     },
@@ -99,6 +114,8 @@ struct Response {
     execution: Option<Execution>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     capabilities: Option<RuntimeCapabilities>,
     #[serde(
@@ -167,6 +184,7 @@ pub fn run_request(
         sandbox_id: Uuid::nil(),
         execution: None,
         content: None,
+        content_base64: None,
         capabilities: None,
         state: None,
     };
@@ -270,14 +288,32 @@ pub fn run_request(
             content,
         } => {
             let dir = sandbox_dir(&root, sandbox_id)?;
-            let host_path = guest_path(&dir, &path)?;
-            let parent = host_path
-                .parent()
-                .ok_or(WasmRequestError::Invalid("missing parent"))?;
-            fs::create_dir_all(parent)?;
-            // Recheck after directory creation. The global lock excludes another
-            // runtime request; no guest process survives execute().
-            fs::write(guest_path(&dir, &path)?, content)?;
+            upload_bytes(&dir, &path, content.as_bytes())?;
+            response.sandbox_id = sandbox_id;
+        }
+        Request::UploadBinary {
+            sandbox_id,
+            path,
+            content_base64,
+        } => {
+            let dir = sandbox_dir(&root, sandbox_id)?;
+            let bytes = BASE64.decode(content_base64)?;
+            if bytes.len() as u64 > MAX_BINARY_BYTES {
+                return Err(WasmRequestError::Invalid("binary upload exceeds 500 KiB"));
+            }
+            upload_bytes(&dir, &path, &bytes)?;
+            response.sandbox_id = sandbox_id;
+        }
+        Request::DownloadBinary { sandbox_id, path } => {
+            let dir = sandbox_dir(&root, sandbox_id)?;
+            let mut bytes = Vec::new();
+            File::open(guest_path(&dir, &path)?)?
+                .take(MAX_BINARY_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_BINARY_BYTES {
+                return Err(WasmRequestError::Invalid("binary download exceeds 500 KiB"));
+            }
+            response.content_base64 = Some(BASE64.encode(bytes));
             response.sandbox_id = sandbox_id;
         }
         Request::Download { sandbox_id, path } => {
@@ -304,6 +340,21 @@ pub fn run_request(
     }
     serde_json::to_writer(&mut output, &response)?;
     output.write_all(b"\n")?;
+    Ok(())
+}
+
+fn upload_bytes(dir: &Path, path: &str, bytes: &[u8]) -> Result<(), WasmRequestError> {
+    let host_path = guest_path(dir, path)?;
+    let parent = host_path
+        .parent()
+        .ok_or(WasmRequestError::Invalid("missing parent"))?;
+    fs::create_dir_all(parent)?;
+    // Recheck under the root lock and publish only complete files. No guest
+    // process survives execute(), so none can replace the checked ancestors.
+    let target = guest_path(dir, path)?;
+    let mut pending = tempfile::NamedTempFile::new_in(parent)?;
+    pending.write_all(bytes)?;
+    pending.persist(target).map_err(|error| error.error)?;
     Ok(())
 }
 

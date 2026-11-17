@@ -12,13 +12,14 @@ workspace = true
 
 [features]
 default = []
-experimental-wasm = ["dep:uuid", "pplx-space-execution-spec/serde"]
+experimental-wasm = ["dep:uuid", "dep:base64", "pplx-space-execution-spec/serde"]
 otel = ["pplx-space-service-host/otel"]
 datadog = ["otel", "pplx-space-service-host/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 
 [dependencies]
+base64 = { workspace = true, optional = true }
 dashmap = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "sched", "mount", "resource"] }
