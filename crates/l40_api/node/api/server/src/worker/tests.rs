@@ -196,13 +196,21 @@ async fn answering_sandbox_manager(
 }
 
 /// A sandbox-manager that opens every response stream and never sends on it,
-/// as an idle file watch or a long-running process does.
+/// as an idle file watch or a long-running process does. A file read sends
+/// one empty message first: node-api holds a read's open until its first item.
 async fn silent_stream_sandbox_manager() -> crate::clients::BackendClients {
-    let backend = axum::Router::new().fallback(|| async {
+    let backend = axum::Router::new().fallback(|uri: http::Uri| async move {
+        // An empty message: uncompressed, zero length.
+        let first = uri
+            .path()
+            .ends_with("/SpacedRead")
+            .then(|| Ok(bytes::Bytes::from_static(&[0, 0, 0, 0, 0])));
         http::Response::builder()
             .header("content-type", "application/grpc")
             .body(axum::body::Body::from_stream(
-                futures_util::stream::pending::<Result<bytes::Bytes, std::io::Error>>(),
+                futures_util::stream::iter(first).chain(futures_util::stream::pending::<
+                    Result<bytes::Bytes, std::io::Error>,
+                >()),
             ))
             .unwrap()
     });
@@ -282,6 +290,10 @@ async fn open_ended_streams_end_with_the_drain_status_once_drained() {
         .await
         .unwrap()
         .into_inner();
+    read.next()
+        .await
+        .expect("SpacedRead delivers its first message")
+        .expect("the first message is not an error");
     assert_open("SpacedWatch", &mut watch).await;
     assert_open("SpacedStartProcess", &mut start).await;
     assert_open("SpacedConnectProcess", &mut connect).await;
@@ -571,4 +583,225 @@ async fn guest_reads_interrupted_by_a_handoff_are_answered_by_the_successor() {
         );
     }
     assert_eq!(successor_calls.load(Ordering::SeqCst), 4);
+}
+
+/// A sandbox-manager whose streams send `items` empty messages and then end
+/// with `code` and `message`, as its handoff ends a stream it already
+/// answered.
+async fn streaming_sandbox_manager(
+    items: usize,
+    code: tonic::Code,
+    message: &'static str,
+) -> tonic::transport::Channel {
+    struct Frames(std::collections::VecDeque<http_body::Frame<bytes::Bytes>>);
+    impl http_body::Body for Frames {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Ready(self.get_mut().0.pop_front().map(Ok))
+        }
+    }
+    let backend = axum::Router::new().fallback(move || async move {
+        // An empty message: no compression, zero length.
+        let mut frames: std::collections::VecDeque<_> = (0..items)
+            .map(|_| http_body::Frame::data(bytes::Bytes::from_static(&[0; 5])))
+            .collect();
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", (code as i32).to_string().parse().unwrap());
+        trailers.insert("grpc-message", message.parse().unwrap());
+        frames.push_back(http_body::Frame::trailers(trailers));
+        http::Response::builder()
+            .header("content-type", "application/grpc")
+            .body(axum::body::Body::new(Frames(frames)))
+            .unwrap()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    tonic::transport::Endpoint::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap()
+}
+
+/// Sandbox-manager ends the streams it is serving when it hands its socket to
+/// the successor, after it already sent their response headers. A listing or
+/// a file read that has delivered nothing yet is replayed on the successor.
+/// Streams whose first item may take long, or that have side effects, are not.
+#[tokio::test]
+async fn guest_read_streams_interrupted_before_their_first_item_reach_the_successor() {
+    const INTERRUPTED: &str = "sandbox-manager handoff interrupted an in-flight RPC";
+    let predecessor = streaming_sandbox_manager(0, tonic::Code::Unavailable, INTERRUPTED).await;
+    let (successor, successor_calls) =
+        answering_sandbox_manager(tonic::Code::NotFound, "answered by the successor").await;
+    let mut service =
+        service_with_limiter(UdsPerSandboxLimiter::for_tests_with_reserved(8, 8, 64)).await;
+    service.clients =
+        crate::clients::BackendClients::with_channel(predecessor).with_sbx_successor(successor);
+    let sandbox_id = || SandboxId::new().to_string();
+
+    let list = service
+        .spaced_list(Request::new(proto::SpacedListRequest {
+            sandbox_id: sandbox_id(),
+            ..Default::default()
+        }))
+        .await;
+    let read = service
+        .spaced_read(Request::new(proto::SpacedReadRequest {
+            sandbox_id: sandbox_id(),
+            ..Default::default()
+        }))
+        .await;
+    for (method, status) in [
+        ("SpacedList", list.map(drop).unwrap_err()),
+        ("SpacedRead", read.map(drop).unwrap_err()),
+    ] {
+        assert_eq!(
+            (status.code(), status.message()),
+            (tonic::Code::NotFound, "answered by the successor"),
+            "{method} was not replayed on the successor"
+        );
+    }
+    assert_eq!(successor_calls.load(Ordering::SeqCst), 2);
+
+    let watch = service
+        .spaced_watch(Request::new(proto::SpacedWatchRequest {
+            sandbox_id: sandbox_id(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .next()
+        .await;
+    let connect = service
+        .spaced_connect_process(Request::new(proto::SpacedConnectProcessRequest {
+            sandbox_id: sandbox_id(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .next()
+        .await;
+    let start = service
+        .spaced_start_process(Request::new(proto::SpacedStartProcessRequest {
+            sandbox_id: sandbox_id(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .next()
+        .await;
+    for (method, first) in [
+        ("SpacedWatch", watch.map(|item| item.map(drop))),
+        ("SpacedConnectProcess", connect.map(|item| item.map(drop))),
+        ("SpacedStartProcess", start.map(|item| item.map(drop))),
+    ] {
+        let status = first.unwrap().unwrap_err();
+        assert_eq!(
+            (status.code(), status.message()),
+            (tonic::Code::Unavailable, INTERRUPTED),
+            "{method} must surface the interruption unchanged"
+        );
+    }
+    assert_eq!(successor_calls.load(Ordering::SeqCst), 2);
+}
+
+/// The guest read streams `rpc` names, on `service`, as streams of unit items.
+async fn open_guest_read_stream(
+    service: &WorkerApiService,
+    rpc: &str,
+) -> Result<PinnedResponseStream<()>, Status> {
+    let sandbox_id = SandboxId::new().to_string();
+    Ok(match rpc {
+        "SpacedList" => pin_stream(
+            service
+                .spaced_list(Request::new(proto::SpacedListRequest {
+                    sandbox_id,
+                    ..Default::default()
+                }))
+                .await?
+                .into_inner()
+                .map(|item| item.map(drop)),
+        ),
+        "SpacedRead" => pin_stream(
+            service
+                .spaced_read(Request::new(proto::SpacedReadRequest {
+                    sandbox_id,
+                    ..Default::default()
+                }))
+                .await?
+                .into_inner()
+                .map(|item| item.map(drop)),
+        ),
+        _ => unreachable!("not a guest read stream: {rpc}"),
+    })
+}
+
+/// A guest read stream whose predecessor sends `items` items and then ends
+/// with `code`, behind a successor that answers every call `NotFound`.
+async fn guest_read_stream_service(
+    items: usize,
+    code: tonic::Code,
+    message: &'static str,
+) -> (WorkerApiService, Arc<AtomicUsize>) {
+    let predecessor = streaming_sandbox_manager(items, code, message).await;
+    let (successor, successor_calls) =
+        answering_sandbox_manager(tonic::Code::NotFound, "answered by the successor").await;
+    let mut service =
+        service_with_limiter(UdsPerSandboxLimiter::for_tests_with_reserved(8, 8, 64)).await;
+    service.clients =
+        crate::clients::BackendClients::with_channel(predecessor).with_sbx_successor(successor);
+    (service, successor_calls)
+}
+
+/// Once a listing or a file read delivered an item, the successor would
+/// deliver it again, so an interruption after it reaches the caller unchanged.
+#[tokio::test]
+async fn a_guest_read_stream_that_delivered_an_item_is_never_replayed() {
+    const INTERRUPTED: &str = "sandbox-manager handoff interrupted an in-flight RPC";
+    for rpc in ["SpacedList", "SpacedRead"] {
+        let (service, successor_calls) =
+            guest_read_stream_service(1, tonic::Code::Unavailable, INTERRUPTED).await;
+
+        let mut items = open_guest_read_stream(&service, rpc).await.unwrap();
+        items.next().await.unwrap().unwrap();
+        let status = items.next().await.unwrap().unwrap_err();
+        assert_eq!(
+            (status.code(), status.message()),
+            (tonic::Code::Unavailable, INTERRUPTED),
+            "{rpc}"
+        );
+        assert!(items.next().await.is_none(), "{rpc}");
+        assert_eq!(successor_calls.load(Ordering::SeqCst), 0, "{rpc}");
+    }
+}
+
+/// A first item the read probe would not replay reaches the caller as the
+/// stream's first item, and a stream that ends with no items stays empty.
+#[tokio::test]
+async fn guest_read_streams_pass_through_first_items_that_are_not_replayed() {
+    for rpc in ["SpacedList", "SpacedRead"] {
+        let (service, successor_calls) =
+            guest_read_stream_service(0, tonic::Code::NotFound, "no such file").await;
+        let mut items = open_guest_read_stream(&service, rpc).await.unwrap();
+        let status = items.next().await.unwrap().unwrap_err();
+        assert_eq!(
+            (status.code(), status.message()),
+            (tonic::Code::NotFound, "no such file"),
+            "{rpc}"
+        );
+        assert_eq!(successor_calls.load(Ordering::SeqCst), 0, "{rpc}");
+
+        let (service, successor_calls) = guest_read_stream_service(0, tonic::Code::Ok, "").await;
+        let mut items = open_guest_read_stream(&service, rpc).await.unwrap();
+        assert!(items.next().await.is_none(), "{rpc} is not empty");
+        assert_eq!(successor_calls.load(Ordering::SeqCst), 0, "{rpc}");
+    }
 }

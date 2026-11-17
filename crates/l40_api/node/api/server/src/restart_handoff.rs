@@ -11,7 +11,10 @@
 //! [`RESTART_RETRY_ON_SUCCESSOR_METADATA`]: pplx_space_sbx_mgr_client::RESTART_RETRY_ON_SUCCESSOR_METADATA
 
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
+
+use futures_util::{Stream, StreamExt};
 
 use pplx_space_common_grpc::{GrpcRetryContext, GrpcRetryPolicy};
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
@@ -462,6 +465,35 @@ where
     };
     log_restart_handoff_outcome(method, outcome, attempts, started_at);
     Err(last_status)
+}
+
+/// A response stream whose first item has been read.
+pub(crate) type HeldStream<Item> = Pin<Box<dyn Stream<Item = Result<Item, Status>> + Send>>;
+
+/// Read a stream's first item before handing the stream on. If that item is
+/// an error `safety` would replay (sandbox-manager's handoff interruption is
+/// the intended case), the attempt fails and the handoff loop may replay it;
+/// such an error that outlasts the replay becomes the call's status. Any other
+/// first item is delivered unchanged, and nothing after the first item is
+/// replayed.
+pub(crate) async fn hold_first_item<Item, S>(
+    safety: RpcReplaySafety,
+    response: Response<S>,
+) -> Result<Response<HeldStream<Item>>, Status>
+where
+    Item: Send + 'static,
+    S: Stream<Item = Result<Item, Status>> + Send + 'static,
+{
+    let (metadata, stream, extensions) = response.into_parts();
+    let mut stream = Box::pin(stream);
+    let first = match stream.next().await {
+        Some(Err(status)) if safety.classify(&status) != ReplayClass::Fatal => {
+            return Err(status);
+        }
+        first => first,
+    };
+    let held: HeldStream<Item> = Box::pin(futures_util::stream::iter(first).chain(stream));
+    Ok(Response::from_parts(metadata, held, extensions))
 }
 
 async fn run_until_deadline<T>(

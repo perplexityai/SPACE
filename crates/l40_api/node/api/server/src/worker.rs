@@ -329,6 +329,41 @@ impl WorkerApiService {
             .await?;
         Ok(response.map(|stream| end_stream_on_drain(stream, drain)))
     }
+
+    /// A guest read stream, replayed across a handoff until it delivers its
+    /// first item and never after.
+    async fn limited_sbx_read_stream<Req, Item, S, F, Fut>(
+        &self,
+        method: &'static str,
+        request: Request<Req>,
+        call: F,
+    ) -> Result<Response<PinnedResponseStream<Item>>, Status>
+    where
+        Req: SandboxScopedRequest + Clone + Send + Sync + 'static,
+        Item: Send + 'static,
+        S: Stream<Item = Result<Item, Status>> + Send + 'static,
+        F: Fn(pplx_space_sbx_mgr_client::SandboxManagerGrpcClient, Request<Req>) -> Fut
+            + Send
+            + Sync,
+        Fut: Future<Output = Result<Response<S>, Status>> + Send,
+    {
+        let sandbox_id = request.get_ref().sandbox_id().to_owned();
+        record_sandbox_id(&tracing::Span::current(), &sandbox_id);
+        let permit = self.acquire_sbx_permit(method, &sandbox_id).await?;
+        let call = &call;
+        let response = crate::restart_handoff::call_with_restart_handoff(
+            method,
+            RpcReplaySafety::ReadOnly,
+            request,
+            &self.clients,
+            |client, request| async move {
+                let response = call(client, request).await?;
+                crate::restart_handoff::hold_first_item(RpcReplaySafety::ReadOnly, response).await
+            },
+        )
+        .await?;
+        Ok(response.map(|stream| guard_stream(stream, permit)))
+    }
 }
 
 type PinnedResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -589,19 +624,24 @@ macro_rules! fwd_sbx_read {
     };
 }
 
-// Forward in the caller's task: a caller that disconnects then drops the
-// sandbox-manager call, which is how an abandoned process start is cancelled.
-// Spawning the forward into an owned task would break that chain.
-macro_rules! fwd_sbx_stream {
+// Guest read streams that answer at once: a directory listing and a file
+// read. They are replayed like guest reads while they have delivered nothing,
+// so a handoff that ends one before its first item reaches the successor.
+// Never use this for a stream whose first item may take long to arrive, such
+// as a watch or a process's output: the caller would see nothing until then.
+macro_rules! fwd_sbx_read_stream {
     ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
         $service
-            .limited_sbx_server_stream($method, $req, |mut client, request| async move {
+            .limited_sbx_read_stream($method, $req, |mut client, request| async move {
                 client.$rpc(request).await
             })
             .await
     };
 }
 
+// Forward in the caller's task: a caller that disconnects then drops the
+// sandbox-manager call, which is how an abandoned process start is cancelled.
+// Spawning the forward into an owned task would break that chain.
 macro_rules! fwd_sbx_open_stream {
     ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
         $service
@@ -900,14 +940,14 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedListRequest>,
     ) -> Result<Response<Self::SpacedListStream>, Status> {
-        fwd_sbx_stream!(self, "SpacedList", spaced_list, r)
+        fwd_sbx_read_stream!(self, "SpacedList", spaced_list, r)
     }
 
     async fn spaced_read(
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedReadRequest>,
     ) -> Result<Response<Self::SpacedReadStream>, Status> {
-        fwd_sbx_stream!(self, "SpacedRead", spaced_read, r)
+        fwd_sbx_read_stream!(self, "SpacedRead", spaced_read, r)
     }
 
     // Client-streaming: the request body is consumed as it streams and
