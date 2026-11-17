@@ -53,16 +53,24 @@ impl From<JsonRejection> for PublicApiError {
         let error = match &rejection {
             JsonRejection::JsonDataError(_) => match body_error(&rejection) {
                 Some(body) => {
-                    let error = Self::bad_request(format!("invalid request body: {body}"));
-                    match field_path(body) {
-                        Some(field) => error.with_field(field),
+                    let field = field_path(body);
+                    let reason = without_echoed_value(&body.inner().to_string());
+                    let message = match &field {
+                        Some(field) => format!("invalid request body: {field}: {reason}"),
+                        None => format!("invalid request body: {reason}"),
+                    };
+                    let error = Self::bad_request(bounded(message));
+                    match field {
+                        Some(field) => error.with_field(bounded(field)),
                         None => error,
                     }
                 }
                 None => Self::bad_request("request body does not match the schema"),
             },
             JsonRejection::JsonSyntaxError(_) => match body_error(&rejection) {
-                Some(body) => Self::bad_request(format!("request body is not valid JSON: {body}")),
+                Some(body) => {
+                    Self::bad_request(bounded(format!("request body is not valid JSON: {body}")))
+                }
                 None => Self::bad_request("request body is not valid JSON"),
             },
             JsonRejection::MissingJsonContentType(_) => {
@@ -98,6 +106,68 @@ fn field_path(error: &serde_path_to_error::Error<serde_json::Error>) -> Option<S
     path.iter()
         .any(|segment| !matches!(segment, serde_path_to_error::Segment::Unknown))
         .then(|| path.to_string())
+}
+
+/// The longest message, or field detail, a refused body answers with. A
+/// field path holds the map keys the client sent, and a deserializer's own
+/// message can quote what it was given, so neither is answered back at the
+/// size of the body.
+const MAX_ANSWERED_LEN: usize = 512;
+
+fn bounded(mut text: String) -> String {
+    if text.len() > MAX_ANSWERED_LEN {
+        let mut end = MAX_ANSWERED_LEN - '…'.len_utf8();
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
+    }
+    text
+}
+
+/// The deserializer's message without the value the client sent where the
+/// schema wanted another: a string of the wrong type or value keeps only
+/// that it is a string, and an unknown enum variant only that it is
+/// unknown. Such a value can be a secret sent to the wrong field, and the
+/// field detail already says where it is.
+fn without_echoed_value(message: &str) -> String {
+    for prefix in ["invalid type: string ", "invalid value: string "] {
+        if let Some(after) = message.strip_prefix(prefix).and_then(after_debug_quoted) {
+            return format!("{}{after}", prefix.trim_end());
+        }
+    }
+    // serde writes the variant as it was sent, unescaped, then the variants
+    // it expected, so the last of these separators ends the variant.
+    if let Some(rest) = message.strip_prefix("unknown variant `")
+        && let Some(end) = ["`, expected ", "`, there are no variants"]
+            .into_iter()
+            .filter_map(|separator| rest.rfind(separator))
+            .max()
+        && let Some(after) = rest.get(end + 1..)
+    {
+        return format!("unknown variant{after}");
+    }
+    message.to_owned()
+}
+
+/// What follows the `Debug`-quoted string `text` starts with; `Debug`
+/// escapes every quote and backslash inside it.
+fn after_debug_quoted(text: &str) -> Option<&str> {
+    let mut chars = text.char_indices();
+    if chars.next()? != (0, '"') {
+        return None;
+    }
+    while let Some((index, char)) = chars.next() {
+        match char {
+            '\\' => {
+                chars.next()?;
+            }
+            '"' => return text.get(index + 1..),
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]

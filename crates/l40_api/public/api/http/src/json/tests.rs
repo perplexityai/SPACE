@@ -28,6 +28,15 @@ struct CreateRequest {
     #[serde(default)]
     env: BTreeMap<String, String>,
     resources: Option<Resources>,
+    visibility: Option<Visibility>,
+    separator: Option<char>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Visibility {
+    Public,
+    Private,
 }
 
 async fn create(PublicJson(_): PublicJson<CreateRequest>) -> StatusCode {
@@ -41,21 +50,23 @@ async fn track(body: Option<PublicJson<CreateRequest>>) -> StatusCode {
     }
 }
 
+const BODY_LIMIT: usize = 2048;
+
 async fn send(
     path: &str,
     content_type: Option<&str>,
-    body: &'static str,
+    body: &str,
 ) -> (StatusCode, PublicErrorEnvelope) {
     let app = Router::new()
         .route("/create", post(create))
         .route("/track", post(track))
-        .layer(axum::extract::DefaultBodyLimit::max(64));
+        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT));
     let mut request = Request::post(path);
     if let Some(content_type) = content_type {
         request = request.header(header::CONTENT_TYPE, content_type);
     }
     let response = app
-        .oneshot(request.body(Body::from(body)).unwrap())
+        .oneshot(request.body(Body::from(body.to_owned())).unwrap())
         .await
         .unwrap();
     let status = response.status();
@@ -78,6 +89,13 @@ fn field(value: &str) -> Vec<PublicErrorDetail> {
 #[tokio::test]
 async fn a_refused_body_says_what_is_wrong_and_where() {
     const JSON: Option<&str> = Some("application/json");
+    let long_key = "K".repeat(600);
+    let long_key_body = format!(r#"{{"template":"seed","env":{{"{long_key}":1}}}}"#);
+    let long_key_message = format!("invalid request body: env.{}…", "K".repeat(483));
+    let too_large = format!(
+        r#"{{"template":"seed","env":{{"K":"{}"}}}}"#,
+        "0".repeat(BODY_LIMIT)
+    );
     for (label, path, content_type, body, status, message, details) in [
         (
             "wrong type in a nested field",
@@ -85,8 +103,44 @@ async fn a_refused_body_says_what_is_wrong_and_where() {
             JSON,
             r#"{"template":"seed","resources":{"vcpu":"two"}}"#,
             StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid request body: resources.vcpu: invalid type: string \"two\", expected u32 at line 1 column 44",
+            "invalid request body: resources.vcpu: invalid type: string, expected u32 at line 1 column 44",
             field("resources.vcpu"),
+        ),
+        (
+            "a string of the wrong type is not answered back",
+            "/create",
+            JSON,
+            r#"{"template":"seed","env":"SECRET=\"x\\"}"#,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid request body: env: invalid type: string, expected a map at line 1 column 39",
+            field("env"),
+        ),
+        (
+            "a string of the wrong value is not answered back",
+            "/create",
+            JSON,
+            r#"{"template":"seed","separator":"SECRET"}"#,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid request body: separator: invalid value: string, expected a character at line 1 column 39",
+            field("separator"),
+        ),
+        (
+            "an unknown variant is not answered back",
+            "/create",
+            JSON,
+            r#"{"template":"seed","visibility":"SECRET`, there are no variants`, expected x"}"#,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid request body: visibility: unknown variant, expected `public` or `private` at line 1 column 77",
+            field("visibility"),
+        ),
+        (
+            "a long map key is cut short",
+            "/create",
+            JSON,
+            &long_key_body,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &long_key_message,
+            field(&format!("env.{}…", "K".repeat(505))),
         ),
         (
             "wrong type in a sequence element",
@@ -137,7 +191,7 @@ async fn a_refused_body_says_what_is_wrong_and_where() {
             "too large",
             "/create",
             JSON,
-            r#"{"template":"seed","env":{"K":"0123456789012345678901234567890123456789"}}"#,
+            &too_large,
             StatusCode::PAYLOAD_TOO_LARGE,
             "request body is too large",
             Vec::new(),
