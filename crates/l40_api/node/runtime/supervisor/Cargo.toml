@@ -37,7 +37,7 @@ uuid = { workspace = true, features = ["v7"], optional = true }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-execution-common = { workspace = true }
-pplx-space-execution-spec = { workspace = true }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-host-linux = { workspace = true }

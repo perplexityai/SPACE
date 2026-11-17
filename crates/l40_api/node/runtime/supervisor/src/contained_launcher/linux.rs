@@ -1,4 +1,4 @@
-use super::Config;
+use super::{Config, RuntimeKind};
 use nix::{
     sched::{CloneFlags, setns, unshare},
     sys::{
@@ -68,6 +68,14 @@ pub(crate) fn run(config: Config, stream: UnixStream) -> Result<(), String> {
 /// Called only by launcher mode, before Tokio or telemetry creates threads.
 fn prepare_and_exec(config: &Config, stream: &mut Option<UnixStream>) -> Result<(), Error> {
     use nix::mount::{MsFlags, mount};
+    if !matches!(
+        config.runtime,
+        RuntimeKind::CloudHypervisor | RuntimeKind::Wasmtime
+    ) {
+        return Err(Error::Invalid(
+            "runtime has no standalone containment profile",
+        ));
+    }
     if pplx_space_host_layout::gateway::gateway_uid(pplx_space_linux_ids::LinuxUid::new(config.uid))
         .is_none()
         || config.uid != config.gid
@@ -87,9 +95,11 @@ fn prepare_and_exec(config: &Config, stream: &mut Option<UnixStream>) -> Result<
         .ok_or(Error::Invalid("isolation root has no parent"))?;
     pplx_space_node_runtime_core::artifact_store::verify_execution_directory(parent, 0)
         .map_err(|_| Error::Invalid("isolation root has unsafe ancestors"))?;
-    if root.metadata().map_err(io("inspect isolation root"))?.uid() != config.uid {
-        return Err(Error::Invalid("isolation root is not owned by the sandbox"));
-    }
+    validate_root_metadata(
+        config.runtime,
+        config.uid,
+        &root.metadata().map_err(io("inspect isolation root"))?,
+    )?;
     let executable = crate::verified_launch::open_catalog_executable(
         &config.executable,
         config.executable_source,
@@ -187,7 +197,7 @@ fn prepare_and_exec(config: &Config, stream: &mut Option<UnixStream>) -> Result<
         return Err(Error::Invalid("private device mount was replaced"));
     }
     nix::unistd::fchdir(&private_devices).map_err(sys("enter private devices"))?;
-    prepare_devices(config.uid, config.gid)?;
+    prepare_devices(config.runtime, config.uid, config.gid)?;
     let null = open_private_null(&private_devices)?;
     nix::unistd::chdir(&config.root).map_err(sys("return to isolation root"))?;
     let returned = std::fs::metadata(".").map_err(io("inspect isolation root after devices"))?;
@@ -311,22 +321,11 @@ fn prepare_and_exec(config: &Config, stream: &mut Option<UnixStream>) -> Result<
     nix::unistd::dup2_stdin(&null).map_err(sys("disconnect runtime stdin"))?;
     drop(output);
     drop(null);
-    // Bind after fork so SO_PEERCRED names the eventual VMM PID. The listener
-    // inode stays root-owned and owner-only after setuid/exec: same-UID sidecars
-    // cannot issue host-path-capable API requests. CH inherits only the fd.
+    // Bind after fork so SO_PEERCRED names the eventual runtime PID. Keep the
+    // optional listener alive through exec; Wasmtime has no VMM control socket.
     nix::sys::stat::umask(Mode::from_bits_truncate(0o077));
-    let control = std::os::unix::net::UnixListener::bind("/control.sock")
-        .map_err(io("bind privileged runtime control"))?;
-    nix::fcntl::fcntl(
-        &control,
-        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
-    )
-    .map_err(sys("inherit runtime control listener"))?;
     let mut arguments = config.arguments.clone();
-    arguments.extend([
-        "--api-socket".to_owned(),
-        format!("fd={}", control.as_raw_fd()),
-    ]);
+    let _control = prepare_runtime_control(config.runtime, &mut arguments)?;
     drop_privileges(config.uid, config.gid)?;
     nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
         .map_err(sys("bind runtime lifetime to runner"))?;
@@ -361,14 +360,45 @@ fn drop_privileges(uid: u32, gid: u32) -> Result<(), Error> {
     nix::sys::prctl::set_no_new_privs().map_err(sys("disable privilege gains"))?;
     Ok(())
 }
-fn prepare_devices(uid: u32, gid: u32) -> Result<(), Error> {
-    std::fs::create_dir("net").map_err(io("create contained device directory"))?;
-    for (path, major, minor) in [
-        ("kvm", 10, 232),
-        ("net/tun", 10, 200),
-        ("null", 1, 3),
-        ("urandom", 1, 9),
-    ] {
+
+fn validate_root_metadata(
+    runtime: RuntimeKind,
+    sandbox_uid: u32,
+    metadata: &std::fs::Metadata,
+) -> Result<(), Error> {
+    match runtime {
+        RuntimeKind::CloudHypervisor if metadata.uid() == sandbox_uid => Ok(()),
+        // Native WASI agents and engines must not resolve their loader, tools
+        // or libraries through names a sandbox identity can replace. Only the
+        // managed workspace beneath this root may be tenant-writable.
+        RuntimeKind::Wasmtime if metadata.uid() == 0 && metadata.mode() & 0o022 == 0 => Ok(()),
+        RuntimeKind::CloudHypervisor | RuntimeKind::Wasmtime => Err(Error::Invalid(
+            "isolation root has unsafe ownership or permissions",
+        )),
+        RuntimeKind::Firecracker | RuntimeKind::Gvisor => Err(Error::Invalid(
+            "runtime has no standalone containment profile",
+        )),
+    }
+}
+
+fn prepare_devices(runtime: RuntimeKind, uid: u32, gid: u32) -> Result<(), Error> {
+    let virtual_machine = match runtime {
+        RuntimeKind::CloudHypervisor => true,
+        RuntimeKind::Wasmtime => false,
+        RuntimeKind::Firecracker | RuntimeKind::Gvisor => {
+            return Err(Error::Invalid(
+                "runtime has no standalone containment profile",
+            ));
+        }
+    };
+    if virtual_machine {
+        std::fs::create_dir("net").map_err(io("create contained device directory"))?;
+    }
+    for (path, major, minor) in [("null", 1, 3), ("urandom", 1, 9)]
+        .into_iter()
+        .chain(virtual_machine.then_some(("kvm", 10, 232)))
+        .chain(virtual_machine.then_some(("net/tun", 10, 200)))
+    {
         mknod(
             Path::new(path),
             SFlag::S_IFCHR,
@@ -384,6 +414,34 @@ fn prepare_devices(uid: u32, gid: u32) -> Result<(), Error> {
         .map_err(sys("assign contained device"))?;
     }
     Ok(())
+}
+
+fn prepare_runtime_control(
+    runtime: RuntimeKind,
+    arguments: &mut Vec<String>,
+) -> Result<Option<std::os::unix::net::UnixListener>, Error> {
+    match runtime {
+        RuntimeKind::CloudHypervisor => {
+            // The inode stays root-owned and owner-only after setuid/exec:
+            // same-UID sidecars cannot issue host-path-capable VMM requests.
+            let control = std::os::unix::net::UnixListener::bind("control.sock")
+                .map_err(io("bind privileged runtime control"))?;
+            nix::fcntl::fcntl(
+                &control,
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+            )
+            .map_err(sys("inherit runtime control listener"))?;
+            arguments.extend([
+                "--api-socket".to_owned(),
+                format!("fd={}", control.as_raw_fd()),
+            ]);
+            Ok(Some(control))
+        }
+        RuntimeKind::Wasmtime => Ok(None),
+        RuntimeKind::Firecracker | RuntimeKind::Gvisor => Err(Error::Invalid(
+            "runtime has no standalone containment profile",
+        )),
+    }
 }
 fn exec(executable: AuthenticatedFile, arguments: &[String]) -> Result<(), Error> {
     let args = std::iter::once("runtime")

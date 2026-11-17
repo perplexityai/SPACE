@@ -4,8 +4,14 @@
 //! remains the authority for all descendants.
 use std::path::PathBuf;
 
-#[derive(serde::Serialize, serde::Deserialize)]
+use pplx_space_execution_spec::RuntimeKind;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Config {
+    // Older supervisors serialize Cloud Hypervisor launch specifications without
+    // a runtime discriminator. Preserve that meaning across rolling upgrades.
+    #[serde(default = "legacy_runtime")]
+    pub runtime: RuntimeKind,
     pub root: PathBuf,
     pub registration_directory: PathBuf,
     pub network_namespace: PathBuf,
@@ -16,6 +22,10 @@ pub(crate) struct Config {
     pub cgroup: PathBuf,
     pub output: PathBuf,
     pub arguments: Vec<String>,
+}
+
+fn legacy_runtime() -> RuntimeKind {
+    RuntimeKind::CloudHypervisor
 }
 
 #[cfg(not(target_os = "linux"))]

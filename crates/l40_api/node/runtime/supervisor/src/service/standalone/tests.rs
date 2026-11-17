@@ -25,6 +25,10 @@ fn standalone_configuration_refuses_unconfined_locators() {
         let config = standalone_config_for_environment(&valid, sandbox, environment).unwrap();
         assert_eq!(config.root.join("console.log"), config.output);
         assert_eq!(config.executable, Path::new(&valid.runtime_binary));
+        let mut legacy = serde_json::to_value(&config).unwrap();
+        legacy.as_object_mut().unwrap().remove("runtime");
+        let legacy: crate::contained_launcher::Config = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.runtime, RuntimeKind::CloudHypervisor);
 
         enum Field {
             Runtime,
