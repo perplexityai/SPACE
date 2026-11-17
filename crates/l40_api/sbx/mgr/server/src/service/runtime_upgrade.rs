@@ -255,9 +255,9 @@ fn require_certified_upgrade_edge(
     target: EnvironmentReference,
 ) -> Result<(), Status> {
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
-    let catalog = CompiledEnvironment::cached_for_architecture(source.guest().architecture)
-        .map_err(|error| Status::failed_precondition(format!("compiled catalog: {error}")))?;
-    let from = CompiledEnvironment::of_execution(catalog, source).ok_or_else(|| {
+    let from = CompiledEnvironment::cached_for_execution(source)
+        .map_err(|error| Status::failed_precondition(format!("compiled catalog: {error}")))?
+        .ok_or_else(|| {
         Status::failed_precondition(
             "the sandbox's execution belongs to no compiled environment, so no upgrade edge leaves it",
         )

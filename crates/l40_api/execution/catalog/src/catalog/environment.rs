@@ -335,6 +335,30 @@ impl CompiledEnvironment {
             .as_deref()
     }
 
+    /// Attribute bound execution by its complete environment reference across
+    /// native host catalogs. A guest instruction set need not be the host's:
+    /// for example, a wasm32 guest runs under a native runtime release.
+    ///
+    /// Like `of_execution`, attribution is not admission. Callers launching a
+    /// sandbox must also check its execution against the returned definition.
+    /// Only historical unbound metadata uses its guest architecture to select
+    /// the catalog; it cannot authorize a new runtime.
+    pub fn cached_for_execution(
+        execution: &ExecutionMetadata,
+    ) -> Result<Option<&'static Self>, &'static CatalogError> {
+        if execution.environment().is_none() {
+            return Self::cached_for_architecture(execution.guest().architecture)
+                .map(|catalog| Self::of_execution(catalog, execution));
+        }
+        for architecture in [Arch::X86_64, Arch::Aarch64] {
+            let catalog = Self::cached_for_architecture(architecture)?;
+            if let Some(environment) = Self::of_execution(catalog, execution) {
+                return Ok(Some(environment));
+            }
+        }
+        Ok(None)
+    }
+
     /// Build an owned catalog for startup validation and qualification tests.
     /// Repeated execution lookups use `cached_for_architecture` instead.
     pub fn for_architecture(architecture: Arch) -> Result<Vec<Self>, CatalogError> {

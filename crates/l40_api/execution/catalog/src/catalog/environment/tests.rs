@@ -333,10 +333,34 @@ fn an_execution_is_attributed_to_the_environment_it_ran_under() {
     let attributed = |execution: &ExecutionMetadata| {
         CompiledEnvironment::of_execution(&environments, execution).map(CompiledEnvironment::name)
     };
+    let cached = |execution: &ExecutionMetadata| {
+        CompiledEnvironment::cached_for_execution(execution)
+            .unwrap()
+            .map(CompiledEnvironment::name)
+    };
 
     // Bound metadata names its environment.
     let bound = e1.definition().execution_requirements().unwrap();
     assert_eq!(attributed(&bound), Some(E1));
+    assert_eq!(cached(&bound), Some(E1));
+
+    // A binding identifies the host environment, even when observations report
+    // another guest instruction set. Attribution must not silently read that
+    // guest's architecture as the native host or authorize the altered metadata.
+    let altered = ExecutionMetadata::new(
+        bound.runtime().clone(),
+        GuestPlatform {
+            os: GuestOperatingSystem::Wasi,
+            architecture: Arch::Wasm32,
+        },
+        bound.state_format().cloned(),
+        bound.components().to_vec(),
+    )
+    .unwrap()
+    .with_environment(bound.environment().unwrap());
+    assert_eq!(cached(&altered), Some(E1));
+    e1.definition().check_execution(&altered).unwrap_err();
+    crate::guest::BootSource::from_execution(&altered).unwrap_err();
 
     // Unbound metadata that satisfies a definition belongs to it.
     let bound_e0 = e0.definition().execution_requirements().unwrap();
@@ -349,6 +373,7 @@ fn an_execution_is_attributed_to_the_environment_it_ran_under() {
     .unwrap();
     assert_eq!(unbound.environment(), None);
     assert_eq!(attributed(&unbound), Some("e0"));
+    assert_eq!(cached(&unbound), Some("e0"));
 
     // A stock E0 snapshot from before boot components were recorded.
     let stock = ExecutionMetadata::new(
@@ -359,6 +384,7 @@ fn an_execution_is_attributed_to_the_environment_it_ran_under() {
     )
     .unwrap();
     assert_eq!(attributed(&stock), Some("e0"));
+    assert_eq!(cached(&stock), Some("e0"));
 
     // A historical contract no compiled environment describes.
     let custom = ExecutionMetadata::new(
@@ -372,6 +398,11 @@ fn an_execution_is_attributed_to_the_environment_it_ran_under() {
     )
     .unwrap();
     assert_eq!(attributed(&custom), None);
+    assert_eq!(cached(&custom), None);
+    assert_eq!(
+        cached(&bound.with_environment(EnvironmentReference::new(Digest::sha256([0xa5; 32])))),
+        None
+    );
 }
 
 #[test]

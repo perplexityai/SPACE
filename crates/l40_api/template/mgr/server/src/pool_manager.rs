@@ -126,10 +126,7 @@ pub(crate) fn pool_base_build(
                     return None;
                 }
                 use pplx_space_execution_catalog::catalog::CompiledEnvironment;
-                let catalog =
-                    CompiledEnvironment::cached_for_architecture(execution.guest().architecture)
-                        .ok()?;
-                let environment = CompiledEnvironment::of_execution(catalog, execution)?;
+                let environment = CompiledEnvironment::cached_for_execution(execution).ok()??;
                 if !environment.supports_memory_state() {
                     return None;
                 }

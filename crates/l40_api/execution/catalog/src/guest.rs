@@ -33,11 +33,8 @@ impl BootSource {
             FIRECRACKER_BOOT_CONTRACT,
         };
         use pplx_space_execution_spec::BootProfile;
-        let catalog = crate::catalog::CompiledEnvironment::cached_for_architecture(
-            execution.guest().architecture,
-        )
-        .map_err(|_| GuestProfileError("compiled environment catalog unavailable"))?;
-        let environment = crate::catalog::CompiledEnvironment::of_execution(catalog, execution)
+        let environment = crate::catalog::CompiledEnvironment::cached_for_execution(execution)
+            .map_err(|_| GuestProfileError("compiled environment catalog unavailable"))?
             .ok_or(GuestProfileError("unknown execution boot contract"))?;
         if execution.environment().is_some() {
             environment
