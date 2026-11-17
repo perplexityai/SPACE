@@ -116,6 +116,7 @@ from space_smoke.teardown_restart import TeardownRestartAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.console import ConsoleAssertions
+from space_smoke.execution_environment import ExecutionEnvironmentAdmission
 from space_smoke.drain_gate import DrainGateAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
@@ -3159,6 +3160,22 @@ class KindEcw(Ecw, KindAdmin):
                 self, self._rate_limiter_control, self._rate_limit_probe, self._context.scope
             )
         return self._rate_limiter_assertions
+
+    _execution_environment: ExecutionEnvironmentAdmission | None = None
+
+    @property
+    def execution_environment(self) -> ExecutionEnvironmentAdmission:
+        """The environment setup admitted and built this sandbox's seed in.
+
+        Only for a scenario whose `SandboxConfig.kind_execution_environment`
+        names one; the scenario withdraws it after deleting the sandbox.
+        """
+
+        if self._execution_environment is None:
+            raise SmokeConfigurationError(
+                "this scenario's sandbox config names no kind_execution_environment"
+            )
+        return self._execution_environment
 
     _cross_node_control: CrossNodeRestoreControl | None = None
     _cross_node_assertions: CrossNodeRestoreAssertions | None = None

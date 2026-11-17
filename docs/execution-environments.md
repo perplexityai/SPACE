@@ -894,9 +894,17 @@ the node settings stay the upper bound on what a node may execute.
 Until placement consumes environment eligibility and fresh usability evidence,
 keep allowed/default policy uniform within each role/host-platform cohort and
 verify that builder outputs work on every worker cohort that may receive them.
-Keep shared fleet defaults at E0: cluster-owned non-default Create remains refused.
-Additional bindings can be exercised through designated node-local paths without
-publishing their templates for shared fleet consumption.
+Keep shared fleet defaults at E0. Sandbox-manager's create validation
+(`validate_environment_create`) doesn't refuse a cluster-owned create because
+its Firecracker binding isn't the default. It refuses a cluster-owned Cloud
+Hypervisor binding, and memory-state operations (pools, snapshots, a
+base-snapshot boot) for a binding that must boot cold. Before the row is
+persisted, it asks the serving node to admit the exact binding
+(`admit_exact_execution`), so a template built bound to another Firecracker
+environment runs it on any node whose policy allows it. Publish no named tag for such a template
+until that environment is meant for shared fleet use, and create from it by
+digest, as `local.selected_environment_survives_suspend_and_cross_node_restore`
+does.
 
 `GetExecutionInventory` reports resolved references and the separate legacy permission.
 Node-ctl forwards it through periodic publication; the cluster records it with

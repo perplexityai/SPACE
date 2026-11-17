@@ -111,6 +111,7 @@ from space_smoke.capabilities import (
     WarmPoolSelection,
 )
 from space_smoke.credmgr_socket import exchange_token, relay_argv
+from space_smoke.execution_environment import ALLOWED_ENVIRONMENTS_ENV
 from space_smoke.leader_election import RECONCILER_TICK_ENV
 from space_smoke.reconcile_queue_gc import (
     GC_ENV_KEYS as RECONCILE_QUEUE_GC_ENV_KEYS,
@@ -565,6 +566,13 @@ NODE_API = "node-api"
 WORKER_NODE_CTL_DAEMONSET = f"space-{NODE_CTL}"
 UNANSWERED_TEMPLATE_EVICT_AFTER_ENV = "SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS"
 UNANSWERED_TEMPLATE_EVICT_AFTER_BOUNDS = (10, 600)
+# The node-manager DaemonSets (worker and builder), on which the
+# execution-environment admission may set `ALLOWED_ENVIRONMENTS_ENV`
+# (`space_smoke/execution_environment.py`).
+NODE_MANAGER_DAEMONSETS = (f"space-{NODE_MANAGER}", f"space-builder-{NODE_MANAGER}")
+# Three hours: longer than the longest budget of a scenario that holds the
+# admission (150 minutes, its cleanup included).
+NODE_MANAGER_MUTATION_LEASE_DURATION_SECONDS = 3 * 3600
 NODE_TEMPLATE_PRESENCE_PREFIX = "space.pplx.net/template-build-"
 # The node services that read the object store, by DaemonSet and the
 # container that does: each holds the store's static keys in
@@ -1172,6 +1180,7 @@ class KindHarness:
         self._public_api_lease_ownership: _LeaseOwnership | None = None
         self._drain_gate_lease_ownership: _LeaseOwnership | None = None
         self._node_ctl_lease_ownership: _LeaseOwnership | None = None
+        self._node_manager_lease_ownership: _LeaseOwnership | None = None
         # The public API autoscaler's bounds before `scale_public_api` pinned
         # them: (name, uid, minReplicas, maxReplicas).
         self._public_api_autoscaler_bounds: tuple[str, str, int, int] | None = None
@@ -1579,6 +1588,7 @@ class KindHarness:
         subject: str,
         *,
         repair: Callable[[Mapping[str, object], _LeaseOwnership], None] | None = None,
+        duration_seconds: int = RETENTION_MUTATION_LEASE_DURATION_SECONDS,
     ) -> _LeaseOwnership:
         """Create or take over `name`; refuse while another live holder exists.
 
@@ -1602,7 +1612,7 @@ class KindHarness:
         acquired_at = datetime.now(UTC)
         spec = {
             "holderIdentity": holder,
-            "leaseDurationSeconds": RETENTION_MUTATION_LEASE_DURATION_SECONDS,
+            "leaseDurationSeconds": duration_seconds,
             "acquireTime": _kube_timestamp(acquired_at),
             "renewTime": _kube_timestamp(acquired_at),
         }
@@ -4114,8 +4124,11 @@ ON CONFLICT (key_hash) DO NOTHING;
         _require_ok(result, "list the cluster's nodes")
         return _parse_nodes(result.stdout)
 
-    def nodes_carrying_label(self, key: str) -> list[str]:
-        result = self.kubectl("get", "nodes", "-l", _label_key(key), "-o", "name", timeout=15)
+    def nodes_carrying_label(self, key: str, value: str | None = None) -> list[str]:
+        if value is not None and not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?", value):
+            raise ValueError(f"refusing label value {value!r}")
+        selector = _label_key(key) if value is None else f"{_label_key(key)}={value}"
+        result = self.kubectl("get", "nodes", "-l", selector, "-o", "name", timeout=15)
         _require_ok(result, f"list nodes carrying {key}")
         return sorted(_kube_node_name(line.split("/", 1)[-1]) for line in result.stdout.split() if line)
 
@@ -5496,17 +5509,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         return release
 
     def unanswered_template_evict_env(self) -> str | None:
-        result = self.kubectl(
-            "get", "daemonset", WORKER_NODE_CTL_DAEMONSET, "-o",
-            f"jsonpath={{.spec.template.spec.containers[?(@.name=='{NODE_CTL}')].env}}",
-            timeout=15,
+        return self._daemonset_env_literal(
+            WORKER_NODE_CTL_DAEMONSET, NODE_CTL, UNANSWERED_TEMPLATE_EVICT_AFTER_ENV
         )
-        _require_ok(result, f"read env of {WORKER_NODE_CTL_DAEMONSET}")
-        return _env_literals(
-            json.loads(result.stdout or "[]"), (UNANSWERED_TEMPLATE_EVICT_AFTER_ENV,),
-            owner=WORKER_NODE_CTL_DAEMONSET,
-            value_from_refusal="; refusing to override what a literal restore could not put back",
-        )[UNANSWERED_TEMPLATE_EVICT_AFTER_ENV]
 
     def set_unanswered_template_evict_after(self, seconds: int) -> None:
         low, high = UNANSWERED_TEMPLATE_EVICT_AFTER_BOUNDS
@@ -5518,22 +5523,56 @@ ON CONFLICT (key_hash) DO NOTHING;
         self._apply_unanswered_template_evict_env(standing)
 
     def _apply_unanswered_template_evict_env(self, value: str | None) -> None:
-        self._require_isolated_kind("worker node-ctl env override")
-        ownership = self._node_ctl_lease_ownership
+        self._set_daemonset_env(
+            {WORKER_NODE_CTL_DAEMONSET: value},
+            NODE_CTL,
+            UNANSWERED_TEMPLATE_EVICT_AFTER_ENV,
+            ownership=self._node_ctl_lease_ownership,
+            what="worker node-ctl",
+        )
+
+    def _daemonset_env_literal(self, daemonset: str, container: str, key: str) -> str | None:
+        """The literal `key` holds on a DaemonSet's container, None if unset."""
+
+        result = self.kubectl(
+            "get", "daemonset", daemonset, "-o",
+            f"jsonpath={{.spec.template.spec.containers[?(@.name=='{container}')].env}}",
+            timeout=15,
+        )
+        _require_ok(result, f"read env of {daemonset}")
+        return _env_literals(
+            json.loads(result.stdout or "[]"), (key,),
+            owner=daemonset,
+            value_from_refusal="; refusing to override what a literal restore could not put back",
+        )[key]
+
+    def _set_daemonset_env(
+        self,
+        values: Mapping[str, str | None],
+        container: str,
+        key: str,
+        *,
+        ownership: _LeaseOwnership | None,
+        what: str,
+    ) -> None:
+        """Set `key` (None unsets) on each DaemonSet under the caller's Lease, then await every rollout."""
+
+        self._require_isolated_kind(f"{what} env override")
         if ownership is None:
             raise SmokeConfigurationError(
-                "refusing a worker node-ctl DaemonSet write without the caller's live mutation Lease"
+                f"refusing a {what} DaemonSet write without the caller's live mutation Lease"
             )
-        self._assert_lease_owned(ownership, "a worker node-ctl DaemonSet write")
-        key = UNANSWERED_TEMPLATE_EVICT_AFTER_ENV
-        _require_ok(
-            self.kubectl(
-                "set", "env", f"daemonset/{WORKER_NODE_CTL_DAEMONSET}", "-c", NODE_CTL,
-                f"{key}-" if value is None else f"{key}={value}", timeout=30,
-            ),
-            f"set env on {WORKER_NODE_CTL_DAEMONSET}",
-        )
-        self._await_daemonset_rollout(WORKER_NODE_CTL_DAEMONSET, timeout=300)
+        self._renew_lease(ownership, f"a {what} DaemonSet write")
+        for daemonset, value in values.items():
+            _require_ok(
+                self.kubectl(
+                    "set", "env", f"daemonset/{daemonset}", "-c", container,
+                    f"{key}-" if value is None else f"{key}={value}", timeout=30,
+                ),
+                f"set env on {daemonset}",
+            )
+        for daemonset in values:
+            self._await_daemonset_rollout(daemonset, timeout=300)
 
     def _await_daemonset_rollout(self, name: str, *, timeout: float) -> None:
         """`rollout status`, then until each node runs one pod and none is Terminating.
@@ -5574,6 +5613,70 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def running_unanswered_template_evict_env(self, node_name: str) -> str | None:
         return self._node_service_env(node_name, NODE_CTL).get(UNANSWERED_TEMPLATE_EVICT_AFTER_ENV)
+
+    # --- node-manager's execution allowlist ----------------------------------
+    #
+    # One key, `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS`, on the worker and the
+    # builder node-manager DaemonSets, under its own Lease
+    # (`space_smoke/execution_environment.py`). The captured literals go back
+    # verbatim.
+
+    def acquire_node_manager_mutation(self) -> Callable[[], None]:
+        context_hash = hashlib.sha256(self.config.context.encode()).hexdigest()[:16]
+        # Held from admission until the allowlist is back, which can be a
+        # whole scenario and its cleanup, so it outlasts the longest budget.
+        ownership = self._acquire_named_mutation_lease(
+            f"space-smoke-node-manager-{context_hash}",
+            "node-manager DaemonSet mutation",
+            duration_seconds=NODE_MANAGER_MUTATION_LEASE_DURATION_SECONDS,
+        )
+        self._node_manager_lease_ownership = ownership
+
+        def release() -> None:
+            self._release_lease(ownership)
+            if self._node_manager_lease_ownership is ownership:
+                self._node_manager_lease_ownership = None
+
+        return release
+
+    def node_manager_allowed_environments(self) -> dict[str, str | None]:
+        return {
+            daemonset: self._daemonset_env_literal(daemonset, NODE_MANAGER, ALLOWED_ENVIRONMENTS_ENV)
+            for daemonset in NODE_MANAGER_DAEMONSETS
+        }
+
+    def set_node_manager_allowed_environments(self, values: Mapping[str, str | None]) -> None:
+        unknown = set(values) - set(NODE_MANAGER_DAEMONSETS)
+        if unknown:
+            raise ValueError(f"refusing to write env on {sorted(unknown)}, not a node-manager DaemonSet")
+        for value in values.values():
+            if value is not None and (not value or "\n" in value):
+                raise ValueError(f"refusing allowlist literal {value!r}")
+        self._set_daemonset_env(
+            values,
+            NODE_MANAGER,
+            ALLOWED_ENVIRONMENTS_ENV,
+            ownership=self._node_manager_lease_ownership,
+            what="node-manager",
+        )
+
+    def node_manager_nodes(self) -> tuple[str, ...]:
+        nodes: set[str] = set()
+        for role in (KIND_WORKER_ROLE, KIND_BUILDER_ROLE):
+            result = self.kubectl(
+                "get", "pods", "-l", _node_service_selector(NODE_MANAGER, role=role),
+                "-o", "jsonpath={.items[*].spec.nodeName}", timeout=15,
+            )
+            nodes.update(_require_ok(result, f"list {role} node-manager pods").split())
+        return tuple(sorted(_kube_node_name(node) for node in nodes))
+
+    def install_runtime_release(self, node_name: str, release: str) -> str:
+        if not re.fullmatch(r"[a-z]+-[0-9]+\.[0-9]+\.[0-9]+", release):
+            raise ValueError(f"refusing runtime release {release!r}")
+        result = self._node_shell_exec(
+            node_name, f"space-rtmgr runtimes install {shlex.quote(release)}", timeout=600
+        )
+        return _require_ok(result, f"install runtime {release} on {node_name}")
 
     def local_template_names(self, node_name: str) -> frozenset[str]:
         result = self._node_shell_exec(node_name, "space-tmplmgr list", timeout=60)

@@ -68,6 +68,7 @@ from space_smoke.runtime import (
     SmokeConfigurationError,
     SubprocessExecutor,
 )
+from space_smoke.execution_environment import ExecutionEnvironmentAdmission
 from space_smoke.template_build import build_dedicated_template
 
 
@@ -325,6 +326,18 @@ class SmokeServices:
                     "dedicated_template",
                     {"alias": built.alias, "build_seconds": built.elapsed_seconds},
                 )
+        admission: ExecutionEnvironmentAdmission | None = None
+        if sandbox_config.kind_execution_environment is not None:
+            if kind is None or fixture_type is not KindEcw:
+                raise SmokeConfigurationError("an execution environment's seed requires KindEcw")
+            name = sandbox_config.kind_execution_environment
+            admission = ExecutionEnvironmentAdmission(
+                context, cast(Any, kind), context.scope, name
+            )
+            with context.phase(f"admit {name} on every node"):
+                admission.admit()
+            with context.phase(f"build seed bound to {name}"):
+                template = admission.build_seed()
         before_create = None
         warm_pool_candidate: WarmPoolCandidate | None = None
         if sandbox_config.kind_cold_create is not None:
@@ -449,6 +462,7 @@ class SmokeServices:
             fixture._sandbox_network_isolation_control = cast(Any, kind)
             fixture._storage_exchange_control = cast(Any, kind)
             fixture._template_selector = template
+            fixture._execution_environment = admission
             fixture._warm_pool_observer = cast(Any, kind)
             fixture._warm_pool_candidate = warm_pool_candidate
             if isinstance(kind, KindHarness) and isinstance(self.ecw, EcwSdk):
