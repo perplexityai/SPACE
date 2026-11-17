@@ -346,7 +346,8 @@ mod slot_pool_tests {
             let mut conn = pool.db.lock().unwrap();
             conn.execute(
                 "UPDATE network_slots SET state = 'leased', sandbox_id = ?1, generation = 7,
-                     pid = NULL, memory_reservation_mib = 8320, updated_at = ?2
+                     pid = NULL, memory_reservation_mib = 8320, health = 'healthy',
+                     last_error = NULL, updated_at = ?2
                  WHERE slot_id = 0",
                 rusqlite::params![
                     SandboxId::new().to_string(),
@@ -378,16 +379,38 @@ mod slot_pool_tests {
 
     // A lease the predecessor allocated moments before this process started
     // belongs to an activation that has not launched yet: startup validation
-    // keeps it for that activation instead of resetting the slot under it.
+    // keeps it for that activation instead of resetting the slot under it, and
+    // the activation launches on it after the grace ends.
     #[tokio::test]
     async fn startup_validation_keeps_a_lease_allocated_just_before_startup() {
-        let pool = runtimeless_startup_lease(Duration::from_secs(1));
+        let mut pool = runtimeless_startup_lease(Duration::from_secs(1));
         assert!(
             validate_live_leased_slots(pool.clone()).await.unwrap(),
             "a young lease is rechecked later"
         );
         let row = record(&pool, 0);
         assert_eq!(row.state, SlotState::Leased);
+        assert_eq!(row.memory_reservation_mib, Some(8320));
+        // The recheck writes nothing: a successor's grace is still fixed by the
+        // allocation, and the lease keeps the allocation's health.
+        assert_eq!(row.health, SlotHealth::Healthy);
+        assert_eq!(row.last_error, None);
+        let regranted = {
+            let conn = pool.db.lock().unwrap();
+            query_startup_young_leases(&conn, now_secs(), STARTUP_YOUNG_LEASE_GRACE).unwrap()
+        };
+        let pid = std::process::id() + 1;
+        pool.set_pid(&row.info.sandbox_id, pid).unwrap();
+        // The grace was fixed when the pool opened; let it run out.
+        let mutable_pool = std::sync::Arc::get_mut(&mut pool).unwrap();
+        assert_eq!(regranted, mutable_pool.startup_young_leases);
+        for grace_ends in mutable_pool.startup_young_leases.values_mut() {
+            *grace_ends = now_secs();
+        }
+        assert!(!validate_live_leased_slots(pool.clone()).await.unwrap());
+        let row = record(&pool, 0);
+        assert_eq!(row.state, SlotState::Leased);
+        assert_eq!(row.info.pid, Some(pid));
         assert_eq!(row.memory_reservation_mib, Some(8320));
     }
 
@@ -415,14 +438,29 @@ mod slot_pool_tests {
 
     #[test]
     fn only_leases_written_within_the_grace_are_young() {
-        let pool = test_pool(NetworkPoolConfig::new(3));
+        let pool = test_pool(NetworkPoolConfig::new(5));
         let conn = pool.db.lock().unwrap();
         let now = now_secs();
-        for (slot, age, state) in [(0, 10, "leased"), (1, 91, "leased"), (2, 10, "ready")] {
+        let pid = std::process::id() + 1;
+        for (slot, age, state, pid) in [
+            (0, 10, "leased", None),
+            (1, 91, "leased", None),
+            (2, 10, "ready", None),
+            // Launched: a missing runtime means it died, not that it is pending.
+            (3, 10, "leased", Some(pid)),
+            // Interrupted mid-setup: its allocation failed, so it is repaired.
+            (4, 10, "leasing", None),
+        ] {
             conn.execute(
-                "UPDATE network_slots SET state = ?1, sandbox_id = ?2, updated_at = ?3
-                 WHERE slot_id = ?4",
-                rusqlite::params![state, format!("sandbox-{slot}"), SqliteU64(now - age), slot],
+                "UPDATE network_slots SET state = ?1, sandbox_id = ?2, pid = ?3, updated_at = ?4
+                 WHERE slot_id = ?5",
+                rusqlite::params![
+                    state,
+                    format!("sandbox-{slot}"),
+                    pid,
+                    SqliteU64(now - age),
+                    slot
+                ],
             )
             .unwrap();
         }

@@ -66,6 +66,8 @@ pub(super) enum ValidationTaskResult<U> {
     Update(U),
     Transient(String),
     RuntimeUnknown(U),
+    /// Retain the lease and check it again, persisting nothing.
+    Deferred,
 }
 
 pub(super) enum StartupLeaseUpdate {
@@ -115,21 +117,6 @@ pub(super) fn validate_startup_runtime(
             ValidationTaskResult::Update(health(SlotHealth::Degraded, Some(error.to_string())))
         }
     }
-}
-
-/// A lease written just before this process started has no runtime yet when
-/// its activation has allocated but not launched. Retain it and check again;
-/// once its grace ends, a lease still without a runtime is reset.
-fn defer_young_startup_lease(info: SlotInfo) -> ValidationTaskResult<StartupLeaseUpdate> {
-    ValidationTaskResult::RuntimeUnknown(StartupLeaseUpdate::Health(LeaseHealthValidationUpdate {
-        slot_id: info.slot,
-        generation: info.generation,
-        sandbox_id: info.sandbox_id,
-        health: SlotHealth::Unknown,
-        last_error: Some(
-            "lease written just before node-manager started has no runtime yet; rechecking".into(),
-        ),
-    }))
 }
 
 struct RecoverableValidationMeta {
@@ -259,6 +246,14 @@ where
                     slot_id,
                     retry_after_secs = POOL_FILL_RETRY_DELAY.as_secs(),
                     "startup lease validation deferred; retaining ownership and retrying"
+                );
+            }
+            ValidationTaskResult::Deferred => {
+                retry = true;
+                tracing::warn!(
+                    slot_id,
+                    retry_after_secs = POOL_FILL_RETRY_DELAY.as_secs(),
+                    "lease allocated just before startup has no runtime yet; retaining it and rechecking"
                 );
             }
             ValidationTaskResult::Update(update) => {
@@ -1155,8 +1150,13 @@ pub(super) async fn validate_live_leased_slots(
                 let info = record.info.clone();
                 let result = match tokio::task::spawn_blocking(move || {
                     let evidence = lease_liveness(&info);
+                    // A lease allocated just before this process started has
+                    // no runtime until its activation launches. Recheck it
+                    // without a write: the grace stays fixed by the
+                    // predecessor's last write, and a lease its activation
+                    // adopts keeps the allocation's health.
                     if young && evidence == LeaseLiveness::Gone {
-                        return defer_young_startup_lease(info);
+                        return ValidationTaskResult::Deferred;
                     }
                     validate_startup_runtime(info, host_ready, evidence)
                 })

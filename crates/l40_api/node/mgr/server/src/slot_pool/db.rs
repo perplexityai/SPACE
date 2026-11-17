@@ -634,8 +634,9 @@ pub(super) fn query_startup_leases(conn: &Connection) -> Result<HashSet<LeaseKey
         .collect())
 }
 
-/// Startup leases last written within `grace` before `now`, each with the time
-/// its grace ends.
+/// Leases allocated but not yet launched (`leased` with no recorded PID) and
+/// last written within `grace` before `now`, each with the time its grace ends.
+/// A lease with a PID was launched, so a missing runtime means it died.
 pub(super) fn query_startup_young_leases(
     conn: &Connection,
     now: u64,
@@ -643,7 +644,7 @@ pub(super) fn query_startup_young_leases(
 ) -> Result<HashMap<LeaseKey, u64>, SlotStoreError> {
     let mut stmt = conn.prepare(
         "SELECT slot_id, generation, sandbox_id, updated_at FROM network_slots
-         WHERE state IN ('leasing', 'leased') AND sandbox_id IS NOT NULL",
+         WHERE state = 'leased' AND sandbox_id IS NOT NULL AND pid IS NULL",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
