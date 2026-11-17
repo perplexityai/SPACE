@@ -359,6 +359,48 @@ impl K8sStore {
             .await
     }
 
+    /// The drain restore operation's claim
+    /// ([`pplx_space_sandbox_store::drain_restore::claim_drain_restore`]),
+    /// under the operation's own lease token, taken before the activation.
+    pub(in crate::controllers::substrate::kubernetes) async fn claim_drain_restore(
+        &self,
+        sandbox_id: SandboxId,
+        restore: crate::controllers::substrate::kubernetes::DrainRestore,
+    ) -> Result<pplx_space_sandbox_store::drain_restore::DrainRestoreClaim, SubstrateError> {
+        pplx_space_sandbox_store::drain_restore::claim_drain_restore(
+            &self.pool,
+            sandbox_id,
+            restore.snapshot_id,
+            recovery_lease_ttl_secs(),
+            restore.restore_lease_token,
+            super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS,
+        )
+        .await
+        .db_context("failed to claim sandbox drain restore")
+    }
+
+    /// Land a drain restore whose lease `restore_lease_token` holds `started`
+    /// from execution `generation`, releasing the activation attempt it ran
+    /// under
+    /// ([`pplx_space_sandbox_store::drain_restore::complete_drain_restore`]).
+    pub(in crate::controllers::substrate::kubernetes) async fn complete_drain_restore(
+        &self,
+        sandbox_id: SandboxId,
+        restore: crate::controllers::substrate::kubernetes::DrainRestore,
+        generation: i64,
+        activation_attempt_id: Option<SandboxActivationAttemptId>,
+    ) -> Result<pplx_space_sandbox_store::drain_restore::DrainRestoreCommit, SubstrateError> {
+        pplx_space_sandbox_store::drain_restore::complete_drain_restore(
+            &self.pool,
+            sandbox_id,
+            restore.restore_lease_token,
+            generation,
+            activation_attempt_id.map(|id| id.as_uuid()),
+        )
+        .await
+        .db_context("failed to complete sandbox drain restore")
+    }
+
     async fn begin_restore_lifecycle_for(
         &self,
         sandbox_id: SandboxId,

@@ -88,3 +88,37 @@ fn a_contended_wake_does_not_revert_the_row_to_suspended() {
          one path reverts a live VM the other preserved"
     );
 }
+
+/// A drain restore's timed-out attempt reverts its fresh claim only while
+/// no Wake was sent: one that was may have landed, and `suspended` would
+/// orphan the live pod. Other claims keep main's rule, under which a timeout
+/// never reverts.
+#[test]
+fn a_drain_restore_timeout_reverts_only_before_its_wake_was_sent() {
+    let drain = RestoreClaimMode::DrainOperation(DrainRestore {
+        snapshot_id: uuid::Uuid::now_v7(),
+        restore_lease_token: uuid::Uuid::now_v7(),
+    });
+    let claim = Some(RestoreClaim::FreshFromSuspended {
+        restore_lease_token: Some(uuid::Uuid::now_v7()),
+    });
+    let timeout = SubstrateError::Timeout {
+        message: "not ready".to_owned(),
+        phase: None,
+    };
+    for (mode, dispatch, reverts) in [
+        (&drain, WakeDispatchStatus::NotDispatched, true),
+        (&drain, WakeDispatchStatus::MayHaveLanded, false),
+        (
+            &RestoreClaimMode::EvacuationMarker,
+            WakeDispatchStatus::NotDispatched,
+            false,
+        ),
+    ] {
+        assert_eq!(
+            drain_restore_timeout_reverts(mode, claim, Some(&timeout), dispatch),
+            reverts,
+            "{mode:?} {dispatch:?}"
+        );
+    }
+}
