@@ -232,10 +232,15 @@ that records it. That covers every release from before #1277, including the
 withdrawn-interval ones that list only the partition migration below, and they
 all predate `SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS`. Rolling back to one needs,
 first, with template-manager stopped and the newer one kept from restarting
-until the older one starts,
-`space-db-migrator template-manager --database-path <db> down` once with a
-migrator that bundles the migration, such as the newer release's. It reverts
-only that migration. 'Template cache partition migration' and
+until the older one starts, `20261031050126` reverted with
+`space-db-migrator template-manager --database-path <db> down`, run with a
+migrator that bundles every migration the database records, such as the newer
+release's. Each run reverts only the newest applied migration, so check
+`sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` first. If
+it prints `20261031050126`, one run reverts only that migration. If it prints a
+later version, revert those later migrations first, newest first, reading each
+down script as 'Rolling back past a newer SQLite migration' describes, until it
+prints `20261031050126`. 'Template cache partition migration' and
 `docs/execution-environments.md` say when this applies to a partition rollback.
 
 ## Template cache partition migration
