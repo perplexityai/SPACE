@@ -1376,6 +1376,57 @@ async fn shut_down(service: &ExecutionService) {
     service.drain().await.expect("complete shutdown");
 }
 
+// A repeated start whose process the guest no longer holds may have run, so
+// the guest says so rather than answer as a start that failed.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_repeated_start_whose_process_is_gone_says_its_replay_expired() {
+    let service = cancellation_service();
+    let mut events = Process::start(&service, cancellation_start_request())
+        .await
+        .expect("first start")
+        .into_inner();
+    while let Some(event) = events.next().await {
+        event.expect("first start's events");
+    }
+    service.inner.processes.records.clear();
+
+    let Err(error) = Process::start(&service, cancellation_start_request()).await else {
+        panic!("a start whose process is gone must not replay");
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
+    assert_eq!(
+        error
+            .metadata()
+            .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
+            .and_then(|reason| reason.to_str().ok()),
+        Some(pplx_space_guest_process::status::PROCESS_REPLAY_EXPIRED)
+    );
+    shut_down(&service).await;
+}
+
+// A permission error can be the executable's, the working directory's or a
+// parent's, and a directory the account cannot search looks missing, so it
+// names no field however the directory looks.
+#[tokio::test]
+async fn a_spawn_permission_error_names_no_field() {
+    use pplx_space_guest_process::status::{ERROR_REASON_METADATA_KEY, PROCESS_START_CWD};
+    let missing = std::path::Path::new("/nonexistent-space-test-dir/cwd");
+    let reason = |status: &Status| {
+        status
+            .metadata()
+            .get(ERROR_REASON_METADATA_KEY)
+            .and_then(|reason| reason.to_str().ok())
+            .map(str::to_string)
+    };
+    for errno in [libc::EACCES, libc::EPERM] {
+        let status = spawn_error_status(io::Error::from_raw_os_error(errno), missing).await;
+        assert_eq!(reason(&status), None, "errno {errno}: {status:?}");
+    }
+    let status = spawn_error_status(io::Error::from_raw_os_error(libc::ENOENT), missing).await;
+    assert_eq!(reason(&status).as_deref(), Some(PROCESS_START_CWD));
+}
+
 // A spawn can stall for seconds under memory or I/O pressure. It must hold up
 // only its own start: another start on the same service is admitted and gets
 // its owner while the first is still inside `spawn`, and the runtime that

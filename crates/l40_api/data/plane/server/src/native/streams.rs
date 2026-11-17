@@ -272,7 +272,7 @@ pub(super) fn process_stream_start_http_error(
     if let Some(response) = backend_refusal_http_error(error) {
         return response;
     }
-    if matches!(error, StreamBridgeError::ProcessNotRetained) {
+    if matches!(error, StreamBridgeError::ProcessNotRetained) || process_replay_expired(error) {
         return data_plane_http_error(
             StatusCode::NOT_FOUND,
             DataPlaneHttpErrorCode::NotFound,
@@ -334,6 +334,23 @@ pub(super) fn process_stream_start_http_error(
     )
 }
 
+/// The guest answered a repeated start whose process it no longer holds. The
+/// command may have run, so this is the process no longer being retained,
+/// not a start that failed. Guests from older templates send it untagged,
+/// and it then reads as [`CommandNotStarted`].
+fn process_replay_expired(error: &StreamBridgeError) -> bool {
+    matches!(
+        error,
+        StreamBridgeError::BackendStatus(status)
+            if status.code() == tonic::Code::FailedPrecondition
+                && status
+                    .metadata()
+                    .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
+                    .and_then(|value| value.to_str().ok())
+                    == Some(pplx_space_guest_process::status::PROCESS_REPLAY_EXPIRED)
+    )
+}
+
 /// A command the sandbox refused to start for good: its executable, working
 /// directory or user cannot be used. It is the caller's request to fix, so it
 /// answers `invalid_request`, never `not_found` (which reads as the session)
@@ -350,7 +367,9 @@ impl CommandNotStarted {
         let StreamBridgeError::BackendStatus(status) = error else {
             return None;
         };
-        if !pplx_space_common_grpc::is_terminal_guest_process_error(status) {
+        if !pplx_space_common_grpc::is_terminal_guest_process_error(status)
+            || process_replay_expired(error)
+        {
             return None;
         }
         let code = status.code();
@@ -442,6 +461,14 @@ pub(super) fn stream_start_error_frame(
 ) -> DataPlaneServerFrame {
     if let Some(refusal) = sandbox_not_running(error, sandbox_id) {
         return refusal.frame();
+    }
+    if process_replay_expired(error) {
+        return DataPlaneServerFrame::Error {
+            code: DataPlaneErrorCode::BackendStreamError,
+            message: PROCESS_NOT_RETAINED_MESSAGE.to_string(),
+            retryable: false,
+            details: Vec::new(),
+        };
     }
     if let Some(not_started) = CommandNotStarted::from_error(error) {
         return DataPlaneServerFrame::Error {

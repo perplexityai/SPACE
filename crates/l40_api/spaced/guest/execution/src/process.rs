@@ -913,19 +913,29 @@ static PTY_INHERITANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// request sets these: the values E2B-compatible terminal clients send.
 const PTY_DEFAULT_ENV: [(&str, &str); 2] = [("TERM", "xterm-256color"), ("LANG", "C.UTF-8")];
 
+/// How long a failed spawn may spend looking at its working directory to say
+/// which field failed. A directory that does not answer in time names none,
+/// so the start still finishes and releases what it holds.
+const WORKING_DIR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// The status of a spawn that failed: its errno's, tagged with the request
 /// field to fix when that is certain. The kernel reports a missing working
 /// directory and a missing executable with the same ENOENT, so the directory
 /// is looked at after the fact. A permission error stays untagged: either
-/// could be what the account may not use.
+/// could be what the account may not use, and a directory the account cannot
+/// search looks missing to that lookup.
 async fn spawn_error_status(error: io::Error, working_dir: &std::path::Path) -> Status {
     let errno = error.raw_os_error();
     let status = map_io_error(error);
-    // On the async start path: a working directory on a hung mount must not
-    // stall the runtime worker the start runs on.
-    let working_dir_usable = tokio::fs::metadata(working_dir)
-        .await
-        .is_ok_and(|metadata| metadata.is_dir());
+    if matches!(errno, Some(libc::EACCES | libc::EPERM)) {
+        return status;
+    }
+    let lookup =
+        tokio::time::timeout(WORKING_DIR_LOOKUP_TIMEOUT, tokio::fs::metadata(working_dir)).await;
+    let Ok(metadata) = lookup else {
+        return status;
+    };
+    let working_dir_usable = metadata.is_ok_and(|metadata| metadata.is_dir());
     let reason = if !working_dir_usable {
         Some(pplx_space_guest_process::status::PROCESS_START_CWD)
     } else if matches!(errno, Some(libc::ENOENT | libc::ENOEXEC | libc::ENOTDIR)) {
@@ -2477,7 +2487,14 @@ impl Process for ExecutionService {
                     .inner
                     .processes
                     .replay(&process_id, Some(0), false)
-                    .ok_or_else(|| Status::failed_precondition("process replay state expired"))?;
+                    .ok_or_else(|| {
+                        // The command may have run: say so, rather than read as
+                        // a start that failed.
+                        with_start_reason(
+                            Status::failed_precondition("process replay state expired"),
+                            pplx_space_guest_process::status::PROCESS_REPLAY_EXPIRED,
+                        )
+                    })?;
                 return Ok(Response::new(
                     replay_process_event_stream(replay) as Self::StartStream
                 ));

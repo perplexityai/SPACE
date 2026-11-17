@@ -66,3 +66,8 @@ pub const PROCESS_START_CWD: &str = "process-start-cwd";
 /// [`ERROR_REASON_METADATA_KEY`] value of a process start that failed
 /// because the account it asked to run as does not exist.
 pub const PROCESS_START_USER: &str = "process-start-user";
+
+/// [`ERROR_REASON_METADATA_KEY`] value of a FAILED_PRECONDITION answering a
+/// repeated start whose process the guest no longer holds: the command may
+/// have run, so it is not a start that failed.
+pub const PROCESS_REPLAY_EXPIRED: &str = "process-replay-expired";

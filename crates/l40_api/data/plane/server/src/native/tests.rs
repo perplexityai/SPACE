@@ -428,6 +428,49 @@ async fn full_guest_storage_is_named_and_not_retryable() {
 // field, never a `not_found` that reads as the session or a `forbidden` that
 // reads as the token. Guests from older templates send no tag, and get the
 // cause their status code allows. WebSocket answers with the same details.
+/// A repeated start the guest answers with an expired replay may have run, so
+/// it answers as a process no longer retained, over SSE and WebSocket, not as
+/// a command that could not be started.
+#[tokio::test]
+async fn a_replayed_start_whose_process_is_gone_is_not_retained() {
+    use http_body_util::BodyExt;
+    let mut status = tonic::Status::failed_precondition("process replay state expired");
+    status
+        .metadata_mut()
+        .insert("space-guest-process-error", "terminal".parse().unwrap());
+    status.metadata_mut().insert(
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(
+            pplx_space_guest_process::status::PROCESS_REPLAY_EXPIRED,
+        ),
+    );
+    let error = StreamBridgeError::BackendStatus(status);
+
+    let response = process_stream_start_http_error(&error, SandboxId::new());
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "not_found", "{body}");
+    assert_eq!(
+        body["error"]["message"], PROCESS_NOT_RETAINED_MESSAGE,
+        "{body}"
+    );
+    assert_eq!(body["error"]["retryable"], false, "{body}");
+
+    let DataPlaneServerFrame::Error {
+        message,
+        retryable,
+        details,
+        ..
+    } = stream_start_error_frame(&error, SandboxId::new())
+    else {
+        panic!("expected error frame")
+    };
+    assert_eq!(message, PROCESS_NOT_RETAINED_MESSAGE);
+    assert!(!retryable);
+    assert!(details.is_empty(), "{details:?}");
+}
+
 #[tokio::test]
 async fn a_command_the_guest_cannot_start_names_the_cause_and_field() {
     use http_body_util::BodyExt;
