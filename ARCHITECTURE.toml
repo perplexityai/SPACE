@@ -740,6 +740,21 @@ common = [
 # writes the table and whether that is permanent or temporary; a temporary
 # grant names the work that removes it.
 [rules.layers.state.co_writers.postgres]
+# Pruning a node's absent sandboxes deletes their facet rows in one statement.
+# Temporary: the prune calls sandbox-teardown for those rows.
+node_facet_conditions = ["pplx-space-sandbox-store"]
+# Pruning a node's absent sandboxes deletes their facet rows in one statement.
+# Temporary: the prune calls sandbox-teardown for those rows.
+node_facet_observed_status = ["pplx-space-sandbox-store"]
+# Teardown deletes an element's queued refs in the caller's transaction.
+# Temporary: the delete moves into cluster-trigger-queue and teardown calls it.
+node_reconcile_queue = ["pplx-space-sandbox-teardown"]
+# Pause-failed recovery retires the quarantine in its sandboxes update.
+# Temporary: the recovery calls sandbox-quarantine-store for the quarantine.
+sandbox_quarantine_history = ["pplx-space-sandbox-store"]
+# Pause-failed recovery retires the quarantine in its sandboxes update.
+# Temporary: the recovery calls sandbox-quarantine-store for the quarantine.
+sandbox_quarantine_state = ["pplx-space-sandbox-store"]
 # Deleting a sandbox orphans its snapshots' storage locations for cleanup.
 # Temporary: the write folds into snapshot-store.
 snapshot_storage_locations = ["pplx-space-sandbox-store"]
