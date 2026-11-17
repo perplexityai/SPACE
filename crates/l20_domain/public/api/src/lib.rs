@@ -2148,7 +2148,10 @@ pub struct PublicErrorEnvelope {
     /// `invalid_request` for a sandbox create or update field outside its limit
     /// carries `{"key": "field", "value": "<field>"}`, such as `metadata` or
     /// `resources.vcpu`, and so does a 422 for a body value of the wrong
-    /// type, naming its path (`command[1]`, `env.NAME`).
+    /// type when the body's decoder reports its path (`command[1]`,
+    /// `env.NAME`). A missing field, or one inside an internally tagged object
+    /// such as a credential reference, carries no field detail; the message
+    /// says what is wrong.
     pub details: Vec<PublicErrorDetail>,
 }
 
