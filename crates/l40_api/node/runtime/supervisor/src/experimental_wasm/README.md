@@ -23,7 +23,8 @@ sandbox gets separate writable `/workspace` and `/tmp` preopens. Host paths
 and environment are otherwise not inherited, and networking is disabled.
 
 Requests are JSON on stdin; a successful response is JSON on stdout.
-Operations are `create`, `upload`, `download`, `execute`, and `delete`.
+Operations are `capabilities`, `create`, `inspect`, `stop`, `start`, `upload`,
+`download`, `execute`, and `delete`.
 Execution takes `sandbox_id`, `argv`, `timeout_secs` (1 through 120), and an
 optional guest `env` map. Arguments are passed directly to the configured
 module, never interpreted as a shell command or a host executable:
@@ -31,6 +32,43 @@ module, never interpreted as a shell command or a host executable:
 ```json
 {"operation":"execute","sandbox_id":"01900000-0000-7000-8000-000000000001","argv":["-c","print(6 * 7)"],"timeout_secs":60,"env":{"PYTHONHOME":"/"}}
 ```
+
+`capabilities` returns SPACE's shared `RuntimeCapabilities` contract. Gateway
+networking, Volume Manager integration, snapshots, pause/resume, fork and warm
+pools are not qualified and are all reported false. `create` accepts that same
+type as `required_capabilities` and the shared `startup_policy`; unsupported
+requirements are rejected before allocating a sandbox, not silently downgraded.
+
+A caller may supply a UUIDv7 `sandbox_id` to make create retries idempotent.
+Creation atomically publishes both writable directories. `stop` persists a
+node-local command-admission marker and `start` removes it without losing files.
+State survives separate supervisor invocations; `delete` is idempotent.
+State observations reuse the shared `SandboxLifecycle` vocabulary.
+These are quiescent operations under the runner's single-flight lock, not
+concurrent cancellation, VM suspension, or durable control-plane reconciliation.
+The storage is still an operator-provided experimental root, not Volume Manager
+storage. These additions enforce more of the platform contract without claiming
+a registered production backend.
+
+## Platform integration boundary
+
+| Platform concern | Current experimental behavior | Required before qualification |
+| --- | --- | --- |
+| Capability admission | Uses shared `RuntimeCapabilities` and `StartupPolicy`; rejects unsupported requirements before sandbox allocation | Scheduler and API select a registered backend using those requirements |
+| Lifecycle | UUIDv7 create retries, atomic directory publication, inspect, quiescent stop/start, idempotent delete | Persist intent through the owning desired-state store and existing reconciliation path; recover after node loss |
+| Execution | Single flight, bounded deadline/output, process-group cleanup | Per-sandbox resource accounting, concurrent cancellation, restart adoption and isolation review |
+| Storage | Two node-local writable preopens; deployment-mounted read-only tools | Volume Manager remains the only managed-storage authority; integrate its attachment, quota and reclamation lifecycle instead of inventing another one |
+| Networking | Guest networking disabled | A mediated WASI networking/HTTP path must enforce the existing gateway's identity, destination policy, credentials and audit contracts |
+| Snapshots and warm capacity | Explicitly unsupported | Define and implement backend-specific semantics before advertising any capability |
+| Operations | Dedicated local protocol; deployment supplies cgroups and identity | Authenticated service integration, tenancy, observability, drain and recovery procedures |
+
+Host sockets opened by a Wasmtime process must not be assumed to traverse a
+VM-oriented gateway interception path.
+Enabling WASI sockets or inheriting the host network would bypass this qualification
+work rather than complete it.
+Similarly, a preopened host directory is not evidence of managed-volume support.
+This runner intentionally does not register itself as a schedulable runtime until
+those owning platform boundaries are integrated.
 
 The deadline includes compilation. The request, guest file size, and each
 captured output stream are limited to 1 MiB. Overflow returns execution status

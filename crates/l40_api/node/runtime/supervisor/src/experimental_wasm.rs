@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
+use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_execution_spec::{RuntimeCapabilities, StartupPolicy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -51,7 +53,23 @@ pub struct WasmConfig {
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    Create {},
+    Capabilities {},
+    Create {
+        #[serde(default)]
+        sandbox_id: Option<Uuid>,
+        #[serde(default)]
+        required_capabilities: RuntimeCapabilities,
+        startup_policy: Option<StartupPolicy>,
+    },
+    Inspect {
+        sandbox_id: Uuid,
+    },
+    Stop {
+        sandbox_id: Uuid,
+    },
+    Start {
+        sandbox_id: Uuid,
+    },
     Execute {
         sandbox_id: Uuid,
         argv: Vec<String>,
@@ -81,6 +99,20 @@ struct Response {
     execution: Option<Execution>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<RuntimeCapabilities>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_lifecycle"
+    )]
+    state: Option<SandboxLifecycle>,
+}
+
+fn serialize_lifecycle<S: serde::Serializer>(
+    state: &Option<SandboxLifecycle>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    state.map(SandboxLifecycle::as_str).serialize(serializer)
 }
 
 #[derive(Serialize)]
@@ -135,15 +167,71 @@ pub fn run_request(
         sandbox_id: Uuid::nil(),
         execution: None,
         content: None,
+        capabilities: None,
+        state: None,
     };
     match request {
-        Request::Create {} => {
-            let id = Uuid::now_v7();
+        Request::Capabilities {} => {
+            // Reuse the platform vocabulary without claiming unqualified
+            // gateway, managed-volume, snapshot or warm-pool integrations.
+            response.capabilities = Some(RuntimeCapabilities::default());
+        }
+        Request::Create {
+            sandbox_id,
+            required_capabilities,
+            startup_policy,
+        } => {
+            let available = RuntimeCapabilities::default();
+            if !available.contains(required_capabilities)
+                || startup_policy
+                    .is_some_and(|policy| !available.contains(policy.required_capabilities()))
+            {
+                return Err(WasmRequestError::Invalid(
+                    "required platform capabilities are not qualified",
+                ));
+            }
+            let id = sandbox_id.unwrap_or_else(Uuid::now_v7);
+            if id.get_version_num() != 7 {
+                return Err(WasmRequestError::Invalid("sandbox id must be UUIDv7"));
+            }
             let dir = root.join(id.to_string());
-            fs::create_dir(&dir)?;
-            fs::create_dir(dir.join("workspace"))?;
-            fs::create_dir(dir.join("tmp"))?;
+            if !dir.try_exists()? {
+                // Publish a complete node-local sandbox or nothing. The root
+                // lock serializes retries; abandoned staging is never runnable.
+                let pending = tempfile::tempdir_in(&root)?;
+                fs::create_dir(pending.path().join("workspace"))?;
+                fs::create_dir(pending.path().join("tmp"))?;
+                fs::rename(pending.path(), &dir)?;
+            }
+            sandbox_dir(&root, id)?;
             response.sandbox_id = id;
+            response.state = Some(sandbox_state(&dir)?);
+        }
+        Request::Inspect { sandbox_id } => {
+            response.state = Some(sandbox_state(&sandbox_dir(&root, sandbox_id)?)?);
+            response.sandbox_id = sandbox_id;
+        }
+        Request::Stop { sandbox_id } => {
+            let dir = sandbox_dir(&root, sandbox_id)?;
+            // Execute holds the same lock until child cleanup. Stop is a
+            // quiescent admission transition, not concurrent cancellation.
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.join(".stopped"))?;
+            response.state = Some(SandboxLifecycle::Stopped);
+            response.sandbox_id = sandbox_id;
+        }
+        Request::Start { sandbox_id } => {
+            let dir = sandbox_dir(&root, sandbox_id)?;
+            match fs::remove_file(dir.join(".stopped")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            response.state = Some(SandboxLifecycle::Started);
+            response.sandbox_id = sandbox_id;
         }
         Request::Execute {
             sandbox_id,
@@ -152,6 +240,9 @@ pub fn run_request(
             env,
         } => {
             let dir = sandbox_dir(&root, sandbox_id)?;
+            if matches!(sandbox_state(&dir)?, SandboxLifecycle::Stopped) {
+                return Err(WasmRequestError::Invalid("sandbox is stopped"));
+            }
             if !(1..=120).contains(&timeout_secs)
                 || argv.len() > 256
                 || argv.iter().map(String::len).sum::<usize>() > 65_536
@@ -202,13 +293,27 @@ pub fn run_request(
             response.sandbox_id = sandbox_id;
         }
         Request::Delete { sandbox_id } => {
-            fs::remove_dir_all(sandbox_dir(&root, sandbox_id)?)?;
+            match sandbox_dir(&root, sandbox_id) {
+                Ok(dir) => fs::remove_dir_all(dir)?,
+                Err(WasmRequestError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             response.sandbox_id = sandbox_id;
         }
     }
     serde_json::to_writer(&mut output, &response)?;
     output.write_all(b"\n")?;
     Ok(())
+}
+
+/// Node-local admission observation, not control-plane desired state.
+fn sandbox_state(dir: &Path) -> Result<SandboxLifecycle, WasmRequestError> {
+    Ok(if dir.join(".stopped").try_exists()? {
+        SandboxLifecycle::Stopped
+    } else {
+        SandboxLifecycle::Started
+    })
 }
 
 fn sandbox_dir(root: &Path, id: Uuid) -> Result<PathBuf, WasmRequestError> {

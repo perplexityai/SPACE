@@ -51,13 +51,51 @@ fn lifecycle_round_trip_does_not_require_kvm_or_launch_a_process() {
     let created = request(serde_json::json!({"operation": "create"}));
     let id = created["sandbox_id"].as_str().expect("id");
     assert_eq!(created["runtime"], "wasmtime-wasi");
+    assert_eq!(created["state"], "started");
+    // A lost create response must not allocate a new directory or discard files.
+    let retried = request(serde_json::json!({"operation":"create", "sandbox_id":id}));
+    assert_eq!(retried["sandbox_id"], id);
     request(serde_json::json!({
         "operation":"upload", "sandbox_id": id, "path":"/tmp/answer.txt", "content":"5050\n"
     }));
+    request(serde_json::json!({"operation":"create", "sandbox_id":id}));
     let downloaded = request(serde_json::json!({
         "operation":"download", "sandbox_id":id, "path":"/tmp/answer.txt"
     }));
     assert_eq!(downloaded["content"], "5050\n");
+    request(serde_json::json!({"operation":"stop", "sandbox_id":id}));
+    assert_eq!(
+        request(serde_json::json!({"operation":"inspect", "sandbox_id":id}))["state"],
+        "stopped"
+    );
+    assert!(
+        matches!(
+            run_request(
+                WasmConfig {
+                    root: root.path().to_path_buf(),
+                    tools: tools.path().to_path_buf(),
+                    module: tools.path().join("absent.wasm"),
+                    preopens: BTreeMap::new(),
+                },
+                serde_json::to_vec(&serde_json::json!({
+                    "operation":"execute", "sandbox_id":id, "argv":[], "timeout_secs":1
+                }))
+                .expect("request")
+                .as_slice(),
+                Vec::new()
+            ),
+            Err(WasmRequestError::Invalid("sandbox is stopped"))
+        ),
+        "stopped command must be rejected before spawning a module"
+    );
+    request(serde_json::json!({"operation":"start", "sandbox_id":id}));
+    assert_eq!(
+        request(
+            serde_json::json!({"operation":"download", "sandbox_id":id, "path":"/tmp/answer.txt"})
+        )["content"],
+        "5050\n"
+    );
+    request(serde_json::json!({"operation":"delete", "sandbox_id":id}));
     request(serde_json::json!({"operation":"delete", "sandbox_id":id}));
     assert!(!root.path().join(id).exists());
 }
@@ -68,6 +106,7 @@ fn request_protocol_rejects_traversal_ids_and_unknown_fields() {
     for request in [
         r#"{"operation":"delete","sandbox_id":"../../etc"}"#,
         r#"{"operation":"create","network":true}"#,
+        r#"{"operation":"create","sandbox_id":"00000000-0000-0000-0000-000000000000"}"#,
     ] {
         assert!(
             run_request(
@@ -83,4 +122,32 @@ fn request_protocol_rejects_traversal_ids_and_unknown_fields() {
             .is_err()
         );
     }
+    for request in [
+        r#"{"operation":"create","startup_policy":"RequireBaseSnapshot"}"#,
+        r#"{"operation":"create","startup_policy":"RequireWarmPool"}"#,
+        r#"{"operation":"create","required_capabilities":{"pause_resume":false,"snapshot":false,"fork":false,"prewarmed_pool":false,"network_gateway":true,"volume_manager":false}}"#,
+        r#"{"operation":"create","required_capabilities":{"pause_resume":false,"snapshot":false,"fork":false,"prewarmed_pool":false,"network_gateway":false,"volume_manager":true}}"#,
+    ] {
+        assert!(matches!(
+            run_request(
+                WasmConfig {
+                    root: root.path().to_path_buf(),
+                    tools: root.path().to_path_buf(),
+                    module: root.path().join("module.wasm"),
+                    preopens: BTreeMap::new(),
+                },
+                request.as_bytes(),
+                Vec::new(),
+            ),
+            Err(WasmRequestError::Invalid(
+                "required platform capabilities are not qualified"
+            ))
+        ));
+    }
+    assert!(
+        fs::read_dir(root.path())
+            .expect("root")
+            .all(|entry| entry.expect("entry").file_name() == ".lock"),
+        "rejected requirements must not allocate sandbox directories"
+    );
 }
