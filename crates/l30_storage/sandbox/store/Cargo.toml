@@ -8,7 +8,14 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.space.state]
-postgres = ["sandboxes"]
+postgres = [
+  "node_local_backup_pending",
+  "sandbox_k8s_executions",
+  "sandbox_observed_states",
+  "sandbox_port_exposures",
+  "sandbox_snapshot_inventory",
+  "sandboxes",
+]
 
 [lints]
 workspace = true
