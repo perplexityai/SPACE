@@ -7,7 +7,9 @@
 //! `runtime_upgrade` reconciler records the subjects a kind's driver finds
 //! ([`insert_pending`]), leases them under the campaign's pacing
 //! ([`lease_items`]), and records each outcome under its lease
-//! ([`finish_item`]). The admin API starts ([`create_campaign`]) and reads
+//! ([`finish_item`]). The admin API starts ([`create_campaign`]), pauses
+//! ([`pause_campaign`]), resumes ([`resume_campaign`]), aborts
+//! ([`abort_campaign`]) and reads
 //! ([`get_record`], [`list_records`]) campaigns.
 //!
 //! # Rules the store enforces
@@ -45,10 +47,12 @@
 //! * **Generation.** The schema owns `generation`: a `BEFORE UPDATE`
 //!   trigger raises it by exactly one whenever an update changes another
 //!   column (other than `updated_at` and the user columns), and overrides any
-//!   value a writer sets. The store never writes it. Here the changes are the
-//!   reconciler's pause at the failure budget ([`pause_if_over_budget`]) and
-//!   completion ([`complete_if_drained`]). Item progress doesn't touch the
-//!   campaign row. A new campaign starts at generation 0.
+//!   value a writer sets. The store never writes it. Here the changes are an
+//!   operator's pause, resume and abort ([`pause_campaign`],
+//!   [`resume_campaign`], [`abort_campaign`]), and the reconciler's pause at
+//!   the failure budget ([`pause_if_over_budget`]) and completion
+//!   ([`complete_if_drained`]). Item progress doesn't touch the campaign row.
+//!   A new campaign starts at generation 0.
 //! * **Errors fit the column.** [`ItemError`] truncates to 4096 characters
 //!   and maps an empty message to `NULL`.
 //! * **Lock order.** A verb that touches a campaign and its items locks the
@@ -79,10 +83,14 @@ use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
 
+mod admin;
 mod create;
 mod items;
 mod phase;
 
+pub use admin::{
+    ChangePhaseError, PhaseChange, PhaseChanged, abort_campaign, pause_campaign, resume_campaign,
+};
 pub use create::{
     CreateCampaignError, NewCampaign, REASON_MAX_CHARS, check_reason, create_campaign,
 };
