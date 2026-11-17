@@ -16,6 +16,13 @@ pub struct CreateEncryptedGp3Volume<'a> {
     pub tags: &'a BTreeMap<String, String>,
 }
 
+/// A creation receipt, not evidence of availability, ownership, or attachments.
+/// Callers must reconcile the tagged inventory before using the disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatedVolume {
+    pub volume_id: String,
+}
+
 /// AWS wire values are retained verbatim, including unknown future states.
 /// Controllers must allowlist states before performing a lifecycle transition.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,7 +54,7 @@ impl<T: QueryTransport> Client<T> {
     pub async fn create_encrypted_gp3_volume(
         &self,
         request: &CreateEncryptedGp3Volume<'_>,
-    ) -> Result<Volume, AwsClientError> {
+    ) -> Result<CreatedVolume, AwsClientError> {
         let mut params = vec![
             (
                 "AvailabilityZone".to_string(),
@@ -80,10 +87,7 @@ impl<T: QueryTransport> Client<T> {
                     .collect(),
             )
             .await?;
-        let mut document = Document::new(&body);
-        let mut root = document.root_element()?;
-        require_root(&root, "CreateVolumeResponse")?;
-        parse_volume(&mut root).map_err(Into::into)
+        parse_creation_receipt(&body).map_err(Into::into)
     }
 
     /// One inventory page, scoped by all supplied ownership tags. Keeping
@@ -209,6 +213,27 @@ fn required(value: Option<String>, field: &'static str) -> Result<String, XmlDec
     value
         .filter(|value| !value.is_empty())
         .ok_or_else(|| XmlDecodeError::custom(format!("EBS response omitted {field}")))
+}
+
+fn parse_creation_receipt(body: &str) -> Result<CreatedVolume, XmlDecodeError> {
+    let mut document = Document::new(body);
+    let mut root = document.root_element()?;
+    require_root(&root, "CreateVolumeResponse")?;
+    let mut volume_id = None;
+    while let Some(mut tag) = root.next_tag() {
+        if tag.start_el().local() == "volumeId" {
+            if volume_id.is_some() {
+                return Err(XmlDecodeError::custom("duplicate EBS creation volumeId"));
+            }
+            volume_id = Some(try_data(&mut tag)?.into_owned());
+        }
+    }
+    // CreateVolume deliberately omits attachmentSet. Do not weaken inventory
+    // parsing or fabricate an empty attachment list from this receipt.
+    // https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CreateVolume.html
+    Ok(CreatedVolume {
+        volume_id: required(volume_id, "volumeId")?,
+    })
 }
 
 fn parse_attachment(

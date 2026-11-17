@@ -20,7 +20,14 @@ const ATTACHMENT: &str = r#"
 async fn create_sends_idempotency_encryption_and_atomic_tags_without_a_snapshot() {
     let transport = RecordingTransport::new(vec![QueryResponse::new(
         StatusCode::OK,
-        format!("<CreateVolumeResponse>{VOLUME}</CreateVolumeResponse>"),
+        // CreateVolume does not return attachmentSet; only DescribeVolumes
+        // can establish the disk's current attachment inventory.
+        format!(
+            "<CreateVolumeResponse>{}</CreateVolumeResponse>",
+            VOLUME
+                .replace("<attachmentSet/>", "")
+                .replace("<status>available</status>", "<status>creating</status>")
+        ),
     )]);
     let client = Client::with_transport("us-west-2", credentials_provider(), transport.clone());
     let tags = BTreeMap::from([("experiment".to_string(), "example-run".to_string())]);
@@ -33,10 +40,12 @@ async fn create_sends_idempotency_encryption_and_atomic_tags_without_a_snapshot(
         })
         .await
         .unwrap();
-    assert_eq!(volume.volume_id, "vol-0123456789abcdef0");
-    assert!(volume.encrypted);
-    assert_eq!(volume.size_gib, 128);
-    assert_eq!(volume.tags, tags);
+    assert_eq!(
+        volume,
+        CreatedVolume {
+            volume_id: "vol-0123456789abcdef0".into(),
+        }
+    );
     let requests = transport.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(
@@ -57,6 +66,18 @@ async fn create_sends_idempotency_encryption_and_atomic_tags_without_a_snapshot(
             ),
         ])
     );
+}
+
+#[test]
+fn creation_receipts_require_one_nonempty_volume_identity() {
+    for invalid in [
+        "<CreateVolumeResponse/>",
+        "<CreateVolumeResponse><volumeId/></CreateVolumeResponse>",
+        "<CreateVolumeResponse><volumeId>vol-one</volumeId><volumeId>vol-two</volumeId></CreateVolumeResponse>",
+        "<Unexpected><volumeId>vol-one</volumeId></Unexpected>",
+    ] {
+        parse_creation_receipt(invalid).unwrap_err();
+    }
 }
 
 #[tokio::test]
