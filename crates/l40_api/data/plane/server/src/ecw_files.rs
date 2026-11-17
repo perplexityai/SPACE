@@ -938,13 +938,14 @@ async fn spaced_write_spooled(
 }
 
 /// Sends a write whose whole upload the data plane holds, and sends it again
-/// while node-api answers with sandbox-manager's restart-drain refusal. That
-/// refusal carries an explicit marker and is made before sandbox-manager
-/// dispatches the call, so the guest never saw the refused write. A resend
-/// reaches the successor once it owns sandbox-manager's socket, within the
-/// drain budget. Every other outcome, any other answered status included, is
-/// returned as the attempt's result: the write may have run. A caller that
-/// gives up drops the wait with its request.
+/// while node-api answers with the retry-on-successor marker. Sandbox-manager's
+/// restart drain sets it on a call it refuses before dispatch, and node-api
+/// sets it on a write whose dial to sandbox-manager failed before sending it,
+/// so either way the guest never saw the refused write. A resend reaches the
+/// successor once it owns sandbox-manager's socket, within the drain budget.
+/// Every other outcome, any other answered status included, is returned as
+/// the attempt's result: the write may have run. A caller that gives up drops
+/// the wait with its request.
 async fn resend_while_sandbox_manager_hands_over<T, SendWrite, Fut>(
     mut send: SendWrite,
 ) -> Result<T, EcwRouteAttemptError>
@@ -970,7 +971,7 @@ where
         tracing::debug!(
             resends,
             retry_in = ?delay,
-            "sandbox-manager restart drain refused a held upload; resending it to the successor"
+            "sandbox-manager's handoff refused a held upload; resending it to the successor"
         );
         tokio::time::sleep(delay).await;
         resends += 1;

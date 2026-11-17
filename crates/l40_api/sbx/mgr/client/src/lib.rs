@@ -19,10 +19,11 @@ pub use pplx_space_sbx_mgr_protocol::{
     authoritative_route_identity_required_status, auto_lifecycle, direct_restore_start_request,
     encode_optional_sandbox_id, is_authoritative_route_identity_required,
     is_restart_retry_on_successor, is_retained_filesystem_only_copy_status, is_stop_not_admitted,
-    is_suspend_publication_pending_status, is_template_policy_dependency, lifecycle, operations,
-    proto, restart_retry_on_successor_status, retained_filesystem_only_copy_status,
-    stop_not_admitted_status, suspend_evidence_requires_retention,
-    suspend_publication_pending_status, template_policy_dependency_status,
+    is_suspend_publication_pending_status, is_template_policy_dependency, lifecycle,
+    mark_restart_retry_on_successor, operations, proto, restart_retry_on_successor_status,
+    retained_filesystem_only_copy_status, stop_not_admitted_status,
+    suspend_evidence_requires_retention, suspend_publication_pending_status,
+    template_policy_dependency_status,
 };
 
 #[cfg(any(test, feature = "test-support"))]

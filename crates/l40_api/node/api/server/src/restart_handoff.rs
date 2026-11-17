@@ -19,8 +19,8 @@ use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 
 use pplx_space_sbx_mgr_client::{
-    RESTART_RETRY_ON_SUCCESSOR_METADATA, SandboxManagerGrpcClient, connect_fresh,
-    is_restart_retry_on_successor,
+    SandboxManagerGrpcClient, connect_fresh, is_restart_retry_on_successor,
+    mark_restart_retry_on_successor,
 };
 
 use crate::clients::BackendClients;
@@ -220,6 +220,21 @@ impl std::fmt::Display for RestartHandoffOutcome {
     }
 }
 
+/// Mark a call node-api's dial to sandbox-manager failed before sending it as
+/// sandbox-manager's restart drain marks a call it refused before dispatch,
+/// so a caller that still holds the call's input can send it again once the
+/// successor owns the socket. Only a typed client-side dial failure proves the
+/// call was never sent; every other failure, an answered drain refusal
+/// included, is returned unchanged. For calls node-api cannot rebuild and
+/// replay itself, such as a client-streamed write.
+pub(crate) fn mark_unsent_for_successor(status: Status) -> Status {
+    if pplx_space_common_grpc::is_client_connect_failure(&status) {
+        mark_restart_retry_on_successor(status)
+    } else {
+        status
+    }
+}
+
 /// Forward one sandbox-manager RPC, replaying it only across a restart
 /// handoff.
 ///
@@ -249,24 +264,6 @@ impl std::fmt::Display for RestartHandoffOutcome {
 /// sooner of the caller's `grpc-timeout` deadline and the hard handoff
 /// budget, and a non-read replay that times out in flight is surfaced as a
 /// deadline, never replayed again.
-/// Mark a call node-api's dial to sandbox-manager failed before sending it as
-/// sandbox-manager's restart drain marks a call it refused before dispatch,
-/// so a caller that still holds the call's input can send it again once the
-/// successor owns the socket. Only a typed client-side dial failure proves the
-/// call was never sent; every other failure is returned unchanged. For calls
-/// node-api cannot rebuild and replay itself, such as a client-streamed write.
-pub(crate) fn mark_unsent_for_successor(mut status: Status) -> Status {
-    if pplx_space_common_grpc::is_client_connect_failure(&status)
-        && !is_restart_retry_on_successor(&status)
-    {
-        status.metadata_mut().insert(
-            RESTART_RETRY_ON_SUCCESSOR_METADATA,
-            tonic::metadata::MetadataValue::from_static("true"),
-        );
-    }
-    status
-}
-
 pub(crate) async fn call_with_restart_handoff<Req, Resp, F, Fut>(
     method: &'static str,
     safety: RpcReplaySafety,

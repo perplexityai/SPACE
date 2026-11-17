@@ -169,7 +169,13 @@ pub const OPERATION_ACTIVATION_RECEIPT_HEALTH_SERVICE: &str =
     "space.sandbox-manager.capability.operation-activation-receipt.v1";
 
 pub fn restart_retry_on_successor_status(message: impl Into<String>) -> tonic::Status {
-    let mut status = tonic::Status::unavailable(message);
+    mark_restart_retry_on_successor(tonic::Status::unavailable(message))
+}
+
+/// `status`, keeping its code, marked as a call refused before it was served.
+/// Only an `Unavailable` status reads as the marker
+/// ([`is_restart_retry_on_successor`]).
+pub fn mark_restart_retry_on_successor(mut status: tonic::Status) -> tonic::Status {
     status.metadata_mut().insert(
         RESTART_RETRY_ON_SUCCESSOR_METADATA,
         tonic::metadata::MetadataValue::from_static("true"),
