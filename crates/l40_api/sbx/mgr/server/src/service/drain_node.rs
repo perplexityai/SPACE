@@ -405,6 +405,10 @@ pub(super) struct DrainPlan {
     pub(super) actions: Vec<PlannedAction>,
     /// The rows whose suspend waits for cache disk, pending or blocked.
     pub(super) disk_waits: Vec<String>,
+    /// The sandboxes whose running action this plan already waits for, so
+    /// that each is reported once however many of its rows' arms and
+    /// artifacts would wait for it.
+    waits_on_running: BTreeSet<String>,
 }
 
 /// Whether a row in `status` may hold a VM. A cleanup-owned row may, failed
@@ -554,6 +558,15 @@ impl DrainPlan {
         }
     }
 
+    /// Wait for `running`, the action running for `sandbox_id`, unless this
+    /// plan already waits for it: the row's own arm and each of its other
+    /// artifacts would otherwise report the same wait again.
+    fn wait_for_running(&mut self, inputs: &PlanInputs, sandbox_id: &str, running: DrainAction) {
+        if self.waits_on_running.insert(sandbox_id.to_owned()) {
+            self.wait_for(inputs, sandbox_id, running);
+        }
+    }
+
     /// Start `action` unless something is already running for its sandbox,
     /// and wait for whichever it is. An upload whose job is still queued or
     /// running is left to that job: enqueueing it again would only ask the
@@ -562,7 +575,7 @@ impl DrainPlan {
         let (sandbox_id, kind) = action.target();
         let sandbox_id = sandbox_id.to_owned();
         match inputs.running.get(&sandbox_id) {
-            Some(running) => self.wait_for(inputs, &sandbox_id, *running),
+            Some(running) => self.wait_for_running(inputs, &sandbox_id, *running),
             None => {
                 self.wait_for(inputs, &sandbox_id, kind);
                 let uploading = matches!(
@@ -799,7 +812,7 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
                 // A transition the drain doesn't drive: wait for it to settle,
                 // and page once it has sat there too long.
                 if let Some(action) = inputs.running.get(id) {
-                    plan.wait_for(inputs, id, *action);
+                    plan.wait_for_running(inputs, id, *action);
                 } else if inputs.unchanged.contains(id) {
                     plan.blocked.push((
                         Some(id.clone()),
@@ -856,7 +869,7 @@ pub(super) fn plan_cancel(
             continue;
         };
         if let Some(action) = inputs.running.get(id) {
-            plan.wait_for(inputs, id, *action);
+            plan.wait_for_running(inputs, id, *action);
             continue;
         }
         // A row being deleted takes its artifacts with it; it settles below.

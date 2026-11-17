@@ -938,6 +938,59 @@ fn a_local_only_artifact_without_a_row_blocks() {
     );
 }
 
+/// A sandbox whose suspend is running is reported once, pending or blocked,
+/// though its own arm and each of its two other local-only artifacts wait
+/// for that suspend; nothing else starts for it while the suspend runs. A
+/// gentle drain plans a running suspend the same way.
+#[test]
+fn a_running_action_is_reported_once_per_sandbox() {
+    const NAMED: &str = "01939e3e-9003-7000-8000-000000000001";
+    const SUPERSEDED: &str = "01939e3e-9004-7000-8000-000000000001";
+    for gentle in [false, true] {
+        for (failures, pending, blocked) in
+            [(MAX_ACTION_FAILURES - 1, 1, 0), (MAX_ACTION_FAILURES, 0, 1)]
+        {
+            let plan = plan(
+                &[row("a", SandboxState::Started)],
+                &PlanInputs {
+                    local_only: BTreeMap::from([(
+                        "a".to_owned(),
+                        vec![
+                            (NAMED.to_owned(), ArtifactKind::Full),
+                            (SUPERSEDED.to_owned(), ArtifactKind::Full),
+                        ],
+                    )]),
+                    running: BTreeMap::from([("a".to_owned(), DrainAction::Suspend)]),
+                    failures: BTreeMap::from([(
+                        ("a".to_owned(), DrainAction::Suspend),
+                        (failures, "no space".to_owned()),
+                    )]),
+                    gentle,
+                    ..PlanInputs::default()
+                },
+            );
+            let case = format!("gentle={gentle} failures={failures}");
+            assert_eq!(
+                plan.pending,
+                vec![("a".to_owned(), "suspend".to_owned()); pending],
+                "{case}"
+            );
+            assert_eq!(
+                plan.blocked,
+                vec![
+                    (
+                        Some("a".to_owned()),
+                        format!("suspend failed {failures} times: no space")
+                    );
+                    blocked
+                ],
+                "{case}"
+            );
+            assert!(plan.actions.is_empty(), "{case}: {:?}", plan.actions);
+        }
+    }
+}
+
 /// Work that has failed fewer than the bound times is pending; at the bound
 /// it is blocked with the last failure, whether it is running or about to
 /// start again, and it is still retried. The count is per kind of work: a
