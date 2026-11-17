@@ -3,7 +3,6 @@
 //! [`each_failure_answers_as_the_api_answers_it`] say where it comes from.
 
 mod drain;
-mod failure_logs;
 mod fakes;
 mod mutations;
 mod proxy;
