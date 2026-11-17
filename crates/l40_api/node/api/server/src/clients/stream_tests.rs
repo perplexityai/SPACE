@@ -312,3 +312,110 @@ async fn served_spaced_write_fails_a_reset_body_instead_of_reading_it_as_empty()
         tonic::Code::Aborted
     );
 }
+
+/// A request body that sends `data` and ends.
+struct OnceBody(Option<bytes::Bytes>);
+impl http_body::Body for OnceBody {
+    type Data = bytes::Bytes;
+    type Error = Status;
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        Poll::Ready(
+            self.get_mut()
+                .0
+                .take()
+                .map(|data| Ok(http_body::Frame::data(data))),
+        )
+    }
+}
+
+/// One served `SpacedWrite` that opens a file and ends its upload.
+fn served_spaced_write() -> http::Request<tonic::body::Body> {
+    use pplx_space_sbx_mgr_client::proto::{SpacedWriteOpen, spaced_write_request};
+    let message = pplx_space_sbx_mgr_client::proto::SpacedWriteRequest {
+        sandbox_id: pplx_space_common_core::types::SandboxId::new().to_string(),
+        operation: Some(pplx_space_sbx_mgr_client::operations::WriteRequest {
+            message: Some(spaced_write_request::Message::Open(SpacedWriteOpen {
+                path: "/tmp/upload".to_string(),
+                ..Default::default()
+            })),
+        }),
+    };
+    let encoded = prost::Message::encode_to_vec(&message);
+    let mut frame = vec![0u8];
+    frame.extend_from_slice(&u32::try_from(encoded.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(&encoded);
+    let mut request = wire_request(
+        "SpacedWrite",
+        tonic::body::Body::new(OnceBody(Some(bytes::Bytes::from(frame)))),
+    );
+    *request.uri_mut() = "/space.node.api.v1.WorkerApi/SpacedWrite".parse().unwrap();
+    request
+}
+
+fn marked_for_successor(response: &http::Response<tonic::body::Body>) -> bool {
+    response
+        .headers()
+        .get(pplx_space_sbx_mgr_client::RESTART_RETRY_ON_SUCCESSOR_METADATA)
+        .is_some_and(|value| value == "true")
+}
+
+/// node-api cannot resend a client-streamed write, so a write its dial to
+/// sandbox-manager never sent carries the restart drain's marker: the caller,
+/// which holds the upload, sends it again to the successor.
+#[tokio::test]
+async fn a_write_whose_sandbox_manager_dial_failed_is_marked_for_the_successor() {
+    let dir = tempfile::tempdir().unwrap();
+    // The gap between the predecessor removing its socket and the successor
+    // binding one, and a socket nothing listens on any more.
+    let missing = dir.path().join("missing.sock");
+    let refused = dir.path().join("refused.sock");
+    drop(std::os::unix::net::UnixListener::bind(&refused).unwrap());
+    for socket in [missing, refused] {
+        let channel = pplx_space_common_grpc::connect_uds_channel_lazy(
+            &socket,
+            tonic::transport::Endpoint::from_static("http://[::]:50051"),
+        );
+        let mut service = WorkerApiService::new(clients_with_channel(channel)).into_grpc_service();
+        let response = service.call(served_spaced_write()).await.unwrap();
+        assert_eq!(
+            response_code(&response),
+            tonic::Code::Unavailable,
+            "{socket:?}"
+        );
+        assert!(marked_for_successor(&response), "{socket:?} was not marked");
+    }
+}
+
+/// An `UNAVAILABLE` sandbox-manager answered may follow a write that ran, so it
+/// reaches the caller unmarked.
+#[tokio::test]
+async fn a_write_sandbox_manager_answered_unavailable_is_not_marked() {
+    let backend = axum::Router::new().fallback(|| async {
+        http::Response::builder()
+            .header("content-type", "application/grpc")
+            .header("grpc-status", (tonic::Code::Unavailable as i32).to_string())
+            .header(
+                "grpc-message",
+                "sandbox-manager handoff interrupted an in-flight RPC",
+            )
+            .body(axum::body::Body::empty())
+            .unwrap()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut service = WorkerApiService::new(clients_with_channel(channel)).into_grpc_service();
+    let response = service.call(served_spaced_write()).await.unwrap();
+
+    assert_eq!(response_code(&response), tonic::Code::Unavailable);
+    assert!(!marked_for_successor(&response));
+}

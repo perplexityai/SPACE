@@ -1016,7 +1016,9 @@ impl WorkerApi for WorkerApiService {
 
     // Client-streaming: the request body is consumed as it streams and
     // cannot be rebuilt, so a restart-drain marker cannot be replayed here.
-    // It surfaces to the caller, which owns any retry of the whole stream.
+    // It surfaces to the caller, which owns any retry of the whole stream. A
+    // dial that failed before the call was sent carries the same marker, so
+    // the caller resends it as well.
     async fn spaced_write(
         &self,
         r: Request<tonic::Streaming<pplx_space_sbx_mgr_client::proto::SpacedWriteRequest>>,
@@ -1053,7 +1055,10 @@ impl WorkerApi for WorkerApiService {
             move |stream| async move {
                 let mut request = Request::new(stream);
                 *request.metadata_mut() = metadata;
-                client.spaced_write(request).await
+                client
+                    .spaced_write(request)
+                    .await
+                    .map_err(crate::restart_handoff::mark_unsent_for_successor)
             },
         )
         .await
