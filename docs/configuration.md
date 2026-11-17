@@ -332,6 +332,10 @@ stopping, suspending or deleting a sandbox frees its place; so does the pod a
 drain uses to re-place a stopped sandbox, which runs no VM. A terminating pod
 doesn't count, so one left on a lost node doesn't hold its client's slot.
 
+A v2 drain's own restores skip the cap, but a user's start, wake or restore
+that cancels a waiting drain restore is charged like any activation, so the
+live cap can refuse it, and the sandbox then stays durably suspended.
+
 Pods count only once they carry the label. Pods created by an older release,
 or while attribution was off, don't, and neither does a pod that later
 replaces one of theirs without an ECW request: a sandbox with no recorded
