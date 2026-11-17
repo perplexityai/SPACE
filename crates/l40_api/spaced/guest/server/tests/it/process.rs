@@ -21,6 +21,166 @@ fn production_default_operation_user_is_user() {
     );
 }
 
+#[cfg(target_os = "linux")]
+async fn mount_probe_process(
+    client: &mut bridge_guest::process_client::ProcessClient<tonic::transport::Channel>,
+    user: &str,
+    command: &[&str],
+) -> Vec<u8> {
+    let stream = client
+        .start(bridge_guest::StartRequest {
+            command: command
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+            user: Some(user.to_owned()),
+            cwd: Some("/".to_owned()),
+            idempotency_key: Some(uuid::Uuid::now_v7().to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("mount probe {command:?} as {user}: {error}"))
+        .into_inner();
+    let events = collect_process_events(stream).await;
+    successful_stdout(&events)
+}
+
+/// A setup process must mount into the namespace later workload processes use.
+/// Exercise real ext4 and the existing Process RPC, without MountDataDrive.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bridge_guest_process_mounts_ext4_for_other_processes() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    const TEST_NAME: &str = "process::bridge_guest_process_mounts_ext4_for_other_processes";
+    const CHILD_ENV: &str = "SPACE_TEST_PROCESS_MOUNT_NAMESPACE_CHILD";
+    if !pplx_space_test_env::root_or_skip(TEST_NAME) {
+        return;
+    }
+    if std::env::var_os(CHILD_ENV).is_none() {
+        // Keep mounts private even when a developer runs the test on a host.
+        let status = Command::new("unshare")
+            .args(["--mount", "--propagation", "private"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("start isolated mount namespace");
+        assert!(status.success(), "isolated mount probe failed: {status}");
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let image = directory.path().join("disk.ext4");
+    std::fs::File::create(&image)
+        .unwrap()
+        .set_len(32 * 1024 * 1024)
+        .unwrap();
+    assert!(
+        Command::new("mkfs.ext4")
+            .args(["-q", "-F"])
+            .arg(&image)
+            .status()
+            .expect("create disposable ext4 filesystem")
+            .success()
+    );
+    let mountpoint = directory.path().join("data");
+    std::fs::create_dir(&mountpoint).unwrap();
+    struct MountCleanup(std::path::PathBuf);
+    impl Drop for MountCleanup {
+        fn drop(&mut self) {
+            // Also runs if an RPC or assertion fails after mounting.
+            let _ = Command::new("umount").arg(&self.0).output();
+        }
+    }
+    let cleanup = MountCleanup(mountpoint.clone());
+    let image = image.to_str().unwrap();
+    let mountpoint = mountpoint.to_str().unwrap();
+    let unprivileged = User::from_uid(Uid::from_raw(65534))
+        .unwrap()
+        .expect("unprivileged test account");
+    let fixture = GuestFixture::start(directory.path()).await;
+    let mut client = bridge_guest::process_client::ProcessClient::new(fixture.channel.clone());
+
+    mount_probe_process(
+        &mut client,
+        "root",
+        &[
+            "mount",
+            "-t",
+            "ext4",
+            "-o",
+            "loop,nodev,nosuid",
+            image,
+            mountpoint,
+        ],
+    )
+    .await;
+    mount_probe_process(&mut client, "root", &["chmod", "0777", mountpoint]).await;
+    let namespace = mount_probe_process(
+        &mut client,
+        &unprivileged.name,
+        &["readlink", "/proc/self/ns/mnt"],
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8(namespace).unwrap().trim(),
+        std::fs::read_link("/proc/self/ns/mnt")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "ordinary workloads must see the service's mount namespace"
+    );
+    let output = mount_probe_process(
+        &mut client,
+        &unprivileged.name,
+        &[
+            "/bin/sh",
+            "-ec",
+            "printf process-api > \"$1/probe\"; cat \"$1/probe\"",
+            "mount-probe",
+            mountpoint,
+        ],
+    )
+    .await;
+    assert_eq!(output, b"process-api");
+
+    mount_probe_process(&mut client, "root", &["umount", mountpoint]).await;
+    mount_probe_process(
+        &mut client,
+        "root",
+        &[
+            "mount",
+            "-t",
+            "ext4",
+            "-o",
+            "loop,ro,noload,nodev,nosuid",
+            image,
+            mountpoint,
+        ],
+    )
+    .await;
+    let output = mount_probe_process(
+        &mut client,
+        &unprivileged.name,
+        &[
+            "/bin/sh",
+            "-ec",
+            "cat \"$1/probe\"; if touch \"$1/forbidden\"; then exit 1; fi",
+            "mount-probe",
+            mountpoint,
+        ],
+    )
+    .await;
+    assert_eq!(output, b"process-api", "data must survive unmount/remount");
+    mount_probe_process(&mut client, "root", &["umount", mountpoint]).await;
+    assert!(!directory.path().join("data/probe").exists());
+    fixture.stop().await;
+    drop(cleanup);
+}
+
 #[tokio::test]
 async fn service_shutdown_signals_running_processes() {
     let directory = tempfile::tempdir().unwrap();
