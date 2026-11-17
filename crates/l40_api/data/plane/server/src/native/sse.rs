@@ -468,13 +468,12 @@ impl ProcessReplayState {
     /// `resync_required(cursor_replay_unavailable)`, as output the client
     /// already has may repeat. Every id the stream sends is above
     /// `Last-Event-ID` while each cursor the session resumed from is one a
-    /// process stream sent. One too high for any id to follow (see
-    /// [`ProcessEventId::first_after`]) was never sent: its replay is
-    /// numbered from the start of the output, so that a resume from the ids
-    /// it does send is exact. A stream resumed from a forged id just below
-    /// that limit sends ids above it, so a resume from those restarts the
-    /// numbering the same way; the id space is finite, so some chain from a
-    /// forged id always ends below an id it sent.
+    /// process stream sent. An id too high for any later id (see
+    /// [`ProcessEventId::first_after`]) was never sent, so its replay is
+    /// numbered from the start of the output and a resume from those ids is
+    /// exact. A forged id just below that limit replays in the last resume
+    /// block, whose ids are themselves too high, so the resume after it
+    /// restarts the numbering the same way.
     fn load(last_event_id: Option<u64>) -> Self {
         let Some(last_event_id) = last_event_id else {
             return Self {

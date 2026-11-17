@@ -3654,6 +3654,21 @@ async fn last_event_id_without_room_after_it_replays_behind_a_resync() {
     let frames = process_events_to_close(&fake.endpoint, session_id, Some(MAX_LAST_EVENT_ID)).await;
 
     assert_eq!(resync_reasons(&frames), ["cursor_replay_unavailable"]);
+    // Numbered from the start of the output: the id after the unsent
+    // `START`, below every output id that follows.
+    let resync_ids: Vec<_> = frames_of_type(&frames, "resync_required")
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(
+        resync_ids,
+        [Some(
+            ProcessEventId::Position {
+                position: 0,
+                frame: 1,
+            }
+            .encode()
+        )]
+    );
     assert_eq!(stdout_text(&frames), JOURNAL.concat());
     let after_two: Vec<_> = frames
         .iter()
