@@ -45,9 +45,16 @@ fn filesystem_refusals_are_distinct_from_internal_failures() {
         windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION,
         windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION,
     ] {
+        let status = io_status(io::Error::from_raw_os_error(i32::try_from(code).unwrap()));
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        // A relay answers a file another process holds as retryable, not as
+        // a path it refuses to read.
         assert_eq!(
-            io_status(io::Error::from_raw_os_error(i32::try_from(code).unwrap())).code(),
-            tonic::Code::FailedPrecondition
+            status
+                .metadata()
+                .get(ERROR_REASON_METADATA_KEY)
+                .and_then(|reason| reason.to_str().ok()),
+            Some(GUEST_FILE_IN_USE)
         );
     }
 }

@@ -1534,3 +1534,21 @@ fn a_read_refused_for_its_path_is_a_bad_request() {
         assert_eq!(unchanged.message, "Sandbox is not running");
     }
 }
+
+// The Windows guest reports a file another of its processes holds open or
+// locked on the read's first message, with the code a refused path has. Its
+// reason keeps it from reading as a bad request: it answers 409 with the
+// guest's reason, which can clear on retry.
+#[test]
+fn a_read_of_a_file_the_guest_holds_is_a_conflict() {
+    let mut in_use = tonic::Status::failed_precondition("guest file is in use");
+    in_use.metadata_mut().insert(
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(
+            pplx_space_guest_process::status::GUEST_FILE_IN_USE,
+        ),
+    );
+    let error = file_read_start_error(in_use);
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "guest file is in use");
+}

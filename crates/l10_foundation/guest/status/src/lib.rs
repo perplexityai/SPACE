@@ -23,6 +23,12 @@ pub const GUEST_PATH_NOT_FOUND: &str = "guest-path-not-found";
 /// unable to take the call.
 pub const GUEST_PATH_REFUSED: &str = "guest-path-refused";
 
+/// [`ERROR_REASON_METADATA_KEY`] value of a FAILED_PRECONDITION that is
+/// another guest process holding the file open or locked (a Windows sharing
+/// or lock violation), which can clear on retry, as opposed to the path
+/// itself being refused.
+pub const GUEST_FILE_IN_USE: &str = "guest-file-in-use";
+
 /// [`ERROR_REASON_METADATA_KEY`] value of an OUT_OF_RANGE that ends a
 /// process output stream whose cursor is past the output the process has
 /// written, as opposed to a message too large for a hop to decode.
