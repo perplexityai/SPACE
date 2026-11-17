@@ -30,7 +30,17 @@ use super::call::Grant;
 /// The API's activation listener, which serves these RPCs beside the ingress
 /// activation ones.
 const ENDPOINT_ENV: &str = "SPACE_INGRESS_ACTIVATION_ENDPOINT";
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// The TCP dial's bound. The listener is in the cluster, where a dial
+/// answers in milliseconds; one that has not answered within a second is
+/// dropped by the network, and every call waiting on it would pay the
+/// bound before its 503.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// How the channel keeps finding out whether its connection still reaches
+/// the API: production's [`KeepAlive`].
+const KEEP_ALIVE: KeepAlive = KeepAlive {
+    interval: Duration::from_secs(2),
+    timeout: Duration::from_secs(2),
+};
 /// Authorization reads credentials and the sandbox row.
 const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Preparation can wake the sandbox. The API bounds that wait below its node
@@ -62,6 +72,30 @@ pub enum NativeFileAccessConfigError {
     Transport(#[source] TransportError),
 }
 
+/// HTTP/2 pings on the activation connection, sent once it has carried
+/// nothing for `interval`, idle or not, and answered within `timeout` or the
+/// connection is closed. A network that starts dropping a live connection's
+/// packets, as an egress policy applied to it can, resets nothing, so without
+/// them every call sent on it waits out its own deadline (15 s for
+/// authorize) before its 503, and the next call is sent on it again. With
+/// them a call on such a connection fails within `interval + timeout` of the
+/// connection's last answer, and the next call dials a new one, which fails
+/// within [`CONNECT_TIMEOUT`] while the API stays unreachable.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeepAlive {
+    pub(crate) interval: Duration,
+    pub(crate) timeout: Duration,
+}
+
+impl KeepAlive {
+    pub(crate) fn configure(self, endpoint: Endpoint) -> Endpoint {
+        endpoint
+            .http2_keep_alive_interval(self.interval)
+            .keep_alive_timeout(self.timeout)
+            .keep_alive_while_idle(true)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct NativeFileAccessClient {
     client: NativeFileAccessApiClient<GrpcClientTrace<Channel>>,
@@ -75,9 +109,20 @@ impl NativeFileAccessClient {
             .ok()
             .filter(|address| !address.trim().is_empty())
             .ok_or(NativeFileAccessConfigError::MissingEndpoint)?;
-        let endpoint = Endpoint::from_shared(address)
-            .map_err(NativeFileAccessConfigError::Endpoint)?
-            .connect_timeout(CONNECT_TIMEOUT);
+        Self::connect(address, KEEP_ALIVE).await
+    }
+
+    /// [`Self::from_env`] for the listener at `address`, pinged as
+    /// `keep_alive` says.
+    pub(crate) async fn connect(
+        address: String,
+        keep_alive: KeepAlive,
+    ) -> Result<Self, NativeFileAccessConfigError> {
+        let endpoint = keep_alive.configure(
+            Endpoint::from_shared(address)
+                .map_err(NativeFileAccessConfigError::Endpoint)?
+                .connect_timeout(CONNECT_TIMEOUT),
+        );
         let channel = ClientTransport::from_env(Service::IngressActivation, endpoint.uri())
             .await
             .and_then(|transport| transport.connect_endpoint(endpoint))
