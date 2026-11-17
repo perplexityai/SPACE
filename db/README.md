@@ -235,12 +235,15 @@ first, with template-manager stopped and the newer one kept from restarting
 until the older one starts, `20261031050126` reverted with
 `space-db-migrator template-manager --database-path <db> down`, run with a
 migrator that bundles every migration the database records, such as the newer
-release's. Each run reverts only the newest applied migration, so check
-`sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` first. If
-it prints `20261031050126`, one run reverts only that migration. If it prints a
-later version, revert those later migrations first, newest first, reading each
-down script as 'Rolling back past a newer SQLite migration' describes, until it
-prints `20261031050126`. 'Template cache partition migration' and
+release's. Each run reverts only the newest applied migration across
+template-manager's history and the shared `common` catalog's, so check both
+first: `sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"`
+and `sqlite3 -readonly <db> "SELECT max(version) FROM _space_common_schema_migrations"`.
+If either prints a version later than `20261031050126`, revert those later
+migrations first, newest first across both, reading each down script as
+'Rolling back past a newer SQLite migration' describes. Then run it once more
+to revert `20261031050126`, and check that `_sqlx_migrations`' `max(version)`
+no longer prints it. 'Template cache partition migration' and
 `docs/execution-environments.md` say when this applies to a partition rollback.
 
 ## Template cache partition migration
