@@ -882,7 +882,8 @@ async fn the_terminated_delete_holds_its_guards_and_lets_go_on_a_reference() -> 
 
 /// The let-go clears the phase and the v2 columns of the node in the epoch,
 /// phase and fence the tick read, records the trace, and writes no sandbox
-/// row; a row that moved on is left as it was.
+/// row; a row that moved on is left as it was. A gentle drain's epoch is its
+/// `gentle_epoch`, which the let-go matches as it matches `epoch`.
 #[tokio::test(flavor = "current_thread")]
 async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -890,9 +891,10 @@ async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
     };
     let pool = &db.pool;
     const OTHER: &str = "i-0000000000000e0e0";
-    for (case, phase, fence, epoch, read_phase, read_fence, clears) in [
+    for (case, gentle, phase, fence, epoch, read_phase, read_fence, clears) in [
         (
             "drained",
+            false,
             Some("drained"),
             None,
             7,
@@ -900,9 +902,10 @@ async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
             None,
             true,
         ),
-        ("cancel pending", None, None, 7, None, None, true),
+        ("cancel pending", false, None, None, 7, None, None, true),
         (
             "fenced",
+            false,
             Some("terminating"),
             Some(INSTANCE),
             7,
@@ -912,6 +915,7 @@ async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
         ),
         (
             "an earlier build's marker",
+            false,
             Some("terminating"),
             Some("terminated"),
             7,
@@ -921,6 +925,7 @@ async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
         ),
         (
             "another epoch",
+            false,
             Some("drained"),
             None,
             8,
@@ -930,6 +935,7 @@ async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
         ),
         (
             "phase moved",
+            false,
             Some("terminating"),
             None,
             7,
@@ -939,6 +945,7 @@ async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
         ),
         (
             "another fence",
+            false,
             Some("terminating"),
             Some(OTHER),
             7,
@@ -948,6 +955,7 @@ async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
         ),
         (
             "fenced since the tick read it",
+            false,
             Some("terminating"),
             Some(INSTANCE),
             7,
@@ -955,8 +963,33 @@ async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
             None,
             false,
         ),
+        (
+            "gentle",
+            true,
+            Some("draining"),
+            None,
+            7,
+            Some("draining"),
+            None,
+            true,
+        ),
+        (
+            "gentle, another epoch",
+            true,
+            Some("draining"),
+            None,
+            8,
+            Some("draining"),
+            None,
+            false,
+        ),
     ] {
         let mut status = done(7, serde_json::json!({}));
+        if gentle {
+            let object = status.as_object_mut().ok_or("an object")?;
+            let epoch = object.remove("epoch").ok_or("an epoch")?;
+            object.insert("gentle_epoch".to_owned(), epoch);
+        }
         match fence {
             Some("terminated") => status["terminated"] = serde_json::json!(true),
             Some(fence) => status["terminate_instance"] = serde_json::json!(fence),
@@ -966,6 +999,12 @@ async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
             status["cancel"] = serde_json::json!(true);
         }
         let node_id = v2_node(pool, phase, status.clone()).await?;
+        if gentle {
+            sqlx::query(sql!("UPDATE nodes SET drain_mode = 'gentle' WHERE id = $1"))
+                .bind(node_id)
+                .execute(pool)
+                .await?;
+        }
         identity(pool, node_id, Some(INSTANCE)).await?;
         let pinned = sandbox(pool, "started", Some(node_id)).await?;
         let cleared = let_go_v2(pool, node_id, epoch, read_phase, read_fence, "the trace").await?;

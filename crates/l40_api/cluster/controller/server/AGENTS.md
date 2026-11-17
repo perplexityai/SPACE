@@ -16,8 +16,11 @@ Every table named here is in the control-plane Postgres store.
   the phase and the stored `node_k8s.k8s_node_uid`; a mismatch refuses. The
   v2 loop (`node_drain::v2`) dispatches a termination only for the instance
   its terminate transaction fenced (`drain_status.terminate_instance`), never
-  one it reads from a Node; registration protects that recorded identity, so
-  a Node under a new UID keeps the drain only if it reports that instance.
+  one it reads from a Node; registration protects that recorded identity. A
+  Node under a new UID keeps the drain only if it reports that instance, and
+  one that reports no instance yet is deferred while the row is fenced, until
+  it reports one; on an unfenced row it counts as a replacement and clears
+  the drain.
 - A new store that joins a credential-fenced `*_encrypted_fields` sidecar
   runs on the credentials pool, as the two snapshot sweepers do.
 - In dry-run, a loop classifies and reports through logs and dry-run-tagged

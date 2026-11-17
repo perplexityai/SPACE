@@ -1376,17 +1376,48 @@ async fn an_unlisted_instance_after_a_recorded_terminated_reads_terminated() {
 /// whatever EC2 answers; past the bound it says the termination was
 /// accepted and the instance still runs. A row an earlier build's
 /// terminator marked `terminated` is dispatched with no time, and is never
-/// dispatched again either.
+/// dispatched again either. No answer from EC2 is said on every check,
+/// with the dispatch's age only where the row records one.
 #[tokio::test]
 async fn a_dispatched_node_is_never_dispatched_again() {
-    for (case, dispatched_at, surfaces) in [
-        ("just dispatched", Some(super::unix_now()), false),
+    let past_bound = super::unix_now() - i64::try_from(TERMINATE_BOUND.as_secs()).unwrap() - 60;
+    let unknown = || InstanceEvidence::Unknown("the EC2 call timed out".to_owned());
+    let running = || InstanceEvidence::Listed("running".to_owned());
+    for (case, dispatched_at, evidence, says) in [
+        ("just dispatched", Some(super::unix_now()), running(), None),
         (
             "past the bound",
-            Some(super::unix_now() - i64::try_from(TERMINATE_BOUND.as_secs()).unwrap() - 60),
-            true,
+            Some(past_bound),
+            running(),
+            Some("EC2 still answers running after 16 minutes"),
         ),
-        ("an earlier build's terminated marker", None, false),
+        (
+            "an earlier build's terminated marker",
+            None,
+            running(),
+            None,
+        ),
+        (
+            "just dispatched, no answer",
+            Some(super::unix_now()),
+            unknown(),
+            Some("was dispatched 0 minutes ago; EC2 answers unknown (the EC2 call timed out)"),
+        ),
+        (
+            "past the bound, no answer",
+            Some(past_bound),
+            unknown(),
+            Some("was dispatched 16 minutes ago; EC2 answers unknown"),
+        ),
+        (
+            "an earlier build's terminated marker, no answer",
+            None,
+            unknown(),
+            Some(
+                "the termination of fenced instance i-0000000000000c0c0 was dispatched; EC2 \
+                 answers unknown (the EC2 call timed out)",
+            ),
+        ),
     ] {
         let node = V2Node {
             dispatched_at,
@@ -1396,18 +1427,22 @@ async fn a_dispatched_node_is_never_dispatched_again() {
             nodes: vec![node.clone()],
             ..FakeSink::default()
         };
-        let authority = FakeAuthority::ok();
+        let authority = FakeAuthority::answering(evidence);
         let report = run_tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES).await;
         assert!(authority.terminated().is_empty(), "{case}");
         assert_eq!(report, V2TickReport::default(), "{case}");
-        assert_eq!(
-            sink.calls()
-                .iter()
-                .any(|call| call.contains("still answers running")),
-            surfaces,
-            "{case}: {:?}",
-            sink.calls()
-        );
+        let errors: Vec<String> = sink
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with(&format!("error {}", node.id)))
+            .collect();
+        match says {
+            Some(says) => assert!(
+                errors.len() == 1 && errors[0].contains(says),
+                "{case}: {errors:?}"
+            ),
+            None => assert!(errors.is_empty(), "{case}: {errors:?}"),
+        }
     }
 }
 

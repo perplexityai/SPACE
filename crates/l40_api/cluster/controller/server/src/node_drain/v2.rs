@@ -1546,6 +1546,23 @@ async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthority>(
                 ),
             )
             .await;
+        } else if let InstanceEvidence::Unknown(_) = evidence {
+            // No answer says nothing about the machine, however long ago the
+            // dispatch was: say so on every check, not only past the bound.
+            // A row an earlier build's terminator acted on has no dispatch
+            // time to report.
+            let since = elapsed.map_or_else(String::new, |elapsed| {
+                format!(" {} minutes ago", elapsed / 60)
+            });
+            sink.record_error(
+                node.id,
+                &format!(
+                    "the termination of fenced instance {fence} was dispatched{since}; EC2 \
+                     answers {evidence}, so the drain can't tell whether it is terminated; \
+                     not deleting the row"
+                ),
+            )
+            .await;
         } else if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed >= bound) {
             sink.record_error(
                 node.id,

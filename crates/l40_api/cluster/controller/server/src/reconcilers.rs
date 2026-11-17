@@ -175,10 +175,21 @@ enum TerminatorBackend {
 
 impl TerminatorBackend {
     async fn load(kind: TerminatorKind) -> Self {
+        Self::load_with(kind, || {
+            aws_config::load_defaults(aws_config::BehaviorVersion::latest())
+        })
+        .await
+    }
+
+    /// [`Self::load`], with the AWS config from `aws_config`, which only
+    /// the `aws` backend calls.
+    async fn load_with<F, Fut>(kind: TerminatorKind, aws_config: F) -> Self
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = aws_config::SdkConfig>,
+    {
         match kind {
-            TerminatorKind::Aws => Self::Aws(Box::new(
-                aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,
-            )),
+            TerminatorKind::Aws => Self::Aws(Box::new(aws_config().await)),
             TerminatorKind::KubeDelete => Self::KubeDelete,
             TerminatorKind::Noop => Self::Noop,
         }

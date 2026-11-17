@@ -158,6 +158,29 @@ fn the_drain_v2_runs_only_with_the_node_drain() {
     }
 }
 
+/// Each terminator kind loads its own backend, and only `aws` loads the
+/// AWS config, so a cluster that runs another terminator never initializes
+/// the AWS SDK for it.
+#[tokio::test]
+async fn each_terminator_kind_loads_its_backend() {
+    for name in ["aws", "kube-delete", "noop"] {
+        let kind = TerminatorKind::parse(Some(name)).unwrap();
+        let loaded = std::cell::Cell::new(false);
+        let backend = TerminatorBackend::load_with(kind, || async {
+            loaded.set(true);
+            aws_config::SdkConfig::builder().build()
+        })
+        .await;
+        let backend = match backend {
+            TerminatorBackend::Aws(_) => "aws",
+            TerminatorBackend::KubeDelete => "kube-delete",
+            TerminatorBackend::Noop => "noop",
+        };
+        assert_eq!(backend, name);
+        assert_eq!(loaded.get(), name == "aws", "{name}");
+    }
+}
+
 /// The v2 loop terminates a node only through EC2: the `aws` backend's
 /// authority is EC2 and Auto Scaling, every other backend's refuses.
 #[test]
