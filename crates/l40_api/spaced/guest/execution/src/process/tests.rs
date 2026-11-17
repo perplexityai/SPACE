@@ -77,6 +77,88 @@ async fn pty_close_stdin_rejects_without_disabling_input() {
     input.expect("unsupported close must preserve PTY input");
 }
 
+// A pty-backed process gets a terminal type and a character set unless the
+// sandbox's environment or the request sets them; a process without a pty
+// gets neither.
+#[tokio::test]
+async fn a_pty_starts_with_terminal_defaults_the_sandbox_and_request_override() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{PtyConfig, process_event::Event};
+
+    let service = cancellation_service();
+    let print = || {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf '[%s][%s]' \"$TERM\" \"$LANG\"".to_string(),
+        ]
+    };
+    let output = |request: StartRequest| {
+        let service = &service;
+        async move {
+            let response = Process::start(service, Request::new(request))
+                .await
+                .expect("process starts");
+            let mut stream = response.into_inner();
+            let mut stdout = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = stream.next().await {
+                    match event.expect("process stream").event {
+                        Some(Event::Stdout(output)) => stdout.extend(output.data),
+                        Some(Event::Exit(_)) => break,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("the process exits");
+            String::from_utf8(stdout).expect("utf-8 output")
+        }
+    };
+    let pty = || Some(PtyConfig { size: None });
+
+    for (label, configured, env, pty, expected) in [
+        ("pty", None, vec![], pty(), "[xterm-256color][C.UTF-8]"),
+        (
+            "request overrides",
+            None,
+            vec![("TERM", "vt100"), ("LANG", "en_US.UTF-8")],
+            pty(),
+            "[vt100][en_US.UTF-8]",
+        ),
+        (
+            "sandbox overrides",
+            Some(("LANG", "ja_JP.UTF-8")),
+            vec![],
+            pty(),
+            "[xterm-256color][ja_JP.UTF-8]",
+        ),
+        ("no pty", None, vec![], None, "[][]"),
+    ] {
+        let configured = configured
+            .map(|(key, value)| HashMap::from([(key.to_string(), value.to_string())]))
+            .unwrap_or_default();
+        service
+            .configure_process_env(EnvMap::try_from(configured).unwrap())
+            .await
+            .unwrap();
+        let printed = output(StartRequest {
+            command: print(),
+            env: env
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            pty,
+            idempotency_key: Some(format!("pty-defaults-{label}")),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(printed, expected, "{label}");
+    }
+    service.inner.shutdown.cancel();
+    service.inner.process_tasks.close();
+    service.inner.process_tasks.wait().await;
+}
+
 // A reconnect re-sends Start for a session whose process may already run. It
 // must get AlreadyExists, the only answer the data plane turns into a connect,
 // even while the start path it would otherwise take is full or blocked.
