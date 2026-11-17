@@ -77,8 +77,9 @@ reviews:
           - ".github/**"
           # Commands that run on developers' machines: agent hooks, MCP
           # servers, the scripts skills and hooks run, the marketplaces that
-          # choose plugin sources, and Git hooks. Manifest entries that run
-          # commands fail the "Agent tooling runs no new commands" check.
+          # choose plugin sources, Git hooks, and Cargo's linkers and aliases.
+          # Manifest entries that run commands fail the "Agent tooling runs
+          # no new commands" check.
           - ".claude/settings*.json"
           - "**/.mcp.json"
           - "**/hooks.json"
@@ -95,9 +96,12 @@ reviews:
           - "**/marketplace.json"
           - ".pre-commit-config.yaml"
           - "lefthook.yaml"
+          - ".cargo/**"
           # External code. CI runs `cargo vet --locked`, so a new or updated
-          # external crate also changes supply-chain/, while edges between
-          # workspace crates in Cargo.toml and Cargo.lock do not.
+          # crates.io crate also changes supply-chain/, while edges between
+          # workspace crates in Cargo.toml and Cargo.lock do not. A Git or
+          # other non-crates.io source fails the "External dependency sources
+          # need a person" check instead.
           - "supply-chain/**"
           - "**/pyproject.toml"
           - "**/uv.lock"
@@ -481,6 +485,18 @@ reviews:
           prose and fenced code in skills and guideline files, pass. Pass
           otherwise. When failing, list each item with its file and line.
 
+      - name: External dependency sources need a person
+        mode: error
+        instructions: |
+          Fail if the diff adds or changes where an external dependency comes
+          from: a `git`, `rev`, `branch`, `tag`, or `registry` key, or a `path`
+          outside this repository, on a dependency in any Cargo.toml,
+          including `[patch]` and `[replace]` sections. cargo vet does not
+          audit those sources, and no path a person approves changes with
+          them. Dependencies between workspace crates, and crates.io version
+          changes, pass. Pass otherwise. When failing, list each item with its
+          file and line.
+
       - name: Public-safe content
         mode: error
         instructions: |
@@ -494,8 +510,9 @@ reviews:
           logs, query output, or production measurements; incident details; a
           description of a security vulnerability that is not yet fixed and
           disclosed. A closing "Created with ..." line that credits the AI
-          tool and links to the session that wrote the pull request passes.
-          Pass otherwise. When failing, give the file and line, and do not
+          tool passes when its link goes to that tool's own site, even to a
+          private session there; the line still fails if it holds any other
+          value listed here, such as an internal hostname. Pass otherwise. When failing, give the file and line, and do not
           quote the sensitive value.
 
   # These would push commits or open pull requests from CodeRabbit, which
