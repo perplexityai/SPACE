@@ -154,7 +154,7 @@ fn a_suspended_eviction_claim_waits_for_the_sandboxes_other_artifacts() {
             let (id, pin) = pinned_suspended(&conn);
             let named = LocalArtifactId::new();
             let snapshot_name =
-                pplx_space_common_core::types::SnapshotName::parse("d-named".to_string()).unwrap();
+                pplx_space_snapshot_model::SnapshotName::parse("d-named".to_string()).unwrap();
             insert_local_artifact(
                 &conn,
                 &id,

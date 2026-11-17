@@ -572,7 +572,7 @@ pub enum SandboxPodRequest<'a> {
         /// Disk restarts use retained rootfs; full restores resume VM memory.
         /// The shim translates the disk marker into a cold Start or a retry
         /// attachment after observing the local sandbox state.
-        artifact_kind: pplx_space_common_core::types::ArtifactKind,
+        artifact_kind: pplx_space_snapshot_model::ArtifactKind,
         common: SandboxPodCommon<'a>,
         runtime: SandboxRuntimePodMetadata<'a>,
         /// Node-group placement recomputed from the *current* template
@@ -767,7 +767,7 @@ pub struct StoppedMaterialization<'a> {
     /// [`STOPPED_MATERIALIZATION_CHECKPOINT`] in place of the checkpoint the
     /// artifact kind would select, and names the artifact in
     /// [`SANDBOX_STOPPED_MATERIALIZATION_ARTIFACT_ID_ANNOTATION`].
-    pub artifact_id: pplx_space_common_core::types::LocalArtifactId,
+    pub artifact_id: pplx_space_snapshot_model::LocalArtifactId,
     /// Workers the pod must not be placed on, rendered as one required
     /// `matchFields: metadata.name NotIn` per node: the nodes the sandbox's
     /// retired executions record. A local `stopped` row for the sandbox can
@@ -860,8 +860,8 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
                         STOPPED_MATERIALIZATION_CHECKPOINT
                     } else {
                         match artifact_kind {
-                            pplx_space_common_core::types::ArtifactKind::Full => "suspend",
-                            pplx_space_common_core::types::ArtifactKind::Disk => "stopped",
+                            pplx_space_snapshot_model::ArtifactKind::Full => "suspend",
+                            pplx_space_snapshot_model::ArtifactKind::Disk => "stopped",
                         }
                     })
             };

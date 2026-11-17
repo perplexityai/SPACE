@@ -1244,7 +1244,7 @@ mod cross_org_routes {
         assert_eq!(
             data[0]["id"],
             pplx_space_public_api::PublicSnapshotId::from(
-                pplx_space_common_core::types::SnapshotId::from_uuid(snapshot_id)
+                pplx_space_snapshot_model::SnapshotId::from_uuid(snapshot_id)
             )
             .to_string()
         );
@@ -1615,7 +1615,7 @@ mod cross_org_routes {
                 answers[0],
                 Some(serde_json::Value::String(
                     pplx_space_public_api::PublicSnapshotId::from(
-                        pplx_space_common_core::types::SnapshotId::from_uuid(snapshot_id)
+                        pplx_space_snapshot_model::SnapshotId::from_uuid(snapshot_id)
                     )
                     .to_string()
                 )),

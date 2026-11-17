@@ -63,7 +63,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName};
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotName};
 
 use crate::db::LocalArtifactRow;
 use crate::db::local_artifact_leases as leases;

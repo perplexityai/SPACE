@@ -84,7 +84,7 @@
 //! `deleting` row as a current cleanup — a crash mid-eviction therefore
 //! converges through the existing cleanup recovery paths.
 
-use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotId};
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotId};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -408,7 +408,7 @@ pub(crate) enum LocalEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PinnedArtifact {
     pub(crate) artifact_id: LocalArtifactId,
-    pub(crate) artifact_kind: pplx_space_common_core::types::ArtifactKind,
+    pub(crate) artifact_kind: pplx_space_snapshot_model::ArtifactKind,
     /// `backup_completed_at IS NOT NULL` — stamped by the upload
     /// worker for exactly this artifact id, only after the cluster
     /// confirmed `FinalizeArtifactBackup(READY)` (which requires

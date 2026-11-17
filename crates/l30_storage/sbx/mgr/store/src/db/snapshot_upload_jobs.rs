@@ -3,7 +3,7 @@
 
 use crate::db::{Connection, Result};
 use pplx_space_accounts::JobId;
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use rusqlite::params;
 
 /// The `jobs.kind` of the snapshot-upload pipeline's jobs.

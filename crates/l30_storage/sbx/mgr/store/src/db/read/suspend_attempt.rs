@@ -1,5 +1,5 @@
 use crate::db::{Connection, OptionalExtension as _, Result};
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 /// The attempt admitted by the lifecycle transition. Its clock is not a row
 /// update time or a file mtime, and is never renewed by recovery.

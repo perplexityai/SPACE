@@ -1,6 +1,6 @@
 use pplx_space_accounts::{NodeId, OrgId, UserId};
-use pplx_space_common_core::types::SnapshotId;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use super::*;
 
@@ -120,10 +120,10 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
 #[tokio::test]
 async fn ready_capture_completes_in_one_claim_but_pending_upload_still_yields()
 -> pplx_space_test_env::TestResult {
-    use pplx_space_common_core::types::LocalArtifactId;
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
     use pplx_space_node_model::SubstrateKind;
     use pplx_space_public_api::{OperationKind, OperationTargetType};
+    use pplx_space_snapshot_model::LocalArtifactId;
     use pplx_space_sql_locator::sql;
 
     use crate::fork_operations::ForkSandboxPayload;
@@ -651,8 +651,8 @@ async fn external_work_has_an_overall_deadline() {
 mod cold_copy_tests {
 
     use super::*;
-    use pplx_space_common_core::types::SnapshotId;
     use pplx_space_db_test_fixtures::try_pg_test_db;
+    use pplx_space_snapshot_model::SnapshotId;
 
     #[test]
     fn cleanup_failure_does_not_overturn_a_successful_fork() {

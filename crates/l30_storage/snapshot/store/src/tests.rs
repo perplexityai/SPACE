@@ -6,11 +6,7 @@ use super::{
 };
 use jiff::Timestamp;
 use pplx_space_accounts::{NodeId, OrgId};
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExactStorageUri, LocalArtifactId,
-    SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId, SnapshotKind,
-    SnapshotName, SnapshotState,
-};
+use pplx_space_common_core::types::{ExactStorageUri, SnapshotArtifact as SnapshotArtifactFile};
 use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_db_test_fixtures::{
@@ -18,6 +14,10 @@ use pplx_space_db_test_fixtures::{
 };
 use pplx_space_execution_spec::{ExecutionMetadata, HostCpu, SnapshotExecutionMetadata};
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
+use pplx_space_snapshot_model::{
+    ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotContentHash, SnapshotId, SnapshotKind,
+    SnapshotName, SnapshotState,
+};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateArtifactDigest, TemplateName};
 use pplx_space_test_env::TestResult;

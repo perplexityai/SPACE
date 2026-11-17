@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 #[cfg(test)]
 use super::cleanup_support::CleanupLockGuard;

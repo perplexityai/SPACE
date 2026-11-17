@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::future::Future;
 use std::pin::Pin;

@@ -4,10 +4,13 @@
 //! path-safe names for node-local artifacts. `SnapshotConfig` records the
 //! compute shape and optional disk shape needed to create or resume a snapshot.
 //!
+//! These types are their own crate so that code can name them without
+//! depending on `pplx-space-common-core`.
+//!
 //! # Examples
 //!
 //! ```rust
-//! # use pplx_space_common_core::types::*;
+//! # use pplx_space_snapshot_model::*;
 //! let id = SnapshotId::new();
 //! let name = SnapshotName::parse("base")?;
 //!
@@ -105,7 +108,7 @@ pub fn base_snapshot_memory_mib_or_default(value: Option<i32>) -> u32 {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_snapshot_model::*;
 /// assert!(SnapshotName::parse("base").is_ok());
 /// assert!(SnapshotName::parse("../base").is_err());
 /// ```
@@ -119,7 +122,7 @@ pub struct SnapshotParseError(&'static str);
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_snapshot_model::*;
 /// assert!(SnapshotId::from_str("not-a-uuid").is_err());
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -133,7 +136,7 @@ pub enum SnapshotIdParseError {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_snapshot_model::*;
 /// let id = SnapshotId::new();
 /// assert_eq!(SnapshotId::from_uuid(id.as_uuid()), id);
 /// ```
@@ -148,7 +151,7 @@ impl SnapshotId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_snapshot_model::*;
     /// let id = SnapshotId::new();
     /// assert_eq!(SnapshotId::from_uuid(id.as_uuid()), id);
     /// ```
@@ -161,7 +164,7 @@ impl SnapshotId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_snapshot_model::*;
     /// let fresh = SnapshotId::new();
     /// let id = SnapshotId::from_uuid(fresh.as_uuid());
     /// assert_eq!(id, fresh);
@@ -175,7 +178,7 @@ impl SnapshotId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_snapshot_model::*;
     /// let id = SnapshotId::new();
     /// assert_eq!(SnapshotId::from_uuid(id.as_uuid()), id);
     /// ```
@@ -445,7 +448,7 @@ impl From<BackupAttemptId> for String {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_snapshot_model::*;
 /// let name = SnapshotName::parse("before-upgrade")?;
 /// assert_eq!(name.as_str(), "before-upgrade");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -461,7 +464,7 @@ impl SnapshotName {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_snapshot_model::*;
     /// assert!(SnapshotName::parse("base").is_ok());
     /// assert!(SnapshotName::parse("..").is_err());
     /// assert!(SnapshotName::parse("nested/base").is_err());
@@ -487,7 +490,7 @@ impl SnapshotName {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_snapshot_model::*;
     /// let name = SnapshotName::parse("base")?;
     /// assert_eq!(name.as_str(), "base");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -600,7 +603,7 @@ impl fmt::Display for SnapshotContentHash {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_snapshot_model::*;
 /// let kind = SnapshotKind::Disk;
 /// assert_eq!(kind, SnapshotKind::Disk);
 /// ```
@@ -805,7 +808,7 @@ pub enum BackupSource {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_snapshot_model::*;
 /// # use std::str::FromStr;
 /// assert_eq!(SnapshotState::Ready.as_str(), "ready");
 /// assert_eq!(SnapshotState::from_str("creating").unwrap(), SnapshotState::Creating);
@@ -922,7 +925,7 @@ impl From<SnapshotState> for String {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_snapshot_model::*;
 /// # use pplx_space_execution_spec::{ComputeShape, CpuLimit};
 /// # use pplx_space_byte_size::{DiskSize, MemorySize};
 /// let compute = ComputeShape::new(CpuLimit::vcpu(2)?, MemorySize::gib(4)?);
@@ -945,7 +948,7 @@ impl SnapshotConfig {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_snapshot_model::*;
     /// # use pplx_space_execution_spec::{ComputeShape, CpuLimit};
     /// # use pplx_space_byte_size::MemorySize;
     /// let compute = ComputeShape::new(CpuLimit::vcpu(2)?, MemorySize::gib(4)?);
@@ -963,7 +966,7 @@ impl SnapshotConfig {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_snapshot_model::*;
     /// # use pplx_space_execution_spec::{ComputeShape, CpuLimit};
     /// # use pplx_space_byte_size::MemorySize;
     /// let compute = ComputeShape::new(CpuLimit::vcpu(1)?, MemorySize::gib(1)?);
@@ -980,7 +983,7 @@ impl SnapshotConfig {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_snapshot_model::*;
     /// # use pplx_space_execution_spec::{ComputeShape, CpuLimit};
     /// # use pplx_space_byte_size::{DiskSize, MemorySize};
     /// let compute = ComputeShape::new(CpuLimit::vcpu(1)?, MemorySize::gib(1)?);
@@ -994,5 +997,7 @@ impl SnapshotConfig {
     }
 }
 
+#[cfg(feature = "sqlx")]
+mod postgres;
 #[cfg(test)]
 mod tests;

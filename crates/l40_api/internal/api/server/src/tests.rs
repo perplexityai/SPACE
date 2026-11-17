@@ -6,7 +6,7 @@ mod substrate_scope;
 #[cfg(feature = "kubernetes")]
 mod template_node_identity;
 use pplx_space_accounts::{NodeId, OrgId, UserId};
-use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use super::metadata::*;
 use super::*;

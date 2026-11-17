@@ -1,9 +1,9 @@
 //! Production [`RetireSink`] backed by Postgres.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use pplx_space_durations::PositiveDuration;
 use pplx_space_sandbox_portability::newest_suspend_snapshot_current;

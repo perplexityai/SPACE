@@ -2871,7 +2871,6 @@ mod postgres_backed {
     };
     use super::*;
     use pplx_space_accounts::NodeId;
-    use pplx_space_common_core::types::SnapshotId;
     use pplx_space_db_test_fixtures::try_pg_test_db;
     use pplx_space_node_model::SubstrateKind;
     use pplx_space_sandbox_model::SandboxId;
@@ -2882,6 +2881,7 @@ mod postgres_backed {
         fail_unrestorable_restoring_query, list_aged_transient_query, revert_to_suspended_query,
         undo_revert_to_suspended_query,
     };
+    use pplx_space_snapshot_model::SnapshotId;
     use sqlx::PgPool;
 
     use pplx_space_test_env::TestResult;

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::*;
 use crate::snapshot_upload::build_storage_uri_for_tests;
@@ -366,7 +366,7 @@ fn published_restore_is_recoverable_after_state_commit_gap() {
         storage_uri: storage_uri.clone(),
         meta,
         codec: RestoreCodec::Full,
-        transfer_scope_id: Some(pplx_space_common_core::types::TransferScopeId::new()),
+        transfer_scope_id: Some(pplx_space_snapshot_model::TransferScopeId::new()),
         credential_subject_id: sandbox_id.to_string(),
         filesystem_scope_id: None,
     };
@@ -505,7 +505,7 @@ fn canonical_restore_exchange_publishes_replacement_and_scopes_the_old_root() {
     write_test_published_metadata(&canonical_dir, sandbox_id, sandbox_id, &old_storage_uri);
     std::fs::write(staging_dir.join("replacement"), b"source-b").unwrap();
     std::fs::write(canonical_dir.join("remnant"), b"source-a").unwrap();
-    let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let transfer_scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     let execution_generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
     let attempt_a = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000001").unwrap(),
@@ -624,7 +624,7 @@ fn same_source_exchange_receipt_recovers_cleanup_after_commit_gap() {
     write_test_published_metadata(&canonical_dir, sandbox_id, sandbox_id, &storage_uri);
     std::fs::write(canonical_dir.join("partial"), b"old incomplete root").unwrap();
 
-    let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let transfer_scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     let execution_generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
     let activation_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     let parsed_storage_uri = storage_uri.parse().unwrap();
@@ -1171,7 +1171,7 @@ fn sandbox_cache_dir_guard_defers_scoped_staging_cleanup() {
     {
         let _guard = SandboxCacheDirGuard::for_restore_staging(
             &sandbox_dir,
-            Some(pplx_space_common_core::types::TransferScopeId::new()),
+            Some(pplx_space_snapshot_model::TransferScopeId::new()),
         );
     }
 
@@ -1920,7 +1920,7 @@ fn scoped_restore_staging_is_group_traversable_under_a_restrictive_umask() {
         let cache = tempfile::tempdir().unwrap();
         // A cache that passes no group on to what is created in it.
         std::fs::set_permissions(cache.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let scope = pplx_space_common_core::types::TransferScopeId::new();
+        let scope = pplx_space_snapshot_model::TransferScopeId::new();
         let staging = paths::sandbox_restore_staging_dir_in(
             cache.path(),
             &SandboxId::new().to_string(),
@@ -1954,7 +1954,7 @@ fn in_place_restore_leaves_the_sandbox_directory_as_it_is() {
     let before = identity(std::fs::metadata(&sandbox_dir).unwrap());
     create_restore_root(
         &sandbox_dir,
-        RestoreMetadataDestination::InPlace(pplx_space_common_core::types::TransferScopeId::new()),
+        RestoreMetadataDestination::InPlace(pplx_space_snapshot_model::TransferScopeId::new()),
         nix::unistd::getegid(),
     )
     .unwrap();
@@ -1985,7 +1985,7 @@ fn volume_manager_downloads_into_scoped_restore_staging_through_the_shared_cache
                 create_restore_root(
                     &staging,
                     RestoreMetadataDestination::Scoped(
-                        pplx_space_common_core::types::TransferScopeId::new(),
+                        pplx_space_snapshot_model::TransferScopeId::new(),
                     ),
                     crate::transfer_directory::shared_cache_group(),
                 )
@@ -2033,7 +2033,7 @@ fn volume_manager_downloads_into_scoped_restore_staging_through_the_shared_cache
         let staging = paths::sandbox_restore_staging_dir_in(
             &cache,
             &SandboxId::new().to_string(),
-            &pplx_space_common_core::types::TransferScopeId::new().to_string(),
+            &pplx_space_snapshot_model::TransferScopeId::new().to_string(),
         );
         if let Some((uid, gid, mode)) = existing {
             std::fs::create_dir(&staging).unwrap();

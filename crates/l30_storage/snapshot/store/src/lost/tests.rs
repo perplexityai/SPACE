@@ -1,6 +1,6 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{SnapshotId, SnapshotKind, SnapshotState};
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{SnapshotId, SnapshotKind, SnapshotState};
 
 use std::time::Duration;
 

@@ -24,7 +24,6 @@ use crate::node_group_placement::{
 use pplx_space_accounts::NodeId;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_cluster_pool::{OpenPoolSlotDeleteLock, WarmPoolStore};
-use pplx_space_common_core::types::{ArtifactKind, BackupSource};
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
 };
@@ -34,6 +33,7 @@ use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_model::{
     ExecutionGeneration, SandboxLifecycle, SandboxTransitionTargetState,
 };
+use pplx_space_snapshot_model::{ArtifactKind, BackupSource};
 use pplx_space_sql_locator::sql;
 use rand::RngExt;
 use sqlx::{Postgres, Transaction};

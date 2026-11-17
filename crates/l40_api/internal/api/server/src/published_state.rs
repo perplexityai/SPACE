@@ -1,6 +1,6 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SnapshotId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_snapshot_model::SnapshotId;
 
 use pplx_space_sql_locator::sql;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,7 +15,6 @@ use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_cluster_trigger_queue::{
     QueuedRefConflict, enqueue_triggers_conn, queue_node_reconcile_refs,
 };
-use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 use pplx_space_cpu_arch::Arch;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -42,6 +41,7 @@ use pplx_space_sbx_mgr_client::proto::{
     QuarantineRecoveryObservedOwner, SnapshotDetail, SnapshotType,
 };
 use pplx_space_semver::SemVer;
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
     FACET_TEMPLATE_DESIRED_STATE, NetworkPolicyTarget, ReconcileReason,

@@ -4,7 +4,7 @@ use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 use super::metadata::*;
 use super::status::*;
 use super::*;
-use pplx_space_common_core::types::BaseSnapshotShape;
+use pplx_space_snapshot_model::BaseSnapshotShape;
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::TemplateDesiredState as DomainTemplateDesiredState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

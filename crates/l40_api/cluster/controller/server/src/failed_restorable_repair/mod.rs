@@ -38,7 +38,7 @@
 //! Ships enabled and repairs eligible rows directly. It emits the sandbox
 //! transition event after the CAS succeeds.
 
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use std::time::{Duration, Instant};
 

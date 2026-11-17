@@ -165,10 +165,10 @@ pub(super) fn artifact_backup_format(
     artifact: &crate::db::LocalArtifactRow,
 ) -> Result<pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat, Status> {
     match artifact.artifact_kind {
-        pplx_space_common_core::types::ArtifactKind::Full => {
+        pplx_space_snapshot_model::ArtifactKind::Full => {
             reupload_format_from_sidecar(&artifact.local_path)
         }
-        pplx_space_common_core::types::ArtifactKind::Disk => {
+        pplx_space_snapshot_model::ArtifactKind::Disk => {
             sidecarless_format_from_artifacts(&artifact.local_path)
         }
     }
@@ -176,9 +176,9 @@ pub(super) fn artifact_backup_format(
 
 pub(super) fn current_instance_backup_precondition(
     state: impl Into<SandboxStatus>,
-    expected_kind: pplx_space_common_core::types::ArtifactKind,
+    expected_kind: pplx_space_snapshot_model::ArtifactKind,
 ) -> Result<(), Status> {
-    use pplx_space_common_core::types::ArtifactKind;
+    use pplx_space_snapshot_model::ArtifactKind;
     let state = state.into();
     let current_kind = match state.unowned() {
         Some(SandboxState::Stopped) => ArtifactKind::Disk,
@@ -331,7 +331,7 @@ pub(super) async fn require_artifact_backup_files(
     inspector: &dyn crate::retained_source::RetainedSourceInspector,
     sandbox_id: &str,
     local_path: &str,
-    kind: pplx_space_common_core::types::ArtifactKind,
+    kind: pplx_space_snapshot_model::ArtifactKind,
     format: crate::proto::SuspendSnapshotFormat,
     policy: BackupFilesPolicy,
 ) -> Result<(), Status> {
@@ -369,10 +369,10 @@ pub(super) async fn require_artifact_backup_files(
         if file.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend {
             // Disk artifacts never retain a source: they have no sidecar.
             let source_id = match kind {
-                pplx_space_common_core::types::ArtifactKind::Full => {
+                pplx_space_snapshot_model::ArtifactKind::Full => {
                     super::sidecar_rootfs_send_source_id(local_path)?
                 }
-                pplx_space_common_core::types::ArtifactKind::Disk => None,
+                pplx_space_snapshot_model::ArtifactKind::Disk => None,
             };
             match crate::retained_source::btrfs_send_rootfs_presence(
                 inspector,
@@ -530,9 +530,9 @@ impl SandboxManagerService {
             )
         })?;
         if sandbox.current_local_artifact_kind
-            != Some(pplx_space_common_core::types::ArtifactKind::Full)
+            != Some(pplx_space_snapshot_model::ArtifactKind::Full)
             || sandbox.current_local_artifact_origin
-                != Some(pplx_space_common_core::types::ArtifactOrigin::Suspend)
+                != Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend)
         {
             return Err(Status::failed_precondition(
                 "current suspended instance artifact is not a full suspend artifact",
@@ -573,10 +573,10 @@ impl SandboxManagerService {
             sandbox_id: artifact.sandbox_id.clone(),
             local_artifact_id: artifact.local_artifact_id.to_string(),
             artifact_kind: match artifact.artifact_kind {
-                pplx_space_common_core::types::ArtifactKind::Disk => {
+                pplx_space_snapshot_model::ArtifactKind::Disk => {
                     crate::proto::ArtifactKind::Disk as i32
                 }
-                pplx_space_common_core::types::ArtifactKind::Full => {
+                pplx_space_snapshot_model::ArtifactKind::Full => {
                     crate::proto::ArtifactKind::Full as i32
                 }
             },
@@ -655,12 +655,8 @@ impl SandboxManagerService {
             return Err(Status::invalid_argument("sandbox_id is required"));
         }
         let expected_kind = match crate::proto::ArtifactKind::try_from(req.expected_artifact_kind) {
-            Ok(crate::proto::ArtifactKind::Disk) => {
-                pplx_space_common_core::types::ArtifactKind::Disk
-            }
-            Ok(crate::proto::ArtifactKind::Full) => {
-                pplx_space_common_core::types::ArtifactKind::Full
-            }
+            Ok(crate::proto::ArtifactKind::Disk) => pplx_space_snapshot_model::ArtifactKind::Disk,
+            Ok(crate::proto::ArtifactKind::Full) => pplx_space_snapshot_model::ArtifactKind::Full,
             _ => {
                 return Err(Status::invalid_argument(
                     "expected_artifact_kind is required",
@@ -674,8 +670,7 @@ impl SandboxManagerService {
             return Err(status);
         }
 
-        let full_current_instance = expected_kind
-            == pplx_space_common_core::types::ArtifactKind::Full
+        let full_current_instance = expected_kind == pplx_space_snapshot_model::ArtifactKind::Full
             && matches!(
                 req.source.as_ref(),
                 Some(crate::proto::enqueue_artifact_backup_request::Source::CurrentInstance(_))
@@ -723,7 +718,7 @@ impl SandboxManagerService {
             }
             Some(crate::proto::enqueue_artifact_backup_request::Source::SnapshotName(value)) => {
                 let name =
-                    pplx_space_common_core::types::SnapshotName::parse(value).map_err(|err| {
+                    pplx_space_snapshot_model::SnapshotName::parse(value).map_err(|err| {
                         Status::invalid_argument(format!("invalid snapshot_name: {err}"))
                     })?;
                 if crate::service::grpc_spaced_process_snapshots::is_internal_snapshot_name(
@@ -741,9 +736,9 @@ impl SandboxManagerService {
                     (existing, false)
                 } else {
                     let adopted_kind = if name.as_str().starts_with("d-") {
-                        pplx_space_common_core::types::ArtifactKind::Disk
+                        pplx_space_snapshot_model::ArtifactKind::Disk
                     } else if name.as_str().starts_with("f-") {
-                        pplx_space_common_core::types::ArtifactKind::Full
+                        pplx_space_snapshot_model::ArtifactKind::Full
                     } else {
                         return Err(Status::failed_precondition(format!(
                             "snapshot {name} does not identify a disk or full artifact"
@@ -972,10 +967,10 @@ impl SandboxManagerService {
                 return Ok(Response::new(EnqueueArtifactBackupResponse {
                     local_artifact_id: artifact.local_artifact_id.to_string(),
                     artifact_kind: match artifact.artifact_kind {
-                        pplx_space_common_core::types::ArtifactKind::Disk => {
+                        pplx_space_snapshot_model::ArtifactKind::Disk => {
                             crate::proto::ArtifactKind::Disk as i32
                         }
-                        pplx_space_common_core::types::ArtifactKind::Full => {
+                        pplx_space_snapshot_model::ArtifactKind::Full => {
                             crate::proto::ArtifactKind::Full as i32
                         }
                     },
@@ -1006,7 +1001,7 @@ impl SandboxManagerService {
         };
         let execution_generation =
             self.capture_execution_generation(&sandbox, &artifact, previous_job.as_ref())?;
-        let backup_attempt_id = pplx_space_common_core::types::BackupAttemptId::new();
+        let backup_attempt_id = pplx_space_snapshot_model::BackupAttemptId::new();
         let backup_attempt_id = match self
             .submit_artifact_backup(
                 &sandbox,
@@ -1043,10 +1038,10 @@ impl SandboxManagerService {
         Ok(Response::new(EnqueueArtifactBackupResponse {
             local_artifact_id: artifact.local_artifact_id.to_string(),
             artifact_kind: match artifact.artifact_kind {
-                pplx_space_common_core::types::ArtifactKind::Disk => {
+                pplx_space_snapshot_model::ArtifactKind::Disk => {
                     crate::proto::ArtifactKind::Disk as i32
                 }
-                pplx_space_common_core::types::ArtifactKind::Full => {
+                pplx_space_snapshot_model::ArtifactKind::Full => {
                     crate::proto::ArtifactKind::Full as i32
                 }
             },
@@ -1192,7 +1187,7 @@ impl SandboxManagerService {
             self.retained_source_inspector.as_ref(),
             &sandbox.id,
             &snapshot_dir,
-            pplx_space_common_core::types::ArtifactKind::Full,
+            pplx_space_snapshot_model::ArtifactKind::Full,
             reupload_format,
             BackupFilesPolicy::Reupload,
         )
@@ -1248,14 +1243,14 @@ impl SandboxManagerService {
         )?;
         let execution_generation =
             self.capture_execution_generation(&sandbox, &artifact, previous_job.as_ref())?;
-        let backup_attempt_id = pplx_space_common_core::types::BackupAttemptId::new();
+        let backup_attempt_id = pplx_space_snapshot_model::BackupAttemptId::new();
         let outcome = self
             .submit_artifact_backup(
                 &sandbox,
                 ArtifactBackupSubmission {
                     local_artifact_id,
-                    artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
-                    artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Suspend,
+                    artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
+                    artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Suspend,
                     snapshot_name: None,
                     backup_attempt_id,
                     snapshot_dir: &snapshot_dir,

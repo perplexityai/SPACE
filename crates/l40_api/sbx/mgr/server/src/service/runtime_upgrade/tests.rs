@@ -5,8 +5,8 @@
 use super::*;
 use crate::db::fixture::insert_test_sandbox;
 use crate::db::{ActivationKind, ActivationRouteAdmission};
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_sandbox_model::{SandboxCleanupEpisodeId, SandboxId};
+use pplx_space_snapshot_model::LocalArtifactId;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 

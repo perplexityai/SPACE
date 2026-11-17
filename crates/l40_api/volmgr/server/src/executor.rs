@@ -35,7 +35,6 @@ use dashmap::DashMap;
 use pplx_space_accounts::OrgId;
 use pplx_space_common_core::types::{
     KekProvider, MasterKeyIdentifier, SnapshotArtifact, StorageUri, SubjectId, SubjectIdParseError,
-    TransferScopeId,
 };
 use pplx_space_common_jobs::{
     Job, JobError, JobExecutor, JobFailureKind, JobFailureReason, JobPriority,
@@ -46,6 +45,7 @@ use pplx_space_object_store::{
 };
 use pplx_space_page_cache as page_cache;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::TransferScopeId;
 use pplx_space_volmgr_client::{
     VERIFIED_REPLICA_PROVENANCE_VERSION, VerifiedReplicaProvenance,
     verified_replica_provenance_path,

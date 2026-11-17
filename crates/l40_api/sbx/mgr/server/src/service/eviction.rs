@@ -4,8 +4,8 @@
 //! exact machinery the Delete RPC drives so eviction cannot diverge from
 //! normal deletion semantics.
 
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use std::time::Duration;
 use tonic::Status;

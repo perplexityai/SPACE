@@ -238,7 +238,7 @@ impl crate::service::SandboxManagerService {
         extensions: Extensions,
         operation_id: crate::db::RuntimeUpgradeOperationId,
         start: StartRequest,
-        decided_checkpoint: Option<pplx_space_common_core::types::LocalArtifactId>,
+        decided_checkpoint: Option<pplx_space_snapshot_model::LocalArtifactId>,
     ) -> Result<StartResponse, Status> {
         let claim = match crate::db::read::runtime_upgrade_report(&*self.db_conn()?, operation_id)
             .map_err(|error| {

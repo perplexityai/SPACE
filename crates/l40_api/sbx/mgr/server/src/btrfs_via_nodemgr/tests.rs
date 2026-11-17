@@ -98,8 +98,7 @@ async fn a_sandbox_instance_is_created_as_a_subvolume_or_reported_unsupported() 
     use pplx_space_node_mgr_client::proto::{
         BtrfsCreateSandboxInstanceRequest, BtrfsCreateSandboxInstanceResponse,
     };
-    let target =
-        || InstanceTarget::RestoreScope(pplx_space_common_core::types::TransferScopeId::new());
+    let target = || InstanceTarget::RestoreScope(pplx_space_snapshot_model::TransferScopeId::new());
 
     let created = crate::node_manager_transport::fake::FakeNodeManager::default()
         .unary(

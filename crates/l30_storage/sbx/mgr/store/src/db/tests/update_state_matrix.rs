@@ -10,8 +10,8 @@
 //! writes the guards admit, including edges the state machine forbids.
 
 use crate::db::{Connection, Transaction};
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_sandbox_model::{SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode};
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::state_write_fixtures::{
     Cell, ExpectedDiff, NULL, Snapshot, assert_diff, assert_unchanged, backdate, force_state,

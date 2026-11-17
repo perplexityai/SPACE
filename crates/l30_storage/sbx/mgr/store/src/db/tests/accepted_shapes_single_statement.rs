@@ -11,12 +11,10 @@
 //! and `start_arms_access_idle_only_after_guest_readiness` cover arming.
 
 use crate::db::Connection;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, TransferScopeId,
-};
 use pplx_space_sandbox_model::{
     SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, TransferScopeId};
 
 use super::state_write_fixtures::{
     Cell, ExpectedDiff, NULL, assert_accepts, backdate, decorate, generation, insert_row,

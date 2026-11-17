@@ -1,6 +1,6 @@
 use super::*;
 use crate::service::tests::service_tests::insert_test_sandbox;
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use std::collections::HashSet;
 
 fn sweep(service: &SandboxManagerService, root: &Path) -> HashSet<PathBuf> {

@@ -8,8 +8,8 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use pplx_space_cluster_id::{ClusterId, process_cluster_id};
-use pplx_space_common_core::types::SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_ENV;
 use pplx_space_feature_flags::{FeatureFlagClient, JsonFlag};
+use pplx_space_snapshot_model::SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_ENV;
 use pplx_space_snapshot_retention::backend::StorageBackendRegistry;
 use tokio_util::sync::CancellationToken;
 
@@ -25,7 +25,7 @@ pub(crate) const DEFAULT_MAX_PER_TICK: u32 = 100;
 pub(crate) const MAX_PER_TICK_CEILING: u32 = 10_000;
 pub(crate) const DEFAULT_KEEP_N: u32 = 3;
 pub(crate) const DEFAULT_MIN_AGE: Duration = Duration::from_secs(
-    pplx_space_common_core::types::SNAPSHOT_RETENTION_SWEEPER_DEFAULT_MIN_AGE_SECONDS,
+    pplx_space_snapshot_model::SNAPSHOT_RETENTION_SWEEPER_DEFAULT_MIN_AGE_SECONDS,
 );
 
 /// Declared here rather than in the flags crate because only this reconciler

@@ -99,7 +99,7 @@
 //! first moved statement. Keep the module declarations below sorted.
 
 use pplx_space_accounts::{OrgId, UserId};
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;

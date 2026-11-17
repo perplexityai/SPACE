@@ -1,5 +1,5 @@
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::{
     future::Future,
@@ -8,7 +8,6 @@ use std::{
 };
 
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
-use pplx_space_common_core::types::{ArtifactKind, BackupAttemptId, BackupSource, SnapshotState};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
@@ -18,6 +17,7 @@ use pplx_space_public_api::{
 use pplx_space_sandbox_model::{
     EcwCredentialEpoch, ExecutionGeneration, SandboxId, SandboxLifecycle,
 };
+use pplx_space_snapshot_model::{ArtifactKind, BackupAttemptId, BackupSource, SnapshotState};
 use sqlx::PgPool;
 
 use crate::controllers::substrate::{

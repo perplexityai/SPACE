@@ -1,5 +1,5 @@
-use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use super::*;
 use crate::db::CleanupCompletion;
@@ -342,7 +342,7 @@ async fn run_selected_remote_stage_for_test(
                         storage_uri,
                         local_artifact_id: stage_local_artifact_id,
                         artifact_kind: stage_local_artifact_id
-                            .map(|_| pplx_space_common_core::types::ArtifactKind::Full),
+                            .map(|_| pplx_space_snapshot_model::ArtifactKind::Full),
                     })
                 }
             }
@@ -948,7 +948,7 @@ async fn suspend_restore_dir_keeps_a_previous_scope_it_cannot_cancel() {
     let id = SandboxId::new().to_string();
     crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Suspended);
     let previous = crate::db::RestoreTransferScopeRow {
-        transfer_scope_id: pplx_space_common_core::types::TransferScopeId::new(),
+        transfer_scope_id: pplx_space_snapshot_model::TransferScopeId::new(),
         execution_generation: Some(ExecutionGeneration::new(2).unwrap()),
         activation_attempt_id: Some(SandboxActivationAttemptId::new()),
         staging_dir: "/synthetic/foreign/staging".to_owned(),
@@ -998,7 +998,7 @@ fn materialize_stopped_request() -> StartRequest {
 }
 
 pub(in crate::service) fn materialize_stopped_request_for(sandbox_id: &str) -> StartRequest {
-    let artifact_snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    let artifact_snapshot_id = pplx_space_snapshot_model::SnapshotId::new();
     StartRequest {
         sandbox_id: sandbox_id.to_string(),
         checkpoint: Some(SUSPEND_CHECKPOINT.to_string()),
@@ -1007,7 +1007,7 @@ pub(in crate::service) fn materialize_stopped_request_for(sandbox_id: &str) -> S
         )),
         target_state: crate::proto::WakeTargetState::Stopped as i32,
         expected_local_artifact_id: Some(
-            pplx_space_common_core::types::LocalArtifactId::new().to_string(),
+            pplx_space_snapshot_model::LocalArtifactId::new().to_string(),
         ),
         route_identity: Some(crate::proto::SpaceApiRouteIdentity {
             execution_generation: Some(7),
@@ -1086,7 +1086,7 @@ fn a_stopped_target_is_refused_on_every_request_shape_that_would_boot() {
 #[test]
 fn a_stopped_target_and_a_fork_cannot_be_requested_together() {
     let source_sandbox_id = SandboxId::new();
-    let artifact_snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    let artifact_snapshot_id = pplx_space_snapshot_model::SnapshotId::new();
     let fork_context = crate::proto::RestoreArtifactAsNewContext {
         source_sandbox_id: source_sandbox_id.to_string(),
         artifact_snapshot_id: artifact_snapshot_id.to_string(),
@@ -1153,7 +1153,7 @@ fn a_stopped_target_and_a_fork_cannot_be_requested_together() {
 /// rather than a suspend checkpoint or a user's named snapshot.
 #[test]
 fn only_the_requested_artifact_lets_a_stopped_row_pass() {
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
     let pinned = LocalArtifactId::new();
     let other = LocalArtifactId::new();
 
@@ -1319,7 +1319,7 @@ async fn a_resumed_stopped_materialization_is_answered_before_the_launch() {
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
     insert_suspended_test_sandbox(&conn, &sandbox_id);
-    let pin = pplx_space_common_core::types::LocalArtifactId::new();
+    let pin = pplx_space_snapshot_model::LocalArtifactId::new();
     conn.execute(
         "UPDATE sandboxes
          SET state = 'stopped',
@@ -1404,7 +1404,7 @@ fn a_stopped_target_requires_the_expected_artifact_id() {
 #[test]
 fn the_stopped_target_selects_the_evacuation_finalize_arm() {
     let request = materialize_stopped_request();
-    let expected: pplx_space_common_core::types::LocalArtifactId = request
+    let expected: pplx_space_snapshot_model::LocalArtifactId = request
         .expected_local_artifact_id
         .as_deref()
         .unwrap()
@@ -1592,7 +1592,7 @@ async fn a_stopped_row_is_reported_materialized_only_when_inert_and_present() {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_suspended_test_sandbox(&conn, &sandbox_id);
-        let pin = pplx_space_common_core::types::LocalArtifactId::new();
+        let pin = pplx_space_snapshot_model::LocalArtifactId::new();
         conn.execute(
             "UPDATE sandboxes
              SET state = 'stopped',
@@ -1689,7 +1689,7 @@ async fn a_stopped_row_is_not_vouched_for_to_a_request_fenced_elsewhere() {
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
     insert_suspended_test_sandbox(&conn, &sandbox_id);
-    let pin = pplx_space_common_core::types::LocalArtifactId::new();
+    let pin = pplx_space_snapshot_model::LocalArtifactId::new();
     conn.execute(
         "UPDATE sandboxes
          SET state = 'stopped',
@@ -1735,7 +1735,7 @@ async fn the_second_stopped_boundary_fences_the_request_too() {
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
     insert_suspended_test_sandbox(&conn, &sandbox_id);
-    let pin = pplx_space_common_core::types::LocalArtifactId::new();
+    let pin = pplx_space_snapshot_model::LocalArtifactId::new();
     conn.execute(
         "UPDATE sandboxes
          SET state = 'stopped',

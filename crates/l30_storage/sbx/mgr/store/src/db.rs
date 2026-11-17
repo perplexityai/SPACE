@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use pplx_space_accounts::{ORPHANED_SANDBOX_OWNER, SandboxOwner};
 use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleRuntimeState};
-use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotName};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
@@ -30,6 +29,7 @@ use pplx_space_sandbox_model::{
     SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
     SandboxTransitionTargetState,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotName};
 use pplx_space_sqlite::SqliteU64;
 use pplx_space_template_model::ORPHANED_SANDBOX_TEMPLATE;
 use rusqlite::types::Type;

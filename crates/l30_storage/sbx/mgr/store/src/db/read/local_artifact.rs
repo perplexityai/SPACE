@@ -1,7 +1,7 @@
 //! One `local_artifacts` row, by identity or by snapshot name, and whether
 //! anything still owns an artifact identity.
 
-use pplx_space_common_core::types::{LocalArtifactId, SnapshotName};
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotName};
 
 use crate::db::{Connection, LocalArtifactRow, Result};
 

@@ -15,9 +15,7 @@ use crate::controllers::substrate::ExecutionIdentity;
 use crate::metrics::sandbox::api::RouteIdentityDecisionReason;
 use pplx_space_accounts::{NodeId, SandboxOwner, UserId};
 use pplx_space_cluster_pool::WarmPoolStore;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExactStorageUri, LocalArtifactId, SnapshotState, StorageUri,
-};
+use pplx_space_common_core::types::{ExactStorageUri, StorageUri};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
@@ -33,6 +31,7 @@ use pplx_space_sandbox_portability::{
     restore_retry_source_snapshot_is_current, restore_retry_suspended_revert_snapshot_exists,
     snapshot_is_current_local_artifact,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotState};
 use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_LOCAL_SUSPEND_KEY};
 use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, postgres::PgRow};

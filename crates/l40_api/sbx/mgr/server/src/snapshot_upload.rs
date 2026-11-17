@@ -36,12 +36,10 @@ use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use pplx_space_common_core::types::snapshot_shard;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotArtifact, SnapshotName,
-    snapshot_object_key,
-};
+use pplx_space_common_core::types::{SnapshotArtifact, snapshot_object_key};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotName};
 use pplx_space_volmgr_client::proto::PushFileRequest;
 
 /// Resolved S3 configuration for snapshot uploads.

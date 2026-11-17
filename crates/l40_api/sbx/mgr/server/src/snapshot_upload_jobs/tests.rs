@@ -1,5 +1,5 @@
 use pplx_space_accounts::JobId;
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::*;
 
@@ -731,8 +731,8 @@ fn payload_for(artifact_id: &str) -> String {
 
 fn reclaim_fixture_meta(
     rootfs_diff_format: Option<&str>,
-    artifact_kind: Option<pplx_space_common_core::types::ArtifactKind>,
-    artifact_origin: Option<pplx_space_common_core::types::ArtifactOrigin>,
+    artifact_kind: Option<pplx_space_snapshot_model::ArtifactKind>,
+    artifact_origin: Option<pplx_space_snapshot_model::ArtifactOrigin>,
     local_artifact_id: Option<LocalArtifactId>,
 ) -> SnapshotMeta {
     SnapshotMeta {
@@ -775,7 +775,7 @@ fn reclaim_fixture_meta(
 /// of scope.
 #[test]
 fn stream_reclaim_applies_only_to_pinned_btrfs_send_suspend_artifacts() {
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
     let id = LocalArtifactId::new();
     let btrfs = Some(crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1);
 
@@ -850,8 +850,8 @@ pub(crate) fn reclaim_fixture_payload(
     SnapshotUploadJobs {
         meta: reclaim_fixture_meta(
             Some(crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1),
-            Some(pplx_space_common_core::types::ArtifactKind::Full),
-            Some(pplx_space_common_core::types::ArtifactOrigin::Suspend),
+            Some(pplx_space_snapshot_model::ArtifactKind::Full),
+            Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend),
             Some(artifact_id.parse().unwrap()),
         ),
         snapshot_id: "01939e3e-ffff-7000-8000-000000000001".to_string(),
@@ -1023,7 +1023,7 @@ fn disk_operation_backup_stamps_its_durability_marker() {
     let snapshot_dir = tmp.path().join("snapshot");
     write_snapshot_dir_fixture(&snapshot_dir);
     let mut payload = reclaim_fixture_payload(artifact, snapshot_dir.clone());
-    payload.meta.artifact_kind = Some(pplx_space_common_core::types::ArtifactKind::Disk);
+    payload.meta.artifact_kind = Some(pplx_space_snapshot_model::ArtifactKind::Disk);
 
     stamp_backup_completed_and_reclaim_stream(&conn, &payload, "fork-backup-1", None).unwrap();
 
@@ -1276,9 +1276,9 @@ fn ready_backup_returns_before_the_retained_source_is_inspected() {
 /// verbatim, and carry nothing when the capture host was unknown.
 #[test]
 fn begin_request_carries_the_recorded_capture_host_cpu() {
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::{ExecutionMetadata, HostCpu, SnapshotExecutionMetadata};
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
     let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
         Arch::X86_64,
@@ -1341,9 +1341,9 @@ fn begin_request_carries_the_capture_generation_mark() {
 /// verdict-only requests, left a row for the probe to close.
 #[test]
 fn verdict_only_begin_is_requested_and_its_echo_read() {
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::{ExecutionMetadata, SnapshotExecutionMetadata};
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
     let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
         Arch::X86_64,
@@ -1391,7 +1391,7 @@ fn absent_volume_manager_socket() -> std::path::PathBuf {
 #[test]
 fn suspend_uncommitted_follows_the_row_state_and_its_pin() {
     use crate::state::{SandboxState, SandboxStatus};
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
     let capture = LocalArtifactId::new();
     let pinned = capture.to_string();

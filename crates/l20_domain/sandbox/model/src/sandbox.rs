@@ -2083,7 +2083,7 @@ impl SandboxLifecycle {
     /// matrix — then silently stops covering the new value.
     ///
     /// So: **when you add a variant, add it here.** Mirrors
-    /// `pplx_space_common_core::types::SnapshotState::all`, which has the same shape and the
+    /// `pplx_space_snapshot_model::SnapshotState::all`, which has the same shape and the
     /// same limitation.
     ///
     /// Not every value `sandboxes.lifecycle` can hold: `deleted` is a tombstone

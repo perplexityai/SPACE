@@ -8,8 +8,8 @@
 //! `k8s_store_postgres_behaviors`, so they run against the same database and
 //! mint no second container.
 
-use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use super::*;
 use pplx_space_db_test_fixtures::SEED_ORG_ID;

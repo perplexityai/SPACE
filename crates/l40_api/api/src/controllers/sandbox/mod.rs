@@ -1290,8 +1290,8 @@ impl SandboxController {
         self.substrate
             .enqueue_artifact_backup(
                 sandbox_id,
-                pplx_space_common_core::types::ArtifactKind::Full,
-                pplx_space_common_core::types::BackupSource::CurrentInstance,
+                pplx_space_snapshot_model::ArtifactKind::Full,
+                pplx_space_snapshot_model::BackupSource::CurrentInstance,
                 target,
             )
             .await

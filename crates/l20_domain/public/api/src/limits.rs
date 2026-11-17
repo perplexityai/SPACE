@@ -37,7 +37,7 @@ pub const MIN_SANDBOX_VCPU: u32 = 1;
 pub const MAX_SANDBOX_VCPU: u32 = 32;
 /// Smallest guest memory a sandbox can request: the smallest memory a template
 /// base snapshot is taken with.
-pub const MIN_SANDBOX_MEMORY_MIB: u32 = pplx_space_common_core::types::MIN_BASE_SNAPSHOT_MEMORY_MIB;
+pub const MIN_SANDBOX_MEMORY_MIB: u32 = pplx_space_snapshot_model::MIN_BASE_SNAPSHOT_MEMORY_MIB;
 /// Largest guest memory a sandbox can request: 2 GiB for each of
 /// [`MAX_SANDBOX_VCPU`] vCPUs. This is an admission bound, not a node's guest
 /// maximum: a node gives the guest the smaller of this request and its own

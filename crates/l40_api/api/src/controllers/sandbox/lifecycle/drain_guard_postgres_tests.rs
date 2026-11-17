@@ -705,7 +705,7 @@ async fn drain_gate_blocks_via_sandbox_k8s_executions_fallback() -> TestResult {
 /// A fresh ready full snapshot with a storage location, which makes a
 /// `suspended` / `restoring` row portable for restore affinity.
 async fn insert_fresh_ready_snapshot(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {
-    let snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    let snapshot_id = pplx_space_snapshot_model::SnapshotId::new();
     sqlx::query(sql!(
         "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp)
          VALUES ($1, $2, 'full', 'ready', NOW())"

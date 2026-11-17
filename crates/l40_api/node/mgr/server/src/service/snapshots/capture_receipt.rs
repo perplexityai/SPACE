@@ -1,9 +1,9 @@
 use crate::service::trusted_paths;
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_node_mgr_client::capture_receipt::{
     CLAIMED, COMMITTED, FAILED, INTENT, REFUSED, STAGING_PREFIX,
 };
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use std::{fs::File, path::Path};
 use tonic::Status;
 

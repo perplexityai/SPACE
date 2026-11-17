@@ -4,7 +4,7 @@
 //! plane. It depends on common domain nouns, but common domain crates do not
 //! depend on these wire contracts.
 
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::{collections::BTreeMap, fmt, str::FromStr};
 

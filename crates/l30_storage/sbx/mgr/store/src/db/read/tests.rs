@@ -1,11 +1,11 @@
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
-use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName, TransferScopeId};
 use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
 use pplx_space_sandbox_model::{
     AutoLifecycleDeleteReceiptId, ExecutionGeneration, SandboxActivationAttemptId,
     SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode,
 };
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotName, TransferScopeId};
 use rusqlite::params;
 
 use super::*;

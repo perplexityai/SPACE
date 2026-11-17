@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use std::os::unix::fs::PermissionsExt;
 
 use super::cache_cleanup::is_sandbox_running;
@@ -47,10 +47,10 @@ fn state_publication_metadata_disposition(
 }
 
 use futures_util::{StreamExt, stream};
-use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
 const STATE_INFO_CONCURRENCY: usize = 16;
 const MIB_BYTES: u64 = 1024 * 1024;
@@ -184,7 +184,7 @@ impl OperationSnapshotPlan {
 
 fn disk_operation_snapshot_response(
     local_artifact_id: LocalArtifactId,
-    snapshot_name: &pplx_space_common_core::types::SnapshotName,
+    snapshot_name: &pplx_space_snapshot_model::SnapshotName,
 ) -> crate::proto::CreateSnapshotResponse {
     crate::proto::CreateSnapshotResponse {
         snapshot_name: snapshot_name.to_string(),
@@ -201,8 +201,8 @@ fn disk_operation_snapshot_response(
 
 fn disk_operation_snapshot_name(
     request_id: Uuid,
-) -> Result<pplx_space_common_core::types::SnapshotName, Status> {
-    pplx_space_common_core::types::SnapshotName::parse(format!("d-operation-{request_id}"))
+) -> Result<pplx_space_snapshot_model::SnapshotName, Status> {
+    pplx_space_snapshot_model::SnapshotName::parse(format!("d-operation-{request_id}"))
         .map_err(|error| Status::internal(format!("invalid generated snapshot name: {error}")))
 }
 
@@ -225,7 +225,7 @@ impl DiskOperationSnapshotPaths {
 
 fn disk_operation_snapshot_paths(
     sandbox_id: &str,
-    snapshot_name: &pplx_space_common_core::types::SnapshotName,
+    snapshot_name: &pplx_space_snapshot_model::SnapshotName,
 ) -> DiskOperationSnapshotPaths {
     let capture =
         pplx_space_host_layout::paths::sandbox_snapshot_dir(sandbox_id, snapshot_name.as_str());
@@ -255,7 +255,7 @@ fn disk_operation_snapshot_artifact_id(
 fn emit_disk_operation_snapshot_published(
     sandbox_id: &str,
     local_artifact_id: LocalArtifactId,
-    snapshot_name: &pplx_space_common_core::types::SnapshotName,
+    snapshot_name: &pplx_space_snapshot_model::SnapshotName,
 ) {
     emit_sandbox_event(
         sandbox_id,
@@ -263,7 +263,7 @@ fn emit_disk_operation_snapshot_published(
         SandboxEventSource::SbxManager,
         SandboxEventDetails::default()
             .local_artifact_id(local_artifact_id.to_string())
-            .artifact_kind(pplx_space_common_core::types::ArtifactKind::Disk.as_str())
+            .artifact_kind(pplx_space_snapshot_model::ArtifactKind::Disk.as_str())
             .artifact_origin("snapshot")
             .snapshot_id(snapshot_name.to_string()),
     );
@@ -273,13 +273,13 @@ fn disk_operation_snapshot_artifact_matches(
     artifact: &crate::db::LocalArtifactRow,
     expected_local_artifact_id: LocalArtifactId,
     sandbox_id: &str,
-    snapshot_name: &pplx_space_common_core::types::SnapshotName,
+    snapshot_name: &pplx_space_snapshot_model::SnapshotName,
     paths: &DiskOperationSnapshotPaths,
 ) -> bool {
     artifact.local_artifact_id == expected_local_artifact_id
         && artifact.sandbox_id == sandbox_id
-        && artifact.artifact_kind == pplx_space_common_core::types::ArtifactKind::Disk
-        && artifact.artifact_origin == pplx_space_common_core::types::ArtifactOrigin::Snapshot
+        && artifact.artifact_kind == pplx_space_snapshot_model::ArtifactKind::Disk
+        && artifact.artifact_origin == pplx_space_snapshot_model::ArtifactOrigin::Snapshot
         && artifact.snapshot_name.as_ref() == Some(snapshot_name)
         && paths.contains(&artifact.local_path)
 }
@@ -356,7 +356,7 @@ fn operation_snapshot_post_create_disposition(
 async fn remove_created_disk_operation_snapshot(
     node_client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
     sandbox_id: &str,
-    snapshot_name: &pplx_space_common_core::types::SnapshotName,
+    snapshot_name: &pplx_space_snapshot_model::SnapshotName,
     failure: &Status,
 ) -> Result<(), Status> {
     match node_client
@@ -382,7 +382,7 @@ async fn remove_created_disk_operation_snapshot(
 async fn remove_disk_operation_snapshot_attempt(
     node_client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
     sandbox_id: &str,
-    snapshot_name: &pplx_space_common_core::types::SnapshotName,
+    snapshot_name: &pplx_space_snapshot_model::SnapshotName,
     paths: &DiskOperationSnapshotPaths,
     failure: &Status,
 ) -> Result<(), Status> {
@@ -1115,26 +1115,26 @@ impl SandboxManagerService {
             }),
             current_local_artifact_kind: sandbox.current_local_artifact_kind.map(
                 |kind| match kind {
-                    pplx_space_common_core::types::ArtifactKind::Disk => {
+                    pplx_space_snapshot_model::ArtifactKind::Disk => {
                         crate::proto::ArtifactKind::Disk as i32
                     }
-                    pplx_space_common_core::types::ArtifactKind::Full => {
+                    pplx_space_snapshot_model::ArtifactKind::Full => {
                         crate::proto::ArtifactKind::Full as i32
                     }
                 },
             ),
             current_local_artifact_origin: sandbox.current_local_artifact_origin.map(|origin| {
                 match origin {
-                    pplx_space_common_core::types::ArtifactOrigin::Stop => {
+                    pplx_space_snapshot_model::ArtifactOrigin::Stop => {
                         crate::proto::ArtifactOrigin::Stop as i32
                     }
-                    pplx_space_common_core::types::ArtifactOrigin::Suspend => {
+                    pplx_space_snapshot_model::ArtifactOrigin::Suspend => {
                         crate::proto::ArtifactOrigin::Suspend as i32
                     }
-                    pplx_space_common_core::types::ArtifactOrigin::Snapshot => {
+                    pplx_space_snapshot_model::ArtifactOrigin::Snapshot => {
                         crate::proto::ArtifactOrigin::Snapshot as i32
                     }
-                    pplx_space_common_core::types::ArtifactOrigin::Fork => {
+                    pplx_space_snapshot_model::ArtifactOrigin::Fork => {
                         crate::proto::ArtifactOrigin::Fork as i32
                     }
                 }
@@ -1191,8 +1191,8 @@ impl SandboxManagerService {
         self.authorize_peer(&request, "CreateSnapshot", ALLOW_SANDBOX_OPERATOR)?;
         let req = request.into_inner();
         let artifact_kind = match snapshot_type_from_proto(req.r#type)? {
-            crate::proto::SnapshotType::Disk => pplx_space_common_core::types::ArtifactKind::Disk,
-            _ => pplx_space_common_core::types::ArtifactKind::Full,
+            crate::proto::SnapshotType::Disk => pplx_space_snapshot_model::ArtifactKind::Disk,
+            _ => pplx_space_snapshot_model::ArtifactKind::Full,
         };
         if let Some(crate::proto::create_snapshot_source::Source::DurableArtifact(source)) = req
             .source
@@ -1223,8 +1223,8 @@ impl SandboxManagerService {
 
         // Determine snapshot type (default to full for backward compat)
         let snap_type = match artifact_kind {
-            pplx_space_common_core::types::ArtifactKind::Disk => "disk",
-            pplx_space_common_core::types::ArtifactKind::Full => "full",
+            pplx_space_snapshot_model::ArtifactKind::Disk => "disk",
+            pplx_space_snapshot_model::ArtifactKind::Full => "full",
         };
 
         // For full snapshots, validate state transition
@@ -1244,7 +1244,7 @@ impl SandboxManagerService {
         let snapshot_name = format!("{type_prefix}-manual-{now}");
         validate_snapshot_name(&snapshot_name)?;
         let typed_snapshot_name =
-            pplx_space_common_core::types::SnapshotName::parse(snapshot_name.clone()).map_err(
+            pplx_space_snapshot_model::SnapshotName::parse(snapshot_name.clone()).map_err(
                 |error| Status::internal(format!("generated snapshot name is invalid: {error}")),
             )?;
         let local_artifact_id = LocalArtifactId::new();
@@ -1381,8 +1381,7 @@ impl SandboxManagerService {
             r#type: actual_type.into(),
             published_artifact: Some(crate::proto::PublishedArtifact {
                 local_artifact_id: local_artifact_id.to_string(),
-                artifact_kind: if artifact_kind == pplx_space_common_core::types::ArtifactKind::Full
-                {
+                artifact_kind: if artifact_kind == pplx_space_snapshot_model::ArtifactKind::Full {
                     crate::proto::ArtifactKind::Full as i32
                 } else {
                     crate::proto::ArtifactKind::Disk as i32
@@ -1398,9 +1397,9 @@ impl SandboxManagerService {
         &self,
         req: &crate::proto::CreateSnapshotRequest,
         initial_sandbox: &crate::db::SandboxRow,
-        artifact_kind: pplx_space_common_core::types::ArtifactKind,
+        artifact_kind: pplx_space_snapshot_model::ArtifactKind,
     ) -> Result<Response<crate::proto::CreateSnapshotResponse>, Status> {
-        if artifact_kind != pplx_space_common_core::types::ArtifactKind::Disk {
+        if artifact_kind != pplx_space_snapshot_model::ArtifactKind::Disk {
             return Err(Status::unimplemented(
                 "operation-safe full snapshots are reserved for rich runtime capture",
             ));
@@ -1473,7 +1472,7 @@ impl SandboxManagerService {
                 &db,
                 &sandbox_id,
                 local_artifact_id,
-                pplx_space_common_core::types::ArtifactKind::Disk,
+                pplx_space_snapshot_model::ArtifactKind::Disk,
                 &snapshot_name,
                 local_path,
             )

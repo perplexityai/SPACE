@@ -4,7 +4,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CreateBtrfsSnapshotRequest, CreateBtrfsSnapshotResponse, DeleteBtrfsSnapshotRequest,
@@ -13,6 +12,7 @@ use pplx_space_node_mgr_client::proto::{
     RestoreInstanceSnapshotResponse,
 };
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use tonic::Status;
 
 use super::super::node_effects::tests::{

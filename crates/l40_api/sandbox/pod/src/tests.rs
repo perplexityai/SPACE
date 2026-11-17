@@ -597,8 +597,8 @@ fn build_sandbox_pod_kill_switch_disables_ssd_tier_bias() {
 #[test]
 fn build_sandbox_pod_direct_restore_keeps_artifact_kind_and_node_assignment() {
     for (artifact_kind, checkpoint) in [
-        (pplx_space_common_core::types::ArtifactKind::Full, "suspend"),
-        (pplx_space_common_core::types::ArtifactKind::Disk, "stopped"),
+        (pplx_space_snapshot_model::ArtifactKind::Full, "suspend"),
+        (pplx_space_snapshot_model::ArtifactKind::Disk, "stopped"),
     ] {
         let env = BTreeMap::new();
         let auto_lifecycle_json = test_auto_lifecycle_json();
@@ -825,7 +825,7 @@ fn build_sandbox_pod_source_pinned_restore_skips_node_services_bias() {
         },
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common,
             runtime,
             suspend_restore_storage_uri: Some(
@@ -937,7 +937,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g2",
                 TEST_SANDBOX_ID,
@@ -960,7 +960,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g3",
                 TEST_SANDBOX_ID,
@@ -992,7 +992,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         },
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g4",
                 TEST_SANDBOX_ID,
@@ -1022,7 +1022,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         },
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g6",
                 TEST_SANDBOX_ID,
@@ -1051,7 +1051,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g5",
                 TEST_SANDBOX_ID,
@@ -1079,20 +1079,19 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     let upgrade_target = pplx_space_execution_spec::EnvironmentReference::new(
         pplx_space_content_digest::Digest::sha256([7; 32]),
     );
-    let runtime_upgrade = |target_state,
-                           checkpoint_local_artifact_id: Option<
-        pplx_space_common_core::types::LocalArtifactId,
-    >| {
-        PodRuntimeUpgrade {
-            operation_id: Uuid::from_u128(0x019f_8000_0000_7000_8000_0000_0000_0011),
-            target_environment: upgrade_target,
-            authorization_id: "environment-block-e0",
-            authorization_reason: "e0 runs a blocked runtime",
-            memory_loss: checkpoint_local_artifact_id.is_some(),
-            target_state,
-            checkpoint_local_artifact_id,
-        }
-    };
+    let runtime_upgrade =
+        |target_state,
+         checkpoint_local_artifact_id: Option<pplx_space_snapshot_model::LocalArtifactId>| {
+            PodRuntimeUpgrade {
+                operation_id: Uuid::from_u128(0x019f_8000_0000_7000_8000_0000_0000_0011),
+                target_environment: upgrade_target,
+                authorization_id: "environment-block-e0",
+                authorization_reason: "e0 runs a blocked runtime",
+                memory_loss: checkpoint_local_artifact_id.is_some(),
+                target_state,
+                checkpoint_local_artifact_id,
+            }
+        };
     let restore_runtime_upgrade =
         |name, generation, artifact_kind, storage_uri, source_node, upgrade| {
             build_sandbox_pod(
@@ -1118,7 +1117,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     let restore_runtime_upgrade_stopped = restore_runtime_upgrade(
         "space-sbx-019de67463d77ef0a5888e106a878093-g21",
         21,
-        pplx_space_common_core::types::ArtifactKind::Disk,
+        pplx_space_snapshot_model::ArtifactKind::Disk,
         None,
         Some("worker-source"),
         runtime_upgrade(PodRuntimeUpgradeTargetState::Stopped, None),
@@ -1126,7 +1125,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     let restore_runtime_upgrade_started = restore_runtime_upgrade(
         "space-sbx-019de67463d77ef0a5888e106a878093-g22",
         22,
-        pplx_space_common_core::types::ArtifactKind::Disk,
+        pplx_space_snapshot_model::ArtifactKind::Disk,
         None,
         Some("worker-source"),
         runtime_upgrade(PodRuntimeUpgradeTargetState::Started, None),
@@ -1134,12 +1133,12 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     let restore_runtime_upgrade_suspended = restore_runtime_upgrade(
         "space-sbx-019de67463d77ef0a5888e106a878093-g23",
         23,
-        pplx_space_common_core::types::ArtifactKind::Full,
+        pplx_space_snapshot_model::ArtifactKind::Full,
         Some("s3://space-test/suspend-snapshots/current?region=us-east-1"),
         None,
         runtime_upgrade(
             PodRuntimeUpgradeTargetState::Started,
-            Some(pplx_space_common_core::types::LocalArtifactId::from_uuid(
+            Some(pplx_space_snapshot_model::LocalArtifactId::from_uuid(
                 Uuid::from_u128(0x019f_8000_0000_7000_8000_0000_0000_0012),
             )),
         ),
@@ -1160,7 +1159,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g4",
                 TEST_SANDBOX_ID,
@@ -1185,7 +1184,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Disk,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Disk,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g5",
                 TEST_SANDBOX_ID,
@@ -1351,7 +1350,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         },
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g11",
                 TEST_SANDBOX_ID,
@@ -1401,7 +1400,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g15",
                 TEST_SANDBOX_ID,
@@ -1586,7 +1585,7 @@ fn every_sandbox_pod_shape_requests_one_network_slot() {
             &config,
             SandboxPodRequest::Restore {
                 stopped_materialization: None,
-                artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+                artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
                 common: common("space-sbx-restore-g2", TEST_SANDBOX_ID, 2),
                 runtime,
                 suspend_restore_storage_uri: None,
@@ -1712,7 +1711,7 @@ fn portable_restore_prefers_source_node_and_carries_remote_fallback() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: test_common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g3",
                 TEST_SANDBOX_ID,
@@ -1862,7 +1861,7 @@ fn build_sandbox_pod_hard_pins_portable_restore_to_source_node() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: test_common("space-sbx-pin-g2", TEST_SANDBOX_ID, 2, &env),
             runtime,
             suspend_restore_storage_uri: Some("s3://space-test/suspend-snapshots/current"),
@@ -1937,7 +1936,7 @@ fn build_sandbox_pod_source_annotation_without_pin_renders_no_source_affinity() 
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: test_common("space-sbx-redrive-g3", TEST_SANDBOX_ID, 3, &env),
             runtime,
             suspend_restore_storage_uri: Some("s3://space-test/suspend-snapshots/current"),
@@ -1999,7 +1998,7 @@ fn build_sandbox_pod_shortlist_renders_or_terms_with_preferred_source() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: test_common("space-sbx-shortlist-g2", TEST_SANDBOX_ID, 2, &env),
             runtime,
             suspend_restore_storage_uri: Some("s3://space-test/suspend-snapshots/current"),
@@ -2085,7 +2084,7 @@ fn build_sandbox_pod_hard_pin_without_ssd_affinity_omits_placement_block() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: test_common("space-sbx-pin-noheadroom-g2", TEST_SANDBOX_ID, 2, &env),
             runtime,
             suspend_restore_storage_uri: Some("s3://space-test/suspend-snapshots/current"),
@@ -2135,7 +2134,7 @@ fn restore_with_extra_tolerations_renders_pod_tolerations() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: test_common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g4",
                 TEST_SANDBOX_ID,
@@ -2252,7 +2251,7 @@ fn extra_required_affinity_renders_into_required_node_selector_term() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: test_common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g5",
                 TEST_SANDBOX_ID,
@@ -2549,7 +2548,7 @@ fn node_group_placement_and_drain_cohort_are_anded_in_one_term() {
         &test_pod_config(),
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: SandboxPodCommon {
                 pod_name: "space-sbx-node-group-g3",
                 sandbox_id: TEST_SANDBOX_ID,
@@ -2690,7 +2689,7 @@ fn local_only_restore_keeps_direct_node_assignment_under_placement() {
         &test_pod_config(),
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: SandboxPodCommon {
                 pod_name: "space-sbx-node-group-g4",
                 sandbox_id: TEST_SANDBOX_ID,
@@ -2875,7 +2874,7 @@ fn soft_pinned_restore_suppresses_the_dedicated_preference() {
         &test_pod_config(),
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: SandboxPodCommon {
                 pod_name: "space-sbx-node-group-g14",
                 sandbox_id: TEST_SANDBOX_ID,
@@ -3081,7 +3080,7 @@ fn restore_shortlist_suppresses_dedicated_preference_but_keeps_toleration() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: SandboxPodCommon {
                 pod_name: "space-sbx-node-group-g6",
                 sandbox_id: TEST_SANDBOX_ID,
@@ -3468,7 +3467,7 @@ fn an_empty_preferred_node_name_does_not_drop_the_required_shortlist() {
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: SandboxPodCommon {
                 pod_name: "space-sbx-node-group-g19",
                 sandbox_id: TEST_SANDBOX_ID,
@@ -3618,7 +3617,7 @@ fn cold_create_env_reaches_infra_pod_contract() {
 /// artifact kind selects, so the field is what changes the shim's intent.
 #[test]
 fn a_stopped_re_placement_pod_names_its_materialization_to_the_shim() {
-    let artifact_id = pplx_space_common_core::types::LocalArtifactId::new();
+    let artifact_id = pplx_space_snapshot_model::LocalArtifactId::new();
     let materializing = render_stopped_re_placement(Some(StoppedMaterialization {
         artifact_id,
         excluded_node_names: &[],
@@ -3666,7 +3665,7 @@ fn a_stopped_re_placement_pod_names_its_materialization_to_the_shim() {
 fn a_stopped_re_placement_pod_is_kept_off_every_prior_host() {
     let excluded = vec!["worker-a".to_string(), "worker-b".to_string()];
     let pod = render_stopped_re_placement(Some(StoppedMaterialization {
-        artifact_id: pplx_space_common_core::types::LocalArtifactId::new(),
+        artifact_id: pplx_space_snapshot_model::LocalArtifactId::new(),
         excluded_node_names: &excluded,
     }));
     let terms = pod
@@ -3696,7 +3695,7 @@ fn a_stopped_re_placement_pod_is_kept_off_every_prior_host() {
     let affinity = |pod: Pod| pod.spec.and_then(|spec| spec.affinity);
     assert_eq!(
         affinity(render_stopped_re_placement(Some(StoppedMaterialization {
-            artifact_id: pplx_space_common_core::types::LocalArtifactId::new(),
+            artifact_id: pplx_space_snapshot_model::LocalArtifactId::new(),
             excluded_node_names: &[],
         }))),
         affinity(render_stopped_re_placement(None)),
@@ -3717,7 +3716,7 @@ fn render_stopped_re_placement(stopped_materialization: Option<StoppedMaterializ
         &config,
         SandboxPodRequest::Restore {
             stopped_materialization,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: test_common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g4",
                 TEST_SANDBOX_ID,
@@ -3853,7 +3852,7 @@ fn a_direct_assigned_restore_still_requires_its_environment() {
             &test_pod_config(),
             SandboxPodRequest::Restore {
                 stopped_materialization: None,
-                artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+                artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
                 common: SandboxPodCommon {
                     environment,
                     ..test_common("space-sbx-env-g3", TEST_SANDBOX_ID, 3, &env)
@@ -3903,7 +3902,7 @@ fn every_shortlist_term_repeats_the_environment_requirement() {
         },
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: SandboxPodCommon {
                 environment: Some(PodEnvironment {
                     reference: bound_environment(),

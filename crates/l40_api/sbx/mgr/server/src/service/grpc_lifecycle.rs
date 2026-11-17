@@ -1,5 +1,5 @@
 use pplx_space_accounts::JobId;
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::activation_support::{
     GuestActivityKind, IdentityFreeDirectActivationAuthority, WakeNetworkContext, WakeStartConfig,
@@ -28,12 +28,12 @@ use super::*;
 use crate::guest_filesystem_flush::{
     GuestSnapshotPreparationBudget, prepare_guest_for_vm_snapshot_via_spaced_host,
 };
-use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
 use pplx_space_events::{
     SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger,
     SandboxEventType, emit_sandbox_event,
 };
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
 mod artifact_backup;
 mod auto_lifecycle_policy;
@@ -309,10 +309,10 @@ impl SuspendRequestContext {
 
 struct ArtifactBackupSubmission<'a> {
     local_artifact_id: LocalArtifactId,
-    artifact_kind: pplx_space_common_core::types::ArtifactKind,
-    artifact_origin: pplx_space_common_core::types::ArtifactOrigin,
+    artifact_kind: pplx_space_snapshot_model::ArtifactKind,
+    artifact_origin: pplx_space_snapshot_model::ArtifactOrigin,
     snapshot_name: Option<&'a str>,
-    backup_attempt_id: pplx_space_common_core::types::BackupAttemptId,
+    backup_attempt_id: pplx_space_snapshot_model::BackupAttemptId,
     snapshot_dir: &'a str,
     request_override: Option<&'a crate::snapshot_upload::SnapshotUploadConfig>,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,

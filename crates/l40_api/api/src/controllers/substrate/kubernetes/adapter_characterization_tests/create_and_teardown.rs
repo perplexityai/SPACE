@@ -301,7 +301,7 @@ async fn a_fork_requires_its_source_snapshot_environment_not_the_templates() -> 
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     let source = SandboxId::new();
     insert_test_sandbox_row(&db.pool, source, "suspended").await?;
-    let snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    let snapshot_id = pplx_space_snapshot_model::SnapshotId::new();
     sqlx::query(sql!(
         "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, org_id, execution_metadata)
          VALUES ($1, $2, 'full', 'ready', NOW(), $3, $4)"

@@ -1,6 +1,6 @@
 //! Durable authorization context for scoped storage credential exchange.
 
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::str::FromStr;
 

@@ -6,8 +6,8 @@
 //! disk pin in place, and a pin that outlived the next start and stop would
 //! make every later forced drain of the sandbox's node refuse it.
 
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::*;
 use pplx_space_db_test_fixtures::pg_test_db;

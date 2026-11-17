@@ -1,6 +1,6 @@
 use crate::db::eviction_scan::{count_malformed_suspended_updated_at, count_resident_rows};
 use crate::db::fixture::params;
-use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use super::*;
 
@@ -20,7 +20,7 @@ fn uuid_v7_ordering_tracks_time() {
 fn pinned(marker: bool) -> LocalEvidence {
     LocalEvidence::Pinned(PinnedArtifact {
         artifact_id: LocalArtifactId::new(),
-        artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+        artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
         backup_marker: marker,
     })
 }
@@ -1281,7 +1281,7 @@ async fn eviction_proofs_use_known_identities_and_fail_closed() {
         let service = SandboxManagerService::for_test(conn);
         let pin = PinnedArtifact {
             artifact_id,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             backup_marker: false,
         };
         let proof = prove_pinned_artifact(&mut client, &service, &sandbox_id, &pin).await;

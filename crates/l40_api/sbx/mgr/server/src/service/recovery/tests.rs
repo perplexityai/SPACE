@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use super::*;
 use crate::service::recovery_cross_node::{
@@ -151,12 +151,12 @@ fn cross_node_restore_row_lifecycle_stays_restoring_until_rootfs_stage_succeeds(
     let local_artifact_id = LocalArtifactId::new();
     let mut meta = restore_meta_with_process_env(process_env);
     meta.local_artifact_id = Some(local_artifact_id);
-    meta.artifact_kind = Some(pplx_space_common_core::types::ArtifactKind::Full);
-    meta.artifact_origin = Some(pplx_space_common_core::types::ArtifactOrigin::Suspend);
+    meta.artifact_kind = Some(pplx_space_snapshot_model::ArtifactKind::Full);
+    meta.artifact_origin = Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend);
 
     insert_restoring_sandbox_row_from_snapshot(&conn, sandbox_id, &meta, &restore_source, None)
         .unwrap();
-    let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let transfer_scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     crate::db::insert_restore_transfer_scope(
         &conn,
         sandbox_id,
@@ -214,7 +214,7 @@ fn cross_node_restore_row_lifecycle_stays_restoring_until_rootfs_stage_succeeds(
     assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
     assert_eq!(
         row.current_local_artifact_kind,
-        Some(pplx_space_common_core::types::ArtifactKind::Full)
+        Some(pplx_space_snapshot_model::ArtifactKind::Full)
     );
     assert!(
         crate::db::restore_transfer_scope(&conn, sandbox_id)

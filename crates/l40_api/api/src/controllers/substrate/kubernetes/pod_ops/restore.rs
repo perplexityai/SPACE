@@ -9,7 +9,7 @@ pub(in crate::controllers::substrate::kubernetes) struct SuspendRestorePlan {
     /// The artifact `storage_uri` holds, which sandbox-manager compares its
     /// local row against. Only the stopped re-placement plan sets it; the
     /// node refuses it with any other wake target.
-    pub expected_local_artifact_id: Option<pplx_space_common_core::types::LocalArtifactId>,
+    pub expected_local_artifact_id: Option<pplx_space_snapshot_model::LocalArtifactId>,
 }
 
 /// Outcome of [`KubernetesSubstrate::hydrate_restored_execution`]: the

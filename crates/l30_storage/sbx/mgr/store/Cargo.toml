@@ -46,6 +46,7 @@ test-support = ["rusqlite/serialize"]
 dashmap = { workspace = true }
 jiff = { workspace = true }
 pplx-space-node-model = { workspace = true }
+pplx-space-snapshot-model = { workspace = true }
 pplx-space-template-model = { workspace = true }
 ref-cast = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }

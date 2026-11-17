@@ -1,5 +1,5 @@
-use pplx_space_common_core::types::SnapshotId;
 use pplx_space_node_model::NodeGroupId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use super::execution::{ensure_wake_recovery_lifecycle, should_join_started_recovery};
 use super::pod_ops::{
@@ -34,8 +34,8 @@ mod substrate_scope;
 mod kubernetes_tests {
 
     use pplx_space_accounts::UserId;
-    use pplx_space_common_core::types::LocalArtifactId;
     use pplx_space_sandbox_model::SandboxId;
+    use pplx_space_snapshot_model::LocalArtifactId;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -72,7 +72,6 @@ mod kubernetes_tests {
         ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV,
         ed25519::SpaceApiRouteEd25519Authority,
     };
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
     use pplx_space_internal_api_server::publish_sandbox_states;
     use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
     use pplx_space_node_api_client::proto::PublishedSandboxState;
@@ -99,6 +98,7 @@ mod kubernetes_tests {
         operations as spaced_ops,
         proto::{SpacedStartProcessRequest, spaced_process_event},
     };
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
     use pplx_space_sql_locator::sql;
     use pplx_space_template_model::{TemplateName, TemplateVisibility};
 

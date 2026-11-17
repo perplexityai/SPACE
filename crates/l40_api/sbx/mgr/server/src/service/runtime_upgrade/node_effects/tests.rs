@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
 use crate::service::SandboxManagerServiceOptions;
 use crate::state::SandboxStatus;
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_common_core::types::SandboxArtifactMetadata;
 use pplx_space_execution_spec::SnapshotExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
@@ -15,6 +14,7 @@ use pplx_space_node_mgr_client::proto::{
 };
 use pplx_space_sandbox_model::SandboxActivationAttemptId;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use std::sync::{Arc, Mutex};
 
 pub(in crate::service::runtime_upgrade) struct Fixture {

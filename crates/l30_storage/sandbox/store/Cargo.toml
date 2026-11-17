@@ -49,6 +49,7 @@ pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sandbox-residency = { workspace = true }
 pplx-space-sandbox-routability = { workspace = true }
 pplx-space-sandbox-teardown = { workspace = true }
+pplx-space-snapshot-model = { workspace = true, features = ["sqlx"] }
 pplx-space-sql-locator = { workspace = true }
 
 [dev-dependencies]

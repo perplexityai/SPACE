@@ -26,11 +26,11 @@ pub(super) fn suspend_artifact_metadata(
 /// no vCPU state, so it has no capture CPU, whatever its metadata says.
 pub(super) fn artifact_backup_execution(
     execution: pplx_space_execution_spec::SnapshotExecutionMetadata,
-    artifact_kind: pplx_space_common_core::types::ArtifactKind,
+    artifact_kind: pplx_space_snapshot_model::ArtifactKind,
 ) -> pplx_space_execution_spec::SnapshotExecutionMetadata {
     match artifact_kind {
-        pplx_space_common_core::types::ArtifactKind::Full => execution,
-        pplx_space_common_core::types::ArtifactKind::Disk => execution.with_host_cpu(None),
+        pplx_space_snapshot_model::ArtifactKind::Full => execution,
+        pplx_space_snapshot_model::ArtifactKind::Disk => execution.with_host_cpu(None),
     }
 }
 
@@ -147,10 +147,7 @@ impl SandboxManagerService {
     pub(in crate::service) async fn submit_artifact_backup_for_test(
         &self,
         sandbox: &crate::db::SandboxRow,
-        artifact_attempt: (
-            LocalArtifactId,
-            pplx_space_common_core::types::BackupAttemptId,
-        ),
+        artifact_attempt: (LocalArtifactId, pplx_space_snapshot_model::BackupAttemptId),
         snapshot_dir: &str,
         request_override: &crate::snapshot_upload::SnapshotUploadConfig,
         restore_visible: bool,
@@ -160,8 +157,8 @@ impl SandboxManagerService {
             sandbox,
             ArtifactBackupSubmission {
                 local_artifact_id,
-                artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
-                artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Suspend,
+                artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
+                artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Suspend,
                 snapshot_name: None,
                 backup_attempt_id,
                 snapshot_dir,
@@ -470,7 +467,7 @@ impl SandboxManagerService {
         meta.artifact_kind = Some(artifact_kind);
         meta.artifact_origin = Some(artifact_origin);
         meta.artifact_snapshot_name = snapshot_name
-            .map(pplx_space_common_core::types::SnapshotName::parse)
+            .map(pplx_space_snapshot_model::SnapshotName::parse)
             .transpose()
             .map_err(|error| format!("invalid artifact snapshot name: {error}"))?;
         // Normalize legacy metadata before persisting the durable intent. The
@@ -801,10 +798,10 @@ impl SandboxManagerService {
             sandbox,
             ArtifactBackupSubmission {
                 local_artifact_id,
-                artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
-                artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Suspend,
+                artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
+                artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Suspend,
                 snapshot_name: None,
-                backup_attempt_id: pplx_space_common_core::types::BackupAttemptId::new(),
+                backup_attempt_id: pplx_space_snapshot_model::BackupAttemptId::new(),
                 snapshot_dir,
                 request_override: request_override.as_ref(),
                 format,

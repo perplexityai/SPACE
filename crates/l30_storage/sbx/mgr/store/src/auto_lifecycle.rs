@@ -9,7 +9,7 @@ use pplx_space_auto_lifecycle::{
     AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, AutoLifecycleTransition,
     AutoLifecycleWakeSource,
 };
-use pplx_space_common_core::types::ArtifactKind;
+use pplx_space_snapshot_model::ArtifactKind;
 use tonic::Status;
 
 use pplx_space_sbx_mgr_protocol::proto;

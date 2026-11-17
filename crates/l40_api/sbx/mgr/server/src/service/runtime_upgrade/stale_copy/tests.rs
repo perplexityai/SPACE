@@ -9,12 +9,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_node_api_client::proto::{
     GetArtifactBackupLocationRequest, GetArtifactBackupLocationResponse,
     LocalArtifactBackupIdentity, backup_readiness_query::Artifact,
 };
+use pplx_space_snapshot_model::LocalArtifactId;
 use tonic::Status;
 
 use super::super::node_effects::tests::{Fixture, certified_target, fixture, remote_upgrade_wake};

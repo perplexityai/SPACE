@@ -26,9 +26,9 @@
 //! - T2 `t2_live_tick_repairs`
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::LocalArtifactId;
-use pplx_space_common_core::types::SnapshotId;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::time::Duration;
 

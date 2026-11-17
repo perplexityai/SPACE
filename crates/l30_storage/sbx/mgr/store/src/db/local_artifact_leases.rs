@@ -4,7 +4,7 @@
 
 use crate::db::db_private_outside_tests;
 use crate::db::{Connection, Error, OptionalExtension, Result};
-use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName};
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotName};
 use pplx_space_sql_locator::sql;
 use pplx_space_sqlite::SqliteU64;
 use rusqlite::params;

@@ -21,12 +21,12 @@ use crate::service::suspend_snapshot_publication::write_full_suspend_artifact;
 use crate::state::{SandboxState, SandboxStatus};
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_events::SandboxEventTrigger;
 use pplx_space_execution_spec::HostCpu;
 use pplx_space_node_runtime_core::vm_state::VmState;
 use pplx_space_sandbox_model::{SandboxId, SandboxRuntimeLabel};
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
+use pplx_space_snapshot_model::LocalArtifactId;
 use std::collections::BTreeMap;
 use tokio::sync::oneshot;
 
@@ -419,7 +419,6 @@ fn active_artifact_backup_jobs_reuse_the_persisted_attempt() {
 
 #[test]
 fn current_instance_backup_preserves_scoped_drain_signals() {
-    use pplx_space_common_core::types::ArtifactKind;
     use pplx_space_rpc_contracts::artifact_backup_signals::{
         CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER,
         CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER,
@@ -427,6 +426,7 @@ fn current_instance_backup_preserves_scoped_drain_signals() {
     use pplx_space_rpc_contracts::node_drain_signals::{
         REUPLOAD_SANDBOX_RESTORING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
     };
+    use pplx_space_snapshot_model::ArtifactKind;
     for kind in [ArtifactKind::Disk, ArtifactKind::Full] {
         for state in SandboxStatus::sweep() {
             let result = current_instance_backup_precondition(state, kind);
@@ -510,8 +510,8 @@ fn current_instance_backup_preserves_scoped_drain_signals() {
 
 #[tokio::test]
 async fn artifact_backup_file_proof_distinguishes_absence_from_io_failure() {
-    use pplx_space_common_core::types::ArtifactKind;
     use pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
+    use pplx_space_snapshot_model::ArtifactKind;
     let inspector = crate::retained_source::FakeInspector::new(
         crate::retained_source::RetainedSourceCheck::Absent,
     );
@@ -592,8 +592,8 @@ fn disk_artifact_backup_uses_the_codec_witnessed_by_its_bytes() {
     let artifact = crate::db::LocalArtifactRow {
         local_artifact_id: LocalArtifactId::new(),
         sandbox_id: "01900000-0000-7000-8000-000000000001".to_string(),
-        artifact_kind: pplx_space_common_core::types::ArtifactKind::Disk,
-        artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Snapshot,
+        artifact_kind: pplx_space_snapshot_model::ArtifactKind::Disk,
+        artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Snapshot,
         snapshot_name: None,
         local_path: artifact_dir.to_string_lossy().into_owned(),
     };
@@ -623,7 +623,7 @@ fn disk_artifact_backup_uses_the_codec_witnessed_by_its_bytes() {
 #[tokio::test]
 async fn encrypted_backup_admission_requires_the_published_container_files() {
     use super::artifact_backup::BackupFilesPolicy;
-    use pplx_space_common_core::types::ArtifactKind;
+    use pplx_space_snapshot_model::ArtifactKind;
 
     let sandbox_id = "01900000-0000-7000-8000-000000000001";
     for format in [
@@ -711,8 +711,8 @@ async fn encrypted_backup_admission_requires_the_published_container_files() {
 #[tokio::test]
 async fn retained_source_backup_precondition_follows_node_manager() {
     use crate::retained_source::{FakeInspector, RetainedSourceCheck};
-    use pplx_space_common_core::types::ArtifactKind;
     use pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
+    use pplx_space_snapshot_model::ArtifactKind;
     let sandbox_id = "01900000-0000-7000-8000-000000000001";
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().to_str().unwrap();
@@ -870,9 +870,9 @@ fn only_a_captured_suspend_records_this_hosts_cpu() {
 /// whatever its metadata says; a full artifact keeps the CPU it recorded.
 #[test]
 fn artifact_backup_execution_keeps_a_capture_cpu_only_for_full_artifacts() {
-    use pplx_space_common_core::types::ArtifactKind;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::{ExecutionMetadata, SnapshotExecutionMetadata};
+    use pplx_space_snapshot_model::ArtifactKind;
 
     let host_cpu = HostCpu::parse("genuineintel-6-85-7").unwrap();
     let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
@@ -1276,8 +1276,8 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
     use crate::service::tests::service_tests::{
         insert_stranded_teardown_suspend_sandbox, prepare_teardown_suspend_request,
     };
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
     use pplx_space_sandbox_model::ExecutionGeneration;
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
     for (failure, expected_marker) in [
         (pplx_space_common_jobs::JobFailure::Retriable, None),

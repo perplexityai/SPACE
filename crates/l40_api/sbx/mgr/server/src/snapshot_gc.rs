@@ -62,8 +62,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_lru_reaper::{self as lru_reaper, EvictionInput};
+use pplx_space_snapshot_model::LocalArtifactId;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 

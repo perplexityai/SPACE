@@ -14,7 +14,6 @@
 
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
-use pplx_space_common_core::types::{BackupAttemptId, LocalArtifactId};
 use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
 use pplx_space_net_gateway_client::proto::{ServicePortIngressFrame, service_port_ingress_frame};
 use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
@@ -26,6 +25,7 @@ use pplx_space_node_api_client::proto::{
 use pplx_space_node_model::NodeManagedBy;
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sbx_mgr_client::proto as sbx;
+use pplx_space_snapshot_model::{BackupAttemptId, LocalArtifactId};
 use pplx_space_template_mgr_client::proto as tmpl;
 use tokio::sync::Mutex;
 use tokio_stream::Stream;

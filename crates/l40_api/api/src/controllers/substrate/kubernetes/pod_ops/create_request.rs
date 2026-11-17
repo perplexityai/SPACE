@@ -418,9 +418,9 @@ impl KubernetesSubstrate {
                     artifact_kind: if sandbox.lifecycle.parse::<SandboxLifecycle>()
                         == Ok(SandboxLifecycle::Stopped)
                     {
-                        pplx_space_common_core::types::ArtifactKind::Disk
+                        pplx_space_snapshot_model::ArtifactKind::Disk
                     } else {
-                        pplx_space_common_core::types::ArtifactKind::Full
+                        pplx_space_snapshot_model::ArtifactKind::Full
                     },
                     common,
                     runtime,
@@ -455,9 +455,9 @@ impl KubernetesSubstrate {
                     || sandbox.lifecycle.parse::<SandboxLifecycle>()
                         == Ok(SandboxLifecycle::Stopped)
                 {
-                    pplx_space_common_core::types::ArtifactKind::Disk
+                    pplx_space_snapshot_model::ArtifactKind::Disk
                 } else {
-                    pplx_space_common_core::types::ArtifactKind::Full
+                    pplx_space_snapshot_model::ArtifactKind::Full
                 },
                 stopped_materialization,
                 common,
