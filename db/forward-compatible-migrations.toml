@@ -14,4 +14,8 @@
 # checksum = "<96 hex digits>"
 # reason = "adds a nullable column this release never names"
 
-migrations = []
+[[migrations]]
+store = "sandbox-manager"
+version = 20261114020000
+checksum = "98f25d61b0439360b174dc09f876f2760bd08f758fcd18ecb08ea674fe2706d5820a0fbaa1ee0a4a2ba9793ab2bd8dcc"
+reason = "drops the generated legacy_state column, which this release never names"
