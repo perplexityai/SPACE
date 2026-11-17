@@ -37,15 +37,17 @@ from __future__ import annotations
 import re
 import secrets
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 from space_smoke.capabilities import (
+    CommandSandbox,
     DrainV2Control,
     DurableLifecycleSandbox,
     KindWorkerControl,
     ResidentLifecycleSandbox,
+    SandboxRowState,
     SnapshotRecord,
     StoppableLifecycleSandbox,
 )
@@ -663,6 +665,12 @@ class DrainV2Assertions:
             )
             self._fixture.wait(3)
 
+    def row_states(self, sandboxes: Sequence[CommandSandbox]) -> dict[str, SandboxRowState]:
+        """Each sandbox's row lifecycle and placement, by bare id."""
+
+        rows = self._control.sandbox_row_states([self.bare_id(s.sandbox_id) for s in sandboxes])
+        return {row.sandbox_id: row for row in rows}
+
     def residency(self, sandbox_id: str) -> tuple[str, str | None]:
         """The sandbox row's lifecycle and active node."""
 
@@ -1111,7 +1119,7 @@ class DrainV2Assertions:
             self._fixture.verify(
                 time.monotonic() < deadline,
                 "the terminated node's row was never deleted",
-                drain_status=self._control.drain_v2_status(node_id),
+                drain_status=getattr(self._control.drain_v2_status(node_id), "status", None),
                 last_error=self.last_error(),
             )
             self._fixture.wait(3)
@@ -1162,17 +1170,24 @@ class DrainV2Assertions:
         )
 
     def terminate_replaced_while_shutting_down(self, *, timeout: float = 600) -> None:
-        """`:terminate`, then, while the fenced instance is still
-        `shutting-down` (run inside `fake_ec2_delay`), the worker comes back
-        under the same name with a new instance. Its registration takes the
-        row and clears the drain, fence included: no tombstone, nothing
-        deleted, and the replacement keeps the row once the old instance is
-        terminated.
+        """`:terminate`, holding the fenced instance `shutting-down` (run
+        inside `fake_ec2_delay` with a delay longer than the run), and the
+        worker comes back under the same name with a new instance. Its
+        registration takes the same row, its `created_at` unchanged, and
+        clears the drain, fence included, while the old instance still reads
+        `shutting-down`: no tombstone, nothing deleted. Only then is the old
+        instance released; once the fake lists it `terminated`, the
+        controller's loops run past it and the replacement still holds the
+        row, undrained, under its own instance.
 
         Runs inside `v2_controller` after `give_fake_instance`.
         """
 
         node_id = self.node_id
+        old = self._instance
+        if old is None:
+            raise RuntimeError("give_fake_instance() must run first")
+        created_at = self._control.node_created_at(node_id)
         restart, _, replacement = self._terminate_and_dispatch()
         self._control.stop_kind_worker(self.node_name)
         sealed = self._come_back(restart, replacement, timeout=timeout)
@@ -1186,25 +1201,59 @@ class DrainV2Assertions:
                 drain_status=columns.status,
             )
             self._fixture.wait(2)
+        old_state = self._control.fake_ec2_instance_state(old)
+        held = {
+            "old_instance_state": old_state,
+            "created_at": self._control.node_created_at(node_id),
+            "created_at_before": created_at,
+            "recorded": self._control.node_recorded_instance(node_id),
+            "tombstoned": self._control.node_tombstoned(node_id),
+        }
+        self._fixture.record("fence_cleared_while_shutting_down", held)
         self._fixture.verify(
-            self._control.node_row_exists(node_id)
-            and self._control.node_recorded_instance(node_id) == replacement
-            and not self._control.node_tombstoned(node_id),
-            "the replacement doesn't hold the row under its own instance",
-            recorded=self._control.node_recorded_instance(node_id),
-            tombstoned=self._control.node_tombstoned(node_id),
+            old_state == "shutting-down",
+            "the old instance left shutting-down before the replacement cleared the fence",
+            **held,
         )
-        # Past the fake's delay the old instance reads terminated; the row,
-        # the replacement's now, stays.
-        self._fixture.wait(DELETE_SETTLE_SECONDS)
         self._fixture.verify(
-            self._control.node_row_exists(node_id) and self.drain_phase() is None,
-            "the replacement's row was deleted or drained after the old instance terminated",
-            drain_status=self._control.drain_v2_status(node_id),
+            created_at is not None
+            and held["created_at"] == created_at
+            and held["recorded"] == replacement
+            and not held["tombstoned"],
+            "the replacement doesn't hold the same row under its own instance",
+            **held,
+        )
+        self._control.release_fake_ec2_instance(old)
+        deadline = time.monotonic() + timeout
+        while (old_state := self._control.fake_ec2_instance_state(old)) != "terminated":
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "the released old instance never read terminated",
+                old_instance_state=old_state,
+            )
+            self._fixture.wait(2)
+        # The controller's loops, past the old instance's `terminated`: the
+        # row, the replacement's now, stays.
+        self._fixture.wait(DELETE_SETTLE_SECONDS)
+        after = {
+            "created_at": self._control.node_created_at(node_id),
+            "recorded": self._control.node_recorded_instance(node_id),
+            "drain_phase": self.drain_phase(),
+            "drain_status": getattr(self._control.drain_v2_status(node_id), "status", None),
+            "tombstoned": self._control.node_tombstoned(node_id),
+        }
+        self._fixture.verify(
+            after["created_at"] == created_at
+            and after["recorded"] == replacement
+            and after["drain_phase"] is None
+            and after["drain_status"] is None
+            and not after["tombstoned"],
+            "the replacement's row was deleted, replaced or drained after the old instance terminated",
+            **after,
         )
         self._fixture.record(
             "after_replacement",
-            {"replacement_instance": replacement, "sealed_epoch_after_unseal": sealed},
+            {"replacement_instance": replacement, "sealed_epoch_after_unseal": sealed, **after},
         )
 
     def terminate_keeping_the_node(self, *, timeout: float = 600) -> None:

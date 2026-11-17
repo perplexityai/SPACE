@@ -295,18 +295,28 @@ async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
 /// decided by the instance it reports: none yet is deferred, as a tombstone
 /// refuses, writing nothing; the fenced instance is the same machine, which
 /// keeps the fence and the drain; any other is a replacement, which takes
-/// the row and clears both. Without a UID change nothing is deferred.
+/// the row and clears both. Without a UID change nothing is deferred. A row
+/// an earlier build's terminator marked `terminated` is fenced on its
+/// recorded instance.
 #[tokio::test]
 async fn a_fenced_rows_new_uid_is_decided_by_its_instance() -> TestDbResult<()> {
     let db = db().await?;
     let mut conn = db.pool.acquire().await?;
-    let fenced_status = r#"{"epoch": 7, "terminate_instance": "i-0a"}"#;
-    for (case, uid, instance_id, outcome) in [
+    let cases = [
         ("unknown", "uid-2", None, "deferred"),
         ("the fenced instance", "uid-2", Some("i-0a"), "kept"),
         ("another instance", "uid-2", Some("i-0b"), "cleared"),
         ("same uid, no instance", "uid-1", None, "kept"),
-    ] {
+    ];
+    let statuses = [
+        r#"{"epoch": 7, "terminate_instance": "i-0a"}"#,
+        r#"{"epoch": 7, "terminated": true}"#,
+    ];
+    for (fenced_status, (case, uid, instance_id, outcome)) in statuses
+        .into_iter()
+        .flat_map(|status| cases.map(|case| (status, case)))
+    {
+        let case = format!("{fenced_status} {case}");
         let node_id = NodeId::new();
         registered(&db.pool, registration(node_id, "uid-1", Some("i-0a"))).await?;
         sqlx::query(sql!(

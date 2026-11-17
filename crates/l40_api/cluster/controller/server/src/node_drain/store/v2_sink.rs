@@ -34,6 +34,25 @@ fn execution_ownership_ttl_secs() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
+/// SQL expression over the `nodes` row aliased `n`: the instance its v2
+/// drain fenced, `drain_status.terminate_instance`. A row an earlier build's
+/// terminator acted on carries `drain_status.terminated` instead, and is
+/// fenced on its recorded instance, the one that terminator terminated.
+const FENCE: &str = "COALESCE(
+    n.drain_status->>'terminate_instance',
+    CASE WHEN COALESCE((n.drain_status->>'terminated')::BOOLEAN, FALSE)
+         THEN (SELECT nk.instance_id FROM node_k8s nk WHERE nk.node_id = n.id)
+    END
+)";
+
+/// SQL expression over the `nodes` row aliased `n`: Auto Scaling accepted
+/// the termination of its fenced instance, `drain_status.dispatched_at`, or
+/// an earlier build's terminator acted on it, `drain_status.terminated`.
+const DISPATCHED: &str = "COALESCE(
+    n.drain_status ? 'dispatched_at' OR (n.drain_status->>'terminated')::BOOLEAN,
+    FALSE
+)";
+
 /// One v2 node as [`list_v2_nodes`] reads it.
 #[derive(sqlx::FromRow)]
 struct V2NodeRow {
@@ -48,7 +67,9 @@ struct V2NodeRow {
     instance_id: Option<String>,
     heartbeat_fresh: bool,
     fence: Option<String>,
+    dispatched: bool,
     dispatched_at: Option<i64>,
+    terminated_observed_at: Option<i64>,
     decrement_capacity: bool,
 }
 
@@ -64,8 +85,10 @@ static LIST_V2_NODES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
                 n.drain_status->'report'->'unrecorded' AS unrecorded,
                 k.k8s_node_name, k.k8s_node_uid, k.instance_id,
                 {fresh} AS heartbeat_fresh,
-                n.drain_status->>'terminate_instance' AS fence,
+                {FENCE} AS fence,
+                {DISPATCHED} AS dispatched,
                 (n.drain_status->>'dispatched_at')::BIGINT AS dispatched_at,
+                (n.drain_status->>'terminated_observed_at')::BIGINT AS terminated_observed_at,
                 n.terminate_decrement_capacity AS decrement_capacity
            FROM nodes n
            LEFT JOIN node_k8s k ON k.node_id = n.id
@@ -93,7 +116,9 @@ pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Er
             instance_id: row.instance_id,
             heartbeat_fresh: row.heartbeat_fresh,
             fence: row.fence,
+            dispatched: row.dispatched,
             dispatched_at: row.dispatched_at,
+            terminated_observed_at: row.terminated_observed_at,
             decrement_capacity: row.decrement_capacity,
         })
         .collect())
@@ -153,9 +178,31 @@ struct LockedV2Node {
     report_done: bool,
     fence: Option<String>,
     dispatched: bool,
+    terminated_observed: bool,
     k8s_node_name: Option<String>,
     instance_id: Option<String>,
 }
+
+/// The locked node's v2 state, by its id `$1`.
+static LOCKED_V2_NODE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    sql!(format!(
+        "SELECT n.drain_engine, n.drain_phase,
+                (n.drain_status->>'epoch')::BIGINT AS epoch,
+                COALESCE(
+                    (n.drain_status->'report'->>'sealed_epoch')::BIGINT
+                        = (n.drain_status->>'epoch')::BIGINT
+                    AND (n.drain_status->'report'->>'done')::BOOLEAN,
+                    FALSE
+                ) AS report_done,
+                {FENCE} AS fence,
+                {DISPATCHED} AS dispatched,
+                COALESCE(n.drain_status ? 'terminated_observed_at', FALSE) AS terminated_observed,
+                k.k8s_node_name, k.instance_id
+           FROM nodes n
+           LEFT JOIN node_k8s k ON k.node_id = n.id
+          WHERE n.id = $1"
+    ))
+});
 
 /// Lock `node_id`'s row `FOR UPDATE` and read its v2 state; `None` when the
 /// row is gone.
@@ -166,25 +213,10 @@ async fn lock_v2_node(
     if !guarded_delete::lock_node(tx, node_id).await? {
         return Ok(None);
     }
-    sqlx::query_as(sql!(
-        "SELECT n.drain_engine, n.drain_phase,
-                (n.drain_status->>'epoch')::BIGINT AS epoch,
-                COALESCE(
-                    (n.drain_status->'report'->>'sealed_epoch')::BIGINT
-                        = (n.drain_status->>'epoch')::BIGINT
-                    AND (n.drain_status->'report'->>'done')::BOOLEAN,
-                    FALSE
-                ) AS report_done,
-                n.drain_status->>'terminate_instance' AS fence,
-                COALESCE(n.drain_status ? 'dispatched_at', FALSE) AS dispatched,
-                k.k8s_node_name, k.instance_id
-           FROM nodes n
-           LEFT JOIN node_k8s k ON k.node_id = n.id
-          WHERE n.id = $1"
-    ))
-    .bind(node_id)
-    .fetch_optional(&mut **tx)
-    .await
+    sqlx::query_as(sqlx::AssertSqlSafe(LOCKED_V2_NODE.as_str()))
+        .bind(node_id)
+        .fetch_optional(&mut **tx)
+        .await
 }
 
 impl LockedV2Node {
@@ -314,6 +346,69 @@ pub(crate) async fn record_v2_dispatched(
         == 1)
 }
 
+/// `$1` = node id, `$2` = epoch, `$3` = fenced instance. Records, by the
+/// database clock in Unix seconds, that EC2 listed the fenced instance
+/// `terminated`, keeping the first time.
+static RECORD_TERMINATED_OBSERVED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    sql!(format!(
+        "UPDATE nodes n
+                SET drain_status = n.drain_status || jsonb_build_object(
+                        'terminated_observed_at',
+                        COALESCE(
+                            n.drain_status->'terminated_observed_at',
+                            to_jsonb(EXTRACT(EPOCH FROM NOW())::BIGINT)
+                        )
+                    )
+              WHERE n.id = $1
+                AND n.drain_engine = 'v2'
+                AND n.drain_phase = 'terminating'
+                AND (n.drain_status->>'epoch')::BIGINT = $2
+                AND {FENCE} = $3"
+    ))
+});
+
+/// Record that EC2 listed the fenced `instance_id` `terminated`: EC2 stops
+/// listing a terminated instance after a while, and the delete of the row
+/// needs this record when it no longer does. Keeps the first time. False
+/// for a row that is no longer that epoch's `terminating` node fenced on
+/// that instance.
+pub(crate) async fn record_v2_terminated_observed(
+    pool: &PgPool,
+    node_id: NodeId,
+    epoch: i64,
+    instance_id: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query(sqlx::AssertSqlSafe(RECORD_TERMINATED_OBSERVED.as_str()))
+            .bind(node_id)
+            .bind(epoch)
+            .bind(instance_id)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            == 1,
+    )
+}
+
+/// `$1` = node id, `$2` = epoch, `$3` = phase, `$4` = fence, `$5` = trace.
+/// The let-go statement.
+static LET_GO_V2_NODE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    sql!(format!(
+        "UPDATE nodes n
+            SET drain_phase = NULL,
+                drain_mode = NULL,
+                drain_started_at = NULL,
+                drain_engine = NULL,
+                drain_status = NULL,
+                drain_last_error = $5
+          WHERE n.id = $1
+            AND n.drain_engine = 'v2'
+            AND (n.drain_status->>'epoch')::BIGINT = $2
+            AND n.drain_phase IS NOT DISTINCT FROM $3::TEXT
+            AND {FENCE} IS NOT DISTINCT FROM $4::TEXT"
+    ))
+});
+
 /// The let-go statement: clear the phase and the v2 columns of the v2 node
 /// under `epoch` in `phase` with fence `fence`, as the caller read them,
 /// and record `trace`. Writes no sandbox row. Returns whether it matched.
@@ -325,28 +420,15 @@ async fn let_go_v2_node(
     fence: Option<&str>,
     trace: &str,
 ) -> Result<bool, sqlx::Error> {
-    Ok(sqlx::query(sql!(
-        "UPDATE nodes
-            SET drain_phase = NULL,
-                drain_mode = NULL,
-                drain_started_at = NULL,
-                drain_engine = NULL,
-                drain_status = NULL,
-                drain_last_error = $5
-          WHERE id = $1
-            AND drain_engine = 'v2'
-            AND (drain_status->>'epoch')::BIGINT = $2
-            AND drain_phase IS NOT DISTINCT FROM $3::TEXT
-            AND drain_status->>'terminate_instance' IS NOT DISTINCT FROM $4::TEXT"
-    ))
-    .bind(node_id)
-    .bind(epoch)
-    .bind(phase)
-    .bind(fence)
-    .bind(trace)
-    .execute(executor)
-    .await?
-    .rows_affected()
+    Ok(sqlx::query(sqlx::AssertSqlSafe(LET_GO_V2_NODE.as_str()))
+        .bind(node_id)
+        .bind(epoch)
+        .bind(phase)
+        .bind(fence)
+        .bind(trace)
+        .execute(executor)
+        .await?
+        .rows_affected()
         == 1)
 }
 
@@ -371,11 +453,13 @@ pub(crate) async fn let_go_v2(
 
 /// Delete the row of the `terminating` v2 node under `epoch` whose fenced
 /// instance `fence` EC2 says is terminated, its Node gone: under the row
-/// lock, the row must still carry that fence with a dispatch recorded and
-/// record that instance; then the guarded delete runs, holding the uid the
-/// tick read, a stale heartbeat and that nothing names the node
-/// ([`guarded_delete::delete_locked_node`]). A row or execution guard that
-/// refuses lets the node go in the same transaction instead.
+/// lock, the row must still carry that fence with a dispatch, and with the
+/// record that EC2 listed the instance `terminated`, which an instance EC2
+/// no longer lists can't stand in for, and record that instance; then the
+/// guarded delete runs, holding the uid the tick read, a stale heartbeat and
+/// that nothing names the node ([`guarded_delete::delete_locked_node`]). A
+/// row or execution guard that refuses lets the node go in the same
+/// transaction instead.
 pub(crate) async fn delete_v2_terminated(
     pool: &PgPool,
     node: &V2Node,
@@ -396,6 +480,11 @@ pub(crate) async fn delete_v2_terminated(
     if !locked.is_v2("terminating", epoch) || !locked.dispatched {
         return Ok(TerminatedDelete::Wait(
             "the row is no longer the epoch's dispatched terminating node".to_owned(),
+        ));
+    }
+    if !locked.terminated_observed {
+        return Ok(TerminatedDelete::Wait(
+            "the row does not record that EC2 listed the fenced instance terminated".to_owned(),
         ));
     }
     let deleted = guarded_delete::delete_locked_node(
@@ -766,6 +855,17 @@ impl DrainV2Sink for SubstrateSink {
         instance_id: &str,
     ) -> Result<bool, String> {
         record_v2_dispatched(&self.pool, node_id, epoch_i64(epoch)?, instance_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn record_terminated_observed(
+        &self,
+        node_id: NodeId,
+        epoch: u64,
+        instance_id: &str,
+    ) -> Result<bool, String> {
+        record_v2_terminated_observed(&self.pool, node_id, epoch_i64(epoch)?, instance_id)
             .await
             .map_err(|error| error.to_string())
     }

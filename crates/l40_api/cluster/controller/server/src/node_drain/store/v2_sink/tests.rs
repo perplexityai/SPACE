@@ -612,10 +612,142 @@ async fn the_dispatch_is_recorded_once_on_the_fenced_instance() -> TestResult {
     assert!(!record_v2_dispatched(pool, node_id, 7, INSTANCE).await?);
     let node = listed(pool, node_id).await?;
     assert_eq!(node.fence.as_deref(), Some(INSTANCE));
+    assert!(node.dispatched);
     assert!(node.dispatched_at.is_some_and(|at| at > 0));
 
     let unfenced = v2_node(pool, Some("terminating"), done(7, serde_json::json!({}))).await?;
     assert!(!record_v2_dispatched(pool, unfenced, 7, INSTANCE).await?);
+    let node = listed(pool, unfenced).await?;
+    assert_eq!((node.fence, node.dispatched), (None, false));
+    Ok(())
+}
+
+/// A row an earlier build's terminator acted on carries
+/// `drain_status.terminated` and no fence: it is listed fenced on its
+/// recorded instance and dispatched, with no dispatch time, and the
+/// terminate transaction doesn't fence it again. A `false` marker is none.
+#[tokio::test(flavor = "current_thread")]
+async fn an_earlier_builds_terminated_marker_reads_as_a_dispatched_fence() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    for (case, marker, fenced) in [("marked", true, true), ("false", false, false)] {
+        let node_id = v2_node(
+            pool,
+            Some("terminating"),
+            done(7, serde_json::json!({"terminated": marker})),
+        )
+        .await?;
+        identity(pool, node_id, Some(INSTANCE)).await?;
+        let node = listed(pool, node_id).await?;
+        assert_eq!(
+            (node.fence.as_deref(), node.dispatched, node.dispatched_at),
+            (fenced.then_some(INSTANCE), fenced, None),
+            "{case}"
+        );
+        let fence = fence_v2_node(pool, node_id, 7).await?;
+        if fenced {
+            assert_eq!(fence, Fence::Moved, "{case}");
+        } else {
+            assert_eq!(fence, Fence::Fenced(INSTANCE.to_owned()), "{case}");
+        }
+    }
+    Ok(())
+}
+
+/// The first time EC2 lists the fenced instance `terminated` is recorded by
+/// the database clock, on its epoch's `terminating` node fenced on that
+/// instance, an earlier build's marker included; a second record keeps the
+/// first time, and any other row is left as it was.
+#[tokio::test(flavor = "current_thread")]
+async fn the_first_terminated_is_recorded_on_the_fenced_instance() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    for (case, phase, extra, epoch, instance, records) in [
+        (
+            "fenced",
+            "terminating",
+            serde_json::json!({"terminate_instance": INSTANCE}),
+            7,
+            INSTANCE,
+            true,
+        ),
+        (
+            "an earlier build's marker",
+            "terminating",
+            serde_json::json!({"terminated": true}),
+            7,
+            INSTANCE,
+            true,
+        ),
+        (
+            "another instance",
+            "terminating",
+            serde_json::json!({"terminate_instance": INSTANCE}),
+            7,
+            "i-0000000000000e0e0",
+            false,
+        ),
+        (
+            "another epoch",
+            "terminating",
+            serde_json::json!({"terminate_instance": INSTANCE}),
+            8,
+            INSTANCE,
+            false,
+        ),
+        (
+            "unfenced",
+            "terminating",
+            serde_json::json!({}),
+            7,
+            INSTANCE,
+            false,
+        ),
+        (
+            "drained",
+            "drained",
+            serde_json::json!({"terminate_instance": INSTANCE}),
+            7,
+            INSTANCE,
+            false,
+        ),
+    ] {
+        let status = done(7, extra);
+        let node_id = v2_node(pool, Some(phase), status.clone()).await?;
+        identity(pool, node_id, Some(INSTANCE)).await?;
+        assert_eq!(
+            record_v2_terminated_observed(pool, node_id, epoch, instance).await?,
+            records,
+            "{case}"
+        );
+        let stored = columns(pool, node_id).await?.2.ok_or("a status")?;
+        if !records {
+            assert_eq!(stored, status, "{case}");
+            continue;
+        }
+        let first = stored["terminated_observed_at"]
+            .as_i64()
+            .ok_or("an observation time")?;
+        assert!(first > 0, "{case}");
+        sqlx::query(sql!(
+            "UPDATE nodes
+                SET drain_status = drain_status || '{\"terminated_observed_at\": 1}'::JSONB
+              WHERE id = $1"
+        ))
+        .bind(node_id)
+        .execute(pool)
+        .await?;
+        assert!(record_v2_terminated_observed(pool, node_id, epoch, instance).await?);
+        assert_eq!(
+            listed(pool, node_id).await?.terminated_observed_at,
+            Some(1),
+            "{case}"
+        );
+    }
     Ok(())
 }
 
@@ -634,13 +766,19 @@ async fn the_terminated_delete_holds_its_guards_and_lets_go_on_a_reference() -> 
     let dispatched = || {
         done(
             7,
-            serde_json::json!({"terminate_instance": INSTANCE, "dispatched_at": 1}),
+            serde_json::json!({
+                "terminate_instance": INSTANCE,
+                "dispatched_at": 1,
+                "terminated_observed_at": 2,
+            }),
         )
     };
     for case in [
         "deleted",
+        "an earlier build's marker",
         "unfenced",
         "not dispatched",
+        "terminated not recorded",
         "heartbeat fresh",
         "uid moved",
         "instance moved",
@@ -648,7 +786,18 @@ async fn the_terminated_delete_holds_its_guards_and_lets_go_on_a_reference() -> 
     ] {
         let status = match case {
             "unfenced" => done(7, serde_json::json!({})),
-            "not dispatched" => done(7, serde_json::json!({"terminate_instance": INSTANCE})),
+            "not dispatched" => done(
+                7,
+                serde_json::json!({"terminate_instance": INSTANCE, "terminated_observed_at": 2}),
+            ),
+            "terminated not recorded" => done(
+                7,
+                serde_json::json!({"terminate_instance": INSTANCE, "dispatched_at": 1}),
+            ),
+            "an earlier build's marker" => done(
+                7,
+                serde_json::json!({"terminated": true, "terminated_observed_at": 2}),
+            ),
             _ => dispatched(),
         };
         let node_id = v2_node(pool, Some("terminating"), status.clone()).await?;
@@ -677,9 +826,9 @@ async fn the_terminated_delete_holds_its_guards_and_lets_go_on_a_reference() -> 
                 .fetch_one(pool)
                 .await?;
         match case {
-            "deleted" => {
-                assert_eq!(outcome, TerminatedDelete::Deleted);
-                assert!(!exists);
+            "deleted" | "an earlier build's marker" => {
+                assert_eq!(outcome, TerminatedDelete::Deleted, "{case}");
+                assert!(!exists, "{case}");
                 let tombstoned: bool = sqlx::query_scalar(sql!(
                     "SELECT EXISTS (SELECT 1 FROM node_k8s_tombstones WHERE node_id = $1)"
                 ))
@@ -740,15 +889,34 @@ async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
         return Ok(());
     };
     let pool = &db.pool;
-    for (case, phase, fence, epoch, read_phase, clears) in [
-        ("drained", Some("drained"), None, 7, Some("drained"), true),
-        ("cancel pending", None, None, 7, None, true),
+    const OTHER: &str = "i-0000000000000e0e0";
+    for (case, phase, fence, epoch, read_phase, read_fence, clears) in [
+        (
+            "drained",
+            Some("drained"),
+            None,
+            7,
+            Some("drained"),
+            None,
+            true,
+        ),
+        ("cancel pending", None, None, 7, None, None, true),
         (
             "fenced",
             Some("terminating"),
             Some(INSTANCE),
             7,
             Some("terminating"),
+            Some(INSTANCE),
+            true,
+        ),
+        (
+            "an earlier build's marker",
+            Some("terminating"),
+            Some("terminated"),
+            7,
+            Some("terminating"),
+            Some(INSTANCE),
             true,
         ),
         (
@@ -757,6 +925,7 @@ async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
             None,
             8,
             Some("drained"),
+            None,
             false,
         ),
         (
@@ -765,19 +934,41 @@ async fn the_let_go_clears_only_the_row_the_tick_read() -> TestResult {
             None,
             7,
             Some("drained"),
+            None,
+            false,
+        ),
+        (
+            "another fence",
+            Some("terminating"),
+            Some(OTHER),
+            7,
+            Some("terminating"),
+            Some(INSTANCE),
+            false,
+        ),
+        (
+            "fenced since the tick read it",
+            Some("terminating"),
+            Some(INSTANCE),
+            7,
+            Some("terminating"),
+            None,
             false,
         ),
     ] {
         let mut status = done(7, serde_json::json!({}));
-        if let Some(fence) = fence {
-            status["terminate_instance"] = serde_json::json!(fence);
+        match fence {
+            Some("terminated") => status["terminated"] = serde_json::json!(true),
+            Some(fence) => status["terminate_instance"] = serde_json::json!(fence),
+            None => {}
         }
         if phase.is_none() {
             status["cancel"] = serde_json::json!(true);
         }
         let node_id = v2_node(pool, phase, status.clone()).await?;
+        identity(pool, node_id, Some(INSTANCE)).await?;
         let pinned = sandbox(pool, "started", Some(node_id)).await?;
-        let cleared = let_go_v2(pool, node_id, epoch, read_phase, fence, "the trace").await?;
+        let cleared = let_go_v2(pool, node_id, epoch, read_phase, read_fence, "the trace").await?;
         assert_eq!(cleared, clears, "{case}");
         let (stored_phase, engine, stored, last_error) = columns(pool, node_id).await?;
         if clears {

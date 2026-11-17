@@ -146,6 +146,16 @@ impl DrainV2Sink for FakeSink {
         Ok(true)
     }
 
+    async fn record_terminated_observed(
+        &self,
+        node_id: NodeId,
+        epoch: u64,
+        instance_id: &str,
+    ) -> Result<bool, String> {
+        self.log(format!("observed {node_id} {epoch} {instance_id}"));
+        Ok(true)
+    }
+
     async fn node_exists(&self, k8s_node_name: &str) -> Result<bool, String> {
         self.log(format!("node_exists {k8s_node_name}"));
         Ok(self.nodes_present.iter().any(|name| name == k8s_node_name))
@@ -239,7 +249,7 @@ async fn run_tick<S: DrainV2Sink, A: V2InstanceAuthority>(
     authority: &A,
     max_evacuating: usize,
 ) -> V2TickReport {
-    tick(sink, authority, max_evacuating, &DispatchBackoff::default()).await
+    tick(sink, authority, max_evacuating, &V2LoopState::default()).await
 }
 
 fn node(phase: Option<&str>, epoch: Option<u64>, cancel: bool) -> V2Node {
@@ -259,7 +269,9 @@ fn node(phase: Option<&str>, epoch: Option<u64>, cancel: bool) -> V2Node {
         instance_id: Some(INSTANCE.to_owned()),
         heartbeat_fresh: true,
         fence: None,
+        dispatched: false,
         dispatched_at: None,
+        terminated_observed_at: None,
         decrement_capacity: false,
     }
 }
@@ -268,6 +280,7 @@ fn node(phase: Option<&str>, epoch: Option<u64>, cancel: bool) -> V2Node {
 fn fenced(dispatched: bool) -> V2Node {
     V2Node {
         fence: Some(INSTANCE.to_owned()),
+        dispatched,
         dispatched_at: dispatched.then(super::unix_now),
         heartbeat_fresh: false,
         ..node(Some("terminating"), Some(5), false)
@@ -716,6 +729,66 @@ async fn a_node_that_does_not_answer_shows_on_the_unanswered_gauge() {
     }
 }
 
+/// A node that leaves the loop's listing, whatever took its row out of the
+/// drain (an operator's let-go, a registration that took the row), has its
+/// v2 gauges zeroed on the next tick, once; a node still listed goes on
+/// publishing its own.
+#[tokio::test(flavor = "current_thread")]
+async fn a_node_that_leaves_the_listing_has_its_v2_gauges_zeroed() {
+    let left = node(Some("draining"), Some(5), false);
+    let stays = node(Some("draining"), Some(6), false);
+    let sink = |nodes: Vec<V2Node>| FakeSink {
+        responses: nodes
+            .iter()
+            .map(|node| ((node.id, false), Err("unreachable".to_owned())))
+            .collect(),
+        nodes,
+        ..FakeSink::default()
+    };
+    let both = sink(vec![left.clone(), stays.clone()]);
+    let only = sink(vec![stays.clone()]);
+    let state = V2LoopState::default();
+    let gauges = |values: &[pplx_space_metrics_emit::test_capture::CapturedValue],
+                  node: &V2Node| {
+        values
+            .iter()
+            .filter(|value| value.tags.contains(&format!("node:{}", node.id)))
+            .map(|value| (value.name.clone(), value.value))
+            .collect::<Vec<_>>()
+    };
+    tick(
+        &both,
+        &FakeAuthority::ok(),
+        DEFAULT_MAX_EVACUATING_NODES,
+        &state,
+    )
+    .await;
+    for (case, cleared) in [("left", true), ("already cleared", false)] {
+        let capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
+        tick(
+            &only,
+            &FakeAuthority::ok(),
+            DEFAULT_MAX_EVACUATING_NODES,
+            &state,
+        )
+        .await;
+        let values = capture.finish();
+        let zeroed: Vec<(String, f64)> = if cleared {
+            ["unanswered", "blocked", "pending"]
+                .map(|name| (format!("node_drain.v2.{name}"), 0.0))
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(gauges(&values, &left), zeroed, "{case}");
+        assert_eq!(
+            gauges(&values, &stays),
+            [("node_drain.v2.unanswered".to_owned(), 1.0)],
+            "{case}"
+        );
+    }
+}
+
 /// An undrained node hands back what the drain evacuated: each sandbox it
 /// reports is recorded, the recorded ones are named for the node to forget,
 /// and the columns clear only once the node, unsealed, has nothing left to
@@ -1038,11 +1111,12 @@ async fn an_unfenced_terminating_node_runs_only_the_terminate_transaction() {
     }
 }
 
-/// A fenced node with no dispatch is dispatched only after EC2 answers for
-/// the fenced instance neither `shutting-down` nor `terminated`: by the
-/// fenced id, with the node's decrement, recording `dispatched_at`. A
-/// `shutting-down` or unknown answer dispatches nothing; a `terminated` one
-/// lets the node go, since the drain can't claim the termination.
+/// A fenced node with no dispatch is dispatched only after EC2 lists the
+/// fenced instance in a state other than `shutting-down` or `terminated`:
+/// by the fenced id, with the node's decrement, recording `dispatched_at`.
+/// A `shutting-down`, unlisted or unknown answer dispatches nothing and
+/// says why; a `terminated` one lets the node go, since the drain can't
+/// claim the termination.
 #[tokio::test]
 async fn a_fenced_node_is_dispatched_only_after_ec2_answers() {
     for (case, evidence, dispatches, lets_go) in [
@@ -1058,7 +1132,7 @@ async fn a_fenced_node_is_dispatched_only_after_ec2_answers() {
             true,
             false,
         ),
-        ("not listed", InstanceEvidence::NotListed, true, false),
+        ("not listed", InstanceEvidence::NotListed, false, false),
         (
             "shutting-down",
             InstanceEvidence::ShuttingDown,
@@ -1109,25 +1183,57 @@ async fn a_fenced_node_is_dispatched_only_after_ec2_answers() {
                 sink.calls()
             );
         }
+        assert_eq!(
+            sink.calls()
+                .iter()
+                .any(|call| call.starts_with(&format!("error {}", node.id))
+                    && call.ends_with("not dispatching its termination")),
+            !dispatches && !lets_go,
+            "{case}: {:?}",
+            sink.calls()
+        );
         assert!(!called(&sink, "delete", &node), "{case}");
     }
 }
 
+/// Once EC2 has been seen to list the fenced instance `terminated`, an
+/// instance it no longer lists reads as terminated: an undispatched node is
+/// let go, as on `terminated`, and dispatches nothing.
+#[tokio::test]
+async fn an_unlisted_instance_after_a_recorded_terminated_reads_terminated() {
+    let node = V2Node {
+        terminated_observed_at: Some(super::unix_now()),
+        ..fenced(false)
+    };
+    let sink = FakeSink {
+        nodes: vec![node.clone()],
+        ..FakeSink::default()
+    };
+    let authority = FakeAuthority::answering(InstanceEvidence::NotListed);
+    let report = run_tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES).await;
+    assert_eq!(report.let_go, [node.id], "{:?}", sink.calls());
+    assert!(authority.terminated().is_empty());
+    assert!(!called(&sink, "observed", &node), "{:?}", sink.calls());
+}
+
 /// Once `dispatched_at` is recorded the loop never dispatches again,
 /// whatever EC2 answers; past the bound it says the termination was
-/// accepted and the instance still runs.
+/// accepted and the instance still runs. A row an earlier build's
+/// terminator marked `terminated` is dispatched with no time, and is never
+/// dispatched again either.
 #[tokio::test]
 async fn a_dispatched_node_is_never_dispatched_again() {
     for (case, dispatched_at, surfaces) in [
-        ("just dispatched", super::unix_now(), false),
+        ("just dispatched", Some(super::unix_now()), false),
         (
             "past the bound",
-            super::unix_now() - i64::try_from(TERMINATE_BOUND.as_secs()).unwrap() - 60,
+            Some(super::unix_now() - i64::try_from(TERMINATE_BOUND.as_secs()).unwrap() - 60),
             true,
         ),
+        ("an earlier build's terminated marker", None, false),
     ] {
         let node = V2Node {
-            dispatched_at: Some(dispatched_at),
+            dispatched_at,
             ..fenced(true)
         };
         let sink = FakeSink {
@@ -1163,9 +1269,9 @@ async fn a_refused_dispatch_counts_and_backs_off() {
         terminate: Err("denied".into()),
         ..FakeAuthority::ok()
     };
-    let backoff = DispatchBackoff::default();
+    let state = V2LoopState::default();
     let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
-    tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES, &backoff).await;
+    tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES, &state).await;
     let counted = counters.finish();
     assert!(
         counted
@@ -1181,14 +1287,14 @@ async fn a_refused_dispatch_counts_and_backs_off() {
         "{:?}",
         sink.calls()
     );
-    tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES, &backoff).await;
+    tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES, &state).await;
     assert_eq!(
         authority.terminated().len(),
         1,
         "the backoff holds the retry"
     );
     tokio::time::advance(DISPATCH_BACKOFF_BASE).await;
-    tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES, &backoff).await;
+    tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES, &state).await;
     assert_eq!(authority.terminated().len(), 2, "the backoff ran out");
 }
 
@@ -1196,86 +1302,149 @@ async fn a_refused_dispatch_counts_and_backs_off() {
 /// deleted once a direct GET finds its Node gone. A Node still there waits
 /// for it; an instance not yet terminated asks nothing of Kubernetes; a
 /// guard that refuses the delete lets the node go; a row a registration
-/// took has nothing left to do.
+/// took has nothing left to do. The first `terminated` is recorded before
+/// anything else; after it, an instance EC2 no longer lists is deleted as a
+/// terminated one, and without it an unlisted instance never is, saying
+/// why. A row an earlier build's terminator marked `terminated` is deleted
+/// as a dispatched one.
 #[tokio::test]
 async fn a_dispatched_node_is_deleted_once_terminated_with_its_node_gone() {
-    for (case, evidence, node_present, delete, looks_up, deletes) in [
-        (
-            "deleted",
-            InstanceEvidence::Terminated,
-            false,
-            None,
-            true,
-            Some(true),
-        ),
-        (
-            "node lingers",
-            InstanceEvidence::Terminated,
-            true,
-            None,
-            true,
-            None,
-        ),
-        (
-            "still running",
-            InstanceEvidence::Listed("running".into()),
-            false,
-            None,
-            false,
-            None,
-        ),
-        (
-            "shutting down",
-            InstanceEvidence::ShuttingDown,
-            false,
-            None,
-            false,
-            None,
-        ),
-        (
-            "guard refused",
-            InstanceEvidence::Terminated,
-            false,
-            Some(TerminatedDelete::LetGo("trace".into())),
-            true,
-            Some(false),
-        ),
-        (
-            "unfenced",
-            InstanceEvidence::Terminated,
-            false,
-            Some(TerminatedDelete::Unfenced),
-            true,
-            Some(false),
-        ),
-    ] {
-        let node = fenced(true);
-        let name = node.k8s_node_name.clone().unwrap();
+    struct Case {
+        name: &'static str,
+        evidence: InstanceEvidence,
+        observed: bool,
+        legacy: bool,
+        node_present: bool,
+        delete: Option<TerminatedDelete>,
+        looks_up: bool,
+        deletes: Option<bool>,
+    }
+    let case = |name, evidence| Case {
+        name,
+        evidence,
+        observed: false,
+        legacy: false,
+        node_present: false,
+        delete: None,
+        looks_up: true,
+        deletes: Some(true),
+    };
+    let cases = [
+        case("deleted", InstanceEvidence::Terminated),
+        Case {
+            node_present: true,
+            deletes: None,
+            ..case("node lingers", InstanceEvidence::Terminated)
+        },
+        Case {
+            looks_up: false,
+            deletes: None,
+            ..case("still running", InstanceEvidence::Listed("running".into()))
+        },
+        Case {
+            looks_up: false,
+            deletes: None,
+            ..case("shutting down", InstanceEvidence::ShuttingDown)
+        },
+        Case {
+            delete: Some(TerminatedDelete::LetGo("trace".into())),
+            deletes: Some(false),
+            ..case("guard refused", InstanceEvidence::Terminated)
+        },
+        Case {
+            delete: Some(TerminatedDelete::Unfenced),
+            deletes: Some(false),
+            ..case("unfenced", InstanceEvidence::Terminated)
+        },
+        Case {
+            observed: true,
+            ..case("terminated again", InstanceEvidence::Terminated)
+        },
+        Case {
+            observed: true,
+            ..case(
+                "not listed after a recorded terminated",
+                InstanceEvidence::NotListed,
+            )
+        },
+        Case {
+            looks_up: false,
+            deletes: None,
+            ..case(
+                "not listed, never seen terminated",
+                InstanceEvidence::NotListed,
+            )
+        },
+        Case {
+            legacy: true,
+            ..case(
+                "an earlier build's terminated marker",
+                InstanceEvidence::Terminated,
+            )
+        },
+    ];
+    for case in cases {
+        let name = case.name;
+        let node = V2Node {
+            terminated_observed_at: case.observed.then(super::unix_now),
+            dispatched_at: if case.legacy {
+                None
+            } else {
+                Some(super::unix_now())
+            },
+            ..fenced(true)
+        };
+        let k8s_name = node.k8s_node_name.clone().unwrap();
         let sink = FakeSink {
             nodes: vec![node.clone()],
-            nodes_present: if node_present {
-                vec![name.clone()]
+            nodes_present: if case.node_present {
+                vec![k8s_name.clone()]
             } else {
                 Vec::new()
             },
-            delete: delete.clone(),
+            delete: case.delete.clone(),
             ..FakeSink::default()
         };
-        let authority = FakeAuthority::answering(evidence);
+        let authority = FakeAuthority::answering(case.evidence.clone());
         let report = run_tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES).await;
+        let calls = sink.calls();
         assert_eq!(
-            sink.calls().contains(&format!("node_exists {name}")),
-            looks_up,
-            "{case}"
+            calls.contains(&format!("node_exists {k8s_name}")),
+            case.looks_up,
+            "{name}: {calls:?}"
         );
-        assert_eq!(called(&sink, "delete", &node), deletes.is_some(), "{case}");
-        assert_eq!(report.deleted == [node.id], deletes == Some(true), "{case}");
+        assert_eq!(
+            called(&sink, "delete", &node),
+            case.deletes.is_some(),
+            "{name}"
+        );
+        assert_eq!(
+            report.deleted == [node.id],
+            case.deletes == Some(true),
+            "{name}"
+        );
         assert_eq!(
             report.let_go == [node.id],
-            matches!(delete, Some(TerminatedDelete::LetGo(_))),
-            "{case}"
+            matches!(case.delete, Some(TerminatedDelete::LetGo(_))),
+            "{name}"
         );
-        assert!(authority.terminated().is_empty(), "{case}");
+        assert!(authority.terminated().is_empty(), "{name}");
+        let records = case.evidence == InstanceEvidence::Terminated && !case.observed;
+        let observed = format!("observed {} 5 {INSTANCE}", node.id);
+        assert_eq!(
+            calls.first() == Some(&observed),
+            records,
+            "{name}: {calls:?}"
+        );
+        assert_eq!(calls.contains(&observed), records, "{name}: {calls:?}");
+        assert_eq!(
+            calls
+                .iter()
+                .any(|call| call
+                    .ends_with("was never seen to list it terminated; not deleting the row")),
+            name == "not listed, never seen terminated",
+            "{name}: {calls:?}"
+        );
     }
 }
 

@@ -1,6 +1,6 @@
 use super::{
-    ReconcilerRuntimeError, Supervision, TerminatorKind, build_if_enabled, drain_v2_enabled,
-    supervise_reconcilers, v2_terminates,
+    ReconcilerRuntimeError, Supervision, TerminatorBackend, TerminatorKind, build_if_enabled,
+    drain_v2_enabled, supervise_reconcilers,
 };
 use std::future::Future;
 use tokio::task::JoinError;
@@ -158,14 +158,25 @@ fn the_drain_v2_runs_only_with_the_node_drain() {
     }
 }
 
-/// The v2 loop terminates a node only through EC2.
+/// The v2 loop terminates a node only through EC2: the `aws` backend's
+/// authority is EC2 and Auto Scaling, every other backend's refuses.
 #[test]
 fn the_v2_loop_terminates_only_through_ec2() {
-    for (kind, terminates) in [
-        (TerminatorKind::Aws, true),
-        (TerminatorKind::KubeDelete, false),
-        (TerminatorKind::Noop, false),
+    use crate::node_drain::v2::V2Terminator;
+    for (case, backend, terminates) in [
+        (
+            "aws",
+            TerminatorBackend::Aws(Box::new(aws_config::SdkConfig::builder().build())),
+            true,
+        ),
+        ("kube-delete", TerminatorBackend::KubeDelete, false),
+        ("noop", TerminatorBackend::Noop, false),
     ] {
-        assert_eq!(v2_terminates(kind), terminates, "{kind:?}");
+        let terminator = backend.v2_terminator();
+        assert_eq!(
+            matches!(terminator, V2Terminator::Ec2 { .. }),
+            terminates,
+            "{case}"
+        );
     }
 }

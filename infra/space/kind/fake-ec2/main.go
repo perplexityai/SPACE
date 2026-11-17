@@ -32,10 +32,13 @@
 // memory, so a restart of the fixture forgets them.
 //
 // The test control listens on loopback only, in plain HTTP, so only a
-// process in the pod reaches it: `space-kind-fake-ec2 terminate <id>...` and
-// `space-kind-fake-ec2 delay <seconds>`, run through `kubectl exec`, post to
+// process in the pod reaches it: `space-kind-fake-ec2 terminate <id>...`,
+// `space-kind-fake-ec2 delay <seconds>`, `space-kind-fake-ec2 release <id>`
+// and `space-kind-fake-ec2 state <id>`, run through `kubectl exec`, post to
 // it. The delay applies to the terminations marked after it is set, so a
-// scenario sets it for itself and puts 0 back.
+// scenario sets it for itself and puts 0 back. Release ends the delay of one
+// instance already marked, which then reads terminated; state prints what
+// DescribeInstances answers for one instance ID.
 //
 // It checks that a request is signed for EC2, or for Auto Scaling, in the
 // cluster's region, but not the signature itself, and refuses every other action, parameter and
@@ -96,6 +99,8 @@ func main() {
 		err = terminateCommand(os.Args[2:])
 	case len(os.Args) > 1 && os.Args[1] == "delay":
 		err = delayCommand(os.Args[2:])
+	case len(os.Args) > 1 && (os.Args[1] == "release" || os.Args[1] == "state"):
+		err = instanceCommand(os.Args[1], os.Args[2:])
 	default:
 		err = run(os.Args[1:])
 	}
@@ -156,6 +161,30 @@ func delayCommand(args []string) error {
 	return nil
 }
 
+// instanceCommand posts one instance ID to the running fixture's test
+// control: `release` ends its delay, so it reads terminated now; `state`
+// prints what DescribeInstances answers for it.
+func instanceCommand(name string, args []string) error {
+	fs := flag.NewFlagSet("space-kind-fake-ec2 "+name, flag.ExitOnError)
+	control := fs.String("control", defaultControl, "the running fixture's test control address")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: space-kind-fake-ec2 %s [-control addr] <instance-id>", name)
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.PostForm("http://"+*control+"/"+name, url.Values{"instance-id": {fs.Arg(0)}})
+	if err != nil {
+		return err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s %s: HTTP %d: %s", name, fs.Arg(0), resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	fmt.Print(string(body))
+	return nil
+}
+
 func run(args []string) error {
 	fs := flag.NewFlagSet("space-kind-fake-ec2", flag.ExitOnError)
 	listen := fs.String("listen", ":8443", "listen address (HTTPS), the cluster-controller's AWS_ENDPOINT_URL_EC2")
@@ -183,6 +212,8 @@ func run(args []string) error {
 	controlMux := http.NewServeMux()
 	controlMux.HandleFunc("POST /terminate", fake.controlTerminate)
 	controlMux.HandleFunc("POST /delay", fake.controlDelay)
+	controlMux.HandleFunc("POST /release", fake.controlRelease)
+	controlMux.HandleFunc("POST /state", fake.controlState)
 	controlSrv := &http.Server{Addr: *control, Handler: controlMux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := controlSrv.ListenAndServe(); err != nil {
@@ -309,6 +340,21 @@ func (s *instances) setDelay(delay time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.delay = delay
+}
+
+// release ends the delay of id, marked terminated, so it reads terminated
+// from now on; false when id was never marked.
+func (s *instances) release(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at, ok := s.terminated[id]
+	if !ok {
+		return false
+	}
+	if now := time.Now(); now.Before(at) {
+		s.terminated[id] = now
+	}
+	return true
 }
 
 // marked is a terminated instance's state: shutting-down until its delay
@@ -532,10 +578,27 @@ func (f *fakeEC2) describeByInstanceID(w http.ResponseWriter, form url.Values, r
 			return
 		}
 	}
-	nodes, err := f.list()
+	matched, err := f.instancesByID(id)
 	if err != nil {
 		fail(http.StatusServiceUnavailable, "Unavailable", "the Kubernetes API did not answer: "+err.Error())
 		return
+	}
+	resp := describeInstancesResponse{Xmlns: ec2NS, RequestID: reqID}
+	for _, inst := range matched {
+		resp.Reservations = append(resp.Reservations, reservation{ReservationID: "r-" + inst.InstanceID[2:], Instances: []instance{inst}})
+	}
+	f.log.Info("answered", append(entry, "status", http.StatusOK, "instance_id", id,
+		"answer", answerOf(matched))...)
+	writeXML(w, http.StatusOK, resp)
+}
+
+// instancesByID is what DescribeInstances lists for one instance ID: the
+// instances behind the Nodes, or, with none, the instance marked
+// terminated.
+func (f *fakeEC2) instancesByID(id string) ([]instance, error) {
+	nodes, err := f.list()
+	if err != nil {
+		return nil, err
 	}
 	var matched []instance
 	for i := range nodes {
@@ -546,18 +609,19 @@ func (f *fakeEC2) describeByInstanceID(w http.ResponseWriter, form url.Values, r
 	if st, ok := f.state.marked(id); ok && len(matched) == 0 {
 		matched = append(matched, instance{InstanceID: id, InstanceState: st})
 	}
-	resp := describeInstancesResponse{Xmlns: ec2NS, RequestID: reqID}
+	return matched, nil
+}
+
+// answerOf is the states listed, comma-separated, or "no instance".
+func answerOf(matched []instance) string {
+	if len(matched) == 0 {
+		return "no instance"
+	}
 	answer := make([]string, 0, len(matched))
 	for _, inst := range matched {
-		resp.Reservations = append(resp.Reservations, reservation{ReservationID: "r-" + inst.InstanceID[2:], Instances: []instance{inst}})
 		answer = append(answer, inst.InstanceState.Name)
 	}
-	if len(answer) == 0 {
-		answer = append(answer, "no instance")
-	}
-	f.log.Info("answered", append(entry, "status", http.StatusOK, "instance_id", id,
-		"answer", strings.Join(answer, ","))...)
-	writeXML(w, http.StatusOK, resp)
+	return strings.Join(answer, ",")
 }
 
 // terminate marks id terminated and returns its state before.
@@ -592,6 +656,40 @@ func (f *fakeEC2) controlTerminate(w http.ResponseWriter, r *http.Request) {
 	before := f.terminate(id)
 	f.log.Info("terminated by test control", "instance_id", id, "previous_state", before.Name)
 	_, _ = fmt.Fprintf(w, "%s terminated\n", id)
+}
+
+// controlRelease is the test control's release: the instance marked
+// terminated reads terminated from now on.
+func (f *fakeEC2) controlRelease(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	id := r.FormValue("instance-id")
+	if !instanceIDForm.MatchString(id) {
+		http.Error(w, "not an instance ID: "+id, http.StatusBadRequest)
+		return
+	}
+	if !f.state.release(id) {
+		http.Error(w, id+" was never marked terminated", http.StatusConflict)
+		return
+	}
+	f.log.Info("released by test control", "instance_id", id)
+	_, _ = fmt.Fprintf(w, "%s released\n", id)
+}
+
+// controlState is the test control's state: what DescribeInstances lists
+// for one instance ID.
+func (f *fakeEC2) controlState(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	id := r.FormValue("instance-id")
+	if !instanceIDForm.MatchString(id) {
+		http.Error(w, "not an instance ID: "+id, http.StatusBadRequest)
+		return
+	}
+	matched, err := f.instancesByID(id)
+	if err != nil {
+		http.Error(w, "the Kubernetes API did not answer: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	_, _ = fmt.Fprintf(w, "%s\n", answerOf(matched))
 }
 
 // controlDelay is the test control's delay: how long each instance marked

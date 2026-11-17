@@ -1391,8 +1391,9 @@ async fn terminate_of_a_v2_node_needs_nothing_naming_it() -> TestResult {
 
 /// `:undrain` of a v2 node in `terminating` moves it to no phase and marks
 /// its epoch for cancel, as any v2 undrain does, until the controller fences
-/// its instance; a fenced one is refused and left as it was. A v1 node in
-/// `terminating` is refused as before.
+/// its instance; a fenced one is refused and left as it was, and so is one
+/// an earlier build's terminator marked `terminated`, which is fenced and
+/// dispatched. A v1 node in `terminating` is refused as before.
 #[tokio::test(flavor = "current_thread")]
 async fn undrain_of_a_terminating_v2_node_runs_only_before_the_fence() -> TestResult {
     if !enter_direct_test_process() {
@@ -1406,9 +1407,25 @@ async fn undrain_of_a_terminating_v2_node_runs_only_before_the_fence() -> TestRe
     let unfenced = serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": true}});
     let mut fenced = unfenced.clone();
     fenced["terminate_instance"] = serde_json::json!("i-0a1b2c3d");
+    let mut legacy = unfenced.clone();
+    legacy["terminated"] = serde_json::json!(true);
+    let mut legacy_false = unfenced.clone();
+    legacy_false["terminated"] = serde_json::json!(false);
     for (case, engine, status, undrains) in [
         ("unfenced v2", Some("v2"), Some(unfenced.clone()), true),
         ("fenced v2", Some("v2"), Some(fenced.clone()), false),
+        (
+            "earlier build's terminated marker",
+            Some("v2"),
+            Some(legacy),
+            false,
+        ),
+        (
+            "a false terminated marker",
+            Some("v2"),
+            Some(legacy_false),
+            true,
+        ),
         ("v1", None, None, false),
     ] {
         let node_id =
@@ -1425,7 +1442,7 @@ async fn undrain_of_a_terminating_v2_node_runs_only_before_the_fence() -> TestRe
         if undrains {
             assert_eq!(phase, None, "{case}: {answer}");
             assert_eq!(stored_engine.as_deref(), Some("v2"), "{case}");
-            let mut cancelled = unfenced.clone();
+            let mut cancelled = status.clone().ok_or("a v2 status")?;
             cancelled["cancel"] = serde_json::json!(true);
             assert_eq!(stored, Some(cancelled), "{case}");
         } else {

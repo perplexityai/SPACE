@@ -126,7 +126,7 @@ pub(super) async fn sync_labeled_nodes_to_db(
                     node = %name,
                     role = %role,
                     reason = %message,
-                    "kube_node_sync: skipping tombstoned node"
+                    "kube_node_sync: registration refused; skipping the node"
                 );
                 continue;
             }

@@ -35,13 +35,20 @@
 //!   `drain_last_error`); and the fence `drain_status.terminate_instance`
 //!   records the instance to terminate, `node_k8s.instance_id`. Only the
 //!   `aws` terminator fences. After the fence, the loop asks EC2 about that
-//!   instance on its dispatch backoff and, while it is neither
-//!   `shutting-down` nor `terminated` and no dispatch has succeeded, asks
-//!   Auto Scaling to terminate exactly it, recording `dispatched_at` on
-//!   success; it never dispatches after that. Once EC2 says `terminated` and
-//!   a direct GET of the Kubernetes Node answers 404, it deletes the row
-//!   while the heartbeat is stale and the row still carries the fence, with
-//!   no tombstone ([`super::guarded_delete`]).
+//!   instance on its dispatch backoff and, while EC2 lists it in a state
+//!   other than `shutting-down` or `terminated` and no dispatch has
+//!   succeeded, asks Auto Scaling to terminate exactly it, recording
+//!   `dispatched_at` on success; it never dispatches after that, and an
+//!   instance EC2 doesn't list is never dispatched. The first time EC2
+//!   lists the fenced instance `terminated`, the loop records it
+//!   (`drain_status.terminated_observed_at`): EC2 stops listing a terminated
+//!   instance after a while, so from then on an unlisted instance reads as
+//!   terminated. Once it does and a direct GET of the Kubernetes Node
+//!   answers 404, the loop deletes the row while the heartbeat is stale and
+//!   the row still carries the fence, a dispatch and the recorded
+//!   `terminated`, with no tombstone ([`super::guarded_delete`]). A row an
+//!   earlier build's terminator acted on (`drain_status.terminated`) reads as
+//!   fenced on its recorded instance and dispatched.
 //! - **undrained** (no phase, `drain_status.cancel`): cancel the epoch on the
 //!   node, and take back what the drain evacuated: the node hands back each
 //!   sandbox the drain suspended, the loop records it as a drain records it
@@ -70,8 +77,9 @@
 //!
 //! Every v1 writer keyed on drain phase skips a v2 row, so this loop is the
 //! only one that moves one. It keeps nothing between ticks but its tick
-//! timer and the dispatch backoff ([`DispatchBackoff`]); a lost backoff only
-//! retries sooner.
+//! timer and [`V2LoopState`]: the dispatch backoff, where a lost backoff
+//! only retries sooner, and the nodes it listed, so a node that leaves its
+//! listing, however its row lost the drain, has its v2 gauges zeroed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
@@ -247,11 +255,21 @@ pub struct V2Node {
     /// The node's heartbeat is fresh by the API's node-status rule.
     pub heartbeat_fresh: bool,
     /// `drain_status.terminate_instance`: the fence, the instance the
-    /// terminate transaction chose to terminate.
+    /// terminate transaction chose to terminate. A row an earlier build's
+    /// terminator acted on (`drain_status.terminated`) is fenced on its
+    /// recorded instance.
     pub fence: Option<String>,
+    /// Auto Scaling accepted the fenced instance's termination:
+    /// `drain_status.dispatched_at` is recorded, or an earlier build's
+    /// terminator acted on the row (`drain_status.terminated`).
+    pub dispatched: bool,
     /// `drain_status.dispatched_at`, in Unix seconds: when Auto Scaling
-    /// accepted the fenced instance's termination.
+    /// accepted the fenced instance's termination; `None` on a row the
+    /// earlier build's terminator acted on.
     pub dispatched_at: Option<i64>,
+    /// `drain_status.terminated_observed_at`, in Unix seconds: when the loop
+    /// first saw EC2 list the fenced instance `terminated`.
+    pub terminated_observed_at: Option<i64>,
     /// `nodes.terminate_decrement_capacity`, which the termination passes on.
     pub decrement_capacity: bool,
 }
@@ -315,7 +333,7 @@ const DISPATCH_BACKOFF_CAP: Duration = Duration::from_secs(120);
 /// a controller that restarts asks again at once, and only a crash, a lost
 /// `dispatched_at` write or an unknown outcome repeats a dispatch.
 #[derive(Debug, Default)]
-pub struct DispatchBackoff {
+struct DispatchBackoff {
     next: Mutex<HashMap<NodeId, (Instant, u32)>>,
 }
 
@@ -347,6 +365,30 @@ impl DispatchBackoff {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|node_id, _| fenced.contains(node_id));
+    }
+}
+
+/// What the loop keeps between ticks: the [`DispatchBackoff`], and the
+/// nodes its last listing returned. In memory only: a controller that
+/// restarts starts with no listing.
+#[derive(Debug, Default)]
+pub struct V2LoopState {
+    backoff: DispatchBackoff,
+    listed: Mutex<HashSet<NodeId>>,
+}
+
+impl V2LoopState {
+    /// Remember `listed` as this tick's listing. Returns the nodes the last
+    /// listing returned that this one doesn't: deleted, let go by the loop
+    /// or by an operator, cancelled, or taken by a registration.
+    fn relist(&self, listed: HashSet<NodeId>) -> Vec<NodeId> {
+        let mut last = self
+            .listed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let left = last.difference(&listed).copied().collect();
+        *last = listed;
+        left
     }
 }
 
@@ -480,6 +522,16 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         epoch: u64,
         instance_id: &str,
     ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
+    /// Record that EC2 listed the fenced `instance_id` `terminated`
+    /// (`drain_status.terminated_observed_at`), keeping the first time it
+    /// did; false when the row is no longer that epoch's `terminating` node
+    /// fenced on that instance.
+    fn record_terminated_observed(
+        &self,
+        node_id: NodeId,
+        epoch: u64,
+        instance_id: &str,
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
     /// Whether the API server has a Node named `k8s_node_name`, by a direct
     /// GET: false only on its 404.
     fn node_exists(
@@ -487,8 +539,9 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         k8s_node_name: &str,
     ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
     /// Delete the row of `node`, whose fenced instance `fence` EC2 says is
-    /// terminated and whose Node is gone; let go of it instead when a row or
-    /// an execution still names it.
+    /// terminated, or no longer lists after the row recorded it
+    /// `terminated`, and whose Node is gone; let go of it instead when a row
+    /// or an execution still names it.
     fn delete_terminated(
         &self,
         node: &V2Node,
@@ -722,14 +775,15 @@ enum NodeStep {
 }
 
 /// One pass over every v2 node, [`NODE_CONCURRENCY`] at a time, with at
-/// most `max_evacuating` of them evacuating. EC2 is asked first, about each
-/// fenced node that `backoff` lets ask and each other node whose heartbeat
+/// most `max_evacuating` of them evacuating. A node the last tick listed and
+/// this one doesn't has its v2 gauges zeroed. EC2 is asked first, about each
+/// fenced node that the backoff lets ask and each other node whose heartbeat
 /// is stale; admission and each node's step read its answer.
 pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
     sink: &S,
     authority: &A,
     max_evacuating: usize,
-    backoff: &DispatchBackoff,
+    state: &V2LoopState,
 ) -> V2TickReport {
     use futures_util::StreamExt as _;
 
@@ -741,6 +795,10 @@ pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
             return report;
         }
     };
+    for node_id in state.relist(nodes.iter().map(|node| node.id).collect()) {
+        crate::metrics::node_drain::clear_v2_gauges(&node_id.to_string());
+    }
+    let backoff = &state.backoff;
     backoff.retain(
         &nodes
             .iter()
@@ -1103,11 +1161,15 @@ async fn fence<S: DrainV2Sink, A: V2InstanceAuthority>(
     }
 }
 
-/// A fenced node, with EC2's answer for its fenced instance: dispatch the
-/// termination while none is confirmed and EC2 says the instance is neither
-/// `shutting-down` nor `terminated`; once it is `terminated`, delete the
-/// row if the termination was confirmed and the Node is gone, or let the
-/// node go if it wasn't. Every path that waits defers the next check.
+/// A fenced node, with EC2's answer for its fenced instance. The first
+/// `terminated` answer is recorded; after it, an instance EC2 no longer
+/// lists reads as terminated, since EC2 stops listing a terminated instance
+/// after a while. Dispatch the termination while none is confirmed and EC2
+/// lists the instance in a state other than `shutting-down` or
+/// `terminated`; an instance it doesn't list, or no answer, dispatches
+/// nothing. Once the instance reads terminated, delete the row if the
+/// termination was confirmed and the Node is gone, or let the node go if it
+/// wasn't. Every path that waits defers the next check.
 async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthority>(
     sink: &S,
     authority: &A,
@@ -1118,30 +1180,51 @@ async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthority>(
     backoff: &DispatchBackoff,
 ) -> Option<NodeStep> {
     let now = Instant::now();
-    let Some(dispatched_at) = node.dispatched_at else {
-        match evidence {
-            InstanceEvidence::Terminated => {
-                let trace = format!(
-                    "v2 drain let go: fenced instance {fence} terminated; dispatch unconfirmed"
-                );
-                return let_go(sink, node, epoch, &trace)
-                    .await
-                    .then_some(NodeStep::LetGo);
-            }
-            InstanceEvidence::ShuttingDown | InstanceEvidence::Unknown(_) => {
+    if *evidence == InstanceEvidence::Terminated && node.terminated_observed_at.is_none() {
+        match sink.record_terminated_observed(node.id, epoch, fence).await {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
                 backoff.defer(node.id, now);
                 sink.record_error(
                     node.id,
-                    &format!(
-                        "EC2 answers {evidence} for fenced instance {fence}; not dispatching its \
-                         termination"
-                    ),
+                    &format!("recording that {fence} is terminated failed: {error}"),
                 )
                 .await;
                 return None;
             }
-            InstanceEvidence::Listed(_) | InstanceEvidence::NotListed => {}
         }
+    }
+    let terminated = match evidence {
+        InstanceEvidence::Terminated => true,
+        InstanceEvidence::NotListed => node.terminated_observed_at.is_some(),
+        _ => false,
+    };
+    if !node.dispatched {
+        if terminated {
+            let trace = format!(
+                "v2 drain let go: fenced instance {fence} terminated; dispatch unconfirmed"
+            );
+            return let_go(sink, node, epoch, &trace)
+                .await
+                .then_some(NodeStep::LetGo);
+        }
+        let InstanceEvidence::Listed(_) = evidence else {
+            backoff.defer(node.id, now);
+            let why = if *evidence == InstanceEvidence::NotListed {
+                format!(
+                    "EC2 does not list fenced instance {fence}, and was never seen to list it \
+                     terminated; not dispatching its termination"
+                )
+            } else {
+                format!(
+                    "EC2 answers {evidence} for fenced instance {fence}; not dispatching its \
+                     termination"
+                )
+            };
+            sink.record_error(node.id, &why).await;
+            return None;
+        };
         backoff.defer(node.id, now);
         return match authority
             .terminate_instance(fence, node.decrement_capacity)
@@ -1177,12 +1260,23 @@ async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthority>(
                 None
             }
         };
-    };
-    if *evidence != InstanceEvidence::Terminated {
+    }
+    if !terminated {
         backoff.defer(node.id, now);
-        let elapsed = unix_now().saturating_sub(dispatched_at);
+        let elapsed = node
+            .dispatched_at
+            .map(|dispatched_at| unix_now().saturating_sub(dispatched_at));
         let bound = i64::try_from(TERMINATE_BOUND.as_secs()).unwrap_or(i64::MAX);
-        if elapsed >= bound {
+        if *evidence == InstanceEvidence::NotListed {
+            sink.record_error(
+                node.id,
+                &format!(
+                    "EC2 does not list fenced instance {fence}, and was never seen to list it \
+                     terminated; not deleting the row"
+                ),
+            )
+            .await;
+        } else if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed >= bound) {
             sink.record_error(
                 node.id,
                 &format!(
@@ -1299,7 +1393,7 @@ pub async fn run<S: DrainV2Sink, A: V2InstanceAuthority>(
         max_evacuating,
         "starting the node drain's v2 loop"
     );
-    let backoff = DispatchBackoff::default();
+    let state = V2LoopState::default();
     let mut interval = tokio::time::interval(tick_every);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -1307,7 +1401,7 @@ pub async fn run<S: DrainV2Sink, A: V2InstanceAuthority>(
             () = shutdown.cancelled() => break,
             _ = interval.tick() => {}
         }
-        let report = tick(&sink, &authority, max_evacuating, &backoff).await;
+        let report = tick(&sink, &authority, max_evacuating, &state).await;
         if report != V2TickReport::default() {
             tracing::info!(?report, "node_drain v2: tick");
         }

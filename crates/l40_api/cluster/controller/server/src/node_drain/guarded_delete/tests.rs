@@ -11,6 +11,18 @@ use super::*;
 const INSTANCE: &str = "i-0000000000000a0a0";
 const UID: &str = "uid-synthetic";
 
+/// The first guard that holds the node: `active_node_id`, `target_node_id`
+/// or `active execution`. `None` when nothing does.
+fn first_guard(references: &NodeReferences) -> Option<&'static str> {
+    [
+        ("active_node_id", &references.active),
+        ("target_node_id", &references.target),
+        ("active execution", &references.executions),
+    ]
+    .into_iter()
+    .find_map(|(guard, ids)| (!ids.is_empty()).then_some(guard))
+}
+
 fn name_of(node_id: NodeId) -> String {
     format!("worker-{}.synthetic.internal", node_id.as_uuid().simple())
 }
@@ -180,11 +192,7 @@ async fn each_guard_refuses_the_delete_and_names_what_holds_it() -> TestResult {
                     "target_node_id" => references.target.push(id),
                     _ => references.executions.push(id),
                 }
-                assert_eq!(
-                    references.first_guard().map(|(guard, _)| guard),
-                    Some(case),
-                    "{case}"
-                );
+                assert_eq!(first_guard(&references), Some(case), "{case}");
                 GuardedDelete::Referenced(references)
             }
             (_, None) => unreachable!("{case}"),

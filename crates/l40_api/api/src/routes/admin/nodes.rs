@@ -2478,11 +2478,7 @@ fn v2_undrain_transition(
     {
         return None;
     }
-    let fenced = columns
-        .status
-        .as_ref()
-        .is_some_and(|status| status.get("terminate_instance").is_some());
-    Some(if fenced {
+    Some(if drain_v2_fenced(columns.status.as_ref()) {
         Err(TransitionError::Conflict {
             current: phase.map(str::to_owned),
             allowed: &[
@@ -2497,6 +2493,20 @@ fn v2_undrain_transition(
             set_started_at: false,
             clear_started_at: true,
         })
+    })
+}
+
+/// Whether a v2 node's `drain_status` fences its instance for termination:
+/// `terminate_instance`, or the `terminated` marker an earlier build's
+/// terminator wrote once it acted on the node, which the controller reads
+/// as a fence already dispatched.
+fn drain_v2_fenced(status: Option<&serde_json::Value>) -> bool {
+    status.is_some_and(|status| {
+        status.get("terminate_instance").is_some()
+            || status
+                .get("terminated")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
     })
 }
 

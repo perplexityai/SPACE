@@ -165,12 +165,39 @@ fn drain_v2_enabled(
     Ok(enabled)
 }
 
-/// Whether the v2 loop terminates a node `:terminate` moved to
-/// `terminating`: only through EC2 and Auto Scaling, and EC2 also says when
-/// a v2 node's instance is gone. Elsewhere it never fences, and the node
-/// waits for an operator, who may still undrain it.
-fn v2_terminates(kind: TerminatorKind) -> bool {
-    kind == TerminatorKind::Aws
+/// The terminator backend a [`TerminatorKind`] selects, with the AWS
+/// config only the `aws` backend loads.
+enum TerminatorBackend {
+    Aws(Box<aws_config::SdkConfig>),
+    KubeDelete,
+    Noop,
+}
+
+impl TerminatorBackend {
+    async fn load(kind: TerminatorKind) -> Self {
+        match kind {
+            TerminatorKind::Aws => Self::Aws(Box::new(
+                aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,
+            )),
+            TerminatorKind::KubeDelete => Self::KubeDelete,
+            TerminatorKind::Noop => Self::Noop,
+        }
+    }
+
+    /// The v2 loop's authority: EC2 and Auto Scaling under the `aws`
+    /// backend, which terminate a node `:terminate` moved to `terminating`
+    /// and say when a v2 node's instance is gone. Under any other it never
+    /// fences, and the node waits for an operator, who may still undrain
+    /// it.
+    fn v2_terminator(&self) -> node_drain::v2::V2Terminator {
+        match self {
+            Self::Aws(aws_config) => node_drain::v2::V2Terminator::Ec2 {
+                ec2: pplx_space_aws_client::ec2::Client::from_config(aws_config),
+                autoscaling: pplx_space_aws_client::autoscaling::Client::from_config(aws_config),
+            },
+            Self::KubeDelete | Self::Noop => node_drain::v2::V2Terminator::Refuse,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -713,41 +740,24 @@ pub async fn run_reconcilers(
                     evacuates_stopped_residents,
                     node_drain_config.replace_stopped_evacuations,
                 );
-                let v2_tick = node_drain_config.tick;
-                let v2_max_evacuating = node_drain_config.v2_max_evacuating_nodes;
+                let backend = TerminatorBackend::load(kind).await;
                 // The v2 drain's loop, beside v1's: it acts only on the rows
                 // `:drain {engine: v2}` marked, which v1's writers skip. It
                 // runs whether or not new v2 drains are admitted, so a
                 // persisted one is still drained or cancelled; it terminates
-                // a node only through EC2 ([`v2_terminates`]).
-                let spawn_v2 = |handles: &mut Vec<_>, terminator: node_drain::v2::V2Terminator| {
-                    handles.push(tokio::spawn(node_drain::v2::run(
-                        node_drain::SubstrateSink::v2(pool.clone(), kube.clone()),
-                        terminator,
-                        v2_tick,
-                        v2_max_evacuating,
-                        shutdown_token.child_token(),
-                    )));
-                };
-                match kind {
-                    TerminatorKind::Aws => {
-                        let aws_config =
-                            aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                // a node only through EC2
+                // ([`TerminatorBackend::v2_terminator`]).
+                handles.push(tokio::spawn(node_drain::v2::run(
+                    node_drain::SubstrateSink::v2(pool.clone(), kube.clone()),
+                    backend.v2_terminator(),
+                    node_drain_config.tick,
+                    node_drain_config.v2_max_evacuating_nodes,
+                    shutdown_token.child_token(),
+                )));
+                match backend {
+                    TerminatorBackend::Aws(aws_config) => {
                         let autoscaling_client =
                             pplx_space_aws_client::autoscaling::Client::from_config(&aws_config);
-                        spawn_v2(
-                            &mut handles,
-                            if v2_terminates(kind) {
-                                node_drain::v2::V2Terminator::Ec2 {
-                                    ec2: pplx_space_aws_client::ec2::Client::from_config(
-                                        &aws_config,
-                                    ),
-                                    autoscaling: autoscaling_client.clone(),
-                                }
-                            } else {
-                                node_drain::v2::V2Terminator::Refuse
-                            },
-                        );
                         let terminator = node_drain::Ec2InstanceTerminator::new(
                             pool.clone(),
                             kube.k8s.client.clone(),
@@ -775,8 +785,7 @@ pub async fn run_reconcilers(
                             node_drain_token,
                         )));
                     }
-                    TerminatorKind::KubeDelete => {
-                        spawn_v2(&mut handles, node_drain::v2::V2Terminator::Refuse);
+                    TerminatorBackend::KubeDelete => {
                         let terminator = node_drain::KubeNodeDeleteTerminator::new(
                             pool.clone(),
                             kube.k8s.client.clone(),
@@ -789,8 +798,7 @@ pub async fn run_reconcilers(
                             node_drain_token,
                         )));
                     }
-                    TerminatorKind::Noop => {
-                        spawn_v2(&mut handles, node_drain::v2::V2Terminator::Refuse);
+                    TerminatorBackend::Noop => {
                         let terminator = node_drain::NoopInstanceTerminator::new();
                         handles.push(tokio::spawn(node_drain::run(
                             node_drain_config,

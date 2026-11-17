@@ -1775,11 +1775,26 @@ class KindWorkerControl(NodeDrainControl, Protocol):
         control; 0 puts the default back."""
         ...
 
+    def release_fake_ec2_instance(self, instance_id: str) -> None:
+        """End the `shutting-down` delay of an instance Kind's fake EC2 already
+        marked terminated, so it reads `terminated` from now on, through its
+        loopback test control."""
+        ...
+
+    def fake_ec2_instance_state(self, instance_id: str) -> str:
+        """What Kind's fake EC2 lists for the instance ID, as DescribeInstances
+        answers it: its states, comma-separated, or `no instance`."""
+        ...
+
     def node_recorded_instance(self, node_id: str) -> str | None:
         """`node_k8s.instance_id` of the node, None when it records none or has no row."""
         ...
 
     def node_row_exists(self, node_id: str) -> bool: ...
+
+    def node_created_at(self, node_id: str) -> str | None:
+        """`nodes.created_at` of the node, as text; None without a row."""
+        ...
 
     def kind_node_labels(self, node_name: str) -> dict[str, str]:
         """The Kind worker's Node labels, which deleting the Node discards."""

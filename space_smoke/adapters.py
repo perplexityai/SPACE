@@ -5774,6 +5774,29 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"set the fake EC2's termination delay to {seconds}s",
         )
 
+    def release_fake_ec2_instance(self, instance_id: str) -> None:
+        self._require_isolated_kind("releasing a fake EC2 instance")
+        validate_fake_instance_id(instance_id)
+        _require_ok(
+            self.kubectl(
+                "exec", "deployment/space-kind-fake-ec2", "--",
+                "space-kind-fake-ec2", "release", instance_id,
+                timeout=30,
+            ),
+            f"release {instance_id} in the fake EC2",
+        )
+
+    def fake_ec2_instance_state(self, instance_id: str) -> str:
+        self._require_isolated_kind("reading a fake EC2 instance")
+        validate_fake_instance_id(instance_id)
+        result = self.kubectl(
+            "exec", "deployment/space-kind-fake-ec2", "--",
+            "space-kind-fake-ec2", "state", instance_id,
+            timeout=30,
+        )
+        _require_ok(result, f"read {instance_id} in the fake EC2")
+        return result.stdout.strip()
+
     def node_recorded_instance(self, node_id: str) -> str | None:
         out = self._psql(
             f"SELECT coalesce(instance_id, '') FROM node_k8s WHERE node_id = '{_sql_uuid(node_id)}';",
@@ -5787,6 +5810,13 @@ ON CONFLICT (key_hash) DO NOTHING;
             action="read the node row",
         )
         return out.strip() == "1"
+
+    def node_created_at(self, node_id: str) -> str | None:
+        out = self._psql(
+            f"SELECT created_at FROM nodes WHERE id = '{_sql_uuid(node_id)}';",
+            action="read the node row's creation time",
+        )
+        return out.strip() or None
 
     def _kind_worker_container(self, node_name: str) -> str:
         container = self._kind_node_container(_kube_node_name(node_name))

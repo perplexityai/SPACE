@@ -212,7 +212,8 @@ pub async fn register_k8s_node(
     // yet is deferred, under the row lock the upsert above took, so the next
     // sync decides once the Node's `providerID` names its instance. A Node's
     // `providerID` never changes once set, so without a UID change the
-    // instance can't change either.
+    // instance can't change either. A row an earlier build's terminator
+    // marked `terminated` is fenced on its recorded instance.
     let awaiting_instance = instance_id.is_none()
         && sqlx::query_scalar::<_, bool>(sql!(
             "SELECT EXISTS (
@@ -221,7 +222,8 @@ pub async fn register_k8s_node(
                    JOIN node_k8s k ON k.node_id = n.id
                   WHERE n.id = $1
                     AND n.drain_engine = 'v2'
-                    AND n.drain_status ? 'terminate_instance'
+                    AND (n.drain_status ? 'terminate_instance'
+                         OR COALESCE((n.drain_status->>'terminated')::BOOLEAN, FALSE))
                     AND k.k8s_node_uid IS DISTINCT FROM $2
              )"
         ))

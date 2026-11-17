@@ -43,19 +43,6 @@ impl NodeReferences {
     pub fn is_empty(&self) -> bool {
         self.active.is_empty() && self.target.is_empty() && self.executions.is_empty()
     }
-
-    /// The first guard that holds the node, and the ids that hold it:
-    /// `active_node_id`, `target_node_id` or `active execution`. `None` when
-    /// nothing does.
-    pub fn first_guard(&self) -> Option<(&'static str, &[SandboxId])> {
-        [
-            ("active_node_id", self.active.as_slice()),
-            ("target_node_id", self.target.as_slice()),
-            ("active execution", self.executions.as_slice()),
-        ]
-        .into_iter()
-        .find(|(_, ids)| !ids.is_empty())
-    }
 }
 
 impl std::fmt::Display for NodeReferences {

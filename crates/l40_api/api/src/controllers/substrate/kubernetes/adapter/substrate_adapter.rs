@@ -3147,7 +3147,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         k8s_node_name = %node_name,
                         role = %role,
                         reason = %message,
-                        "skipping tombstoned kube node from inventory listing"
+                        "kube node registration refused; skipping it in the inventory listing"
                     );
                     continue;
                 }
