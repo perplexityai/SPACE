@@ -1797,6 +1797,15 @@ fn create_translation_applies_resource_overrides() {
         ),
         (r#"{"vcpu":4}"#, Some(4), None, None),
         (r#"{"memory_mib":8192}"#, None, Some(8192), None),
+        // Above a node's default guest maximum, which the node clamps to;
+        // the API still admits it.
+        (r#"{"memory_mib":16896}"#, None, Some(16896), None),
+        (
+            r#"{"vcpu":32,"memory_mib":65536,"disk_mib":131072}"#,
+            Some(32),
+            Some(65536),
+            Some(131072),
+        ),
         (r#"{"disk_mib":20480}"#, None, None, Some(20480)),
         ("{}", None, None, None),
     ] {
@@ -1830,7 +1839,7 @@ fn create_translation_rejects_invalid_resource_overrides() {
         r#"{"vcpu":2147483648}"#,
         r#"{"vcpu":33}"#,
         r#"{"memory_mib":2147483648}"#,
-        r#"{"memory_mib":8193}"#,
+        r#"{"memory_mib":65537}"#,
         r#"{"memory_mib":511}"#,
         r#"{"disk_mib":0}"#,
         r#"{"disk_mib":131073}"#,

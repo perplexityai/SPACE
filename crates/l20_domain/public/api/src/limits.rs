@@ -38,12 +38,13 @@ pub const MAX_SANDBOX_VCPU: u32 = 32;
 /// Smallest guest memory a sandbox can request: the smallest memory a template
 /// base snapshot is taken with.
 pub const MIN_SANDBOX_MEMORY_MIB: u32 = pplx_space_common_core::types::MIN_BASE_SNAPSHOT_MEMORY_MIB;
-/// Largest guest memory a sandbox can request: the node runtime's default
-/// guest maximum, `pplx_space_node_runtime_core::cgroup::
-/// DEFAULT_SANDBOX_GUEST_MEMORY_MAX_MIB`, which deployments run. That module
-/// is host-only, so the value is restated here. A node would otherwise clamp a larger request silently. Raising a
-/// node's guest maximum requires raising this too.
-pub const MAX_SANDBOX_MEMORY_MIB: u32 = 8192;
+/// Largest guest memory a sandbox can request: 2 GiB for each of
+/// [`MAX_SANDBOX_VCPU`] vCPUs. This is an admission bound, not a node's guest
+/// maximum: a node gives the guest the smaller of this request and its own
+/// configured maximum (`sandbox_cgroup_memory_mib` less headroom), so the
+/// bound must cover every shape existing callers send, including ones above
+/// any node's maximum.
+pub const MAX_SANDBOX_MEMORY_MIB: u32 = 2 * 1024 * MAX_SANDBOX_VCPU;
 /// Smallest writable disk a sandbox can request. The template's own rootfs is
 /// the real floor, which the node enforces when it prepares the sandbox.
 pub const MIN_SANDBOX_DISK_MIB: u32 = 1;
