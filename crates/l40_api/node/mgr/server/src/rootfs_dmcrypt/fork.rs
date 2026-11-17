@@ -69,8 +69,8 @@ pub(crate) async fn stage(
         return Ok(());
     };
     let (source, source_loop, target, target_loop) = device_backing::blocking(move || {
-        let source_loop = LoopDevice::attach(&source, true)?;
-        let target_loop = LoopDevice::attach(&target, false)?;
+        let source_loop = LoopDevice::attach(&source, true, super::LoopIoMode::Buffered)?;
+        let target_loop = LoopDevice::attach(&target, false, super::LoopIoMode::Buffered)?;
         Ok((source, source_loop, target, target_loop))
     })
     .await?;

@@ -561,6 +561,16 @@ async fn busy_close_reports_its_holders_and_recovers() {
         .write(true)
         .open(format!("/dev/mapper/{mapper}"))
         .unwrap();
+    let deps = run("dmsetup", &["deps", "-o", "devname", &mapper])
+        .await
+        .unwrap();
+    let loop_path = PathBuf::from(loop_dep(&String::from_utf8_lossy(&deps)).unwrap());
+    let backing = Backing::open(&backing_path, false).unwrap().unwrap();
+    // Hold this loop through release so the read-only assertion cannot inspect
+    // an unrelated device after index reuse, or other workloads' read-only loops.
+    let held_loop = LoopDevice::matching(&loop_path, &backing.file)
+        .unwrap()
+        .unwrap();
     release_with(
         &sandbox_id,
         "snapshot",
@@ -613,22 +623,18 @@ async fn busy_close_reports_its_holders_and_recovers() {
     drop(raw);
     reopen(|| prepare(params(false))).await;
     assert_eq!(std::fs::read(&memory).unwrap(), b"vmstate");
-    let loops = std::fs::read_dir("/sys/block")
+    assert_eq!(
+        std::fs::read_to_string(
+            Path::new("/sys/block")
+                .join(held_loop.path().file_name().unwrap())
+                .join("ro")
+        )
         .unwrap()
-        .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("loop"))
-        .filter(|entry| {
-            std::fs::read_to_string(entry.path().join("ro"))
-                .unwrap_or_default()
-                .trim()
-                == "1"
-        })
-        .map(|entry| entry.file_name())
-        .collect::<Vec<_>>();
-    assert!(
-        loops.is_empty(),
-        "the seal left read-only loop devices: {loops:?}"
+        .trim(),
+        "0",
+        "the seal must not poison its loop device's read-only flag"
     );
+    drop(held_loop);
 
     // A reader in a private namespace keeps its copy of the mount, as a
     // `btrfs receive` child used to. The read-only superblock reaches that

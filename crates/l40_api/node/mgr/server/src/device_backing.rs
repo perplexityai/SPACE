@@ -204,17 +204,31 @@ impl Backing {
     }
 }
 
+/// Requested or observed loop I/O mode. Direct I/O is an optimization: a backing
+/// that cannot support it stays buffered, with its effective mode reported.
+/// Filesystems can still buffer individual requests, such as compressed extents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopIoMode {
+    Buffered,
+    Direct,
+}
+
 /// The held block fd prevents index reuse during setup. AUTOCLEAR releases a
 /// failed attachment on drop; a successful dm table owns it after handoff.
 pub(crate) struct LoopDevice {
     #[cfg(target_os = "linux")]
     _device: File,
     path: PathBuf,
+    io_mode: LoopIoMode,
 }
 
 impl LoopDevice {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn io_mode(&self) -> LoopIoMode {
+        self.io_mode
     }
 
     pub(crate) fn matching(device: &Path, backing: &File) -> io::Result<Option<Self>> {
@@ -237,6 +251,7 @@ impl LoopDevice {
                 (info.device == metadata.dev() && info.inode == metadata.ino()).then(|| Self {
                     _device: file,
                     path: device.to_owned(),
+                    io_mode: info.io_mode(),
                 }),
             )
         }
@@ -247,7 +262,11 @@ impl LoopDevice {
         }
     }
 
-    pub(crate) fn attach(backing: &Backing, readonly: bool) -> io::Result<Self> {
+    pub(crate) fn attach(
+        backing: &Backing,
+        readonly: bool,
+        requested_io: LoopIoMode,
+    ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -275,10 +294,15 @@ impl LoopDevice {
                 // SAFETY: Config is Linux loop_config; both descriptors and its
                 // buffer remain alive for the atomic LOOP_CONFIGURE ioctl.
                 if unsafe { libc::ioctl(device.as_raw_fd(), 0x4c0a, &mut config) } == 0 {
-                    return Ok(Self {
+                    let mut attached = Self {
                         _device: device,
                         path,
-                    });
+                        io_mode: LoopIoMode::Buffered,
+                    };
+                    if requested_io == LoopIoMode::Direct {
+                        attached.enable_direct_io()?;
+                    }
+                    return Ok(attached);
                 }
                 let error = io::Error::last_os_error();
                 if error.raw_os_error() != Some(libc::EBUSY) {
@@ -291,9 +315,45 @@ impl LoopDevice {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (backing, readonly);
+            let _ = (backing, readonly, requested_io);
             Err(io::ErrorKind::Unsupported.into())
         }
+    }
+
+    /// Only called on a new, exclusively held attachment, before dm-crypt can
+    /// submit I/O. Never change the mode of a mounted or adopted volume.
+    #[cfg(target_os = "linux")]
+    fn enable_direct_io(&mut self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        // SET_DIRECT_IO isolates an unsupported optimization from failures of
+        // LOOP_CONFIGURE. Keep its existing block size and backing descriptor.
+        // SAFETY: the ioctl takes an integer flag and the owned loop fd is live.
+        let unsupported =
+            if unsafe { libc::ioctl(self._device.as_raw_fd(), 0x4c08, 1 as libc::c_ulong) } != 0 {
+                let error = io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY) => Some(error),
+                    _ => return Err(error),
+                }
+            } else {
+                None
+            };
+        let mut info = Info::default();
+        // SAFETY: Info is the LOOP_GET_STATUS64 buffer; the attachment remains
+        // owned until the verified mode is returned or AUTOCLEAR runs on drop.
+        if unsafe { libc::ioctl(self._device.as_raw_fd(), 0x4c05, &mut info) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.io_mode = info.io_mode();
+        if self.io_mode == LoopIoMode::Buffered {
+            tracing::warn!(
+                device = %self.path.display(),
+                error = ?unsupported,
+                "loop direct I/O unavailable; using buffered I/O"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -312,6 +372,17 @@ struct Info {
     flags: u32,
     names_and_key: [u64; 20],
     init: [u64; 2],
+}
+
+#[cfg(target_os = "linux")]
+impl Info {
+    fn io_mode(&self) -> LoopIoMode {
+        if self.flags & 16 != 0 {
+            LoopIoMode::Direct
+        } else {
+            LoopIoMode::Buffered
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
