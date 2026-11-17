@@ -68,7 +68,16 @@ pub(crate) async fn session_events(
         }
     };
 
-    let attached = match resolve_attach_route(&state, session_id, &token).await {
+    // The wait for a sandbox on its way to a route can be long; a drain that
+    // starts during it sends the client to another replica at once.
+    let attached = tokio::select! {
+        biased;
+        () = state.drain_started.cancelled() => {
+            return native_draining_response(session_id.kind().as_str());
+        }
+        attached = resolve_attach_route(&state, session_id, &token) => attached,
+    };
+    let attached = match attached {
         Ok(attached) => attached,
         Err(error) => {
             crate::metrics::attach(session_id.kind().as_str(), error.metric_label());

@@ -42,6 +42,14 @@ pub(super) fn route_resolution_error(status: &tonic::Status) -> RouteResolutionE
             RouteResolutionError::SessionAtRest(at_rest)
         }
         tonic::Code::FailedPrecondition => RouteResolutionError::SessionNotReady,
+        // ClusterApi routes no session to a sandbox that is restoring, and
+        // marks that refusal: the restore is the wake on its way.
+        tonic::Code::Unavailable
+            if pplx_space_common_grpc::SandboxServiceRouteNotReady::from_status(status)
+                .is_some() =>
+        {
+            RouteResolutionError::SessionNotReady
+        }
         _ => RouteResolutionError::ResolutionFailed,
     }
 }
@@ -49,21 +57,34 @@ pub(super) fn route_resolution_error(status: &tonic::Status) -> RouteResolutionE
 /// How often an attach looks again for a route its sandbox does not have yet.
 const SESSION_NOT_READY_POLL: Duration = Duration::from_millis(500);
 
-/// [`resolve_session_route`] for a client attach, which waits up to the
-/// attach deadline while the session's sandbox has no route: a wake started
-/// with the session, such as the one `createCommand` starts for a sandbox at
-/// rest, places the sandbox again in about that time.
+/// How long an events attach waits for a route its sandbox is on its way to.
+///
+/// The wake `createCommand` queues for a sandbox at rest runs behind the
+/// sandbox's earlier lifecycle operations and the organization's lifecycle
+/// limits, so when many sandboxes wake at once the last ones are placed tens
+/// of seconds after their commands were created. The wait stays under the
+/// 60 s idle timeout common to HTTP proxies, so a client behind one gets the
+/// attach's own answer rather than the proxy's.
+const ATTACH_ROUTE_WAIT: Duration = Duration::from_secs(45);
+
+/// [`resolve_session_route`] for a client attach, which waits up to
+/// [`ATTACH_ROUTE_WAIT`] while the session's sandbox has no route but is
+/// about to: it is placing, waking or restoring, as after the wake
+/// `createCommand` starts for a sandbox at rest.
 pub(super) async fn resolve_attach_route(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
     token: &str,
 ) -> Result<AttachedSession, RouteResolutionError> {
-    retry_not_ready_until(tokio::time::Instant::now() + state.attach_deadline, || {
+    retry_not_ready_until(tokio::time::Instant::now() + ATTACH_ROUTE_WAIT, || {
         resolve_session_route(state, session_id, token)
     })
     .await
 }
 
+/// Resolve until the route is anything but not ready, or until `deadline`.
+/// A resolve still running at the deadline, such as one ClusterApi holds on
+/// a restore, ends there as not ready: the attach answers by its deadline.
 pub(super) async fn retry_not_ready_until<T, F, Fut>(
     deadline: tokio::time::Instant,
     mut resolve: F,
@@ -73,13 +94,14 @@ where
     Fut: Future<Output = Result<T, RouteResolutionError>>,
 {
     loop {
-        match resolve().await {
-            Err(RouteResolutionError::SessionNotReady)
+        match tokio::time::timeout_at(deadline, resolve()).await {
+            Err(_) => return Err(RouteResolutionError::SessionNotReady),
+            Ok(Err(RouteResolutionError::SessionNotReady))
                 if tokio::time::Instant::now() + SESSION_NOT_READY_POLL < deadline =>
             {
                 tokio::time::sleep(SESSION_NOT_READY_POLL).await;
             }
-            result => return result,
+            Ok(result) => return result,
         }
     }
 }
