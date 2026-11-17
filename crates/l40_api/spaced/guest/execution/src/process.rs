@@ -382,7 +382,10 @@ impl ProcessLaunch {
             );
         }
         let (spawn_result, mut prepared_pty) = spawned?;
-        let mut child = spawn_result.map_err(|error| spawn_error_status(error, &working_dir))?;
+        let mut child = match spawn_result {
+            Ok(child) => child,
+            Err(error) => return Err(spawn_error_status(error, &working_dir).await),
+        };
         let Some(pid) = child.id() else {
             terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
             return Err(Status::internal("spawned child has no pid"));
@@ -915,10 +918,14 @@ const PTY_DEFAULT_ENV: [(&str, &str); 2] = [("TERM", "xterm-256color"), ("LANG",
 /// directory and a missing executable with the same ENOENT, so the directory
 /// is looked at after the fact. A permission error stays untagged: either
 /// could be what the account may not use.
-fn spawn_error_status(error: io::Error, working_dir: &std::path::Path) -> Status {
+async fn spawn_error_status(error: io::Error, working_dir: &std::path::Path) -> Status {
     let errno = error.raw_os_error();
     let status = map_io_error(error);
-    let working_dir_usable = std::fs::metadata(working_dir).is_ok_and(|metadata| metadata.is_dir());
+    // On the async start path: a working directory on a hung mount must not
+    // stall the runtime worker the start runs on.
+    let working_dir_usable = tokio::fs::metadata(working_dir)
+        .await
+        .is_ok_and(|metadata| metadata.is_dir());
     let reason = if !working_dir_usable {
         Some(pplx_space_guest_process::status::PROCESS_START_CWD)
     } else if matches!(errno, Some(libc::ENOENT | libc::ENOEXEC | libc::ENOTDIR)) {
