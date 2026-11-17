@@ -3,7 +3,7 @@
 //! This deliberately has no public listener or production scheduling registration.
 //! A trusted local caller provides configuration; untrusted commands only reach
 //! Wasmtime/WASI. Container cgroups must supply the memory limit. Snapshots, networking,
-//! arbitrary OCI images, concurrent execution and production tenancy are absent.
+//! arbitrary OCI images and production tenancy are absent.
 //! Additional preopened directories must be mounted read-only by deployment.
 //! The configured module is trusted; guest requests only supply its arguments.
 
@@ -78,10 +78,16 @@ enum Request {
     },
     Execute {
         sandbox_id: Uuid,
+        #[serde(default)]
+        execution_id: Option<Uuid>,
         argv: Vec<String>,
         timeout_secs: u64,
         #[serde(default)]
         env: BTreeMap<String, String>,
+    },
+    Cancel {
+        sandbox_id: Uuid,
+        execution_id: Uuid,
     },
     Upload {
         sandbox_id: Uuid,
@@ -108,6 +114,7 @@ enum Request {
 
 #[derive(Serialize)]
 struct Response {
+    protocol_version: u32,
     runtime: &'static str,
     sandbox_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,8 +141,10 @@ fn serialize_lifecycle<S: serde::Serializer>(
 
 #[derive(Serialize)]
 struct Execution {
+    execution_id: Uuid,
     exit_code: i32,
     timed_out: bool,
+    cancelled: bool,
     stdout: String,
     stderr: String,
     elapsed_ms: u128,
@@ -143,7 +152,7 @@ struct Execution {
     runtime_pid: u32,
 }
 
-/// Single-flight local protocol entrypoint. Synchronous by design: this mode is
+/// Per-sandbox single-flight local protocol entrypoint. Synchronous by design: this mode is
 /// a dedicated supervisor process, never a Tokio worker or stateless API handler.
 pub fn run_request(
     config: WasmConfig,
@@ -167,19 +176,74 @@ pub fn run_request(
     fs::create_dir_all(&config.root)?;
     let root = fs::canonicalize(&config.root)?;
     let tools = fs::canonicalize(&config.tools)?;
-    let lock = OpenOptions::new()
+    // Version-one callers took this lock exclusively. A shared lock preserves
+    // safe exclusion from an older in-flight runner without serializing v2
+    // sandboxes against one another.
+    let compatibility_lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(root.join(".lock"))?;
-    lock.try_lock()?;
+    compatibility_lock.try_lock_shared()?;
     let mut bytes = Vec::new();
     input.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_BYTES {
         return Err(WasmRequestError::Invalid("request exceeds 1 MiB"));
     }
-    let request: Request = serde_json::from_slice(&bytes)?;
+    let mut request: Request = serde_json::from_slice(&bytes)?;
+    if let Request::Create {
+        sandbox_id,
+        required_capabilities,
+        startup_policy,
+    } = &request
+    {
+        let available = RuntimeCapabilities::default();
+        if !available.contains(*required_capabilities)
+            || startup_policy
+                .is_some_and(|policy| !available.contains(policy.required_capabilities()))
+        {
+            return Err(WasmRequestError::Invalid(
+                "required platform capabilities are not qualified",
+            ));
+        }
+        if sandbox_id.is_some_and(|id| id.get_version_num() != 7) {
+            return Err(WasmRequestError::Invalid("sandbox id must be UUIDv7"));
+        }
+    }
+    // Locks live outside deletable sandboxes: deleting and recreating an ID
+    // must not give two callers different lock inodes for the same resource.
+    let id = match &mut request {
+        Request::Capabilities {} => None,
+        Request::Create { sandbox_id, .. } => Some(*sandbox_id.get_or_insert_with(Uuid::now_v7)),
+        Request::Inspect { sandbox_id }
+        | Request::Stop { sandbox_id }
+        | Request::Start { sandbox_id }
+        | Request::Execute { sandbox_id, .. }
+        | Request::Cancel { sandbox_id, .. }
+        | Request::Upload { sandbox_id, .. }
+        | Request::Download { sandbox_id, .. }
+        | Request::UploadBinary { sandbox_id, .. }
+        | Request::DownloadBinary { sandbox_id, .. }
+        | Request::Delete { sandbox_id } => Some(*sandbox_id),
+    };
+    let locks = root.join(".locks");
+    fs::create_dir_all(&locks)?;
+    let _lock = if !matches!(&request, Request::Cancel { .. }) {
+        id.map(|id| {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(locks.join(id.to_string()))?;
+            file.try_lock()?;
+            Ok::<_, WasmRequestError>(file)
+        })
+        .transpose()?
+    } else {
+        None
+    };
     let mut response = Response {
+        protocol_version: 2,
         runtime: "wasmtime-wasi",
         sandbox_id: Uuid::nil(),
         execution: None,
@@ -194,27 +258,11 @@ pub fn run_request(
             // gateway, managed-volume, snapshot or warm-pool integrations.
             response.capabilities = Some(RuntimeCapabilities::default());
         }
-        Request::Create {
-            sandbox_id,
-            required_capabilities,
-            startup_policy,
-        } => {
-            let available = RuntimeCapabilities::default();
-            if !available.contains(required_capabilities)
-                || startup_policy
-                    .is_some_and(|policy| !available.contains(policy.required_capabilities()))
-            {
-                return Err(WasmRequestError::Invalid(
-                    "required platform capabilities are not qualified",
-                ));
-            }
+        Request::Create { sandbox_id, .. } => {
             let id = sandbox_id.unwrap_or_else(Uuid::now_v7);
-            if id.get_version_num() != 7 {
-                return Err(WasmRequestError::Invalid("sandbox id must be UUIDv7"));
-            }
             let dir = root.join(id.to_string());
             if !dir.try_exists()? {
-                // Publish a complete node-local sandbox or nothing. The root
+                // Publish a complete node-local sandbox or nothing. The sandbox
                 // lock serializes retries; abandoned staging is never runnable.
                 let pending = tempfile::tempdir_in(&root)?;
                 fs::create_dir(pending.path().join("workspace"))?;
@@ -253,6 +301,7 @@ pub fn run_request(
         }
         Request::Execute {
             sandbox_id,
+            execution_id,
             argv,
             timeout_secs,
             env,
@@ -280,7 +329,38 @@ pub fn run_request(
                 return Err(WasmRequestError::Invalid("invalid guest environment"));
             }
             response.sandbox_id = sandbox_id;
-            response.execution = Some(execute(&config, &tools, &dir, &argv, timeout_secs, env)?);
+            let execution_id = execution_id.unwrap_or_else(Uuid::now_v7);
+            if execution_id.get_version_num() != 7 {
+                return Err(WasmRequestError::Invalid("execution id must be UUIDv7"));
+            }
+            response.execution = Some(execute(
+                &config,
+                &tools,
+                &dir,
+                &argv,
+                env,
+                ExecutionControl {
+                    execution_id,
+                    timeout_secs,
+                },
+            )?);
+        }
+        Request::Cancel {
+            sandbox_id,
+            execution_id,
+        } => {
+            if execution_id.get_version_num() != 7 {
+                return Err(WasmRequestError::Invalid("execution id must be UUIDv7"));
+            }
+            let dir = sandbox_dir(&root, sandbox_id)?;
+            // An ID-scoped marker also covers cancellation racing process
+            // startup. No PID is accepted or signalled by this request.
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.join(format!(".cancel-{execution_id}")))?;
+            response.sandbox_id = sandbox_id;
         }
         Request::Upload {
             sandbox_id,
@@ -423,14 +503,49 @@ impl Drop for RuntimeChild {
     }
 }
 
+struct CancellationFile(PathBuf);
+
+impl Drop for CancellationFile {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.0)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "failed to remove experimental cancellation marker");
+        }
+    }
+}
+
+struct ExecutionControl {
+    execution_id: Uuid,
+    timeout_secs: u64,
+}
+
 fn execute(
     config: &WasmConfig,
     tools: &Path,
     dir: &Path,
     argv: &[String],
-    timeout_secs: u64,
     env: BTreeMap<String, String>,
+    control: ExecutionControl,
 ) -> Result<Execution, WasmRequestError> {
+    let ExecutionControl {
+        execution_id,
+        timeout_secs,
+    } = control;
+    let cancellation = CancellationFile(dir.join(format!(".cancel-{execution_id}")));
+    if cancellation.0.try_exists()? {
+        return Ok(Execution {
+            execution_id,
+            exit_code: 130,
+            timed_out: false,
+            cancelled: true,
+            stdout: String::new(),
+            stderr: String::new(),
+            elapsed_ms: 0,
+            supervisor_pid: std::process::id(),
+            runtime_pid: 0,
+        });
+    }
     let mut command = Command::new("/usr/bin/prlimit");
     command
         .args([
@@ -476,6 +591,19 @@ fn execute(
     }
     // No shell, native executable fallback, host env inheritance, or network.
     command.arg(&config.module).args(argv);
+    let owner = nix::unistd::getpid();
+    // SAFETY: the child runs only allocation-free Linux syscalls before exec.
+    // Arm before checking getppid so parent loss on either side of setup cannot
+    // leave an unowned guest. The dedicated caller remains the spawning thread.
+    unsafe {
+        command.pre_exec(move || {
+            nix::sys::prctl::set_pdeathsig(Signal::SIGKILL).map_err(std::io::Error::from)?;
+            if nix::unistd::getppid() != owner {
+                return Err(std::io::Error::from_raw_os_error(nix::libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
     let started = Instant::now();
     let mut child = RuntimeChild(command.spawn()?);
     let runtime_pid = child.0.id();
@@ -496,9 +624,12 @@ fn execute(
             .ok_or(WasmRequestError::Invalid("missing stderr pipe"))?,
         limit_tx,
     )?;
-    let (mut exit_code, timed_out) = loop {
+    let (mut exit_code, timed_out, cancelled) = loop {
+        if cancellation.0.try_exists()? {
+            break (130, false, true);
+        }
         if limit_rx.try_recv().is_ok() {
-            break (125, false);
+            break (125, false, false);
         }
         if let Some(status) = child.0.try_wait()? {
             break (
@@ -506,10 +637,11 @@ fn execute(
                     .code()
                     .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
                 false,
+                false,
             );
         }
         if started.elapsed() >= Duration::from_secs(timeout_secs) {
-            break (124, true);
+            break (124, true, false);
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -527,8 +659,10 @@ fn execute(
         exit_code = 125;
     }
     Ok(Execution {
+        execution_id,
         exit_code,
         timed_out,
+        cancelled,
         stdout,
         stderr,
         elapsed_ms: started.elapsed().as_millis(),

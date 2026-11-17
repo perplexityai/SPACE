@@ -1,6 +1,65 @@
 use super::*;
 
 #[test]
+fn sandbox_locks_do_not_block_other_sandboxes_or_cancellation() {
+    let root = tempfile::tempdir().expect("fixture");
+    let request = |value: serde_json::Value| {
+        let mut output = Vec::new();
+        run_request(
+            WasmConfig {
+                root: root.path().to_path_buf(),
+                tools: root.path().to_path_buf(),
+                module: root.path().join("absent.wasm"),
+                preopens: BTreeMap::new(),
+            },
+            serde_json::to_vec(&value).expect("request").as_slice(),
+            &mut output,
+        )?;
+        Ok::<_, WasmRequestError>(
+            serde_json::from_slice::<serde_json::Value>(&output).expect("response"),
+        )
+    };
+    let first = request(serde_json::json!({"operation":"create"})).expect("create");
+    let first = first["sandbox_id"].as_str().expect("id");
+    let second = request(serde_json::json!({"operation":"create"})).expect("create");
+    let second = second["sandbox_id"].as_str().expect("id");
+    let lock = OpenOptions::new()
+        .write(true)
+        .open(root.path().join(".locks").join(first))
+        .expect("lock");
+    lock.try_lock().expect("lock");
+    request(serde_json::json!({"operation":"inspect","sandbox_id":first}))
+        .expect_err("same sandbox must be serialized");
+    request(serde_json::json!({
+        "operation":"upload", "sandbox_id":second,
+        "path":"/workspace/answer", "content":"42"
+    }))
+    .expect("a busy sandbox must not monopolize the node");
+    let execution = Uuid::now_v7();
+    request(serde_json::json!({
+        "operation":"cancel","sandbox_id":first,"execution_id":execution
+    }))
+    .expect("cancellation must bypass execution admission");
+    drop(lock);
+    let response = request(serde_json::json!({
+        "operation":"execute","sandbox_id":first,"execution_id":execution,
+        "argv":["-c","raise AssertionError('must not run')"],"timeout_secs":1
+    }))
+    .expect("pre-start cancellation does not need an installed runtime");
+    assert_eq!(response["execution"]["exit_code"], 130);
+    assert_eq!(response["execution"]["cancelled"], true);
+    assert_eq!(response["execution"]["runtime_pid"], 0);
+    assert!(
+        !root
+            .path()
+            .join(first)
+            .join(format!(".cancel-{execution}"))
+            .exists(),
+        "consuming cancellation must reclaim its marker"
+    );
+}
+
+#[test]
 fn output_is_preserved_up_to_the_limit_and_overflow_is_reported() {
     for length in [5, 1_048_577] {
         let (tx, rx) = std::sync::mpsc::sync_channel(2);

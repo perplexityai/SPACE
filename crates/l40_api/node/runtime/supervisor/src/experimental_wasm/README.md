@@ -23,8 +23,9 @@ sandbox gets separate writable `/workspace` and `/tmp` preopens. Host paths
 and environment are otherwise not inherited, and networking is disabled.
 
 Requests are JSON on stdin; a successful response is JSON on stdout.
-Operations are `capabilities`, `create`, `inspect`, `stop`, `start`, `upload`,
-`download`, `execute`, and `delete`.
+Protocol version 2 operations are `capabilities`, `create`, `inspect`, `stop`,
+`start`, `upload`, `download`, `upload_binary`, `download_binary`, `execute`,
+`cancel`, and `delete`.
 Execution takes `sandbox_id`, `argv`, `timeout_secs` (1 through 120), and an
 optional guest `env` map. Arguments are passed directly to the configured
 module, never interpreted as a shell command or a host executable:
@@ -44,8 +45,10 @@ Creation atomically publishes both writable directories. `stop` persists a
 node-local command-admission marker and `start` removes it without losing files.
 State survives separate supervisor invocations; `delete` is idempotent.
 State observations reuse the shared `SandboxLifecycle` vocabulary.
-These are quiescent operations under the runner's single-flight lock, not
-concurrent cancellation, VM suspension, or durable control-plane reconciliation.
+Operations on one sandbox are single-flight; independent sandboxes may execute
+concurrently. A busy sandbox fails admission rather than queuing. `stop` and
+`delete` are quiescent operations, not VM suspension or durable control-plane
+reconciliation.
 The storage is still an operator-provided experimental root, not Volume Manager
 storage. These additions enforce more of the platform contract without claiming
 a registered production backend.
@@ -56,7 +59,7 @@ a registered production backend.
 | --- | --- | --- |
 | Capability admission | Uses shared `RuntimeCapabilities` and `StartupPolicy`; rejects unsupported requirements before sandbox allocation | Scheduler and API select a registered backend using those requirements |
 | Lifecycle | UUIDv7 create retries, atomic directory publication, inspect, quiescent stop/start, idempotent delete | Persist intent through the owning desired-state store and existing reconciliation path; recover after node loss |
-| Execution | Single flight, bounded deadline/output, process-group cleanup | Per-sandbox resource accounting, concurrent cancellation, restart adoption and isolation review |
+| Execution | Per-sandbox single flight, concurrent independent sandboxes, identity-scoped cancellation, bounded deadline/output, process-group cleanup | Per-sandbox resource accounting, restart adoption and isolation review |
 | Storage | Two node-local writable preopens; deployment-mounted read-only tools | Volume Manager remains the only managed-storage authority; integrate its attachment, quota and reclamation lifecycle instead of inventing another one |
 | Networking | Guest networking disabled | A mediated WASI networking/HTTP path must enforce the existing gateway's identity, destination policy, credentials and audit contracts |
 | Snapshots and warm capacity | Explicitly unsupported | Define and implement backend-specific semantics before advertising any capability |
@@ -69,6 +72,29 @@ work rather than complete it.
 Similarly, a preopened host directory is not evidence of managed-volume support.
 This runner intentionally does not register itself as a schedulable runtime until
 those owning platform boundaries are integrated.
+
+## Execution ownership and cancellation
+
+An optional UUIDv7 `execution_id` correlates `execute` with its response and
+`cancel`. Cancellation bypasses that sandbox's admission lock and records a
+marker for that identity, including before startup. The owning supervisor checks
+it while waiting, kills and reaps its process group, and returns exit status
+130 with `cancelled: true`. The cancel acknowledgment alone does not prove the
+guest has exited: the caller must join the original execute request before
+deleting the sandbox or acknowledging cancellation to its parent.
+
+Cancellation never accepts a caller-supplied PID. Consumed markers are removed;
+a late cancellation may leave a marker until sandbox deletion. Do not reuse
+execution IDs. Stable lock files under `.locks/` survive sandbox deletion to
+avoid two locks for a deleted and recreated identity. Reclaim that coordination
+directory only after draining every caller of the experimental root.
+
+Version 2 callers hold the compatibility root lock shared, excluding an older
+version 1 caller that holds it exclusively. The child arms Linux parent-death
+SIGKILL before executing, closing the startup race by checking its parent
+afterward. Losing the supervisor therefore kills the guest instead of adopting
+it. Graceful cancellation must still join the supervisor to reap the child;
+crash adoption and durable execution ownership are not implemented.
 
 The deadline includes compilation. The request, guest file size, and each
 captured output stream are limited to 1 MiB. Overflow returns execution status
