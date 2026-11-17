@@ -25,7 +25,8 @@ pub(crate) fn prepare(path: &Path) -> std::io::Result<()> {
     prepare_under(root, relative)
 }
 
-fn prepare_under(root: &Path, relative: &Path) -> std::io::Result<()> {
+/// [`prepare`] for `relative` below the installation root `root`.
+pub(crate) fn prepare_under(root: &Path, relative: &Path) -> std::io::Result<()> {
     if relative.components().next().is_none()
         || relative
             .components()

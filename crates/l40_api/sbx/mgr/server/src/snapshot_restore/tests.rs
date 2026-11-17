@@ -1908,3 +1908,187 @@ fn only_a_bootable_instance_falls_back_to_a_plain_directory() {
             .expect_err("a stopped re-placement must not proceed without a snapshottable instance");
     }
 }
+
+#[test]
+fn scoped_restore_staging_is_group_traversable_under_a_restrictive_umask() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if !pplx_space_test_env::enter_test_process(&[]) {
+        return;
+    }
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+    // Unprivileged, the group is this process's own: this checks modes only.
+    let group = nix::unistd::getegid();
+    for existing in [false, true] {
+        let cache = tempfile::tempdir().unwrap();
+        // A cache that passes no group on to what is created in it.
+        std::fs::set_permissions(cache.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let scope = pplx_space_common_core::types::TransferScopeId::new();
+        let staging = paths::sandbox_restore_staging_dir_in(
+            cache.path(),
+            &SandboxId::new().to_string(),
+            &scope.to_string(),
+        );
+        if existing {
+            // As an earlier attempt or an older version left it.
+            std::fs::create_dir(&staging).unwrap();
+            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        create_restore_root(&staging, RestoreMetadataDestination::Scoped(scope), group).unwrap();
+        let metadata = std::fs::metadata(&staging).unwrap();
+        assert_eq!(metadata.gid(), group.as_raw());
+        assert_eq!(
+            metadata.mode() & 0o2050,
+            0o2050,
+            "staging mode {:o} lacks setgid or group traversal (existing: {existing})",
+            metadata.mode()
+        );
+    }
+}
+
+#[test]
+fn in_place_restore_leaves_the_sandbox_directory_as_it_is() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let cache = tempfile::tempdir().unwrap();
+    let sandbox_dir = cache.path().join(SandboxId::new().to_string());
+    std::fs::create_dir(&sandbox_dir).unwrap();
+    std::fs::set_permissions(&sandbox_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = |metadata: std::fs::Metadata| (metadata.uid(), metadata.gid(), metadata.mode());
+    let before = identity(std::fs::metadata(&sandbox_dir).unwrap());
+    create_restore_root(
+        &sandbox_dir,
+        RestoreMetadataDestination::InPlace(pplx_space_common_core::types::TransferScopeId::new()),
+        nix::unistd::getegid(),
+    )
+    .unwrap();
+    assert_eq!(identity(std::fs::metadata(&sandbox_dir).unwrap()), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn volume_manager_downloads_into_scoped_restore_staging_through_the_shared_cache_group() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::time::Duration;
+
+    use nix::unistd::{Gid, Uid, chown, geteuid};
+    use pplx_space_host_layout::identities::{groups, users};
+
+    const STAGE: &str = "SPACE_TEST_RESTORE_STAGING_STAGE";
+    const ROOT: &str = "SPACE_TEST_RESTORE_STAGING_ROOT";
+    const STAGING: &str = "SPACE_TEST_RESTORE_STAGING_DIR";
+    if let Ok(stage) = std::env::var(STAGE) {
+        let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+        let staging = PathBuf::from(std::env::var_os(STAGING).unwrap());
+        let snapshot = staging.join("snapshot");
+        match stage.as_str() {
+            "stage" => {
+                assert_eq!(geteuid().as_raw(), users::SPACE_SBXMGR.uid);
+                nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+                create_restore_root(
+                    &staging,
+                    RestoreMetadataDestination::Scoped(
+                        pplx_space_common_core::types::TransferScopeId::new(),
+                    ),
+                    crate::transfer_directory::shared_cache_group(),
+                )
+                .unwrap();
+                // As the restore creates `snapshot/` and each pull prepares it.
+                std::fs::create_dir_all(&snapshot).unwrap();
+                crate::transfer_directory::prepare_under(
+                    &root,
+                    snapshot.strip_prefix(&root).unwrap(),
+                )
+                .unwrap();
+            }
+            "download" => {
+                assert_eq!(geteuid().as_raw(), users::SPACE_VOLMGR.uid);
+                let temp = snapshot.join("rootfs.ext4.partial");
+                std::fs::write(&temp, b"downloaded").unwrap();
+                std::fs::rename(&temp, snapshot.join("rootfs.ext4")).unwrap();
+            }
+            _ => panic!("unexpected test stage"),
+        }
+        println!("verified restore staging stage {stage}");
+        return;
+    }
+    if !pplx_space_test_env::root_or_skip("switch between two real service UIDs") {
+        return;
+    }
+    // Fresh, and private with sandbox-manager's own group as an older version
+    // created it under a restrictive umask.
+    for existing in [
+        None,
+        Some((users::SPACE_SBXMGR.uid, groups::SPACE_SBXMGR.gid, 0o700)),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Group-shared but not setgid: nothing created in it inherits the group.
+        let cache = root.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        chown(
+            &cache,
+            None,
+            Some(Gid::from_raw(groups::SPACE_CACHE_RW.gid)),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let staging = paths::sandbox_restore_staging_dir_in(
+            &cache,
+            &SandboxId::new().to_string(),
+            &pplx_space_common_core::types::TransferScopeId::new().to_string(),
+        );
+        if let Some((uid, gid, mode)) = existing {
+            std::fs::create_dir(&staging).unwrap();
+            chown(&staging, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).unwrap();
+            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        for (stage, uid, primary_gid, supplementary) in [
+            (
+                "stage",
+                users::SPACE_SBXMGR.uid,
+                groups::SPACE_SBXMGR.gid,
+                format!(
+                    "{},{}",
+                    groups::SPACE_SBXCLIENTS.gid,
+                    groups::SPACE_CACHE_RW.gid
+                ),
+            ),
+            (
+                "download",
+                users::SPACE_VOLMGR.uid,
+                groups::SPACE_VOLMGR.gid,
+                format!(
+                    "{},{},{}",
+                    groups::SPACE_SBXCLIENTS.gid,
+                    groups::SPACE_CACHE_RW.gid,
+                    groups::SPACE_VOLCREDCLIENTS.gid
+                ),
+            ),
+        ] {
+            let mut command = Command::new("setpriv");
+            command
+                .arg(format!("--reuid={uid}"))
+                .arg(format!("--regid={primary_gid}"))
+                .arg(format!("--groups={supplementary}"))
+                .arg("--")
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "snapshot_restore::tests::volume_manager_downloads_into_scoped_restore_staging_through_the_shared_cache_group",
+                    "--nocapture",
+                ])
+                .env(STAGE, stage)
+                .env(ROOT, root.path())
+                .env(STAGING, &staging);
+            let (_, output) =
+                pplx_space_test_env::run_command(&mut command, Duration::from_secs(30)).unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success()
+                    && stdout.contains(&format!("verified restore staging stage {stage}")),
+                "{stage} (existing: {existing:?}): {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}

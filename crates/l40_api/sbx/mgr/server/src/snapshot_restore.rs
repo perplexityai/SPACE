@@ -1780,6 +1780,33 @@ async fn restore_pull_metadata_from_source(
         .await
 }
 
+/// Create `sandbox_dir`, the directory `destination` restores into.
+/// Volume-manager only traverses it, to write the pulls into `snapshot/`,
+/// which each pull shares itself. A scoped staging root is this service's
+/// own, so it is shared through `group` whatever the umask and whether the
+/// cache directory passes its group on, including when an earlier attempt or
+/// an older version left it private. An in-place destination is the
+/// sandbox's canonical directory; an existing one keeps its owner and mode.
+/// Production passes the shared cache group.
+fn create_restore_root(
+    sandbox_dir: &Path,
+    destination: RestoreMetadataDestination,
+    group: nix::unistd::Gid,
+) -> std::io::Result<()> {
+    match destination {
+        RestoreMetadataDestination::InPlace(_) => std::fs::create_dir_all(sandbox_dir),
+        RestoreMetadataDestination::Scoped(_) => {
+            let (Some(cache), Some(name)) = (sandbox_dir.parent(), sandbox_dir.file_name()) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "restore staging has no parent",
+                ));
+            };
+            crate::transfer_directory::prepare_readable_child(cache, name, group)
+        }
+    }
+}
+
 pub(crate) fn validate_restore_metadata_identity(
     meta: &crate::snapshot_upload::SnapshotMeta,
     target_sandbox_id: &str,
@@ -1861,7 +1888,12 @@ async fn restore_pull_metadata_from_source_for_identity(
     // here so the directory shape matches what `start_from_checkpoint`'s
     // downstream callers expect to find.
     let snapshots_dir = sandbox_dir.join("snapshots");
-    std::fs::create_dir_all(&sandbox_dir).map_err(|source| RestoreError::CreateDirectory {
+    create_restore_root(
+        &sandbox_dir,
+        destination,
+        crate::transfer_directory::shared_cache_group(),
+    )
+    .map_err(|source| RestoreError::CreateDirectory {
         path: sandbox_dir.clone(),
         source,
     })?;
