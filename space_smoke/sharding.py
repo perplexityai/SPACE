@@ -93,7 +93,7 @@ _DURATION_SECONDS = {
         "local.sandbox_network_isolation_holds": 20,
         "local.storage_exchange_scoping": 26,
         "local.suspend_snapshot_rows_are_per_attempt": 15,
-        "local.telemetry_reaches_local_backends": 16,
+        "local.telemetry_reaches_local_backends": 75,
         "local.template_startup_recovery_decision_table": 18,
         "local.unanswered_template_deleted_after_wait": 104,
         "network_policy.v1_cidr_allow": 6,
