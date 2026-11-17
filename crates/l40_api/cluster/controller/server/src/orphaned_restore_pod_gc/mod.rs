@@ -1,4 +1,6 @@
-//! Cluster-singleton garbage collector for orphaned restore pods.
+//! Cluster-singleton garbage collector for orphaned restore pods and, when
+//! `SPACE_ORPHANED_RESTORE_POD_GC_TERMINAL_PODS` is on, for terminal sandbox
+//! pods nothing owns (see "Terminal pods" below).
 //!
 //! ## The orphan this closes
 //!
@@ -143,6 +145,28 @@
 //! generation, so a same-generation pod is still adoptable by a restore that
 //! resumes it, and deleting it unlocked would race that adoption.
 //!
+//! ## Terminal pods
+//!
+//! Sandbox pods are bare pods with `restartPolicy: Never` and no owner
+//! reference, so Kubernetes never collects one. A sandbox's idle or timeout
+//! action runs on its node: the VM exits, the pod goes `Succeeded`, and the
+//! control plane deletes the row (a delete) or retires the execution (a
+//! suspend). Neither path deletes the pod, so each such sandbox leaves a
+//! `Completed` pod in the sandbox namespace for good, and no row-driven
+//! reconciler can find one whose row is gone.
+//!
+//! With `terminal_pods` on, the scan also takes every `Succeeded` or `Failed`
+//! pod outside the warm pool (the warm-pool orphan sweep owns those), and
+//! [`classify::classify_terminal_pod`] reaps one whose row is missing or
+//! `suspended` with no active execution. A terminal pod runs no VM, so
+//! deleting it starts no teardown capture and the backup-fence reasoning above
+//! doesn't arise. Every other safeguard applies unchanged: the continuous
+//! observation threshold, the authoritative re-read and the Postgres recheck
+//! that classifies what it read, the UID + resourceVersion
+//! preconditions, the rate limit, and dry-run. A `stopped` row's pod is left
+//! alone, since its active execution still names the pod and `start` replaces
+//! it.
+//!
 //! ## The orphans this loop deliberately does NOT handle
 //!
 //! A pod whose execution was retired as something other than `replaced`, with
@@ -167,8 +191,10 @@
 //! it.
 //!
 //! Safeguards, in order:
-//! - **Restore-only.** Only pods carrying a restore annotation are considered;
-//!   fresh-create pods are skipped at the source.
+//! - **Restore pods, or terminal pods.** Only pods carrying a restore
+//!   annotation are considered, and, with `terminal_pods` on, terminal pods
+//!   outside the warm pool; a running or pending fresh-create pod is skipped
+//!   at the source.
 //! - **Supersession disposition.** A row that is `restoring` (including a
 //!   same-generation re-drive) or in any other transient lifecycle, or whose
 //!   active execution is at or above the pod's generation, is never reaped.
@@ -188,11 +214,13 @@
 //!   or failed scan, when the pod's fresh read or Postgres recheck fails, and
 //!   whenever the pod stops classifying as superseded.
 //! - **Verify before destroy.** Immediately before deleting, the pod is
-//!   re-read authoritatively (cache-bypassing GET) — same UID, restore marker,
-//!   sandbox id, and generation, and not terminating — and the owning row is
-//!   re-classified from Postgres — so a pod the row re-claimed
-//!   (a same-generation re-drive → `restoring`) or that became the current
-//!   runtime between the cached scan and the delete is left alone.
+//!   re-read authoritatively (cache-bypassing GET) — same UID, still a pod
+//!   this loop scans (a restore pod, or a terminal pod outside the warm pool
+//!   with `terminal_pods` on), same sandbox id and generation, and not
+//!   terminating — and the owning row is re-classified from Postgres — so a
+//!   pod the row re-claimed (a same-generation re-drive → `restoring`) or
+//!   that became the current runtime between the cached scan and the delete
+//!   is left alone.
 //! - **UID + resourceVersion preconditions.** The delete carries both, so
 //!   neither a same-name pod from a newer generation nor a same-UID pod that
 //!   bound to a node between the verify GET and the delete is collaterally
@@ -244,7 +272,7 @@ pub(crate) use backend::{BackendError, DeleteOutcome, PodBackend, SandboxStore};
 #[cfg(test)]
 pub(crate) use classify::{
     Disposition, OrphanReason, RestorePodSnapshot, RowLifecycle, SandboxRestoreState, SkipClass,
-    classify_disposition,
+    classify_disposition, classify_pod, classify_terminal_pod,
 };
 #[cfg(test)]
 pub(crate) use reconciler::{Clock, Reconciler};

@@ -1,9 +1,9 @@
 //! Dependency-injection seams so the reconciler core is testable without a
 //! live cluster or Postgres:
 //!
-//! - [`PodBackend`] — enumerate restore pods from the reflector cache, re-read
-//!   one authoritatively, and delete one with a UID + resourceVersion
-//!   precondition. Live impl: [`KubernetesPodBackend`].
+//! - [`PodBackend`] — enumerate restore and terminal pods from the reflector
+//!   cache, re-read one authoritatively, and delete one with a UID +
+//!   resourceVersion precondition. Live impl: [`KubernetesPodBackend`].
 //! - [`SandboxStore`] — classify the owning `sandboxes` rows for a batch of
 //!   sandbox ids, each with its pods' lowest generation. Live impl:
 //!   [`super::store::SandboxDbStore`].
@@ -49,8 +49,11 @@ pub trait PodBackend: Send + Sync {
     /// list. The loop skips ticks until then so it never acts on a cold cache.
     fn caches_ready(&self) -> bool;
 
-    /// Snapshot every *restore* pod currently in the reflector cache
-    /// (fresh-create pods carry no restore annotation and are excluded).
+    /// Snapshot every *restore* pod and every *terminal* (`Succeeded` or
+    /// `Failed`) pod currently in the reflector cache. A running or pending
+    /// fresh-create pod carries no restore annotation and is excluded; the
+    /// reconciler decides which of the listed pods it classifies (see
+    /// [`RestorePodSnapshot::is_scanned`]).
     fn list_restore_pods(
         &self,
     ) -> impl std::future::Future<Output = Vec<RestorePodSnapshot>> + Send;
@@ -113,11 +116,12 @@ impl PodBackend for KubernetesPodBackend {
             .state()
             .iter()
             // Gate the (allocating) snapshot build on the cheap annotation
-            // check so the per-tick cost scales with the restore-pod subset,
-            // not every sandbox pod in the cache. A restored sandbox's pod
-            // keeps the annotation after the restore completes, so the
-            // sandbox-row disposition, not this filter, decides orphanhood.
-            .filter(|pod| pod.has_restore_annotation())
+            // and phase checks so the per-tick cost scales with the restore
+            // and terminal subset, not every sandbox pod in the cache. A
+            // restored sandbox's pod keeps the annotation after the restore
+            // completes, so the sandbox-row disposition, not this filter,
+            // decides orphanhood.
+            .filter(|pod| pod.has_restore_annotation() || pod.is_terminal())
             .map(|pod| RestorePodSnapshot::from_pod(pod))
             .collect()
     }
