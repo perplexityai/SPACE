@@ -37,6 +37,25 @@ async fn block_volume_grants_authenticate_origin_and_fence_progress_but_keep_del
     .bind(attempt)
     .execute(&pool)
     .await?;
+    let execution = BlockVolumeExecution {
+        node_id: node.to_string(),
+        sandbox_id: sandbox.to_string(),
+        execution_generation: 1,
+        activation_attempt_id: attempt.to_string(),
+    };
+    let resolve = ResolveBlockVolumeBindingRequest {
+        execution: Some(execution.clone()),
+    };
+    assert!(
+        fixture
+            .service
+            .resolve_block_volume_binding(node_request(resolve.clone()))
+            .await?
+            .into_inner()
+            .binding
+            .is_none(),
+        "diskless executions do not require an experiment host grant"
+    );
     let mut env = TestEnv::default();
     env.set(
         "SPACE_EBS_NODE_BINDINGS",
@@ -45,7 +64,7 @@ async fn block_volume_grants_authenticate_origin_and_fence_progress_but_keep_del
         })
         .to_string(),
     );
-    fixture.service.block_volume_hosts = crate::block_volumes::Hosts::from_environment(&env)?;
+    let hosts = crate::block_volumes::Hosts::from_environment(&env)?;
     let mount: BlockVolumeMount = serde_json::from_value(serde_json::json!({
         "type":"ebs", "size_gib":128, "permissions":"read_write", "mount":"/data"
     }))?;
@@ -65,15 +84,17 @@ async fn block_volume_grants_authenticate_origin_and_fence_progress_but_keep_del
     tx.commit().await?;
     let row = volumes::get(&pool, sandbox).await?.unwrap();
     assert!(volumes::observe(&pool, &row, VolumePhase::Available, Some(CLOUD_DISK), None).await?);
-    let execution = BlockVolumeExecution {
-        node_id: node.to_string(),
-        sandbox_id: sandbox.to_string(),
-        execution_generation: 1,
-        activation_attempt_id: attempt.to_string(),
-    };
-    let resolve = ResolveBlockVolumeBindingRequest {
-        execution: Some(execution.clone()),
-    };
+    assert_eq!(
+        fixture
+            .service
+            .resolve_block_volume_binding(node_request(resolve.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied,
+        "a retained disk still requires an experiment host grant"
+    );
+    fixture.service.block_volume_hosts = hosts;
     assert_eq!(
         fixture
             .service

@@ -38,6 +38,12 @@ struct Host {
 pub(crate) struct Hosts(BTreeMap<NodeId, Host>);
 
 impl Hosts {
+    fn require(&self, node: NodeId) -> Result<&Host, Status> {
+        self.0.get(&node).ok_or_else(|| {
+            Status::permission_denied("node has no administrator-verified block-volume identity")
+        })
+    }
+
     pub(crate) fn from_environment(
         env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Self, Status> {
@@ -147,11 +153,7 @@ impl ClusterApiService {
             Some(NodeRole::Worker),
         )
         .await?;
-        if !self.block_volume_hosts.0.contains_key(&execution.node) {
-            return Err(Status::permission_denied(
-                "node has no administrator-verified block-volume identity",
-            ));
-        }
+        self.block_volume_hosts.require(execution.node)?;
         Ok(())
     }
 
@@ -208,8 +210,15 @@ impl ClusterApiService {
     ) -> Result<Response<ResolveBlockVolumeBindingResponse>, Status> {
         let wire = request.get_ref().execution.as_ref().ok_or_else(refused)?;
         let execution = Execution::parse(wire)?;
-        self.authenticate_block_execution(&request, &execution)
-            .await?;
+        // Every worker resolves this dependency, including workers outside the
+        // disk experiment. Authenticate its current execution before revealing
+        // absence; require an EBS host grant only when a disk actually exists.
+        self.authenticated_origin_node_id(
+            &request,
+            &execution.node.to_string(),
+            Some(NodeRole::Worker),
+        )
+        .await?;
         let mut tx = self.lock_current_block_execution(&execution).await?;
         let Some(mut row) = store::get(&mut *tx, execution.sandbox)
             .await
@@ -220,15 +229,11 @@ impl ClusterApiService {
                 binding: None,
             }));
         };
+        let host = self.block_volume_hosts.require(execution.node)?;
         if row.delete_requested {
             return Err(refused());
         }
         if row.phase == VolumePhase::Available {
-            let host = self
-                .block_volume_hosts
-                .0
-                .get(&execution.node)
-                .ok_or_else(refused)?;
             store::reserve_attachment(
                 &mut tx,
                 execution.sandbox,
