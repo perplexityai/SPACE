@@ -3348,6 +3348,7 @@ async fn restart_spaced_host(
             uid,
             gid: uid,
             env: crate::sidecar_env::telemetry_env_for_service("space-spaced-host"),
+            replace_gateway_pid: None,
         })
         .await
         .map_err(SpacedHostRestartError::Launch)?;
@@ -3499,6 +3500,7 @@ async fn relaunch_netgtw(
             uid: process_uid,
             gid: process_uid,
             env: crate::sidecar_env::net_gateway_env(),
+            replace_gateway_pid: None,
         })
         .await
         .map_err(NetGatewayRelaunchError::Launch)?;

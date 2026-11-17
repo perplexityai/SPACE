@@ -1550,7 +1550,10 @@ impl DeadGatewayFixture {
             .unary(
                 "Launch",
                 move |_: pplx_space_node_mgr_client::proto::LaunchRequest| {
-                    launch().map(|pid| pplx_space_node_mgr_client::proto::LaunchResponse { pid })
+                    launch().map(|pid| pplx_space_node_mgr_client::proto::LaunchResponse {
+                        pid,
+                        inherited_gateway_sockets: 0,
+                    })
                 },
             )
             .serve();

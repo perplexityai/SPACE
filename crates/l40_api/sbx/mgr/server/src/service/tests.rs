@@ -4922,7 +4922,10 @@ pub(crate) mod service_tests {
         let (gateway_arm_done_tx, gateway_arm_done_rx) = tokio::sync::oneshot::channel();
         let netgtw_arm = async {
             let result = register_net_gateway_launch(&db, &sandbox_id, sbx_uid, async {
-                Ok(pplx_space_node_mgr_client::proto::LaunchResponse { pid: netgtw_pid })
+                Ok(pplx_space_node_mgr_client::proto::LaunchResponse {
+                    pid: netgtw_pid,
+                    inherited_gateway_sockets: 0,
+                })
             })
             .await;
             gateway_arm_done_tx
