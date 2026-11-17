@@ -980,6 +980,7 @@ async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() 
             action: SandboxLifecycleAction::Start,
             rollback: None,
             wake_activity: None,
+            queued_execution_generation: None,
         }
         .into_json(),
         attempts: 1,
@@ -1358,6 +1359,7 @@ async fn a_system_wake_operation_runs_only_while_the_policy_allows_its_activity(
         action: SandboxLifecycleAction::Wake,
         rollback: None,
         wake_activity: recorded,
+        queued_execution_generation: None,
     }
     .into_json();
     let case = format!("{actor:?} {wake_on:?} {recorded:?}");

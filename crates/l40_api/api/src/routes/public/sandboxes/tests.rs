@@ -857,6 +857,7 @@ async fn delete_replay_survives_target_removal_without_crossing_tenant_or_reques
                 action,
                 rollback: None,
                 wake_activity: None,
+                queued_execution_generation: None,
             }
             .into_json(),
             idempotency: Some(CreatePublicOperationIdempotency {

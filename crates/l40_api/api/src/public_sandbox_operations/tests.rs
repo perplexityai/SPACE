@@ -1031,6 +1031,7 @@ fn wake_payload_without_an_activity_is_wire_compatible_with_old_shape() {
             action: SandboxLifecycleAction::Wake,
             rollback: None,
             wake_activity,
+            queued_execution_generation: None,
         }
         .into_json()
     };
@@ -1058,6 +1059,168 @@ fn wake_payload_without_an_activity_is_wire_compatible_with_old_shape() {
         assert_eq!(parsed.wake_activity, Some(activity));
         assert!(serde_json::from_value::<PreActivityLifecycleOperationPayload>(recorded).is_err());
     }
+}
+
+#[test]
+fn suspend_payload_without_a_generation_is_wire_compatible_with_old_shape() {
+    let payload = |queued_execution_generation| {
+        SandboxLifecycleOperationPayload {
+            sandbox_id: PublicSandboxId::new(),
+            action: SandboxLifecycleAction::Suspend,
+            rollback: None,
+            wake_activity: None,
+            queued_execution_generation,
+        }
+        .into_json()
+    };
+
+    // With the fence off, an older executor parses the suspend.
+    let unfenced = payload(None);
+    assert_eq!(
+        unfenced.as_object().map(|object| object.len()),
+        Some(2),
+        "{unfenced}"
+    );
+    serde_json::from_value::<PreActivityLifecycleOperationPayload>(unfenced).unwrap();
+
+    // An older API's suspend parses here, fenced on nothing.
+    let old = serde_json::json!({ "sandbox_id": PublicSandboxId::new(), "action": "suspend" });
+    let parsed: SandboxLifecycleOperationPayload = serde_json::from_value(old).unwrap();
+    assert_eq!(parsed.queued_execution_generation, None);
+
+    // A recorded generation is a key an older executor rejects, so it waits
+    // for every executor to read it (`SUSPEND_EXECUTION_FENCE_ENV`).
+    let generation = ExecutionGeneration::new(7).unwrap();
+    let fenced = payload(Some(generation));
+    assert_eq!(fenced["queued_execution_generation"], 7, "{fenced}");
+    let parsed: SandboxLifecycleOperationPayload = serde_json::from_value(fenced.clone()).unwrap();
+    assert_eq!(parsed.queued_execution_generation, Some(generation));
+    assert!(serde_json::from_value::<PreActivityLifecycleOperationPayload>(fenced).is_err());
+}
+
+/// On Direct, whose suspend RPC carries no generation, the executor's check
+/// is the only fence. A sandbox's route identity is at route generation 5 and
+/// execution generation 2, and its worker would suspend it on request. A
+/// suspend queued for execution generation 1 ends `canceled` and the worker
+/// is never asked: its record and the row stay running. One queued for
+/// generation 2 suspends the sandbox through that worker.
+#[tokio::test]
+async fn direct_suspend_of_a_replaced_execution_never_reaches_the_worker() -> TestResult {
+    use pplx_space_common_core::types::NodeManagedBy;
+    use pplx_space_node_api_sim::{SandboxRecord, SimWorkerHarness};
+
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let node_id = NodeId::new();
+    let worker = SimWorkerHarness::builder(node_id.to_string())
+        .with_internal_api()
+        .start()
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '127.0.0.1', 'worker', 'space', 'ready')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_direct (node_id, node_api_endpoint) VALUES ($1, $2)"
+    ))
+    .bind(node_id)
+    .bind(worker.endpoint())
+    .execute(&db.pool)
+    .await?;
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             active_node_id, network_policy_generation
+         )
+         VALUES ($1, $2, $3, 'space', 'started', 'on_node', $4, 1)"
+    ))
+    .bind(sandbox_id)
+    .bind(user_id)
+    .bind(org_id)
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_direct_route_identities
+             (sandbox_id, route_generation, current_node_id, substrate_kind,
+              execution_generation, activation_attempt_id)
+         VALUES ($1, 5, $2, 'space', 2, $3)"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    let mut record = SandboxRecord::new_creating(
+        sandbox_id.to_string(),
+        "seed".to_owned(),
+        "fc".to_owned(),
+        "root".to_owned(),
+        Some("hash-seed".to_owned()),
+        false,
+    )
+    .with_route_identity_provenance(5, 2, Some(NodeManagedBy::Space));
+    record.status = "running".to_owned();
+    worker.state().insert_new(record).await?;
+
+    let executor = SandboxLifecycleOperationExecutor::new(
+        db.pool.clone(),
+        direct_sandbox_controller(&db.pool),
+    );
+    let suspend = |generation| -> TestResult<ClaimedPublicOperation> {
+        Ok(ClaimedPublicOperation {
+            kind: OperationKind::SuspendSandbox,
+            payload: serde_json::to_value(SandboxLifecycleOperationPayload {
+                sandbox_id: PublicSandboxId::from(sandbox_id),
+                action: SandboxLifecycleAction::Suspend,
+                rollback: None,
+                wake_activity: None,
+                queued_execution_generation: Some(ExecutionGeneration::new(generation)?),
+            })?,
+            ..claimed_delete_operation(sandbox_id, org_id, Some(user_id), ApiProduct::Native)
+        })
+    };
+    let lifecycle = || {
+        sqlx::query_scalar::<_, String>(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+    };
+
+    let superseded = executor.execute(&suspend(1)?).await;
+    assert_eq!(superseded.state, OperationState::Canceled, "{superseded:?}");
+    let error = superseded
+        .terminal_error_json
+        .ok_or("a superseded suspend records why")?;
+    assert_eq!(
+        error["reason"], SUSPEND_SUPERSEDED_BY_NEWER_EXECUTION_REASON,
+        "{error}"
+    );
+    assert_eq!(error["queued_execution_generation"], 1, "{error}");
+    assert_eq!(error["current_execution_generation"], 2, "{error}");
+    assert_eq!(
+        worker.state().get(&sandbox_id.to_string()).await?.status,
+        "running",
+        "the worker was never asked to suspend"
+    );
+    assert_eq!(lifecycle().await?, "started");
+
+    let current = executor.execute(&suspend(2)?).await;
+    assert_eq!(current.state, OperationState::Succeeded, "{current:?}");
+    assert_eq!(
+        worker.state().get(&sandbox_id.to_string()).await?.status,
+        "suspended",
+        "the worker suspends a sandbox it is asked to"
+    );
+    assert_eq!(lifecycle().await?, "suspended");
+    Ok(())
 }
 
 #[test]
@@ -1468,6 +1631,7 @@ fn claimed_delete_operation(
             action: SandboxLifecycleAction::Delete,
             rollback: None,
             wake_activity: None,
+            queued_execution_generation: None,
         })
         .expect("delete payload serializes"),
         attempts: 1,
@@ -1512,6 +1676,7 @@ async fn pause_of_a_sandbox_without_a_runtime_fails_as_a_conflict() -> TestResul
                 action: SandboxLifecycleAction::Pause,
                 rollback: None,
                 wake_activity: None,
+                queued_execution_generation: None,
             })?,
             ..claimed_delete_operation(sandbox_id, org_id, Some(user_id), ApiProduct::Native)
         };
@@ -1567,6 +1732,7 @@ async fn pause_of_a_sandbox_without_a_runtime_fails_as_a_conflict() -> TestResul
             action: SandboxLifecycleAction::Pause,
             rollback: None,
             wake_activity: None,
+            queued_execution_generation: None,
         })?,
         ..claimed_delete_operation(sandbox_id, org_id, Some(user_id), ApiProduct::Native)
     };

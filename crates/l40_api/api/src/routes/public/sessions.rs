@@ -379,6 +379,7 @@ async fn enqueue_implicit_wake(
         action: SandboxLifecycleAction::Wake,
         rollback: None,
         wake_activity: record_activity.then_some(activity.into()),
+        queued_execution_generation: None,
     }
     .into_json();
     let store = PublicOperationStore::new(pool.clone());

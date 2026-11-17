@@ -874,6 +874,7 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
     async fn suspend_execution(
         &self,
         _sandbox_id: SandboxId,
+        _fence: Option<pplx_space_common_core::types::ExecutionGeneration>,
     ) -> Result<Option<crate::controllers::substrate::PublishedLocalArtifact>, SubstrateError> {
         panic!("unused")
     }
@@ -1218,6 +1219,7 @@ impl SubstrateAdapter for NodeRpcStubbedKubernetes {
     async fn suspend_execution(
         &self,
         _sandbox_id: SandboxId,
+        _fence: Option<pplx_space_common_core::types::ExecutionGeneration>,
     ) -> Result<Option<crate::controllers::substrate::PublishedLocalArtifact>, SubstrateError> {
         panic!("unused")
     }

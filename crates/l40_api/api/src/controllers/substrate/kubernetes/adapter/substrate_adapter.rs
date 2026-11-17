@@ -1298,21 +1298,38 @@ impl SubstrateAdapter for KubernetesSubstrate {
     async fn suspend_execution(
         &self,
         sandbox_id: SandboxId,
+        fence: Option<ExecutionGeneration>,
     ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
         let suspend_deadline = Instant::now() + self.budgets.suspend_durability;
+        let execution = self.store.active_execution_status(sandbox_id).await;
+        // A fenced suspend of a replaced execution is refused before anything
+        // is requested, so it is not reported as a requested suspend. The
+        // claim below binds `expected_generation`, so checking it against the
+        // fence here makes the claim conditional on the fence, as far as the
+        // claim's own check holds: it reads the active execution in its
+        // statement, not under the sandbox row lock.
+        if let Some(fenced) = fence
+            && let Ok(Some(execution)) = &execution
+            && execution.generation != fenced.get()
+        {
+            return Err(SubstrateError::ExecutionReplaced {
+                fenced,
+                current: ExecutionGeneration::new(execution.generation).map_err(|error| {
+                    SubstrateError::Failed {
+                        message: format!("invalid active Kubernetes execution generation: {error}"),
+                    }
+                })?,
+            });
+        }
         SandboxEvent::new(
             sandbox_id,
             SandboxEventType::SuspendRequested,
             SandboxEventSource::Substrate,
         )
         .emit_with(SandboxEventDetails::default());
-        let execution = self
-            .store
-            .active_execution_status(sandbox_id)
-            .await?
-            .ok_or_else(|| SubstrateError::SandboxNoPod {
-                message: "sandbox is not assigned to a pod".to_string(),
-            })?;
+        let execution = execution?.ok_or_else(|| SubstrateError::SandboxNoPod {
+            message: "sandbox is not assigned to a pod".to_string(),
+        })?;
         let expected_generation =
             ExecutionGeneration::new(execution.generation).map_err(|error| {
                 SubstrateError::Failed {

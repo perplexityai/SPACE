@@ -271,6 +271,7 @@ mod delete {
             action: PublicSandboxLifecycleAction::Delete,
             rollback: None,
             wake_activity: None,
+            queued_execution_generation: None,
         }
         .into_json();
         match store
@@ -368,6 +369,7 @@ mod delete {
             action: PublicSandboxLifecycleAction::Delete,
             rollback: None,
             wake_activity: None,
+            queued_execution_generation: None,
         }
         .into_json();
         let native = match store

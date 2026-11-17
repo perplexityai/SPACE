@@ -185,14 +185,22 @@ async fn each_exit_of_an_execution_returns_how_it_ended() -> TestDbResult<()> {
                     .create_operation(operation_input(OperationKind::DeleteSandbox, sandbox))
                     .await?;
                 let ended = run(&store, claim, config, executed(OperationState::Queued));
-                vec![(
-                    "superseded by a delete",
-                    ended.await?,
-                    TickReport {
-                        canceled: 1,
-                        ..TickReport::default()
-                    },
-                )]
+                let canceled = TickReport {
+                    canceled: 1,
+                    ..TickReport::default()
+                };
+                // An executor that found its operation superseded, as a
+                // suspend whose execution another replaced, ends it itself.
+                let claim = claimed(&store, OperationKind::SuspendSandbox, "sbx_woken").await?;
+                let superseded = run(&store, claim, config, executed(OperationState::Canceled));
+                vec![
+                    ("superseded by a delete", ended.await?, canceled.clone()),
+                    (
+                        "superseded by a newer execution",
+                        superseded.await?,
+                        canceled,
+                    ),
+                ]
             }
             ExecutionOutcome::Lost => {
                 let mut exits = Vec::new();
@@ -202,6 +210,7 @@ async fn each_exit_of_an_execution_returns_how_it_ended() -> TestDbResult<()> {
                     OperationState::Succeeded,
                     OperationState::Failed,
                     OperationState::Queued,
+                    OperationState::Canceled,
                 ] {
                     let (_, operation) =
                         claimed(&store, wake, &format!("sbx_lost_{state}")).await?;

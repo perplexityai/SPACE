@@ -7,7 +7,7 @@ use crate::metrics::sandbox::api::{SandboxApiMetricIdentity, scope_request_clien
 use axum::http::StatusCode;
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    NodePoolName, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
+    ExecutionGeneration, NodePoolName, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -180,6 +180,25 @@ pub struct SandboxLifecycleOperationPayload {
     /// must run this release before any producer sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_activity: Option<ImplicitWakeActivity>,
+    /// The execution generation the sandbox ran when this suspend was
+    /// queued: the execution the suspend is for. An attempt that finds
+    /// another generation active ends the operation `canceled` with
+    /// `terminal_error.reason` `superseded_by_newer_execution`, whatever
+    /// replaced it (see [`replacing_generation`]). The Kubernetes suspend
+    /// claim is conditional on the fence too. Only a
+    /// suspend queued while [`SUSPEND_EXECUTION_FENCE_ENV`] is on, with its
+    /// sandbox `started` or `paused` and nothing ahead of it in the sandbox's
+    /// queue, carries one (see
+    /// [`crate::public_operations::PublicOperationAdmission::fenced_execution_generation`]).
+    ///
+    /// Same mixed-version rule as `wake_activity`: an absent key serializes
+    /// byte-identically to the payload older producers emit, and a suspend
+    /// without it, such as one an older API queued, runs as an older
+    /// executor runs every suspend. A present key is rejected by an older
+    /// executor's `deny_unknown_fields`, so every `space-cluster-controller`
+    /// replica must run this release before any producer sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_execution_generation: Option<ExecutionGeneration>,
 }
 
 /// A session's activity, as the wake policy names it, recorded on the
@@ -223,6 +242,95 @@ pub(crate) const IMPLICIT_WAKE_ACTIVITY_ENV: &str = "SPACE_IMPLICIT_WAKE_ACTIVIT
 pub(crate) fn implicit_wake_activity_enabled() -> bool {
     pplx_space_env_vars::env_flag_var(IMPLICIT_WAKE_ACTIVITY_ENV, false)
 }
+
+/// The switch for recording
+/// [`SandboxLifecycleOperationPayload::queued_execution_generation`] on the
+/// native suspends the API queues: `1`, `true`, `yes`, `on` or `enabled`, in
+/// any case, turns it on; unset or anything else keeps it off. Off, every
+/// suspend goes in without it and an attempt acts on whatever execution is
+/// active when it runs, as before the field. On, a suspend whose attempt
+/// finds that another execution replaced the one it was queued for ends
+/// `canceled` instead of suspending the newer one. Only the cluster
+/// controller executes suspends, so
+/// turn it on only once every `space-cluster-controller` replica runs a
+/// release that reads the field. Before rolling one back, turn it off and
+/// let the suspends queued with it drain (`docs/configuration.md` gives the
+/// check). An API replica reads the setting from its environment, so one
+/// started with it on keeps sending the field until it exits.
+pub(crate) const SUSPEND_EXECUTION_FENCE_ENV: &str = "SPACE_SUSPEND_EXECUTION_FENCE_ENABLED";
+
+/// Whether the API records the execution generation on the suspends it
+/// queues; see [`SUSPEND_EXECUTION_FENCE_ENV`].
+pub(crate) fn suspend_execution_fence_enabled() -> bool {
+    pplx_space_env_vars::env_flag_var(SUSPEND_EXECUTION_FENCE_ENV, false)
+}
+
+/// The generation `sandbox` runs now, if it is not `queued`, the one a
+/// suspend was queued for. `None` while `queued` is still active, and while
+/// no generation is: a sandbox between activations proves nothing replaced
+/// the suspend's, so the attempt goes on as before and the substrate decides.
+///
+/// The executor runs this after the "already in the target state"
+/// short-circuit, so a suspend whose sandbox is already `suspended`
+/// completes. Any other generation ends the operation `canceled` with
+/// `terminal_error.reason` `superseded_by_newer_execution`, whatever
+/// replaced the queued one: a wake or restore of a suspended sandbox, a
+/// start that rebuilt the execution, a Kubernetes recovery that rebuilt a
+/// lost pod, or a drain's suspend and restore. A resume of a paused sandbox
+/// keeps its generation on both substrates, and a Kubernetes start of a
+/// stopped sandbox can keep it, so a suspend queued before either can still
+/// apply afterwards. On Kubernetes the suspend claim binds the generation
+/// too, and the substrate's `ExecutionReplaced` refusal ends the operation
+/// the same way. On Direct, whose node call carries no generation, this
+/// check before the call is the only one.
+fn replacing_generation(
+    queued: ExecutionGeneration,
+    sandbox: &crate::models::Sandbox,
+) -> Option<ExecutionGeneration> {
+    let current = ExecutionGeneration::new(sandbox.active_execution_generation?).ok()?;
+    (current != queued).then_some(current)
+}
+
+/// The terminal record of a suspend whose execution another replaced: ended
+/// `canceled`, as a create a later delete supersedes is, with the reason and
+/// both generations, without suspending the sandbox.
+fn superseded_suspend(
+    operation: &ClaimedPublicOperation,
+    sandbox_id: SandboxId,
+    queued: ExecutionGeneration,
+    current: ExecutionGeneration,
+) -> PublicOperationExecutionResult {
+    tracing::info!(
+        operation_id = %operation.id,
+        %sandbox_id,
+        queued_execution_generation = %queued,
+        current_execution_generation = %current,
+        "suspend's execution was replaced; not suspending the sandbox"
+    );
+    PublicOperationExecutionResult {
+        state: OperationState::Canceled,
+        progress_message: format!(
+            "Execution generation {queued}, which this suspend was requested for, is no \
+             longer active; generation {current} now runs, and this suspend is not applied to \
+             it. Request a new suspend to suspend the sandbox as it runs now."
+        ),
+        result_json: None,
+        terminal_error_code: Some(PublicErrorCode::OperationFailed),
+        terminal_error_json: Some(serde_json::json!({
+            "operation_id": operation.id.to_string(),
+            "kind": operation.kind.as_str(),
+            "reason": SUSPEND_SUPERSEDED_BY_NEWER_EXECUTION_REASON,
+            "queued_execution_generation": queued.get(),
+            "current_execution_generation": current.get(),
+        })),
+        retry_after: None,
+        requeue_reason: PublicOperationRequeueReason::TransientFailure,
+    }
+}
+
+/// `terminal_error.reason` of a suspend whose execution another replaced.
+pub(crate) const SUSPEND_SUPERSEDED_BY_NEWER_EXECUTION_REASON: &str =
+    "superseded_by_newer_execution";
 
 /// The switch for recording
 /// [`CreateSandboxOperationPayload::requested_by_user_id`] on admin creates,
@@ -850,6 +958,17 @@ impl SandboxLifecycleOperationExecutor {
                 "sandbox lifecycle action already completed",
             ));
         }
+        // A suspend acts only on the execution it was queued for. One
+        // another execution replaced ends here, before anything touches the
+        // sandbox; a suspend already `suspended` completed above.
+        let fenced_generation = payload
+            .queued_execution_generation
+            .filter(|_| payload.action == SandboxLifecycleAction::Suspend);
+        if let Some(queued) = fenced_generation
+            && let Some(current) = replacing_generation(queued, sandbox)
+        {
+            return Ok(superseded_suspend(operation, sandbox.id, queued, current));
+        }
         if payload.action == SandboxLifecycleAction::Pause
             && pause_cannot_succeed(sandbox.lifecycle.parse()?)
         {
@@ -909,9 +1028,9 @@ impl SandboxLifecycleOperationExecutor {
                 crate::controllers::substrate::ActivationClient::Native,
             )
         };
-        let body = self
+        let acted = self
             .controller
-            .action(
+            .action_on_execution(
                 &self.pool,
                 sandbox_uuid.into(),
                 Some(sandbox),
@@ -919,8 +1038,28 @@ impl SandboxLifecycleOperationExecutor {
                 controller_action,
                 None,
                 activating_client,
+                fenced_generation,
             )
-            .await?;
+            .await;
+        let body = match acted {
+            Ok(body) => body,
+            Err(error) => {
+                // The Kubernetes substrate refuses to suspend an execution
+                // other than the fenced one, so one that replaced it after
+                // the check above surfaces as this refusal, naming it.
+                let (Some(queued), Some(replaced)) =
+                    (fenced_generation, error.execution_replaced_details())
+                else {
+                    return Err(error.into());
+                };
+                return Ok(superseded_suspend(
+                    operation,
+                    sandbox.id,
+                    queued,
+                    replaced.current(),
+                ));
+            }
+        };
         let updated = fetch_sandbox(&self.pool, sandbox_uuid.into()).await?;
         let state = updated
             .as_ref()

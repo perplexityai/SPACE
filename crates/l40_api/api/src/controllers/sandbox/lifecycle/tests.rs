@@ -295,8 +295,8 @@ async fn finalize_sandbox_db_delete_removes_live_sandbox() -> TestResult {
 /// current thread, keyed by `event_type`, so a test can assert which
 /// lifecycle events a controller call did (or did not) emit.
 #[derive(Clone, Default)]
-struct SandboxEventCapture {
-    types: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+pub(super) struct SandboxEventCapture {
+    pub(super) types: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl<S> tracing_subscriber::Layer<S> for SandboxEventCapture

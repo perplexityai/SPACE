@@ -1698,6 +1698,227 @@ async fn complete_claimed_operation_terminalizes_and_unclaims() -> TestResult {
     Ok(())
 }
 
+/// An operation an executor found superseded ends `canceled`, with its
+/// error and an `operation.canceled` event, as a superseded create does, and
+/// only under the claim that ran it.
+#[tokio::test]
+async fn cancel_claimed_operation_terminalizes_as_canceled() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let operation_id = create_test_operation(&store, org_id, OperationKind::SuspendSandbox)
+        .await?
+        .expect_created();
+    let claim = store
+        .claim_operations(ClaimPublicOperations {
+            limits: ClaimLimits::any(1),
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::SuspendSandbox],
+        })
+        .await?;
+    let cancel = |claim_token: String| CancelClaimedPublicOperation {
+        claim_token,
+        operation_id,
+        progress_message: "superseded".to_string(),
+        terminal_error_code: PublicErrorCode::OperationFailed,
+        terminal_error_json: serde_json::json!({ "reason": "superseded_by_newer_execution" }),
+    };
+
+    assert!(
+        !store
+            .cancel_claimed_operation(cancel("another-claim".to_string()))
+            .await?,
+        "a lost claim cancels nothing"
+    );
+    assert!(
+        store
+            .cancel_claimed_operation(cancel(claim.claim_token))
+            .await?
+    );
+
+    let (state, code, error, claim_token): (String, Option<String>, serde_json::Value, String) =
+        sqlx::query_as(sql!(
+            "SELECT state, terminal_error_code, terminal_error_json, claim_token
+               FROM public_operations WHERE operation_id = $1"
+        ))
+        .bind(operation_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        (state.as_str(), code.as_deref(), claim_token.as_str()),
+        ("canceled", Some("operation_failed"), "")
+    );
+    assert_eq!(error["reason"], "superseded_by_newer_execution");
+    let events = store
+        .fetch_operation_events(org_id, operation_id, None, 10)
+        .await?
+        .ok_or("the operation exists")?;
+    let last = events.last().ok_or("the cancel recorded an event")?;
+    assert_eq!(last.event_type, PublicOperationEventType::Canceled);
+    assert_eq!(last.event["state"], "canceled");
+    Ok(())
+}
+
+/// A suspend queued on an idle `started` or `paused` sandbox records its
+/// active generation, from the Kubernetes execution or the Direct route
+/// identity. One queued behind other work for the sandbox, or while the
+/// sandbox is in another lifecycle or has no active generation, records
+/// none. Taking the queue lock first leaves the admission free to insert.
+#[tokio::test]
+async fn a_suspend_records_the_generation_only_of_an_idle_active_sandbox() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(Uuid::from_u128(1));
+    let store = PublicOperationStore::new(db.pool.clone());
+    let seed = |lifecycle: &'static str, k8s: Option<(i64, bool)>, direct: Option<i64>| {
+        let pool = db.pool.clone();
+        async move {
+            let sandbox_id = SandboxId::new();
+            sqlx::query(sql!(
+                "INSERT INTO sandboxes (
+                     id, user_id, org_id, managed_by, lifecycle, placement,
+                     network_policy_generation
+                 )
+                 VALUES (
+                     $1, '00000000-0000-0000-0000-000000000010',
+                     '00000000-0000-0000-0000-000000000001', $3, $2, 'unplaced', 1
+                 )"
+            ))
+            .bind(sandbox_id)
+            .bind(lifecycle)
+            .bind(if direct.is_some() { "space" } else { "k8s" })
+            .execute(&pool)
+            .await?;
+            if let Some((generation, active)) = k8s {
+                sqlx::query(sql!(
+                    "INSERT INTO sandbox_k8s_executions
+                         (sandbox_id, generation, pod_name, pod_namespace, state, active)
+                     VALUES ($1, $2, $3, 'space', 'running', $4)"
+                ))
+                .bind(sandbox_id)
+                .bind(generation)
+                .bind(format!(
+                    "space-sbx-{}-g{generation}",
+                    sandbox_id.as_uuid().simple()
+                ))
+                .bind(active)
+                .execute(&pool)
+                .await?;
+            }
+            if let Some(generation) = direct {
+                // The route generation differs from the execution generation,
+                // which is the one the fence records.
+                sqlx::query(sql!(
+                    "INSERT INTO sandbox_direct_route_identities
+                         (sandbox_id, route_generation, current_node_id, substrate_kind,
+                          execution_generation, activation_attempt_id)
+                     VALUES ($1, $2 + 4, $3, 'space', $2, $4)"
+                ))
+                .bind(sandbox_id)
+                .bind(generation)
+                .bind(pplx_space_accounts::NodeId::new())
+                .bind(Uuid::now_v7())
+                .execute(&pool)
+                .await?;
+            }
+            Ok::<_, sqlx::Error>(sandbox_id)
+        }
+    };
+    let fenced = |sandbox_id: SandboxId| {
+        let store = store.clone();
+        async move {
+            let key = IdempotencyKey::parse(format!("suspend-{sandbox_id}"))?;
+            let fingerprint = RequestFingerprint::parse("f".repeat(64))?;
+            let idempotency = CreatePublicOperationIdempotency {
+                method: HttpOperationMethod::Post,
+                path_template: OperationPathTemplate::new("/v1/sandboxes/{sandbox_id}:suspend"),
+                key: &key,
+                request_fingerprint: &fingerprint,
+            };
+            let target_id = PublicSandboxId::from(sandbox_id).to_string();
+            let mut admission = store
+                .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+                .await?;
+            let generation = admission
+                .fenced_execution_generation(
+                    org_id,
+                    PublicSandboxId::from(sandbox_id),
+                    pplx_space_sandbox_store::suspend::CLAIMABLE_LIFECYCLES,
+                )
+                .await?;
+            let created = admission
+                .create(CreatePublicOperation {
+                    org_id,
+                    actor_user_id: None,
+                    api_product: ApiProduct::Native,
+                    kind: OperationKind::SuspendSandbox,
+                    target_type: Some(OperationTargetType::Sandbox),
+                    target_id: Some(&target_id),
+                    payload_json: serde_json::json!({}),
+                    idempotency: Some(idempotency.clone()),
+                    traceparent: None,
+                })
+                .await?;
+            assert!(matches!(created, CreatePublicOperationResult::Created(_)));
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(generation.map(|g| g.get()))
+        }
+    };
+
+    for (case, lifecycle, k8s, direct, expected) in [
+        (
+            "started on Kubernetes",
+            "started",
+            Some((3, true)),
+            None,
+            Some(3),
+        ),
+        (
+            "paused on Kubernetes",
+            "paused",
+            Some((3, true)),
+            None,
+            Some(3),
+        ),
+        ("started on Direct", "started", None, Some(5), Some(5)),
+        (
+            "suspended, its execution retired",
+            "suspended",
+            Some((3, false)),
+            None,
+            None,
+        ),
+        ("restoring", "restoring", Some((4, true)), None, None),
+        ("stopped", "stopped", Some((3, true)), None, None),
+        (
+            "started with no active generation",
+            "started",
+            None,
+            None,
+            None,
+        ),
+    ] {
+        let sandbox_id = seed(lifecycle, k8s, direct).await?;
+        assert_eq!(fenced(sandbox_id).await?, expected, "{case}");
+    }
+
+    // Behind a wake still in the sandbox's queue, a suspend is for the woken
+    // sandbox, not for the generation that runs now.
+    let sandbox_id = seed("started", Some((3, true)), None).await?;
+    create_test_operation_for_target(
+        &store,
+        org_id,
+        OperationKind::WakeSandbox,
+        &PublicSandboxId::from(sandbox_id).to_string(),
+    )
+    .await?
+    .expect_created();
+    assert_eq!(fenced(sandbox_id).await?, None, "queued behind a wake");
+    Ok(())
+}
+
 #[tokio::test]
 async fn release_claimed_operation_requeues_with_backoff() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {

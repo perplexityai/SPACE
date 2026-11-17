@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::metrics::operations::ClaimAttempt;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_common_core::types::{ExecutionGeneration, SandboxId, SandboxLifecycle};
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     OperationId, OperationKind, OperationState, OperationTargetType, PublicErrorCode,
@@ -1053,7 +1053,36 @@ impl PublicOperationStore {
         &self,
         input: FailClaimedPublicOperation,
     ) -> Result<bool, PublicOperationStoreError> {
-        fail_claimed_operation(&self.pool, input).await
+        end_claimed_operation(&self.pool, input, ClaimedOperationEnd::Failed).await
+    }
+
+    /// Record a claimed operation `canceled` because something later
+    /// superseded it: the terminal write [`Self::fail_claimed_operation`]
+    /// makes, in the `canceled` state, with an `operation.canceled` event, as
+    /// a create a later delete supersedes is recorded.
+    pub async fn cancel_claimed_operation(
+        &self,
+        input: CancelClaimedPublicOperation,
+    ) -> Result<bool, PublicOperationStoreError> {
+        let CancelClaimedPublicOperation {
+            claim_token,
+            operation_id,
+            progress_message,
+            terminal_error_code,
+            terminal_error_json,
+        } = input;
+        end_claimed_operation(
+            &self.pool,
+            FailClaimedPublicOperation {
+                claim_token,
+                operation_id,
+                progress_message,
+                terminal_error_code,
+                terminal_error_json,
+            },
+            ClaimedOperationEnd::Canceled,
+        )
+        .await
     }
 
     /// Record an operation claimed for the first time as `expired` rather
@@ -1644,6 +1673,74 @@ impl PublicOperationAdmission {
         self.sandbox_belongs_to_org(row, org_id).await
     }
 
+    /// The execution generation a lifecycle operation about to be queued
+    /// for `sandbox_id` is for, to record on its payload: the sandbox's active
+    /// execution (Kubernetes) or route identity (Direct) generation, as
+    /// [`sandbox_store::auto_lifecycle_execution`] reads it and
+    /// [`crate::controllers::sandbox::fetch_sandbox`] reports it to the
+    /// executor.
+    ///
+    /// `None` unless the sandbox is in one of `lifecycles`, has an active
+    /// generation, and nothing in its queue is queued or running. An
+    /// operation queued behind others acts on the sandbox those leave it in,
+    /// not on what runs now: a suspend queued after a `:wake` the queue still
+    /// holds is for the woken sandbox, so recording today's generation would
+    /// make that wake look like it superseded the suspend.
+    ///
+    /// Takes the sandbox's queue lock first, as [`create_operation_tx`] does
+    /// just before its `INSERT` (the lock is re-entrant), so no operation for
+    /// the sandbox commits between this read and that insert. Only the
+    /// idempotency lock [`PublicOperationStore::begin_operation_admission`]
+    /// took comes before it, the same order an insert takes them in.
+    pub(crate) async fn fenced_execution_generation(
+        &mut self,
+        org_id: OrgId,
+        sandbox_id: pplx_space_public_api::PublicSandboxId,
+        lifecycles: &[SandboxLifecycle],
+    ) -> Result<Option<ExecutionGeneration>, PublicOperationStoreError> {
+        // The queue is keyed by the public id, as the operation's
+        // `target_id`; the sandbox row by the domain id.
+        let target_id = sandbox_id.to_string();
+        let target_id = target_id.as_str();
+        let sandbox_id = SandboxId::from(sandbox_id);
+        lock_sandbox_queue(&mut self.tx, org_id, target_id).await?;
+        let queued_ahead = sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM public_operations
+                  WHERE org_id = $1
+                    AND target_type = $2
+                    AND target_id = $3
+                    AND kind <> ALL($4)
+                    AND state IN ($5, $6)
+             )"
+        ))
+        .bind(org_id)
+        .bind(OperationTargetType::Sandbox.as_str())
+        .bind(target_id)
+        .bind(outside_sandbox_queue_labels())
+        .bind(OperationState::Queued.as_str())
+        .bind(OperationState::Running.as_str())
+        .fetch_one(&mut *self.tx)
+        .await?;
+        if queued_ahead {
+            return Ok(None);
+        }
+        let Some(execution) = sandbox_store::auto_lifecycle_execution(&mut *self.tx, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from)?
+        else {
+            return Ok(None);
+        };
+        let in_lifecycle = lifecycles
+            .iter()
+            .any(|lifecycle| lifecycle.as_str() == execution.lifecycle);
+        Ok(execution
+            .execution_generation
+            .filter(|_| in_lifecycle)
+            .and_then(|generation| ExecutionGeneration::new(generation).ok()))
+    }
+
     pub(crate) async fn lock_target_lifecycle(
         &mut self,
         target_id: SandboxId,
@@ -2144,6 +2241,18 @@ pub struct CompleteClaimedPublicOperation {
 
 #[derive(Debug, Clone)]
 pub struct FailClaimedPublicOperation {
+    pub claim_token: String,
+    pub operation_id: OperationId,
+    pub progress_message: String,
+    pub terminal_error_code: PublicErrorCode,
+    pub terminal_error_json: serde_json::Value,
+}
+
+/// The terminal record of a claimed operation something later superseded,
+/// for [`PublicOperationStore::cancel_claimed_operation`]: ended `canceled`
+/// with its reason in `terminal_error_json`.
+#[derive(Debug, Clone)]
+pub struct CancelClaimedPublicOperation {
     pub claim_token: String,
     pub operation_id: OperationId,
     pub progress_message: String,
@@ -2694,8 +2803,15 @@ fn sandbox_queue_target<'a>(input: &CreatePublicOperation<'a>) -> Option<&'a str
 /// Every insert into a sandbox's queue takes this lock last, just before its
 /// `INSERT`, so it waits for an earlier insert to commit and nothing checked
 /// earlier in the transaction (idempotency, quota, a joinable operation) is
-/// held up by it. Afterwards only row locks follow: a delete locks its
-/// sandbox's active creates to cancel them. Claims, renewals, releases and
+/// held up by it. The exception is a fenced suspend, which takes it earlier,
+/// in [`PublicOperationAdmission::fenced_execution_generation`], right after
+/// its idempotency key's lock, so that nothing is queued for the sandbox
+/// between reading what the fence records and the insert. What it does
+/// before the insert then (the sandbox reads, the idempotency record's lookup
+/// and expired-record delete) takes no lock another of the sandbox's inserts
+/// holds while it waits here: the idempotency record is that key's own, and
+/// every transaction locks its key before anything else. Afterwards only row
+/// locks follow: a delete locks its sandbox's active creates to cancel them. Claims, renewals, releases and
 /// completions take row locks and never this lock, so no transaction waits
 /// for it while holding a row an insert waits for.
 async fn lock_sandbox_queue(
@@ -3269,9 +3385,33 @@ async fn complete_claimed_operation(
     Ok(updated.is_some())
 }
 
-async fn fail_claimed_operation(
+/// How [`end_claimed_operation`] ends a claimed operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimedOperationEnd {
+    Failed,
+    Canceled,
+}
+
+impl ClaimedOperationEnd {
+    const fn state(self) -> OperationState {
+        match self {
+            Self::Failed => OperationState::Failed,
+            Self::Canceled => OperationState::Canceled,
+        }
+    }
+
+    const fn event(self) -> PublicOperationEventType {
+        match self {
+            Self::Failed => PublicOperationEventType::Failed,
+            Self::Canceled => PublicOperationEventType::Canceled,
+        }
+    }
+}
+
+async fn end_claimed_operation(
     pool: &PgPool,
     input: FailClaimedPublicOperation,
+    end: ClaimedOperationEnd,
 ) -> Result<bool, PublicOperationStoreError> {
     let mut tx = pool.begin().await?;
     let updated = sqlx::query_scalar::<_, Uuid>(sql!(
@@ -3293,7 +3433,7 @@ async fn fail_claimed_operation(
     ))
     .bind(input.operation_id.as_uuid())
     .bind(&input.claim_token)
-    .bind(OperationState::Failed.as_str())
+    .bind(end.state().as_str())
     .bind(&input.progress_message)
     .bind(input.terminal_error_code.as_str())
     .bind(Json(input.terminal_error_json.clone()))
@@ -3305,9 +3445,9 @@ async fn fail_claimed_operation(
         append_operation_event_tx(
             &mut tx,
             input.operation_id,
-            PublicOperationEventType::Failed,
+            end.event(),
             serde_json::json!({
-                "state": OperationState::Failed.as_str(),
+                "state": end.state().as_str(),
                 "code": input.terminal_error_code.as_str(),
                 "error": input.terminal_error_json,
             }),

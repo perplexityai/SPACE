@@ -8,7 +8,9 @@ use crate::controllers::substrate::{
 };
 use crate::metrics::sandbox::api::RequestedKind;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeDrainPhase, NodeDrainState, NodeManagedBy, NodeRole};
+use pplx_space_common_core::types::{
+    ExecutionGeneration, NodeDrainPhase, NodeDrainState, NodeManagedBy, NodeRole,
+};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
@@ -1625,6 +1627,41 @@ impl SandboxController {
         activation: Option<SandboxActivationRequest>,
         activating_client: ActivationClient,
     ) -> Result<serde_json::Value, ControllerError> {
+        self.action_on_execution(
+            pool,
+            id,
+            sandbox,
+            metric_identity,
+            action,
+            activation,
+            activating_client,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::action`], with a suspend bound to `queued_generation`, the
+    /// execution generation it is fenced on: the Kubernetes substrate refuses
+    /// to request the suspend of any other execution and answers
+    /// [`SubstrateError::ExecutionReplaced`], returned as a
+    /// [`ControllerError`] whose
+    /// [`ControllerError::execution_replaced_details`] names the replacing
+    /// generation, with no lifecycle-error metric and no `suspend_failed`
+    /// event (see
+    /// [`crate::controllers::substrate::SubstrateAdapter::suspend_execution`]).
+    /// Other actions ignore it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn action_on_execution(
+        &self,
+        pool: &PgPool,
+        id: SandboxId,
+        sandbox: Option<&Sandbox>,
+        metric_identity: SandboxApiMetricIdentity,
+        action: SandboxAction,
+        activation: Option<SandboxActivationRequest>,
+        activating_client: ActivationClient,
+        queued_generation: Option<ExecutionGeneration>,
+    ) -> Result<serde_json::Value, ControllerError> {
         admit_user_lifecycle(id, UserLifecycleRequest::Action(action));
         let Some(sandbox) = sandbox else {
             return self
@@ -2165,8 +2202,18 @@ impl SandboxController {
                 }
                 SandboxAction::Suspend => {
                     suspend_teardown = self.live_teardown(typed_id).await;
-                    match self.substrate.suspend_execution(typed_id).await {
+                    match self
+                        .substrate
+                        .suspend_execution(typed_id, queued_generation)
+                        .await
+                    {
                         Ok(_) => {}
+                        // The fenced execution was replaced before anything
+                        // was requested: not a failed suspend, and the
+                        // executor ends the operation `canceled`.
+                        Err(err @ SubstrateError::ExecutionReplaced { .. }) => {
+                            return Err(ControllerError::from(err));
+                        }
                         Err(err) => {
                             crate::metrics::sandbox::api::lifecycle_error(
                                 id,
@@ -2507,7 +2554,7 @@ impl SandboxController {
             }
             SandboxAction::Suspend => {
                 self.substrate
-                    .suspend_execution(typed_id)
+                    .suspend_execution(typed_id, None)
                     .await
                     .map_err(ControllerError::from)?;
                 SandboxLifecycleStatus::Suspended

@@ -762,6 +762,7 @@ async fn enqueue_admin_lifecycle_operation(
         action,
         rollback,
         wake_activity: None,
+        queued_execution_generation: None,
     }
     .into_json();
     admit_user_lifecycle(target.public_id.into(), UserLifecycleRequest::from(action));

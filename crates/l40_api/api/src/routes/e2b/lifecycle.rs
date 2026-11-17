@@ -568,6 +568,7 @@ pub(super) async fn delete_sandbox(
         action: PublicSandboxLifecycleAction::Delete,
         rollback: None,
         wake_activity: None,
+        queued_execution_generation: None,
     }
     .into_json();
     let target_id = public_sandbox_id.to_string();

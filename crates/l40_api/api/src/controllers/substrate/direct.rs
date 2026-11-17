@@ -5208,6 +5208,9 @@ impl SubstrateAdapter for DirectSubstrate {
     async fn suspend_execution(
         &self,
         sandbox_id: SandboxId,
+        // The node owns a Direct suspend and its RPC carries no generation;
+        // the caller checks the fence before calling (see the trait).
+        _fence: Option<ExecutionGeneration>,
     ) -> Result<Option<super::PublishedLocalArtifact>, SubstrateError> {
         let (_, _, mut client) = self.worker_client_for_sandbox(sandbox_id).await?;
         let response = client

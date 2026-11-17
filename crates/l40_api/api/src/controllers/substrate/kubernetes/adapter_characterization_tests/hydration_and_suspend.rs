@@ -460,7 +460,7 @@ async fn suspend_execution_refuses_before_claiming_without_retiring_the_pod(
         scripted_kube_client(|_| kube_status(StatusCode::BAD_REQUEST, "BadRequest"));
     let substrate = substrate_with_store_and_client(db.pool.clone(), client);
 
-    let outcome = substrate.suspend_execution_tracked(sandbox_id).await;
+    let outcome = substrate.suspend_execution_tracked(sandbox_id, None).await;
 
     match refusal {
         SuspendRefusal::NoExecution | SuspendRefusal::ExecutionWithoutPodUid => assert!(
@@ -535,7 +535,9 @@ async fn suspend_execution_resumes_retirement_of_a_committed_suspend() -> TestRe
     );
     substrate.k8s.k8s_blocking_delete_timeout = BLOCKING_DELETE_TIMEOUT;
 
-    let returned = substrate.suspend_execution_tracked(sandbox_id).await?;
+    let returned = substrate
+        .suspend_execution_tracked(sandbox_id, None)
+        .await?;
 
     assert_eq!(returned, Some(artifact));
     assert!(delete_attempts.load(Ordering::SeqCst) >= 1);
@@ -684,7 +686,7 @@ async fn suspend_execution_commits_the_durable_artifact_before_retiring_the_pod(
     let mut substrate = substrate_with_node_api_on(&db.pool, client, worker.port);
     substrate.k8s.k8s_blocking_delete_timeout = BLOCKING_DELETE_TIMEOUT;
 
-    let outcome = substrate.suspend_execution_tracked(sandbox_id).await;
+    let outcome = substrate.suspend_execution_tracked(sandbox_id, None).await;
 
     if matches!(answer, NodeSuspendAnswer::DeletedWithoutEvidence) {
         assert!(
@@ -752,7 +754,7 @@ async fn suspend_execution_keeps_the_pod_when_the_node_refuses() -> TestResult {
         scripted_kube_client(|_| kube_status(StatusCode::BAD_REQUEST, "BadRequest"));
     let substrate = substrate_with_node_api_on(&db.pool, client, worker.port);
 
-    let outcome = substrate.suspend_execution_tracked(sandbox_id).await;
+    let outcome = substrate.suspend_execution_tracked(sandbox_id, None).await;
 
     assert!(
         matches!(outcome, Err(SubstrateError::Unavailable { .. })),
@@ -868,7 +870,7 @@ async fn suspend_execution_polls_the_node_within_its_durability_budget(
     let started = Instant::now();
     let outcome = tokio::time::timeout(
         Duration::from_secs(10),
-        substrate.suspend_execution_tracked(sandbox_id),
+        substrate.suspend_execution_tracked(sandbox_id, None),
     )
     .await
     .map_err(|_| format!("{durability:?}: the suspend must end within its budget"))?;

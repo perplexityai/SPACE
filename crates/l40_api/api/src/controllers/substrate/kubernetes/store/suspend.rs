@@ -285,7 +285,7 @@ impl K8sStore {
         generation: ExecutionGeneration,
         expected_pod_uid: &PodUid,
     ) -> Result<SuspendExecutionClaim, SubstrateError> {
-        for previous in [SandboxLifecycle::Started, SandboxLifecycle::Paused] {
+        for &previous in pplx_space_sandbox_store::suspend::CLAIMABLE_LIFECYCLES {
             let claimed = pplx_space_sandbox_store::suspend::claim(
                 &self.pool,
                 sandbox_id,

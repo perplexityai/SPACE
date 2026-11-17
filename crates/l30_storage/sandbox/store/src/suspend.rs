@@ -15,14 +15,19 @@ use pplx_space_k8s_ids::PodUid;
 
 use pplx_space_common_core::sql;
 
+/// The lifecycles a suspend claims its sandbox from, in the order
+/// [`claim`]'s callers try them. A native suspend queued while its sandbox is
+/// in one records the sandbox's active execution generation as its fence.
+pub const CLAIMABLE_LIFECYCLES: &[SandboxLifecycle] =
+    &[SandboxLifecycle::Started, SandboxLifecycle::Paused];
+
 /// **Operation step.** Claim the suspend of the execution at `generation`
 /// tracking `pod_uid`: flip the row from `previous` to `suspending` while
 /// that execution is still the active `running` one. Returns whether the row
 /// flipped.
 ///
-/// The caller tries each lifecycle a suspend may start from (`started`,
-/// `paused`) in turn; a zero-row match means another writer won or the
-/// execution moved on.
+/// The caller tries each of [`CLAIMABLE_LIFECYCLES`] in turn; a zero-row
+/// match means another writer won or the execution moved on.
 pub async fn claim(
     executor: impl sqlx::PgExecutor<'_>,
     sandbox_id: SandboxId,

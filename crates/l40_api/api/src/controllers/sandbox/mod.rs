@@ -643,7 +643,10 @@ fn reconnect_error_outcome(
         | SubstrateError::FailedPrecondition { .. }
         | SubstrateError::InvalidRequest { .. }
         | SubstrateError::RetainedFilesystemOnlyCopy { .. }
-        | SubstrateError::EvacuationClaimLost { .. } => (
+        | SubstrateError::EvacuationClaimLost { .. }
+        // Only a fenced suspend returns it, so a wake never sees it; it
+        // shares the arm of the 409 it is answered as.
+        | SubstrateError::ExecutionReplaced { .. } => (
             ReconnectOutcome::Rejected,
             ReconnectTerminalPhase::Api,
             ReconnectReason::Conflict,

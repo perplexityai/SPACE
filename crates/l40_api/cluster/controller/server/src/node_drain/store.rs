@@ -1737,7 +1737,7 @@ impl SubstrateSinkBackend {
 
     async fn suspend_execution(&self, sandbox_id: SandboxId) -> SuspendExecutionResult {
         match self {
-            Self::Kubernetes(substrate) => substrate.suspend_execution(sandbox_id).await,
+            Self::Kubernetes(substrate) => substrate.suspend_execution(sandbox_id, None).await,
             #[cfg(test)]
             Self::SuspendOnly(suspend) => suspend(sandbox_id).await,
             #[cfg(test)]
@@ -3370,6 +3370,10 @@ impl NodeDrainSink for SubstrateSink {
                 | SubstrateError::EvacuationClaimLost { message }
                 | SubstrateError::Failed { message },
             ) => Err(PromoteError::NodeApi(message)),
+            // Only a fenced suspend returns it; a promotion never does.
+            Err(error @ SubstrateError::ExecutionReplaced { .. }) => {
+                Err(PromoteError::NodeApi(error.to_string()))
+            }
         }
     }
 

@@ -15,9 +15,10 @@ use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicEr
 use tokio::time::MissedTickBehavior;
 
 use crate::public_operations::{
-    ApiProduct, ClaimedPublicOperation, CompleteClaimedPublicOperation, ExpirePublicOperation,
-    FailClaimedPublicOperation, OverdueQueuedPublicOperations, PublicOperationRequeueReason,
-    PublicOperationStore, PublicOperationStoreError, ReleaseClaimedPublicOperation, ReleasedClaim,
+    ApiProduct, CancelClaimedPublicOperation, ClaimedPublicOperation,
+    CompleteClaimedPublicOperation, ExpirePublicOperation, FailClaimedPublicOperation,
+    OverdueQueuedPublicOperations, PublicOperationRequeueReason, PublicOperationStore,
+    PublicOperationStoreError, ReleaseClaimedPublicOperation, ReleasedClaim,
 };
 use crate::public_sandbox_operations::PublicOperationExecutionResult;
 use crate::retry_deferral::RetryDeferral;
@@ -484,11 +485,40 @@ where
             }
             updated.then_some(ExecutionOutcome::Failed)
         }
+        // An executor ends an operation `canceled` when something later
+        // superseded it (a suspend whose execution another replaced),
+        // recorded as a create a later delete supersedes is: terminal, with
+        // its reason.
+        OperationState::Canceled => {
+            let terminal_error_code = result
+                .terminal_error_code
+                .unwrap_or(PublicErrorCode::OperationFailed);
+            let updated = store
+                .cancel_claimed_operation(CancelClaimedPublicOperation {
+                    claim_token,
+                    operation_id,
+                    progress_message: result.progress_message,
+                    terminal_error_code,
+                    terminal_error_json: result
+                        .terminal_error_json
+                        .unwrap_or_else(|| serde_json::json!({})),
+                })
+                .await?;
+            if updated {
+                report.canceled += 1;
+                crate::metrics::operations::completed_by(
+                    api_product_label,
+                    kind.as_str(),
+                    OperationState::Canceled.as_str(),
+                    executor,
+                );
+            }
+            updated.then_some(ExecutionOutcome::Canceled)
+        }
         // Executors only produce the known states; an `Other` here would be a
         // programming error, and releasing the claim is the safe reading.
         OperationState::Queued
         | OperationState::Running
-        | OperationState::Canceled
         | OperationState::Expired
         | OperationState::Other(_) => {
             let supported_requeue = result.state == OperationState::Queued;

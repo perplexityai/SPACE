@@ -61,7 +61,7 @@ use crate::{
     },
     public_sandbox_operations::{
         CreateSandboxOperationPayload, SandboxLifecycleOperationPayload,
-        UpdateSandboxOperationPayload, controller_create_request,
+        UpdateSandboxOperationPayload, controller_create_request, suspend_execution_fence_enabled,
     },
     public_sandbox_projection::public_lifecycle_state as project_public_lifecycle_state,
     routes::{AppState, metrics::RouteTemplateName},
@@ -1049,11 +1049,24 @@ async fn enqueue_lifecycle_operation(
     }
     admit_user_lifecycle(sandbox_id.into(), UserLifecycleRequest::from(action));
     let sandbox_id_string = sandbox_id.to_string();
+    let queued_execution_generation =
+        if action == SandboxLifecycleAction::Suspend && suspend_execution_fence_enabled() {
+            admission
+                .fenced_execution_generation(
+                    org_id,
+                    sandbox_id,
+                    pplx_space_sandbox_store::suspend::CLAIMABLE_LIFECYCLES,
+                )
+                .await?
+        } else {
+            None
+        };
     let payload_json = SandboxLifecycleOperationPayload {
         sandbox_id,
         action,
         rollback,
         wake_activity: None,
+        queued_execution_generation,
     }
     .into_json();
     let input = CreatePublicOperation {

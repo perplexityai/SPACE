@@ -845,6 +845,7 @@ mod not_running {
                     action: SandboxLifecycleAction::Wake,
                     rollback: None,
                     wake_activity: None,
+                    queued_execution_generation: None,
                 }
                 .into_json(),
                 idempotency: None,
@@ -1683,6 +1684,7 @@ mod not_running {
                     action: SandboxLifecycleAction::Wake,
                     rollback: None,
                     wake_activity: None,
+                    queued_execution_generation: None,
                 }
                 .into_json(),
                 None,

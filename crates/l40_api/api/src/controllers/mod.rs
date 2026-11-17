@@ -73,6 +73,10 @@ enum ControllerErrorKind {
     /// retry cause, and a caller with a fallback passes it through rather
     /// than retrying under a weaker charge.
     ClusterAdmissionRejection(substrate::ActivationRejectionKind),
+    /// A fenced suspend found its execution replaced before it requested
+    /// anything ([`substrate::SubstrateError::ExecutionReplaced`]). Carried
+    /// so the suspend executor can tell this refusal from a failed suspend.
+    ExecutionReplaced(ExecutionReplaced),
     /// The client's live-sandbox cap refused this activation. Carried so the
     /// reconnect series records a per-client refusal as `rate_limited`, like
     /// the concurrency limiter's, rather than as the cluster saturation a
@@ -123,6 +127,21 @@ impl SnapshotUploadInFlight {
     /// [`crate::reconcile_queue::in_flight_snapshot_upload_idle_for`] reports it.
     pub(crate) fn idle_for(self) -> Duration {
         Duration::from_secs(u64::from(self.idle_secs))
+    }
+}
+
+/// A fenced suspend's refusal: [`Self::current`] is the generation that
+/// replaced the one it was fenced on, which its caller passed. Only that one
+/// is carried, which keeps `ControllerError` small.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecutionReplaced {
+    current: pplx_space_common_core::types::ExecutionGeneration,
+}
+
+impl ExecutionReplaced {
+    /// The generation that replaced the fenced one.
+    pub(crate) const fn current(self) -> pplx_space_common_core::types::ExecutionGeneration {
+        self.current
     }
 }
 
@@ -439,6 +458,29 @@ impl ControllerError {
     pub(crate) const fn snapshot_upload_in_flight_details(&self) -> Option<SnapshotUploadInFlight> {
         match self.kind {
             ControllerErrorKind::SnapshotUploadInFlight(upload) => Some(upload),
+            _ => None,
+        }
+    }
+
+    /// A fenced suspend's refusal of a replaced execution; see
+    /// [`substrate::SubstrateError::ExecutionReplaced`].
+    pub(crate) fn execution_replaced(
+        fenced: pplx_space_common_core::types::ExecutionGeneration,
+        current: pplx_space_common_core::types::ExecutionGeneration,
+    ) -> Self {
+        let mut error = Self::conflict(format!(
+            "execution generation {fenced}, which this suspend is fenced on, was replaced by \
+             {current}; the suspend was not requested"
+        ));
+        error.kind = ControllerErrorKind::ExecutionReplaced(ExecutionReplaced { current });
+        error
+    }
+
+    /// The generation that replaced a fenced suspend's, if this is that
+    /// refusal.
+    pub(crate) const fn execution_replaced_details(&self) -> Option<ExecutionReplaced> {
+        match self.kind {
+            ControllerErrorKind::ExecutionReplaced(replaced) => Some(replaced),
             _ => None,
         }
     }

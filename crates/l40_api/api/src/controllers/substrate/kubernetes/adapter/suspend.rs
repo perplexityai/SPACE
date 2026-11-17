@@ -27,11 +27,14 @@ impl KubernetesSubstrate {
     pub(in crate::controllers::substrate) async fn suspend_execution_tracked(
         &self,
         sandbox_id: SandboxId,
+        fence: Option<ExecutionGeneration>,
     ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
         let substrate = self.clone();
         await_suspend_continuation(&self.task_tracker, async move {
-            <KubernetesSubstrate as SubstrateAdapter>::suspend_execution(&substrate, sandbox_id)
-                .await
+            <KubernetesSubstrate as SubstrateAdapter>::suspend_execution(
+                &substrate, sandbox_id, fence,
+            )
+            .await
         })
         .await
     }

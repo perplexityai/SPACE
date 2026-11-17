@@ -45,9 +45,9 @@ use pplx_space_api_route::wait_ready_lifecycle_request;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_bearer_token::SpaceBearerToken;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, BackupAttemptId, BackupSource, LocalArtifactId, NodeAddress,
-    NodeManagedBy, NodePoolName, NodeRole, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
-    SandboxRouteIdentity, TemplateName,
+    ArtifactKind, ArtifactOrigin, BackupAttemptId, BackupSource, ExecutionGeneration,
+    LocalArtifactId, NodeAddress, NodeManagedBy, NodePoolName, NodeRole,
+    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity, TemplateName,
 };
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
@@ -685,6 +685,20 @@ pub enum SubstrateError {
     /// same sandbox without allocating a successor execution.
     #[error("{message}")]
     SuspendInFlight { message: String },
+    /// A fenced suspend found another execution active than the one it was
+    /// fenced on, before it claimed or requested anything: `fenced` was
+    /// replaced by `current`. Raised only for a suspend that carries a fence
+    /// (see [`SubstrateAdapter::suspend_execution`]). The sandbox was not
+    /// touched, so this is not a failed suspend; the operation executor
+    /// ends the operation `canceled`.
+    #[error(
+        "execution generation {fenced}, which this suspend is fenced on, was replaced by \
+         {current}; the suspend was not requested"
+    )]
+    ExecutionReplaced {
+        fenced: ExecutionGeneration,
+        current: ExecutionGeneration,
+    },
     /// Node-local deletion was refused because the retained filesystem may
     /// be the sandbox's only copy. Cluster deletion must preserve its row for
     /// recovery, but node drain must report the sandbox as stuck rather than
@@ -1011,6 +1025,9 @@ impl From<SubstrateError> for ControllerError {
             }
             SubstrateError::RetainedFilesystemOnlyCopy { message } => {
                 ControllerError::new(axum::http::StatusCode::CONFLICT, message)
+            }
+            SubstrateError::ExecutionReplaced { fenced, current } => {
+                ControllerError::execution_replaced(fenced, current)
             }
             SubstrateError::NodeDeleteNotAdmitted { message } => {
                 ControllerError::service_unavailable(message).with_retry_after(GATEWAY_RETRY_AFTER)
@@ -1512,9 +1529,20 @@ pub trait SubstrateAdapter: Send + Sync {
     /// persisted suspend state. Returns once the suspend has been requested;
     /// the snapshot upload itself runs asynchronously on the node and
     /// registers its storage location with the cluster API separately.
+    ///
+    /// With `fence`, the execution generation a queued suspend is fenced on,
+    /// the suspend must not act on any other execution. Kubernetes compares
+    /// it with the active execution before it emits `suspend_requested` or
+    /// claims anything, refuses another with
+    /// [`SubstrateError::ExecutionReplaced`], and makes its suspend claim
+    /// conditional on the fenced generation. Direct has no control-plane
+    /// claim to bind: the node owns the suspend and its RPC carries no
+    /// generation, so Direct suspends unfenced and the caller's own check of
+    /// the generation before the call is the only fence.
     async fn suspend_execution(
         &self,
         sandbox_id: SandboxId,
+        fence: Option<ExecutionGeneration>,
     ) -> Result<Option<PublishedLocalArtifact>, SubstrateError>;
 
     /// Wake to command readiness. An activity source makes this implicit and
@@ -2817,11 +2845,14 @@ impl SubstrateAdapter for Substrate {
     async fn suspend_execution(
         &self,
         sandbox_id: SandboxId,
+        fence: Option<ExecutionGeneration>,
     ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
         match &self.inner {
-            Inner::Direct(substrate) => substrate.suspend_execution(sandbox_id).await,
+            Inner::Direct(substrate) => substrate.suspend_execution(sandbox_id, fence).await,
             #[cfg(feature = "kubernetes")]
-            Inner::Kubernetes(substrate) => substrate.suspend_execution_tracked(sandbox_id).await,
+            Inner::Kubernetes(substrate) => {
+                substrate.suspend_execution_tracked(sandbox_id, fence).await
+            }
         }
     }
 
