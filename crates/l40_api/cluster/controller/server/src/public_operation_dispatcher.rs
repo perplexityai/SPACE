@@ -87,6 +87,17 @@ const HELD_BACK_CLAIM_BACKOFF: Duration = Duration::from_millis(250);
 /// in this process becomes claimable again.
 const BUSY_KEY_RETRY_AFTER: Duration = Duration::from_secs(1);
 const KEYED_CLAIM_ENABLED_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_KEYED_CLAIM_ENABLED";
+/// How long a stopping dispatcher lets its executions run on to record their
+/// own outcomes before it stops the rest and hands their operations back.
+const SHUTDOWN_EXECUTION_GRACE: Duration = Duration::from_secs(5);
+/// How long a stopping dispatcher's hand-backs may take. With the grace this
+/// stays inside the reconcilers' shutdown drain, so a leader that stops still
+/// drains cleanly and releases its Lease instead of leaving it to expire.
+const SHUTDOWN_HAND_BACK_TIMEOUT: Duration = Duration::from_secs(3);
+const _: () = assert!(
+    SHUTDOWN_EXECUTION_GRACE.as_millis() + SHUTDOWN_HAND_BACK_TIMEOUT.as_millis()
+        < crate::reconcilers::SHUTDOWN_DRAIN_TIMEOUT.as_millis()
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcilerConfig {
@@ -114,6 +125,10 @@ pub struct ReconcilerConfig {
     /// was held back; see [`HELD_BACK_CLAIM_BACKOFF`]. Not read from the
     /// environment: only tests shorten it.
     pub held_back_claim_backoff: Duration,
+    /// How long a stopping dispatcher lets its executions run on; see
+    /// [`SHUTDOWN_EXECUTION_GRACE`]. Not read from the environment: only
+    /// tests shorten it.
+    pub shutdown_grace: Duration,
     /// How each claimed operation is renewed, retried and bounded: the same
     /// settings, read from the same variables, as inline execution in the
     /// API. Its `defer_retry_waits` is the retry-deferral kill switch,
@@ -135,6 +150,7 @@ impl Default for ReconcilerConfig {
             org_slot_headroom: DEFAULT_ORG_SLOT_HEADROOM as usize,
             keyed_claim_enabled: true,
             held_back_claim_backoff: HELD_BACK_CLAIM_BACKOFF,
+            shutdown_grace: SHUTDOWN_EXECUTION_GRACE,
             execution: OperationExecutionConfig::default(),
         }
     }
@@ -191,6 +207,7 @@ impl ReconcilerConfig {
             keyed_claim_enabled: config
                 .truthy_default(KEYED_CLAIM_ENABLED_ENV, default.keyed_claim_enabled),
             held_back_claim_backoff: default.held_back_claim_backoff,
+            shutdown_grace: default.shutdown_grace,
             // Shared with inline execution in the API, which must renew,
             // retry and bound an operation as this loop does.
             execution: OperationExecutionConfig::from_environment(env),
@@ -417,6 +434,8 @@ pub async fn run<E>(
     let mut busy_keys: HashMap<String, OperationId> = HashMap::new();
     let mut task_keys: HashMap<tokio::task::Id, String> = HashMap::new();
     let mut other_tasks: HashSet<tokio::task::Id> = HashSet::new();
+    // Each execution's claim, to hand back if shutdown stops the execution.
+    let mut claims: HashMap<tokio::task::Id, (String, ClaimedPublicOperation)> = HashMap::new();
     let mut hand_backs = JoinSet::new();
     // Reclaiming an operation still executing here means its execution lost
     // the claim and notices only at its next renewal. Any other collision is
@@ -431,7 +450,7 @@ pub async fn run<E>(
             _ = interval.tick() => {
                 // Free finished executions' slots and keys before claiming.
                 while let Some(joined) = in_flight.try_join_next_with_id() {
-                    finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
+                    finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks, &mut claims);
                     claim_backoff_until = None;
                 }
                 crate::metrics::operations::dispatcher_slots(
@@ -473,7 +492,7 @@ pub async fn run<E>(
                         // must not make its successor look busy.
                         let mut finished_meanwhile = false;
                         while let Some(joined) = in_flight.try_join_next_with_id() {
-                            finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
+                            finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks, &mut claims);
                             finished_meanwhile = true;
                         }
                         let claimed = claim.operations.len();
@@ -511,6 +530,7 @@ pub async fn run<E>(
                             }
                             let is_teardown = TEARDOWN_KINDS.contains(&operation.kind);
                             let span = execution_span(&operation);
+                            let claimed = (claim.claim_token.clone(), operation.clone());
                             let execution = execute_claimed_operation(
                                 store.clone(),
                                 executor.clone(),
@@ -520,6 +540,7 @@ pub async fn run<E>(
                             )
                             .instrument(span);
                             let task = in_flight.spawn(execution);
+                            claims.insert(task.id(), claimed);
                             if !is_teardown {
                                 other_tasks.insert(task.id());
                             }
@@ -554,7 +575,7 @@ pub async fn run<E>(
                 }
             }
             Some(joined) = in_flight.join_next_with_id(), if !in_flight.is_empty() => {
-                finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
+                finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks, &mut claims);
                 claim_backoff_until = None;
             }
             Some(_) = hand_backs.join_next(), if !hand_backs.is_empty() => {}
@@ -562,27 +583,64 @@ pub async fn run<E>(
         }
     }
 
-    // Stop claiming, but let claimed executions finish and record their
-    // outcome, matching the previous behavior of completing the in-progress
-    // batch before exiting.
-    while let Some(joined) = in_flight.join_next_with_id().await {
-        finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
+    // Stop claiming, and let claimed executions finish and record their
+    // outcomes within the grace. Stop the rest and hand their operations
+    // back, due now: left claimed, an operation waits `claim_stale_after`
+    // before the dispatcher that replaces this one may start it.
+    let drained = tokio::time::timeout(config.shutdown_grace, async {
+        while let Some(joined) = in_flight.join_next_with_id().await {
+            finish_execution(
+                joined,
+                &mut busy_keys,
+                &mut task_keys,
+                &mut other_tasks,
+                &mut claims,
+            );
+        }
+    })
+    .await
+    .is_ok();
+    if !drained {
+        in_flight.abort_all();
+        while let Some(joined) = in_flight.join_next_with_id().await {
+            if let Some((claim_token, operation)) = finish_execution(
+                joined,
+                &mut busy_keys,
+                &mut task_keys,
+                &mut other_tasks,
+                &mut claims,
+            ) {
+                hand_backs.spawn(hand_back_stopped(store.clone(), claim_token, operation));
+            }
+        }
     }
-    while hand_backs.join_next().await.is_some() {}
+    let handed_back = tokio::time::timeout(SHUTDOWN_HAND_BACK_TIMEOUT, async {
+        while hand_backs.join_next().await.is_some() {}
+    })
+    .await;
+    if handed_back.is_err() {
+        tracing::warn!(
+            "public-operation-dispatcher stopped before every hand-back finished; \
+             an operation not handed back becomes claimable once its claim goes stale"
+        );
+    }
 }
 
 type ExecutionOutcome =
     Result<TickReport, pplx_space_api::public_operations::PublicOperationStoreError>;
 
-/// Frees the finished execution's slot and key, whether it returned or panicked: a
-/// panicked execution is gone, and the claim it stopped renewing goes stale
-/// so the claim query recovers the operation in its key's order.
+/// Frees the finished execution's slot and key, whether it returned, panicked
+/// or was stopped: a panicked execution is gone, and the claim it stopped
+/// renewing goes stale so the claim query recovers the operation in its key's
+/// order. Returns the claim of an execution shutdown stopped, for the caller
+/// to hand back.
 fn finish_execution(
     joined: Result<(tokio::task::Id, ExecutionOutcome), tokio::task::JoinError>,
     busy_keys: &mut HashMap<String, OperationId>,
     task_keys: &mut HashMap<tokio::task::Id, String>,
     other_tasks: &mut HashSet<tokio::task::Id>,
-) {
+    claims: &mut HashMap<tokio::task::Id, (String, ClaimedPublicOperation)>,
+) -> Option<(String, ClaimedPublicOperation)> {
     let task_id = match &joined {
         Ok((task_id, _)) => *task_id,
         Err(error) => error.id(),
@@ -591,7 +649,63 @@ fn finish_execution(
     if let Some(key) = task_keys.remove(&task_id) {
         busy_keys.remove(&key);
     }
-    log_execution_outcome(joined.map(|(_, outcome)| outcome));
+    let claim = claims.remove(&task_id);
+    match joined {
+        Err(error) if error.is_cancelled() => claim,
+        joined => {
+            log_execution_outcome(joined.map(|(_, outcome)| outcome));
+            None
+        }
+    }
+}
+
+/// Requeue, due now, an operation whose execution shutdown stopped, without
+/// charging the attempt it did not finish. The execution has ended, so a
+/// create a later delete supersedes ends canceled instead.
+async fn hand_back_stopped(
+    store: PublicOperationStore,
+    claim_token: String,
+    operation: ClaimedPublicOperation,
+) {
+    match store
+        .release_claimed_operation(ReleaseClaimedPublicOperation {
+            claim_token,
+            operation_id: operation.id,
+            progress_message: "handed back: the dispatcher running it stopped".to_owned(),
+            retry_after: Duration::ZERO,
+            count_attempt: false,
+            undo_first_start: false,
+            cancel_if_superseded: true,
+            carried_error: None,
+        })
+        .await
+    {
+        Ok(ReleasedClaim::Superseded { delete_id }) => {
+            pplx_space_api::metrics::operations::completed(
+                operation.api_product.as_str(),
+                operation.kind.as_str(),
+                OperationState::Canceled.as_str(),
+            );
+            tracing::info!(
+                operation_id = %operation.id,
+                delete_operation_id = %delete_id,
+                "public create canceled instead of handed back: a later delete supersedes it"
+            );
+        }
+        Ok(ReleasedClaim::Requeued) => tracing::info!(
+            operation_id = %operation.id,
+            kind = operation.kind.as_str(),
+            "public-operation-dispatcher stopped an execution as it shut down; handed it back"
+        ),
+        // It recorded an outcome, or lost its claim, before it was stopped.
+        Ok(ReleasedClaim::Lost) => {}
+        Err(error) => tracing::warn!(
+            operation_id = %operation.id,
+            error = %error,
+            "public-operation-dispatcher could not hand back a stopped execution; \
+             it becomes claimable once its claim goes stale"
+        ),
+    }
 }
 
 /// Requeue an operation this process cannot start because another of its
