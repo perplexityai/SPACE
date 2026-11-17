@@ -8,7 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.space.state]
-postgres = ["node_reconcile_triggers"]
+postgres = ["node_reconcile_queue", "node_reconcile_triggers"]
 
 [lints]
 workspace = true
