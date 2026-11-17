@@ -2314,7 +2314,10 @@ to it needs no other database step. One from before #1277 doesn't: it reverses
 this migration, then refuses a database that still records `20261031050126`.
 Before starting it, check that
 `sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` prints
-`20261031050126`; if it prints `20261026220935`, skip this, and otherwise
+`20261031050126` and that
+`sqlite3 -readonly <db> "SELECT version FROM _space_common_schema_migrations WHERE version > 20260930000000"`
+prints nothing, since `down` reverts the newest migration across both
+histories; if the first prints `20261026220935`, skip this, and otherwise
 stop. Then run `space-db-migrator template-manager --database-path <db> down`
 once with a migrator that bundles `20261031050126`, that is from #1235 on,
 such as the release you are rolling back from. It reverts only that migration.
@@ -2328,9 +2331,10 @@ procedure below.
 A template-manager from #988 until #1070 bundles this migration, with the same
 checksum, but not `20261031050126`. To roll back to one, stop template-manager,
 keep the newer one from restarting until the older one starts (at startup it
-re-applies the dirty-ref migration), and check that `max(version)` prints
-`20261031050126`; if it prints
-`20261026220935`, skip the `down`, and otherwise stop. If it printed
+re-applies the dirty-ref migration), and run the same two checks: if
+`max(version)` prints `20261031050126` and the common check prints nothing,
+continue; if `max(version)` prints `20261026220935`, skip the `down`; and
+otherwise stop. If it printed
 `20261031050126`, run
 `space-db-migrator template-manager --database-path <db> down` once with a
 migrator from #1235 on, reverting only the dirty-ref migration. Nothing else is
