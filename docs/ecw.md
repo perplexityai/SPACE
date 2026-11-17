@@ -197,10 +197,12 @@ not an upstream E2B create option. ECW already uses reserved metadata for
 [full network policies](ecw-network-policy.md). The current upstream E2B create
 schema and Python SDK 2.62.0 do not expose CPU, memory, or disk overrides.
 
-Provided values must be positive integers no larger than 2,147,483,647; actual
-allocation remains subject to runtime and available capacity. `disk_mib`
-overrides the template's disk size; it must be at least the template rootfs
-size, and a value above 128 GiB returns HTTP 400. A smaller value fails the
+`vcpu` must be 1 to 32, `memory_mib` 512 to 65,536 and `disk_mib` 1 to
+131,072; a value outside them returns HTTP 400 before anything is created. These
+are admission bounds, the same as the native API's. A node gives the guest at
+most its own configured guest maximum, and allocation remains subject to
+available capacity. `disk_mib` overrides the template's disk size; it must be
+at least the template rootfs size. A smaller value fails the
 create with HTTP 400 naming the rootfs size once the node refuses to start it,
 usually within seconds. Malformed JSON, unknown
 fields, and invalid values return HTTP 400. Omitted fields retain the normal
