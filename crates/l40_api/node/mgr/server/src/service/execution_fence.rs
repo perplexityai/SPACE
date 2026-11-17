@@ -56,7 +56,9 @@ impl NodeManagerService {
             let _claim = tokio::select! {
                 biased;
                 _ = self.pool.shutdown_token.cancelled() => {
-                    return Err(Status::unavailable("node-manager is shutting down"));
+                    return Err(Status::unavailable(
+                        pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE,
+                    ));
                 }
                 claim = self.pool.claim_sandbox_mutation(&sandbox_id) => claim,
             };

@@ -77,7 +77,9 @@ impl NodeManagerService {
         }
         validate_sandbox_uid(sandbox_id, uid, current.sandbox_uid)?;
         if self.pool.shutdown_token.is_cancelled() {
-            return Err(Status::unavailable("node-manager is shutting down"));
+            return Err(Status::unavailable(
+                pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE,
+            ));
         }
         Ok(PreparationOwnership {
             lease: current,

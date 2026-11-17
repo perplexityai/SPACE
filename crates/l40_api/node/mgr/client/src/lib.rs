@@ -6,6 +6,12 @@ pub const MEMORY_CAPTURE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration
 /// Events. Distinguishes memory admission from other ResourceExhausted errors.
 pub const MEMORY_ADMISSION_REFUSAL_PREFIX: &str = "node memory admission refused:";
 
+/// `UNAVAILABLE` message node-manager returns for a call it refuses because
+/// its shutdown has begun. Clients match it by its exact text to tell a
+/// restart from other `UNAVAILABLE` answers, and released clients compare
+/// against this text, so it must not change.
+pub const SHUTTING_DOWN_MESSAGE: &str = "node-manager is shutting down";
+
 pub use pplx_space_node_mgr_protocol::proto;
 
 pub mod environment_selection;

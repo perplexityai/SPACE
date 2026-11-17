@@ -158,6 +158,21 @@ fn policy_mutation_requires_control_plane_authority() {
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
 }
 
+/// A backend that answers every call with `Unimplemented`, so a call node-api
+/// forwarded is told apart from one it refused at admission.
+fn unimplemented_backend() -> axum::Router {
+    axum::Router::new().fallback(|| async {
+        http::Response::builder()
+            .header("content-type", "application/grpc")
+            .header(
+                "grpc-status",
+                (tonic::Code::Unimplemented as i32).to_string(),
+            )
+            .body(axum::body::Body::empty())
+            .unwrap()
+    })
+}
+
 /// A sandbox-manager that answers every call with `Unimplemented`, so a call
 /// node-api forwarded is told apart from one it refused at admission.
 async fn unimplemented_sandbox_manager() -> crate::clients::BackendClients {
@@ -804,4 +819,288 @@ async fn guest_read_streams_pass_through_first_items_that_are_not_replayed() {
         assert!(items.next().await.is_none(), "{rpc} is not empty");
         assert_eq!(successor_calls.load(Ordering::SeqCst), 0, "{rpc}");
     }
+}
+
+fn service_with_clients(clients: crate::clients::BackendClients) -> WorkerApiService {
+    WorkerApiService {
+        clients,
+        uds_per_sandbox_limiter: UdsPerSandboxLimiter::for_tests_with_reserved(1, 1, 8),
+        service_port_ingress_limiter: shared_service_port_ingress_limiter(),
+        resource_status_reader: NodeResourceStatusReader::new(),
+        shutdown_token: CancellationToken::new(),
+        open_stream_drain_token: CancellationToken::new(),
+    }
+}
+
+/// A fake node-manager on a Unix socket: holds the socket directory and the
+/// server task.
+struct FakeNodeManager {
+    _dir: tempfile::TempDir,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for FakeNodeManager {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+/// A node-manager client built as production builds it
+/// (`pplx_space_node_mgr_client::connect()`), so a refused redial is retried
+/// by the channel itself before node-api's own retry sees it.
+async fn node_manager_clients(socket: &std::path::Path) -> crate::clients::BackendClients {
+    crate::clients::BackendClients::with_channel(
+        pplx_space_common_grpc::connect_uds_channel_with_retrying_redials(
+            "node-manager",
+            socket,
+            tonic::transport::Endpoint::from_static("http://[::]:50051"),
+            pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+        .unwrap(),
+    )
+}
+
+/// Reads HTTP/2 frames from `stream` until the client has sent the headers of
+/// a call.
+async fn read_until_call_headers(stream: &tokio::net::UnixStream) {
+    const PREFACE_LEN: usize = 24;
+    const FRAME_HEADER_LEN: usize = 9;
+    const HEADERS_FRAME: u8 = 0x1;
+    let mut received = Vec::new();
+    loop {
+        let mut frame = PREFACE_LEN;
+        while received.len() >= frame + FRAME_HEADER_LEN {
+            if received[frame + 3] == HEADERS_FRAME {
+                return;
+            }
+            let length =
+                u32::from_be_bytes([0, received[frame], received[frame + 1], received[frame + 2]])
+                    as usize;
+            frame += FRAME_HEADER_LEN + length;
+        }
+        stream.readable().await.unwrap();
+        let mut chunk = [0; 4096];
+        match stream.try_read(&mut chunk) {
+            Ok(0) => panic!("the client closed the connection before calling"),
+            Ok(read) => received.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("reading the call: {error}"),
+        }
+    }
+}
+
+/// A node-manager listener whose first connection is cut once a call arrives
+/// on it, as the draining predecessor's connection closes under a call. Every
+/// later connection is served. Counts the connections accepted.
+struct CuttingFirstConnection {
+    listener: tokio::net::UnixListener,
+    accepted: Arc<AtomicUsize>,
+}
+
+impl axum::serve::Listener for CuttingFirstConnection {
+    type Io = tokio::net::UnixStream;
+    type Addr = tokio::net::unix::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = self.listener.accept().await.unwrap();
+            if self.accepted.fetch_add(1, Ordering::SeqCst) > 0 {
+                return (stream, addr);
+            }
+            tokio::spawn(async move {
+                read_until_call_headers(&stream).await;
+                drop(stream);
+            });
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
+
+/// A running node-manager that answers its first call with `code` and
+/// `message`, and every later one with `Unimplemented`. Counts the calls.
+async fn node_manager_answering_once(
+    code: tonic::Code,
+    message: &'static str,
+) -> (
+    WorkerApiService,
+    FakeNodeManager,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("node-manager.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let clients = node_manager_clients(&socket).await;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let backend = axum::Router::new().fallback(move || {
+        let call = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async move {
+            let (code, message) = if call == 0 {
+                (code, message)
+            } else {
+                (tonic::Code::Unimplemented, "")
+            };
+            http::Response::builder()
+                .header("content-type", "application/grpc")
+                .header("grpc-status", (code as i32).to_string())
+                .header("grpc-message", message)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        }
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    (
+        service_with_clients(clients),
+        FakeNodeManager { _dir: dir, server },
+        calls,
+    )
+}
+
+fn allow_port_request() -> Request<pplx_space_node_mgr_client::proto::AllowPortRequest> {
+    Request::new(pplx_space_node_mgr_client::proto::AllowPortRequest {
+        sandbox_id: SandboxId::new().to_string(),
+        port: 8080,
+        protocol: pplx_space_node_mgr_client::proto::NetworkProtocol::Tcp as i32,
+    })
+}
+
+// An `Unavailable` that node-manager answers for a reason of its own goes back
+// to the caller as sent, not replayed until the restart budget runs out.
+#[tokio::test]
+async fn a_port_call_returns_an_unavailable_answer_after_one_attempt() {
+    const BUSY: &str = "sandbox cleanup or reset is in progress; retry";
+    let (service, _node_manager, calls) =
+        node_manager_answering_once(tonic::Code::Unavailable, BUSY).await;
+
+    let status = service.allow_port(allow_port_request()).await.unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+    assert_eq!(status.message(), BUSY);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+// A draining node-manager's refusal is the restart, so the call is replayed.
+#[tokio::test]
+async fn a_port_call_retries_a_shutting_down_node_manager() {
+    let (service, _node_manager, calls) = node_manager_answering_once(
+        tonic::Code::Unavailable,
+        pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE,
+    )
+    .await;
+
+    let status = service.allow_port(allow_port_request()).await.unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::Unimplemented, "{status}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+// A call cut when the draining node-manager closes its connection is replayed
+// on the channel's next connection.
+#[tokio::test]
+async fn expose_port_replays_a_call_cut_by_a_restarting_node_manager() {
+    use pplx_space_node_mgr_client::proto::{ExposePortRequest, NetworkProtocol};
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("node-manager.sock");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let listener = CuttingFirstConnection {
+        listener: tokio::net::UnixListener::bind(&socket).unwrap(),
+        accepted: accepted.clone(),
+    };
+    let server = tokio::spawn(async move {
+        axum::serve(listener, unimplemented_backend())
+            .await
+            .unwrap()
+    });
+    let service = service_with_clients(node_manager_clients(&socket).await);
+    let _node_manager = FakeNodeManager { _dir: dir, server };
+
+    let forwarded = service
+        .expose_port(Request::new(ExposePortRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            port: 8080,
+            protocol: NetworkProtocol::Tcp as i32,
+            guest_port: None,
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+}
+
+// A port call waits for node-manager's successor even when the socket stays
+// unbound for longer than the channel's own redial budget.
+#[tokio::test(start_paused = true)]
+async fn allow_port_waits_out_an_unbound_window_longer_than_the_redial_budget() {
+    let unbound_for = Duration::from_secs(15);
+    assert!(unbound_for > pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY.max_elapsed);
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("node-manager.sock");
+    let predecessor = tokio::net::UnixListener::bind(&socket).unwrap();
+    let service = service_with_clients(node_manager_clients(&socket).await);
+    // The predecessor closes its connection and its listener, leaving the
+    // socket file refusing dials until the successor replaces it.
+    let (connection, _) = predecessor.accept().await.unwrap();
+    drop(predecessor);
+    drop(connection);
+    // Let the channel see its connection close, so the call starts on a redial.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let started_at = tokio::time::Instant::now();
+    let successor_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        tokio::time::sleep(unbound_for).await;
+        std::fs::remove_file(&successor_socket).unwrap();
+        let listener = tokio::net::UnixListener::bind(&successor_socket).unwrap();
+        axum::serve(listener, unimplemented_backend())
+            .await
+            .unwrap();
+    });
+    let _node_manager = FakeNodeManager { _dir: dir, server };
+
+    let forwarded = service.allow_port(allow_port_request()).await.unwrap_err();
+
+    assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
+    assert!(
+        started_at.elapsed() >= unbound_for
+            && started_at.elapsed() < PEER_RESTART_RETRY_POLICY.max_elapsed,
+        "answered after {:?}",
+        started_at.elapsed()
+    );
+}
+
+// An attempt that stalls after refused dials gives up when the restart budget
+// runs out, not at a longer caller deadline.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_port_call_is_bounded_by_the_restart_budget() {
+    let mut request = Request::new(());
+    request
+        .metadata_mut()
+        .insert("grpc-timeout", "120S".parse().unwrap());
+    let started_at = tokio::time::Instant::now();
+    let refused_until = started_at + Duration::from_secs(20);
+
+    let status =
+        forward_port_rpc_through_node_manager_restart("allow_port", request, |_| async move {
+            if tokio::time::Instant::now() < refused_until {
+                let mut refused = Status::unknown("transport error");
+                refused.set_source(std::sync::Arc::new(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionRefused,
+                )));
+                return Err(refused);
+            }
+            std::future::pending::<Result<Response<()>, Status>>().await
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::DeadlineExceeded, "{status}");
+    assert!(
+        started_at.elapsed() <= PEER_RESTART_RETRY_POLICY.max_elapsed,
+        "gave up after {:?}",
+        started_at.elapsed()
+    );
 }
