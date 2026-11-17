@@ -7169,6 +7169,7 @@ dependencies = [
  "pplx-space-observability",
  "pplx-space-service-host",
  "pplx-space-service-lifecycle",
+ "pplx-space-spaced-guest-server",
  "pplx-space-test-env",
  "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-bind",

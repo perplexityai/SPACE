@@ -12,7 +12,12 @@ workspace = true
 
 [features]
 default = []
-experimental-wasm = ["dep:uuid", "dep:base64", "pplx-space-execution-spec/serde"]
+experimental-wasm = [
+    "dep:uuid",
+    "dep:base64",
+    "pplx-space-execution-spec/serde",
+    "dep:pplx-space-spaced-guest-server",
+]
 otel = ["pplx-space-service-host/otel"]
 datadog = ["otel", "pplx-space-service-host/datadog"]
 # Deprecated for one release; use otel and datadog.
@@ -47,6 +52,7 @@ pplx-space-node-runtime-core = { workspace = true, features = ["host-runtime", "
 pplx-space-observability = { workspace = true }
 pplx-space-service-host = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
+pplx-space-spaced-guest-server = { workspace = true, optional = true, features = ["service-entrypoint", "experimental-wasm"] }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
 

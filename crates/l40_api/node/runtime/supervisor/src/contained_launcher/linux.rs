@@ -24,7 +24,7 @@ use std::{
 };
 
 #[derive(Debug, thiserror::Error)]
-enum Error {
+pub(super) enum Error {
     #[error("invalid contained process: {0}")]
     Invalid(&'static str),
     #[error("{operation}: {source}")]
@@ -41,11 +41,25 @@ enum Error {
     },
     #[error("authenticate executable: {0}")]
     Authentication(tonic::Status),
+    #[cfg(feature = "experimental-wasm")]
+    #[error("authenticate native guest input: {0}")]
+    GuestInput(#[source] pplx_space_node_runtime_core::authenticated_source::AuthenticationError),
+    #[cfg(feature = "experimental-wasm")]
+    #[error("unsafe native guest input directory: {0}")]
+    InputDirectory(#[source] pplx_space_node_runtime_core::artifact_store::VerifyError),
+    #[cfg(feature = "experimental-wasm")]
+    #[error("invalid WASI process profile: {0}")]
+    WasiProfile(
+        #[source] pplx_space_spaced_guest_server::platform::current::WasiProcessProfileError,
+    ),
+    #[cfg(feature = "experimental-wasm")]
+    #[error("contained WASI guest failed: {0}")]
+    WasiGuest(#[source] pplx_space_spaced_guest_server::platform::current::RunSpacedGuestError),
 }
-fn io(operation: &'static str) -> impl FnOnce(std::io::Error) -> Error {
+pub(super) fn io(operation: &'static str) -> impl FnOnce(std::io::Error) -> Error {
     move |source| Error::Io { operation, source }
 }
-fn sys(operation: &'static str) -> impl FnOnce(nix::Error) -> Error {
+pub(super) fn sys(operation: &'static str) -> impl FnOnce(nix::Error) -> Error {
     move |source| Error::System { operation, source }
 }
 
@@ -55,11 +69,10 @@ pub(crate) fn run(config: Config, stream: UnixStream) -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(error) => {
             let error = error.to_string();
-            crate::sidecar_launcher::write_error(
-                stream.as_mut().expect("child retains status stream"),
-                &error,
-            )
-            .map_err(|report| format!("{error}; report launch failure: {report}"))?;
+            if let Some(stream) = stream.as_mut() {
+                crate::sidecar_launcher::write_error(stream, &error)
+                    .map_err(|report| format!("{error}; report launch failure: {report}"))?;
+            }
             Err(error)
         }
     }
@@ -75,6 +88,12 @@ fn prepare_and_exec(config: &Config, stream: &mut Option<UnixStream>) -> Result<
         return Err(Error::Invalid(
             "runtime has no standalone containment profile",
         ));
+    }
+    #[cfg(feature = "experimental-wasm")]
+    if matches!(&config.entrypoint, super::Entrypoint::WasiGuest(_))
+        && config.runtime != RuntimeKind::Wasmtime
+    {
+        return Err(Error::Invalid("WASI guest requires the Wasmtime runtime"));
     }
     if pplx_space_host_layout::gateway::gateway_uid(pplx_space_linux_ids::LinuxUid::new(config.uid))
         .is_none()
@@ -164,6 +183,15 @@ fn prepare_and_exec(config: &Config, stream: &mut Option<UnixStream>) -> Result<
     if (mounted.dev(), mounted.ino()) != (contained.dev(), contained.ino()) {
         return Err(Error::Invalid("isolation root changed before pivot"));
     }
+    #[cfg(feature = "experimental-wasm")]
+    let native_guest = match &config.entrypoint {
+        super::Entrypoint::Runtime => None,
+        super::Entrypoint::WasiGuest(guest) => Some(super::wasi_guest::Prepared::prepare(
+            guest,
+            config,
+            &registration,
+        )?),
+    };
     // Create mount points without following guest-controlled entries. Mount via
     // pinned descriptors before dropping the host procfs; never chown an entry
     // in the sandbox-owned tree by pathname.
@@ -342,6 +370,15 @@ fn prepare_and_exec(config: &Config, stream: &mut Option<UnixStream>) -> Result<
         .expect("child retains status stream")
         .write_all(&[crate::sidecar_launcher::PREPARED_TAG])
         .map_err(io("report contained launch ready"))?;
+    #[cfg(feature = "experimental-wasm")]
+    if let Some(guest) = native_guest {
+        // There is no second exec for the embedded native agent. Close the
+        // launch-status channel explicitly, as CLOEXEC does for VM engines.
+        // Guest listener readiness remains a separate authenticated RPC.
+        drop(executable);
+        drop(stream.take());
+        return guest.run();
+    }
     exec(executable, &arguments)
 }
 

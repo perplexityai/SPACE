@@ -6,9 +6,15 @@ import base64
 import json
 import os
 import selectors
+import signal
+import socket
+import struct
 import subprocess
+import tempfile
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -63,6 +69,130 @@ class SpacedRuntimeFixture:
     socket: str
     endpoint: SpacedEndpoint = SpacedEndpoint.GUEST
     privileged_client: bool = False
+
+    @contextmanager
+    def contained_agent(self, program: Path, specification: Path) -> Iterator[int]:
+        """Exercise the real single-threaded launcher, not supervisor admission.
+
+        The operator supplies fresh task-owned roots and a private cgroup in
+        the specification. This fixture owns the launched process lifetime,
+        not catalog qualification, volume attachment or cluster scheduling.
+        """
+        if os.geteuid() != 0 or not program.is_absolute() or not specification.is_absolute():
+            raise ValueError("contained-agent qualification requires root and absolute fixture paths")
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise ValueError("contained-agent qualification requires a pidfd-capable Python build")
+        if (
+            os.environ.get("SPACE_TEST_EXECUTION_PRIVATE_CGROUP_NS") != "1"
+            or Path("/proc/self/cgroup").read_text() != "0::/\n"
+        ):
+            raise ValueError("contained-agent qualification requires a disposable private cgroup namespace")
+        if self.endpoint is not SpacedEndpoint.GUEST:
+            raise ValueError("contained-agent qualification requires the guest fixture endpoint")
+        with specification.open("rb") as source:
+            payload = source.read(1024 * 1024 + 1)
+        if len(payload) > 1024 * 1024:
+            raise ValueError("contained-agent specification exceeds the fixture budget")
+        launch = json.loads(payload)
+        config = launch["config"]["contained"]
+        if (
+            launch["kind"] != "Contained"
+            or config["runtime"] != "wasmtime"
+            or "WasiGuest" not in config["entrypoint"]
+            or Path(self.socket)
+            != Path(config["registration_directory"]) / "wasi-guest/bridge-guest.sock"
+        ):
+            raise ValueError("fixture endpoint does not match its contained WASI launch")
+
+        def receive_exact(channel: socket.socket, count: int) -> bytes:
+            result = bytearray()
+            while len(result) < count:
+                chunk = channel.recv(count - len(result))
+                if not chunk:
+                    raise RuntimeError("contained launcher closed before reporting ownership")
+                result.extend(chunk)
+            return bytes(result)
+
+        parent, child = socket.socketpair()
+        observer: int | None = None
+        process: subprocess.Popen[bytes] | None = None
+        with tempfile.TemporaryFile() as diagnostic:
+            try:
+                parent.settimeout(15)
+                process = subprocess.Popen(
+                    [str(program), "--sidecar-launcher-fd", str(child.fileno())],
+                    pass_fds=(child.fileno(),),
+                    stdin=subprocess.DEVNULL,
+                    stdout=diagnostic,
+                    stderr=diagnostic,
+                    env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+                )
+                child.close()
+                parent.sendall(struct.pack("!I", len(payload)) + payload)
+                parent.shutdown(socket.SHUT_WR)
+
+                def receive_tag() -> bytes:
+                    tag = receive_exact(parent, 1)
+                    if tag == b"E":
+                        size = struct.unpack("!I", receive_exact(parent, 4))[0]
+                        if size > 65536:
+                            raise ValueError("contained launcher exceeded its diagnostic budget")
+                        raise RuntimeError(receive_exact(parent, size).decode(errors="replace"))
+                    return tag
+
+                if receive_tag() != b"\x03":
+                    raise RuntimeError("contained launcher omitted the runtime PID")
+                pid = struct.unpack("!I", receive_exact(parent, 4))[0]
+                if pid <= 1:
+                    raise ValueError("contained launcher reported an invalid host PID")
+                observer = os.pidfd_open(pid)
+                if receive_tag() != b"P" or parent.recv(1):
+                    raise RuntimeError("contained launcher did not finish namespace preparation")
+                deadline = time.monotonic() + 15
+                with selectors.DefaultSelector() as selector:
+                    selector.register(observer, selectors.EVENT_READ)
+                    while not Path(self.socket).is_socket():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or selector.select(timeout=min(0.02, remaining)):
+                            diagnostic.seek(0)
+                            raise RuntimeError(
+                                "contained agent did not publish its endpoint: "
+                                + diagnostic.read(65536).decode(errors="replace")
+                            )
+                yield pid
+            finally:
+                child.close()
+                parent.close()
+                terminated = True
+                if observer is not None:
+                    # A pidfd never targets a reused PID. Terminate the namespace
+                    # init, which also tears down every remaining WASI process.
+                    try:
+                        signal.pidfd_send_signal(observer, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    finally:
+                        try:
+                            with selectors.DefaultSelector() as selector:
+                                selector.register(observer, selectors.EVENT_READ)
+                                terminated = bool(selector.select(timeout=5))
+                        finally:
+                            os.close(observer)
+                if process is not None:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                if not terminated:
+                    raise RuntimeError("contained namespace did not terminate within its cleanup budget")
+                members = (Path(config["cgroup"]) / "cgroup.procs").read_text().strip()
+                self.context.verify(
+                    not members, "contained cleanup left processes in its owned resource domain",
+                    remaining_pids=members,
+                )
 
     def _command(self, service: str, method: str, request: dict[str, Any]) -> tuple[str, ...]:
         return (("sudo", "-n") if self.privileged_client else ()) + (

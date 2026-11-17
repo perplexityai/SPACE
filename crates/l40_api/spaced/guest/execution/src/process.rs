@@ -2394,7 +2394,12 @@ impl Process for ExecutionService {
         // `OOMScoreAdjust`), and children inherit it: reset the workload to
         // the default so the OOM killer prefers it over spaced, not the
         // reverse. Also before dropping credentials.
-        reset_workload_oom_score(&mut command);
+        // A contained unprivileged broker inherits the launch owner's OOM
+        // policy along with its workload. It cannot lower that score through
+        // procfs; retain the enclosing resource domain's policy instead.
+        if self.inner.identity_policy != crate::IdentityPolicy::Contained {
+            reset_workload_oom_score(&mut command);
+        }
         let uses_pty = pty_config.is_some();
         if !uses_pty {
             command.process_group(0);

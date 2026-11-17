@@ -32,6 +32,11 @@ pub struct RuntimeSupervisorRunConfig {
 /// Why [`run`] returned without a clean shutdown.
 #[derive(Debug, thiserror::Error)]
 pub enum RunRuntimeSupervisorError {
+    #[cfg(all(target_os = "linux", feature = "experimental-wasm"))]
+    #[error(transparent)]
+    FilesystemWorker(
+        #[from] pplx_space_spaced_guest_server::platform::current::RunFilesystemWorkerError,
+    ),
     /// Launcher mode failed. The protocol reports the same string back to the
     /// requesting supervisor over the launcher socket before this returns.
     #[error("sidecar launcher failed: {0}")]
@@ -66,6 +71,13 @@ pub fn run(config: RuntimeSupervisorRunConfig) -> Result<(), RunRuntimeSuperviso
     if let Some(raw_fd) = config.sidecar_launcher_fd {
         return crate::sidecar_launcher::run(raw_fd)
             .map_err(RunRuntimeSupervisorError::SidecarLauncher);
+    }
+    #[cfg(all(target_os = "linux", feature = "experimental-wasm"))]
+    if pplx_space_spaced_guest_server::platform::current::run_filesystem_worker_from_environment()?
+    {
+        // The contained agent's filesystem workers re-enter this trusted
+        // binary. Dispatch before any telemetry threads or Tokio runtime.
+        return Ok(());
     }
 
     tokio::runtime::Builder::new_multi_thread()
