@@ -1797,6 +1797,10 @@ fn create_translation_applies_resource_overrides() {
         ),
         (r#"{"vcpu":4}"#, Some(4), None, None),
         (r#"{"memory_mib":8192}"#, None, Some(8192), None),
+        // Above the native bound: ECW clients run these shapes, and the node
+        // clamps to its configured sandbox memory.
+        (r#"{"memory_mib":16896}"#, None, Some(16896), None),
+        (r#"{"memory_mib":511}"#, None, Some(511), None),
         (r#"{"disk_mib":20480}"#, None, None, Some(20480)),
         ("{}", None, None, None),
     ] {
@@ -1830,8 +1834,6 @@ fn create_translation_rejects_invalid_resource_overrides() {
         r#"{"vcpu":2147483648}"#,
         r#"{"vcpu":33}"#,
         r#"{"memory_mib":2147483648}"#,
-        r#"{"memory_mib":8193}"#,
-        r#"{"memory_mib":511}"#,
         r#"{"disk_mib":0}"#,
         r#"{"disk_mib":131073}"#,
         r#"{"memory_mb":8192}"#,
@@ -6638,7 +6640,7 @@ async fn seed_ecw_create_template(pool: &PgPool) -> TestResult {
 #[tokio::test(flavor = "current_thread")]
 async fn ecw_create_refuses_out_of_bounds_resources_up_front() -> TestResult {
     use pplx_space_public_api::limits::{
-        MAX_SANDBOX_MEMORY_MIB, MAX_SANDBOX_VCPU, MIN_SANDBOX_MEMORY_MIB, MIN_SANDBOX_VCPU,
+        MAX_SANDBOX_DISK_MIB, MAX_SANDBOX_VCPU, MIN_SANDBOX_DISK_MIB, MIN_SANDBOX_VCPU,
     };
     let db = pg_test_db().await?;
     seed_ecw_create_template(&db.pool).await?;
@@ -6668,16 +6670,10 @@ async fn ecw_create_refuses_out_of_bounds_resources_up_front() -> TestResult {
             MAX_SANDBOX_VCPU,
         ),
         (
-            json!({ "memory_mib": MAX_SANDBOX_MEMORY_MIB + 1 }),
-            "memory_mib",
-            MIN_SANDBOX_MEMORY_MIB,
-            MAX_SANDBOX_MEMORY_MIB,
-        ),
-        (
-            json!({ "memory_mib": MIN_SANDBOX_MEMORY_MIB - 1 }),
-            "memory_mib",
-            MIN_SANDBOX_MEMORY_MIB,
-            MAX_SANDBOX_MEMORY_MIB,
+            json!({ "disk_mib": MAX_SANDBOX_DISK_MIB + 1 }),
+            "disk_mib",
+            MIN_SANDBOX_DISK_MIB,
+            MAX_SANDBOX_DISK_MIB,
         ),
     ] {
         let body = json!({

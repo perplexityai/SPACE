@@ -3,8 +3,10 @@
 //! The handlers call [`validate_create_request`] and
 //! [`validate_update_request`] before admitting an operation, and the
 //! published `CreateSandboxRequest` schema reads the same constants, so the
-//! two cannot disagree about what is accepted. ECW's create checks its
-//! resource override with [`validate_resources`].
+//! two cannot disagree about what is accepted. ECW's create checks the vCPU
+//! and disk of its resource override with [`validate_resources`]; it does not
+//! apply [`MAX_SANDBOX_MEMORY_MIB`], because nodes clamp memory to their own
+//! configured sandbox maximum and ECW clients already run larger shapes.
 
 use std::collections::BTreeMap;
 use std::fmt;

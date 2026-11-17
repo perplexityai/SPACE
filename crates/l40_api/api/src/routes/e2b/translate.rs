@@ -47,17 +47,29 @@ pub(super) fn translate_create_request(
         .transpose()
         .map_err(|error| E2bApiError::bad_request(format!("invalid space.resources: {error}")))?
         .unwrap_or_default();
-    // The native API's bounds, checked before admission. Past them a node
-    // boots no VM (too many vCPUs, so the create waits out its readiness
-    // budget) or clamps the guest memory it was asked for.
+    // The native API's vCPU and disk bounds, checked before admission. Past
+    // MAX_SANDBOX_VCPU a node boots no VM, so the create would wait out its
+    // readiness budget.
     pplx_space_public_api::limits::validate_resources(&pplx_space_public_api::SandboxResources {
         vcpu: resources.vcpu,
-        memory_mib: resources.memory_mib,
+        memory_mib: None,
         disk_mib: resources.disk_mib,
     })
     // The native field is `resources.<name>`; ECW's is the reserved
     // `space.resources` metadata key.
     .map_err(|error| E2bApiError::bad_request(format!("space.{error}")))?;
+    // Memory is not held to the native MAX_SANDBOX_MEMORY_MIB. Each node
+    // clamps a request to its own configured sandbox cgroup memory, which
+    // deployments raise past that constant, and existing ECW clients create
+    // sandboxes above it. Only the signed 32-bit column range applies.
+    if let Some(memory_mib) = resources.memory_mib
+        && (memory_mib == 0 || memory_mib > i32::MAX as u32)
+    {
+        return Err(E2bApiError::bad_request(format!(
+            "space.resources.memory_mib must be between 1 and {}",
+            i32::MAX
+        )));
+    }
     let mut unsupported = Vec::new();
     let network_policy = if let Some(raw) = req.metadata.remove(NETWORK_POLICY_METADATA_KEY) {
         if req.network.is_some()
