@@ -28,6 +28,29 @@ fn block_volume_admission_is_opt_in_and_owner_scoped() {
             .unwrap()
             .is_some()
     );
+    let qualified_hash = format!("sha256:{}", "a".repeat(64));
+    let other_hash = format!("sha256:{}", "b".repeat(64));
+    let policy = admit(&env, &mounts, owner, RuntimeKind::Firecracker, false)
+        .unwrap()
+        .unwrap();
+    policy.require_guest(&qualified_hash).unwrap_err();
+    for version in [1, 2] {
+        env.set(
+            POLICY_ENV,
+            serde_json::json!({
+                "organization_ids": [owner],
+                "availability_zone": "test-region-1a",
+                "qualified_guest_images": {qualified_hash.clone(): version}
+            })
+            .to_string(),
+        );
+        let policy = admit(&env, &mounts, owner, RuntimeKind::Firecracker, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.require_guest(&qualified_hash).is_ok(), version == 1);
+        policy.require_guest(&other_hash).unwrap_err();
+        policy.require_guest("seed:latest").unwrap_err();
+    }
     admit(&env, &mounts, other, RuntimeKind::Firecracker, false).unwrap_err();
     admit(&env, &mounts, owner, RuntimeKind::Firecracker, true).unwrap_err();
     admit(

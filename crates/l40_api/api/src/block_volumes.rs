@@ -1,8 +1,9 @@
 //! Default-off admission policy for the bounded retained-disk experiment.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pplx_space_accounts::OrgId;
+use pplx_space_content_digest::ContentHash;
 use pplx_space_execution_spec::{BlockVolumeMount, RuntimeKind};
 use serde::Deserialize;
 
@@ -53,6 +54,25 @@ pub(crate) async fn populate_status(
 pub(crate) struct Admission {
     organization_ids: BTreeSet<OrgId>,
     pub(crate) availability_zone: String,
+    #[serde(default)]
+    qualified_guest_images: BTreeMap<ContentHash, u32>,
+}
+
+impl Admission {
+    /// Operator qualification is bound to immutable bytes, never a movable tag.
+    pub(crate) fn require_guest(&self, content_hash: &str) -> Result<(), ControllerError> {
+        let qualified = content_hash
+            .parse::<ContentHash>()
+            .ok()
+            .and_then(|hash| self.qualified_guest_images.get(&hash))
+            == Some(&1);
+        if !qualified {
+            return Err(ControllerError::bad_request(
+                "template is not qualified for MountDataDrive protocol version 1",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn admit(

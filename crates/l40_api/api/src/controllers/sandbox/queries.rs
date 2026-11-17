@@ -1297,7 +1297,8 @@ impl SandboxController {
             runtime,
             org_byok,
         )?;
-        if block_volume_admission.is_some() {
+        if let Some(admission) = &block_volume_admission {
+            admission.require_guest(&resolved_content_hash)?;
             if !self
                 .substrate
                 .capabilities()
