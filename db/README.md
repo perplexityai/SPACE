@@ -105,7 +105,12 @@ migration. `down` and `status` don't consult the list.
 List a migration one release before the release that bundles it, and only if
 it is additive for the listing release: it adds tables, nullable or defaulted
 columns, or indexes that release never trips over, and every read and write
-that release makes stays valid with it applied. The bundling release must ship
+that release makes stays valid with it applied. The contract step of an
+expand/contract change counts as additive for a release that has already
+stopped naming what it removes, when the removed object holds no data of its
+own: dropping a generated column, a view or an index that release never names
+qualifies. Dropping a stored column or a table doesn't, because its data is
+gone after the drop. The bundling release must ship
 the same up SQL byte for byte, comments included, because the listing release
 accepts only that checksum; `every_listed_forward_migration_matches_the_catalog_that_bundles_it`
 checks it once both are in the tree. Never list a migration that isn't additive
