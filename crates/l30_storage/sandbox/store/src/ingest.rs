@@ -630,6 +630,12 @@ pub async fn converge_published_stopped(
 /// projection re-checks only that the row is outside the suspend, hold and
 /// delete lifecycles: if a newer suspend owns the row, the attempt is still
 /// released but its stale target is not projected.
+///
+/// A projected `started` target also clears `command_ready_pending`. The node
+/// writes an activation-completed receipt only once the guest has passed its
+/// readiness gate, so the receipt for the attempt a create gave up waiting on
+/// is the evidence the marker was waiting for. A receipt that releases
+/// nothing leaves the marker to the data-plane confirmation.
 pub async fn release_completed_activations(
     executor: impl sqlx::PgExecutor<'_>,
     node_id: NodeId,
@@ -675,6 +681,11 @@ pub async fn release_completed_activations(
                     WHEN released.transition_receipt_target_state IN ('started', 'paused')
                     THEN 'on_node'
                     ELSE sandbox.placement
+                END,
+                command_ready_pending = CASE
+                    WHEN released.transition_receipt_target_state = 'started'
+                    THEN FALSE
+                    ELSE sandbox.command_ready_pending
                 END
            FROM released
           WHERE sandbox.id = released.sandbox_id

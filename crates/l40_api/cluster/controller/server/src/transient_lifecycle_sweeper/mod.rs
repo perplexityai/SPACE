@@ -30,6 +30,13 @@
 //! `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_ENABLED=false` disables the entire
 //! loop.
 //!
+//! The command-ready-pending phase, the deadline for a `started` row whose
+//! create stopped waiting for its guest (`command_ready_pending`), has its
+//! own switch, `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_COMMAND_READY_PENDING_ENABLED`,
+//! off unless set to a `true` spelling. It heals a marker whose guest probes
+//! ready and reaps a row whose guest probes wedged, or stays unreachable past
+//! the terminal age ([`ReconcilerConfig::command_ready_pending_enabled`]).
+//!
 //! ## Verify before destroy
 //!
 //! Aging out is **select -> probe -> classify -> act**. The CAS to `failed`
@@ -791,7 +798,11 @@ pub struct ReconcilerConfig {
     /// When true, probe-and-resolve preserved `started` +
     /// `command_ready_pending` rows older than
     /// [`Self::command_ready_pending_age`]. Independent of `enabled` so an
-    /// operator can run only this reaper. Default `false`.
+    /// operator can run only this reaper. Default `false`; set
+    /// `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_COMMAND_READY_PENDING_ENABLED` to a
+    /// `true` spelling to turn it on. The node's activation-completion receipt
+    /// and the data-plane confirmation clear a marker whose guest came up, so
+    /// the rows left for it are the ones with no evidence the guest ever did.
     pub command_ready_pending_enabled: bool,
     /// Minimum age (since the row entered `started` with the marker set) before
     /// a `command_ready_pending` row is probed. Generous by design — see
@@ -937,7 +948,10 @@ impl ReconcilerConfig {
             // disable it rather than leave it running.
             failed_cleanup_enabled: config.destructive_gate("SPACE_FAILED_SANDBOX_CLEANUP_ENABLED"),
             failed_cleanup_batch_size: default.failed_cleanup_batch_size,
-            command_ready_pending_enabled: false,
+            command_ready_pending_enabled: config.truthy_default(
+                "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_COMMAND_READY_PENDING_ENABLED",
+                default.command_ready_pending_enabled,
+            ),
             command_ready_pending_age: default.command_ready_pending_age,
             command_ready_pending_probe_timeout: default.command_ready_pending_probe_timeout,
             command_ready_pending_terminal_age: default.command_ready_pending_terminal_age,
@@ -2946,7 +2960,8 @@ pub async fn run<S: SweepSink>(
             "transient_lifecycle_sweeper disabled \
              (SPACE_TRANSIENT_LIFECYCLE_SWEEPER_ENABLED, \
               SPACE_FAILED_SANDBOX_CLEANUP_ENABLED, and \
-              the fixed-disabled command-ready-pending reaper are all false); waiting for shutdown"
+              SPACE_TRANSIENT_LIFECYCLE_SWEEPER_COMMAND_READY_PENDING_ENABLED \
+              are all false); waiting for shutdown"
         );
         shutdown_token.cancelled().await;
         return;

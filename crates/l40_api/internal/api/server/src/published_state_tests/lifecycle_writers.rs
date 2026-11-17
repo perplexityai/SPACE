@@ -447,6 +447,105 @@ async fn activation_completion_receipt_projects_its_target_outside_the_suspend_w
     assert_other_node_report_is_inert(pool, sandbox_id, report).await
 }
 
+async fn command_ready_pending(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<bool> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT command_ready_pending FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// A `started` row whose create gave up waiting for its guest, carrying
+/// `command_ready_pending` and the create's still-held activation attempt.
+async fn insert_pending_create(
+    pool: &PgPool,
+    node_id: NodeId,
+    attempt: Uuid,
+) -> TestResult<SandboxId> {
+    let (sandbox_id, _) = insert_running(pool, node_id, "started").await?;
+    set_activation_attempt(pool, sandbox_id, attempt, "started").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET command_ready_pending = TRUE WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    Ok(sandbox_id)
+}
+
+/// An activation-completion receipt for `started` is the node's evidence
+/// that the guest passed its readiness gate, so the receipt that releases a
+/// create's attempt also clears the `command_ready_pending` marker the create
+/// left when it stopped waiting. A receipt that releases nothing (another
+/// attempt or generation, another node, or an execution without a pod IP)
+/// leaves the marker for the data-plane confirmation.
+#[tokio::test(flavor = "current_thread")]
+async fn activation_completion_receipt_clears_the_command_ready_marker_of_its_attempt() -> TestResult
+{
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = ready_node(pool).await?;
+    let receipt = |sandbox_id, generation, attempt| {
+        with_receipt(
+            published_sandbox_state(sandbox_id, "started"),
+            "activation_completed",
+            "started",
+            generation,
+            Some(attempt),
+            "",
+        )
+    };
+
+    let attempt = Uuid::now_v7();
+    let sandbox_id = insert_pending_create(pool, node_id, attempt).await?;
+    publish(pool, node_id, receipt(sandbox_id, 7, attempt)).await?;
+    let after = row(pool, sandbox_id).await?;
+    assert_eq!(
+        (after.lifecycle.as_str(), after.activation_attempt_id),
+        ("started", None)
+    );
+    assert!(!command_ready_pending(pool, sandbox_id).await?);
+
+    // (receipt generation, receipt names the held attempt)
+    for (generation, current_attempt) in [(7, false), (8, true)] {
+        let held = Uuid::now_v7();
+        let sandbox_id = insert_pending_create(pool, node_id, held).await?;
+        let attempt = if current_attempt {
+            held
+        } else {
+            Uuid::now_v7()
+        };
+        publish(pool, node_id, receipt(sandbox_id, generation, attempt)).await?;
+        assert!(
+            command_ready_pending(pool, sandbox_id).await?,
+            "generation {generation}, current attempt {current_attempt}"
+        );
+        assert_eq!(
+            row(pool, sandbox_id).await?.activation_attempt_id,
+            Some(held)
+        );
+    }
+
+    let attempt = Uuid::now_v7();
+    let sandbox_id = insert_pending_create(pool, node_id, attempt).await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET pod_ip = NULL WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    publish(pool, node_id, receipt(sandbox_id, 7, attempt)).await?;
+    assert!(command_ready_pending(pool, sandbox_id).await?, "no pod IP");
+
+    let attempt = Uuid::now_v7();
+    let sandbox_id = insert_pending_create(pool, node_id, attempt).await?;
+    let other_node_id = ready_node(pool).await?;
+    publish(pool, other_node_id, receipt(sandbox_id, 7, attempt)).await?;
+    assert!(command_ready_pending(pool, sandbox_id).await?, "other node");
+    Ok(())
+}
+
 /// One open and one closed port exposure on `sandbox_id`, both observed as
 /// applied on `node_id`.
 async fn insert_port_exposures(
