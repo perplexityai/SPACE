@@ -239,6 +239,15 @@ message GetTemplateRequest {
   // doesn't make these checks; its answer leaves GetTemplateResponse's
   // cached_only false.
   bool cached_only = 5;
+  // Answer only with a build bound to template.environment's cache partition,
+  // never another environment's build of the digest. Requires
+  // template.environment and an exact content_hash, and excludes cached_only.
+  // A lookup that holds no such build pulls the release even when another
+  // partition holds the digest: the release's manifest decides where it
+  // lands, and if it isn't that partition the lookup is NOT_FOUND. A
+  // template-manager that predates the field ignores it and answers with its
+  // preferred build, which the caller checks.
+  bool environment_required = 6;
 }
 
 message GetTemplateResponse {

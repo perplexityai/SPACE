@@ -2405,7 +2405,7 @@ type CreateRequest struct {
 	Environment      *EnvironmentCreateInput `protobuf:"bytes,30,opt,name=environment,proto3" json:"environment,omitempty"`
 	Template         string                  `protobuf:"bytes,1,opt,name=template,proto3" json:"template,omitempty"`
 	Owner            string                  `protobuf:"bytes,2,opt,name=owner,proto3" json:"owner,omitempty"`
-	Runtime          string                  `protobuf:"bytes,3,opt,name=runtime,proto3" json:"runtime,omitempty"`                                                                    // Required for legacy input: "fc". Absent with environment.
+	Runtime          string                  `protobuf:"bytes,3,opt,name=runtime,proto3" json:"runtime,omitempty"`                                                                    // Required for legacy input: "fc". Absent with environment or required_environment.
 	SnapshotsEnabled bool                    `protobuf:"varint,4,opt,name=snapshots_enabled,json=snapshotsEnabled,proto3" json:"snapshots_enabled,omitempty"`                         // Enable rolling btrfs snapshots when started
 	Autostart        bool                    `protobuf:"varint,5,opt,name=autostart,proto3" json:"autostart,omitempty"`                                                               // If true, start the sandbox after creation
 	PoolTemplate     *string                 `protobuf:"bytes,6,opt,name=pool_template,json=poolTemplate,proto3,oneof" json:"pool_template,omitempty"`                                // Internal: mark this sandbox as a pool member for the given template
@@ -2437,8 +2437,27 @@ type CreateRequest struct {
 	// Older callers omit these and receive the platform defaults.
 	DiskIoMaxOperationsPerSec   *uint64 `protobuf:"varint,28,opt,name=disk_io_max_operations_per_sec,json=diskIoMaxOperationsPerSec,proto3,oneof" json:"disk_io_max_operations_per_sec,omitempty"`
 	DiskIoMaxBandwidthMibPerSec *uint64 `protobuf:"varint,29,opt,name=disk_io_max_bandwidth_mib_per_sec,json=diskIoMaxBandwidthMibPerSec,proto3,oneof" json:"disk_io_max_bandwidth_mib_per_sec,omitempty"`
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	// The environment a bound Kubernetes pod requires: its
+	// space.pplx.net/environment annotation, sent while the pod's
+	// space.pplx.net/environment-required annotation says the environment
+	// placement gate is on. Requires content_hash and no runtime: the create
+	// takes the runtime from the build's binding. Template lookup asks for
+	// that environment's build of the digest only
+	// (GetTemplateRequest.environment_required), pulling it when the node holds
+	// the digest only under another environment. The create fails, NOT_FOUND
+	// when template-manager has no build bound to that environment's cache
+	// partition and FAILED_PRECONDITION when the build it answers with isn't
+	// in it (an older template-manager answers with its preferred build), so
+	// another environment's build is never booted in its place. Unlike
+	// `environment`, it doesn't select a consumer: the sandbox runs the
+	// resolved build's own binding, which the node admits first unless it's
+	// E0's, and always boots cold. Older readers
+	// drop the field and then refuse the create for want of a runtime, so it
+	// never boots their preferred build. The shim also checks the
+	// create-required-environment capability first, for a clearer error.
+	RequiredEnvironment *string `protobuf:"bytes,31,opt,name=required_environment,json=requiredEnvironment,proto3,oneof" json:"required_environment,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *CreateRequest) Reset() {
@@ -2644,6 +2663,13 @@ func (x *CreateRequest) GetDiskIoMaxBandwidthMibPerSec() uint64 {
 		return *x.DiskIoMaxBandwidthMibPerSec
 	}
 	return 0
+}
+
+func (x *CreateRequest) GetRequiredEnvironment() string {
+	if x != nil && x.RequiredEnvironment != nil {
+		return *x.RequiredEnvironment
+	}
+	return ""
 }
 
 type CreateResponse struct {
@@ -14393,7 +14419,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x18_last_auto_transition_atB\x12\n" +
 	"\x10_last_auto_errorB\x11\n" +
 	"\x0f_last_access_atB\x12\n" +
-	"\x10_last_command_at\"\xbc\x0e\n" +
+	"\x10_last_command_at\"\x8d\x0f\n" +
 	"\rCreateRequest\x12R\n" +
 	"\venvironment\x18\x1e \x01(\v20.space.sandbox.manager.v1.EnvironmentCreateInputR\venvironment\x12\x1a\n" +
 	"\btemplate\x18\x01 \x01(\tR\btemplate\x12\x14\n" +
@@ -14421,7 +14447,9 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x11volume_encryption\x18\x16 \x01(\bR\x10volumeEncryption\x12W\n" +
 	"\x0eroute_identity\x18\x1a \x01(\v2+.space.net.gateway.v1.SpaceApiRouteIdentityH\aR\rrouteIdentity\x88\x01\x01\x12F\n" +
 	"\x1edisk_io_max_operations_per_sec\x18\x1c \x01(\x04H\bR\x19diskIoMaxOperationsPerSec\x88\x01\x01\x12K\n" +
-	"!disk_io_max_bandwidth_mib_per_sec\x18\x1d \x01(\x04H\tR\x1bdiskIoMaxBandwidthMibPerSec\x88\x01\x01\x1a6\n" +
+	"!disk_io_max_bandwidth_mib_per_sec\x18\x1d \x01(\x04H\tR\x1bdiskIoMaxBandwidthMibPerSec\x88\x01\x01\x126\n" +
+	"\x14required_environment\x18\x1f \x01(\tH\n" +
+	"R\x13requiredEnvironment\x88\x01\x01\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x10\n" +
@@ -14434,7 +14462,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x18_template_network_policyB\x11\n" +
 	"\x0f_route_identityB!\n" +
 	"\x1f_disk_io_max_operations_per_secB$\n" +
-	"\"_disk_io_max_bandwidth_mib_per_sec\"\xad\x04\n" +
+	"\"_disk_io_max_bandwidth_mib_per_secB\x17\n" +
+	"\x15_required_environment\"\xad\x04\n" +
 	"\x0eCreateResponse\x12%\n" +
 	"\venvironment\x18\n" +
 	" \x01(\tH\x00R\venvironment\x88\x01\x01\x12\x1d\n" +

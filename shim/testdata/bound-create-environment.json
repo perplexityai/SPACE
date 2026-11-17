@@ -1,0 +1,9 @@
+{
+  "shadow": {
+    "space.pplx.net/environment": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "on": {
+    "space.pplx.net/environment": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "space.pplx.net/environment-required": "true"
+  }
+}

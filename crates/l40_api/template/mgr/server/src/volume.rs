@@ -419,10 +419,13 @@ impl VolumePuller {
     ) -> PullOutcome {
         self.pull_in_scope(
             db,
-            name,
-            req_hash,
-            req_tag,
-            trigger,
+            PullSpec {
+                name,
+                req_hash,
+                req_tag,
+                trigger,
+                required: None,
+            },
             Some(TemplateLookupScope::Cluster),
         )
         .await
@@ -431,32 +434,22 @@ impl VolumePuller {
     #[tracing::instrument(
         skip_all,
         fields(
-            template = name,
-            trigger = trigger.as_tag(),
-            req_hash = req_hash,
-            req_tag = req_tag,
+            template = spec.name,
+            trigger = spec.trigger.as_tag(),
+            req_hash = spec.req_hash,
+            req_tag = spec.req_tag,
             content_hash = tracing::field::Empty,
         )
     )]
     pub(crate) async fn pull_in_scope(
         &self,
         db: Arc<std::sync::Mutex<rusqlite::Connection>>,
-        name: &str,
-        req_hash: &str,
-        req_tag: &str,
-        trigger: PullTrigger,
+        spec: PullSpec<'_>,
         scope: Option<TemplateLookupScope>,
     ) -> PullOutcome {
         let started = Instant::now();
-        let base_tags = pull_metric_tags(name, req_hash, req_tag, trigger);
+        let base_tags = pull_metric_tags(spec.name, spec.req_hash, spec.req_tag, spec.trigger);
         let mut path_taken = PullPath::FreshPull;
-
-        let spec = PullSpec {
-            name,
-            req_hash,
-            req_tag,
-            trigger,
-        };
         let outcome = pull_inner(self, db, spec, &base_tags, &mut path_taken, scope).await;
 
         crate::metrics::pull_duration(&base_tags, outcome_label(&outcome, path_taken), started);
@@ -491,6 +484,7 @@ impl VolumePuller {
                 release.hash,
                 release.storage_uris,
                 &tags,
+                spec.required,
             )
             .await;
         let outcome = result.outcome.into_outcome();
@@ -507,7 +501,14 @@ impl VolumePuller {
         resolved_hash: String,
         storage_uris: Vec<String>,
         base_tags: &[String],
+        required: Option<TemplateCachePartition>,
     ) -> PullTaskResult {
+        // One flight per digest whatever a caller requires: they all pull
+        // the one release, which lands where its manifest says. A caller that
+        // requires a partition and joins a flight whose owner checked another
+        // requirement and found the digest cached goes round again, as the
+        // owner if nobody else has started a flight, so its own fast path
+        // decides. Joiners requiring the owner's partition take its answer.
         let key = PullKey::new(name.clone(), resolved_hash.clone());
         loop {
             let (flight, started) = self.start_or_join_flight(key.clone());
@@ -530,15 +531,18 @@ impl VolumePuller {
                     async move {
                         let (outcome, path_taken) = pull_resolved_owner(
                             db,
-                            &name,
-                            &resolved_hash,
-                            &storage_uris,
+                            OwnedPull {
+                                name: &name,
+                                resolved_hash: &resolved_hash,
+                                storage_uris: &storage_uris,
+                                required,
+                            },
                             &base_tags,
                             background_worker.as_ref(),
                             backing_policy,
                         )
                         .await;
-                        guard.finish(PullTaskResult::new(&outcome, path_taken));
+                        guard.finish(PullTaskResult::new(&outcome, path_taken, required));
                     }
                     .in_current_span(),
                 );
@@ -557,6 +561,23 @@ impl VolumePuller {
             }
 
             match flight.wait_for_result().await {
+                Some(result)
+                    if !started
+                        && result.path == PullPath::DbHit
+                        && result.required != required
+                        && required.is_some_and(|partition| {
+                            !local_build_bound_to_exists(&db, &name, &resolved_hash, partition)
+                        }) =>
+                {
+                    debug!(
+                        template = %name,
+                        content_hash = %resolved_hash,
+                        "joined pull found another partition's build; retrying for the required one"
+                    );
+                    // A finished flight reports its result just before it
+                    // leaves the map, as in `claim_digest`.
+                    tokio::task::yield_now().await;
+                }
                 Some(mut result) => {
                     if !started && result.mark_coalesced_if_materialized() {
                         crate::metrics::pull_coalesced(base_tags);
@@ -698,13 +719,22 @@ impl PullKey {
 struct PullTaskResult {
     outcome: PullOutcomeSnapshot,
     path: PullPath,
+    /// The partition the owner's caller required ([`PullSpec::required`]),
+    /// which its fast path checked: a joiner that requires the same one
+    /// takes the owner's answer rather than probe again.
+    required: Option<TemplateCachePartition>,
 }
 
 impl PullTaskResult {
-    fn new(outcome: &PullOutcome, path: PullPath) -> Self {
+    fn new(
+        outcome: &PullOutcome,
+        path: PullPath,
+        required: Option<TemplateCachePartition>,
+    ) -> Self {
         Self {
             outcome: PullOutcomeSnapshot::from(outcome),
             path,
+            required,
         }
     }
 
@@ -884,6 +914,12 @@ pub(crate) struct PullSpec<'a> {
     pub(crate) req_hash: &'a str,
     pub(crate) req_tag: &'a str,
     pub(crate) trigger: PullTrigger,
+    /// The partition a lookup requires the build in
+    /// (`GetTemplateRequest.environment_required`): the owner's fast path
+    /// then skips the pull only for a build bound to it, so a digest held
+    /// under another environment is still pulled. The release's manifest
+    /// still decides where the build lands.
+    pub(crate) required: Option<TemplateCachePartition>,
 }
 
 async fn pull_inner(
@@ -948,7 +984,14 @@ async fn pull_inner(
     );
 
     let result = puller
-        .pull_resolved(db, name.to_string(), resolved_hash, storage_uris, base_tags)
+        .pull_resolved(
+            db,
+            name.to_string(),
+            resolved_hash,
+            storage_uris,
+            base_tags,
+            spec.required,
+        )
         .await;
     *path_taken = result.path;
     result.outcome.into_outcome()
@@ -1077,12 +1120,19 @@ async fn refuse_pull_during_eviction(
     Ok(())
 }
 
+/// The resolved digest a flight's owner pulls, and the partition its caller
+/// requires the build in ([`PullSpec::required`]).
+struct OwnedPull<'a> {
+    name: &'a str,
+    resolved_hash: &'a str,
+    storage_uris: &'a [String],
+    required: Option<TemplateCachePartition>,
+}
+
 /// The owner's work for one resolved digest.
 async fn pull_resolved_owner(
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
-    name: &str,
-    resolved_hash: &str,
-    storage_uris: &[String],
+    pull: OwnedPull<'_>,
     base_tags: &[String],
     background_worker: Option<
         &pplx_space_common_jobs::BackgroundWorker<
@@ -1091,6 +1141,12 @@ async fn pull_resolved_owner(
     >,
     backing_policy: RootfsBackingPolicy,
 ) -> (PullOutcome, PullPath) {
+    let OwnedPull {
+        name,
+        resolved_hash,
+        storage_uris,
+        required,
+    } = pull;
     // A build of this digest mid-eviction refuses the pull, retryably,
     // before the fast path: its row still counts as present, and its dir is
     // the one being deleted. `do_pull` checks again for an eviction that
@@ -1104,8 +1160,13 @@ async fn pull_resolved_owner(
     // DB fast-path: a prior call (or startup recovery) already committed
     // this build. This check intentionally runs inside the owner task too:
     // a caller may have won the flight after another caller finished between
-    // its first local miss and the flight-map insert.
-    if local_build_exists(&db, name, resolved_hash) {
+    // its first local miss and the flight-map insert. A pull that requires a
+    // partition takes it only for a build bound to that partition.
+    let present = match required {
+        None => local_build_exists(&db, name, resolved_hash),
+        Some(partition) => local_build_bound_to_exists(&db, name, resolved_hash, partition),
+    };
+    if present {
         info!(
             template = name,
             content_hash = %resolved_hash,
@@ -1118,6 +1179,7 @@ async fn pull_resolved_owner(
     // partition the release lands in, which the pull learns from its
     // manifest; `try_pull_from` checks once it has probed it.
     // Fresh pull. Vol-mgr deduplicates concurrent PullFile calls server-side.
+    let mut path = PullPath::FreshPull;
     let outcome = match do_pull(
         db,
         name,
@@ -1129,7 +1191,16 @@ async fn pull_resolved_owner(
     )
     .await
     {
-        Ok(()) => PullOutcome::Materialized,
+        Ok(PullWrite::Written) => PullOutcome::Materialized,
+        // Nothing was pulled: the release's partition already held the
+        // build, which a pull that required a partition finds past the fast
+        // path when that build isn't bound to the required one. Reported as
+        // the fast path's hit, so metrics and a required pull that joined
+        // this one see that nothing was pulled.
+        Ok(PullWrite::AlreadyPresent) => {
+            path = PullPath::DbHit;
+            PullOutcome::Materialized
+        }
         Err(PullError::Failure(failure)) => PullOutcome::ClassifiedFailure(failure),
         Err(PullError::Retryable(status)) => PullOutcome::Retryable(status),
         Err(PullError::Failed(status)) => PullOutcome::DownstreamFailure {
@@ -1142,7 +1213,7 @@ async fn pull_resolved_owner(
             )))
         }
     };
-    (outcome, PullPath::FreshPull)
+    (outcome, path)
 }
 
 /// Connects to the cluster-role node-api and asks
@@ -1158,6 +1229,7 @@ async fn find_release(
         req_hash,
         req_tag,
         trigger,
+        required: _,
     } = spec;
     let generic_only = trigger.is_prefetch();
     let result =
@@ -1457,7 +1529,7 @@ async fn do_pull(
         >,
     >,
     backing_policy: RootfsBackingPolicy,
-) -> Result<(), PullError> {
+) -> Result<PullWrite, PullError> {
     // Validate name + hash once — both are URI-independent.
     pplx_space_common_core::types::TemplateName::parse(name.to_string()).map_err(|err| {
         warn!(error = %err, name, "invalid template name; volume pull skipped");
@@ -1528,7 +1600,7 @@ async fn do_pull(
             )
             .await
             {
-                Ok(()) => return Ok(()),
+                Ok(written) => return Ok(written),
                 Err(PullError::HashMismatch { expected, actual }) => {
                     return Err(PullError::HashMismatch { expected, actual });
                 }
@@ -1722,7 +1794,7 @@ async fn try_pull_from(
     >,
     backing_policy: RootfsBackingPolicy,
     cleanup: &PullCleanupSlot,
-) -> Result<(), PullError> {
+) -> Result<PullWrite, PullError> {
     // Parse the template name into the typed identity that becomes the
     // SubjectId we hand to volume-manager. This is also the *only* boundary
     // parse we need on the local-input side; credmgr-side identity (AWS STS
@@ -1783,21 +1855,28 @@ async fn try_pull_from(
     } = probe_release_partition(&client, &subject, parts, name, content_hash, base_tags).await?;
     let digest_dir =
         pplx_space_common_core::types::template_build_dir(name, content_hash, partition);
-    // A pull never writes into, or deletes, a build dir it didn't create:
-    // the owner found no row for the digest, so a dir in this partition is
-    // one without a row. Dirs of other partitions are left alone.
-    if let Some(refusal) =
-        probed_partition_refusal(Path::new(TEMPLATE_DIR), name, content_hash, partition)
-    {
-        warn!(
-            template = name,
-            content_hash,
-            cache_partition = %partition,
-            dir = %digest_dir,
-            %refusal,
-            "refusing the pull until template-manager verifies the build dir"
-        );
-        return Err(PullError::Retryable(Status::unavailable(refusal)));
+    match probed_partition_action(&db, Path::new(TEMPLATE_DIR), name, content_hash, partition)? {
+        ProbedPartition::Present => {
+            info!(
+                template = name,
+                content_hash,
+                cache_partition = %partition,
+                "the release's build is already in its cache partition; no pull needed"
+            );
+            return Ok(PullWrite::AlreadyPresent);
+        }
+        ProbedPartition::Refuse(refusal) => {
+            warn!(
+                template = name,
+                content_hash,
+                cache_partition = %partition,
+                dir = %digest_dir,
+                %refusal,
+                "refusing the pull until template-manager verifies the build dir"
+            );
+            return Err(PullError::Retryable(Status::unavailable(refusal)));
+        }
+        ProbedPartition::Pull => {}
     }
     // Arm the cleanup guard before any subvolume create / file write
     // touches the digest dir. Any error path below — including the
@@ -2232,7 +2311,7 @@ async fn try_pull_from(
             );
             crate::node_state_sync::mark_template_dirty(&db_for_mark, name);
             cleanup_guard.disarm();
-            Ok(())
+            Ok(PullWrite::Written)
         }
         Ok(Err(err)) => {
             record_phase(base_tags, "db_upsert", "error", phase_started);
@@ -3098,6 +3177,82 @@ fn decompress_phase(target: &DecompressTarget, rootfs_filename: &str) -> &'stati
     } else {
         "manifest_file_decompress"
     }
+}
+
+/// Whether the node holds a ready build of the digest bound to
+/// `partition` ([`crate::db::find_ready_build_bound_to`]). A DB error reads
+/// as absent, so the pull goes ahead, as [`local_build_exists`] does.
+pub(crate) fn local_build_bound_to_exists(
+    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> bool {
+    let Ok(conn) = db.lock() else {
+        return false;
+    };
+    crate::db::find_ready_build_bound_to(&conn, name, content_hash, partition)
+        .is_ok_and(|build| build.is_some())
+}
+
+/// What a pull that found no error left on the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullWrite {
+    /// It wrote the release's build and its row.
+    Written,
+    /// The release's partition already held the build
+    /// ([`ProbedPartition::Present`]), so it wrote nothing.
+    AlreadyPresent,
+}
+
+/// What a pull does once it has probed the partition its release lands in.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbedPartition {
+    /// The partition has a row of the digest: the release's build is on the
+    /// node already. A pull that required a partition gets here past the
+    /// owner's fast path when that build isn't bound to the required one;
+    /// the caller's own lookup then decides.
+    Present,
+    /// The partition has the digest's build dir but no row
+    /// ([`probed_partition_refusal`]); the pull refuses retryably.
+    Refuse(String),
+    /// Nothing of the digest is in the partition; the pull writes it.
+    Pull,
+}
+
+/// [`ProbedPartition`] for the release of `content_hash` landing in
+/// `partition` under `template_root`. A pull never writes into, or deletes,
+/// a build dir it didn't create, and dirs of other partitions are left alone.
+/// The row read is one indexed query under the lock, as in
+/// [`local_build_exists`].
+fn probed_partition_action(
+    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    template_root: &Path,
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> Result<ProbedPartition, PullError> {
+    let present = db
+        .lock()
+        .map_err(|_| "template DB mutex poisoned".to_string())
+        .and_then(|conn| {
+            crate::db::get_build(&conn, name, content_hash, partition)
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|error| {
+            warn!(template = name, content_hash, %error, "checking the release's partition failed");
+            PullError::Failure(PullFailure::LocalDatabaseUnavailable)
+        })?
+        .is_some();
+    if present {
+        return Ok(ProbedPartition::Present);
+    }
+    Ok(
+        match probed_partition_refusal(template_root, name, content_hash, partition) {
+            Some(refusal) => ProbedPartition::Refuse(refusal),
+            None => ProbedPartition::Pull,
+        },
+    )
 }
 
 /// Whether a build row exists for the digest in any cache partition.

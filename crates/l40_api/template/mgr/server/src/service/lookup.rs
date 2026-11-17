@@ -1,6 +1,7 @@
 use pplx_space_accounts::OrgId;
 use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 
+use super::support::PartitionChoice;
 use super::*;
 
 /// Cache partition a request's `TemplateRef.environment` selects; `None`
@@ -82,6 +83,39 @@ impl TemplateManagerService {
             crate::volume::ResolvedRelease,
         ) -> crate::volume::PullOutcome,
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
+        self.get_template_with(request, resolve, materialize, async |spec, scope| {
+            self.volume_puller
+                .pull_in_scope(Arc::clone(&self.db), spec, scope)
+                .await
+        })
+        .await
+    }
+
+    /// [`Self::get_template_resolving`], with the pull of a lookup that
+    /// resolves its release inside the puller (an untagged lookup with no
+    /// caller org) supplied too.
+    pub(super) async fn get_template_with(
+        &self,
+        request: Request<crate::proto::GetTemplateRequest>,
+        resolve: impl AsyncFnOnce(
+            &str,
+            &str,
+            &str,
+            Option<OrgId>,
+        ) -> Result<
+            crate::volume::ResolvedRelease,
+            crate::volume::FindReleaseError,
+        >,
+        materialize: impl AsyncFnOnce(
+            crate::volume::PullSpec<'_>,
+            std::time::Duration,
+            crate::volume::ResolvedRelease,
+        ) -> crate::volume::PullOutcome,
+        pull: impl AsyncFnOnce(
+            crate::volume::PullSpec<'_>,
+            Option<TemplateLookupScope>,
+        ) -> crate::volume::PullOutcome,
+    ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
         self.authorize_peer(&request, "GetTemplate", ALLOW_TEMPLATE_OBSERVER)?;
         let scope = TemplateLookupScope::from_request(&request)?;
         let req = request.get_ref();
@@ -100,6 +134,21 @@ impl TemplateManagerService {
         }
         let req_tag = tmpl_ref.tag.clone().unwrap_or_default();
         let requested_partition = requested_cache_partition(tmpl_ref.environment.as_deref())?;
+        // Which partition the lookup answers from, and a required one pulls
+        // for.
+        let choice = match (requested_partition, req.environment_required) {
+            (None, false) => PartitionChoice::Any,
+            (Some(partition), false) => PartitionChoice::Prefer(partition),
+            (Some(partition), true) if !req_hash.is_empty() && !req.cached_only => {
+                PartitionChoice::Require(partition)
+            }
+            (_, true) => {
+                return Err(Status::invalid_argument(
+                    "environment_required takes an environment and an exact content_hash, \
+                     and excludes cached_only",
+                ));
+            }
+        };
         let caller_org = req
             .caller_org_id
             .as_deref()
@@ -134,7 +183,8 @@ impl TemplateManagerService {
                 TemplateSelection {
                     name: template_id.clone(),
                     content_hash: req_hash,
-                    partition: requested_partition,
+                    partition: requested_partition
+                        .map_or(PartitionChoice::Any, PartitionChoice::Prefer),
                 },
                 None,
                 None,
@@ -208,20 +258,28 @@ impl TemplateManagerService {
                 let db = Arc::clone(&self.db);
                 let template_id = template_id.clone();
                 let req_hash = req_hash.clone();
-                let preferred = requested_partition;
                 tokio::task::spawn_blocking(move || {
                     let conn = db
                         .lock()
                         .map_err(|_| Status::internal("template DB mutex poisoned"))?;
-                    // Resolve with the request's preference, so the build
-                    // whose LRU this touches is the one the request serves.
-                    let name = TemplateManagerService::resolve_template_build(
-                        &conn,
-                        &template_id,
-                        &req_hash,
-                        preferred,
-                    )?
-                    .name;
+                    // Settings are the template's, whichever build serves
+                    // it. Resolve with the request's preference, so the build
+                    // whose LRU this touches is the one the request serves. A
+                    // required lookup reads them by name and touches nothing:
+                    // the node may hold the digest only under another
+                    // environment, whose build it won't serve.
+                    let name = match choice {
+                        PartitionChoice::Require(_) => template_id,
+                        PartitionChoice::Any | PartitionChoice::Prefer(_) => {
+                            TemplateManagerService::resolve_selected_build(
+                                &conn,
+                                &template_id,
+                                &req_hash,
+                                choice,
+                            )?
+                            .name
+                        }
+                    };
                     let settings = crate::db::get_template_settings(&conn, &name)
                         .map_err(|e| Status::internal(format!("db get_template_settings: {e}")))?;
                     Ok::<_, Status>(
@@ -279,7 +337,7 @@ impl TemplateManagerService {
         let selection = |content_hash: String| TemplateSelection {
             name: template_id.clone(),
             content_hash,
-            partition: requested_partition,
+            partition: choice,
         };
 
         // First attempt: local-only lookup.
@@ -324,20 +382,22 @@ impl TemplateManagerService {
                     req_hash: &requested_hash,
                     req_tag: &req_tag,
                     trigger: crate::volume::PullTrigger::OnDemand,
+                    required: choice.required(),
                 };
                 materialize(spec, resolve_elapsed, release).await
             }
             None => {
-                self.volume_puller
-                    .pull_in_scope(
-                        Arc::clone(&self.db),
-                        template_id,
-                        &req_hash,
-                        &req_tag,
-                        crate::volume::PullTrigger::OnDemand,
-                        scope,
-                    )
-                    .await
+                pull(
+                    crate::volume::PullSpec {
+                        name: template_id,
+                        req_hash: &req_hash,
+                        req_tag: &req_tag,
+                        trigger: crate::volume::PullTrigger::OnDemand,
+                        required: choice.required(),
+                    },
+                    scope,
+                )
+                .await
             }
         };
         match outcome {

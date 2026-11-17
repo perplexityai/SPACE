@@ -87,8 +87,16 @@ const (
 	sandboxOwnerAnnotation                       = "space.pplx.net/sandbox-owner"
 	sandboxUserAnnotation                        = "space.pplx.net/sandbox-user"
 	sandboxVolumeEncryptionAnnotation            = "space.pplx.net/volume-encryption"
-	kubernetesPodUIDAnnotation                   = "io.kubernetes.pod.uid"
-	kubernetesCriSandboxUIDAnnotation            = "io.kubernetes.cri.sandbox-uid"
+	// The environment a bound pod's work runs under, and whether the
+	// environment placement gate requires it. They mirror
+	// SANDBOX_ENVIRONMENT_ANNOTATION and
+	// SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION in
+	// crates/l40_api/sandbox/pod/src/environment_labels.rs, which renders
+	// them. The shim reads the environment only when it's required.
+	sandboxEnvironmentAnnotation         = "space.pplx.net/environment"
+	sandboxEnvironmentRequiredAnnotation = "space.pplx.net/environment-required"
+	kubernetesPodUIDAnnotation           = "io.kubernetes.pod.uid"
+	kubernetesCriSandboxUIDAnnotation    = "io.kubernetes.cri.sandbox-uid"
 
 	sandboxStateMaxAttempts       = 3
 	sandboxStateRetryDelay        = 100 * time.Millisecond
@@ -664,6 +672,11 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 		emitShimStepError("create", "parse_volume_encryption", "parse_volume_encryption", err)
 		return nil, status.Errorf(codes.InvalidArgument, "parse sandbox volume encryption: %v", err)
 	}
+	requiredEnvironment, err := spec.sandboxRequiredEnvironment()
+	if err != nil {
+		emitShimStepError("create", "parse_required_environment", "parse_required_environment", err)
+		return nil, status.Errorf(codes.InvalidArgument, "parse sandbox required environment: %v", err)
+	}
 	// Only a cold create seeds the manager's policy; restores keep the stored one.
 	sandboxNetworkPolicy, err := spec.sandboxNetworkPolicy()
 	if err != nil {
@@ -695,6 +708,19 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 	}
 	if requestedSandboxID != nil {
 		createReq.SandboxId = ptr(requestedSandboxID.String())
+	}
+	if requiredEnvironment != nil {
+		if err := requireCreateRequiredEnvironmentSupport(ctx, conn); err != nil {
+			emitShimStepError("create", "required_environment_support", "required_environment_support", err)
+			return nil, err
+		}
+		createReq.RequiredEnvironment = requiredEnvironment
+		// The required build's binding names the runtime, so the create
+		// names none. A sandbox-manager that predates required_environment
+		// drops it and then refuses a create without a runtime, rather than
+		// boot whichever build it prefers. That closes the window between the
+		// probe above and this create, if a rollback swaps the manager.
+		createReq.Runtime = ""
 	}
 	createRPCStartedAt := time.Now()
 	createSpan, createCtx := startSpan(ctx, "shim.sbxmgr.create", attribute.String("template", sandboxTemplate))
@@ -1334,23 +1360,46 @@ func (s *spaceTaskService) waitForTaskTeardownRelease(
 	return detach, err
 }
 
+// The health services naming sandbox-manager capabilities the shim probes
+// for. They mirror ACTIVATION_POLICY_HEALTH_SERVICE and
+// CREATE_REQUIRED_ENVIRONMENT_HEALTH_SERVICE in
+// crates/l20_domain/sbx/mgr/protocol/src/lib.rs.
+const (
+	activationPolicyCapability          = "space.sandbox-manager.capability.activation-policy.v1"
+	createRequiredEnvironmentCapability = "space.sandbox-manager.capability.create-required-environment.v1"
+)
+
 // Probe the same connection used by Start, without caching across reconnects.
 // An old worker would otherwise accept Start and silently discard its policy.
 func requireActivationPolicySupport(ctx context.Context, connection io.Closer) error {
+	return requireSandboxManagerCapability(ctx, connection, activationPolicyCapability, "activation policy")
+}
+
+// Probe the connection Create uses. An old worker would otherwise accept the
+// create, ignore its required environment and boot whichever build of the
+// digest it prefers.
+func requireCreateRequiredEnvironmentSupport(ctx context.Context, connection io.Closer) error {
+	return requireSandboxManagerCapability(ctx, connection, createRequiredEnvironmentCapability, "a create's required environment")
+}
+
+// requireSandboxManagerCapability fails with Unavailable unless the
+// sandbox-manager on connection serves the health service that names a
+// capability. what names the capability in the error.
+func requireSandboxManagerCapability(ctx context.Context, connection io.Closer, service, what string) error {
 	channel, ok := connection.(grpc.ClientConnInterface)
 	if !ok {
-		return status.Error(codes.Internal, "sandbox-manager connection cannot check activation policy support")
+		return status.Errorf(codes.Internal, "sandbox-manager connection cannot check support for %s", what)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	response, err := healthpb.NewHealthClient(channel).Check(ctx, &healthpb.HealthCheckRequest{
-		Service: "space.sandbox-manager.capability.activation-policy.v1",
+		Service: service,
 	})
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "sandbox-manager activation policy support: %v", err)
+		return status.Errorf(codes.Unavailable, "sandbox-manager support for %s: %v", what, err)
 	}
 	if response.GetStatus() != healthpb.HealthCheckResponse_SERVING {
-		return status.Error(codes.Unavailable, "sandbox-manager does not support activation policy")
+		return status.Errorf(codes.Unavailable, "sandbox-manager does not support %s", what)
 	}
 	return nil
 }
@@ -2635,6 +2684,27 @@ func sandboxCreateBootMode(rootfsSizeMb *uint32) pb.BootMode {
 		return pb.BootMode_BOOT_MODE_COLD
 	}
 	return pb.BootMode_BOOT_MODE_UNSPECIFIED
+}
+
+// sandboxRequiredEnvironment is the environment a cold create must boot a
+// build of: the pod's environment annotation while its environment-required
+// annotation is "true", which the control plane renders only with the
+// environment placement gate on. In shadow the environment is recorded for
+// the census alone and the create names none, so the worker boots what it
+// would with the gate off. sbx-manager parses the reference.
+func (s *ociSpec) sandboxRequiredEnvironment() (*string, error) {
+	environment := strings.TrimSpace(s.Annotations[sandboxEnvironmentAnnotation])
+	switch required := strings.TrimSpace(s.Annotations[sandboxEnvironmentRequiredAnnotation]); required {
+	case "", "false":
+		return nil, nil
+	case "true":
+		if environment == "" {
+			return nil, fmt.Errorf("%s requires %s", sandboxEnvironmentRequiredAnnotation, sandboxEnvironmentAnnotation)
+		}
+		return &environment, nil
+	default:
+		return nil, fmt.Errorf("%s must be \"true\" or \"false\", not %q", sandboxEnvironmentRequiredAnnotation, required)
+	}
 }
 
 // sandboxVolumeEncryption reads the BYOK immutable encrypted-volumes flag.

@@ -324,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
                     }),
                     vcpu,
                     memory_mib,
+                    environment_required: false,
                 })
                 .await?;
             let r = resp.into_inner();

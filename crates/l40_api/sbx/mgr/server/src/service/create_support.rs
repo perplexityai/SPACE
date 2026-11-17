@@ -51,6 +51,9 @@ pub(super) struct RequestedSandboxCreateSpec<'a> {
     /// An explicit selection must match the row's saved binding. An
     /// unselected retry keeps the row's own binding.
     pub(super) environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+    /// A required environment must name the partition of the row's saved
+    /// binding, which the build the row was created from is cached in.
+    pub(super) required_environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 }
 
 pub(super) struct CreateWithIdArgs<'a> {
@@ -85,6 +88,14 @@ pub(super) fn validate_create_request(
         .runtime
         .parse()
         .map_err(|e| Status::invalid_argument(format!("runtime: {e}")))?;
+    require_lifecycle_adapter(runtime)?;
+    validate_create_request_fields(req)
+}
+
+/// Refuse a runtime sandbox-manager has no lifecycle adapter for.
+pub(super) fn require_lifecycle_adapter(
+    runtime: pplx_space_execution_spec::RuntimeKind,
+) -> Result<(), Status> {
     if !matches!(
         runtime,
         pplx_space_execution_spec::RuntimeKind::Firecracker
@@ -94,7 +105,7 @@ pub(super) fn validate_create_request(
             "runtime has no sandbox lifecycle adapter",
         ));
     }
-    validate_create_request_fields(req)
+    Ok(())
 }
 
 /// Validate inputs independent of the runtime resolved from an environment.
@@ -151,8 +162,12 @@ impl SandboxManagerService {
         // explicit environment selection never falls back, while a warm start
         // restores through whichever loader the node selects for the snapshot,
         // and donors are matched by build rather than binding; so a selected
-        // create always boots cold.
-        let eligible_mode = if req.rootfs_size_mb.is_some() || target.selected {
+        // create always boots cold. So does a create that requires an
+        // environment: a base snapshot or a donor could load under another.
+        let eligible_mode = if req.rootfs_size_mb.is_some()
+            || target.selected
+            || req.required_environment.is_some()
+        {
             BootMode::Cold
         } else if requested_mode == BootMode::Pool
             && (requested_id.is_some()
@@ -534,6 +549,14 @@ pub(super) fn requested_sandbox_create_mismatches(
     {
         mismatches.push("environment");
     }
+    if let Some(required) = requested.required_environment
+        && !super::validation::is_in_environment_partition(
+            required,
+            existing.execution_metadata.as_ref(),
+        )
+    {
+        mismatches.push("required_environment");
+    }
     mismatches
 }
 
@@ -730,6 +753,21 @@ pub(super) async fn resolve_template_paths(
     template_ref: pplx_space_template_mgr_client::proto::TemplateRef,
     scope: TemplateLookupScope,
 ) -> Result<ResolvedTemplatePaths, tonic::Status> {
+    resolve_template_paths_requiring(templates, template_ref, scope, false).await
+}
+
+/// [`resolve_template_paths`], asking template-manager to answer only with a
+/// build bound to `template_ref.environment` when `environment_required`
+/// (`GetTemplateRequest.environment_required`), and to pull that build when
+/// the node holds the digest only under another environment. A
+/// template-manager that predates the field answers with its preferred build,
+/// which the create's own partition check refuses.
+pub(super) async fn resolve_template_paths_requiring(
+    templates: &dyn crate::template_resolver::TemplateResolver,
+    template_ref: pplx_space_template_mgr_client::proto::TemplateRef,
+    scope: TemplateLookupScope,
+    environment_required: bool,
+) -> Result<ResolvedTemplatePaths, tonic::Status> {
     use crate::template_resolver::TemplateLookupError;
     let mut request =
         tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
@@ -738,6 +776,7 @@ pub(super) async fn resolve_template_paths(
             template: Some(template_ref),
             vcpu: None,
             memory_mib: None,
+            environment_required,
         });
     scope.attach(&mut request);
     let response = templates

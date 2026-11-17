@@ -205,13 +205,19 @@ impl SandboxManagerService {
         let peer = self.authorize_peer(&request, "Create", ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR)?;
         let mut request = request;
         let environment = super::validation::normalize_environment_input(request.get_mut())?;
+        let required_environment =
+            super::validation::required_environment(request.get_ref(), environment)?;
         let span = tracing::info_span!("sbxmgr.create", template = %request.get_ref().template);
         let publish_node_state = !should_skip_node_publish(&request);
         let mut result = async move {
             let req = request.get_ref();
             let sandbox_owner = Self::authorize_create_sandbox_owner(&peer, req)?;
+            // A selected or required environment names the runtime, which
+            // the create fills in once it knows the environment's binding.
             let (requested_boot_mode, requested_id) = if environment.is_some() {
                 super::validation::validate_selected_create_fields(req)?;
+                validate_create_request_fields(req)?
+            } else if required_environment.is_some() {
                 validate_create_request_fields(req)?
             } else {
                 validate_create_request(req)?
@@ -237,7 +243,6 @@ impl SandboxManagerService {
             } else { None };
             let req = request.get_ref();
             let template = &req.template;
-            let runtime = &req.runtime;
 
             use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
             let mut scope = template_lookup_scope(&sandbox_owner, req.sandbox_id.as_deref())?;
@@ -257,20 +262,35 @@ impl SandboxManagerService {
 
             // Resolve template to content-addressed paths via template-manager.
             // If caller pinned a content_hash, use it; otherwise resolve newest.
-            // A selected environment prefers its own build of the rootfs, so a
-            // twin bound to it boots instead of its sibling; otherwise any
-            // compatible build of the digest is checked below.
-            let mut resolved_template = resolve_template_paths(
+            // A selected or required environment prefers its own build of the
+            // rootfs, so a twin bound to it boots instead of its sibling;
+            // otherwise any compatible build of the digest is checked below.
+            let mut resolved_template = super::create_support::resolve_template_paths_requiring(
                 self.template_resolver.as_ref(),
                 pplx_space_template_mgr_client::proto::TemplateRef {
                     name: template.to_string(),
                     content_hash: req.content_hash.clone(),
                     tag: None,
-                    environment: environment.map(|reference| reference.to_string()),
+                    environment: environment
+                        .or(required_environment)
+                        .map(|reference| reference.to_string()),
                 },
                 scope,
+                required_environment.is_some(),
             )
             .await?;
+            if let Some(required) = required_environment {
+                super::validation::require_environment_partition(
+                    required,
+                    &resolved_template.execution,
+                )?;
+                let runtime = resolved_template.execution.runtime().kind;
+                require_lifecycle_adapter(runtime)?;
+                request.get_mut().runtime = runtime.alias().to_owned();
+            }
+            let req = request.get_ref();
+            let template = &req.template;
+            let runtime = &req.runtime;
             if let Some(selected) = &verified {
                 selected.definition.check_cold_boot_source(&resolved_template.execution)
                     .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -425,6 +445,7 @@ impl SandboxManagerService {
                         volume_encryption: req.volume_encryption,
                         auto_lifecycle: &auto_lifecycle,
                         environment,
+                        required_environment,
                     };
                     let auto_lifecycle_changed =
                         requested_sandbox_create_auto_lifecycle_changed(&existing, &requested);
@@ -1404,6 +1425,8 @@ fn project_template_catalog(
 mod create_after_lookup_tests;
 #[cfg(test)]
 mod create_environment_tests;
+#[cfg(test)]
+mod create_required_environment_tests;
 #[cfg(test)]
 mod create_template_lookup_tests;
 #[cfg(test)]

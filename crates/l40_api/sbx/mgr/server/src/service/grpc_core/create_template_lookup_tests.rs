@@ -189,6 +189,7 @@ async fn create_checks_auto_lifecycle_authority_before_template_lookup(
                 }),
                 vcpu: None,
                 memory_mib: None,
+                environment_required: false,
             }]
         } else {
             Vec::new()

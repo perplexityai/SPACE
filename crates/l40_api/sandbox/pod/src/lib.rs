@@ -37,8 +37,9 @@ pub use runtime_upgrade::*;
 
 pub mod environment_labels;
 pub use environment_labels::{
-    ENVIRONMENT_LABEL_KEY_PREFIX, ENVIRONMENT_USABLE_LABEL_VALUE, PodEnvironment,
-    SANDBOX_ENVIRONMENT_ANNOTATION, environment_label_key, is_environment_label_key,
+    ENVIRONMENT_LABEL_KEY_PREFIX, ENVIRONMENT_REQUIRED_ANNOTATION_VALUE,
+    ENVIRONMENT_USABLE_LABEL_VALUE, PodEnvironment, SANDBOX_ENVIRONMENT_ANNOTATION,
+    SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION, environment_label_key, is_environment_label_key,
     node_publishes_any_environment, node_publishes_environment,
 };
 
@@ -1129,6 +1130,12 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             SANDBOX_ENVIRONMENT_ANNOTATION.to_string(),
             environment.reference.to_string(),
         );
+        if environment.required {
+            annotations.insert(
+                SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION.to_string(),
+                ENVIRONMENT_REQUIRED_ANNOTATION_VALUE.to_string(),
+            );
+        }
     }
     if let Some(pool) = pool {
         let sandbox_owner = ROOT_SANDBOX_OWNER.as_str().to_string();

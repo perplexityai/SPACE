@@ -136,6 +136,7 @@ async fn ensure_template(
         }),
         vcpu: None,
         memory_mib: None,
+        environment_required: false,
     });
     request.set_timeout(timeout);
 

@@ -1156,6 +1156,36 @@ whose node-ctl stops reconciling keeps its labels. They also don't drop
 retired environments, which the cluster filters out of
 `usable_environment_refs` only.
 
+With the gate `on`, a bound pod also carries
+`space.pplx.net/environment-required: "true"`, and the shim's cold create
+sends the pod's environment to sandbox-manager as
+`CreateRequest.required_environment`, with no runtime: the create takes it
+from the required build's binding. The shim first checks that sandbox-manager
+serves the `create-required-environment` capability and fails the create as
+unavailable if it doesn't. An older sandbox-manager that the create reaches
+anyway, after a rollback between the check and the create, drops the field
+and refuses a create without a runtime, so it never boots its preferred build.
+A shim that predates the annotation ignores it and boots as with `off`, so
+enabling `on` on Kubernetes needs every worker's shim from this release first,
+and rolling the shim, sandbox-manager or template-manager back below it needs
+the gate back at `shadow` first. Sandbox-manager asks
+template-manager for that environment's build of the digest only
+(`GetTemplateRequest.environment_required`), and refuses the create unless the
+build it gets is bound to that environment's partition: a node holding a
+digest under E0 and E1 boots the E1 build for an E1 pod, and an E0 pod boots
+the legacy-partition build, which unbound builds share. A node holding the
+digest only under another environment pulls the release, which its manifest
+places; a release that lands in another partition leaves the lookup
+`NOT_FOUND`, and the create fails rather than boot the build that's there. An
+older template-manager answers with its preferred build, which the
+partition check refuses. The
+sandbox runs the build's own binding, which the node admits first when it
+isn't E0's, never a compatible consumer selected on the node. It always boots
+cold: never from a base snapshot or a warm-pool donor, which could load under
+another environment. A restore, fork or stopped start
+pod boots through Start, not Create, and doesn't send it. In `shadow` the
+annotation is absent and the create names no environment.
+
 On Kubernetes, `on` fails startup for now (see "Not covered"), so what
 follows describes what it does once it's supported. It has no fleet-wide
 fallback and no E0 exemption. If every node lacks the
@@ -1173,19 +1203,14 @@ gate to `shadow` stops new pods from requiring the label.
 
 #### Not covered
 
-On Kubernetes, `on` fails startup with `SubstrateError::Unsupported` until the
-worker takes the pod's environment as its cache-partition preference. Today a
-Kubernetes create passes no preference, so template-manager boots the digest's
-legacy-partition build when the node holds one, whatever environment the pod's
-affinity required: a node that publishes the required environment can boot
-another environment's build of the same digest. A runtime-upgrade activation's
-pod also requires the recorded environment rather than the upgrade's target.
+On Kubernetes, `on` fails startup with `SubstrateError::Unsupported`: a
+runtime-upgrade activation's pod requires the recorded environment rather than
+the upgrade's target. Lifting it also needs every worker on a shim that reads
+`space.pplx.net/environment-required`, since an older shim ignores it.
 `shadow` runs: it records, labels and counts without changing placement.
 
 The gate doesn't yet:
 
-- align the build a Kubernetes worker boots with the environment its pod
-  requires (above);
 - gate a Kubernetes pod whose release records no binding while the nodes
   holding its build report different ones. Direct gates each candidate by its
   own inventory row, but a pod requires one label, so with no agreed binding
@@ -2172,7 +2197,20 @@ binding's environment, and checks the disk and boot inputs against that
 binding. A cache miss pulls the
 release without a selector: the pull reads the release manifest and metadata
 before choosing a directory and reuses those bytes. Responses echo the resolved
-build's environment. `ListTemplates` reports each build's partition key in
+build's environment.
+`GetTemplateRequest.environment_required` turns the preference into a
+requirement, for a Kubernetes create the placement gate requires an
+environment of: only a ready build bound to that environment's partition
+answers, which is the build in that partition or an adopted legacy build bound
+to it. It needs an exact digest and excludes `cached_only`. A node holding no
+such build pulls the release even when another partition holds the digest,
+since the pull's fast path then counts only a build bound to the required
+partition. If the release's manifest places it in a partition that already
+holds the digest, the pull writes nothing, and the lookup is `NOT_FOUND`.
+Pulls of one digest share a flight whatever they require. A required pull
+that joins a flight whose owner found the digest cached in another partition
+goes round again, and pulls as the owner when nobody else has started one.
+`ListTemplates` reports each build's partition key in
 `TemplateFullInfo.cache_partition`, and sandbox-manager's template catalog
 reads a build's supplemental `metadata.json` from the directory that key names,
 not its binding's, so an adopted build's metadata comes from its legacy

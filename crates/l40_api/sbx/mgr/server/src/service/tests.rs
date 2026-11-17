@@ -21827,6 +21827,7 @@ pub(crate) mod service_tests {
             volume_encryption: false,
             auto_lifecycle: &requested_policy,
             environment: None,
+            required_environment: None,
         };
 
         assert!(
@@ -21880,6 +21881,7 @@ pub(crate) mod service_tests {
             volume_encryption: false,
             auto_lifecycle: &policy,
             environment: None,
+            required_environment: None,
         };
 
         assert!(
@@ -21916,6 +21918,7 @@ pub(crate) mod service_tests {
             volume_encryption: true,
             auto_lifecycle: &policy,
             environment: None,
+            required_environment: None,
         };
 
         assert_eq!(
@@ -21954,6 +21957,7 @@ pub(crate) mod service_tests {
             volume_encryption: false,
             auto_lifecycle: &requested_policy,
             environment: None,
+            required_environment: None,
         };
 
         assert!(requested_sandbox_create_mismatches(&existing, &requested).is_empty());

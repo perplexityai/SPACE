@@ -3797,6 +3797,48 @@ fn a_bound_pod_requires_its_environment_label_and_an_unbound_one_does_not() {
     );
 }
 
+/// The environment annotations a bound on-demand pod renders in shadow and
+/// on are the ones `shim/testdata/bound-create-environment.json` gives the
+/// shim, whose test reads the same file: shadow names the environment for
+/// the census only, and on also tells the shim to require it at create.
+#[test]
+fn bound_create_environment_reaches_the_shim_contract() {
+    let contract: BTreeMap<String, BTreeMap<String, String>> = serde_json::from_str(include_str!(
+        "../../../../../shim/testdata/bound-create-environment.json"
+    ))
+    .unwrap();
+    let env = BTreeMap::new();
+    let auto_lifecycle_json = test_auto_lifecycle_json();
+    let network_policy_json = test_network_policy_json();
+    let sandbox_owner = test_sandbox_owner();
+    for (mode, required) in [("shadow", false), ("on", true)] {
+        let pod = build_sandbox_pod(
+            &test_pod_config(),
+            on_demand_request(
+                SandboxPodCommon {
+                    environment: Some(PodEnvironment {
+                        reference: bound_environment(),
+                        required,
+                    }),
+                    ..test_common("space-sbx-env-g1", TEST_SANDBOX_ID, 1, &env)
+                },
+                test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json),
+            ),
+        );
+        let rendered: BTreeMap<String, String> = pod
+            .metadata
+            .annotations
+            .unwrap()
+            .into_iter()
+            .filter(|(key, _)| {
+                key == SANDBOX_ENVIRONMENT_ANNOTATION
+                    || key == SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION
+            })
+            .collect();
+        assert_eq!(rendered, contract[mode], "{mode}");
+    }
+}
+
 /// A restore pre-bound to its source node renders no other affinity: the
 /// scheduler is bypassed, so no scoring or exclusion term applies. Its
 /// environment requirement still has to render, since kubelet checks required

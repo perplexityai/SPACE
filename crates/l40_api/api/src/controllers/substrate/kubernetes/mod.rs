@@ -6,7 +6,7 @@
 //!
 //! | Refused or missing | Effect today | Owner | Removed by |
 //! |---|---|---|---|
-//! | Environment placement gate `on` (`SPACE_ENVIRONMENT_PLACEMENT_GATE`) | `on` fails startup with `SubstrateError::Unsupported`. A Kubernetes create names no cache partition, so the worker boots the digest's legacy-partition build whatever environment the pod requires, and a runtime-upgrade activation's pod requires the recorded environment rather than the upgrade's target. `shadow` records, labels and counts, and places as `off` | the-gigi-pplx | the worker taking the pod's environment as its cache-partition preference, and activation pods recording an upgrade's target |
+//! | Environment placement gate `on` (`SPACE_ENVIRONMENT_PLACEMENT_GATE`) | `on` fails startup with `SubstrateError::Unsupported`. A runtime-upgrade activation's pod requires the recorded environment rather than the upgrade's target. With `on`, a cold create requires the pod's environment (`space.pplx.net/environment-required`), so the worker boots that environment's build of the digest, pulling it when the node holds the digest only under another environment. A shim that predates the annotation ignores it, so `on` also needs every worker's shim from that release. `shadow` records, labels and counts, and places as `off` | the-gigi-pplx | activation pods recording an upgrade's target |
 
 use std::{
     fmt,

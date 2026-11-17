@@ -152,6 +152,7 @@ fn local_create_request(
         route_identity: None,
         disk_io_max_operations_per_sec: None,
         disk_io_max_bandwidth_mib_per_sec: None,
+        required_environment: None,
     };
     if let Some(reference) = input.environment {
         pplx_space_sbx_mgr_client::environment::bind(&mut request, reference);

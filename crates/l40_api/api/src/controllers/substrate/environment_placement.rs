@@ -103,17 +103,17 @@ impl EnvironmentPlacementGate {
 
     /// Whether the Kubernetes substrate supports this mode (the gap table in
     /// `kubernetes/mod.rs`). `off` and `shadow` are, since shadow places as
-    /// off. `on` is refused at startup: a Kubernetes create names no cache
-    /// partition, so the worker boots the digest's legacy-partition build
-    /// whatever environment the pod's affinity required, and the requirement
-    /// would claim enforcement the worker doesn't provide.
+    /// off. `on` is refused at startup until its gap-table row closes: a
+    /// runtime-upgrade activation's pod requires the recorded environment
+    /// rather than the upgrade's target, so the requirement would claim
+    /// enforcement the worker doesn't yet provide.
     pub fn check_kubernetes_support(self) -> Result<(), super::SubstrateError> {
         match self {
             Self::Off | Self::Shadow => Ok(()),
             Self::On => Err(super::SubstrateError::Unsupported {
                 message: format!(
-                    "{}=on isn't supported on the Kubernetes substrate yet: the worker doesn't \
-                     yet boot the environment a pod requires; use shadow",
+                    "{}=on isn't supported on the Kubernetes substrate yet: runtime-upgrade pods \
+                     don't yet require the upgrade's target environment; use shadow",
                     Self::ENV
                 ),
             }),

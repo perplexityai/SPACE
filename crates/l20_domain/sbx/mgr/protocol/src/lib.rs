@@ -165,6 +165,10 @@ pub const PROCESS_OUTPUT_CURSOR_HEALTH_SERVICE: &str =
 /// Start can install the supplied cluster policy before runtime activation.
 pub const ACTIVATION_POLICY_HEALTH_SERVICE: &str =
     "space.sandbox-manager.capability.activation-policy.v1";
+/// Create honors `CreateRequest.required_environment`, which an older
+/// sandbox-manager ignores.
+pub const CREATE_REQUIRED_ENVIRONMENT_HEALTH_SERVICE: &str =
+    "space.sandbox-manager.capability.create-required-environment.v1";
 pub const OPERATION_ACTIVATION_RECEIPT_HEALTH_SERVICE: &str =
     "space.sandbox-manager.capability.operation-activation-receipt.v1";
 

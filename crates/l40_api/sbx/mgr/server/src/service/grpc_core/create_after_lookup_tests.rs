@@ -222,6 +222,7 @@ impl Fixture {
                 }),
                 vcpu: None,
                 memory_mib: None,
+                environment_required: false,
             }],
             "{context}"
         );

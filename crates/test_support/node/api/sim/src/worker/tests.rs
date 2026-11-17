@@ -53,6 +53,7 @@ fn test_create_request(sandbox_id: &str) -> sbx::CreateRequest {
         route_identity: None,
         disk_io_max_operations_per_sec: None,
         disk_io_max_bandwidth_mib_per_sec: None,
+        required_environment: None,
     }
 }
 

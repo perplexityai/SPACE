@@ -563,6 +563,7 @@ fn build_vm_create_request(
         route_identity: None,
         disk_io_max_operations_per_sec: None,
         disk_io_max_bandwidth_mib_per_sec: None,
+        required_environment: None,
     };
     if let Some(reference) = environment {
         pplx_space_sbx_mgr_client::environment::bind(&mut request, reference);
@@ -731,6 +732,7 @@ impl TemplateBuilder {
                     template: Some(TemplateRef::try_from(&base)?),
                     vcpu: None,
                     memory_mib: None,
+                    environment_required: false,
                 })
                 .await
                 .map_err(|e| {
