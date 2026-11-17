@@ -824,81 +824,60 @@ pub fn sandbox_query(sql: &str) -> String {
         .replace("{sandbox_join_tail}", SANDBOX_JOIN_TAIL)
 }
 
-pub async fn fetch_sandbox(pool: &PgPool, id: SandboxId) -> Result<Option<Sandbox>, sqlx::Error> {
+pub async fn fetch_sandbox(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: SandboxId,
+) -> Result<Option<Sandbox>, sqlx::Error> {
     sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(sandbox_query(
         "SELECT {sandbox_columns} FROM {sandbox_from} WHERE s.id = $1",
     ))))
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
-/// The lifecycles [`update_and_fetch_post_wake_sandbox`] may replace: a
-/// resume's decision. The pooled claim inserts the row `paused`, the wake
-/// resumes it, and a Kubernetes activation receipt can project `started`
-/// before this update. The pooled prepare claims and joins no restore on
-/// either substrate. So, as for a resume, it refuses `stopped` (a stop that
-/// completed while the wake was in flight; the wake did not begin from it)
-/// and `restoring` (another owner's restore claim). It also refuses
-/// `failed`, `quarantined` and the tombstones (the sweeper or a quarantine
-/// won), `deleting` (the delete owns the row), `suspending` and `suspended`
-/// (a suspend owns it), `stopping` (no control-plane writer sets it; node
-/// publication and the transient-lifecycle sweeper converge it), and any
-/// value outside the stored vocabulary. The `action_stamp` module of
-/// `pplx-space-sandbox-store` says who finishes each.
-const POOLED_POST_WAKE_FROM: sandbox_store::action_stamp::ActionStamp =
-    sandbox_store::action_stamp::ActionStamp::Resume;
-
 /// Marks a pooled sandbox as started/on-node after its wake completes and
-/// returns the freshly-joined response row in the same round-trip. The
-/// lifecycle guard ([`POOLED_POST_WAKE_FROM`]) refuses a row another writer
-/// moved while the wake was in flight: this helper must surface the CAS miss
-/// rather than resurrecting a failed row as started or overwriting a delete
-/// or suspend that began.
+/// returns the freshly-joined response row. The store verb's lifecycle guard
+/// ([`sandbox_store::action_stamp::stamp_pooled_post_wake`]) refuses a row
+/// another writer moved while the wake was in flight: this helper must
+/// surface the CAS miss rather than resurrecting a failed row as started or
+/// overwriting a delete or suspend that began. The read shares the write's
+/// transaction, so the row lock keeps the response showing this write.
 pub async fn update_and_fetch_post_wake_sandbox(
     pool: &PgPool,
     id: SandboxId,
     active_node_id: Option<NodeId>,
 ) -> Result<Sandbox, ControllerError> {
-    let sql = sandbox_query(
-        "WITH updated AS (
-             UPDATE sandboxes
-             SET lifecycle = 'started',
-                 placement = 'on_node',
-                 active_node_id = $1,
-                 placement_changed_at = NOW()
-             WHERE id = $2
-               AND LOWER(TRIM(lifecycle)) = ANY($3::TEXT[])
-             RETURNING *
-         )
-         SELECT {sandbox_columns}
-         FROM updated s
-         {sandbox_join_tail}",
-    );
-    sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(sql.as_str())))
-        .bind(active_node_id)
-        .bind(id)
-        .bind(POOLED_POST_WAKE_FROM.admitted_values())
-        .fetch_optional(pool)
+    // Not classified, deliberately, and for the same reason as the
+    // `fetch_sandbox` arm this shares an `if` with in
+    // `queries::try_create_from_pool`: by the time this runs the warm slot
+    // is claimed, bound, and prepared and the pod is running, with no
+    // rollback on this arm. `create` mints a fresh `SandboxId` per request
+    // with no idempotency key, so a retryable 503 here claims a second
+    // slot and starts a second sandbox while the first stays `started`
+    // under an id the caller never sees. See `db_contention_error`'s
+    // exception. This is the `wait_until_ready` arm — the one ECW create
+    // takes — so it is the more common of the two, not the edge case.
+    let failed =
+        |err| crate::controllers::internal_error("pooled sandbox post-wake update failed", err);
+    let lost_cas = || {
+        ControllerError::internal(
+            "pooled sandbox wake lost the lifecycle CAS — another writer moved the row to a \
+             terminal, deleting, stopped, restoring or suspend lifecycle while pooled wake was \
+             in flight",
+        )
+    };
+    let mut tx = pool.begin().await.map_err(failed)?;
+    if !sandbox_store::action_stamp::stamp_pooled_post_wake(&mut *tx, id, active_node_id)
         .await
-        // Not classified, deliberately, and for the same reason as the
-        // `fetch_sandbox` arm this shares an `if` with in
-        // `queries::try_create_from_pool`: by the time this runs the warm slot
-        // is claimed, bound, and prepared and the pod is running, with no
-        // rollback on this arm. `create` mints a fresh `SandboxId` per request
-        // with no idempotency key, so a retryable 503 here claims a second
-        // slot and starts a second sandbox while the first stays `started`
-        // under an id the caller never sees. See `db_contention_error`'s
-        // exception. This is the `wait_until_ready` arm — the one ECW create
-        // takes — so it is the more common of the two, not the edge case.
-        .map_err(|err| {
-            crate::controllers::internal_error("pooled sandbox post-wake update failed", err)
-        })?
-        .ok_or_else(|| {
-            ControllerError::internal(
-                "pooled sandbox wake lost the lifecycle CAS — another writer moved the row to a \
-                 terminal, deleting, stopped, restoring or suspend lifecycle while pooled wake was \
-                 in flight",
-            )
-        })
+        .map_err(failed)?
+    {
+        return Err(lost_cas());
+    }
+    let sandbox = fetch_sandbox(&mut *tx, id)
+        .await
+        .map_err(failed)?
+        .ok_or_else(lost_cas)?;
+    tx.commit().await.map_err(failed)?;
+    Ok(sandbox)
 }

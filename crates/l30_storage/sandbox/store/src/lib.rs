@@ -16,7 +16,11 @@
 //!   cap in `architecture-baseline.toml`. The plain write verbs
 //!   ([`insert_unplaced`], [`insert_pooled`], [`update_desired_state`],
 //!   [`set_auto_lifecycle_policy`]) touch `sandboxes` only and re-check
-//!   nothing in their `WHERE` beyond the row's id.
+//!   nothing in their `WHERE` beyond the row's id. A write whose caller
+//!   answers with a row shape this crate does not own, such as the api's
+//!   joined response row, still moves here: the caller reads its shape after
+//!   the verb in the same transaction, as the pooled create does after
+//!   [`action_stamp::stamp_pooled_post_wake`].
 //! * **Column writes respect the row's triggers.** `sandboxes` carries five
 //!   `BEFORE UPDATE` triggers. `updated_at` is trigger-maintained, so verbs
 //!   here leave it to the trigger, except

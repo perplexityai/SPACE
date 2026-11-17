@@ -783,7 +783,8 @@ async fn a_start_keeps_a_rewrite_that_landed_after_its_stamp() -> TestResult {
 /// `update_and_fetch_post_wake_sandbox`. The store's `action_stamp` tests
 /// cover each stamp's own states, and the stamps that keep `suspended`.
 /// Whether a row is written is read from `xmin`, so a stamp that rewrites the
-/// value the row already holds still counts as applied.
+/// value the row already holds still counts as applied. The post-wake
+/// update's returned row must show the row as it wrote it.
 #[tokio::test(flavor = "current_thread")]
 async fn post_action_stamps_write_only_over_an_in_flight_lifecycle() -> TestResult {
     const EXPECTED: &[&str] = &[
@@ -842,6 +843,7 @@ async fn post_action_stamps_write_only_over_an_in_flight_lifecycle() -> TestResu
 
             // The stamps are best-effort and report nothing; the post-wake
             // update reports a refusal as an error.
+            let mut responded = None;
             let (moved_to, reported) = match writer {
                 Writer::Stamp => {
                     maybe_update_sandbox_lifecycle(pool, sandbox_id, ActionStamp::Pause).await;
@@ -860,6 +862,10 @@ async fn post_action_stamps_write_only_over_an_in_flight_lifecycle() -> TestResu
                     let updated =
                         update_and_fetch_post_wake_sandbox(pool, sandbox_id, Some(NodeId::new()))
                             .await;
+                    responded = updated
+                        .as_ref()
+                        .ok()
+                        .map(|sandbox| Row::new(&sandbox.lifecycle, &sandbox.placement));
                     (Row::new("started", "on_node"), Some(updated.is_ok()))
                 }
             };
@@ -869,10 +875,12 @@ async fn post_action_stamps_write_only_over_an_in_flight_lifecycle() -> TestResu
             let expected = if expect.applies() { moved_to } else { before };
             if written != expect.applies()
                 || reported.is_some_and(|updated| updated != expect.applies())
+                || responded.as_ref().is_some_and(|row| *row != after)
                 || after != expected
             {
                 mismatches.push(format!(
-                    "{writer:?} from {stored:?} ({expect:?}): written {written}, row now {after:?}"
+                    "{writer:?} from {stored:?} ({expect:?}): written {written}, row now \
+                     {after:?}, returned {responded:?}"
                 ));
             }
         }
