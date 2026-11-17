@@ -646,15 +646,34 @@ fn sandbox_idle_deadline_is_nullable_and_serialized_as_rfc3339() {
 
 #[test]
 fn only_a_resident_sandbox_reports_its_idle_deadline() {
-    for (lifecycle, reported) in [
-        ("started", true),
-        ("paused", true),
-        ("suspended", false),
-        ("stopped", false),
-        ("failed", false),
-    ] {
+    use pplx_space_common_core::types::SandboxLifecycle;
+    // Only a started or paused sandbox is held by the node that publishes its
+    // deadline; every other lifecycle, transitions included, reports none.
+    let cases = [
+        (SandboxLifecycle::Created, false),
+        (SandboxLifecycle::Creating, false),
+        (SandboxLifecycle::Starting, false),
+        (SandboxLifecycle::Started, true),
+        (SandboxLifecycle::Restoring, false),
+        (SandboxLifecycle::Pausing, false),
+        (SandboxLifecycle::Paused, true),
+        (SandboxLifecycle::Resuming, false),
+        (SandboxLifecycle::Suspending, false),
+        (SandboxLifecycle::Suspended, false),
+        (SandboxLifecycle::Stopping, false),
+        (SandboxLifecycle::Stopped, false),
+        (SandboxLifecycle::Deleting, false),
+        (SandboxLifecycle::Checkpointing, false),
+        (SandboxLifecycle::Quarantined, false),
+        (SandboxLifecycle::Failed, false),
+    ];
+    assert_eq!(
+        cases.map(|(lifecycle, _)| lifecycle).as_slice(),
+        SandboxLifecycle::all()
+    );
+    for (lifecycle, reported) in cases {
         let mut row = public_sandbox_row(OffsetDateTime::UNIX_EPOCH, SandboxId::new());
-        row.lifecycle = lifecycle.to_string();
+        row.lifecycle = lifecycle.as_str().to_string();
         row.next_auto_event_at = Some(1_700_000_000);
         let sandbox = public_sandbox_from_row(row).unwrap();
         assert_eq!(
