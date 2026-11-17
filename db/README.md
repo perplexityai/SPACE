@@ -227,10 +227,16 @@ at 0. A send the serving pod started before the reversal and acknowledges
 after a re-apply can then match a restarted revision and delete a re-enqueue
 made during that send.
 
-A release with neither the list nor the migration predates
-`SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS`, so rolling back to one needs the newer
-image's `space-db-migrator template-manager … down` first, as 'Rolling back
-past a newer SQLite migration' describes.
+A release that neither bundles nor lists `20261031050126` refuses a database
+that records it. That covers every release from before #1277, including the
+withdrawn-interval ones that list only the partition migration below, and they
+all predate `SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS`. Rolling back to one needs,
+first, with template-manager stopped and the newer one kept from restarting
+until the older one starts,
+`space-db-migrator template-manager --database-path <db> down` once with a
+migrator that bundles the migration, such as the newer release's. It reverts
+only that migration. 'Template cache partition migration' and
+`docs/execution-environments.md` say when this applies to a partition rollback.
 
 ## Template cache partition migration
 
