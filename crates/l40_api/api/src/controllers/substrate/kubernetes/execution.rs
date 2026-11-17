@@ -275,6 +275,14 @@ impl RestoreClaimHandling {
     }
 }
 
+/// What [`KubernetesSubstrate::restore_execution_activation`] produced.
+enum RestoreActivation {
+    /// The restore joined another caller's, which finishes it.
+    Joined,
+    /// This caller's restore, with its binding and the attempt it ran under.
+    Owned(Box<ExecutionActivation>),
+}
+
 impl KubernetesSubstrate {
     /// Decide a lease winner's live cap (`CapPolicy::ReserveAtClaim`, RFC
     /// Decision 6). A fresh claim from `suspended` gives the sandbox a new
@@ -1391,6 +1399,85 @@ impl KubernetesSubstrate {
         .map(|_| ())
     }
 
+    /// One attempt of the drain restore operation's restore of a sandbox a
+    /// forced drain suspended, back to `started`, placed as the drain's
+    /// evacuation is ([`Self::restore_evacuated_execution`]). It claims the
+    /// row first, as a user's restore does ([`K8sStore::claim_drain_restore`]);
+    /// a row it can't claim answers [`DrainRestoreAttempt::Refused`] with why,
+    /// and nothing was written. Once the node brought the VM up it lands the
+    /// row `started` under the claim's lease
+    /// ([`K8sStore::complete_drain_restore`]), or reads the row the node's
+    /// activation receipt already landed on this restore's execution as
+    /// landed, and releases the activation attempt the restore ran under.
+    ///
+    /// A failed activation is reverted to `suspended` as a failed user
+    /// restore's is, so the operation's next attempt claims afresh, but only
+    /// while no Wake can have landed ([`drain_restore_timeout_reverts`] and
+    /// [`restore_failure_should_revert_to_suspended`]). One that may have
+    /// leaves the row `restoring` under the lease and answers the error: the
+    /// next attempt finds the row held and waits, until the node's receipt
+    /// lands it `started` or the lease lapses and the transient-lifecycle
+    /// sweeper settles it.
+    pub async fn restore_drained_execution(
+        &self,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
+        sandbox_id: SandboxId,
+        options: ActivationOptions,
+        placement: Option<&EvacuationPlacement>,
+        restore: DrainRestore,
+    ) -> Result<DrainRestoreAttempt, SubstrateError> {
+        use pplx_space_sandbox_store::drain_restore::DrainRestoreClaim;
+        match self.store.claim_drain_restore(sandbox_id, restore).await? {
+            DrainRestoreClaim::Claimed => {}
+            DrainRestoreClaim::Refused(refusal) => {
+                return Ok(DrainRestoreAttempt::Refused(refusal));
+            }
+        }
+        let activation = match self
+            .restore_execution_activation(
+                metric_identity,
+                sandbox_id,
+                options,
+                RestoreIntent::drain_operation(placement.cloned(), restore),
+            )
+            .await?
+        {
+            RestoreActivation::Owned(activation) => activation,
+            // A drain restore's claim neither joins an in-flight restore nor
+            // a completed one.
+            RestoreActivation::Joined => {
+                return Err(SubstrateError::Failed {
+                    message: format!("drain restore of sandbox {sandbox_id} joined a restore"),
+                });
+            }
+        };
+        let generation = i64::try_from(activation.binding.execution_generation).map_err(|_| {
+            SubstrateError::Failed {
+                message: format!(
+                    "drain restore of sandbox {sandbox_id} ran on execution generation {}, \
+                     above i64::MAX",
+                    activation.binding.execution_generation
+                ),
+            }
+        })?;
+        let attempt = activation
+            .lease_completion
+            .filter(|completion| completion.generation == generation)
+            .map(|completion| completion.attempt_id);
+        Ok(
+            if self
+                .store
+                .complete_drain_restore(sandbox_id, restore, generation, attempt)
+                .await?
+                .landed()
+            {
+                DrainRestoreAttempt::Landed
+            } else {
+                DrainRestoreAttempt::Lost
+            },
+        )
+    }
+
     /// Shared lifecycle bookkeeping for both [`SubstrateAdapter::restore_execution`]
     /// (user-API restore, [`RestoreIntent::user`]) and
     /// [`Self::restore_evacuated_execution`] (cluster-controller drain
@@ -1405,6 +1492,26 @@ impl KubernetesSubstrate {
         options: ActivationOptions,
         intent: RestoreIntent,
     ) -> Result<ActivationCompletion, SubstrateError> {
+        Ok(
+            match self
+                .restore_execution_activation(metric_identity, sandbox_id, options, intent)
+                .await?
+            {
+                RestoreActivation::Joined => ActivationCompletion::Joined,
+                RestoreActivation::Owned(activation) => activation.completion,
+            },
+        )
+    }
+
+    /// [`Self::restore_execution_inner`], keeping the activation an owned
+    /// restore produced: its binding and the attempt it ran under.
+    async fn restore_execution_activation(
+        &self,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
+        sandbox_id: SandboxId,
+        options: ActivationOptions,
+        intent: RestoreIntent,
+    ) -> Result<RestoreActivation, SubstrateError> {
         let target_state = intent.target.state();
         if !options.blocking {
             return Err(SubstrateError::Conflict {
@@ -1450,6 +1557,10 @@ impl KubernetesSubstrate {
                 RestoreClaimMode::UserLease { .. } => {
                     self.store.begin_restore_lifecycle(sandbox_id, false).await
                 }
+                // Claimed by `restore_drained_execution` before this.
+                RestoreClaimMode::DrainOperation(restore) => Ok(RestoreClaim::FreshFromSuspended {
+                    restore_lease_token: Some(restore.restore_lease_token),
+                }),
             };
             match claim {
                 Ok(restore_claim) => break restore_claim,
@@ -1471,7 +1582,7 @@ impl KubernetesSubstrate {
                         .await?
                     {
                         UserRestoreJoin::Completed(_) => {
-                            return Ok(ActivationCompletion::Joined);
+                            return Ok(RestoreActivation::Joined);
                         }
                         UserRestoreJoin::Claimable => {
                             crate::metrics::sandbox::api::restore_claim_lap(
@@ -1489,7 +1600,7 @@ impl KubernetesSubstrate {
                         .await?
                         .is_some()
                     {
-                        return Ok(ActivationCompletion::Joined);
+                        return Ok(RestoreActivation::Joined);
                     }
                     return Err(err);
                 }
@@ -1529,7 +1640,7 @@ impl KubernetesSubstrate {
                 RestoreClaimHandling::preclaimed_with_cleanup(restore_claim),
             )
             .await?;
-        Ok(activation.completion)
+        Ok(RestoreActivation::Owned(Box::new(activation)))
     }
 
     pub(super) async fn wake_execution_with_metric_identity(
@@ -2480,12 +2591,20 @@ impl KubernetesSubstrate {
         )
         .await;
 
-        if cleanup_on_failure
-            && restore_failure_should_revert_to_suspended(
+        let drain_timeout = drain_restore_timeout_reverts(
+            &intent.claim,
+            prepared.restore_claim,
+            result.as_ref().err(),
+            wake_dispatch,
+        );
+        let reverts = drain_timeout
+            || restore_failure_should_revert_to_suspended(
                 prepared.restore_claim,
                 result.as_ref().err(),
                 wake_dispatch,
-            )
+            );
+        if cleanup_on_failure
+            && reverts
             && let Some(restore_claim) = prepared.restore_claim
         {
             self.revert_failed_restore_claim(
@@ -2494,13 +2613,18 @@ impl KubernetesSubstrate {
                 activation_assignment.assigned(),
             )
             .await;
+            // The retry runs under an attempt of its own; this one's lease
+            // would refuse it until it lapsed.
+            if drain_timeout && let Some((attempt, generation)) = activation_assignment.assigned() {
+                self.store
+                    .release_finished_activation_attempt_best_effort(
+                        sandbox_id, generation, attempt,
+                    )
+                    .await;
+            }
         }
         if cleanup_on_failure
-            && !restore_failure_should_revert_to_suspended(
-                prepared.restore_claim,
-                result.as_ref().err(),
-                wake_dispatch,
-            )
+            && !reverts
             && wake_failure_should_revert_to_suspended(result.as_ref().err(), wake_dispatch)
             && let Some(restore_lease_token) = prepared
                 .restore_claim
@@ -2586,7 +2710,25 @@ impl KubernetesSubstrate {
                 ),
             }
         }
-        result.map(|(binding, _)| ExecutionActivation::owned(binding))
+        // The attempt this wake owned, for the one caller that commits the
+        // lifecycle itself and releases it then: the drain restore
+        // operation. Every other wake hands back none, so a start that
+        // delegates here leaves its attempt to the release above or to the
+        // node's receipt.
+        let hands_back_attempt = matches!(intent.claim, RestoreClaimMode::DrainOperation(_));
+        result.map(|(binding, owned_attempt)| {
+            let mut activation = ExecutionActivation::owned(binding);
+            activation.lease_completion =
+                owned_attempt
+                    .filter(|_| hands_back_attempt)
+                    .map(|(attempt_id, generation)| {
+                        crate::controllers::substrate::ActivationLeaseCompletion {
+                            generation,
+                            attempt_id,
+                        }
+                    });
+            activation
+        })
     }
 }
 
@@ -2636,6 +2778,28 @@ pub(super) fn wake_failure_should_revert_to_suspended(
                     | SubstrateError::ActivationInFlight { .. }
                 | SubstrateError::LockContention { .. }
         ))
+}
+
+/// A drain restore's fresh claim whose attempt timed out before any Wake was
+/// sent is reverted as a failed one is, so the operation's retry claims the
+/// row at once instead of waiting out the lease and the sweeper. A user's
+/// timed-out restore stays claimed: its caller retries the same sandbox and
+/// converges on the restore that may still land. A drain restore whose Wake
+/// was sent stays claimed too, for the reason
+/// [`wake_failure_should_revert_to_suspended`] gives: the Wake may have
+/// landed, and `suspended` would orphan the live pod. Its operation's next
+/// attempt finds the row held under the lease and waits, until the node's
+/// receipt lands it or the lease lapses and the sweeper settles the row.
+pub(super) fn drain_restore_timeout_reverts(
+    mode: &RestoreClaimMode,
+    claim: Option<RestoreClaim>,
+    err: Option<&SubstrateError>,
+    dispatch: WakeDispatchStatus,
+) -> bool {
+    matches!(mode, RestoreClaimMode::DrainOperation(_))
+        && dispatch.operation_release_is_safe()
+        && matches!(claim, Some(RestoreClaim::FreshFromSuspended { .. }))
+        && matches!(err, Some(SubstrateError::Timeout { .. }))
 }
 
 /// Root rollback invariant for failed restores: only a fresh

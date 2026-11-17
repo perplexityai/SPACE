@@ -25,6 +25,12 @@ struct KeyedRecordingExecutor {
 
 #[async_trait::async_trait]
 impl PublicOperationExecutor for KeyedRecordingExecutor {
+    // As the production executor does, so these claims carry the drain
+    // restore terms, with no drain restore to claim.
+    fn runs_drain_restores(&self) -> bool {
+        true
+    }
+
     fn supported_kinds(&self) -> &'static [OperationKind] {
         &[
             OperationKind::CreateSandbox,
@@ -291,7 +297,7 @@ async fn admit_inline_round(
                     org_id,
                     actor_user_id: None,
                     api_product: ApiProduct::Native,
-                    kind,
+                    kind: kind.into(),
                     target_type: Some(pplx_space_public_api::OperationTargetType::Sandbox),
                     target_id: Some(sandbox),
                     payload_json: serde_json::json!({}),
@@ -1051,6 +1057,12 @@ struct DeleteDuringCreate {
 
 #[async_trait::async_trait]
 impl PublicOperationExecutor for DeleteDuringCreate {
+    // As the production executor does, so these claims carry the drain
+    // restore terms, with no drain restore to claim.
+    fn runs_drain_restores(&self) -> bool {
+        true
+    }
+
     fn supported_kinds(&self) -> &'static [OperationKind] {
         &[OperationKind::CreateSandbox, OperationKind::DeleteSandbox]
     }
@@ -1288,7 +1300,7 @@ async fn a_create_released_while_its_delete_commits_ends_canceled() -> TestResul
             org_id,
             actor_user_id: None,
             api_product: ApiProduct::Native,
-            kind: OperationKind::DeleteSandbox,
+            kind: OperationKind::DeleteSandbox.into(),
             target_type: Some(OperationTargetType::Sandbox),
             target_id: Some("sbx_released_meanwhile"),
             payload_json: serde_json::json!({}),

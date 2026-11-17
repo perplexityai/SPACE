@@ -16,7 +16,8 @@ pub(crate) use kubernetes_tests::{
     insert_test_sandbox_row, mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
     paused_restore_test_subject, running_pod_kubernetes_client,
     running_pod_kubernetes_client_with_create_barrier, sandbox_pod_on_node,
-    start_sequenced_wake_worker, substrate_with_inventory_caches_and_pool, substrate_with_store,
+    start_sequenced_wake_worker, substrate_with_failed_pod_creates,
+    substrate_with_inventory_caches_and_pool, substrate_with_store,
     substrate_with_store_and_client, substrate_with_store_client_pods_and_nodes,
     substrate_with_store_client_proxy_port_and_pod,
     substrate_with_store_client_proxy_port_and_pods, substrate_with_unreachable_store,
@@ -24,6 +25,7 @@ pub(crate) use kubernetes_tests::{
 };
 
 mod activating_client;
+pub(crate) mod drain_restore;
 pub(super) mod environment_placement;
 mod native_pod_failover;
 mod runtime_upgrade_dispatch;
@@ -2024,6 +2026,8 @@ mod kubernetes_tests {
         /// Every Wake received, in arrival order.
         pub(crate) received:
             Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
+        /// How long each Wake waits before it answers.
+        pub(crate) wake_delay: Arc<std::sync::Mutex<Option<Duration>>>,
     }
 
     #[tonic::async_trait]
@@ -2056,6 +2060,10 @@ mod kubernetes_tests {
             let request = request.into_inner();
             self.received.lock().unwrap().push(request.clone());
             let attempt = self.wake_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            let delay = *self.wake_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             if self
                 .succeed_after_attempt
                 .is_none_or(|succeed_after| attempt < succeed_after)
@@ -2092,12 +2100,24 @@ mod kubernetes_tests {
     // `SimWorkerHarness`.
     pub(crate) struct SequencedWakeWorkerHandle {
         pub(crate) port: u16,
+        /// The simulator behind the worker's public RPCs (`PauseSandbox`,
+        /// `SandboxState`), which a test seeds with the VM it expects.
+        pub(crate) sim_state: SimState,
         pub(crate) received:
             Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
+        wake_delay: Arc<std::sync::Mutex<Option<Duration>>>,
         health_reporter: tonic_health::server::HealthReporter,
         shutdown: CancellationToken,
         task: JoinHandle<()>,
         _dir: tempfile::TempDir,
+    }
+
+    impl SequencedWakeWorkerHandle {
+        /// Make every later Wake wait `delay` before it answers, as a node
+        /// still bringing the VM up does.
+        pub(crate) fn delay_wakes(&self, delay: Duration) {
+            *self.wake_delay.lock().unwrap() = Some(delay);
+        }
     }
 
     impl Drop for SequencedWakeWorkerHandle {
@@ -2137,13 +2157,15 @@ mod kubernetes_tests {
             dir.path().join("sandboxes"),
             "node-a".to_string(),
         );
-        let worker_service = SimWorkerApiService::new(sim_state);
+        let worker_service = SimWorkerApiService::new(sim_state.clone());
         let received = Arc::default();
+        let wake_delay = Arc::default();
         let service = SequencedWakeWorker {
             wake_attempts,
             succeed_after_attempt,
             echo_route_identity,
             received: Arc::clone(&received),
+            wake_delay: Arc::clone(&wake_delay),
         };
         let (health_reporter, health_service) = pplx_space_grpc_server::grpc_health_service();
         health_reporter
@@ -2176,7 +2198,9 @@ mod kubernetes_tests {
         });
         Ok(SequencedWakeWorkerHandle {
             port,
+            sim_state,
             received,
+            wake_delay,
             health_reporter,
             shutdown,
             task,
@@ -4529,7 +4553,9 @@ mod kubernetes_tests {
         Ok(())
     }
 
-    fn substrate_with_failed_pod_creates(pool: PgPool) -> (KubernetesSubstrate, Arc<AtomicUsize>) {
+    pub(crate) fn substrate_with_failed_pod_creates(
+        pool: PgPool,
+    ) -> (KubernetesSubstrate, Arc<AtomicUsize>) {
         let request_count = Arc::new(AtomicUsize::new(0));
         let client = blocking_failed_pod_create_kubernetes_client(
             Arc::clone(&request_count),
