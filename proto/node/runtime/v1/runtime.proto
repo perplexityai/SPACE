@@ -71,8 +71,9 @@ message LaunchSidecarRequest {
   // Net-gateway only: replace the live gateway with this pid instead of
   // returning it. Its listening sockets are handed to the replacement when
   // every one is found, so traffic queued on them is not lost; otherwise the
-  // replacement binds fresh ones. A supervisor that predates this field
-  // returns the live pid unchanged.
+  // replacement binds fresh ones. A gateway without launch evidence is
+  // refused, as every launch refuses it. A supervisor that predates this
+  // field returns the live pid unchanged.
   optional uint32 replace_pid = 11;
 }
 

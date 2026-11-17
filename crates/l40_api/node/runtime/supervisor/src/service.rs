@@ -835,12 +835,10 @@ impl RuntimeSupervisorService {
             if let Some(pid) = live_runtime_pid(&sandbox_id, &pid_filename)?
                 && require_sidecar_identity(pid, &req.program, req.uid, req.gid)?
             {
-                let recorded = if is_gateway {
-                    require_recorded_gateway(self, sandbox_id, pid, req.uid).await
-                } else {
-                    Ok(())
-                };
-                if live_sidecar_decision(pid, replace_pid, recorded)? == LiveSidecar::Replace {
+                if is_gateway {
+                    require_recorded_gateway(self, sandbox_id, pid, req.uid).await?;
+                }
+                if replace_pid == Some(pid) {
                     replaced = Some(pid);
                 } else {
                     tracing::info!(
@@ -860,12 +858,10 @@ impl RuntimeSupervisorService {
                 && let Some(pid) = live_sidecar_pid_from_cgroup(&sandbox_id, &program_filename)?
                 && require_sidecar_identity(pid, &req.program, req.uid, req.gid)?
             {
-                let recorded = if is_gateway {
-                    require_recorded_gateway(self, sandbox_id, pid, req.uid).await
-                } else {
-                    Ok(())
-                };
-                if live_sidecar_decision(pid, replace_pid, recorded)? == LiveSidecar::Replace {
+                if is_gateway {
+                    require_recorded_gateway(self, sandbox_id, pid, req.uid).await?;
+                }
+                if replace_pid == Some(pid) {
                     replaced = Some(pid);
                 } else {
                     write_pid_symlink(&sandbox_id, &pid_filename, pid)?;
@@ -1272,38 +1268,6 @@ impl RuntimeSupervisorService {
 }
 
 /// Refuse adoption when an existing gateway lacks its original launch evidence.
-/// What a launch does with the live sidecar it found.
-#[derive(Debug, PartialEq, Eq)]
-enum LiveSidecar {
-    /// Return it to the caller unchanged.
-    Keep,
-    /// Stop it and launch its replacement on its listening sockets.
-    Replace,
-}
-
-/// A live gateway without valid launch evidence is never adopted. Asked to
-/// replace one, the launch instead returns it unchanged, as a supervisor
-/// without replacement does, so the caller stops and relaunches it: such a
-/// gateway is one an operator cycles.
-fn live_sidecar_decision(
-    pid: u32,
-    replace_pid: Option<u32>,
-    recorded: Result<(), Status>,
-) -> Result<LiveSidecar, Status> {
-    match (replace_pid == Some(pid), recorded) {
-        (true, Ok(())) => Ok(LiveSidecar::Replace),
-        (true, Err(status)) => {
-            tracing::info!(
-                pid,
-                reason = status.message(),
-                "not replacing a net-gateway in place; its caller stops and relaunches it"
-            );
-            Ok(LiveSidecar::Keep)
-        }
-        (false, recorded) => recorded.map(|()| LiveSidecar::Keep),
-    }
-}
-
 async fn require_recorded_gateway(
     service: &RuntimeSupervisorService,
     sandbox_id: SandboxId,

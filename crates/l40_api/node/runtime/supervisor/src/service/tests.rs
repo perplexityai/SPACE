@@ -1098,34 +1098,3 @@ async fn an_unlaunchable_replacement_is_refused_before_anything_changes() {
         assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
     }
 }
-
-#[test]
-fn a_gateway_without_launch_evidence_is_returned_rather_than_replaced() {
-    let unrecorded = || Err(Status::failed_precondition("no launch evidence"));
-    assert_eq!(
-        live_sidecar_decision(7, Some(7), Ok(())).unwrap(),
-        LiveSidecar::Replace
-    );
-    // Replacing it is declined, so the caller stops and relaunches it.
-    assert_eq!(
-        live_sidecar_decision(7, Some(7), unrecorded()).unwrap(),
-        LiveSidecar::Keep
-    );
-    // Without a replacement request it is still refused, never adopted.
-    assert_eq!(
-        live_sidecar_decision(7, None, unrecorded())
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
-    assert_eq!(
-        live_sidecar_decision(7, Some(8), unrecorded())
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
-    assert_eq!(
-        live_sidecar_decision(7, Some(8), Ok(())).unwrap(),
-        LiveSidecar::Keep
-    );
-}

@@ -164,7 +164,6 @@ fn credentials_match(status: &str, uid: u32, gid: u32) -> bool {
         })
 }
 
-/// Identify a deployed sidecar binary, including content-addressed installs.
 /// Reject a sidecar program, argument or environment entry that the launcher
 /// could not pass to exec. Run it before any irreversible step, such as
 /// stopping the gateway a launch replaces.
@@ -190,6 +189,7 @@ pub fn validate_sidecar_launch_strings(
     Ok(())
 }
 
+/// Identify a deployed sidecar binary, including content-addressed installs.
 pub fn process_matches_program(pid: u32, program: &str) -> std::io::Result<bool> {
     use pplx_space_uds_peer_auth::exe::{
         is_content_addressed_binary_file_name, strip_exe_deleted_marker,
