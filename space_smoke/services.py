@@ -68,6 +68,7 @@ from space_smoke.runtime import (
     SmokeConfigurationError,
     SubprocessExecutor,
 )
+from space_smoke.node_runtime import NodeRuntimeFixture
 from space_smoke.template_build import build_dedicated_template
 
 
@@ -117,6 +118,7 @@ class SmokeServices:
     native: CommandSandboxFactory | None = None
     api_surface: str = ECW_API_SURFACE
     direct_node: DirectNodeConfig | None = None
+    node_runtime_command: tuple[str, ...] = ()
     # Reads the Kind bench's modes for the suite. Set on the kind backend
     # whatever the fixture, unlike `kind`, which only fixtures given Kind
     # controls receive.
@@ -187,6 +189,8 @@ class SmokeServices:
         sandbox: SandboxConfig,
         sandbox_count: int = 1,
     ) -> Fixture:
+        if fixture_type is NodeRuntimeFixture:
+            return cast(Fixture, NodeRuntimeFixture(context, self.node_runtime_command))
         if fixture_type is KindAdmin:
             if self.kind is None:
                 raise SmokeConfigurationError("KindAdmin requires the kind backend")
@@ -539,6 +543,28 @@ class SmokeServices:
         *,
         required_tools: Iterable[str] | None = None,
     ) -> SmokeServices:
+        if scenario.fixture_type is NodeRuntimeFixture:
+            import json
+
+            values = dict(os.environ if environment is None else environment)
+            if values.get("SPACE_SMOKE_BACKEND") != DEPLOYED_BACKEND or values.get(
+                "SPACE_SMOKE_API_SURFACE"
+            ) != "node":
+                raise SmokeConfigurationError("node runtime requires deployed backend and node surface")
+            try:
+                command = json.loads(values["SPACE_SMOKE_NODE_RUNTIME_COMMAND"])
+            except (KeyError, ValueError) as error:
+                raise SmokeConfigurationError("set SPACE_SMOKE_NODE_RUNTIME_COMMAND to a JSON argv") from error
+            if not isinstance(command, list) or not command or any(
+                not isinstance(part, str) or not part for part in command
+            ):
+                raise SmokeConfigurationError("node runtime command must be a nonempty string argv")
+            if shutil.which(command[0]) is None:
+                raise MissingToolError(f"node runtime requires {command[0]}")
+            return cls(
+                kind=None, ecw=None, api_key="", owns_api_key=False,
+                api_surface="node", node_runtime_command=tuple(command),
+            )
         if scenario.fixture_type is DirectNodeRecoveryFixture:
             values = dict(os.environ if environment is None else environment)
             if (

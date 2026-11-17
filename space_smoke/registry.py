@@ -15,12 +15,14 @@ from space_smoke.direct_node import DirectNodeRecoveryFixture
 from space_smoke.fixtures import CommandSandboxFixture, Ecw, KindAdmin, KindEcw, KindNetworkEcw
 from space_smoke.native_hardening import NativeHardeningFixture
 from space_smoke.native_recovery import KindNativeHardeningFixture
+from space_smoke.node_runtime import NodeRuntimeFixture
 from space_smoke.runtime import ScenarioContext, SmokeConfigurationError
 from space_smoke.services import SmokeServices
 
 # The fixture type is the scenario's capability declaration; requesting a
 # privileged fixture narrows the backends the scenario may run on.
 FIXTURE_BACKENDS: dict[type[Any], frozenset[str]] = {
+    NodeRuntimeFixture: frozenset({"deployed"}),
     DirectNodeRecoveryFixture: frozenset({"deployed"}),
     NativeHardeningFixture: frozenset({"kind", "deployed"}),
     KindNativeHardeningFixture: frozenset({"kind"}),
@@ -42,6 +44,7 @@ FIXTURE_BACKENDS: dict[type[Any], frozenset[str]] = {
 # support what it asserts by contract: one that asserts sandbox pods, or forks,
 # narrows to kubernetes.
 FIXTURE_SUBSTRATES: dict[type[Any], frozenset[str]] = {
+    NodeRuntimeFixture: frozenset({"kubernetes", "direct"}),
     # A standalone node, outside any cluster control plane.
     DirectNodeRecoveryFixture: frozenset({"direct"}),
     NativeHardeningFixture: frozenset({"kubernetes", "direct"}),
@@ -244,13 +247,13 @@ def scenario(
             )
         if fixture_type is KindAdmin and sandboxes != 1:
             raise ValueError("KindAdmin does not allocate sandboxes; omit sandboxes")
-        if (fixture_type is DirectNodeRecoveryFixture) != (
+        if (fixture_type in (DirectNodeRecoveryFixture, NodeRuntimeFixture)) != (
             "node" in supported_surfaces
         ):
-            raise TypeError("node API scenarios require DirectNodeRecoveryFixture")
-        if fixture_type is DirectNodeRecoveryFixture and supported_surfaces != {"node"}:
+            raise TypeError("node API scenarios require a node fixture")
+        if fixture_type in (DirectNodeRecoveryFixture, NodeRuntimeFixture) and supported_surfaces != {"node"}:
             raise TypeError(
-                "DirectNodeRecoveryFixture requires only the node API surface"
+                "node fixtures require only the node API surface"
             )
         if "native" in supported_surfaces and fixture_type not in (
             CommandSandboxFixture,
@@ -296,7 +299,7 @@ def scenario(
             fixture_name=fixture_type.fixture_name,
             fixture_type=cast(type[Fixture], fixture_type),
             sandbox=sandbox_config,
-            sandbox_count=0 if fixture_type is KindAdmin else sandboxes,
+            sandbox_count=0 if fixture_type in (KindAdmin, NodeRuntimeFixture) else sandboxes,
             templates=supported_templates,
             rerun_environment=rerun_names,
             required_tools=tool_names,

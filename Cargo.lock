@@ -7168,6 +7168,7 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -7178,6 +7179,7 @@ dependencies = [
  "clap",
  "pplx-space-host-layout",
  "pplx-space-node-runtime-supervisor",
+ "serde_json",
 ]
 
 [[package]]

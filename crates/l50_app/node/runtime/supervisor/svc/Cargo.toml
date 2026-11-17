@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [features]
 default = []
+experimental-wasm = ["pplx-space-node-runtime-supervisor/experimental-wasm", "dep:serde_json"]
 otel = ["pplx-space-node-runtime-supervisor/otel"]
 datadog = ["otel", "pplx-space-node-runtime-supervisor/datadog"]
 # Deprecated for one release; use otel and datadog.
@@ -24,6 +25,7 @@ datadog-otel = ["otel", "datadog"]
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
+serde_json = { workspace = true, optional = true }
 
 # internal
 pplx-space-host-layout = { workspace = true }

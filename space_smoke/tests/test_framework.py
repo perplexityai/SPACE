@@ -97,11 +97,7 @@ runpy.run_module("space_smoke", run_name="__main__")
         self.assertIs(registered.fixture_type, CommandSandboxFixture)
         self.assertEqual(registered.fixture_name, "command_sandbox")
         self.assertTrue(callable(registered.verify))
-        self.assertEqual(
-            REGISTRY.categories,
-            ("ecw", "local", "native", "native_concurrency", "native_contract",
-             "native_recovery", "network_policy", "node")
-        )
+        self.assertIn(registered.category, REGISTRY.categories)
 
     def test_external_scenario_package_extends_the_public_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -12,6 +12,7 @@ workspace = true
 
 [features]
 default = []
+experimental-wasm = ["dep:uuid"]
 otel = ["pplx-space-service-host/otel"]
 datadog = ["otel", "pplx-space-service-host/datadog"]
 # Deprecated for one release; use otel and datadog.
@@ -30,6 +31,7 @@ tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true, features = ["v7"], optional = true }
 
 # internal
 pplx-space-common-core = { workspace = true }

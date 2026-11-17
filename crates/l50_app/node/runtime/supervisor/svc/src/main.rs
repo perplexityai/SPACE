@@ -16,6 +16,11 @@ use pplx_space_node_runtime_supervisor::{
     disable_version_flag = true
 )]
 struct Cli {
+    /// Experimental local WASI protocol. Reads one bounded JSON request from
+    /// stdin; never binds the privileged supervisor socket or launches a VM.
+    #[cfg(all(target_os = "linux", feature = "experimental-wasm"))]
+    #[arg(long, conflicts_with = "sidecar_launcher_fd")]
+    experimental_wasm_config: Option<PathBuf>,
     /// Print version.
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
     _version: (),
@@ -51,6 +56,13 @@ impl From<Cli> for RuntimeSupervisorRunConfig {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(all(target_os = "linux", feature = "experimental-wasm"))]
+    if let Some(path) = &cli.experimental_wasm_config {
+        use pplx_space_node_runtime_supervisor::experimental_wasm::{WasmConfig, run_request};
+        let config: WasmConfig = serde_json::from_reader(std::fs::File::open(path)?)?;
+        run_request(config, std::io::stdin().lock(), std::io::stdout().lock())?;
+        return Ok(());
+    }
     // The library owns the Tokio runtime, telemetry, and the shutdown token for
     // this service: launcher mode has to run in a single-threaded process with
     // none of them, so the mode choice cannot be made out here.
