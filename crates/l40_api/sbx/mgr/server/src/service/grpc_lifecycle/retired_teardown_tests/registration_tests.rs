@@ -60,7 +60,7 @@ fn node_local_suspend_registers_under_its_kubernetes_execution() {
 
     let mut space_runtime = row.clone();
     space_runtime.space_api_route_identity.substrate_kind =
-        Some(pplx_space_common_core::types::NodeManagedBy::Space);
+        Some(pplx_space_node_model::NodeManagedBy::Space);
     assert!(space_runtime.space_api_route_identity.pod_uid.is_some());
     assert_eq!(
         super::super::node_local_registration_generation(&space_runtime),
@@ -93,7 +93,7 @@ async fn node_local_suspend_of_a_superseded_execution_retains_the_published_capt
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
         let mut fields = runtime_fields(generation(GENERATION), 7);
         fields.space_api_route_identity.substrate_kind =
-            Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+            Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
         crate::db::update_runtime_fields(&conn, sandbox_id.parse().unwrap(), fields).unwrap();
         let service = service_with_runtime_probe(conn, true);
         let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
@@ -215,7 +215,7 @@ async fn suspend_cleanup_requires_handoff_and_retries_the_same_artifact() {
                 insert_test_sandbox(&conn, &subject, SandboxState::Suspending);
                 let mut fields = runtime_fields(generation(GENERATION), 7);
                 fields.space_api_route_identity.substrate_kind =
-                    Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+                    Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
                 crate::db::update_runtime_fields(&conn, id, fields).unwrap();
                 let artifact = LocalArtifactId::new();
                 let scratch = tempfile::tempdir().unwrap();
@@ -242,7 +242,7 @@ async fn suspend_cleanup_requires_handoff_and_retries_the_same_artifact() {
                     crate::db::complete_row_intent_cleanup(&conn, &subject, CleanupCompletion::MarkSuspended, Some((artifact, path.to_str().unwrap()))).unwrap();
                     assert!(matches!(crate::db::update_state_from_states(&conn, &subject, crate::db::StateSet::of(&[SandboxState::Suspended]), SandboxState::Restoring).unwrap(), crate::db::StateWriteOutcome::Applied { .. }));
                     let mut fields = runtime_fields(generation(GENERATION), 7);
-                    fields.space_api_route_identity.substrate_kind = Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+                    fields.space_api_route_identity.substrate_kind = Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
                     crate::db::update_runtime_fields(&conn, id, fields).unwrap();
                     crate::db::mark_cleanup_required(&conn, &subject, true, CleanupCompletion::MarkSuspended, "retire incomplete restore").unwrap();
                 }
@@ -781,7 +781,7 @@ async fn legacy_capture_recovery_adopts_without_inventing_capture_order() {
             insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
             let mut fields = runtime_fields(generation(GENERATION), 7);
             fields.space_api_route_identity.substrate_kind =
-                Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+                Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
             crate::db::update_runtime_fields(&conn, sandbox_id.parse().unwrap(), fields).unwrap();
             // A, captured and published by the previous execution's teardown.
             let cache_dir = tempfile::tempdir().unwrap();

@@ -782,8 +782,9 @@ impl Fixture {
     /// retry of the same pod matches it. Returns that pod's route identity.
     fn roll_back_a_restore(&self) -> pplx_space_common_core::types::SpaceApiRouteIdentity {
         use pplx_space_common_core::types::{
-            ExecutionGeneration, NodeManagedBy, RouteGeneration, SandboxActivationAttemptId,
+            ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId,
         };
+        use pplx_space_node_model::NodeManagedBy;
         let generation = ExecutionGeneration::new(4).unwrap();
         let attempt = SandboxActivationAttemptId::new();
         let route = pplx_space_common_core::types::SpaceApiRouteIdentity {

@@ -1362,7 +1362,7 @@ impl SandboxManagerService {
         let published_route_identity = sandbox.space_api_route_identity.clone();
         let preserves_kubernetes_identity = req.route_identity.is_none()
             && published_route_identity.effective_substrate_kind()
-                == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+                == Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
         let requested_route_identity = if preserves_kubernetes_identity {
             published_route_identity
         } else {

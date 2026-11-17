@@ -2,7 +2,7 @@
 
 use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_core::types::SubstrateKind;
+use pplx_space_node_model::SubstrateKind;
 
 use pplx_space_durations::PositiveDuration;
 use pplx_space_sandbox_portability::failed_repair_revert_eligibility;

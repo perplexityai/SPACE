@@ -18,8 +18,8 @@ use pplx_space_cluster_trigger_queue::{
     QueuedRefConflict, enqueue_triggers_tx, queue_node_reconcile_refs,
 };
 use pplx_space_common_core::types::{
-    EcwCredentialEpoch, ExecutionGeneration, NodeManagedBy, RouteGeneration,
-    SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
+    EcwCredentialEpoch, ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId,
+    SandboxId, SandboxLifecycle,
 };
 use pplx_space_common_grpc::{RetryableNotReady, sandbox_service_route_not_ready_status};
 use pplx_space_ecw_credential::{EcwCredentialKeyring, EcwCredentialKind, EcwCredentialMatch};
@@ -27,6 +27,7 @@ use pplx_space_k8s_ids::PodUid;
 use pplx_space_network_roles::GuestPort;
 use pplx_space_node_api_client::WorkerApiClient;
 use pplx_space_node_api_client::proto::ImplicitWakeActivity;
+use pplx_space_node_model::NodeManagedBy;
 use pplx_space_public_api::SessionKind;
 use pplx_space_rpc_auth::DataPlaneSessionRefreshAuthority;
 use pplx_space_sandbox_store as sandbox_store;

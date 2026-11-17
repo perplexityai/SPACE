@@ -12,8 +12,8 @@ use std::{
 use super::*;
 use axum::body::Bytes;
 use http_body_util::Full;
-use pplx_space_common_core::types::NodeDrainMode;
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_node_model::NodeDrainMode;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;

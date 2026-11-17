@@ -498,17 +498,14 @@ fn apply_route_identity_provenance_to_state(
         provenance.current_substrate_kind,
         provenance.retained_substrate_kind,
     ];
-    let substrate_kind = if observed_substrates.contains(&Some(
-        pplx_space_common_core::types::NodeManagedBy::Kubernetes,
-    )) {
-        crate::proto::SandboxSubstrateKind::Kubernetes
-    } else if observed_substrates
-        .contains(&Some(pplx_space_common_core::types::NodeManagedBy::Space))
-    {
-        crate::proto::SandboxSubstrateKind::Direct
-    } else {
-        crate::proto::SandboxSubstrateKind::Unspecified
-    };
+    let substrate_kind =
+        if observed_substrates.contains(&Some(pplx_space_node_model::NodeManagedBy::Kubernetes)) {
+            crate::proto::SandboxSubstrateKind::Kubernetes
+        } else if observed_substrates.contains(&Some(pplx_space_node_model::NodeManagedBy::Space)) {
+            crate::proto::SandboxSubstrateKind::Direct
+        } else {
+            crate::proto::SandboxSubstrateKind::Unspecified
+        };
     sandbox.route_provenance_substrate_kind = substrate_kind as i32;
 
     let generation = [

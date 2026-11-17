@@ -3,10 +3,11 @@ use std::time::Duration;
 
 use pplx_space_accounts::{JobId, NodeId};
 use pplx_space_common_core::types::{
-    ExecutionGeneration, LocalArtifactId, NodeManagedBy, RouteGeneration,
-    SandboxActivationAttemptId, SandboxId, SpaceApiRouteIdentity,
+    ExecutionGeneration, LocalArtifactId, RouteGeneration, SandboxActivationAttemptId, SandboxId,
+    SpaceApiRouteIdentity,
 };
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::NodeManagedBy;
 use tonic::Request;
 
 use super::*;

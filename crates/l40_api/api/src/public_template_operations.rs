@@ -4,7 +4,7 @@ use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
 use pplx_space_cluster_pool::{TemplateWarmPoolUsage, WarmPoolStore};
-use pplx_space_common_core::types::SubstrateKind;
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicErrorDetail, PublicOperationResult,
     PublicTemplateOperationResult,

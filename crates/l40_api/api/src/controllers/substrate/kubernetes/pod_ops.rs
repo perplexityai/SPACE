@@ -16,14 +16,14 @@ use crate::node_group_placement::{
 };
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeRole as SpaceNodeRole, SandboxActivationAttemptId, SandboxLifecycle,
-    SandboxTransitionTargetState,
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
     SandboxRestoreProvenance,
 };
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::NodeRole as SpaceNodeRole;
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_pod::{
     EvacuationPlacement, NodeGroupPlacement, PodEnvironment, PodToleration,

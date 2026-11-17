@@ -40,9 +40,9 @@ const SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED_ENV: &str =
     "SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED";
 
 /// Node role for an auth surface. Reuses the shared registry vocabulary from
-/// `pplx-space-common-core` (with its `FromStr`/`Display`) rather than forking a
+/// `pplx-space-node-model` (with its `FromStr`/`Display`) rather than forking a
 /// parallel enum; parse inbound role strings at the boundary via `FromStr`.
-pub use pplx_space_common_core::types::NodeRole;
+pub use pplx_space_node_model::NodeRole;
 
 #[derive(Clone)]
 pub struct NodeApiAuthLayer {

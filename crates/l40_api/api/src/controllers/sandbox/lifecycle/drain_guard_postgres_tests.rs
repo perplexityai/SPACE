@@ -3,8 +3,8 @@ use pplx_space_common_core::types::SandboxId;
 
 use super::*;
 use axum::{http::StatusCode, response::IntoResponse};
-use pplx_space_common_core::types::NodeDrainMode;
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_node_model::NodeDrainMode;
 
 use pplx_space_test_env::TestResult;
 

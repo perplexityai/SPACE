@@ -32,10 +32,10 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, NodeDrainMode, NodeDrainPhase, SandboxId,
-    SandboxLifecycle,
+    ArtifactKind, ArtifactOrigin, LocalArtifactId, SandboxId, SandboxLifecycle,
 };
 use pplx_space_durations::PositiveDuration;
+use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase};
 
 use std::sync::LazyLock;
 use std::time::Duration;

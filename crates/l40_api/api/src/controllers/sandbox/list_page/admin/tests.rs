@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SubstrateKind;
 use pplx_space_db_test_fixtures::{
     TestDbResult, insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db,
 };
+use pplx_space_node_model::SubstrateKind;
 use time::Duration;
 
 use super::*;

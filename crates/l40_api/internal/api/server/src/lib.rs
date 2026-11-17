@@ -53,15 +53,15 @@ use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, BackupAttemptId, ExactStorageUri, ExecutionGeneration,
-    LocalArtifactId, NodeRole as SpaceNodeRole, SandboxId,
-    SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId, SnapshotKind,
-    SnapshotName, SnapshotState, SubstrateKind,
+    LocalArtifactId, SandboxId, SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash,
+    SnapshotId, SnapshotKind, SnapshotName, SnapshotState,
 };
 use pplx_space_content_digest::Digest;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
 use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_node_model::{NodeRole as SpaceNodeRole, SubstrateKind};
 use pplx_space_rpc_contracts::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
 use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,

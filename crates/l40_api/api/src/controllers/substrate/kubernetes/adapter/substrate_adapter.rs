@@ -3,7 +3,7 @@
 use super::pooled::PooledPodEnvironment;
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
-use pplx_space_common_core::types::{NodePoolName, SubstrateKind};
+use pplx_space_node_model::{NodePoolName, SubstrateKind};
 
 impl SubstrateAdapter for KubernetesSubstrate {
     fn managed_by(&self) -> &'static str {

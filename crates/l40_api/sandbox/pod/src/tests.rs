@@ -1,5 +1,5 @@
-fn placement_template() -> pplx_space_common_core::types::TemplateCompatSpec {
-    pplx_space_common_core::types::TemplateCompatSpec {
+fn placement_template() -> pplx_space_node_model::TemplateCompatSpec {
+    pplx_space_node_model::TemplateCompatSpec {
         name: pplx_space_template_model::TemplateName::parse("seed").unwrap(),
         org_id: None,
         visibility: pplx_space_template_model::TemplateVisibility::Generic,
@@ -10,22 +10,22 @@ fn node_group(name: &str) -> NodeGroupName {
     NodeGroupName::parse(name).unwrap()
 }
 
-fn shared_group(name: &str) -> pplx_space_common_core::types::NodeGroup {
-    pplx_space_common_core::types::NodeGroup {
-        id: pplx_space_common_core::types::NodeGroupId::new(),
+fn shared_group(name: &str) -> pplx_space_node_model::NodeGroup {
+    pplx_space_node_model::NodeGroup {
+        id: pplx_space_node_model::NodeGroupId::new(),
         name: node_group(name),
-        policy: pplx_space_common_core::types::NodeGroupPolicy::Generic { is_default: false },
+        policy: pplx_space_node_model::NodeGroupPolicy::Generic { is_default: false },
         template_allowlist: std::collections::BTreeSet::new(),
     }
 }
 
-fn dedicated_group(name: &str, org_id: OrgId) -> pplx_space_common_core::types::NodeGroup {
-    pplx_space_common_core::types::NodeGroup {
-        id: pplx_space_common_core::types::NodeGroupId::new(),
+fn dedicated_group(name: &str, org_id: OrgId) -> pplx_space_node_model::NodeGroup {
+    pplx_space_node_model::NodeGroup {
+        id: pplx_space_node_model::NodeGroupId::new(),
         name: node_group(name),
-        policy: pplx_space_common_core::types::NodeGroupPolicy::Dedicated {
+        policy: pplx_space_node_model::NodeGroupPolicy::Dedicated {
             org_id,
-            template_policy: pplx_space_common_core::types::NodeGroupTemplatePolicy::Default,
+            template_policy: pplx_space_node_model::NodeGroupTemplatePolicy::Default,
         },
         template_allowlist: std::collections::BTreeSet::new(),
     }
@@ -38,7 +38,7 @@ fn dedicated_group(name: &str, org_id: OrgId) -> pplx_space_common_core::types::
 /// builds.
 fn org_specific_node_group_placement() -> NodeGroupPlacement {
     let org = TEST_ORG_ID;
-    let template = pplx_space_common_core::types::TemplateCompatSpec {
+    let template = pplx_space_node_model::TemplateCompatSpec {
         name: pplx_space_template_model::TemplateName::parse(ORG_SPECIFIC_TEMPLATE).unwrap(),
         org_id: Some(org),
         visibility: pplx_space_template_model::TemplateVisibility::OrgSpecific,
@@ -80,7 +80,7 @@ use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
     AutoLifecyclePolicy, AutoLifecycleStage,
 };
-use pplx_space_common_core::types::NodeGroupName;
+use pplx_space_node_model::NodeGroupName;
 
 const TEST_SANDBOX_ID: pplx_space_common_core::types::SandboxId =
     pplx_space_common_core::types::SandboxId::from_uuid(Uuid::from_u128(

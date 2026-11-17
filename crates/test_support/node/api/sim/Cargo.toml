@@ -35,6 +35,7 @@ uuid = { workspace = true, features = ["v7"] }
 pplx-space-api-route = { workspace = true }
 pplx-space-auto-lifecycle = { workspace = true }
 pplx-space-common-core = { workspace = true }
+pplx-space-node-model = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-guest-process = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }

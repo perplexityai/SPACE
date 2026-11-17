@@ -74,7 +74,7 @@
 //! [`WorkerNodeLabels`] for kube (reflector scan, not a per-tick LIST).
 //! Production impls in [`store`] and [`kube`]; fakes in tests.
 
-use pplx_space_common_core::types::NodeGroupId;
+use pplx_space_node_model::NodeGroupId;
 
 use std::time::Duration;
 
@@ -85,10 +85,8 @@ use pplx_space_api::routes::admin::audit::{
     SYSTEM_ACTOR_NODE_GROUP_LABELER, SystemNodeGroupAuditEntry, record_node_group_system,
 };
 use pplx_space_api::routes::admin::node_groups::group_state_summary;
-use pplx_space_common_core::types::{
-    NodeGroupName, NodeGroupNameParseError, NodeGroupTemplatePolicy,
-};
 use pplx_space_durations::PositiveDuration;
+use pplx_space_node_model::{NodeGroupName, NodeGroupNameParseError, NodeGroupTemplatePolicy};
 
 use crate::env_config;
 

@@ -575,10 +575,10 @@ pub enum RunSbxMgrError {
     NodeRole {
         role: String,
         #[source]
-        source: pplx_space_common_core::types::NodeRoleParseError,
+        source: pplx_space_node_model::NodeRoleParseError,
     },
     #[error("invalid {SPACE_NODE_MANAGED_BY_ENV}: {0}")]
-    NodeManagedBy(#[source] pplx_space_common_core::types::NodeManagedByParseError),
+    NodeManagedBy(#[source] pplx_space_node_model::NodeManagedByParseError),
     #[error("could not read {SPACE_NODE_MANAGED_BY_ENV}: {0}")]
     NodeManagedByEnvironment(#[source] std::env::VarError),
     #[error("failed to enable dependency restart drain: {0}")]
@@ -660,7 +660,7 @@ fn report_active_failure(error: &RunSbxMgrError) {
 
 fn parse_node_managed_by(
     value: Result<String, std::env::VarError>,
-) -> Result<Option<pplx_space_common_core::types::NodeManagedBy>, RunSbxMgrError> {
+) -> Result<Option<pplx_space_node_model::NodeManagedBy>, RunSbxMgrError> {
     match value {
         Ok(value) => value
             .parse()
@@ -808,7 +808,7 @@ pub async fn run(
         Ok(value) if !value.trim().is_empty() => {
             let role = value.trim();
             Some(
-                pplx_space_common_core::types::NodeRole::from_str(role).map_err(|source| {
+                pplx_space_node_model::NodeRole::from_str(role).map_err(|source| {
                     RunSbxMgrError::NodeRole {
                         role: role.to_string(),
                         source,

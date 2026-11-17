@@ -579,7 +579,7 @@ impl SandboxManagerService {
             // hold is an identity-free Direct activation.
             let kubernetes = |identity: &pplx_space_common_core::types::SpaceApiRouteIdentity| {
                 identity.effective_substrate_kind()
-                    == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+                    == Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
             };
             let row_kubernetes = match self.lookup_sandbox(&req.sandbox_id) {
                 Ok(row) => kubernetes(&row.space_api_route_identity),

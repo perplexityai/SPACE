@@ -45,9 +45,8 @@ use pplx_space_api_route::wait_ready_lifecycle_request;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_bearer_token::SpaceBearerToken;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, BackupAttemptId, BackupSource, LocalArtifactId, NodeAddress,
-    NodeManagedBy, NodePoolName, NodeRole, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
-    SandboxRouteIdentity,
+    ArtifactKind, ArtifactOrigin, BackupAttemptId, BackupSource, LocalArtifactId,
+    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
 };
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
@@ -55,6 +54,7 @@ use pplx_space_common_grpc::{
 use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyProto;
+use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodePoolName, NodeRole};
 use pplx_space_rpc_auth::SpaceBearerInterceptor;
 use pplx_space_template_model::TemplateName;
 
@@ -1211,7 +1211,7 @@ pub struct SubstrateCapabilities {
     /// and force-upload actions refuse before reading the node, except
     /// `:undrain`, which only clears a `drain_phase` an earlier drain left.
     /// A node row's counterpart is
-    /// [`SubstrateKind::has_node_drain_reconciler`](pplx_space_common_core::types::SubstrateKind::has_node_drain_reconciler).
+    /// [`SubstrateKind::has_node_drain_reconciler`](pplx_space_node_model::SubstrateKind::has_node_drain_reconciler).
     pub supports_node_drain: bool,
     /// The adapter drives sandboxes through a Kubernetes apiserver, with a
     /// client the process builds from its environment (an in-cluster config

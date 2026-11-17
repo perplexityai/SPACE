@@ -5,10 +5,11 @@ use crate::db::Connection;
 use crate::db::db_private_outside_tests;
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeManagedBy, RouteGeneration, SandboxActivationAttemptId,
-    SandboxTransitionReceiptKind, SpaceApiRouteIdentity,
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxTransitionReceiptKind,
+    SpaceApiRouteIdentity,
 };
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::NodeManagedBy;
 use pplx_space_sqlite::SqliteU64;
 use rusqlite::params;
 

@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt, stream};
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{NodeManagedBy, NodeRole as SpaceNodeRole};
 use pplx_space_node_api_client::proto::{
     StateReconciliationReason as ProtoReconcileReason, TriggerStateReconciliationRequest,
 };
 use pplx_space_node_api_client::{BuilderApiClient, NodeApiClient, WorkerApiClient};
+use pplx_space_node_model::{NodeManagedBy, NodeRole as SpaceNodeRole};
 use pplx_space_state_reconciliation::ReconcileReason;
 use sqlx::PgPool;
 use tokio::sync::Mutex;

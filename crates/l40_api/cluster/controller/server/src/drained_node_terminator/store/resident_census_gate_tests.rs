@@ -10,7 +10,8 @@
 //! keeps every row blocking.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{SandboxId, SubstrateKind};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_node_model::SubstrateKind;
 
 use std::time::Duration;
 

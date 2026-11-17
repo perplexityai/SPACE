@@ -359,7 +359,7 @@ fn identity(generation: u64, sandbox: &str) -> anyhow::Result<SandboxRouteIdenti
         sandbox_id: Some(sandbox.parse()?),
         route_generation: Some(generation.try_into()?),
         current_node_id: Some(NODE.parse()?),
-        substrate_kind: Some(pplx_space_common_core::types::NodeManagedBy::Space),
+        substrate_kind: Some(pplx_space_node_model::NodeManagedBy::Space),
         execution_generation: Some(pplx_space_common_core::types::ExecutionGeneration::new(1)?),
         activation_attempt_id: Some(ATTEMPT.parse()?),
         pod_uid: None,

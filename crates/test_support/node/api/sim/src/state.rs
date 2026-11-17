@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use pplx_space_common_core::types::NodeManagedBy;
+use pplx_space_node_model::NodeManagedBy;
 
 /// String values match the production `SandboxInfo.status` lexicon so existing
 /// clients can deserialize the simulator's responses unchanged.

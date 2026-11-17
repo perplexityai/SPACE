@@ -207,7 +207,7 @@ async fn recovery_wait_does_not_hold_the_dependency_work_gate() {
 
 #[test]
 fn host_ownership_configuration_is_explicit_and_fails_closed() {
-    use pplx_space_common_core::types::NodeManagedBy;
+    use pplx_space_node_model::NodeManagedBy;
     assert_eq!(
         parse_node_managed_by(Err(std::env::VarError::NotPresent)).unwrap(),
         None

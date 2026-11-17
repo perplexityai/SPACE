@@ -18,13 +18,13 @@ use pplx_space_api::controllers::substrate::{
 };
 use pplx_space_api::reconcile_queue::{ReconcileRef, enqueue_sandbox_reconcile};
 use pplx_space_common_core::types::{
-    ArtifactKind, BackupSource, ExecutionGeneration, LocalArtifactId, NodeDrainMode, NodeManagedBy,
-    NodeRole, SandboxId, SubstrateKind,
+    ArtifactKind, BackupSource, ExecutionGeneration, LocalArtifactId, SandboxId,
 };
 use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_node_model::{NodeDrainMode, NodeManagedBy, NodeRole, SubstrateKind};
 use pplx_space_rpc_contracts::node_drain_signals::{
     EVACUATION_RESTORE_READY_CHANNEL, REUPLOAD_ARTIFACT_MISSING_MARKER,
     REUPLOAD_SANDBOX_RESTORING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,

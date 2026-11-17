@@ -16,11 +16,13 @@
 
 #![cfg(feature = "serde")]
 
-use super::{NodeAddress, NodeDrainMode, NodeManagedBy, NodeRole};
 use pplx_space_accounts::NodeId;
 use serde::{Deserialize, Serialize};
 
-use crate::types::node_group::{NodeGroupName, NodeGroupTemplatePolicy};
+use pplx_space_node_model::{
+    NodeAddress, NodeDrainMode, NodeGroupId, NodeGroupName, NodeGroupTemplatePolicy, NodeManagedBy,
+    NodeRole,
+};
 use pplx_space_template_model::{TemplateName, TemplateVisibility};
 
 /// Response shape for `GET /admin/api/v1/nodes` (each element) and
@@ -131,7 +133,7 @@ pub struct AdminNodeResponse {
     /// `space-node-group` label. Absent for an unlabeled node; such a worker
     /// belongs to the default group (`is_default` in `GET /node-groups`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_group_id: Option<crate::types::NodeGroupId>,
+    pub node_group_id: Option<NodeGroupId>,
     /// Present on `GET /nodes` and `GET /nodes/{id}` when the node has a
     /// queued state-reconciliation trigger; per-facet work in
     /// `node_reconcile_queue` is not shown. Action responses never carry it.
@@ -688,7 +690,7 @@ fn is_false(value: &bool) -> bool {
 /// extra round trip).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminNodeGroupResponse {
-    pub id: crate::types::NodeGroupId,
+    pub id: NodeGroupId,
     pub name: NodeGroupName,
     /// `None` ⇒ generic (shared) group; `Some` ⇒ dedicated group for that org.
     pub org_id: Option<pplx_space_accounts::OrgId>,

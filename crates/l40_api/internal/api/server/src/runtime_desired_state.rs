@@ -6,7 +6,7 @@
 //!
 //! [`RuntimeProvisioningCohort`]: crate::runtime_provisioning_cohort::RuntimeProvisioningCohort
 
-use pplx_space_common_core::types::NodeRole;
+use pplx_space_node_model::NodeRole;
 use pplx_space_runtime_environment_catalog_store as catalog_store;
 use pplx_space_runtime_environment_policy_store as policy_store;
 use tonic::{Request, Response, Status};

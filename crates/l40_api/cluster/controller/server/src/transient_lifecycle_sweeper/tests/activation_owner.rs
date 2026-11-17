@@ -12,11 +12,10 @@
 use std::collections::HashMap;
 
 use pplx_space_api::controllers::substrate::{AbandonedRestoreRetirement, RetireFence};
-use pplx_space_common_core::types::{
-    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SubstrateKind,
-};
+use pplx_space_common_core::types::{SandboxActivationAttemptId, SandboxId, SandboxLifecycle};
 use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_store::sweeper::REPAIR_FAILED_ACTIVE_EXECUTION_SQL;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;

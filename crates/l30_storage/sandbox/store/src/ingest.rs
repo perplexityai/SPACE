@@ -33,9 +33,10 @@ use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, SandboxId,
     SandboxQuarantineHistoryAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceiptKind, SandboxTransitionTargetState, SubstrateKind,
+    SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::SubstrateKind;
 
 use std::sync::LazyLock;
 

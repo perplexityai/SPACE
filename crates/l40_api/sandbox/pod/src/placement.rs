@@ -15,7 +15,7 @@ use k8s_openapi::api::core::v1::{
 
 use super::PodToleration;
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::{NodeGroup, NodeGroupName, TemplateCompatSpec};
+use pplx_space_node_model::{NodeGroup, NodeGroupName, TemplateCompatSpec};
 use pplx_space_template_model::TemplateName;
 
 /// Node label naming the node group a worker node belongs to.

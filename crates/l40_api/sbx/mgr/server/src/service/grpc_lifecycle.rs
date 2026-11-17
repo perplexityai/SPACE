@@ -418,10 +418,9 @@ fn node_local_registration_generation(
     sandbox: &crate::db::SandboxRow,
 ) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
     let route = &sandbox.space_api_route_identity;
-    (route.effective_substrate_kind()
-        == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes))
-    .then_some(route.execution_generation)
-    .flatten()
+    (route.effective_substrate_kind() == Some(pplx_space_node_model::NodeManagedBy::Kubernetes))
+        .then_some(route.execution_generation)
+        .flatten()
 }
 
 /// Where a teardown suspend's artifact came from, which decides whether its

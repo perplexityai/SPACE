@@ -2872,8 +2872,9 @@ mod postgres_backed {
     use super::*;
     use pplx_space_accounts::NodeId;
     use pplx_space_common_core::types::SandboxLifecycle;
-    use pplx_space_common_core::types::{SandboxId, SnapshotId, SubstrateKind};
+    use pplx_space_common_core::types::{SandboxId, SnapshotId};
     use pplx_space_db_test_fixtures::try_pg_test_db;
+    use pplx_space_node_model::SubstrateKind;
     use pplx_space_sandbox_store::sweeper::{
         AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL, REAP_COMMAND_READY_PENDING_SQL,
         REPAIR_FAILED_ACTIVE_EXECUTION_SQL, converge_restoring_query, fail_candidate_query,

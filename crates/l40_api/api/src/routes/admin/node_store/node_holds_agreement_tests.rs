@@ -16,8 +16,9 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SubstrateKind};
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_residency::{NON_RESIDENT_LIFECYCLES, ResidencyEvidence};
 use pplx_space_sandbox_store::node_holds::{self, NodeHoldPlacement, NodeHoldReason};
 use pplx_space_sql_locator::sql;

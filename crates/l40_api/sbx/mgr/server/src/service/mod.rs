@@ -23,9 +23,8 @@ use pplx_space_auto_lifecycle::{
     AutoLifecycleRuntimeState, AutoLifecycleTransition,
 };
 use pplx_space_common_core::types::{
-    ExecutionGeneration, IncompleteSandboxRouteIdentityError, NodeManagedBy, NodeRole,
-    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode, SandboxRouteIdentity,
-    SandboxRuntimeLabel, SpaceApiRouteIdentity,
+    ExecutionGeneration, IncompleteSandboxRouteIdentityError, SandboxCleanupEpisodeId, SandboxId,
+    SandboxQuarantineReasonCode, SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
 use pplx_space_durations::parse_grpc_timeout;
 use pplx_space_execution_spec::RuntimeKind;
@@ -41,6 +40,7 @@ use pplx_space_node_mgr_client::proto::{
     PrepareSandboxArtifactDirRequest, PrepareSandboxRequest, ReleaseRequest, RestoreVmStateRequest,
     ResumeSandboxRequest, StopProcessRequest, SyncGuestRequest,
 };
+use pplx_space_node_model::{NodeManagedBy, NodeRole};
 use pplx_space_spaced_guest_protocol::{validate_duration, validate_optional_reason};
 use pplx_space_spaced_host_client::proto as host_proto;
 use pplx_space_spaced_protocol::proto::host_control::host_control_server::HostControl;
@@ -611,8 +611,7 @@ fn persisted_route_stream_epoch(
     ) && has_suspend_artifact
         && identity.route_generation.is_none()
         && identity.current_node_id.is_none()
-        && identity.substrate_kind
-            == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+        && identity.substrate_kind == Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
         && identity.execution_generation.is_some()
         && identity.pod_uid.is_some()
         && identity.activation_attempt_id.is_none();
@@ -630,8 +629,7 @@ fn persisted_route_stream_epoch(
             .is_unowned(crate::state::SandboxState::Restoring)
         && identity.route_generation.is_none()
         && identity.execution_generation.is_some()
-        && identity.substrate_kind
-            == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+        && identity.substrate_kind == Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
     if is_owned_legacy_restore_provenance {
         return Ok(None);
     }
