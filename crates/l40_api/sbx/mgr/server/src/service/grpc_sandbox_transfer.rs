@@ -222,6 +222,7 @@ pub(super) async fn verify_delta_base(
             memory_mib: None,
             caller_org_id: None,
             cached_only: true,
+            environment_required: false,
         });
     let scope = pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope::LocalExecution;
     scope.attach(&mut request);

@@ -4264,6 +4264,10 @@ impl DirectSubstrate {
                             disk_io_max_bandwidth_mib_per_sec: Some(
                                 request.disk_io_limits.max_bandwidth_mib_per_sec(),
                             ),
+                            // The gate checked this candidate's own inventory
+                            // row, which names the build a create without a
+                            // preference resolves.
+                            required_environment: None,
                         })
                         .await;
 

@@ -28,13 +28,25 @@ pub const ENVIRONMENT_USABLE_LABEL_VALUE: &str = "usable";
 /// census can compare it with the labels of the node the pod landed on.
 pub const SANDBOX_ENVIRONMENT_ANNOTATION: &str = "space.pplx.net/environment";
 
+/// Pod annotation, set to [`ENVIRONMENT_REQUIRED_ANNOTATION_VALUE`] while the
+/// gate is on, telling the shim that a cold create must boot a build of
+/// [`SANDBOX_ENVIRONMENT_ANNOTATION`]'s environment
+/// (`CreateRequest.required_environment`). In shadow it's absent, so the
+/// worker boots what it would with the gate off.
+pub const SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION: &str = "space.pplx.net/environment-required";
+
+/// The value of [`SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION`].
+pub const ENVIRONMENT_REQUIRED_ANNOTATION_VALUE: &str = "true";
+
 /// The environment a bound sandbox pod renders: always as
-/// [`SANDBOX_ENVIRONMENT_ANNOTATION`], and as a required node affinity on its
-/// [`environment_label_key`] when `required`.
+/// [`SANDBOX_ENVIRONMENT_ANNOTATION`], and when `required` as a required node
+/// affinity on its [`environment_label_key`] and as
+/// [`SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PodEnvironment {
     pub reference: EnvironmentReference,
-    /// The gate is on, so the pod may run only on a node labeled with it.
+    /// The gate is on, so the pod may run only on a node labeled with it, and
+    /// its worker may boot only a build of it.
     pub required: bool,
 }
 

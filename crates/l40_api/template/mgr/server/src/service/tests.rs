@@ -1519,6 +1519,7 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
             cached_only: false,
             vcpu: Some(1),
             memory_mib: Some(512),
+            environment_required: false,
         })
     };
 
@@ -1639,6 +1640,7 @@ fn cached_only_lookup(hash: Option<String>) -> Request<crate::proto::GetTemplate
         cached_only: true,
         vcpu: None,
         memory_mib: None,
+        environment_required: false,
     })
 }
 

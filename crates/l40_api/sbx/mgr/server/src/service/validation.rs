@@ -348,8 +348,9 @@ pub(super) fn validate_environment_create(
         ));
     }
     let non_default = is_non_default_execution(execution);
-    // A selected create always boots cold, so only its snapshots load memory.
-    let memory_state = if environment.is_some() {
+    // A selected create, or one that requires an environment, always boots
+    // cold, so only its snapshots load memory.
+    let memory_state = if environment.is_some() || request.required_environment.is_some() {
         request.snapshots_enabled
     } else {
         requests_memory_state(request)
@@ -393,13 +394,15 @@ fn requests_memory_state(request: &crate::proto::CreateRequest) -> bool {
 }
 
 /// Node-local cold creation may select a compatible consumer before its first
-/// persisted execution. Cluster-directed work and pools keep the exact binding
-/// their placement and donors were chosen for.
+/// persisted execution. Cluster-directed work, pools and a required
+/// environment keep the exact binding their placement and donors were chosen
+/// for.
 pub(super) fn allows_node_local_environment_selection(
     request: &crate::proto::CreateRequest,
 ) -> bool {
     request.sandbox_id.as_deref().is_none_or(str::is_empty)
         && request.route_identity.is_none()
+        && request.required_environment.is_none()
         && !requests_memory_state(request)
 }
 
@@ -451,6 +454,81 @@ pub(super) fn base_snapshot_matches_execution(
             false
         }
     }
+}
+
+/// The environment a bound pod requires its create to boot a build of
+/// (`CreateRequest.required_environment`), parsed. It isn't a selection, so
+/// a request naming both is refused rather than one silently winning. It
+/// names the build by its exact digest, as a bound pod does, and no runtime,
+/// which the create takes from the build it resolves.
+pub(super) fn required_environment(
+    request: &crate::proto::CreateRequest,
+    selected: Option<pplx_space_execution_spec::EnvironmentReference>,
+) -> Result<Option<pplx_space_execution_spec::EnvironmentReference>, Status> {
+    let Some(value) = request.required_environment.as_deref() else {
+        return Ok(None);
+    };
+    if selected.is_some() {
+        return Err(Status::invalid_argument(
+            "required_environment excludes the environment create input",
+        ));
+    }
+    // The required build's binding names the runtime. A request that names
+    // none is also one an older sandbox-manager, which drops this field,
+    // refuses for want of a runtime instead of booting its preferred build.
+    if !request.runtime.is_empty() {
+        return Err(Status::invalid_argument(
+            "required_environment takes no runtime: the required build's binding names it",
+        ));
+    }
+    // A pool member takes its template's binding and is paused for adoption,
+    // which a required create, always cold, never is.
+    if is_pool_member(request) {
+        return Err(Status::invalid_argument(
+            "required_environment excludes pool_template",
+        ));
+    }
+    // Template-manager answers a required lookup only for an exact digest.
+    if request.content_hash.as_deref().is_none_or(str::is_empty) {
+        return Err(Status::invalid_argument(
+            "required_environment takes an exact content_hash",
+        ));
+    }
+    value
+        .parse()
+        .map(Some)
+        .map_err(|error: pplx_space_content_digest::DigestParseError| {
+            Status::invalid_argument(format!("invalid required_environment: {error}"))
+        })
+}
+
+/// Refuse a template build whose binding isn't cached in `required`'s
+/// partition. The partition, not the reference, is what has to match: E0
+/// shares the legacy partition with unbound builds, and a legacy-layout
+/// build bound to another environment is adopted in the legacy partition
+/// but read by its binding's.
+pub(super) fn require_environment_partition(
+    required: pplx_space_execution_spec::EnvironmentReference,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
+) -> Result<(), Status> {
+    if !is_in_environment_partition(required, Some(execution)) {
+        return Err(Status::failed_precondition(format!(
+            "the node's build of the template is in cache partition {}, not the required \
+             environment {required}'s",
+            sandbox_template_partition(Some(execution))
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a build or sandbox with binding `execution` (`None` for one
+/// predating bindings) is in `required`'s cache partition.
+pub(super) fn is_in_environment_partition(
+    required: pplx_space_execution_spec::EnvironmentReference,
+    execution: Option<&pplx_space_execution_spec::ExecutionMetadata>,
+) -> bool {
+    sandbox_template_partition(execution)
+        == pplx_space_node_runtime_core::catalog::template_cache_partition(Some(required))
 }
 
 /// Decode the additive input before normal admission. Both legacy inputs must

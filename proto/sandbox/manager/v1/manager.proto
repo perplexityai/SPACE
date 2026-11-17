@@ -492,7 +492,7 @@ message CreateRequest {
   EnvironmentCreateInput environment = 30;
   string template = 1;
   string owner = 2;
-  string runtime = 3;            // Required for legacy input: "fc". Absent with environment.
+  string runtime = 3;            // Required for legacy input: "fc". Absent with environment or required_environment.
   bool snapshots_enabled = 4;    // Enable rolling btrfs snapshots when started
   bool autostart = 5;            // If true, start the sandbox after creation
   optional string pool_template = 6; // Internal: mark this sandbox as a pool member for the given template
@@ -524,6 +524,25 @@ message CreateRequest {
   // Older callers omit these and receive the platform defaults.
   optional uint64 disk_io_max_operations_per_sec = 28;
   optional uint64 disk_io_max_bandwidth_mib_per_sec = 29;
+  // The environment a bound Kubernetes pod requires: its
+  // space.pplx.net/environment annotation, sent while the pod's
+  // space.pplx.net/environment-required annotation says the environment
+  // placement gate is on. Requires content_hash and no runtime: the create
+  // takes the runtime from the build's binding. Template lookup asks for
+  // that environment's build of the digest only
+  // (GetTemplateRequest.environment_required), pulling it when the node holds
+  // the digest only under another environment. The create fails, NOT_FOUND
+  // when template-manager has no build bound to that environment's cache
+  // partition and FAILED_PRECONDITION when the build it answers with isn't
+  // in it (an older template-manager answers with its preferred build), so
+  // another environment's build is never booted in its place. Unlike
+  // `environment`, it doesn't select a consumer: the sandbox runs the
+  // resolved build's own binding, which the node admits first unless it's
+  // E0's, and always boots cold. Older readers
+  // drop the field and then refuse the create for want of a runtime, so it
+  // never boots their preferred build. The shim also checks the
+  // create-required-environment capability first, for a clearer error.
+  optional string required_environment = 31;
 }
 
 message CreateResponse {

@@ -173,6 +173,7 @@ async fn probe_cached_template(
             }),
             vcpu: pull.snapshot_vcpu,
             memory_mib: pull.snapshot_memory_mib,
+            environment_required: false,
         });
     scope.attach(&mut request);
     let Ok(response) = pplx_space_common_grpc::fwd_retry!(

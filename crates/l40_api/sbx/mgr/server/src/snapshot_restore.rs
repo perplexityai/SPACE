@@ -2884,6 +2884,7 @@ async fn ensure_local_template(
                 }),
                 vcpu: None,
                 memory_mib: None,
+                environment_required: false,
             });
         let scope = crate::service::template_lookup_scope(owner, Some(sandbox_id))
             .map_err(|error| RestoreError::Other(error.to_string()))?;

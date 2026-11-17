@@ -158,6 +158,18 @@ impl BuildRow {
     pub fn environment(&self) -> Option<pplx_space_execution_spec::EnvironmentReference> {
         self.execution_metadata()?.environment()
     }
+
+    /// The cache partition of the environment the build is bound to, by the
+    /// rule sandbox-manager checks a build it boots against
+    /// (`template_cache_partition` of the binding). It's the row's partition,
+    /// except for a legacy row bound to another environment, as startup
+    /// recovery adopts a legacy-layout build in place, and for a row whose
+    /// stored execution metadata doesn't parse, which reads as unbound and so
+    /// legacy. Sandbox-manager reads the binding from the build's own
+    /// `metadata.json` and refuses a build of another partition.
+    pub fn bound_partition(&self) -> TemplateCachePartition {
+        pplx_space_node_runtime_core::catalog::template_cache_partition(self.environment())
+    }
 }
 
 fn parse_cache_partition(value: &str, column: usize) -> Result<TemplateCachePartition> {
@@ -224,6 +236,21 @@ pub fn find_ready_build(
         build_row,
     )?;
     rows.next().transpose()
+}
+
+/// The ready build of a digest bound to `partition`'s environment
+/// ([`BuildRow::bound_partition`]): the one in that partition, else an
+/// adopted legacy build bound to it.
+pub fn find_ready_build_bound_to(
+    conn: &Connection,
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> Result<Option<BuildRow>> {
+    Ok(list_builds_for_hash(conn, name, content_hash)?
+        .into_iter()
+        .filter(|build| build.state == "ready" && build.bound_partition() == partition)
+        .min_by_key(|build| build.cache_partition != partition))
 }
 
 /// Whether a row exists for the digest in any partition, in any state.

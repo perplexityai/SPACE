@@ -1039,6 +1039,12 @@ pub async fn run(
         .await;
     health_reporter
         .set_service_status(
+            pplx_space_sbx_mgr_client::CREATE_REQUIRED_ENVIRONMENT_HEALTH_SERVICE,
+            tonic_health::ServingStatus::Serving,
+        )
+        .await;
+    health_reporter
+        .set_service_status(
             pplx_space_sbx_mgr_client::PROCESS_OUTPUT_CURSOR_HEALTH_SERVICE,
             tonic_health::ServingStatus::Serving,
         )

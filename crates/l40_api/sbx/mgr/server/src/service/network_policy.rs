@@ -145,6 +145,7 @@ pub(crate) async fn fetch_template_default_network_policy(
             }),
             vcpu: None,
             memory_mib: None,
+            environment_required: false,
         });
     let scope = pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope::LocalExecution;
     scope.attach(&mut request);

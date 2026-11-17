@@ -496,6 +496,7 @@ async fn do_create_from_base(
             rootfs_size_mb: None,
             disk_io_max_operations_per_sec: None,
             disk_io_max_bandwidth_mib_per_sec: None,
+            required_environment: None,
             network_policy: None,
             network_policy_generation: 0,
             network_policy_authority: crate::db::PolicyAuthority::Cluster.as_proto_i32(),
