@@ -751,6 +751,53 @@ pub(super) fn reclaim_abandoned_restore_metadata_staging<StagingGuard>(
     }
 }
 
+/// Remove `path` if it is an upload's deferred-metadata staging directory and
+/// no upload of its sandbox is pending, running or cancelling. Only an
+/// upload's worker creates the directory, once the upload's job exists, and
+/// the upload removes it when its transfers finish or one fails permanently.
+/// A job that ends without that cleanup after its worker wrote the directory
+/// leaves it behind, for example one cancelled while running; this reclaims
+/// it.
+///
+/// Returns whether `path` names such a directory, so the caller stops there.
+pub(super) fn reclaim_abandoned_upload_metadata_staging(
+    path: &Path,
+    db: &impl InventoryDbAccess,
+) -> Result<bool, InventoryError> {
+    let Some(sandbox_id) = path
+        .file_name()
+        .and_then(crate::snapshot_upload::deferred_metadata_staging_sandbox_id)
+    else {
+        return Ok(false);
+    };
+    if db.with_connection(|conn| {
+        crate::db::read::snapshot_upload_in_flight(conn, &sandbox_id.to_string())
+    })?? {
+        return Ok(true);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => match std::fs::remove_dir_all(path) {
+            Ok(()) => tracing::info!(
+                sandbox_id = %sandbox_id,
+                "removed abandoned upload metadata staging"
+            ),
+            Err(error) => tracing::warn!(
+                sandbox_id = %sandbox_id,
+                %error,
+                "failed to remove abandoned upload metadata staging"
+            ),
+        },
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            sandbox_id = %sandbox_id,
+            %error,
+            "failed to inspect abandoned upload metadata staging"
+        ),
+    }
+    Ok(true)
+}
+
 pub(super) trait InventoryDbAccess {
     fn with_connection<T>(
         &self,
