@@ -161,7 +161,7 @@ use crate::controllers::substrate::{ChargeState, KeyResolution, RecoveryCharge};
 use crate::controllers::{ControllerError, db_contention_error};
 use crate::metrics::environment_placement::EnvironmentPlacementPath;
 use crate::models::Sandbox;
-use pplx_space_common_core::types::ClientId;
+use pplx_space_accounts::ClientId;
 use pplx_space_node_status_store::environment_refusal;
 use pplx_space_sandbox_store::attribute_runtime::set_activating_client;
 
@@ -4721,7 +4721,7 @@ impl SubstrateAdapter for DirectSubstrate {
     async fn label_adopted_execution(
         &self,
         _claim: &PooledExecutionClaim,
-        _client_id: Option<&pplx_space_common_core::types::ClientId>,
+        _client_id: Option<&pplx_space_accounts::ClientId>,
         _on_transient: crate::controllers::substrate::AdoptionLabelTransient,
     ) -> Result<crate::controllers::substrate::AdoptionLabelOutcome, ControllerError> {
         Ok(crate::controllers::substrate::AdoptionLabelOutcome::Labeled)

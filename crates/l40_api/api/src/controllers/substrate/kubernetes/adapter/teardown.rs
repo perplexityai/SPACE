@@ -409,7 +409,7 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         identity: &ExecutionIdentity,
         observed_uid: &str,
-        observed_client: Option<&pplx_space_common_core::types::ClientId>,
+        observed_client: Option<&pplx_space_accounts::ClientId>,
     ) {
         match self
             .store

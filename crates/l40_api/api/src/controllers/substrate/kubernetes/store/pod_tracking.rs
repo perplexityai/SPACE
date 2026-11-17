@@ -200,7 +200,7 @@ impl K8sStore {
         sandbox_id: SandboxId,
         identity: &ExecutionIdentity,
         pod_uid: &str,
-        pod_client: Option<&pplx_space_common_core::types::ClientId>,
+        pod_client: Option<&pplx_space_accounts::ClientId>,
     ) -> Result<bool, SubstrateError> {
         let (generation, activation_attempt_id, _, route_activation_id) =
             Self::identity_binds(identity);

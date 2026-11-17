@@ -4,7 +4,7 @@
 //! view of the same pod, and leaves it alone for an unlabeled view of the same
 //! pod or a sandbox that's being torn down.
 
-use pplx_space_common_core::types::ClientId;
+use pplx_space_accounts::ClientId;
 use pplx_space_k8s_ids::PodName;
 
 use super::*;

@@ -84,7 +84,7 @@ fn new_admission_persists_the_explicit_v1_workflow() -> TestResult {
         federated_owner: None,
         federated_service_grant: None,
         idempotency_key: &idempotency_key,
-        client_id: &pplx_space_common_core::types::ClientId::unknown(),
+        client_id: &pplx_space_accounts::ClientId::unknown(),
     };
 
     let prepared = prepare_fork_operation(&input)?;
@@ -519,7 +519,7 @@ async fn fork_admission_waits_for_source_lifecycle_guard() -> TestResult {
                 federated_owner: None,
                 federated_service_grant: None,
                 idempotency_key: &idempotency_key,
-                client_id: &pplx_space_common_core::types::ClientId::unknown(),
+                client_id: &pplx_space_accounts::ClientId::unknown(),
             },
         ),
     )
@@ -552,7 +552,7 @@ async fn fork_admission_waits_for_source_lifecycle_guard() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &missing_key,
-            client_id: &pplx_space_common_core::types::ClientId::unknown(),
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -601,7 +601,7 @@ async fn admission_reuses_matching_request_and_preserves_original_targets() -> T
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
-            client_id: &pplx_space_common_core::types::ClientId::unknown(),
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -621,7 +621,7 @@ async fn admission_reuses_matching_request_and_preserves_original_targets() -> T
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
-            client_id: &pplx_space_common_core::types::ClientId::unknown(),
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -662,7 +662,7 @@ async fn admitted_replay_survives_a_missing_source_sandbox() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
-            client_id: &pplx_space_common_core::types::ClientId::unknown(),
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -691,7 +691,7 @@ async fn admitted_replay_survives_a_missing_source_sandbox() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
-            client_id: &pplx_space_common_core::types::ClientId::unknown(),
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -723,7 +723,7 @@ async fn admission_rejects_same_key_with_different_request() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
-            client_id: &pplx_space_common_core::types::ClientId::unknown(),
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -743,7 +743,7 @@ async fn admission_rejects_same_key_with_different_request() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &idempotency_key,
-            client_id: &pplx_space_common_core::types::ClientId::unknown(),
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;
@@ -793,7 +793,7 @@ async fn seed_user(pool: &sqlx::PgPool, org_id: OrgId) -> Result<Uuid, sqlx::Err
 #[test]
 fn a_fork_payload_carries_its_activating_client() -> TestResult {
     use crate::controllers::substrate::ActivationClient;
-    use pplx_space_common_core::types::ClientId;
+    use pplx_space_accounts::ClientId;
 
     let idempotency_key = IdempotencyKey::parse("fork-client")?;
     let forker = ClientId::parse("forker")?;

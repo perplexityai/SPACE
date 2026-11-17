@@ -314,7 +314,7 @@ async fn a_rolled_back_create_stops_counting_against_the_live_cap() -> TestResul
         )
         .with_live_cap(cap.clone()),
     );
-    let alpha = pplx_space_common_core::types::ClientId::parse("alpha")?;
+    let alpha = pplx_space_accounts::ClientId::parse("alpha")?;
     let created = SandboxId::new();
     cap.reserve(&alpha, created)
         .await

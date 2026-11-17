@@ -509,7 +509,7 @@ pub struct CreateExecutionRequest<'a> {
     /// The create's client id: the ECW caller's, or `native`. The sandbox
     /// pod is labeled with it as `space.pplx.net/client-id`; `None` creates
     /// it unlabeled.
-    pub client_id: Option<&'a pplx_space_common_core::types::ClientId>,
+    pub client_id: Option<&'a pplx_space_accounts::ClientId>,
 }
 
 pub struct CreateExecutionOutcome {
@@ -1664,7 +1664,7 @@ pub trait SubstrateAdapter: Send + Sync {
     async fn label_adopted_execution(
         &self,
         claim: &PooledExecutionClaim,
-        client_id: Option<&pplx_space_common_core::types::ClientId>,
+        client_id: Option<&pplx_space_accounts::ClientId>,
         on_transient: AdoptionLabelTransient,
     ) -> Result<AdoptionLabelOutcome, ControllerError>;
 
@@ -3107,7 +3107,7 @@ impl SubstrateAdapter for Substrate {
     async fn label_adopted_execution(
         &self,
         claim: &PooledExecutionClaim,
-        client_id: Option<&pplx_space_common_core::types::ClientId>,
+        client_id: Option<&pplx_space_accounts::ClientId>,
         on_transient: AdoptionLabelTransient,
     ) -> Result<AdoptionLabelOutcome, ControllerError> {
         match &self.inner {

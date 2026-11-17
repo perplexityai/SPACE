@@ -1,13 +1,5 @@
 //! SPACE Linux guest contracts.
 
-/// SPACE guest Linux network contract.
-pub mod network {
-    pub const PRIMARY_INTERFACE: &str = "eth0";
-    pub use pplx_space_net_common::guest_link::{
-        GATEWAY_IPV4_ADDR, GATEWAY_IPV4_CIDR, IPV4_ADDR, IPV4_NETMASK,
-    };
-}
-
 /// SPACE guest Linux filesystem paths.
 pub mod paths {
     use std::path::PathBuf;
@@ -23,7 +15,7 @@ pub mod paths {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::guest::linux::paths::default_guest_uds_path;
+    /// # use pplx_space_guest_process::linux::paths::default_guest_uds_path;
     /// assert!(default_guest_uds_path("spaced.sock").ends_with("spaced.sock"));
     /// ```
     pub fn default_guest_uds_path(socket_file: &str) -> PathBuf {
@@ -35,7 +27,7 @@ pub mod paths {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::guest::linux::paths::default_uds_path;
+    /// # use pplx_space_guest_process::linux::paths::default_uds_path;
     /// assert!(default_uds_path("/run", "svc.sock").ends_with("svc.sock"));
     /// ```
     pub fn default_uds_path(linux_socket_dir: &str, socket_file: &str) -> PathBuf {
@@ -46,4 +38,7 @@ pub mod paths {
         }
         .join(socket_file)
     }
+
+    #[cfg(test)]
+    mod tests;
 }

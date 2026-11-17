@@ -318,7 +318,7 @@ pub(super) struct ActiveExecutionStatusRow {
     pub(super) activation_attempt_id: Option<SandboxActivationAttemptId>,
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
     /// The sandbox's record of whose activation created its runtime.
-    pub(super) activating_client_id: Option<pplx_space_common_core::types::ClientId>,
+    pub(super) activating_client_id: Option<pplx_space_accounts::ClientId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

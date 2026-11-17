@@ -637,7 +637,7 @@ async fn persisted_delete_intent_denies_later_fork_admission() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &key,
-            client_id: &pplx_space_common_core::types::ClientId::unknown(),
+            client_id: &pplx_space_accounts::ClientId::unknown(),
         },
     )
     .await?;

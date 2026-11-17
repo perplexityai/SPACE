@@ -1358,7 +1358,7 @@ impl SubstrateAdapter for NodeRpcStubbedKubernetes {
     async fn label_adopted_execution(
         &self,
         claim: &PooledExecutionClaim,
-        client_id: Option<&pplx_space_common_core::types::ClientId>,
+        client_id: Option<&pplx_space_accounts::ClientId>,
         on_transient: AdoptionLabelTransient,
     ) -> Result<crate::controllers::substrate::AdoptionLabelOutcome, ControllerError> {
         self.inner

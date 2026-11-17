@@ -56,7 +56,7 @@ pub struct PooledExecutionClaimRequest<'a> {
     pub volume_encryption: bool,
     /// The create's client id: the ECW caller's, or `native`; `None` adopts
     /// an unlabeled pod.
-    pub client_id: Option<&'a pplx_space_common_core::types::ClientId>,
+    pub client_id: Option<&'a pplx_space_accounts::ClientId>,
 }
 
 /// What `label_adopted_execution` does with a claim whose label patch failed

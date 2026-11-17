@@ -3030,7 +3030,7 @@ async fn a_create_records_its_activating_client(
     #[case] attribution: crate::controllers::substrate::ActivationClientAttribution,
 ) -> TestResult {
     use crate::controllers::substrate::ActivationClient;
-    use pplx_space_common_core::types::ClientId;
+    use pplx_space_accounts::ClientId;
 
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
@@ -4089,9 +4089,7 @@ async fn cross_node_restore_handles_candidate_failures(
     pplx_space_sandbox_store::attribute_runtime::set_activating_client(
         &fixture.pool,
         sandbox_id,
-        Some(&pplx_space_common_core::types::ClientId::parse(
-            "previous-client",
-        )?),
+        Some(&pplx_space_accounts::ClientId::parse("previous-client")?),
     )
     .await?;
     insert_ready_worker(
@@ -4153,7 +4151,7 @@ async fn cross_node_restore_handles_candidate_failures(
             crate::controllers::substrate::RecoveryCharge::uncapped(
                 crate::controllers::substrate::ChargeState::Exempt,
                 crate::controllers::substrate::ActivationAttribution::client(
-                    pplx_space_common_core::types::ClientId::parse("restore-client")?,
+                    pplx_space_accounts::ClientId::parse("restore-client")?,
                 ),
             ),
         )

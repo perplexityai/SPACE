@@ -486,10 +486,8 @@ fn on_demand_request<'a>(
 
 /// The activating client every test runtime is attributed to, so the golden
 /// pod snapshots show the `space.pplx.net/client-id` label.
-static TEST_CLIENT_ID: std::sync::LazyLock<pplx_space_common_core::types::ClientId> =
-    std::sync::LazyLock::new(|| {
-        pplx_space_common_core::types::ClientId::from_header(Some("example-client"))
-    });
+static TEST_CLIENT_ID: std::sync::LazyLock<pplx_space_accounts::ClientId> =
+    std::sync::LazyLock::new(|| pplx_space_accounts::ClientId::from_header(Some("example-client")));
 
 /// Exhaustive `SandboxRuntimePodMetadata` literal for tests to mutate or
 /// struct-update from. Neither pod-render type derives `Default` (every field

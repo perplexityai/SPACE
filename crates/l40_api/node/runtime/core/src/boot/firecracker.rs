@@ -26,7 +26,7 @@ pub(super) fn configuration(input: &GuestBoot<'_>) -> Value {
     let mut net = object([
         (
             "iface_id",
-            json!(pplx_space_common_core::guest::linux::network::PRIMARY_INTERFACE),
+            json!(pplx_space_net_common::guest_link::PRIMARY_INTERFACE),
         ),
         ("guest_mac", json!(input.mac)),
         ("host_dev_name", json!(input.tap)),
