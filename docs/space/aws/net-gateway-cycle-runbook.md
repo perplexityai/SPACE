@@ -32,11 +32,13 @@ to its replacement: the runtime supervisor stops the old gateway and starts the
 new one on the same kernel sockets, so that traffic waits for the new gateway
 instead. Connections the old gateway already relays still drop.
 
-The flag is off unless given. Each cycled line reports whether the sockets
-were handed over. A node whose node-manager or runtime supervisor predates the
-handover stops and relaunches the gateway as without the flag, and the line
-says so. The host `space-sbxmgr` that `--execute` runs rejects the flag until
-the node's image includes it, so roll the node services out first.
+The flag is off unless given. Each cycled line reports whether the sockets were
+handed over. A node whose node-manager or runtime supervisor predates the
+handover stops and relaunches the gateway as without the flag, and the line says
+so. A handover that fails, for example on a gateway without launch evidence,
+falls back the same way. The host `space-sbxmgr` that `--execute` runs rejects
+the flag until the node's image includes it, so roll the node services out
+first.
 
 ## Protected control endpoint rollout
 

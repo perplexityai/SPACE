@@ -125,42 +125,10 @@ impl SandboxManagerService {
             Status::internal(error)
         };
 
-        // With handover, one node-manager launch replaces the old gateway and
-        // passes its listening sockets on. A node that predates it returns the
-        // old gateway's pid, and the cycle stops and relaunches it instead.
-        let replaced = if req.hand_over_sockets {
-            let replaced = self
-                .watchdog
-                .replace_netgtw(&id, uid, old_pid)
-                .await
-                .map_err(|error| fail(format!("replace net-gateway failed: {error}")))?;
-            if replaced.pid == old_pid {
-                tracing::info!(
-                    sandbox_id = %id,
-                    old_pid,
-                    "node cannot hand net-gateway sockets over; stopping and relaunching it"
-                );
-                None
-            } else {
-                Some(replaced)
-            }
-        } else {
-            None
-        };
-        let (new_pid, inherited_sockets, kill_outcome) = match replaced {
-            Some(replaced) => (
-                replaced.pid,
-                replaced.inherited_sockets,
-                NetGatewayKillOutcome::Replaced,
-            ),
-            None => {
-                let (new_pid, kill_outcome) = self
-                    .stop_and_relaunch_netgtw(&sandbox, uid, old_pid)
-                    .await
-                    .map_err(fail)?;
-                (new_pid, 0, kill_outcome)
-            }
-        };
+        let (new_pid, inherited_sockets, kill_outcome) = self
+            .replace_or_relaunch_netgtw(&sandbox, uid, old_pid, req.hand_over_sockets)
+            .await
+            .map_err(fail)?;
 
         crate::metrics::sandbox::worker::net_gateway_cycle(
             crate::metrics::sandbox::worker::NetGatewayCycleResult::Ok,
@@ -180,6 +148,48 @@ impl SandboxManagerService {
             old_build_git_sha,
             inherited_sockets,
         }))
+    }
+
+    /// Cycle the gateway, returning its replacement's pid, the sockets it
+    /// took over and how the old one ended. With handover, one node-manager
+    /// launch replaces the old gateway and passes its listening sockets on.
+    /// Any other answer falls back to stopping and relaunching it: a node
+    /// that predates the handover returns the old pid, or refuses a gateway
+    /// without launch evidence, and a handover can fail after the old
+    /// gateway stopped. The fallback converges whether the old gateway is
+    /// still running, already gone, or replaced.
+    async fn replace_or_relaunch_netgtw(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        uid: u32,
+        old_pid: u32,
+        hand_over_sockets: bool,
+    ) -> Result<(u32, u32, NetGatewayKillOutcome), String> {
+        let id = &sandbox.id;
+        if hand_over_sockets {
+            match self.watchdog.replace_netgtw(id, uid, old_pid).await {
+                Ok(replaced) if replaced.pid != old_pid => {
+                    return Ok((
+                        replaced.pid,
+                        replaced.inherited_sockets,
+                        NetGatewayKillOutcome::Replaced,
+                    ));
+                }
+                Ok(_) => tracing::info!(
+                    sandbox_id = %id,
+                    old_pid,
+                    "node cannot hand net-gateway sockets over; stopping and relaunching it"
+                ),
+                Err(error) => tracing::warn!(
+                    sandbox_id = %id,
+                    old_pid,
+                    %error,
+                    "net-gateway handover failed; stopping and relaunching it"
+                ),
+            }
+        }
+        let (new_pid, kill_outcome) = self.stop_and_relaunch_netgtw(sandbox, uid, old_pid).await?;
+        Ok((new_pid, 0, kill_outcome))
     }
 
     /// Cycle by stopping the old gateway, then launching one that binds
@@ -272,3 +282,6 @@ async fn wait_for_netgtw_death(sandbox_id: &str, grace: Duration) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod tests;
