@@ -138,6 +138,7 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             "/nodes/{node_id}/sandboxes",
             get(nodes::list_node_sandboxes),
         )
+        .route("/nodes/{node_id}/holds", get(nodes::list_node_holds))
         .route(
             "/nodes/{node_id}/health",
             get(node_maintenance::node_health),
