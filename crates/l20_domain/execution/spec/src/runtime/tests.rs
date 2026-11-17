@@ -32,6 +32,14 @@ fn runtime_kind_parses_aliases_and_displays_full_names() {
     assert_eq!(RuntimeKind::Gvisor.to_string(), RUNTIME_GVISOR);
     assert_eq!(RuntimeKind::Gvisor.alias(), RUNTIME_GVISOR_ALIAS);
 
+    assert_eq!(
+        RuntimeKind::parse("wasmtime").unwrap(),
+        RuntimeKind::Wasmtime
+    );
+    assert_eq!(RuntimeKind::parse("wasm").unwrap(), RuntimeKind::Wasmtime);
+    assert_eq!(RuntimeKind::Wasmtime.to_string(), RUNTIME_WASMTIME);
+    assert_eq!(RuntimeKind::Wasmtime.alias(), RUNTIME_WASMTIME_ALIAS);
+
     RuntimeKind::parse("unknown").unwrap_err();
 }
 
@@ -60,6 +68,13 @@ fn runtime_kind_exposes_baseline_capabilities() {
     }
     assert!(!RuntimeKind::Gvisor.supports_startup(StartupPolicy::RequireBaseSnapshot));
     assert!(!RuntimeKind::Gvisor.supports_startup(StartupPolicy::RequireWarmPool));
+    assert_eq!(
+        RuntimeKind::Wasmtime.baseline_capabilities(),
+        RuntimeCapabilities::default()
+    );
+    assert!(RuntimeKind::Wasmtime.supports_startup(StartupPolicy::ColdOnly));
+    assert!(!RuntimeKind::Wasmtime.supports_startup(StartupPolicy::RequireBaseSnapshot));
+    assert!(!RuntimeKind::Wasmtime.supports_startup(StartupPolicy::RequireWarmPool));
 
     RuntimeKind::Firecracker
         .validate_startup(StartupPolicy::RequireBaseSnapshot)

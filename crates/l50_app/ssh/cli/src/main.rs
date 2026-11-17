@@ -120,6 +120,9 @@ async fn main() {
         .map(|execution| execution.guest().os)
         .unwrap_or(GuestOperatingSystem::Linux);
     match guest_os {
+        GuestOperatingSystem::Wasi => {
+            pplx_space_common_cli::exit_error("WASI sandboxes do not provide SSH");
+        }
         GuestOperatingSystem::Windows | GuestOperatingSystem::Macos => {
             let sandbox_id = sandbox
                 .sandbox_id
@@ -202,7 +205,9 @@ fn native_ssh_command(cli: &Cli, sandbox_id: SandboxId, guest_os: GuestOperating
     }
     let user = cli.user.as_deref().or(match guest_os {
         GuestOperatingSystem::Windows => Some("Administrator"),
-        GuestOperatingSystem::Linux | GuestOperatingSystem::Macos => None,
+        GuestOperatingSystem::Linux | GuestOperatingSystem::Macos | GuestOperatingSystem::Wasi => {
+            None
+        }
     });
     if let Some(user) = user {
         command.args(["-l", user]);

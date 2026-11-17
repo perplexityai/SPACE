@@ -8,7 +8,8 @@ use crate::routes::{MAX_AGGREGATE_UTF8_BYTES_EXTENSION, MAX_UTF8_BYTES_EXTENSION
 use pplx_space_content_digest::{HashAlg, MIN_DIGEST_PREFIX_HEX_LEN};
 use pplx_space_execution_spec::{
     RUNTIME_CLOUD_HYPERVISOR, RUNTIME_CLOUD_HYPERVISOR_ALIAS, RUNTIME_FIRECRACKER,
-    RUNTIME_FIRECRACKER_ALIAS, RUNTIME_GVISOR, RUNTIME_GVISOR_ALIAS,
+    RUNTIME_FIRECRACKER_ALIAS, RUNTIME_GVISOR, RUNTIME_GVISOR_ALIAS, RUNTIME_WASMTIME,
+    RUNTIME_WASMTIME_ALIAS,
 };
 use pplx_space_guest_process::{
     MAX_ENV_ENTRIES, MAX_ENV_KEY_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES,
@@ -185,9 +186,11 @@ pub(crate) fn optional_runtime_kind(generator: &mut SchemaGenerator) -> Schema {
                     RUNTIME_FIRECRACKER,
                     RUNTIME_CLOUD_HYPERVISOR,
                     RUNTIME_GVISOR,
+                    RUNTIME_WASMTIME,
                     RUNTIME_FIRECRACKER_ALIAS,
                     RUNTIME_CLOUD_HYPERVISOR_ALIAS,
-                    RUNTIME_GVISOR_ALIAS
+                    RUNTIME_GVISOR_ALIAS,
+                    RUNTIME_WASMTIME_ALIAS
                 ],
                 "description": "Sandbox runtime. Prefer the canonical names; the short aliases are accepted for compatibility. Input enums are closed, so new runtimes are added additively."
             },

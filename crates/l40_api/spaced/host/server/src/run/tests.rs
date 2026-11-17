@@ -1,5 +1,38 @@
 use super::*;
 
+#[test]
+fn wasi_requires_a_complete_unprivileged_uds_peer() {
+    for (pid, uid, guest, host, vsock, admitted) in [
+        (Some(42), Some(10001), true, true, false, true),
+        (None, None, true, true, false, false),
+        (None, Some(10001), true, true, false, false),
+        (Some(42), None, true, true, false, false),
+        (Some(0), Some(10001), true, true, false, false),
+        (Some(u32::MAX), Some(10001), true, true, false, false),
+        (Some(42), Some(0), true, true, false, false),
+        (Some(42), Some(10001), false, true, false, false),
+        (Some(42), Some(10001), true, false, false, false),
+        (Some(42), Some(10001), true, true, true, false),
+    ] {
+        let result = resolve_service_config(SpacedHostRunConfig {
+            guest_agent: QualifiedGuestAgent::WasiPythonV1,
+            bridge_guest_uds: guest.then(|| "/tmp/guest.sock".into()),
+            bridge_host_uds: host.then(|| "/tmp/host.sock".into()),
+            bridge_guest_pid: pid,
+            bridge_guest_uid: uid,
+            vsock_uds: vsock.then(|| "/tmp/v.sock".into()),
+            ..Default::default()
+        });
+        assert_eq!(result.is_ok(), admitted);
+        if let Ok(config) = result {
+            assert!(matches!(
+                config.bridge_guest_connector,
+                BridgeGuestConnector::AuthenticatedUds { .. }
+            ));
+        }
+    }
+}
+
 /// Omitted socket flags preserve service socket defaults; agent policy is
 /// supplied independently by the run configuration.
 #[test]

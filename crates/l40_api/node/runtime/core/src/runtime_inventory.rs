@@ -847,7 +847,9 @@ impl RuntimeDriverRegistry {
         match kind {
             RuntimeKind::Firecracker => Ok(&self.firecracker),
             RuntimeKind::CloudHypervisor => Ok(&self.cloud_hypervisor),
-            RuntimeKind::Gvisor => Err(RuntimeInventoryError::UnsupportedRuntime(kind)),
+            RuntimeKind::Gvisor | RuntimeKind::Wasmtime => {
+                Err(RuntimeInventoryError::UnsupportedRuntime(kind))
+            }
         }
     }
 }

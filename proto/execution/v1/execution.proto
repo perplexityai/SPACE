@@ -9,6 +9,7 @@ enum RuntimeKind {
   RUNTIME_KIND_FIRECRACKER = 1;
   RUNTIME_KIND_CLOUD_HYPERVISOR = 2;
   RUNTIME_KIND_GVISOR = 3;
+  RUNTIME_KIND_WASMTIME = 4;
 }
 
 enum GuestOperatingSystem {
@@ -16,12 +17,14 @@ enum GuestOperatingSystem {
   GUEST_OPERATING_SYSTEM_LINUX = 1;
   GUEST_OPERATING_SYSTEM_WINDOWS = 2;
   GUEST_OPERATING_SYSTEM_MACOS = 3;
+  GUEST_OPERATING_SYSTEM_WASI = 4;
 }
 
 enum CpuArchitecture {
   CPU_ARCHITECTURE_UNSPECIFIED = 0;
   CPU_ARCHITECTURE_X86_64 = 1;
   CPU_ARCHITECTURE_AARCH64 = 2;
+  CPU_ARCHITECTURE_WASM32 = 3;
 }
 
 enum ArtifactComponentKind {
@@ -32,6 +35,7 @@ enum ArtifactComponentKind {
   ARTIFACT_COMPONENT_KIND_ROOTFS = 4;
   ARTIFACT_COMPONENT_KIND_BOOT_DISK = 5;
   ARTIFACT_COMPONENT_KIND_GUEST_TOOLS = 6;
+  ARTIFACT_COMPONENT_KIND_WASM_MODULE = 7;
 }
 
 enum ExecutionSelectionMode {
@@ -176,12 +180,15 @@ message HostPlatform {
 enum HypervisorBackend {
   HYPERVISOR_BACKEND_UNSPECIFIED = 0;
   HYPERVISOR_BACKEND_KVM = 1;
+  HYPERVISOR_BACKEND_USERSPACE = 2;
 }
 
 enum IsolationClass {
   ISOLATION_CLASS_UNSPECIFIED = 0;
   // A separate hardware VM boundary for each sandbox; not an ordered strength.
   ISOLATION_CLASS_HARDWARE_VM = 1;
+  // WebAssembly memory/capability isolation, not a hardware VM guarantee.
+  ISOLATION_CLASS_WEBASSEMBLY = 2;
 }
 
 enum RuntimePayloadLayout {

@@ -145,6 +145,13 @@ impl UpdateRuntime {
 
 impl SpacedGuestService {
     pub(crate) async fn prepare_update_startup(&self) -> Result<(), Status> {
+        // A host-side WASI broker cannot adopt the native guest image's update
+        // contract, even if that image happens to contain an update journal.
+        if self.inner.platform.os()
+            == pplx_space_spaced_guest_protocol::proto::platform::GuestOs::Wasi
+        {
+            return Ok(());
+        }
         if !cfg!(any(target_os = "linux", windows)) {
             return Ok(());
         }

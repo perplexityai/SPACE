@@ -10,6 +10,23 @@ use pplx_space_spaced_guest_server::platform::current::SpacedGuestRunConfig;
     disable_version_flag = true
 )]
 struct Cli {
+    /// Operator-only immutable Wasmtime/Python tool root inside a contained agent.
+    #[cfg(all(unix, feature = "experimental-wasm"))]
+    #[arg(long, requires_all = ["wasmtime_workspace", "wasmtime_bridge_socket", "wasmtime_host_bridge_socket"])]
+    wasmtime_root: Option<std::path::PathBuf>,
+
+    #[cfg(all(unix, feature = "experimental-wasm"))]
+    #[arg(long, requires = "wasmtime_root")]
+    wasmtime_workspace: Option<std::path::PathBuf>,
+
+    #[cfg(all(unix, feature = "experimental-wasm"))]
+    #[arg(long, requires = "wasmtime_root")]
+    wasmtime_bridge_socket: Option<std::path::PathBuf>,
+
+    #[cfg(all(unix, feature = "experimental-wasm"))]
+    #[arg(long, requires = "wasmtime_root")]
+    wasmtime_host_bridge_socket: Option<std::path::PathBuf>,
+
     /// Print version.
     #[arg(
         short = 'v',
@@ -53,12 +70,52 @@ struct Cli {
     console: bool,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "experimental-wasm")))]
 impl From<Cli> for SpacedGuestRunConfig {
     fn from(_cli: Cli) -> Self {
         // The guest daemon takes no flags: the microVM's environment is its
         // configuration, and the library reads it.
         Self::default()
+    }
+}
+
+#[cfg(all(unix, feature = "experimental-wasm"))]
+impl TryFrom<Cli> for SpacedGuestRunConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(cli: Cli) -> Result<Self, Self::Error> {
+        use pplx_space_spaced_guest_server::platform::current::{
+            HostConnectorType, SpacedGuestServiceConfig, WasiProcessProfile,
+        };
+        let Some(root) = cli.wasmtime_root else {
+            return Ok(Self::default());
+        };
+        let workspace = cli
+            .wasmtime_workspace
+            .ok_or_else(|| anyhow::anyhow!("Wasmtime workspace is required"))?;
+        let bridge = cli
+            .wasmtime_bridge_socket
+            .ok_or_else(|| anyhow::anyhow!("Wasmtime bridge socket is required"))?;
+        let host_bridge = cli
+            .wasmtime_host_bridge_socket
+            .ok_or_else(|| anyhow::anyhow!("Wasmtime host bridge socket is required"))?;
+        let profile = WasiProcessProfile::new(
+            root.join("bin/wasmtime"),
+            root.join("python/python.wasm"),
+            workspace.clone(),
+            root.join("python"),
+            1024 * 1024 * 1024,
+        )?;
+        Ok(Self {
+            service_config: Some(SpacedGuestServiceConfig {
+                wasi_process_profile: Some(profile),
+                default_working_dir: Some(workspace),
+                local_socket_path: None,
+                bridge_socket_path: Some(bridge),
+                host_connector_type: HostConnectorType::Uds(host_bridge),
+                ..Default::default()
+            }),
+        })
     }
 }
 
@@ -89,7 +146,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         Ok(pplx_space_spaced_guest_server::platform::current::run(
-            cli.into(),
+            cli.try_into()?,
         )?)
     }
     #[cfg(windows)]

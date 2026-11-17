@@ -32,10 +32,11 @@ pub const CLOUD_HYPERVISOR_WINDOWS_MACHINE_CONTRACT: &str = "cloud-hypervisor-wi
 pub const CLOUD_HYPERVISOR_MACHINE_CONTRACT: &str = "cloud-hypervisor-pci-v1";
 
 /// The direct-boot image format is part of the compiled CH boot contract.
-pub const fn cloud_hypervisor_linux_format(architecture: Arch) -> &'static str {
+pub const fn cloud_hypervisor_linux_format(architecture: Arch) -> Option<&'static str> {
     match architecture {
-        Arch::Aarch64 => "linux-image",
-        Arch::X86_64 => "vmlinux",
+        Arch::Aarch64 => Some("linux-image"),
+        Arch::X86_64 => Some("vmlinux"),
+        Arch::Wasm32 => None,
     }
 }
 
@@ -240,9 +241,11 @@ impl From<&EnvironmentDefinition> for proto::EnvironmentDefinition {
                 }),
                 backend: match spec.backend {
                     HypervisorBackend::Kvm => proto::HypervisorBackend::Kvm,
+                    HypervisorBackend::Userspace => proto::HypervisorBackend::Userspace,
                 } as i32,
                 isolation: match spec.isolation {
                     IsolationClass::HardwareVm => proto::IsolationClass::HardwareVm,
+                    IsolationClass::WebAssembly => proto::IsolationClass::Webassembly,
                 } as i32,
                 boot: Some((&spec.boot).into()),
                 compatibility: Some((&spec.compatibility).into()),
@@ -271,10 +274,12 @@ impl TryFrom<&proto::EnvironmentDefinition> for EnvironmentDefinition {
             guest: required(spec.guest.as_ref(), "guest")?.try_into()?,
             backend: match proto::HypervisorBackend::try_from(spec.backend) {
                 Ok(proto::HypervisorBackend::Kvm) => HypervisorBackend::Kvm,
+                Ok(proto::HypervisorBackend::Userspace) => HypervisorBackend::Userspace,
                 _ => return Err(unsupported("backend", spec.backend)),
             },
             isolation: match proto::IsolationClass::try_from(spec.isolation) {
                 Ok(proto::IsolationClass::HardwareVm) => IsolationClass::HardwareVm,
+                Ok(proto::IsolationClass::Webassembly) => IsolationClass::WebAssembly,
                 _ => return Err(unsupported("isolation", spec.isolation)),
             },
             runtime: RuntimeBinding::ManagedRelease(ManagedRuntimeRelease {

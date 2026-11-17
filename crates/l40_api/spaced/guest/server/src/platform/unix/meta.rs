@@ -146,16 +146,20 @@ mod guest_specs_tests;
 impl SpacedGuestService {
     fn current_wait_ready_response(&self) -> BridgeGuestWaitReadyResponse {
         let ready = *self.inner.ready.borrow();
+        let native_linux = self.inner.platform.os()
+            == pplx_space_spaced_guest_protocol::proto::platform::GuestOs::Linux;
         BridgeGuestWaitReadyResponse {
-            platform: Some(
-                pplx_space_spaced_guest_protocol::platform::GuestPlatform::for_target().wire(),
-            ),
+            platform: Some(self.inner.platform.wire()),
             ready,
-            guest_uptime: ready.then(|| (self.inner.guest_uptime_source)()).flatten(),
+            guest_uptime: (ready && native_linux)
+                .then(|| (self.inner.guest_uptime_source)())
+                .flatten(),
             version: pplx_space_spaced_protocol::spaced_version().to_string(),
             compatibility_family: pplx_space_spaced_guest_protocol::spaced_compatibility_family(),
-            mem_total_bytes: ready.then(guest_mem_total_bytes).flatten(),
-            vcpu_count: ready.then(guest_vcpu_count).flatten(),
+            mem_total_bytes: (ready && native_linux)
+                .then(guest_mem_total_bytes)
+                .flatten(),
+            vcpu_count: (ready && native_linux).then(guest_vcpu_count).flatten(),
         }
     }
 
@@ -294,7 +298,7 @@ impl BridgeGuestMeta for SpacedGuestService {
     ) -> Result<Response<BridgeGuestWaitReadyResponse>, Status> {
         let request = request.into_inner();
         pplx_space_spaced_guest_protocol::platform::require_host_contract(
-            pplx_space_spaced_guest_protocol::platform::target_os(),
+            self.inner.platform.os(),
             request.host_contract_revision,
         )?;
         let timeout = validate_timeout(request.timeout)?;
@@ -330,6 +334,9 @@ impl BridgeGuestMeta for SpacedGuestService {
         &self,
         request: Request<NotifyResumeRequest>,
     ) -> Result<Response<NotifyResumeResponse>, Status> {
+        self.require_platform_operation(
+            pplx_space_spaced_guest_protocol::proto::platform::GuestOperation::Resume,
+        )?;
         let request = request.into_inner();
         let reason = pplx_space_spaced_guest_protocol::proto::bridge_guest::ResumeReason::try_from(
             request.reason,
@@ -362,6 +369,9 @@ impl BridgeGuestMeta for SpacedGuestService {
         &self,
         _request: Request<FlushFilesystemsRequest>,
     ) -> Result<Response<FlushFilesystemsResponse>, Status> {
+        self.require_platform_operation(
+            pplx_space_spaced_guest_protocol::proto::platform::GuestOperation::Flush,
+        )?;
         run_filesystem_flush(
             self.inner.filesystem_flush_slots.clone(),
             flush_guest_filesystems,

@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [features]
+experimental-wasm = []
 test-hooks = ["pplx-space-test-hooks/test-hooks"]
 telemetry = ["dep:pplx-space-observability", "dep:pplx-space-service-host"]
 otel = ["telemetry", "pplx-space-service-host/otel"]

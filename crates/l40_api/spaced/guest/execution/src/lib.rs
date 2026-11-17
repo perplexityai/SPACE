@@ -44,12 +44,16 @@ mod identity_policy;
 mod payload;
 mod placement;
 mod process;
+#[cfg(feature = "experimental-wasm")]
+mod wasmtime;
 mod worker_executable;
 pub use execution::{CreateExecutionServiceError, ExecutionService, ExecutionServiceConfig};
 use idempotency::IdempotencyStore;
 pub use identity_policy::IdentityPolicy;
 pub use placement::ExecutionCgroups;
 use process::ProcessRegistry;
+#[cfg(feature = "experimental-wasm")]
+pub use wasmtime::{WasiProcessProfile, WasiProcessProfileError};
 pub use worker_executable::{OpenWorkerExecutableError, WorkerExecutable};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

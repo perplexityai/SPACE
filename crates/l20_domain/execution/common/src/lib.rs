@@ -63,6 +63,7 @@ impl From<RuntimeKind> for proto::RuntimeKind {
             RuntimeKind::Firecracker => Self::Firecracker,
             RuntimeKind::CloudHypervisor => Self::CloudHypervisor,
             RuntimeKind::Gvisor => Self::Gvisor,
+            RuntimeKind::Wasmtime => Self::Wasmtime,
         }
     }
 }
@@ -75,6 +76,7 @@ impl TryFrom<proto::RuntimeKind> for RuntimeKind {
             proto::RuntimeKind::Firecracker => Ok(Self::Firecracker),
             proto::RuntimeKind::CloudHypervisor => Ok(Self::CloudHypervisor),
             proto::RuntimeKind::Gvisor => Ok(Self::Gvisor),
+            proto::RuntimeKind::Wasmtime => Ok(Self::Wasmtime),
             proto::RuntimeKind::Unspecified => Err(ExecutionProtoError::UnspecifiedRuntimeKind),
         }
     }
@@ -86,6 +88,7 @@ impl From<GuestOperatingSystem> for proto::GuestOperatingSystem {
             GuestOperatingSystem::Linux => Self::Linux,
             GuestOperatingSystem::Windows => Self::Windows,
             GuestOperatingSystem::Macos => Self::Macos,
+            GuestOperatingSystem::Wasi => Self::Wasi,
         }
     }
 }
@@ -98,6 +101,7 @@ impl TryFrom<proto::GuestOperatingSystem> for GuestOperatingSystem {
             proto::GuestOperatingSystem::Linux => Ok(Self::Linux),
             proto::GuestOperatingSystem::Windows => Ok(Self::Windows),
             proto::GuestOperatingSystem::Macos => Ok(Self::Macos),
+            proto::GuestOperatingSystem::Wasi => Ok(Self::Wasi),
             proto::GuestOperatingSystem::Unspecified => {
                 Err(ExecutionProtoError::UnspecifiedGuestOperatingSystem)
             }
@@ -110,6 +114,7 @@ impl From<Arch> for proto::CpuArchitecture {
         match value {
             Arch::X86_64 => Self::X8664,
             Arch::Aarch64 => Self::Aarch64,
+            Arch::Wasm32 => Self::Wasm32,
         }
     }
 }
@@ -121,6 +126,7 @@ impl TryFrom<proto::CpuArchitecture> for Arch {
         match value {
             proto::CpuArchitecture::X8664 => Ok(Self::X86_64),
             proto::CpuArchitecture::Aarch64 => Ok(Self::Aarch64),
+            proto::CpuArchitecture::Wasm32 => Ok(Self::Wasm32),
             proto::CpuArchitecture::Unspecified => {
                 Err(ExecutionProtoError::UnspecifiedCpuArchitecture)
             }
@@ -137,6 +143,7 @@ impl From<ArtifactComponentKind> for proto::ArtifactComponentKind {
             ArtifactComponentKind::Rootfs => Self::Rootfs,
             ArtifactComponentKind::BootDisk => Self::BootDisk,
             ArtifactComponentKind::GuestTools => Self::GuestTools,
+            ArtifactComponentKind::WasmModule => Self::WasmModule,
         }
     }
 }
@@ -152,6 +159,7 @@ impl TryFrom<proto::ArtifactComponentKind> for ArtifactComponentKind {
             proto::ArtifactComponentKind::Rootfs => Ok(Self::Rootfs),
             proto::ArtifactComponentKind::BootDisk => Ok(Self::BootDisk),
             proto::ArtifactComponentKind::GuestTools => Ok(Self::GuestTools),
+            proto::ArtifactComponentKind::WasmModule => Ok(Self::WasmModule),
             proto::ArtifactComponentKind::Unspecified => {
                 Err(ExecutionProtoError::UnspecifiedArtifactComponentKind)
             }

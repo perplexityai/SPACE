@@ -323,6 +323,12 @@ impl CompiledEnvironment {
         let cache = match architecture {
             Arch::X86_64 => &X86,
             Arch::Aarch64 => &ARM,
+            Arch::Wasm32 => {
+                static UNSUPPORTED: CatalogError = CatalogError::EnvironmentDefinition(
+                    CompiledEnvironmentDefinitionError::UnsupportedArchitecture(Arch::Wasm32),
+                );
+                return Err(&UNSUPPORTED);
+            }
         };
         cache
             .get_or_init(|| Self::for_architecture(architecture))
@@ -714,6 +720,9 @@ fn standalone_definition(
                     pplx_space_execution_common::environment::cloud_hypervisor_linux_format(
                         kernel.architecture,
                     )
+                    .ok_or(CompiledEnvironmentDefinitionError::UnsupportedArchitecture(
+                        kernel.architecture,
+                    ))?
                     .parse()?,
                 )],
             },

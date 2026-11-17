@@ -16,6 +16,8 @@
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "experimental-wasm")]
+pub use pplx_space_spaced_guest_execution::{WasiProcessProfile, WasiProcessProfileError};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -241,6 +243,9 @@ pub enum HostConnectorType {
 
 #[derive(Clone, Debug)]
 pub struct SpacedGuestServiceConfig {
+    /// Only for a launch owner that supplies a contained, read-only tool root.
+    #[cfg(feature = "experimental-wasm")]
+    pub wasi_process_profile: Option<WasiProcessProfile>,
     pub host_connector_type: HostConnectorType,
     pub local_socket_path: Option<PathBuf>,
     pub bridge_socket_path: Option<PathBuf>,
@@ -267,6 +272,8 @@ impl Default for SpacedGuestServiceConfig {
     fn default() -> Self {
         let execution = ExecutionServiceConfig::default();
         Self {
+            #[cfg(feature = "experimental-wasm")]
+            wasi_process_profile: None,
             host_connector_type: HostConnectorType::default(),
             local_socket_path: Some(
                 pplx_space_common_core::guest::linux::paths::default_guest_uds_path(
@@ -299,6 +306,7 @@ impl std::fmt::Debug for SpacedGuestService {
 }
 
 struct SpacedGuestServiceInner {
+    platform: pplx_space_spaced_guest_protocol::platform::GuestPlatform,
     update: update::UpdateRuntime,
     shutdown: CancellationToken,
     filesystem_flush_slots: Arc<Semaphore>,
@@ -332,6 +340,21 @@ pub enum CreateSpacedGuestServiceError {
 }
 
 impl SpacedGuestService {
+    fn require_platform_operation(
+        &self,
+        operation: pplx_space_spaced_guest_protocol::proto::platform::GuestOperation,
+    ) -> Result<(), Status> {
+        if !self.inner.platform.supports(operation) {
+            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
+                pplx_space_common_grpc::GuestCapability::PlatformOperations,
+                format!(
+                    "the selected execution profile does not support {}",
+                    operation.as_str_name()
+                ),
+            ));
+        }
+        Ok(())
+    }
     pub fn new(shutdown: CancellationToken) -> Result<Self, CreateSpacedGuestServiceError> {
         Self::with_config(shutdown, SpacedGuestServiceConfig::default())
     }
@@ -361,7 +384,11 @@ impl SpacedGuestService {
         let worker_executable = None;
         // Only initialize cgroups inside a Firecracker guest, including custom
         // daemon entrypoints. The execution service receives placement only.
-        let guest_cgroups = if native_vsock_available() {
+        #[cfg(feature = "experimental-wasm")]
+        let native_guest = config.wasi_process_profile.is_none();
+        #[cfg(not(feature = "experimental-wasm"))]
+        let native_guest = true;
+        let guest_cgroups = if native_guest && native_vsock_available() {
             let cgroups = cgroup::GuestCgroups::initialize_for_process();
             cgroup::GuestCgroups::report_process_setup();
             #[cfg(all(target_os = "linux", feature = "service-entrypoint"))]
@@ -374,16 +401,32 @@ impl SpacedGuestService {
         let (ready_events, _) = watch::channel(0);
         let loopback_bridge = LoopbackBridgeManager::new(shutdown.clone());
         let service_generation = uuid::Uuid::now_v7().to_string();
+        let platform = pplx_space_spaced_guest_protocol::platform::GuestPlatform::for_target();
+        #[cfg(feature = "experimental-wasm")]
+        let platform = if config.wasi_process_profile.is_some() {
+            pplx_space_spaced_guest_protocol::platform::GuestPlatform::wasi_python()
+        } else {
+            platform
+        };
+        let identity_policy = pplx_space_spaced_guest_execution::IdentityPolicy::Guest;
+        #[cfg(feature = "experimental-wasm")]
+        let identity_policy = if config.wasi_process_profile.is_some() {
+            pplx_space_spaced_guest_execution::IdentityPolicy::Contained
+        } else {
+            identity_policy
+        };
         let execution = ExecutionService::with_cgroups(
             shutdown.clone(),
             ExecutionServiceConfig {
+                #[cfg(feature = "experimental-wasm")]
+                wasi_process_profile: config.wasi_process_profile.clone(),
                 default_operation_user: config.default_operation_user.clone(),
                 default_working_dir: config.default_working_dir.clone(),
                 filesystem_execution: config.filesystem_execution,
                 cancellation_grace: config.cancellation_grace,
-                guest_memory_bytes: meta::guest_mem_total_bytes(),
+                guest_memory_bytes: native_guest.then(meta::guest_mem_total_bytes).flatten(),
                 worker_executable,
-                identity_policy: pplx_space_spaced_guest_execution::IdentityPolicy::Guest,
+                identity_policy,
                 ..Default::default()
             },
             guest_cgroups.map(|cgroups| Arc::clone(&cgroups.placement)),
@@ -391,6 +434,7 @@ impl SpacedGuestService {
         loopback_bridge.set_execution_admission(execution.clone());
         Ok(Self {
             inner: Arc::new(SpacedGuestServiceInner {
+                platform,
                 update: update::UpdateRuntime::new(),
                 shutdown,
                 filesystem_flush_slots: Arc::new(Semaphore::new(1)),
@@ -402,7 +446,11 @@ impl SpacedGuestService {
                 bridge_socket_path: config.bridge_socket_path,
                 http2_preface_timeout: config.http2_preface_timeout,
                 guest_uptime_source: config.guest_uptime_source,
-                guest_memory_used_source: config.guest_memory_used_source,
+                guest_memory_used_source: if native_guest {
+                    config.guest_memory_used_source
+                } else {
+                    || None
+                },
                 guest_memory_read_slots: Arc::new(Semaphore::new(1)),
                 ready,
                 ready_events,
@@ -519,7 +567,11 @@ impl SpacedGuestService {
         // Resolve the loopback bridge's external bind IP off the request
         // path so the first OpenLoopbackBridge call doesn't pay for the
         // up-to-5 s autodetect retry loop on top of its own wait_timeout.
-        self.inner.loopback_bridge.spawn_warm();
+        if self.inner.platform.supports(
+            pplx_space_spaced_guest_protocol::proto::platform::GuestOperation::LoopbackForward,
+        ) {
+            self.inner.loopback_bridge.spawn_warm();
+        }
         let local_server = self.clone().run_local_server();
         let bridge_server = self.clone().run_bridge_guest_server();
         self.serve_until_shutdown(local_server, bridge_server).await

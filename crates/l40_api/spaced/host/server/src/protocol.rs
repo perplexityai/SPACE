@@ -184,6 +184,7 @@ pub(super) fn bridge_process_start_request(
                 .into_map()
         }
         pplx_space_execution_spec::guest_image::QualifiedGuestAgent::LinuxV1
+        | pplx_space_execution_spec::guest_image::QualifiedGuestAgent::WasiPythonV1
         | pplx_space_execution_spec::guest_image::QualifiedGuestAgent::Absent => {
             proto_env(&parse_env(request.env))
         }

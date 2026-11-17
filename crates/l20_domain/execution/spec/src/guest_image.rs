@@ -157,6 +157,8 @@ pub enum QualifiedGuestAgent {
     LinuxV1,
     /// Native Windows readiness, memory lifecycle and session-0 process/files.
     WindowsV1,
+    /// Contained agent serving bounded Python/WASI commands, not Linux exec.
+    WasiPythonV1,
 }
 impl QualifiedGuestAgent {
     pub const fn as_str(self) -> &'static str {
@@ -164,6 +166,7 @@ impl QualifiedGuestAgent {
             Self::Absent => "absent",
             Self::LinuxV1 => "linux-v1",
             Self::WindowsV1 => "windows-v1",
+            Self::WasiPythonV1 => "wasi-python-v1",
         }
     }
 }
@@ -182,6 +185,7 @@ impl std::str::FromStr for QualifiedGuestAgent {
             "absent" => Ok(Self::Absent),
             "linux-v1" => Ok(Self::LinuxV1),
             "windows-v1" => Ok(Self::WindowsV1),
+            "wasi-python-v1" => Ok(Self::WasiPythonV1),
             _ => Err(QualifiedGuestAgentParseError(value.into())),
         }
     }
@@ -197,6 +201,6 @@ impl QualifiedGuestAgent {
     }
 
     pub fn supports_process_environment(self) -> bool {
-        matches!(self, Self::LinuxV1)
+        matches!(self, Self::LinuxV1 | Self::WasiPythonV1)
     }
 }

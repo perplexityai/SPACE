@@ -28,6 +28,7 @@ const (
 	RuntimeKind_RUNTIME_KIND_FIRECRACKER      RuntimeKind = 1
 	RuntimeKind_RUNTIME_KIND_CLOUD_HYPERVISOR RuntimeKind = 2
 	RuntimeKind_RUNTIME_KIND_GVISOR           RuntimeKind = 3
+	RuntimeKind_RUNTIME_KIND_WASMTIME         RuntimeKind = 4
 )
 
 // Enum value maps for RuntimeKind.
@@ -37,12 +38,14 @@ var (
 		1: "RUNTIME_KIND_FIRECRACKER",
 		2: "RUNTIME_KIND_CLOUD_HYPERVISOR",
 		3: "RUNTIME_KIND_GVISOR",
+		4: "RUNTIME_KIND_WASMTIME",
 	}
 	RuntimeKind_value = map[string]int32{
 		"RUNTIME_KIND_UNSPECIFIED":      0,
 		"RUNTIME_KIND_FIRECRACKER":      1,
 		"RUNTIME_KIND_CLOUD_HYPERVISOR": 2,
 		"RUNTIME_KIND_GVISOR":           3,
+		"RUNTIME_KIND_WASMTIME":         4,
 	}
 )
 
@@ -80,6 +83,7 @@ const (
 	GuestOperatingSystem_GUEST_OPERATING_SYSTEM_LINUX       GuestOperatingSystem = 1
 	GuestOperatingSystem_GUEST_OPERATING_SYSTEM_WINDOWS     GuestOperatingSystem = 2
 	GuestOperatingSystem_GUEST_OPERATING_SYSTEM_MACOS       GuestOperatingSystem = 3
+	GuestOperatingSystem_GUEST_OPERATING_SYSTEM_WASI        GuestOperatingSystem = 4
 )
 
 // Enum value maps for GuestOperatingSystem.
@@ -89,12 +93,14 @@ var (
 		1: "GUEST_OPERATING_SYSTEM_LINUX",
 		2: "GUEST_OPERATING_SYSTEM_WINDOWS",
 		3: "GUEST_OPERATING_SYSTEM_MACOS",
+		4: "GUEST_OPERATING_SYSTEM_WASI",
 	}
 	GuestOperatingSystem_value = map[string]int32{
 		"GUEST_OPERATING_SYSTEM_UNSPECIFIED": 0,
 		"GUEST_OPERATING_SYSTEM_LINUX":       1,
 		"GUEST_OPERATING_SYSTEM_WINDOWS":     2,
 		"GUEST_OPERATING_SYSTEM_MACOS":       3,
+		"GUEST_OPERATING_SYSTEM_WASI":        4,
 	}
 )
 
@@ -131,6 +137,7 @@ const (
 	CpuArchitecture_CPU_ARCHITECTURE_UNSPECIFIED CpuArchitecture = 0
 	CpuArchitecture_CPU_ARCHITECTURE_X86_64      CpuArchitecture = 1
 	CpuArchitecture_CPU_ARCHITECTURE_AARCH64     CpuArchitecture = 2
+	CpuArchitecture_CPU_ARCHITECTURE_WASM32      CpuArchitecture = 3
 )
 
 // Enum value maps for CpuArchitecture.
@@ -139,11 +146,13 @@ var (
 		0: "CPU_ARCHITECTURE_UNSPECIFIED",
 		1: "CPU_ARCHITECTURE_X86_64",
 		2: "CPU_ARCHITECTURE_AARCH64",
+		3: "CPU_ARCHITECTURE_WASM32",
 	}
 	CpuArchitecture_value = map[string]int32{
 		"CPU_ARCHITECTURE_UNSPECIFIED": 0,
 		"CPU_ARCHITECTURE_X86_64":      1,
 		"CPU_ARCHITECTURE_AARCH64":     2,
+		"CPU_ARCHITECTURE_WASM32":      3,
 	}
 )
 
@@ -184,6 +193,7 @@ const (
 	ArtifactComponentKind_ARTIFACT_COMPONENT_KIND_ROOTFS      ArtifactComponentKind = 4
 	ArtifactComponentKind_ARTIFACT_COMPONENT_KIND_BOOT_DISK   ArtifactComponentKind = 5
 	ArtifactComponentKind_ARTIFACT_COMPONENT_KIND_GUEST_TOOLS ArtifactComponentKind = 6
+	ArtifactComponentKind_ARTIFACT_COMPONENT_KIND_WASM_MODULE ArtifactComponentKind = 7
 )
 
 // Enum value maps for ArtifactComponentKind.
@@ -196,6 +206,7 @@ var (
 		4: "ARTIFACT_COMPONENT_KIND_ROOTFS",
 		5: "ARTIFACT_COMPONENT_KIND_BOOT_DISK",
 		6: "ARTIFACT_COMPONENT_KIND_GUEST_TOOLS",
+		7: "ARTIFACT_COMPONENT_KIND_WASM_MODULE",
 	}
 	ArtifactComponentKind_value = map[string]int32{
 		"ARTIFACT_COMPONENT_KIND_UNSPECIFIED": 0,
@@ -205,6 +216,7 @@ var (
 		"ARTIFACT_COMPONENT_KIND_ROOTFS":      4,
 		"ARTIFACT_COMPONENT_KIND_BOOT_DISK":   5,
 		"ARTIFACT_COMPONENT_KIND_GUEST_TOOLS": 6,
+		"ARTIFACT_COMPONENT_KIND_WASM_MODULE": 7,
 	}
 )
 
@@ -348,6 +360,7 @@ type HypervisorBackend int32
 const (
 	HypervisorBackend_HYPERVISOR_BACKEND_UNSPECIFIED HypervisorBackend = 0
 	HypervisorBackend_HYPERVISOR_BACKEND_KVM         HypervisorBackend = 1
+	HypervisorBackend_HYPERVISOR_BACKEND_USERSPACE   HypervisorBackend = 2
 )
 
 // Enum value maps for HypervisorBackend.
@@ -355,10 +368,12 @@ var (
 	HypervisorBackend_name = map[int32]string{
 		0: "HYPERVISOR_BACKEND_UNSPECIFIED",
 		1: "HYPERVISOR_BACKEND_KVM",
+		2: "HYPERVISOR_BACKEND_USERSPACE",
 	}
 	HypervisorBackend_value = map[string]int32{
 		"HYPERVISOR_BACKEND_UNSPECIFIED": 0,
 		"HYPERVISOR_BACKEND_KVM":         1,
+		"HYPERVISOR_BACKEND_USERSPACE":   2,
 	}
 )
 
@@ -395,6 +410,8 @@ const (
 	IsolationClass_ISOLATION_CLASS_UNSPECIFIED IsolationClass = 0
 	// A separate hardware VM boundary for each sandbox; not an ordered strength.
 	IsolationClass_ISOLATION_CLASS_HARDWARE_VM IsolationClass = 1
+	// WebAssembly memory/capability isolation, not a hardware VM guarantee.
+	IsolationClass_ISOLATION_CLASS_WEBASSEMBLY IsolationClass = 2
 )
 
 // Enum value maps for IsolationClass.
@@ -402,10 +419,12 @@ var (
 	IsolationClass_name = map[int32]string{
 		0: "ISOLATION_CLASS_UNSPECIFIED",
 		1: "ISOLATION_CLASS_HARDWARE_VM",
+		2: "ISOLATION_CLASS_WEBASSEMBLY",
 	}
 	IsolationClass_value = map[string]int32{
 		"ISOLATION_CLASS_UNSPECIFIED": 0,
 		"ISOLATION_CLASS_HARDWARE_VM": 1,
+		"ISOLATION_CLASS_WEBASSEMBLY": 2,
 	}
 )
 
@@ -2135,21 +2154,24 @@ const file_execution_v1_execution_proto_rawDesc = "" +
 	"\n" +
 	"descriptor\x18\x03 \x01(\v2).space.execution.v1.EnvironmentDescriptorR\n" +
 	"descriptor\x126\n" +
-	"\x17identity_schema_version\x18\x04 \x01(\rR\x15identitySchemaVersion*\x85\x01\n" +
+	"\x17identity_schema_version\x18\x04 \x01(\rR\x15identitySchemaVersion*\xa0\x01\n" +
 	"\vRuntimeKind\x12\x1c\n" +
 	"\x18RUNTIME_KIND_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18RUNTIME_KIND_FIRECRACKER\x10\x01\x12!\n" +
 	"\x1dRUNTIME_KIND_CLOUD_HYPERVISOR\x10\x02\x12\x17\n" +
-	"\x13RUNTIME_KIND_GVISOR\x10\x03*\xa6\x01\n" +
+	"\x13RUNTIME_KIND_GVISOR\x10\x03\x12\x19\n" +
+	"\x15RUNTIME_KIND_WASMTIME\x10\x04*\xc7\x01\n" +
 	"\x14GuestOperatingSystem\x12&\n" +
 	"\"GUEST_OPERATING_SYSTEM_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cGUEST_OPERATING_SYSTEM_LINUX\x10\x01\x12\"\n" +
 	"\x1eGUEST_OPERATING_SYSTEM_WINDOWS\x10\x02\x12 \n" +
-	"\x1cGUEST_OPERATING_SYSTEM_MACOS\x10\x03*n\n" +
+	"\x1cGUEST_OPERATING_SYSTEM_MACOS\x10\x03\x12\x1f\n" +
+	"\x1bGUEST_OPERATING_SYSTEM_WASI\x10\x04*\x8b\x01\n" +
 	"\x0fCpuArchitecture\x12 \n" +
 	"\x1cCPU_ARCHITECTURE_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17CPU_ARCHITECTURE_X86_64\x10\x01\x12\x1c\n" +
-	"\x18CPU_ARCHITECTURE_AARCH64\x10\x02*\xa2\x02\n" +
+	"\x18CPU_ARCHITECTURE_AARCH64\x10\x02\x12\x1b\n" +
+	"\x17CPU_ARCHITECTURE_WASM32\x10\x03*\xcb\x02\n" +
 	"\x15ArtifactComponentKind\x12'\n" +
 	"#ARTIFACT_COMPONENT_KIND_UNSPECIFIED\x10\x00\x12\"\n" +
 	"\x1eARTIFACT_COMPONENT_KIND_KERNEL\x10\x01\x12\"\n" +
@@ -2157,7 +2179,8 @@ const file_execution_v1_execution_proto_rawDesc = "" +
 	" ARTIFACT_COMPONENT_KIND_FIRMWARE\x10\x03\x12\"\n" +
 	"\x1eARTIFACT_COMPONENT_KIND_ROOTFS\x10\x04\x12%\n" +
 	"!ARTIFACT_COMPONENT_KIND_BOOT_DISK\x10\x05\x12'\n" +
-	"#ARTIFACT_COMPONENT_KIND_GUEST_TOOLS\x10\x06*\xd5\x01\n" +
+	"#ARTIFACT_COMPONENT_KIND_GUEST_TOOLS\x10\x06\x12'\n" +
+	"#ARTIFACT_COMPONENT_KIND_WASM_MODULE\x10\a*\xd5\x01\n" +
 	"\x16ExecutionSelectionMode\x12(\n" +
 	"$EXECUTION_SELECTION_MODE_UNSPECIFIED\x10\x00\x12*\n" +
 	"&EXECUTION_SELECTION_MODE_NEW_COLD_BOOT\x10\x01\x12/\n" +
@@ -2167,13 +2190,15 @@ const file_execution_v1_execution_proto_rawDesc = "" +
 	"!HOST_OPERATING_SYSTEM_UNSPECIFIED\x10\x00\x12\x1f\n" +
 	"\x1bHOST_OPERATING_SYSTEM_LINUX\x10\x01\x12!\n" +
 	"\x1dHOST_OPERATING_SYSTEM_WINDOWS\x10\x02\x12\x1f\n" +
-	"\x1bHOST_OPERATING_SYSTEM_MACOS\x10\x03*S\n" +
+	"\x1bHOST_OPERATING_SYSTEM_MACOS\x10\x03*u\n" +
 	"\x11HypervisorBackend\x12\"\n" +
 	"\x1eHYPERVISOR_BACKEND_UNSPECIFIED\x10\x00\x12\x1a\n" +
-	"\x16HYPERVISOR_BACKEND_KVM\x10\x01*R\n" +
+	"\x16HYPERVISOR_BACKEND_KVM\x10\x01\x12 \n" +
+	"\x1cHYPERVISOR_BACKEND_USERSPACE\x10\x02*s\n" +
 	"\x0eIsolationClass\x12\x1f\n" +
 	"\x1bISOLATION_CLASS_UNSPECIFIED\x10\x00\x12\x1f\n" +
-	"\x1bISOLATION_CLASS_HARDWARE_VM\x10\x01*m\n" +
+	"\x1bISOLATION_CLASS_HARDWARE_VM\x10\x01\x12\x1f\n" +
+	"\x1bISOLATION_CLASS_WEBASSEMBLY\x10\x02*m\n" +
 	"\x14RuntimePayloadLayout\x12&\n" +
 	"\"RUNTIME_PAYLOAD_LAYOUT_UNSPECIFIED\x10\x00\x12-\n" +
 	")RUNTIME_PAYLOAD_LAYOUT_CATALOG_RELEASE_V1\x10\x02BCZAgithub.com/perplexityai/SPACE/shim/proto/execution/v1;executionv1b\x06proto3"

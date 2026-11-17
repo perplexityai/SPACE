@@ -30,6 +30,27 @@ impl GuestPlatform {
         self.0.clone()
     }
 
+    pub fn os(&self) -> GuestOs {
+        GuestOs::try_from(self.0.os).unwrap_or(GuestOs::Unspecified)
+    }
+
+    /// Bounded Python/WASI commands plus the contained agent's file services.
+    /// No networking, memory lifecycle or guest-wide flush qualification.
+    pub fn wasi_python() -> Self {
+        Self(GuestPlatformDescriptor {
+            os: GuestOs::Wasi as i32,
+            operations: [
+                GuestOperation::Process,
+                GuestOperation::ProcessEnvironment,
+                GuestOperation::InteractiveProcessControl,
+                GuestOperation::Files,
+                GuestOperation::FileWatch,
+            ]
+            .map(|op| op as i32)
+            .to_vec(),
+        })
+    }
+
     /// Existing Linux operations; this does not qualify VM snapshots.
     pub fn linux() -> Self {
         Self(GuestPlatformDescriptor {

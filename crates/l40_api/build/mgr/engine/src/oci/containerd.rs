@@ -300,6 +300,8 @@ pub enum OciBuildError {
     InvalidSnapshotMount { output: String },
     #[error(transparent)]
     UnsupportedArch(#[from] ArchParseError),
+    #[error("OCI rootfs builds require a native architecture, got {0}")]
+    NonNativeArchitecture(Arch),
     #[error(transparent)]
     Storage(#[from] OciStorageError),
     #[error("OCI registry validation failed")]
@@ -318,6 +320,7 @@ impl OciBuildError {
             | Self::InvalidWorkingDirectory
             | Self::Registry { .. }
             | Self::UnsupportedArch(_)
+            | Self::NonNativeArchitecture(_)
             | Self::Command {
                 operation: OciOperation::PullImage | OciOperation::ReadImageConfig,
                 ..
@@ -955,6 +958,9 @@ async fn mount_with_registry_dependencies(
     ecr_auth_root: &Path,
     dependencies: OciMountDependencies,
 ) -> Result<OciRootfs, OciBuildError> {
+    if arch == Arch::Wasm32 {
+        return Err(OciBuildError::NonNativeArchitecture(arch));
+    }
     let OciMountDependencies {
         runner,
         storage_config,
@@ -1236,6 +1242,7 @@ fn container_platform(arch: Arch) -> &'static str {
     match arch {
         Arch::Aarch64 => "linux/arm64",
         Arch::X86_64 => "linux/amd64",
+        Arch::Wasm32 => "wasip1/wasm",
     }
 }
 

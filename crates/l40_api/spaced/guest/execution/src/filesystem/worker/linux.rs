@@ -810,7 +810,7 @@ fn worker_command_from_environment(
         .env(WORKER_FD_ENV, worker_raw_fd.to_string())
         .env(WORKER_IDENTITY_POLICY_ENV, identity_policy.as_str())
         .kill_on_drop(true);
-    if identity_policy == crate::IdentityPolicy::Restricted {
+    if identity_policy.restricts_authority() {
         // SAFETY: prctl is called only in the forked child before exec.
         // Prevent the selected artifact itself from acquiring extra privileges;
         // it retains the launcher's authority until it installs the account.
@@ -960,7 +960,7 @@ fn run_worker(
     raw_fd: RawFd,
     policy: crate::IdentityPolicy,
 ) -> Result<(), FilesystemWorkerError> {
-    if policy == crate::IdentityPolicy::Restricted {
+    if policy.restricts_authority() {
         // capset and no_new_privs affect only the calling thread. Dispatch must
         // precede application initialization; reject an already threaded host.
         let tasks =

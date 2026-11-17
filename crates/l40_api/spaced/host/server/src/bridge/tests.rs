@@ -30,6 +30,66 @@ impl guest_protocol::networking_server::Networking for CloseGuest {
     }
 }
 
+#[tokio::test]
+async fn authenticated_uds_rejects_wrong_process_or_user_before_dispatch() {
+    use guest_protocol::networking_client::NetworkingClient;
+    use guest_protocol::networking_server::NetworkingServer;
+    use pplx_space_spaced_client::ExpectedUdsPeer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("guest.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    let guest = CloseGuest {
+        calls: calls.clone(),
+        reply_error: None,
+    };
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(NetworkingServer::new(guest))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::UnixListenerStream::new(listener),
+                stop.cancelled_owned(),
+            )
+            .await
+            .unwrap();
+    });
+    let pid = std::process::id() as i32;
+    let (local, _peer) = tokio::net::UnixStream::pair().unwrap();
+    let uid = local.peer_cred().unwrap().uid();
+    for (expected_peer, admitted) in [
+        (ExpectedUdsPeer::new(pid + 1, uid), false),
+        (ExpectedUdsPeer::new(pid, uid.wrapping_add(1)), false),
+        (ExpectedUdsPeer::new(pid, uid), true),
+    ] {
+        let service = SpacedHostService::new_with_config(
+            CancellationToken::new(),
+            SpacedHostServiceConfig {
+                bridge_guest_connector: BridgeGuestConnector::AuthenticatedUds {
+                    path: socket.clone(),
+                    expected_peer,
+                },
+                ..Default::default()
+            },
+        );
+        let result = service.connect_bridge_guest_channel().await;
+        assert_eq!(result.is_ok(), admitted);
+        if let Ok((channel, connection)) = result {
+            assert!(connection.is_some());
+            NetworkingClient::new(channel)
+                .close_loopback_bridge(guest_protocol::CloseLoopbackBridgeRequest { port: 8080 })
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+    server.await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn close_retries_connection_establishment_but_never_a_dispatched_rpc() {
     use crate::proto::networking_server::Networking;

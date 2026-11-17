@@ -24,6 +24,9 @@ pub(crate) fn require_running(shutdown: &CancellationToken) -> Result<(), Status
 /// Other platforms default to Direct filesystem execution with the guest policy.
 #[derive(Clone, Debug)]
 pub struct ExecutionServiceConfig {
+    /// Default-off command adapter, supplied only by a contained launch owner.
+    #[cfg(feature = "experimental-wasm")]
+    pub wasi_process_profile: Option<crate::WasiProcessProfile>,
     pub default_operation_user: GuestUserName,
     /// Image WORKDIR for commands without an explicit cwd; None uses the account home.
     pub default_working_dir: Option<std::path::PathBuf>,
@@ -47,6 +50,8 @@ pub struct ExecutionServiceConfig {
 impl Default for ExecutionServiceConfig {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "experimental-wasm")]
+            wasi_process_profile: None,
             default_working_dir: None,
             default_operation_user: GuestUserName::parse(DEFAULT_GUEST_USER)
                 .expect("default guest user constant is valid"),
@@ -78,6 +83,10 @@ pub enum CreateExecutionServiceError {
     RestrictedRequiresIdentityWorkers,
     #[error("restricted identities require a root launcher with CAP_SETUID and CAP_SETGID")]
     RestrictedRequiresPrivilege,
+    #[error(
+        "contained identities require a non-root launcher with no capabilities and no_new_privs"
+    )]
+    ContainedRequiresUnprivileged,
     #[error("cannot inspect launcher capabilities: {0}")]
     InspectPrivileges(#[source] std::io::Error),
 }
@@ -88,6 +97,8 @@ pub struct ExecutionService {
 }
 
 pub(super) struct ExecutionServiceInner {
+    #[cfg(feature = "experimental-wasm")]
+    pub(super) wasi_process_profile: Option<crate::WasiProcessProfile>,
     pub(super) shutdown: CancellationToken,
     pub(super) lifecycle: crate::lifecycle::Lifecycle,
     drain_gate: Mutex<()>,
@@ -200,6 +211,8 @@ impl ExecutionService {
             .validate(config.filesystem_execution)?;
         Ok(Self {
             inner: Arc::new(ExecutionServiceInner {
+                #[cfg(feature = "experimental-wasm")]
+                wasi_process_profile: config.wasi_process_profile,
                 lifecycle: filesystem.lifecycle.clone(),
                 drain_gate: Mutex::new(()),
                 shutdown,

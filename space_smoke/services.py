@@ -69,6 +69,7 @@ from space_smoke.runtime import (
     SubprocessExecutor,
 )
 from space_smoke.node_runtime import NodeRuntimeFixture
+from space_smoke.spaced_runtime import SpacedEndpoint, SpacedRuntimeFixture
 from space_smoke.template_build import build_dedicated_template
 
 
@@ -119,6 +120,9 @@ class SmokeServices:
     api_surface: str = ECW_API_SURFACE
     direct_node: DirectNodeConfig | None = None
     node_runtime_command: tuple[str, ...] = ()
+    spaced_runtime_socket: str = ""
+    spaced_runtime_endpoint: SpacedEndpoint = SpacedEndpoint.GUEST
+    spaced_runtime_privileged_client: bool = False
     # Reads the Kind bench's modes for the suite. Set on the kind backend
     # whatever the fixture, unlike `kind`, which only fixtures given Kind
     # controls receive.
@@ -191,6 +195,11 @@ class SmokeServices:
     ) -> Fixture:
         if fixture_type is NodeRuntimeFixture:
             return cast(Fixture, NodeRuntimeFixture(context, self.node_runtime_command))
+        if fixture_type is SpacedRuntimeFixture:
+            return cast(Fixture, SpacedRuntimeFixture(
+                context, self.spaced_runtime_socket, self.spaced_runtime_endpoint,
+                self.spaced_runtime_privileged_client,
+            ))
         if fixture_type is KindAdmin:
             if self.kind is None:
                 raise SmokeConfigurationError("KindAdmin requires the kind backend")
@@ -543,6 +552,33 @@ class SmokeServices:
         *,
         required_tools: Iterable[str] | None = None,
     ) -> SmokeServices:
+        if scenario.fixture_type is SpacedRuntimeFixture:
+            values = dict(os.environ if environment is None else environment)
+            socket = values.get("SPACE_SMOKE_SPACED_SOCKET", "")
+            if (
+                values.get("SPACE_SMOKE_BACKEND") != DEPLOYED_BACKEND
+                or values.get("SPACE_SMOKE_API_SURFACE") != "node"
+                or not socket.startswith("/")
+            ):
+                raise SmokeConfigurationError(
+                    "spaced runtime requires deployed/node and an absolute SPACE_SMOKE_SPACED_SOCKET"
+                )
+            if shutil.which("grpcurl") is None:
+                raise MissingToolError("spaced runtime requires grpcurl")
+            try:
+                endpoint = SpacedEndpoint(values.get("SPACE_SMOKE_SPACED_ENDPOINT", "guest"))
+            except ValueError as error:
+                raise SmokeConfigurationError("spaced endpoint must be guest or host") from error
+            privileged = values.get("SPACE_SMOKE_SPACED_SUDO", "0")
+            if privileged not in ("0", "1"):
+                raise SmokeConfigurationError("SPACE_SMOKE_SPACED_SUDO must be 0 or 1")
+            if privileged == "1" and shutil.which("sudo") is None:
+                raise MissingToolError("privileged spaced RPC client requires sudo")
+            return cls(
+                kind=None, ecw=None, api_key="", owns_api_key=False,
+                api_surface="node", spaced_runtime_socket=socket,
+                spaced_runtime_endpoint=endpoint, spaced_runtime_privileged_client=privileged == "1",
+            )
         if scenario.fixture_type is NodeRuntimeFixture:
             import json
 

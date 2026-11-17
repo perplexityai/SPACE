@@ -22,6 +22,7 @@ required-features = ["otel"]
 workspace = true
 
 [features]
+experimental-wasm = ["pplx-space-spaced-guest-execution/experimental-wasm"]
 # The service entry point: process-mode dispatch, telemetry init, the Tokio
 # runtime, and the readiness loop that `spaced-svc`'s `main` calls. Off by
 # default because it is the only thing here that needs `service-host`: consumers

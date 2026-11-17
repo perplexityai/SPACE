@@ -53,7 +53,7 @@ impl ReleaseLayout {
         match runtime {
             RuntimeKind::Firecracker => Some(&FIRECRACKER_RELEASE_LAYOUT),
             RuntimeKind::CloudHypervisor => Some(&CLOUD_HYPERVISOR_RELEASE_LAYOUT),
-            RuntimeKind::Gvisor => None,
+            RuntimeKind::Gvisor | RuntimeKind::Wasmtime => None,
         }
     }
 }

@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 pub enum Arch {
     X86_64,
     Aarch64,
+    /// The 32-bit WebAssembly instruction set, never a native node target.
+    Wasm32,
 }
 
 impl Arch {
@@ -29,6 +31,7 @@ impl Arch {
         match self {
             Self::X86_64 => "x86_64",
             Self::Aarch64 => "aarch64",
+            Self::Wasm32 => "wasm32",
         }
     }
 }
@@ -50,6 +53,7 @@ impl std::str::FromStr for Arch {
         match value {
             "x86_64" | "amd64" => Ok(Self::X86_64),
             "aarch64" | "arm64" => Ok(Self::Aarch64),
+            "wasm32" => Ok(Self::Wasm32),
             other => Err(ArchParseError(other.to_string())),
         }
     }

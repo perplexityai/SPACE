@@ -34,6 +34,7 @@ pub use host_cpu::*;
 pub use runtime::{
     EffectiveStartup, RUNTIME_CLOUD_HYPERVISOR, RUNTIME_CLOUD_HYPERVISOR_ALIAS,
     RUNTIME_FIRECRACKER, RUNTIME_FIRECRACKER_ALIAS, RUNTIME_GVISOR, RUNTIME_GVISOR_ALIAS,
-    RuntimeCapabilities, RuntimeDeploymentId, RuntimeDeploymentIdParseError, RuntimeKind,
-    RuntimeKindParseError, StartupPolicy, UnsupportedStartupPolicyError,
+    RUNTIME_WASMTIME, RUNTIME_WASMTIME_ALIAS, RuntimeCapabilities, RuntimeDeploymentId,
+    RuntimeDeploymentIdParseError, RuntimeKind, RuntimeKindParseError, StartupPolicy,
+    UnsupportedStartupPolicyError,
 };

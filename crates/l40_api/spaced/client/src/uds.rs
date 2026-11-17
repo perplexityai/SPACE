@@ -187,9 +187,19 @@ pub async fn connect_uds_channel_with_expected_peer(
     socket_path: &Path,
     expected_peer: ExpectedUdsPeer,
 ) -> Result<tonic::transport::Channel, UdsConnectError> {
-    connect_uds_channel_inner(service_name, socket_path, Some(expected_peer), true)
+    connect_uds_channel_with_expected_peer_pinned(service_name, socket_path, expected_peer)
         .await
         .map(|(channel, _)| channel)
+}
+
+/// Authenticate one physical connection and retain its liveness observation.
+/// A replacement peer requires a fresh connection and capability negotiation.
+pub async fn connect_uds_channel_with_expected_peer_pinned(
+    service_name: &'static str,
+    socket_path: &Path,
+    expected_peer: ExpectedUdsPeer,
+) -> Result<(tonic::transport::Channel, PinnedConnection), UdsConnectError> {
+    connect_uds_channel_inner(service_name, socket_path, Some(expected_peer), true).await
 }
 
 /// One physical channel for connection-scoped protocol negotiation. Reconnects

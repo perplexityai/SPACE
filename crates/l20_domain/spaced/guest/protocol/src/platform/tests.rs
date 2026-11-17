@@ -12,7 +12,7 @@ fn explicit_capabilities_never_fall_back_to_version_defaults() {
 
 #[test]
 fn readiness_requires_matching_platform_and_host_contract() {
-    for os in [GuestOs::Linux, GuestOs::Windows] {
+    for os in [GuestOs::Linux, GuestOs::Windows, GuestOs::Wasi] {
         for revision in [0, HOST_CONTRACT_REVISION, 99] {
             assert_eq!(
                 require_host_contract(os, revision).is_ok(),

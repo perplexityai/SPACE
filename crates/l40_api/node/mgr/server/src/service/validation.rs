@@ -334,7 +334,8 @@ pub(super) fn prepare_sidecar_launch_args(
         match expected_peer.guest_agent {
             // Old Linux spaced-host binaries do not accept the policy flag.
             pplx_space_execution_spec::guest_image::QualifiedGuestAgent::LinuxV1 => {}
-            pplx_space_execution_spec::guest_image::QualifiedGuestAgent::WindowsV1 => prepared
+            pplx_space_execution_spec::guest_image::QualifiedGuestAgent::WindowsV1
+            | pplx_space_execution_spec::guest_image::QualifiedGuestAgent::WasiPythonV1 => prepared
                 .extend([
                     "--guest-agent".to_owned(),
                     expected_peer.guest_agent.to_string(),

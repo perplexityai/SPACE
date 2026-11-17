@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [features]
 default = []
+experimental-wasm = ["pplx-space-spaced-guest-server/experimental-wasm"]
 otel = ["pplx-space-spaced-guest-server/otel"]
 datadog = ["otel", "pplx-space-spaced-guest-server/datadog"]
 # Deprecated for one release; use otel and datadog.

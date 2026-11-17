@@ -12,6 +12,8 @@ enum GuestOs {
   GUEST_OS_UNSPECIFIED = 0;
   GUEST_OS_LINUX = 1;
   GUEST_OS_WINDOWS = 2;
+  // WASI execution semantics, not a Linux guest or a hardware VM.
+  GUEST_OS_WASI = 3;
 }
 // Sub-features not implemented by an advertised operation return the typed
 // capability refusal, never Unimplemented (reserved for RPCs the guest predates).

@@ -6,6 +6,7 @@ use super::*;
 fn header(architecture: Arch) -> Vec<u8> {
     let mut header = vec![0u8; 4096];
     match architecture {
+        Arch::Wasm32 => panic!("WebAssembly has no native Linux boot header"),
         Arch::X86_64 => {
             header[..4].copy_from_slice(b"\x7fELF");
             header[4] = 2;

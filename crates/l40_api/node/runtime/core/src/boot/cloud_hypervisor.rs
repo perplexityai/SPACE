@@ -40,6 +40,7 @@ pub(super) fn configuration(input: &GuestBoot<'_>) -> Result<Value, BootConfigEr
     let console = match input.guest.architecture {
         Arch::Aarch64 => "ttyAMA0",
         Arch::X86_64 => "ttyS0",
+        Arch::Wasm32 => return Err(BootConfigError::Guest(input.guest)),
     };
     let payload = match input.source {
         BootSource::LinuxDirect => object([

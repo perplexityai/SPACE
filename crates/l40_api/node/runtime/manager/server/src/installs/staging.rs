@@ -75,6 +75,7 @@ const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
 pub(super) fn is_boot_image(path: &Path, architecture: Arch) -> Result<bool, StagingError> {
     let inspect = |error| StagingError::new("inspect", path, error);
     match architecture {
+        Arch::Wasm32 => Ok(false),
         Arch::X86_64 => Ok(matches!(
             diagnostic::probe_elf_file(path).map_err(inspect)?,
             ElfProbe::Elf {

@@ -485,7 +485,7 @@ fn initial_environment_reference(
         pplx_space_cpu_arch::Arch::X86_64 => {
             Some(pplx_space_node_runtime_core::catalog::initial_environment_reference())
         }
-        pplx_space_cpu_arch::Arch::Aarch64 => None,
+        pplx_space_cpu_arch::Arch::Aarch64 | pplx_space_cpu_arch::Arch::Wasm32 => None,
     }
 }
 

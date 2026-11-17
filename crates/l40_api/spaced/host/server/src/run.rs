@@ -10,7 +10,8 @@ use pplx_space_spaced_guest_protocol::proto::bridge_guest::ResumeReason;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    BridgeGuestConnector, RunSpacedHostServerError, SpacedHostService, SpacedHostServiceConfig,
+    BridgeGuestConnector, QualifiedGuestAgent, RunSpacedHostServerError, SpacedHostService,
+    SpacedHostServiceConfig,
 };
 
 #[cfg(test)]
@@ -83,6 +84,9 @@ pub struct SpacedHostRunConfig {
     /// Reach the guest's bridge over this UDS instead of a Firecracker vsock.
     /// Ignored when `vsock_uds` is set.
     pub bridge_guest_uds: Option<PathBuf>,
+    /// Host-visible identity of a contained broker, checked in both directions.
+    pub bridge_guest_pid: Option<u32>,
+    pub bridge_guest_uid: Option<u32>,
     /// Listen for the guest's host-bound bridge on this UDS instead of a
     /// Firecracker vsock. Ignored when `vsock_uds` is set.
     pub bridge_host_uds: Option<PathBuf>,
@@ -110,6 +114,10 @@ impl SpacedHostRunConfig {
 /// Why [`run`] returned without a clean shutdown.
 #[derive(Debug, thiserror::Error)]
 pub enum RunSpacedHostError {
+    #[error(
+        "contained guest bridge requires UDS paths and a positive PID with a non-root UID; it cannot use vsock"
+    )]
+    InvalidContainedPeer,
     #[error("--firecracker-pid is required with --vsock-uds")]
     MissingFirecrackerPid,
     #[error("--firecracker-uid is required with --vsock-uds")]
@@ -134,6 +142,25 @@ pub enum RunSpacedHostError {
 fn resolve_service_config(
     config: SpacedHostRunConfig,
 ) -> Result<SpacedHostServiceConfig, RunSpacedHostError> {
+    let contained_peer = match (config.bridge_guest_pid, config.bridge_guest_uid) {
+        (None, None) => None,
+        (Some(pid), Some(uid))
+            if pid > 0
+                && pid <= i32::MAX as u32
+                && uid != 0
+                && config.bridge_guest_uds.is_some()
+                && config.bridge_host_uds.is_some()
+                && config.vsock_uds.is_none() =>
+        {
+            Some(pplx_space_spaced_client::ExpectedUdsPeer::new(
+                pid as i32, uid,
+            ))
+        }
+        _ => return Err(RunSpacedHostError::InvalidContainedPeer),
+    };
+    if config.guest_agent == QualifiedGuestAgent::WasiPythonV1 && contained_peer.is_none() {
+        return Err(RunSpacedHostError::InvalidContainedPeer);
+    }
     let mut service_config = SpacedHostServiceConfig {
         guest_agent: config.guest_agent,
         ..Default::default()
@@ -173,7 +200,13 @@ fn resolve_service_config(
         // additive: unset leaves the default UDS paths untouched, so production
         // behavior is unchanged.
         if let Some(bridge_guest_uds) = config.bridge_guest_uds {
-            service_config.bridge_guest_connector = BridgeGuestConnector::Uds(bridge_guest_uds);
+            service_config.bridge_guest_connector = match contained_peer {
+                Some(expected_peer) => BridgeGuestConnector::AuthenticatedUds {
+                    path: bridge_guest_uds,
+                    expected_peer,
+                },
+                None => BridgeGuestConnector::Uds(bridge_guest_uds),
+            };
         }
         if let Some(bridge_host_uds) = config.bridge_host_uds {
             service_config.bridge_host_socket_path = bridge_host_uds;

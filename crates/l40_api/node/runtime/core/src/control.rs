@@ -91,7 +91,9 @@ pub fn connect(
             socket,
             peer.ok_or(ControlError::MissingPeer)?,
         ))),
-        RuntimeKind::Gvisor => Err(ControlError::UnsupportedRuntime(runtime)),
+        RuntimeKind::Gvisor | RuntimeKind::Wasmtime => {
+            Err(ControlError::UnsupportedRuntime(runtime))
+        }
     }
 }
 
@@ -170,7 +172,9 @@ pub fn socket_path(
     let filename = match runtime {
         RuntimeKind::Firecracker => "firecracker.sock",
         RuntimeKind::CloudHypervisor => "control.sock",
-        RuntimeKind::Gvisor => return Err(ControlError::UnsupportedRuntime(runtime)),
+        RuntimeKind::Gvisor | RuntimeKind::Wasmtime => {
+            return Err(ControlError::UnsupportedRuntime(runtime));
+        }
     };
     Ok(isolation_root(runtime, &sandbox_id.to_string())?.join(filename))
 }
@@ -186,7 +190,9 @@ pub fn isolation_root(runtime: RuntimeKind, sandbox_id: &str) -> Result<PathBuf,
         .join(runtime.as_str())
         .join(sandbox_id)
         .join("root")),
-        RuntimeKind::Gvisor => Err(ControlError::UnsupportedRuntime(runtime)),
+        RuntimeKind::Gvisor | RuntimeKind::Wasmtime => {
+            Err(ControlError::UnsupportedRuntime(runtime))
+        }
     }
 }
 
@@ -203,7 +209,9 @@ pub fn guest_endpoint_identity(
     let executable = match runtime {
         RuntimeKind::Firecracker => "firecracker",
         RuntimeKind::CloudHypervisor => "cloud-hypervisor",
-        RuntimeKind::Gvisor => return Err(ControlError::UnsupportedRuntime(runtime)),
+        RuntimeKind::Gvisor | RuntimeKind::Wasmtime => {
+            return Err(ControlError::UnsupportedRuntime(runtime));
+        }
     };
     Ok((executable, std::path::Path::new("/v.sock")))
 }

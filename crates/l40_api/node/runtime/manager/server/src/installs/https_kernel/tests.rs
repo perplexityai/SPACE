@@ -35,6 +35,7 @@ async fn listed_kernels_match_architecture_and_reject_substituted_sources() {
         request.architecture = match architecture {
             Arch::Aarch64 => Arch::X86_64,
             Arch::X86_64 => Arch::Aarch64,
+            Arch::Wasm32 => panic!("native host fixture cannot be WebAssembly"),
         };
         assert!(matches!(
             source.open(&request).await,

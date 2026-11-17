@@ -41,8 +41,12 @@ macro_rules! vocabulary {
 vocabulary!(#[derive(Ord, PartialOrd)] HostOperatingSystem, HostOperatingSystemParseError, {
     Linux => "linux", Windows => "windows", Macos => "macos",
 });
-vocabulary!(#[derive(Ord, PartialOrd)] HypervisorBackend, HypervisorBackendParseError, { Kvm => "kvm" });
-vocabulary!(IsolationClass, IsolationClassParseError, { HardwareVm => "hardware_vm" });
+vocabulary!(#[derive(Ord, PartialOrd)] HypervisorBackend, HypervisorBackendParseError, {
+    Kvm => "kvm", Userspace => "userspace",
+});
+vocabulary!(IsolationClass, IsolationClassParseError, {
+    HardwareVm => "hardware_vm", WebAssembly => "webassembly",
+});
 vocabulary!(#[derive(Ord, PartialOrd)] RuntimePayloadLayout, RuntimePayloadLayoutParseError, {
     FirecrackerReleaseV1 => "firecracker_release_v1",
     CatalogReleaseV1 => "catalog_release_v1",
@@ -201,6 +205,8 @@ pub struct EnvironmentSpec {
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum EnvironmentDescriptorError {
+    #[error("WebAssembly is a guest instruction set, not a native host architecture")]
+    WasmHost,
     #[error("managed runtime target {target:?} differs from required host {host:?}")]
     RuntimeTarget {
         target: HostPlatform,
@@ -210,9 +216,7 @@ pub enum EnvironmentDescriptorError {
     KvmHost(HostOperatingSystem),
     #[error("KVM requires the guest architecture {guest} to match the host {host}")]
     KvmArchitecture { host: Arch, guest: Arch },
-    #[error(
-        "the implemented boot/backend/compatibility profiles require Firecracker on Linux with a same-architecture Linux guest"
-    )]
+    #[error("runtime, host, guest, isolation and execution profiles are inconsistent")]
     UnsupportedCombination,
     #[error("direct Linux boot requires a kernel component")]
     BootComponent,
@@ -241,6 +245,9 @@ impl TryFrom<EnvironmentSpec> for EnvironmentDescriptor {
             ArtifactComponentKind, FIRECRACKER_STATE_FORMAT, GuestOperatingSystem, RuntimeKind,
         };
         let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
+        if spec.host.architecture == Arch::Wasm32 {
+            return Err(EnvironmentDescriptorError::WasmHost);
+        }
         if release.target != spec.host {
             return Err(EnvironmentDescriptorError::RuntimeTarget {
                 target: release.target,
@@ -258,6 +265,37 @@ impl TryFrom<EnvironmentSpec> for EnvironmentDescriptor {
                 });
             }
             HypervisorBackend::Kvm => {}
+            HypervisorBackend::Userspace => {
+                if release.runtime.kind != RuntimeKind::Wasmtime
+                    || spec.guest.os != GuestOperatingSystem::Wasi
+                    || spec.guest.architecture != Arch::Wasm32
+                    || spec.isolation != IsolationClass::WebAssembly
+                    || !matches!(
+                        (&spec.boot, &spec.compatibility),
+                        (
+                            BootProfile::ArtifactsV1 { .. },
+                            ExecutionCompatibilityProfile::RuntimeV1 {
+                                state_format: None,
+                                ..
+                            }
+                        )
+                    )
+                {
+                    return Err(EnvironmentDescriptorError::UnsupportedCombination);
+                }
+            }
+        }
+        if release.runtime.kind == RuntimeKind::Wasmtime
+            && spec.backend != HypervisorBackend::Userspace
+        {
+            return Err(EnvironmentDescriptorError::UnsupportedCombination);
+        }
+        if spec.backend != HypervisorBackend::Userspace
+            && (spec.guest.os == GuestOperatingSystem::Wasi
+                || spec.guest.architecture == Arch::Wasm32
+                || spec.isolation == IsolationClass::WebAssembly)
+        {
+            return Err(EnvironmentDescriptorError::UnsupportedCombination);
         }
         match (&release.layout, &mut spec.boot, &spec.compatibility) {
             (

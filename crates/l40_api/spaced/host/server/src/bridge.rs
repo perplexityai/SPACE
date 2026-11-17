@@ -793,7 +793,8 @@ impl SpacedHostService {
 
     pub fn new_with_config(shutdown: CancellationToken, config: SpacedHostServiceConfig) -> Self {
         let bridge_host_expected_peer = match &config.bridge_guest_connector {
-            BridgeGuestConnector::FirecrackerVsock { expected_peer, .. } => Some(*expected_peer),
+            BridgeGuestConnector::FirecrackerVsock { expected_peer, .. }
+            | BridgeGuestConnector::AuthenticatedUds { expected_peer, .. } => Some(*expected_peer),
             BridgeGuestConnector::Uds(_) => None,
         };
         Self {
@@ -955,6 +956,19 @@ impl SpacedHostService {
         &self,
     ) -> Result<WithPinnedConnection<tonic::transport::Channel>, ConnectBridgeGuestError> {
         match &self.inner.bridge_guest_connector {
+            BridgeGuestConnector::AuthenticatedUds {
+                path,
+                expected_peer,
+            } => {
+                let (channel, connection) =
+                    pplx_space_spaced_client::uds::connect_uds_channel_with_expected_peer_pinned(
+                        "spaced bridge guest",
+                        path,
+                        *expected_peer,
+                    )
+                    .await?;
+                Ok((channel, Some(connection)))
+            }
             BridgeGuestConnector::Uds(path) => {
                 let (channel, connection) =
                     pplx_space_spaced_client::uds::connect_uds_channel_pinned(

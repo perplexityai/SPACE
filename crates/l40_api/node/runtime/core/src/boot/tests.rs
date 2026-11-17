@@ -69,7 +69,7 @@ fn cold_boot_adapters_preserve_resources_and_choose_their_device_model() {
                     &config["disks"][0]["rate_limiter_config"],
                 )
             }
-            RuntimeKind::Gvisor => unreachable!(),
+            RuntimeKind::Gvisor | RuntimeKind::Wasmtime => unreachable!(),
         };
         assert_eq!(memory, 1_073_741_824);
         assert_eq!(

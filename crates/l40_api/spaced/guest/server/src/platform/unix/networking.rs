@@ -42,6 +42,9 @@ impl BridgeGuestNetworking for SpacedGuestService {
         &self,
         request: Request<OpenLoopbackBridgeRequest>,
     ) -> Result<Response<OpenLoopbackBridgeResponse>, Status> {
+        self.require_platform_operation(
+            pplx_space_spaced_guest_protocol::proto::platform::GuestOperation::LoopbackForward,
+        )?;
         self.require_ready()?;
         let _admission = self.inner.execution.admit_external_operation()?;
         let req = request.into_inner();
@@ -60,6 +63,9 @@ impl BridgeGuestNetworking for SpacedGuestService {
         &self,
         request: Request<CloseLoopbackBridgeRequest>,
     ) -> Result<Response<CloseLoopbackBridgeResponse>, Status> {
+        self.require_platform_operation(
+            pplx_space_spaced_guest_protocol::proto::platform::GuestOperation::LoopbackForward,
+        )?;
         self.require_ready()?;
         let _admission = self.inner.execution.admit_external_operation()?;
         let req = request.into_inner();

@@ -281,7 +281,8 @@ impl BuildExecutionBinding {
                 pplx_space_execution_common::environment::CLOUD_HYPERVISOR_MACHINE_CONTRACT,
                 pplx_space_execution_common::environment::cloud_hypervisor_linux_format(
                     self.execution.guest().architecture,
-                ),
+                )
+                .ok_or(BuildExecutionBindingError::ScratchProfile)?,
             ),
             _ => return Err(BuildExecutionBindingError::ScratchProfile),
         };

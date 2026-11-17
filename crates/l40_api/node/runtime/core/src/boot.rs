@@ -78,7 +78,9 @@ pub fn configuration(
     let value = match runtime {
         RuntimeKind::Firecracker => firecracker::configuration(input),
         RuntimeKind::CloudHypervisor => cloud_hypervisor::configuration(input)?,
-        RuntimeKind::Gvisor => return Err(BootConfigError::UnsupportedRuntime(runtime)),
+        RuntimeKind::Gvisor | RuntimeKind::Wasmtime => {
+            return Err(BootConfigError::UnsupportedRuntime(runtime));
+        }
     };
     Ok(serde_json::to_string(&value)?)
 }

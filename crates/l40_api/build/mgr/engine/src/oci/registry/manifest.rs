@@ -86,6 +86,9 @@ fn validate_requested_digest(
 }
 
 fn selected_platform(descriptors: &[Descriptor], arch: Arch) -> Result<&Descriptor, RegistryError> {
+    if arch == Arch::Wasm32 {
+        return Err(RegistryError::MissingOrAmbiguousPlatform);
+    }
     let mut matches = descriptors.iter().filter(|descriptor| {
         descriptor.platform().as_ref().is_some_and(|platform| {
             platform.os() == &Os::Linux && platform.architecture() == &oci_arch(arch)
@@ -115,5 +118,6 @@ const fn oci_arch(arch: Arch) -> OciArch {
     match arch {
         Arch::X86_64 => OciArch::Amd64,
         Arch::Aarch64 => OciArch::ARM64,
+        Arch::Wasm32 => OciArch::Wasm,
     }
 }

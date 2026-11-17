@@ -116,6 +116,10 @@ const ALLOW_ROOT_OR_SBXMGR: &[UdsPeerPrincipal] = &[
 #[derive(Clone, Debug)]
 pub enum BridgeGuestConnector {
     Uds(PathBuf),
+    AuthenticatedUds {
+        path: PathBuf,
+        expected_peer: pplx_space_spaced_client::ExpectedUdsPeer,
+    },
     FirecrackerVsock {
         vsock_uds_path: PathBuf,
         port: u32,

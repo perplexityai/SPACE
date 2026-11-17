@@ -129,6 +129,9 @@ impl ReleaseSource for GitHubReleaseSource {
             GitHubRuntime::CloudHypervisor => match architecture {
                 Arch::X86_64 => "cloud-hypervisor-static".to_owned(),
                 Arch::Aarch64 => "cloud-hypervisor-static-aarch64".to_owned(),
+                // No compiled pin exists for this target. Installation rejects
+                // it before source resolution; never alias it to a host binary.
+                Arch::Wasm32 => "cloud-hypervisor-static-wasm32".to_owned(),
             },
         };
         self.base.join(&format!("v{version}")).join(&asset)

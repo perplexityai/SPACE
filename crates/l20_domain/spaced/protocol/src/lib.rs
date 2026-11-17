@@ -94,5 +94,12 @@ pub fn allowed_guest_operations(
         QualifiedGuestAgent::WindowsV1 => {
             &[Process, Files, Flush, Resume, InteractiveProcessControl]
         }
+        QualifiedGuestAgent::WasiPythonV1 => &[
+            Process,
+            ProcessEnvironment,
+            Files,
+            FileWatch,
+            InteractiveProcessControl,
+        ],
     }
 }

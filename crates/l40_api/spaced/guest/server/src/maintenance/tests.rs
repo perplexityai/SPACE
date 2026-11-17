@@ -94,6 +94,26 @@ fn fixture() -> (tempfile::TempDir, SpacedGuestService, Attempt) {
 }
 
 #[tokio::test]
+async fn wasi_broker_does_not_adopt_a_native_guest_update_journal() {
+    let (_root, mut service, _attempt) = fixture();
+    let inner = Arc::get_mut(&mut service.inner).unwrap();
+    inner.platform = pplx_space_spaced_guest_protocol::platform::GuestPlatform::wasi_python();
+    inner.update.enabled.store(false, Ordering::Release);
+    inner.update.gated.store(false, Ordering::Release);
+    inner.update.boot = std::sync::OnceLock::new();
+    service.prepare_update_startup().await.unwrap();
+    assert!(!service.inner.update.enabled());
+    assert!(!service.inner.update.trial_gated());
+    assert_eq!(
+        GuestUpdate::get_status(&service, Request::new(wire::StatusRequest {}))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented
+    );
+}
+
+#[tokio::test]
 async fn commit_retry_finishes_link_repair_before_releasing_readiness() {
     let (root, service, attempt) = fixture();
     *service.inner.update.configured.lock().await = Some(attempt.clone());

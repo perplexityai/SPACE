@@ -2282,6 +2282,14 @@ impl Process for ExecutionService {
             return Err(process_id_in_use());
         }
         let account_name = user.unwrap_or_else(|| self.inner.default_operation_user.clone());
+        #[cfg(feature = "experimental-wasm")]
+        if self.inner.wasi_process_profile.is_some()
+            && account_name != self.inner.default_operation_user
+        {
+            return Err(Status::permission_denied(
+                "WASI commands must use the sandbox's configured identity",
+            ));
+        }
         let (account, _start_admission) = resolve_process_account(
             self.inner.process_tasks.clone(),
             self.inner.process_payload_slots.clone(),
@@ -2350,6 +2358,31 @@ impl Process for ExecutionService {
                     .iter()
                     .map(|(key, value)| (key.as_str(), Pii::new(value).expose_pii().expose())),
             );
+        }
+        #[cfg(feature = "experimental-wasm")]
+        if let Some(profile) = &self.inner.wasi_process_profile {
+            let guest_env = command
+                .as_std()
+                .get_envs()
+                .filter_map(|(key, value)| {
+                    value.map(|value| {
+                        (
+                            key.to_string_lossy().into_owned(),
+                            value.to_string_lossy().into_owned(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            // Replace, do not wrap, the native command. No request-controlled
+            // program or environment is ever used to launch a host process.
+            command = profile.command(
+                argv,
+                cwd.as_ref()
+                    .map(|cwd| std::path::Path::new(cwd.expose()))
+                    .unwrap_or(account.home()),
+                guest_env.into_iter(),
+                pty_config.is_some(),
+            )?;
         }
         // Place the workload in its `workloads/` cgroup before exec, and
         // before dropping credentials: the move writes a root-owned

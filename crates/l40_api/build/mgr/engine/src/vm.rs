@@ -24,7 +24,9 @@ pub(crate) fn guest_exit_command(
         RuntimeKind::CloudHypervisor => {
             Ok("nohup sh -c 'sync; sleep 1; exec poweroff -f' >/dev/null 2>&1 </dev/null &")
         }
-        RuntimeKind::Gvisor => Err(super::BuildError::UnsupportedGuestExit(runtime)),
+        RuntimeKind::Gvisor | RuntimeKind::Wasmtime => {
+            Err(super::BuildError::UnsupportedGuestExit(runtime))
+        }
     }
 }
 

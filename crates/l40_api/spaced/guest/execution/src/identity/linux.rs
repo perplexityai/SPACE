@@ -6,6 +6,9 @@ use pplx_space_guest_process::GuestUserName;
 use tokio::process::Command;
 use tonic::Status;
 
+#[cfg(test)]
+mod tests;
+
 fn set_process_gid(gid: libc::gid_t) -> std::io::Result<()> {
     nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)).map_err(std::io::Error::from)
 }
@@ -97,9 +100,17 @@ impl GuestAccount {
     }
 
     pub(crate) fn validate_policy(&self, policy: crate::IdentityPolicy) -> Result<(), Status> {
-        if policy == crate::IdentityPolicy::Restricted && self.uid == 0 {
+        if policy.restricts_authority() && self.uid == 0 {
             return Err(Status::failed_precondition(
                 "restricted identities require a non-root account",
+            ));
+        }
+        if policy == crate::IdentityPolicy::Contained
+            && (nix::unistd::Uid::effective().as_raw() != self.uid
+                || nix::unistd::Gid::effective().as_raw() != self.gid)
+        {
+            return Err(Status::failed_precondition(
+                "contained identities cannot switch accounts",
             ));
         }
         Ok(())
@@ -109,7 +120,9 @@ impl GuestAccount {
         &self,
         policy: crate::IdentityPolicy,
     ) -> std::io::Result<()> {
-        if policy == crate::IdentityPolicy::Restricted {
+        if policy.restricts_authority() {
+            self.validate_policy(policy)
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EPERM))?;
             return assume_restricted_credentials(self.uid, self.gid, &self.supplementary_groups);
         }
         nix::unistd::setgroups(&self.supplementary_groups)
@@ -130,7 +143,7 @@ impl GuestAccount {
         use nix::unistd::{Gid, Uid};
 
         self.validate_policy(policy)?;
-        if policy == crate::IdentityPolicy::Restricted {
+        if policy.restricts_authority() {
             let cwd = CString::new(cwd.as_os_str().as_bytes())
                 .map_err(|_| Status::invalid_argument("working directory contains a NUL byte"))?;
             let uid = self.uid;
@@ -208,7 +221,17 @@ fn assume_restricted_credentials(
         return Err(std::io::Error::from_raw_os_error(libc::EPERM));
     }
     rustix::thread::set_no_new_privs(true)?;
-    nix::unistd::setgroups(groups)?;
+    if Uid::effective().is_root() {
+        nix::unistd::setgroups(groups)?;
+    } else if !super::supplementary_groups_match(
+        nix::unistd::getgroups()?,
+        groups,
+        Gid::from_raw(gid),
+    ) {
+        // A contained unprivileged broker cannot install groups. Reuse only
+        // the exact account authority; never retain extra inherited access.
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
     let uid = Uid::from_raw(uid);
     let gid = Gid::from_raw(gid);
     nix::unistd::setresgid(gid, gid, gid)?;

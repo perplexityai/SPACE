@@ -46,6 +46,8 @@ pub enum RuntimeKind {
     CloudHypervisor,
     /// gVisor container runtime.
     Gvisor,
+    /// Wasmtime WebAssembly runtime. Qualification is profile-specific.
+    Wasmtime,
 }
 
 /// Error returned when a runtime identifier cannot be parsed.
@@ -63,8 +65,13 @@ pub struct RuntimeKindParseError(String);
 
 impl RuntimeKind {
     /// All runtime kinds, including kinds without a qualified node adapter.
-    pub const fn all() -> [Self; 3] {
-        [Self::Firecracker, Self::CloudHypervisor, Self::Gvisor]
+    pub const fn all() -> [Self; 4] {
+        [
+            Self::Firecracker,
+            Self::CloudHypervisor,
+            Self::Gvisor,
+            Self::Wasmtime,
+        ]
     }
 
     /// Returns the canonical full runtime identifier.
@@ -80,6 +87,7 @@ impl RuntimeKind {
             Self::Firecracker => RUNTIME_FIRECRACKER,
             Self::CloudHypervisor => RUNTIME_CLOUD_HYPERVISOR,
             Self::Gvisor => RUNTIME_GVISOR,
+            Self::Wasmtime => RUNTIME_WASMTIME,
         }
     }
 
@@ -96,6 +104,7 @@ impl RuntimeKind {
             Self::Firecracker => RUNTIME_FIRECRACKER_ALIAS,
             Self::CloudHypervisor => RUNTIME_CLOUD_HYPERVISOR_ALIAS,
             Self::Gvisor => RUNTIME_GVISOR_ALIAS,
+            Self::Wasmtime => RUNTIME_WASMTIME_ALIAS,
         }
     }
 
@@ -116,6 +125,7 @@ impl RuntimeKind {
             RUNTIME_FIRECRACKER | RUNTIME_FIRECRACKER_ALIAS => Ok(Self::Firecracker),
             RUNTIME_CLOUD_HYPERVISOR | RUNTIME_CLOUD_HYPERVISOR_ALIAS => Ok(Self::CloudHypervisor),
             RUNTIME_GVISOR | RUNTIME_GVISOR_ALIAS => Ok(Self::Gvisor),
+            RUNTIME_WASMTIME | RUNTIME_WASMTIME_ALIAS => Ok(Self::Wasmtime),
             other => Err(RuntimeKindParseError(other.to_string())),
         }
     }
@@ -143,6 +153,16 @@ impl RuntimeKind {
                 prewarmed_pool: false,
                 network_gateway: true,
                 volume_manager: true,
+            },
+            // A runtime identity does not grant VM lifecycle, networking or
+            // storage capabilities. Those need an admitted execution profile.
+            Self::Wasmtime => RuntimeCapabilities {
+                pause_resume: false,
+                snapshot: false,
+                fork: false,
+                prewarmed_pool: false,
+                network_gateway: false,
+                volume_manager: false,
             },
         }
     }
@@ -181,6 +201,10 @@ pub const RUNTIME_CLOUD_HYPERVISOR_ALIAS: &str = "ch";
 pub const RUNTIME_GVISOR: &str = "gvisor";
 /// Short alias for the gVisor runtime.
 pub const RUNTIME_GVISOR_ALIAS: &str = "gv";
+/// Canonical identifier for the Wasmtime runtime.
+pub const RUNTIME_WASMTIME: &str = "wasmtime";
+/// Short alias for the Wasmtime runtime.
+pub const RUNTIME_WASMTIME_ALIAS: &str = "wasm";
 
 impl fmt::Display for RuntimeKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

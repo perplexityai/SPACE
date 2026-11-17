@@ -373,6 +373,7 @@ pub(crate) fn executable(architecture: Arch, fill: u8) -> Vec<u8> {
     let machine: u16 = match architecture {
         Arch::X86_64 => 62,
         Arch::Aarch64 => 183,
+        Arch::Wasm32 => panic!("WASM is not an ELF host architecture"),
     };
     binary[18..20].copy_from_slice(&machine.to_le_bytes());
     binary[20..24].copy_from_slice(&1u32.to_le_bytes());

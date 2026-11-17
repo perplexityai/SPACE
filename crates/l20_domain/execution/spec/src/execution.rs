@@ -120,7 +120,7 @@ identifier_type!(
     "execution contract"
 );
 
-/// Operating system presented inside the sandbox boundary.
+/// Operating system or execution interface presented inside the sandbox boundary.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -128,6 +128,7 @@ pub enum GuestOperatingSystem {
     Linux,
     Windows,
     Macos,
+    Wasi,
 }
 
 impl GuestOperatingSystem {
@@ -136,6 +137,7 @@ impl GuestOperatingSystem {
             Self::Linux => "linux",
             Self::Windows => "windows",
             Self::Macos => "macos",
+            Self::Wasi => "wasi",
         }
     }
 }
@@ -152,6 +154,7 @@ impl FromStr for GuestOperatingSystem {
             "linux" => Ok(Self::Linux),
             "windows" => Ok(Self::Windows),
             "macos" => Ok(Self::Macos),
+            "wasi" => Ok(Self::Wasi),
             other => Err(GuestOperatingSystemParseError(other.to_string())),
         }
     }
@@ -174,6 +177,7 @@ pub enum ArtifactComponentKind {
     Rootfs,
     BootDisk,
     GuestTools,
+    WasmModule,
 }
 
 impl ArtifactComponentKind {
@@ -185,6 +189,7 @@ impl ArtifactComponentKind {
             Self::Rootfs => "rootfs",
             Self::BootDisk => "boot_disk",
             Self::GuestTools => "guest_tools",
+            Self::WasmModule => "wasm_module",
         }
     }
 }
@@ -204,6 +209,7 @@ impl FromStr for ArtifactComponentKind {
             "rootfs" => Ok(Self::Rootfs),
             "boot_disk" => Ok(Self::BootDisk),
             "guest_tools" => Ok(Self::GuestTools),
+            "wasm_module" => Ok(Self::WasmModule),
             other => Err(ArtifactComponentKindParseError(other.to_string())),
         }
     }

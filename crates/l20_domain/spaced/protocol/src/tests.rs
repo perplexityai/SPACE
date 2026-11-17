@@ -51,6 +51,7 @@ fn lifecycle_qualification_agrees_with_the_guest_operation_allowlist() {
         QualifiedGuestAgent::Absent,
         QualifiedGuestAgent::LinuxV1,
         QualifiedGuestAgent::WindowsV1,
+        QualifiedGuestAgent::WasiPythonV1,
     ] {
         let allowed = allowed_guest_operations(agent);
         assert_eq!(

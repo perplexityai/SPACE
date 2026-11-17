@@ -184,6 +184,7 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
     let other = match architecture {
         Arch::X86_64 => Arch::Aarch64,
         Arch::Aarch64 => Arch::X86_64,
+        Arch::Wasm32 => panic!("native host fixture cannot be WebAssembly"),
     };
     let checksum = |bytes: &[u8]| Digest::sha256(Sha256::digest(bytes).into());
     for case in [

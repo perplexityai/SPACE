@@ -16,12 +16,14 @@ from space_smoke.fixtures import CommandSandboxFixture, Ecw, KindAdmin, KindEcw,
 from space_smoke.native_hardening import NativeHardeningFixture
 from space_smoke.native_recovery import KindNativeHardeningFixture
 from space_smoke.node_runtime import NodeRuntimeFixture
+from space_smoke.spaced_runtime import SpacedRuntimeFixture
 from space_smoke.runtime import ScenarioContext, SmokeConfigurationError
 from space_smoke.services import SmokeServices
 
 # The fixture type is the scenario's capability declaration; requesting a
 # privileged fixture narrows the backends the scenario may run on.
 FIXTURE_BACKENDS: dict[type[Any], frozenset[str]] = {
+    SpacedRuntimeFixture: frozenset({"deployed"}),
     NodeRuntimeFixture: frozenset({"deployed"}),
     DirectNodeRecoveryFixture: frozenset({"deployed"}),
     NativeHardeningFixture: frozenset({"kind", "deployed"}),
@@ -44,6 +46,7 @@ FIXTURE_BACKENDS: dict[type[Any], frozenset[str]] = {
 # support what it asserts by contract: one that asserts sandbox pods, or forks,
 # narrows to kubernetes.
 FIXTURE_SUBSTRATES: dict[type[Any], frozenset[str]] = {
+    SpacedRuntimeFixture: frozenset({"kubernetes", "direct"}),
     NodeRuntimeFixture: frozenset({"kubernetes", "direct"}),
     # A standalone node, outside any cluster control plane.
     DirectNodeRecoveryFixture: frozenset({"direct"}),
@@ -247,11 +250,11 @@ def scenario(
             )
         if fixture_type is KindAdmin and sandboxes != 1:
             raise ValueError("KindAdmin does not allocate sandboxes; omit sandboxes")
-        if (fixture_type in (DirectNodeRecoveryFixture, NodeRuntimeFixture)) != (
+        if (fixture_type in (DirectNodeRecoveryFixture, NodeRuntimeFixture, SpacedRuntimeFixture)) != (
             "node" in supported_surfaces
         ):
             raise TypeError("node API scenarios require a node fixture")
-        if fixture_type in (DirectNodeRecoveryFixture, NodeRuntimeFixture) and supported_surfaces != {"node"}:
+        if fixture_type in (DirectNodeRecoveryFixture, NodeRuntimeFixture, SpacedRuntimeFixture) and supported_surfaces != {"node"}:
             raise TypeError(
                 "node fixtures require only the node API surface"
             )

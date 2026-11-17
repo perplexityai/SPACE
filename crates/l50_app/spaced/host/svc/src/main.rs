@@ -27,6 +27,10 @@ struct Cli {
     /// Ignored when `--vsock-uds` is set.
     #[arg(long)]
     bridge_guest_uds: Option<PathBuf>,
+    #[arg(long, requires_all = ["bridge_guest_uds", "bridge_host_uds", "bridge_guest_uid"], conflicts_with = "vsock_uds")]
+    bridge_guest_pid: Option<u32>,
+    #[arg(long, requires = "bridge_guest_pid")]
+    bridge_guest_uid: Option<u32>,
     /// Listen for the guest's host-bound bridge on this UDS instead of a
     /// Firecracker vsock. Ignored when `--vsock-uds` is set.
     #[arg(long)]
@@ -69,6 +73,8 @@ impl From<Cli> for SpacedHostRunConfig {
             firecracker_pid: cli.firecracker_pid,
             firecracker_uid: cli.firecracker_uid,
             bridge_guest_uds: cli.bridge_guest_uds,
+            bridge_guest_pid: cli.bridge_guest_pid,
+            bridge_guest_uid: cli.bridge_guest_uid,
             bridge_host_uds: cli.bridge_host_uds,
             sandbox_id: cli.sandbox_id,
             boot_type: cli.boot_type.into(),

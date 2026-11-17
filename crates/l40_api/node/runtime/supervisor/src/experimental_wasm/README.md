@@ -1,9 +1,76 @@
-# Experimental Wasmtime runner
+# Experimental Wasmtime support
+
+## Existing command-service adapter
+
+The default-off `experimental-wasm` feature on `spaced-svc` selects a bounded
+Python/WASI process profile inside the existing guest command service. Clients
+use the existing `Process.Start`, `ConnectProcess`, `ListProcesses`, `SendSignal`
+and filesystem gRPC APIs. There is no new command-execution transport.
+
+The native agent must already run as its non-root sandbox account, without
+capabilities and with `no_new_privs`, inside a per-sandbox filesystem, PID and
+network containment boundary. The image's `user` account must name that same
+identity; process and filesystem requests cannot switch accounts. Its launch
+owner must authenticate and read-only
+mount the Wasmtime executable, Python WASM module and Python library tree, and
+attach the sandbox's managed writable workspace and resource limits. The adapter
+does not allocate those resources or provide containment by itself.
+
+The operator supplies the contained agent's locators:
+
+```text
+spaced-svc --wasmtime-root /runtime --wasmtime-workspace /workspace \
+  --wasmtime-bridge-socket /run/space/guest.sock \
+  --wasmtime-host-bridge-socket /run/space/host.sock
+```
+
+The tool-root layout is `bin/wasmtime`, `python/python.wasm`, and
+`python/lib`. Process and filesystem APIs use the same contained path namespace.
+Native command fallback and PTYs are refused; command environment variables are
+passed only to WASI, never to the native engine. The ordinary process supervisor
+retains ownership, output, idempotency, deadlines and cancellation. The agent
+advertises WASI rather than Linux, omits native-host resource measurements,
+and does not adopt the native guest agent's update journal.
+
+The manual typed scenario `wasm.spaced` uses the standard gRPC socket. Set
+`SPACE_SMOKE_BACKEND=deployed`, `SPACE_SMOKE_API_SURFACE=node` and
+`SPACE_SMOKE_SPACED_SOCKET` to the absolute socket path. For the normal
+spaced-host endpoint, also set `SPACE_SMOKE_SPACED_ENDPOINT=host`; the default
+`guest` addresses the contained agent directly. `SPACE_SMOKE_SPACED_SUDO=1`
+runs the local RPC client with noninteractive sudo when the host endpoint
+requires root authorization. It does not disable host authorization.
+
+The host's `wasi-python-v1` profile requires both bridge UDS paths and the
+contained agent's host-visible PID and non-root UID through
+`--bridge-guest-pid` and `--bridge-guest-uid`. The host checks kernel peer
+credentials before dispatching guest RPCs and checks the same identity on
+guest-initiated bridge calls. Its launcher must arrange socket access without
+giving other sandbox identities access. An agent replacement requires fresh
+launch attestation; the old PID must not be silently reused.
+
+This scenario covers command execution, filesystem exchange, idempotent retry,
+timeout recovery, disconnected background ownership, cancellation and retained
+output through the existing APIs. It also checks refusal of native commands
+and account switching. Its evidence covers the command-service adapter, not
+sandbox creation or placement.
+
+The shared domain and additive wire schemas can describe Wasmtime/WASI without
+claiming KVM or hardware-VM isolation. No Wasmtime environment is approved in the
+compiled execution catalog. API/scheduler selection, node launch, endpoint
+attestation, managed volumes, gateway policy and reconciled lifecycle integration
+remain required before workloads can select this runtime through the platform.
+Unknown runtime/OS values fail closed on older services; default features and
+existing native guest contracts are unchanged. Do not route new WASI executions
+until the entire mixed-version path is qualified.
+
+## Legacy single-request diagnostic
 
 The optional `experimental-wasm` feature adds a dedicated, single-request mode:
 `space-runtime-supervisor-svc --experimental-wasm-config CONFIG`.
-It does not register a runtime kind, API listener, scheduler backend, or fleet
-provider. Existing supervisor behavior is unchanged without the flag.
+It does not install or qualify a managed runtime, API listener, scheduler backend
+or fleet provider. This diagnostic protocol is not a platform integration path;
+new integration work belongs in the existing APIs and lifecycle owners.
+Existing supervisor behavior is unchanged without the flag.
 
 Configuration is supplied by a trusted operator:
 

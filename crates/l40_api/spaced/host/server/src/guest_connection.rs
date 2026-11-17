@@ -48,7 +48,9 @@ impl<C> OperationClient<C> {
             ),
         };
         match self.policy {
-            QualifiedGuestAgent::LinuxV1 | QualifiedGuestAgent::WindowsV1 => {}
+            QualifiedGuestAgent::LinuxV1
+            | QualifiedGuestAgent::WindowsV1
+            | QualifiedGuestAgent::WasiPythonV1 => {}
             QualifiedGuestAgent::Absent => {
                 return Err(guest_capability_unsupported_status(
                     GuestCapability::PlatformOperations,
@@ -128,6 +130,7 @@ impl GuestPlatformObservation {
         let expected = match policy {
             QualifiedGuestAgent::LinuxV1 => GuestOs::Linux,
             QualifiedGuestAgent::WindowsV1 => GuestOs::Windows,
+            QualifiedGuestAgent::WasiPythonV1 => GuestOs::Wasi,
             QualifiedGuestAgent::Absent => {
                 return Err(Status::failed_precondition(
                     "image has no qualified guest agent",

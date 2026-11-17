@@ -35,6 +35,47 @@ fn portable_spec(kind: RuntimeKind) -> EnvironmentSpec {
 }
 
 #[test]
+fn wasi_identity_round_trips_without_claiming_a_native_guest_or_vm_isolation() {
+    let mut spec = portable_spec(RuntimeKind::Wasmtime);
+    spec.guest = pplx_space_execution_spec::GuestPlatform {
+        os: GuestOperatingSystem::Wasi,
+        architecture: Arch::Wasm32,
+    };
+    spec.backend = HypervisorBackend::Userspace;
+    spec.isolation = IsolationClass::WebAssembly;
+    spec.boot = BootProfile::ArtifactsV1 {
+        contract: "test-wasi-command-v1".parse().unwrap(),
+        artifacts: vec![BootArtifact::new(
+            "program".parse().unwrap(),
+            ComponentIdentity {
+                kind: ArtifactComponentKind::WasmModule,
+                version: "1.0.0".parse().unwrap(),
+                digest: Digest::sha256([10; 32]),
+            },
+            "wasm".parse().unwrap(),
+        )],
+    };
+    let definition = EnvironmentDefinition::new(spec.clone().try_into().unwrap());
+    let wire = proto::EnvironmentDefinition::from(&definition);
+    assert_eq!(EnvironmentDefinition::try_from(&wire).unwrap(), definition);
+    let requirements = definition.execution_requirements().unwrap();
+    definition.check_execution(&requirements).unwrap();
+    assert_eq!(requirements.guest().architecture, Arch::Wasm32);
+    // Reject contracts that would acquire stronger or unrelated semantics.
+    for mutate in [
+        |s: &mut EnvironmentSpec| s.backend = HypervisorBackend::Kvm,
+        |s: &mut EnvironmentSpec| s.isolation = IsolationClass::HardwareVm,
+        |s: &mut EnvironmentSpec| s.guest.os = GuestOperatingSystem::Linux,
+        |s: &mut EnvironmentSpec| s.guest.architecture = Arch::X86_64,
+        |s: &mut EnvironmentSpec| s.host.architecture = Arch::Wasm32,
+    ] {
+        let mut invalid = spec.clone();
+        mutate(&mut invalid);
+        EnvironmentDescriptor::try_from(invalid).unwrap_err();
+    }
+}
+
+#[test]
 fn runtimes_share_one_wire_shape_with_optional_memory_state() {
     // These are synthetic structural definitions, not qualified catalog entries.
     for runtime in [
@@ -162,6 +203,7 @@ fn incomplete_portable_profiles_are_refused() {
         spec.guest.architecture = match spec.host.architecture {
             Arch::X86_64 => Arch::Aarch64,
             Arch::Aarch64 => Arch::X86_64,
+            Arch::Wasm32 => panic!("native profile fixture has a WASM host"),
         };
         assert!(matches!(
             EnvironmentDescriptor::try_from(spec),

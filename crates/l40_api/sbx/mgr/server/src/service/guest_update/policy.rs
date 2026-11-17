@@ -165,7 +165,7 @@ pub(super) fn platform(row: &crate::db::SandboxRow) -> Option<model::RecoveryPla
     {
         QualifiedGuestAgent::LinuxV1 => Some(model::RecoveryPlatform::Linux),
         QualifiedGuestAgent::WindowsV1 => Some(model::RecoveryPlatform::Windows),
-        QualifiedGuestAgent::Absent => None,
+        QualifiedGuestAgent::Absent | QualifiedGuestAgent::WasiPythonV1 => None,
     }
 }
 
