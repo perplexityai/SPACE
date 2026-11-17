@@ -162,6 +162,10 @@ const REVOCATION_MAX_STALENESS: Duration = Duration::from_secs(60);
 /// How long one revocation check may wait on the cluster API, across all of
 /// its reads. A check that takes longer counts as unavailable.
 const REVOCATION_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often an attached process, terminal or file-watch WebSocket is pinged.
+/// The `/sessions/{session_id}/attach` description in the public OpenAPI
+/// document states it.
+const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(5);
 /// The longest revocation check interval the service accepts: a third of
 /// what is left of the staleness bound after one check timeout, 19 s at the
 /// defaults. A failed check keeps a verdict until it is that bound less one
@@ -295,6 +299,7 @@ struct DataPlaneState {
     revocation_max_staleness: Duration,
     revocation_check_timeout: Duration,
     route_cache_ttl: Duration,
+    websocket_ping_interval: Duration,
     /// Cancelled on SIGTERM: a child of the caller's shutdown token. New
     /// streams are refused once it is cancelled, and sockets still
     /// authenticating are told to reconnect; streams already attached keep
@@ -496,6 +501,7 @@ pub async fn run(
         revocation_max_staleness: REVOCATION_MAX_STALENESS,
         revocation_check_timeout: REVOCATION_CHECK_TIMEOUT,
         route_cache_ttl: config.route_cache_ttl.max(Duration::from_millis(1)),
+        websocket_ping_interval: WEBSOCKET_PING_INTERVAL,
         drain_started,
         stream_shutdown_token: stream_shutdown_token.clone(),
         upgrade_tasks: upgrade_tasks.clone(),

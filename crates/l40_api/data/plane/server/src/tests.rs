@@ -1165,6 +1165,9 @@ async fn test_data_plane_state_with_runtime_access(
         revocation_max_staleness: REVOCATION_MAX_STALENESS,
         revocation_check_timeout: REVOCATION_CHECK_TIMEOUT,
         route_cache_ttl: Duration::from_secs(60),
+        // Pings would interleave with the frames tests read; the keepalive
+        // test sets its own interval.
+        websocket_ping_interval: Duration::from_secs(3600),
         drain_started: CancellationToken::new(),
         stream_shutdown_token: CancellationToken::new(),
         upgrade_tasks: TaskTracker::new(),

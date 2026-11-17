@@ -1029,7 +1029,7 @@ const PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS: u32 = 3;
 /// Why the guest ended a process stream because its cursor is outside the
 /// output it retains.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OutputWindowMiss {
+pub(super) enum OutputWindowMiss {
     /// The cursor is past the output the process has written.
     CursorAhead,
     /// The output at the cursor was evicted. `first_retained` is the cursor
@@ -1042,7 +1042,7 @@ enum OutputWindowMiss {
 /// those tags, a RESOURCE_EXHAUSTED with its lag message. Other statuses with
 /// these codes (a hop's refusal of an oversized chunk, an HTTP/2 reset) are
 /// not misses.
-fn output_window_miss(status: &tonic::Status) -> Option<OutputWindowMiss> {
+pub(super) fn output_window_miss(status: &tonic::Status) -> Option<OutputWindowMiss> {
     use pplx_space_guest_process::status::{
         ERROR_REASON_METADATA_KEY, PROCESS_OUTPUT_CURSOR_AHEAD,
         PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY, PROCESS_OUTPUT_LAGGED,
