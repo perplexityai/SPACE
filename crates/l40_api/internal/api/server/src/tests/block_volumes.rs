@@ -6,8 +6,18 @@ use crate::proto::{
 };
 use pplx_space_execution_common::proto::BlockVolumeExecution;
 use pplx_space_execution_spec::BlockVolumeMount;
+#[cfg(feature = "kubernetes")]
+use pplx_space_rpc_auth::{
+    NodeApiAuthConfig, NodeApiAuthLayer, NodeRole as AuthRole,
+    test_support::{
+        pod_bound_service_account_status, projected_token, serve_token_reviews,
+        service_account_status,
+    },
+};
 use pplx_space_sandbox_store::block_volume::{self as volumes, VolumePhase};
 use pplx_space_test_env::TestEnv;
+#[cfg(feature = "kubernetes")]
+use tokio_stream::wrappers::TcpListenerStream;
 
 const ZONE: &str = "test-region-1a";
 const INSTANCE: &str = "i-00000000000000001";
@@ -15,6 +25,118 @@ const CLOUD_DISK: &str = "vol-00000000000000001";
 
 fn node_request<T>(body: T) -> Request<T> {
     request_from_node(body, TEST_WORKER_IP)
+}
+
+#[tokio::test]
+#[cfg(feature = "kubernetes")]
+async fn block_volume_pod_origin_requires_reviewed_live_node_incarnation() -> TestResult {
+    let fixture = cluster_fixture().await?.expect("Postgres required");
+    let pool = &fixture.service.pool;
+    let node = NodeId::from_uuid(insert_k8s_node(pool, "192.0.2.10".parse()?, "worker").await?);
+    let node_uid = Uuid::now_v7().to_string();
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid) VALUES ($1, $2, $3)"
+    ))
+    .bind(node)
+    .bind("volume-worker")
+    .bind(&node_uid)
+    .execute(pool)
+    .await?;
+    let sandbox = SandboxId::new();
+    let attempt = Uuid::now_v7();
+    seed_active_k8s_sandbox(pool, sandbox, node).await?;
+    seed_active_k8s_execution(pool, sandbox, 1, "192.0.2.20").await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET activation_attempt_id = $2 WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox)
+    .bind(attempt)
+    .execute(pool)
+    .await?;
+    let tokens = ["bound", "stale", "missing", "malformed"].map(projected_token);
+    let reviewed_tokens = tokens.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let kube_config = kube::Config::new(format!("http://{}", listener.local_addr()?).parse()?);
+    let _reviewer = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(serve_token_reviews(
+        listener,
+        move |spec| {
+            let index = reviewed_tokens
+                .iter()
+                .position(|token| Some(token) == spec.token.as_ref())
+                .unwrap();
+            let username = "system:serviceaccount:space:workers";
+            if index == 2 {
+                return service_account_status("space-cluster-api", username);
+            }
+            let uid = if index == 1 { "stale-uid" } else { &node_uid };
+            let mut status = pod_bound_service_account_status(
+                "space-cluster-api",
+                username,
+                "volume-worker",
+                uid,
+            );
+            if index == 3 {
+                status
+                    .user
+                    .as_mut()
+                    .unwrap()
+                    .extra
+                    .as_mut()
+                    .unwrap()
+                    .insert(
+                        "authentication.kubernetes.io/node-uid".into(),
+                        vec![uid.into(), uid.into()],
+                    );
+            }
+            status
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )));
+    let mut env = TestEnv::default();
+    for (key, value) in [
+        ("SPACE_K8S_TOKEN_AUTH_ENABLED", "true"),
+        ("SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED", "false"),
+        ("SPACE_K8S_TOKEN_AUTH_NAMESPACE", "space"),
+        ("KUBERNETES_SERVICE_HOST", "127.0.0.1"),
+        ("SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS", "workers"),
+    ] {
+        env.set(key, value);
+    }
+    let config = NodeApiAuthConfig::from_environment(&env, AuthRole::Cluster, String::new(), None)?;
+    let auth =
+        NodeApiAuthLayer::with_k8s_client_for_test(config, kube::Client::try_from(kube_config)?);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .layer(auth)
+            .add_service(crate::proto::cluster_api_server::ClusterApiServer::new(
+                fixture.service,
+            ))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    }));
+    let mut client = crate::proto::cluster_api_client::ClusterApiClient::connect(endpoint).await?;
+    for (index, token) in tokens.iter().enumerate() {
+        let mut request = Request::new(ResolveBlockVolumeBindingRequest {
+            execution: Some(BlockVolumeExecution {
+                node_id: node.to_string(),
+                sandbox_id: sandbox.to_string(),
+                execution_generation: 1,
+                activation_attempt_id: attempt.to_string(),
+            }),
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse()?);
+        let response = client.resolve_block_volume_binding(request).await;
+        if index == 0 {
+            assert!(response?.into_inner().binding.is_none());
+        } else {
+            assert_eq!(response.unwrap_err().code(), Code::PermissionDenied);
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test]

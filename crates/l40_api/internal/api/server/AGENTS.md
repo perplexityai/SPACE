@@ -19,6 +19,12 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
   address matching for missing claims), never by a
   request field alone; one that names a node uses `authenticated_origin_node_id`. Existing exception:
   `TouchArtifactBackup` binds no node.
+- Retained block-volume RPCs also accept TokenReview-established pod-bound node
+  name/UID matched against live worker inventory, because volume-manager's pod
+  IP is not its host's registered IP. Malformed claims or an unknown/stale node
+  UID fail closed without address fallback; callers without reviewed node claims
+  retain registered-address authentication. Execution and EBS host grants still
+  apply after authenticating the node.
 - ClusterApi never creates a node registration. `nodes` and `node_k8s` rows
   come from the cluster controller's Kubernetes node sync, sandbox pod
   placement and Direct admin registration; a request naming an unregistered

@@ -12,6 +12,7 @@ use pplx_space_execution_common::proto::{
     BlockVolumeBinding, BlockVolumeExecution, BlockVolumeFence,
 };
 use pplx_space_execution_spec::GuestDataDrive;
+use pplx_space_rpc_auth::{AuthenticatedNodeIdentity, NodeApiAuthenticatedCaller};
 use pplx_space_sandbox_store::{
     self as sandboxes,
     block_volume::{self as store, BlockVolume, Initialization, VolumePhase},
@@ -21,7 +22,7 @@ use sqlx::{Postgres, Transaction};
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::{ClusterApiService, proto::*};
+use crate::{ClusterApiService, proto::*, template_releases_store::TemplateReadScope};
 
 const HOSTS_ENV: &str = "SPACE_EBS_NODE_BINDINGS";
 
@@ -142,17 +143,56 @@ impl Fence {
 }
 
 impl ClusterApiService {
+    async fn authenticate_block_origin<T>(
+        &self,
+        request: &Request<T>,
+        execution: &Execution,
+    ) -> Result<(), Status> {
+        match request
+            .extensions()
+            .get::<NodeApiAuthenticatedCaller>()
+            .map(NodeApiAuthenticatedCaller::node_identity)
+        {
+            Some(AuthenticatedNodeIdentity::Kubernetes(node)) => {
+                // Volume-manager uses a pod network address. Bind its reviewed
+                // node name AND incarnation to inventory, not that pod IP.
+                let scope = self
+                    .template_releases_store
+                    .node_scope_for_identity(node)
+                    .await
+                    .map_err(database)?;
+                if !matches!(scope, TemplateReadScope::NodeScoped { node_ids } if node_ids.contains(&execution.node))
+                {
+                    return Err(Status::permission_denied(
+                        "reviewed block-volume caller does not own this node incarnation",
+                    ));
+                }
+                self.resolve_origin_node_id(&execution.node.to_string(), Some(NodeRole::Worker))
+                    .await?;
+            }
+            Some(AuthenticatedNodeIdentity::MalformedKubernetesClaims) => {
+                return Err(Status::permission_denied(
+                    "block-volume caller has malformed Kubernetes node claims",
+                ));
+            }
+            _ => {
+                self.authenticated_origin_node_id(
+                    request,
+                    &execution.node.to_string(),
+                    Some(NodeRole::Worker),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn authenticate_block_execution<T>(
         &self,
         request: &Request<T>,
         execution: &Execution,
     ) -> Result<(), Status> {
-        self.authenticated_origin_node_id(
-            request,
-            &execution.node.to_string(),
-            Some(NodeRole::Worker),
-        )
-        .await?;
+        self.authenticate_block_origin(request, execution).await?;
         self.block_volume_hosts.require(execution.node)?;
         Ok(())
     }
@@ -213,12 +253,7 @@ impl ClusterApiService {
         // Every worker resolves this dependency, including workers outside the
         // disk experiment. Authenticate its current execution before revealing
         // absence; require an EBS host grant only when a disk actually exists.
-        self.authenticated_origin_node_id(
-            &request,
-            &execution.node.to_string(),
-            Some(NodeRole::Worker),
-        )
-        .await?;
+        self.authenticate_block_origin(&request, &execution).await?;
         let mut tx = self.lock_current_block_execution(&execution).await?;
         let Some(mut row) = store::get(&mut *tx, execution.sandbox)
             .await
