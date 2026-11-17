@@ -310,9 +310,8 @@ impl SandboxManagerService {
     }
 
     /// Admit and seal the row's recorded encrypted capture, if one needs it.
-    /// Callers must hold the row's lifecycle and cleanup guards across both
-    /// admission and seal; the teardown caller does, and periodic recovery
-    /// calls the two halves under the fences it moves into its task.
+    /// Callers must hold the row's wake, artifact and cleanup guards until
+    /// this returns.
     pub(in crate::service) async fn seal_recorded_encrypted_capture(
         &self,
         sandbox: &crate::db::SandboxRow,
@@ -338,11 +337,11 @@ impl SandboxManagerService {
         Ok(capture.artifact_id)
     }
 
-    /// The admitted capture that still needs a seal, if any: only the admitted
-    /// capture, within its fixed retry window and with runtime evidence
-    /// consistent with the producer's confirmed stop. This is every check
-    /// before the node-manager call, so callers can tell without waiting on a
-    /// seal whether one is needed at all.
+    /// Check whether the admitted suspend attempt has a capture eligible for
+    /// sealing. `None` means no seal may be started, not that publication is
+    /// safe: recovery must still classify missing or contradictory evidence.
+    /// Keep the row's wake, artifact and cleanup guards held from this check
+    /// through `seal_admitted_encrypted_capture`.
     pub(in crate::service) fn recorded_encrypted_capture_to_seal(
         &self,
         sandbox: &crate::db::SandboxRow,

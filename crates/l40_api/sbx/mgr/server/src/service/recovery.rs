@@ -768,11 +768,10 @@ impl SandboxManagerService {
     /// recorded but could not seal. A refused close can take tens of seconds,
     /// so it must not hold up this periodic pass. The task keeps the row's
     /// wake, artifact and cleanup fences until it finishes, so a later pass
-    /// neither starts a second seal nor classifies the row mid-seal. Once the
-    /// seal succeeds, the next pass publishes the staged capture. A task is
-    /// spawned only for a capture that still needs its seal: one holding the
-    /// fences with nothing to seal would race this pass's own classification
-    /// and could keep deferring the publication of a sealed capture.
+    /// neither starts a second seal nor classifies the row mid-seal. Check
+    /// eligibility before spawning: a no-op task would hold these fences and
+    /// could make this pass skip an already-sealed capture. After a seal
+    /// succeeds, the next pass can classify it without that contention.
     pub(super) fn spawn_encrypted_capture_seal(
         &self,
         cache_dir: &Path,

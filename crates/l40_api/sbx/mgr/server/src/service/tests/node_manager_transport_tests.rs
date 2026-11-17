@@ -230,6 +230,24 @@ async fn recover_batch(service: &SandboxManagerService, cache: &Path, id: &str) 
         .expect("the seal task finishes");
 }
 
+fn assert_capture_fences_available(service: &SandboxManagerService, id: &str) {
+    assert!(
+        service.auto_lifecycle.wake_lock(id).try_lock().is_ok(),
+        "a no-op seal must release the wake lock before classification"
+    );
+    assert!(
+        service.auto_lifecycle.artifact_lock(id).try_lock().is_ok(),
+        "a no-op seal must release the artifact lock before classification"
+    );
+    assert!(
+        matches!(
+            service.try_cleanup_fence(id),
+            CleanupLockTryResult::Acquired(_)
+        ),
+        "a no-op seal must release the cleanup fence before classification"
+    );
+}
+
 #[tokio::test]
 async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed() {
     use crate::service::suspend_snapshot_publication as publication;
@@ -364,7 +382,7 @@ async fn expired_encrypted_capture_is_quarantined_without_a_seal_attempt() {
     assert!(staging.exists(), "the unsealed capture must be retained");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn complete_staged_capture_publishes_past_an_older_unsealed_record() {
     let node_manager = sealing_node_manager(0);
     let conn = crate::db::test_conn();
@@ -385,14 +403,10 @@ async fn complete_staged_capture_publishes_past_an_older_unsealed_record() {
             .unwrap(),
         Some(newer),
     );
-    // spawn_encrypted_capture_seal must not hold the row's locks for a capture
-    // with nothing left to seal: a task holding them would make the pass's own
-    // classification skip it.
+    // Do not yield between spawning and checking the fences. On this
+    // current-thread runtime, a no-op task cannot run and mask the regression.
     service.spawn_encrypted_capture_seal(cache.path(), &service.lookup_sandbox(&id).unwrap());
-    assert!(
-        service.auto_lifecycle.wake_lock(&id).try_lock().is_ok(),
-        "no seal task holds a sealed capture's row"
-    );
+    assert_capture_fences_available(&service, &id);
     recover_batch(&service, cache.path(), &id).await;
 
     assert_eq!(
@@ -677,65 +691,99 @@ async fn stats_answers_without_cgroup_figures_when_node_manager_stalls() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn both_seal_entry_points_reject_a_live_runtime_and_ignore_other_attempts() {
-    for case in ["gone", "live", "unknown", "contradiction", "failed"] {
-        let live = case == "live";
-        let may_seal = case == "gone";
-        let node_manager = sealing_node_manager(0);
-        let conn = crate::db::test_conn();
-        let id = SandboxId::new().to_string();
-        let cache = tempfile::tempdir().unwrap();
-        let (_, stale) = record_encrypted_capture(&conn, cache.path(), &id, Duration::ZERO, true);
-        let (current, staging) =
-            record_encrypted_capture_in(cache.path(), &id, Duration::ZERO, true);
-        conn.execute(
-            "UPDATE sandboxes SET suspend_attempt_artifact_id = ?1 WHERE id = ?2",
-            crate::db::fixture::params![current.to_string(), &id],
-        )
-        .unwrap();
-        if matches!(case, "contradiction" | "failed") {
-            std::fs::copy(
-                staging.join(pplx_space_node_mgr_client::capture_receipt::COMMITTED),
-                staging.join(if case == "failed" {
-                    pplx_space_node_mgr_client::capture_receipt::FAILED
-                } else {
-                    pplx_space_node_mgr_client::capture_receipt::REFUSED
-                }),
+    for periodic_recovery in [false, true] {
+        for case in ["gone", "live", "unknown", "contradiction", "failed"] {
+            let live = case == "live";
+            let may_seal = case == "gone";
+            let node_manager = sealing_node_manager(0);
+            let conn = crate::db::test_conn();
+            let id = SandboxId::new().to_string();
+            let cache = tempfile::tempdir().unwrap();
+            let (_, stale) =
+                record_encrypted_capture(&conn, cache.path(), &id, Duration::ZERO, true);
+            let (current, staging) =
+                record_encrypted_capture_in(cache.path(), &id, Duration::ZERO, true);
+            conn.execute(
+                "UPDATE sandboxes SET suspend_attempt_artifact_id = ?1 WHERE id = ?2",
+                crate::db::fixture::params![current.to_string(), &id],
             )
             .unwrap();
+            if matches!(case, "contradiction" | "failed") {
+                std::fs::copy(
+                    staging.join(pplx_space_node_mgr_client::capture_receipt::COMMITTED),
+                    staging.join(if case == "failed" {
+                        pplx_space_node_mgr_client::capture_receipt::FAILED
+                    } else {
+                        pplx_space_node_mgr_client::capture_receipt::REFUSED
+                    }),
+                )
+                .unwrap();
+            }
+            let service = SandboxManagerService::new_with_options(
+                conn,
+                SandboxManagerServiceOptions {
+                    node_manager: node_manager.connector(),
+                    sandbox_runtime_live: Arc::new(move |_| live),
+                    capture_runtime_probe: (case == "unknown").then(|| {
+                        Arc::new(|_: &str| {
+                            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                        }) as crate::service::RuntimeLivenessProbe
+                    }),
+                    ..SandboxManagerServiceOptions::for_test_in(cache.path())
+                },
+            );
+            let row = service.lookup_sandbox(&id).unwrap();
+            if periodic_recovery {
+                service.spawn_encrypted_capture_seal(cache.path(), &row);
+                if !may_seal {
+                    // A rejected capture must not block classification, even
+                    // before any spawned task has a chance to run.
+                    assert_capture_fences_available(&service, &id);
+                }
+                let wake = service.auto_lifecycle.wake_lock(&id);
+                tokio::time::timeout(Duration::from_secs(10), wake.lock())
+                    .await
+                    .expect("the admitted seal task finishes");
+            } else {
+                let _wake = service
+                    .auto_lifecycle
+                    .wake_lock(&id)
+                    .try_lock_owned()
+                    .unwrap();
+                let _artifact = service
+                    .auto_lifecycle
+                    .artifact_lock(&id)
+                    .try_lock_owned()
+                    .unwrap();
+                let CleanupLockTryResult::Acquired(_cleanup) = service.try_cleanup_fence(&id)
+                else {
+                    panic!("the teardown caller must hold the cleanup fence");
+                };
+                let result = service
+                    .seal_recorded_encrypted_capture(&row, cache.path())
+                    .await
+                    .unwrap();
+                assert_eq!(result, may_seal.then_some(current));
+            }
+            assert_eq!(
+                node_manager.calls().len(),
+                usize::from(may_seal),
+                "case={case}, periodic_recovery={periodic_recovery}"
+            );
+            assert!(
+                stale
+                    .join(pplx_space_node_mgr_client::capture_receipt::COMMITTED)
+                    .exists()
+            );
+            assert_eq!(
+                staging
+                    .join(pplx_space_node_mgr_client::capture_receipt::COMMITTED)
+                    .exists(),
+                !may_seal
+            );
         }
-        let service = SandboxManagerService::new_with_options(
-            conn,
-            SandboxManagerServiceOptions {
-                node_manager: node_manager.connector(),
-                sandbox_runtime_live: Arc::new(move |_| live),
-                capture_runtime_probe: (case == "unknown").then(|| {
-                    Arc::new(|_: &str| {
-                        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
-                    }) as crate::service::RuntimeLivenessProbe
-                }),
-                ..SandboxManagerServiceOptions::for_test_in(cache.path())
-            },
-        );
-        // Periodic and teardown recovery share this guarded entry point.
-        let result = service
-            .seal_recorded_encrypted_capture(&service.lookup_sandbox(&id).unwrap(), cache.path())
-            .await
-            .unwrap();
-        assert_eq!(result, may_seal.then_some(current));
-        assert_eq!(node_manager.calls().len(), usize::from(may_seal));
-        assert!(
-            stale
-                .join(pplx_space_node_mgr_client::capture_receipt::COMMITTED)
-                .exists()
-        );
-        assert_eq!(
-            staging
-                .join(pplx_space_node_mgr_client::capture_receipt::COMMITTED)
-                .exists(),
-            !may_seal
-        );
     }
 }
 
