@@ -260,8 +260,9 @@ migration' describes. One from before #1277 doesn't list that version and
 refuses a database that records it. If
 `sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` prints
 `20261031050126`, stop template-manager, keep the newer one from restarting
-until the older one starts, and run `space-db-migrator template-manager down`
-once, with a migrator from #1235 on such as the newer release's, before
+until the older one starts, and run
+`space-db-migrator template-manager --database-path <db> down` once, with a
+migrator from #1235 on such as the newer release's, before
 starting the older one; it reverts only that migration. `docs/execution-environments.md` describes the
 steps. A release that bundles it applies it normally and never reverses it.
 
