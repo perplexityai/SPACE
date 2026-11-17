@@ -341,27 +341,96 @@ async fn a_body_too_large_to_check_first_is_authorized_before_it_is_read() {
         return;
     }
     let harness = Harness::start().await;
+    let unauthorized = br#"{"code":"unauthorized","message":"invalid API key","request_id":"req_1","retryable":false,"details":[]}"#;
+    let stat_body = json!({"path": "/workspace/a.txt"}).to_string();
     // Valid, and one byte over the bound once padded.
-    let mut padded = json!({"path": "/workspace/a.txt"}).to_string();
+    let mut padded = stat_body.clone();
     padded.insert_str(1, &" ".repeat(16 * 1024 + 1 - padded.len()));
-    let over_the_bound = Request::post(harness.path("stat"))
-        .header(header::AUTHORIZATION, CLIENT_KEY)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(padded))
-        .unwrap();
-    // A client that waits for `100 Continue` has not sent its body yet.
-    let mut waits_to_send = stat(&harness);
-    waits_to_send
-        .headers_mut()
-        .insert(header::EXPECT, "100-continue".parse().unwrap());
-    for request in [over_the_bound, waits_to_send] {
+    // Each body declares its exact size, as one with a `Content-Length` does:
+    // one past the bound, and one within it from a client that waits for
+    // `100 Continue` before it sends it.
+    let request = |body: &str, waits_to_send: bool, read: &Arc<AtomicBool>| {
+        let mut request = Request::post(harness.path("stat"))
+            .header(header::AUTHORIZATION, CLIENT_KEY)
+            .header(header::CONTENT_TYPE, "application/json");
+        if waits_to_send {
+            request = request.header(header::EXPECT, "100-continue");
+        }
+        request.body(sized_watched_body(body, read)).unwrap()
+    };
+    for (body, waits_to_send) in [(padded.as_str(), false), (stat_body.as_str(), true)] {
+        // Refused from its headers, before anything read its body.
+        harness.api.authorize(Answer::Refuse(rendered(
+            401,
+            &[("content-type", "application/json")],
+            unauthorized,
+        )));
+        let read = Arc::new(AtomicBool::new(false));
+        let response = harness.send(request(body, waits_to_send, &read)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{waits_to_send}"
+        );
+        assert!(!read.load(Ordering::SeqCst), "{waits_to_send}");
+
+        // Authorized, it is read and answered.
         harness.worker.reply(Reply::Stat(Ok(StatResponse {
             info: Some(file_info("/workspace/a.txt", 5)),
         })));
-        assert_eq!(harness.send(request).await.status(), StatusCode::OK);
+        let read = Arc::new(AtomicBool::new(false));
+        let response = harness.send(request(body, waits_to_send, &read)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{waits_to_send}");
+        assert!(read.load(Ordering::SeqCst), "{waits_to_send}");
     }
     let asked: Vec<_> = harness.api.calls().iter().map(|call| call.rpc).collect();
-    assert_eq!(asked, ["authorize", "prepare", "authorize", "prepare"]);
+    assert_eq!(
+        asked,
+        [
+            "authorize",
+            "authorize",
+            "prepare",
+            "authorize",
+            "authorize",
+            "prepare"
+        ]
+    );
+}
+
+/// `bytes` as a body that declares its exact size and records whether
+/// anything read it.
+fn sized_watched_body(bytes: &str, read: &Arc<AtomicBool>) -> Body {
+    struct SizedWatched {
+        bytes: Option<Bytes>,
+        len: u64,
+        read: Arc<AtomicBool>,
+    }
+    impl http_body::Body for SizedWatched {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            self.read.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(
+                self.bytes
+                    .take()
+                    .map(|bytes| Ok(http_body::Frame::data(bytes))),
+            )
+        }
+
+        fn size_hint(&self) -> http_body::SizeHint {
+            http_body::SizeHint::with_exact(self.len)
+        }
+    }
+    let bytes = Bytes::copy_from_slice(bytes.as_bytes());
+    Body::new(SizedWatched {
+        len: bytes.len() as u64,
+        bytes: Some(bytes),
+        read: Arc::clone(read),
+    })
 }
 
 /// A body that records whether anything read it.
