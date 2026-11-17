@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod artifact;
+pub mod block_volumes;
 mod btrfs_push;
 mod codec_admission;
 pub mod credentials;

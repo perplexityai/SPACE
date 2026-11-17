@@ -1597,6 +1597,7 @@ fn create_request(
     requested_timeout: ForkSandboxLifetimeSeconds,
 ) -> CreateSandboxRequest {
     CreateSandboxRequest {
+        volume_mounts: Vec::new(),
         name: None,
         template: Some(config.template.clone()),
         runtime: config.runtime.clone(),

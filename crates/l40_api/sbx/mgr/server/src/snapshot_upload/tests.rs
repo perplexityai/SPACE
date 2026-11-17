@@ -70,6 +70,7 @@ fn fixture_meta(rootfs_diff_format: Option<&str>) -> SnapshotMeta {
         local_artifact_id: None,
         artifact_kind: None,
         artifact_origin: None,
+        retained_live_disk_v1: None,
         artifact_snapshot_name: None,
     }
 }

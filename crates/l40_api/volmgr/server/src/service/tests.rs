@@ -160,6 +160,7 @@ async fn test_service(temp: &tempfile::TempDir) -> VolumeManagerService {
         db_path.to_str().expect("utf8 db path"),
         temp.path().join("staging"),
         VolumeManagerServiceConfig {
+            block_volume_authority: None,
             push_concurrency: 1,
             pull_concurrency: 1,
             pull_priority_bands: Vec::new(),

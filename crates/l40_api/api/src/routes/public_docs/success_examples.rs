@@ -20,6 +20,7 @@ pub(super) fn insert_success_examples(spec: &mut Value) {
     let created_at = OffsetDateTime::from_unix_timestamp(1_790_596_800)
         .expect("fixed example timestamp is valid");
     let sandbox = PublicSandbox {
+        volume_mounts: Vec::new(),
         id: sandbox_id,
         name: Some("example-sandbox".to_owned()),
         state: SandboxLifecycleState::Running,

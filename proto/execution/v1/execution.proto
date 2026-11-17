@@ -4,6 +4,34 @@ package space.execution.v1;
 
 option go_package = "github.com/perplexityai/SPACE/shim/proto/execution/v1;executionv1";
 
+// A control-plane activation, distinct from node-manager's local execution fence.
+message BlockVolumeExecution {
+  string node_id = 1;
+  string sandbox_id = 2;
+  uint64 execution_generation = 3;
+  string activation_attempt_id = 4;
+}
+
+message BlockVolumeFence {
+  BlockVolumeExecution execution = 1;
+  string volume_id = 2;
+  uint64 attachment_epoch = 3;
+}
+
+// No caller-supplied host paths. The privileged node pins the EBS device by
+// its AWS serial and reconstructs the fixed data0 topology.
+message BlockVolumeBinding {
+  BlockVolumeFence fence = 1;
+  string aws_volume_id = 2;
+  string filesystem_uuid = 3;
+  string mount = 4;
+  bool read_only = 5;
+  uint64 disk_generation = 6;
+  bool initialization_ready = 7;
+  optional string initialization_claim = 8;
+  uint32 topology_version = 9;
+}
+
 enum RuntimeKind {
   RUNTIME_KIND_UNSPECIFIED = 0;
   RUNTIME_KIND_FIRECRACKER = 1;

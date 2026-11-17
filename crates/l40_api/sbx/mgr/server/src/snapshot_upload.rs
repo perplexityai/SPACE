@@ -125,6 +125,9 @@ impl SnapshotUploadConfig {
 /// "stale snapshot" warnings when the underlying template build advances.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotMeta {
+    /// Versioned dependency on a mutable disk, never an immutable EBS snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_live_disk_v1: Option<crate::service::block_volumes::RetainedLiveDisk>,
     /// Schema version — increment when adding required fields.
     pub version: u32,
     /// Version 2 execution metadata. Version 1 snapshots derive this from

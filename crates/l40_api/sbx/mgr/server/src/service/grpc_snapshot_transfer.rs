@@ -85,6 +85,7 @@ impl SandboxManagerService {
         request: Request<ExportSnapshotRequest>,
     ) -> Result<Response<SbxExportSnapshotStream>, Status> {
         self.authorize_peer(&request, "ExportSnapshot", ALLOW_LOCAL_ARTIFACT_OPERATOR)?;
+        self.refuse_retained_disk_operation(&request.get_ref().sandbox_id)?;
         let req = request.into_inner();
         let pinned = self.lookup_sandbox(&req.sandbox_id)?;
         let early_base = super::grpc_sandbox_transfer::EarlyDeltaBase::look_up(

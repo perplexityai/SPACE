@@ -1173,12 +1173,13 @@ fn cleanup_runtime_artifacts(sandbox_id: &str) -> Result<Vec<String>, JailCleanu
     Ok(actions)
 }
 
-pub(super) const JAIL_BIND_NAMES: [&str; 5] = [
+pub(super) const JAIL_BIND_NAMES: [&str; 6] = [
     "rootfs.ext4",
     "memory",
     super::snapshots::ENC_SNAPSHOT_JAIL_SUBDIR,
     "state/encsnap",
     "state",
+    "block-volumes/data0",
 ];
 
 #[derive(Debug, thiserror::Error)]

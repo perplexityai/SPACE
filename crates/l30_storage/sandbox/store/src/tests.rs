@@ -115,6 +115,7 @@ fn proves_no_execution_only_for_kubernetes_rows() {
         (SubstrateKind::Space, false),
     ] {
         let execution = AutoLifecycleExecution {
+            activation_attempt_id: None,
             managed_by,
             lifecycle: "started".to_owned(),
             placement: "unplaced".to_owned(),

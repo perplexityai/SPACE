@@ -119,6 +119,7 @@ impl QueryTransport for ReqwestTransport {
 pub(crate) enum AwsQueryService {
     Ec2,
     AutoScaling,
+    Sts,
 }
 
 impl AwsQueryService {
@@ -126,6 +127,7 @@ impl AwsQueryService {
         match self {
             Self::Ec2 => "ec2",
             Self::AutoScaling => "autoscaling",
+            Self::Sts => "sts",
         }
     }
 
@@ -139,6 +141,7 @@ impl AwsQueryService {
         match self {
             Self::Ec2 => "EC2",
             Self::AutoScaling => "Auto Scaling",
+            Self::Sts => "STS",
         }
     }
 }

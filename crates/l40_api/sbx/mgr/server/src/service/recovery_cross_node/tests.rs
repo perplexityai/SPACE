@@ -461,6 +461,7 @@ fn disk_artifact_meta() -> (
             local_artifact_id: Some(LocalArtifactId::new()),
             artifact_kind: Some(pplx_space_common_core::types::ArtifactKind::Disk),
             artifact_origin: Some(pplx_space_common_core::types::ArtifactOrigin::Snapshot),
+            retained_live_disk_v1: None,
             artifact_snapshot_name: Some(capture_name.clone()),
         },
         capture_name,

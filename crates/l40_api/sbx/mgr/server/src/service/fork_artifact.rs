@@ -303,6 +303,11 @@ where
         .map_err(|error| Status::internal(format!("read fork metadata: {error}")))?;
     let metadata: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&metadata_bytes)
         .map_err(|error| Status::failed_precondition(format!("parse fork metadata: {error}")))?;
+    if metadata.retained_live_disk_v1.is_some() {
+        return Err(Status::failed_precondition(
+            "a retained live disk cannot be forked",
+        ));
+    }
     if metadata.sandbox_id != source_sandbox_id.to_string() {
         return Err(Status::failed_precondition(
             "snapshot metadata belongs to a different source sandbox",

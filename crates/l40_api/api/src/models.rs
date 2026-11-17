@@ -637,6 +637,8 @@ pub struct UpdateUserRoleRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateSandboxRequest {
+    #[serde(default)]
+    pub volume_mounts: Vec<pplx_space_execution_spec::BlockVolumeMount>,
     pub name: Option<String>,
     pub template: Option<TemplateReference>,
     pub runtime: Option<String>,

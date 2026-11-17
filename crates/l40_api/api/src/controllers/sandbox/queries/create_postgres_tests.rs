@@ -627,6 +627,7 @@ fn pooled_create_request(
     network_policy: Option<NetworkPolicyV1>,
 ) -> CreateSandboxRequest {
     CreateSandboxRequest {
+        volume_mounts: Vec::new(),
         name: Some(name.to_string()),
         template: None,
         runtime: Some("fc".to_string()),

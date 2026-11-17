@@ -939,6 +939,8 @@ pub struct AdmitForkOperation<'a> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdmitForkOperationError {
+    #[error("fork is unsupported for a sandbox with a retained live disk")]
+    RetainedDiskUnsupported,
     #[error("failed to serialize fork operation state: {0}")]
     Serialize(#[from] serde_json::Error),
     #[error("generated fork request fingerprint is invalid: {0}")]
@@ -966,6 +968,12 @@ pub async fn admit_locked_fork_operation(
     input: AdmitForkOperation<'_>,
 ) -> Result<CreatePublicOperationResult, AdmitForkOperationError> {
     let prepared = prepare_fork_operation(&input)?;
+    if admission
+        .sandbox_has_retained_disk(input.source_sandbox_id)
+        .await?
+    {
+        return Err(AdmitForkOperationError::RetainedDiskUnsupported);
+    }
     if matches!(
         admission.observation(),
         crate::public_operations::ObservePublicOperationIdempotency::Missing

@@ -99,6 +99,13 @@ struct Key<'v> {
 }
 
 impl SandboxView<'_> {
+    pub fn has_retained_block_volume(&self) -> Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM retained_block_sandboxes WHERE sandbox_id = ?1)",
+            params![self.id],
+            |row| row.get(0),
+        )
+    }
     fn key(&self) -> Key<'_> {
         Key {
             conn: self.conn,

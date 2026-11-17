@@ -1521,6 +1521,7 @@ async fn seed_template_release(pool: &PgPool) -> Result<(), sqlx::Error> {
 
 fn public_create_request() -> pplx_space_public_api::CreateSandboxRequest {
     pplx_space_public_api::CreateSandboxRequest {
+        volume_mounts: Vec::new(),
         template: "seed:latest".parse::<TemplateReference>().unwrap(),
         runtime: Some(RuntimeKind::Firecracker),
         name: Some("native-create".to_string()),

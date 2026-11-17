@@ -788,6 +788,7 @@ impl SandboxManagerService {
     ) -> Result<Response<CloneFromDonorResponse>, Status> {
         let peer =
             self.authorize_peer(&request, "CloneFromDonor", ALLOW_SANDBOX_ADMIN_OR_TMPLMGR)?;
+        self.refuse_retained_disk_operation(&request.get_ref().donor_sandbox_id)?;
         // Bound connect and capability lookup together. Reuse this channel for
         // creation; never cache capability across a node-manager reconnect.
         let mut node_client = tokio::time::timeout(Duration::from_secs(5), async {

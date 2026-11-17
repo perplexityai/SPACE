@@ -70,8 +70,47 @@ pub(crate) fn optional_incubating_string(generator: &mut SchemaGenerator) -> Sch
     incubating(Option::<String>::json_schema(generator))
 }
 
+pub(crate) fn block_volume_mounts(_: &mut SchemaGenerator) -> Schema {
+    incubating(schemars::json_schema!({
+        "type": "array",
+        "maxItems": 1,
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "size_gib", "permissions", "mount"],
+            "properties": {
+                "type": {"type": "string", "enum": ["ebs"]},
+                "size_gib": {"type": "integer", "minimum": 128, "maximum": 128},
+                "permissions": {"type": "string", "enum": ["read_write", "read_only"]},
+                "mount": {"type": "string", "minLength": 2, "maxLength": 4095,
+                    "description": "Absolute canonical guest path outside reserved system directories. Must be empty and symlink-free."}
+            }
+        }
+    }))
+}
+
 pub(crate) fn optional_incubating_idle_action(generator: &mut SchemaGenerator) -> Schema {
     incubating(Option::<crate::SandboxIdleAction>::json_schema(generator))
+}
+
+pub(crate) fn block_volume_status(generator: &mut SchemaGenerator) -> Schema {
+    let state = generator.subschema_for::<crate::SandboxBlockVolumeState>();
+    incubating(schemars::json_schema!({
+        "type": "array",
+        "maxItems": 1,
+        "items": {
+            "type": "object",
+            "required": ["volume_id", "type", "size_gib", "permissions", "mount", "state"],
+            "properties": {
+                "volume_id": {"type": "string", "format": "uuid"},
+                "type": {"type": "string", "enum": ["ebs"]},
+                "size_gib": {"type": "integer", "minimum": 128, "maximum": 128},
+                "permissions": {"type": "string", "enum": ["read_write", "read_only"]},
+                "mount": {"type": "string"},
+                "state": state
+            }
+        }
+    }))
 }
 
 pub(crate) fn optional_incubating_idle_action_input(generator: &mut SchemaGenerator) -> Schema {

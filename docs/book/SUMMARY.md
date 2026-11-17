@@ -15,6 +15,7 @@
   - [Troubleshooting](troubleshooting.md)
   - [Upgrading spaced](spaced-upgrades.md)
   - [Warm pools](warm-pools.md)
+  - [Retained block-volume experiment](retained-block-volumes.md)
   - [Base snapshots](base-snapshots.md)
   - [Internal RPC TLS](internal-rpc-tls.md)
   - [TLS interception exemptions](tls-interception-exemptions.md)

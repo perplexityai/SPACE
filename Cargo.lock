@@ -5257,10 +5257,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aws-config",
+ "aws-credential-types",
  "aws-smithy-types",
  "axum",
  "bytes",
  "dashmap",
+ "form_urlencoded",
  "futures-util",
  "http-body-util",
  "jiff",
@@ -6868,9 +6870,11 @@ dependencies = [
  "pplx-space-local-health",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
+ "pplx-space-node-api-client",
  "pplx-space-node-ctl-client",
  "pplx-space-node-disk-admission",
  "pplx-space-node-mgr-client",
+ "pplx-space-node-mgr-store",
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
  "pplx-space-service-lifecycle",
@@ -6880,6 +6884,8 @@ dependencies = [
  "pplx-space-test-hooks",
  "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-bind",
+ "pplx-space-volmgr-client",
+ "prost",
  "reqwest 0.13.5",
  "rstest",
  "rtnetlink",
@@ -6949,6 +6955,13 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "pplx-space-node-mgr-store"
+version = "0.8.2"
+dependencies = [
+ "rusqlite",
 ]
 
 [[package]]
@@ -8637,6 +8650,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-jobs",
  "pplx-space-credmgr-client",
+ "pplx-space-execution-common",
  "pplx-space-file-io",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
@@ -8644,6 +8658,7 @@ dependencies = [
  "pplx-space-host-linux",
  "pplx-space-local-health",
  "pplx-space-metrics-emit",
+ "pplx-space-node-api-client",
  "pplx-space-node-disk-admission",
  "pplx-space-node-mgr-client",
  "pplx-space-object-store",
@@ -8701,6 +8716,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
  "pplx-space-host-layout",
+ "pplx-space-node-api-client",
  "prost",
  "serde",
  "serde_json",

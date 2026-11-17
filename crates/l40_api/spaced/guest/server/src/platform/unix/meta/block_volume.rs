@@ -12,7 +12,7 @@ use {
         fs::File,
         os::unix::{
             ffi::OsStringExt,
-            fs::{FileExt, FileTypeExt, MetadataExt},
+            fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt},
         },
         path::PathBuf,
     },
@@ -116,7 +116,17 @@ pub(super) fn mount_data_drive(request: MountDataDriveRequest) -> Result<(), Sta
             "mounted guest data device mismatch",
         ));
     }
-    verify_permissions(&mounted, request.read_only)
+    verify_permissions(&mounted, request.read_only)?;
+    if !request.read_only {
+        // A fresh ext4 root belongs to root. The sandbox's ordinary user must
+        // be able to use its disk without any host filesystem traversal.
+        mounted
+            .set_permissions(std::fs::Permissions::from_mode(0o777))
+            .map_err(|error| {
+                Status::internal(format!("initialize data directory permissions: {error}"))
+            })?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

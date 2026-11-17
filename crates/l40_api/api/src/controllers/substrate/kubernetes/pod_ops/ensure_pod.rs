@@ -1172,6 +1172,7 @@ impl KubernetesSubstrate {
         mark_pod_may_exist(&mut live);
         let pod_result = create_sandbox_pod(
             &self.k8s,
+            self.store.pool(),
             self.sandbox_pod_request(
                 &sandbox,
                 &claim.row,

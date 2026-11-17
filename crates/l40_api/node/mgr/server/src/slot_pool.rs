@@ -2046,6 +2046,7 @@ fn retire_stale_pod_namespace_lease(
     Ok(record.info.slot)
 }
 
+mod block_volumes;
 #[cfg(test)]
 mod claim_contention_tests;
 mod db;

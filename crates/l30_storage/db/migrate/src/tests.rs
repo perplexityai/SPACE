@@ -23,11 +23,20 @@ async fn suspend_attempt_rollback_preserves_ownership_and_migration_history() {
     let path = directory.path().join("sandbox.sqlite");
     let database = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
     migrate_sqlite_up(database, &path).await.unwrap();
-    // Step back past the newer legacy_state restore first: the property is
-    // about suspend_attempt's own down migration.
-    rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
-        .await
-        .unwrap();
+    // Exercise suspend_attempt's down migration, not whichever migration is
+    // newest when this regression test runs.
+    let after_suspend_attempt = pplx_space_sbx_mgr_store::db::migration::target()
+        .service
+        .iter()
+        .filter(|migration| {
+            migration.migration_type.is_up_migration() && migration.version > 20261112160000
+        })
+        .count();
+    for _ in 0..after_suspend_attempt {
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    }
     let conn = Connection::open(&path).unwrap();
     conn.execute(
         "INSERT INTO sandboxes (id, uuid8, state, template, created_at, updated_at,

@@ -736,6 +736,7 @@ impl NodeManagerService {
 /// Validate sandbox_id is a safe UUID-like string (prevents path traversal).
 mod adapter;
 mod artifact_fs;
+mod block_volumes;
 pub mod btrfs_balance;
 mod btrfs_delegation;
 mod btrfs_send_source;

@@ -343,6 +343,9 @@ fn fork_internal_error(context: &'static str, error: impl std::fmt::Display) -> 
 /// gets the deduped answer. Reporting it as a 500 tells the SDK not to bother.
 fn fork_admission_error(context: &'static str, error: AdmitForkOperationError) -> E2bApiError {
     match error {
+        AdmitForkOperationError::RetainedDiskUnsupported => {
+            E2bApiError::bad_request("fork is unsupported for a sandbox with a retained live disk")
+        }
         AdmitForkOperationError::Store(store) => fork_store_error(context, store),
         other => fork_internal_error(context, other),
     }

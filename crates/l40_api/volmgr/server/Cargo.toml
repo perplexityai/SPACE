@@ -62,6 +62,8 @@ pplx-space-object-store = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
+pplx-space-node-api-client = { workspace = true }
+pplx-space-execution-common = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 tempfile = { workspace = true }
 

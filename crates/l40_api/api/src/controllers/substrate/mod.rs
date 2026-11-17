@@ -1146,6 +1146,11 @@ pub enum NodeAddressing {
 /// a [`SubstrateAdapter`] method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubstrateCapabilities {
+    /// A placed execution's generation and activation attempt are durable in
+    /// the control plane before its node may launch the runtime. Node-bound
+    /// resource grants can therefore authenticate initial launch as well as
+    /// subsequent activations. Direct currently persists launch receipts later.
+    pub publishes_execution_identity_before_launch: bool,
     /// Every restore-shaped wake (from `suspended` or `restoring`) claims
     /// `restoring` before its node call and leaves `restoring -> started` to
     /// the caller's completion CAS. The caller can then treat a `suspended`
@@ -1217,6 +1222,7 @@ pub struct SubstrateCapabilities {
 
 impl SubstrateCapabilities {
     pub const DIRECT: Self = Self {
+        publishes_execution_identity_before_launch: false,
         caller_completes_claimed_restore: false,
         start_of_suspended_claims_restoring: false,
         node_addressing: NodeAddressing::DirectEndpoint,
@@ -1229,6 +1235,7 @@ impl SubstrateCapabilities {
     };
 
     pub const KUBERNETES: Self = Self {
+        publishes_execution_identity_before_launch: true,
         caller_completes_claimed_restore: true,
         start_of_suspended_claims_restoring: true,
         node_addressing: NodeAddressing::SubstrateNodeId,

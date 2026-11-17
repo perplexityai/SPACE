@@ -363,7 +363,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // From here until the response, the apiserver may accept a pod this
         // call never learns, so the guard keeps the claim that names it.
         cancel_guard.begin_pod_create();
-        let pod = match create_sandbox_pod(&self.k8s, pod_request)
+        let pod = match create_sandbox_pod(&self.k8s, self.store.pool(), pod_request)
             .instrument(tracing::info_span!(
                 "substrate.k8s.create_pod",
                 sandbox_id = %sandbox_id,

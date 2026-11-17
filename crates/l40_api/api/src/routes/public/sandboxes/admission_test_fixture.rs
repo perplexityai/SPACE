@@ -180,6 +180,7 @@ impl AdmissionPoolFixture {
     /// A default-shape native create of the fixture template.
     pub(crate) fn request(&self) -> CreateSandboxRequest {
         CreateSandboxRequest {
+            volume_mounts: Vec::new(),
             template: format!("{TEMPLATE}:latest")
                 .parse()
                 .expect("fixture template reference parses"),

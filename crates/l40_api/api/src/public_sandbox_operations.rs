@@ -958,10 +958,11 @@ pub(crate) fn controller_create_request(
             disk_mib: None,
         });
     ControllerCreateSandboxRequest {
+        boot_mode: (!request.volume_mounts.is_empty()).then(|| "cold".to_owned()),
+        volume_mounts: request.volume_mounts,
         name: request.name,
         template: Some(request.template),
         runtime: request.runtime.map(|runtime| runtime.alias().to_string()),
-        boot_mode: None,
         env: request.env,
         metadata: controller_metadata(request.metadata),
         vcpu: resources.vcpu,

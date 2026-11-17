@@ -367,6 +367,7 @@ fn public_sandbox_failure_code_has_an_exact_nullable_wire_shape() {
     );
     let timestamp = time::OffsetDateTime::from_unix_timestamp(0).unwrap();
     let mut sandbox = PublicSandbox {
+        volume_mounts: Vec::new(),
         id: sandbox_id,
         name: None,
         state: SandboxLifecycleState::Failed,
@@ -418,6 +419,33 @@ fn public_sandbox_failure_code_has_an_exact_nullable_wire_shape() {
     for field in ["expires_at", "idle_timeout", "idle_action"] {
         serialized.as_object_mut().unwrap().remove(field);
     }
+    assert_eq!(
+        serde_json::from_value::<PublicSandbox>(serialized).unwrap(),
+        sandbox
+    );
+    let mount: PublicSandboxVolumeMount = serde_json::from_value(serde_json::json!({
+        "volume_id": "019d0000-0000-7000-8000-000000000002",
+        "type": "ebs",
+        "size_gib": 128,
+        "permissions": "read_write",
+        "mount": "/data",
+        "state": "future_resource_state"
+    }))
+    .unwrap();
+    assert_eq!(mount.state.as_str(), "future_resource_state");
+    sandbox.volume_mounts.push(mount);
+    let serialized = serde_json::to_value(&sandbox).unwrap();
+    assert_eq!(
+        serialized["volume_mounts"][0],
+        serde_json::json!({
+            "volume_id": "019d0000-0000-7000-8000-000000000002",
+            "type": "ebs",
+            "size_gib": 128,
+            "permissions": "read_write",
+            "mount": "/data",
+            "state": "future_resource_state"
+        })
+    );
     assert_eq!(
         serde_json::from_value::<PublicSandbox>(serialized).unwrap(),
         sandbox

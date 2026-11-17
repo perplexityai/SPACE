@@ -1,3 +1,4 @@
+mod block_volumes;
 mod prefetch_catalog;
 pub(crate) mod queued_ref;
 mod reconcile_claim_origins;

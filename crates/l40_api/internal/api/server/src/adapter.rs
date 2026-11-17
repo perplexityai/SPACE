@@ -148,6 +148,42 @@ impl ClusterApiService {
 
 #[tonic::async_trait]
 impl ClusterApi for ClusterApiService {
+    async fn resolve_block_volume_binding(
+        &self,
+        request: Request<crate::proto::ResolveBlockVolumeBindingRequest>,
+    ) -> Result<Response<crate::proto::ResolveBlockVolumeBindingResponse>, Status> {
+        ClusterApiService::resolve_block_volume_binding(self, request).await
+    }
+    async fn claim_block_volume_initialization(
+        &self,
+        request: Request<crate::proto::ClaimBlockVolumeInitializationRequest>,
+    ) -> Result<Response<crate::proto::ClaimBlockVolumeInitializationResponse>, Status> {
+        ClusterApiService::claim_block_volume_initialization(self, request).await
+    }
+    async fn complete_block_volume_initialization(
+        &self,
+        request: Request<crate::proto::CompleteBlockVolumeInitializationRequest>,
+    ) -> Result<Response<crate::proto::BlockVolumeProgressResponse>, Status> {
+        ClusterApiService::complete_block_volume_initialization(self, request).await
+    }
+    async fn activate_block_volume(
+        &self,
+        request: Request<crate::proto::ActivateBlockVolumeRequest>,
+    ) -> Result<Response<crate::proto::BlockVolumeProgressResponse>, Status> {
+        ClusterApiService::activate_block_volume(self, request).await
+    }
+    async fn publish_block_volume_checkpoint(
+        &self,
+        request: Request<crate::proto::PublishBlockVolumeCheckpointRequest>,
+    ) -> Result<Response<crate::proto::BlockVolumeProgressResponse>, Status> {
+        ClusterApiService::publish_block_volume_checkpoint(self, request).await
+    }
+    async fn release_block_volume_binding(
+        &self,
+        request: Request<crate::proto::ReleaseBlockVolumeBindingRequest>,
+    ) -> Result<Response<crate::proto::BlockVolumeProgressResponse>, Status> {
+        ClusterApiService::release_block_volume_binding(self, request).await
+    }
     async fn create_system_template_publication_grant(
         &self,
         request: Request<CreateSystemTemplatePublicationGrantRequest>,

@@ -1290,6 +1290,34 @@ impl SandboxController {
         // It gates the pool bypass below, lands on the control-plane row, and
         // rides the substrate create to the node row.
         let org_byok = org_byok_enabled(pool, create_owner.org_id).await?;
+        let block_volume_admission = crate::block_volumes::admit(
+            &pplx_space_env_vars::ProcessEnvironment,
+            &req.volume_mounts,
+            create_owner.org_id,
+            runtime,
+            org_byok,
+        )?;
+        if block_volume_admission.is_some() {
+            if !self
+                .substrate
+                .capabilities()
+                .publishes_execution_identity_before_launch
+            {
+                return Err(crate::controllers::substrate::SubstrateError::Unsupported {
+                    message: "block-volume grants require durable pre-launch execution identity"
+                        .to_owned(),
+                }
+                .into());
+            }
+            if boot_mode != CreateBootMode::Cold
+                || restore_from.is_some()
+                || federated_owner.is_some()
+            {
+                return Err(ControllerError::bad_request(
+                    "block volumes require a native cold create, without a fork or federated owner",
+                ));
+            }
+        }
         let encryption_required = org_byok && byok_volume_encryption_engaged();
         let volume_encryption = match fork_volume_encryption {
             Some(frozen) => {
@@ -1375,9 +1403,10 @@ impl SandboxController {
                 return Ok(response);
             }
             skip_pool_reserved_generation = true;
-        } else if let Some(observation) =
-            pool_bypass_observation(placement_requested, restore_from.is_some())
-        {
+        } else if let Some(observation) = pool_bypass_observation(
+            placement_requested || block_volume_admission.is_some(),
+            restore_from.is_some(),
+        ) {
             create_path.set_observation(observation);
         } else {
             let PoolCreateResult {
@@ -1468,8 +1497,11 @@ impl SandboxController {
         };
         match (federated_owner, federated_service_grant) {
             (None, None) => {
+                let mut tx = pool.begin().await.map_err(|error| {
+                    db_contention_error("failed to begin sandbox create transaction", &error)
+                })?;
                 pplx_space_sandbox_store::insert_unplaced(
-                    pool,
+                    &mut *tx,
                     &insert,
                     volume_encryption,
                     restore_operation_id.map(|operation_id| operation_id.as_uuid()),
@@ -1477,6 +1509,34 @@ impl SandboxController {
                 )
                 .await
                 .map_err(|err| sandbox_insert_error(err.into()))?;
+                if let Some(admission) = &block_volume_admission {
+                    let [mount_spec] = req.volume_mounts.as_slice() else {
+                        return Err(ControllerError::internal(
+                            "admitted block-volume request must have one mount",
+                        ));
+                    };
+                    pplx_space_sandbox_store::block_volume::reserve(
+                        &mut tx,
+                        pplx_space_sandbox_store::block_volume::NewBlockVolume {
+                            sandbox_id: sandbox_uuid,
+                            org_id: create_owner.org_id,
+                            managed_by: self.substrate.managed_by(),
+                            mount_spec,
+                            availability_zone: &admission.availability_zone,
+                            resource_limit: 2,
+                        },
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        pplx_space_sandbox_store::block_volume::VolumeStoreError::Capacity => {
+                            ControllerError::service_unavailable(error.to_string())
+                        }
+                        _ => ControllerError::internal(error.to_string()),
+                    })?;
+                }
+                tx.commit().await.map_err(|error| {
+                    db_contention_error("failed to commit sandbox create transaction", &error)
+                })?;
             }
             (Some(owner), Some(grant)) => {
                 let mut tx = pool.begin().await.map_err(|err| {
@@ -2501,7 +2561,7 @@ impl SandboxController {
         boot_mode: CreateBootMode,
         backend: &str,
     ) -> bool {
-        if req.node_pool.is_some() {
+        if req.node_pool.is_some() || !req.volume_mounts.is_empty() {
             return false;
         }
         let file_changes_enabled = req

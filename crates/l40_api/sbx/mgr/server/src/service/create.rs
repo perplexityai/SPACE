@@ -983,6 +983,22 @@ impl SandboxManagerService {
         .display()
         .to_string();
 
+        let retained_checkpoint = super::block_volumes::checkpoint(&snapshot_dir)?;
+        let retained_block = self
+            .prepare_retained_block(
+                &mut node_client,
+                id,
+                execution_fence,
+                &space_api_route_identity,
+            )
+            .await
+            .map_err(|error| activation_cleanup.failure(error))?;
+        if retained_block.is_some() != retained_checkpoint.is_some() {
+            return Err(activation_cleanup.failure(Status::failed_precondition(
+                "checkpoint and sandbox retained-disk topology differ",
+            )));
+        }
+
         // Build minimal VM config for snapshot restore (need network + vsock)
         // Keep Firecracker's block-device defaults. The cache/io-engine variants
         // we measured did not improve lifecycle latency, so avoid carrying an
@@ -1270,6 +1286,17 @@ impl SandboxManagerService {
             spawn_network_policy_refresh(self.db.clone(), id.to_string(), "snapshot-restore");
         }
 
+        // Consume the exact disk dependency before any restored code can run.
+        self.activate_retained_block(
+            &mut node_client,
+            id,
+            execution_fence,
+            retained_block.as_ref(),
+            retained_checkpoint.as_ref(),
+        )
+        .await
+        .map_err(|error| activation_cleanup.failure(error))?;
+
         // Load the snapshot and start spaced-host concurrently. spaced-host only
         // binds its local socket at startup; guest bridge connections happen on
         // demand and are no longer part of the default blocking restore gate.
@@ -1484,7 +1511,8 @@ impl SandboxManagerService {
         self.watchdog.mark_restored_from_snapshot(id);
 
         // Resume snapshot scheduling if enabled
-        if sandbox.snapshots_enabled && sandbox.pool_template.is_none() {
+        if sandbox.snapshots_enabled && sandbox.pool_template.is_none() && retained_block.is_none()
+        {
             self.snapshot_scheduler
                 .add_sandbox(id.clone(), sandbox.template.clone())
                 .await;

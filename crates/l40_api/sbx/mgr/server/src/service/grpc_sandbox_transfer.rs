@@ -711,6 +711,7 @@ impl SandboxManagerService {
         request: Request<ExportSandboxRequest>,
     ) -> Result<Response<SbxExportSandboxStream>, Status> {
         self.authorize_peer(&request, "ExportSandbox", ALLOW_LOCAL_ARTIFACT_OPERATOR)?;
+        self.refuse_retained_disk_operation(&request.get_ref().sandbox_id)?;
         let req = request.into_inner();
         let pinned = self.lookup_sandbox(&req.sandbox_id)?;
         let early_base = EarlyDeltaBase::look_up(

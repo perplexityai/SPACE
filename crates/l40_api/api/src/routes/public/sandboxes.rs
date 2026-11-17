@@ -94,6 +94,14 @@ pub async fn create_sandbox(
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<impl IntoResponse, PublicApiError> {
     let idempotency_key = idempotency_key(&headers)?;
+    crate::block_volumes::admit(
+        &pplx_space_env_vars::ProcessEnvironment,
+        &request.volume_mounts,
+        org.id,
+        pplx_space_execution_spec::RuntimeKind::Firecracker,
+        org.byok_enabled,
+    )
+    .map_err(controller_error)?;
     let template_name = request.template.name().as_str().to_owned();
     let owner = federated
         .as_ref()
@@ -213,6 +221,11 @@ pub(crate) async fn create_native_sandbox_operation(
     inline: Option<&InlineLifecycle>,
 ) -> Result<SandboxOperationResponse, PublicApiError> {
     let (request, mut fingerprint) = prepare_native_create_request(request)?;
+    // A live warm VM has no second drive. Disk-backed creates are always
+    // queued cold, never adopted or run inline while cloud work converges.
+    let has_block_volume = !request.volume_mounts.is_empty();
+    let pool_claims = pool_claims.filter(|_| !has_block_volume);
+    let inline = inline.filter(|_| !has_block_volume);
     if let Some(profiles) = federated_create
         .as_ref()
         .and_then(|context| context.egress_profiles.as_ref())
@@ -650,7 +663,11 @@ pub async fn list_sandboxes(
     )
     .await
     .map_err(database_error)?;
-    Ok(Json(sandboxes_page(rows, limit)?))
+    let mut page = sandboxes_page(rows, limit)?;
+    crate::block_volumes::populate_status(&state.pool, org.id, &mut page.data)
+        .await
+        .map_err(database_error)?;
+    Ok(Json(page))
 }
 
 pub async fn get_sandbox(
@@ -675,7 +692,11 @@ pub(crate) async fn read_public_sandbox(
     else {
         return Err(PublicApiError::not_found("sandbox not found"));
     };
-    public_sandbox_from_row(sandbox)
+    let mut response = public_sandbox_from_row(sandbox)?;
+    crate::block_volumes::populate_status(pool, org_id, std::slice::from_mut(&mut response))
+        .await
+        .map_err(database_error)?;
+    Ok(response)
 }
 
 pub async fn get_sandbox_stats(
@@ -1587,6 +1608,7 @@ fn public_sandbox_from_row(sandbox: PublicSandboxRow) -> Result<PublicSandbox, P
         _ => (None, None),
     };
     Ok(PublicSandbox {
+        volume_mounts: Vec::new(),
         id: PublicSandboxId::from(sandbox.id),
         name: sandbox.name,
         state,

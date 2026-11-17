@@ -12,7 +12,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_api::controllers::substrate::{NodeApiTarget, Substrate, SubstrateError};
+use pplx_space_api::controllers::substrate::{
+    NodeApiTarget, Substrate, SubstrateAdapter, SubstrateError,
+};
 use pplx_space_api::egress_profiles::EgressProfiles;
 use pplx_space_api::tls_interception_exemptions::TlsInterceptionExemptions;
 use pplx_space_cluster_pool::WarmPoolStore;
@@ -62,6 +64,8 @@ pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// it.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcilerRuntimeError {
+    #[error("invalid block-volume controller policy: {0}")]
+    BlockVolumes(#[from] crate::block_volumes::PolicyError),
     #[error("federated identity configuration failed: {0}")]
     FederatedIdentity(#[from] pplx_space_federated_identity::FederatedIdentityPolicyError),
     /// A spawned reconciler task exited (returned or panicked) before the
@@ -219,6 +223,14 @@ pub async fn run_reconcilers(
             .map_err(ReconcilerRuntimeError::from)
         })?;
     let mut handles = vec![
+        tokio::spawn(crate::block_volumes::run(
+            crate::block_volumes::Policy::from_environment(
+                &pplx_space_env_vars::ProcessEnvironment,
+            )?,
+            pool.clone(),
+            substrate.managed_by().to_owned(),
+            shutdown_token.child_token(),
+        )),
         tokio::spawn(trigger_fanout::run(
             pool.clone(),
             trigger_substrate,

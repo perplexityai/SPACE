@@ -1192,6 +1192,7 @@ impl SandboxManagerService {
         request: Request<crate::proto::CreateSnapshotRequest>,
     ) -> Result<Response<crate::proto::CreateSnapshotResponse>, Status> {
         self.authorize_peer(&request, "CreateSnapshot", ALLOW_SANDBOX_OPERATOR)?;
+        self.refuse_retained_disk_operation(&request.get_ref().sandbox_id)?;
         let req = request.into_inner();
         let artifact_kind = match snapshot_type_from_proto(req.r#type)? {
             crate::proto::SnapshotType::Disk => pplx_space_common_core::types::ArtifactKind::Disk,

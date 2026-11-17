@@ -848,6 +848,7 @@ impl SandboxManagerService {
         request: Request<EnableSnapshotsRequest>,
     ) -> Result<Response<EnableSnapshotsResponse>, Status> {
         self.authorize_peer(&request, "EnableSnapshots", ALLOW_SANDBOX_SNAPSHOT_OPERATOR)?;
+        self.refuse_retained_disk_operation(&request.get_ref().sandbox_id)?;
         let publish_node_state = !should_skip_node_publish(&request);
         let sandbox_id = &request.get_ref().sandbox_id;
         let sandbox = self.lookup_sandbox(sandbox_id)?;
@@ -1288,6 +1289,7 @@ impl SandboxManagerService {
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
         let peer = self.authorize_peer(&request, "Rollback", ALLOW_SANDBOX_OPERATOR)?;
+        self.refuse_retained_disk_operation(&request.get_ref().sandbox_id)?;
         let req = request.get_ref();
         let sandbox_id = &req.sandbox_id;
         let snapshot_name = &req.snapshot_name;

@@ -17,6 +17,43 @@ const ATTACHMENT: &str = r#"
 "#;
 
 #[tokio::test]
+async fn exact_lookup_requires_an_exact_result_and_only_accepts_structured_not_found() {
+    const ID: &str = "vol-0123456789abcdef0";
+    let responses = [
+        (StatusCode::OK, format!("<DescribeVolumesResponse><volumeSet><item>{VOLUME}</item></volumeSet></DescribeVolumesResponse>")),
+        (StatusCode::BAD_REQUEST, "<Response><Errors><Error><Code>InvalidVolume.NotFound</Code><Message>missing</Message></Error></Errors></Response>".to_owned()),
+        (StatusCode::FORBIDDEN, "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>denied</Message></Error></Errors></Response>".to_owned()),
+        (StatusCode::OK, "<DescribeVolumesResponse><volumeSet/></DescribeVolumesResponse>".to_owned()),
+        (StatusCode::OK, format!("<DescribeVolumesResponse><volumeSet><item>{}</item></volumeSet></DescribeVolumesResponse>", VOLUME.replace(ID, "vol-11111111111111111"))),
+    ];
+    let transport = RecordingTransport::new(
+        responses
+            .into_iter()
+            .map(|(status, body)| QueryResponse::new(status, body))
+            .collect(),
+    );
+    let client = Client::with_transport("us-west-2", credentials_provider(), transport.clone());
+    assert_eq!(
+        client.describe_volume(ID).await.unwrap().unwrap().volume_id,
+        ID
+    );
+    assert!(client.describe_volume(ID).await.unwrap().is_none());
+    for _ in 0..3 {
+        client.describe_volume(ID).await.unwrap_err();
+    }
+    for request in transport.requests() {
+        assert_eq!(
+            parse_body(&request.body),
+            HashMap::from([
+                ("Action".into(), "DescribeVolumes".into()),
+                ("Version".into(), "2016-11-15".into()),
+                ("VolumeId.1".into(), ID.into()),
+            ])
+        );
+    }
+}
+
+#[tokio::test]
 async fn create_sends_idempotency_encryption_and_atomic_tags_without_a_snapshot() {
     let transport = RecordingTransport::new(vec![QueryResponse::new(
         StatusCode::OK,

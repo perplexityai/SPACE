@@ -538,6 +538,10 @@ pub fn emit_auto_lifecycle_delete_receipt_superseded_if_present(
 /// nothing writes or reads any more and a later release drops.
 fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
     tx.execute(
+        "DELETE FROM retained_block_sandboxes WHERE sandbox_id = ?1",
+        params![id],
+    )?;
+    tx.execute(
         "DELETE FROM guest_update_operations WHERE sandbox_id = ?1",
         params![id],
     )?;
@@ -573,6 +577,17 @@ fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
     )?;
     tx.execute(
         "DELETE FROM sandbox_runtime_upgrade_outcomes WHERE sandbox_id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// Sticky dependency recorded before exposing a block device to an execution.
+/// Device release authority is separately owned by node-manager.
+pub fn remember_retained_block_volume(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO retained_block_sandboxes (sandbox_id)
+         SELECT id FROM sandboxes WHERE id = ?1 ON CONFLICT DO NOTHING",
         params![id],
     )?;
     Ok(())

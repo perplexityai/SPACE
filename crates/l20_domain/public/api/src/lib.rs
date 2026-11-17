@@ -1228,6 +1228,17 @@ pub struct SetSandboxTimeoutResponse {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateSandboxRequest {
+    /// Experimental, creation-time data disk. Requires cluster and organization
+    /// opt-in; an empty list retains the existing creation contract.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::block_volume_mounts")
+    )]
+    pub volume_mounts: Vec<pplx_space_execution_spec::BlockVolumeMount>,
     #[cfg_attr(
         feature = "schema",
         schemars(schema_with = "schema::template_reference")
@@ -1382,6 +1393,16 @@ pub struct SandboxCondition {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PublicSandbox {
+    /// Experimental retained live disks, not independently restorable snapshots.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::block_volume_status")
+    )]
+    pub volume_mounts: Vec<PublicSandboxVolumeMount>,
     #[cfg_attr(
         feature = "schema",
         schemars(schema_with = "schema::public_sandbox_id")
@@ -1435,6 +1456,27 @@ pub struct PublicSandbox {
     #[cfg_attr(feature = "serde", serde(with = "time::serde::rfc3339"))]
     #[cfg_attr(feature = "schema", schemars(schema_with = "schema::date_time"))]
     pub updated_at: time::OffsetDateTime,
+}
+
+open_wire_enum!(SandboxBlockVolumeState, "block-volume state", {
+    Requested => "requested",
+    Provisioning => "provisioning",
+    Available => "available",
+    Attaching => "attaching",
+    Attached => "attached",
+    Releasing => "releasing",
+    Detaching => "detaching",
+    Deleting => "deleting",
+    Deleted => "deleted",
+});
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PublicSandboxVolumeMount {
+    pub volume_id: Uuid,
+    #[cfg_attr(feature = "serde", serde(flatten))]
+    pub mount_spec: pplx_space_execution_spec::BlockVolumeMount,
+    pub state: SandboxBlockVolumeState,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

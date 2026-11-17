@@ -16,6 +16,7 @@ sqlite.sandbox-manager = [
   "local_artifacts",
   "node_dirty_ref_revision",
   "node_dirty_refs",
+  "retained_block_sandboxes",
   "sandbox_cleanup_episodes",
   "sandbox_execution_delete_receipts",
   "sandbox_open_route_activations",

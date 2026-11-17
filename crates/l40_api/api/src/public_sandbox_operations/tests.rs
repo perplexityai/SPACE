@@ -1294,6 +1294,7 @@ fn public_create_request() -> pplx_space_public_api::CreateSandboxRequest {
     metadata.insert("debug".to_string(), PublicSandboxMetadataValue::Bool(true));
 
     pplx_space_public_api::CreateSandboxRequest {
+        volume_mounts: Vec::new(),
         template: "seed:latest".parse::<TemplateReference>().unwrap(),
         runtime: Some(RuntimeKind::Firecracker),
         name: Some("native-create".to_string()),

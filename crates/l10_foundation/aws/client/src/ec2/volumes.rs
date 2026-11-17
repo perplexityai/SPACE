@@ -120,6 +120,37 @@ impl<T: QueryTransport> Client<T> {
         parse_volume_page(&body).map_err(Into::into)
     }
 
+    /// Absence is authoritative only for the exact ID, never an ownership-tag
+    /// filter whose membership can change independently of the disk.
+    pub async fn describe_volume(&self, volume_id: &str) -> Result<Option<Volume>, AwsClientError> {
+        let body = match self
+            .query
+            .send_action(
+                "DescribeVolumes",
+                EC2_API_VERSION,
+                vec![("VolumeId.1", volume_id.to_owned())],
+            )
+            .await
+        {
+            Ok(body) => body,
+            Err(AwsClientError::AwsService { code, .. }) if code == "InvalidVolume.NotFound" => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let page = parse_volume_page(&body)?;
+        let mut volumes = page.volumes.into_iter();
+        let volume = volumes.next().ok_or_else(|| {
+            AwsClientError::Xml("exact volume lookup returned an empty successful result".into())
+        })?;
+        if volume.volume_id != volume_id || volumes.next().is_some() || page.next_token.is_some() {
+            return Err(AwsClientError::Xml(
+                "exact volume lookup returned an ambiguous result".into(),
+            ));
+        }
+        Ok(Some(volume))
+    }
+
     pub async fn attach_volume(
         &self,
         volume_id: &str,

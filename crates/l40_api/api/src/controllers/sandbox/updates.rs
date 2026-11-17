@@ -626,6 +626,16 @@ impl SandboxController {
         sandbox: &Sandbox,
         enabled: bool,
     ) -> Result<serde_json::Value, ControllerError> {
+        if enabled
+            && sandbox_store::block_volume::get(pool, sandbox.id)
+                .await
+                .map_err(|err| db_contention_error("read retained disk dependency", &err))?
+                .is_some()
+        {
+            return Err(ControllerError::bad_request(
+                "manual snapshots are unsupported for retained live disks",
+            ));
+        }
         let mut tx = pool.begin().await.map_err(|err| {
             db_contention_error("failed to begin sandbox snapshot intent update", &err)
         })?;
@@ -1102,6 +1112,15 @@ impl SandboxController {
         snapshot_name: String,
         auto_restart: bool,
     ) -> Result<serde_json::Value, ControllerError> {
+        if sandbox_store::block_volume::get(pool, sandbox.id)
+            .await
+            .map_err(|err| db_contention_error("read retained disk dependency", &err))?
+            .is_some()
+        {
+            return Err(ControllerError::bad_request(
+                "rollback is unsupported for retained live disks",
+            ));
+        }
         // Rollback is destructive and runs through `runtime_client`, which on
         // k8s recovers a missing pod for any recoverable-live lifecycle and
         // re-pins the new pod to `target_node_id`. Gate before the substrate

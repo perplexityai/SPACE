@@ -1604,6 +1604,14 @@ pub struct PublicOperationAdmission {
 }
 
 impl PublicOperationAdmission {
+    pub(crate) async fn sandbox_has_retained_disk(
+        &mut self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, PublicOperationStoreError> {
+        Ok(sandbox_store::block_volume::get(&mut *self.tx, sandbox_id)
+            .await?
+            .is_some())
+    }
     pub const fn observation(&self) -> &ObservePublicOperationIdempotency {
         &self.observation
     }

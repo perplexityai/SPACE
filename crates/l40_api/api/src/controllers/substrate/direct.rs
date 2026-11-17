@@ -85,6 +85,7 @@
 //!
 //! | Refused or missing | Effect today | Owner | Removed by |
 //! |---|---|---|---|
+//! | Retained EBS disks | `Unsupported` before provisioning: initial node grants require a durable pre-launch execution identity | ac-pplx | Publish Direct's fenced execution intent before launch, then qualify block-device lifecycle on registered nodes |
 //! | Node-pool placement | [`SubstrateError::Unsupported`]: a create naming a node pool is refused | ac-pplx | Node-pool membership for registered nodes, read by core placement |
 //! | Forks (restoring a durable fork disk as a new sandbox) | `Unsupported`: the create is refused | ac-pplx | A Direct launch that stages the fork disk on the chosen node |
 //! | Cluster pool configs (`list_pool_configs`, `upsert_pool_config`, `disable_pool_config`) | `Unsupported` from the trait defaults | ac-pplx | Pool-config handling in the core for both substrates |

@@ -676,6 +676,7 @@ fn reclaim_fixture_meta(
         local_artifact_id,
         artifact_kind,
         artifact_origin,
+        retained_live_disk_v1: None,
         artifact_snapshot_name: None,
     }
 }

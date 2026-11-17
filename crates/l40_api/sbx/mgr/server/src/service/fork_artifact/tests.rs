@@ -67,6 +67,7 @@ fn suspended_metadata(sandbox_id: SandboxId) -> crate::snapshot_upload::Snapshot
         local_artifact_id: Some(LocalArtifactId::new()),
         artifact_kind: Some(ArtifactKind::Full),
         artifact_origin: Some(ArtifactOrigin::Suspend),
+        retained_live_disk_v1: None,
         artifact_snapshot_name: Some("s-donor".parse().expect("valid snapshot name")),
     }
 }

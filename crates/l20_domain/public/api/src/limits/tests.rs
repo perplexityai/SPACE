@@ -2,6 +2,7 @@ use super::*;
 
 fn create_request() -> CreateSandboxRequest {
     CreateSandboxRequest {
+        volume_mounts: Vec::new(),
         template: "seed:latest".parse().unwrap(),
         runtime: None,
         name: None,

@@ -210,11 +210,45 @@ service ClusterApi {
   // answer is `EXECUTION_CURRENCY_UNSPECIFIED`.
   rpc GetExecutionCurrency(GetExecutionCurrencyRequest) returns (GetExecutionCurrencyResponse);
 
+  // Retained EBS disks are separate from S3 artifact registrations. Every
+  // request is bound to a registered node's remote address and execution.
+  rpc ResolveBlockVolumeBinding(ResolveBlockVolumeBindingRequest) returns (ResolveBlockVolumeBindingResponse);
+  rpc ClaimBlockVolumeInitialization(ClaimBlockVolumeInitializationRequest) returns (ClaimBlockVolumeInitializationResponse);
+  rpc CompleteBlockVolumeInitialization(CompleteBlockVolumeInitializationRequest) returns (BlockVolumeProgressResponse);
+  rpc ActivateBlockVolume(ActivateBlockVolumeRequest) returns (BlockVolumeProgressResponse);
+  rpc PublishBlockVolumeCheckpoint(PublishBlockVolumeCheckpointRequest) returns (BlockVolumeProgressResponse);
+  rpc ReleaseBlockVolumeBinding(ReleaseBlockVolumeBindingRequest) returns (BlockVolumeProgressResponse);
+
   // BYOK volume encryption (per-sandbox DEK gate, KEK resolution, and wrap
   // storage) is owned end to end by the credential manager
   // (credmgr GetOrIssueSandboxVolumeDek), so
   // cluster-api carries no encryption RPCs.
 }
+
+message ResolveBlockVolumeBindingRequest { space.execution.v1.BlockVolumeExecution execution = 1; }
+message ResolveBlockVolumeBindingResponse { optional space.execution.v1.BlockVolumeBinding binding = 1; }
+message ClaimBlockVolumeInitializationRequest {
+  space.execution.v1.BlockVolumeFence fence = 1;
+  string claim_id = 2;
+}
+message ClaimBlockVolumeInitializationResponse { bool granted = 1; }
+message CompleteBlockVolumeInitializationRequest {
+  space.execution.v1.BlockVolumeFence fence = 1;
+  string claim_id = 2;
+  string filesystem_uuid = 3;
+}
+message ActivateBlockVolumeRequest {
+  space.execution.v1.BlockVolumeFence fence = 1;
+  string activation_id = 2;
+  optional string checkpoint_id = 3;
+}
+message PublishBlockVolumeCheckpointRequest {
+  space.execution.v1.BlockVolumeFence fence = 1;
+  uint64 disk_generation = 2;
+  string checkpoint_id = 3;
+}
+message ReleaseBlockVolumeBindingRequest { space.execution.v1.BlockVolumeFence fence = 1; }
+message BlockVolumeProgressResponse { uint64 disk_generation = 1; }
 
 message ListNodesRequest {
   optional NodeRole role = 1;

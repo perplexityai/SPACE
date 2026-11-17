@@ -45,6 +45,24 @@ async fn observe_rpc<T>(
 
 #[tonic::async_trait]
 impl NodeManager for NodeManagerService {
+    async fn prepare_block_volume(
+        &self,
+        request: Request<crate::proto::PrepareBlockVolumeRequest>,
+    ) -> Result<Response<crate::proto::PrepareBlockVolumeResponse>, Status> {
+        NodeManagerService::prepare_block_volume(self, request).await
+    }
+    async fn activate_block_volume(
+        &self,
+        request: Request<crate::proto::ActivateBlockVolumeRequest>,
+    ) -> Result<Response<crate::proto::PrepareBlockVolumeResponse>, Status> {
+        NodeManagerService::activate_block_volume(self, request).await
+    }
+    async fn publish_block_volume_checkpoint(
+        &self,
+        request: Request<crate::proto::PublishBlockVolumeCheckpointRequest>,
+    ) -> Result<Response<crate::proto::PrepareBlockVolumeResponse>, Status> {
+        NodeManagerService::publish_block_volume_checkpoint(self, request).await
+    }
     type OpenGuestChannelStream = super::guest_control::ChannelStream;
     async fn request_guest_shutdown(
         &self,

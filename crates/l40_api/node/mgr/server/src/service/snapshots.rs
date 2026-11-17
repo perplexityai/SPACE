@@ -382,6 +382,11 @@ impl NodeManagerService {
         self.run_owned_sandbox_work(&owner, async move {
             let _gate = service.lock_sandbox_vm_cgroup_launch(&sandbox_id).await;
             service.check_execution(&sandbox_id, fence.as_ref(), false)?;
+            if !paused {
+                service
+                    .invalidate_retained_checkpoint_before_resume(&sandbox_id)
+                    .await?;
+            }
             let execution = service.recorded_execution(sandbox_id.clone()).await?;
             let runtime = execution.as_ref().map_or(
                 pplx_space_execution_spec::RuntimeKind::Firecracker,

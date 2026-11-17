@@ -567,7 +567,7 @@ fn record_endpoint_attestation_error(error: &Status) {
     spaced_endpoint_attestation(result, super::start::short_grpc_code(error.code()));
 }
 
-async fn connect_spaced_host_live(
+pub(super) async fn connect_spaced_host_live(
     sandbox: &crate::db::SandboxRow,
 ) -> Result<pplx_space_spaced_host_client::SpacedHostClient, Status> {
     use crate::metrics::sandbox::worker::{

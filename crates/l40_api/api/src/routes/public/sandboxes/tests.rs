@@ -29,6 +29,7 @@ fn create_request_with_auto_lifecycle(
     auto_lifecycle: Option<AutoLifecyclePolicy>,
 ) -> CreateSandboxRequest {
     CreateSandboxRequest {
+        volume_mounts: Vec::new(),
         template: "seed:latest".parse().unwrap(),
         runtime: None,
         name: None,

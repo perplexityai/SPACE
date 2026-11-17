@@ -2471,6 +2471,16 @@ impl SandboxManagerService {
         )
         .map_err(|error| activation_cleanup.failure(error))?;
 
+        let retained_block = self
+            .prepare_retained_block(
+                &mut node_client,
+                id,
+                execution_fence,
+                &start_ctx.space_api_route_identity,
+            )
+            .await
+            .map_err(|error| activation_cleanup.failure(error))?;
+
         // The runtime adapter owns device names and configuration syntax.
         let vcpu_default = template_defaults.vcpu.unwrap_or(2);
         let vcpu = optional_positive_or_default("vcpu", req_vcpu, vcpu_default)
@@ -2496,7 +2506,7 @@ impl SandboxManagerService {
             disk_rate: self.rootfs_rate_limiter(is_builder, sandbox.disk_io_limits),
             network_rate: (!is_builder).then_some(NET_RATE_LIMITER),
             balloon,
-            data_drive: None,
+            data_drive: super::block_volumes::drive(retained_block.as_ref()),
             huge_pages: self.config.hugepages,
             console: guest_console_logs_enabled(),
             builder: is_builder,
@@ -2805,6 +2815,16 @@ impl SandboxManagerService {
             None
         };
 
+        self.activate_retained_block(
+            &mut node_client,
+            id,
+            execution_fence,
+            retained_block.as_ref(),
+            None,
+        )
+        .await
+        .map_err(|error| activation_cleanup.failure(error))?;
+
         // Launch Firecracker first. spaced-host also binds a bridge-host socket
         // inside the Firecracker jail root, which launch_sandbox creates.
         let jailer_result = node_client
@@ -3025,7 +3045,8 @@ impl SandboxManagerService {
             .await;
 
         // Start snapshot scheduling if enabled
-        if sandbox.snapshots_enabled && sandbox.pool_template.is_none() {
+        if sandbox.snapshots_enabled && sandbox.pool_template.is_none() && retained_block.is_none()
+        {
             self.snapshot_scheduler
                 .add_sandbox(id.clone(), sandbox.template.clone())
                 .instrument(tracing::info_span!(
@@ -3046,6 +3067,9 @@ impl SandboxManagerService {
         // their policy via the adoption path, so they skip the gate. The push
         // runs concurrently with the guest-readiness wait, so it adds no latency
         // on the common path where guest boot is the slower half.
+        self.mount_retained_block(id, retained_block.as_ref())
+            .await
+            .map_err(|error| activation_cleanup.failure(error))?;
         let apply_network_policy = !Self::sandbox_is_pool_member(&sandbox);
         if req.blocking {
             if let Err(error) = wait_ready_and_mark_started(

@@ -4,6 +4,11 @@ package space.node.v1;
 import "execution/v1/execution.proto";
 
 service NodeManager {
+  // Resolve and initialize only the control-plane-owned disk for this fenced
+  // execution. No host device path is accepted.
+  rpc PrepareBlockVolume(PrepareBlockVolumeRequest) returns (PrepareBlockVolumeResponse);
+  rpc ActivateBlockVolume(ActivateBlockVolumeRequest) returns (PrepareBlockVolumeResponse);
+  rpc PublishBlockVolumeCheckpoint(PublishBlockVolumeCheckpointRequest) returns (PrepareBlockVolumeResponse);
   // Request ACPI shutdown of the fenced execution; acknowledgement is not proof of exit.
   rpc RequestGuestShutdown(RequestGuestShutdownRequest) returns (RequestGuestShutdownResponse);
   // Probe a guest TCP port inside the assigned namespace; no caller-supplied address.
@@ -702,6 +707,24 @@ message LaunchSandboxRequest {
   // still exists as the dm-snapshot origin behind the mapper.
   optional string rootfs_block_device_path = 11;
   ExecutionFence execution_fence = 12;
+}
+
+message PrepareBlockVolumeRequest {
+  ExecutionFence execution_fence = 1;
+  space.execution.v1.BlockVolumeExecution execution = 2;
+}
+message PrepareBlockVolumeResponse {
+  optional space.execution.v1.BlockVolumeBinding binding = 1;
+}
+message ActivateBlockVolumeRequest {
+  string sandbox_id = 1;
+  ExecutionFence execution_fence = 2;
+  optional string checkpoint_id = 3;
+}
+message PublishBlockVolumeCheckpointRequest {
+  string sandbox_id = 1;
+  ExecutionFence execution_fence = 2;
+  string checkpoint_id = 3;
 }
 
 message LaunchSandboxResponse {

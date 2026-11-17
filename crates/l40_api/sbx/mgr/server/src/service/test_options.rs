@@ -60,6 +60,7 @@ impl SandboxManagerServiceOptions {
     pub(crate) fn for_test_in(scratch: &Path) -> Self {
         let run_dir = scratch.to_owned();
         Self {
+            retained_block_volumes: false,
             automatic_guest_updates: false,
             capture_runtime_probe: None,
             host_control_socket_path: scratch.join("absent-host-control.sock"),

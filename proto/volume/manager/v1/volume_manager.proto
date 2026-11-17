@@ -1,12 +1,29 @@
 syntax = "proto3";
 package space.volume.manager.v1;
 
+import "node/api/v1/cluster.proto";
+
 // VolumeManager runs on each worker node. Sandbox Manager calls the lifecycle
 // RPCs (Attach/Detach/List) during sandbox start/stop. spaced-host calls the
 // file-operation RPCs on behalf of guest processes.
 //
 // File-transfer RPCs are implemented by the volume-manager transfer worker.
 service VolumeManager {
+    // Separate from S3 attachments. Only authenticated sandbox-manager/root
+    // peers may relay grants, and their node identity is fixed at startup.
+    rpc ResolveBlockVolumeBinding(space.node.api.v1.ResolveBlockVolumeBindingRequest)
+        returns (space.node.api.v1.ResolveBlockVolumeBindingResponse);
+    rpc ClaimBlockVolumeInitialization(space.node.api.v1.ClaimBlockVolumeInitializationRequest)
+        returns (space.node.api.v1.ClaimBlockVolumeInitializationResponse);
+    rpc CompleteBlockVolumeInitialization(space.node.api.v1.CompleteBlockVolumeInitializationRequest)
+        returns (space.node.api.v1.BlockVolumeProgressResponse);
+    rpc ActivateBlockVolume(space.node.api.v1.ActivateBlockVolumeRequest)
+        returns (space.node.api.v1.BlockVolumeProgressResponse);
+    rpc PublishBlockVolumeCheckpoint(space.node.api.v1.PublishBlockVolumeCheckpointRequest)
+        returns (space.node.api.v1.BlockVolumeProgressResponse);
+    rpc ReleaseBlockVolumeBinding(space.node.api.v1.ReleaseBlockVolumeBindingRequest)
+        returns (space.node.api.v1.BlockVolumeProgressResponse);
+
     // --- Lifecycle RPCs (called by Sandbox Manager) ---
 
     // Register a volume attachment for a sandbox. Validates bucket access and

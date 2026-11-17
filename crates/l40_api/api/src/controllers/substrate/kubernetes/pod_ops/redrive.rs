@@ -658,6 +658,7 @@ impl KubernetesSubstrate {
 
             let cross_node_pod = match create_sandbox_pod(
                 &self.k8s,
+                self.store.pool(),
                 self.sandbox_pod_request(
                     sandbox,
                     &claim.row,

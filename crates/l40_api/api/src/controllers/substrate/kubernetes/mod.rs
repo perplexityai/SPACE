@@ -643,6 +643,7 @@ fn is_wake_recovery_lifecycle(lifecycle: &str) -> bool {
 
 async fn create_sandbox_pod(
     k8s: &KubernetesState,
+    pool: &PgPool,
     mut request: SandboxPodRequest<'_>,
 ) -> Result<SandboxPodView, KubeError> {
     let common = match &mut request {
@@ -663,12 +664,27 @@ async fn create_sandbox_pod(
     // span. The Pod carries the context of the operation that materializes it,
     // captured before rendering so the containerd shim can resume this trace.
     common.traceparent = pplx_space_observability::trace_propagation::traceparent_for_span(&span);
+    let sandbox_id = common.sandbox_id;
+    let mut pod = build_sandbox_pod(&sandbox_pod_config(k8s), request);
+    let dependency = pplx_space_sandbox_store::block_volume::get(pool, sandbox_id)
+        .await
+        .map_err(|error| KubeError::Service(error.into()))?;
+    if let Some(dependency) = dependency {
+        if dependency.delete_requested {
+            return Err(KubeError::Service(
+                std::io::Error::other("retained disk is being deleted").into(),
+            ));
+        }
+        crate::block_volumes::constrain_pod(
+            &mut pod,
+            &dependency.availability_zone,
+            &pplx_space_env_vars::ProcessEnvironment,
+        )
+        .map_err(|error| KubeError::Service(error.into()))?;
+    }
     let pods: Api<Pod> = Api::namespaced(k8s.client.clone(), &k8s.sandbox_namespace);
     let result = pods
-        .create(
-            &PostParams::default(),
-            &build_sandbox_pod(&sandbox_pod_config(k8s), request),
-        )
+        .create(&PostParams::default(), &pod)
         .instrument(span.clone())
         .await;
     if let Err(error) = &result {

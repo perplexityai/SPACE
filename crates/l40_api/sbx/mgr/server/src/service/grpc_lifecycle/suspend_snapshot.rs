@@ -636,6 +636,31 @@ impl SandboxManagerService {
             sync_started_at,
         );
 
+        let retained_block = if self.retained_block_volumes {
+            let fence =
+                crate::service::cleanup_support::read_node_execution_fence(&self.db, &sandbox.id)?
+                    .ok_or_else(|| {
+                        Status::failed_precondition("suspend disk execution is missing")
+                    })?;
+            self.prepare_retained_block(
+                &mut node_client,
+                &sandbox.id,
+                fence,
+                &sandbox.space_api_route_identity,
+            )
+            .await?
+        } else {
+            None
+        };
+        let retained_checkpoint = retained_block
+            .as_ref()
+            .map(|binding| {
+                crate::service::block_volumes::RetainedLiveDisk::for_capture(
+                    binding,
+                    local_artifact_id,
+                )
+            })
+            .transpose()?;
         let sandbox_dir = std::path::PathBuf::from(format!("{CACHE_DIR}/{}", sandbox.id));
         let snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir);
         let staging_parent = suspend_snapshot_staging_parent_dir(&sandbox_dir);
@@ -700,7 +725,7 @@ impl SandboxManagerService {
             // still roll back to paused: once the capture stops the runtime, a
             // failed seal is recoverable only through that record.
             let encrypted_capture_metadata = if sandbox.volume_encryption {
-                let metadata = match suspend_artifact_metadata(
+                let mut metadata = match suspend_artifact_metadata(
                     &sandbox,
                     published_format,
                     local_artifact_id,
@@ -718,6 +743,7 @@ impl SandboxManagerService {
                         return Err(status);
                     }
                 };
+                metadata.retained_live_disk_v1 = retained_checkpoint.clone();
                 if let Err(error) = prepare_encrypted_capture_record(&staging_dir, &metadata) {
                     let reason = format!("record encrypted capture failed: {error}");
                     self.record_suspend_snapshot_publication_failure_without_capture(
@@ -1035,7 +1061,7 @@ impl SandboxManagerService {
             }
             // An encrypted capture's sidecar was written by its seal.
             if !encrypted {
-                let metadata = match suspend_artifact_metadata(
+                let mut metadata = match suspend_artifact_metadata(
                     &sandbox,
                     published_format,
                     local_artifact_id,
@@ -1055,6 +1081,7 @@ impl SandboxManagerService {
                         return Err(status);
                     }
                 };
+                metadata.retained_live_disk_v1 = retained_checkpoint.clone();
                 if let Err(error) = crate::snapshot_upload::write_snapshot_metadata(
                     &metadata,
                     &staging_dir,
@@ -1150,6 +1177,13 @@ impl SandboxManagerService {
                 return Err(Status::internal(reason));
             }
             staging_guard.disarm();
+            self.publish_retained_block(
+                &mut node_client,
+                &sandbox,
+                local_artifact_id,
+                retained_block.as_ref(),
+            )
+            .await?;
             crate::metrics::snapshot::create_step(
                 create_kind,
                 create_codec,

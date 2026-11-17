@@ -1,3 +1,4 @@
+pub(crate) mod block_volumes;
 mod environment_selection;
 use pplx_space_accounts::NodeId;
 
@@ -381,6 +382,7 @@ impl Drop for TeardownSuspendDriverSlot {
 
 #[derive(Clone)]
 pub struct SandboxManagerService {
+    retained_block_volumes: bool,
     db: crate::db::SharedConnection,
     local_node_id: Option<NodeId>,
     local_artifacts: crate::local_artifacts::LocalArtifacts,
@@ -1073,6 +1075,7 @@ pub type RuntimeLivenessProbe = Arc<dyn Fn(&str) -> std::io::Result<bool> + Send
 
 #[derive(Clone)]
 pub struct SandboxManagerServiceOptions {
+    pub retained_block_volumes: bool,
     pub automatic_guest_updates: bool,
     pub host_control_socket_path: PathBuf,
     pub credential_manager_socket_path: PathBuf,
@@ -1119,6 +1122,7 @@ pub struct SandboxManagerServiceOptions {
 impl Default for SandboxManagerServiceOptions {
     fn default() -> Self {
         Self {
+            retained_block_volumes: std::env::var_os("SPACE_EBS_NODE_ID").is_some(),
             automatic_guest_updates: true,
             host_control_socket_path: PathBuf::from(
                 pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET,
@@ -1845,6 +1849,7 @@ impl SandboxManagerService {
         );
         Self {
             db,
+            retained_block_volumes: options.retained_block_volumes,
             local_node_id: options.local_node_id,
             local_artifacts,
             watchdog,

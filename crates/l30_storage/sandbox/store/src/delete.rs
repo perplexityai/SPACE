@@ -102,6 +102,7 @@ pub async fn delete_with_dependents(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sandbox_id: SandboxId,
 ) -> Result<(), sqlx::Error> {
+    crate::block_volume::request_delete(&mut **tx, sandbox_id).await?;
     let cleanup_refs = sandbox_reconcile_cleanup_refs(sandbox_id);
     sqlx::query(sql!(
         "DELETE FROM sandbox_observed_states WHERE sandbox_id = $1"

@@ -75,7 +75,13 @@ fn open_beneath_installation(root: &Path, relative: &Path, owner: u32) -> Result
     // point it into the administrator's persistent directory. Trust that fixed
     // root-owned entry, not caller-supplied symlinks beneath it. Cache children
     // are intentionally group-writable and are walked with O_NOFOLLOW.
-    let entry = std::fs::symlink_metadata(root).map_err(path_error)?;
+    let entry = std::fs::symlink_metadata(root).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Status::not_found("privileged installation root is absent")
+        } else {
+            path_error(error)
+        }
+    })?;
     if entry.uid() != owner || (!entry.is_symlink() && entry.mode() & 0o022 != 0) {
         return Err(path_error("installation root is not administrator-owned"));
     }

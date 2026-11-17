@@ -274,6 +274,8 @@ pub struct VolmgrRunConfig {
 /// sequence, which logs and hard-exits rather than returning.
 #[derive(Debug, thiserror::Error)]
 pub enum RunVolmgrError {
+    #[error("configure the retained block-volume authority")]
+    BlockVolumeAuthority(#[source] tonic::Status),
     #[error("invalid pull priority bands")]
     PullPriorityBands(#[from] ValidatePullPriorityBandsError),
     #[error("create service mutex directory {path}")]
@@ -500,6 +502,9 @@ pub async fn run(
         &config.db_path,
         &config.staging_dir,
         VolumeManagerServiceConfig {
+            block_volume_authority: crate::block_volumes::BlockVolumeAuthority::from_env()
+                .await
+                .map_err(RunVolmgrError::BlockVolumeAuthority)?,
             push_concurrency: config.push_concurrency,
             pull_concurrency: config.pull_concurrency,
             pull_priority_bands,

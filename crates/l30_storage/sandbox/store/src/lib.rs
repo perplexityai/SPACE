@@ -113,6 +113,7 @@ pub mod action_stamp;
 pub mod admin_occupancy;
 pub mod artifact_marker;
 pub mod attribute_runtime;
+pub mod block_volume;
 pub mod create;
 pub mod delete;
 pub mod direct;
@@ -721,6 +722,7 @@ pub struct AutoLifecycleExecution {
     pub active_node_id: Option<NodeId>,
     pub target_node_id: Option<NodeId>,
     pub execution_generation: Option<i64>,
+    pub activation_attempt_id: Option<Uuid>,
     pub has_direct_route: bool,
     pub has_activation_lease: bool,
     pub policy: sqlx::types::Json<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
@@ -750,6 +752,7 @@ pub async fn auto_lifecycle_execution(
         "SELECT s.managed_by, s.lifecycle, s.placement,
                 s.active_node_id, s.target_node_id,
                 COALESCE(e.generation, r.execution_generation) AS execution_generation,
+                COALESCE(e.activation_attempt_id, r.activation_attempt_id) AS activation_attempt_id,
                 r.sandbox_id IS NOT NULL AS has_direct_route,
                 s.restore_lease_token IS NOT NULL AS has_activation_lease,
                 s.auto_lifecycle_json AS policy

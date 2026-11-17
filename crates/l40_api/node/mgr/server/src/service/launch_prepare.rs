@@ -521,6 +521,8 @@ impl NodeManagerService {
         })
         .await
         .map_err(|e| Status::internal(format!("bind rootfs task failed: {e}")))??;
+        self.bind_retained_block_for_launch(sandbox_id, &jail_root)
+            .await?;
 
         // Copy config into jail (skip for snapshot restore — FC starts idle)
         if !req.snapshot_restore || standalone {

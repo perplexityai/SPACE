@@ -54,7 +54,7 @@ const PULL_ARTIFACT_KIND: &str = "pull_artifact";
 // Socket-group membership grants connectivity, not authority. Keep this list
 // to workload identities so local operator and observer accounts fail closed.
 const ROOT_PEERS: &[UdsPeerPrincipal] = &[UdsPeerPrincipal::Root];
-const SANDBOX_MANAGER_PEERS: &[UdsPeerPrincipal] = &[
+pub(crate) const SANDBOX_MANAGER_PEERS: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
 ];
@@ -82,6 +82,7 @@ fn transfer_scope_job_ids(
 
 #[derive(Clone)]
 pub struct VolumeManagerService {
+    pub(crate) block_volume_authority: Option<crate::block_volumes::BlockVolumeAuthority>,
     db: Arc<Mutex<rusqlite::Connection>>,
     pub(crate) worker: BackgroundWorker<TransferExecutor>,
     pub(crate) btrfs_submission: Arc<tokio::sync::Mutex<()>>,
@@ -89,7 +90,7 @@ pub struct VolumeManagerService {
     shadow_comparisons: ShadowComparisonController,
     staging: StagingDir,
     transfer_admission: TransferAdmission,
-    peer_authorizer: UdsPeerAuthorizer,
+    pub(crate) peer_authorizer: UdsPeerAuthorizer,
 }
 
 #[derive(Clone)]
@@ -191,6 +192,7 @@ impl Drop for TransferAdmissionLease {
 }
 
 pub struct VolumeManagerServiceConfig {
+    pub block_volume_authority: Option<crate::block_volumes::BlockVolumeAuthority>,
     pub push_concurrency: usize,
     pub pull_concurrency: usize,
     pub pull_priority_bands: Vec<PriorityBand>,
@@ -221,6 +223,7 @@ impl VolumeManagerService {
         let shadow_comparisons = executor.shadow_comparison_controller();
         let worker = BackgroundWorker::new(Arc::clone(&db), executor, worker_config);
         Ok(Self {
+            block_volume_authority: config.block_volume_authority,
             db,
             worker,
             shadow_comparisons,
@@ -1043,6 +1046,120 @@ fn classify_pull_artifact_retry<E: JobExecutor>(
 
 #[tonic::async_trait]
 impl VolumeManager for VolumeManagerService {
+    async fn resolve_block_volume_binding(
+        &self,
+        request: Request<pplx_space_node_api_client::proto::ResolveBlockVolumeBindingRequest>,
+    ) -> Result<
+        Response<pplx_space_node_api_client::proto::ResolveBlockVolumeBindingResponse>,
+        Status,
+    > {
+        let mut client = self.block_client(
+            &request,
+            request.get_ref().execution.as_ref(),
+            "resolve_block_volume_binding",
+        )?;
+        client
+            .resolve_block_volume_binding(request.into_inner())
+            .await
+    }
+
+    async fn claim_block_volume_initialization(
+        &self,
+        request: Request<pplx_space_node_api_client::proto::ClaimBlockVolumeInitializationRequest>,
+    ) -> Result<
+        Response<pplx_space_node_api_client::proto::ClaimBlockVolumeInitializationResponse>,
+        Status,
+    > {
+        let mut client = self.block_client(
+            &request,
+            request
+                .get_ref()
+                .fence
+                .as_ref()
+                .and_then(|f| f.execution.as_ref()),
+            "claim_block_volume_initialization",
+        )?;
+        client
+            .claim_block_volume_initialization(request.into_inner())
+            .await
+    }
+
+    async fn complete_block_volume_initialization(
+        &self,
+        request: Request<
+            pplx_space_node_api_client::proto::CompleteBlockVolumeInitializationRequest,
+        >,
+    ) -> Result<Response<pplx_space_node_api_client::proto::BlockVolumeProgressResponse>, Status>
+    {
+        let mut client = self.block_client(
+            &request,
+            request
+                .get_ref()
+                .fence
+                .as_ref()
+                .and_then(|f| f.execution.as_ref()),
+            "complete_block_volume_initialization",
+        )?;
+        client
+            .complete_block_volume_initialization(request.into_inner())
+            .await
+    }
+
+    async fn activate_block_volume(
+        &self,
+        request: Request<pplx_space_node_api_client::proto::ActivateBlockVolumeRequest>,
+    ) -> Result<Response<pplx_space_node_api_client::proto::BlockVolumeProgressResponse>, Status>
+    {
+        let mut client = self.block_client(
+            &request,
+            request
+                .get_ref()
+                .fence
+                .as_ref()
+                .and_then(|f| f.execution.as_ref()),
+            "activate_block_volume",
+        )?;
+        client.activate_block_volume(request.into_inner()).await
+    }
+
+    async fn publish_block_volume_checkpoint(
+        &self,
+        request: Request<pplx_space_node_api_client::proto::PublishBlockVolumeCheckpointRequest>,
+    ) -> Result<Response<pplx_space_node_api_client::proto::BlockVolumeProgressResponse>, Status>
+    {
+        let mut client = self.block_client(
+            &request,
+            request
+                .get_ref()
+                .fence
+                .as_ref()
+                .and_then(|f| f.execution.as_ref()),
+            "publish_block_volume_checkpoint",
+        )?;
+        client
+            .publish_block_volume_checkpoint(request.into_inner())
+            .await
+    }
+
+    async fn release_block_volume_binding(
+        &self,
+        request: Request<pplx_space_node_api_client::proto::ReleaseBlockVolumeBindingRequest>,
+    ) -> Result<Response<pplx_space_node_api_client::proto::BlockVolumeProgressResponse>, Status>
+    {
+        let mut client = self.block_client(
+            &request,
+            request
+                .get_ref()
+                .fence
+                .as_ref()
+                .and_then(|f| f.execution.as_ref()),
+            "release_block_volume_binding",
+        )?;
+        client
+            .release_block_volume_binding(request.into_inner())
+            .await
+    }
+
     async fn attach_volume(
         &self,
         request: Request<AttachVolumeRequest>,

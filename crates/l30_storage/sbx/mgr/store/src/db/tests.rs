@@ -10431,3 +10431,40 @@ fn cleanup_and_eviction_keep_the_capture_attempt_until_physical_work_settles() {
 }
 
 mod published_suspend;
+
+#[test]
+fn retained_block_volume_dependency_is_sticky_and_deleted_with_its_owner() {
+    let conn = test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new(&id, "block001", SandboxState::Stopped),
+    );
+    assert!(
+        !read::sandbox_view(&conn, &id)
+            .has_retained_block_volume()
+            .unwrap()
+    );
+    remember_retained_block_volume(&conn, &id).unwrap();
+    remember_retained_block_volume(&conn, &id).unwrap();
+    assert!(
+        read::sandbox_view(&conn, &id)
+            .has_retained_block_volume()
+            .unwrap()
+    );
+    delete_sandbox(&conn, &id).unwrap();
+    assert!(
+        !read::sandbox_view(&conn, &id)
+            .has_retained_block_volume()
+            .unwrap()
+    );
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new(&id, "block001", SandboxState::Stopped),
+    );
+    assert!(
+        !read::sandbox_view(&conn, &id)
+            .has_retained_block_volume()
+            .unwrap()
+    );
+}

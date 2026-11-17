@@ -15,6 +15,7 @@ pub use pplx_space_node_api_client::proto;
 pub use pplx_space_rpc_auth as auth;
 
 mod api_key_store;
+mod block_volumes;
 pub mod metrics;
 pub mod node_info;
 pub use node_info::ClusterNodeInfoService;
@@ -298,6 +299,7 @@ fn published_node_status_db(status: PublishedNodeStatus) -> Result<PublishedNode
 
 #[derive(Clone)]
 pub struct ClusterApiService {
+    block_volume_hosts: block_volumes::Hosts,
     ingress_activation: Option<std::sync::Arc<dyn ingress_activation::IngressActivation>>,
     reserved_template_names: template_publication::ReservedTemplateNames,
     trusted_template_storage: trusted_storage::TrustedTemplateStorageBuckets,
@@ -622,6 +624,7 @@ impl ClusterApiService {
             template_releases_store::TemplateReleasesStore::new(pool.clone());
         Self {
             ingress_activation: None,
+            block_volume_hosts: block_volumes::Hosts::default(),
             reserved_template_names: template_publication::ReservedTemplateNames::default(),
             trusted_template_storage: trusted_storage::TrustedTemplateStorageBuckets::default(),
             visibility_pool: pool.clone(),
@@ -702,6 +705,8 @@ impl ClusterApiService {
         let mut service =
             Self::with_security_state(pool, route_ed25519_authority, ecw_credential_keyring);
         service.reserved_template_names = template_publication::ReservedTemplateNames::from_env()?;
+        service.block_volume_hosts =
+            block_volumes::Hosts::from_environment(&pplx_space_env_vars::ProcessEnvironment)?;
         service.trusted_template_storage =
             trusted_storage::TrustedTemplateStorageBuckets::from_env()
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
