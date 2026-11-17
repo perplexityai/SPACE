@@ -8,6 +8,10 @@ use pplx_space_node_registration_store::{
 };
 
 impl K8sStore {
+    /// `instance_id` is the EC2 instance the Node's `providerID` names.
+    /// `None` keeps the recorded instance while the Node's UID is unchanged;
+    /// on a UID change it clears it, since a new Node may be another machine.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::controllers::substrate::kubernetes) async fn persist_k8s_node_inventory(
         &self,
         node_name: &str,
@@ -16,6 +20,7 @@ impl K8sStore {
         role: NodeRole,
         address: Option<&str>,
         state: NodeStateWrite,
+        instance_id: Option<&Ec2InstanceId>,
     ) -> Result<bool, SubstrateError> {
         let mut tx = self
             .pool
@@ -33,6 +38,7 @@ impl K8sStore {
                     role,
                     address,
                     state,
+                    instance_id,
                 },
             )
             .await?;
@@ -116,6 +122,7 @@ impl K8sStore {
             role,
             address,
             state,
+            instance_id,
         } = upsert;
 
         // `manage_state` decides whether a conflict-update writes `state`.
@@ -137,6 +144,7 @@ impl K8sStore {
                 address,
                 state,
                 manage_state,
+                instance_id,
             },
             || {
                 tracing::warn!(
