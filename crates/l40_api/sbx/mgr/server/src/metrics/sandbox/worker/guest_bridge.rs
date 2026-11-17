@@ -1,5 +1,5 @@
 //! The spaced guest as sbx-mgr sees it: the activation environment, guest
-//! flushes on stop, and observed guest specs. The bridge's RPC results,
+//! flushes on stop, observed guest specs, and guest memory usage. The bridge's RPC results,
 //! latency and guest readiness are spaced-host-server's (its `metrics`), and
 //! the guest readiness wait is in `pplx-space-sandbox-metrics`'
 //! `gateway_readiness`.
@@ -43,4 +43,19 @@ pub fn guest_observed_specs(template: &str, mem_total_bytes: Option<u64>, vcpu_c
     if let Some(value) = vcpu_count {
         distribution("sandbox.guest.vcpu_count", f64::from(value), tags);
     }
+}
+
+/// One guest memory reading of a running sandbox, in bytes.
+///
+/// Reports `MemTotal - MemAvailable` tagged by template; deployment
+/// dimensions come from the sink. The watchdog emits one sample per accepted
+/// probe of a started sandbox. Paused sandboxes, including ready warm-pool
+/// slots, are not pinged and record nothing.
+/// Do not attach sandbox IDs or other per-sandbox identifiers.
+pub fn guest_memory_used(template: &str, used_bytes: u64) {
+    distribution(
+        "sandbox.guest.mem_used_bytes",
+        used_bytes as f64,
+        &[tag("template", template)],
+    );
 }
