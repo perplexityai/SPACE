@@ -613,6 +613,68 @@ async fn run_shutdown_drains_in_flight_executions() -> TestResult {
 }
 
 #[tokio::test]
+async fn run_shutdown_hands_back_executions_that_outlast_the_grace() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let slow = create_queued_operation(
+        &store,
+        org_id,
+        ApiProduct::Native,
+        OperationKind::DeleteSandbox,
+        TargetBlockingExecutor::BLOCKED_TARGET,
+    )
+    .await?;
+    let config = ReconcilerConfig {
+        shutdown_grace: Duration::from_millis(100),
+        ..fast_loop_config(1)
+    };
+    // Never released: the execution outlasts the grace.
+    let stuck = TargetBlockingExecutor::default();
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(run(
+        config.clone(),
+        store.clone(),
+        stuck.clone(),
+        shutdown.clone(),
+    ));
+    stuck.started.notified().await;
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher)
+        .await
+        .expect("shutdown stops an execution that outlasts the grace")?;
+
+    // The claim the stopped execution held would stay live for the default
+    // 60 s `claim_stale_after`; a successor starts the operation at once.
+    let successor = TargetBlockingExecutor::default();
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(run(
+        config,
+        store.clone(),
+        successor.clone(),
+        shutdown.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), successor.started.notified())
+        .await
+        .expect("a successor claims the handed-back operation at once");
+    successor.release.notify_one();
+    wait_for_state(&db.pool, slow, OperationState::Succeeded).await?;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    let attempts: i32 = sqlx::query_scalar(sql!(
+        "SELECT attempts FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(slow.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(attempts, 1, "the stopped attempt is not charged");
+    Ok(())
+}
+
+#[tokio::test]
 async fn tick_does_not_exhaust_workflow_progress_requeues() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
         return Ok(());
