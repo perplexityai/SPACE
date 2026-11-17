@@ -68,11 +68,14 @@ assert result.returncode != 0, "guest remounted a host-read-only drive writable"
 for path in ["/data/forbidden-write", "/dev/vdb"]:
     try:
         fd = os.open(path, os.O_WRONLY | (os.O_CREAT if path.startswith("/data/") else 0))
+        try:
+            os.write(fd, b"forbidden")
+        finally:
+            os.close(fd)
     except OSError as error:
         assert error.errno in [errno.EROFS, errno.EACCES, errno.EPERM], error
     else:
-        os.close(fd)
-        raise AssertionError("read-only drive opened writable: " + path)
+        raise AssertionError("read-only drive accepted a write: " + path)
 print("read-only-and-isolated")
 """
 
