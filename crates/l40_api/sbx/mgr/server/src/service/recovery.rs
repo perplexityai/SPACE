@@ -759,8 +759,10 @@ impl SandboxManagerService {
         let verdicts = match recovered {
             Ok(verdicts) => verdicts,
             Err(error) => {
+                // Seal retries do not depend on classification, so a failed
+                // classification task still dispatches them.
                 tracing::warn!(%error, "periodic suspend publication recovery task failed");
-                return Default::default();
+                Default::default()
             }
         };
         // Classify completed captures before seal retries take their fences.
