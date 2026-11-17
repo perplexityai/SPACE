@@ -3,7 +3,8 @@
 //! The handlers call [`validate_create_request`] and
 //! [`validate_update_request`] before admitting an operation, and the
 //! published `CreateSandboxRequest` schema reads the same constants, so the
-//! two cannot disagree about what is accepted.
+//! two cannot disagree about what is accepted. ECW's create checks its
+//! resource override with [`validate_resources`].
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -173,7 +174,8 @@ pub fn validate_update_request(request: &UpdateSandboxRequest) -> Result<(), Req
     Ok(())
 }
 
-fn validate_resources(resources: &SandboxResources) -> Result<(), RequestLimitError> {
+/// Checks requested vCPU, memory and disk against the limits in this module.
+pub fn validate_resources(resources: &SandboxResources) -> Result<(), RequestLimitError> {
     for (field, value, min, max) in [
         (
             RequestField::Vcpu,

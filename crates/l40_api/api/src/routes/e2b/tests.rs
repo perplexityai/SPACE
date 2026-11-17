@@ -1828,8 +1828,12 @@ fn create_translation_rejects_invalid_resource_overrides() {
         r#"{"vcpu":1.5}"#,
         r#"{"vcpu":"4"}"#,
         r#"{"vcpu":2147483648}"#,
+        r#"{"vcpu":33}"#,
         r#"{"memory_mib":2147483648}"#,
+        r#"{"memory_mib":8193}"#,
+        r#"{"memory_mib":511}"#,
         r#"{"disk_mib":0}"#,
+        r#"{"disk_mib":131073}"#,
         r#"{"memory_mb":8192}"#,
     ] {
         let mut request = base_create_request();
@@ -6600,6 +6604,123 @@ async fn seed_ecw_caller(pool: &PgPool) -> TestResult<(Organization, crate::mode
     Ok((org, actor))
 }
 
+/// Seeds the `seed` template with a `latest` release an ECW create resolves.
+#[cfg(feature = "kubernetes")]
+async fn seed_ecw_create_template(pool: &PgPool) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, visibility) VALUES ($1, 'seed', 'generic')"
+    ))
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, 'seed', 'fc', 'sha256:ecw-create-seed')"
+    ))
+    .bind(release_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+         VALUES ($1, 'seed', 'latest')"
+    ))
+    .bind(release_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A create whose `space.resources` the native API refuses is a 400 naming the
+/// native bounds, answered before the create reaches the substrate: no
+/// sandbox row is written and no pod is requested.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn ecw_create_refuses_out_of_bounds_resources_up_front() -> TestResult {
+    use pplx_space_public_api::limits::{
+        MAX_SANDBOX_MEMORY_MIB, MAX_SANDBOX_VCPU, MIN_SANDBOX_MEMORY_MIB, MIN_SANDBOX_VCPU,
+    };
+    let db = pg_test_db().await?;
+    seed_ecw_create_template(&db.pool).await?;
+    let pod_creates = Arc::new(Mutex::new(Vec::new()));
+    let kubernetes =
+        crate::controllers::substrate::kubernetes::tests::substrate_with_store_and_client(
+            db.pool.clone(),
+            crate::controllers::substrate::kubernetes::tests::mock_kubernetes_client(Arc::clone(
+                &pod_creates,
+            )),
+        );
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
+        crate::controllers::substrate::Substrate::from_kubernetes(kubernetes),
+    );
+    let (_, actor) = seed_ecw_caller(&db.pool).await?;
+    let app = e2b_api_routes()
+        .layer(Extension(AuthEcwActor(Some(actor))))
+        .layer(Extension(test_ecw_host_config()))
+        .with_state(state);
+
+    for (resources, field, min, max) in [
+        (
+            json!({ "vcpu": MAX_SANDBOX_VCPU + 1 }),
+            "vcpu",
+            MIN_SANDBOX_VCPU,
+            MAX_SANDBOX_VCPU,
+        ),
+        (
+            json!({ "memory_mib": MAX_SANDBOX_MEMORY_MIB + 1 }),
+            "memory_mib",
+            MIN_SANDBOX_MEMORY_MIB,
+            MAX_SANDBOX_MEMORY_MIB,
+        ),
+        (
+            json!({ "memory_mib": MIN_SANDBOX_MEMORY_MIB - 1 }),
+            "memory_mib",
+            MIN_SANDBOX_MEMORY_MIB,
+            MAX_SANDBOX_MEMORY_MIB,
+        ),
+    ] {
+        let body = json!({
+            "templateID": "seed",
+            "metadata": { "space.resources": resources.to_string() },
+        });
+        // Bounds a create that reaches the substrate, whose readiness wait
+        // the mock apiserver may not end.
+        let response = tokio::time::timeout(
+            Duration::from_secs(20),
+            app.clone().oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/sandboxes")
+                    .header(header::HOST, TEST_ECW_API_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))?,
+            ),
+        )
+        .await
+        .map_err(|_| format!("{resources}: the create was not refused up front"))??;
+
+        let status = response.status();
+        let error: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resources}: {error}");
+        assert_eq!(
+            error["message"],
+            format!("space.resources.{field} must be between {min} and {max}"),
+            "{resources}"
+        );
+    }
+    assert!(
+        pod_creates.lock().unwrap().is_empty(),
+        "a refused create requested a pod"
+    );
+    let sandboxes: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes"))
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(sandboxes, 0, "a refused create wrote a sandbox row");
+    Ok(())
+}
+
 /// A cold ECW create is admitted once, for the ID it answers with.
 #[cfg(feature = "kubernetes")]
 #[rstest]
@@ -6614,27 +6735,7 @@ async fn ecw_create_is_admitted_for_the_sandbox_it_creates(
         return Ok(());
     }
     let fixture = kubernetes_app_state_fixture.await?;
-    sqlx::query(sql!(
-        "INSERT INTO templates (id, name, visibility) VALUES ($1, 'seed', 'generic')"
-    ))
-    .bind(Uuid::now_v7())
-    .execute(&fixture.pool)
-    .await?;
-    let release_id = Uuid::now_v7();
-    sqlx::query(sql!(
-        "INSERT INTO template_releases (id, template_name, type, hash)
-         VALUES ($1, 'seed', 'fc', 'sha256:ecw-create-admission')"
-    ))
-    .bind(release_id)
-    .execute(&fixture.pool)
-    .await?;
-    sqlx::query(sql!(
-        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
-         VALUES ($1, 'seed', 'latest')"
-    ))
-    .bind(release_id)
-    .execute(&fixture.pool)
-    .await?;
+    seed_ecw_create_template(&fixture.pool).await?;
     let (_, actor) = seed_ecw_caller(&fixture.pool).await?;
 
     let response = e2b_api_routes()

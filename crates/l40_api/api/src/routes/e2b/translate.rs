@@ -47,21 +47,17 @@ pub(super) fn translate_create_request(
         .transpose()
         .map_err(|error| E2bApiError::bad_request(format!("invalid space.resources: {error}")))?
         .unwrap_or_default();
-    for (field, value) in [
-        ("vcpu", resources.vcpu),
-        ("memory_mib", resources.memory_mib),
-        ("disk_mib", resources.disk_mib),
-    ] {
-        // Resource columns are signed 32-bit integers; reject before admission.
-        if let Some(value) = value
-            && (value == 0 || value > i32::MAX as u32)
-        {
-            return Err(E2bApiError::bad_request(format!(
-                "space.resources.{field} must be between 1 and {}",
-                i32::MAX
-            )));
-        }
-    }
+    // The native API's bounds, checked before admission. Past them a node
+    // boots no VM (too many vCPUs, so the create waits out its readiness
+    // budget) or clamps the guest memory it was asked for.
+    pplx_space_public_api::limits::validate_resources(&pplx_space_public_api::SandboxResources {
+        vcpu: resources.vcpu,
+        memory_mib: resources.memory_mib,
+        disk_mib: resources.disk_mib,
+    })
+    // The native field is `resources.<name>`; ECW's is the reserved
+    // `space.resources` metadata key.
+    .map_err(|error| E2bApiError::bad_request(format!("space.{error}")))?;
     let mut unsupported = Vec::new();
     let network_policy = if let Some(raw) = req.metadata.remove(NETWORK_POLICY_METADATA_KEY) {
         if req.network.is_some()
