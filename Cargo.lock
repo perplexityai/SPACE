@@ -5299,6 +5299,7 @@ dependencies = [
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-runtime-environment-catalog-store",
+ "pplx-space-runtime-upgrade-campaign-store",
  "pplx-space-sandbox-pod",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-quarantine-store",
