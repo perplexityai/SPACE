@@ -213,9 +213,12 @@ sandbox, change a template, or alter fork, connect, or resume behavior. Requests
 without the extension retain their existing behavior.
 
 Deploy an API version supporting this extension before enabling callers. Older
-versions accept the key as ordinary metadata and do not apply its sizing.
-Callers should verify the allocation returned by `get_info()` and reject an
-undersized sandbox.
+versions accept the key as ordinary metadata and do not apply its sizing;
+`get_info()` then reports the default sizing instead of the requested values.
+`get_info()` reports the requested `memory_mb`, not the memory the node gave the
+guest, so it cannot show that a request above the node's guest maximum was
+capped. To check a guest's memory, read it inside the sandbox, for example
+`MemTotal` in `/proc/meminfo`, which sits slightly below the allocation.
 
 ## Compatibility contract
 
