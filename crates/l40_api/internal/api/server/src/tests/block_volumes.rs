@@ -47,7 +47,8 @@ async fn block_volume_pod_origin_requires_reviewed_live_node_incarnation() -> Te
     seed_active_k8s_sandbox(pool, sandbox, node).await?;
     seed_active_k8s_execution(pool, sandbox, 1, "192.0.2.20").await?;
     sqlx::query(sql!(
-        "UPDATE sandbox_k8s_executions SET activation_attempt_id = $2 WHERE sandbox_id = $1"
+        "UPDATE sandbox_k8s_executions
+         SET activation_attempt_id = $2, route_activation_id = $2 WHERE sandbox_id = $1"
     ))
     .bind(sandbox)
     .bind(attempt)
@@ -153,7 +154,8 @@ async fn block_volume_grants_authenticate_origin_and_fence_progress_but_keep_del
     seed_active_k8s_sandbox(&pool, sandbox, node).await?;
     seed_active_k8s_execution(&pool, sandbox, 1, "192.0.2.20").await?;
     sqlx::query(sql!(
-        "UPDATE sandbox_k8s_executions SET activation_attempt_id = $2 WHERE sandbox_id = $1"
+        "UPDATE sandbox_k8s_executions
+         SET activation_attempt_id = $2, route_activation_id = $2 WHERE sandbox_id = $1"
     ))
     .bind(sandbox)
     .bind(attempt)
@@ -322,6 +324,27 @@ async fn block_volume_grants_authenticate_origin_and_fence_progress_but_keep_del
         .await?
         .into_inner();
     assert_eq!(active.disk_generation, 1);
+    // Normal activation completion releases the temporary claim, not the
+    // resident execution's identity. Pause/resume must retain disk authority.
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET activation_attempt_id = NULL WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox)
+    .execute(&pool)
+    .await?;
+    let mut wrong_owner = execution;
+    wrong_owner.activation_attempt_id = Uuid::now_v7().to_string();
+    assert_eq!(
+        fixture
+            .service
+            .resolve_block_volume_binding(node_request(ResolveBlockVolumeBindingRequest {
+                execution: Some(wrong_owner),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
     assert_eq!(
         fixture
             .service

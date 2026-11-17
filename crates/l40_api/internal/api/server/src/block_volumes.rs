@@ -13,9 +13,8 @@ use pplx_space_execution_common::proto::{
 };
 use pplx_space_execution_spec::GuestDataDrive;
 use pplx_space_rpc_auth::{AuthenticatedNodeIdentity, NodeApiAuthenticatedCaller};
-use pplx_space_sandbox_store::{
-    self as sandboxes,
-    block_volume::{self as store, BlockVolume, Initialization, VolumePhase},
+use pplx_space_sandbox_store::block_volume::{
+    self as store, BlockVolume, Initialization, VolumePhase,
 };
 use serde::Deserialize;
 use sqlx::{Postgres, Transaction};
@@ -213,12 +212,12 @@ impl ClusterApiService {
         if exists.is_none() {
             return Err(refused());
         }
-        let current = sandboxes::auto_lifecycle_execution(&mut *tx, execution.sandbox)
+        let current = store::current_execution(&mut *tx, execution.sandbox)
             .await
             .map_err(database)?
             .ok_or_else(refused)?;
         if current.execution_generation != Some(execution.generation.get())
-            || current.activation_attempt_id != Some(execution.attempt)
+            || current.execution_id != Some(execution.attempt)
             || ![current.active_node_id, current.target_node_id].contains(&Some(execution.node))
         {
             tracing::warn!(
@@ -227,7 +226,7 @@ impl ClusterApiService {
                 requested_attempt = %execution.attempt,
                 requested_node = %execution.node,
                 current_generation = ?current.execution_generation,
-                current_attempt = ?current.activation_attempt_id,
+                current_attempt = ?current.execution_id,
                 active_node = ?current.active_node_id,
                 target_node = ?current.target_node_id,
                 "retained block-volume execution rejected"

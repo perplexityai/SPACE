@@ -77,6 +77,34 @@ pub struct NewBlockVolume<'a> {
     pub resource_limit: u32,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+pub struct CurrentExecution {
+    pub execution_generation: Option<i64>,
+    pub execution_id: Option<Uuid>,
+    pub active_node_id: Option<NodeId>,
+    pub target_node_id: Option<NodeId>,
+}
+
+/// The resident execution survives completion of its temporary activation
+/// claim. Disk authority follows its durable route identity until retirement.
+pub async fn current_execution(
+    executor: impl PgExecutor<'_>,
+    sandbox: SandboxId,
+) -> Result<Option<CurrentExecution>, sqlx::Error> {
+    sqlx::query_as::<_, CurrentExecution>(sql!(
+        "SELECT COALESCE(e.generation, r.execution_generation) AS execution_generation,
+                COALESCE(e.route_activation_id, r.activation_attempt_id) AS execution_id,
+                s.active_node_id, s.target_node_id
+         FROM sandboxes s
+         LEFT JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id AND e.active
+         LEFT JOIN sandbox_direct_route_identities r ON r.sandbox_id = s.id
+         WHERE s.id = $1"
+    ))
+    .bind(sandbox)
+    .fetch_optional(executor)
+    .await
+}
+
 /// The advisory lock serializes admissions, including creates whose AWS result
 /// is still unknown. Deleted tombstones do not consume capacity; all others do.
 /// This must share the transaction that records the sandbox's creation intent.

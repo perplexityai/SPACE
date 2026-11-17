@@ -25,6 +25,9 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
   UID fail closed without address fallback; callers without reviewed node claims
   retain registered-address authentication. Execution and EBS host grants still
   apply after authenticating the node.
+- Retained-disk execution checks use the durable Kubernetes
+  `route_activation_id`, not the temporary `activation_attempt_id` claim that
+  activation-completion receipts clear while the VM remains resident.
 - ClusterApi never creates a node registration. `nodes` and `node_k8s` rows
   come from the cluster controller's Kubernetes node sync, sandbox pod
   placement and Direct admin registration; a request naming an unregistered
