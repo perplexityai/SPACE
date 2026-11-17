@@ -1,5 +1,5 @@
 [package]
-name = "pplx-space-common-connection-admission"
+name = "pplx-space-connection-admission"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

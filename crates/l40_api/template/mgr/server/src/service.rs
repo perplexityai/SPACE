@@ -526,7 +526,7 @@ fn copy_template_file(src: &Path, dst: &Path) -> Result<(), Status> {
             let times = std::fs::FileTimes::new()
                 .set_accessed(metadata.accessed()?)
                 .set_modified(metadata.modified()?);
-            pplx_space_common_io::reflink::copy_file(src, dst)?;
+            pplx_space_file_io::reflink::copy_file(src, dst)?;
             std::fs::File::open(dst)?.set_times(times)
         };
         copy().map_err(|error| {
