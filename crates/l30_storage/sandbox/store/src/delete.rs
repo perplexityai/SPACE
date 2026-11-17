@@ -71,6 +71,38 @@ pub async fn restore_lifecycle_from_deleting(
     Ok(changed == 1)
 }
 
+/// Lock the sandbox's `sandbox_observed_states` rows for a delete. A delete
+/// transaction that locks the `sandboxes` row before calling
+/// [`delete_with_dependents`] takes this first.
+///
+/// A node publication writes a sandbox's observed state before its
+/// `sandboxes` row, in one transaction. A delete that held the `sandboxes`
+/// row and then deleted the observed state waited on that publication while
+/// the publication waited on it, and Postgres aborted one of them with
+/// `deadlock detected`. Locking the observed state first puts the delete in
+/// the publication's order: it waits for an in-flight publication to commit
+/// before it takes the `sandboxes` row. Nothing else waits longer.
+///
+/// `nowait` fails with `55P03` instead of waiting, for callers that run
+/// inside a publication and already lock the `sandboxes` row with `NOWAIT`.
+/// A sandbox with no observed-state row locks nothing.
+pub async fn lock_observed_states_for_delete(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    nowait: bool,
+) -> Result<(), sqlx::Error> {
+    let query = if nowait {
+        sql!("SELECT 1 FROM sandbox_observed_states WHERE sandbox_id = $1 FOR UPDATE NOWAIT")
+    } else {
+        sql!("SELECT 1 FROM sandbox_observed_states WHERE sandbox_id = $1 FOR UPDATE")
+    };
+    sqlx::query(query)
+        .bind(sandbox_id.as_uuid())
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
 /// Delete a central sandbox and every non-FK reconcile row in one transaction.
 ///
 /// Writes an **operation step**: it is the last step of each caller's
