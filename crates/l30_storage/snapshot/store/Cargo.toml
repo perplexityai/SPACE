@@ -10,6 +10,7 @@ publish.workspace = true
 [package.metadata.space.state]
 postgres = [
   "snapshot_artifact_digests",
+  "snapshot_storage_location_encrypted_fields",
   "snapshot_storage_locations",
   "snapshots",
 ]
