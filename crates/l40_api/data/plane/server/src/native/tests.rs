@@ -3883,21 +3883,24 @@ async fn an_attach_waits_for_a_route_within_its_deadline() {
 }
 
 /// A cluster API that refuses every session route resolve with `refusal`,
-/// given how long it has been up.
+/// given how long since the first resolve it received, so the caller's setup
+/// does not count.
 async fn spawn_route_refusing_fake(
     refusal: impl Fn(Duration) -> tonic::Status + Clone + Send + Sync + 'static,
 ) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let started = tokio::time::Instant::now();
+    let first_resolve = Arc::new(std::sync::OnceLock::new());
     let service = axum::Router::new().fallback(move |request: Request<Body>| {
         let refusal = refusal.clone();
+        let first_resolve = Arc::clone(&first_resolve);
         async move {
             let path = request.uri().path().to_string();
             if path.ends_with("/Check") {
                 return crate::tests::grpc_test_response(vec![8, 1]);
             }
             assert!(path.ends_with("/ResolveDataPlaneSessionRoute"), "{path}");
+            let started = *first_resolve.get_or_init(tokio::time::Instant::now);
             refusal(started.elapsed()).into_http::<Body>()
         }
     });
