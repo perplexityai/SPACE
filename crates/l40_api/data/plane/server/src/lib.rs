@@ -171,6 +171,9 @@ const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(5);
 /// the exit anyway. Only the session's public state waits on the record, so a
 /// slow cluster API must not hold `process_exited` for its full RPC timeout.
 const PROCESS_EXIT_RECORD_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long an exit record the cluster API could not take for now waits
+/// before it is sent again; each later retry waits twice as long.
+const PROCESS_EXIT_RECORD_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// The longest revocation check interval the service accepts: a third of
 /// what is left of the staleness bound after one check timeout, 19 s at the
 /// defaults. A failed check keeps a verdict until it is that bound less one
@@ -304,6 +307,7 @@ struct DataPlaneState {
     revocation_max_staleness: Duration,
     revocation_check_timeout: Duration,
     process_exit_record_timeout: Duration,
+    process_exit_record_retry_delay: Duration,
     route_cache_ttl: Duration,
     websocket_ping_interval: Duration,
     /// Cancelled on SIGTERM: a child of the caller's shutdown token. New
@@ -507,6 +511,7 @@ pub async fn run(
         revocation_max_staleness: REVOCATION_MAX_STALENESS,
         revocation_check_timeout: REVOCATION_CHECK_TIMEOUT,
         process_exit_record_timeout: PROCESS_EXIT_RECORD_TIMEOUT,
+        process_exit_record_retry_delay: PROCESS_EXIT_RECORD_RETRY_DELAY,
         route_cache_ttl: config.route_cache_ttl.max(Duration::from_millis(1)),
         websocket_ping_interval: WEBSOCKET_PING_INTERVAL,
         drain_started,

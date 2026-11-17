@@ -2,7 +2,7 @@ use super::*;
 use axum::extract::ws::Message;
 use pplx_space_api_route::{RouteIdentityRemediation, set_route_identity_rejection_metadata};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[tokio::test]
 async fn process_start_http_errors_preserve_permanent_guest_failures() {
@@ -801,6 +801,48 @@ async fn an_unanswered_exit_record_does_not_hold_back_the_exit() {
         *fake.exited_process_ids.lock().unwrap(),
         [pplx_space_public_api::process_id_for_session(session_id).to_string()],
         "the stream tried to record the exit; {seen}"
+    );
+}
+
+/// An exit record the cluster API could not take for now is sent again
+/// after the stream has reported the exit, so the session still closes
+/// although no client reattaches.
+#[tokio::test]
+async fn an_exit_record_the_cluster_api_refused_for_now_is_retried() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+    )
+    .await;
+    fake.exit_record_refusals.store(1, Ordering::SeqCst);
+    let mut state = fake_state(&fake.endpoint).await;
+    state.process_exit_record_retry_delay = Duration::from_millis(10);
+    let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
+
+    let (_state, mut chunks) = open_process_events_on(state, session_id, None).await;
+    let mut seen = String::new();
+    read_until(&mut chunks, &mut seen, "process_exited").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fake.exited_process_ids.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the refused record was not sent again: {:?}",
+            fake.exited_process_ids.lock().unwrap()
+        )
+    });
+    assert_eq!(fake.exit_record_refusals.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *fake.exited_process_ids.lock().unwrap(),
+        [process_id.clone(), process_id]
     );
 }
 
@@ -2530,6 +2572,8 @@ struct ProcessFake {
     exited_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
     /// Set to take exit records without ever answering them.
     exit_records_unanswered: Arc<AtomicBool>,
+    /// How many exit records still to refuse as unavailable before taking one.
+    exit_record_refusals: Arc<AtomicUsize>,
     calls: Arc<std::sync::Mutex<Vec<String>>>,
     started_stdin: Arc<std::sync::Mutex<Vec<bool>>>,
     /// Whether the guest lists the session's process as running.
@@ -2588,6 +2632,7 @@ async fn spawn_process_fake(
         bound_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         exited_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         exit_records_unanswered: Arc::new(AtomicBool::new(false)),
+        exit_record_refusals: Arc::new(AtomicUsize::new(0)),
         calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         started_stdin: Arc::new(std::sync::Mutex::new(Vec::new())),
         running: Arc::new(AtomicBool::new(true)),
@@ -2602,6 +2647,7 @@ async fn spawn_process_fake(
     let running = Arc::clone(&fake.running);
     let exited_process_ids = Arc::clone(&fake.exited_process_ids);
     let exit_records_unanswered = Arc::clone(&fake.exit_records_unanswered);
+    let exit_record_refusals = Arc::clone(&fake.exit_record_refusals);
     let service = axum::Router::new().fallback(move |request: Request<Body>| {
         let mut route = route.clone();
         let process_id = process_id.clone();
@@ -2613,6 +2659,7 @@ async fn spawn_process_fake(
         let bound_process_ids = Arc::clone(&bound_process_ids);
         let exited_process_ids = Arc::clone(&exited_process_ids);
         let exit_records_unanswered = Arc::clone(&exit_records_unanswered);
+        let exit_record_refusals = Arc::clone(&exit_record_refusals);
         let calls = Arc::clone(&calls);
         let started_stdin = Arc::clone(&started_stdin);
         let route_lookups = Arc::clone(&route_lookups);
@@ -2674,6 +2721,11 @@ async fn spawn_process_fake(
                 exited_process_ids.lock().unwrap().push(request.process_id);
                 if exit_records_unanswered.load(Ordering::SeqCst) {
                     std::future::pending::<()>().await;
+                }
+                // A stream sends its records one at a time.
+                if exit_record_refusals.load(Ordering::SeqCst) > 0 {
+                    exit_record_refusals.fetch_sub(1, Ordering::SeqCst);
+                    return tonic::Status::unavailable("cluster API restarting").into_http();
                 }
                 return crate::tests::grpc_test_response(Vec::new());
             }
