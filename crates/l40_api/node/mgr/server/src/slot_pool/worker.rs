@@ -80,11 +80,21 @@ struct LiveValidationMeta {
     sandbox_id: String,
 }
 
+/// `young` is whether the lease is still inside its startup grace
+/// (`STARTUP_YOUNG_LEASE_GRACE`).
 pub(super) fn validate_startup_runtime(
     info: SlotInfo,
     host_ready: bool,
     evidence: LeaseLiveness,
+    young: bool,
 ) -> ValidationTaskResult<StartupLeaseUpdate> {
+    // A lease allocated just before this process started has no runtime
+    // until its activation launches. Recheck it without a write: the grace
+    // stays fixed by the predecessor's last write, and a lease its activation
+    // adopts keeps the allocation's health.
+    if young && evidence != LeaseLiveness::Live {
+        return ValidationTaskResult::Deferred;
+    }
     let health = |health, last_error| {
         StartupLeaseUpdate::Health(LeaseHealthValidationUpdate {
             slot_id: info.slot,
@@ -1150,15 +1160,7 @@ pub(super) async fn validate_live_leased_slots(
                 let info = record.info.clone();
                 let result = match tokio::task::spawn_blocking(move || {
                     let evidence = lease_liveness(&info);
-                    // A lease allocated just before this process started has
-                    // no runtime until its activation launches. Recheck it
-                    // without a write: the grace stays fixed by the
-                    // predecessor's last write, and a lease its activation
-                    // adopts keeps the allocation's health.
-                    if young && evidence == LeaseLiveness::Gone {
-                        return ValidationTaskResult::Deferred;
-                    }
-                    validate_startup_runtime(info, host_ready, evidence)
+                    validate_startup_runtime(info, host_ready, evidence, young)
                 })
                 .await
                 {

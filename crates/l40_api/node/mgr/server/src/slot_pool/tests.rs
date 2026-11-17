@@ -144,7 +144,7 @@ mod slot_pool_tests {
             query_startup_leases(&pool.db.lock().unwrap()).unwrap();
         for _ in 0..=MAX_SLOT_TRANSIENT_VALIDATION_RETRIES {
             let ValidationTaskResult::RuntimeUnknown(update) =
-                validate_startup_runtime(info.clone(), false, LeaseLiveness::Live)
+                validate_startup_runtime(info.clone(), false, LeaseLiveness::Live, false)
             else {
                 panic!("host readiness must defer rather than validate the missing namespace");
             };
@@ -412,6 +412,35 @@ mod slot_pool_tests {
         assert_eq!(row.state, SlotState::Leased);
         assert_eq!(row.info.pid, Some(pid));
         assert_eq!(row.memory_reservation_mib, Some(8320));
+    }
+
+    // Inside its grace a lease without live runtime evidence is rechecked
+    // without a write, whether the evidence says gone or cannot tell, so no
+    // write renews the grace a successor computes. Live evidence is validated
+    // as before.
+    #[test]
+    fn startup_validation_rechecks_a_young_lease_without_a_write_unless_it_is_live() {
+        let pool = runtimeless_startup_lease(Duration::from_secs(1));
+        let info = record(&pool, 0).info;
+        for evidence in [LeaseLiveness::Gone, LeaseLiveness::Unknown] {
+            assert!(matches!(
+                validate_startup_runtime(info.clone(), true, evidence, true),
+                ValidationTaskResult::Deferred
+            ));
+        }
+        assert!(matches!(
+            validate_startup_runtime(info.clone(), false, LeaseLiveness::Live, true),
+            ValidationTaskResult::RuntimeUnknown(_)
+        ));
+        // Once the grace ends the same evidence is recorded and acted on.
+        assert!(matches!(
+            validate_startup_runtime(info.clone(), true, LeaseLiveness::Unknown, false),
+            ValidationTaskResult::RuntimeUnknown(_)
+        ));
+        assert!(matches!(
+            validate_startup_runtime(info, true, LeaseLiveness::Gone, false),
+            ValidationTaskResult::Update(StartupLeaseUpdate::Gone(_))
+        ));
     }
 
     // Once its grace ends, a lease that still has no runtime is an orphan and
