@@ -238,7 +238,7 @@ fn rpc_failure(rpc: &'static str, status: &tonic::Status) -> Response {
     tracing::warn!(
         rpc,
         code = ?status.code(),
-        message = status.message(),
+        grpc_message = status.message(),
         "native file access call failed"
     );
     match status.code() {

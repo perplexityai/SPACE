@@ -136,7 +136,7 @@ async fn read(state: &DataPlaneState, request: Request<Body>) -> Result<Response
             // aborted response tells the client. Record it on this side too.
             tracing::warn!(
                 code = ?status.code(),
-                message = status.message(),
+                grpc_message = status.message(),
                 "native file read failed mid-stream"
             );
             std::io::Error::other(status.message().to_owned())
