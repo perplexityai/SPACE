@@ -654,6 +654,9 @@ async fn resolve_pool_template_release(
     .map_err(|err| db_contention_error("failed to resolve pool template release", &err))
 }
 
+/// The worker registered under the slot pod's Kubernetes node name. Node ids
+/// are scoped by role, so a builder on the same host has its own row under
+/// that name.
 async fn resolve_pool_slot_node_id(
     tx: &mut Transaction<'_, Postgres>,
     node_name: Option<&str>,
@@ -662,7 +665,11 @@ async fn resolve_pool_slot_node_id(
         return Ok(None);
     };
     sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT node_id FROM node_k8s WHERE k8s_node_name = $1"
+        "SELECT nk.node_id
+         FROM node_k8s nk
+         JOIN nodes n ON n.id = nk.node_id
+         WHERE nk.k8s_node_name = $1
+           AND n.role = 'worker'"
     ))
     .bind(node_name)
     .fetch_optional(&mut **tx)
