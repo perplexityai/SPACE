@@ -116,6 +116,44 @@ fn installation_symlink_is_followed_but_descendant_links_are_not() {
     std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o777)).unwrap();
     open_beneath_installation(&alias, Path::new("cache"), owner).unwrap_err();
 }
+
+#[test]
+fn absent_installation_root_is_absent_not_unsafe() {
+    // The host's /space may not exist (a fresh build box): callers that map
+    // absence to NotFound must see the same code whether the root or a
+    // component beneath it is missing.
+    let temp = tempfile::tempdir().unwrap();
+    let owner = std::fs::metadata(temp.path()).unwrap().uid();
+    let missing = temp.path().join("space");
+    let error = open_beneath_installation(&missing, Path::new("cache"), owner).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::NotFound, "{error}");
+    assert!(error.message().contains("component is absent"), "{error}");
+    // A dangling root symlink is not absence: its target may return.
+    symlink(temp.path().join("persistent"), &missing).unwrap();
+    let error = open_beneath_installation(&missing, Path::new("cache"), owner).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    // The failure is the open through the link, not the ownership check.
+    assert!(
+        error.message().contains("No such file or directory"),
+        "{error}"
+    );
+    // A safe root missing only the child is NotFound, as a missing root is.
+    std::fs::remove_file(&missing).unwrap();
+    std::fs::create_dir(&missing).unwrap();
+    std::fs::set_permissions(&missing, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let error = open_beneath_installation(&missing, Path::new("cache"), owner).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::NotFound, "{error}");
+    assert!(error.message().contains("component is absent"), "{error}");
+    // Absence never excuses an unsafe root that does exist.
+    std::fs::set_permissions(&missing, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let error = open_beneath_installation(&missing, Path::new("cache"), owner).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(
+        error.message().contains("not administrator-owned"),
+        "{error}"
+    );
+}
+
 #[test]
 fn bind_target_creation_rejects_links_and_keeps_existing_contents() {
     let temp = tempfile::tempdir().unwrap();
