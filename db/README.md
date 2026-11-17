@@ -108,9 +108,11 @@ columns, or indexes that release never trips over, and every read and write
 that release makes stays valid with it applied. The contract step of an
 expand/contract change counts as additive for a release that has already
 stopped naming what it removes, when the removed object holds no data of its
-own: dropping a generated column, a view or an index that release never names
-qualifies. Dropping a stored column or a table doesn't, because its data is
-gone after the drop. The bundling release must ship
+own and enforces no rule that release relies on: dropping a generated column,
+a view or a plain index that release never names qualifies. Dropping a stored
+column or a table doesn't, because its data is gone after the drop. Neither
+does dropping a unique index, a trigger or a CHECK constraint, because the
+listing release could then write rows the rule would have rejected. The bundling release must ship
 the same up SQL byte for byte, comments included, because the listing release
 accepts only that checksum; `every_listed_forward_migration_matches_the_catalog_that_bundles_it`
 checks it once both are in the tree. Never list a migration that isn't additive
