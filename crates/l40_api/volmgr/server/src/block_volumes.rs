@@ -1,6 +1,7 @@
 //! Node-bound relay for retained EBS disks, independent of object-store volumes.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::NodeRole;
 use pplx_space_execution_common::proto::BlockVolumeExecution;
 use pplx_space_node_api_client::cluster::AuthenticatedClusterApiClient;
 use tonic::{Request, Status};
@@ -20,10 +21,10 @@ impl BlockVolumeAuthority {
         let Some(raw) = std::env::var_os("SPACE_EBS_NODE_ID") else {
             return Ok(None);
         };
-        let node = raw
+        let raw = raw
             .to_str()
-            .ok_or_else(|| Status::failed_precondition("invalid EBS node identity"))?
-            .parse()
+            .ok_or_else(|| Status::failed_precondition("invalid EBS node identity"))?;
+        let node = pplx_space_k8s_node_id::space_node_id(raw, NodeRole::Worker)
             .map_err(|_| Status::failed_precondition("invalid EBS node identity"))?;
         let client = pplx_space_node_api_client::cluster::connect_from_env()
             .await

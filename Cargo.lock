@@ -8656,6 +8656,7 @@ dependencies = [
  "pplx-space-grpc-server",
  "pplx-space-host-layout",
  "pplx-space-host-linux",
+ "pplx-space-k8s-node-id",
  "pplx-space-local-health",
  "pplx-space-metrics-emit",
  "pplx-space-node-api-client",
