@@ -110,6 +110,8 @@ fn service_connect_options(
 /// One generic pool knob per setting, set per-Deployment in Helm (env is
 /// per-container, so per-service env names add nothing):
 /// `POSTGRES_POOL_MAX_CONNECTIONS` (default 25),
+/// `POSTGRES_CREDS_POOL_MAX_CONNECTIONS` (the `space_creds` pool's cap;
+/// unset uses `POSTGRES_POOL_MAX_CONNECTIONS`),
 /// `POSTGRES_POOL_MIN_CONNECTIONS` (default 1),
 /// `POSTGRES_POOL_ACQUIRE_TIMEOUT_SECS` (default 5),
 /// `POSTGRES_POOL_IDLE_TIMEOUT_SECS` (default 300),
@@ -125,7 +127,7 @@ pub async fn connect_postgres_as(
     password: &str,
 ) -> Result<PgPool, ConnectPostgresAsError> {
     let options = service_connect_options(database_url, application_name, identity, password)?;
-    postgres_pool_options()
+    postgres_pool_options(identity)
         .connect_with(options)
         .await
         .map_err(ConnectPostgresAsError::Connect)
@@ -180,7 +182,7 @@ pub fn connect_postgres_lazy_as_capped(
 ) -> Result<PgPool, DatabaseConnectOptionsError> {
     let max_connections = max_connections.get();
     let options = service_connect_options(database_url, application_name, identity, password)?;
-    let pool_options = postgres_pool_options()
+    let pool_options = postgres_pool_options(identity)
         .max_connections(max_connections)
         .min_connections(min_connections_from_env().min(max_connections));
     let pool_options = match statement_timeout {
@@ -227,11 +229,11 @@ pub fn connect_postgres_lazy_as(
     password: &str,
 ) -> Result<PgPool, DatabaseConnectOptionsError> {
     let options = service_connect_options(database_url, application_name, identity, password)?;
-    Ok(postgres_pool_options().connect_lazy_with(options))
+    Ok(postgres_pool_options(identity).connect_lazy_with(options))
 }
 
-fn postgres_pool_options() -> PgPoolOptions {
-    let max_connections = max_connections_from_env();
+fn postgres_pool_options(identity: DatabaseIdentity) -> PgPoolOptions {
+    let max_connections = max_connections_from_env(identity);
     let max_lifetime = max_lifetime_from_env();
     let max_lifetime_jitter_fraction = max_lifetime_jitter_fraction_from_env();
 
@@ -285,12 +287,24 @@ async fn warm_type_cache(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Erro
     Ok(())
 }
 
-fn max_connections_from_env() -> u32 {
-    u32::try_from(parse_positive_env_u64(
+/// `POSTGRES_POOL_MAX_CONNECTIONS`, except that a `space_creds` pool reads
+/// `POSTGRES_CREDS_POOL_MAX_CONNECTIONS` first. A process that opens both
+/// pools (the API, the cluster controller) otherwise holds up to twice the
+/// general cap, even where its `space_creds` traffic is a few admin calls.
+fn max_connections_from_env(identity: DatabaseIdentity) -> u32 {
+    let general = u32::try_from(parse_positive_env_u64(
         "POSTGRES_POOL_MAX_CONNECTIONS",
         u64::from(DEFAULT_MAX_CONNECTIONS),
     ))
-    .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+    .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+    match identity {
+        DatabaseIdentity::SpaceUser => general,
+        DatabaseIdentity::SpaceCreds => u32::try_from(parse_positive_env_u64(
+            "POSTGRES_CREDS_POOL_MAX_CONNECTIONS",
+            u64::from(general),
+        ))
+        .unwrap_or(general),
+    }
 }
 
 fn min_connections_from_env() -> u32 {
