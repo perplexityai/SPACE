@@ -1,7 +1,7 @@
 //! `space-admin-cli runtime env ...`: the cluster's execution environment
 //! policy, through `/admin/api/v1/runtime-environments`. The server validates
 //! every write and enforces the policy rules; this module sends requests and
-//! renders what comes back.
+//! renders what comes back. `runtime campaign ...` lives in [`campaign`].
 
 use std::collections::BTreeMap;
 
@@ -134,6 +134,21 @@ struct Population {
     invalid: Counts,
 }
 
+/// The command that shows whether a policy write landed.
+const POLICY_CHECK: &str = "runtime env list";
+
+/// A page of a cursor-paged admin list.
+pub(super) trait Paged: serde::de::DeserializeOwned {
+    /// The cursor for the next page; `None` on the last.
+    fn next_after(&self) -> Option<Uuid>;
+}
+
+impl Paged for NodePage {
+    fn next_after(&self) -> Option<Uuid> {
+        self.next_after
+    }
+}
+
 fn runtime_environments_url(base_url: &str, suffix: &str) -> String {
     format!("{base_url}{ADMIN_API_PREFIX}/runtime-environments{suffix}")
 }
@@ -148,7 +163,13 @@ impl AdminClient {
         &self,
         command: RuntimeCommands,
     ) -> Result<String, CliError> {
-        let RuntimeCommands::Env { command } = command;
+        match command {
+            RuntimeCommands::Env { command } => self.env_command(command).await,
+            RuntimeCommands::Campaign { command } => self.campaign_command(command).await,
+        }
+    }
+
+    async fn env_command(&self, command: RuntimeEnvCommands) -> Result<String, CliError> {
         match command {
             RuntimeEnvCommands::List { json } => {
                 let body = self
@@ -174,7 +195,9 @@ impl AdminClient {
                         "reason": reason,
                         "strand": strand,
                     }));
-                let body = self.send_write(request, if_generation).await?;
+                let body = self
+                    .send_write(request, if_generation, POLICY_CHECK)
+                    .await?;
                 if json {
                     return Ok(body);
                 }
@@ -208,7 +231,9 @@ impl AdminClient {
                         "reason": reason,
                         "strand": strand,
                     }));
-                let body = self.send_write(request, if_generation).await?;
+                let body = self
+                    .send_write(request, if_generation, POLICY_CHECK)
+                    .await?;
                 if json {
                     return Ok(body);
                 }
@@ -236,13 +261,14 @@ impl AdminClient {
         }
     }
 
-    /// [`AdminClient::send`] for a policy write, conditional on the policy
-    /// generation when one is given. A transport failure may come after the
-    /// server committed, so say so.
+    /// [`AdminClient::send`] for a write, conditional on the generation when
+    /// one is given. A transport failure may come after the server committed,
+    /// so say so, naming the `check` command that shows whether it did.
     async fn send_write(
         &self,
         request: reqwest::RequestBuilder,
         if_generation: Option<u64>,
+        check: &str,
     ) -> Result<String, CliError> {
         let request = match if_generation {
             Some(generation) => request.header(reqwest::header::IF_MATCH, generation.to_string()),
@@ -250,8 +276,7 @@ impl AdminClient {
         };
         self.send(request).await.map_err(|error| match error {
             CliError::Transport(message) => CliError::Transport(format!(
-                "{message}; the write may have landed, so check with `runtime env list` before \
-                 retrying"
+                "{message}; the write may have landed, so check with `{check}` before retrying"
             )),
             other => other,
         })
@@ -259,40 +284,25 @@ impl AdminClient {
 
     async fn runtime_nodes(
         &self,
-        mut after: Option<Uuid>,
+        after: Option<Uuid>,
         all: bool,
         json: bool,
     ) -> Result<String, CliError> {
-        // Each page decoded once, kept as JSON for --json and typed to render.
-        let mut pages = Vec::new();
-        loop {
-            // A UUID cursor needs no escaping.
-            let suffix = after.map_or_else(
-                || "/nodes".to_string(),
-                |after| format!("/nodes?after={after}"),
-            );
-            let request = self
-                .http
-                .get(runtime_environments_url(&self.base_url, &suffix));
-            let page: serde_json::Value = decode(&self.send(request).await?, "node status")?;
-            let typed = NodePage::deserialize(&page).map_err(|err| {
-                CliError::Decode(format!("could not parse the node status response: {err}"))
-            })?;
-            // Pages run in node id order, so a cursor that doesn't advance
-            // means the server would serve the same page forever.
-            if let (Some(previous), Some(next)) = (after, typed.next_after)
-                && next <= previous
-            {
-                return Err(CliError::Decode(format!(
-                    "node status paging didn't advance past {previous}"
-                )));
-            }
-            after = typed.next_after;
-            pages.push((page, typed));
-            if !all || after.is_none() {
-                break;
-            }
-        }
+        let pages = self
+            .fetch_pages::<NodePage>(
+                |after| {
+                    // A UUID cursor needs no escaping.
+                    let suffix = after.map_or_else(
+                        || "/nodes".to_string(),
+                        |after| format!("/nodes?after={after}"),
+                    );
+                    runtime_environments_url(&self.base_url, &suffix)
+                },
+                after,
+                all,
+                "node status",
+            )
+            .await?;
         if json {
             let raw: Vec<_> = pages.into_iter().map(|(page, _)| page).collect();
             // Without --all the loop ran once: one page, printed as itself.
@@ -304,6 +314,41 @@ impl AdminClient {
         }
         let typed: Vec<_> = pages.into_iter().map(|(_, typed)| typed).collect();
         Ok(render_nodes(&typed))
+    }
+
+    /// GET pages from `url_for(cursor)`, starting at `after` and following
+    /// `next_after` to the end when `follow` is set. Each page is decoded
+    /// once, kept as JSON for `--json` and typed to render.
+    pub(super) async fn fetch_pages<P: Paged>(
+        &self,
+        url_for: impl Fn(Option<Uuid>) -> String,
+        mut after: Option<Uuid>,
+        follow: bool,
+        what: &str,
+    ) -> Result<Vec<(serde_json::Value, P)>, CliError> {
+        let mut pages = Vec::new();
+        loop {
+            let request = self.http.get(url_for(after));
+            let page: serde_json::Value = decode(&self.send(request).await?, what)?;
+            let typed = P::deserialize(&page).map_err(|err| {
+                CliError::Decode(format!("could not parse the {what} response: {err}"))
+            })?;
+            let next = typed.next_after();
+            // Pages run in id order, so a cursor that doesn't advance means
+            // the server would serve the same page forever.
+            if let (Some(previous), Some(next)) = (after, next)
+                && next <= previous
+            {
+                return Err(CliError::Decode(format!(
+                    "{what} paging didn't advance past {previous}"
+                )));
+            }
+            after = next;
+            pages.push((page, typed));
+            if !follow || after.is_none() {
+                return Ok(pages);
+            }
+        }
     }
 }
 
@@ -531,6 +576,8 @@ fn render_population(population: &Population) -> String {
         population.generation
     )
 }
+
+mod campaign;
 
 #[cfg(test)]
 mod tests;

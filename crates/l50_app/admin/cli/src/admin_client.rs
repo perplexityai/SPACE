@@ -881,7 +881,7 @@ fn network_slots_empty(slots: &AdminNodeNetworkSlots) -> bool {
 /// Render an optional number, with `-` for absent. Absent is a real state
 /// here — an uncomputed counter or a node-manager field the node never
 /// reported — and must not print as `0`.
-fn opt_num<T: std::fmt::Display>(value: Option<T>) -> String {
+pub(crate) fn opt_num<T: std::fmt::Display>(value: Option<T>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string())

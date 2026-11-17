@@ -1897,6 +1897,123 @@ the restore and activation leases already give, and a Wake that meets the
 node's fence is retried to its deadline and answers a retryable 503. The
 decision is counted by `runtime_upgrade.activation.decision`.
 
+### Runtime upgrade campaigns
+
+A campaign moves one kind of subject, template releases (`templates`) or
+sandboxes (`sandboxes`), off one execution environment and onto another, at a
+pace an operator sets. Campaigns live in `runtime_upgrade_campaigns`, with one
+row per subject in `runtime_upgrade_items`. The cluster controller's
+`runtime_upgrade` loop drives them, and the admin API starts and steers them.
+Both read `runtime_upgrade_campaigns.generation`, so the migration that adds it
+(`20261118041622_runtime_upgrade_campaigns_generation`) has to be applied to a
+cluster before a build with campaigns runs there, and stay applied for as long
+as such a build may be rolled back to.
+
+The loop is off unless `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on
+([configuration.md](configuration.md)). Off, it reads and writes no campaign
+table. What a kind's subjects are, and how one is upgraded, belong to that
+kind's driver. No kind has a driver yet, so the admin API refuses to start a
+valid campaign (409), and the loop only reports a campaign it finds. Each tick the
+loop also returns a finished campaign's in-flight items whose leases lapsed to
+pending (see abort below), and for every unfinished campaign whose kind has a
+driver, it:
+
+1. returns items whose lease lapsed to pending, or fails them after five
+   leases;
+2. pauses the campaign once its failed items reach its failure budget;
+3. asks the driver whether the campaign is held this tick, and whether what
+   it finds moves or is stranded;
+4. records one page of the driver's subjects on the source as pending items.
+   Stranded subjects are recorded too, but not leased;
+5. completes a rolling campaign on the tick a whole pass of subjects ends
+   with no item pending or in flight, its failures under budget and the
+   driver's plan moving (a stranded campaign stays open until its plan
+   moves or an operator aborts it), when the
+   pass also began with nothing open and leased nothing, so a subject
+   skipped mid-pass is found again first. A canary none of whose items is
+   done completes the same way. A subject that reaches the source behind the
+   pass's cursor is left to a later campaign;
+6. leases pending items within the campaign's pacing and hands each to the
+   driver on its own task, renewing the lease while the driver works and
+   failing the item past `SPACE_RUNTIME_UPGRADE_ITEM_DEADLINE_SECS`.
+
+Steps 2 to 6 run only for a canary or rolling campaign. A paused campaign
+gets step 1 alone, so it records no new items while it waits.
+
+Pacing is `max_in_flight_per_cluster`, the wave size. A sandbox item also
+counts against `max_in_flight_per_node` on the node that last published its
+sandbox, and is leased only while that node is reachable with fresh
+environment evidence; until then it stays pending. A sandbox item whose
+sandbox no node has published counts against the cluster cap only and is
+leased, so the driver can skip it instead of holding the campaign open. A
+template release has no node, so only the cluster
+cap applies to it. A campaign that starts as a canary leases one item at a
+time until one is done, then waits for a resume; one whose items all fail or
+are skipped, under the budget, completes instead (step 5).
+
+Every change to a campaign row raises its `generation` by one: an operator's
+pause, resume or abort, and the loop's pause at the failure budget or its
+completion. A trigger on the table does the raising, on any update that
+changes a column other than `generation`, `updated_at` and the user columns.
+Item progress doesn't touch the row.
+
+#### Admin API and CLI
+
+The routes are under `/admin/api/v1/runtime-upgrade-campaigns`, for a
+managing-organization admin. `space-admin-cli runtime campaign` wraps them
+(see the CLI README).
+
+* `POST /runtime-upgrade-campaigns` starts a campaign from a kind, source,
+  target, `canary_size` (`1`, the default, or `0` to start rolling; a canary
+  is one subject, so nothing else is accepted),
+  `max_in_flight_per_cluster`, `max_in_flight_per_node` (default 1),
+  `failure_budget`, `include_running` (sandbox campaigns only: also take
+  running and paused sandboxes, as the sandbox driver defines it) and a
+  required `reason`. An invalid request is refused (400) first. A valid one is
+  refused (409) for a kind with no driver, and while an unfinished campaign of
+  the same kind moves the same source.
+* `POST /runtime-upgrade-campaigns/{id}:pause`, `:resume` and `:abort` take
+  a required `reason`, which the audit log records, and an optional
+  `If-Match` generation. A stale generation answers 412 and changes nothing.
+  The phase check comes first: a change the campaign's phase doesn't allow
+  answers 409 even when the generation is stale too.
+* `GET /runtime-upgrade-campaigns` and `GET /runtime-upgrade-campaigns/{id}`
+  report each campaign's phase, generation, items by phase and stranded
+  count. For a sandbox campaign, `stranded` is its pending items while the
+  catalog certifies no upgrade edge from its source to its target, and 0
+  once the campaign is finished. It's `null` for template campaigns.
+
+A resume goes to `rolling` once any item is done. A campaign with no done
+item goes back to `canary`, whichever phase it started in, since nothing has
+shown the upgrade works yet. The failure budget counts every failed item, so
+a campaign that paused itself at its budget would pause again on the next
+tick. Resume refuses it (409) unless the request sets `retry_failed`, which
+returns every failed item to pending with its attempts reset. Each item keeps
+its last error until a new outcome replaces it, and the budget then counts
+only new failures.
+
+Abort ends a canary, rolling or paused campaign for good: `aborted` is final.
+Nothing already upgraded is undone, and nothing leases the campaign's items
+again. The source is free for a new campaign at once. Items in flight keep
+their leases. A finished campaign's lease can't be renewed, so the worker
+holding one drops its upgrade at its next renewal attempt, or at its local
+lease deadline (a tenth short of the lease) if the database is out of reach,
+before the lease lapses. The loop returns the item to pending once it does. An
+upgrade that finishes before that renewal still records its outcome, which is
+true of the subject. A lease never takes a subject another campaign holds in flight under a
+live lease, so a new campaign for the same source upgrades such a subject
+only after the aborted campaign's worker has stopped: one worker upgrades a
+subject at a time.
+
+Blocking an environment needs `strand: true` while an unfinished template
+campaign moves its releases: a block mid-campaign stops the releases that
+don't have a twin on the target yet. The refusal (409) names the campaign and,
+when the block would also stop other work, reports it in `at_risk`, since
+`strand: true` waives that check too. A block of an environment that already
+doesn't execute (blocked, or with no state under a cluster default) stops
+nothing new and needs no `strand`, unless another policy write lands while the
+block waits for the lock; then both checks run in full.
+
 ### Node runtime provisioning
 
 The whole-node `runtime-provisioning` facet reads
