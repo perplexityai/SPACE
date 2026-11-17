@@ -77,8 +77,9 @@ async fn unsupported_envd_surfaces_return_explicit_ecw_errors() {
 }
 
 /// A request that names no ECW sandbox host is a Native client's: when it
-/// matches no route, the envd-only paths included, or uses a method a Native
-/// route does not serve, it is answered in the Native data-plane envelope.
+/// matches no route, the envd-only paths included, uses a method a Native
+/// route does not serve, or asks to attach without a WebSocket upgrade, it is
+/// answered in the Native data-plane envelope.
 #[tokio::test]
 async fn unmatched_native_requests_answer_in_the_native_envelope() {
     if !pplx_space_test_env::enter_test_process(&[(
@@ -88,7 +89,9 @@ async fn unmatched_native_requests_answer_in_the_native_envelope() {
         return;
     }
 
-    let app = router(test_data_plane_state_with_ecw_hosts().await);
+    let app = router(test_data_plane_state_with_ecw_hosts().await).layer(
+        axum::extract::connect_info::MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))),
+    );
     let session_id = DataPlaneSessionId::Process(Default::default());
     for (method, path, status, code) in [
         (
@@ -125,6 +128,12 @@ async fn unmatched_native_requests_answer_in_the_native_envelope() {
             "DELETE",
             format!("/v1/sessions/{session_id}/attach"),
             StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_request",
+        ),
+        (
+            "GET",
+            format!("/v1/sessions/{session_id}/attach"),
+            StatusCode::BAD_REQUEST,
             "invalid_request",
         ),
     ] {

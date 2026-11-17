@@ -8,9 +8,25 @@ pub(crate) async fn attach_session(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
+    upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
     uri: axum::http::Uri,
 ) -> Result<Response, AttachError> {
+    // Taken as a `Result` so a request that is not a WebSocket upgrade is
+    // refused in the data-plane envelope, with axum's status (400, 405 or
+    // 426), rather than in axum's plain text.
+    let upgrade = match upgrade {
+        Ok(upgrade) => upgrade,
+        Err(rejection) => {
+            return Ok(data_plane_http_error(
+                rejection.status(),
+                DataPlaneHttpErrorCode::InvalidRequest,
+                "attach must be a WebSocket upgrade request",
+                false,
+                ResponseOrigin::Client,
+                ResponseKind::Validation,
+            ));
+        }
+    };
     reject_query_tokens(uri.query())?;
     let session_id = session_id
         .parse::<DataPlaneSessionId>()
