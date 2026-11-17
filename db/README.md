@@ -96,7 +96,11 @@ roll back to:
    while the daemon writes (a plain copy of the database and its `-wal` and
    `-shm` files can mix pages from a write in progress), and run the target
    image's `space-db-migrator <store> --database-path <copy> up` against the
-   copy. It changes only the copy. A release with this setting refuses and names each
+   copy, with `SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS` unset (for example
+   `env -u SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS space-db-migrator …`): an entry
+   left over from an earlier rollback would accept its migration and hide it
+   from the list. It changes only the copy. A release with this setting
+   refuses and names each
    successful migration newer than everything it bundles as a
    `<store>:<version>` entry, where `<store>` is the database name, such as
    `sandbox-manager`, `template-manager`, or `common` for the shared catalog.
@@ -118,9 +122,10 @@ roll back to:
    - Does the migration rewrite or move existing rows the target reads (an
      `UPDATE` or `INSERT … SELECT`, or values moved to a new column or
      table)?
-   - Since the newer release started, has it written values the target
-     doesn't handle, such as a new state or reason, into tables or columns
-     the target reads?
+   - Can the newer release write values the target doesn't handle, such as
+     a new state or reason, into tables or columns the target reads? Answer
+     it from the newer release's code, not from the copy: the newer daemon
+     keeps writing until the revert replaces it.
    - Will the newer release still work on rows the target writes in the
      meantime, for when you roll forward again?
 
