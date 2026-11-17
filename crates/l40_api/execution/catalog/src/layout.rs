@@ -53,7 +53,8 @@ impl ReleaseLayout {
         match runtime {
             RuntimeKind::Firecracker => Some(&FIRECRACKER_RELEASE_LAYOUT),
             RuntimeKind::CloudHypervisor => Some(&CLOUD_HYPERVISOR_RELEASE_LAYOUT),
-            RuntimeKind::Gvisor | RuntimeKind::Wasmtime => None,
+            RuntimeKind::Wasmtime => Some(&WASMTIME_RELEASE_LAYOUT),
+            RuntimeKind::Gvisor => None,
         }
     }
 }
@@ -71,6 +72,13 @@ const CLOUD_HYPERVISOR_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
     state_format: None,
     // Install pins do not qualify this runtime for sandbox execution.
     known_releases: || vec![crate::catalog::CLOUD_HYPERVISOR_INSTALL_VERSION],
+};
+
+const WASMTIME_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
+    binaries: &["bin/wasmtime"],
+    state_format: None,
+    // Installation pins do not qualify a schedulable WASI environment.
+    known_releases: || vec![crate::catalog::WASMTIME_INSTALL_VERSION],
 };
 
 fn firecracker_known_releases() -> Vec<&'static str> {

@@ -24,6 +24,10 @@ pub const FIRECRACKER_RELEASE_SOURCE: &str =
 pub const CLOUD_HYPERVISOR_RELEASE_SOURCE: &str =
     "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download";
 
+/// Wasmtime's upstream native CLI release archives.
+pub const WASMTIME_RELEASE_SOURCE: &str =
+    "https://github.com/bytecodealliance/wasmtime/releases/download";
+
 /// An `https://` URL with a host and no userinfo, query or fragment: a release
 /// source's download base or an archive under it. The path can be extended with
 /// [`ReleaseUrl::join`] without re-parsing.
@@ -126,6 +130,9 @@ pub type ReleaseChunks =
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReleasePayload {
     TarGz {
+        members: Vec<ReleaseArchiveMember>,
+    },
+    TarXz {
         members: Vec<ReleaseArchiveMember>,
     },
     /// One executable, with no archive wrapper. The runtime layout must name one binary.

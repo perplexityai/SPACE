@@ -620,15 +620,17 @@ pub(crate) fn staging_holds_no_job(staging: &Path) -> bool {
     })
 }
 
-pub(crate) struct FakeExecutableSource {
+pub(crate) struct FakePayloadSource {
     pub(crate) location: super::release_source::ReleaseUrl,
     pub(crate) bytes: Vec<u8>,
+    pub(crate) runtime: RuntimeKind,
+    pub(crate) payload: ReleasePayload,
 }
 
 #[async_trait::async_trait]
-impl ReleaseSource for FakeExecutableSource {
+impl ReleaseSource for FakePayloadSource {
     fn runtime(&self) -> RuntimeKind {
-        RuntimeKind::CloudHypervisor
+        self.runtime
     }
 
     fn root(&self) -> &super::release_source::ReleaseUrl {
@@ -640,7 +642,7 @@ impl ReleaseSource for FakeExecutableSource {
     }
 
     fn payload(&self, _: &RuntimeIdentity, _: Arch) -> ReleasePayload {
-        ReleasePayload::Executable
+        self.payload.clone()
     }
 
     async fn open(

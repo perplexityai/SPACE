@@ -180,3 +180,37 @@ fn cloud_hypervisor_uses_the_upstream_static_asset_without_a_jailer_or_archive()
         .join("firecracker-v1.15.1-aarch64.tgz");
     assert!(!source.holds(&foreign));
 }
+
+#[test]
+fn wasmtime_maps_native_archives_to_the_single_engine_binary() {
+    use crate::installs::release_source::WASMTIME_RELEASE_SOURCE;
+    let source = GitHubReleaseSource::new(
+        GitHubRuntime::Wasmtime,
+        WASMTIME_RELEASE_SOURCE.parse().unwrap(),
+    )
+    .unwrap();
+    let release = RuntimeIdentity {
+        kind: RuntimeKind::Wasmtime,
+        version: "50.0.2".parse().unwrap(),
+    };
+    assert_eq!(source.runtime(), RuntimeKind::Wasmtime);
+    for architecture in [Arch::X86_64, Arch::Aarch64] {
+        let directory = format!("wasmtime-v50.0.2-{architecture}-linux");
+        let location = source.archive(&release, architecture);
+        assert_eq!(
+            location.as_str(),
+            format!("{WASMTIME_RELEASE_SOURCE}/v50.0.2/{directory}.tar.xz")
+        );
+        assert!(source.holds(&location));
+        assert_eq!(
+            source.payload(&release, architecture),
+            ReleasePayload::TarXz {
+                members: vec![crate::ReleaseArchiveMember {
+                    binary: "bin/wasmtime".into(),
+                    member: format!("{directory}/wasmtime"),
+                }],
+            }
+        );
+    }
+    assert!(!source.holds(&"https://example.test/wasmtime.tar.xz".parse().unwrap()));
+}

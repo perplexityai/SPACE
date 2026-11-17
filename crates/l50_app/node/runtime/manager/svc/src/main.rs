@@ -117,6 +117,10 @@ struct Cli {
     #[arg(long, default_value = pplx_space_node_runtime_manager::CLOUD_HYPERVISOR_RELEASE_SOURCE, value_parser = ReleaseSourceParser)]
     cloud_hypervisor_release_source: ReleaseUrl,
 
+    /// Where Wasmtime native CLI archives are downloaded from.
+    #[arg(long, default_value = pplx_space_node_runtime_manager::WASMTIME_RELEASE_SOURCE, value_parser = ReleaseSourceParser)]
+    wasmtime_release_source: ReleaseUrl,
+
     /// Largest kernel or release archive one install downloads, in bytes.
     #[arg(long, default_value_t = DEFAULT_INSTALL_LIMITS.max_bytes)]
     max_install_bytes: u64,
@@ -217,6 +221,10 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
                     source: ReleaseSourceConfig::CloudHypervisorGitHub(
                         cli.cloud_hypervisor_release_source,
                     ),
+                },
+                RuntimeManagerReleaseConfig {
+                    root: paths::NODE_WASMTIME_DIR.into(),
+                    source: ReleaseSourceConfig::WasmtimeGitHub(cli.wasmtime_release_source),
                 },
             ],
             install,

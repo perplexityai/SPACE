@@ -19,6 +19,15 @@ use tokio_util::sync::CancellationToken;
 
 const PAYLOAD_FILE: &str = "release.download";
 const MAX_ARCHIVE_ENTRIES: usize = 256;
+// XZ dictionaries allocate before output is produced. The byte and entry
+// bounds alone cannot constrain a decoder's working memory.
+const MAX_XZ_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+pub(crate) enum ArchiveCompression {
+    Gzip,
+    Xz,
+}
 
 #[derive(Clone)]
 pub(crate) struct ReleaseContext {
@@ -273,13 +282,22 @@ fn read_error(error: std::io::Error, limit: u64) -> UnpackError {
 pub(crate) fn unpack(
     archive: &Path,
     release_dir: &Path,
+    compression: ArchiveCompression,
     members: &[(&str, String)],
     limits: UnpackLimits,
     cancellation: &CancellationToken,
 ) -> Result<(), UnpackError> {
     let file = std::fs::File::open(archive).map_err(UnpackError::Read)?;
+    let decoder: Box<dyn std::io::Read> = match compression {
+        ArchiveCompression::Gzip => Box::new(flate2::read::GzDecoder::new(file)),
+        ArchiveCompression::Xz => {
+            let stream = xz2::stream::Stream::new_stream_decoder(MAX_XZ_MEMORY_BYTES, 0)
+                .map_err(|error| UnpackError::Read(std::io::Error::other(error)))?;
+            Box::new(xz2::read::XzDecoder::new_stream(file, stream))
+        }
+    };
     let bounded = BoundedRead {
-        inner: flate2::read::GzDecoder::new(file),
+        inner: decoder,
         remaining: limits.max_total_bytes,
         cancellation,
     };
@@ -490,7 +508,10 @@ impl DownloadError {
 
 /// A payload mapped to trusted layout paths before any download is started.
 enum Materialization {
-    TarGz(Vec<(&'static str, String)>),
+    Archive {
+        compression: ArchiveCompression,
+        members: Vec<(&'static str, String)>,
+    },
     Executable(&'static str),
 }
 
@@ -501,30 +522,46 @@ impl Materialization {
                 [binary] => Ok(Self::Executable(binary)),
                 _ => Err(DownloadError::PayloadLayout),
             },
-            ReleasePayload::TarGz { members } if members.len() == layout.binaries.len() => {
-                let mut seen_members = std::collections::HashSet::new();
-                if members
-                    .iter()
-                    .any(|entry| !seen_members.insert(&entry.member))
-                {
+            ReleasePayload::TarGz { members } => {
+                Self::archive(ArchiveCompression::Gzip, members, layout)
+            }
+            ReleasePayload::TarXz { members } => {
+                Self::archive(ArchiveCompression::Xz, members, layout)
+            }
+        }
+    }
+
+    fn archive(
+        compression: ArchiveCompression,
+        members: Vec<super::release_source::ReleaseArchiveMember>,
+        layout: &ReleaseLayout,
+    ) -> Result<Self, DownloadError> {
+        if members.len() != layout.binaries.len() {
+            return Err(DownloadError::PayloadLayout);
+        }
+        let mut seen_members = std::collections::HashSet::new();
+        if members
+            .iter()
+            .any(|entry| !seen_members.insert(&entry.member))
+        {
+            return Err(DownloadError::PayloadLayout);
+        }
+        let mapped = layout
+            .binaries
+            .iter()
+            .map(|binary| {
+                let mut matching = members.iter().filter(|member| member.binary == *binary);
+                let member = matching.next().ok_or(DownloadError::PayloadLayout)?;
+                if matching.next().is_some() {
                     return Err(DownloadError::PayloadLayout);
                 }
-                let mapped = layout
-                    .binaries
-                    .iter()
-                    .map(|binary| {
-                        let mut matching = members.iter().filter(|member| member.binary == *binary);
-                        let member = matching.next().ok_or(DownloadError::PayloadLayout)?;
-                        if matching.next().is_some() {
-                            return Err(DownloadError::PayloadLayout);
-                        }
-                        Ok((*binary, member.member.clone()))
-                    })
-                    .collect::<Result<Vec<_>, DownloadError>>()?;
-                Ok(Self::TarGz(mapped))
-            }
-            ReleasePayload::TarGz { .. } => Err(DownloadError::PayloadLayout),
-        }
+                Ok((*binary, member.member.clone()))
+            })
+            .collect::<Result<Vec<_>, DownloadError>>()?;
+        Ok(Self::Archive {
+            compression,
+            members: mapped,
+        })
     }
 }
 
@@ -626,9 +663,13 @@ impl InstallExecutor {
                 .create(&unpacked)
                 .map_err(|error| StagingError::new("create", &unpacked, error))?;
             match materialization {
-                Materialization::TarGz(members) => unpack(
+                Materialization::Archive {
+                    compression,
+                    members,
+                } => unpack(
                     &unpacked_archive,
                     &unpacked,
+                    compression,
                     &members,
                     unpack_limits,
                     &unpack_cancellation,

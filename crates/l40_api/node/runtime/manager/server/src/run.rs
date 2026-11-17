@@ -102,6 +102,9 @@ pub enum ReleaseSourceConfig {
     /// Cloud Hypervisor's upstream static executable releases.
     #[cfg(feature = "github")]
     CloudHypervisorGitHub(crate::ReleaseUrl),
+    /// Wasmtime's upstream native CLI archives.
+    #[cfg(feature = "github")]
+    WasmtimeGitHub(crate::ReleaseUrl),
     /// A source the deployment supplies.
     Custom(Arc<dyn ReleaseSource>),
 }
@@ -116,6 +119,10 @@ impl std::fmt::Debug for ReleaseSourceConfig {
                 .debug_tuple("CloudHypervisorGitHub")
                 .field(base)
                 .finish(),
+            #[cfg(feature = "github")]
+            Self::WasmtimeGitHub(base) => {
+                formatter.debug_tuple("WasmtimeGitHub").field(base).finish()
+            }
             Self::Custom(source) => formatter
                 .debug_tuple("Custom")
                 .field(&source.root())
@@ -139,6 +146,14 @@ impl ReleaseSourceConfig {
             Self::CloudHypervisorGitHub(base) => Ok(Arc::new(
                 crate::installs::GitHubReleaseSource::new(
                     crate::installs::GitHubRuntime::CloudHypervisor,
+                    base,
+                )
+                .map_err(RunRuntimeManagerError::ReleaseSource)?,
+            )),
+            #[cfg(feature = "github")]
+            Self::WasmtimeGitHub(base) => Ok(Arc::new(
+                crate::installs::GitHubReleaseSource::new(
+                    crate::installs::GitHubRuntime::Wasmtime,
                     base,
                 )
                 .map_err(RunRuntimeManagerError::ReleaseSource)?,

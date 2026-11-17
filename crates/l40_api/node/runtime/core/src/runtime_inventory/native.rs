@@ -1,15 +1,21 @@
-//! CH execution discovery accepts only a release verified against compiled pins.
+//! Native engine discovery accepts only a release verified against catalog pins.
 //! External diagnostic discovery is separate and never grants launch eligibility.
 use super::*;
 
-pub(super) struct CloudHypervisorDriver;
+pub(super) enum PinnedNativeDriver {
+    CloudHypervisor,
+    Wasmtime,
+}
 
-impl RuntimeDriver for CloudHypervisorDriver {
+impl RuntimeDriver for PinnedNativeDriver {
     fn restore_requires_boot_components(&self) -> bool {
-        true
+        matches!(self, Self::CloudHypervisor)
     }
     fn kind(&self) -> RuntimeKind {
-        RuntimeKind::CloudHypervisor
+        match self {
+            Self::CloudHypervisor => RuntimeKind::CloudHypervisor,
+            Self::Wasmtime => RuntimeKind::Wasmtime,
+        }
     }
 
     #[cfg(any(feature = "artifact-store", test))]
@@ -18,7 +24,10 @@ impl RuntimeDriver for CloudHypervisorDriver {
         root: PathBuf,
         version: RuntimeVersion,
     ) -> Result<RuntimeInstallation, RuntimeInventoryError> {
-        let binary = root.join("bin/cloud-hypervisor");
+        let binary = root.join(match self {
+            Self::CloudHypervisor => "bin/cloud-hypervisor",
+            Self::Wasmtime => "bin/wasmtime",
+        });
         if !probe_inventory_path(&binary)?.is_some_and(|metadata| metadata.is_file()) {
             return Err(RuntimeInventoryError::IncompleteInstallation {
                 root,
@@ -30,9 +39,15 @@ impl RuntimeDriver for CloudHypervisorDriver {
                 kind: self.kind(),
                 version,
             },
-            guest: GuestPlatform {
-                os: GuestOperatingSystem::Linux,
-                architecture: host_arch()?,
+            guest: match self {
+                Self::CloudHypervisor => GuestPlatform {
+                    os: GuestOperatingSystem::Linux,
+                    architecture: host_arch()?,
+                },
+                Self::Wasmtime => GuestPlatform {
+                    os: GuestOperatingSystem::Wasi,
+                    architecture: Arch::Wasm32,
+                },
             },
             state_format: None,
             files: RuntimeInstallationFiles::new([(RuntimeFileRole::RuntimeExecutable, binary)]),
@@ -62,11 +77,11 @@ impl RuntimeDriver for CloudHypervisorDriver {
         // Installed releases are exact inputs here; replacement preference is
         // owned by the qualification catalog, never inferred from directory names.
         // This ordering is only for diagnostic listing, not replacement selection.
-        Ok(parse_version(left)?.cmp(&parse_version(right)?))
+        Ok(parse_version(self.kind(), left)?.cmp(&parse_version(self.kind(), right)?))
     }
 
     fn version_sort_key(&self, version: &RuntimeVersion) -> Option<VersionSortKey> {
-        semver_sort_key(&parse_version(version).ok()?)
+        semver_sort_key(&parse_version(self.kind(), version).ok()?)
     }
 
     fn can_execute(
@@ -86,16 +101,19 @@ impl RuntimeDriver for CloudHypervisorDriver {
 }
 
 /// CH labels releases `major.minor`; read a missing patch as zero.
-fn parse_version(version: &RuntimeVersion) -> Result<semver::Version, RuntimeInventoryError> {
+fn parse_version(
+    kind: RuntimeKind,
+    version: &RuntimeVersion,
+) -> Result<semver::Version, RuntimeInventoryError> {
     let text = version.as_str();
-    let normalized = if text.split('.').count() == 2 {
+    let normalized = if kind == RuntimeKind::CloudHypervisor && text.split('.').count() == 2 {
         format!("{text}.0")
     } else {
         text.to_owned()
     };
     semver::Version::parse(&normalized).map_err(|source| {
         RuntimeInventoryError::InvalidVersionOutput {
-            path: PathBuf::from("cloud-hypervisor"),
+            path: PathBuf::from(kind.as_str()),
             output: format!("{version}: {source}"),
         }
     })

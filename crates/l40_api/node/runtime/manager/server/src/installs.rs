@@ -50,7 +50,7 @@ pub(crate) use release::{ReleaseContext, ReleaseSources};
 pub use release_source::{
     CLOUD_HYPERVISOR_RELEASE_SOURCE, FIRECRACKER_RELEASE_SOURCE, ReleaseArchiveMember,
     ReleaseChunks, ReleasePayload, ReleaseSource, ReleaseSourceError, ReleaseUrl,
-    ReleaseUrlParseError, VerifiableRelease,
+    ReleaseUrlParseError, VerifiableRelease, WASMTIME_RELEASE_SOURCE,
 };
 pub(crate) use s3::S3KernelSource;
 pub(crate) use source::host_arch;

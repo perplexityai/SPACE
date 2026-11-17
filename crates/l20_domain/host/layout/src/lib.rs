@@ -87,6 +87,8 @@ pub mod paths {
     pub const NODE_FIRECRACKER_DIR: &str = "/space/vendor/artifacts/firecracker";
     /// Managed Cloud Hypervisor releases, separate from execution caches.
     pub const NODE_CLOUD_HYPERVISOR_DIR: &str = "/space/vendor/artifacts/cloud-hypervisor";
+    /// Managed Wasmtime engines, separate from sandbox execution caches.
+    pub const NODE_WASMTIME_DIR: &str = "/space/vendor/artifacts/wasmtime";
     /// Managed guest kernels. Existing vendor/cache execution paths stay separate.
     pub const NODE_KERNELS_DIR: &str = "/space/vendor/artifacts/kernels";
     pub const SANDBOX_MANAGER_SOCKET: &str = "/space/run/sandbox-manager/sandbox-manager.sock";

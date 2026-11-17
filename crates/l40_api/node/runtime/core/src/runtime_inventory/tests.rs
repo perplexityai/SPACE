@@ -1470,7 +1470,7 @@ fn cold_only_runtime_has_no_launcher_or_snapshot_claims() {
         b"synthetic verified payload",
     )
     .unwrap();
-    let driver = cloud_hypervisor::CloudHypervisorDriver;
+    let driver = native::PinnedNativeDriver::CloudHypervisor;
     let installation = driver
         .inspect_installation(
             root.path().to_owned(),
@@ -1542,6 +1542,37 @@ fn cold_only_runtime_has_no_launcher_or_snapshot_claims() {
     }
     let reported = inventory(vec![installation]).to_proto();
     assert!(reported.runtimes[0].state_formats.is_empty());
+}
+
+#[test]
+fn wasmtime_inventory_describes_the_wasi_guest_not_the_native_engine() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("bin")).unwrap();
+    let binary = root.path().join("bin/wasmtime");
+    std::fs::write(&binary, b"synthetic verified engine").unwrap();
+    let installation = DRIVERS
+        .get(RuntimeKind::Wasmtime)
+        .unwrap()
+        .inspect_installation(root.path().to_owned(), "50.0.2".parse().unwrap())
+        .unwrap();
+    assert_eq!(
+        installation.guest,
+        GuestPlatform {
+            os: GuestOperatingSystem::Wasi,
+            architecture: Arch::Wasm32,
+        }
+    );
+    assert_eq!(
+        installation.files.path(RuntimeFileRole::RuntimeExecutable),
+        Some(binary.as_path())
+    );
+    assert!(
+        installation
+            .files
+            .path(RuntimeFileRole::LauncherExecutable)
+            .is_none()
+    );
+    assert!(installation.state_format.is_none());
 }
 
 #[test]
@@ -1720,7 +1751,7 @@ fn firecracker_sort_keys_order_as_the_driver_compares() {
 
 #[test]
 fn cloud_hypervisor_sort_keys_order_as_the_driver_compares() {
-    let driver = cloud_hypervisor::CloudHypervisorDriver;
+    let driver = native::PinnedNativeDriver::CloudHypervisor;
     let versions = ["40.0", "54.0", "54.0.1", "54.1", "100.0"];
     let version = |text: &str| RuntimeVersion::parse(text).unwrap();
     for left in versions {

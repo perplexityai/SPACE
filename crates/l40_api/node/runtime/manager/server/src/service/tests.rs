@@ -554,7 +554,7 @@ async fn artifact_mutations_require_an_operator_and_an_enabled_installer() {
 #[tokio::test]
 async fn catalog_listing_routes_only_configured_sources_without_a_mutation_worker() {
     use crate::installs::test_support::{
-        FakeExecutableSource, FakeReleaseSource, FakeSource, TestPins, release_pin,
+        FakePayloadSource, FakeReleaseSource, FakeSource, TestPins, release_pin,
     };
     use pplx_space_execution_spec::RuntimeKind;
     for (include_ch, include_kernels) in
@@ -578,7 +578,9 @@ async fn catalog_listing_routes_only_configured_sources_without_a_mutation_worke
         if include_ch {
             releases.push(crate::installs::ReleaseContext {
                 root: dir.path().join("managed/cloud-hypervisor"),
-                source: Arc::new(FakeExecutableSource {
+                source: Arc::new(FakePayloadSource {
+                    runtime: RuntimeKind::CloudHypervisor,
+                    payload: crate::ReleasePayload::Executable,
                     location: "https://releases.example.test/ch".parse().unwrap(),
                     bytes: Vec::new(),
                 }),

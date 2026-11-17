@@ -15,11 +15,11 @@ use pplx_space_execution_spec::{
 };
 use sha2::{Digest as _, Sha256};
 
-mod cloud_hypervisor;
 pub mod diagnostic;
 pub mod kernel_release;
 #[cfg(feature = "artifact-store")]
 mod managed;
+mod native;
 mod observation;
 
 const BOOT_COMPONENT_ROLE: &str = "boot";
@@ -832,14 +832,16 @@ impl RuntimeDriver for FirecrackerDriver {
 
 struct RuntimeDriverRegistry {
     firecracker: FirecrackerDriver,
-    cloud_hypervisor: cloud_hypervisor::CloudHypervisorDriver,
+    cloud_hypervisor: native::PinnedNativeDriver,
+    wasmtime: native::PinnedNativeDriver,
 }
 
 impl RuntimeDriverRegistry {
     const fn new() -> Self {
         Self {
             firecracker: FirecrackerDriver,
-            cloud_hypervisor: cloud_hypervisor::CloudHypervisorDriver,
+            cloud_hypervisor: native::PinnedNativeDriver::CloudHypervisor,
+            wasmtime: native::PinnedNativeDriver::Wasmtime,
         }
     }
 
@@ -847,9 +849,8 @@ impl RuntimeDriverRegistry {
         match kind {
             RuntimeKind::Firecracker => Ok(&self.firecracker),
             RuntimeKind::CloudHypervisor => Ok(&self.cloud_hypervisor),
-            RuntimeKind::Gvisor | RuntimeKind::Wasmtime => {
-                Err(RuntimeInventoryError::UnsupportedRuntime(kind))
-            }
+            RuntimeKind::Wasmtime => Ok(&self.wasmtime),
+            RuntimeKind::Gvisor => Err(RuntimeInventoryError::UnsupportedRuntime(kind)),
         }
     }
 }

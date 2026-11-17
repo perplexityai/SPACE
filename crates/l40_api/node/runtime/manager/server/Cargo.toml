@@ -24,6 +24,7 @@ async-trait = { workspace = true }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio"] }
 bytes = { workspace = true }
 flate2 = { workspace = true }
+xz2 = { workspace = true }
 http = { workspace = true }
 futures-util = { workspace = true }
 jiff = { workspace = true }

@@ -337,6 +337,7 @@ sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed
 tempfile = "3"
 tar = "0.4.46"
 flate2 = "1"
+xz2 = "0.1.7"
 form_urlencoded = "1"
 # testcontainers-modules 0.15 requires testcontainers 0.27. Keep the pair
 # aligned until a stable modules release supports testcontainers 0.28.

@@ -43,6 +43,7 @@ pub const CATALOG_SCHEMA: u32 = 1;
 
 /// Installation support does not qualify a runtime for sandbox execution.
 pub(crate) const CLOUD_HYPERVISOR_INSTALL_VERSION: &str = "54.0";
+pub(crate) const WASMTIME_INSTALL_VERSION: &str = "50.0.2";
 
 struct CompiledRelease {
     runtime: RuntimeKind,
@@ -56,7 +57,29 @@ struct CompiledRelease {
 /// Download and executable pins. Firecracker archives were checked against
 /// their `.sha256.txt`; Cloud Hypervisor's static ARM64 and x86_64 payloads were
 /// downloaded, hashed and compared with the upstream release asset digests.
+/// Wasmtime's native CLI archives were compared with upstream asset digests;
+/// their executable members were separately extracted and hashed.
 const COMPILED_RELEASES: &[CompiledRelease] = &[
+    CompiledRelease {
+        runtime: RuntimeKind::Wasmtime,
+        version: WASMTIME_INSTALL_VERSION,
+        architecture: "x86_64",
+        archive_sha256: "5db0ca8e838ab95a51ba9acdf11f42888bcd0092dda45a86129ae540c4fa952c",
+        binaries: &[(
+            "bin/wasmtime",
+            "45b48cfa0c04a1564cba14d76fe22ffb764bf0fc661b802e73b3784f8827e46e",
+        )],
+    },
+    CompiledRelease {
+        runtime: RuntimeKind::Wasmtime,
+        version: WASMTIME_INSTALL_VERSION,
+        architecture: "aarch64",
+        archive_sha256: "c3665e79d97a8d42484f3d0320c2911441ca87c58daab3f360ff1cf8770b9960",
+        binaries: &[(
+            "bin/wasmtime",
+            "6eb2fa6ae5f2b785f418da5e8b8063696e288ff6835e81191de7726a7c66e442",
+        )],
+    },
     CompiledRelease {
         runtime: RuntimeKind::Firecracker,
         version: "1.15.1",

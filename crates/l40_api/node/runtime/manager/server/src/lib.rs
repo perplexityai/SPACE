@@ -21,7 +21,7 @@ pub use installs::{
     PrepareStagingError, ReleaseArchiveMember, ReleaseChunks, ReleaseConfigurationError,
     ReleaseLine, ReleaseLineParseError, ReleasePayload, ReleaseSource, ReleaseSourceError,
     ReleaseUrl, ReleaseUrlParseError, RuntimeLine, SourceError, SourceKernel, StagingError,
-    StoreError, VerifiableKernel, VerifiableRelease,
+    StoreError, VerifiableKernel, VerifiableRelease, WASMTIME_RELEASE_SOURCE,
 };
 pub use run::{
     DEFAULT_INSTALL_LIMITS, DEFAULT_LIST_ADMISSION_TIMEOUT, DEFAULT_SCAN_LIMITS,

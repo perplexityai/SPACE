@@ -57,6 +57,10 @@ impl Default for ArtifactStorePaths {
                     pplx_space_execution_spec::RuntimeKind::CloudHypervisor,
                     paths::NODE_CLOUD_HYPERVISOR_DIR.into(),
                 ),
+                (
+                    pplx_space_execution_spec::RuntimeKind::Wasmtime,
+                    paths::NODE_WASMTIME_DIR.into(),
+                ),
             ]
             .into(),
             kernels: paths::NODE_KERNELS_DIR.into(),

@@ -20,6 +20,7 @@ const MAX_REDIRECTS: usize = 5;
 pub(crate) enum GitHubRuntime {
     Firecracker,
     CloudHypervisor,
+    Wasmtime,
 }
 
 pub(crate) struct GitHubReleaseSource {
@@ -115,6 +116,7 @@ impl ReleaseSource for GitHubReleaseSource {
         match self.runtime {
             GitHubRuntime::Firecracker => RuntimeKind::Firecracker,
             GitHubRuntime::CloudHypervisor => RuntimeKind::CloudHypervisor,
+            GitHubRuntime::Wasmtime => RuntimeKind::Wasmtime,
         }
     }
 
@@ -133,6 +135,9 @@ impl ReleaseSource for GitHubReleaseSource {
                 // it before source resolution; never alias it to a host binary.
                 Arch::Wasm32 => "cloud-hypervisor-static-wasm32".to_owned(),
             },
+            GitHubRuntime::Wasmtime => {
+                format!("wasmtime-v{version}-{architecture}-linux.tar.xz")
+            }
         };
         self.base.join(&format!("v{version}")).join(&asset)
     }
@@ -143,6 +148,15 @@ impl ReleaseSource for GitHubReleaseSource {
             GitHubRuntime::Firecracker => {
                 super::release_source::firecracker_payload(release, architecture)
             }
+            GitHubRuntime::Wasmtime => ReleasePayload::TarXz {
+                members: vec![super::release_source::ReleaseArchiveMember {
+                    binary: "bin/wasmtime".to_owned(),
+                    member: format!(
+                        "wasmtime-v{}-{architecture}-linux/wasmtime",
+                        release.version
+                    ),
+                }],
+            },
         }
     }
 
