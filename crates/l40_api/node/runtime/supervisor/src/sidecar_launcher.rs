@@ -29,6 +29,9 @@ pub(crate) struct SpawnedSidecarLauncher {
 pub(crate) struct PreparedSidecarLauncher {
     launch_spec: Vec<u8>,
     launcher_slot: OwnedSemaphorePermit,
+    /// Descriptors the launch specification names as inherited sockets. The
+    /// caller keeps them open until the launch completes.
+    inherited_fds: Vec<RawFd>,
 }
 
 impl SpawnedSidecarLauncher {
@@ -104,6 +107,14 @@ async fn prepare_spec(
     config: LaunchSpec,
     launcher_slot: OwnedSemaphorePermit,
 ) -> Result<PreparedSidecarLauncher, String> {
+    let inherited_fds = match &config {
+        LaunchSpec::Sidecar(sidecar) => sidecar
+            .pre_exec_sockets
+            .iter()
+            .filter_map(|socket| socket.inherited_fd)
+            .collect(),
+        LaunchSpec::Contained { .. } => Vec::new(),
+    };
     // Move the permit into the blocking task. Dropping the caller detaches
     // spawn_blocking work, so retaining the permit outside this closure would
     // let repeated cancellations bypass the actual serialization bound.
@@ -123,6 +134,7 @@ async fn prepare_spec(
     Ok(PreparedSidecarLauncher {
         launch_spec,
         launcher_slot,
+        inherited_fds,
     })
 }
 
@@ -133,12 +145,13 @@ impl PreparedSidecarLauncher {
     /// error that lets the caller remove newly created state.
     ///
     /// The only application-supplied work between the process library's fork
-    /// and its first exec is one async-signal-safe `fcntl(2)` call that passes
-    /// the private status socket to the new image.
+    /// and its first exec is async-signal-safe `fcntl(2)` calls that pass the
+    /// private status socket and any inherited sockets to the new image.
     pub(crate) fn spawn(self) -> Result<SpawnedSidecarLauncher, String> {
         let PreparedSidecarLauncher {
             launch_spec,
             launcher_slot,
+            inherited_fds,
         } = self;
         let (parent_stream, child_stream) = StdUnixStream::pair()
             .map_err(|error| format!("create sidecar launcher socketpair: {error}"))?;
@@ -163,6 +176,7 @@ impl PreparedSidecarLauncher {
         unsafe {
             command.pre_exec(move || set_cloexec(&child_stream, false));
         }
+        inherit_descriptors(&mut command, inherited_fds);
         let child = command
             .spawn()
             .map_err(|error| format!("exec sidecar launcher: {error}"))?;
@@ -173,6 +187,28 @@ impl PreparedSidecarLauncher {
             stream,
             launch_spec,
         })
+    }
+}
+
+/// Let `command`'s child, and no other process, keep `descriptors` across its
+/// exec. They stay close-on-exec in the multithreaded supervisor, so a
+/// concurrent launch for another sandbox never inherits them.
+fn inherit_descriptors(command: &mut Command, descriptors: Vec<RawFd>) {
+    if descriptors.is_empty() {
+        return;
+    }
+    let clear_cloexec = move || {
+        for descriptor in &descriptors {
+            // SAFETY: the caller keeps each descriptor open through the spawn.
+            let descriptor = unsafe { std::os::fd::BorrowedFd::borrow_raw(*descriptor) };
+            set_cloexec(descriptor, false)?;
+        }
+        Ok(())
+    };
+    // SAFETY: the closure calls only fcntl(2), an async-signal-safe syscall,
+    // and allocates nothing.
+    unsafe {
+        command.pre_exec(clear_cloexec);
     }
 }
 

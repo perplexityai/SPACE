@@ -1550,7 +1550,10 @@ impl DeadGatewayFixture {
             .unary(
                 "Launch",
                 move |_: pplx_space_node_mgr_client::proto::LaunchRequest| {
-                    launch().map(|pid| pplx_space_node_mgr_client::proto::LaunchResponse { pid })
+                    launch().map(|pid| pplx_space_node_mgr_client::proto::LaunchResponse {
+                        pid,
+                        inherited_gateway_sockets: 0,
+                    })
                 },
             )
             .serve();
@@ -1996,4 +1999,58 @@ async fn other_launch_failures_retry_every_sweep_without_backoff() {
 
     assert_eq!(fixture.sweep_for(6).await.len(), 6);
     assert!(fixture.backoff().await.is_none());
+}
+
+#[tokio::test]
+async fn gateway_replacement_names_the_old_gateway_and_commits_only_a_new_one() {
+    // A node that hands sockets over answers with the new gateway; one that
+    // predates the handover answers with the live one, which must stay
+    // committed so the cycle can fall back to stopping it.
+    for (answered_pid, inherited_sockets, replaced) in [(40_003, 2, true), (30_003, 0, false)] {
+        let sandbox_id = "0199c1e0-0000-7000-8000-000000000006";
+        let (mut watchdog, _tracker) = watchdog_with_committed_gateway(sandbox_id).await;
+        let requested = Arc::new(std::sync::Mutex::new(None));
+        let seen = Arc::clone(&requested);
+        let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+            .unary(
+                "Launch",
+                move |request: pplx_space_node_mgr_client::proto::LaunchRequest| {
+                    *seen.lock().unwrap() = request.replace_gateway_pid;
+                    Ok(pplx_space_node_mgr_client::proto::LaunchResponse {
+                        pid: answered_pid,
+                        inherited_gateway_sockets: inherited_sockets,
+                    })
+                },
+            )
+            .serve();
+        watchdog.node_manager = node_manager.connector();
+
+        let relaunch = watchdog
+            .replace_netgtw(sandbox_id, 20_001, 30_003)
+            .await
+            .expect("replace net-gateway");
+
+        assert_eq!(*requested.lock().unwrap(), Some(30_003));
+        assert_eq!(
+            relaunch,
+            NetGatewayRelaunch {
+                pid: answered_pid,
+                inherited_sockets,
+            }
+        );
+        let row = crate::db::get_sandbox(&watchdog.db.lock().unwrap(), sandbox_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.netgtw_pid, Some(answered_pid));
+        let sha = watchdog
+            .get_health(sandbox_id)
+            .await
+            .unwrap()
+            .netgtw_git_sha;
+        assert_eq!(
+            sha.is_none(),
+            replaced,
+            "probe state clears only on a new gateway"
+        );
+    }
 }

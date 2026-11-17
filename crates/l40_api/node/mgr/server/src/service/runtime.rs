@@ -684,6 +684,7 @@ impl NodeManagerService {
                     transparent: true,
                     recvorigdstaddr: false,
                     fd_arg: "--tcp-fd".to_string(),
+                    inherited_fd: None,
                 },
                 launch::PreExecSocket {
                     bind_addr: format!("0.0.0.0:{}", crate::firewall::NETGTW_UDP_PORT)
@@ -698,6 +699,7 @@ impl NodeManagerService {
                     transparent: true,
                     recvorigdstaddr: true,
                     fd_arg: "--udp-fd".to_string(),
+                    inherited_fd: None,
                 },
             ]
         } else {
@@ -705,7 +707,7 @@ impl NodeManagerService {
         };
 
         let grant_cap = req.program == pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN;
-        let pid = self
+        let launched = self
             .runtime_supervisor
             .launch_sidecar(pplx_space_node_runtime_core::proto::LaunchSidecarRequest {
                 execution_id: req
@@ -732,6 +734,7 @@ impl NodeManagerService {
                     )
                     .collect(),
                 grant_cap_net_admin: grant_cap,
+                replace_pid: req.replace_gateway_pid.filter(|_| is_gateway),
             })
             .await
             .map_err(|error| {
@@ -739,8 +742,8 @@ impl NodeManagerService {
                 emit_launch_failed(typed_sandbox_id, &req.program, status.message());
                 status
             })?
-            .into_inner()
-            .pid;
+            .into_inner();
+        let (pid, inherited_gateway_sockets) = (launched.pid, launched.inherited_sockets);
 
         if let Err(error) = self.pool.set_pid(&req.sandbox_id, pid) {
             tracing::error!(
@@ -802,7 +805,10 @@ impl NodeManagerService {
                 .sandbox_uid(sandbox_uid.to_string()),
         );
 
-        Ok(Response::new(LaunchResponse { pid }))
+        Ok(Response::new(LaunchResponse {
+            pid,
+            inherited_gateway_sockets,
+        }))
     }
 
     pub(super) async fn release(

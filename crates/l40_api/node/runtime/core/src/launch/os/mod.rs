@@ -164,6 +164,31 @@ fn credentials_match(status: &str, uid: u32, gid: u32) -> bool {
         })
 }
 
+/// Reject a sidecar program, argument or environment entry that the launcher
+/// could not pass to exec. Run it before any irreversible step, such as
+/// stopping the gateway a launch replaces.
+pub fn validate_sidecar_launch_strings(
+    program: &str,
+    args: &[String],
+    env: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    if program.contains('\0') {
+        return Err("invalid program path: contains NUL".into());
+    }
+    if args.iter().any(|arg| arg.contains('\0')) {
+        return Err("sidecar argument contains NUL byte".into());
+    }
+    for (key, value) in env {
+        if key.is_empty() || key.contains('=') {
+            return Err("invalid env key: must be nonempty and contain no '='".into());
+        }
+        if key.contains('\0') || value.contains('\0') {
+            return Err("invalid env entry: contains NUL".into());
+        }
+    }
+    Ok(())
+}
+
 /// Identify a deployed sidecar binary, including content-addressed installs.
 pub fn process_matches_program(pid: u32, program: &str) -> std::io::Result<bool> {
     use pplx_space_uds_peer_auth::exe::{

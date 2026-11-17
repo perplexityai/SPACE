@@ -108,7 +108,27 @@ pub(super) fn pin_current_process() -> Result<ProcessHandle, ProcessHandleError>
     })
 }
 
+/// Non-Linux hosts have no network namespaces.
+pub fn require_network_namespace(_namespace: &std::fs::File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "network namespaces require Linux",
+    ))
+}
+
 impl ProcessHandle {
+    /// Non-Linux hosts cannot duplicate another process's descriptors.
+    pub fn duplicate_listening_socket(
+        &self,
+        _expected: &PreExecSocket,
+        _network_namespace: &std::fs::File,
+    ) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "socket handover requires Linux pidfds",
+        ))
+    }
+
     pub fn open(pid: u32) -> Result<Self, ProcessHandleError> {
         validate_process_pid(pid).map_err(ProcessHandleError::InvalidPid)?;
         Ok(Self { pid })
@@ -176,6 +196,9 @@ pub struct PreExecSocket {
     pub recvorigdstaddr: bool,
     /// CLI arg name to pass the FD number (e.g., "--tcp-fd")
     pub fd_arg: String,
+    /// An already-bound socket the launcher inherited for this entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_fd: Option<i32>,
 }
 
 #[derive(Deserialize, Serialize)]

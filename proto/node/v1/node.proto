@@ -524,10 +524,20 @@ message LaunchRequest {
   uint32 gid = 5;
   map<string, string> env = 6;
   ExecutionFence execution_fence = 7;
+  // Net-gateway only: replace the live gateway with this pid, handing its
+  // listening sockets to the replacement when the runtime supervisor can.
+  // A node-manager or supervisor that predates the field returns the live
+  // pid unchanged, or refuses a gateway without launch evidence. Callers
+  // that see either, or any other error, fall back to stopping the gateway
+  // themselves.
+  optional uint32 replace_gateway_pid = 8;
 }
 
 message LaunchResponse {
   uint32 pid = 1;
+  // How many listening sockets a replacement gateway took over from the one
+  // it replaced; zero when it bound fresh ones.
+  uint32 inherited_gateway_sockets = 2;
 }
 
 message ReleaseRequest {

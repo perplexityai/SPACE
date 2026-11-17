@@ -516,6 +516,12 @@ pub(super) enum Commands {
         /// whose staleness reading may not have refreshed yet.
         #[arg(long)]
         min_age: Option<SimpleDuration>,
+        /// Hand each old gateway's listening sockets to its replacement, so
+        /// guest traffic sent during the cycle, DNS included, waits for the
+        /// new gateway instead of being dropped. A node whose node-manager or
+        /// runtime supervisor predates the handover cycles as without it.
+        #[arg(long)]
+        hand_over_sockets: bool,
     },
     /// Pause a running sandbox (freeze vCPUs, process stays alive)
     Pause {

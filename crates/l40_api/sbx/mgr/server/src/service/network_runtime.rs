@@ -451,6 +451,7 @@ pub(super) async fn launch_net_gateway_via_node(
             uid: process_uid,
             gid: process_uid,
             env,
+            replace_gateway_pid: None,
         })
         .instrument(span)
         .await
