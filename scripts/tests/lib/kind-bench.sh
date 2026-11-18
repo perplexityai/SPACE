@@ -248,18 +248,47 @@ kind_bench_docker_up() {
   # enable-containerd-store step).
   # KIND_BENCH_MIRROR, an http://host:port Docker Hub mirror, is plain HTTP
   # on a host-local address, so it is also listed as insecure.
+  # cgroupfs: on a systemd host dockerd defaults to the systemd driver,
+  # which refuses a --cgroup-parent that is a path.
   jq -n --arg pool "$(kind_bench_pool "$i")" --arg mirror "${KIND_BENCH_MIRROR:-}" '{
       features: {"containerd-snapshotter": true},
+      "exec-opts": ["native.cgroupdriver=cgroupfs"],
       "default-address-pools": [{base: $pool, size: 24}],
       "log-opts": {"max-size": "20m", "max-file": "2"}
     } + (if $mirror == "" then {} else {
       "registry-mirrors": [$mirror],
       "insecure-registries": [$mirror | sub("^https?://"; "")]
     } end)' | sudo -n tee "$run/daemon.json" >/dev/null || return 1
-  # setsid: the daemon outlives the shell that started it, and a Ctrl-C to the
-  # run reaches it only through the teardown, in order.
+  # The bench's own containerd, under its data and run directories: without
+  # --containerd, dockerd uses a host containerd it finds at the default socket,
+  # which would put the bench's images outside its root and its shims outside
+  # its namespaces.
+  printf '%s\n' \
+    'version = 3' \
+    "root = \"$dir/docker/containerd/daemon\"" \
+    "state = \"$run/exec/containerd/daemon\"" \
+    'disabled_plugins = ["io.containerd.grpc.v1.cri"]' \
+    '[grpc]' "  address = \"$run/containerd.sock\"" \
+    '[ttrpc]' "  address = \"$run/containerd.sock.ttrpc\"" \
+    '[debug]' "  address = \"$run/containerd-debug.sock\"" \
+    | sudo -n tee "$run/containerd.toml" >/dev/null || return 1
+  # setsid: the daemons outlive the shell that started them, and a Ctrl-C to
+  # the run reaches them only through the teardown, in order.
   local cgroup
   cgroup="$(kind_bench_cgroup "$i" daemon)" || return 1
+  # shellcheck disable=SC2024 # the log is the caller's file, written as the caller
+  sudo -n nsenter --net="/run/netns/$ns" -- env \
+    PATH="$KIND_BENCH_DOCKER_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    setsid sh -c 'echo $$ >"$1/cgroup.procs" && echo $$ >"$2" && shift 2 && exec "$@"' _ \
+      "$cgroup" "$run/containerd.pid" containerd --config "$run/containerd.toml" \
+      </dev/null >"$dir/containerd.log" 2>&1 &
+  local _
+  for _ in $(seq 1 60); do
+    sudo -n test -S "$run/containerd.sock" && break
+    sleep 0.5
+  done
+  sudo -n test -S "$run/containerd.sock" \
+    || { tail -n 20 "$dir/containerd.log" >&2; kind_bench_log "bench $i: containerd did not start"; return 1; }
   # shellcheck disable=SC2024 # the log is the caller's file, written as the caller
   sudo -n nsenter --net="/run/netns/$ns" -- env \
     PATH="$KIND_BENCH_DOCKER_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
@@ -269,6 +298,7 @@ kind_bench_docker_up() {
       --exec-root "$run/exec" \
       --host "unix://$sock" \
       --pidfile "$run/docker.pid" \
+      --containerd "$run/containerd.sock" \
       --containerd-namespace "$ns" \
       --containerd-plugins-namespace "$ns-plugins" \
       --cgroup-parent "/$ns" \
@@ -378,6 +408,7 @@ kind_bench_existing() {
 # step tolerates what an interrupted run or an earlier step left, so it also
 # cleans a half-created bench.
 kind_bench_teardown() {
+  local _
   local i="$1" ns dir run sock veth comment pid
   ns="$(kind_bench_ns "$i")"
   dir="$(kind_bench_dir "$i")"
@@ -424,6 +455,16 @@ kind_bench_teardown() {
     done
     sudo -n kill -KILL "$dockerd_pid" 2>/dev/null || true
   fi
+  local containerd_pid=""
+  containerd_pid="$(sudo -n cat "$run/containerd.pid" 2>/dev/null || true)"
+  if [[ -n "$containerd_pid" ]] && sudo -n kill -0 "$containerd_pid" 2>/dev/null; then
+    sudo -n kill -TERM "$containerd_pid" 2>/dev/null || true
+    for _ in $(seq 1 15); do
+      sudo -n kill -0 "$containerd_pid" 2>/dev/null || break
+      sleep 1
+    done
+    sudo -n kill -KILL "$containerd_pid" 2>/dev/null || true
+  fi
   if [[ -e "/run/netns/$ns" ]]; then
     for pid in $(sudo -n ip netns pids "$ns" 2>/dev/null); do
       sudo -n kill -KILL "$pid" 2>/dev/null || true
@@ -443,6 +484,14 @@ kind_bench_teardown() {
   # The daemon's cgroup parent, leaves first; a cgroup still holding a process
   # stays, and says so.
   if [[ -d "/sys/fs/cgroup/$ns" ]]; then
+    # Whatever is still in the bench's cgroups dies with them.
+    if [[ -e "/sys/fs/cgroup/$ns/cgroup.kill" ]]; then
+      echo 1 | sudo -n tee "/sys/fs/cgroup/$ns/cgroup.kill" >/dev/null 2>&1 || true
+      for _ in $(seq 1 20); do
+        [[ -z "$(find "/sys/fs/cgroup/$ns" -name cgroup.procs -exec cat {} + 2>/dev/null)" ]] && break
+        sleep 0.5
+      done
+    fi
     find "/sys/fs/cgroup/$ns" -depth -type d -exec sudo -n rmdir {} \; 2>/dev/null || true
     [[ ! -d "/sys/fs/cgroup/$ns" ]] || kind_bench_log "WARNING: /sys/fs/cgroup/$ns still holds processes"
   fi
