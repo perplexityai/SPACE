@@ -245,6 +245,92 @@ newer copy, so the reconciler leaves the sandbox to that node in two ways.
 The listing's skip has no metric of its own: such a sandbox is one the node
 reports while the control plane has no pod for it.
 
+## A v2 node drain that waits
+
+A v2 drain (`:drain {engine: v2, hold_seconds}`) shows in the admin node response as `drain_engine: v2` and `drain`: the drain's `generation` and `deadline`, `cancelling` after an undrain whose cancel the cluster controller hasn't finished on the node, `fenced` once the terminate transaction recorded the instance to terminate, `evacuated_total` (every sandbox the controller recorded as evacuated, a released one included), when the controller stored the node's last report (`reported_at`) and when the set of sandboxes it reports evacuated last grew (`evacuated_grew_at`), and the report itself: `evacuated`, `pending` (each sandbox with its `wait`, whether it is `running`, whether it is a warm-pool member, and the node's reason, which is for display) and `blocked`. `drain_last_error` says what the controller is waiting for. The console's node page shows the same as Drain progress. The fence and the dispatch are kept in `drain_status` (`terminate_instance`, `dispatched_at`, `terminated_observed_at`), which the statements below read.
+
+The node seals itself against VM activations and makes every resident durable elsewhere except a running sandbox, which it lists `pending` with the wait `hold` until the deadline. Its calls work until then. From the deadline on, every call from the controller asks the node to evacuate, and it suspends the running sandboxes and makes them durable too. The deadline is read by the database clock on each tick, so a drain whose controller doesn't call the node (the controller is down, or the node unreachable) holds where it is. A sandbox the drain suspended stays suspended until a call wakes it on another node; the drain restores nothing. While the drain is `draining`, or its cancel is pending, a running sandbox's calls go through, and every activation of a sandbox of the node that isn't running (a start, wake, restore, resume, implicit wake, or runtime recovery) is refused with a 503 and `Retry-After`. A `suspended` or `restoring` sandbox whose current snapshot is durable passes the gate whatever its node and restores elsewhere. Once `drained` or `terminating`, every call against the node's sandboxes is refused, with the same 503, except a start of a stopped sandbox whose disk the drain made durable: with `SPACE_DRAIN_V2_ENABLED` on, the start hands it off the node (it pins the disk, marks it for re-placement and unplaces it), re-places it on another node and boots it there. A start that fails after it claimed the re-placement answers a 503 with `Retry-After`, and the next start resumes it. The controller writes no sandbox row while the drain drains; the terminate transaction hands off the stopped sandboxes no start moved, and releases the durably suspended ones, and a later start or wake places them elsewhere.
+
+A drain suspends a running sandbox the way an idle auto-pause does, and restores nothing. A client brings it back as it would after an idle suspend. A native client whose sandbox's policy doesn't wake on access, which is the native create's default, gets `409` `sandbox is suspended, not running` with a `wake` detail naming `POST /v1/sandboxes/{id}:wake`, and calls `:wake`. An ECW (E2B) client reconnects with `connect`. Either restores the sandbox on another node; the first wake is placed without the drain's evacuation tolerations.
+
+The first release drains clean nodes only. A node whose preview lists a quarantined sandbox, a sandbox whose cleanup failed, or a phantom holder (a sandbox the control plane places on the node though the node doesn't host it) won't reach `:terminate`: resolve those first. A preview skips node-manager's orphan inventory, which a drain call reads, so a drain can find more node-wide blockers than its preview listed.
+
+Past its deadline, a drain whose node has reported no further sandbox evacuated for 15 minutes is stalled: `drain_last_error` starts `the drain is stalled`, and `node_drain.v2.stalled` reads 1 for the node. The console shows it stalled from `evacuated_grew_at` plus 15 minutes. The mark changes nothing else, and it clears once the node reports another sandbox evacuated or the drain finishes. Before its deadline a drain is never stalled, however long it holds. A sandbox that never becomes durable keeps its wakes getting the 503.
+
+| What the listing shows | What it means and what to do |
+|---|---|
+| `:drain` answers 409 with `code` `drain_v2_evacuation_cap` | Every evacuation slot is held (`SPACE_DRAIN_V2_MAX_EVACUATING_NODES`). Retry after `Retry-After`, or free a slot: shorten a drain in flight with `:drain {engine: v2, hold_seconds: 0}`, or undrain one. |
+| `:drain` answers 409 with `code` `drain_v2_node_heartbeat_stale` and `Retry-After: 60` | The node isn't answering, and a v2 drain is the node's own work. Find out why the node is down; drain it with v1 if it won't come back. |
+| `:drain` answers 409, `undrain still finishing` | An earlier v2 drain's undrain hasn't reached the node yet (no phase, `drain_engine` still `v2`): the node may still be sealed under that drain. Retry once the engine is gone. See a stuck cancel below. |
+| `drain_last_error` starts `the drain is stalled` | Past the deadline, nothing more has been evacuated for 15 minutes. `pending` says what the node still does or waits for, each with `since`, when the row entered its state: a sandbox whose wait is `external` waits on work the drain doesn't drive, such as its own lifecycle. `blocked` lists node-wide problems, such as a scan that failed or an untracked runtime process, which keep the drain from finishing. |
+| `the node answered DrainNode under generation N sealed under generation M` (or `with a cancel's result`, `with no result`) `; it records nothing from the answer` | The answer isn't this drain's, so the controller records nothing from it and asks again every tick; `node_drain.v2.unanswered` reads 1. Check the node's sandbox-manager, or undrain. |
+| `DrainNode failed: ...` | The node is down or unreachable, or refused the call, which the error names; a node whose sandbox-manager predates drain v2 answers `Unimplemented`. `node_drain.v2.unanswered` reads 1, and the drain keeps its slot and asks again every tick. A node whose machine is gone is let go once its heartbeat is stale and EC2 lists its instance `terminated`. An `Aborted` call, another drain call in progress on the node, is skipped for the tick and recorded nowhere. |
+| `cordon convergence failed: ...; not calling DrainNode` | The Kubernetes Node under the drain's node name has another UID than the one registration recorded, so the controller doesn't call it. Registration settles which machine it is. |
+| `drained`, `drain_last_error` starts `terminate refused:` | `:terminate` moved the node to `terminating`, and the terminating tick's fresh `DrainNode` call didn't let it fence: the call failed (`terminate refused: DrainNode failed: ...`, an unreadable seal after a sandbox-manager restart among them) or the node reported something left (`terminate refused: the node reports N pending, M blocked: ...`). The node is back in `drained`. Resolve what it names and `:terminate` again. |
+| `terminating`, `terminate held: ...` | The fresh check passed, but rows or executions still name the node. The terminate transaction hands off the stopped rows at home on the node whose disk is durable since their stop and releases the durably suspended rows, and a row whose restore is in flight settles once the restore lands elsewhere. A stopped row whose disk isn't durable, or that pins another artifact, still holds the node. A phantom row, a `quarantined` row naming the node, a row the drain can't make durable, and a `failed` or `deleted` row whose execution on the node is still active don't settle on their own and hold the node until someone resolves them. The controller retries every tick. |
+| `terminating`, `drain_last_error` names the `aws` terminator | The cluster runs another terminator. Under it the v2 loop never calls the node for the fresh check, never asks EC2 about a node's instance and writes no fence, so it never lets a dead v2 node go itself. `:undrain` hands back a node it hasn't fenced; terminate that one another way. A fence written while the cluster ran `aws` stays when the terminator changes, and `:undrain` is refused once a fence exists. |
+| `terminating`, `terminating fenced instance ... failed: ...` | Auto Scaling refuses the termination; the controller retries with backoff. There is no undrain after the fence, since a termination may already be accepted. Terminate the fenced instance in AWS: once EC2 says it is `terminated`, the drain lets the node go. |
+| `EC2 does not list fenced instance ..., and was never seen to list it terminated` | EC2 doesn't list the fenced instance, and the drain never saw it `terminated`, so it neither dispatches the termination nor deletes the row. A missing instance alone isn't death. Check the instance in AWS. If the machine is gone, use the guarded let-go below. |
+| `the termination of fenced instance ... was dispatched N minutes ago; EC2 answers unknown (...)` | The termination was dispatched, and EC2 gave no answer. The drain can't tell whether the instance is gone, so it keeps the row and says so on every check. Restore EC2 access; if you have confirmed the machine gone in AWS, use the guarded let-go below. |
+| `Auto Scaling accepted the termination of ...; EC2 still answers ... after N minutes` | Auto Scaling accepted the termination and EC2 still lists the instance. Check the instance in AWS. |
+| `fenced instance ... is terminated; waiting for its Kubernetes Node ... to go` | EC2 says the fenced instance is `terminated` but its Node object stays. Confirm EC2 reports that instance `terminated` and that the Node's `providerID` names it, then delete the Node with a uid precondition. The drain's next check deletes the row if its heartbeat is stale and nothing names the node; a row or execution that still names it has the drain let the node go instead. |
+| `... is terminated, but ...`, ending `not letting it go` | EC2 says the recorded (or fenced) instance is terminated, but the node's heartbeat is fresh, or its Kubernetes Node is live on another instance or names none: EC2's answer may be about another machine. The drain waits. Check the Node and its machine. |
+| `drain_last_error` starts `v2 drain let go` | The drain released the node: its heartbeat is stale and its instance terminated outside the drain, a fenced instance terminated with no dispatch confirmed, or the delete found a row or execution still naming the node. The phase and drain columns are cleared, and the gone-node loops handle the node as any crashed node. |
+| No phase, `drain.cancelling`, `DrainNode cancel failed: ...` | The undrain's cancel hasn't reached the node. The controller sends it every tick, forever: giving up would uncordon a sealed node or orphan its seal. `node_drain.v2.unanswered` reads 1. See a stuck cancel below. |
+| A registration warning that a Node under a new uid reports no EC2 instance yet, and `node_drain.v2.registration_deferred` | A node with a v2 drain re-registered under a new Kubernetes Node UID before the Node reported its `providerID`. Registration defers it; the next sync keeps the drain if the Node reports the recorded instance, and clears it if it reports another. |
+| A wake or start refused with a 503 on a node no drain lists, and `node_drain.v2.orphaned_seal_refusals` | An orphaned seal: the node's sandbox-manager is sealed, but Postgres records no v2 drain of it. See below. |
+| A sandbox the drain suspended is still `suspended` after the drain, or after an undrain | Expected: the drain restores nothing, and the sandbox's next call wakes it on another node. `node_drain.v2.evacuated_still_suspended` counts, for each drain, the sandboxes it saw running that have stayed suspended for over 15 minutes. |
+
+**An orphaned seal.** A node can stay sealed with no v2 drain recorded, for instance after its row lost the drain while the node was unreachable. Nothing heals it on its own, and every activation on the node keeps being refused. `:drain {engine: v2, hold_seconds: ...}` then `:undrain` heals it: the drain takes a new, later generation and the undrain's cancel unseals the node. Alternatively send the node `DrainNode{generation, Cancel}` through its node-api with the generation it is sealed under, which its refusals name.
+
+**A stuck cancel.** An undrain whose cancel never reaches the node keeps the node cordoned and its evacuation slot held. Restore the node's connectivity so the cancel lands, or replace the machine: once its heartbeat is stale and EC2 lists its instance `terminated`, the drain lets it go and the row is cleared.
+
+**A backward step of the database clock.** A drain's generation is its start in microseconds by the database clock, and the node takes generations only forward, refusing one at or below a generation it was cancelled under. After the clock stepped backward, a new drain can be refused by the node for that reason (`FailedPrecondition` naming both generations). Undrain it, and drain again once the clock has passed the cancelled generation.
+
+**An unknown engine with a NULL phase.** A `drain_engine` this build doesn't know, with no phase, refuses every activation on the node, fails closed, and no loop clears it. Clear it by hand once you have confirmed no drain of that engine runs: `UPDATE nodes SET drain_engine = NULL, drain_status = NULL WHERE id = '<node id>' AND drain_phase IS NULL AND drain_engine = '<engine>';`.
+
+A v2 node whose machine you have confirmed gone in AWS, but which the drain doesn't let go, keeps its drain, and a draining or undrained one keeps its evacuation slot. That happens when EC2 never reports its instance `terminated`, doesn't list it, or gives no answer, or when the cluster runs another terminator, under which the v2 loop never asks EC2. Let it go by hand. First read what the row records:
+
+```sql
+SELECT n.drain_phase,
+       n.drain_status->>'generation' AS generation,
+       n.drain_status->>'terminate_instance' AS fence,
+       k.instance_id, k.k8s_node_uid, k.k8s_node_name
+  FROM nodes n JOIN node_k8s k ON k.node_id = n.id
+ WHERE n.id = '<node id>';
+```
+
+Confirm in AWS that this instance is the machine that is gone. Then confirm it is the machine the node registered, as the drain itself requires before it lets a node go: `kubectl get node <k8s node name> -o jsonpath='{.spec.providerID}'` answers `NotFound`, or names that instance (`aws:///<zone>/<instance id>`). A live Node that names another instance, or none, means the recorded instance is stale and the machine may still be running, sealed under the drain: don't let it go. Then fill in the values you verified. Write `NULL`, unquoted, for an undrained node's phase or an unfenced node's fence. The statement locks the row, and clears the drain only if every value still matches, so a same-name replacement that registered in the meantime, or a drain that moved on, is left as it is. It touches no sandbox row.
+
+```sql
+WITH verified AS (
+  SELECT n.id
+    FROM nodes n JOIN node_k8s k ON k.node_id = n.id
+   WHERE n.id = '<node id>'
+     AND n.drain_engine = 'v2'
+     AND k.instance_id = '<instance id>'
+     AND k.k8s_node_uid = '<k8s node uid>'
+     AND (n.drain_status->>'generation')::BIGINT = <generation>
+     AND n.drain_phase IS NOT DISTINCT FROM '<phase>'
+     AND n.drain_status->>'terminate_instance' IS NOT DISTINCT FROM '<fence>'
+     FOR UPDATE OF n, k
+)
+UPDATE nodes n
+   SET drain_phase = NULL, drain_mode = NULL, drain_started_at = NULL,
+       drain_engine = NULL, drain_status = NULL,
+       drain_last_error = 'v2 drain let go by an operator: machine gone'
+  FROM verified
+ WHERE n.id = verified.id;
+```
+
+`UPDATE 1` let the node go. `UPDATE 0` means the row no longer matches what you verified: read it again, verify it again in AWS, and only then retry with the new values.
+
+**Monitors before turning drain v2 on.** Alert on `node_drain.v2.orphaned_seal_refusals` (any orphaned seal), and on `node_drain.v2.unanswered` reading 1 for a node for more than 15 minutes (a drain or cancel the node doesn't answer).
+
+**Rolling back the node half.** Rolling sandbox-manager back is image-only once the release deployed everywhere before it already contains the activation seal. Otherwise, run the seal migration's down on every node first, so the older build doesn't meet a seal row it doesn't know.
+
+**Known gaps.** A sandbox whose policy has no implicit wake answers its first call after a drain with the native `409` and a `:wake` hint. The first wake after a drain is placed without the drain's evacuation tolerations. After an undrain, the sandboxes the drain suspended stay suspended until a call wakes them. A suspend the node started before a cancel may finish after it. A drain waits while the controller is down. A sandbox that never becomes durable keeps its wakes getting the 503 for as long as the drain runs.
+
 ## Timeouts mean different things
 
 A client deadline limits how long the client waits; it does not cancel a lifecycle operation or establish that a process stopped. Inspect the resource before retrying or issuing another command.
