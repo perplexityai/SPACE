@@ -416,8 +416,7 @@ run_clippy_checks() {
             -D warnings
     done
 
-    # The libraries that reach common-core at most directly, and those its
-    # ALSO list names, are linted alone by run_isolated_crate_checks in
+    # Every workspace library is linted alone by run_isolated_crate_checks in
     # lib/rust-isolated-crates.sh (the isolated-crates mode), which finds them
     # in the workspace metadata. A new crate needs no step here.
 }

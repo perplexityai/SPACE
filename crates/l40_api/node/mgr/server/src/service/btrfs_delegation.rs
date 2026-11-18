@@ -450,7 +450,7 @@ fn instance_ro_in_snapshot_dir(snapshot_dir: &Path) -> PathBuf {
 fn rootfs_btrfs_send_path(snapshot_dir: &Path) -> PathBuf {
     // Wire-format filename for the btrfs-send rootfs codec. Mirrors
     // `crate::snapshot_upload::ROOTFS_BTRFS_SEND_FILENAME` in sbxmgr;
-    // not promoted to common_core yet so we duplicate the literal
+    // not promoted to a shared crate yet so we duplicate the literal
     // here. Both sides MUST agree.
     snapshot_dir.join("rootfs.btrfs-send")
 }

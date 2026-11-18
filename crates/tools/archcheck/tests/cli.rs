@@ -461,7 +461,7 @@ fn crate_names_behaviours() {
     let mixed_case = new("crates/x", "Foo-Utils", "utils");
     let mixed_separators = new("crates/x", "foo_Shared-io", "shared");
     let unprefixed = new("crates/x", "foo-core", "core");
-    let first = new("crates/x", "pplx-space-common-core", "common");
+    let first = new("crates/x", "pplx-space-misc-core", "misc");
     let renamed_to_utils = new("crates/x", "pplx-space-io-utils", "utils");
     let not_bootstrap = "pplx-space-foo-utils is in [crate_names] in architecture-baseline.toml \
                          but not one of the 16 crates listed when the rule was added, and there \
@@ -519,7 +519,7 @@ fn crate_names_behaviours() {
             "the first matching part is named",
             Base::Unresolved,
             &[],
-            &[("crates/x", "pplx-space-common-core")],
+            &[("crates/x", "pplx-space-misc-core")],
             &[("no_new", &first)],
         ),
         (

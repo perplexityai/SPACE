@@ -201,11 +201,12 @@ pub(crate) fn optional_runtime_kind(generator: &mut SchemaGenerator) -> Schema {
 ///
 /// `network_policy` and `auto_lifecycle` are internal types today -
 /// `NetworkPolicyV1` from `pplx-space-net-common` and `AutoLifecyclePolicy`
-/// from `pplx-space-common-core`. Describing their trees here means restating
-/// validation this crate does not own, and review found three ways that goes
-/// wrong: destinations accepting `{"ip": "not-an-ip"}`, stage durations
-/// accepting `0s` and `1.5s`, and over-precise or overflowing durations. Each
-/// is a schema that tells an SDK to accept a request the server rejects.
+/// from `pplx-space-auto-lifecycle`. Describing their trees here means
+/// restating validation this crate does not own, and review found three ways
+/// that goes wrong: destinations accepting `{"ip": "not-an-ip"}`, stage
+/// durations accepting `0s` and `1.5s`, and over-precise or overflowing
+/// durations. Each is a schema that tells an SDK to accept a request the
+/// server rejects.
 ///
 /// Publishing an open object instead keeps the field usable without promising a
 /// structure this crate cannot validate. RFC decision 7 also holds that the
