@@ -105,8 +105,9 @@ Use the native update only for:
 builds in flight, which callers retry, so a native update is appropriate.
 The module sets its `update_strategy` explicitly because EKS keeps returning
 a strategy once one has been set and cannot clear it, so an unset value plans
-`<value> -> null` on every run. Choose the strategy from the capacity you can
-guarantee:
+`<value> -> null` on every run. The `space` module sets builders to
+`DEFAULT` in `locals.tf`; no input selects the strategy, so moving builders
+to `MINIMAL` is a module change. The tradeoff between the two:
 
 - `DEFAULT` keeps a builder serving during the update but needs a second
   instance of the builder's type in the same AZ, within 15 minutes. When
@@ -124,9 +125,12 @@ a builder capacity failure does not hold up unrelated work.
 
 `scripts/space-rollout-mng.py` moves sandboxes from a source MNG to a target
 MNG through the cluster-controller drain reconciler, which evacuates each
-sandbox onto the target instead of evicting it. The target carries a cohort
-taint that only evacuation pods tolerate, so user creates stay off it until
-the rollout is promoted. The target module and taint are described in
+sandbox onto the target instead of evicting it. Target nodes register with a
+cohort taint that only evacuation pods tolerate. As each source node
+terminates, the script removes the taint from one Ready target node, which
+then accepts user creates; it always keeps `H` Ready target nodes tainted
+for incoming evacuations, and untaints those last ones when the source is
+empty. The target module and taint are described in
 [`rollout-mng`](../../../infra/space/aws/eks/modules/rollout-mng/README.md).
 
 The script's two knobs:
@@ -136,13 +140,20 @@ The script's two knobs:
 - `H`, `--headroom-count`, is the number of extra target nodes kept ahead of
   the drains. The script requires `1 <= K <= H`.
 
-Total capacity stays at `N + H`, where `N` is the source's starting size:
-the target starts at `H` and grows by one for each source node terminated,
-ending at `N + H`. Because a capacity group has a Terraform-enforced ceiling
-of 99 nodes, a single source-target pair needs `N + H <= 99`. A full 99-node
-source therefore cannot roll into one 99-node target with any headroom.
-Size groups that will be rolled this way with room for `H`, or first move
-some of the source's sandboxes elsewhere.
+The script holds the two groups' combined desired size at `N + H`, where
+`N` is the source's starting size: the target's desired size starts at `H`
+and grows by one for each source node terminated, ending at `N + H`. Ready
+capacity can dip below that while a replacement target node boots, because
+a source terminate lowers the source at once and the target node takes
+time to become Ready.
+
+The target must be able to grow to `N + H`. A `rollout-mng` or
+`workers_rollout_cohorts` target takes its `max_size` from the caller, but a
+`worker_capacity_groups` entry has a Terraform-enforced ceiling of 99, so a
+capacity group used as the target needs `N + H <= 99`. A full 99-node
+source cannot roll into one such group with any headroom. Size groups that
+will be rolled this way with room for `H`, or first move some of the
+source's sandboxes elsewhere.
 
 Tradeoffs:
 
@@ -171,13 +182,25 @@ they can be blue/green targets.
 ## Pin each capacity group's launch template
 
 The intended control for `worker_capacity_groups` is an optional
-`launch_template_version` on each group:
+`launch_template_version` on each group, proposed in
+[#1958](https://github.com/perplexityai/SPACE/pull/1958) and not yet on
+`main`:
 
 - Unset, the group follows `latest_version`. That suits empty groups,
   which then never scale out on a stale bootstrap.
 - Set, the group stays on that version, so a new LT version is published
-  without being adopted. Adoption becomes a reviewed one-line change to the
-  pin, made only after the group is empty or through a blue/green rollout.
+  without being adopted. A non-blocking `check` warns while a pin lags the
+  latest version. Adoption becomes a reviewed one-line change to the pin,
+  made after the group is empty or through a blue/green rollout. Moving
+  the pin of a populated group is a native in-place update of that group.
+
+The module does not require a populated group to be pinned; pinning
+nonempty groups is a convention to follow. The same change adds a
+`builders_launch_template_version` input for the builders pool.
+
+Until the pin lands, every nonempty capacity group adopts a new shared LT
+version on the next apply. Before applying such a change, drain each
+nonempty group to zero, or hold the apply.
 
 With the pin in place, a change to the shared LT updates only empty groups
 in place, and nonempty groups adopt it when an operator chooses. Empty
@@ -204,8 +227,8 @@ wall time roughly by the number of pairs. It is not implemented. It needs:
 | Change | Strategy |
 | --- | --- |
 | Empty capacity group | Native update; it adopts the latest LT on apply. |
-| Boot-only or cosmetic LT change on nonempty groups | Pin the groups; let empty groups adopt it and roll the rest at the next planned rollout. |
-| Planned worker AMI, kernel or bootstrap change | Sandbox-aware blue/green, one pair at a time, with `N + H <= 99`. |
+| Boot-only or cosmetic LT change on nonempty groups | Once the pin is available, pin the groups, let empty groups adopt it and roll the rest at the next planned rollout. Until then, hold the apply or drain the nonempty groups to zero first. |
+| Planned worker AMI, kernel or bootstrap change | Pin, or drain to zero, every nonempty capacity group before the apply that publishes the LT. Then roll sandbox-aware blue/green, one pair at a time, with room for `N + H` in the target. |
 | Builders | Native update with an explicit strategy, one cluster at a time. |
 | Emergency on nonempty workers | Blue/green with larger `K` and `H` if headroom exists; otherwise native update one group at a time, with approval. |
 
