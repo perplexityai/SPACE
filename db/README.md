@@ -257,7 +257,9 @@ the down SQL and removes the history row at startup. Whether rolling back to
 it needs more than the image depends on how it treats
 `20261031050126_node_dirty_ref_revisions`, as 'Node dirty-ref revision
 migration' describes. One from before #1277 doesn't list that version and
-refuses a database that records it. Check the database's history first:
+refuses a database that records it. First stop template-manager and keep the
+newer one from restarting until the older one starts: a restart can apply a
+migration the database doesn't yet record. Then check the database's history:
 `sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` must
 print `20261031050126`, or `20261026220935` if the node doesn't record the
 dirty-ref migration, and
@@ -265,8 +267,7 @@ dirty-ref migration, and
 must print nothing, since `down` reverts the newest migration across both
 histories. If either check fails, stop and follow 'Node dirty-ref revision
 migration' instead. If the first printed `20261026220935`, no `down` is
-needed. If it printed `20261031050126`, stop template-manager, keep the newer
-one from restarting until the older one starts, and run
+needed. If it printed `20261031050126`, run
 `space-db-migrator template-manager --database-path <db> down` once, with a
 migrator from #1235 on such as the newer release's, before starting the older
 one; it reverts only that migration. `docs/execution-environments.md`
