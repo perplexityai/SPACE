@@ -84,6 +84,11 @@ grep -qx -- "type=registry,ref=$repository:kind-x,mode=max,image-manifest=true,o
 result="$(flags kind-x SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" SPACE_KIND_BUILD_CACHE_WRITE=1 \
     "${main_push[@]}" GITHUB_REPOSITORY=example-owner/SPACE)"
 [[ "$(head -1 <<<"$result")" != 0 ]] || fail "a fork's main push must not export" "$result"
+# A loopback registry is the caller's own and takes its writes outside CI.
+result="$(flags kind-x SPACE_KIND_BUILD_CACHE_REPOSITORY=localhost:5001/space-kind-build-cache SPACE_KIND_BUILD_CACHE_WRITE=1)"
+[[ "$(head -1 <<<"$result")" == 0 ]] || fail "a loopback registry must take a local export" "$result"
+grep -qx -- "type=registry,ref=localhost:5001/space-kind-build-cache:kind-x,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" <<<"$result" \
+    || fail "a loopback export must write the scope" "$result"
 result="$(flags kind-x SPACE_KIND_BUILD_CACHE_REPOSITORY="$repository" SPACE_KIND_BUILD_CACHE_WRITE=yes)"
 [[ "$(head -1 <<<"$result")" != 0 ]] || fail "a write setting other than 0 or 1 must be refused" "$result"
 

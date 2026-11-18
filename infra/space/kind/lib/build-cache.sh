@@ -13,7 +13,8 @@
 #                                      registry on the loopback interface
 #                                      (localhost:<port>/<name>) to try the cache
 #                                      locally; unset leaves builds unchanged
-#   SPACE_KIND_BUILD_CACHE_WRITE       1 exports layers (trusted main CI only);
+#   SPACE_KIND_BUILD_CACHE_WRITE       1 exports layers (trusted main CI only,
+#                                      or anyone to a loopback registry);
 #                                      default 0 imports without exporting
 #
 # Imports are optional performance hints: a missing or unreachable cache makes
@@ -75,7 +76,12 @@ space_kind_cache_flags() {
     CACHE_FROM_FLAGS+=(--cache-from "type=gha,scope=$scope,timeout=60s")
   fi
   if [[ "$write" == 1 ]]; then
-    if [[ "${GITHUB_ACTIONS:-}" != true || "${GITHUB_EVENT_NAME:-}" != push \
+    # The shared GHCR cache takes writes only from trusted main CI. A registry
+    # on the loopback interface is the caller's own (one host's benches share
+    # layers through it, scripts/tests/smoke-kind-parallel.sh), and nothing
+    # else reads it, so it takes the caller's writes.
+    if [[ ! "$repository" =~ ^(localhost|127\.0\.0\.1): ]] \
+        && [[ "${GITHUB_ACTIONS:-}" != true || "${GITHUB_EVENT_NAME:-}" != push \
           || "${GITHUB_REF:-}" != refs/heads/main || "${GITHUB_REPOSITORY:-}" != perplexityai/SPACE ]]; then
       printf 'build cache: cache writes are restricted to perplexityai/SPACE main push CI\n' >&2
       return 1
