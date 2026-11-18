@@ -66,6 +66,12 @@ async fn main() {
                 // This command is how an operator escalates a drain in place,
                 // so it never asks for the start-only precondition.
                 require_undrained: false,
+                // The engine stays the server's choice: a new drain runs on
+                // v1, and one in flight keeps its own.
+                engine: None,
+                // A deadline is a gentle v2 drain's, which this command
+                // doesn't start.
+                deadline: None,
             };
             client.post_drain(&node, &request).await
         }

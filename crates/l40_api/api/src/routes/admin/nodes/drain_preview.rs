@@ -6,15 +6,28 @@
 //! `disk`, or blocked after repeated suspend failures), and the window slots
 //! that frees can start other work sooner.
 
-use axum::{Json, http::StatusCode, response::IntoResponse};
+use axum::{
+    Extension, Json,
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::NodeRole;
 use pplx_space_postgres_pool::contention;
 use pplx_space_sbx_mgr_client::proto::{DrainPrior, PreviewDrainNodeResponse};
 
+use crate::middleware::auth::AuthUser;
 use crate::routes::AppState;
 use crate::routes::admin::node_store;
-use crate::routes::admin::support::{api_error, read_db_error};
+use crate::routes::admin::support::{api_error, read_db_error, require_managing_org_admin};
+
+/// The longest a drain preview takes once its caller is authorized: reading
+/// the node's rows, then finding its node-api, connecting to it, and the call
+/// under the probe's own request timeout. The console waits longer than this
+/// for a preview (`DRAIN_PREVIEW_TIMEOUT_MS` in
+/// `ui/src/lib/drain-preview.ts`), so it covers the whole request.
+pub(super) const DRAIN_PREVIEW_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Why a drain preview got no answer from the node.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -156,6 +169,33 @@ pub(super) fn preview_body(
         // doesn't account for them.
         "unchecked": response.unchecked,
     })
+}
+
+/// Ask the node what a forced v2 drain would find on it now, a `PreviewDrainNode`
+/// call, through the client `:terminate`'s probe uses
+/// ([`super::V2DrainProbe`]). The node seals nothing, starts nothing and
+/// writes nothing, so this answers whether or not drain v2 is enabled. The
+/// client reaches a Kubernetes node through its node-api pod and a Direct
+/// node through the endpoint it registered, so either can be previewed.
+/// Only a worker can: a builder's node-api serves no `PreviewDrainNode`. What
+/// `:drain` would refuse a v2 drain of the node for, whatever the request
+/// asks, is reported as node-level blockers beside the node's own, every
+/// refusal where `:drain` answers with the first; when the node can't
+/// answer, the error lists them as `refusals`. Past authorization, the
+/// request is bounded by [`DRAIN_PREVIEW_DEADLINE`].
+///
+/// A read: it writes no node row, and being a `GET` it persists no request
+/// audit event (`admin_request_should_persist_audit_event`). The admin reads
+/// emit no `audit::record` line either; that is for actions.
+pub(in crate::routes::admin) async fn preview_node_drain(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Path(node_id): Path<NodeId>,
+) -> axum::response::Response {
+    if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
+        return err.into_response();
+    }
+    preview_within(&state, node_id, DRAIN_PREVIEW_DEADLINE).await
 }
 
 /// [`preview_node_drain`] once its caller is authorized: the node's reads

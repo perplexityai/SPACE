@@ -1405,7 +1405,6 @@ pub(super) mod terminate_gate_agreement_tests;
 
 /// What resolves the node's node-api: its role, substrate and Kubernetes
 /// name. `None` when the row is gone.
-#[cfg(test)]
 pub(super) async fn node_api_target(
     pool: &sqlx::PgPool,
     node_id: NodeId,

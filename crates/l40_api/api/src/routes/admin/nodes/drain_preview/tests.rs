@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use pplx_space_accounts::NodeId;
 use pplx_space_sbx_mgr_client::proto::{
     DrainBlocked, DrainEvacuated, DrainPending, PreviewDrainNodeResponse,
@@ -192,6 +192,231 @@ async fn insert_node_with(
         .await?;
     }
     Ok(node_id)
+}
+
+/// Each table a preview could write: the node's own rows.
+async fn node_rows(pool: &sqlx::PgPool, node_id: NodeId) -> TestResult<serde_json::Value> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT jsonb_build_object(
+                    'node', (SELECT to_jsonb(n) FROM nodes n WHERE n.id = $1),
+                    'node_k8s', (SELECT to_jsonb(k) FROM node_k8s k WHERE k.node_id = $1),
+                    'node_direct', (SELECT to_jsonb(d) FROM node_direct d WHERE d.node_id = $1))"
+    ))
+    .bind(node_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// An operator previews a node through the admin router: the node's report
+/// comes back as the node gave it, nothing is written to the node's rows
+/// or the audit log, and only an operator may ask. A Direct node is asked
+/// through the endpoint it registered. An unknown node is 404, and a cluster
+/// or builder node 400; a node that can't be reached and one too old to
+/// preview each answer their own error.
+#[tokio::test(flavor = "current_thread")]
+async fn an_operator_previews_a_node_and_nothing_is_written() -> TestResult {
+    let scripts = BTreeMap::from([
+        ("preview-ok".to_owned(), Ok(report())),
+        ("127.0.0.1:9801".to_owned(), Ok(report())),
+        (
+            "preview-unreachable".to_owned(),
+            Err(DrainPreviewError::Unreachable("connection refused".into())),
+        ),
+        (
+            "preview-older".to_owned(),
+            Err(DrainPreviewError::from_status(
+                tonic::Status::unimplemented("unknown method PreviewDrainNode"),
+            )),
+        ),
+    ]);
+    let Some(harness) = admin_router_harness_with(|state| {
+        state.v2_drain_probe = std::sync::Arc::new(ScriptedPreviews(scripts));
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let pool = &harness.db.pool;
+    let node = insert_node(pool, "worker", "k8s", "preview-ok").await?;
+    let path = format!("/nodes/{node}/drain-v2-preview");
+    let before = node_rows(pool, node).await?;
+
+    let (status, body) = harness.as_operator(Method::GET, &path, &[], None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, preview_body(node, &report()));
+    harness
+        .assert_refused_to_non_operators(Method::GET, &path, None)
+        .await;
+    assert_eq!(node_rows(pool, node).await?, before);
+    assert_eq!(
+        harness.audit_events(&path).await,
+        Vec::<serde_json::Value>::new()
+    );
+
+    let (status, _) = harness
+        .as_operator(
+            Method::GET,
+            &format!("/nodes/{}/drain-v2-preview", NodeId::new()),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    for (role, managed_by, name, expected, reason) in [
+        (
+            "cluster",
+            "k8s",
+            "preview-ok",
+            StatusCode::BAD_REQUEST,
+            None,
+        ),
+        (
+            "builder",
+            "k8s",
+            "preview-ok",
+            StatusCode::BAD_REQUEST,
+            None,
+        ),
+        ("worker", "space", "127.0.0.1:9801", StatusCode::OK, None),
+        (
+            "worker",
+            "k8s",
+            "preview-unreachable",
+            StatusCode::BAD_GATEWAY,
+            Some("node_unreachable"),
+        ),
+        (
+            "worker",
+            "k8s",
+            "preview-older",
+            StatusCode::NOT_IMPLEMENTED,
+            Some("node_version_unsupported"),
+        ),
+    ] {
+        let other = insert_node(pool, role, managed_by, name).await?;
+        let (status, body) = harness
+            .as_operator(
+                Method::GET,
+                &format!("/nodes/{other}/drain-v2-preview"),
+                &[],
+                None,
+            )
+            .await;
+        assert_eq!(
+            (status, body["reason"].as_str()),
+            (expected, reason),
+            "{role} {managed_by} {name}: {body}"
+        );
+    }
+    Ok(())
+}
+
+/// What `:drain` would refuse a v2 drain of the node for comes ahead of the
+/// node's own blockers, each a node-level one, and keeps a drain of the node
+/// from finishing: a Kubernetes node without a recorded EC2 instance, and a Direct
+/// node, which is also without one. A Kubernetes node with its instance
+/// recorded gets the node's answer as it is.
+#[tokio::test(flavor = "current_thread")]
+async fn the_preview_reports_what_drain_would_refuse_the_node_for() -> TestResult {
+    let finished = PreviewDrainNodeResponse {
+        sealed_epoch: None,
+        would_finish: true,
+        ..PreviewDrainNodeResponse::default()
+    };
+    let unreachable = || Err(DrainPreviewError::Unreachable("connection refused".into()));
+    let scripts = BTreeMap::from([
+        ("recorded".to_owned(), Ok(finished.clone())),
+        ("unrecorded".to_owned(), Ok(report())),
+        ("127.0.0.1:9802".to_owned(), Ok(finished.clone())),
+        ("recorded-unreachable".to_owned(), unreachable()),
+        ("unrecorded-unreachable".to_owned(), unreachable()),
+        ("127.0.0.1:9803".to_owned(), unreachable()),
+    ]);
+    let Some(harness) = admin_router_harness_with(|state| {
+        state.v2_drain_probe = std::sync::Arc::new(ScriptedPreviews(scripts));
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let pool = &harness.db.pool;
+    const KUBERNETES_ONLY: &str = "drain engine v2 drains Kubernetes nodes only";
+    const NO_INSTANCE: &str = "drain engine v2 needs the node's EC2 instance recorded: the \
+                               drain terminates that instance, and asks EC2 about it when the \
+                               node stops answering";
+    let node_level = |reasons: &[&str]| -> Vec<serde_json::Value> {
+        reasons
+            .iter()
+            .map(|reason| serde_json::json!({"sandbox_id": null, "reason": reason}))
+            .collect()
+    };
+    for (managed_by, name, instance, refusals, node_blocked, would_finish) in [
+        ("k8s", "recorded", true, vec![], vec![], true),
+        (
+            "k8s",
+            "unrecorded",
+            false,
+            vec![NO_INSTANCE],
+            preview_body(NodeId::new(), &report())["blocked"]
+                .as_array()
+                .unwrap()
+                .clone(),
+            false,
+        ),
+        (
+            "space",
+            "127.0.0.1:9802",
+            false,
+            vec![KUBERNETES_ONLY, NO_INSTANCE],
+            vec![],
+            false,
+        ),
+    ] {
+        let node = insert_node_with(pool, "worker", managed_by, name, instance).await?;
+        let (status, body) = harness
+            .as_operator(
+                Method::GET,
+                &format!("/nodes/{node}/drain-v2-preview"),
+                &[],
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+        let mut expected = node_level(&refusals);
+        expected.extend(node_blocked);
+        assert_eq!(body["blocked"], serde_json::Value::from(expected), "{name}");
+        assert_eq!(body["would_finish"], would_finish, "{name}");
+    }
+
+    // A node that can't answer still gets the admin API's refusals, every
+    // one, in the error.
+    for (managed_by, name, instance, refusals) in [
+        ("k8s", "recorded-unreachable", true, vec![]),
+        ("k8s", "unrecorded-unreachable", false, vec![NO_INSTANCE]),
+        (
+            "space",
+            "127.0.0.1:9803",
+            false,
+            vec![KUBERNETES_ONLY, NO_INSTANCE],
+        ),
+    ] {
+        let node = insert_node_with(pool, "worker", managed_by, name, instance).await?;
+        let (status, body) = harness
+            .as_operator(
+                Method::GET,
+                &format!("/nodes/{node}/drain-v2-preview"),
+                &[],
+                None,
+            )
+            .await;
+        assert_eq!(
+            (status, body["reason"].as_str()),
+            (StatusCode::BAD_GATEWAY, Some("node_unreachable")),
+            "{name}: {body}"
+        );
+        assert_eq!(body["refusals"], serde_json::json!(refusals), "{name}");
+    }
+    Ok(())
 }
 
 /// Answers every preview with `response` after `delay`.

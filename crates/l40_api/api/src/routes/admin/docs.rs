@@ -107,7 +107,7 @@ fn admin_openapi_value() -> Value {
                     ],
                     "requestBody": {
                         "required": false,
-                        "description": "Optional drain options. An omitted body means a gentle drain that auto-replaces the instance on termination. Also accepted against a node already draining: gentle -> forced escalates the drain in place and preserves drain_started_at; the same mode leaves the mode alone but still clears drain_last_error; forced -> gentle is refused. A drain's replace_after_terminate is fixed when it starts: on an already-draining node, omit the field to escalate on the existing terms; one that disagrees with the drain in flight is a 409.",
+                        "description": "Optional drain options. An omitted body means a gentle drain that auto-replaces the instance on termination. Also accepted against a node already draining: gentle -> forced escalates the drain in place and preserves drain_started_at; the same mode leaves the mode alone but still clears drain_last_error; forced -> gentle is refused. A drain's replace_after_terminate is fixed when it starts: on an already-draining node, omit the field to escalate on the existing terms; one that disagrees with the drain in flight is a 409. With engine v2, a gentle drain needs a deadline: the node is sealed against VM activations, running sandboxes keep running and are reported held until they leave started on their own (idle auto-suspend, a user suspend, stop or delete), everything else is made durable elsewhere as under a forced v2 drain, and at the deadline the drain turns forced. :drain with mode forced escalates it earlier.",
                         "content": {
                             "application/json": {
                                 "schema": {
@@ -118,7 +118,17 @@ fn admin_openapi_value() -> Value {
                                             "type": "string",
                                             "enum": ["gentle", "forced"],
                                             "default": "gentle",
-                                            "description": "gentle: cordon the node and wait for resident sandboxes to leave on their own (auto-suspend on inactivity, user suspend, delete); user calls against them keep working. forced: evacuate every resident started/paused sandbox immediately and reject user calls against them with 409 for the whole drain window. forced also enables the stale-transient sweep, which flips any resident wedged in a non-evacuable transient lifecycle past the cluster's abandon age to failed, unrecoverably. That age is measured from the sandbox's own last lifecycle change, not from the drain, so a resident already wedged longer than it is flipped on the first tick after the write — escalating a long-parked gentle drain has no grace period. Read both node_drain.sandboxes_remaining and node_drain.drain_blockers first: neither is a superset of what the sweep destroys (they differ in both the lifecycles and the node-pinning column they count), so two zeros is the only reassuring answer."
+                                            "description": "gentle: cordon the node and wait for resident sandboxes to leave on their own (auto-suspend on inactivity, user suspend, delete); user calls against them keep working. forced: evacuate every resident started/paused sandbox immediately and reject user calls against them with 409 for the whole drain window. forced also enables the stale-transient sweep, which flips any resident wedged in a non-evacuable transient lifecycle past the cluster's abandon age to failed, unrecoverably. That age is measured from the sandbox's own last lifecycle change, not from the drain, so a resident already wedged longer than it is flipped on the first tick after the write — escalating a long-parked gentle drain has no grace period. Read both node_drain.sandboxes_remaining and node_drain.drain_blockers first: neither is a superset of what the sweep destroys (they differ in both the lifecycles and the node-pinning column they count), so two zeros is the only reassuring answer. With engine v2, gentle seals the node against VM activations once admitted and evacuates every resident except a started sandbox, which keeps running, its calls open, and is reported pending with the action hold until it leaves started on its own; any call that could activate a sandbox that isn't running (a start, wake, restore or resume, or an access path that would wake it) is refused when the sandbox has no durable snapshot of its current state, with a 409 naming the call, or a 503 with Retry-After while the drain still makes it durable; a suspended or restoring sandbox whose current snapshot is durable passes the gate whatever its node and restores elsewhere; a suspend, stop, kill, pause, checkpoint, snapshot setting, stats read or delete goes through. A sandbox that suspends on its own is not restored elsewhere: its snapshot is uploaded, and once it is durable its next wake restores it on another node while the drain still runs. At the deadline, or on a :drain with mode forced, the drain turns forced and suspends and moves the held sandboxes."
+                                        },
+                                        "engine": {
+                                            "type": "string",
+                                            "enum": ["v1", "v2"],
+                                            "description": "The drain engine. Omitted, a new drain runs on v1 and a drain in flight keeps its engine. v2 seals the node and lets it make its residents durable itself; it needs SPACE_DRAIN_V2_ENABLED, a Kubernetes node and the node's EC2 instance recorded."
+                                        },
+                                        "deadline": {
+                                            "type": "string",
+                                            "format": "date-time",
+                                            "description": "When a gentle v2 drain turns forced, an RFC 3339 timestamp in the future. Required to start a gentle v2 drain; there is no default. Refused (400) on any other drain. Against a gentle v2 drain in flight it may be omitted; one that disagrees with the drain's deadline is a 409. Stored as drain_status.deadline, in Unix seconds."
                                         },
                                         "replace_after_terminate": {
                                             "type": "boolean",
@@ -136,7 +146,8 @@ fn admin_openapi_value() -> Value {
                     },
                     "responses": {
                         "200": { "description": "Drain accepted, escalated in place, or already in the requested mode" },
-                        "409": { "description": "Node transition conflict: the node's drain_phase does not accept :drain, the request asked to downgrade an in-flight forced drain to gentle, it carried a replace_after_terminate disagreeing with the drain already in flight, or it set require_undrained and the node already has a drain phase" },
+                        "409": { "description": "Node transition conflict: the node's drain_phase does not accept :drain, the request asked to downgrade an in-flight forced drain to gentle, it carried a replace_after_terminate disagreeing with the drain already in flight, a deadline disagreeing with the gentle v2 drain in flight, or it set require_undrained and the node already has a drain phase" },
+                        "400": { "description": "An invalid drain request: a gentle v2 drain without a deadline, or with one that isn't an RFC 3339 timestamp in the future, a deadline on any other drain, or engine v2 while SPACE_DRAIN_V2_ENABLED is off" },
                         "501": { "description": "Not available on the active substrate" }
                     }
                 }
@@ -548,6 +559,23 @@ fn insert_node_maintenance_paths(paths: &mut Map<String, Value>) {
                 "responses": {
                     "200": { "description": "Node health" },
                     "404": { "description": "Node not found" }
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/nodes/{node_id}/drain-v2-preview".to_string(),
+        json!({
+            "get": {
+                "summary": "Preview what a forced v2 drain would find on one worker node, changing nothing on it",
+                "description": "It reports what a forced v2 drain would find on this node now. It plans as a forced drain. A gentle drain holds each started sandbox whose suspend is neither refused nor already running: it lists it pending with the action hold, whatever this preview lists for it (suspend, queued, disk, or blocked after repeated suspend failures), and the window slots that frees can start other work sooner. A row that has already sat in a transition the drain doesn't drive for over 15 minutes counts as blocked, as a drain would report it after waiting that long. What the admin API would refuse a v2 drain of the node for (a node not managed by Kubernetes, or one without a recorded EC2 instance) is reported as node-level blockers, every refusal, where :drain answers with the first; when the node can't answer, the error lists them as refusals. The preview reads node-manager's orphan inventory as a drain call does. Node-manager serves one page of it at a time and keeps up to 4 scans, evicting the least recently used one when another starts, so on a draining node a preview can delay a drain call's read or cut it short. Once the caller is authorized, the request is bounded at 60 s, its database reads and the node call together.",
+                "responses": {
+                    "200": { "description": "What a drain would report: blocked, pending, evacuated, the node's seal as it stands, and whether a drain would finish at once" },
+                    "400": { "description": "Not a worker node" },
+                    "404": { "description": "Node not found" },
+                    "501": { "description": "The node's sandbox-manager or node-api predates drain previews (reason node_version_unsupported); refusals lists what :drain would refuse the node for" },
+                    "502": { "description": "The node can't be reached or didn't answer within the bound (reason node_unreachable), or failed the preview (node_preview_failed); refusals lists what :drain would refuse the node for" },
+                    "503": { "description": "The admin API's database ended or lost a read. With reason database_timeout, a read of the node's rows timed out, by the 60 s bound or, first under the defaults, by the database's own bounds (the pool's acquire timeout, statement_timeout or a cancel, or lock_timeout); the error names the read. Without a reason, a read lost a serialization, deadlock or lock race; retry." }
                 }
             }
         }),
