@@ -337,8 +337,9 @@ slowest, so more shards would not shorten the run.
 
 ## The whole suite on one host
 
-`scripts/tests/smoke-kind-parallel.sh` runs every CI smoke shard's work on one
-Linux/KVM host at once, as N isolated benches side by side:
+`scripts/tests/smoke-kind-parallel.sh` is the default way to run the whole
+typed suite on a Linux/KVM host. It runs every CI smoke shard's work on that
+host at once, as N isolated benches side by side:
 
 ```bash
 scripts/tests/smoke-kind-parallel.sh --benches 4            # one command, one summary
@@ -478,8 +479,16 @@ those reservations bring its available space under the floor, the larger of
 setting the charts keep at 1 GiB. Every other scenario, the concurrent ones
 included, runs in the lane.
 
-Bring a cluster up in the lane and run it as CI does (with the admin token and
-cold-receipts setup of [CI smoke partitions](#ci-smoke-partitions)):
+For a full validation of the lane on one host, run the whole suite with
+[the parallel runner](#the-whole-suite-on-one-host), which builds the release
+image once and hands it to every bench:
+
+```bash
+SPACE_KIND_RUST_BUILD=release bash scripts/tests/smoke-kind-parallel.sh
+```
+
+To bring one cluster up in the lane and run it as CI does (with the admin token
+and cold-receipts setup of [CI smoke partitions](#ci-smoke-partitions)):
 
 ```bash
 SPACE_KIND_RUST_BUILD=release SPACE_KIND_TELEMETRY_MODE=otel \
@@ -563,7 +572,15 @@ and names the teardown that switches it.
   withholds the scenario on every substrate, the required Kubernetes lane
   included.
 
-Bring a cluster up in the lane, run the baseline, then the typed suite:
+For a full validation of the lane on one host, run the whole suite with
+[the parallel runner](#the-whole-suite-on-one-host):
+
+```bash
+SPACE_KIND_SUBSTRATE=direct SPACE_KIND_STORAGE_CREDENTIALS=static \
+  bash scripts/tests/smoke-kind-parallel.sh
+```
+
+To bring one cluster up in the lane, run the baseline, then the typed suite:
 
 ```bash
 export SPACE_KIND_SUBSTRATE=direct SPACE_KIND_STORAGE_CREDENTIALS=static
