@@ -287,6 +287,9 @@ fn proto_reconcile_reason(reason: StateReconciliationReason) -> Option<Reconcile
         StateReconciliationReason::NodeTemplateInventoryPublished => {
             Some(ReconcileReason::NodeTemplateInventoryPublished)
         }
+        StateReconciliationReason::FirewallRulesChanged => {
+            Some(ReconcileReason::FirewallRulesChanged)
+        }
     }
 }
 
