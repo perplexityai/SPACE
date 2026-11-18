@@ -47,7 +47,7 @@
 //! on these tables.
 
 use pplx_space_accounts::UserId;
-use pplx_space_rollout_queue::{Changed, HeaderPhase, Locked, OperatorStore, Refusal};
+use pplx_space_rollout_queue::{HeaderPhase, Locked, OperatorStore, Refusal};
 use pplx_space_sql_locator::sql;
 use sqlx::{Acquire, PgConnection, Postgres};
 
@@ -101,18 +101,14 @@ pub enum ChangePhaseError {
     Database(#[from] sqlx::Error),
 }
 
-/// The runtime form of what a shared operator change returned.
-fn changed(
-    result: Result<Result<Changed, Refusal>, ChangePhaseError>,
-) -> Result<PhaseChanged, ChangePhaseError> {
-    match result? {
-        Ok(changed) => Ok(PhaseChanged {
-            phase: CampaignPhase::from_queue(changed.phase),
-            generation: changed.generation,
-            retried: changed.retried,
-            draining: changed.draining,
-        }),
-        Err(refusal) => Err(match refusal {
+/// [`Operating`]'s error: a [`ChangePhaseError`] that the shared verbs'
+/// refusals convert into. Private, so [`ChangePhaseError`] itself gains no
+/// conversion from the shared crate's [`Refusal`].
+struct OperatorError(ChangePhaseError);
+
+impl From<Refusal> for OperatorError {
+    fn from(refusal: Refusal) -> Self {
+        Self(match refusal {
             Refusal::NotFound => ChangePhaseError::NotFound,
             Refusal::Finished(phase) => {
                 ChangePhaseError::Finished(CampaignPhase::from_queue(phase))
@@ -135,7 +131,19 @@ fn changed(
                 generation,
                 expected,
             },
-        }),
+        })
+    }
+}
+
+impl From<sqlx::Error> for OperatorError {
+    fn from(error: sqlx::Error) -> Self {
+        Self(error.into())
+    }
+}
+
+impl From<UnknownValue> for OperatorError {
+    fn from(error: UnknownValue) -> Self {
+        Self(error.into())
     }
 }
 
@@ -147,9 +155,9 @@ struct Operating<'c> {
 }
 
 impl OperatorStore for Operating<'_> {
-    type Error = ChangePhaseError;
+    type Error = OperatorError;
 
-    async fn lock(&mut self) -> Result<Option<Locked>, ChangePhaseError> {
+    async fn lock(&mut self) -> Result<Option<Locked>, OperatorError> {
         let Some((phase, generation, failure_budget)) =
             sqlx::query_as::<_, (String, i64, i64)>(sql!(
                 "SELECT phase, generation, failure_budget
@@ -171,7 +179,7 @@ impl OperatorStore for Operating<'_> {
         }))
     }
 
-    async fn progress(&mut self) -> Result<(bool, u64), ChangePhaseError> {
+    async fn progress(&mut self) -> Result<(bool, u64), OperatorError> {
         // Each reads only its phase's range of the (campaign_id, phase)
         // index.
         let (any_done, failed) = sqlx::query_as::<_, (bool, i64)>(sql!(
@@ -194,7 +202,7 @@ impl OperatorStore for Operating<'_> {
         Ok((any_done, u64::try_from(failed).unwrap_or(0)))
     }
 
-    async fn retry_failed(&mut self) -> Result<u64, ChangePhaseError> {
+    async fn retry_failed(&mut self) -> Result<u64, OperatorError> {
         Ok(sqlx::query(sql!(
             "UPDATE runtime_upgrade_items
              SET phase = $3,
@@ -210,7 +218,7 @@ impl OperatorStore for Operating<'_> {
         .rows_affected())
     }
 
-    async fn in_flight(&mut self) -> Result<u64, ChangePhaseError> {
+    async fn in_flight(&mut self) -> Result<u64, OperatorError> {
         let in_flight = sqlx::query_scalar::<_, i64>(sql!(
             "SELECT count(*)
              FROM runtime_upgrade_items
@@ -224,7 +232,7 @@ impl OperatorStore for Operating<'_> {
         Ok(u64::try_from(in_flight).unwrap_or(0))
     }
 
-    async fn write_phase(&mut self, phase: HeaderPhase) -> Result<u64, ChangePhaseError> {
+    async fn write_phase(&mut self, phase: HeaderPhase) -> Result<u64, OperatorError> {
         let phase = CampaignPhase::from_queue(phase);
         let generation = sqlx::query_scalar::<_, i64>(sql!(
             "UPDATE runtime_upgrade_campaigns
@@ -258,8 +266,16 @@ pub async fn pause_campaign(
         campaign_id,
         actor: change.actor,
     };
-    let paused = pplx_space_rollout_queue::pause(&mut operating, change.expected_generation).await;
-    end_transaction(tx, changed(paused)).await
+    let paused = pplx_space_rollout_queue::pause(&mut operating, change.expected_generation)
+        .await
+        .map(|generation| PhaseChanged {
+            phase: CampaignPhase::Paused,
+            generation,
+            retried: 0,
+            draining: 0,
+        })
+        .map_err(|OperatorError(error)| error);
+    end_transaction(tx, paused).await
 }
 
 /// Resume a paused campaign, or move a canary whose item is done on to
@@ -286,8 +302,15 @@ pub async fn resume_campaign(
     };
     let resumed =
         pplx_space_rollout_queue::resume(&mut operating, change.expected_generation, retry_failed)
-            .await;
-    end_transaction(tx, changed(resumed)).await
+            .await
+            .map(|resumed| PhaseChanged {
+                phase: CampaignPhase::from_queue(resumed.phase),
+                generation: resumed.generation,
+                retried: resumed.retried,
+                draining: 0,
+            })
+            .map_err(|OperatorError(error)| error);
+    end_transaction(tx, resumed).await
 }
 
 /// Abort an unfinished campaign (canary, rolling or paused); see the module
@@ -308,6 +331,14 @@ pub async fn abort_campaign(
         campaign_id,
         actor: change.actor,
     };
-    let aborted = pplx_space_rollout_queue::abort(&mut operating, change.expected_generation).await;
-    end_transaction(tx, changed(aborted)).await
+    let aborted = pplx_space_rollout_queue::abort(&mut operating, change.expected_generation)
+        .await
+        .map(|aborted| PhaseChanged {
+            phase: CampaignPhase::Aborted,
+            generation: aborted.generation,
+            retried: 0,
+            draining: aborted.draining,
+        })
+        .map_err(|OperatorError(error)| error);
+    end_transaction(tx, aborted).await
 }

@@ -7476,6 +7476,7 @@ dependencies = [
 name = "pplx-space-rollout-queue"
 version = "0.8.2"
 dependencies = [
+ "tokio",
  "uuid",
 ]
 

@@ -1,4 +1,4 @@
-//! The mechanics of a rollout queue: a header paces its items out under
+//! The rules of a rollout queue: a header paces its items out under
 //! leases, takes each item's outcome under its lease, and changes phase on
 //! its own (at its failure budget, or once drained) or at an operator's
 //! request.
@@ -11,7 +11,8 @@
 //! between them: the lease bounds, canary and failure-budget pacing, the
 //! cluster cap, the lease token, and which phase changes are allowed. The
 //! store decides what a step reads (which items are candidates, what holds a
-//! subject), applies any caps of its own, and ends the transaction.
+//! subject), applies any caps and evidence checks of its own, and ends the
+//! transaction.
 //!
 //! Each step names the lock it takes. Taken in the order a verb runs them,
 //! the locks follow one order: the header row, then the store's lease
@@ -25,15 +26,15 @@ mod outcome;
 mod phase;
 
 pub use lease::{Candidates, ClaimStore, Pacing, RenewStore, claim, renew};
-pub use operator::{Changed, Locked, OperatorStore, Refusal, abort, pause, resume};
-pub use outcome::{LEASE_EXPIRED, Outcome, RedriveReport};
+pub use operator::{Aborted, Locked, OperatorStore, Refusal, Resumed, abort, pause, resume};
+pub use outcome::{LEASE_EXPIRED, RedriveReport};
 pub use phase::{Drain, Leasing, PhaseStore, complete_if_drained, drained, pause_if_over_budget};
 
 #[cfg(test)]
 mod tests;
 
-/// The longest lease any verb grants. A live lease blocks the down migration,
-/// so a lease must lapse within an operator's patience.
+/// The longest lease any verb grants, so an item whose worker is gone is
+/// held for at most this long.
 pub const MAX_LEASE: Duration = Duration::from_secs(60 * 60);
 
 /// The lease a verb grants for a requested `lease`: clamped to 1 second
@@ -45,12 +46,22 @@ pub fn clamp_lease(lease: Duration) -> Duration {
     lease.clamp(Duration::from_secs(1), MAX_LEASE)
 }
 
+/// The step [`ClaimStore`] and [`PhaseStore`] share, and the error of every
+/// step of both.
+pub trait FailedItems {
+    type Error;
+
+    /// How many of the header's items have failed.
+    fn failed(&mut self) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+}
+
 /// Where a header is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum HeaderPhase {
-    /// Upgrading one item, then waiting for an operator's resume.
+    /// Leasing one item at a time until one is done, then waiting for an
+    /// operator's resume.
     Canary,
-    /// Upgrading items under the header's pacing.
+    /// Leasing items under the header's pacing.
     Rolling,
     /// Stopped by an operator or by the failure budget; nothing new is
     /// leased.
@@ -69,14 +80,4 @@ impl HeaderPhase {
     pub const fn finished(self) -> bool {
         matches!(self, Self::Completed | Self::Aborted)
     }
-}
-
-/// Where an item is.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum ItemState {
-    Pending,
-    InFlight,
-    Done,
-    Failed,
-    Skipped,
 }
