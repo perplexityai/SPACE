@@ -409,6 +409,12 @@ base_sqlite_catalog_max_versions() {
 # every catalog rather than only the consumers, which the migrator lists; a new
 # migration elsewhere is compared with its catalog and db/common. A catalog
 # absent from the base has no earlier release to roll back to and is skipped.
+#
+# A store migration that ties db/common's max is rejected on purpose, even
+# though down would revert it first. A same-second tie basically never happens,
+# and accepting one would tie this guard to rollback_last_sqlite_database's
+# strictly-newer tie-break, so a later change there would silently make the
+# guard wrong.
 validate_new_sqlite_migration_versions() {
   local file
   local dir
@@ -452,6 +458,9 @@ validate_new_sqlite_migration_versions() {
       thresholds["${dir}"]="${all_max}"
       threshold_dirs["${dir}"]="${all_max_dir}"
     elif ((${base_max_versions[db/common]:-0} > base_max_versions["${dir}"])); then
+      # Stores that don't consume db/common are compared with it too. That is
+      # stricter than their down needs, but it keeps the consumer list in the
+      # migrator rather than copied here.
       thresholds["${dir}"]="${base_max_versions[db/common]}"
       threshold_dirs["${dir}"]=db/common
     else

@@ -322,7 +322,9 @@ expect_guard_failure "${work_repo}" "sqlite-consumer-below-common"
 expect_sqlite_finding "sqlite-consumer-below-common" "db/template-manager" "20261008000000" \
   "db/common" "db/template-manager/20261005000000_below_common.up.sql"
 
-# `down` reverts the service migration on a tie, so equal is not newer.
+# A consumer migration that ties db/common's max fails on purpose. `down` would
+# revert it first, but a same-second tie basically never happens, and accepting
+# one would make the guard depend on the migrator's tie-break.
 git -C "${work_repo}" checkout --quiet -B sqlite-equal-common "${sqlite_base_commit}"
 write_sqlite_migration_pair "${work_repo}" "template-manager" "20261008000000" "equal_common"
 git -C "${work_repo}" add .
@@ -330,6 +332,45 @@ git -C "${work_repo}" commit --quiet -m "consumer migration equal to db/common's
 expect_guard_failure "${work_repo}" "sqlite-equal-common"
 expect_sqlite_finding "sqlite-equal-common" "db/template-manager" "20261008000000" \
   "db/common" "db/template-manager/20261008000000_equal_common.up.sql"
+
+# A db/common migration that ties a consumer's max, and a consumer migration
+# that ties its own catalog's max, are not newer and fail too.
+git -C "${work_repo}" checkout --quiet -B sqlite-common-equal-consumer "${sqlite_base_commit}"
+write_sqlite_migration_pair "${work_repo}" "common" "20261010000000" "equal_consumer"
+git -C "${work_repo}" add .
+git -C "${work_repo}" commit --quiet -m "db/common migration equal to a consumer's max"
+expect_guard_failure "${work_repo}" "sqlite-common-equal-consumer"
+expect_sqlite_finding "sqlite-common-equal-consumer" "db/common" "20261010000000" \
+  "db/sandbox-manager" "db/common/20261010000000_equal_consumer.up.sql"
+
+git -C "${work_repo}" checkout --quiet -B sqlite-equal-own "${sqlite_base_commit}"
+write_sqlite_migration_pair "${work_repo}" "sandbox-manager" "20261010000000" "equal_own"
+git -C "${work_repo}" add .
+git -C "${work_repo}" commit --quiet -m "consumer migration equal to its own catalog's max"
+expect_guard_failure "${work_repo}" "sqlite-equal-own"
+expect_sqlite_finding "sqlite-equal-own" "db/sandbox-manager" "20261010000000" \
+  "db/sandbox-manager" "db/sandbox-manager/20261010000000_equal_own.up.sql"
+
+# A catalog absent from the base has no release to roll back to, so even a
+# version below every base max passes.
+git -C "${work_repo}" checkout --quiet -B sqlite-new-catalog "${sqlite_base_commit}"
+write_sqlite_migration_pair "${work_repo}" "new-store" "20261001000000" "baseline"
+git -C "${work_repo}" add .
+git -C "${work_repo}" commit --quiet -m "new SQLite catalog"
+expect_guard_success "${work_repo}" "sqlite-new-catalog"
+
+# A file added directly under history/ is not part of a catalog. The
+# absent-catalog skip also drops it, since db/<store>/history is never a base
+# catalog, so this case fails only with both that skip and the catalog-path
+# filter removed.
+git -C "${work_repo}" checkout --quiet -B sqlite-history-added "${sqlite_base_commit}"
+for kind in up down; do
+  cp "${work_repo}/db/template-manager/20260930000000_baseline.${kind}.sql" \
+    "${work_repo}/db/template-manager/history/20261002000000_archived.${kind}.sql"
+done
+git -C "${work_repo}" add .
+git -C "${work_repo}" commit --quiet -m "add a history migration"
+expect_guard_success "${work_repo}" "sqlite-history-added"
 
 # A migration moved into a catalog is an addition, committed or only staged.
 git -C "${work_repo}" checkout --quiet -B sqlite-moved-in "${sqlite_base_commit}"

@@ -440,9 +440,13 @@ both catalogs, choosing the service migration first when timestamps match.
 Migration timestamps must reflect release/dependency order. The migration
 version guard enforces this for SQLite catalogs too. An up migration added or
 moved directly into a service catalog `db/<store>/` must be newer than the
-newest version on the base branch in both that catalog and `db/common/`. One
-added or moved into `db/common/` must be newer than the newest version on the
-base branch in every SQLite catalog, not only the consumers. `history/`
+newest version on the base branch in both that catalog and `db/common/`. For a
+store that doesn't consume `db/common/`, that comparison is stricter than `down`
+needs, but it keeps the consumer list in the migrator. A tie with `db/common/`'s
+newest version is rejected on purpose: it basically never happens, and
+accepting it would make the guard depend on the migrator's tie-break. One added
+or moved into `db/common/` must be newer than the newest version on the base
+branch in every SQLite catalog, not only the consumers. `history/`
 subdirectories are not part of a catalog, and a catalog absent from the base
 branch is not compared. A branch overtaken by a newer migration renumbers on
 rebase, as Postgres branches already do. Baseline down migrations reject
