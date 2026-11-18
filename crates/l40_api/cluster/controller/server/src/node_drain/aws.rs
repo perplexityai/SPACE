@@ -1,4 +1,5 @@
 use pplx_space_accounts::NodeId;
+use pplx_space_k8s_node_id::Ec2InstanceId;
 
 use pplx_space_sql_locator::sql;
 use std::future::Future;
@@ -201,4 +202,21 @@ impl<C: AsgTerminateClient> InstanceTerminator for Ec2InstanceTerminator<C> {
             .terminate_instance(instance_id.to_string(), row.decrement_capacity)
             .await
     }
+}
+
+/// Ask Auto Scaling to terminate exactly `instance_id`, the instance a v2
+/// drain fenced, passing the node's `terminate_decrement_capacity`. The v2
+/// loop's terminate: unlike [`Ec2InstanceTerminator`], it reads no
+/// Kubernetes Node, since the fence already names the machine.
+pub(crate) async fn terminate_fenced_instance<C: AsgTerminateClient>(
+    autoscaling: &C,
+    instance_id: &Ec2InstanceId,
+    should_decrement_desired_capacity: bool,
+) -> Result<(), TerminateError> {
+    autoscaling
+        .terminate_instance(
+            instance_id.as_str().to_owned(),
+            should_decrement_desired_capacity,
+        )
+        .await
 }

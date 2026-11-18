@@ -744,6 +744,38 @@ async fn an_undrained_node_is_cancelled_until_unsealed() {
     assert!(sink.calls().is_empty());
 }
 
+/// With new v2 drains not admitted, the loop still owns the persisted ones:
+/// it drains a draining node to `drained` and cancels an undrained one. With
+/// no terminator that terminates, it never fences a `terminating` node,
+/// which waits unfenced with the refusal as its error.
+#[tokio::test]
+async fn the_loop_owns_persisted_drains_without_terminating() {
+    let draining = node(Some("draining"), Some(5), false);
+    let undrained = node(None, Some(5), true);
+    let terminating = node(Some("terminating"), Some(5), false);
+    let sink = FakeSink {
+        nodes: vec![draining.clone(), undrained.clone(), terminating.clone()],
+        responses: HashMap::from([
+            ((draining.id, false), Ok(response(Some(5), true, &[]))),
+            ((undrained.id, true), Ok(response(None, false, &[]))),
+        ]),
+        ..FakeSink::default()
+    };
+    let report = run_tick(&sink, &V2Terminator::Refuse, DEFAULT_MAX_EVACUATING_NODES).await;
+    assert_eq!(report.drained, [draining.id]);
+    assert_eq!(report.cancelled, [undrained.id]);
+    assert!(report.fenced.is_empty());
+    let calls = sink.calls();
+    assert!(
+        calls.contains(&format!("error {} {REFUSED_TERMINATE}", terminating.id)),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|call| call.starts_with("fence ")),
+        "{calls:?}"
+    );
+}
+
 /// A draining node that doesn't answer its `DrainNode` call reads 1 on the
 /// unanswered gauge, so a dead node pages as a blocked one does; one that
 /// answers reads 0.
