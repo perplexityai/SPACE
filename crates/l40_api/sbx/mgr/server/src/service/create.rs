@@ -831,6 +831,12 @@ impl SandboxManagerService {
         // to see, or can't finish before this restore claims the row.
         self.refuse_retired_activation_retry(id, open_route_activation.as_ref())
             .await?;
+        // A node that refuses activations, sealed or with an unreadable seal,
+        // refuses the restore here, before its claim, its network allocation
+        // or its cleanup episode: the row stays as it was. The admission
+        // below still refuses a seal that lands after this check.
+        self.activation_seal
+            .check(ActivationAdmissionKind::Restore.as_str(), id)?;
 
         let cleanup_episode = {
             let db = self.db_conn()?;
@@ -1166,8 +1172,8 @@ impl SandboxManagerService {
             .admit_vm_activation(ActivationAdmissionKind::Restore, id)
             .await
         {
-            Ok(permit) => {
-                activation_cleanup.admit(permit);
+            Ok(admission) => {
+                activation_cleanup.admit_activation(admission);
             }
             Err(status) => {
                 activation_cleanup.cleanup();
