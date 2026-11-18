@@ -5,7 +5,7 @@ use crate::test_fixtures::{
     ACCEPTANCE_ADMIN, ACCEPTANCE_BASE, ACCEPTANCE_PROBE, ACCEPTANCE_WEB_PRIME, ids, payload_eq,
     port_rule, revision,
 };
-use crate::{DecodeErrorKind, Match, Value};
+use crate::{Match, Value};
 
 fn rule_json(text: &str) -> Rule {
     Rule::from_json_str(text).unwrap()
@@ -169,10 +169,13 @@ fn edits_naming_one_id_twice_reject_the_batch() {
     let remove = |name: &str| Edit::Remove(id(name));
     let cases = [
         (add("x"), add("x")),
+        (add("x"), replace("x")),
         (add("x"), remove("x")),
-        (remove("p"), add("p")),
-        (replace("p"), remove("p")),
+        (replace("p"), add("p")),
         (replace("p"), replace("p")),
+        (replace("p"), remove("p")),
+        (remove("p"), add("p")),
+        (remove("p"), replace("p")),
         (remove("p"), remove("p")),
     ];
     for (first, second) in cases {
@@ -264,6 +267,25 @@ fn ordering_follows_the_documented_convention() {
             }
         }
     }
+
+    // The diff follows base order, not ID order.
+    let b = port_rule("b", "tcp", 1);
+    let a = port_rule("a", "tcp", 2);
+    let b_prime = port_rule("b", "udp", 1);
+    let base = revision(vec![b.clone(), a.clone()]);
+    let change = base
+        .apply(&[Edit::Replace(b_prime.clone()), Edit::Remove(id("a"))])
+        .unwrap();
+    assert_eq!(
+        change.diff().changes(),
+        [
+            RuleChange::Replaced {
+                before: b,
+                after: b_prime,
+            },
+            RuleChange::Removed(a),
+        ]
+    );
 }
 
 #[test]
@@ -306,45 +328,6 @@ fn reordering_matches_is_a_replacement() {
         change.diff().changes(),
         [RuleChange::Replaced { before, after }]
     );
-}
-
-#[test]
-fn complete_revisions_are_validated_at_every_boundary() {
-    // A base with a repeated ID cannot be built or decoded, so it can never
-    // reach `apply` with untouched invalid content.
-    assert_eq!(
-        FirewallRuleRevision::new(vec![
-            port_rule("a", "tcp", 1),
-            port_rule("b", "tcp", 2),
-            port_rule("a", "tcp", 3),
-        ]),
-        Err(RuleRevisionError::DuplicateRuleId {
-            id: id("a"),
-            first_index: 0,
-            duplicate_index: 2,
-        })
-    );
-    let untouched_duplicate = r#"{"schema_version":1,"rules":[
-        {"id":"a","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":1}]},
-        {"id":"b","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":2}]},
-        {"id":"b","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":3}]}
-    ]}"#;
-    let error = FirewallRuleRevision::from_json_str(untouched_duplicate).unwrap_err();
-    assert_eq!(error.path().to_string(), "$.rules[2].id");
-    assert!(matches!(
-        error.kind(),
-        DecodeErrorKind::DuplicateRuleId { first_index: 1, .. }
-    ));
-    let untouched_invalid = r#"{"schema_version":1,"rules":[
-        {"id":"a","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":1}]},
-        {"id":"b","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":{"range":[9,1]}}]}
-    ]}"#;
-    let error = FirewallRuleRevision::from_json_str(untouched_invalid).unwrap_err();
-    assert_eq!(error.path().to_string(), "$.rules[1].all_of[0].right.range");
-    assert!(matches!(
-        error.kind(),
-        DecodeErrorKind::ReversedRange { start: 9, end: 1 }
-    ));
 }
 
 #[test]
@@ -439,19 +422,31 @@ impl Generator {
 
 const ID_POOL: [&str; 8] = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"];
 
-/// The first problem a batch has, computed independently of `apply`: for each
-/// edit in order, a repeated ID, then the presence its kind requires.
-fn expected_failure(base: &FirewallRuleRevision, edits: &[Edit]) -> Option<(usize, EditKind)> {
+/// The error for the first problem a batch has, computed independently of
+/// `apply`: for each edit in order, a repeated ID, then the presence its kind
+/// requires.
+fn expected_failure(base: &FirewallRuleRevision, edits: &[Edit]) -> Option<EditError> {
     let present: HashSet<&str> = base.rules().iter().map(|r| r.id().as_str()).collect();
-    let mut seen = HashSet::new();
+    let mut seen: HashMap<&str, (usize, EditKind)> = HashMap::new();
     edits.iter().enumerate().find_map(|(index, edit)| {
         let name = edit.id().as_str();
-        let ok = seen.insert(name)
-            && match edit {
-                Edit::Add(_) => !present.contains(name),
-                Edit::Replace(_) | Edit::Remove(_) => present.contains(name),
-            };
-        (!ok).then_some((index, edit.kind()))
+        let (id, kind) = (edit.id().clone(), edit.kind());
+        if let Some(&(first_index, first_kind)) = seen.get(name) {
+            return Some(EditError::ConflictingEdits {
+                id,
+                first_index,
+                first_kind,
+                index,
+                kind,
+            });
+        }
+        seen.insert(name, (index, kind));
+        match (edit, present.contains(name)) {
+            (Edit::Add(_), true) => Some(EditError::AddExisting { id, index }),
+            (Edit::Replace(_), false) => Some(EditError::ReplaceMissing { id, index }),
+            (Edit::Remove(_), false) => Some(EditError::RemoveMissing { id, index }),
+            _ => None,
+        }
     })
 }
 
@@ -482,16 +477,9 @@ fn generated_batches_keep_the_edit_and_diff_invariants() {
         assert_eq!(base, original, "apply changed its base");
 
         match (expected_failure(&base, &edits), result) {
-            (Some((index, kind)), Err(error)) => {
+            (Some(expected), Err(error)) => {
                 failures += 1;
-                let reported = match error {
-                    EditError::ConflictingEdits { index, kind, .. } => (index, kind),
-                    EditError::AddExisting { index, .. } => (index, EditKind::Add),
-                    EditError::ReplaceMissing { index, .. } => (index, EditKind::Replace),
-                    EditError::RemoveMissing { index, .. } => (index, EditKind::Remove),
-                    EditError::InvalidCandidate(error) => panic!("unexpected {error}"),
-                };
-                assert_eq!(reported, (index, kind), "{edits:?}");
+                assert_eq!(error, expected, "{edits:?}");
             }
             (None, Ok(change)) => {
                 successes += 1;
@@ -532,6 +520,13 @@ fn assert_successful_change(
             .collect()
     };
     assert_eq!(untouched(candidate), untouched(base));
+
+    // Each added or replacing rule is in the candidate exactly as written.
+    for edit in edits {
+        if let Edit::Add(rule) | Edit::Replace(rule) = edit {
+            assert_eq!(candidate.rule(rule.id()), Some(rule), "{edit:?}");
+        }
+    }
 
     // Survivors keep base order; additions follow in batch order.
     let added: Vec<&RuleId> = edits

@@ -159,11 +159,6 @@ fn boundary_values_keep_their_meaning() {
             Value::Ipv4Prefix(Ipv4Prefix::new(Ipv4Addr::new(192, 0, 2, 7), 32).unwrap()),
         ),
         (
-            // Host bits are kept as written, not masked off.
-            r#"{"prefix":{"addr":"192.0.2.7","len":24}}"#,
-            Value::Ipv4Prefix(Ipv4Prefix::new(Ipv4Addr::new(192, 0, 2, 7), 24).unwrap()),
-        ),
-        (
             r#"{"range":[5,5]}"#,
             Value::Range(IntegerRange::new(5, 5).unwrap()),
         ),
@@ -181,6 +176,17 @@ fn boundary_values_keep_their_meaning() {
         );
         assert_round_trips(&revision);
     }
+
+    // Host bits are kept as written, not masked off.
+    let host_bits = decode(&document_with_right(
+        r#"{"prefix":{"addr":"192.0.2.7","len":24}}"#,
+    ));
+    let Value::Ipv4Prefix(prefix) = host_bits.rules()[0].all_of()[0].right() else {
+        panic!("not a prefix: {host_bits:?}");
+    };
+    assert_eq!(prefix.addr(), Ipv4Addr::new(192, 0, 2, 7));
+    assert_eq!(prefix.prefix_len(), 24);
+    assert_round_trips(&host_bits);
 
     let masked = decode(&document_with_left(
         r#"{"&":[{"payload":{"protocol":"tcp","field":"flags"}},18446744073709551615]}"#,
@@ -200,17 +206,18 @@ fn names_are_kept_verbatim_without_qualification() {
     // structurally valid and kept byte for byte.
     let revision = decode(&document_with_match(
         r#"{"left":{"payload":{"protocol":"Not A Protocol","field":" spaced "}},"op":"==","right":1},
-           {"left":{"tcp option":{"name":"option-that-does-not-exist"}},"op":"==","right":true}"#,
+           {"left":{"tcp option":{"name":"Option-That-Does-Not-Exist"}},"op":"==","right":true}"#,
     ));
     let all_of = revision.rules()[0].all_of();
-    assert_eq!(
-        all_of[0].left(),
-        &Read::Payload(header("Not A Protocol", " spaced "))
-    );
-    assert_eq!(
-        all_of[1].left(),
-        &Read::TcpOption(TcpOptionName::new("option-that-does-not-exist"))
-    );
+    let Read::Payload(payload) = all_of[0].left() else {
+        panic!("not a payload read: {:?}", all_of[0]);
+    };
+    assert_eq!(payload.protocol().as_str(), "Not A Protocol");
+    assert_eq!(payload.field().as_str(), " spaced ");
+    let Read::TcpOption(option) = all_of[1].left() else {
+        panic!("not a TCP option read: {:?}", all_of[1]);
+    };
+    assert_eq!(option.as_str(), "Option-That-Does-Not-Exist");
 }
 
 #[test]
@@ -477,6 +484,11 @@ fn rejects_malformed_rules_at_the_bad_rule() {
             document_with_rules(&[good_rule("a"), good_rule("b"), good_rule("a")]),
             "$.rules[2].id",
             |k| matches!(k, DecodeErrorKind::DuplicateRuleId { id, first_index: 0 } if id.as_str() == "a"),
+        ),
+        (
+            document_with_rules(&[good_rule("a"), good_rule("b"), good_rule("b")]),
+            "$.rules[2].id",
+            |k| matches!(k, DecodeErrorKind::DuplicateRuleId { id, first_index: 1 } if id.as_str() == "b"),
         ),
         (
             document_with_rules(&[format!(
@@ -755,6 +767,13 @@ fn rejects_malformed_values_without_coercion() {
                 }
             )
         }),
+        // Too large for a 64-bit float, so tokenizing fails: the error is at
+        // the root and carries the line and column of the number's last digit.
+        (
+            document_with_right("1e400"),
+            "$",
+            |k| matches!(k, DecodeErrorKind::Syntax(error) if (error.line(), error.column()) == (1, 127)),
+        ),
         (document_with_right("18446744073709551616"), at, |k| {
             matches!(
                 k,
@@ -1231,6 +1250,25 @@ fn error_display_names_the_location() {
         duplicate.to_string(),
         r#"$.rules[1].id: rule ID "a" repeats the rule at index 0"#
     );
+}
+
+#[test]
+fn paths_bracket_keys_that_dot_shorthand_cannot_name() {
+    // RFC 9535 dot shorthand cannot start with a digit, and a bracketed name
+    // is a JSON string, so a control character is written as a \u escape.
+    for (key, path) in [
+        (r#""123""#, r#"$["123"]"#),
+        (r#""a\u0000b""#, r#"$["a\u0000b"]"#),
+        (r#""_x9""#, "$._x9"),
+    ] {
+        let document = format!(r#"{{"schema_version":1,"rules":[],{key}:1}}"#);
+        let error = FirewallRuleRevision::from_json_str(&document).unwrap_err();
+        assert_eq!(error.path().to_string(), path, "{document}: {error}");
+        assert!(
+            matches!(error.kind(), DecodeErrorKind::UnexpectedField { .. }),
+            "{error:?}"
+        );
+    }
 }
 
 #[test]

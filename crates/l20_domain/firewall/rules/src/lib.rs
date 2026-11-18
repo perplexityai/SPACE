@@ -54,6 +54,9 @@
 //! reversed range, a non-integer where an integer is required, and a repeated
 //! rule ID. A missing revision, `null`, or a document without `rules` is never
 //! read as an empty revision; `{"schema_version": 1, "rules": []}` is.
+//! Malformed JSON, including a number too large for a 64-bit float such as
+//! `1e400`, fails while the text is tokenized, before any element has a path:
+//! its [`DecodeErrorKind::Syntax`] error reports the line and column instead.
 //!
 //! # Shape is not runtime qualification
 //!

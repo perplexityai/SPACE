@@ -102,6 +102,10 @@ impl DecodeError {
 /// What is wrong at a [`DecodeError`]'s path.
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeErrorKind {
+    /// serde_json could not parse the text, for example because it is not
+    /// JSON or holds a number too large for a 64-bit float such as `1e400`.
+    /// This fails before any element has a path, so the path is the root and
+    /// the error's line and column give the location.
     #[error("malformed JSON")]
     Syntax(#[source] serde_json::Error),
     #[error("expected {expected}, found {found}")]
@@ -176,8 +180,8 @@ impl fmt::Display for JsonKind {
     }
 }
 
-/// The location of an element in a firewall rules document, such as
-/// `$.rules[1].all_of[0].left`.
+/// The location of an element in a firewall rules document, written as an
+/// RFC 9535 JSONPath such as `$.rules[1].all_of[0].left` or `$["123"]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JsonPath(Vec<PathSegment>);
 
@@ -215,18 +219,28 @@ impl fmt::Display for JsonPath {
         f.write_str("$")?;
         for segment in &self.0 {
             match segment {
-                PathSegment::Key(key)
-                    if !key.is_empty()
-                        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
-                {
-                    write!(f, ".{key}")?;
+                PathSegment::Key(key) if is_member_name_shorthand(key) => write!(f, ".{key}")?,
+                PathSegment::Key(key) => {
+                    // A JSON string literal is a valid RFC 9535 name selector.
+                    let quoted = serde_json::to_string(key).map_err(|_| fmt::Error)?;
+                    write!(f, "[{quoted}]")?;
                 }
-                PathSegment::Key(key) => write!(f, "[{key:?}]")?,
                 PathSegment::Index(index) => write!(f, "[{index}]")?,
             }
         }
         Ok(())
     }
+}
+
+/// Whether RFC 9535 lets `key` follow a dot: an ASCII letter or `_`, then
+/// ASCII letters, digits or `_`. Any other key, including a non-ASCII one the
+/// RFC would also allow, is written as a bracketed JSON string.
+fn is_member_name_shorthand(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// A parsed JSON value that keeps every object entry, repeated keys included,

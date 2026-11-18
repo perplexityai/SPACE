@@ -412,3 +412,6 @@ pub struct ReversedRangeError {
     pub start: u64,
     pub end: u64,
 }
+
+#[cfg(test)]
+mod tests;
