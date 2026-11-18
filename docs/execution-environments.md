@@ -2308,15 +2308,50 @@ holds it. An older node-ctl publishes a template's last listed build, which can
 be a twin.
 
 Roll back in the reverse order, template-manager before or together with the
-others. A template-manager released while this migration was withdrawn
-reverses it at startup when every build, tag pin and unfinished stamp job is in
-the legacy partition, so rolling back to one needs no database step;
-`db/README.md` describes the check and a read-only query that runs it. Remove
-the directories listed in step 3 first: the check counts rows, not
-directories. A database with environment-partition rows, or a rollback to a
-release that predates the migration, needs the procedure below: such a
-template-manager refuses the migrated database, and its migrator doesn't
-bundle the migration.
+others. A template-manager released while this migration was withdrawn, from
+#1070 until #1075 bundled it again, reverses it at startup when every build,
+tag pin and unfinished stamp job is in the legacy partition; `db/README.md`
+describes the check and a read-only query that runs it. The check counts rows,
+not directories, so before starting one, follow steps 1 to 3 below: stop
+template-manager and sandbox-manager and keep the newer ones from restarting,
+copy the database, run step 2's checks, and remove the directories step 3
+lists. One from #1277 on also reverses the newer
+`20261031050126_node_dirty_ref_revisions` at startup, along with this
+migration, so rolling back to it needs no other database step. One from before
+#1277 doesn't: it reverses this migration, then refuses a database that still
+records `20261031050126`.
+Before starting it, check that
+`sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` prints
+`20261031050126` and that
+`sqlite3 -readonly <db> "SELECT version FROM _space_common_schema_migrations WHERE version > 20260930000000"`
+prints nothing, since `down` reverts the newest migration across both
+histories; if the first prints `20261026220935`, skip this, and otherwise
+stop. Then run `space-db-migrator template-manager --database-path <db> down`
+once with a migrator that bundles `20261031050126`, that is from #1235 on,
+such as the release you are rolling back from. It reverts only that migration.
+A migrator without it, the target's own included, refuses the database instead
+of running. The same run recovers a database on which such a
+template-manager already started and refused that version. Then start the
+older template-manager, and the older sandbox-manager after it, as in step 5.
+If any build, tag pin or unfinished stamp job is outside the legacy partition,
+a release from this interval refuses the database instead of reversing the
+migration: use the procedure below.
+
+A template-manager from #988 until #1070 bundles this migration, with the same
+checksum, but not `20261031050126`. To roll back to one, stop template-manager,
+keep the newer one from restarting until the older one starts (at startup it
+re-applies the dirty-ref migration), copy the database with its `-wal` and
+`-shm` files as step 2 describes, and run the same two checks: if
+`max(version)` prints `20261031050126` and the common check prints nothing,
+continue; if `max(version)` prints `20261026220935`, skip the `down`; and
+otherwise stop. If it printed
+`20261031050126`, run
+`space-db-migrator template-manager --database-path <db> down` once with a
+migrator from #1235 on, reverting only the dirty-ref migration. Nothing else is
+needed: the target keeps this migration, so neither the partition-row check
+nor the procedure below applies to it. A rollback to a release that predates this
+migration needs the procedure below: such a template-manager refuses the
+migrated database, and its migrator doesn't bundle the migration.
 
 1. Stop template-manager on the node and keep the new version from restarting:
    at startup it re-applies the migration. Stop sandbox-manager too, and keep a
@@ -2335,7 +2370,8 @@ bundle the migration.
    migrator's `status` lists only migrations its catalog bundles and would
    omit a newer applied one:
    `sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` must
-   print `20261026220935`, and
+   print `20261031050126`, or `20261026220935` if the node doesn't record the
+   dirty-ref migration, and
    `sqlite3 -readonly <db> "SELECT version FROM _space_common_schema_migrations WHERE version > 20260930000000"`
    must print nothing. If either check fails, stop: this procedure doesn't
    cover that database, and no directory has been removed yet.
@@ -2349,12 +2385,19 @@ bundle the migration.
    `btrfs subvolume show <dir>` succeeds with `btrfs subvolume delete <dir>`,
    and remove any other, a plain directory left on a host without btrfs or by a
    pull whose subvolume request failed, with `rm -rf <dir>`.
-4. Run a migrator that bundles this migration, last: once it commits, an older
-   template-manager can open the database. Run
-   `space-db-migrator template-manager --database-path <db> down` once. It
-   drops the rows of every environment partition and removes the migration's
-   history row. A second run reaches the baseline, which is a rollback floor:
-   it fails and changes nothing.
+4. Run a migrator that bundles every migration step 2 found, such as the newer
+   release's, last: once it commits, an older template-manager can open the
+   database. Each `space-db-migrator template-manager --database-path <db> down`
+   reverts only the newest applied migration, so run it once per migration,
+   newest first. If step 2 printed `20261031050126`, run it once to revert the
+   dirty-ref migration, keeping every outbox row, and check that `max(version)`
+   now prints `20261026220935`; if it prints `20260930000000`, the partition
+   migration is already reverted: go to step 5. Revert it here even for a
+   target from #1277 on: `down` reaches the partition migration only after it.
+   Then run it once to revert the partition migration. That run drops the rows
+   of every environment partition and removes the migration's history row.
+   Another run reaches the baseline, which is a rollback floor: it fails and
+   changes nothing.
 5. Start the older template-manager, then the older sandbox-manager.
 
 Known limits until the cluster side carries partitions:

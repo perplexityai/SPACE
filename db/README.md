@@ -253,9 +253,26 @@ after some nodes had applied it, and is bundled again with the same SQL.
 Releases from the withdrawn interval don't bundle it. Their writes succeed on either
 schema, so one can keep serving while a migrator applies the migration.
 When one finds the migration recorded with its original checksum, it applies
-the down SQL and removes the history row at startup, so rolling back to it
-needs no database step beyond the image. A release that bundles it applies it
-normally and never reverses it.
+the down SQL and removes the history row at startup. Whether rolling back to
+it needs more than the image depends on how it treats
+`20261031050126_node_dirty_ref_revisions`, as 'Node dirty-ref revision
+migration' describes. One from before #1277 doesn't list that version and
+refuses a database that records it. First stop template-manager and keep the
+newer one from restarting until the older one starts: a restart can apply a
+migration the database doesn't yet record. Then check the database's history:
+`sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` must
+print `20261031050126`, or `20261026220935` if the node doesn't record the
+dirty-ref migration, and
+`sqlite3 -readonly <db> "SELECT version FROM _space_common_schema_migrations WHERE version > 20260930000000"`
+must print nothing, since `down` reverts the newest migration across both
+histories. If either check fails, stop and follow 'Node dirty-ref revision
+migration' instead. If the first printed `20261026220935`, no `down` is
+needed. If it printed `20261031050126`, run
+`space-db-migrator template-manager --database-path <db> down` once, with a
+migrator from #1235 on such as the newer release's, before starting the older
+one; it reverts only that migration. `docs/execution-environments.md`
+describes the steps. A release that bundles it applies it normally and never
+reverses it.
 
 The reversal counts rows only. A `{hash}@{environment}` build or snapshot
 directory left without a row stays on disk, and that release's startup
