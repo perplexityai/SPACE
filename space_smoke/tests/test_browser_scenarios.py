@@ -36,6 +36,7 @@ def _services(browser_unavailable: str | None) -> mock.Mock:
     services.telemetry_mode.return_value = "otel"
     services.storage_credentials.return_value = "exchange"
     services.substrate.return_value = "kubernetes"
+    services.drain_v2_enabled.return_value = False
     services.browser_unavailable.return_value = browser_unavailable
     return services
 

@@ -14,7 +14,7 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from space_smoke.__main__ import _apply_substrate, _failure_detail, _run_all
+from space_smoke.__main__ import _apply_drain_v1, _apply_substrate, _failure_detail, _run_all
 from space_smoke.adapters import KindConfig, KindHarness
 from space_smoke.registry import ScenarioRegistry
 from space_smoke.runtime import CommandResult
@@ -58,6 +58,7 @@ class SmokeSuiteTests(unittest.TestCase):
         services.telemetry_mode.return_value = "otel"
         services.storage_credentials.return_value = "exchange"
         services.substrate.return_value = "kubernetes"
+        services.drain_v2_enabled.return_value = False
         services.browser_unavailable.return_value = None
         selected = tuple(
             scenario
@@ -115,6 +116,7 @@ class SmokeSuiteTests(unittest.TestCase):
         services.telemetry_mode.return_value = "otel"
         services.storage_credentials.return_value = "exchange"
         services.substrate.return_value = "kubernetes"
+        services.drain_v2_enabled.return_value = False
         services.browser_unavailable.return_value = None
         live = tuple(
             scenario
@@ -673,6 +675,48 @@ class SmokeSuiteTests(unittest.TestCase):
                 self.assertIn("direct", registered.substrates)
                 self.assertIsNone(registered.quarantined)
                 self.assertEqual(registered.tier, "routine")
+
+
+class DrainV1Tests(unittest.TestCase):
+    """The v1 drain scenarios are skipped, visibly, on a bench running drain v2."""
+
+    KIND = tuple(scenario for scenario in REGISTRY if "kind" in scenario.backends)
+    V1_DRAINS = {
+        "local.forced_drain_evacuates_sandbox",
+        "local.gentle_drain_leaves_sandbox_resident",
+        "native.forced_drain_re_drains_re_placed_stopped_sandbox",
+        "native.forced_drain_re_drains_restarted_re_placed_stopped_sandbox",
+    }
+
+    def _apply(self, drain_v2):
+        services = mock.Mock()
+        if isinstance(drain_v2, Exception):
+            services.drain_v2_enabled.side_effect = drain_v2
+        else:
+            services.drain_v2_enabled.return_value = drain_v2
+        stdout, stderr = StringIO(), StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            runnable = _apply_drain_v1(self.KIND, services)
+        return runnable, stdout.getvalue(), stderr.getvalue()
+
+    def test_the_v1_drain_scenarios_declare_it(self) -> None:
+        self.assertEqual({s.id for s in REGISTRY if s.drain_v1}, self.V1_DRAINS)
+
+    def test_a_bench_running_drain_v2_skips_them_visibly(self) -> None:
+        runnable, stdout, _ = self._apply(True)
+        self.assertEqual(runnable, tuple(s for s in self.KIND if s.id not in self.V1_DRAINS))
+        for scenario_id in self.V1_DRAINS:
+            self.assertIn(f"SKIPPED {scenario_id}: drives v1 drains", stdout)
+
+    def test_a_bench_with_drain_v2_off_runs_them(self) -> None:
+        runnable, stdout, _ = self._apply(False)
+        self.assertEqual(runnable, self.KIND)
+        self.assertNotIn("SKIPPED", stdout)
+
+    def test_a_bench_that_cannot_be_read_runs_them(self) -> None:
+        runnable, _, stderr = self._apply(RuntimeError("no API Deployment"))
+        self.assertEqual(runnable, self.KIND)
+        self.assertIn("could not read whether the bench runs drain v2", stderr)
 
 
 class BenchSubstrateTests(unittest.TestCase):

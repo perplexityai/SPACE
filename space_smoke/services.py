@@ -160,6 +160,16 @@ class SmokeServices:
             )
         return self.bench.rust_build()
 
+    def drain_v2_enabled(self) -> bool:
+        """Whether the Kind bench's public API runs drain v2
+        (`SPACE_DRAIN_V2_ENABLED`), read from the cluster."""
+
+        if self.bench is None:
+            raise SmokeConfigurationError(
+                "whether drain v2 is on is only readable on the kind backend"
+            )
+        return self.bench.drain_v2_enabled()
+
     def substrate(self) -> str:
         """The control-plane substrate (`kubernetes` or `direct`) the Kind bench runs."""
 

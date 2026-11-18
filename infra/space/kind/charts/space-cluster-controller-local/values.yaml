@@ -18,6 +18,15 @@ clusterId: "kind-local"
 clusterActivationAdmission:
   enabled: ""
 
+# SPACE_DRAIN_V2_ENABLED, which the controller checks against the node drain
+# its v2 loop runs in (the API admits v2 drains; see `drainV2` in
+# `charts/space-api-local/values.yaml`). Off, as in the binary: the
+# caller-provided-cluster chart (infra/space/cluster/chart) keeps this default
+# and refuses any other, and drain v2 stays off outside Kind until it is
+# ready to enable. The Kind bench turns it on in values-kind.yaml.
+drainV2:
+  enabled: "false"
+
 # The activation limiter's store. The public-operation dispatcher
 # (`NativePublicOperationExecutor::new`) builds its limiter from
 # `ClusterSandboxAdmissionConfig::from_env`, which reads SPACE_REDIS_URL;
