@@ -408,9 +408,17 @@ trap 'exit 143' TERM
 
 mark() { : >"$HOST/$1.$2"; }
 # Wait for host step <name> to finish; fails if it did.
+# Bounded, as CI bounds its wait for the producer (70 min): a host step that
+# hangs, or dies without its marker, would otherwise hold every bench, and the
+# host lock, until someone killed the run.
+AWAIT_SECONDS=4200
 await() {
-  local name="$1"
+  local name="$1" deadline=$(( SECONDS + AWAIT_SECONDS ))
   until [[ -e "$HOST/$name.ok" || -e "$HOST/$name.failed" ]]; do
+    if (( SECONDS >= deadline )); then
+      log "gave up waiting for host step $name after $AWAIT_SECONDS s"
+      return 1
+    fi
     sleep 2
   done
   [[ -e "$HOST/$name.ok" ]]
@@ -703,7 +711,9 @@ run_bench() {
   phase "bench$i" prepare_cluster bx env SPACE_CI_IMAGE_MIRROR="${SPACE_CI_IMAGE_MIRROR:-ghcr}" \
     bash "$src/infra/space/kind/scripts/prepare-cluster.sh" || return 1
   # As CI's step runs it: a failed preflight fails the bench.
-  phase "bench$i" observability bx env SPACE_KIND_CLUSTER=space-local bash -c '
+  # Bounded at 30 min, as CI bounds the step: `kind load` and `ctr images ls`
+  # have no deadline of their own.
+  phase "bench$i" observability bx env SPACE_KIND_CLUSTER=space-local timeout --kill-after=30 1800 bash -c '
       set -euo pipefail
       python3 infra/space/kind/scripts/datadog_backend.py preflight --for-deployment >/dev/null
       bash infra/space/kind/scripts/install-observability.sh' || return 1
