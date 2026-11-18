@@ -183,6 +183,9 @@ pub enum ReconcileReason {
     TemplatePoolPolicyDeleted,
     NodeSandboxInventoryPublished,
     NodeTemplateInventoryPublished,
+    /// The node's firewall rules revision changed. Like every reason it only
+    /// wakes the node to drain its queue; it carries no rules.
+    FirewallRulesChanged,
 }
 
 impl ReconcileReason {
@@ -205,6 +208,7 @@ impl ReconcileReason {
             Self::TemplatePoolPolicyDeleted => "template_pool_policy_deleted",
             Self::NodeSandboxInventoryPublished => "node_sandbox_inventory_published",
             Self::NodeTemplateInventoryPublished => "node_template_inventory_published",
+            Self::FirewallRulesChanged => "firewall_rules_changed",
         }
     }
 
@@ -229,6 +233,7 @@ impl ReconcileReason {
             "template_pool_policy_deleted" => Some(Self::TemplatePoolPolicyDeleted),
             "node_sandbox_inventory_published" => Some(Self::NodeSandboxInventoryPublished),
             "node_template_inventory_published" => Some(Self::NodeTemplateInventoryPublished),
+            "firewall_rules_changed" => Some(Self::FirewallRulesChanged),
             _ => None,
         }
     }

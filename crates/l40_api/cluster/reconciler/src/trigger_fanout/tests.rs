@@ -165,3 +165,101 @@ async fn fanout_resolves_live_nodes_once_and_dead_letters_ghosts_without_resolvi
     );
     Ok(())
 }
+
+/// Each reason's wire number. Numbers are only ever appended: a node decodes
+/// the number a controller of any version sends, so none may move or be
+/// reused.
+#[test]
+fn every_reason_encodes_to_its_wire_number() {
+    let wire_numbers = [
+        (ReconcileReason::NodeRegistered, 1),
+        (ReconcileReason::NodeUpdated, 2),
+        (ReconcileReason::ManualNodeStatusRefresh, 3),
+        (ReconcileReason::ManualNodeReconcile, 4),
+        (ReconcileReason::ManualNodeNetworkPolicyReconcile, 5),
+        (ReconcileReason::NodeTemplatePulled, 6),
+        (ReconcileReason::SandboxRegistered, 7),
+        (ReconcileReason::SandboxPortExposureUpdated, 8),
+        (ReconcileReason::SandboxNetworkPolicyUpdated, 9),
+        (ReconcileReason::SandboxDesiredStateUpdated, 10),
+        (ReconcileReason::TemplateNetworkPolicyUpdated, 11),
+        (ReconcileReason::TemplateDesiredStateUpdated, 12),
+        (ReconcileReason::TemplateBaseSnapshotPolicyUpdated, 13),
+        (ReconcileReason::TemplatePoolPolicyUpdated, 14),
+        (ReconcileReason::TemplatePoolPolicyDeleted, 15),
+        (ReconcileReason::NodeSandboxInventoryPublished, 16),
+        (ReconcileReason::NodeTemplateInventoryPublished, 17),
+        (ReconcileReason::FirewallRulesChanged, 18),
+    ];
+    // The numbers run from 1 without gaps, so this fails when a number is
+    // added without a row above.
+    ProtoReconcileReason::try_from(wire_numbers.len() as i32 + 1).unwrap_err();
+    for (reason, number) in wire_numbers {
+        assert_eq!(
+            i32::from(proto_reconcile_reason(reason)),
+            number,
+            "{reason}"
+        );
+    }
+}
+
+/// A claimed trigger holding the firewall rules reason, alone or beside
+/// another, becomes a request naming the claim's typed reasons and its
+/// diagnostic text, and nothing else: the request has no field that could
+/// carry rules, a revision or a report.
+#[tokio::test(flavor = "current_thread")]
+async fn a_claimed_firewall_rules_trigger_requests_only_a_wakeup() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let firewall_rules_only = NodeId::new();
+    let mixed = NodeId::new();
+    for node_id in [firewall_rules_only, mixed] {
+        sqlx::query(pplx_space_sql_locator::sql!(
+            "INSERT INTO nodes (id, role, managed_by, state)
+             VALUES ($1, $2, $3, 'registered')"
+        ))
+        .bind(node_id)
+        .bind(SpaceNodeRole::Worker)
+        .bind(NodeManagedBy::Kubernetes)
+        .execute(&db.pool)
+        .await?;
+    }
+    enqueue_triggers(&db.pool, [mixed], ReconcileReason::NodeUpdated).await?;
+    enqueue_triggers(
+        &db.pool,
+        [firewall_rules_only, mixed],
+        ReconcileReason::FirewallRulesChanged,
+    )
+    .await?;
+
+    let requests = claim_triggers(&db.pool, 10)
+        .await?
+        .triggers
+        .iter()
+        .map(|trigger| {
+            (
+                trigger.node_id,
+                trigger_request(&TriggerReasonPayload::from(trigger)),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        requests,
+        BTreeMap::from([
+            (
+                firewall_rules_only,
+                TriggerStateReconciliationRequest {
+                    reasons: vec![18],
+                    diagnostic_reason: "firewall_rules_changed".to_string(),
+                },
+            ),
+            (
+                mixed,
+                TriggerStateReconciliationRequest {
+                    reasons: vec![18, 2],
+                    diagnostic_reason: "firewall_rules_changed,node_updated".to_string(),
+                },
+            ),
+        ])
+    );
+    Ok(())
+}
