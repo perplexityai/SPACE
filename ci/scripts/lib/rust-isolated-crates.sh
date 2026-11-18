@@ -239,13 +239,15 @@ affected = {owner(p) for p in changed} - {None}
 # the crate, and #[path = "..."], relative to the source file. An include of
 # concat!(env!("OUT_DIR"), ...) reads the crate's own build-script output,
 # whose inputs outside every crate already check them all. Any other include
-# of a computed path could read anything, so it checks every crate.
+# of a computed path could read anything, so it checks every crate. An
+# argument cannot start with a backslash, so `include_str!(\"...\")` is
+# escaped text in a string literal, such as a test fixture's, not an include.
 changed_set = set(changed)
 literal = re.compile(r'\binclude(?:_str|_bytes)?!\(\s*"([^"]+)"|#\[path\s*=\s*"([^"]+)"\]')
 manifest_relative = re.compile(
     r'\binclude(?:_str|_bytes)?!\(\s*concat!\(\s*env!\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*"([^"]+)"\s*\)\s*\)'
 )
-computed = re.compile(r'\binclude(?:_str|_bytes)?!\(\s*(?=[^\s"])(?!concat!\(\s*env!\(\s*"OUT_DIR")')
+computed = re.compile(r'\binclude(?:_str|_bytes)?!\(\s*(?=[^\s"\\])(?!concat!\(\s*env!\(\s*"OUT_DIR")')
 for name, crate_dir in directory.items():
     for dirpath, dirnames, filenames in os.walk(os.path.join(root, crate_dir)):
         dirnames[:] = [d for d in dirnames if d != "target"]

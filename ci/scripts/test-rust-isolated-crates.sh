@@ -100,6 +100,20 @@ printf 'change\n' >>"${fixture}/crates/b/src/lib.rs"
 git -C "${fixture}" commit -q -am b
 computed="$(cd "${fixture}" && affected_lint_crates "${tmp_dir}/metadata.json" "${computed_base}" "${listed}" 2>/dev/null | tr '\n' ' ')"
 [[ "${computed% }" == "a b c d e" ]] || { echo "a computed include: got '${computed% }'" >&2; exit 1; }
+# Only an include in code counts: one escaped in a string literal, as in a
+# test fixture, is text, while an include of a variable is computed.
+assert_source_affects() {
+    local expected="$1" line="$2"
+    git -C "${fixture}" checkout -q --detach "${base}"
+    printf '%s\n' "${line}" >>"${fixture}/crates/c/src/lib.rs"
+    git -C "${fixture}" commit -q -am source
+    local actual
+    actual="$(cd "${fixture}" && affected_lint_crates "${tmp_dir}/metadata.json" "${base}" "${listed}" 2>/dev/null | tr '\n' ' ')"
+    [[ "${actual% }" == "${expected}" ]] ||
+        { echo "${line}: expected '${expected}', got '${actual% }'" >&2; exit 1; }
+}
+assert_source_affects "c" 'const FIXTURE: &str = "#[doc = include_str!(\"README.md\")]\n";'
+assert_source_affects "a b c d e" 'const VARIABLE: &str = include_str!(some_path);'
 
 # lint_affects_any answers for a set of crates, and always without a base.
 git -C "${fixture}" checkout -q --detach "${base}"
