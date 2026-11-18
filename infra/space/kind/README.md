@@ -337,9 +337,15 @@ slowest, so more shards would not shorten the run.
 
 ## The whole suite on one host
 
-`scripts/tests/smoke-kind-parallel.sh` is the default way to run the whole
-typed suite on a Linux/KVM host. It runs every CI smoke shard's work on that
-host at once, as N isolated benches side by side:
+`scripts/tests/smoke-kind-parallel.sh` runs every CI smoke shard's work on one
+Linux/KVM host at once, as N isolated benches side by side. It is the default
+way to run the whole typed suite **on a dedicated Linux KVM development host
+whose owner has agreed to the host-wide changes listed below**. It has been run
+on one host shape so far: 32 CPUs, 123 GiB of memory, the bench data on one
+network block volume of about 330 MB/s, and the host's Docker in a sidecar
+container. On any other machine, bring up one stack and run
+`scripts/tests/smoke-kind-typed.sh all` (see
+[CI smoke partitions](#ci-smoke-partitions)).
 
 ```bash
 scripts/tests/smoke-kind-parallel.sh --benches 4            # one command, one summary
@@ -367,27 +373,38 @@ holds the host at a time (a lock on `/run/space-bench.d`), and a run first
 removes the benches an interrupted or `--keep` run left; only directories
 marked as a bench's when it was created are ever deleted.
 
-It needs Linux with cgroup v2, read-write `/dev/kvm`, passwordless sudo and the
-host's Docker with the containerd image store, and refuses a host whose
-`/etc/resolv.conf` names a loopback resolver (such as systemd-resolved's
-`127.0.0.53` stub) or that has a route in 192.168.0.0/16 other than its own
-benches'. It raises the inotify and aio limits and sets
-`net.ipv4.ip_forward=1`, loads the device-mapper crypt and snapshot modules,
-installs socat and rsync (and the Kind prerequisites) when they are missing,
-installs Docker's static release under `/opt/space-bench-docker`, and stages
-loop-device nodes. Per bench it creates a network namespace, a veth, iptables
-rules, cgroups under `/sys/fs/cgroup/space-bench-<i>` and a worktree of the
-checkout. It also adds a dummy interface holding 192.168.241.1, a mangle-table
-chain that accepts connections to that address only from the host and the
-benches' links, and two registry containers on the host's Docker that keep
-running between runs. A run's exit removes its benches; `teardown` also stops
-the registries and removes the interface and the chain. The registries' data
-and the seed stay in `<bench root>/cache` (default `~/.space-benches/cache`);
-to reclaim the space, run `teardown` first (the registries keep running between
-runs with that directory mounted), then delete it yourself (with `sudo`: the
-registries write as root). The registries take no credentials: the layer cache is
-local to the host, and any local user can write it. The loop nodes, the raised limits, the modules,
-the static Docker release and the lock directory stay.
+It needs Linux with cgroup v2, read-write `/dev/kvm`, passwordless sudo, `curl`,
+`iptables`, and Docker Engine 28 or later on this host (`DOCKER_HOST` unset, a
+Unix socket, or a loopback address) with the containerd image store. It refuses
+a host whose `/etc/resolv.conf` names a loopback resolver (such as
+systemd-resolved's `127.0.0.53` stub) or that has a route in 192.168.0.0/16
+other than its own benches', and a bench root or `--out` directory inside the
+checkout. What it changes on the host:
+
+- **Kernel and limits:** raises the inotify and aio limits (only ever upward),
+  sets `net.ipv4.ip_forward=1`, loads the device-mapper crypt and snapshot
+  modules, and stages loop-device nodes in `/dev`.
+- **Packages:** installs socat and rsync with `apt-get`, and the Kind
+  prerequisites (`install-prereqs.sh`), when they are missing.
+- **Docker:** installs Docker's static release under
+  `/opt/space-bench-docker/<version>`, and starts two registry containers on the
+  host's Docker (`--restart unless-stopped`) that keep running between runs.
+- **Network:** a dummy interface holding 192.168.241.1, a mangle-table chain
+  that accepts connections to that address only from the host and the benches'
+  links, and per bench a network namespace, a veth and iptables rules.
+- **Per bench:** cgroups under `/sys/fs/cgroup/space-bench-<i>`, a dockerd and
+  containerd running as root with their data under the bench root, and a
+  worktree of the checkout.
+
+A run's exit removes its benches; `teardown` also stops the registries and
+removes the interface and the chain. The registries' data and the seed stay in
+`<bench root>/cache` (default `~/.space-benches/cache`); to reclaim the space,
+run `teardown` first (the registries keep running between runs with that
+directory mounted), then delete it yourself (with `sudo`: the registries write
+as root). The registries take no credentials: the layer cache is local to the
+host, and any local user can write it. The loop nodes, the raised limits, the
+modules, the installed packages, the static Docker release and the lock
+directory stay.
 
 Each bench keeps every default name and port (`space-local`, API
 `127.0.0.1:8080`, data plane `:8090`, Tilt `:10350`), so the bring-up and the
@@ -399,7 +416,11 @@ scenarios run unchanged. What isolates it
 - a dockerd and containerd of its own in that namespace (data root under
   `~/.space-benches/<i>`, or `$SPACE_KIND_BENCH_ROOT/<i>`, containerd image
   store; a root on another volume must be a directory the caller owns, such as
-  one made with `sudo install -d -o "$USER" /mnt/data/benches`). It, its Kind nodes and the
+  one made with `sudo install -d -o "$USER" /mnt/data/benches`). Its socket
+  belongs to the caller alone. The host's Docker bind-mounts `<bench root>/cache`:
+  where that daemon does not see the bench volume (a sidecar with its own
+  `/tmp`, say), make `cache` a symbolic link to a directory it does see, and the
+  runner resolves it. It, its Kind nodes and the
   bench's commands run in the cgroup `/space-bench-<i>`, not the caller's: a
   caller in a CPU-capped container (as on a host whose own Docker is a
   sidecar) would otherwise throttle every bench's image unpacking;
@@ -443,7 +464,12 @@ write throughput (I/O pressure above 60%) and for CPU, and take about two
 minutes longer per bench. On such a host the fastest N is 4 to 5; N=8 does not
 fit 393 GB. The default N is the smallest of CPUs / 8, available memory / 16 GiB, free
 disk / 60 GB and the volume's probed write MB/s / 70, at most 6; on that
-volume the probe reads 320-350 MB/s and chooses 4.
+volume the probe reads 320-350 MB/s and chooses 4. The 70 MB/s per bench comes
+from these runs: a bench wrote 55.5, 55.9, 57.0 and 59.8 GB while it came up
+(at N=1, 4, 5 and 4); on a volume probed at 326 MB/s the last baseline passed
+after 4:56 at N=1, 9:13 at N=4, 11:22 at N=5 and 13:50 at N=6, and the whole
+run was shortest at N=4-5 (22:43-23:49), with N=6 no faster (25:12), or about
+326 / 4.7 MB/s per bench. Six is the most benches that have run.
 
 ## Release-build lane
 
