@@ -38,10 +38,17 @@ BEGIN
             'abort it by direct SQL (phase aborted, unfinished_slot NULL, '
             'finished_at now())';
     END IF;
+    -- A lease is held only while in_flight, which the up migration's checks
+    -- enforce, so probing each rollout's in_flight rows through the
+    -- (rollout_id, phase, node_id) index finds every live lease without
+    -- scanning item history.
     IF EXISTS (SELECT 1
-                 FROM firewall_rules_rollout_items
-                WHERE phase = 'in_flight'
-                  AND lease_expires_at > now()) THEN
+                 FROM firewall_rules_rollouts AS r
+                WHERE EXISTS (SELECT 1
+                                FROM firewall_rules_rollout_items AS i
+                               WHERE i.rollout_id = r.id
+                                 AND i.phase = 'in_flight'
+                                 AND i.lease_expires_at > now())) THEN
         RAISE EXCEPTION 'a firewall rules rollout item holds an unexpired lease, '
             'so a worker may still be issuing it; wait for every lease to expire '
             'before rolling back this migration, or once no worker can still be '

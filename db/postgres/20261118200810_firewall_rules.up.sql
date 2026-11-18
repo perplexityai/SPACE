@@ -7,8 +7,8 @@ SET LOCAL statement_timeout = '5s';
 -- here. Nothing in this migration assigns a revision, starts a rollout or wakes
 -- a node.
 --
--- Item phase is bound through a closed Rust enum by the store, so its value set
--- isn't enforced here; the checks that relate a phase to another column stay.
+-- Item phase will be bound through a closed Rust enum by the store, so its value
+-- set isn't enforced here; the checks that relate a phase to another column stay.
 -- Rollout phase is the exception: the unfinished-slot check sorts every phase
 -- into one that holds the slot or one that doesn't, so a phase it doesn't list
 -- must be refused rather than treated as finished. A new rollout phase needs a
@@ -261,7 +261,7 @@ CREATE TRIGGER firewall_rules_rollout_items_set_updated_at
 COMMENT ON TABLE firewall_rules_rollout_items IS
     'One node a firewall rollout targets, and its progress';
 COMMENT ON COLUMN firewall_rules_rollout_items.phase IS
-    'in_flight exactly while a lease is held; a pending item with an issuance stamp has been assigned and awaits readback, and is not issued again';
+    'pending, in_flight, done or failed; in_flight exactly while a lease is held. A pending item with an issuance stamp has been assigned and awaits readback, and is not issued again';
 COMMENT ON COLUMN firewall_rules_rollout_items.lease_token IS
     'Set with lease_expires_at exactly while the item is in_flight; the outcome that ends in_flight is recorded only under the matching token';
 COMMENT ON COLUMN firewall_rules_rollout_items.issued_assignment_generation IS
