@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       per_commit_migration_isolation:
-        description: Check migration isolation separately for each first-parent commit after base_sha
+        description: Check migration isolation and SQLite rollback safety separately for each first-parent commit after base_sha
         required: false
         default: false
         type: boolean
@@ -562,7 +562,11 @@ jobs:
               export MIGRATION_VERSION_GUARD_BASE_REF="$migration_base" &&
               export MIGRATION_ISOLATION_BASE_REF="$migration_base" &&
               export MIGRATION_SQUAWK_BASE_REF="$migration_base" &&
+              export MIGRATION_SQLITE_ROLLBACK_BASE_REF="$migration_base" &&
               bash scripts/check-migration-versions.sh &&
+              if [[ "$SPACE_CI_PER_COMMIT_MIGRATION_ISOLATION" == true ]]; then
+              bash ci/scripts/check-sqlite-migrations-rollback-per-commit.sh "$migration_base";
+              else bash scripts/check-sqlite-migrations-rollback.sh; fi &&
               if [[ "$SPACE_CI_PER_COMMIT_MIGRATION_ISOLATION" == true ]]; then
               bash ci/scripts/check-migration-isolation-per-commit.sh "$migration_base";
               else bash scripts/check-postgres-migrations-isolated.sh; fi &&
