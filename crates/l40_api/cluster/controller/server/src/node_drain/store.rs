@@ -3291,6 +3291,7 @@ impl NodeDrainSink for SubstrateSink {
                 | SubstrateError::NotFound { message }
                 | SubstrateError::InvalidRequest { message }
                 | SubstrateError::Conflict { message }
+                | SubstrateError::NodeSealed { message }
                 | SubstrateError::FailedPrecondition { message }
                 | SubstrateError::Timeout { message, .. }
                 | SubstrateError::RestoreContextUnavailable { message }

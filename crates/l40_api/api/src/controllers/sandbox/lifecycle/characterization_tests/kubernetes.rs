@@ -945,18 +945,16 @@ enum SandboxPod {
 /// Twin of `completed_actions_do_not_wait_for_a_key_share_lock`, renamed
 /// because its claim does not hold here. With the pod cached, resume, pause,
 /// stop and kill finish while a transaction holds `FOR KEY SHARE` on the
-/// sandbox row, as on direct. Start and wake block on it in `SELECT lifecycle
-/// FROM sandboxes WHERE id = $1 FOR UPDATE`, sandbox-store's
-/// `row_locks::lock_lifecycle`, whose row lock conflicts with `FOR KEY
-/// SHARE`. The `sql!` locator names where that verb is defined,
-/// `pplx_space_sandbox_store::row_locks`, not which caller ran it. In the
-/// api, `lock_sandbox_execution_lifecycle_in` calls it, and so does the
-/// delete guard; that function in turn has three callers
-/// (`persist_materialized_pod_metadata`, `claim_started_recovery` and
-/// `lock_sandbox_for_execution_lifecycle_in`, which the execution claim and
-/// `claim_active_execution_pod_materialization` both call). That the first
-/// wait is the execution claim `ensure_pod_exists` takes before it
-/// materializes the pod is an inference from the code.
+/// sandbox row, as on direct. Start and wake block on it in `SELECT
+/// s.lifecycle, n.drain_engine, … FROM sandboxes s LEFT JOIN nodes n … FOR
+/// UPDATE OF s`, sandbox-store's
+/// `row_locks::lock_lifecycle_with_active_node_drain`, whose row lock
+/// conflicts with `FOR KEY SHARE`. The `sql!` locator names where that verb
+/// is defined, `pplx_space_sandbox_store::row_locks`, not which caller ran
+/// it. In the api, `lock_sandbox_for_claim_in` calls it; that function has
+/// two callers (the execution claim `ensure_pod_exists` takes, and
+/// `claim_started_recovery`). That the first wait is the execution claim,
+/// taken before it materializes the pod, is an inference from the code.
 ///
 /// Stop and kill of a sandbox whose pod is gone block too, before any pod is
 /// recreated, on `SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE`
@@ -1006,7 +1004,7 @@ async fn activations_and_suspend_wait_for_a_key_share_lock() -> TestResult {
     let db = pg_test_db_with_max_connections(5).await?;
     let pool = &db.pool;
     let (worker, node_id) = start_kubernetes_sim_worker(pool).await?;
-    let lifecycle_lock = r"^/\*pplx_space_sandbox_store::row_locks:[0-9]+\*/ SELECT lifecycle FROM sandboxes WHERE id = \$1 FOR UPDATE$";
+    let materialization_lock = r"^/\*pplx_space_sandbox_store::row_locks:[0-9]+\*/ SELECT s\.lifecycle, n\.drain_engine, n\.drain_phase, n\.drain_mode\s+FROM sandboxes s\s+LEFT JOIN nodes n ON n\.id = s\.active_node_id\s+WHERE s\.id = \$1\s+FOR UPDATE OF s$";
     let id_lock = r"^/\*pplx_space_sandbox_store::row_locks:[0-9]+\*/ SELECT id FROM sandboxes WHERE id = \$1 FOR UPDATE$";
 
     for (action, prior, resident, completed, pod_seed, waits_on) in [
@@ -1016,7 +1014,7 @@ async fn activations_and_suspend_wait_for_a_key_share_lock() -> TestResult {
             "stopped",
             "started",
             SandboxPod::Cached,
-            Some(lifecycle_lock),
+            Some(materialization_lock),
         ),
         (
             SandboxAction::Wake,
@@ -1024,7 +1022,7 @@ async fn activations_and_suspend_wait_for_a_key_share_lock() -> TestResult {
             "paused",
             "started",
             SandboxPod::Cached,
-            Some(lifecycle_lock),
+            Some(materialization_lock),
         ),
         (
             SandboxAction::Resume,

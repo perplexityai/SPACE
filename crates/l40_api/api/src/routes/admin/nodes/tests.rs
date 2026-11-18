@@ -43,6 +43,7 @@ fn test_admin_node_row() -> AdminNodeRow {
         drain_mode: None,
         drain_started_at: None,
         drain_last_error: None,
+        drain_engine: None,
         terminate_decrement_capacity: false,
         node_group_id: None,
         metadata: None,
@@ -343,6 +344,31 @@ fn force_upload_refusal_text_has_no_embedded_indentation() {
             );
         }
     }
+}
+
+/// The force-upload gate aborts on an engine or a phase this build doesn't
+/// know, as an unknown phase did before v2, rather than reading the drain:
+/// it can't tell whether such a drain refuses wakes. Known drains read as
+/// they are.
+#[test]
+fn force_upload_aborts_on_an_unknown_drain() {
+    use pplx_space_node_drain::V2DrainPhase;
+    for (engine, phase, expected) in [
+        (Some("v9"), Some("drained"), "unrecognized drain engine"),
+        (None, Some("unrecognized"), "unrecognized drain phase"),
+        (Some("v2"), Some("unrecognized"), "unrecognized drain phase"),
+    ] {
+        let err = super::force_upload_drain_state(engine, phase, None)
+            .expect_err("an unknown drain aborts the upload");
+        assert!(err.contains(expected), "{err}");
+    }
+    assert_eq!(
+        super::force_upload_drain_state(Some("v2"), Some("drained"), None),
+        Ok(Some(NodeDrain::V2 {
+            phase: V2DrainPhase::Drained
+        }))
+    );
+    assert_eq!(super::force_upload_drain_state(None, None, None), Ok(None));
 }
 
 #[test]

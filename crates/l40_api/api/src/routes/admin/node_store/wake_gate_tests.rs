@@ -1,6 +1,6 @@
 //! Postgres-backed contract for [`is_node_wake_gate_closed`]'s decoding of the
-//! drain columns: a gate-closing state reads closed, and a phase this build
-//! does not know fails the check rather than reading as an open gate.
+//! drain columns: a gate-closing state reads closed, and an engine or a
+//! phase this build does not know fails the check, never reading as open.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
@@ -87,5 +87,39 @@ async fn unrecognized_drain_phase_fails_the_wake_gate_check() -> TestResult {
         matches!(&err, sqlx::Error::ColumnDecode { index, .. } if index == "0"),
         "{err:?}"
     );
+    Ok(())
+}
+
+/// A drain under an engine this build cannot interpret fails the check the
+/// same way: an unknown phase under the v2 engine on column 0, before the
+/// engine is read, and an engine a newer build writes, which no constraint
+/// limits, on column 2, the engine's position. This build is the old replica
+/// relative to any newer engine.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unrecognized_engine_or_v2_phase_fails_the_wake_gate_check() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    sqlx::query("ALTER TABLE nodes DROP CONSTRAINT nodes_drain_phase_check")
+        .execute(&db.pool)
+        .await?;
+
+    for (engine, phase, column) in [("v2", "unrecognized-phase", "0"), ("v9", "drained", "2")] {
+        set_drain(&db.pool, node_id, Some(phase), None).await?;
+        sqlx::query("UPDATE nodes SET drain_engine = $2 WHERE id = $1")
+            .bind(node_id)
+            .bind(engine)
+            .execute(&db.pool)
+            .await?;
+        let err = is_node_wake_gate_closed(&db.pool, node_id)
+            .await
+            .expect_err("an unrecognized drain must fail the check");
+        assert!(
+            matches!(&err, sqlx::Error::ColumnDecode { index, .. } if index == column),
+            "engine {engine} phase {phase}: {err:?}"
+        );
+    }
     Ok(())
 }

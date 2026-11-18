@@ -1,6 +1,7 @@
 //! Reads of one `sandboxes` row that answer a question rather than return
-//! the row: who owns it, whether it has prior state, how long its restore
-//! lease has left, and whose activation its runtime records. [`owner`] also
+//! the row: who owns it, whether it has prior state, whether it is started,
+//! how long its restore lease has left, and whose activation its runtime
+//! records. [`owner`] also
 //! reads whether the owning organization brings its own key.
 //!
 //! Plain reads: none takes a lock, and each runs on the executor its caller
@@ -64,6 +65,19 @@ pub async fn prior_state_exists(
 pub struct ActivationRecord {
     pub lifecycle: String,
     pub activating_client_id: Option<ClientId>,
+}
+
+/// Whether `sandbox_id` is `started`; `false` when the row is gone.
+pub async fn is_started(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT COALESCE((SELECT lifecycle = 'started' FROM sandboxes WHERE id = $1), FALSE)"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(executor)
+    .await
 }
 
 /// [`ActivationRecord`] of `sandbox_id`; `None` when the row is gone. See

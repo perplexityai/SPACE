@@ -1453,6 +1453,21 @@ impl WarmPoolStore {
                AND s.disk_io_max_bandwidth_mib_per_sec = c.disk_io_max_bandwidth_mib_per_sec
                AND s.pod_ip IS NOT NULL
                AND s.pod_namespace = $4
+               -- A slot on a node with any drain engine recorded (a v2
+               -- drain, its cancel, or an engine this build doesn't know) is
+               -- never claimed: a v2 node's VMs are leaving, a sealed node
+               -- refuses the claim's activation, and an unknown engine fails
+               -- closed. A v1 drain's node (engine NULL) is claimed as
+               -- before, and so is a slot with no node name. The engine-set
+               -- nodes' names are read once for the statement, not per
+               -- candidate slot; `node_k8s.k8s_node_name` is NOT NULL, so the
+               -- list holds no NULL to make `<> ALL` unknown.
+               AND (s.k8s_node_name IS NULL OR s.k8s_node_name <> ALL (ARRAY(
+                   SELECT nk.k8s_node_name
+                     FROM node_k8s nk
+                     JOIN nodes n ON n.id = nk.node_id
+                    WHERE n.drain_engine IS NOT NULL
+               )))
              ORDER BY s.ready_at ASC
              FOR UPDATE OF s SKIP LOCKED
              LIMIT 1"
@@ -1502,6 +1517,14 @@ impl WarmPoolStore {
                AND s.disk_io_max_bandwidth_mib_per_sec = c.disk_io_max_bandwidth_mib_per_sec
                AND s.pod_ip IS NOT NULL
                AND s.pod_namespace = $2
+               -- As `claim_ready_slot`: never a slot on a node with any
+               -- drain engine recorded; a v1 drain's node is claimed.
+               AND (s.k8s_node_name IS NULL OR s.k8s_node_name <> ALL (ARRAY(
+                   SELECT nk.k8s_node_name
+                     FROM node_k8s nk
+                     JOIN nodes n ON n.id = nk.node_id
+                    WHERE n.drain_engine IS NOT NULL
+               )))
              ORDER BY s.ready_at ASC
              FOR UPDATE OF s SKIP LOCKED
              LIMIT 1"

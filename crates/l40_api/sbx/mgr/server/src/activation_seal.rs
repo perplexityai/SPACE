@@ -65,10 +65,11 @@ use crate::db::activation_seal::{ActivationSealRecord, write_activation_seal};
 use crate::state::{SandboxState, SandboxStatus};
 
 /// The marker in the `FailedPrecondition` status a sealed node refuses a VM
-/// activation with. The node refuses the same activation until it is
-/// unsealed, so a caller places the work on another node or waits for the
-/// unseal rather than retrying here.
-pub(crate) const ACTIVATIONS_SEALED_MARKER: &str = "node activations are sealed";
+/// activation with, the contract's one definition, which the API matches.
+/// The node refuses the same activation until it is unsealed, so a caller
+/// places the work on another node or waits for the unseal rather than
+/// retrying here.
+pub(crate) use pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER;
 
 /// The marker in the `Unavailable` status a node whose seal row couldn't be
 /// read refuses a VM activation with. The background read clears it within

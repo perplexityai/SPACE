@@ -1100,13 +1100,26 @@ impl SandboxController {
         // Rollback is destructive and runs through `runtime_client`, which on
         // k8s recovers a missing pod for any recoverable-live lifecycle and
         // re-pins the new pod to `target_node_id`. Gate before the substrate
-        // call so a rollback can't sneak past the drain reconciler.
-        super::lifecycle::ensure_access_path_not_blocked_by_drain(
-            pool,
-            sandbox,
-            super::lifecycle::SandboxAction::Rollback,
-        )
-        .await?;
+        // call so a rollback can't sneak past the drain reconciler. A rollback
+        // without restart leaves the sandbox stopped, which a v2 drain doesn't
+        // move, so it is also refused while the sandbox's node has a v2 drain
+        // recorded, as a stop is, from the same read; a restarting rollback's
+        // restart is refused by the sealed node itself.
+        if auto_restart {
+            super::lifecycle::ensure_access_path_not_blocked_by_drain(
+                pool,
+                sandbox,
+                super::lifecycle::SandboxAction::Rollback,
+            )
+            .await?;
+        } else {
+            super::lifecycle::ensure_stop_admitted_by_drain(
+                pool,
+                sandbox.id,
+                super::lifecycle::SandboxAction::Rollback,
+            )
+            .await?;
+        }
         // Rollback is a recovery-capable data-plane op: if the pod is gone it is
         // recreated, so charge the cluster limiter for that recreation.
         let mut client = self

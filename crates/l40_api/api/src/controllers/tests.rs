@@ -260,3 +260,37 @@ fn demoting_after_a_side_effect_strips_the_whole_retryable_disposition() {
     assert_eq!(demoted_fleet.retry_after_cause(), None);
     assert_eq!(demoted_fleet.retry_after_header(), None);
 }
+
+/// A node's refusal of a VM activation because a drain sealed it reaches the
+/// caller as the drain gate's retryable 503, with a `Retry-After`, whichever
+/// way the call met it: a node RPC's status, or the substrate's error.
+#[test]
+fn a_sealed_nodes_refusal_is_the_drains_retryable_503() {
+    use axum::response::IntoResponse as _;
+    let status = tonic::Status::failed_precondition(format!(
+        "{} (generation 7); refusing the resume activation of sandbox s",
+        pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER
+    ));
+    for error in [
+        ControllerError::from(status),
+        ControllerError::from(super::substrate::SubstrateError::NodeSealed {
+            message: "sealed".to_owned(),
+        }),
+    ] {
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("10")
+        );
+    }
+    // Another FailedPrecondition keeps its own answer.
+    let other = ControllerError::from(tonic::Status::failed_precondition("something else"));
+    assert_ne!(
+        other.into_response().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}

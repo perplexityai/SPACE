@@ -629,6 +629,13 @@ fn reconnect_error_outcome(
             ReconnectTerminalPhase::Api,
             ReconnectReason::WaitBudget,
         ),
+        // A node a drain sealed refused the wake before any VM work: a drain
+        // refusal, as the drain gate's own is, with the same 503.
+        SubstrateError::NodeSealed { .. } => (
+            ReconnectOutcome::Rejected,
+            ReconnectTerminalPhase::Api,
+            ReconnectReason::DrainBlocked,
+        ),
         // Only suspend returns `SandboxNoPod` and only a Delete teardown
         // returns `NodeDeleteNotAdmitted`, so a wake never sees either; they
         // share `Unavailable`'s arm, as they share its 503.
