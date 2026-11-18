@@ -193,6 +193,26 @@ impl SandboxManagerService {
         }
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
         let artifact_guard = artifact_lock.lock_for_capture().await;
+        // A caller's suspend (an ECW pause among them) takes the sandbox back
+        // from a node drain: the drain's record of the lifecycle to restore
+        // goes, under the wake lock its own suspend records it under, so the
+        // drain then reports a suspended sandbox with no prior and nothing
+        // restores it. The drain's own suspends don't come through here. A
+        // node whose seal row doesn't exist holds no record, and its suspends
+        // skip the delete; a node whose seal row is unreadable may hide one,
+        // so its suspends run it, and one that fails fails the suspend.
+        if self.activation_seal.may_hold_drain_records() {
+            self.db_conn().and_then(|conn| {
+                crate::db::activation_seal::forget_drain_suspend(&conn, &sandbox.id).map_err(
+                    |error| {
+                        Status::internal(format!(
+                            "forget the drain's record of {}: {error}",
+                            sandbox.id
+                        ))
+                    },
+                )
+            })?;
+        }
         // A blocking suspend commits the full artifact before replying. If the
         // caller loses the response or its control-plane marker write fails,
         // retrying must return that exact committed artifact instead of trying

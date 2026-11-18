@@ -15,20 +15,15 @@
 //! ([`ACTIVATION_SEAL_UNREADABLE_MARKER`]), since the row it couldn't read may
 //! say sealed. [`ActivationSeal::recover`] reads the row again in the
 //! background with a short bounded backoff and publishes what it reads under
-//! the state lock, before any activation is admitted.
+//! the state lock, before any activation is admitted. While it still can't
+//! read, it logs a warning every [`UNREADABLE_WARN_INTERVAL`] naming the
+//! error and how long the seal has been unknown.
 //!
 //! Each admitted activation holds an [`ActivationInFlightToken`] from
 //! admission until its last step finishes or fails, including the finalizer
 //! it detaches. The seal state lock orders every admission against every
 //! seal: an activation is admitted and registered entirely before a seal
 //! lands, and counts as in flight, or is refused.
-//!
-//! Nothing in this build writes a seal: [`ActivationSeal::seal`], its cancel
-//! and the status a drain reads compile for tests only until the node drain
-//! that calls them lands, so a startup read that succeeds finds no row and
-//! every activation is admitted, as before. A startup read that fails refuses
-//! them until the background read succeeds, and logs a warning every
-//! [`UNREADABLE_WARN_INTERVAL`] while it still can't.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,9 +35,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
 use crate::db::SharedConnection;
-use crate::db::activation_seal::ActivationSealRecord;
-#[cfg(test)]
-use crate::db::activation_seal::write_activation_seal;
+use crate::db::activation_seal::{ActivationSealRecord, DrainPrior, write_activation_seal};
 
 /// The marker in the `FailedPrecondition` status a sealed node refuses a VM
 /// activation with. The node refuses the same activation until it is
@@ -65,7 +58,6 @@ const RECOVERY_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const UNREADABLE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The seal and the activations in flight, read together.
-#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ActivationSealStatus {
     /// The epoch the node is sealed under.
@@ -123,7 +115,6 @@ impl SealState {
     /// The readable row, `None` on a node never sealed or cancelled. A row
     /// the last read couldn't read is read again first; one that still can't
     /// be read refuses the seal or cancel that asked.
-    #[cfg(test)]
     fn current(&mut self, db: &SharedConnection) -> Result<Option<ActivationSealRecord>, Status> {
         if self.is_unknown() {
             let conn = db
@@ -299,7 +290,6 @@ impl ActivationSeal {
     /// epoch again changes nothing; a later epoch replaces the current one.
     /// Epochs only move forward: an epoch below the current one, or a
     /// cancelled one, is refused.
-    #[cfg(test)]
     pub(crate) fn seal(&self, db: &SharedConnection, epoch: u64) -> Result<(), Status> {
         validate_epoch(epoch)?;
         let mut state = self.lock_state();
@@ -329,11 +319,84 @@ impl ActivationSeal {
         Ok(())
     }
 
+    /// Record that a drain suspend of `sandbox_id` under `epoch` begins from
+    /// `prior`, if the node is still sealed under `epoch`, keeping an earlier
+    /// attempt's record; the prior the record holds, or `None` when the node
+    /// is not sealed under `epoch`. Under the state lock, which every seal
+    /// and cancel holds, so no record is written once a cancel or a later
+    /// seal has taken over from `epoch`.
+    pub(crate) fn record_drain_suspend(
+        &self,
+        db: &SharedConnection,
+        epoch: u64,
+        sandbox_id: &str,
+        prior: DrainPrior,
+    ) -> Result<Option<DrainPrior>, Status> {
+        let state = self.lock_state();
+        if state.sealed_epoch() != Some(epoch) {
+            return Ok(None);
+        }
+        let conn = db
+            .lock()
+            .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
+        let recorded = crate::db::activation_seal::record_drain_suspend(&conn, sandbox_id, prior)
+            .map_err(|error| {
+            Status::internal(format!("record the drain suspend of {sandbox_id}: {error}"))
+        })?;
+        drop(conn);
+        drop(state);
+        Ok(Some(recorded))
+    }
+
+    /// Forget the drain's records of `sandbox_ids` for a cancel call under
+    /// `epoch`, only while `epoch` is still the node's cancelled epoch; false,
+    /// forgetting nothing, once a later seal or cancel has taken over, whose
+    /// records an older cancel's call must not delete. The check and the
+    /// deletes run under the state lock, which every seal, cancel and record
+    /// write holds. Three other deletes of a record don't take it: a caller's
+    /// suspend and a failed drain suspend forget one sandbox's own record,
+    /// and a sandbox's deletion removes it with the row.
+    pub(crate) fn forget_cancelled_drain_suspends(
+        &self,
+        db: &SharedConnection,
+        epoch: u64,
+        sandbox_ids: &[String],
+    ) -> Result<bool, Status> {
+        let state = self.lock_state();
+        let current = state.record.as_ref().ok().copied().flatten();
+        if current
+            != Some(ActivationSealRecord {
+                epoch,
+                sealed: false,
+            })
+        {
+            return Ok(false);
+        }
+        if sandbox_ids.is_empty() {
+            return Ok(true);
+        }
+        let conn = db
+            .lock()
+            .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
+        for sandbox_id in sandbox_ids {
+            crate::db::activation_seal::forget_drain_suspend(&conn, sandbox_id).map_err(
+                |error| {
+                    Status::internal(format!(
+                        "forget the drain's record of {sandbox_id}: {error}"
+                    ))
+                },
+            )?;
+        }
+        drop(conn);
+        drop(state);
+        Ok(true)
+    }
+
     /// Cancel `epoch`: clear the seal if it is under `epoch` or an earlier
     /// one, and remember `epoch` so no seal at or below it is taken again,
-    /// even one whose call arrives after this cancel. An epoch below the
-    /// current seal's is refused and changes nothing.
-    #[cfg(test)]
+    /// even one whose call arrives after this cancel. Every drain evacuation
+    /// is kept, for the cancel to hand back. An epoch below the current
+    /// seal's is refused and changes nothing.
     pub(crate) fn unseal(&self, db: &SharedConnection, epoch: u64) -> Result<(), Status> {
         validate_epoch(epoch)?;
         let mut state = self.lock_state();
@@ -348,7 +411,7 @@ impl ActivationSeal {
             epoch: current.map_or(epoch, |current| current.epoch.max(epoch)),
             sealed: false,
         };
-        persist(db, record)?;
+        persist_cancel(db, record)?;
         state.record = Ok(Some(record));
         drop(state);
         if current.is_some_and(|current| current.sealed) {
@@ -357,7 +420,14 @@ impl ActivationSeal {
         Ok(())
     }
 
-    #[cfg(test)]
+    /// Whether the node may hold a drain record. A record is written only
+    /// while sealed, after the seal row it needs, and no cancel removes that
+    /// row, so a node with no row holds none and a caller's suspend skips
+    /// forgetting one. An unreadable row may hide one.
+    pub(crate) fn may_hold_drain_records(&self) -> bool {
+        !matches!(self.lock_state().record, Ok(None))
+    }
+
     pub(crate) fn status(&self) -> ActivationSealStatus {
         let sealed_epoch = self.lock_state().sealed_epoch();
         ActivationSealStatus {
@@ -404,7 +474,6 @@ fn refuse_while_sealed(
     )))
 }
 
-#[cfg(test)]
 fn refuse_stale_epoch(current: ActivationSealRecord, epoch: u64) -> Status {
     Status::failed_precondition(if current.sealed {
         format!(
@@ -419,7 +488,6 @@ fn refuse_stale_epoch(current: ActivationSealRecord, epoch: u64) -> Status {
     })
 }
 
-#[cfg(test)]
 fn validate_epoch(epoch: u64) -> Result<(), Status> {
     if epoch == 0 || i64::try_from(epoch).is_err() {
         return Err(Status::invalid_argument(
@@ -429,13 +497,22 @@ fn validate_epoch(epoch: u64) -> Result<(), Status> {
     Ok(())
 }
 
-#[cfg(test)]
 fn persist(db: &SharedConnection, record: ActivationSealRecord) -> Result<(), Status> {
     let conn = db
         .lock()
         .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
     write_activation_seal(&conn, record)
         .map_err(|error| Status::internal(format!("persist the activation seal: {error}")))
+}
+
+/// Persist a cancel. Every drain evacuation is kept, for the cancel calls to
+/// hand back until the control plane names each in `forget`.
+fn persist_cancel(db: &SharedConnection, record: ActivationSealRecord) -> Result<(), Status> {
+    let conn = db
+        .lock()
+        .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
+    crate::db::activation_seal::cancel_drain(&conn, record)
+        .map_err(|error| Status::internal(format!("persist the drain cancel: {error}")))
 }
 
 /// The sandbox of each activation in flight, by a token id issued in order.
@@ -459,7 +536,6 @@ impl InFlightRegistry {
         self.lock_entries().remove(&id);
     }
 
-    #[cfg(test)]
     fn list(&self) -> Vec<String> {
         self.lock_entries().values().cloned().collect()
     }

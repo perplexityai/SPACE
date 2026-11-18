@@ -306,6 +306,13 @@ const ALLOW_LOCAL_BACKUP_INVENTORY: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
 ];
+// A drain seals the node and evacuates every resident, and its cancel
+// unseals it. node-api relays it for the control plane and authorizes that
+// caller first; root may drive it by hand.
+const ALLOW_NODE_DRAIN: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
+];
 const ALLOW_SANDBOX_ADMIN_OR_TMPLMGR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Admin),
@@ -417,6 +424,8 @@ pub struct SandboxManagerService {
     /// Refuses every VM activation while the node is sealed, and tracks the
     /// activation work in flight, which a drain reports as pending.
     activation_seal: Arc<crate::activation_seal::ActivationSeal>,
+    /// The node drain's work in flight in this process.
+    drain_actions: Arc<drain_node::DrainActions>,
     /// At most one in-process driver may advance a persisted teardown suspend
     /// for a sandbox. The durable operation itself lives in SQLite; this map
     /// only bounds concurrent reattachment attempts from shim polling.
@@ -1890,6 +1899,9 @@ impl SandboxManagerService {
             )),
             activation_admission_limiter: Arc::new(ActivationAdmissionLimiter::from_env()),
             activation_seal,
+            drain_actions: Arc::new(drain_node::DrainActions::with_window(
+                drain_node::drain_node_window_from_env(),
+            )),
             teardown_suspend_drivers: Arc::new(dashmap::DashMap::new()),
             teardown_suspend_driver_sem: Arc::new(tokio::sync::Semaphore::new(
                 teardown_suspend_driver_concurrency,
@@ -2160,6 +2172,7 @@ pub(crate) mod drain;
 mod eviction;
 pub(crate) mod snapshot_capture;
 pub(crate) use eviction::{EvictionClaim, is_unrecorded_snapshot_refusal};
+mod drain_node;
 mod grpc_auto_lifecycle_delete_receipts;
 mod grpc_core;
 mod grpc_lifecycle;
