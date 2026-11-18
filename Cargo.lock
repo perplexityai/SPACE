@@ -6102,6 +6102,7 @@ dependencies = [
 name = "pplx-space-firewall-rules-model"
 version = "0.8.2"
 dependencies = [
+ "serde",
  "thiserror 2.0.20",
 ]
 

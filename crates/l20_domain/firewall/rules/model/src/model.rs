@@ -5,6 +5,11 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 
+use serde::de::{self, Deserializer};
+use serde::{Deserialize, Serialize, Serializer};
+
+use crate::shape::{self, Comparison, MapOnly, Op};
+
 /// The longest rule ID or name, in bytes.
 const MAX_NAME_LEN: usize = 64;
 
@@ -38,8 +43,17 @@ impl RuleId {
 /// Runtime qualification decides whether a valid name means anything.
 /// Loosening this later still accepts stored revisions; tightening would
 /// reject some.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
 pub struct Name(String);
+
+impl<'de> Deserialize<'de> for Name {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Name::new(value.as_str())
+            .map_err(|error| de::Error::custom(format_args!("name {value:?} {error}")))
+    }
+}
 
 impl Name {
     pub fn new(value: impl Into<String>) -> Result<Self, NameError> {
@@ -179,21 +193,47 @@ pub struct EmptyAllOfError;
 /// only operator the grammar allows.
 ///
 /// Any read may be paired with any value here; whether the pair makes sense for
-/// the field is runtime qualification.
+/// the field is runtime qualification. It serializes as the `{left, op, right}`
+/// object an nft JSON `match` statement holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Match {
     pub left: Read,
     pub right: Value,
 }
 
+impl Serialize for Match {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Comparison {
+            left: &self.left,
+            op: Op::Eq,
+            right: &self.right,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Match {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let Comparison {
+            left,
+            op: Op::Eq,
+            right,
+        } = Comparison::deserialize(MapOnly(deserializer))?;
+        Ok(Match { left, right })
+    }
+}
+
 /// The packet data a comparison reads.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Read {
     /// A payload header field.
+    #[serde(rename = "payload")]
     Payload(PayloadHeader),
     /// A TCP option.
+    #[serde(rename = "tcp option", with = "shape::tcp_option")]
     TcpOption(Name),
     /// A payload header field ANDed with a nonzero mask.
+    #[serde(rename = "&", with = "shape::masked")]
     MaskedPayload {
         header: PayloadHeader,
         mask: NonZeroU64,
@@ -201,10 +241,23 @@ pub enum Read {
 }
 
 /// A protocol header field, named as the caller wrote it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct PayloadHeader {
     pub protocol: Name,
     pub field: Name,
+}
+
+impl Serialize for PayloadHeader {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PayloadHeader {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::deserialize(MapOnly(deserializer))
+    }
 }
 
 /// The value a read is compared with.
@@ -212,22 +265,42 @@ pub struct PayloadHeader {
 /// Values that match the same packets stay distinct: `Integer(80)` is not
 /// `Range` 80 to 80, and an address is not its `/32` prefix. Re-encoding a
 /// rule from one form to the other is a replacement in a diff.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(expecting = "expected an unsigned integer, an IPv4 address, true, a prefix or a range")]
 pub enum Value {
+    #[serde(rename = "prefix")]
+    Ipv4Prefix(Ipv4Prefix),
+    #[serde(rename = "range")]
+    Range(IntegerRange),
+    #[serde(untagged)]
     Integer(u64),
+    #[serde(untagged)]
     Ipv4(Ipv4Addr),
     /// The literal `true`, as in "this TCP option is present". There is no
     /// `false`.
+    #[serde(untagged, with = "shape::literal_true")]
     True,
-    Ipv4Prefix(Ipv4Prefix),
-    Range(IntegerRange),
 }
 
 /// An IPv4 prefix. The address is kept as written, including host bits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct Ipv4Prefix {
     addr: Ipv4Addr,
     len: u8,
+}
+
+impl Serialize for Ipv4Prefix {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Ipv4Prefix {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let read = Self::deserialize(MapOnly(deserializer))?;
+        Ipv4Prefix::new(read.addr, read.len).map_err(de::Error::custom)
+    }
 }
 
 impl Ipv4Prefix {
@@ -256,11 +329,27 @@ pub struct PrefixLengthError {
     pub len: u8,
 }
 
-/// An inclusive integer range whose start does not exceed its end.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// An inclusive integer range whose start does not exceed its end, written
+/// `[start, end]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "(u64, u64)")]
 pub struct IntegerRange {
     start: u64,
     end: u64,
+}
+
+impl Serialize for IntegerRange {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (self.start, self.end).serialize(serializer)
+    }
+}
+
+impl TryFrom<(u64, u64)> for IntegerRange {
+    type Error = ReversedRangeError;
+
+    fn try_from((start, end): (u64, u64)) -> Result<Self, Self::Error> {
+        IntegerRange::new(start, end)
+    }
 }
 
 impl IntegerRange {

@@ -1,16 +1,16 @@
 //! The typed runtime drop-only firewall rules and the [`diff`] between two
-//! revisions; `pplx-space-firewall-rules-protocol` owns the wire format.
+//! revisions. [`Match`] and its reads and values serialize as nft JSON `match`
+//! operands and deserialize only into validated values;
+//! `pplx-space-firewall-rules-protocol` adds the versioned document.
 //! Rule IDs and names are limited to the sets on [`RuleId`] and [`Name`].
-//! The node renderer must build nft input as structured JSON and namespace the
-//! rule IDs it puts in nft comments.
-//! Decoding checks shape only; the rollout's canary phase and failure budget
-//! are meant to contain a revision nft rejects.
-//! The renderer must add runtime rules at the end of
-//! `ip sandbox pre_tproxy_guardrails`, after its established/related return;
-//! they only add drops.
+//! The caller supplies the comparisons; SPACE owns placement, the interface
+//! guard and the verdict, and must render nft input as structured JSON with
+//! namespaced rule IDs in comments. A revision that decodes may still be one
+//! Linux cannot install or enforce.
 
 mod diff;
 mod model;
+mod shape;
 
 #[cfg(test)]
 mod test_fixtures;

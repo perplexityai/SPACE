@@ -200,6 +200,29 @@ fn the_acceptance_example_encodes_to_the_golden_bytes() {
     assert_eq!(decode_revision(golden).unwrap(), revision);
 }
 
+/// A validated comparison is the middle statement of a rendered nft rule: it
+/// goes under `"match"` as is, with no second conversion.
+#[test]
+fn a_decoded_comparison_is_an_nft_match_operand() {
+    let revision = decode_revision(concat!(
+        r#"{"schema_version":1,"rules":[{"id":"dns","all_of":["#,
+        r#"{"left":{"payload":{"protocol":"udp","field":"dport"}},"op":"==","right":53}]}]}"#,
+    ))
+    .unwrap();
+    let comparison = &revision.rules()[0].all_of()[0];
+    let expected: serde_json::Value = serde_json::from_str(
+        r#"{
+          "match": {
+            "left": { "payload": { "protocol": "udp", "field": "dport" } },
+            "op": "==",
+            "right": 53
+          }
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(serde_json::json!({ "match": comparison }), expected);
+}
+
 /// Boundary documents already in canonical form, one per line as in
 /// [`REJECTED`].
 const CANONICAL: &str = r##"
