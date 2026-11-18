@@ -226,7 +226,7 @@ async fn a_pods_upgrade_boots_in_the_pods_namespace_under_the_target() {
     assert!(
         !error
             .message()
-            .contains(pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER),
+            .contains(pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER),
         "{error}"
     );
     assert!(error.message().contains("rolled back"), "{error}");

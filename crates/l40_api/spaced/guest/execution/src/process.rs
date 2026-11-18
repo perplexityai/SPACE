@@ -1856,9 +1856,9 @@ fn process_event_stream_with_prefix(
 fn process_output_cursor_ahead_status() -> Status {
     let mut status = Status::out_of_range(PROCESS_OUTPUT_CURSOR_AHEAD_MESSAGE);
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_CURSOR_AHEAD,
         ),
     );
     status
@@ -1869,17 +1869,17 @@ fn process_output_cursor_ahead_status() -> Status {
 /// can continue from there. `None` once the journal itself is gone.
 fn process_output_lagged_status(first_sequence: Option<u64>) -> Status {
     let mut status =
-        Status::resource_exhausted(pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE);
+        Status::resource_exhausted(pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED_MESSAGE);
     let metadata = status.metadata_mut();
     metadata.insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED,
         ),
     );
     if let Some(first_sequence) = first_sequence {
         metadata.insert(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
             tonic::metadata::MetadataValue::from(first_sequence),
         );
     }

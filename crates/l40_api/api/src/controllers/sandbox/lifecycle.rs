@@ -7,7 +7,6 @@ use crate::controllers::substrate::{
     ActivationAttribution, ActivationClient, CapPolicy, RecoveryCharge,
 };
 use crate::metrics::sandbox::api::RequestedKind;
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeDrainPhase, NodeDrainState, NodeManagedBy, NodeRole};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -19,6 +18,7 @@ use pplx_space_sandbox_store::delete::{mark_deleting, restore_lifecycle_from_del
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
+use pplx_space_sql_locator::sql;
 use user_admission::{UserLifecycleRequest, admit_user_lifecycle};
 
 const FINALIZE_SANDBOX_DB_DELETE_ATTEMPTS: usize = 4;

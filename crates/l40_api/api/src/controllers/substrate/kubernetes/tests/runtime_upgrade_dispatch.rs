@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_sql_locator::sql;
 
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::RuntimeUpgradeAtActivation;

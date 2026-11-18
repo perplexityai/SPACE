@@ -1,6 +1,6 @@
 use pplx_space_accounts::{OrgId, UserId};
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::LazyLock;
@@ -215,7 +215,7 @@ impl PublicOperationStore {
         operation_id: OperationId,
         hard_deadline: Duration,
     ) -> Result<Option<Duration>, PublicOperationStoreError> {
-        let seconds = sqlx::query_scalar::<_, i64>(pplx_space_common_core::sql!(
+        let seconds = sqlx::query_scalar::<_, i64>(pplx_space_sql_locator::sql!(
             "SELECT GREATEST(
                  0,
                  FLOOR(EXTRACT(EPOCH FROM (
@@ -237,7 +237,7 @@ impl PublicOperationStore {
         &self,
         operation_id: OperationId,
     ) -> Result<Option<Duration>, PublicOperationStoreError> {
-        let seconds = sqlx::query_scalar::<_, Option<f64>>(pplx_space_common_core::sql!(
+        let seconds = sqlx::query_scalar::<_, Option<f64>>(pplx_space_sql_locator::sql!(
             "SELECT EXTRACT(EPOCH FROM NOW() - started_at)::DOUBLE PRECISION
              FROM public_operations
              WHERE operation_id = $1"

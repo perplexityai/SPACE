@@ -6,7 +6,7 @@ use pplx_space_common_core::types::SandboxId;
 
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// Finalize `failed` the dead uploads `node_id` left for `ids`, which were

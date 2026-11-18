@@ -33,7 +33,7 @@
 //! whose owner commit didn't land, and a redrive that finds the row already
 //! `started` has nothing left to do.
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 

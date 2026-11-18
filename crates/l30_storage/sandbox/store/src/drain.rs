@@ -40,13 +40,13 @@ use pplx_space_durations::PositiveDuration;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
     current_disk_artifact_backup_ready, current_suspend_snapshot_ready,
     failed_repair_revert_eligibility, inflight_suspend_upload_exists, latest_full_snapshot_ready,
     newest_full_snapshot_unambiguous, pod_less_drain_revert_loses_no_newer_bytes,
     recoverable_suspend_snapshot_exists, snapshot_durable_for_source_release,
 };
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// Saturating seconds-as-`i64` for SQL binds; any value above `i64::MAX`

@@ -229,7 +229,7 @@ pub type RootfsPresenceProbe = Arc<dyn Fn(&str) -> std::io::Result<bool> + Send 
 const TEMPLATE_DIR: &str = pplx_space_host_layout::paths::TEMPLATE_DIR;
 const NET_GATEWAY_SIDECAR_PID_NAME: &str = "space-netgtw-svc";
 
-const MAX_WRITE_BATCH_ENTRIES: usize = pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES;
+const MAX_WRITE_BATCH_ENTRIES: usize = pplx_space_guest_process::MAX_WRITE_BATCH_ENTRIES;
 const DEFAULT_BLOCKING_READY_TIMEOUT_SECS: u32 = 30;
 const DEFAULT_RESUME_READY_TIMEOUT_SECS: u32 = 5;
 const GRPC_TIMEOUT_METADATA_KEY: &str = "grpc-timeout";

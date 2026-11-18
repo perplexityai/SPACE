@@ -2,8 +2,8 @@
 //! holds the sandbox's current local artifact, both, or neither.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SnapshotId};
+use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 
 /// Where one catalog snapshot's bytes are, as the catalog records it.

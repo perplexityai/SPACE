@@ -16,9 +16,9 @@ fn retryable_status_codes_match_bridge_policy() {
 fn refused_before_start_is_never_retried_by_a_hop() {
     let mut refused = tonic::Status::unavailable("guest shutting down");
     refused.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::REQUEST_REFUSED,
+            pplx_space_guest_process::status::REQUEST_REFUSED,
         ),
     );
     assert!(!status_is_retryable(&refused));

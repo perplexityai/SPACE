@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Pod;
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 
 use super::*;
@@ -27,7 +27,7 @@ async fn control_runtime_client_wakes_only_kubernetes_rows_after_an_unreachable_
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
         insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE sandboxes SET managed_by = $2 WHERE id = $1"
         ))
         .bind(sandbox_id)
@@ -198,7 +198,7 @@ async fn control_runtime_client_admits_the_fallback_wake_it_runs() -> TestResult
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
         insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE sandboxes SET managed_by = $2 WHERE id = $1"
         ))
         .bind(sandbox_id)

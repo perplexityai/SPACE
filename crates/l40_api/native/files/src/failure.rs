@@ -116,9 +116,9 @@ fn is_guest_storage_full(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::ResourceExhausted
         && status
             .metadata()
-            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
             .and_then(|reason| reason.to_str().ok())
-            == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL)
+            == Some(pplx_space_guest_process::status::GUEST_STORAGE_FULL)
 }
 
 fn http_status_for_grpc_code(code: tonic::Code) -> StatusCode {

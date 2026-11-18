@@ -2903,7 +2903,7 @@ mod postgres_backed {
         .await?;
         insert_execution(&db.pool, id, true, 3600, Some("node-proof")).await?;
         set_execution_pod_state(&db.pool, id, "running", Some("10.90.0.9")).await?;
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE sandbox_k8s_executions
                 SET route_activation_id = $2, activation_attempt_id = $3,
                     activation_attempt_expires_at = NOW() - INTERVAL '1 hour',
@@ -2935,7 +2935,7 @@ mod postgres_backed {
                 assert!(candidates.iter().all(|row| row.id != id));
             }
         }
-        let row: (bool, Option<Uuid>) = sqlx::query_as(pplx_space_common_core::sql!(
+        let row: (bool, Option<Uuid>) = sqlx::query_as(pplx_space_sql_locator::sql!(
             "SELECT active, activation_attempt_id FROM sandbox_k8s_executions WHERE sandbox_id = $1"
         ))
         .bind(id)

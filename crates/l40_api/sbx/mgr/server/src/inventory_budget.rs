@@ -1,6 +1,6 @@
 //! Wire and bounded-sidecar counterparts of the storage inventory budget.
 
-use pplx_space_common_core::inventory::{
+use pplx_space_rpc_contracts::inventory::{
     InventoryBudget, InventoryLimitExceeded, MAX_ENCODED_BYTES,
 };
 use tonic::{Response, Status};

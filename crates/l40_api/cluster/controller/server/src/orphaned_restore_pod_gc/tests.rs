@@ -1820,9 +1820,9 @@ async fn terminating_pod_seen_after_restart_is_tracked_for_stuck_teardown() {
 // ---------------------------------------------------------------------------
 
 mod postgres_backed {
-    use pplx_space_common_core::sql;
     use pplx_space_common_core::types::SandboxId;
     use pplx_space_db_test_fixtures::try_pg_test_db;
+    use pplx_space_sql_locator::sql;
     use sqlx::PgPool;
     use uuid::Uuid;
 

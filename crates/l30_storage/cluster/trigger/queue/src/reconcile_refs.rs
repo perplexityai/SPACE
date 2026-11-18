@@ -3,7 +3,7 @@
 //! writer that asked for it.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 /// What an enqueue does to a ref that is already queued on the node.
 ///

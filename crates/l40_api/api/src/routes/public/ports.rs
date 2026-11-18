@@ -6,7 +6,6 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use pplx_space_common_core::sql;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     ClosePortExposureRequest, ListPortExposuresResponse, OpenPortExposureRequest, PortExposure,
@@ -14,6 +13,7 @@ use pplx_space_public_api::{
     PortExposureVisibility, RequestFingerprint,
 };
 use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
+use pplx_space_sql_locator::sql;
 use sha2::{Digest, Sha256};
 use sqlx::types::Json as SqlJson;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};

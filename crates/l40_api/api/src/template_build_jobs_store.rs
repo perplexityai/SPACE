@@ -1,10 +1,8 @@
 use std::str::FromStr;
 
 use pplx_space_accounts::{NodeId, OrgId, SystemPublicationGrantId, TenantPublicationGrantId};
-use pplx_space_common_core::{
-    sql,
-    types::{BuildRunId, BuildRunIdParseError, TemplateName},
-};
+use pplx_space_common_core::types::{BuildRunId, BuildRunIdParseError, TemplateName};
+use pplx_space_sql_locator::sql;
 use sqlx::{PgExecutor, PgPool};
 use time::OffsetDateTime;
 

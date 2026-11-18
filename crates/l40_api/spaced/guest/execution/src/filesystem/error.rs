@@ -11,9 +11,9 @@ pub(crate) fn map_io_error(error: std::io::Error) -> Status {
             libc::ENOSPC | libc::EDQUOT => {
                 let mut status = Status::resource_exhausted(error.to_string());
                 status.metadata_mut().insert(
-                    pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+                    pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
                     tonic::metadata::MetadataValue::from_static(
-                        pplx_space_common_core::spaced::GUEST_STORAGE_FULL,
+                        pplx_space_guest_process::status::GUEST_STORAGE_FULL,
                     ),
                 );
                 return status;

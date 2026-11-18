@@ -1,7 +1,7 @@
 use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_common_core::types::SandboxId;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 use std::time::Duration;
 

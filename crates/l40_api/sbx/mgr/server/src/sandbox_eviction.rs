@@ -1173,7 +1173,7 @@ fn classify_reupload_failure(
         tonic::Code::FailedPrecondition => {
             let message = status.message();
             if message.contains(
-                pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER,
+                pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER,
             ) {
                 Ok(LegacyRepairSkipReason::MissingLocalFiles)
             } else if message.contains("no snapshot upload destination configured") {

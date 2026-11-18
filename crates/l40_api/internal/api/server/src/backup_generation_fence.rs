@@ -1,12 +1,12 @@
 //! `BeginArtifactBackup`'s execution-generation fence: the registration of a
 //! capture whose runtime the control plane superseded is refused.
 
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
 use pplx_space_node_api_client::cluster::backup_execution_superseded_status;
 use pplx_space_sandbox_portability::execution_supersession::{
     ExecutionSupersessionRow, execution_generation_superseded,
 };
+use pplx_space_sql_locator::sql;
 use tonic::Status;
 
 /// One execution row as the fence's query selects it, decoded by column name

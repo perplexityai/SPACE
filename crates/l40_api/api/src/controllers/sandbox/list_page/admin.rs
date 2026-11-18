@@ -26,11 +26,11 @@ use std::sync::LazyLock;
 
 use pplx_space_accounts::{NodeId, OrgId, UserId};
 use pplx_space_cluster_pool::WarmPoolStore;
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{SandboxId, TemplateName};
 use pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_semver::SemVer;
+use pplx_space_sql_locator::sql;
 use serde::Serialize;
 use sqlx::PgPool;
 use time::OffsetDateTime;

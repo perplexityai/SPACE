@@ -1,8 +1,8 @@
 //! One State RPC batch: each requested sandbox's row and the publication
 //! fields around it, every field with its own result.
 
-use pplx_space_common_core::inventory::InventoryBudget;
 use pplx_space_execution_spec::ExecutionMetadata;
+use pplx_space_rpc_contracts::inventory::InventoryBudget;
 
 use crate::db::inventory_read::InventoryReadError;
 use crate::db::timestamps::EpochSeconds;

@@ -19,10 +19,10 @@ use pplx_space_api::controllers::substrate::kubernetes::{
 use pplx_space_bearer_token::{
     SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV, SPACE_NODE_API_TOKEN_PATH_ENV,
 };
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::internal_transport::INSECURE_DEV_ENV;
 use pplx_space_db_test_fixtures::TestDb;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;

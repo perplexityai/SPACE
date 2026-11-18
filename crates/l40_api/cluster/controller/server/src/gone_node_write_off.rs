@@ -13,8 +13,8 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{SandboxId, SubstrateKind};
 
-use pplx_space_common_core::sql;
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// Whether the Kubernetes node row is still in `drain_phase` (`None` = outside

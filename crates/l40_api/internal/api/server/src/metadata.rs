@@ -13,7 +13,7 @@ use crate::template_visibility_cache::TemplateVisibilityCache;
 
 use super::status::*;
 use super::*;
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 // ── Template metadata: row types and helpers ──────────────────────────────
 

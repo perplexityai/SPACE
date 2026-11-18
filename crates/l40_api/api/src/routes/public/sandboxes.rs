@@ -2,7 +2,7 @@ use crate::routes::public::error::database_error;
 use pplx_space_accounts::{NodeId, OrgId, UserId};
 use pplx_space_common_core::types::SandboxId;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::{convert::Infallible, str::FromStr, time::Duration};
 
 use crate::metrics::operations::InlineAdmissionPath;

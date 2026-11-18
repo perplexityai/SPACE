@@ -24,18 +24,16 @@ use crate::node_group_placement::{
 use pplx_space_accounts::NodeId;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_cluster_pool::{OpenPoolSlotDeleteLock, WarmPoolStore};
-use pplx_space_common_core::{
-    sql,
-    types::{
-        ArtifactKind, BackupSource, ExecutionGeneration, NodeAddress,
-        NodeManagedBy as SpaceNodeManagedBy, SandboxLifecycle, SandboxTransitionTargetState,
-    },
+use pplx_space_common_core::types::{
+    ArtifactKind, BackupSource, ExecutionGeneration, NodeAddress,
+    NodeManagedBy as SpaceNodeManagedBy, SandboxLifecycle, SandboxTransitionTargetState,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
 };
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sql_locator::sql;
 use rand::RngExt;
 use sqlx::{Postgres, Transaction};
 

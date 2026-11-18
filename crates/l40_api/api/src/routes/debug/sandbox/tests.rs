@@ -134,8 +134,8 @@ async fn the_debug_read_reports_quarantine_and_snapshot_storage()
 -> pplx_space_db_test_fixtures::TestDbResult<()> {
     use axum::extract::{Path, State};
     use pplx_space_accounts::NodeId;
-    use pplx_space_common_core::sql;
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node};
+    use pplx_space_sql_locator::sql;
 
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     let state = crate::routes::AppState::from_pool(db.pool.clone())
@@ -293,7 +293,7 @@ async fn the_debug_response_lists_env_names_without_values()
         .await
         .expect("app state from the test pool");
     let sandbox_id = SandboxId::new();
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO sandboxes (
              id, user_id, org_id, lifecycle, placement, managed_by,
              network_policy_generation, env

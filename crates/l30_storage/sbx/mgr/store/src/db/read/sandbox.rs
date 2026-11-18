@@ -1,8 +1,8 @@
 //! One sandbox's whole row, decoded strictly, and the two raw projections
 //! that a whole-row read cannot stand in for.
 
-use pplx_space_common_core::inventory::InventoryBudget;
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_rpc_contracts::inventory::InventoryBudget;
 
 use crate::db::auto_lifecycle_delete_receipts::RouteIdentityAdoptionMetadata;
 use crate::db::inventory_read::InventoryReadError;

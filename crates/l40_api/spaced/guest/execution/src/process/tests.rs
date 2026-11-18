@@ -453,7 +453,7 @@ async fn losing_start_response_preserves_output_supervision_and_idempotency() {
                             assert_eq!(error.code(), tonic::Code::ResourceExhausted);
                             assert_eq!(
                                 error.message(),
-                                pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE
+                                pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED_MESSAGE
                             );
                             lagged = true;
                             assert!(replay.next().await.is_none());
@@ -1023,9 +1023,9 @@ async fn cursor_past_the_output_fails_instead_of_waiting() {
         assert_eq!(
             error
                 .metadata()
-                .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+                .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
                 .and_then(|value| value.to_str().ok()),
-            Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD)
+            Some(pplx_space_guest_process::status::PROCESS_OUTPUT_CURSOR_AHEAD)
         );
         assert!(ahead.next().await.is_none());
 
@@ -1068,11 +1068,11 @@ async fn lagged_cursor_reports_the_oldest_retained_output() {
             .map(str::to_owned)
     };
     assert_eq!(
-        metadata(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY).as_deref(),
-        Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED)
+        metadata(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY).as_deref(),
+        Some(pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED)
     );
     let first_sequence: u64 =
-        metadata(pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
+        metadata(pplx_space_guest_process::status::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
             .expect("the oldest retained output")
             .parse()
             .unwrap();

@@ -5,8 +5,8 @@ use uuid::Uuid;
 use super::*;
 use crate::models::User;
 use crate::user_role::UserRole;
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use tower::ServiceExt;
 

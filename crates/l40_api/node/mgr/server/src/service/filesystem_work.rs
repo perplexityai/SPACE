@@ -79,7 +79,7 @@ impl NodeManagerService {
             .map_err(|_| {
                 Status::unavailable(format!(
                     "sandbox artifact work {}",
-                    pplx_space_common_core::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER
+                    pplx_space_rpc_contracts::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER
                 ))
             })?;
         let claim = self.claim_sandbox_mutation(sandbox_id)?;

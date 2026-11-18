@@ -6,8 +6,8 @@ use axum::{
     middleware,
     routing::get,
 };
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;

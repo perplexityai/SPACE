@@ -516,7 +516,7 @@ impl SandboxManagerService {
             let error = if sandbox.state.is_unowned(SandboxState::Failed) {
                 format!(
                     "cannot suspend: {}",
-                    pplx_space_common_core::node_drain_signals::SUSPEND_SANDBOX_FAILED_MARKER
+                    pplx_space_rpc_contracts::node_drain_signals::SUSPEND_SANDBOX_FAILED_MARKER
                 )
             } else {
                 format!(

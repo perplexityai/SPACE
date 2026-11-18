@@ -339,9 +339,9 @@ fn cursor_ahead_status() -> Status {
     let mut status =
         Status::out_of_range("process output cursor is past the output the process has written");
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_CURSOR_AHEAD,
         ),
     );
     status

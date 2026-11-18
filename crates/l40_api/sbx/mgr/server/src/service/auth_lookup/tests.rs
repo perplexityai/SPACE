@@ -5,7 +5,7 @@ async fn gateway_identity_mapping_preserves_exact_pid_and_lifecycle_authority() 
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     conn.execute(
-        pplx_space_common_core::sql!(
+        pplx_space_sql_locator::sql!(
             "INSERT INTO sandboxes (id,uuid8,state,template,user,runtime,created_at,updated_at)
              VALUES (?1,'gateway1','started','seed','deploy','fc','1','1')"
         ),

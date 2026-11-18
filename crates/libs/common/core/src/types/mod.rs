@@ -27,7 +27,6 @@
 
 pub mod admin;
 pub mod client_id;
-pub mod cluster;
 pub mod kek;
 pub mod node;
 pub mod node_fs;
@@ -46,7 +45,6 @@ pub mod template;
 #[cfg(feature = "serde")]
 pub use admin::*;
 pub use client_id::*;
-pub use cluster::*;
 pub use kek::*;
 pub use node::*;
 pub use node_fs::*;

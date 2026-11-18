@@ -125,7 +125,7 @@ async fn federated_replay_uses_the_owner_organization_namespace() -> TestResult 
         org_id: UpstreamOrgId::parse("upstream-org")?,
         subject_id: UpstreamSubjectId::parse("upstream-user")?,
     };
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO organizations (
              id, name, slug, owner_source, upstream_issuer, upstream_org_id
          )
@@ -187,7 +187,7 @@ async fn invalid_federated_grant_does_not_materialize_owner_namespace() -> TestR
     .expect_err("a federated fork without a service grant is unauthorized");
     assert_eq!(error.status, StatusCode::UNAUTHORIZED);
 
-    let owner_org_exists: bool = sqlx::query_scalar(pplx_space_common_core::sql!(
+    let owner_org_exists: bool = sqlx::query_scalar(pplx_space_sql_locator::sql!(
         "SELECT EXISTS (
              SELECT 1 FROM organizations
              WHERE owner_source = 'federated_identity'

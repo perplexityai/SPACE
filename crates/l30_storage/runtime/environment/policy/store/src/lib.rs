@@ -45,9 +45,9 @@ use std::fmt;
 use std::str::FromStr;
 
 use pplx_space_accounts::UserId;
-use pplx_space_common_core::sql;
 use pplx_space_content_digest::DigestParseError;
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_sql_locator::sql;
 
 mod write;
 

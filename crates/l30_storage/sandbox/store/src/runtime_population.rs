@@ -4,12 +4,12 @@
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::SubstrateKind;
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, no_newer_full_snapshot,
     restore_retry_source_snapshot_is_current, snapshot_is_current_local_artifact,
 };
+use pplx_space_sql_locator::sql;
 
 /// One group of [`sandbox_population`]: sandboxes with the same binding
 /// record and lifecycle.

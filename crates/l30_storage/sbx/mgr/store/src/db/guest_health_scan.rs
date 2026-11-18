@@ -5,7 +5,7 @@ use crate::db::{Connection, Error, Result};
 use rusqlite::OptionalExtension as _;
 use rusqlite::types::Type;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxGuestHealthRow {

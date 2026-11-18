@@ -203,9 +203,9 @@ pub(super) fn guest_storage_full(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::ResourceExhausted
         && status
             .metadata()
-            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
             .and_then(|value| value.to_str().ok())
-            == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL)
+            == Some(pplx_space_guest_process::status::GUEST_STORAGE_FULL)
 }
 
 /// The refusal when the backend would not start work because the sandbox is

@@ -34,7 +34,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 
 use super::*;

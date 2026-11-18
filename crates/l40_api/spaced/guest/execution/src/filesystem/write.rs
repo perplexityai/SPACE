@@ -155,7 +155,7 @@ pub(super) async fn write_batch(
     account: &GuestAccount,
     tasks: tokio_util::task::TaskTracker,
 ) -> Result<WriteBatchResponse, Status> {
-    if request.entries.len() > pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES {
+    if request.entries.len() > pplx_space_guest_process::MAX_WRITE_BATCH_ENTRIES {
         return Err(Status::invalid_argument("too many write_batch entries"));
     }
     let mut files_written = 0;

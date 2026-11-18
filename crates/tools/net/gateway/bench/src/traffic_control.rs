@@ -12,7 +12,8 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519KeyId, ed25519::SpaceApiRouteEd25519Signer,
     ed25519::insert_space_api_route_ed25519_token,
 };
-use pplx_space_common_core::types::{ClusterId, SandboxRouteIdentity, SpaceApiRouteIdentity};
+use pplx_space_cluster_id::ClusterId;
+use pplx_space_common_core::types::{SandboxRouteIdentity, SpaceApiRouteIdentity};
 use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 use pplx_space_net_common::{
     CredentialHeaderBindingV1, EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope,

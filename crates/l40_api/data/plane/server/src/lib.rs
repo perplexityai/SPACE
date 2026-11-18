@@ -35,8 +35,8 @@ use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_bearer_token::{SpaceBearerToken, insert_space_bearer_token};
+use pplx_space_cluster_id::process_cluster_id;
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_core::types::cluster::process_cluster_id;
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };

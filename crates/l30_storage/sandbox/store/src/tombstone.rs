@@ -8,7 +8,7 @@
 
 use uuid::Uuid;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 /// What one [`prune_deleted_sandboxes`] call removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

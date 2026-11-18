@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
-use pplx_space_common_core::types::CLUSTER_ID_ENV;
+use pplx_space_cluster_id::CLUSTER_ID_ENV;
 use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_guest_protocol::proto::worker::worker_filesystem_client::WorkerFilesystemClient as FilesystemClient;
 use pplx_space_spaced_guest_protocol::proto::worker::worker_filesystem_server::WorkerFilesystemServer as FilesystemServer;

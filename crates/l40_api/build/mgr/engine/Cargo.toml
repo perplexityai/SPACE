@@ -71,6 +71,7 @@ pplx-space-template-mgr-client = { workspace = true }
 [dev-dependencies]
 libc = { workspace = true }
 pplx-space-execution-common = { workspace = true, features = ["serde"] }
+pplx-space-sql-locator = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 pplx-space-credmgr = { workspace = true, features = ["test-hooks"] }
 pplx-space-db-test-fixtures = { workspace = true }

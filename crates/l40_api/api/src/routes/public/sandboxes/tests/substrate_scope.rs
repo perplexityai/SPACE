@@ -22,7 +22,7 @@ async fn insert_failed_sandbox(
 ) -> TestDbResult<SandboxId> {
     let sandbox_id = SandboxId::new();
     let activation_id = Uuid::now_v7();
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO sandboxes (
              id, user_id, org_id, lifecycle, placement, managed_by, active_node_id,
              network_policy_override_json, network_policy_generation
@@ -40,7 +40,7 @@ async fn insert_failed_sandbox(
     .await?;
     match record {
         ExecutionRecord::KubernetesExecution => {
-            sqlx::query(pplx_space_common_core::sql!(
+            sqlx::query(pplx_space_sql_locator::sql!(
                 "INSERT INTO sandbox_k8s_executions (
                      sandbox_id, generation, pod_name, pod_namespace, pod_uid, state, active,
                      route_activation_id
@@ -55,7 +55,7 @@ async fn insert_failed_sandbox(
             .await?;
         }
         ExecutionRecord::DirectRoute => {
-            sqlx::query(pplx_space_common_core::sql!(
+            sqlx::query(pplx_space_sql_locator::sql!(
                 "INSERT INTO sandbox_direct_route_identities (
                      sandbox_id, route_generation, current_node_id, substrate_kind,
                      execution_generation, activation_attempt_id
@@ -69,7 +69,7 @@ async fn insert_failed_sandbox(
             .await?;
         }
     }
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO sandbox_observed_states (
              sandbox_id, node_id, status, failure_reason
          ) VALUES ($1, $2, 'failed', $3)"
@@ -79,7 +79,7 @@ async fn insert_failed_sandbox(
     .bind(INTERNAL_FAILURE_REASON)
     .execute(pool)
     .await?;
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO node_facet_observed_status (
              node_id, facet, element, observed_payload, observed_at
          ) VALUES (

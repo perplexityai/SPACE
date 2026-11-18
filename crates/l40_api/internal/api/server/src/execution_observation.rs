@@ -2,11 +2,11 @@
 //! as an empty inventory. Existing placement projections remain unchanged.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::sql;
 use pplx_space_execution_common::proto::NodeExecutionInventory;
 use pplx_space_execution_spec::{
     ArtifactComponentMetadata, GuestPlatform, RuntimeIdentity, StateFormatIdentity,
 };
+use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
 use tonic::Status;
 

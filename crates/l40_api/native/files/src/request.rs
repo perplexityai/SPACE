@@ -2,7 +2,7 @@
 //! error's text is the `invalid_request` message the client gets.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES;
+use pplx_space_guest_process::MAX_WRITE_BATCH_ENTRIES;
 use pplx_space_guest_process::{
     GuestUserName, PathParseError, ProcessParseError, validate_linux_guest_path_input,
 };

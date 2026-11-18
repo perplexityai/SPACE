@@ -27,7 +27,7 @@ pub(super) fn optional_positive_or_default(
 }
 
 pub(super) fn canonical_batched_sandbox_ids(ids: &[String]) -> Result<Vec<String>, Status> {
-    use pplx_space_common_core::inventory::{InventoryBudget, MAX_ENCODED_BYTES, MAX_ITEMS};
+    use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ENCODED_BYTES, MAX_ITEMS};
     let mut budget = InventoryBudget::new(MAX_ITEMS, MAX_ENCODED_BYTES);
     for id in ids {
         budget

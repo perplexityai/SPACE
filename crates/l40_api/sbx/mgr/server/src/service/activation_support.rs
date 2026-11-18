@@ -7,13 +7,13 @@ use pplx_space_common_core::types::{
     ExecutionGeneration, NodeRole as SpaceNodeRole, RouteGeneration, SandboxActivationAttemptId,
     SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
 };
-use pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 use pplx_space_host_layout::identities::users;
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_k8s_node_id::space_node_id;
+use pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER;
 
 const NODE_ID_PATH: &str = "/space/etc/node-id";
 

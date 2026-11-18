@@ -82,9 +82,6 @@ pplx-space-snapshot-retention = [
 [layers.domain_dependencies]
 
 [layers.model_protocol]
-pplx-space-common-core = [
-  "pplx-space-rpc-contracts",
-]
 
 [layers.storage_access]
 pplx-space-api = [

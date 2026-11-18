@@ -8,7 +8,8 @@ use std::str::FromStr;
 use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair, VerificationAlgorithm};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use pplx_space_common_core::types::{ClusterId, SandboxRouteIdentity};
+use pplx_space_cluster_id::ClusterId;
+use pplx_space_common_core::types::SandboxRouteIdentity;
 use pplx_space_network_roles::GuestPort;
 use serde::{Deserialize, Serialize};
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
@@ -749,7 +750,7 @@ pub enum SpaceApiRouteEd25519Error {
     #[error("SPACE cluster id is required for Ed25519 route tokens")]
     MissingClusterId,
     #[error("SPACE cluster id is invalid: {0}")]
-    InvalidClusterId(#[from] pplx_space_common_core::types::ClusterIdParseError),
+    InvalidClusterId(#[from] pplx_space_cluster_id::ClusterIdParseError),
     #[error("failed to read SPACE API route verification bundle {path}: {source}")]
     ReadVerificationBundle {
         path: PathBuf,

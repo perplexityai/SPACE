@@ -16,7 +16,7 @@ async fn sandbox_state_batches_preserve_the_census_or_fail_without_partial_outpu
         let mut calls = 0;
         let response = fetch_sandbox_state_batches(&ids, |batch| {
             calls += 1;
-            assert!(batch.len() <= pplx_space_common_core::inventory::READ_BATCH_ITEMS);
+            assert!(batch.len() <= pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS);
             std::future::ready(if fail_second && calls == 2 {
                 Err(tonic::Status::unavailable("injected middle-batch failure"))
             } else {

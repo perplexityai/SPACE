@@ -32,6 +32,7 @@ pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-portability = { workspace = true }
+pplx-space-sql-locator = { workspace = true }
 
 [dev-dependencies]
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }

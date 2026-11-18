@@ -10,8 +10,8 @@
 //! stay here until store functions for these tables replace them.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 use time::OffsetDateTime;
 use uuid::Uuid;

@@ -1,7 +1,7 @@
 use std::env;
 
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::raw_pg_test_db;
+use pplx_space_sql_locator::sql;
 
 const POSTGRES_ADMIN_URL_ENV: &str = "SPACE_TEST_POSTGRES_ADMIN_URL";
 const TESTCONTAINERS_POSTGRES_IMAGE_ENV: &str = "TESTCONTAINERS_POSTGRES_IMAGE";

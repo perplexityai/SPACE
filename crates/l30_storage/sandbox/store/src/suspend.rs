@@ -13,7 +13,7 @@ use pplx_space_common_core::types::{
 };
 use pplx_space_k8s_ids::PodUid;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 /// **Operation step.** Claim the suspend of the execution at `generation`
 /// tracking `pod_uid`: flip the row from `previous` to `suspending` while

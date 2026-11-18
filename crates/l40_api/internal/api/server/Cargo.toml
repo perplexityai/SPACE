@@ -58,6 +58,7 @@ pplx-space-ecw-credential = { workspace = true }
 pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
 pplx-space-network-roles = { workspace = true, features = ["serde"] }
+pplx-space-rpc-contracts = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-events = { workspace = true }
@@ -83,6 +84,7 @@ pplx-space-semver = { workspace = true, features = ["serde"] }
 pplx-space-snapshot-store = { workspace = true }
 pplx-space-runtime-environment-catalog-store = { workspace = true }
 pplx-space-runtime-environment-policy-store = { workspace = true }
+pplx-space-sql-locator = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 pplx-space-test-hooks = { workspace = true }

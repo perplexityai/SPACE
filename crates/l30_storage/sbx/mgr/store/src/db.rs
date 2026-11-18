@@ -32,7 +32,7 @@ pub use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sqlite::SqliteU64;
 use rusqlite::types::Type;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use rusqlite::{OptionalExtension as _, params};
 
 mod handle;

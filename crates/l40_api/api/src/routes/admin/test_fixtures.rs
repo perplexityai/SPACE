@@ -45,7 +45,7 @@ pub(super) async fn admin_router_harness_with(
     configure: impl FnOnce(&mut crate::routes::AppState),
 ) -> TestResult<Option<AdminRouterHarness>> {
     use pplx_space_accounts::{OrgId, UserId};
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
 
     let Some(db) = postgres_fixture().await? else {
         return Ok(None);

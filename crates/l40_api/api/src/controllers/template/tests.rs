@@ -9,8 +9,8 @@ use build_proto::recipe::{
     Origin,
     origin::{FromTemplate, Kind},
 };
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{TestDb, TestDbResult, pg_test_db};
+use pplx_space_sql_locator::sql;
 use rstest::{fixture, rstest};
 const TEST_ORG: OrgId = OrgId::from_uuid(uuid::Uuid::from_u128(1));
 
@@ -419,7 +419,7 @@ struct TemplateControllerFixture {
 async fn template_controller_fixture() -> TestDbResult<TemplateControllerFixture> {
     let db = pg_test_db().await?;
     let builder_node_id = NodeId::new();
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO nodes (id, address, role, managed_by, state)
          VALUES ($1, '10.0.0.1'::INET, 'builder', 'k8s', 'ready')"
     ))

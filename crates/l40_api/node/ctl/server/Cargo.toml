@@ -50,6 +50,7 @@ pplx-space-execution-spec = { workspace = true }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
+pplx-space-rpc-contracts = { workspace = true }
 pplx-space-sandbox-pod = { workspace = true, optional = true }
 pplx-space-local-health = { workspace = true }
 pplx-space-observability = { workspace = true }

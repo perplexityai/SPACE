@@ -15,7 +15,7 @@
 //!   sidecar (when present) cascades via the FK declared in migration
 //!   050.
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
 use sqlx::PgPool;

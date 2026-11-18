@@ -15,11 +15,11 @@ use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, restore_retry_suspended_revert_snapshot_exists,
     started_suspend_revert_eligibility,
 };
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// Unplace a sandbox whose pod tracking was torn down, clearing its active

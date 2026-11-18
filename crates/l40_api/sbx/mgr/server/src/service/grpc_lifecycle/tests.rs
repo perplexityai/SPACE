@@ -418,14 +418,14 @@ fn active_artifact_backup_jobs_reuse_the_persisted_attempt() {
 
 #[test]
 fn current_instance_backup_preserves_scoped_drain_signals() {
-    use pplx_space_common_core::artifact_backup_signals::{
+    use pplx_space_common_core::types::ArtifactKind;
+    use pplx_space_rpc_contracts::artifact_backup_signals::{
         CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER,
         CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER,
     };
-    use pplx_space_common_core::node_drain_signals::{
+    use pplx_space_rpc_contracts::node_drain_signals::{
         REUPLOAD_SANDBOX_RESTORING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
     };
-    use pplx_space_common_core::types::ArtifactKind;
     for kind in [ArtifactKind::Disk, ArtifactKind::Full] {
         for state in SandboxStatus::sweep() {
             let result = current_instance_backup_precondition(state, kind);
@@ -509,8 +509,8 @@ fn current_instance_backup_preserves_scoped_drain_signals() {
 
 #[tokio::test]
 async fn artifact_backup_file_proof_distinguishes_absence_from_io_failure() {
-    use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
     use pplx_space_common_core::types::ArtifactKind;
+    use pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
     let inspector = crate::retained_source::FakeInspector::new(
         crate::retained_source::RetainedSourceCheck::Absent,
     );
@@ -710,8 +710,8 @@ async fn encrypted_backup_admission_requires_the_published_container_files() {
 #[tokio::test]
 async fn retained_source_backup_precondition_follows_node_manager() {
     use crate::retained_source::{FakeInspector, RetainedSourceCheck};
-    use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
     use pplx_space_common_core::types::ArtifactKind;
+    use pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
     let sandbox_id = "01900000-0000-7000-8000-000000000001";
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().to_str().unwrap();
@@ -893,7 +893,7 @@ fn artifact_backup_execution_keeps_a_capture_cpu_only_for_full_artifacts() {
 
 #[test]
 fn current_instance_handler_refuses_incomplete_suspend_without_publishing_a_pin() {
-    use pplx_space_common_core::node_drain_signals::{
+    use pplx_space_rpc_contracts::node_drain_signals::{
         REUPLOAD_ARTIFACT_MISSING_MARKER, REUPLOAD_SANDBOX_RESTORING_MARKER,
         REUPLOAD_SANDBOX_UNKNOWN_MARKER,
     };
@@ -1089,7 +1089,7 @@ fn reupload_sidecar_corrupt_json_is_internal_error_not_silent_full() {
 /// older snapshot would lose work. Mirrors the producer's per-state branch.
 #[test]
 fn reupload_restoring_message_carries_marker_running_states_do_not() {
-    use pplx_space_common_core::node_drain_signals::REUPLOAD_SANDBOX_RESTORING_MARKER;
+    use pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_SANDBOX_RESTORING_MARKER;
 
     // Mirror the producer's per-state rendering.
     let render = |state: SandboxState| -> String {
@@ -2322,7 +2322,7 @@ async fn pause_refuses_rows_that_cannot_enter_pausing_before_writing_state() {
 #[tokio::test]
 async fn suspend_refuses_rows_that_are_neither_started_nor_paused() {
     use crate::service::activation_support::internal_request;
-    use pplx_space_common_core::node_drain_signals::SUSPEND_SANDBOX_FAILED_MARKER;
+    use pplx_space_rpc_contracts::node_drain_signals::SUSPEND_SANDBOX_FAILED_MARKER;
 
     let sockets = tempfile::tempdir().unwrap();
     for state in SandboxStatus::sweep().into_iter().filter(|state| {

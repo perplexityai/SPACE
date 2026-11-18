@@ -11,7 +11,7 @@ use pplx_space_common_core::types::{NodeRole, SubstrateKind};
 
 use std::net::IpAddr;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use serde::Deserialize;
 use sqlx::types::Json;
 use sqlx::{FromRow, PgPool};

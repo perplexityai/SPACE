@@ -387,7 +387,7 @@ db_private_outside_tests! {
     fn fenced_runtime_upgrade_publications(
         conn: &Connection,
         sandbox_ids: &[String],
-        budget: &mut pplx_space_common_core::inventory::InventoryBudget,
+        budget: &mut pplx_space_rpc_contracts::inventory::InventoryBudget,
     ) -> std::result::Result<
         HashMap<String, Result<ExecutionMetadata>>,
         crate::db::inventory_read::InventoryReadError,

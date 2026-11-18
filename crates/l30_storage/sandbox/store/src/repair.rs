@@ -17,10 +17,10 @@ use pplx_space_durations::PositiveDuration;
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, newest_suspend_snapshot_current,
 };
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// `make_interval(secs => $n::BIGINT)` needs an i64 bind. Saturate rather

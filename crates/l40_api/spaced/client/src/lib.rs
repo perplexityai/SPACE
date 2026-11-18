@@ -107,9 +107,9 @@ pub fn status_is_retryable(status: &tonic::Status) -> bool {
 fn status_is_refused_before_start(status: &tonic::Status) -> bool {
     status
         .metadata()
-        .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+        .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
         .and_then(|value| value.to_str().ok())
-        == Some(pplx_space_common_core::spaced::REQUEST_REFUSED)
+        == Some(pplx_space_guest_process::status::REQUEST_REFUSED)
 }
 
 #[cfg(test)]

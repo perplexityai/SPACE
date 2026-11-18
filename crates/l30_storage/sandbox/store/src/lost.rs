@@ -7,11 +7,11 @@ use pplx_space_common_core::types::{SandboxId, SubstrateKind};
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
     inflight_suspend_upload_from_other_node_exists, snapshot_durable_for_source_release,
     started_restore_source_absent,
 };
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// Quiet period a same-node `creating` snapshot row must have sat without a

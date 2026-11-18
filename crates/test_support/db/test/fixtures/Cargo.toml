@@ -25,5 +25,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
+pplx-space-sql-locator = { workspace = true }
 pplx-space-test-env = { workspace = true }
 tempfile = { workspace = true }

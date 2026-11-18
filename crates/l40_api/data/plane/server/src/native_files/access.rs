@@ -46,7 +46,7 @@ const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Preparation can wake the sandbox. The API bounds that wait below its node
 /// RPC timeout and answers a structured, retryable error when it runs out, so
 /// this waits a little longer than that timeout for the answer.
-const PREPARE_TIMEOUT: Duration = pplx_space_common_core::restore_ownership::NODE_RPC_TIMEOUT
+const PREPARE_TIMEOUT: Duration = pplx_space_rpc_contracts::restore_ownership::NODE_RPC_TIMEOUT
     .saturating_add(Duration::from_secs(15));
 /// `Retry-After` when the API could not be asked. A retry may reach another
 /// replica, or the API's own routes.

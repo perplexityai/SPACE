@@ -558,7 +558,7 @@ async fn collect_cycle_state<R: CycleStateReader>(
     all_ids: &[String],
 ) -> Result<Vec<SandboxInfo>, tonic::Status> {
     let mut pending = all_ids
-        .chunks(pplx_space_common_core::inventory::READ_BATCH_ITEMS)
+        .chunks(pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS)
         .map(|batch| batch.to_vec())
         .collect::<std::collections::VecDeque<_>>();
     let mut sandboxes = Vec::with_capacity(all_ids.len());

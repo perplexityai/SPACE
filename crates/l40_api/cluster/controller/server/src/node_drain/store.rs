@@ -1,5 +1,5 @@
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::SnapshotId;
+use pplx_space_sql_locator::sql;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -17,11 +17,6 @@ use pplx_space_api::controllers::substrate::{
     enqueue_artifact_backup_with_node_api, sandbox_state_with_node_api,
 };
 use pplx_space_api::reconcile_queue::{ReconcileRef, enqueue_sandbox_reconcile};
-use pplx_space_common_core::node_drain_signals::{
-    EVACUATION_RESTORE_READY_CHANNEL, REUPLOAD_ARTIFACT_MISSING_MARKER,
-    REUPLOAD_SANDBOX_RESTORING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
-    SUSPEND_SANDBOX_FAILED_MARKER,
-};
 use pplx_space_common_core::types::{
     ArtifactKind, BackupSource, ExecutionGeneration, LocalArtifactId, NodeDrainMode, NodeManagedBy,
     NodeRole, SandboxId, SubstrateKind,
@@ -29,6 +24,11 @@ use pplx_space_common_core::types::{
 use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
+};
+use pplx_space_rpc_contracts::node_drain_signals::{
+    EVACUATION_RESTORE_READY_CHANNEL, REUPLOAD_ARTIFACT_MISSING_MARKER,
+    REUPLOAD_SANDBOX_RESTORING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
+    SUSPEND_SANDBOX_FAILED_MARKER,
 };
 use pplx_space_sandbox_pod::EvacuationPlacement;
 use pplx_space_sandbox_portability::{
@@ -3306,7 +3306,7 @@ impl NodeDrainSink for SubstrateSink {
             // `FailedPrecondition` into `SubstrateError::Conflict` with
             // the message verbatim. Both producer and consumer
             // reference the shared constants in
-            // `pplx_space_common_core::node_drain_signals`, so a
+            // `pplx_space_rpc_contracts::node_drain_signals`, so a
             // reworded producer message cannot silently flip this
             // classifier from "terminal, mark sandbox failed" to "retry
             // forever".

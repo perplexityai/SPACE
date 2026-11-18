@@ -66,7 +66,9 @@ pplx-space-api-route = { workspace = true }
 pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-byte-size = { workspace = true, features = ["serde"] }
+pplx-space-cluster-id = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-rpc-contracts = { workspace = true }
 pplx-space-template-runtime = { workspace = true }
 pplx-space-btrfs = { workspace = true }
 pplx-space-host-layout = { workspace = true }
@@ -128,6 +130,7 @@ pplx-space-template-manifest = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
+pplx-space-sql-locator = { workspace = true }
 rstest = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }

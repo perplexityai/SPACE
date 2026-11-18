@@ -39,8 +39,8 @@ use pplx_space_k8s_ids::PodUid;
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::node_published_execution_identity_matches;
+use pplx_space_sql_locator::sql;
 use sqlx::types::{Json, JsonValue};
 use uuid::Uuid;
 

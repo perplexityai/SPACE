@@ -638,9 +638,9 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "summary": "Write a bounded batch of guest files",
                 "description": format!(
                     "A batch holds at most {} entries, and their decoded data and paths together may total at most {} bytes (3 MiB), because the batch travels to the sandbox as one gRPC message of at most {} bytes. A larger batch gets 400. With `parents` set, every entry's missing parent directories are created first, as `files:mkdir` creates them for the same `user`; without it a missing parent returns 404. The request body is limited to {} bytes, counting any JSON escaping. Use `files:write` for larger files. {}",
-                    pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES,
+                    pplx_space_guest_process::MAX_WRITE_BATCH_ENTRIES,
                     super::public::MAX_FILE_WRITE_BATCH_BYTES,
-                    pplx_space_common_core::spaced::MAX_MESSAGE_BYTES,
+                    pplx_space_guest_process::MAX_MESSAGE_BYTES,
                     super::public::WRITE_FILE_BATCH_BODY_LIMIT_BYTES,
                     file_key_replayed()
                 ),

@@ -28,7 +28,7 @@ use pplx_space_common_grpc::{
 };
 use tonic::transport::{Channel, Endpoint};
 
-pub use pplx_space_common_core::operation_budget::RuntimeOperationBudget as NodeApiOperationBudget;
+pub use pplx_space_rpc_contracts::operation_budget::RuntimeOperationBudget as NodeApiOperationBudget;
 
 type NodeApiConnectFuture = Pin<
     Box<

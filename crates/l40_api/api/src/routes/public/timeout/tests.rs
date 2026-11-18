@@ -6,9 +6,10 @@ use axum::{
 };
 use pplx_space_accounts::NodeId;
 use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakeSource};
-use pplx_space_common_core::{sql, types::SandboxId};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDbResult, pg_test_db};
 use pplx_space_node_api_sim::SimWorkerHarness;
+use pplx_space_sql_locator::sql;
 use serde_json::{Value, json};
 use sqlx::{PgPool, types::Json as SqlJson};
 use tower::ServiceExt;

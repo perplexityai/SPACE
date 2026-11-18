@@ -1,14 +1,12 @@
 //! Postgres snapshots used to authorize network-credential resolution.
 
 use pplx_space_accounts::{CredentialReferenceId, NodeId};
-use pplx_space_common_core::{
-    sql,
-    types::{ExecutionGeneration, SandboxId},
-};
+use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
 use pplx_space_k8s_ids::K8sNodeUid;
 use pplx_space_net_common::{
     EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope, NetworkPolicyV1, network_policy_hash,
 };
+use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
 use uuid::Uuid;
 

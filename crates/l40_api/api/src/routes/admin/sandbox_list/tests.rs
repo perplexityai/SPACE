@@ -2,11 +2,11 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request};
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{
     TestDb, TestDbResult, insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db,
 };
 use pplx_space_public_api::PublicSandboxId;
+use pplx_space_sql_locator::sql;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;

@@ -87,6 +87,7 @@ pplx-space-spaced-guest-update = { workspace = true }
 pplx-space-test-hooks = { workspace = true }
 
 [dev-dependencies]
+pplx-space-cluster-id = { workspace = true }
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]

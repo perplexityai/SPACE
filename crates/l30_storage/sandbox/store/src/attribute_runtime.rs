@@ -12,8 +12,8 @@
 //! identity rows, or under the restore's `sandboxes` row lock, so `sandboxes`
 //! is locked first either way.
 
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{ClientId, SandboxId, SandboxLifecycle};
+use pplx_space_sql_locator::sql;
 
 /// Lifecycles in which no activation can be creating a runtime. The record
 /// isn't written in them, so a teardown, a stop or a suspend that observes a

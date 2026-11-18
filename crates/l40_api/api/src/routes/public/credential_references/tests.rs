@@ -1,8 +1,8 @@
 use super::*;
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt;
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDbResult, pg_test_db};
+use pplx_space_sql_locator::sql;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;

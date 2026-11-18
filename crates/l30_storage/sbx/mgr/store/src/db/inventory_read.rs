@@ -4,7 +4,7 @@
 
 use crate::db::db_private_outside_tests;
 use crate::db::{Connection, Error};
-use pplx_space_common_core::inventory::{
+use pplx_space_rpc_contracts::inventory::{
     InventoryBudget, InventoryLimitExceeded, MAX_ITEMS, MAX_RAW_BYTES,
 };
 use rusqlite::{Row, types::ValueRef};

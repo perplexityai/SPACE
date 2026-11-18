@@ -1038,25 +1038,29 @@ enum OutputWindowMiss {
 /// these codes (a hop's refusal of an oversized chunk, an HTTP/2 reset) are
 /// not misses.
 fn output_window_miss(status: &tonic::Status) -> Option<OutputWindowMiss> {
-    use pplx_space_common_core::spaced;
+    use pplx_space_guest_process::status::{
+        ERROR_REASON_METADATA_KEY, PROCESS_OUTPUT_CURSOR_AHEAD,
+        PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY, PROCESS_OUTPUT_LAGGED,
+        PROCESS_OUTPUT_LAGGED_MESSAGE,
+    };
     let metadata = status.metadata();
     let reason = metadata
-        .get(spaced::ERROR_REASON_METADATA_KEY)
+        .get(ERROR_REASON_METADATA_KEY)
         .and_then(|value| value.to_str().ok());
     match (status.code(), reason) {
-        (tonic::Code::OutOfRange, Some(spaced::PROCESS_OUTPUT_CURSOR_AHEAD)) => {
+        (tonic::Code::OutOfRange, Some(PROCESS_OUTPUT_CURSOR_AHEAD)) => {
             Some(OutputWindowMiss::CursorAhead)
         }
-        (tonic::Code::ResourceExhausted, Some(spaced::PROCESS_OUTPUT_LAGGED)) => {
+        (tonic::Code::ResourceExhausted, Some(PROCESS_OUTPUT_LAGGED)) => {
             Some(OutputWindowMiss::Evicted {
                 first_retained: metadata
-                    .get(spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
+                    .get(PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse().ok()),
             })
         }
         (tonic::Code::ResourceExhausted, None)
-            if status.message() == spaced::PROCESS_OUTPUT_LAGGED_MESSAGE =>
+            if status.message() == PROCESS_OUTPUT_LAGGED_MESSAGE =>
         {
             Some(OutputWindowMiss::Evicted {
                 first_retained: None,

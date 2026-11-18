@@ -4,7 +4,6 @@ use std::str::FromStr;
 
 use jiff::Timestamp;
 use pplx_space_accounts::{NodeId, OrgId};
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactKindParseError, ArtifactOrigin, ArtifactOriginParseError,
     ExactStorageUri, ExecutionGeneration, ExecutionGenerationParseError, LocalArtifactId,
@@ -16,6 +15,7 @@ use pplx_space_common_core::types::{
 };
 use pplx_space_content_digest::{Digest, DigestParseError};
 use pplx_space_execution_spec::SnapshotExecutionMetadata;
+use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 use sqlx::types::Json;
 use time::OffsetDateTime;

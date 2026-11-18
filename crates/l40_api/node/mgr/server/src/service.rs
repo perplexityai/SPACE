@@ -631,7 +631,7 @@ impl NodeManagerService {
             .ok_or_else(|| {
                 Status::unavailable(format!(
                     "sandbox host mutation or reset {}",
-                    pplx_space_common_core::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER
+                    pplx_space_rpc_contracts::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER
                 ))
             })
     }

@@ -7,8 +7,8 @@
 //! over the node's whole pinned `suspended` history to find the few rows
 //! without a durable copy.
 
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 use uuid::Uuid;
 

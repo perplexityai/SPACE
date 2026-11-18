@@ -158,7 +158,7 @@ async fn failed_backup_attempt(
     pool: &PgPool,
     attempt_id: BackupAttemptId,
 ) -> Result<Option<String>, ForkExecutionError> {
-    let row = sqlx::query_as::<_, (String, Option<String>)>(pplx_space_common_core::sql!(
+    let row = sqlx::query_as::<_, (String, Option<String>)>(pplx_space_sql_locator::sql!(
         "SELECT state, failure_reason FROM snapshots WHERE id = $1"
     ))
     .bind(attempt_id.as_uuid())
