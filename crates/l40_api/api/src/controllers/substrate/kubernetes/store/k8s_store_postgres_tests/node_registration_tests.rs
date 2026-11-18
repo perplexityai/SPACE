@@ -298,3 +298,68 @@ async fn tombstone_committed_mid_registration_rolls_back_every_caller() -> TestR
     }
     Ok(())
 }
+
+/// A Node under a new uid that reports no instance yet, for a node with a
+/// v2 drain, is refused on every caller's tombstone path, the per-node skip
+/// each one already takes, with a warning, and writes nothing: the row
+/// keeps its uid and its drain, and pod placement records no node for the
+/// sandbox.
+#[tokio::test(flavor = "current_thread")]
+async fn a_v2_nodes_new_uid_without_an_instance_is_skipped_by_every_caller() -> TestResult {
+    let fixture = postgres_store().await?;
+    for caller in RegistrationCaller::ALL {
+        let node_name = format!("fenced-{caller:?}").to_lowercase();
+        let node_id = NodeId::new();
+        sqlx::query(sql!(
+            "INSERT INTO nodes (id, address, role, managed_by, state, drain_phase, drain_mode,
+                                drain_started_at, drain_engine, drain_status)
+             VALUES ($1, '10.0.0.71'::INET, 'worker', 'k8s', 'ready', 'draining', NULL,
+                     NOW(), 'v2', '{\"generation\": 7, \"deadline_at\": 0}'::JSONB)"
+        ))
+        .bind(node_id)
+        .execute(&fixture.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid, instance_id)
+             VALUES ($1, $2, 'uid-before', 'i-0a1b2c3d')"
+        ))
+        .bind(node_id)
+        .bind(&node_name)
+        .execute(&fixture.pool)
+        .await?;
+        let sandbox_id = insert_placeable_sandbox(&fixture).await?;
+
+        let result = caller
+            .register(&fixture.store, sandbox_id, &node_name, node_id)
+            .await;
+        assert!(
+            matches!(result, Err(SubstrateError::NodeTombstoned { .. })),
+            "{caller:?}: {result:?}"
+        );
+        let kept: (Option<String>, Option<String>, Option<serde_json::Value>) =
+            sqlx::query_as(sql!(
+                "SELECT k.k8s_node_uid, n.drain_phase, n.drain_status
+               FROM nodes n JOIN node_k8s k ON k.node_id = n.id
+              WHERE n.id = $1"
+            ))
+            .bind(node_id)
+            .fetch_one(&fixture.pool)
+            .await?;
+        assert_eq!(
+            kept,
+            (
+                Some("uid-before".to_owned()),
+                Some("draining".to_owned()),
+                Some(serde_json::json!({"generation": 7, "deadline_at": 0})),
+            ),
+            "{caller:?}"
+        );
+        let placed: Option<NodeId> =
+            sqlx::query_scalar(sql!("SELECT active_node_id FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(&fixture.pool)
+                .await?;
+        assert_eq!(placed, None, "{caller:?}");
+    }
+    Ok(())
+}
