@@ -31,7 +31,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::{KekProvider, MasterKeyIdentifier};
+use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
 use pplx_space_credential_provider_client::v2::issue_intermediate_key_response::Outcome as IssueOutcome;
 use pplx_space_credential_provider_client::v2::unwrap_intermediate_key_response::Outcome as UnwrapOutcome;
 use pplx_space_credential_provider_client::v2::{

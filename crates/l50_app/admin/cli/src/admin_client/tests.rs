@@ -1,6 +1,6 @@
 use super::*;
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::admin::AdminNodeDrainability;
+use pplx_space_admin_protocol::AdminNodeDrainability;
 use pplx_space_node_model::{NodeManagedBy, NodeRole};
 
 #[test]

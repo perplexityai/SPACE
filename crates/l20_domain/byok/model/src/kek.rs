@@ -14,7 +14,7 @@
 //! # Examples
 //!
 //! ```rust
-//! # use pplx_space_common_core::types::*;
+//! # use pplx_space_byok_model::*;
 //! # use pplx_space_sandbox_model::*;
 //! let provider = KekProvider::parse("intermediate-key-broker").unwrap();
 //! assert_eq!(provider, KekProvider::IntermediateKeyBroker);
@@ -61,7 +61,7 @@ const LEGACY_INTERMEDIATE_KEY_BROKER_PROVIDER: &str = "external-branching";
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_byok_model::*;
 /// # use pplx_space_sandbox_model::*;
 /// assert_eq!(KekProvider::IntermediateKeyBroker.as_str(), "external-branching");
 /// assert_eq!(KekProvider::parse("in-memory").unwrap(), KekProvider::InMemory);
@@ -88,7 +88,7 @@ pub enum KekProvider {
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::KekProvider;
+/// # use pplx_space_byok_model::KekProvider;
 /// assert!(KekProvider::from_str("unknown").is_err());
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -101,7 +101,7 @@ impl KekProvider {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byok_model::*;
     /// # use pplx_space_sandbox_model::*;
     /// assert_eq!(KekProvider::IntermediateKeyBroker.as_str(), "external-branching");
     /// ```
@@ -118,7 +118,7 @@ impl KekProvider {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byok_model::*;
     /// # use pplx_space_sandbox_model::*;
     /// assert_eq!(
     ///     KekProvider::parse("intermediate-key-broker").unwrap(),
@@ -224,7 +224,7 @@ pub struct MasterKeyIdentifierParseError;
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_byok_model::*;
 /// # use pplx_space_sandbox_model::*;
 /// let id = MasterKeyIdentifier::parse("alias/example-org-default").unwrap();
 /// assert_eq!(id.as_str(), "alias/example-org-default");

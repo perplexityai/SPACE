@@ -21,7 +21,7 @@
 
 use pplx_space_accounts::OrgId;
 use pplx_space_artifact_model::StorageUri;
-use pplx_space_common_core::types::{KekProvider, MasterKeyIdentifier, SubjectId};
+use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
 use pplx_space_credmgr_client::{
     AWS_CREDENTIALS_TOKEN_TYPE, STORAGE_READ_SCOPE, STORAGE_SESSION_TTL_SECONDS,
     STORAGE_TOKEN_AUDIENCE, STORAGE_WRITE_SCOPE, SUBJECT_ID_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
@@ -30,6 +30,7 @@ use pplx_space_credmgr_client::{
     },
 };
 use pplx_space_object_store::ObjectCredentials;
+use pplx_space_subject_model::SubjectId;
 use tonic::{Code, Status};
 use zeroize::Zeroizing;
 

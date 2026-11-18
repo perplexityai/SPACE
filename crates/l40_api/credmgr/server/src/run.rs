@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::{types::KekProvider, types::MasterKeyIdentifier};
+use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
 use pplx_space_host_layout::identities::group_names;
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
@@ -206,9 +206,7 @@ pub enum RunCredmgrError {
     )]
     MissingPlatformKekIdentifier,
     #[error("SPACE_PLATFORM_KEK_IDENTIFIER is invalid: {0}")]
-    InvalidPlatformKekIdentifier(
-        #[source] pplx_space_common_core::types::MasterKeyIdentifierParseError,
-    ),
+    InvalidPlatformKekIdentifier(#[source] pplx_space_byok_model::MasterKeyIdentifierParseError),
     #[error(
         "SPACE_PLATFORM_KEK_PROVIDER=intermediate-key-broker requires DATABASE_URL and a \
          non-empty SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_URL"
@@ -582,7 +580,7 @@ async fn initialize_authority_service(
             (private_ca_issuer, resolver)
         };
 
-    let platform_kek_provider = pplx_space_common_core::types::platform_default_kek_provider();
+    let platform_kek_provider = pplx_space_byok_model::platform_default_kek_provider();
     let in_memory_enabled = pplx_space_env_vars::env_flag(
         pplx_space_test_hooks::test_hook_var(IN_MEMORY_KEK_ENABLED_ENV).as_deref(),
         false,

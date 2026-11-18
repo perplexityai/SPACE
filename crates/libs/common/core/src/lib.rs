@@ -19,6 +19,3 @@
 //! ```
 //!
 pub mod types;
-
-#[cfg(feature = "archive")]
-pub mod archive;

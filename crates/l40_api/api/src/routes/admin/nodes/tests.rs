@@ -442,8 +442,8 @@ fn an_omitted_replace_after_terminate_is_unexpressed_and_defaults_to_replace() {
         // This pins the parse only. That an omitted field *resolves* to
         // auto-replace is a separate, independently-breakable property — flipping
         // `unwrap_or(true)` leaves this assertion green — and lives with the type
-        // in
-        // `types::admin::tests::an_unexpressed_replace_after_terminate_resolves_to_auto_replace`.
+        // in `pplx_space_admin_protocol`'s
+        // `admin::tests::an_unexpressed_replace_after_terminate_resolves_to_auto_replace`.
         assert_eq!(
             req.replace_after_terminate, None,
             "{body:?}: an omitted field must stay distinguishable from an explicit true"

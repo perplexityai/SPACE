@@ -3,7 +3,7 @@
 
 use super::*;
 use pplx_space_artifact_model::{ExactStorageUri, StorageUriParseError};
-use pplx_space_common_core::types::SubjectIdParseError;
+use pplx_space_subject_model::SubjectIdParseError;
 use pplx_space_volmgr_client::proto::CopyObjectRequest;
 
 pub(crate) const KIND: &str = "copy_object";

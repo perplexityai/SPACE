@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::admin::{
+use pplx_space_admin_protocol::{
     AdminNodeReconcileTrigger, AdminNodeResponse, AdminNodeRuntimeInstallation,
 };
 

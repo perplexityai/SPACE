@@ -7,7 +7,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use pplx_space_common_core::types::admin::{
+use pplx_space_admin_protocol::{
     AdminExecutionInventoryObservation, AdminNodeDrainability, AdminNodeHealthStatus,
     AdminNodeNetworkSlots, AdminNodeResponse, AdminNodeSchedulingStatus, AdminNodeSort,
     AdminNodeStatusSnapshot, DrainRequest, ForceUploadFailure, ForceUploadLocalSnapshotsResponse,

@@ -34,9 +34,7 @@ use crate::materialization::{MaterializationLayout, MaterializationMode};
 use dashmap::DashMap;
 use pplx_space_accounts::OrgId;
 use pplx_space_artifact_model::{SnapshotArtifact, StorageUri};
-use pplx_space_common_core::types::{
-    KekProvider, MasterKeyIdentifier, SubjectId, SubjectIdParseError,
-};
+use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
 use pplx_space_common_jobs::{
     Job, JobError, JobExecutor, JobFailureKind, JobFailureReason, JobPriority,
 };
@@ -47,6 +45,7 @@ use pplx_space_object_store::{
 use pplx_space_page_cache as page_cache;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::TransferScopeId;
+use pplx_space_subject_model::{SubjectId, SubjectIdParseError};
 use pplx_space_volmgr_client::{
     VERIFIED_REPLICA_PROVENANCE_VERSION, VerifiedReplicaProvenance,
     verified_replica_provenance_path,
@@ -256,14 +255,14 @@ pub struct TransferPayload {
 /// [`ArtifactPayload`] (and copied onto each synthetic per-entry
 /// [`TransferPayload`]). A serde-friendly Rust struct so the persisted
 /// JSON stays self-contained. Identifying fields are typed via the
-/// shared `common-core` newtypes, so deserialising a stored payload
-/// re-runs the same parse/validate path as the gRPC boundary; corrupt
-/// or hand-edited rows fail the worker's `from_json` step rather than
-/// reaching credmgr. `wrapped_dek` is the opaque ciphertext we persist;
-/// the AADs (artifact-level wrap + per-entry chunk) are derived at
-/// execute time from the payload's subject, `artifact_id`, and entry
-/// `role` via [`derive_artifact_aads`], so no AAD bytes round-trip
-/// through the request or the SQLite row.
+/// shared `pplx-space-accounts` and `pplx-space-byok-model` newtypes,
+/// so deserialising a stored payload re-runs the same parse/validate
+/// path as the gRPC boundary; corrupt or hand-edited rows fail the
+/// worker's `from_json` step rather than reaching credmgr. `wrapped_dek`
+/// is the opaque ciphertext we persist; the AADs (artifact-level wrap +
+/// per-entry chunk) are derived at execute time from the payload's
+/// subject, `artifact_id`, and entry `role` via [`derive_artifact_aads`],
+/// so no AAD bytes round-trip through the request or the SQLite row.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TransferEncryption {
     pub organization_id: OrgId,

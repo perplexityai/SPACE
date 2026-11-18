@@ -25,7 +25,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use pplx_space_common_core::types::admin::{
+use pplx_space_admin_protocol::{
     AdminNodeGroupResponse, AssignOrgRequest, CreateNodeGroupRequest, SetCompatRequest,
     SetTemplatePolicyRequest,
 };

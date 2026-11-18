@@ -1,6 +1,6 @@
 use clap::builder::TypedValueParser;
 use clap::{Parser, Subcommand, ValueEnum};
-use pplx_space_common_core::types::admin::AdminNodeSort;
+use pplx_space_admin_protocol::AdminNodeSort;
 use pplx_space_execution_spec::EnvironmentReference;
 use std::str::FromStr;
 

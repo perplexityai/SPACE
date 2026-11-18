@@ -21,6 +21,7 @@ datadog-otel = ["otel", "datadog"]
 [dependencies]
 pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-artifact-model = { workspace = true }
+pplx-space-byok-model = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-sandbox-model = { workspace = true }
 aes-gcm = { workspace = true }
@@ -46,6 +47,7 @@ jiff = { workspace = true }
 http-body = { workspace = true }
 pplx-space-node-model = { workspace = true }
 pplx-space-snapshot-model = { workspace = true }
+pplx-space-subject-model = { workspace = true, features = ["serde"] }
 pplx-space-template-model = { workspace = true }
 sha2 = { workspace = true }
 http-body-util = { workspace = true }

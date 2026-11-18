@@ -1,6 +1,6 @@
 # Archive envelope integration boundary
 
-This optional `common-core/archive` library implements a byte envelope, not
+This `pplx-space-archive-model` library implements a byte envelope, not
 production archival or a reconstruction schema. It retains AWS-LC hashing and
 has no storage or database I/O. Consumers must define their reconstruction,
 handoff, timer, and execution-generation contracts before using the envelope.

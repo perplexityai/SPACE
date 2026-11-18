@@ -6,7 +6,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use pplx_space_common_core::types::{KekProvider, platform_default_kek_provider};
+use pplx_space_byok_model::{KekProvider, platform_default_kek_provider};
 use pplx_space_sandbox_store::UserSandboxRows;
 use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;

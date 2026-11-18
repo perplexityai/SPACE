@@ -1000,7 +1000,7 @@ pub(crate) fn published_remote_restore_source_at(
             )));
         }
     };
-    let expected_subject = pplx_space_common_core::types::SubjectId::Sandbox(sandbox_id);
+    let expected_subject = pplx_space_subject_model::SubjectId::Sandbox(sandbox_id);
     if provenance.subject_id != expected_subject {
         return Err(RestoreError::Other(format!(
             "published restore provenance names subject {} instead of {expected_subject}",
@@ -1061,7 +1061,7 @@ fn published_remote_restore_artifacts_complete(
     let Ok(config) = SnapshotUploadConfig::from_uri(expected_storage_uri.as_wire()) else {
         return false;
     };
-    let expected_subject = pplx_space_common_core::types::SubjectId::Sandbox(sandbox_id);
+    let expected_subject = pplx_space_subject_model::SubjectId::Sandbox(sandbox_id);
     let snapshot_dir = canonical_sandbox_dir.join("snapshot");
     let artifacts = if meta.encrypted {
         crate::snapshot_upload::encrypted_artifacts(artifact_kind)
