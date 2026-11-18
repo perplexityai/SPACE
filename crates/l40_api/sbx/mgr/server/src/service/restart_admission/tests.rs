@@ -188,6 +188,7 @@ async fn restart_drain_rejects_writers_but_serves_both_read_classes() {
     }
     for path in [
         "/space.sandbox.manager.v1.SandboxManager/Stats",
+        "/space.sandbox.manager.v1.SandboxManager/GrowBlockVolume",
         "/space.sandbox.manager.v1.SandboxManager/EvictClusterDeletedSandbox",
         "/space.spaced.host.control.v1.HostControl/SetActivityState",
         "/space.spaced.host.control.v1.HostControl/IssueGatewayIntermediateCertificate",

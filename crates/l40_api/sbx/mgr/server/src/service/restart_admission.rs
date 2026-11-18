@@ -248,6 +248,7 @@ restart_rpcs! {
     SandboxRollback => ("/space.sandbox.manager.v1.SandboxManager/Rollback", StateWriter),
     SandboxStats => ("/space.sandbox.manager.v1.SandboxManager/Stats", StateWriter),
     SandboxUpdate => ("/space.sandbox.manager.v1.SandboxManager/Update", StateWriter),
+    SandboxGrowBlockVolume => ("/space.sandbox.manager.v1.SandboxManager/GrowBlockVolume", StateWriter),
     SandboxSetAutoLifecyclePolicy => ("/space.sandbox.manager.v1.SandboxManager/SetAutoLifecyclePolicy", StateWriter),
     SandboxTouchAutoLifecycle => ("/space.sandbox.manager.v1.SandboxManager/TouchAutoLifecycle", StateWriter),
     SandboxGetNetworkPolicy => ("/space.sandbox.manager.v1.SandboxManager/GetNetworkPolicy", ReadOnly),
