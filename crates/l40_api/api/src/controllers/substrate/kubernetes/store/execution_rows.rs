@@ -2,6 +2,7 @@
 //! active execution of a sandbox, plus abandoning unmaterialized create claims.
 
 use super::*;
+use pplx_space_node_model::NodeDrain;
 
 impl K8sStore {
     pub(super) fn execution_pod_name(sandbox_id: SandboxId, generation: i64) -> String {
@@ -628,6 +629,81 @@ impl K8sStore {
             .transpose()
     }
 
+    /// The orphaned-seal detector: after a node refused an activation of
+    /// `sandbox_id` as sealed, check that Postgres records a v2 drain of the
+    /// node the sandbox is active on (or targeted at). When it records none,
+    /// the node's seal is orphaned, which nothing heals on its own: warn and
+    /// count it (`node_drain.v2.orphaned_seal_refusals`). Only a sealed
+    /// refusal runs this statement, and a failure to read is logged.
+    pub(in crate::controllers::substrate::kubernetes) async fn note_sealed_refusal(
+        &self,
+        sandbox_id: SandboxId,
+        node_said: &str,
+    ) {
+        let row: Result<Option<(Option<NodeId>, bool)>, sqlx::Error> = sqlx::query_as(sql!(
+            "SELECT n.id, COALESCE(n.drain_engine = 'v2', FALSE)
+               FROM sandboxes s
+               LEFT JOIN nodes n ON n.id = COALESCE(s.active_node_id, s.target_node_id)
+              WHERE s.id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_optional(&self.pool)
+        .await;
+        match row {
+            Ok(Some((Some(node_id), false))) => {
+                tracing::warn!(
+                    %node_id,
+                    %sandbox_id,
+                    node_said,
+                    "a node refused an activation as sealed, but no v2 drain of it is recorded: \
+                     an orphaned seal; a :drain {{engine: v2}} then :undrain heals it"
+                );
+                crate::metrics::node_drain::v2_orphaned_seal_refusal(&node_id.to_string());
+            }
+            Ok(_) => {}
+            Err(error) => tracing::debug!(
+                %sandbox_id,
+                %error,
+                "reading the drain of a node that refused an activation as sealed failed"
+            ),
+        }
+    }
+
+    /// [`Self::lock_sandbox_execution_lifecycle_in`] for a claim that may
+    /// boot the sandbox's VM somewhere: the same one statement, which also
+    /// reads the drain of the node the sandbox is active on, from its shared
+    /// columns ([`NodeDrain::from_columns`]). It locks only the sandbox row.
+    pub(super) async fn lock_sandbox_for_claim_in(
+        conn: &mut PgConnection,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<(SandboxLifecycle, Option<NodeDrain>)>, SubstrateError> {
+        type Row = (String, Option<String>, Option<String>, Option<String>);
+        let row: Option<Row> = sqlx::query_as(sql!(
+            "SELECT s.lifecycle, n.drain_engine, n.drain_phase, n.drain_mode
+               FROM sandboxes s
+               LEFT JOIN nodes n ON n.id = s.active_node_id
+              WHERE s.id = $1
+                FOR UPDATE OF s"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .fetch_optional(conn)
+        .await
+        .db_context("failed to lock sandbox for execution materialization")?;
+        row.map(|(lifecycle, engine, phase, mode)| {
+            let lifecycle =
+                lifecycle
+                    .parse::<SandboxLifecycle>()
+                    .map_err(|err| SubstrateError::Failed {
+                        message: format!("failed to parse sandbox execution lifecycle: {err}"),
+                    })?;
+            Ok((
+                lifecycle,
+                NodeDrain::from_columns(engine.as_deref(), phase.as_deref(), mode.as_deref()),
+            ))
+        })
+        .transpose()
+    }
+
     pub(super) async fn lock_sandbox_for_execution_lifecycle_in(
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
@@ -722,8 +798,23 @@ impl K8sStore {
             .await
             .db_context("failed to start Kubernetes materialization transaction")?;
 
-        Self::lock_sandbox_for_execution_lifecycle_in(&mut tx, sandbox_id, expected_lifecycle)
-            .await?;
+        let Some((lifecycle, drain)) = Self::lock_sandbox_for_claim_in(&mut tx, sandbox_id).await?
+        else {
+            return Err(SubstrateError::NotFound {
+                message: format!("sandbox not found: {sandbox_id}"),
+            });
+        };
+        if lifecycle == SandboxLifecycle::Suspending {
+            return Err(SubstrateError::suspend_in_flight(sandbox_id));
+        }
+        if lifecycle != expected_lifecycle {
+            return Err(SubstrateError::Conflict {
+                message: format!(
+                    "sandbox cannot materialize a {expected_lifecycle} execution while lifecycle is {lifecycle}"
+                ),
+            });
+        }
+        refuse_started_recovery_under_v2_drain(sandbox_id, lifecycle, drain)?;
         if let Some(restore_lease_token) = restore_lease_token {
             let renewed = pplx_space_sandbox_store::wake::renew_restore_lease_for_execution_claim(
                 &mut *tx,
@@ -1167,5 +1258,35 @@ impl K8sStore {
         .fetch_optional(&self.pool)
         .await
         .db_context("failed to query pod metadata")
+    }
+}
+
+/// The recovery gate: a claim that would materialize a `started` sandbox's
+/// execution anew, its VM cold-booted wherever the pod lands, is refused
+/// while the node the row is active on is under a v2 drain, in any phase,
+/// its cancel included, or a drain this build doesn't know. While that node
+/// suspends the sandbox the row still reads `started`, and a call in that
+/// window must never boot it elsewhere: the refusal is the drain's
+/// retryable 503 ([`SubstrateError::NodeSealed`]), and the retried call
+/// finds the sandbox suspended and restores it from its snapshot. A v1
+/// drain's claim is not refused here; its own gates decide, as they did.
+pub(super) fn refuse_started_recovery_under_v2_drain(
+    sandbox_id: SandboxId,
+    lifecycle: SandboxLifecycle,
+    drain: Option<NodeDrain>,
+) -> Result<(), SubstrateError> {
+    match drain {
+        Some(drain @ (NodeDrain::V2 { .. } | NodeDrain::Unknown))
+            if lifecycle == SandboxLifecycle::Started =>
+        {
+            Err(SubstrateError::NodeSealed {
+                message: format!(
+                    "sandbox {sandbox_id} is started on a node that is {drain} in a v2 drain, \
+                     which may be suspending it; its runtime is not recovered elsewhere \
+                     meanwhile; retry shortly"
+                ),
+            })
+        }
+        _ => Ok(()),
     }
 }

@@ -13,7 +13,7 @@ use pplx_space_admin_protocol::{
     AdminNodeStatusSnapshot, DrainRequest, ForceUploadFailure, ForceUploadLocalSnapshotsResponse,
     GetAdminNodeFilters, ListAdminNodesFilters,
 };
-use pplx_space_node_model::{NodeDrain, NodeDrainMode, NodeDrainPhase, NodeManagedBy};
+use pplx_space_node_model::{NodeDrain, NodeDrainMode, NodeManagedBy};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
@@ -2206,21 +2206,11 @@ async fn apply_force_upload_local_snapshots(
     // either mode. Sharing the predicate with the gate is what keeps the two from
     // drifting — the whole hazard here is a reader that thinks wakes are blocked
     // when they aren't.
-    let drain_state = match node
-        .drain_phase
-        .as_deref()
-        .map(NodeDrainPhase::parse)
-        .transpose()
-    {
-        Ok(phase) => NodeDrain::from_v1_columns(phase, node.drain_mode.as_deref()),
-        Err(err) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("node has an unrecognized drain phase: {err}"),
-            )
-            .into_response();
-        }
-    };
+    let drain_state = NodeDrain::from_columns(
+        node.drain_engine.as_deref(),
+        node.drain_phase.as_deref(),
+        node.drain_mode.as_deref(),
+    );
     if !drain_state.is_some_and(NodeDrain::refuses_activations) {
         let (error, detail) = force_upload_gate_open_message(drain_state);
         audit::record(AdminAuditEntry {

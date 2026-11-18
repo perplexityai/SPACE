@@ -88,15 +88,18 @@ impl K8sStore {
             .begin()
             .await
             .db_context("failed to start Kubernetes recovery transaction")?;
-        let Some(lifecycle) =
-            Self::lock_sandbox_execution_lifecycle_in(&mut tx, sandbox_id).await?
+        let Some((lifecycle, drain)) = Self::lock_sandbox_for_claim_in(&mut tx, sandbox_id).await?
         else {
             return Err(SubstrateError::NotFound {
                 message: format!("sandbox not found: {sandbox_id}"),
             });
         };
         match lifecycle {
-            SandboxLifecycle::Started => {}
+            SandboxLifecycle::Started => {
+                super::execution_rows::refuse_started_recovery_under_v2_drain(
+                    sandbox_id, lifecycle, drain,
+                )?;
+            }
             SandboxLifecycle::Suspending => {
                 return Err(SubstrateError::suspend_in_flight(sandbox_id));
             }

@@ -569,6 +569,18 @@ impl KubernetesSubstrate {
                                         ),
                                     });
                                 }
+                                WakeRpcErrorDisposition::NodeSealed => {
+                                    self.store
+                                        .note_sealed_refusal(sandbox_id, error.message())
+                                        .await;
+                                    return Err(SubstrateError::NodeSealed {
+                                        message: format!(
+                                            "sandbox cannot be woken yet: its node is \
+                                             draining; retry shortly: {}",
+                                            error.message()
+                                        ),
+                                    });
+                                }
                                 WakeRpcErrorDisposition::Fail => {
                                     return Err(SubstrateError::Conflict {
                                         message: format!("sandbox wake failed: {error}"),
