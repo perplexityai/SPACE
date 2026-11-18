@@ -1,9 +1,6 @@
 //! Sandbox identity, selection, metadata and lifecycle types, the legacy
 //! sandbox ID string helpers, the rootfs entitlement and the abandoned-restore
 //! retirement switch.
-//!
-//! They are their own crate so that code can name them without depending on
-//! `pplx-space-common-core`.
 
 #[cfg(feature = "sqlx")]
 mod postgres;

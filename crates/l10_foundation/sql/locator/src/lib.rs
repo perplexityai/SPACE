@@ -8,7 +8,7 @@
 //! and consumes only one word of sqlx's word-based query summary.
 //!
 //! It is its own crate, with no dependencies, so a crate that needs only the
-//! locator does not depend on `pplx-space-common-core` for it.
+//! locator depends on nothing else for it.
 
 /// Prepend a `/*module_path:line*/` locator comment to a SQL statement.
 ///

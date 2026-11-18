@@ -5,7 +5,7 @@
 //! the wrapped data by default.
 //!
 //! It is its own crate so that code can mark values as PII without depending
-//! on `pplx-space-common-core`: import [`Pii`] from here.
+//! on a SPACE model crate.
 
 use std::fmt;
 

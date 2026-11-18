@@ -121,7 +121,7 @@ Reach for this shape only for foundational, repo-wide errors. Most error types s
 | Context                                                   | Use                       |
 | --------------------------------------------------------- | ------------------------- |
 | Terminal `main.rs` / CLI glue that reports and exits      | `anyhow::Result<T>`       |
-| Reusable code in `crates/libs/**` and the `l10`–`l40` layer directories | typed `thiserror` enum |
+| Reusable code in the `l10`–`l40` layer directories        | typed `thiserror` enum    |
 | Service/reconciler/worker code in `crates/l50_app/**` | typed `thiserror` enum |
 | Tests                                                     | `anyhow` or `eyre` is fine; clarity > rigor |
 

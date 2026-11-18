@@ -1,9 +1,10 @@
 //! The CPU architecture a template is built for and a sandbox runs on, with
 //! its canonical names and the aliases it parses from.
 //!
-//! It is its own crate because it is a generic value type: both the template
-//! and the execution models in `pplx-space-common-core` name it, and keeping
-//! it in either one would make the other depend on it.
+//! It is its own crate because it is a generic value type. The execution spec
+//! (`pplx-space-execution-spec`) names it, and so does the `spaced` agent
+//! catalog (`pplx-space-spaced-update`), which does not depend on the
+//! execution spec.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};

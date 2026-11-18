@@ -6,9 +6,8 @@
 //! that syntax's parse and format functions and the parser for gRPC's
 //! `grpc-timeout` metadata value.
 //!
-//! None of it depends on the SPACE domain model, so it is its own crate rather
-//! than part of `pplx-space-common-core`: a crate that needs only these values
-//! can depend on it alone. Import them from here.
+//! None of it depends on the SPACE domain model, so it is its own crate: a
+//! crate that needs only these values can depend on it alone.
 
 use std::{fmt, str::FromStr, time::Duration};
 

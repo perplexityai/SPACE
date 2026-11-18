@@ -36,19 +36,11 @@ one `rust-static-ci.yml` entry per shard, each with its own compiler-cache
 family) lint workspace libraries one at a time, so a crate that uses a dependency feature
 it gets only through workspace feature unification fails. Its selection and
 lints live in `ci/scripts/lib/rust-isolated-crates.sh`, which the cache keys do
-not hash either. From `cargo metadata` it selects every library, other than
-`pplx-space-common-core`, that reaches common-core at most directly: no other
-workspace member in its normal dependency graph may reach it. Declared dependencies, optional ones included, decide
-first; a library they leave out is decided again from the graph `cargo tree`
-resolves for it with all of its features, so an optional dependency nothing
-enables does not count. Crates that reach common-core through another crate
-are left out because each builds that crate's graph too. A commented `ALSO`
-list, empty today, adds such a crate when it builds quickly alone; the check
-fails on an entry that is not a workspace library or that the rule does not
-leave out for that reason. The log
-names the libraries left out. Each crate gets its own `cargo clippy` runs with
-`--no-default-features` and with `--all-features`, each once with
-`--all-targets` and once with `--lib`. The `--lib` runs catch a feature that
+not hash either. From `cargo metadata` it selects every workspace library, of
+any crate type. Each crate gets its own `cargo clippy` runs with its minimum
+supported features (`--no-default-features`, plus `kubernetes` for the cluster
+controller) and with `--all-features`, each once with `--all-targets` and once
+with `--lib`. The `--lib` runs catch a feature that
 only a dev-dependency turns on. A new crate needs no CI edit. Each entry sets
 `SPACE_RUST_ISOLATED_SHARD=K/N`: every shard splits every selected library into
 the same N parts, balanced by cost (one plus the workspace crates a crate's

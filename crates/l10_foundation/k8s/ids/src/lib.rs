@@ -2,8 +2,8 @@
 //! and node name and UID; and the Kubernetes label value. They encode
 //! Kubernetes' own naming rules; no SPACE node-model types or logic.
 //!
-//! They are their own crate so that code can name them without depending on
-//! `pplx-space-common-core`: import them from here.
+//! They are their own crate so that code can name them without depending on a
+//! SPACE model crate.
 
 mod label;
 
