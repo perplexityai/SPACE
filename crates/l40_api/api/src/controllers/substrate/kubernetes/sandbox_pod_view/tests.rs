@@ -86,6 +86,7 @@ fn full_sandbox_pod() -> Pod {
                     "message": "0/3 nodes are available",
                 },
                 { "type": "Ready", "status": "True" },
+                { "type": "PodReadyToStartContainers", "status": "False" },
                 { "type": "ContainersReady", "status": "False", "message": UNREAD_MARKER },
             ],
             "containerStatuses": [{
@@ -152,6 +153,7 @@ fn view_keeps_every_consumer_field_and_drops_the_rest() {
     assert_eq!(view.phase(), Some("Running"));
     assert_eq!(view.pod_ip(), Some("10.0.0.7"));
     assert!(view.is_ready());
+    assert!(view.is_sandbox_not_ready());
     assert_eq!(
         view.unschedulable_message(),
         Some("0/3 nodes are available")
@@ -201,6 +203,7 @@ fn view_of_a_bare_pod_reads_as_absent_everywhere() {
     assert_eq!(view.network_slot_request(), 0);
     assert_eq!(view.phase(), None);
     assert!(!view.is_ready());
+    assert!(!view.is_sandbox_not_ready());
     assert_eq!(view.unschedulable_message(), None);
     assert_eq!(view.container_statuses().all().count(), 0);
 }
