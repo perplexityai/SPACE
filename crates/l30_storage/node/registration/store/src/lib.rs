@@ -21,6 +21,7 @@ use pplx_space_node_model::{NodeRole, SubstrateKind};
 use pplx_space_sql_locator::sql;
 
 pub mod drain_reads;
+pub mod drain_v2;
 pub mod drain_write;
 pub mod inventory;
 pub mod lookup;
