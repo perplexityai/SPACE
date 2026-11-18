@@ -105,6 +105,8 @@ pub(crate) fn mark_terminating_query(residency: ResidencyEvidence) -> String {
              drain_last_error = NULL
          WHERE id = $1
            AND drain_phase = $3
+           -- A v2 drain ends through its own loop.
+           AND drain_engine IS NULL
            -- Snapshot guard: block on local-disk lifecycles and in-flight
            -- durable uploads (same predicate as local_snapshots_count_query;
            -- atomic here to close the TOCTOU with the pre-check).
@@ -153,6 +155,7 @@ pub(crate) fn delete_drained_node_if_orphan_query(residency: ResidencyEvidence) 
         "DELETE FROM nodes
          WHERE id = $1
            AND drain_phase = 'drained'
+           AND drain_engine IS NULL
            AND managed_by = $3
            -- Identity guard: refuse if a same-name kube Node replacement
            -- bumped node_k8s.k8s_node_uid since the EC2 cross-check observed
