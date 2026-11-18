@@ -81,6 +81,11 @@ while (( $# > 0 )); do
     *) die "unknown argument: $1" ;;
   esac
 done
+# Before anything is torn down: an invalid count must not cost the benches a
+# --keep run left.
+if [[ -n "$BENCHES" ]] && { ! [[ "$BENCHES" =~ ^[1-9][0-9]*$ ]] || (( BENCHES > KIND_BENCH_MAX )); }; then
+  die "--benches must be 1..$KIND_BENCH_MAX (got $BENCHES)"
+fi
 
 # Two registries on the host's own Docker, kept across runs:
 #   - a pull-through Docker Hub mirror every bench daemon uses, so an image
@@ -204,6 +209,28 @@ teardown_all() {
 }
 
 kind_bench_platform
+# Both commands remove, as root, the marked bench directories under the bench
+# root, so an existing root must be the caller's. One that does not exist yet
+# holds nothing to remove; a run creates it below.
+if [[ -e "$KIND_BENCH_ROOT" ]] && ! [[ -d "$KIND_BENCH_ROOT" && -O "$KIND_BENCH_ROOT" ]]; then
+  die "SPACE_KIND_BENCH_ROOT must be a directory you own (or a path this script can create): $KIND_BENCH_ROOT"
+fi
+# The mount table escapes whitespace and backslashes, and the teardown finds a
+# bench's mounts there by its paths' text.
+[[ "$KIND_BENCH_ROOT" != *[[:space:]\\]* ]] \
+  || die "SPACE_KIND_BENCH_ROOT must not contain whitespace or backslashes: $KIND_BENCH_ROOT"
+# Inside the checkout, a run's own files would be untracked files that every
+# bench's checkout copies (kind_bench_checkout).
+inside_checkout() {
+  local repo
+  repo="$(realpath -- "$REPO_ROOT")"
+  [[ "$1" == "$repo" || "$1" == "$repo"/* ]]
+}
+inside_checkout "$KIND_BENCH_ROOT" && die "SPACE_KIND_BENCH_ROOT must be outside the checkout: $KIND_BENCH_ROOT"
+if [[ -n "$OUT" ]]; then
+  OUT="$(realpath -m -- "$OUT")"
+  inside_checkout "$OUT" && die "--out must be outside the checkout: $OUT"
+fi
 kind_bench_lock
 if [[ "$COMMAND" == teardown ]]; then
   sudo -n true 2>/dev/null || die "teardown needs passwordless sudo"
@@ -286,15 +313,26 @@ default_benches() {
 }
 
 # The benches' directories are the caller's; only their Docker data roots are
-# root's. Created before the default N reads its free disk; an existing root
-# must already be the caller's, since nothing here would give it back.
+# root's. Created before the default N reads its free disk.
 if [[ ! -e "$KIND_BENCH_ROOT" ]]; then
   mkdir -p "$KIND_BENCH_ROOT" 2>/dev/null \
     || sudo -n install -d -o "$(id -u)" -g "$(id -g)" "$KIND_BENCH_ROOT" \
     || die "cannot create $KIND_BENCH_ROOT"
 fi
-[[ -d "$KIND_BENCH_ROOT" && -O "$KIND_BENCH_ROOT" ]] \
-  || die "SPACE_KIND_BENCH_ROOT must be a directory you own (or a path this script can create): $KIND_BENCH_ROOT"
+
+# The host's Docker builds the shared images, bind-mounts the seed and the
+# registries' data from this host's paths, and publishes the registries that
+# the benches reach on this host, so it must be a daemon on this host, and
+# one that keeps a port published on 127.0.0.1 (the layer cache) to this host,
+# which Docker Engine does from 28.0.
+case "${DOCKER_HOST:-}" in
+  "" | unix://* | tcp://localhost:* | tcp://127.0.0.1:*) ;;
+  *) die "DOCKER_HOST=$DOCKER_HOST is not a daemon on this host; the runner needs a local one" ;;
+esac
+engine="$(timeout 30 docker version --format '{{.Server.Version}}' 2>/dev/null)" \
+  || die "the host's Docker does not answer"
+[[ "${engine%%.*}" =~ ^[0-9]+$ ]] && (( ${engine%%.*} >= 28 )) \
+  || die "the host's Docker Engine is $engine; the runner needs 28.0 or later"
 
 # Before the default N reads the free disk, which an earlier run's benches
 # still hold.
@@ -306,9 +344,6 @@ fi
 
 if [[ -z "$BENCHES" ]]; then
   default_benches
-fi
-if ! [[ "$BENCHES" =~ ^[1-9][0-9]*$ ]] || (( BENCHES > KIND_BENCH_MAX )); then
-  die "--benches must be 1..$KIND_BENCH_MAX (got $BENCHES)"
 fi
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-n${BENCHES}"

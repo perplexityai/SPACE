@@ -130,7 +130,9 @@ kind_bench_preflight() {
   sudo -n true 2>/dev/null || kind_bench_die "benches need passwordless sudo (network namespaces, dockerd)"
   [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] || kind_bench_die "benches need readable and writable /dev/kvm"
   local tool
-  for tool in ip nsenter setpriv iptables; do
+  # curl too: installing the bench daemons downloads them before anything
+  # else is installed.
+  for tool in ip nsenter setpriv iptables curl; do
     command -v "$tool" >/dev/null 2>&1 || sudo -n sh -c "command -v $tool" >/dev/null 2>&1 \
       || kind_bench_die "benches need $tool on the host"
   done
