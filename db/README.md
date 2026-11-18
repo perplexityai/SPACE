@@ -205,7 +205,7 @@ migrations they reverse on rollback, with a copy of its SQL under their own
 `db/template-manager/history/`. Their reversal compares the recorded checksum
 only with that copy and ignores `db/accepted-checksums.toml`, so it reverses
 the migration only while the bundled file keeps that checksum:
-`dirty_ref_revision_migration_keeps_the_checksum_releases_reverse` pins it.
+`template_manager_migrations_keep_the_checksums_releases_reverse` pins it.
 Change the schema with a new migration, never by editing this one.
 
 Rolling back to one of those releases reverses the migration with the image
@@ -287,8 +287,8 @@ until it exits.
 
 Their reversal compares the recorded checksum only with its own copy and
 ignores `db/accepted-checksums.toml`, so the migration's SQL must stay
-byte-identical: `partition_migration_keeps_the_checksum_releases_reverse` pins
-its checksum.
+byte-identical: `template_manager_migrations_keep_the_checksums_releases_reverse`
+pins its checksum.
 Change the schema with a new migration, never by editing this one.
 
 ## Console password provisioning
@@ -494,7 +494,11 @@ unless the operator accepts each newer migration as described under 'Rolling
 back past a newer SQLite migration'. Some earlier template-manager releases
 reverse `20261026220935` and `20261031050126` themselves instead, as described
 under 'Node dirty-ref revision migration' and 'Template cache partition
-migration'. Use expand/contract sequencing and retain verified backups.
+migration'. A template-manager migration must also leave the database readable
+and writable by the release before it: a rollout can run
+`space-db-migrator template-manager up` in an init container while the
+previous release's pod still serves from the same node-local database. Use
+expand/contract sequencing and retain verified backups.
 
 The migrator never adopts untracked schemas, repairs rejected history, or
 recreates a database after a migration failure. Baseline history conversion is

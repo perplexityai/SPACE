@@ -217,6 +217,137 @@ async fn capture_time_marker_round_trips_and_reupgrades_as_not_comparable() {
     );
 }
 
+const DIRTY_REF_REVISIONS: i64 = 20261031050126;
+
+/// db/README.md has operators roll template-manager back past the dirty-ref
+/// revision migration with `space-db-migrator template-manager down`. That
+/// drops the revision column, its counter and the triggers that stamp it,
+/// keeps every queued outbox row, and `up` applies it again.
+#[tokio::test]
+async fn dirty_ref_revisions_down_keeps_outbox_rows_and_reapplies() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("template-manager.sqlite");
+    let database = sqlite_template_manager();
+    let recorded = |conn: &Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?1",
+            [DIRTY_REF_REVISIONS],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let revision_objects = |conn: &Connection| -> Vec<String> {
+        let mut statement = conn
+            .prepare(
+                "SELECT name FROM pragma_table_info('node_dirty_refs') WHERE name = 'revision'
+                 UNION ALL
+                 SELECT name FROM sqlite_schema
+                 WHERE name IN ('node_dirty_ref_revision', 'node_dirty_refs_insert_revision',
+                                'node_dirty_refs_update_revision')
+                 ORDER BY name",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let outbox = |conn: &Connection| -> Vec<(i64, String, String, String, String)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT facet, element_kind, element_value, requested_at, updated_at
+                 FROM node_dirty_refs ORDER BY facet, element_kind, element_value",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let all_revision_objects = vec![
+        "node_dirty_ref_revision".to_owned(),
+        "node_dirty_refs_insert_revision".to_owned(),
+        "node_dirty_refs_update_revision".to_owned(),
+        "revision".to_owned(),
+    ];
+
+    migrate_sqlite_up(database, &path).await.unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "INSERT INTO node_dirty_refs (facet, element_kind, element_value, requested_at, updated_at)
+         VALUES (1, 'template', 'a', '1', '1'), (2, 'pool', 'b', '2', '3');
+         UPDATE node_dirty_refs SET requested_at = '4', updated_at = '4' WHERE facet = 1;",
+    )
+    .unwrap();
+    let rows = outbox(&conn);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(recorded(&conn), 1);
+    assert_eq!(revision_objects(&conn), all_revision_objects);
+
+    // Revert any newer migration in either catalog first, as the README's
+    // procedure does, so the next `down` reaches the dirty-ref migration.
+    let newer = [&TEMPLATE_MANAGER_MIGRATOR, &COMMON_SCHEMA_MIGRATOR]
+        .into_iter()
+        .flat_map(|migrator| migrator.iter())
+        .filter(|migration| {
+            migration.migration_type.is_up_migration() && migration.version > DIRTY_REF_REVISIONS
+        })
+        .count();
+    for _ in 0..newer {
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    }
+    rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+        .await
+        .unwrap();
+    assert_eq!(recorded(&conn), 0);
+    assert_eq!(revision_objects(&conn), Vec::<String>::new());
+    assert_eq!(outbox(&conn), rows, "the down keeps every outbox row");
+
+    migrate_sqlite_up(database, &path).await.unwrap();
+    assert_eq!(recorded(&conn), 1);
+    assert_eq!(revision_objects(&conn), all_revision_objects);
+    assert_eq!(outbox(&conn), rows);
+}
+
+/// Some earlier template-manager releases don't bundle these migrations but
+/// reverse them at startup, and only when the recorded checksum is the one
+/// pinned here, so rolling back to them stays image-only. Change the schema
+/// with a new migration, never by editing one of these. See db/README.md.
+#[test]
+fn template_manager_migrations_keep_the_checksums_releases_reverse() {
+    let pins = [
+        (
+            20261026220935,
+            "bb39d295eee07bfc5ff54e6d2f076efb42a50b43d7cedffd8907e9cbf73e7e9b2837295cb1131306798e1c3a4bf4b820",
+        ),
+        (
+            DIRTY_REF_REVISIONS,
+            "c92d51875e4001e0346e759fcf75c45b1f3929e9c5b719eda3a32d6af21651fdb37559a1deea96f86c262efe8c6264dd",
+        ),
+    ];
+    for (version, checksum) in pins {
+        let up = TEMPLATE_MANAGER_MIGRATOR
+            .iter()
+            .find(|migration| {
+                migration.version == version && migration.migration_type.is_up_migration()
+            })
+            .unwrap_or_else(|| panic!("template-manager doesn't bundle {version}"));
+        assert_eq!(hex::encode(up.checksum.as_ref()), checksum, "{version}");
+    }
+}
+
 #[test]
 fn embedded_migrations_have_unique_versions_and_public_baselines() {
     for (name, migrator) in ALL_MIGRATORS {
