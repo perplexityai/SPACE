@@ -58,7 +58,11 @@ For new work:
 
 - Put behavior above the adapter. Add an adapter method only for an
   infrastructure action the existing ones cannot express, and implement it
-  for both substrates in the same PR.
+  for both substrates in the same PR. The one exception is a pre-check that
+  lets a route refuse before it enqueues the operation, such as
+  `check_node_pool_placement`: it returns the same `Unsupported` as the
+  operation it guards, through one refusal function both call, and the gap
+  row names both.
 - Record every gap. If one substrate cannot support an operation yet, return
   `SubstrateError::Unsupported` from it and add a row to the gap table in its
   module doc (`direct.rs`, or `kubernetes/mod.rs`, whose first gap starts
