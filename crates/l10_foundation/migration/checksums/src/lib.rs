@@ -60,7 +60,7 @@ pub enum ManifestError {
 
 /// Whether `store` can name a migration store: its `db/` directory, such as
 /// `sandbox-manager`, or `common` for the shared catalog.
-pub fn valid_store_name(store: &str) -> bool {
+fn valid_store_name(store: &str) -> bool {
     !store.is_empty()
         && store
             .bytes()
