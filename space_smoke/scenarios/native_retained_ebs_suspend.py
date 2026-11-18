@@ -95,6 +95,7 @@ def _run(
     program: str,
     *,
     timeout_seconds: int = 60,
+    output_limit: int = 32768,
 ) -> bytes:
     accepted = test.command(
         sandbox, ["sudo", "-n", "python3", "-c", program],
@@ -102,7 +103,7 @@ def _run(
     ).require(201)
     events = test.events(accepted, timeout=timeout_seconds + 5)
     test.context.verify(events.status == 200, "guest command attachment failed")
-    output, errors = command_output(events.events, limit=32768)
+    output, errors = command_output(events.events, limit=output_limit)
     test.context.verify(not errors, "guest proof command failed", stderr=errors.decode(errors="replace"))
     return output
 

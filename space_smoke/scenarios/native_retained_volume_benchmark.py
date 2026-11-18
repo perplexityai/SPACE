@@ -1,4 +1,4 @@
-"""Paired local-rootfs/data-disk file I/O, not a fleet saturation benchmark."""
+"""Paired, bounded fio workloads on local-rootfs and retained data files."""
 
 from __future__ import annotations
 
@@ -9,107 +9,112 @@ from space_smoke.registry import scenario
 from space_smoke.scenarios.native_retained_ebs_suspend import _run
 
 
-BENCHMARK = r"""
-import json, math, mmap, os, random, statistics, tempfile, time
+BENCHMARK = r'''
+import hashlib, json, os, shutil, subprocess, tempfile
 from pathlib import Path
 
-MIB = 1024 * 1024
-BLOCK = 4096
+def run_fio(base, size_mib=48, random_seconds=5, random_operations=20000, transactions=128):
+    assert 1 <= size_mib <= 48 and 1 <= random_seconds <= 5
+    assert 1 <= random_operations <= 20000 and 1 <= transactions <= 128
+    assert os.statvfs(base).f_bavail * os.statvfs(base).f_frsize >= (size_mib + 8)*1024**2
+    with tempfile.TemporaryDirectory(prefix=".space-fio-", dir=base) as directory:
+        # fio treats colons as directory separators; never accept a job-file injection.
+        assert not any(character in directory for character in ":\n\r\\")
+        jobs = Path(directory) / "workload.fio"
+        jobs.write_text(f"""
+[global]
+ioengine=sync
+thread=1
+numjobs=1
+iodepth=1
+directory={directory}
+size={size_mib}m
+fallocate=none
+create_on_open=1
+randrepeat=1
+refill_buffers=1
+percentile_list=50:95:99
+exitall_on_error=1
 
-def distribution(samples):
-    ordered = sorted(samples)
-    assert ordered, "benchmark produced no observations"
-    return {
-        "samples": len(ordered),
-        "p50_ms": ordered[math.ceil(len(ordered) * .50) - 1] * 1000,
-        "p95_ms": ordered[math.ceil(len(ordered) * .95) - 1] * 1000,
-        "p99_ms": ordered[math.ceil(len(ordered) * .99) - 1] * 1000,
-    }
+[sequential_write]
+filename=data
+rw=write
+bs=1m
+direct=1
+end_fsync=1
 
-def random_io(fd, buffer, size, write, seconds, limit):
-    randomizer = random.Random(0)
-    samples = []
-    started = time.monotonic()
-    while len(samples) < limit and time.monotonic() - started < seconds:
-        offset = randomizer.randrange(size // BLOCK) * BLOCK
-        before = time.monotonic()
-        count = os.pwrite(fd, buffer, offset) if write else os.preadv(fd, [buffer], offset)
-        assert count == BLOCK, ("short random I/O", count)
-        if write:
-            os.fdatasync(fd)
-        samples.append(time.monotonic() - before)
-    elapsed = time.monotonic() - started
-    return {
-        "iops": len(samples) / elapsed,
-        "elapsed_seconds": elapsed,
-        "latency": distribution(samples),
-    }
+[random_read]
+stonewall=1
+filename=data
+allow_file_create=0
+rw=randread
+bs=4k
+direct=1
+runtime={random_seconds}
+io_size={random_operations * 4096}
 
-def measure(base, size=48*MIB, seconds=5.0, limit=20000, transactions=128):
-    assert size > 0 and size % MIB == 0
-    assert seconds > 0 and limit > 0 and transactions > 0
-    capacity = os.statvfs(base)
-    assert capacity.f_bavail * capacity.f_frsize >= size + 8*MIB, "insufficient free space"
-    results = {}
-    with tempfile.TemporaryDirectory(prefix=".space-io-bench-", dir=base) as directory:
-        # No raw-device writes. Private files and O_EXCL preserve existing data.
-        fd = os.open(directory + "/direct",
-                     os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_DIRECT, 0o600)
-        try:
-            with mmap.mmap(-1, MIB) as buffer:
-                buffer[:] = os.urandom(MIB)
-                started = time.monotonic()
-                for offset in range(0, size, MIB):
-                    assert os.pwrite(fd, buffer, offset) == MIB, "short sequential write"
-                os.fsync(fd)
-                elapsed = time.monotonic() - started
-                results["sequential_write"] = {
-                    "mib_per_second": size / MIB / elapsed,
-                    "elapsed_seconds": elapsed,
-                }
-            with mmap.mmap(-1, BLOCK) as buffer:
-                results["random_read"] = random_io(fd, buffer, size, False, seconds, limit)
-                buffer[:] = os.urandom(BLOCK)
-                results["random_overwrite_fdatasync"] = random_io(
-                    fd, buffer, size, True, seconds, limit,
-                )
-        finally:
-            os.close(fd)
+[random_overwrite_fdatasync]
+stonewall=1
+filename=data
+allow_file_create=0
+rw=randwrite
+bs=4k
+direct=0
+fdatasync=1
+end_fsync=1
+runtime={random_seconds}
+io_size={random_operations * 4096}
 
-        payload = os.urandom(BLOCK)
-        fd = os.open(directory + "/append", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            samples = []
-            for index in range(transactions):
-                started = time.monotonic()
-                assert os.write(fd, payload) == BLOCK, "short append"
-                os.fdatasync(fd)
-                samples.append(time.monotonic() - started)
-            results["append_fdatasync"] = distribution(samples)
-        finally:
-            os.close(fd)
+[append_fdatasync]
+stonewall=1
+filename=append
+rw=write
+bs=4k
+direct=0
+file_append=1
+fdatasync=1
+end_fsync=1
+size={transactions * 4096}
+io_size={transactions * 4096}
 
-        samples = []
-        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            for index in range(transactions):
-                started = time.monotonic()
-                fd = os.open(directory + "/small-" + str(index),
-                             os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                try:
-                    assert os.write(fd, payload) == BLOCK, "short small-file write"
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                # Include directory durability, not just the newly created inode.
-                os.fsync(directory_fd)
-                samples.append(time.monotonic() - started)
-        finally:
-            os.close(directory_fd)
-        results["small_file_create_fsync"] = distribution(samples)
-    return results
+[small_file_create]
+stonewall=1
+ioengine=filecreate
+rw=write
+bs=4k
+nrfiles={transactions}
+openfiles=1
+filesize=4k
+size={transactions * 4096}
+""")
+        result = subprocess.run(
+            ["fio", "--eta=never", "--output-format=json",
+             "--aux-path=" + directory, str(jobs)],
+            cwd=directory, text=True, capture_output=True, timeout=150,
+        )
+        if result.returncode:
+            raise RuntimeError(f"fio failed ({result.returncode}): "
+                               f"{result.stderr[-2000:]} {result.stdout[-4000:]}")
+        observed = json.loads(result.stdout)
+        expected = {"sequential_write", "random_read", "random_overwrite_fdatasync",
+                    "append_fdatasync", "small_file_create"}
+        assert len(observed["jobs"]) == len(expected)
+        assert {job["jobname"] for job in observed["jobs"]} == expected
+        assert all(job["error"] == 0 for job in observed["jobs"]), observed
+        for job in observed["jobs"]:
+            direction = "read" if job["jobname"] == "random_read" else "write"
+            assert job[direction]["total_ios"] > 0, job
+            if job["jobname"].endswith("_fdatasync"):
+                # fio 3.33's sync.total_ios counts DDIR_SYNC, not DDIR_DATASYNC.
+                # The shared sync latency sample count includes fdatasync.
+                assert job["sync"]["lat_ns"]["N"] > 0, job
+        return observed
 
 def main():
+    binary = shutil.which("fio")
+    assert binary, "qualified guest must include fio; no custom fallback"
+    version = subprocess.check_output([binary, "--version"], text=True, timeout=10).strip()
+    assert version.startswith("fio-3."), ("expected the fio I/O tester", version)
     entries = [line.split() for line in Path("/proc/self/mountinfo").read_text().splitlines()]
     data, = [entry for entry in entries if entry[4] == "/data"]
     assert data[data.index("-") + 1:data.index("-") + 3] == ["ext4", "/dev/vdb"], data
@@ -117,13 +122,14 @@ def main():
     assert os.stat("/var/tmp").st_dev == os.stat("/").st_dev, "baseline is not the rootfs"
     targets = {"local_rootfs": "/var/tmp", "retained_data": "/data"}
     results = {
-        "method": "paired_guest_file_io_v2",
-        "working_set_bytes": 48*MIB,
-        "random_block_bytes": BLOCK,
-        "random_seconds_limit": 5.0,
-        "random_samples_limit": 20000,
+        "method": "paired_guest_fio_v1",
+        "fio_version": version,
+        "fio_binary_sha256": hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
+        "working_set_bytes": 48*1024**2,
+        "random_seconds_limit": 5,
+        "random_operations_limit": 20000,
         "transactions_per_phase": 128,
-        "small_file_directory_fsync": True,
+        "small_file_create_includes_content_fsync": False,
         "usable_filesystem_bytes": os.statvfs("/data").f_blocks * os.statvfs("/data").f_frsize,
         "kernel": os.uname().release,
         "mounts": {
@@ -136,37 +142,19 @@ def main():
         },
         "runs": [],
     }
-    # Alternate which arm runs first; both arms share the same guest and worker.
+    # Retain fio's own JSON, including separate write and sync latency statistics.
+    # Neither summing their percentiles nor calling filecreate durable is valid.
     for pair in range(4):
         order = tuple(targets) if pair % 2 == 0 else tuple(reversed(targets))
         for name in order:
             results["runs"].append({
-                "pair": pair, "target": name, "results": measure(targets[name]),
+                "pair": pair, "target": name, "fio": run_fio(targets[name]),
             })
-    summaries = {}
-    for name in targets:
-        runs = [run["results"] for run in results["runs"] if run["target"] == name]
-        summaries[name] = {
-            "sequential_write_mib_per_second": statistics.median(
-                run["sequential_write"]["mib_per_second"] for run in runs
-            ),
-        }
-        for metric in ("random_read", "random_overwrite_fdatasync",
-                       "append_fdatasync", "small_file_create_fsync"):
-            observations = [
-                run[metric]["latency"] if "latency" in run[metric] else run[metric]
-                for run in runs
-            ]
-            summaries[name][metric] = {
-                percentile: statistics.median(item[percentile] for item in observations)
-                for percentile in ("p50_ms", "p95_ms", "p99_ms")
-            }
-    results["median_summary"] = summaries
     print(json.dumps(results))
 
 if __name__ == "__main__":
     main()
-"""
+'''
 
 
 @scenario(
@@ -174,11 +162,11 @@ if __name__ == "__main__":
     api_surfaces=("native",),
     substrates=("kubernetes",),
     tier="manual",
-    manual_reason="requires an admitted organization and an approved single-disk I/O budget",
-    timeout_minutes=20,
+    manual_reason="requires guest fio, an admitted organization and an approved single-disk I/O budget",
+    timeout_minutes=30,
 )
 def retained_volume_benchmark(test: NativeHardeningFixture) -> None:
-    """Compare four interleaved pairs using one sandbox and one data disk.
+    """Compare four interleaved fio pairs using one sandbox and one data disk.
 
     The baseline is labeled local_rootfs, not NVMe: operator evidence must
     independently establish its backing device. Filesystem/CoW differences
@@ -191,8 +179,10 @@ def retained_volume_benchmark(test: NativeHardeningFixture) -> None:
                 "permissions": "read_write", "mount": "/data",
             }],
         }, timeout=600)
-    with test.context.phase("paired rootfs and retained-disk file I/O observations"):
-        observed = json.loads(_run(test, sandbox, BENCHMARK, timeout_seconds=600))
+    with test.context.phase("paired rootfs and retained-disk fio observations"):
+        observed = json.loads(_run(
+            test, sandbox, BENCHMARK, timeout_seconds=1200, output_limit=2*1024**2,
+        ))
         test.context.record("retained_volume_io_benchmark", observed)
         test.context.verify(
             observed["usable_filesystem_bytes"] > 120 * 1024**3,

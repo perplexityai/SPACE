@@ -185,15 +185,24 @@ Record provider volume identity independently; tenant responses intentionally
 do not expose it.
 
 `native.retained_volume_benchmark` compares the local rootfs (`/var/tmp`) and
-retained data disk (`/data`) inside one sandbox. Four pairs alternate which arm
-runs first, recording individual runs and median summaries. Each arm uses a
-48-MiB working set: direct sequential writes, direct 4-KiB random reads,
-direct 4-KiB overwrites with per-write `fdatasync`, buffered 4-KiB appends with
-`fdatasync`, and small-file creation with file and directory `fsync`.
+retained data disk (`/data`) inside one sandbox using the standard
+[fio I/O tester](https://fio.readthedocs.io/en/master/fio_doc.html).
+Four pairs alternate which arm runs first and retain fio's original JSON,
+tool version and binary hash. Each arm uses a 48-MiB working set: direct
+sequential writes, direct 4-KiB random reads, buffered 4-KiB overwrites and
+appends with periodic `fdatasync` after each write and a final `fsync`, and
+fio's `filecreate` engine. Jobs use one synchronous I/O at a time and refill
+write buffers rather than repeatedly submitting one unchanged buffer.
 Latency observations include p50, p95 and p99. Each random phase stops after
 five seconds or 20,000 operations; append and creation phases have 128 samples
-each. Files are private to the scenario and removed afterward. Missing
-direct-I/O support fails rather than silently measuring guest page-cache reads.
+each. File creation does not measure content writes or durable creation.
+Fio reports write and sync latencies separately; do not add their percentiles
+and call that a transaction percentile.
+
+The qualified guest must include fio 3.x; no custom benchmark fallback or
+implicit package installation is performed. Files and fio auxiliary state
+are private to the scenario and removed afterward, including on failure.
+Missing direct-I/O support fails rather than silently measuring page-cache reads.
 
 The baseline is named `local_rootfs`, not NVMe. Establish its backing device
 independently before reporting an NVMe/EBS comparison. Record filesystem types
