@@ -121,8 +121,19 @@ def main():
     assert os.stat("/data").st_dev != os.stat("/").st_dev, "required data mount missing"
     assert os.stat("/var/tmp").st_dev == os.stat("/").st_dev, "baseline is not the rootfs"
     targets = {"local_rootfs": "/var/tmp", "retained_data": "/data"}
+    write_cache = {
+        name: Path(f"/sys/block/{device}/queue/write_cache").read_text().strip()
+        for name, device in (("local_rootfs", "vda"), ("retained_data", "vdb"))
+    }
     results = {
         "method": "paired_guest_fio_v1",
+        "comparison_scope": "current_filesystem_stacks_not_isolated_media",
+        "guest_write_cache_modes": write_cache,
+        "guest_write_cache_modes_match": len(set(write_cache.values())) == 1,
+        # Matching guest labels alone does not establish host flush behavior.
+        # Capture the VMM configuration separately before comparing durability.
+        "equal_durability_verified": False,
+        "guest_direct_io_bypasses_host_page_cache": False,
         "fio_version": version,
         "fio_binary_sha256": hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
         "working_set_bytes": 48*1024**2,
@@ -170,7 +181,9 @@ def retained_volume_benchmark(test: NativeHardeningFixture) -> None:
 
     The baseline is labeled local_rootfs, not NVMe: operator evidence must
     independently establish its backing device. Filesystem/CoW differences
-    remain part of this end-to-end comparison, not isolated media performance.
+    and potentially different VMM flush policies remain part of this end-to-end
+    comparison. Guest direct I/O does not bypass the host page cache. A passing
+    workload is not evidence of equal durability or isolated media performance.
     """
     with test.context.phase("create the single benchmark sandbox"):
         sandbox = test.create_ready({
