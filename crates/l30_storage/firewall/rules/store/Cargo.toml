@@ -1,0 +1,22 @@
+[package]
+name = "pplx-space-firewall-rules-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.space.state]
+postgres = [
+    "firewall_rollouts",
+    "firewall_rollout_items",
+    "firewall_rules_revisions",
+    "firewall_rules_control",
+    "firewall_rules_node_assignments",
+    "firewall_rules_node_observations",
+    "firewall_rules_mutation_receipts",
+]
+
+[lints]
+workspace = true
