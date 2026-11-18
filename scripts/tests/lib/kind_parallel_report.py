@@ -106,6 +106,10 @@ KNOWN_FAILURE = re.compile(r"^  KNOWN FAILURE (\S+): ")
 # smoke-kind-typed.sh `all` repeats both passes' SUITE lines after this; read
 # as part of the last pass they would replace its counts with the first's.
 SUMMARY = "=== typed smoke summary"
+# The same line carries each pass's own exit status, which a mode check
+# (telemetry, storage credentials, Rust build, browser state) can raise to 2
+# while every scenario still runs.
+PASS_STATUS = re.compile(r"^=== typed smoke summary: ecw exit (-?\d+), native exit (-?\d+) ===$")
 VERDICT = {0: "pass", 42: "warn", 1: "fail"}
 
 
@@ -120,6 +124,11 @@ def parse_typed(log: Path) -> dict:
     for raw in log.read_text(errors="replace").splitlines():
         line = raw.rstrip()
         if line.startswith(SUMMARY):
+            if match := PASS_STATUS.match(line):
+                for surface, status in zip(SURFACES, match.groups()):
+                    surfaces.setdefault(
+                        surface, {"run": [], "exits": {}, "skipped": {}, "known": set(), "suite": None}
+                    )["status"] = int(status)
             break
         if match := SURFACE.match(line):
             current = surfaces.setdefault(
@@ -293,8 +302,8 @@ def summarize(out: Path) -> int:
         }
         if not result.startswith("typed_exit_"):
             incomplete = True
-        bench_not_passed = 0
         for surface, data in typed.items():
+            pass_failed = False
             seen.setdefault(surface, Counter()).update(data["run"])
             skipped.setdefault(surface, {}).update(data["skipped"])
             for scenario in data["run"]:
@@ -307,13 +316,11 @@ def summarize(out: Path) -> int:
                     else:
                         verdict = VERDICT.get(code, "inconclusive")
                     if verdict == "fail":
-                        failed = True
+                        failed = pass_failed = True
                     elif verdict in ("inconclusive", "unfinished"):
                         incomplete = True
                     elif verdict == "warn":
                         warned = True
-                    if verdict != "known failure":
-                        bench_not_passed += 1
                     not_passed.append(
                         {
                             "bench": bench,
@@ -324,10 +331,16 @@ def summarize(out: Path) -> int:
                             "log": str(directory / "typed.log"),
                         }
                     )
-        # A shard that exited nonzero with nothing but passes and excused
-        # failures failed outside its scenarios (its bootstrap, a missing
-        # tool): inconclusive.
-        if result.startswith("typed_exit_") and result != "typed_exit_0" and not bench_not_passed:
+            # Each pass's own status: anything but 0, 1 and 42, or a 1 that no
+            # failed scenario accounts for, is an incomplete pass. A pass that
+            # never printed one did not finish.
+            status = data.get("status")
+            if status is None:
+                incomplete = incomplete or result != "typed_exit_0"
+            elif status not in (0, 1, 42) or (status == 1 and not pass_failed):
+                incomplete = True
+        # A shard that exited nonzero before either pass reported a status.
+        if result != "typed_exit_0" and not any("status" in data for data in typed.values()):
             incomplete = True
 
     coverage = {"checked": inventory_data is not None, "surfaces": {}}
