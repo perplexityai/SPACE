@@ -1369,7 +1369,10 @@ class CommandSandboxFixture(ScenarioFixture):
         present = control.sandbox_cache_dir_present(worker, sandbox_id)
         # A rootfs a poll already removed needs no run, and no second probe.
         if present and facets is not None:
-            present = not self._run_cluster_deleted_eviction(facets, control, worker, sandbox_id, deadline)
+            # Probed again unless the run saw it go: a failed or timed-out run
+            # says nothing about the rootfs, which may have gone meanwhile.
+            gone = self._run_cluster_deleted_eviction(facets, control, worker, sandbox_id, deadline)
+            present = not gone and control.sandbox_cache_dir_present(worker, sandbox_id)
         while present:
             self.verify(
                 time.monotonic() < deadline,
