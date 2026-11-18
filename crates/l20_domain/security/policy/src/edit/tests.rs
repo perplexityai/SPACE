@@ -96,9 +96,16 @@ fn acceptance_batch_with_an_invalid_fifth_edit_fails_whole() {
     ] {
         let mut edits = acceptance_edits();
         edits.push(fifth);
-        assert_eq!(base.apply(&edits), Err(expected));
+        let error = base.apply(&edits).unwrap_err();
+        assert_eq!(error, expected);
         assert_eq!(base, original);
     }
+    let mut edits = acceptance_edits();
+    edits.push(Edit::Remove(id("web")));
+    assert_eq!(
+        base.apply(&edits).unwrap_err().to_string(),
+        r#"edit 4 (remove) names rule "web", which edit 0 (replace) already names"#
+    );
 }
 
 #[test]

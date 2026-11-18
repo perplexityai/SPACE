@@ -140,7 +140,7 @@ impl Serialize for PolicyRevision {
 /// A rule list that cannot form a revision.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
-    #[error("rule ID {id:?} at index {duplicate_index} repeats the rule at index {first_index}")]
+    #[error("rule ID {id:?} at index {duplicate_index} repeats the rule at index {first_index}", id = .id.as_str())]
     DuplicateRuleId {
         id: RuleId,
         first_index: usize,
@@ -184,7 +184,7 @@ impl Serialize for Rule {
 
 /// A rule was given no comparisons, which would match every packet.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("rule {id:?} has an empty all_of")]
+#[error("rule {id:?} has an empty all_of", id = .id.as_str())]
 pub struct EmptyAllOfError {
     pub id: RuleId,
 }

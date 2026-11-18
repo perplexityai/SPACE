@@ -135,7 +135,7 @@ pub enum DecodeErrorKind {
     PrefixLength { len: u64 },
     #[error("range start {start} exceeds its end {end}")]
     ReversedRange { start: u64, end: u64 },
-    #[error("rule ID {id:?} repeats the rule at index {first_index}")]
+    #[error("rule ID {id:?} repeats the rule at index {first_index}", id = .id.as_str())]
     DuplicateRuleId { id: RuleId, first_index: usize },
 }
 

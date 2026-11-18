@@ -83,9 +83,7 @@ impl PolicyChange {
 /// Why an edit batch was rejected. Edit indexes are positions in the batch.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EditError {
-    #[error(
-        "edit {index} ({kind}) names rule {id:?}, which edit {first_index} ({first_kind}) already names"
-    )]
+    #[error("edit {index} ({kind}) names rule {id:?}, which edit {first_index} ({first_kind}) already names", id = .id.as_str())]
     ConflictingEdits {
         id: RuleId,
         first_index: usize,
@@ -93,11 +91,11 @@ pub enum EditError {
         index: usize,
         kind: EditKind,
     },
-    #[error("edit {index} adds rule {id:?}, which the base policy already has")]
+    #[error("edit {index} adds rule {id:?}, which the base policy already has", id = .id.as_str())]
     AddExisting { id: RuleId, index: usize },
-    #[error("edit {index} replaces rule {id:?}, which the base policy does not have")]
+    #[error("edit {index} replaces rule {id:?}, which the base policy does not have", id = .id.as_str())]
     ReplaceMissing { id: RuleId, index: usize },
-    #[error("edit {index} removes rule {id:?}, which the base policy does not have")]
+    #[error("edit {index} removes rule {id:?}, which the base policy does not have", id = .id.as_str())]
     RemoveMissing { id: RuleId, index: usize },
     #[error("the edited policy is invalid")]
     InvalidCandidate(#[source] PolicyError),

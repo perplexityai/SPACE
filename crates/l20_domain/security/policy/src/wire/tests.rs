@@ -1216,6 +1216,14 @@ fn error_display_names_the_location() {
         error.to_string(),
         r#"$.rules[0].all_of[0].left["&"][1]: mask must be nonzero"#
     );
+
+    let duplicate =
+        PolicyRevision::from_json_str(&document_with_rules(&[good_rule("a"), good_rule("a")]))
+            .unwrap_err();
+    assert_eq!(
+        duplicate.to_string(),
+        r#"$.rules[1].id: rule ID "a" repeats the rule at index 0"#
+    );
 }
 
 #[test]

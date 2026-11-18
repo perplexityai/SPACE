@@ -64,6 +64,8 @@
 //! negative number is rejected, never wrapped or truncated. An IPv4 prefix
 //! keeps its address as written, including host bits. The node that programs
 //! the firewall decides whether a structurally valid policy can run there.
+//! This crate sets no limit on document size, rule count, `all_of` length or
+//! name length; the caller that accepts a document enforces those.
 //!
 //! # Edits
 //!
