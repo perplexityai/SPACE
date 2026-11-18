@@ -30,14 +30,11 @@ impl ControlError {
     /// A mutation may have executed when its deadline expires. Callers must
     /// reconcile or terminate the fenced execution, never retry it blindly.
     pub fn is_timeout(&self) -> bool {
-        #[cfg(feature = "host-runtime")]
-        if matches!(
-            self,
-            Self::CloudHypervisor(cloud_hypervisor::ApiError::Timeout)
-        ) {
-            return true;
+        match self {
+            #[cfg(feature = "host-runtime")]
+            Self::CloudHypervisor(cloud_hypervisor::ApiError::Timeout) => true,
+            _ => false,
         }
-        false
     }
 }
 

@@ -14,7 +14,6 @@ workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 jiff = { workspace = true }
 prost = { workspace = true }
@@ -34,7 +33,6 @@ uuid = { workspace = true, features = ["v7"] }
 # internal
 pplx-space-api-route = { workspace = true }
 pplx-space-auto-lifecycle = { workspace = true }
-pplx-space-common-core = { workspace = true }
 pplx-space-node-model = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-guest-process = { workspace = true }

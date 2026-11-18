@@ -30,8 +30,8 @@ h2 = { workspace = true }
 hyper = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
-pplx-space-artifact-model = { workspace = true }
-pplx-space-snapshot-model = { workspace = true }
+pplx-space-artifact-model = { workspace = true, features = ["serde"] }
+pplx-space-snapshot-model = { workspace = true, features = ["serde"] }
 pplx-space-template-model = { workspace = true }
 rustix = { workspace = true, features = ["fs", "mount", "process"] }
 nix = { workspace = true, features = ["dir", "fs", "mount", "sched", "process", "resource", "signal", "user"] }
@@ -55,7 +55,6 @@ zeroize = { workspace = true }
 
 # internal
 pplx-space-accounts = { workspace = true }
-pplx-space-common-core = { workspace = true }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-btrfs = { workspace = true }
 pplx-space-host-layout = { workspace = true }
@@ -89,7 +88,7 @@ pplx-space-test-hooks = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = { workspace = true }

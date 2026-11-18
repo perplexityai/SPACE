@@ -45,7 +45,7 @@ impl UnixSocketPath {
     /// ```
     pub fn parse(value: impl Into<PathBuf>) -> Result<Self, UnixSocketPathParseError> {
         let value = value.into();
-        if value.as_os_str().is_empty() || !value.is_absolute() {
+        if value.is_empty() || !value.is_absolute() {
             return Err(UnixSocketPathParseError);
         }
         #[cfg(unix)]

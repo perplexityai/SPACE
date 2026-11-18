@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
     io,
+    mem::DropGuard,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::Path,
 };
@@ -52,14 +53,6 @@ fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
     let write = unsafe { OwnedHandle::from_raw_handle(write) };
     Ok((read, write))
 }
-struct Attributes(Vec<usize>);
-impl Drop for Attributes {
-    fn drop(&mut self) {
-        // SAFETY: initialized attribute allocation remains live until this call.
-        unsafe { DeleteProcThreadAttributeList(self.0.as_mut_ptr().cast()) }
-    }
-}
-
 pub(super) fn quote(arg: &str) -> String {
     let mut result = String::from("\"");
     let mut slashes = 0;
@@ -91,21 +84,17 @@ fn environment(identity: &Identity, overrides: &HashMap<String, String>) -> io::
             0,
         ))?;
     }
-    struct Environment(*mut std::ffi::c_void);
-    impl Drop for Environment {
-        fn drop(&mut self) {
-            // SAFETY: unique block returned by CreateEnvironmentBlock.
-            unsafe {
-                DestroyEnvironmentBlock(self.0);
-            }
+    let block = DropGuard::new(block, |block| {
+        // SAFETY: unique block returned by CreateEnvironmentBlock.
+        unsafe {
+            DestroyEnvironmentBlock(block);
         }
-    }
-    let block = Environment(block);
+    });
     let mut values = BTreeMap::new();
     let mut index = 0;
     // Windows guarantees a double-NUL terminated block. Advance only after
     // inspecting a valid element; no speculative reads beyond the terminator.
-    let ptr = block.0.cast::<u16>();
+    let ptr = block.cast::<u16>();
     let mut string = Vec::new();
     loop {
         let current = ptr.wrapping_add(index);
@@ -226,11 +215,14 @@ pub(super) fn spawn(
             &mut size,
         ))?;
     }
-    let mut attributes = Attributes(storage);
+    let mut attributes = DropGuard::new(storage, |mut storage| {
+        // SAFETY: initialized attribute allocation remains live until this call.
+        unsafe { DeleteProcThreadAttributeList(storage.as_mut_ptr().cast()) }
+    });
     // SAFETY: the attribute list and exact inherited handles live through create.
     unsafe {
         checked(UpdateProcThreadAttribute(
-            attributes.0.as_mut_ptr().cast(),
+            attributes.as_mut_ptr().cast(),
             0,
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
             handles.as_ptr().cast(),
@@ -248,7 +240,7 @@ pub(super) fn spawn(
             hStdError: handles[2],
             ..Default::default()
         },
-        lpAttributeList: attributes.0.as_mut_ptr().cast(),
+        lpAttributeList: attributes.as_mut_ptr().cast(),
     };
     // SAFETY: unnamed noninheritable job, owned by this function after success.
     let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };

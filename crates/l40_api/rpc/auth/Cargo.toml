@@ -13,14 +13,14 @@ workspace = true
 [features]
 default = []
 # Kubernetes TokenReview verification for the node-api and build auth layers.
-k8s = ["dep:k8s-openapi", "dep:kube", "dep:pplx-space-kube-client"]
+k8s = ["dep:k8s-openapi", "dep:kube", "dep:pplx-space-kube-client", "dep:pplx-space-test-hooks", "dep:sha2"]
 # Exposes the shared authentication test helpers (`test_support`, with `k8s`,
 # and the `*_for_test` constructors) to other crates. This crate's unit tests
 # get them under `cfg(test)`; external test suites opt in through a
 # dev-dependency.
 test-support = ["dep:axum", "dep:jiff", "dep:tokio-util"]
 # Enables the test-only environment overrides (see `pplx_space_test_hooks::test_hook`).
-test-hooks = ["pplx-space-test-hooks/test-hooks"]
+test-hooks = ["pplx-space-test-hooks?/test-hooks"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
@@ -32,7 +32,7 @@ jiff = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 kube = { workspace = true, default-features = false, features = ["client", "config", "runtime", "rustls-tls"], optional = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
+sha2 = { workspace = true, optional = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "time"] }
@@ -50,7 +50,7 @@ pplx-space-host-layout = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-metrics-emit = { workspace = true }
-pplx-space-test-hooks = { workspace = true }
+pplx-space-test-hooks = { workspace = true, optional = true }
 pplx-space-uds-peer-auth = { workspace = true }
 
 [dev-dependencies]

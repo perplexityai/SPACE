@@ -11,56 +11,14 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-pplx-space-accounts = { workspace = true }
-pplx-space-artifact-model = { workspace = true }
-pplx-space-byok-model = { workspace = true }
-pplx-space-byte-size = { workspace = true }
-pplx-space-content-digest = { workspace = true }
-pplx-space-durations = { workspace = true }
-pplx-space-env-vars = { workspace = true }
-pplx-space-execution-spec = { workspace = true }
-pplx-space-job-id = { workspace = true }
-pplx-space-k8s-ids = { workspace = true }
-pplx-space-linux-ids = { workspace = true }
-pplx-space-node-model = { workspace = true }
 pplx-space-sandbox-model = { workspace = true }
-pplx-space-semver = { workspace = true }
-pplx-space-snapshot-model = { workspace = true }
-pplx-space-sql-codec = { workspace = true, optional = true }
-pplx-space-subject-model = { workspace = true }
+
+[dev-dependencies]
+pplx-space-byte-size = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 pplx-space-template-model = { workspace = true }
-serde = { workspace = true, features = ["derive"], optional = true }
-uuid = { workspace = true, features = ["v5", "v7"] }
 
 [features]
 default = []
-serde = [
-    "dep:serde",
-    "pplx-space-byte-size/serde",
-    "pplx-space-content-digest/serde",
-    "pplx-space-durations/serde",
-    "uuid/serde",
-    "pplx-space-semver/serde",
-    "pplx-space-k8s-ids/serde",
-    "pplx-space-accounts/serde",
-    "pplx-space-execution-spec/serde",
-    "pplx-space-linux-ids/serde",
-    "pplx-space-template-model/serde",
-    "pplx-space-node-model/serde",
-    "pplx-space-sandbox-model/serde",
-    "pplx-space-snapshot-model/serde",
-    "pplx-space-artifact-model/serde",
-    "pplx-space-byok-model/serde",
-    "pplx-space-subject-model/serde",
-]
-sqlx = [
-    "dep:pplx-space-sql-codec",
-    "pplx-space-sql-codec/postgres",
-    "pplx-space-semver/sqlx",
-    "pplx-space-k8s-ids/sqlx",
-    "pplx-space-accounts/sqlx",
-    "pplx-space-template-model/sqlx",
-    "pplx-space-node-model/sqlx",
-    "pplx-space-sandbox-model/sqlx",
-    "pplx-space-snapshot-model/sqlx",
-]
+serde = ["pplx-space-sandbox-model/serde"]
+sqlx = ["pplx-space-sandbox-model/sqlx"]

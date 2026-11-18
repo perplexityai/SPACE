@@ -1139,10 +1139,7 @@ fn parse_native_snapshot_mount(
 ) -> Result<PathBuf, OciBuildError> {
     let output = bounded_output(output);
     let target_and_options = format!(" {} -o rbind,ro", expected_target.display());
-    let Some(source) = output
-        .strip_prefix("mount -t bind ")
-        .and_then(|mount| mount.strip_suffix(&target_and_options))
-    else {
+    let Some(source) = output.strip_circumfix("mount -t bind ", &target_and_options) else {
         return Err(OciBuildError::InvalidSnapshotMount { output });
     };
     let source = PathBuf::from(source);

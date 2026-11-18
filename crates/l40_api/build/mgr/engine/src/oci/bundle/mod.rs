@@ -136,7 +136,7 @@ pub(super) fn normalize_relative_path(path: &Path) -> Result<PathBuf, GuestBundl
             }
         }
     }
-    if normalized.as_os_str().is_empty() {
+    if normalized.is_empty() {
         return Err(GuestBundleError::UnsafeDependency {
             path: path.display().to_string(),
         });

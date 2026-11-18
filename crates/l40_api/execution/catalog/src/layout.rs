@@ -81,10 +81,7 @@ fn firecracker_known_releases() -> Vec<&'static str> {
 }
 
 fn firecracker_state_format(version: &RuntimeVersion) -> Result<StateFormatIdentity, String> {
-    let version = version
-        .as_str()
-        .strip_prefix('v')
-        .unwrap_or(version.as_str());
+    let version = version.as_str().trim_prefix('v');
     semver::Version::parse(version).map_err(|error| error.to_string())?;
     let release = FIRECRACKER_STATE_FORMAT_RELEASES
         .iter()

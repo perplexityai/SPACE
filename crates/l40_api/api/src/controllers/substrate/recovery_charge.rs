@@ -513,6 +513,7 @@ impl RecoveryCharge {
 
     /// An enforcing charge acting for the sandbox's record, for tests that
     /// exercise admission but not attribution or caps.
+    #[cfg(feature = "kubernetes")]
     pub(crate) fn enforce_for_tests<T>(admission: Option<&Arc<T>>) -> Self
     where
         T: ActivationAdmission + 'static,

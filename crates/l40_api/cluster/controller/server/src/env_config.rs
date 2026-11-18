@@ -194,11 +194,7 @@ where
         Ok(n) => Some(n.min(ceiling)),
         Err(err)
             if *err.kind() == std::num::IntErrorKind::PosOverflow
-                && raw
-                    .strip_prefix('+')
-                    .unwrap_or(raw)
-                    .bytes()
-                    .all(|b| b.is_ascii_digit()) =>
+                && raw.trim_prefix('+').bytes().all(|b| b.is_ascii_digit()) =>
         {
             Some(ceiling)
         }

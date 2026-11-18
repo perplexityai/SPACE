@@ -19,6 +19,7 @@ pub(crate) fn enter_sim_worker_process() -> bool {
 }
 
 /// [`enter_sim_worker_process`], with `extra` set in the child as well.
+#[cfg(feature = "kubernetes")]
 pub(crate) fn enter_sim_worker_process_with(extra: &[(&str, Option<&std::ffi::OsStr>)]) -> bool {
     enter_sim_worker_process_with_token_paths(None, None, extra)
 }

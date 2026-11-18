@@ -19,8 +19,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(test)]
-pub(crate) use crate::inline_operations::InlineExecution;
 pub(crate) use crate::inline_operations::InlineExecutor;
 use crate::inline_operations::{InlineOperations, InlinePermit, InlineStart};
 use crate::public_operations::{InlineClaim, PublicOperationStore, PublicOperationStoreError};

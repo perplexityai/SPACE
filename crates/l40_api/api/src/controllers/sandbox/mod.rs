@@ -15,6 +15,7 @@ use pplx_space_node_mgr_client::proto::{AllowPortRequest, ExposePortRequest, Net
 use pplx_space_node_model::NodePoolName;
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_store::ObservedSpacedVersion;
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use pplx_space_sbx_mgr_client::proto::{
     AutoLifecycleTouchResult, CreateSnapshotRequest, KillRequest, ListSnapshotsRequest,
@@ -77,7 +78,8 @@ struct SandboxObservedState {
     substrate_node_id: Option<String>,
     template: Option<String>,
     status: Option<String>,
-    spaced_version: Option<SemVer>,
+    #[sqlx(flatten)]
+    version: ObservedSpacedVersion,
     pid: Option<i32>,
     namespace: Option<String>,
     uptime: Option<String>,
@@ -1464,7 +1466,7 @@ use responses::*;
 pub(crate) use org::sandbox_matches_federated_owner;
 pub use org::{SandboxAccessScope, SandboxPageCursor};
 pub(crate) use queries::org_byok_enabled;
-#[cfg(test)]
+#[cfg(all(test, feature = "kubernetes"))]
 pub(crate) use queries::pooled_prepare_error_is_reclaimable;
 pub use queries::{FederatedSandboxCreateContext, RestoreForkDiskAsNewContext};
 pub use responses::{

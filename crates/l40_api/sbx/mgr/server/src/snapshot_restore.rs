@@ -1093,8 +1093,7 @@ fn pull_replacement_prefix(local_path: &Path) -> Option<String> {
 }
 
 fn replacement_artifact_basename(name: &str) -> &str {
-    name.strip_prefix('.')
-        .and_then(|name| name.strip_suffix(".volmgr-replica.json"))
+    name.strip_circumfix('.', ".volmgr-replica.json")
         .unwrap_or(name)
 }
 

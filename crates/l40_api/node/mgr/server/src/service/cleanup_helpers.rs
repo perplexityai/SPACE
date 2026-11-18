@@ -1713,10 +1713,10 @@ fn sandbox_backing_roots(
 }
 
 fn backing_belongs_to_sandbox(backing: &str, roots: &[std::path::PathBuf]) -> bool {
-    let path = Path::new(backing.strip_suffix(" (deleted)").unwrap_or(backing));
+    let path = Path::new(backing.trim_suffix(" (deleted)"));
     roots.iter().any(|root| {
         path.strip_prefix(root)
-            .is_ok_and(|relative| !relative.as_os_str().is_empty())
+            .is_ok_and(|relative| !relative.is_empty())
     })
 }
 

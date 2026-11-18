@@ -22,7 +22,6 @@ datadog-otel = ["otel", "datadog"]
 pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-artifact-model = { workspace = true }
 pplx-space-byok-model = { workspace = true, features = ["serde"] }
-pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-sandbox-model = { workspace = true }
 aes-gcm = { workspace = true }
 async-trait = { workspace = true }
@@ -116,7 +115,6 @@ pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
 
 [dev-dependencies]
-pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 # Point the test's default credentials chain at a fake container credential
 # endpoint without touching the process environment.
 aws-config = { workspace = true, features = ["test-util"] }

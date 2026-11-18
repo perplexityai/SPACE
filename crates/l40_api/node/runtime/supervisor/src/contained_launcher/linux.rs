@@ -398,8 +398,7 @@ fn exec(executable: AuthenticatedFile, arguments: &[String]) -> Result<(), Error
         &[] as &[CString],
         nix::fcntl::AtFlags::AT_EMPTY_PATH,
     )
-    .map_err(sys("exec authenticated runtime"))?;
-    unreachable!("execveat never returns on success")
+    .map_err(sys("exec authenticated runtime"))?
 }
 
 /// Refuse existing entries instead of repairing an attacker-controlled tree.

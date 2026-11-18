@@ -174,7 +174,7 @@ pub(super) fn read_archive(bytes: &[u8]) -> io::Result<Files> {
         if entry.header().entry_type().is_dir() && path == std::path::Path::new(".") {
             continue;
         }
-        let path = path.strip_prefix(".").unwrap_or(&path);
+        let path = path.trim_prefix(".");
         if !entry.header().entry_type().is_file() || path.components().count() != 1 {
             return Err(io::Error::other(
                 "runtime bundle must contain only regular files",

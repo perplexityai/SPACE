@@ -49,11 +49,7 @@ pub(super) fn layer_dir(member: &str) -> Option<(Layer, &str)> {
 /// The directories a package's path below its layer directory is made of:
 /// its name without [`PACKAGE_PREFIX`], split on `-`.
 pub(super) fn name_segments(package: &str) -> Vec<&str> {
-    package
-        .strip_prefix(PACKAGE_PREFIX)
-        .unwrap_or(package)
-        .split('-')
-        .collect()
+    package.trim_prefix(PACKAGE_PREFIX).split('-').collect()
 }
 
 /// A dependency of one member on another, both with a layer.
@@ -336,7 +332,7 @@ pub(super) fn use_tree(text: &mut &str, prefix: &str, paths: &mut Vec<String>) {
                 }
             }
             let rest = text.trim_start();
-            *text = rest.strip_prefix('}').unwrap_or(rest);
+            *text = rest.trim_prefix('}');
             return;
         }
         let (segment, after) = rest.split_at(ident_len(rest));

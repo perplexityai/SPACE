@@ -8,7 +8,7 @@ pub(super) const ROOTFS_SPARSE_BLOCK_BYTES: usize = 64 * 1024;
 
 pub(super) fn transfer_artifact_name(local_path: &Path) -> Option<&str> {
     let name = local_path.file_name()?.to_str()?;
-    let name = name.strip_prefix('.').unwrap_or(name);
+    let name = name.trim_prefix('.');
     Some(name.split(".restore-").next().unwrap_or(name))
 }
 

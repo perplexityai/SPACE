@@ -749,7 +749,7 @@ where
 }
 
 fn parse_grpc_path(path: &str) -> (&str, &str) {
-    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    let trimmed = path.trim_prefix('/');
     match trimmed.rsplit_once('/') {
         Some((service, method)) => (service, method),
         None => ("", trimmed),

@@ -59,21 +59,6 @@
 # namespace to its live tables that no store declares. Only remove entries:
 # a pull request that adds one is reported.
 [layers.codec_features]
-pplx-space-api = [
-  "pplx-space-common-core/sqlx",
-]
-pplx-space-cluster-controller-server = [
-  "pplx-space-common-core/sqlx",
-]
-pplx-space-credmgr = [
-  "pplx-space-common-core/sqlx",
-]
-pplx-space-internal-api-server = [
-  "pplx-space-common-core/sqlx",
-]
-pplx-space-snapshot-retention = [
-  "pplx-space-common-core/sqlx",
-]
 
 [layers.dev_direction]
 

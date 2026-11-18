@@ -27,7 +27,7 @@ hex = { workspace = true }
 jiff = { workspace = true }
 oci-spec = { workspace = true, features = ["image"] }
 object = { workspace = true }
-pplx-space-artifact-model = { workspace = true }
+pplx-space-artifact-model = { workspace = true, features = ["serde"] }
 pplx-space-template-model = { workspace = true }
 reqwest = { workspace = true, features = ["query"] }
 serde = { workspace = true, features = ["derive"] }
@@ -45,7 +45,6 @@ tracing = { workspace = true }
 # internal
 pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-build-mgr-client = { workspace = true }
-pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-template-runtime = { workspace = true }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }

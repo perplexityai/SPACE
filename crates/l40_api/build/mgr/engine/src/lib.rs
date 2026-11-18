@@ -2335,7 +2335,7 @@ fn extract_requested_tar_payload(
 
 fn requested_tar_entry_target(path: &Path, source_path: &Path, staged: &Path) -> Option<PathBuf> {
     path.strip_prefix(source_path).ok().map(|relative_path| {
-        if relative_path.as_os_str().is_empty() {
+        if relative_path.is_empty() {
             staged.to_path_buf()
         } else {
             staged.join(relative_path)
@@ -2468,7 +2468,7 @@ fn validate_supported_tar_entry(
 }
 
 fn validate_tar_entry_path(path: &Path) -> Result<(), SshError> {
-    if path.as_os_str().is_empty() {
+    if path.is_empty() {
         return Err(SshError::CopyPayload(
             "tar payload contains empty entry path".into(),
         ));
@@ -2497,7 +2497,7 @@ fn validate_tar_entry_path(path: &Path) -> Result<(), SshError> {
 /// virtual cursor would step above the staging root. Absolute targets and
 /// any `RootDir` / `Prefix` components are rejected outright.
 fn validate_tar_symlink_target(link_path: &Path, target: &Path) -> Result<(), SshError> {
-    if target.as_os_str().is_empty() {
+    if target.is_empty() {
         return Err(SshError::CopyPayload(format!(
             "tar payload symlink {} has empty target",
             link_path.display()

@@ -143,7 +143,7 @@ impl WatchFilter {
         if self.config.use_default_excludes && is_tmp_browser_scratch_path(path) {
             return false;
         }
-        let relative = if relative.as_os_str().is_empty() {
+        let relative = if relative.is_empty() {
             Path::new(".")
         } else {
             relative

@@ -37,16 +37,6 @@ import subprocess
 import sys
 
 COMMON_CORE = "pplx-space-common-core"
-# Reach common-core, besides directly, only through crates that are linted
-# alone themselves (pplx-space-api-route), and build quickly alone, so they
-# are linted as well. rpc-auth is here so that its build without `k8s` is
-# linted: no binary's release build leaves that feature off. Each entry must
-# be a workspace library the rule leaves out for reaching common-core through
-# another crate.
-ALSO = {
-    "pplx-space-rpc-auth",
-}
-
 with open(sys.argv[1]) as metadata_file:
     packages = {p["name"]: p for p in json.load(metadata_file)["packages"]}
 
@@ -127,16 +117,6 @@ for name in libraries:
     else:
         group = "selected"
     groups[group].append(name)
-for name in sorted(ALSO):
-    if name not in libraries:
-        sys.exit(f"isolated_crates: {name} is listed in ALSO but is not a workspace library")
-    if name not in groups["indirect"]:
-        sys.exit(
-            f"isolated_crates: {name} is listed in ALSO but the rule does not leave it "
-            "out for reaching common-core through another crate; remove it"
-        )
-    groups["indirect"].remove(name)
-    groups["selected"].append(name)
 for name in sorted(groups["selected"]):
     print(name)
 print(
@@ -334,10 +314,10 @@ lint_affects_any() {
     [ -n "${affected}" ]
 }
 
-# Lint each crate isolated_crates names on its own, with no features and with
-# all of them. One Cargo invocation per crate and configuration: a single one
-# would unify features across its packages again. `--all-targets` builds the
-# library with its dev-dependencies' features too, so the library is also
+# Lint each crate isolated_crates names on its own, with its minimum supported
+# features and with all of them. Use one Cargo invocation per crate and
+# configuration so Cargo cannot unify features across packages. `--all-targets`
+# builds the library with its dev-dependencies' features too, so the library is also
 # linted alone with `--lib`. That run is a no-op taking a fraction of a second
 # when the dev-dependencies change nothing, which is less than asking
 # `cargo tree` whether they do. Every crate runs, and every failing crate and
@@ -375,14 +355,16 @@ run_isolated_crate_checks() {
     echo "Linting ${#crates[@]} crates alone: ${crates[*]}"
 
     local crate config flags=() failures=() run_count=0
-    local configs=(
-        "--no-default-features --all-targets"
-        "--no-default-features --lib"
-        "--all-features --all-targets"
-        "--all-features --lib"
-    )
+    local minimal_features
     for crate in "${crates[@]}"; do
-        for config in "${configs[@]}"; do
+        minimal_features="--no-default-features"
+        # Cluster controller requires its Kubernetes client even in Direct mode
+        # for leader election when the controller runs inside a pod.
+        if [[ "${crate}" == pplx-space-cluster-controller-server ]]; then
+            minimal_features+=" --features kubernetes"
+        fi
+        for config in "${minimal_features} --all-targets" "${minimal_features} --lib" \
+            "--all-features --all-targets" "--all-features --lib"; do
             echo "--- :rust: Linting ${crate} alone (${config})"
             run_count=$((run_count + 1))
             read -ra flags <<<"${config}"

@@ -336,7 +336,7 @@ pub(super) fn record_grpc_status_on_span(status: &Status, span: &tracing::Span) 
 /// into `(service, method)`. Returns `("", path)` if the shape doesn't match,
 /// so we still produce a usable span for non-gRPC traffic that ends up here.
 pub(super) fn parse_grpc_path(path: &str) -> (&str, &str) {
-    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    let trimmed = path.trim_prefix('/');
     match trimmed.rsplit_once('/') {
         Some((service, method)) => (service, method),
         None => ("", trimmed),

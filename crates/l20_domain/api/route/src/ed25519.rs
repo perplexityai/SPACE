@@ -913,10 +913,7 @@ fn decode_public_verification_key(
 fn decode_pem_block(text: &str, label: &str) -> Result<Vec<u8>, ()> {
     let begin = format!("-----BEGIN {label}-----");
     let end = format!("-----END {label}-----");
-    let body = text
-        .strip_prefix(&begin)
-        .and_then(|value| value.strip_suffix(&end))
-        .ok_or(())?;
+    let body = text.strip_circumfix(&begin, &end).ok_or(())?;
     let encoded = body.lines().map(str::trim).collect::<String>();
     STANDARD.decode(encoded).map_err(|_| ())
 }

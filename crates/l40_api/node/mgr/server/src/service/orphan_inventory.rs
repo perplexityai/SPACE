@@ -209,7 +209,7 @@ fn inspect_entry(
             }
         }
         Source::Cgroups => {
-            let id = name.strip_prefix("sbx-").unwrap_or(&name);
+            let id = name.trim_prefix("sbx-");
             if id.parse::<SandboxId>().is_ok() && !evidence.sandboxes.contains(id) {
                 page.orphaned_cgroups.push(path);
             }
@@ -268,12 +268,7 @@ fn inspect_entry(
             let ids: Vec<_> = cgroup
                 .lines()
                 .flat_map(|line| line.trim_end_matches(" (deleted)").split('/'))
-                .filter_map(|part| {
-                    part.strip_prefix("sbx-")
-                        .unwrap_or(part)
-                        .parse::<SandboxId>()
-                        .ok()
-                })
+                .filter_map(|part| part.trim_prefix("sbx-").parse::<SandboxId>().ok())
                 .collect();
             if !ids
                 .iter()

@@ -19,7 +19,6 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-execution-common = { workspace = true }
 pplx-space-execution-spec = { workspace = true, features = ["serde"] }

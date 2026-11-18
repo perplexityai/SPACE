@@ -1,6 +1,7 @@
 use super::cleanup_support::CleanupLockTryResult;
 use super::create_support::{validate_path_component, validate_snapshot_name};
 use super::*;
+use std::mem::DropGuard;
 
 /// The name an import publishes its snapshot under: the client's
 /// `target_name`, which must be a valid name of the snapshot's type, or a
@@ -213,16 +214,14 @@ impl SandboxManagerService {
                                 files.push(("memory", format!("{snapshot_dir}/memory"), true));
                             }
 
-                            // Track diff cleanup for rootfs delta
-                            struct DiffCleanup(Option<String>);
-                            impl Drop for DiffCleanup {
-                                fn drop(&mut self) {
-                                    if let Some(ref p) = self.0 {
-                                        let _ = std::fs::remove_file(p);
-                                    }
+                            let mut rootfs_diff_guard = DropGuard::new(None::<String>, |path| {
+                                if let Some(path) = path
+                                    && let Err(error) = std::fs::remove_file(&path)
+                                    && error.kind() != std::io::ErrorKind::NotFound
+                                {
+                                    tracing::warn!(%path, %error, "failed to remove temporary rootfs diff");
                                 }
-                            }
-                            let mut _rootfs_diff_guard = DiffCleanup(None);
+                            });
 
                             if include_rootfs {
                                 // Prefer rootfs from the snapshot itself (full snapshots are btrfs clones of instance/)
@@ -239,7 +238,7 @@ impl SandboxManagerService {
                                     let diff_id = uuid::Uuid::now_v7();
                                     let diff_path =
                                         format!("{snapshot_dir}/.rootfs.diff.{diff_id}.tmp");
-                                    _rootfs_diff_guard = DiffCleanup(Some(diff_path.clone()));
+                                    *rootfs_diff_guard = Some(diff_path.clone());
                                     if super::grpc_sandbox_transfer::diff_against_verified_base(
                                         &lookup_runtime,
                                         resolver.as_ref(),

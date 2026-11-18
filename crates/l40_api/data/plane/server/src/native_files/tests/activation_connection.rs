@@ -4,7 +4,7 @@
 //! 503 promptly, not once its RPC's own deadline passes.
 
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::super::access::KeepAlive;
 use super::proxy::{Fault, FaultyProxy};
@@ -94,7 +94,7 @@ async fn a_call_whose_activation_dial_goes_unanswered_is_a_prompt_503() {
     }
     let harness = harness_reaching(api, worker, unanswered, FAST_KEEP_ALIVE).await;
 
-    let started = Instant::now();
+    let started = std::time::Instant::now();
     let response = tokio::time::timeout(Duration::from_secs(10), harness.send(stat(&harness)))
         .await
         .expect("the call is answered once its dial gives up");

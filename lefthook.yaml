@@ -37,7 +37,7 @@ pre-push:
 
     rust-clippy:
       glob: "*.rs"
-      run: cargo clippy --workspace --locked --all-features -- -D warnings
+      run: cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
       fail_text: |
         Clippy found warnings (treated as errors).
         Fix the clippy warnings above before pushing.

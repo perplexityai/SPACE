@@ -480,7 +480,7 @@ fn capture_process(
     let observed_executable = executable_target
         .file_name()
         .and_then(|name| name.to_str())
-        .map(|name| name.strip_suffix(" (deleted)").unwrap_or(name));
+        .map(|name| name.trim_suffix(" (deleted)"));
     if observed_executable != Some(executable_name) {
         return Err(EndpointProofError::Mismatch(format!(
             "process {pid} does not run {executable_name}"

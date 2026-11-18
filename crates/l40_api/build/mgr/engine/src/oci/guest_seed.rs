@@ -79,9 +79,8 @@ impl GuestSeeds {
 fn identity_value(value: &str) -> Option<&str> {
     let value = value.trim();
     let value = value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .strip_circumfix('"', '"')
+        .or_else(|| value.strip_circumfix('\'', '\''))
         .unwrap_or(value);
     (!value.is_empty()
         && value

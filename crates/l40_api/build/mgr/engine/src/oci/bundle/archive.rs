@@ -214,7 +214,7 @@ impl GuestBundle {
                 directories.insert(path.clone());
             }
             let mut parent = path.parent();
-            while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            while let Some(path) = parent.filter(|path| !path.is_empty()) {
                 directories.insert(path.to_path_buf());
                 parent = path.parent();
             }

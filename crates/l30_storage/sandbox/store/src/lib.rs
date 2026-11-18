@@ -151,6 +151,12 @@ pub mod wake;
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
 pub use lifecycle::StoredSandboxLifecycle;
 
+/// The nullable `spaced_version` column shared by sandbox observation queries.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct ObservedSpacedVersion {
+    pub spaced_version: Option<pplx_space_semver::SemVer>,
+}
+
 /// The `sandboxes.metadata` document: caller-supplied labels, untyped by
 /// design. Distinct from the validated `SandboxMetadata` newtype in
 /// `pplx-space-sandbox-model` — that one enforces a key/value vocabulary,
