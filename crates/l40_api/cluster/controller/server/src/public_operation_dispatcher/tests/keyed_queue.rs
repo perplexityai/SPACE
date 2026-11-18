@@ -25,6 +25,12 @@ struct KeyedRecordingExecutor {
 
 #[async_trait::async_trait]
 impl PublicOperationExecutor for KeyedRecordingExecutor {
+    // As the production executor does, so these claims carry the drain
+    // restore terms, with no drain restore to claim.
+    fn runs_drain_restores(&self) -> bool {
+        true
+    }
+
     fn supported_kinds(&self) -> &'static [OperationKind] {
         &[
             OperationKind::CreateSandbox,
@@ -1051,6 +1057,12 @@ struct DeleteDuringCreate {
 
 #[async_trait::async_trait]
 impl PublicOperationExecutor for DeleteDuringCreate {
+    // As the production executor does, so these claims carry the drain
+    // restore terms, with no drain restore to claim.
+    fn runs_drain_restores(&self) -> bool {
+        true
+    }
+
     fn supported_kinds(&self) -> &'static [OperationKind] {
         &[OperationKind::CreateSandbox, OperationKind::DeleteSandbox]
     }

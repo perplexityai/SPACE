@@ -1,5 +1,7 @@
 use super::DrainRestoreRetry;
 
+mod executor;
+
 /// The backoff doubles from its base to its cap.
 #[test]
 fn failed_attempts_back_off_to_the_cap() {

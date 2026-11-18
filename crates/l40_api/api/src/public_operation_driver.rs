@@ -488,11 +488,38 @@ where
             }
             updated.then_some(ExecutionOutcome::Failed)
         }
+        // An executor that found its work superseded. Only the drain restore's
+        // returns this.
+        OperationState::Canceled => {
+            let terminal_error_code = result
+                .terminal_error_code
+                .unwrap_or(PublicErrorCode::OperationFailed);
+            let updated = store
+                .cancel_claimed_operation(FailClaimedPublicOperation {
+                    claim_token,
+                    operation_id,
+                    progress_message: result.progress_message,
+                    terminal_error_code,
+                    terminal_error_json: result
+                        .terminal_error_json
+                        .unwrap_or_else(|| serde_json::json!({})),
+                })
+                .await?;
+            if updated {
+                report.canceled += 1;
+                crate::metrics::operations::completed_by(
+                    api_product_label,
+                    kind.as_str(),
+                    OperationState::Canceled.as_str(),
+                    executor,
+                );
+            }
+            updated.then_some(ExecutionOutcome::Canceled)
+        }
         // Executors only produce the known states; an `Other` here would be a
         // programming error, and releasing the claim is the safe reading.
         OperationState::Queued
         | OperationState::Running
-        | OperationState::Canceled
         | OperationState::Expired
         | OperationState::Other(_) => {
             let supported_requeue = result.state == OperationState::Queued;
@@ -696,6 +723,7 @@ where
                     }
                     None => retry_hint,
                 };
+                let attempt_message = last_progress_message.clone();
                 let released = store
                     .release_claimed_operation(ReleaseClaimedPublicOperation {
                         claim_token,
@@ -739,6 +767,23 @@ where
                             operation_id = %operation_id,
                             delete_operation_id = %delete_id,
                             "public create canceled instead of retried: a later delete supersedes it"
+                        );
+                        Some(ExecutionOutcome::Canceled)
+                    }
+                    ReleasedClaim::DrainRestoreSuperseded { by } => {
+                        report.canceled += 1;
+                        crate::metrics::operations::completed_by(
+                            api_product_label,
+                            kind.as_str(),
+                            OperationState::Canceled.as_str(),
+                            executor,
+                        );
+                        tracing::info!(
+                            operation_id = %operation_id,
+                            superseding_operation_id = %by,
+                            attempt = %attempt_message,
+                            "drain restore canceled instead of retried: a later user request \
+                             supersedes it"
                         );
                         Some(ExecutionOutcome::Canceled)
                     }
