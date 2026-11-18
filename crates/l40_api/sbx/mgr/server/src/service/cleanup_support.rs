@@ -56,6 +56,7 @@ pub(super) async fn cleanup_sandbox_via_node_with_options(
         keep_filesystem,
         return_after_slot_release,
         immediate_kill,
+        recover_deleted_owner_block_volume: false,
     };
     let response = node_client
         .cleanup_sandbox(request)

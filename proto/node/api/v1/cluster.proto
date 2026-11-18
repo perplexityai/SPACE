@@ -247,7 +247,17 @@ message PublishBlockVolumeCheckpointRequest {
   uint64 disk_generation = 2;
   string checkpoint_id = 3;
 }
-message ReleaseBlockVolumeBindingRequest { space.execution.v1.BlockVolumeFence fence = 1; }
+message ReleaseBlockVolumeBindingRequest {
+  space.execution.v1.BlockVolumeFence fence = 1;
+  // Alternative to a received fence, after positive node cleanup. The owner
+  // must be absent; authority is reconstructed only for this authenticated node.
+  DeletedBlockVolumeOwnerCleanup deleted_owner_cleanup = 2;
+}
+message DeletedBlockVolumeOwnerCleanup {
+  string sandbox_id = 1;
+  // Filled by the node-local volume-manager, never selected by a guest.
+  string node_id = 2;
+}
 message BlockVolumeProgressResponse { uint64 disk_generation = 1; }
 
 message ListNodesRequest {

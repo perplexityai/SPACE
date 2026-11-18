@@ -215,6 +215,7 @@ impl NodeManagerService {
         Ok(Response::new(CleanupSandboxResponse {
             retained_execution_id: None,
             actions: vec!["Disposed prepared clone resources".into()],
+            deleted_owner_block_volume_released: false,
         }))
     }
 

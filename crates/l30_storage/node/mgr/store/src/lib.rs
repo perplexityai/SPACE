@@ -4,6 +4,45 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+pub fn pending_block_resolution(
+    db: &Connection,
+    sandbox: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    db.query_row(
+        "SELECT execution_id FROM pending_block_resolutions WHERE sandbox_id = ?1",
+        params![sandbox],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+pub fn save_pending_block_resolution(
+    db: &Connection,
+    sandbox: &str,
+    execution: &str,
+) -> Result<bool, rusqlite::Error> {
+    Ok(db.execute(
+        "INSERT INTO pending_block_resolutions (sandbox_id, execution_id)
+         SELECT ?1, ?2 WHERE EXISTS (
+             SELECT 1 FROM sandbox_executions WHERE sandbox_id = ?1 AND execution_id = ?2)
+         ON CONFLICT (sandbox_id) DO UPDATE SET execution_id = excluded.execution_id
+         WHERE pending_block_resolutions.execution_id = excluded.execution_id",
+        params![sandbox, execution],
+    )? == 1)
+}
+
+pub fn clear_pending_block_resolution(
+    db: &Connection,
+    sandbox: &str,
+    execution: &str,
+) -> Result<(), rusqlite::Error> {
+    db.execute(
+        "DELETE FROM pending_block_resolutions WHERE sandbox_id = ?1 AND execution_id = ?2",
+        params![sandbox, execution],
+    )?;
+    Ok(())
+}
+
 pub struct RetainedBlockBinding {
     pub execution_id: String,
     pub binding: Vec<u8>,

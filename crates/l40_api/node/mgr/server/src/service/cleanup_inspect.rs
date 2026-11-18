@@ -517,8 +517,11 @@ impl NodeManagerService {
 
         // 5. Remove per-run runtime artifacts even when the retained cache is kept.
         actions.extend(cleanup_runtime_artifacts_blocking(sandbox_id, &_lifecycle_permit).await?);
-        self.release_retained_block_after_cleanup(sandbox_id)
-            .await?;
+        self.release_retained_block_after_cleanup(
+            sandbox_id,
+            req.recover_deleted_owner_block_volume,
+        )
+        .await?;
         tracing::info!(
             sandbox_id,
             elapsed_ms = cleanup_started.elapsed().as_millis() as u64,
@@ -704,6 +707,7 @@ impl NodeManagerService {
         Ok(CleanupSandboxResponse {
             actions,
             retained_execution_id,
+            deleted_owner_block_volume_released: req.recover_deleted_owner_block_volume,
         })
     }
 

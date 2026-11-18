@@ -42,6 +42,7 @@ impl GuestPlatform {
                 GuestOperation::FileWatch,
                 GuestOperation::Flush,
                 GuestOperation::BlockVolumeMount,
+                GuestOperation::BlockVolumeQuiesce,
                 GuestOperation::Resume,
                 GuestOperation::LoopbackForward,
             ]

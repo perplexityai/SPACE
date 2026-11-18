@@ -121,6 +121,7 @@ async fn fatal_kill_signal_failure_still_schedules_admitted_cleanup() {
             keep_filesystem: true,
             return_after_slot_release: true,
             immediate_kill: true,
+            recover_deleted_owner_block_volume: false,
         }]
     );
     assert_eq!(node_manager.calls(), ["StopProcess", "CleanupSandbox"]);

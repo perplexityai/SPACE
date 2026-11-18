@@ -35,6 +35,51 @@ only after safe teardown and observed detach. Explicit volume deletion requires
 no sandbox reservation. Existing inline-created volumes preserve their old
 delete-with-sandbox behavior and authorization.
 
+Read-only reuse requires a clean ext4 journal. Before terminating a live
+volume-backed execution, a compatible manager/host/guest combination freezes
+the data filesystem with `FIFREEZE`, which blocks writers and checkpoints the
+journal before VM exit. This is distinct from suspend: memory capture keeps
+the filesystem unfrozen, and its post-capture teardown must not change disk
+state. Ordinary diskless stop flushes are unchanged.
+
+The stop-only request requires the explicitly advertised
+`BLOCK_VOLUME_QUIESCE` guest capability. Older guests retain their normal flush
+behavior, but cannot provide the new clean handoff. Stop remains bounded and
+proceeds on guest failure. A later read-only owner rejects a disk still marked
+as requiring journal recovery or containing filesystem errors, rather than
+weakening host/VMM read-only access. Its guest mount uses `ro,noload` only after
+that check. Recover an unclean journal with an exclusive read-write owner
+before attempting read-only reuse. A failed or malicious guest does not receive
+an application-consistency guarantee.
+
+Grant resolution can attach a disk before its response reaches node-manager.
+Node-manager therefore persists a pending-resolution receipt before that RPC,
+replacing it with the exact binding receipt after success. Cleanup preserves
+both across execution retirement and restarts; a missing response never means
+that no attachment exists. Normal diskless cleanup adds no control-plane call.
+
+When a binding response was never received, recovery additionally requires that
+the sandbox owner has been deleted. After supervisor termination, cgroup
+quiescence and non-lazy jail unmounts, node-manager asks the authenticated
+volume-manager relay to acknowledge only that deleted owner's attachment on
+its own verified node. The controller still performs and observes ordinary
+detach. A live owner or another node's attachment is refused.
+
+For an older failed execution that predates pending receipts, an operator may
+run `sudo space-nodemgr cleanup <sandbox-id> --recover-deleted-owner-block-volume`
+on its attachment host after deleting the sandbox through its normal API.
+This repeats the host cleanup barrier, not just an AWS detach. The CLI requires
+an explicit recovery acknowledgement, so an old node-manager ignoring the new
+flag is not success. Verify control-plane reservation release and provider
+detach before requesting native volume deletion, then verify cloud absence.
+
+Deploy the additive node-store migration and compatible cluster API,
+volume-manager and node-manager before recovery. Older relays or cluster APIs
+refuse the alternative release request rather than inferring a fence.
+Do not downgrade node-manager while pending-resolution rows remain: older
+cleanup code cannot consume them, and the down migration refuses to discard
+nonempty receipts. Keep compatible lifecycle binaries until cleanup finishes.
+
 Independent creation/mounting requires `independent_volumes: true` and
 `volume_management: true` in the default-off admission policy, as well as the
 organization allowlist. Upgrade compatible API and controller lifecycle support

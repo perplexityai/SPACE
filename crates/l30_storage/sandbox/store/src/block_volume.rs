@@ -519,6 +519,50 @@ pub async fn publish_checkpoint(
         == 1)
 }
 
+/// Recover a lost grant response only after the authenticated node has proven
+/// teardown and the sandbox owner is gone. Never releases a live owner's disk.
+pub async fn acknowledge_deleted_owner_release(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sandbox_id: SandboxId,
+    node_id: NodeId,
+) -> Result<bool, sqlx::Error> {
+    let owner: Option<Uuid> =
+        sqlx::query_scalar(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
+            .bind(sandbox_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if owner.is_some() {
+        return Ok(false);
+    }
+    let changed = sqlx::query(sql!(
+        "UPDATE sandbox_block_volumes
+         SET phase = 'detaching', released_epoch = attachment_epoch,
+             revision = revision + 1, updated_at = NOW()
+         WHERE sandbox_id = $1 AND node_id = $2
+           AND execution_id IS NOT NULL AND attachment_epoch > 0
+           AND phase IN ('attaching', 'attached', 'releasing', 'detaching')
+           AND NOT EXISTS (SELECT 1 FROM sandboxes WHERE id = $1)"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if changed {
+        return Ok(true);
+    }
+    // A lost response may be retried after the controller finished detaching
+    // and cleared the logical reservation. No attachment remains to release.
+    Ok(get(&mut **tx, sandbox_id).await?.is_none_or(|row| {
+        row.node_id.is_none()
+            && matches!(
+                row.phase,
+                VolumePhase::Available | VolumePhase::Deleting | VolumePhase::Deleted
+            )
+    }))
+}
+
 pub async fn acknowledge_release(
     executor: impl PgExecutor<'_>,
     volume_id: Uuid,

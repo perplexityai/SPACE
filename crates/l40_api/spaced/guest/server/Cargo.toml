@@ -63,7 +63,7 @@ pplx-space-execution-spec = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 hyper-util = { workspace = true, features = ["tokio"] }
-nix = { workspace = true, features = ["signal", "process", "user", "net", "fs", "term", "time", "mount"] }
+nix = { workspace = true, features = ["signal", "process", "user", "net", "fs", "term", "time", "mount", "ioctl"] }
 libc = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 tokio-stream = { workspace = true, features = ["net"] }

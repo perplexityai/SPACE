@@ -27,6 +27,12 @@ Postgres migration on startup and requires operator intervention. Node-local
 SQLite stores can hold authoritative state. New changes must remain additive
 migrations for every store.
 
+The node-manager `pending_block_resolutions` table preserves cleanup intent
+before central disk-grant resolution, including when its response is lost.
+These receipts survive execution retirement and must not be dropped on
+rollback. Its down migration refuses nonempty receipts; keep compatible cleanup
+binaries until the pending work and corresponding attachments have converged.
+
 Postgres migrations under `db/postgres/` use SQLx numeric versions. Retired
 legacy migrations used `NNN_name.up.sql` / `NNN_name.down.sql` names through
 `093`. New Postgres migrations must use a UTC creation timestamp:

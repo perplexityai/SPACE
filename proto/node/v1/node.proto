@@ -806,6 +806,9 @@ message CleanupSandboxRequest {
   // shutdown is not part of the lifecycle contract.
   bool immediate_kill = 6;
   ExecutionFence execution_fence = 7;
+  // Operator recovery after a failed grant lookup lost its release receipt.
+  // Requires completed host cleanup and control-plane proof of owner absence.
+  bool recover_deleted_owner_block_volume = 8;
 }
 
 message CleanupSandboxResponse {
@@ -813,6 +816,9 @@ message CleanupSandboxResponse {
   // A retained filesystem keeps its identity after lease release. The owner
   // persists this acknowledgement before completing its cleanup episode.
   optional string retained_execution_id = 2;
+  // Explicit acknowledgement for the optional recovery request. Old servers
+  // leave this false, so new operators cannot mistake ignored flags for proof.
+  bool deleted_owner_block_volume_released = 3;
 }
 
 message InspectSandboxRequest {

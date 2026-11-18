@@ -46,6 +46,7 @@ pub(crate) struct MockBridgeGuest {
     pub(crate) list_body_error: bool,
     pub(crate) read_continue: Option<Arc<tokio::sync::Notify>>,
     pub(crate) flush_calls: Arc<AtomicUsize>,
+    pub(crate) flush_requests: Arc<std::sync::Mutex<Vec<FlushFilesystemsRequest>>>,
     pub(crate) mount_requests: Arc<
         std::sync::Mutex<
             Vec<pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveRequest>,
@@ -70,6 +71,7 @@ impl Default for MockBridgeGuest {
             list_body_error: false,
             read_continue: None,
             flush_calls: Arc::default(),
+            flush_requests: Arc::default(),
             mount_requests: Arc::default(),
             lost_reply_calls: None,
             env_reply_failure: None,
@@ -644,9 +646,13 @@ impl Meta for MockBridgeGuest {
 
     async fn flush_filesystems(
         &self,
-        _request: Request<FlushFilesystemsRequest>,
+        request: Request<FlushFilesystemsRequest>,
     ) -> Result<Response<FlushFilesystemsResponse>, Status> {
         self.flush_calls.fetch_add(1, Ordering::SeqCst);
+        self.flush_requests
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
         Ok(Response::new(FlushFilesystemsResponse {}))
     }
 }

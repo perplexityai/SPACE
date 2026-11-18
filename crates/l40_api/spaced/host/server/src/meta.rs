@@ -179,12 +179,20 @@ impl Meta for SpacedHostService {
             .with_grpc_timeout_metadata(request.metadata())
             .remaining()
             .unwrap_or(Duration::ZERO);
+        let quiesce_data_drive_for_stop = request.into_inner().quiesce_data_drive_for_stop;
+        let operations: &[GuestOperation] = if quiesce_data_drive_for_stop {
+            &[GuestOperation::Flush, GuestOperation::BlockVolumeQuiesce]
+        } else {
+            &[GuestOperation::Flush]
+        };
         self.call_bridge_guest_once(
             "bridge_guest_flush_filesystems",
-            Requirement::Operations(&[GuestOperation::Flush]),
+            Requirement::Operations(operations),
             BridgeGuestOperationBudget::FilesystemFlush(timeout),
             |mut client| async move {
-                let mut request = Request::new(BridgeGuestFlushFilesystemsRequest {});
+                let mut request = Request::new(BridgeGuestFlushFilesystemsRequest {
+                    quiesce_data_drive_for_stop,
+                });
                 request.set_timeout(timeout);
                 client.flush_filesystems(request).await
             },
@@ -238,7 +246,9 @@ impl Meta for SpacedHostService {
                 Requirement::Operations(&[GuestOperation::Flush]),
                 BridgeGuestOperationBudget::FilesystemFlush(timeout),
                 |mut client| async move {
-                    let mut request = Request::new(BridgeGuestFlushFilesystemsRequest {});
+                    let mut request = Request::new(BridgeGuestFlushFilesystemsRequest {
+                        quiesce_data_drive_for_stop: false,
+                    });
                     request.set_timeout(timeout);
                     client.flush_filesystems(request).await
                 },

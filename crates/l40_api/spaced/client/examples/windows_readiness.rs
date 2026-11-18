@@ -77,7 +77,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if lifecycle {
                 println!("connection {connection}: flushing volumes and synchronizing UTC");
-                client.flush_filesystems(FlushFilesystemsRequest {}).await?;
+                client
+                    .flush_filesystems(FlushFilesystemsRequest::default())
+                    .await?;
                 let host_time = std::time::SystemTime::now().into();
                 let resumed = client
                     .notify_resume(NotifyResumeRequest {

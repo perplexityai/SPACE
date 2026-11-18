@@ -145,5 +145,9 @@ message NotifyResumeResponse {
   bool ready = 2;
 }
 
-message FlushFilesystemsRequest {}
+message FlushFilesystemsRequest {
+  // Irreversible preparation for terminating this execution, never suspend.
+  // Requires BLOCK_VOLUME_QUIESCE. The data filesystem stays frozen until exit.
+  bool quiesce_data_drive_for_stop = 1;
+}
 message FlushFilesystemsResponse {}

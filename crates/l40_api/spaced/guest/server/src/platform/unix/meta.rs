@@ -26,14 +26,14 @@ async fn run_filesystem_flush(
     .map_err(|error| Status::internal(format!("guest filesystem flush task failed: {error}")))?
 }
 
-fn flush_guest_filesystems() -> Result<(), Status> {
+fn flush_guest_filesystems(quiesce_data_drive_for_stop: bool) -> Result<(), Status> {
     #[cfg(target_os = "linux")]
     {
         flush_filesystem_at_path_with_syncfs("/", |root| {
             nix::unistd::syncfs(root).map_err(Into::into)
         })
         .map_err(|error| Status::internal(format!("syncfs / failed: {error}")))?;
-        block_volume::flush_data_drive()?;
+        block_volume::flush_data_drive(quiesce_data_drive_for_stop)?;
         Ok(())
     }
 
@@ -333,12 +333,12 @@ impl BridgeGuestMeta for SpacedGuestService {
 
     async fn flush_filesystems(
         &self,
-        _request: Request<FlushFilesystemsRequest>,
+        request: Request<FlushFilesystemsRequest>,
     ) -> Result<Response<FlushFilesystemsResponse>, Status> {
-        run_filesystem_flush(
-            self.inner.filesystem_flush_slots.clone(),
-            flush_guest_filesystems,
-        )
+        let quiesce_data_drive_for_stop = request.into_inner().quiesce_data_drive_for_stop;
+        run_filesystem_flush(self.inner.filesystem_flush_slots.clone(), move || {
+            flush_guest_filesystems(quiesce_data_drive_for_stop)
+        })
         .await?;
         tracing::info!(
             command = "bridge_guest_flush_filesystems",

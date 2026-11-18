@@ -28,6 +28,10 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
 - Retained-disk execution checks use the durable Kubernetes
   `route_activation_id`, not the temporary `activation_attempt_id` claim that
   activation-completion receipts clear while the VM remains resident.
+- Lost block-volume grant responses can be released after positive host cleanup
+  only when the sandbox owner is absent and the attachment belongs to the
+  authenticated, administrator-granted node. This alternative never releases a
+  live owner's disk or substitutes a caller-chosen execution fence.
 - Cold activation of an already exposed retained disk additionally requires
   `retained_cold_start: true` on its administrator-owned
   `SPACE_EBS_NODE_BINDINGS` entry. Missing flags stay false; a retained

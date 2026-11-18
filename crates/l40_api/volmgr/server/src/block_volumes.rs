@@ -36,6 +36,22 @@ impl BlockVolumeAuthority {
 }
 
 impl VolumeManagerService {
+    pub(crate) fn deleted_owner_block_client<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<(NodeId, AuthenticatedClusterApiClient), Status> {
+        self.peer_authorizer.authorize_request(
+            request,
+            "release_deleted_owner_block_volume",
+            SANDBOX_MANAGER_PEERS,
+        )?;
+        let authority = self
+            .block_volume_authority
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("block-volume relay is disabled"))?;
+        Ok((authority.node, authority.client.clone()))
+    }
+
     pub(crate) fn block_client<T>(
         &self,
         request: &Request<T>,

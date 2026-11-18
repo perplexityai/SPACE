@@ -74,6 +74,16 @@ impl NodeManagerService {
                     .check_execution(sandbox, req.execution_fence.as_ref(), false)?
                     .ok_or_else(refused)?;
                 let mut volumes = connect_volumes().await?;
+                // Resolving can reserve/attach centrally before its response is
+                // received. Persist uncertainty before crossing that boundary.
+                let local_execution = local.current().to_string();
+                if !service
+                    .pool
+                    .save_pending_block_resolution(sandbox, &local_execution)
+                    .map_err(slot_store_status)?
+                {
+                    return Err(refused());
+                }
                 let Some(mut binding) = volumes
                     .resolve_block_volume_binding(cluster::ResolveBlockVolumeBindingRequest {
                         execution: Some(execution),
@@ -92,6 +102,10 @@ impl NodeManagerService {
                     {
                         return Err(refused());
                     }
+                    service
+                        .pool
+                        .clear_pending_block_resolution(sandbox, &local_execution)
+                        .map_err(slot_store_status)?;
                     return Ok(Response::new(proto::PrepareBlockVolumeResponse {
                         binding: None,
                     }));
@@ -122,6 +136,10 @@ impl NodeManagerService {
                 {
                     return Err(refused());
                 }
+                service
+                    .pool
+                    .clear_pending_block_resolution(sandbox, &local_execution)
+                    .map_err(slot_store_status)?;
                 if !binding.initialization_ready {
                     let claim = match binding.initialization_claim.clone() {
                         Some(claim) => {
@@ -340,20 +358,46 @@ impl NodeManagerService {
     pub(super) async fn release_retained_block_after_cleanup(
         &self,
         sandbox: &str,
+        recover_deleted_owner: bool,
     ) -> Result<(), Status> {
+        let pending = self
+            .pool
+            .pending_block_resolution(sandbox)
+            .map_err(slot_store_status)?;
         let Some(record) = self
             .pool
             .retained_block_binding(sandbox)
             .map_err(slot_store_status)?
         else {
+            if recover_deleted_owner || pending.is_some() {
+                connect_volumes()
+                    .await?
+                    .release_block_volume_binding(cluster::ReleaseBlockVolumeBindingRequest {
+                        fence: None,
+                        deleted_owner_cleanup: Some(cluster::DeletedBlockVolumeOwnerCleanup {
+                            sandbox_id: sandbox.to_owned(),
+                            node_id: String::new(),
+                        }),
+                    })
+                    .await?;
+                if let Some(execution) = pending {
+                    self.pool
+                        .clear_pending_block_resolution(sandbox, &execution)
+                        .map_err(slot_store_status)?;
+                }
+            }
             return Ok(());
         };
         connect_volumes()
             .await?
             .release_block_volume_binding(cluster::ReleaseBlockVolumeBindingRequest {
                 fence: record.binding.fence,
+                deleted_owner_cleanup: None,
             })
             .await?;
+        self.pool
+            .clear_pending_block_resolution(sandbox, &record.execution_id)
+            .map_err(slot_store_status)?;
         self.pool
             .clear_retained_block_binding(sandbox, &record.execution_id)
             .map_err(slot_store_status)

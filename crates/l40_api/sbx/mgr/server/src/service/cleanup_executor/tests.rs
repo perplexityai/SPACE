@@ -84,6 +84,7 @@ async fn blocking_stop_follows_a_retryable_attempt_to_durable_completion() {
         keep_filesystem: true,
         return_after_slot_release: true,
         immediate_kill: true,
+        recover_deleted_owner_block_volume: false,
     };
     assert_eq!(*cleanups.lock().unwrap(), [requested.clone(), requested]);
     assert_eq!(node_manager.calls(), ["CleanupSandbox", "CleanupSandbox"]);

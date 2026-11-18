@@ -10,6 +10,7 @@ use {
     pplx_space_execution_spec::{GuestBlockMountPath, GuestDataDrive},
     std::{
         fs::File,
+        os::fd::AsRawFd,
         os::unix::{
             ffi::OsStringExt,
             fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt},
@@ -20,6 +21,9 @@ use {
 
 #[cfg(target_os = "linux")]
 const DEVICE: &str = "/dev/vdb";
+
+#[cfg(target_os = "linux")]
+nix::ioctl_readwrite!(freeze_filesystem, b'X', 119, libc::c_int);
 
 #[cfg(target_os = "linux")]
 fn data_device() -> Result<Option<std::fs::Metadata>, Status> {
@@ -51,7 +55,7 @@ pub(super) fn mount_data_drive(request: MountDataDriveRequest) -> Result<(), Sta
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let device =
         data_device()?.ok_or_else(|| Status::failed_precondition("guest data drive missing"))?;
-    verify_filesystem_uuid(&request.filesystem_uuid)?;
+    verify_filesystem_uuid(&request.filesystem_uuid, request.read_only)?;
     std::fs::create_dir_all(path.as_str()).map_err(|error| {
         Status::internal(format!("create guest data mountpoint failed: {error}"))
     })?;
@@ -98,7 +102,7 @@ pub(super) fn mount_data_drive(request: MountDataDriveRequest) -> Result<(), Sta
         canonical.as_path(),
         Some("ext4"),
         flags,
-        None::<&str>,
+        request.read_only.then_some("noload"),
     )
     .map_err(|error| Status::internal(format!("mount guest data filesystem failed: {error}")))?;
     let mounted = File::open(&canonical).map_err(|error| {
@@ -130,7 +134,7 @@ pub(super) fn mount_data_drive(request: MountDataDriveRequest) -> Result<(), Sta
 }
 
 #[cfg(target_os = "linux")]
-fn verify_filesystem_uuid(expected: &str) -> Result<(), Status> {
+fn verify_filesystem_uuid(expected: &str, read_only: bool) -> Result<(), Status> {
     let expected = uuid::Uuid::parse_str(expected)
         .map_err(|_| Status::invalid_argument("a valid ext4 filesystem UUID is required"))?;
     let device = File::open(DEVICE)
@@ -142,7 +146,30 @@ fn verify_filesystem_uuid(expected: &str) -> Result<(), Status> {
     device
         .read_exact_at(&mut superblock, 1024)
         .map_err(|error| Status::internal(format!("read guest data superblock failed: {error}")))?;
-    verify_ext4_identity(&superblock, expected)
+    verify_ext4_identity(&superblock, expected)?;
+    if read_only {
+        verify_read_only_clean(&superblock)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_read_only_clean(superblock: &[u8; 0x78]) -> Result<(), Status> {
+    // noload is safe only after a clean journal checkpoint. Never hide an
+    // unclean shutdown by skipping recovery on a genuinely dirty journal.
+    let incompat = u32::from_le_bytes([
+        superblock[0x60],
+        superblock[0x61],
+        superblock[0x62],
+        superblock[0x63],
+    ]);
+    let state = u16::from_le_bytes([superblock[0x3a], superblock[0x3b]]);
+    if incompat & 0x4 != 0 || state & 0x2 != 0 {
+        return Err(Status::failed_precondition(
+            "read-only data mount requires a clean journal; recover with a read-write owner first",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -172,7 +199,7 @@ fn verify_permissions(directory: &File, read_only: bool) -> Result<(), Status> {
 /// in-process registry: a guest agent restart must not silently stop flushing
 /// the data disk. Pin and verify every opened filesystem before syncfs.
 #[cfg(target_os = "linux")]
-pub(super) fn flush_data_drive() -> Result<(), Status> {
+pub(super) fn flush_data_drive(quiesce_for_stop: bool) -> Result<(), Status> {
     let Some(device) = data_device()? else {
         return Ok(());
     };
@@ -205,9 +232,25 @@ pub(super) fn flush_data_drive() -> Result<(), Status> {
                 "guest data mount changed during flush",
             ));
         }
-        nix::unistd::syncfs(&filesystem).map_err(|error| {
-            Status::internal(format!("syncfs guest data filesystem failed: {error}"))
-        })?;
+        if quiesce_for_stop {
+            // FIFREEZE blocks new writers and checkpoints ext4's journal,
+            // including clearing needs_recovery. syncfs alone does neither.
+            // Do not thaw: this execution is terminating, not being captured.
+            // SAFETY: this is a pinned filesystem FD; FIFREEZE ignores the
+            // integer argument. EBUSY makes a repeated stop attempt idempotent.
+            match unsafe { freeze_filesystem(filesystem.as_raw_fd(), &mut 0) } {
+                Ok(_) | Err(nix::errno::Errno::EBUSY) => {}
+                Err(error) => {
+                    return Err(Status::internal(format!(
+                        "freeze guest data filesystem before stop failed: {error}"
+                    )));
+                }
+            }
+        } else {
+            nix::unistd::syncfs(&filesystem).map_err(|error| {
+                Status::internal(format!("syncfs guest data filesystem failed: {error}"))
+            })?;
+        }
     }
     Ok(())
 }
@@ -285,6 +328,23 @@ mod tests {
                 .code(),
             tonic::Code::FailedPrecondition
         );
+    }
+
+    #[test]
+    fn read_only_mount_refuses_journal_recovery_and_filesystem_errors() {
+        let mut superblock = [0; 0x78];
+        verify_read_only_clean(&superblock).unwrap();
+        // Other incompatibility bits do not imply journal recovery.
+        superblock[0x60..0x64].copy_from_slice(&0x40_u32.to_le_bytes());
+        verify_read_only_clean(&superblock).unwrap();
+        for (incompat, state) in [(0x44_u32, 0_u16), (0x40, 2)] {
+            superblock[0x60..0x64].copy_from_slice(&incompat.to_le_bytes());
+            superblock[0x3a..0x3c].copy_from_slice(&state.to_le_bytes());
+            assert_eq!(
+                verify_read_only_clean(&superblock).unwrap_err().code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
     }
 
     #[test]

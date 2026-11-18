@@ -87,6 +87,7 @@ impl Rpc {
             keep_filesystem: stop,
             return_after_slot_release: stop,
             immediate_kill: stop,
+            recover_deleted_owner_block_volume: false,
         }
     }
 

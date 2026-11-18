@@ -388,6 +388,7 @@ async fn block_volume_grants_authenticate_origin_and_fence_progress_but_keep_del
         .service
         .release_block_volume_binding(node_request(ReleaseBlockVolumeBindingRequest {
             fence: Some(fence.clone()),
+            deleted_owner_cleanup: None,
         }))
         .await?;
     let detached = volumes::get(&pool, sandbox).await?.unwrap();
@@ -481,6 +482,23 @@ async fn block_volume_grants_authenticate_origin_and_fence_progress_but_keep_del
         volumes::get(&pool, sandbox).await?.unwrap().released_epoch,
         None
     );
+    let orphan_cleanup = ReleaseBlockVolumeBindingRequest {
+        fence: None,
+        deleted_owner_cleanup: Some(crate::proto::DeletedBlockVolumeOwnerCleanup {
+            sandbox_id: sandbox.to_string(),
+            node_id: node.to_string(),
+        }),
+    };
+    assert_eq!(
+        fixture
+            .service
+            .release_block_volume_binding(node_request(orphan_cleanup.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition,
+        "a live owner cannot be released by reconstructing a lost grant",
+    );
     let mut tx = pool.begin().await?;
     pplx_space_sandbox_store::delete::delete_with_dependents(&mut tx, sandbox).await?;
     tx.commit().await?;
@@ -490,18 +508,30 @@ async fn block_volume_grants_authenticate_origin_and_fence_progress_but_keep_del
         fixture
             .service
             .release_block_volume_binding(node_request(ReleaseBlockVolumeBindingRequest {
-                fence: Some(wrong_epoch)
+                fence: Some(wrong_epoch),
+                deleted_owner_cleanup: None,
             }))
             .await
             .unwrap_err()
             .code(),
         Code::FailedPrecondition
     );
+    assert_eq!(
+        fixture
+            .service
+            .release_block_volume_binding(Request::new(orphan_cleanup.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied,
+    );
     fixture
         .service
-        .release_block_volume_binding(node_request(ReleaseBlockVolumeBindingRequest {
-            fence: Some(fence.clone()),
-        }))
+        .release_block_volume_binding(node_request(orphan_cleanup.clone()))
+        .await?;
+    fixture
+        .service
+        .release_block_volume_binding(node_request(orphan_cleanup))
         .await?;
     let released = volumes::get(&pool, sandbox).await?.unwrap();
     assert!(released.delete_requested);

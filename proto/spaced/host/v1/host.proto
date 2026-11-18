@@ -135,7 +135,10 @@ message NotifyResumeResponse {
   bool ready = 2;
 }
 
-message FlushGuestFilesystemsRequest {}
+message FlushGuestFilesystemsRequest {
+  // Never set for a memory snapshot or a VM that will resume.
+  bool quiesce_data_drive_for_stop = 1;
+}
 message FlushGuestFilesystemsResponse {}
 
 message PrepareSuspendRequest {}

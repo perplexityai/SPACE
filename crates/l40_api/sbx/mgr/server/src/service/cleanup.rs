@@ -3206,10 +3206,26 @@ impl SandboxManagerService {
         }) {
             return;
         }
+        let quiesce_data_drive_for_stop = match self.has_retained_block(sandbox_id) {
+            Ok(retained) => retained,
+            Err(error) => {
+                tracing::warn!(
+                    sandbox_id,
+                    %error,
+                    "cannot read disk dependency; conservatively request stop quiescence"
+                );
+                true
+            }
+        };
         let flushed = within_stop_flush_budget(
             crate::guest_filesystem_flush::GUEST_FILESYSTEM_FLUSH_TIMEOUT,
             self.resume_paused_vm_before_flush(sandbox_id),
-            || crate::guest_filesystem_flush::flush_guest_root_filesystem_before_stop(sandbox_id),
+            || {
+                crate::guest_filesystem_flush::flush_guest_root_filesystem_before_stop(
+                    sandbox_id,
+                    quiesce_data_drive_for_stop,
+                )
+            },
         )
         .await;
         match flushed {

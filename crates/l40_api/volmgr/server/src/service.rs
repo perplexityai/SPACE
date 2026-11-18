@@ -1146,6 +1146,15 @@ impl VolumeManager for VolumeManagerService {
         request: Request<pplx_space_node_api_client::proto::ReleaseBlockVolumeBindingRequest>,
     ) -> Result<Response<pplx_space_node_api_client::proto::BlockVolumeProgressResponse>, Status>
     {
+        if request.get_ref().deleted_owner_cleanup.is_some() {
+            let (node, mut client) = self.deleted_owner_block_client(&request)?;
+            let mut body = request.into_inner();
+            body.deleted_owner_cleanup
+                .as_mut()
+                .expect("checked")
+                .node_id = node.to_string();
+            return client.release_block_volume_binding(body).await;
+        }
         let mut client = self.block_client(
             &request,
             request

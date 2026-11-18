@@ -87,6 +87,7 @@ pub(crate) async fn prepare_guest_for_vm_snapshot_via_spaced_host(
 /// VM regardless.
 pub(crate) async fn flush_guest_root_filesystem_before_stop(
     sandbox_id: &str,
+    quiesce_data_drive_for_stop: bool,
 ) -> Result<(), GuestFlushError> {
     let budget = GUEST_FILESYSTEM_FLUSH_TIMEOUT;
     let started = tokio::time::Instant::now();
@@ -104,7 +105,27 @@ pub(crate) async fn flush_guest_root_filesystem_before_stop(
     })?
     .map_err(GuestFlushError::Connect)?;
     flush_until_own_attempt_runs(budget.saturating_sub(started.elapsed()), |remaining| {
-        client.flush_guest_filesystems(remaining)
+        let client = &client;
+        async move {
+            if quiesce_data_drive_for_stop {
+                match client.quiesce_guest_filesystems_for_stop(remaining).await {
+                    Err(status)
+                        if pplx_space_common_grpc::GuestCapabilityUnsupported::from_status(&status)
+                            .is_some() =>
+                    {
+                        // Capability refusal happens before dispatch. Preserve
+                        // older guests' stop flush without claiming a clean
+                        // read-only handoff; never retry a transport ambiguity.
+                        tracing::warn!(
+                            %sandbox_id,
+                            "guest lacks stop quiescence; retained disk may require read-write journal recovery"
+                        );
+                    }
+                    result => return result,
+                }
+            }
+            client.flush_guest_filesystems(remaining).await
+        }
     })
     .await
 }

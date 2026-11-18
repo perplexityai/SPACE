@@ -116,8 +116,29 @@ impl SpacedHostClient {
         &self,
         timeout: std::time::Duration,
     ) -> Result<(), tonic::Status> {
+        self.flush_guest_filesystems_with_stop_policy(timeout, false)
+            .await
+    }
+
+    /// Flush and freeze the data filesystem immediately before terminating
+    /// this execution. This must never prepare a resumable memory snapshot.
+    pub async fn quiesce_guest_filesystems_for_stop(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), tonic::Status> {
+        self.flush_guest_filesystems_with_stop_policy(timeout, true)
+            .await
+    }
+
+    async fn flush_guest_filesystems_with_stop_policy(
+        &self,
+        timeout: std::time::Duration,
+        quiesce_data_drive_for_stop: bool,
+    ) -> Result<(), tonic::Status> {
         self.call_meta_once("flush_guest_filesystems", |mut client| async move {
-            let mut request = tonic::Request::new(FlushGuestFilesystemsRequest {});
+            let mut request = tonic::Request::new(FlushGuestFilesystemsRequest {
+                quiesce_data_drive_for_stop,
+            });
             request.set_timeout(timeout.min(std::time::Duration::from_secs(180)));
             client.flush_guest_filesystems(request).await
         })

@@ -156,6 +156,9 @@ enum Commands {
         /// Force cleanup even if processes are running
         #[arg(long)]
         force: bool,
+        /// Recover a lost block-volume grant only after its sandbox owner was deleted.
+        #[arg(long)]
+        recover_deleted_owner_block_volume: bool,
     },
     /// Allocate a network slot (low-level, for debugging)
     Allocate {
@@ -618,7 +621,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
         }
 
-        Commands::Cleanup { sandbox_id, force } => {
+        Commands::Cleanup {
+            sandbox_id,
+            force,
+            recover_deleted_owner_block_volume,
+        } => {
             let sandbox_id = resolve_sandbox_selector(&mut client, &sandbox_id).await?;
             let execution_fence = operator_execution_fence(&mut client, &sandbox_id)
                 .await
@@ -631,11 +638,15 @@ async fn run(cli: Cli) -> Result<(), String> {
                     keep_filesystem: false,
                     return_after_slot_release: false,
                     immediate_kill: false,
+                    recover_deleted_owner_block_volume,
                 })
                 .await
                 .map_err(|error| cleanup_error("cleanup", error))?
                 .into_inner();
 
+            if recover_deleted_owner_block_volume && !resp.deleted_owner_block_volume_released {
+                return Err("node-manager did not acknowledge block-volume recovery; check server compatibility".into());
+            }
             if resp.actions.is_empty() {
                 println!(
                     "Nothing to clean up for {}",

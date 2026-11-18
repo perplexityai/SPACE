@@ -45,6 +45,63 @@ struct ReadyWaitGuest {
 struct ActiveWaitReadyCall(Arc<AtomicUsize>);
 
 #[tokio::test]
+async fn stop_quiesce_requires_explicit_support_and_never_leaks_into_suspend() {
+    use pplx_space_spaced_guest_protocol::proto::platform::{
+        GuestOperation, GuestOs, GuestPlatformDescriptor,
+    };
+    for capable in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("guest.sock");
+        let mut operations = vec![GuestOperation::Flush as i32, GuestOperation::Resume as i32];
+        if capable {
+            operations.push(GuestOperation::BlockVolumeQuiesce as i32);
+        }
+        let guest = MockBridgeGuest {
+            version: "0.8.2",
+            platform: Some(GuestPlatformDescriptor {
+                os: GuestOs::Linux as i32,
+                operations,
+            }),
+            ..Default::default()
+        };
+        let requests = guest.flush_requests.clone();
+        let task = start_mock_bridge_guest_with_service(socket.clone(), guest).await;
+        let fixture = HostFixture::start(Some(socket)).await;
+        let client = fixture.client().await;
+        let outcome = client
+            .quiesce_guest_filesystems_for_stop(Duration::from_secs(5))
+            .await;
+        if capable {
+            outcome.unwrap();
+        } else {
+            assert_eq!(outcome.unwrap_err().code(), tonic::Code::FailedPrecondition);
+            assert!(requests.lock().unwrap().is_empty());
+        }
+        client
+            .flush_guest_filesystems(Duration::from_secs(5))
+            .await
+            .unwrap();
+        client
+            .prepare_suspend(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let expected: Vec<_> = capable
+            .then_some(true)
+            .into_iter()
+            .chain([false, false])
+            .map(
+                |quiesce_data_drive_for_stop| BridgeGuestFlushFilesystemsRequest {
+                    quiesce_data_drive_for_stop,
+                },
+            )
+            .collect();
+        assert_eq!(*requests.lock().unwrap(), expected);
+        fixture.stop().await;
+        task.abort();
+    }
+}
+
+#[tokio::test]
 async fn data_mount_is_forwarded_exactly_once_only_to_an_explicitly_capable_guest() {
     use pplx_space_spaced_guest_protocol::proto::platform::{
         GuestOperation, GuestOs, GuestPlatformDescriptor,

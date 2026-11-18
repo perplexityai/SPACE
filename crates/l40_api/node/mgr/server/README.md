@@ -6,6 +6,26 @@ process restarts; lease absence alone does not authorize cleanup of a live VM.
 An explicit owner cleanup token can authorize an unbound, quiescent instance.
 Missing or stale authority is not repaired by retrying with a newly observed token.
 
+## Retained block-volume cleanup
+
+Before resolving a central disk grant, persist a pending-resolution receipt.
+The RPC can reserve or attach a device even when no response arrives. Replace
+that receipt with the received binding before preparing the device, and keep
+cleanup receipts across execution retirement. Uncertainty never authorizes
+formatting, launch or detach.
+
+After positive runtime/cgroup/jail cleanup, an unresolved receipt may release
+only a deleted owner's attachment on this authenticated node. A live owner is
+refused. The operator escape hatch for older missing receipts is
+`sudo space-nodemgr cleanup <sandbox-id> --recover-deleted-owner-block-volume`;
+it runs the same host barrier and requires an explicit server acknowledgement.
+Only the controller performs normal cloud detach, and cloud absence must still
+be verified separately. No forced detach or invented execution fence is used.
+
+Deploy compatible cluster API and volume-manager support before recovery.
+Retain compatible node-manager binaries while pending receipts exist; the
+additive migration's down path refuses to drop unresolved cleanup work.
+
 ## Startup authority gate
 
 Node-manager and sandbox-manager refuse startup with persisted state that has

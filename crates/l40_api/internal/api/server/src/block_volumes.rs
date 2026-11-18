@@ -149,6 +149,14 @@ impl ClusterApiService {
         request: &Request<T>,
         execution: &Execution,
     ) -> Result<(), Status> {
+        self.authenticate_block_node(request, execution.node).await
+    }
+
+    async fn authenticate_block_node<T>(
+        &self,
+        request: &Request<T>,
+        node_id: NodeId,
+    ) -> Result<(), Status> {
         match request
             .extensions()
             .get::<NodeApiAuthenticatedCaller>()
@@ -162,13 +170,13 @@ impl ClusterApiService {
                     .node_scope_for_identity(node)
                     .await
                     .map_err(database)?;
-                if !matches!(scope, TemplateReadScope::NodeScoped { node_ids } if node_ids.contains(&execution.node))
+                if !matches!(scope, TemplateReadScope::NodeScoped { node_ids } if node_ids.contains(&node_id))
                 {
                     return Err(Status::permission_denied(
                         "reviewed block-volume caller does not own this node incarnation",
                     ));
                 }
-                self.resolve_origin_node_id(&execution.node.to_string(), Some(NodeRole::Worker))
+                self.resolve_origin_node_id(&node_id.to_string(), Some(NodeRole::Worker))
                     .await?;
             }
             Some(AuthenticatedNodeIdentity::MalformedKubernetesClaims) => {
@@ -179,7 +187,7 @@ impl ClusterApiService {
             _ => {
                 self.authenticated_origin_node_id(
                     request,
-                    &execution.node.to_string(),
+                    &node_id.to_string(),
                     Some(NodeRole::Worker),
                 )
                 .await?;
@@ -467,6 +475,26 @@ impl ClusterApiService {
         &self,
         request: Request<ReleaseBlockVolumeBindingRequest>,
     ) -> Result<Response<BlockVolumeProgressResponse>, Status> {
+        if let Some(cleanup) = &request.get_ref().deleted_owner_cleanup {
+            if request.get_ref().fence.is_some() {
+                return Err(Status::invalid_argument(
+                    "choose one block-volume release authority",
+                ));
+            }
+            let sandbox: SandboxId = cleanup.sandbox_id.parse().map_err(invalid)?;
+            let node: NodeId = cleanup.node_id.parse().map_err(invalid)?;
+            self.authenticate_block_node(&request, node).await?;
+            self.block_volume_hosts.require(node)?;
+            let mut tx = self.pool.begin().await.map_err(database)?;
+            if !store::acknowledge_deleted_owner_release(&mut tx, sandbox, node)
+                .await
+                .map_err(database)?
+            {
+                return Err(refused());
+            }
+            tx.commit().await.map_err(database)?;
+            return progress(0);
+        }
         let fence = Fence::parse(request.get_ref().fence.as_ref().ok_or_else(refused)?)?;
         self.authenticate_block_execution(&request, &fence.execution)
             .await?;

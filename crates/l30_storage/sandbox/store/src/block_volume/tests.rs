@@ -215,13 +215,24 @@ async fn independent_reservation_survives_detach_and_releases_only_with_deleted_
     );
     assert_eq!(get(&db.pool, b).await?.unwrap().disk_generation, 2);
     assert!(!acknowledge_release(&db.pool, volume, execution_a, 1).await?);
-    assert!(acknowledge_release(&db.pool, volume, execution_b, 2).await?);
-    let detaching = get(&db.pool, b).await?.unwrap();
-    assert!(finish_detach(&db.pool, &detaching).await?);
+    let node = bound_b.node_id.unwrap();
+    let mut tx = db.pool.begin().await?;
+    assert!(!acknowledge_deleted_owner_release(&mut tx, b, node).await?);
+    tx.commit().await?;
     sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
         .bind(b)
         .execute(&db.pool)
         .await?;
+    let mut tx = db.pool.begin().await?;
+    assert!(!acknowledge_deleted_owner_release(&mut tx, b, NodeId::new()).await?);
+    assert!(acknowledge_deleted_owner_release(&mut tx, b, node).await?);
+    tx.commit().await?;
+    let detaching = get(&db.pool, b).await?.unwrap();
+    assert_eq!(detaching.released_epoch, Some(2));
+    assert!(finish_detach(&db.pool, &detaching).await?);
+    let mut tx = db.pool.begin().await?;
+    assert!(acknowledge_deleted_owner_release(&mut tx, b, node).await?);
+    tx.commit().await?;
     assert!(resource::release_deleted_owner(&db.pool, volume).await?);
     let mut tx = db.pool.begin().await?;
     assert!(resource::request_delete(&mut tx, org, volume, Uuid::now_v7()).await?);
