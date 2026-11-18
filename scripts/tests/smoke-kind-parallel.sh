@@ -136,6 +136,22 @@ prune_bench_worktrees() {
   done
 }
 
+# Keep what a bench that did not pass logged outside its output directory (the
+# bring-up's Tilt log and the bench's daemons'), which its teardown deletes.
+keep_failed_bench_logs() {
+  local i dir bench result
+  for dir in "$OUT"/benches/*/; do
+    [[ -d "$dir" ]] || continue
+    i="$(basename "$dir")"
+    result="$(cat "$dir/result" 2>/dev/null || echo unknown)"
+    [[ "$result" == typed_exit_0 ]] && continue
+    bench="$(kind_bench_dir "$i")"
+    mkdir -p "$dir/bench-logs"
+    cp -p "$bench"/home/.space-devbox/kind/*.log "$bench"/dockerd.log "$bench"/containerd.log \
+      "$dir/bench-logs/" 2>/dev/null || true
+  done
+}
+
 # Remove every bench the host has. Returns 1, naming them, when any is left.
 teardown_all() {
   local i pids=() left
@@ -393,6 +409,7 @@ on_exit() {
   if (( KEEP == 1 )); then
     log "--keep: benches left up; remove them with: $0 teardown"
   elif (( KEEP == 0 )); then
+    keep_failed_bench_logs
     phase run teardown teardown_all >"$OUT/teardown.log" 2>&1 || true
     rm -f "$HOST/shared-images.tar" "$HOST/rust/kind-rust.tar.gz"
   fi
@@ -797,6 +814,7 @@ await inventory || true
 FINISHED=1
 # Torn down before the summary, so its time is in it.
 if (( ! KEEP )); then
+  keep_failed_bench_logs
   phase run teardown teardown_all >"$OUT/teardown.log" 2>&1 || true
   rm -f "$HOST/shared-images.tar" "$HOST/rust/kind-rust.tar.gz"
   KEEP=2
