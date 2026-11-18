@@ -47,6 +47,7 @@ def _describe(scenario_id: str) -> int:
         "telemetry_mode": scenario.telemetry_mode,
         "storage_credentials": scenario.storage_credentials,
         "test_hooks": scenario.test_hooks,
+        "drain_v1": scenario.drain_v1,
         "browser": scenario.browser,
         "selected_api_surface": os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw"),
         "sandbox": {
@@ -556,6 +557,9 @@ def _run_all(
     telemetry_error = telemetry_error or rust_build_error
     if not scenarios:
         return _mode_emptied(selection, "Rust build", shard, telemetry_error)
+    scenarios = _apply_drain_v1(scenarios, services)
+    if not scenarios:
+        return _mode_emptied(selection, "drain v2 state", shard, telemetry_error)
     scenarios, browser_error = _apply_browser(scenarios, browser_selection, services)
     telemetry_error = telemetry_error or browser_error
     if not scenarios:
@@ -772,6 +776,41 @@ def _apply_rust_build(
             "the bench runs release binaries"
         )
     return tuple(scenario for scenario in scenarios if scenario.test_hooks is None), None
+
+
+def _apply_drain_v1(
+    scenarios: tuple[Scenario, ...], services: SmokeServices
+) -> tuple[Scenario, ...]:
+    """Skip the scenarios that drive v1 drains on a bench running drain v2.
+
+    With SPACE_DRAIN_V2_ENABLED on, the admin API refuses every v1 `:drain`
+    (v1 and v2 drains never run together), so a v1 drain scenario can only
+    fail there. The switch is read from the bench's public API, which is
+    what refuses; a bench the read cannot classify keeps the scenarios, whose
+    own drains then report it.
+    """
+
+    declared = tuple(scenario for scenario in scenarios if scenario.drain_v1)
+    if not declared:
+        return scenarios
+    try:
+        drain_v2 = services.drain_v2_enabled()
+    except Exception as error:  # noqa: BLE001 - the scenarios report their own reads
+        names = ", ".join(scenario.id for scenario in declared)
+        print(
+            f"WARN: could not read whether the bench runs drain v2, so {names} will run: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return scenarios
+    if not drain_v2:
+        return scenarios
+    for skipped in declared:
+        print(
+            f"SKIPPED {skipped.id}: drives v1 drains, which the bench's API refuses while "
+            "drain v2 is on (SPACE_DRAIN_V2_ENABLED); run it on a bench with drain v2 off"
+        )
+    return tuple(scenario for scenario in scenarios if not scenario.drain_v1)
 
 
 BROWSER_SCENARIOS_ENV = "SPACE_SMOKE_BROWSER_SCENARIOS"

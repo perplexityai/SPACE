@@ -25,6 +25,8 @@ MARKER = "space-smoke-forced-drain-ok"
 # fleet with no node mid-drain and nothing else of yours on the worker.
 @smoke.scenario(
     "local.forced_drain_evacuates_sandbox",
+    # v1 drains: the admin API refuses them while drain v2 is on.
+    drain_v1=True,
     # A suspend, a durable upload, and a restore pulled from object storage on
     # a slow KVM bench, then drained convergence and the undrain.
     sandbox=smoke.SandboxConfig(timeout=900),

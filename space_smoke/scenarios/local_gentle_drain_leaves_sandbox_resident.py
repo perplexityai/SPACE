@@ -15,6 +15,8 @@ import space_smoke as smoke
 # convergence half on the same node).
 @smoke.scenario(
     "local.gentle_drain_leaves_sandbox_resident",
+    # v1 drains: the admin API refuses them while drain v2 is on.
+    drain_v1=True,
     # A 20 s hold, a suspend, up to 120 s of convergence, and the undrain.
     sandbox=smoke.SandboxConfig(timeout=900),
 )

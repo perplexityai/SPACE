@@ -23,6 +23,8 @@ MARKER = "space-smoke-forced-drain-stopped-ok"
 # on either worker.
 @smoke.scenario(
     "native.forced_drain_re_drains_restarted_re_placed_stopped_sandbox",
+    # v1 drains: the admin API refuses them while drain v2 is on.
+    drain_v1=True,
     api_surfaces=("native",),
     # The re-placement is a materialization pod staged by the containerd shim.
     substrates=("kubernetes",),

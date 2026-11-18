@@ -6401,6 +6401,14 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise SmokeConfigurationError(f"the bench runs no single Rust build: {result.detail()}")
         return result.stdout.strip()
 
+    def drain_v2_enabled(self) -> bool:
+        # The public API Deployment's SPACE_DRAIN_V2_ENABLED, which is what
+        # refuses a v1 `:drain`, read with the API's own flag vocabulary
+        # (`pplx_space_env_vars::parse_env_flag`).
+        name = self._public_api_deployment()
+        value = self._read_deployment_env(name, ("SPACE_DRAIN_V2_ENABLED",))["SPACE_DRAIN_V2_ENABLED"]
+        return (value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
     def substrate(self) -> str:
         # The API Deployment's SPACE_K8S_CONTROL_PLANE, which the bring-up
         # reads too (space_kind_deployed_substrate, infra/space/kind/lib/substrate.sh).
