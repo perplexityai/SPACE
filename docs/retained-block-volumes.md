@@ -35,6 +35,13 @@ only after safe teardown and observed detach. Explicit volume deletion requires
 no sandbox reservation. Existing inline-created volumes preserve their old
 delete-with-sandbox behavior and authorization.
 
+A new sandbox create referencing a missing, foreign, deleting or deleted volume
+returns HTTP 400 before recording an operation. Replaying an already admitted
+create preserves its original sandbox and operation IDs, even if its volume has
+since been deleted; changing the body under that key remains HTTP 409.
+Admission is not a reservation: execution revalidates the volume when binding,
+and a deletion that races an admitted create can still fail that operation.
+
 Read-only reuse requires a clean ext4 journal. Before terminating a live
 volume-backed execution through ordinary stop or sandbox deletion, a compatible
 manager/host/guest combination freezes

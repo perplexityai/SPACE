@@ -222,6 +222,107 @@ fn native_create_rejects_zero_vcpu_before_operation_admission() {
     }
 }
 
+#[tokio::test]
+async fn native_create_rejects_unavailable_volumes_without_changing_idempotent_replays()
+-> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let (org_id, user_id) = seed_quota_org(&db.pool).await?;
+    let (foreign_org, foreign_user) = seed_quota_org(&db.pool).await?;
+    let volume_id = Uuid::now_v7();
+    let mut tx = db.pool.begin().await?;
+    pplx_space_sandbox_store::block_volume::resource::reserve(
+        &mut tx,
+        pplx_space_sandbox_store::block_volume::resource::NewResource {
+            id: volume_id,
+            org_id,
+            managed_by: "test",
+            availability_zone: "test-region-1a",
+            resource_limit: 1,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    let mut request = create_request_with_auto_lifecycle(None);
+    request.volume_mounts = vec![VolumeMountRequest::Existing(
+        pplx_space_public_api::ExistingVolumeMount {
+            volume_id,
+            mount: "/data".to_owned().try_into()?,
+            permissions: pplx_space_execution_spec::BlockVolumePermissions::ReadWrite,
+        },
+    )];
+    let create = |key: &'static str, org_id, user_id, request| {
+        let pool = db.pool.clone();
+        async move {
+            create_native_sandbox_operation(
+                &pool,
+                org_id,
+                user_id,
+                &IdempotencyKey::parse(key).expect("test key parses"),
+                request,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        }
+    };
+    let first = create("volume-first", org_id, user_id, request.clone())
+        .await
+        .expect("an existing retained disk admits new intent");
+    let foreign = create("volume-foreign", foreign_org, foreign_user, request.clone())
+        .await
+        .expect_err("another tenant cannot admit this disk");
+    assert_eq!(foreign.into_response().status(), StatusCode::BAD_REQUEST);
+    for phase in ["deleting", "deleted"] {
+        sqlx::query(pplx_space_common_core::sql!(
+            "UPDATE sandbox_block_volumes
+             SET phase = $2, delete_requested = TRUE, delete_operation_id = $3 WHERE id = $1"
+        ))
+        .bind(volume_id)
+        .bind(phase)
+        .bind(Uuid::now_v7())
+        .execute(&db.pool)
+        .await?;
+        let replay = create("volume-first", org_id, user_id, request.clone())
+            .await
+            .expect("deletion cannot change an admitted create replay");
+        assert_eq!(
+            (replay.sandbox_id, replay.operation_id),
+            (first.sandbox_id, first.operation_id),
+        );
+        let refused = create("volume-new", org_id, user_id, request.clone())
+            .await
+            .expect_err("new intent cannot use a deleting or deleted disk");
+        assert_eq!(refused.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+    let mut changed = request.clone();
+    changed.volume_mounts = vec![VolumeMountRequest::Existing(
+        pplx_space_public_api::ExistingVolumeMount {
+            volume_id: Uuid::now_v7(),
+            mount: "/data".to_owned().try_into()?,
+            permissions: pplx_space_execution_spec::BlockVolumePermissions::ReadWrite,
+        },
+    )];
+    let missing = create("volume-missing", org_id, user_id, changed.clone())
+        .await
+        .expect_err("a missing disk must be rejected before recording intent");
+    assert_eq!(missing.into_response().status(), StatusCode::BAD_REQUEST);
+    let conflict = create("volume-first", org_id, user_id, changed)
+        .await
+        .expect_err("changed intent keeps its idempotency conflict");
+    assert_eq!(conflict.into_response().status(), StatusCode::CONFLICT);
+    let operations: i64 = sqlx::query_scalar(pplx_space_common_core::sql!(
+        "SELECT COUNT(*) FROM public_operations WHERE org_id IN ($1, $2)"
+    ))
+    .bind(org_id)
+    .bind(foreign_org)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(operations, 1, "rejections must not leave create operations");
+    Ok(())
+}
+
 /// With `SPACE_NATIVE_CREATE_CLIENT_ATTRIBUTION_ENABLED` unset, a native
 /// create from an allowlisted client goes in without `metric_client_id`, so
 /// executors older than the field still accept it.

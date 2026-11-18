@@ -28,7 +28,7 @@ use pplx_space_public_api::{
     RequestFingerprint, RollbackSandboxRequest, SandboxCondition, SandboxConditionType,
     SandboxFailureCode, SandboxIdleAction, SandboxLifecycleAction, SandboxLifecycleState,
     SandboxOperationResponse, SandboxResources, SandboxStatsResponse, UpdateSandboxRequest,
-    routes as native_routes,
+    VolumeMountRequest, routes as native_routes,
 };
 use pplx_space_state_reconciliation::{
     FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
@@ -345,6 +345,7 @@ pub(crate) async fn create_native_sandbox_operation(
                 sandbox_quota,
                 create(fresh_sandbox_id, &sandbox_id_string, None),
                 cold_inline,
+                &request.volume_mounts,
             )
             .await?;
             (fresh_sandbox_id, outcome, result)
@@ -465,6 +466,7 @@ pub(crate) async fn create_native_sandbox_operation(
                                 sandbox_quota,
                                 create(fresh_sandbox_id, &sandbox_id_string, None),
                                 cold_inline,
+                                &request.volume_mounts,
                             )
                             .await?;
                             (fresh_sandbox_id, AdmissionClaimOutcome::Miss, result)
@@ -554,15 +556,49 @@ async fn create_unclaimed_operation(
     sandbox_quota: Option<SandboxQuota>,
     input: CreatePublicOperation<'_>,
     inline: Option<&InlineLifecycle>,
+    mounts: &[VolumeMountRequest],
 ) -> Result<CreatePublicOperationResult, PublicApiError> {
     let org_id = input.org_id;
+    let existing_volumes: Vec<_> = mounts
+        .iter()
+        .filter_map(|mount| match mount {
+            VolumeMountRequest::Existing(mount) => Some(mount.volume_id),
+            VolumeMountRequest::Inline(_) => None,
+        })
+        .collect();
     let inline = inline.filter(|inline| inline.enabled_for(org_id, OperationKind::CreateSandbox));
-    if inline.is_none() && sandbox_quota.is_none() {
+    if inline.is_none() && sandbox_quota.is_none() && existing_volumes.is_empty() {
         return Ok(store.create_operation(input).await?);
     }
     let mut admission = store
         .begin_operation_admission(org_id, ApiProduct::Native, idempotency)
         .await?;
+    if matches!(
+        admission.observation(),
+        ObservePublicOperationIdempotency::Missing
+    ) {
+        // Check new intent after the idempotency lock, so deleting a disk cannot
+        // change a replay's answer. Binding still revalidates in its own transaction.
+        for volume in existing_volumes {
+            let resource = pplx_space_sandbox_store::block_volume::resource::get(
+                &mut **admission.transaction(),
+                org_id,
+                volume,
+            )
+            .await
+            .map_err(database_error)?;
+            if !resource.is_some_and(|resource| {
+                resource.retained
+                    && !resource.delete_requested
+                    && resource.phase
+                        != pplx_space_sandbox_store::block_volume::VolumePhase::Deleted
+            }) {
+                return Err(PublicApiError::bad_request(
+                    "required volume is unavailable",
+                ));
+            }
+        }
+    }
     let Some(inline) = inline else {
         if let Some(quota) = sandbox_quota {
             admit_within_sandbox_quota(&mut admission, quota).await?;
