@@ -59,7 +59,7 @@ impl ClusterApiService {
             .map(published_node_status_db)
             .transpose()?;
         // Per-row validation and telemetry live in
-        // `publish_sandbox_states_with_retirement`.
+        // `publish_sandbox_states_under_drain`.
         // Pruning reuses only identities that can name a central row.
         let mut sandbox_inventory_prunable = sandbox_inventory_complete;
         let present_sandbox_ids = request
@@ -106,9 +106,10 @@ impl ClusterApiService {
         .await?;
         let templates_accepted =
             publish_template_states(&mut tx, origin.id, origin.role, &request.templates).await?;
-        let sandbox_publication = crate::published_state::publish_sandbox_states_with_retirement(
+        let sandbox_publication = crate::published_state::publish_sandbox_states_under_drain(
             &mut tx,
             origin.id,
+            origin.drain,
             &request.sandboxes,
             self.abandoned_restore_retirement,
         )

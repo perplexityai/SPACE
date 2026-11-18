@@ -43,6 +43,7 @@ fn test_admin_node_row() -> AdminNodeRow {
         drain_mode: None,
         drain_started_at: None,
         drain_last_error: None,
+        drain_engine: None,
         terminate_decrement_capacity: false,
         node_group_id: None,
         metadata: None,

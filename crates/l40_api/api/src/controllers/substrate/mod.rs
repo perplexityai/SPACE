@@ -696,6 +696,12 @@ pub enum SubstrateError {
     Unschedulable { message: String },
     #[error("{message}")]
     Conflict { message: String },
+    /// The node refused the activation because a node drain sealed it
+    /// ([`pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER`]),
+    /// before any VM work. Answered as the drain gate's retryable 503: once
+    /// the drain has made the sandbox durable, the same call lands elsewhere.
+    #[error("{message}")]
+    NodeSealed { message: String },
     #[error("{message}")]
     FailedPrecondition { message: String },
     #[error("{message}")]
@@ -1018,6 +1024,7 @@ impl From<SubstrateError> for ControllerError {
             SubstrateError::Conflict { message } => {
                 ControllerError::new(axum::http::StatusCode::CONFLICT, message)
             }
+            SubstrateError::NodeSealed { message } => ControllerError::node_draining(message),
             SubstrateError::FailedPrecondition { message } => {
                 ControllerError::new(axum::http::StatusCode::PRECONDITION_FAILED, message)
             }

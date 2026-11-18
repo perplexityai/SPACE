@@ -289,3 +289,128 @@ fn unknown_drain_phase_strings_are_rejected_rather_than_guessed() {
         NodeDrainPhase::parse(phase).unwrap();
     }
 }
+
+/// The gate answers with the candidate that blocks placement, wherever it
+/// came from; else one that refuses VM activations, the primary first; else
+/// the primary; else the first sibling.
+#[test]
+fn the_gate_prefers_a_blocking_candidate_then_a_refusing_one() {
+    use pplx_space_node_drain::V2DrainPhase;
+    let v1 = state(NodeDrainPhase::Draining, NodeDrainMode::Gentle);
+    let v2 = NodeDrain::V2 {
+        phase: V2DrainPhase::Draining,
+    };
+    let forced = state(NodeDrainPhase::Draining, NodeDrainMode::Forced);
+    for (primary, siblings, expected) in [
+        (Some(v1), &[v2, forced][..], Some(forced)),
+        (Some(forced), &[v2][..], Some(forced)),
+        (Some(v1), &[v1, v2][..], Some(v2)),
+        (None, &[v1, v2][..], Some(v2)),
+        (Some(v2), &[v2][..], Some(v2)),
+        (
+            Some(v1),
+            &[NodeDrain::Unknown][..],
+            Some(NodeDrain::Unknown),
+        ),
+        (Some(v1), &[v1][..], Some(v1)),
+        (None, &[v1][..], Some(v1)),
+        (None, &[][..], None),
+    ] {
+        assert_eq!(
+            super::drain_state_precedence(primary, siblings),
+            expected,
+            "{primary:?} with {siblings:?}"
+        );
+    }
+}
+
+/// The one allow-list of actions a sealed node lets through on a sandbox
+/// that isn't running ([`super::activates_no_vm`]), pinned for every
+/// `SandboxAction`. The match below is exhaustive, so a new action fails to
+/// compile here until it is listed with its answer; the gate refuses it
+/// meanwhile, since the allow-list's own match names it nowhere.
+#[test]
+fn every_action_is_listed_for_a_sealed_node() {
+    use crate::controllers::substrate::ExecutionActivityKind;
+    let expected = |action: SandboxAction| match action {
+        SandboxAction::Suspend
+        | SandboxAction::Stop
+        | SandboxAction::Kill
+        | SandboxAction::Pause
+        | SandboxAction::Checkpoint
+        | SandboxAction::EnableSnapshots
+        | SandboxAction::DisableSnapshots
+        | SandboxAction::Stats => true,
+        SandboxAction::Start
+        | SandboxAction::Wake
+        | SandboxAction::ImplicitWake(_)
+        | SandboxAction::Restore
+        | SandboxAction::Resume
+        | SandboxAction::OpenPort
+        | SandboxAction::Rollback
+        | SandboxAction::Spaced
+        | SandboxAction::Update => false,
+    };
+    for action in [
+        SandboxAction::Start,
+        SandboxAction::Wake,
+        SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
+        SandboxAction::ImplicitWake(ExecutionActivityKind::Command),
+        SandboxAction::Resume,
+        SandboxAction::Restore,
+        SandboxAction::Suspend,
+        SandboxAction::Stop,
+        SandboxAction::Kill,
+        SandboxAction::Pause,
+        SandboxAction::Checkpoint,
+        SandboxAction::EnableSnapshots,
+        SandboxAction::DisableSnapshots,
+        SandboxAction::Stats,
+        SandboxAction::OpenPort,
+        SandboxAction::Rollback,
+        SandboxAction::Spaced,
+        SandboxAction::Update,
+    ] {
+        assert_eq!(super::activates_no_vm(action), expected(action), "{action}");
+    }
+}
+
+/// A v1 refusal is the 409; a v2 one, or one under an engine this build
+/// doesn't know, is a 503 with `Retry-After`.
+#[test]
+fn a_v2_refusal_is_a_retryable_503() {
+    use axum::response::IntoResponse as _;
+    use pplx_space_node_drain::V2DrainPhase;
+    for (drain, status) in [
+        (
+            state(NodeDrainPhase::Drained, NodeDrainMode::Gentle),
+            axum::http::StatusCode::CONFLICT,
+        ),
+        (
+            NodeDrain::V2 {
+                phase: V2DrainPhase::Cancelling,
+            },
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            NodeDrain::V2 {
+                phase: V2DrainPhase::Terminating,
+            },
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            NodeDrain::Unknown,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let response = super::drain_refusal(SandboxAction::Wake, drain).into_response();
+        assert_eq!(response.status(), status, "{drain:?}");
+        assert_eq!(
+            response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            status == axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{drain:?}"
+        );
+    }
+}

@@ -1464,6 +1464,23 @@ pub async fn publish_sandbox_states_with_retirement(
     states: &[PublishedSandboxState],
     retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
 ) -> Result<SandboxPublicationOutcome, Status> {
+    publish_sandbox_states_under_drain(conn, node_id, None, states, retirement).await
+}
+
+/// [`publish_sandbox_states_with_retirement`] for a node whose drain is
+/// `node_drain`, as its row read when the call was authenticated. Under a v2
+/// drain it also projects the stopped disk pin from the rows the node
+/// published `stopped`
+/// (`pplx_space_sandbox_store::drain_restore::project_stopped_disk_pins`),
+/// which re-checks the drain in its statement; under any other it sends no
+/// statement of its own, and the publication is exactly what it was.
+pub async fn publish_sandbox_states_under_drain(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    node_drain: Option<pplx_space_node_model::NodeDrain>,
+    states: &[PublishedSandboxState],
+    retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
+) -> Result<SandboxPublicationOutcome, Status> {
     let mut states_by_id = BTreeMap::new();
     for state in states {
         let sandbox_id = match parse_sandbox_id(&state.sandbox_id) {
@@ -2255,6 +2272,12 @@ pub async fn publish_sandbox_states_with_retirement(
         None,
         "stopped",
     );
+    if matches!(
+        node_drain,
+        Some(pplx_space_node_model::NodeDrain::V2 { .. })
+    ) {
+        project_stopped_disk_pins(conn, node_id, &rows).await?;
+    }
 
     let failed_sandboxes = converge_failed_sandboxes(conn, node_id, &rows).await?;
     emit_node_published_state_events(
@@ -3634,6 +3657,29 @@ async fn converge_stopped_sandboxes(
         .map_err(|err| Status::internal(format!("promote stopped sandbox lifecycle: {err}")))?
     };
     Ok(stopped_ids)
+}
+
+/// Project the stopped disk pin from the rows a v2-drained node published
+/// `stopped`; none sends no statement. A degraded publication is never among
+/// `rows`: the caller keeps it out.
+async fn project_stopped_disk_pins(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<Vec<SandboxId>, Status> {
+    let stopped: Vec<&PublishedSandboxRow> = rows
+        .iter()
+        .filter(|row| row.reports_lifecycle(SandboxLifecycle::Stopped))
+        .collect();
+    if stopped.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stopped = Json(serde_json::to_value(stopped).map_err(|error| {
+        Status::internal(format!("serialize stopped publication rows: {error}"))
+    })?);
+    pplx_space_sandbox_store::drain_restore::project_stopped_disk_pins(&mut *conn, node_id, stopped)
+        .await
+        .map_err(|err| Status::internal(format!("project stopped disk pins: {err}")))
 }
 
 async fn converge_failed_sandboxes(

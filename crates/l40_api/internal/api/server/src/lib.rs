@@ -168,7 +168,10 @@ impl FinalizedSnapshotRow {
 #[path = "published_state.rs"]
 mod published_state;
 /// Re-exported so Space's Datadog DBM query tests (private to Space) can drive the publish path.
-pub use published_state::{publish_sandbox_states, publish_sandbox_states_with_retirement};
+pub use published_state::{
+    publish_sandbox_states, publish_sandbox_states_under_drain,
+    publish_sandbox_states_with_retirement,
+};
 mod sandbox_quarantine_store;
 use published_state::{
     capture_host_cpu, project_ready_suspend_snapshot, prune_absent_node_templates,
@@ -381,6 +384,19 @@ struct OriginNodeRow {
     id: NodeId,
     address: Option<String>,
     role: String,
+    drain_engine: Option<String>,
+    drain_phase: Option<String>,
+    drain_mode: Option<String>,
+}
+
+impl OriginNodeRow {
+    fn drain(&self) -> Option<pplx_space_node_model::NodeDrain> {
+        pplx_space_node_model::NodeDrain::from_columns(
+            self.drain_engine.as_deref(),
+            self.drain_phase.as_deref(),
+            self.drain_mode.as_deref(),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -389,6 +405,11 @@ struct OriginNode {
     display_id: String,
     address: Option<IpAddr>,
     role: SpaceNodeRole,
+    /// The node's drain as its row read when the call was authenticated,
+    /// folded into that read: the status ingest projects the stopped disk
+    /// pin only for a node whose drain is v2, and the projection re-checks
+    /// it under its own transaction.
+    drain: Option<pplx_space_node_model::NodeDrain>,
 }
 
 /// Capture-time fields the `snapshots` row inherits from the source sandbox.
@@ -1494,7 +1515,10 @@ impl ClusterApiService {
         let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
             "SELECT n.id,
                     host(n.address) AS address,
-                    n.role
+                    n.role,
+                    n.drain_engine,
+                    n.drain_phase,
+                    n.drain_mode
              FROM nodes n
              JOIN node_k8s nk ON nk.node_id = n.id
              WHERE nk.k8s_node_name = $1
@@ -1526,6 +1550,7 @@ impl ClusterApiService {
             display_id: value.to_string(),
             address: parse_origin_address(row.address.as_deref())?,
             role,
+            drain: row.drain(),
         })
     }
 
@@ -1581,7 +1606,10 @@ async fn registered_origin_node(
     let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
         "SELECT n.id,
                 host(n.address) AS address,
-                n.role
+                n.role,
+                n.drain_engine,
+                n.drain_phase,
+                n.drain_mode
          FROM nodes n
          WHERE n.id = $1
            AND ($2::TEXT IS NULL OR n.role = $2)
@@ -1612,6 +1640,7 @@ async fn registered_origin_node(
         display_id: display_id.to_string(),
         address: parse_origin_address(row.address.as_deref())?,
         role,
+        drain: row.drain(),
     })
 }
 

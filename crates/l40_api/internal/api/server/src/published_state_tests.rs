@@ -794,3 +794,5 @@ mod first_seen_enqueue;
 mod lifecycle_writers;
 #[path = "published_state_tests/published_status.rs"]
 mod published_status;
+#[path = "published_state_tests/stopped_disk_pin.rs"]
+mod stopped_disk_pin;
