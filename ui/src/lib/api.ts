@@ -13,12 +13,14 @@ const ADMIN_BASE = '/admin/api';
 export class ApiError extends Error {
   // `body` is the parsed JSON error body, or null when it was not JSON;
   // `text` is the raw body. Axum answers a body it cannot deserialize (an
-  // unknown field, for one) with a 422 in plain text.
+  // unknown field, for one) with a 422 in plain text. `retryAfter` is the
+  // answer's `Retry-After` header as sent, or null without one.
   constructor(
     public status: number,
     message: string,
     public body: Record<string, unknown> | null = null,
     public text: string = '',
+    public retryAfter: string | null = null,
   ) {
     super(message);
   }
@@ -102,7 +104,7 @@ async function responseOnce(
     const message = (typeof body?.error === 'string' && body.error)
       || (typeof body?.message === 'string' && body.message)
       || 'Request failed';
-    throw new ApiError(res.status, message, body, text);
+    throw new ApiError(res.status, message, body, text, res.headers.get('Retry-After'));
   }
 
   return res;
