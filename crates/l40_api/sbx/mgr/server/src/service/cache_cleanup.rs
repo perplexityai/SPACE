@@ -355,7 +355,7 @@ fn inspect_remote_restore_provenance(
                 });
             }
         };
-    let expected_subject = pplx_space_common_core::types::SubjectId::Sandbox(sandbox_id);
+    let expected_subject = pplx_space_subject_model::SubjectId::Sandbox(sandbox_id);
     if provenance.subject_id != expected_subject {
         return Ok(RemoteRestoreProvenanceInspection::Unsafe {
             detail: format!(

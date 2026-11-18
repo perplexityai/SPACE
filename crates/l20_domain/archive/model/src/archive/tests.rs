@@ -222,7 +222,6 @@ fn readback_requires_complete_exact_revision_bytes() {
     );
 }
 
-#[cfg(feature = "serde")]
 #[test]
 fn reconstruction_codec_consumes_verified_bytes_and_preserves_configuration() {
     use pplx_space_byte_size::MemorySize;

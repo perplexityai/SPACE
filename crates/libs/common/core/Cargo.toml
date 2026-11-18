@@ -11,9 +11,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-aws-lc-rs = { workspace = true, optional = true }
 pplx-space-accounts = { workspace = true }
 pplx-space-artifact-model = { workspace = true }
+pplx-space-byok-model = { workspace = true }
 pplx-space-byte-size = { workspace = true }
 pplx-space-content-digest = { workspace = true }
 pplx-space-durations = { workspace = true }
@@ -27,23 +27,15 @@ pplx-space-sandbox-model = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-snapshot-model = { workspace = true }
 pplx-space-sql-codec = { workspace = true, optional = true }
+pplx-space-subject-model = { workspace = true }
 pplx-space-template-model = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
-serde_json = { workspace = true, optional = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }
-
-[dev-dependencies]
-pplx-space-guest-process = { workspace = true, features = ["serde"] }
-serde_json = { workspace = true }
 
 [features]
 default = []
-archive = ["dep:aws-lc-rs"]
 serde = [
     "dep:serde",
-    "dep:serde_json",
     "pplx-space-byte-size/serde",
     "pplx-space-content-digest/serde",
     "pplx-space-durations/serde",
@@ -58,6 +50,8 @@ serde = [
     "pplx-space-sandbox-model/serde",
     "pplx-space-snapshot-model/serde",
     "pplx-space-artifact-model/serde",
+    "pplx-space-byok-model/serde",
+    "pplx-space-subject-model/serde",
 ]
 sqlx = [
     "dep:pplx-space-sql-codec",

@@ -31,7 +31,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use pplx_space_accounts::{NodeId, OrgId, SandboxOwnerSource, UserId};
-use pplx_space_common_core::types::admin::DrainRequest;
+use pplx_space_admin_protocol::DrainRequest;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_node_model::NodeDrainMode;
 use pplx_space_sql_locator::sql;

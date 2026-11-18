@@ -343,8 +343,8 @@ fn record_deduplicated_submission(job_id: &JobId) {
 /// The bare sandbox UUID a `sandbox:<uuid>` subject names: the canonical
 /// `sandbox_id` that every service's spans and logs carry, so a sandbox's
 /// jobs are found by the same value as the rest of its telemetry. This reads
-/// the sandbox form of common-core's `SubjectId` wire text, whose sandbox ID
-/// is a UUID displayed hyphenated, without depending on it.
+/// the sandbox form of `pplx-space-subject-model`'s `SubjectId` wire text,
+/// whose sandbox ID is a UUID displayed hyphenated, without depending on it.
 fn subject_sandbox_id(subject_id: Option<&str>) -> Option<String> {
     let sandbox_id = subject_id?.strip_prefix("sandbox:")?;
     uuid::Uuid::parse_str(sandbox_id)

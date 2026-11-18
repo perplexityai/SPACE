@@ -16,9 +16,7 @@ use axum::{
     response::IntoResponse,
 };
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::admin::{
-    AdminTemplateVisibilityResponse, SetTemplateVisibilityRequest,
-};
+use pplx_space_admin_protocol::{AdminTemplateVisibilityResponse, SetTemplateVisibilityRequest};
 use pplx_space_template_model::TemplateName;
 use pplx_space_template_model::TemplateVisibility;
 

@@ -21,7 +21,7 @@ use pplx_space_template_model::{TemplateName, TemplateParseError};
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::SubjectId;
+/// # use pplx_space_subject_model::SubjectId;
 /// let s: SubjectId = "template:seed".parse().unwrap();
 /// assert_eq!(s.to_string(), "template:seed");
 /// ```

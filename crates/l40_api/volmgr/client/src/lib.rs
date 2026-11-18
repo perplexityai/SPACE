@@ -167,7 +167,7 @@ pub struct VerifiedReplicaProvenance {
 /// Typed source identity recovered from a verified-replica sidecar.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedReplicaSource {
-    pub subject_id: pplx_space_common_core::types::SubjectId,
+    pub subject_id: pplx_space_subject_model::SubjectId,
     pub storage_uri: pplx_space_artifact_model::ExactStorageUri,
 }
 
@@ -191,7 +191,7 @@ pub enum ReadVerifiedReplicaProvenanceError {
     Subject {
         path: PathBuf,
         #[source]
-        source: pplx_space_common_core::types::SubjectIdParseError,
+        source: pplx_space_subject_model::SubjectIdParseError,
     },
     #[error("verified replica provenance {path} has invalid storage URI: {source}")]
     StorageUri {

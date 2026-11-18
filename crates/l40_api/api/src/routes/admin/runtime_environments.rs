@@ -32,7 +32,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pplx_space_accounts::{NodeId, UserId};
-use pplx_space_common_core::types::admin::ListAdminNodesFilters;
+use pplx_space_admin_protocol::ListAdminNodesFilters;
 use pplx_space_execution_spec::{EnvironmentReference, ExecutionPolicyObservation};
 use pplx_space_node_model::NodeRole;
 use pplx_space_runtime_environment_policy_store::{

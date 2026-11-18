@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::admin::{
+use pplx_space_admin_protocol::{
     AdminNodeCtlStatus, AdminNodeServiceHealth, ListAdminNodesFilters,
 };
 use pplx_space_node_model::{

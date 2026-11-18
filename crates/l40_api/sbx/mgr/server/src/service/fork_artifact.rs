@@ -1,11 +1,11 @@
 use pplx_space_accounts::JobId;
 use pplx_space_artifact_model::SnapshotArtifact;
-use pplx_space_common_core::types::SubjectId;
 use pplx_space_node_disk_admission::{
     CacheDiskMeasurement, CacheDiskProbeError, read_cache_disk_measurement,
 };
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
+use pplx_space_subject_model::SubjectId;
 use pplx_space_volmgr_client::{
     VOLMGR_SOCKET,
     proto::{

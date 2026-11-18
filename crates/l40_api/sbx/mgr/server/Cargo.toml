@@ -31,6 +31,7 @@ test-hooks = [
 
 [dependencies]
 pplx-space-artifact-model = { workspace = true }
+pplx-space-subject-model = { workspace = true, features = ["serde"] }
 rustix = { workspace = true, features = ["fs"] }
 nix = { workspace = true, features = ["dir", "fs", "user"] }
 arc-swap = { workspace = true }

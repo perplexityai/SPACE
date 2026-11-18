@@ -6,7 +6,6 @@ use std::fmt;
 
 use pplx_space_accounts::OrgId;
 use pplx_space_artifact_model::{SnapshotArtifact, TemplateArtifact, snapshot_shard};
-use pplx_space_common_core::types::SubjectId;
 use pplx_space_content_digest::ContentHash;
 use pplx_space_credmgr_client::{
     AWS_CREDENTIALS_TOKEN_TYPE, BUILD_INPUT_SHA256_TOKEN_TYPE, SERVICE_ACTOR_TOKEN_TYPE,
@@ -15,6 +14,7 @@ use pplx_space_credmgr_client::{
 };
 use pplx_space_host_layout::identities::users;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_subject_model::SubjectId;
 use pplx_space_template_model::TemplateName;
 
 use crate::auth::{ClientService, ResolvedCaller};

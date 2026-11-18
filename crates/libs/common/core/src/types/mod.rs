@@ -27,15 +27,6 @@
 //! assert_eq!(compute.memory().as_mib_floor(), 4096);
 //! ```
 
-pub mod admin;
-pub mod kek;
-pub mod subject;
-
-#[cfg(feature = "serde")]
-pub use admin::*;
-pub use kek::*;
-pub use subject::{SubjectId, SubjectIdParseError, SubjectKind};
-
 /// Transitional: `SandboxId` lives in `pplx-space-sandbox-model`. This re-export keeps the
 /// old `types::SandboxId` path compiling for downstream crates until the common-core
 /// deletion removes it.

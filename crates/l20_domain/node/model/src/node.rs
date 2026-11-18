@@ -656,7 +656,7 @@ impl NodeDrainState {
 ///
 /// [`Self::Gentle`] is the answer everywhere a mode is missing or unreadable
 /// rather than chosen — a `:drain` body with no `mode` (see
-/// `pplx_space_common_core::types::admin::DrainRequest`), a NULL
+/// `pplx_space_admin_protocol::DrainRequest`), a NULL
 /// `nodes.drain_mode` column, and a column value this build does not recognize
 /// (the latter two via [`Self::from_column_str`]). That is one rule, and it is a safety
 /// property rather than a preference: [`Self::Forced`] is the destructive mode,

@@ -66,7 +66,6 @@ use std::time::{Duration, Instant};
 
 use pplx_space_accounts::OrgId;
 use pplx_space_artifact_model::{StorageUri, TEMPLATE_ROOTFS_FILE};
-use pplx_space_common_core::types::SubjectId;
 use pplx_space_common_grpc::GrpcClientTrace;
 use pplx_space_content_digest::ContentHash;
 use pplx_space_host_layout::paths::{TEMPLATE_CACHE_DIR_MODE, TEMPLATE_CACHE_FILE_MODE};
@@ -75,6 +74,7 @@ use pplx_space_node_api_client::proto::{
     FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest,
     ListLatestTemplateReleasesRequest, TemplateVisibility,
 };
+use pplx_space_subject_model::SubjectId;
 use pplx_space_template_cache_permissions::{
     normalize_template_cache_tree, set_template_cache_permissions,
 };

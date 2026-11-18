@@ -10,8 +10,7 @@ use crate::crypto::wrap_aad;
 use crate::materialization::MaterializationMode;
 use pplx_space_accounts::OrgId;
 use pplx_space_artifact_model::{SnapshotArtifact, StorageUri, parse_snapshot_object_key};
-use pplx_space_common_core::types::SubjectId;
-use pplx_space_common_core::types::{KekProvider, MasterKeyIdentifier};
+use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
 use pplx_space_common_jobs::{
     BackgroundWorker, JobExecutor, JobFailure, JobFailureReason, JobPriority, PriorityBand,
     WorkerConfig,
@@ -19,6 +18,7 @@ use pplx_space_common_jobs::{
 use pplx_space_host_layout::{identities::user_names, identities::users};
 use pplx_space_sandbox_grpc::record_sandbox_id;
 use pplx_space_snapshot_model::TransferScopeId;
+use pplx_space_subject_model::SubjectId;
 use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };

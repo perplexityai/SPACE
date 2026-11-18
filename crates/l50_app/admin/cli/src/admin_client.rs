@@ -1,5 +1,5 @@
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
-use pplx_space_common_core::types::admin::{
+use pplx_space_admin_protocol::{
     AdminNodeNetworkSlots, AdminNodeResponse, AdminNodeSort, DrainRequest,
 };
 use pplx_space_node_model::NodeAddress;

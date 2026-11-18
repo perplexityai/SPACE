@@ -5,7 +5,7 @@
 //! ([`crate::kek_provisioning`]); this store is read-only.
 
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::MasterKeyIdentifier;
+use pplx_space_byok_model::MasterKeyIdentifier;
 use pplx_space_sql_locator::sql;
 
 use crate::intermediate_key_broker::{WrappedIntermediateKeyStore, WrappedKeyStoreError};
