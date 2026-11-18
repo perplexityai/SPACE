@@ -55,7 +55,9 @@ retire the script when no tests remain in it.
 A full Kubernetes Kind validation is `bash scripts/tests/smoke-kind-parallel.sh`
 on one Linux/KVM host, and its `summary.md` (with `summary.json`) is the
 evidence: one table across benches, every scenario that did not pass with its
-log, and a check that both API surfaces' inventory ran exactly once. Its exit
+log, and a check that the benches cover the inventory exactly once (each
+(surface, scenario) pair has one `=== RUN`, or was skipped by a bench's mode
+after the partition, which counts as covered). Its exit
 status ranks as a typed suite's does: `1` when a scenario failed, else `2` for an
 incomplete run (a bench down, an inconclusive scenario, a coverage gap), else
 `42` for a warning, else `0`. Don't run the CI shards one after
