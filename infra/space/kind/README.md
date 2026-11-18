@@ -335,6 +335,83 @@ consume fourteen concurrent runners; queue time remains a separate constraint.
 At fourteen, the leader-election brownout's shard holds it alone and is the
 slowest, so more shards would not shorten the run.
 
+## The whole suite on one host
+
+`scripts/tests/smoke-kind-parallel.sh` runs every CI smoke shard's work on one
+Linux/KVM host at once, as N isolated benches side by side:
+
+```bash
+scripts/tests/smoke-kind-parallel.sh --benches 4            # one command, one summary
+scripts/tests/smoke-kind-parallel.sh --benches 4 --keep     # leave the benches up
+scripts/tests/smoke-kind-parallel.sh teardown               # remove what a run left
+```
+
+Bench `i` of `N` is one CI shard runner: it runs the baseline
+(`smoke-kind-e2e.sh`) and then `smoke-kind-typed.sh all i/N`, so the benches
+together run both API surfaces' inventory once each. The summary
+(`summary.md`, `summary.json` and `timeline.txt` in the run's output directory,
+printed at the end) lists each bench's phase times and SUITE counts, every
+scenario that did not pass with its log, and checks that the benches' `=== RUN`
+ids cover the inventory exactly once. The script exits 0 when every bench
+passed, 1 when a scenario failed and 2 when a bench did not come up, a scenario
+was inconclusive or the coverage check failed. Without `--benches` it picks N
+from the host's CPUs, memory and free disk, and prints it. One run or teardown
+holds the host at a time (`~/.space-benches.lock`), and a run first removes
+the benches an interrupted one left.
+
+Each bench keeps every default name and port (`space-local`, API
+`127.0.0.1:8080`, data plane `:8090`, Tilt `:10350`), so the bring-up and the
+scenarios run unchanged. What isolates it
+(`scripts/tests/lib/kind-bench.sh`):
+
+- a network namespace with a veth to the host and NAT out, so each bench has
+  its own loopback ports and its own Docker networks;
+- a dockerd of its own in that namespace (data root under
+  `~/.space-benches/<i>`, containerd image store). It, its Kind nodes and the
+  bench's commands run in the cgroup `/space-bench-<i>`, not the caller's: a
+  caller in a CPU-capped container (as on a host whose own Docker is a
+  sidecar) would otherwise throttle every bench's image unpacking;
+- a PID namespace with its own `/proc`: the bring-up finds its Tilt and
+  port-forwards by scanning processes, and with one shared process table the
+  benches stopped each other's watchers;
+- its own `HOME`, `TMPDIR`, kubeconfig and Tilt state, and its own worktree of
+  the checkout (with the uncommitted changes copied in): N bring-ups writing
+  one tree raced in Helm's chart vendoring.
+
+What is the same on every bench is done once on the host: the Rust artifact
+image is built once and handed to each bench as CI hands it to its shards
+(`rust-artifact-handoff.py record`/`load`, `SPACE_KIND_RUST_ARTIFACTS=prebuilt`);
+the node images and build bases are saved once and loaded into each bench; the
+seed is built once and copied in; the host's loop-device pool and inotify
+limits are raised before any bench starts (loop devices are kernel-global, but
+a container's `/dev` holds only the nodes its host had when it was created; see
+`scripts/lib/space-loop-devices.sh`). Two registries on the host's
+Docker, kept across runs under `~/.space-benches-cache`, serve every bench: a
+pull-through Docker Hub mirror, so an image costs one pull from the host's
+egress rather than one per bench, and the layer cache
+([CI layer cache](#ci-layer-cache)) as a loopback registry, into which the host
+exports the runtime images' dependency stages and the whole UI build.
+
+What it costs, measured on a 32-CPU, 123 GiB host whose bench data is on one
+network block volume (about 330 MB/s of writes), with a warm Rust target
+directory, for the 118 (surface, scenario) pairs of the routine tiers:
+
+| N | wall-clock | until the last baseline passed | slowest typed shard |
+|---|---|---|---|
+| 4 | 23-25 min | 9-10.5 min | 12-13 min |
+| 5 | 23 min | 11 min | 10.5 min |
+| 6 | 25 min | 13.5 min | 10 min |
+
+The typed phase is mostly waiting and scales as the serial suite (about
+48 minutes) over N; at N=6 the scenarios took 7% longer in sum than their
+hints. The bring-ups are not: each bench writes 50-65 GB (image loads, the
+nodes' containerd stores, `kind load` of every image into every node it runs
+on) and holds about 50 GB at its peak, so N bring-ups contend for that volume's
+write throughput (I/O pressure above 60%) and for CPU, and take about two
+minutes longer per bench. On such a host the fastest N is 4 to 5; N=8 does not
+fit 393 GB. The default N is the smallest of CPUs / 8, memory / 16 GiB and free
+disk / 60 GB, at most 6.
+
 ## Release-build lane
 
 Every Kind binary is normally built with the `test-hooks` feature (see

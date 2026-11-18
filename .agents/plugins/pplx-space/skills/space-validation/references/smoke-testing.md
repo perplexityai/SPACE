@@ -50,6 +50,21 @@ cleanup path, exit status, and pipeline gate it had. Remove it from the legacy
 script once the typed scenario has passed on the environments that ran it, and
 retire the script when no tests remain in it.
 
+## The whole Kind suite on one host
+
+For full Kubernetes Kind validation on one Linux/KVM host, run
+`scripts/tests/smoke-kind-parallel.sh [--benches N] [--keep] [--out DIR]`
+rather than the CI shards one after another on one stack. It runs N isolated
+benches side by side, each one CI shard runner (its own network and PID
+namespaces, dockerd and checkout), builds Rust and the shared images once, and
+prints one summary with an exactly-once coverage check; its exit status is the
+typed suite's `0` / `1` / `2`. It needs passwordless sudo and takes about 23
+minutes at N=4 or 5 on a 32-CPU host with a warm Rust target directory,
+holding about 50 GB of disk per bench. A scenario that fails there and passes on a clean
+single bench (`--benches 1`) is contention from its neighbours until shown
+otherwise. "The whole suite on one host" in `infra/space/kind/README.md`
+describes what each bench shares and what it costs.
+
 ## Scenario-scoped cluster knobs (kind)
 
 Some kind-chart values are cross-deployment invariants, not free knobs: the
