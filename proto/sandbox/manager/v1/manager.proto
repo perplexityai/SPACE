@@ -818,6 +818,10 @@ message SandboxInfo {
   // available after the active runtime identity is cleared.
   optional uint64 route_provenance_generation = 51;
   optional int64 route_provenance_execution_generation = 52;
+  // Substrate recorded for the sandbox's current or retained route, not how
+  // the sandbox is hosted: KUBERNETES if any of those records names
+  // Kubernetes, else DIRECT if any names Direct, else UNSPECIFIED (none
+  // recorded, or the node could not read them).
   space.net.gateway.v1.SandboxSubstrateKind route_provenance_substrate_kind = 53;
   // Time the node-local state last changed. Carried with the matching state so
   // cluster publication can measure node-to-Postgres convergence.
