@@ -97,7 +97,10 @@ pub(crate) struct UnsupportedOperator(String);
 
 /// `false` decodes here and is rejected when converted to the model.
 #[derive(Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(
+    untagged,
+    expecting = "expected an unsigned integer, an IPv4 address, true, a prefix or a range"
+)]
 pub(crate) enum ValueV1 {
     Integer(u64),
     Ipv4(Ipv4Addr),

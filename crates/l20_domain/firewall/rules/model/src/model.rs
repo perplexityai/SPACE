@@ -9,15 +9,20 @@ use std::num::NonZeroU64;
 const MAX_NAME_LEN: usize = 64;
 
 /// The stable identity of a rule within a revision, by which a diff matches
-/// rules: 1 to 64 bytes of printable ASCII other than space (0x21 to 0x7E),
-/// kept as written.
+/// rules: 1 to 64 bytes, an ASCII letter or digit and then ASCII letters,
+/// digits, `.`, `_` or `-` (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`), kept as
+/// written.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RuleId(String);
 
 impl RuleId {
     pub fn new(value: impl Into<String>) -> Result<Self, NameError> {
         let value = value.into();
-        validate(&value, |c| c.is_ascii_graphic())?;
+        validate(
+            &value,
+            |c| c.is_ascii_alphanumeric(),
+            |c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'),
+        )?;
         Ok(Self(value))
     }
 
@@ -27,16 +32,21 @@ impl RuleId {
 }
 
 /// A protocol, header field or TCP option name, such as `tcp`, `dport` or
-/// `mptcp`: 1 to 64 bytes of printable ASCII, space included (0x20 to 0x7E),
-/// kept as written. Runtime qualification decides whether a valid name means
-/// anything.
+/// `sack-perm`: 1 to 64 bytes, a lowercase ASCII letter or digit and then
+/// lowercase ASCII letters, digits, `_` or `-` (`[a-z0-9][a-z0-9_-]{0,63}`).
+/// Runtime qualification decides whether a valid name means anything.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Name(String);
 
 impl Name {
     pub fn new(value: impl Into<String>) -> Result<Self, NameError> {
         let value = value.into();
-        validate(&value, |c| c.is_ascii_graphic() || c == ' ')?;
+        fn lower_or_digit(c: char) -> bool {
+            c.is_ascii_lowercase() || c.is_ascii_digit()
+        }
+        validate(&value, lower_or_digit, |c| {
+            lower_or_digit(c) || matches!(c, '_' | '-')
+        })?;
         Ok(Self(value))
     }
 
@@ -45,9 +55,9 @@ impl Name {
     }
 }
 
-// The syntax rules admit printable ASCII only, so writing a rule ID or name
-// raw cannot emit a control character, an escape sequence or an invisible
-// character.
+// The syntax rules admit no space, quote, backslash, control or non-ASCII
+// character, so a rule ID or name written raw prints exactly as it is and two
+// different ones never print alike.
 impl fmt::Display for RuleId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -60,14 +70,17 @@ impl fmt::Display for Name {
     }
 }
 
-fn validate(value: &str, allows: fn(char) -> bool) -> Result<(), NameError> {
+fn validate(value: &str, first: fn(char) -> bool, rest: fn(char) -> bool) -> Result<(), NameError> {
     if value.is_empty() {
         return Err(NameError::Empty);
     }
     if value.len() > MAX_NAME_LEN {
         return Err(NameError::TooLong { len: value.len() });
     }
-    match value.char_indices().find(|&(_, c)| !allows(c)) {
+    let refused = value
+        .char_indices()
+        .find(|&(index, c)| !if index == 0 { first(c) } else { rest(c) });
+    match refused {
         Some((index, found)) => Err(NameError::InvalidCharacter { index, found }),
         None => Ok(()),
     }

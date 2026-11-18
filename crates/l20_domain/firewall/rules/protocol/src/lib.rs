@@ -1,6 +1,6 @@
 //! The versioned JSON document for
-//! [`pplx_space_firewall_rules::FirewallRuleRevision`]: a strict decoder and
-//! the canonical encoder, shared by the CLI and the Admin API.
+//! [`pplx_space_firewall_rules_model::FirewallRuleRevision`]: a strict decoder
+//! and the canonical encoder, shared by the CLI and the Admin API.
 //! [`encode_revision`] writes the only canonical bytes; the model types
 //! implement no `Serialize`, so nothing else can write a second form.
 //!

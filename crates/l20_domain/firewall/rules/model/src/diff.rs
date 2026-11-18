@@ -6,8 +6,14 @@ use crate::model::{FirewallRuleRevision, Rule, RuleId};
 
 /// The rules that differ between a base and its candidate, in canonical order:
 /// replaced and removed rules in base order, then added rules in candidate
-/// order. Unchanged rules are absent. Rule order is part of a revision, so the
-/// diff also reports whether the rules both revisions hold changed order.
+/// order. Unchanged rules are absent. An addition carries no position; the
+/// candidate revision holds the full order.
+///
+/// Rule order is part of a revision, so the diff also reports whether the
+/// rules both revisions hold changed order: a revision is the exact document
+/// pushed, and a push that only reorders must not look like no change. Every
+/// rule drops, so today a reorder does not change which packets drop; whether
+/// a reorder-only diff needs a reconcile is the caller's decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuleRevisionDiff {
     changes: Vec<RuleChange>,

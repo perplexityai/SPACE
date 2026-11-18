@@ -2,7 +2,7 @@
 //! conversion rejects `false` and the model constructors check names,
 //! prefixes, ranges and rule IDs.
 
-use pplx_space_firewall_rules::{
+use pplx_space_firewall_rules_model::{
     FirewallRuleRevision, IntegerRange, Ipv4Prefix, Match, Name, NameError, PayloadHeader,
     PrefixLengthError, Read, ReversedRangeError, Rule, RuleId, Value,
 };

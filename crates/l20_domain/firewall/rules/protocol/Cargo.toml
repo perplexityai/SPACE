@@ -11,7 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-pplx-space-firewall-rules = { workspace = true }
+pplx-space-firewall-rules-model = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

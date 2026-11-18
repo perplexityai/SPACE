@@ -6099,7 +6099,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-firewall-rules"
+name = "pplx-space-firewall-rules-model"
 version = "0.8.2"
 dependencies = [
  "thiserror 2.0.20",
@@ -6109,7 +6109,7 @@ dependencies = [
 name = "pplx-space-firewall-rules-protocol"
 version = "0.8.2"
 dependencies = [
- "pplx-space-firewall-rules",
+ "pplx-space-firewall-rules-model",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

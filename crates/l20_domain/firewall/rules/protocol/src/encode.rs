@@ -1,6 +1,8 @@
 //! The canonical encoder: the model converted to the private wire types.
 
-use pplx_space_firewall_rules::{FirewallRuleRevision, Match, PayloadHeader, Read, Rule, Value};
+use pplx_space_firewall_rules_model::{
+    FirewallRuleRevision, Match, PayloadHeader, Read, Rule, Value,
+};
 
 use crate::SCHEMA_VERSION;
 use crate::wire::{

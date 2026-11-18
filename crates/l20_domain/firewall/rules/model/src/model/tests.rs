@@ -16,23 +16,45 @@ fn a_revision_rejects_a_repeated_rule_id() {
 
 #[test]
 fn names_follow_their_syntax_rules() {
-    let longest = "a".repeat(64);
-    let too_long = "a".repeat(65);
+    let longest_id = "A".repeat(64);
+    for valid in ["a", "Z", "0", "Web.Edge-1_a", longest_id.as_str()] {
+        assert_eq!(RuleId::new(valid).unwrap().as_str(), valid);
+    }
+    let longest_name = "a".repeat(64);
+    for valid in [
+        "tcp",
+        "ip6",
+        "sack-perm",
+        "frag-off",
+        "a_b",
+        "9",
+        longest_name.as_str(),
+    ] {
+        assert_eq!(Name::new(valid).unwrap().as_str(), valid);
+    }
+
     type Check = fn(&str) -> Result<(), NameError>;
     let checks: [(&str, Check); 2] = [
         ("rule ID", |value| RuleId::new(value).map(drop)),
         ("name", |value| Name::new(value).map(drop)),
     ];
     for (kind, check) in checks {
-        assert_eq!(check("!~"), Ok(()), "{kind}");
-        assert_eq!(check(&longest), Ok(()), "{kind}");
         assert_eq!(check(""), Err(NameError::Empty), "{kind}");
         assert_eq!(
-            check(&too_long),
+            check(&"a".repeat(65)),
             Err(NameError::TooLong { len: 65 }),
             "{kind}"
         );
         for (value, index, found) in [
+            ("-a", 0, '-'),
+            ("_a", 0, '_'),
+            (".a", 0, '.'),
+            (" a", 0, ' '),
+            ("a ", 1, ' '),
+            ("a b", 1, ' '),
+            ("a\"} {", 1, '"'),
+            ("tcp; flush ruleset", 3, ';'),
+            ("space-cfg:x", 9, ':'),
             ("a\nb", 1, '\n'),
             ("\u{1b}[31m", 0, '\u{1b}'),
             ("web\u{200b}", 3, '\u{200b}'),
@@ -47,14 +69,20 @@ fn names_follow_their_syntax_rules() {
         }
     }
 
-    // Only a rule ID refuses the space.
+    // Only a rule ID takes uppercase letters and `.`.
     assert_eq!(
-        RuleId::new("a b"),
+        Name::new("Tcp"),
         Err(NameError::InvalidCharacter {
-            index: 1,
-            found: ' '
+            index: 0,
+            found: 'T'
         })
     );
-    assert_eq!(Name::new(" a b ").unwrap().as_str(), " a b ");
+    assert_eq!(
+        Name::new("a.b"),
+        Err(NameError::InvalidCharacter {
+            index: 1,
+            found: '.'
+        })
+    );
     assert_eq!(RuleId::new("web").unwrap().to_string(), "web");
 }

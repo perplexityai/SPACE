@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 
-use pplx_space_firewall_rules::{
+use pplx_space_firewall_rules_model::{
     FirewallRuleRevision, IntegerRange, Ipv4Prefix, Match, Name, PayloadHeader, Read, Rule, RuleId,
     Value,
 };
@@ -86,8 +86,8 @@ fn documents(table: &str) -> Vec<String> {
 }
 
 /// Golden bytes for every read and value kind, decoding regardless of key order
-/// and whitespace, names kept verbatim and escaped, and boundary documents that
-/// encode back to themselves.
+/// and whitespace, names kept verbatim, and boundary documents that encode back
+/// to themselves.
 #[test]
 fn documents_round_trip_through_the_canonical_form() {
     let expected = FirewallRuleRevision::new(vec![
@@ -139,18 +139,15 @@ fn documents_round_trip_through_the_canonical_form() {
     ],"schema_version":1}"#;
     assert_eq!(decode_revision(reordered).unwrap(), expected);
 
-    let escaped = FirewallRuleRevision::new(vec![
+    let verbatim = FirewallRuleRevision::new(vec![
         rule(
-            r#"q"\/x"#,
-            vec![eq(
-                Read::Payload(header(r#"say "hi" \ bye"#, r#" {"field":1} "#)),
-                Value::True,
-            )],
+            "Web.Edge-1_a",
+            vec![eq(Read::Payload(header("ip6", "frag-off")), Value::True)],
         ),
         rule(
-            r"\\",
+            "0",
             vec![eq(
-                Read::TcpOption(Name::new(r#"opt "a" \b"#).unwrap()),
+                Read::TcpOption(Name::new("sack-perm").unwrap()),
                 Value::True,
             )],
         ),
@@ -158,12 +155,12 @@ fn documents_round_trip_through_the_canonical_form() {
     .unwrap();
     let golden = concat!(
         r#"{"schema_version":1,"rules":["#,
-        r#"{"id":"q\"\\/x","all_of":[{"left":{"payload":{"protocol":"say \"hi\" \\ bye","field":" {\"field\":1} "}},"op":"==","right":true}]},"#,
-        r#"{"id":"\\\\","all_of":[{"left":{"tcp option":{"name":"opt \"a\" \\b"}},"op":"==","right":true}]}"#,
+        r#"{"id":"Web.Edge-1_a","all_of":[{"left":{"payload":{"protocol":"ip6","field":"frag-off"}},"op":"==","right":true}]},"#,
+        r#"{"id":"0","all_of":[{"left":{"tcp option":{"name":"sack-perm"}},"op":"==","right":true}]}"#,
         r#"]}"#,
     );
-    assert_eq!(encode_revision(&escaped), golden);
-    assert_eq!(decode_revision(golden).unwrap(), escaped);
+    assert_eq!(encode_revision(&verbatim), golden);
+    assert_eq!(decode_revision(golden).unwrap(), verbatim);
 
     for document in documents(CANONICAL) {
         let revision = decode_revision(&document).unwrap_or_else(|e| panic!("{document}: {e}"));
@@ -217,10 +214,9 @@ right {"prefix":{"addr":"192.0.2.7","len":32}}
 right {"range":[5,5]}
 right {"range":[0,18446744073709551615]}
 left {"&":[{"payload":{"protocol":"tcp","field":"flags"}},18446744073709551615]}
-left {"payload":{"protocol":"Not A Protocol","field":" spaced "}}
+left {"payload":{"protocol":"udplite","field":"csumcov"}}
 rules {"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","all_of":[GOOD]}
-rules {"id":"!#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`ab","all_of":[GOOD]}
-rules {"id":"cdefghijklmnopqrstuvwxyz{|}~","all_of":[GOOD]}
+rules {"id":"Az09.Z_z-9","all_of":[GOOD]}
 "##;
 
 #[test]
@@ -370,6 +366,19 @@ right {"range":[1,2,3]}
 left {"&":[{"payload":{"protocol":"tcp","field":"flags"}}]}
 # Operator other than ==
 op "!="
+# Rule IDs and names outside their character sets
+rules {"id":"!#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`ab","all_of":[GOOD]}
+rules {"id":"cdefghijklmnopqrstuvwxyz{|}~","all_of":[GOOD]}
+rules {"id":"-a","all_of":[GOOD]}
+rules {"id":".a","all_of":[GOOD]}
+left {"payload":{"protocol":"Not A Protocol","field":"dport"}}
+left {"payload":{"protocol":"TCP","field":"dport"}}
+left {"payload":{"protocol":"tcp","field":" spaced "}}
+left {"payload":{"protocol":" tcp","field":"dport"}}
+left {"payload":{"protocol":"tcp","field":"dport "}}
+left {"payload":{"protocol":"tcp; flush ruleset","field":"dport"}}
+left {"tcp option":{"name":"a\"} {"}}
+left {"tcp option":{"name":"-mptcp"}}
 # Empty all_of, invalid names, duplicate rule IDs
 rules {"id":"a","all_of":[GOOD]},{"id":"b","all_of":[]}
 rules {"id":"a b","all_of":[GOOD]}
