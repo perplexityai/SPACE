@@ -197,6 +197,12 @@ pub fn isolation_root(runtime: RuntimeKind, sandbox_id: &str) -> Result<PathBuf,
 }
 
 pub fn guest_socket_path(runtime: RuntimeKind, sandbox_id: &str) -> Result<PathBuf, ControlError> {
+    if runtime == RuntimeKind::Wasmtime {
+        return Ok(
+            PathBuf::from(pplx_space_host_layout::paths::sandbox_run_dir(sandbox_id))
+                .join("wasi-guest/bridge-guest.sock"),
+        );
+    }
     Ok(isolation_root(runtime, sandbox_id)?.join("v.sock"))
 }
 
@@ -206,12 +212,15 @@ pub fn guest_socket_path(runtime: RuntimeKind, sandbox_id: &str) -> Result<PathB
 pub fn guest_endpoint_identity(
     runtime: RuntimeKind,
 ) -> Result<(&'static str, &'static std::path::Path), ControlError> {
-    let executable = match runtime {
-        RuntimeKind::Firecracker => "firecracker",
-        RuntimeKind::CloudHypervisor => "cloud-hypervisor",
-        RuntimeKind::Gvisor | RuntimeKind::Wasmtime => {
-            return Err(ControlError::UnsupportedRuntime(runtime));
-        }
-    };
-    Ok((executable, std::path::Path::new("/v.sock")))
+    match runtime {
+        RuntimeKind::Firecracker => Ok(("firecracker", std::path::Path::new("/v.sock"))),
+        RuntimeKind::CloudHypervisor => Ok(("cloud-hypervisor", std::path::Path::new("/v.sock"))),
+        // The trusted native agent owns the listener. Wasmtime is its bounded
+        // per-command child, not the long-lived endpoint process.
+        RuntimeKind::Wasmtime => Ok((
+            "space-runtime-supervisor-svc",
+            std::path::Path::new("/run/bridge-guest.sock"),
+        )),
+        RuntimeKind::Gvisor => Err(ControlError::UnsupportedRuntime(runtime)),
+    }
 }

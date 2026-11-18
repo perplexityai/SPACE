@@ -434,6 +434,42 @@ fn validate_spaced_host_arguments(
 }
 
 fn spaced_host_arguments_match(bytes: &[u8], runtime: &RegisteredEndpointRuntime) -> bool {
+    if runtime.runtime_kind == pplx_space_execution_spec::RuntimeKind::Wasmtime {
+        return process_arguments_include(
+            bytes,
+            "--bridge-guest-uds",
+            &runtime.vsock_path.to_string_lossy(),
+        ) && process_arguments_include(
+            bytes,
+            "--bridge-host-uds",
+            &runtime
+                .vsock_path
+                .with_file_name("bridge-host.sock")
+                .to_string_lossy(),
+        ) && process_arguments_include(
+            bytes,
+            "--bridge-guest-pid",
+            &runtime.runtime_pid.to_string(),
+        ) && process_arguments_include(
+            bytes,
+            "--bridge-guest-uid",
+            &runtime.sandbox_uid.to_string(),
+        ) && process_arguments_include(bytes, "--guest-agent", "wasi-python-v1")
+            && !bytes.split(|byte| *byte == 0).any(|argument| {
+                [
+                    b"--vsock-uds".as_slice(),
+                    b"--firecracker-pid",
+                    b"--firecracker-uid",
+                ]
+                .into_iter()
+                .any(|flag| {
+                    argument == flag
+                        || argument
+                            .strip_prefix(flag)
+                            .is_some_and(|s| s.starts_with(b"="))
+                })
+            });
+    }
     process_arguments_include(bytes, "--vsock-uds", &runtime.vsock_path.to_string_lossy())
         && process_arguments_include(bytes, "--firecracker-pid", &runtime.runtime_pid.to_string())
         && process_arguments_include(bytes, "--firecracker-uid", &runtime.sandbox_uid.to_string())
@@ -444,14 +480,30 @@ fn process_arguments_include(bytes: &[u8], flag: &str, expected_value: &str) -> 
     if bytes.ends_with(&[0]) {
         arguments.pop();
     }
-    arguments.windows(2).any(|pair| {
-        matches!(
-            pair,
-            [observed_flag, observed_value]
-                if *observed_flag == flag.as_bytes()
-                    && *observed_value == expected_value.as_bytes()
-        )
-    })
+    let matches = arguments
+        .windows(2)
+        .filter(|pair| {
+            matches!(
+                pair,
+                [observed_flag, observed_value]
+                    if *observed_flag == flag.as_bytes()
+                        && *observed_value == expected_value.as_bytes()
+            )
+        })
+        .count();
+    // An earlier matching value cannot attest a later override (including
+    // --flag=value). Fail closed on ambiguous process configuration.
+    matches == 1
+        && arguments
+            .iter()
+            .filter(|argument| {
+                **argument == flag.as_bytes()
+                    || argument
+                        .strip_prefix(flag.as_bytes())
+                        .is_some_and(|suffix| suffix.starts_with(b"="))
+            })
+            .count()
+            == 1
 }
 
 fn capture_process(

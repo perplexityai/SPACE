@@ -2476,6 +2476,64 @@ table inet space {
             .code(),
             tonic::Code::FailedPrecondition
         );
+
+        // The contained agent is a peer-authenticated UDS service, not a VMM
+        // implementing the CONNECT/vsock protocol.
+        let bridge =
+            std::path::PathBuf::from(pplx_space_host_layout::paths::sandbox_run_dir(sandbox_id))
+                .join("wasi-guest");
+        let wasi_args = vec![
+            "--socket".to_owned(),
+            pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
+            "--sandbox-id".to_owned(),
+            sandbox_id.to_owned(),
+            "--bridge-guest-uds".to_owned(),
+            bridge.join("bridge-guest.sock").display().to_string(),
+            "--bridge-host-uds".to_owned(),
+            bridge.join("bridge-host.sock").display().to_string(),
+            "--host-control-socket".to_owned(),
+            pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.to_owned(),
+        ];
+        let wasi_peer = peer
+            .for_runtime(pplx_space_execution_spec::RuntimeKind::Wasmtime)
+            .for_guest_agent(QualifiedGuestAgent::WasiPythonV1);
+        let wasi =
+            prepare_sidecar_launch_args(program, sandbox_id, &wasi_args, Some(wasi_peer)).unwrap();
+        for (flag, value) in [
+            ("--bridge-guest-pid", runtime_pid.to_string()),
+            ("--bridge-guest-uid", sandbox_uid.to_string()),
+            ("--guest-agent", "wasi-python-v1".to_owned()),
+        ] {
+            assert_eq!(require_launch_arg(&wasi, program, flag).unwrap(), value);
+        }
+        require_launch_arg(&wasi, program, "--vsock-uds").unwrap_err();
+        require_launch_arg(&wasi, program, "--firecracker-pid").unwrap_err();
+        for injected in [
+            vec!["--bridge-guest-pid", "1"],
+            vec!["--bridge-guest-uid=0"],
+            vec!["--vsock-uds", "/synthetic/other.sock"],
+            vec!["--guest-agent=linux-v1"],
+        ] {
+            let mut spoofed = wasi_args.clone();
+            spoofed.extend(injected.into_iter().map(str::to_owned));
+            assert_eq!(
+                prepare_sidecar_launch_args(program, sandbox_id, &spoofed, Some(wasi_peer))
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        for mismatched in [
+            wasi_peer.for_runtime(pplx_space_execution_spec::RuntimeKind::CloudHypervisor),
+            wasi_peer.for_guest_agent(QualifiedGuestAgent::LinuxV1),
+        ] {
+            assert_eq!(
+                prepare_sidecar_launch_args(program, sandbox_id, &wasi_args, Some(mismatched))
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
     }
 
     #[test]

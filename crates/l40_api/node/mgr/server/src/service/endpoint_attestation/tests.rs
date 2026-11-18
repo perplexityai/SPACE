@@ -145,6 +145,18 @@ fn process_argument_matching_preserves_empty_values() {
         "--vsock-uds",
         "/v.sock",
     ));
+    for arguments in [
+        b"host\0--peer\0expected\0--peer\0other\0".as_slice(),
+        b"host\0--peer\0expected\0--peer=other\0",
+        b"host\0--peer=other\0--peer\0expected\0",
+    ] {
+        assert!(!process_arguments_include(arguments, "--peer", "expected"));
+    }
+    assert!(process_arguments_include(
+        b"host\0--peer\0expected\0",
+        "--peer",
+        "expected",
+    ));
 }
 
 #[test]
@@ -179,6 +191,50 @@ fn validation_uses_the_recorded_runtime_endpoint() {
         assert_eq!(path, Path::new("/v.sock"));
         let host_path = guest_socket_path(kind, "sandbox").unwrap();
         assert!(host_path.ends_with(format!("{executable}/sandbox/root/v.sock")));
+    }
+    let (name, path) = guest_endpoint_identity(RuntimeKind::Wasmtime).unwrap();
+    assert_eq!(name, "space-runtime-supervisor-svc");
+    assert_eq!(path, Path::new("/run/bridge-guest.sock"));
+    assert_eq!(
+        guest_socket_path(RuntimeKind::Wasmtime, "sandbox").unwrap(),
+        Path::new(&pplx_space_host_layout::paths::sandbox_run_dir("sandbox"))
+            .join("wasi-guest/bridge-guest.sock")
+    );
+    let runtime = RegisteredEndpointRuntime {
+        sandbox_id: "sandbox".to_owned(),
+        sandbox_uid: 20_001,
+        guest_cid: 3,
+        spaced_host_pid: 43,
+        runtime_pid: 42,
+        runtime_kind: RuntimeKind::Wasmtime,
+        vsock_path: guest_socket_path(RuntimeKind::Wasmtime, "sandbox").unwrap(),
+    };
+    let args = format!(
+        "space-spaced-host-svc\0--bridge-guest-uds\0{}\0--bridge-host-uds\0{}\0--bridge-guest-pid\0{pid}\0--bridge-guest-uid\0{uid}\0--guest-agent\0wasi-python-v1\0",
+        runtime.vsock_path.display(),
+        runtime
+            .vsock_path
+            .with_file_name("bridge-host.sock")
+            .display(),
+        pid = runtime.runtime_pid,
+        uid = runtime.sandbox_uid,
+    );
+    assert!(spaced_host_arguments_match(args.as_bytes(), &runtime));
+    for changed in [
+        args.replace("wasi-python-v1", "linux-v1"),
+        args.replace(
+            &format!("--bridge-guest-pid\0{}\0", runtime.runtime_pid),
+            &format!("--bridge-guest-pid\0{}\0", runtime.runtime_pid + 1),
+        ),
+        args.replace(
+            &format!("--bridge-guest-uid\0{}\0", runtime.sandbox_uid),
+            &format!("--bridge-guest-uid\0{}\0", runtime.sandbox_uid + 1),
+        ),
+        args.replace("bridge-host.sock", "other.sock"),
+        format!("{args}--vsock-uds\0/v.sock\0"),
+        format!("{args}--bridge-guest-pid\0{}\0", runtime.runtime_pid + 1),
+    ] {
+        assert!(!spaced_host_arguments_match(changed.as_bytes(), &runtime));
     }
 }
 

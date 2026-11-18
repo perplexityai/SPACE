@@ -300,21 +300,52 @@ pub(super) fn prepare_sidecar_launch_args(
             &pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
         )?;
         require_launch_arg_eq(args, program, "--sandbox-id", sandbox_id)?;
-        require_launch_arg_eq(
-            args,
-            program,
-            "--vsock-uds",
-            &pplx_space_node_runtime_core::control::guest_socket_path(
-                expected_peer.runtime,
-                sandbox_id,
-            )
-            .map_err(|e| Status::failed_precondition(e.to_string()))?
-            .display()
-            .to_string(),
-        )?;
         reject_caller_controlled_launch_arg(args, program, "--guest-agent")?;
         reject_caller_controlled_launch_arg(args, program, "--firecracker-pid")?;
         reject_caller_controlled_launch_arg(args, program, "--firecracker-uid")?;
+        reject_caller_controlled_launch_arg(args, program, "--bridge-guest-pid")?;
+        reject_caller_controlled_launch_arg(args, program, "--bridge-guest-uid")?;
+        use pplx_space_execution_spec::{RuntimeKind, guest_image::QualifiedGuestAgent};
+        let contained = expected_peer.runtime == RuntimeKind::Wasmtime;
+        if contained != (expected_peer.guest_agent == QualifiedGuestAgent::WasiPythonV1) {
+            return Err(Status::failed_precondition(
+                "WASI guest policy requires the contained Wasmtime transport",
+            ));
+        }
+        let guest_socket = pplx_space_node_runtime_core::control::guest_socket_path(
+            expected_peer.runtime,
+            sandbox_id,
+        )
+        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let (pid_flag, uid_flag) = if contained {
+            reject_caller_controlled_launch_arg(args, program, "--vsock-uds")?;
+            require_launch_arg_eq(
+                args,
+                program,
+                "--bridge-guest-uds",
+                &guest_socket.display().to_string(),
+            )?;
+            require_launch_arg_eq(
+                args,
+                program,
+                "--bridge-host-uds",
+                &guest_socket
+                    .with_file_name("bridge-host.sock")
+                    .display()
+                    .to_string(),
+            )?;
+            ("--bridge-guest-pid", "--bridge-guest-uid")
+        } else {
+            reject_caller_controlled_launch_arg(args, program, "--bridge-guest-uds")?;
+            reject_caller_controlled_launch_arg(args, program, "--bridge-host-uds")?;
+            require_launch_arg_eq(
+                args,
+                program,
+                "--vsock-uds",
+                &guest_socket.display().to_string(),
+            )?;
+            ("--firecracker-pid", "--firecracker-uid")
+        };
         require_launch_arg_eq(
             args,
             program,
@@ -326,9 +357,9 @@ pub(super) fn prepare_sidecar_launch_args(
         // sandbox-manager revisions coexist during a DaemonSet rollout.
         let mut prepared = args.to_vec();
         prepared.extend([
-            "--firecracker-pid".to_string(),
+            pid_flag.to_owned(),
             expected_peer.runtime_pid.get().get().to_string(),
-            "--firecracker-uid".to_string(),
+            uid_flag.to_owned(),
             expected_peer.sandbox_uid.get().to_string(),
         ]);
         match expected_peer.guest_agent {
