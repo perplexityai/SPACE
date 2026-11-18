@@ -38,6 +38,7 @@ from space_smoke.capabilities import (
     ForkableSandbox,
     KindEnvironment,
     NetworkConfig,
+    NodeCtlFacetControl,
     ProcessSandbox,
     ResidentLifecycleSandbox,
     SandboxInfo,
@@ -535,6 +536,9 @@ class SmokeServices:
             _stoppable_lifecycle=cast(StoppableLifecycleSandbox, sandboxes[0]),
             _local_cleanup_control=(
                 cast(ColdEvictionControl, kind) if kind is not None else None
+            ),
+            _node_ctl_facet_control=(
+                cast(NodeCtlFacetControl, kind) if kind is not None else None
             ),
             _encrypted_resuspend_control=(
                 cast(EncryptedResuspendControl, kind) if kind is not None else None

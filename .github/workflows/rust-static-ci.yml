@@ -59,10 +59,16 @@ jobs:
             runner: ubuntu-24.04-16core
             rust_cache: true
             rust_cache_key: isolated-crates
-            rust_cache_size: 2G
+            # One pass over every selected library must fit, or each run
+            # evicts the entries the next run needs first and hits almost
+            # nothing. A full pass wrote about 3 GiB when this was set;
+            # compare the size main's upload step prints.
+            rust_cache_size: 4G
             rust_cache_refresh_misses: 20
             cargo_registry: restore
-            timeout: 45
+            # A change to Cargo.lock or another root path lints every selected
+            # library alone, which takes far longer than an affected-only run.
+            timeout: 75
 
     steps:
       - name: Check out SPACE

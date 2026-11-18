@@ -131,11 +131,14 @@ PY
 # one per line: those whose own directory changed, those that include a
 # changed file from another crate's directory (include_str!, include_bytes!),
 # and every workspace crate that depends on one of them, through any kind of
-# dependency. Prints every listed crate when the change touches a path outside
-# all crates that such a lint may read (Cargo.lock, the root manifest, the
-# toolchain, proto/, db/, templates/, ...), since Cargo, a build script or an
-# include can read it; ci/check-scopes/rust.skip and UNREAD_BY_LINT below name
-# the paths none reads. Main CI passes no base and lints all.
+# dependency. A change to Cargo.lock affects the workspace crates whose
+# resolved dependency tree holds a package it changed (see
+# lock_affected_crates below). Prints every listed crate when the change
+# touches any other path outside all crates that such a lint may read (the
+# root manifest, the toolchain, Cargo's configuration, proto/, db/,
+# templates/, ...), since Cargo, a build script or an include can read it;
+# ci/check-scopes/rust.skip and UNREAD_BY_LINT below name the paths none
+# reads. Main CI passes no base and lints all.
 affected_lint_crates() {
     local metadata="$1" base="$2" listed="$3"
     python3 - "${metadata}" "${base}" "${listed}" <<'PY'
@@ -145,6 +148,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 
 metadata, base, listed = sys.argv[1], sys.argv[2], sys.argv[3].split()
 with open(metadata) as metadata_file:
@@ -211,41 +215,172 @@ def unread_by_lint(path):
     return path.startswith("ci/")
 
 
-listing = subprocess.run(
-    ["git", "-c", f"safe.directory={root}", "diff", "--name-only", "--no-renames",
-     "-z", base, "HEAD"],
-    cwd=root, stdout=subprocess.PIPE, check=False,
-)
-if listing.returncode != 0:
-    print(f"Cannot list the change against {base}: linting every crate.", file=sys.stderr)
+# Root files that configure every crate's build, whatever Cargo.lock says:
+# the root manifest holds [workspace.dependencies], [patch] and the profiles.
+def configures_every_build(path):
+    return path in ("Cargo.toml", "rust-toolchain", "rust-toolchain.toml") or (
+        fnmatch.fnmatchcase(path, ".cargo/config*")
+    )
+
+
+def lint_every_crate(reason):
+    print(f"{reason}: linting every crate.", file=sys.stderr)
     print("\n".join(listed))
     sys.exit(0)
+
+
+def git(*args):
+    return subprocess.run(
+        ["git", "-c", f"safe.directory={root}", *args],
+        cwd=root, stdout=subprocess.PIPE, check=False,
+    )
+
+
+def lock_packages(revision):
+    """Cargo.lock at REVISION: its [[package]] entries by (name, version,
+    source), and its other top-level fields; None if it cannot be parsed."""
+    shown = git("show", f"{revision}:Cargo.lock")
+    if shown.returncode != 0:
+        return None
+    try:
+        lock = tomllib.loads(shown.stdout.decode())
+        entries = {}
+        for package in lock.pop("package", []):
+            key = (package["name"], package["version"], package.get("source"))
+            if key in entries:
+                return None
+            entries[key] = package
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError, KeyError, TypeError, AttributeError):
+        return None
+    return entries, lock
+
+
+def lock_affected_crates():
+    """The workspace crates whose resolved dependency tree holds a package
+    that Cargo.lock changes since BASE: one it adds, or whose entry (version,
+    source, checksum, dependencies) differs, workspace members included. A
+    package the lock removes needs no search of its own: whatever depended on
+    it now lists other dependencies or another version, and so changed too.
+    None, with the reason printed, when the change cannot be told apart.
+
+    The tree is the resolve graph of `cargo metadata --all-features` without
+    --filter-platform: every feature of every member, every target platform,
+    and normal, build and dev edges. Each lint configuration builds one crate
+    with none or all of its features for the host, so its build is a subgraph
+    of that crate's tree there; unifying the workspace's features can only add
+    crates. `cargo tree -i` reads the same resolve, but takes one call per
+    package and fails on a package it does not resolve."""
+    before, after = lock_packages(base), lock_packages("HEAD")
+    if before is None or after is None:
+        print("Cannot parse Cargo.lock on both sides of the change.", file=sys.stderr)
+        return None
+    (base_entries, base_rest), (entries, rest) = before, after
+    if base_rest != rest:
+        print("Cargo.lock changes outside its package list.", file=sys.stderr)
+        return None
+    changes = sorted(key for key, entry in entries.items() if base_entries.get(key) != entry)
+    removed = sorted(key for key in base_entries if key not in entries)
+
+    resolved = subprocess.run(
+        ["cargo", "metadata", "--locked", "--format-version", "1", "--all-features"],
+        cwd=root, stdout=subprocess.PIPE, check=False,
+    )
+    if resolved.returncode != 0:
+        print("cargo metadata cannot resolve the workspace.", file=sys.stderr)
+        return None
+    graph = json.loads(resolved.stdout)
+    key_of = {
+        package["id"]: (package["name"], package["version"], package["source"])
+        for package in graph["packages"]
+    }
+    id_of = {key: package_id for package_id, key in key_of.items()}
+    dependents_of = {}
+    for node in graph["resolve"]["nodes"]:
+        for dependency in node["deps"]:
+            dependents_of.setdefault(dependency["pkg"], set()).add(node["id"])
+    members = set(graph["workspace_members"])
+
+    def describe(key):
+        name, version, source = key
+        if key not in entries:
+            return f"{name} {version} (removed)"
+        if key in base_entries:
+            if base_entries[key].get("dependencies") != entries[key].get("dependencies"):
+                return f"{name} {version} (its dependencies)"
+            return f"{name} {version} (its lock entry)"
+        earlier = [k for k in removed if k[0] == name]
+        if not earlier:
+            return f"{name} {version} (added)"
+        if all(k[1] == version for k in earlier):
+            return f"{name} {version} (its source)"
+        return f"{name} {', '.join(k[1] for k in earlier)} -> {version}"
+
+    print(f"Cargo.lock changes {len(changes)} and removes {len(removed)} packages:", file=sys.stderr)
+    for key in removed:
+        if not any(k[0] == key[0] for k in changes):
+            print(f"  {describe(key)}", file=sys.stderr)
+    crates = set()
+    for key in changes:
+        if key not in id_of:
+            print(f"cargo metadata does not resolve {describe(key)}.", file=sys.stderr)
+            return None
+        holders, pending = {id_of[key]}, [id_of[key]]
+        while pending:
+            for dependent in dependents_of.get(pending.pop(), set()) - holders:
+                holders.add(dependent)
+                pending.append(dependent)
+        names = sorted(key_of[package_id][0] for package_id in holders & members)
+        print(f"  {describe(key)}: in the tree of {len(names)}: {' '.join(names)}", file=sys.stderr)
+        crates.update(names)
+    print(
+        f"Cargo.lock affects {len(crates)} workspace crates: {' '.join(sorted(crates))}",
+        file=sys.stderr,
+    )
+    return crates
+
+
+listing = git("diff", "--name-only", "--no-renames", "-z", base, "HEAD")
+if listing.returncode != 0:
+    lint_every_crate(f"Cannot list the change against {base}")
 # surrogateescape: a path that is not UTF-8 still compares and matches.
 changed = [
     path for path in listing.stdout.decode(errors="surrogateescape").split("\0") if path
 ]
+for path in changed:
+    if configures_every_build(path):
+        lint_every_crate(f"{path} configures every crate's build")
 outside = [
-    p for p in changed if owner(p) is None and not unread_by_rust(p) and not unread_by_lint(p)
+    p
+    for p in changed
+    if p != "Cargo.lock"
+    and owner(p) is None
+    and not unread_by_rust(p)
+    and not unread_by_lint(p)
 ]
 if outside:
-    print(f"{outside[0]} is outside every crate: linting every crate.", file=sys.stderr)
-    print("\n".join(listed))
-    sys.exit(0)
+    lint_every_crate(f"{outside[0]} is outside every crate")
 
 affected = {owner(p) for p in changed} - {None}
+if "Cargo.lock" in changed:
+    from_lock = lock_affected_crates()
+    if from_lock is None:
+        lint_every_crate("Cannot tell which crates the Cargo.lock change affects")
+    affected |= from_lock
 # A crate whose source reads a changed file from another crate's directory:
 # include!, include_str! or include_bytes! of a literal path, relative to the
 # source file, or of concat!(env!("CARGO_MANIFEST_DIR"), "..."), relative to
 # the crate, and #[path = "..."], relative to the source file. An include of
 # concat!(env!("OUT_DIR"), ...) reads the crate's own build-script output,
 # whose inputs outside every crate already check them all. Any other include
-# of a computed path could read anything, so it checks every crate.
+# of a computed path could read anything, so it checks every crate. An
+# argument cannot start with a backslash, so `include_str!(\"...\")` is
+# escaped text in a string literal, such as a test fixture's, not an include.
 changed_set = set(changed)
 literal = re.compile(r'\binclude(?:_str|_bytes)?!\(\s*"([^"]+)"|#\[path\s*=\s*"([^"]+)"\]')
 manifest_relative = re.compile(
     r'\binclude(?:_str|_bytes)?!\(\s*concat!\(\s*env!\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*"([^"]+)"\s*\)\s*\)'
 )
-computed = re.compile(r'\binclude(?:_str|_bytes)?!\(\s*(?=[^\s"])(?!concat!\(\s*env!\(\s*"OUT_DIR")')
+computed = re.compile(r'\binclude(?:_str|_bytes)?!\(\s*(?=[^\s"\\])(?!concat!\(\s*env!\(\s*"OUT_DIR")')
 for name, crate_dir in directory.items():
     for dirpath, dirnames, filenames in os.walk(os.path.join(root, crate_dir)):
         dirnames[:] = [d for d in dirnames if d != "target"]
@@ -267,12 +402,7 @@ for name, crate_dir in directory.items():
                     affected.add(name)
             if len(computed.findall(code)) > len(manifest_relative.findall(code)):
                 relative_source = os.path.relpath(source, root)
-                print(
-                    f"{relative_source} includes a path this cannot resolve: linting every crate.",
-                    file=sys.stderr,
-                )
-                print("\n".join(listed))
-                sys.exit(0)
+                lint_every_crate(f"{relative_source} includes a path this cannot resolve")
 dependents = {}
 for name, package in packages.items():
     for dependency in package["dependencies"]:
