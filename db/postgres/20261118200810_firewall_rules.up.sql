@@ -92,9 +92,7 @@ COMMENT ON COLUMN firewall_rules_mutation_receipts.result IS
 -- NULL, which it admits any number of times. The slot check is null-safe, so an
 -- unfinished rollout without the slot is refused rather than escaping the key.
 -- A writer changes phase, unfinished_slot and finished_at in one update. The
--- cap is cluster-wide in-flight items within this rollout; it doesn't admit a
--- second rollout. The creation receipt records who started the rollout and is
--- never reused.
+-- creation receipt records who started the rollout and is never reused.
 CREATE TABLE firewall_rules_rollouts (
     id UUID NOT NULL,
     to_revision_id UUID NOT NULL,
@@ -103,7 +101,6 @@ CREATE TABLE firewall_rules_rollouts (
     -- Only ever 1 or NULL.
     -- squawk-ignore prefer-bigint-over-smallint
     unfinished_slot SMALLINT,
-    max_in_flight_per_cluster BIGINT NOT NULL,
     reason TEXT NOT NULL,
     generation BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -124,9 +121,6 @@ CREATE TABLE firewall_rules_rollouts (
         UNIQUE (unfinished_slot),
     CONSTRAINT firewall_rules_rollouts_created_by_receipt_id_key
         UNIQUE (created_by_receipt_id),
-    CONSTRAINT firewall_rules_rollouts_max_in_flight_per_cluster_check CHECK (
-        max_in_flight_per_cluster >= 1
-    ),
     CONSTRAINT firewall_rules_rollouts_reason_check CHECK (
         char_length(reason) BETWEEN 1 AND 1024
     ),
@@ -168,8 +162,6 @@ COMMENT ON COLUMN firewall_rules_rollouts.phase IS
     'canary, rolling, paused, completed or aborted; finished_at is set exactly when the phase is completed or aborted';
 COMMENT ON COLUMN firewall_rules_rollouts.unfinished_slot IS
     '1 while the phase is canary, rolling or paused, NULL once it is completed or aborted; unique, so one rollout is unfinished at a time';
-COMMENT ON COLUMN firewall_rules_rollouts.max_in_flight_per_cluster IS
-    'Items of this rollout in flight at once across the cluster';
 COMMENT ON COLUMN firewall_rules_rollouts.generation IS
     'Raised by one by the runtime_upgrade_campaigns_raise_generation trigger on every update that changes another column (not updated_at); unrelated to node assignment generations';
 
