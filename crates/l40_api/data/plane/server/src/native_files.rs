@@ -12,11 +12,14 @@
 //!
 //! A request whose body is not small enough to check first is authorized
 //! from its headers before its body is read, in an RPC of its own: every
-//! write, and any request that declares no length or more than
+//! write, and any request whose body size is not known or is more than
 //! [`CHECKED_BEFORE_AUTHORIZATION_MAX_BYTES`]. A small body is checked first
 //! so that a request the API admits costs it one RPC, not two. One that
 //! fails its checks is authorized before it is answered, so the API's
-//! refusal still comes first, as it does on the API's own route.
+//! refusal still comes first, as it does on the API's own route. A small
+//! body that has not arrived within [`SMALL_BODY_DEADLINE`] is authorized
+//! from its headers before the rest of it is waited for, so a client that
+//! stalls it is refused as promptly as one that sends a large body.
 
 mod access;
 mod admission;
@@ -26,10 +29,11 @@ mod read;
 mod write;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path},
     http::{
         Extensions, HeaderMap, HeaderValue, Method, Request, StatusCode, Version, header,
@@ -39,6 +43,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
+use futures_util::StreamExt as _;
+use http_body_util::BodyExt as _;
 use pplx_space_accounts::OrgId;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_native_files::FileOperation;
@@ -50,6 +56,7 @@ use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api_http::{PublicApiError, normalize_public_error};
 use pplx_space_sandbox_model::SandboxId;
 use serde::de::DeserializeOwned;
+use tokio::time::Instant;
 
 pub(crate) use access::NativeFileAccessClient;
 pub use access::NativeFileAccessConfigError;
@@ -60,12 +67,17 @@ use super::DataPlaneState;
 use crate::upload_admission::UploadAdmission;
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
-/// The largest declared body a request is checked with before the API has
+/// The largest known body size a request is checked with before the API has
 /// authorized it. Every body but a write's is a path or two and a few
 /// fields, well under this; an unauthenticated client can make a replica
 /// hold no more than this per request, less than the headers it already
 /// sends the API to be authorized.
 const CHECKED_BEFORE_AUTHORIZATION_MAX_BYTES: u64 = 16 * 1024;
+/// How long a body checked before authorization has to arrive, from when its
+/// request is received. A client sends a body this small with its headers,
+/// so one that has not is slow or stalled; it is authorized from its headers
+/// before more is waited for, which costs an admitted request one more RPC.
+const SMALL_BODY_DEADLINE: Duration = Duration::from_millis(100);
 
 /// Whether this data plane answers Native `files:*`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -143,7 +155,7 @@ fn handler(operation: FileOperation) -> axum::routing::MethodRouter<DataPlaneSta
     }
 }
 
-/// A files request with its body still unread.
+/// A files request, apart from its body.
 pub(super) struct FileRequest {
     files: Arc<NativeFiles>,
     /// What the API is asked about the request.
@@ -153,7 +165,8 @@ pub(super) struct FileRequest {
     extensions: Extensions,
     pub(super) version: Version,
     /// Whether the API has authorized the request from its headers already.
-    /// One it has not is authorized when it is prepared.
+    /// One it has not is authorized when it is prepared, after its body is
+    /// checked.
     authorized: bool,
 }
 
@@ -167,10 +180,11 @@ pub(super) struct Authorized {
 
 impl FileRequest {
     /// Take `request` as `operation` without asking the API yet when its
-    /// body is small enough to check first, or else have the API authorize
-    /// it from its headers as [`Self::authorize`] does. Pass the outcome of
-    /// the body's checks to [`Self::checked`]. The body is handed back
-    /// unread.
+    /// body is small enough to check first and arrives within
+    /// [`SMALL_BODY_DEADLINE`], or else have the API authorize it from its
+    /// headers first, and answer its refusal if it refuses. Pass the outcome
+    /// of the body's checks to [`Self::checked`]. The body is handed back
+    /// whole, with any of it read so far.
     pub(super) async fn receive(
         state: &DataPlaneState,
         operation: FileOperation,
@@ -180,9 +194,21 @@ impl FileRequest {
             let (request, _, body) = Self::authorize(state, operation, request).await?;
             return Ok((request, body));
         }
+        let deadline = Instant::now() + SMALL_BODY_DEADLINE;
         let (files, parts, body) = accept(state, request)?;
         let access = access::file_request(operation, &parts);
-        Ok((Self::from_parts(files, access, parts, false), body))
+        let arrived = Arrived::read(body, deadline).await;
+        // One whose client is slow to send it is refused, if the API would
+        // refuse it, before the rest is waited for. Preparing it still waits
+        // until all of it is checked.
+        let authorized = arrived.rest.is_some();
+        if authorized {
+            files.access.authorize(access.clone()).await?;
+        }
+        Ok((
+            Self::from_parts(files, access, parts, authorized),
+            arrived.into_body(),
+        ))
     }
 
     /// Have the API authorize `request` as `operation` from its headers
@@ -295,15 +321,62 @@ fn accept(
 }
 
 /// Whether `request`'s body is checked before the API authorizes it: a POST
-/// that declares a body of at most [`CHECKED_BEFORE_AUTHORIZATION_MAX_BYTES`]
-/// and does not wait for `100 Continue` to send it. Any other is authorized
-/// first, so an unauthenticated client is refused before it sends more.
+/// whose body size is known and at most
+/// [`CHECKED_BEFORE_AUTHORIZATION_MAX_BYTES`], and that does not wait for
+/// `100 Continue` to send it. Any other is authorized first, so an
+/// unauthenticated client is refused before it sends more.
 fn checks_before_authorization(request: &Request<Body>) -> bool {
     request.method() == Method::POST
         && !request.headers().contains_key(header::EXPECT)
         && http_body::Body::size_hint(request.body())
             .exact()
-            .is_some_and(|declared| declared <= CHECKED_BEFORE_AUTHORIZATION_MAX_BYTES)
+            .is_some_and(|size| size <= CHECKED_BEFORE_AUTHORIZATION_MAX_BYTES)
+}
+
+/// What arrived of a small body before its request was authorized.
+struct Arrived {
+    /// Its data, and the error that ended it if one did.
+    chunks: Vec<Result<Bytes, axum::Error>>,
+    /// The rest of it, when it had not ended.
+    rest: Option<Body>,
+}
+
+impl Arrived {
+    /// Read `body` until it ends, `deadline` passes, or more of it arrives
+    /// than a body checked before authorization may have.
+    async fn read(mut body: Body, deadline: Instant) -> Self {
+        let mut chunks = Vec::new();
+        let mut len = 0;
+        while len <= CHECKED_BEFORE_AUTHORIZATION_MAX_BYTES {
+            let Ok(frame) = tokio::time::timeout_at(deadline, body.frame()).await else {
+                break;
+            };
+            match frame {
+                None => return Self { chunks, rest: None },
+                Some(Err(error)) => {
+                    chunks.push(Err(error));
+                    return Self { chunks, rest: None };
+                }
+                // The JSON extractor drops trailers too.
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        len += data.len() as u64;
+                        chunks.push(Ok(data));
+                    }
+                }
+            }
+        }
+        Self {
+            chunks,
+            rest: Some(body),
+        }
+    }
+
+    /// The body again: what arrived, then the rest as it arrives.
+    fn into_body(self) -> Body {
+        let rest = futures_util::stream::iter(self.rest.map(Body::into_data_stream)).flatten();
+        Body::from_stream(futures_util::stream::iter(self.chunks).chain(rest))
+    }
 }
 
 /// The body as `T`, rejected as the API's `Json` extractor rejects it: the

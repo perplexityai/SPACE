@@ -397,6 +397,131 @@ async fn a_body_too_large_to_check_first_is_authorized_before_it_is_read() {
     );
 }
 
+#[tokio::test]
+async fn a_small_body_that_stalls_is_authorized_from_its_headers_before_the_rest_is_awaited() {
+    if !test_process() {
+        return;
+    }
+    let harness = Harness::start().await;
+    let unauthorized = br#"{"code":"unauthorized","message":"invalid API key","request_id":"req_1","retryable":false,"details":[]}"#;
+    let request = |body: Body| {
+        Request::post(harness.path("stat"))
+            .header(header::AUTHORIZATION, CLIENT_KEY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap()
+    };
+    let asked = || -> Vec<_> { harness.api.calls().iter().map(|call| call.rpc).collect() };
+    // Well past the deadline for the rest of a small body, and well short of
+    // forever, which is how long a request waits for a body that never ends.
+    fn promptly<F: Future>(response: F) -> tokio::time::Timeout<F> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), response)
+    }
+    let stat_body = json!({"path": "/workspace/a.txt"}).to_string();
+    let (first, rest) = stat_body.split_at(1);
+
+    // Refused: the client gets the API's refusal while it still withholds
+    // the rest of its body, and nothing is prepared or called.
+    harness.api.authorize(Answer::Refuse(rendered(
+        401,
+        &[("content-type", "application/json")],
+        unauthorized,
+    )));
+    let (body, sender) = stalled_body(first, stat_body.len());
+    let response = promptly(harness.send(request(body)))
+        .await
+        .expect("refused before the rest of the body is sent");
+    let (status, _, body) = read_body(response).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body.as_ref(), unauthorized);
+    drop(sender);
+    assert_eq!(asked(), ["authorize"]);
+    assert!(harness.worker.calls().is_empty());
+
+    // Authorized, it is answered once the rest arrives, from all of it.
+    let a = file_info("/workspace/a.txt", 5);
+    harness.worker.reply(Reply::Stat(Ok(StatResponse {
+        info: Some(a.clone()),
+    })));
+    let (body, sender) = stalled_body(first, stat_body.len());
+    let finish = async {
+        while asked().len() < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        sender
+            .send(Bytes::copy_from_slice(rest.as_bytes()))
+            .unwrap();
+        drop(sender);
+    };
+    let (response, ()) = promptly(async { tokio::join!(harness.send(request(body)), finish) })
+        .await
+        .unwrap();
+    let (status, _, body) = read_body(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({ "entry": public_entry(a) })
+    );
+    assert_eq!(asked(), ["authorize", "authorize", "prepare"]);
+    assert_eq!(harness.worker.calls().len(), 1);
+
+    // Authorized, a body whose rest fails its checks is refused for them,
+    // and nothing is prepared.
+    let malformed = r#"{"path": 1}"#;
+    let (first, rest) = malformed.split_at(1);
+    let (body, sender) = stalled_body(first, malformed.len());
+    let finish = async {
+        while asked().len() < 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        sender
+            .send(Bytes::copy_from_slice(rest.as_bytes()))
+            .unwrap();
+        drop(sender);
+    };
+    let (response, ()) = promptly(async { tokio::join!(harness.send(request(body)), finish) })
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(asked(), ["authorize", "authorize", "prepare", "authorize"]);
+    assert_eq!(harness.worker.calls().len(), 1);
+}
+
+/// A body that declares its exact size, `len`, sends `first`, and then
+/// sends what the returned sender sends until it is dropped.
+fn stalled_body(first: &str, len: usize) -> (Body, tokio::sync::mpsc::UnboundedSender<Bytes>) {
+    struct Stalled {
+        chunks: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+        len: u64,
+    }
+    impl http_body::Body for Stalled {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            self.chunks
+                .poll_recv(cx)
+                .map(|chunk| chunk.map(|chunk| Ok(http_body::Frame::data(chunk))))
+        }
+
+        fn size_hint(&self) -> http_body::SizeHint {
+            http_body::SizeHint::with_exact(self.len)
+        }
+    }
+    let (sender, chunks) = tokio::sync::mpsc::unbounded_channel();
+    sender
+        .send(Bytes::copy_from_slice(first.as_bytes()))
+        .unwrap();
+    let body = Body::new(Stalled {
+        chunks,
+        len: len as u64,
+    });
+    (body, sender)
+}
+
 /// `bytes` as a body that declares its exact size and records whether
 /// anything read it.
 fn sized_watched_body(bytes: &str, read: &Arc<AtomicBool>) -> Body {

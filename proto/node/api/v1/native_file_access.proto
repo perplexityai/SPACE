@@ -12,9 +12,10 @@ import "node/api/v1/cluster.proto";
 // revoked credential is refused on its next request.
 service NativeFileAccessApi {
   // Authenticate and authorize a request from its headers alone: before its
-  // body is read, for a request whose body the edge does not check first,
-  // or after its body failed the edge's checks, so that a refusal here is
-  // answered first.
+  // body is read, for a request whose body the edge does not check first;
+  // before the rest of a small body is waited for, when it is slow to
+  // arrive; or after its body failed the edge's checks, so that a refusal
+  // here is answered first.
   rpc AuthorizeNativeFileRequest(AuthorizeNativeFileRequestRequest)
       returns (AuthorizeNativeFileRequestResponse);
   // Authorize the request, whether or not AuthorizeNativeFileRequest was
