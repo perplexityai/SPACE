@@ -276,7 +276,7 @@ def summarize(out: Path) -> int:
 
     per_bench = {}
     seen: dict[str, Counter] = {surface: Counter() for surface in SURFACES}
-    skipped: dict[str, dict[str, str]] = {surface: {} for surface in SURFACES}
+    skipped: dict[str, Counter] = {surface: Counter() for surface in SURFACES}
     not_passed = []
     # The suite's ranking (suite_exit_code): a failure outranks an incomplete
     # result, which outranks a warning.
@@ -302,7 +302,7 @@ def summarize(out: Path) -> int:
         for surface, data in typed.items():
             pass_failed = False
             seen.setdefault(surface, Counter()).update(data["run"])
-            skipped.setdefault(surface, {}).update(data["skipped"])
+            skipped.setdefault(surface, Counter()).update(data["skipped"].keys())
             for scenario in data["run"]:
                 code = data["exits"].get(scenario)
                 if code != 0:
@@ -329,15 +329,17 @@ def summarize(out: Path) -> int:
                         }
                     )
             # Each pass's own status: anything but 0, 1 and 42, or a 1 that no
-            # failed scenario accounts for, is an incomplete pass. A pass that
-            # never printed one did not finish.
+            # failed scenario accounts for, is an incomplete pass.
             status = data.get("status")
-            if status is None:
-                incomplete = incomplete or result != "typed_exit_0"
-            elif status not in (0, 1, 42) or (status == 1 and not pass_failed):
+            if status is not None and (status not in (0, 1, 42) or (status == 1 and not pass_failed)):
                 incomplete = True
-        # A shard that exited nonzero before either pass reported a status.
-        if result != "typed_exit_0" and not any("status" in data for data in typed.values()):
+        # The shard's exit must be the one smoke-kind-typed.sh `all` gives for
+        # those statuses: the ECW pass's when nonzero, else the native pass's.
+        # Without the closing line, or with any other exit (the shard's log
+        # pipeline failing after both passes ended, say), the bench's result
+        # is unexplained.
+        statuses = [typed.get(surface, {}).get("status") for surface in SURFACES]
+        if None in statuses or result != f"typed_exit_{statuses[0] or statuses[1]}":
             incomplete = True
 
     coverage = {"checked": inventory_data is not None, "surfaces": {}}
@@ -347,15 +349,16 @@ def summarize(out: Path) -> int:
         for surface in SURFACES:
             expected = set(inventory_data["surfaces"][surface])
             ran = seen.get(surface, Counter())
-            mode_skipped = set(skipped.get(surface, {}))
-            covered = set(ran) | mode_skipped
+            mode_skipped = skipped.get(surface, Counter())
+            # Each pair once across the benches, run or skipped by a mode.
+            occurrences = ran + mode_skipped
             entry = {
                 "expected": len(expected),
                 "ran": sum(ran.values()),
                 "skipped_by_mode": sorted(mode_skipped),
-                "missing": sorted(expected - covered),
-                "unexpected": sorted(covered - expected),
-                "duplicated": sorted(s for s, n in ran.items() if n > 1),
+                "missing": sorted(expected - set(occurrences)),
+                "unexpected": sorted(set(occurrences) - expected),
+                "duplicated": sorted(s for s, n in occurrences.items() if n > 1),
             }
             entry["exactly_once"] = not (entry["missing"] or entry["unexpected"] or entry["duplicated"])
             coverage["surfaces"][surface] = entry
