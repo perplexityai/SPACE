@@ -2,10 +2,9 @@ SET LOCAL lock_timeout = '1s';
 SET LOCAL statement_timeout = '5s';
 
 -- Firewall rules: immutable revisions, the default for newly enrolled nodes,
--- each node's assignment and observation, and the rollouts that move nodes from
--- one revision to another. pplx-space-firewall-rules-store owns every table
--- here. Nothing in this migration assigns a revision, starts a rollout or wakes
--- a node.
+-- each node's assignment and observation, and the rollouts that move nodes to a
+-- revision. pplx-space-firewall-rules-store owns every table here. Nothing in
+-- this migration assigns a revision, starts a rollout or wakes a node.
 --
 -- Item phase will be bound through a closed Rust enum by the store, so its value
 -- set isn't enforced here; the checks that relate a phase to another column stay.
@@ -97,7 +96,6 @@ COMMENT ON COLUMN firewall_rules_mutation_receipts.result IS
 -- second rollout.
 CREATE TABLE firewall_rules_rollouts (
     id UUID NOT NULL,
-    from_revision_id UUID NOT NULL,
     to_revision_id UUID NOT NULL,
     created_by_receipt_id UUID NOT NULL,
     phase TEXT NOT NULL,
@@ -144,8 +142,6 @@ CREATE TABLE firewall_rules_rollouts (
     CONSTRAINT firewall_rules_rollouts_finished_at_phase_check CHECK (
         (finished_at IS NOT NULL) = (phase IN ('completed', 'aborted'))
     ),
-    CONSTRAINT firewall_rules_rollouts_from_revision_id_fkey
-        FOREIGN KEY (from_revision_id) REFERENCES firewall_rules_revisions(id),
     CONSTRAINT firewall_rules_rollouts_to_revision_id_fkey
         FOREIGN KEY (to_revision_id) REFERENCES firewall_rules_revisions(id),
     CONSTRAINT firewall_rules_rollouts_created_by_receipt_id_fkey
@@ -169,7 +165,7 @@ CREATE TRIGGER firewall_rules_rollouts_raise_generation
     FOR EACH ROW EXECUTE FUNCTION runtime_upgrade_campaigns_raise_generation();
 
 COMMENT ON TABLE firewall_rules_rollouts IS
-    'Paced moves of nodes from one firewall revision to another; at most one is unfinished';
+    'Paced moves of nodes to a firewall revision; at most one is unfinished';
 COMMENT ON COLUMN firewall_rules_rollouts.created_by_receipt_id IS
     'Receipt of the request that started the rollout';
 COMMENT ON COLUMN firewall_rules_rollouts.phase IS

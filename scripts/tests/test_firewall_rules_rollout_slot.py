@@ -3,9 +3,9 @@
 
 firewall_rules_rollouts enforces that itself, not through a writer's lock: an
 unfinished header must hold unfinished_slot 1, which a unique key admits once.
-These tests apply every db/postgres up migration to a new database and race two
-connections to it. No rollout has items, so the rule holds before membership
-does. Each refusal is checked by constraint name, and
+These tests apply every db/postgres up migration to a new database, and the
+first two race two connections to it. No rollout has items, so the rule holds
+before membership does. Each refusal is checked by constraint name, and
 the fixtures are valid revisions and receipts, so an unrelated constraint
 can't stand in for the slot.
 """
@@ -89,8 +89,7 @@ class FirewallRulesRolloutSlotTest(unittest.TestCase):
         try:
             apply_migrations(cls.url)
             with psycopg.connect(cls.url, autocommit=True) as conn:
-                cls.from_revision = cls._insert_revision(conn)
-                cls.to_revision = cls._insert_revision(conn)
+                cls.revision = cls._insert_revision(conn)
         except BaseException:
             cls._drop_database()
             raise
@@ -130,14 +129,9 @@ class FirewallRulesRolloutSlotTest(unittest.TestCase):
         return conn
 
     def insert_header(
-        self,
-        conn: psycopg.Connection,
-        phase: str,
-        unfinished_slot: int | None,
-        to_revision: uuid.UUID | None = None,
+        self, conn: psycopg.Connection, phase: str, unfinished_slot: int | None
     ) -> uuid.UUID:
-        """Insert a rollout header from from_revision to to_revision (by default
-        the fixture's other revision) with its own new receipt, in conn's open
+        """Insert a rollout header with its own new receipt, in conn's open
         transaction."""
         receipt = uuid.uuid4()
         conn.execute(
@@ -149,14 +143,12 @@ class FirewallRulesRolloutSlotTest(unittest.TestCase):
         rollout = uuid.uuid4()
         conn.execute(
             "INSERT INTO firewall_rules_rollouts"
-            " (id, from_revision_id, to_revision_id, created_by_receipt_id,"
-            "  phase, unfinished_slot, max_in_flight_per_cluster, failure_budget,"
-            "  reason)"
-            " VALUES (%s, %s, %s, %s, %s, %s, 1, 1, 'test')",
+            " (id, to_revision_id, created_by_receipt_id, phase, unfinished_slot,"
+            "  max_in_flight_per_cluster, failure_budget, reason)"
+            " VALUES (%s, %s, %s, %s, %s, 1, 1, 'test')",
             (
                 rollout,
-                self.from_revision,
-                to_revision or self.to_revision,
+                self.revision,
                 receipt,
                 phase,
                 unfinished_slot,
@@ -294,13 +286,6 @@ class FirewallRulesRolloutSlotTest(unittest.TestCase):
         self.assertCountEqual(
             terminal_rows, list(zip(finished, ("completed", "aborted")))
         )
-        self.assertEqual(self.unfinished(), [rollout])
-
-    def test_from_and_to_may_be_the_same_revision(self) -> None:
-        with self.connect() as conn:
-            rollout = self.insert_header(conn, "canary", 1, to_revision=self.from_revision)
-            conn.commit()
-
         self.assertEqual(self.unfinished(), [rollout])
 
     def test_null_slot_cannot_bypass_the_key(self) -> None:
