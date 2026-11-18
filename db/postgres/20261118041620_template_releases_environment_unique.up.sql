@@ -11,8 +11,9 @@ SET LOCAL statement_timeout = '5s';
 -- later migration drops it. Until then both indexes hold, and this one is
 -- implied by the old one, so building it can't fail on existing rows.
 --
--- That drop waits until no deployed or rollback binary relies on the old
--- uniqueness:
+-- That drop waits until nothing that writes template_releases relies on the
+-- old uniqueness, neither a deployed or rollback binary nor
+-- scripts/bootstrap-templates.sh:
 -- * INSERT ... ON CONFLICT (template_name, hash): Postgres picks the arbiter
 --   index from that target and refuses the statement when no unique index
 --   matches it.
@@ -24,6 +25,13 @@ SET LOCAL statement_timeout = '5s';
 -- * UPDATEs that set execution_metadata on an unbound row. They change this
 --   index's key, so they fail with a unique violation when a twin bound to the
 --   same environment exists.
+--
+-- scripts/bootstrap-templates.sh does the first two. It registers a release
+-- with ON CONFLICT (template_name, hash) DO UPDATE, and its tag and
+-- storage-location inserts select releases by template_name and hash alone.
+-- Once a twin exists, its tag insert fails with "ON CONFLICT DO UPDATE command
+-- cannot affect row a second time", and its storage-location insert attaches
+-- the location to every twin.
 --
 -- The environment is the execution_metadata key, not a column: a stored
 -- generated column would rewrite the table under ACCESS EXCLUSIVE, and a plain
