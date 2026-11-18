@@ -46,16 +46,19 @@ jobs:
       base_sha: ${{ github.event.pull_request.base.sha }}
       scope_base: ${{ github.event.pull_request.base.sha }}
 
-  # The Kind smoke runs only when the PR changes a path it exercises
-  # (ci/kind-pull-paths.txt). Selecting it here rather than with a workflow
-  # `paths:` filter lets the required space-pull-ci check depend on it: a
-  # filtered-out workflow reports nothing, which a required check cannot use.
+  # Without the kind-smoke label, the Kind smoke runs only when the PR changes
+  # a path it exercises (ci/kind-pull-paths.txt, ci/kind-placement-paths.txt).
+  # Selecting it here rather than with a workflow `paths:` filter lets the
+  # required space-pull-ci check depend on it: a filtered-out workflow reports
+  # nothing, which a required check cannot use.
   #
   # A draft defers it: most Kind runs were drafts' intermediate pushes, each
   # taking a large runner per shard. A deferred run fails space-pull-ci, so a
   # pull request cannot merge on a run that skipped Kind; marking it ready
-  # runs the smoke on that head. The kind-smoke label opts a draft in; the
-  # label is read from the event, so it applies from the next push.
+  # runs the smoke on that head. The kind-smoke label opts a draft in, and
+  # runs the smoke on any pull request whatever paths it changes, so an author
+  # can get Kind evidence for a runtime change the path list does not select;
+  # the label is read from the event, so it applies from the next push.
   kind_paths:
     if: github.repository == 'perplexityai/SPACE'
     name: Select Kind smoke
@@ -109,6 +112,13 @@ jobs:
             off) ;;
             *) echo "SPACE_KIND_CONSOLE_SMOKE must be on or off, not '${SPACE_KIND_CONSOLE_SMOKE}'." >&2; exit 1 ;;
           esac
+          # The kind-smoke label runs the smoke when no path list selected
+          # it. It changes only `needed`: placement and console scenarios
+          # still run only for their own paths.
+          if [[ "${needed}" == false && "${SPACE_KIND_PULL_OPT_IN}" == true ]]; then
+            echo "::notice title=Kind smoke forced::No Kind smoke path changed; the kind-smoke label requires the smoke anyway." >&2
+            needed=true
+          fi
           printf 'needed=%s\nconsole=%s\nplacement=%s\n' "${needed}" "${console}" "${placement}" >>"${GITHUB_OUTPUT}"
 
       # Named here, where the synthetic merge is checked out; space-pull-ci
