@@ -169,7 +169,7 @@ async fn operation_event_stream_stops_when_operation_state_is_terminal() -> Test
             org_id: OrgId::from_uuid(org_id),
             actor_user_id: None,
             api_product: ApiProduct::Native,
-            kind: OperationKind::WakeSandbox,
+            kind: OperationKind::WakeSandbox.into(),
             target_type: Some(OperationTargetType::Sandbox),
             target_id: Some("sbx_terminal"),
             payload_json: serde_json::json!({}),

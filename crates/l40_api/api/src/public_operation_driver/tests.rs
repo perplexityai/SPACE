@@ -76,7 +76,7 @@ fn operation_input(kind: OperationKind, sandbox: &str) -> CreatePublicOperation<
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         actor_user_id: None,
         api_product: ApiProduct::Native,
-        kind,
+        kind: kind.into(),
         target_type: Some(OperationTargetType::Sandbox),
         target_id: Some(sandbox),
         payload_json: serde_json::json!({}),

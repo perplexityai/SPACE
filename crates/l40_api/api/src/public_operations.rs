@@ -88,12 +88,10 @@ pub(crate) use responses::ResponseAdmissionError;
 mod response_reservations;
 pub(crate) use response_reservations::ResponseReservation;
 mod sandbox_quota;
-#[cfg(test)]
 mod stored_kind;
 pub use sandbox_quota::{
     SandboxQuota, SandboxQuotaOutcome, SandboxQuotaRefusal, SubjectSandboxQuota,
 };
-#[cfg(test)]
 pub use stored_kind::StoredOperationKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -778,7 +776,7 @@ impl PublicOperationStore {
         let creation = CreationRecord {
             superseded,
             api_product: ApiProduct::Native,
-            kind,
+            kind: kind.into(),
             target_type: Some(OperationTargetType::Sandbox),
         };
         let CreatePublicOperationResult::Created(operation_id) = result else {
@@ -885,7 +883,7 @@ impl PublicOperationStore {
                 // missing actor; it keeps the snapshot-upload 409 for them.
                 actor_user_id: None,
                 api_product: ApiProduct::Native,
-                kind,
+                kind: kind.into(),
                 target_type: Some(OperationTargetType::Sandbox),
                 target_id: Some(target_id),
                 payload_json,
@@ -1175,7 +1173,7 @@ pub struct CreatePublicOperation<'a> {
     pub org_id: OrgId,
     pub actor_user_id: Option<UserId>,
     pub api_product: ApiProduct,
-    pub kind: OperationKind,
+    pub kind: StoredOperationKind,
     pub target_type: Option<OperationTargetType>,
     pub target_id: Option<&'a str>,
     pub payload_json: serde_json::Value,
@@ -1274,7 +1272,7 @@ async fn claim_created_operation_tx(
         operation.id,
         PublicOperationEventType::Claimed,
         serde_json::json!({
-            "kind": operation.kind.as_str(),
+            "kind": operation.kind.public_kind().as_str(),
             "attempt": operation.attempts,
         }),
     )
@@ -1440,7 +1438,7 @@ enum JoinedOrInserted {
 struct CreationRecord {
     superseded: SupersededCreates,
     api_product: ApiProduct,
-    kind: OperationKind,
+    kind: StoredOperationKind,
     target_type: Option<OperationTargetType>,
 }
 
@@ -1796,7 +1794,7 @@ impl PublicOperationAdmission {
         input: &CreatePublicOperation<'_>,
     ) -> Result<Option<OperationId>, PublicOperationStoreError> {
         let request = (
-            input.kind,
+            input.kind.as_public(),
             input.target_id,
             input.actor_user_id,
             input.idempotency.as_ref(),
@@ -1804,23 +1802,27 @@ impl PublicOperationAdmission {
         debug_assert!(
             matches!(
                 request,
-                (OperationKind::WakeSandbox, Some(_), Some(_), Some(_))
+                (Some(OperationKind::WakeSandbox), Some(_), Some(_), Some(_))
             ),
             "only a caller's keyed sandbox wake can join one"
         );
-        let (OperationKind::WakeSandbox, Some(target_id), Some(actor_user_id), Some(idempotency)) =
-            request
+        let (
+            Some(kind @ OperationKind::WakeSandbox),
+            Some(target_id),
+            Some(actor_user_id),
+            Some(idempotency),
+        ) = request
         else {
             return Ok(None);
         };
         if !matches!(self.observation, ObservePublicOperationIdempotency::Missing) {
             return Ok(None);
         }
-        lock_active_sandbox_operation(&mut self.tx, input.org_id, input.kind, target_id).await?;
+        lock_active_sandbox_operation(&mut self.tx, input.org_id, kind, target_id).await?;
         let Some(joinable) = joinable_active_sandbox_operation(
             &mut self.tx,
             input.org_id,
-            input.kind,
+            kind,
             target_id,
             Some(actor_user_id),
         )
@@ -2045,7 +2047,7 @@ pub struct ClaimedPublicOperation {
     pub org_id: OrgId,
     pub actor_user_id: Option<UserId>,
     pub api_product: ApiProduct,
-    pub kind: OperationKind,
+    pub kind: StoredOperationKind,
     pub target_type: Option<OperationTargetType>,
     pub target_id: Option<String>,
     pub payload: serde_json::Value,
@@ -2176,7 +2178,7 @@ pub struct OverdueQueuedPublicOperations<'a> {
 #[derive(Debug, Clone)]
 pub struct OverdueQueuedPublicOperation {
     pub id: OperationId,
-    pub kind: OperationKind,
+    pub kind: StoredOperationKind,
     pub attempts: i32,
     pub progress_message: String,
 }
@@ -2370,7 +2372,7 @@ pub async fn create_operation_tx(
         operation_id,
         PublicOperationEventType::Created,
         serde_json::json!({
-                "kind": input.kind.as_str(),
+                "kind": input.kind.public_kind().as_str(),
                 "state": OperationState::Queued.as_str(),
         }),
     )
@@ -2666,11 +2668,13 @@ fn outside_sandbox_queue_labels() -> Vec<&'static str> {
 /// [`OUTSIDE_SANDBOX_QUEUE_KINDS`].
 fn sandbox_queue_key<'a>(
     target_type: Option<&OperationTargetType>,
-    kind: OperationKind,
+    kind: StoredOperationKind,
     target_id: Option<&'a str>,
 ) -> Option<&'a str> {
     if target_type != Some(&OperationTargetType::Sandbox)
-        || OUTSIDE_SANDBOX_QUEUE_KINDS.contains(&kind)
+        || kind
+            .as_public()
+            .is_some_and(|kind| OUTSIDE_SANDBOX_QUEUE_KINDS.contains(&kind))
     {
         return None;
     }
@@ -3196,7 +3200,7 @@ async fn claim_operations(
             operation.id,
             PublicOperationEventType::Claimed,
             serde_json::json!({
-                "kind": operation.kind.as_str(),
+                "kind": operation.kind.public_kind().as_str(),
                 "attempt": operation.attempts,
             }),
         )
@@ -3842,7 +3846,7 @@ pub struct AdminPublicOperationRecord {
     /// when the request ran, it does not record who the actor was.
     pub actor_email: Option<String>,
     pub api_product: ApiProduct,
-    pub kind: OperationKind,
+    pub kind: StoredOperationKind,
     pub state: OperationState,
     pub target_type: Option<OperationTargetType>,
     pub target_id: Option<String>,
@@ -3995,7 +3999,9 @@ impl TryFrom<PublicOperationRow> for PublicOperationRecord {
     fn try_from(row: PublicOperationRow) -> Result<Self, Self::Error> {
         Ok(Self {
             id: OperationId::from_uuid(row.operation_id),
-            kind: parse_stored_enum("kind", &row.kind)?,
+            // A client sees a system kind as the public kind it does the work
+            // of: the contract's kinds are frozen.
+            kind: parse_stored_enum::<StoredOperationKind>("kind", &row.kind)?.public_kind(),
             state: parse_stored_enum("state", &row.state)?,
             target_type: row
                 .target_type

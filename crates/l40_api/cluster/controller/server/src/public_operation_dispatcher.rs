@@ -21,7 +21,7 @@ pub use pplx_space_api::public_operation_driver::{OperationExecutionResult, Tick
 use pplx_space_api::public_operations::{
     ClaimLimits, ClaimPublicOperations, ClaimedPublicOperation, OrgSlotLimit, PublicOperationClaim,
     PublicOperationRequeueReason, PublicOperationStore, ReleaseClaimedPublicOperation,
-    ReleasedClaim, TEARDOWN_KINDS,
+    ReleasedClaim, StoredOperationKind,
 };
 use pplx_space_api::public_sandbox_operations::{
     CreateSandboxOperationExecutor, SandboxLifecycleOperationExecutor,
@@ -341,7 +341,11 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
         claim_token: &str,
         operation: ClaimedPublicOperation,
     ) -> OperationExecutionResult {
-        match operation.kind {
+        let kind = match operation.kind {
+            StoredOperationKind::DrainRestoreSandbox => return unhandled(&operation),
+            StoredOperationKind::Public(kind) => kind,
+        };
+        match kind {
             OperationKind::CreateSandbox => self.create_sandbox.execute(&operation).await.into(),
             OperationKind::UpdateSandbox => self.update_sandbox.execute(&operation).await.into(),
             OperationKind::DeleteTemplate => self.delete_template.execute(&operation).await.into(),
@@ -365,20 +369,27 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
             | OperationKind::RollbackSandbox => {
                 self.sandbox_lifecycle.execute(&operation).await.into()
             }
-            kind => OperationExecutionResult {
-                state: OperationState::Failed,
-                progress_message: format!("operation kind {kind} is not handled"),
-                result_json: None,
-                terminal_error_code: Some(PublicErrorCode::Internal),
-                terminal_error_json: Some(serde_json::json!({
-                    "operation_id": operation.id.to_string(),
-                    "kind": kind.as_str(),
-                    "reason": "unsupported_operation_kind",
-                })),
-                retry_after: None,
-                requeue_reason: PublicOperationRequeueReason::TransientFailure,
-            },
+            OperationKind::CreateSession => unhandled(&operation),
         }
+    }
+}
+
+/// The result for an operation of a kind this executor claims but has no
+/// executor for.
+fn unhandled(operation: &ClaimedPublicOperation) -> OperationExecutionResult {
+    let kind = operation.kind;
+    OperationExecutionResult {
+        state: OperationState::Failed,
+        progress_message: format!("operation kind {kind} is not handled"),
+        result_json: None,
+        terminal_error_code: Some(PublicErrorCode::Internal),
+        terminal_error_json: Some(serde_json::json!({
+            "operation_id": operation.id.to_string(),
+            "kind": kind.public_kind().as_str(),
+            "reason": "unsupported_operation_kind",
+        })),
+        retry_after: None,
+        requeue_reason: PublicOperationRequeueReason::TransientFailure,
     }
 }
 
@@ -528,7 +539,7 @@ pub async fn run<E>(
                             if let Some(key) = &key {
                                 busy_keys.insert(key.clone(), operation.id);
                             }
-                            let is_teardown = TEARDOWN_KINDS.contains(&operation.kind);
+                            let is_teardown = operation.kind.is_teardown();
                             let span = execution_span(&operation);
                             let claimed = (claim.claim_token.clone(), operation.clone());
                             let execution = execute_claimed_operation(

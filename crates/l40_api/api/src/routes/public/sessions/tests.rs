@@ -550,7 +550,7 @@ mod not_running {
                 org_id,
                 actor_user_id: Some(UserId::from_uuid(SEED_USER_ID)),
                 api_product: ApiProduct::Native,
-                kind: OperationKind::WakeSandbox,
+                kind: OperationKind::WakeSandbox.into(),
                 target_type: Some(OperationTargetType::Sandbox),
                 target_id: Some(&target_id),
                 payload_json: json!({}),
@@ -837,7 +837,7 @@ mod not_running {
                 org_id: OrgId::from_uuid(SEED_ORG_ID),
                 actor_user_id: Some(UserId::from_uuid(SEED_USER_ID)),
                 api_product: ApiProduct::Admin,
-                kind: OperationKind::WakeSandbox,
+                kind: OperationKind::WakeSandbox.into(),
                 target_type: Some(OperationTargetType::Sandbox),
                 target_id: Some(&target_id),
                 payload_json: SandboxLifecycleOperationPayload {
