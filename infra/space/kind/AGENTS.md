@@ -37,7 +37,9 @@ path: the run-scoped ECW API key, stale node tombstones contradicted by
 Kubernetes, stranded lifecycle rows created by the sweeper smoke, the
 backdated reconcile-queue rows of the reconcile-queue GC smoke's synthetic
 nodes, the drain restore operations the drain restore smoke enqueues (only
-the system enqueues one), and Kubernetes Node patches exercised by the
+the system enqueues one), the stale `node_k8s.instance_id` the drain v2
+stale-instance smoke writes (only an older registration writer leaves one),
+and Kubernetes Node patches exercised by the
 node-ctl admission smoke. Keep these exceptions inside their existing helpers
 or suites.
 

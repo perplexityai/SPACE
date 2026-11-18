@@ -8,10 +8,8 @@ resume or wake, and leaves a stopped sandbox stopped and unplaced, its disk
 pinned, for a user start to boot anywhere. The scenarios here pin
 residents to one worker by cordoning the other, uncordon it, and drain the
 first with `engine: v2`. Every run arms, before the drain, the undrain and
-the uncordon of the worker. Only the control plane may call a node's
-`DrainNode`, so a worker the run leaves sealed is opened again the way an
-operator would: `:undrain`, or a fresh v2 drain and its `:undrain`, whose
-cancel unseals the node (`reopen`).
+the uncordon of the worker; only the control plane may call a node's
+`DrainNode`, and the undrain's cancel unseals the node.
 
 Every run scopes the controller's drain v2 flag and the `aws` terminator to
 itself (`v2_controller`), under the controller-mutation Lease, with the
@@ -29,9 +27,9 @@ the dispatch, the harness plays the cloud's part, stopping the worker's
 container and deleting its Node. Once EC2 says the instance is terminated
 and the Node is gone, the drain deletes the node's row, with no tombstone.
 The worker comes back under the same name with a new providerID, a
-same-name replacement, started from the stopped container with its sealed
-sandbox-manager database, which the run opens again (`reopen`); that start
-is armed before the terminate. A worker that dies mid-drain is let go once EC2 says its
+same-name replacement, started from the stopped container with an empty
+sandbox-manager database, as a new machine starts; that start is armed
+before the terminate. A worker that dies mid-drain is let go once EC2 says its
 instance is terminated, and the gone-node loops take its rows as any
 crashed node's.
 """
@@ -246,9 +244,6 @@ class DrainV2Assertions:
         self._replacement: str | None = None
         # Each resident a report this run read named evacuated, with its prior.
         self._reported_priors: dict[str, Any] = {}
-        # The workers a drain of this run sealed and no cancel has opened yet,
-        # shared with the companion: `v2_controller` opens them on its way out.
-        self._sealed_workers: list[DrainV2Assertions] = []
 
     @staticmethod
     def bare_id(sandbox_id: str) -> str:
@@ -371,8 +366,7 @@ class DrainV2Assertions:
             if restore_slots is not None:
                 overrides[DRAIN_RESTORE_SLOTS_ENV] = str(restore_slots)
             if not overrides:
-                with self._reopened_on_exit():
-                    yield
+                yield
                 return
             standing = self._control.drain_restore_hold_env()
             self._fixture.record("standing_drain_restore_env", standing)
@@ -393,28 +387,10 @@ class DrainV2Assertions:
                 running_pods=pods,
             )
             try:
-                with self._reopened_on_exit():
-                    yield
+                yield
             finally:
                 with self._fixture.phase("put the standing drain-restore env back"):
                     restore.release()
-
-    @contextmanager
-    def _reopened_on_exit(self) -> Iterator[None]:
-        """Open every worker this run's drains left sealed once the body
-        ends, while the v2 flag a reopening drain needs is still on. A run
-        that ends with its `:undrain` cancelled leaves none. A failure here is
-        recorded, not raised over the body's own outcome."""
-
-        try:
-            yield
-        finally:
-            for worker in list(self._sealed_workers):
-                try:
-                    with self._fixture.phase(f"open {worker.node_name} again"):
-                        worker.reopen()
-                except Exception as error:  # noqa: BLE001 - cleanup records, the body decides
-                    self._fixture.record(f"reopen_failed_{worker.node_name}", repr(error)[:500])
 
     def create_resident(self, *, idle_timeout: str | None = None) -> DurableLifecycleSandbox:
         """A run-owned sandbox, running on the pinned worker; with
@@ -685,7 +661,6 @@ class DrainV2Assertions:
         other._node_name = self._other
         other._node_id = node.id
         other._other = self.node_name
-        other._sealed_workers = self._sealed_workers
         return other
 
     def cordon(self) -> None:
@@ -811,51 +786,8 @@ class DrainV2Assertions:
             )
         assert isinstance(epoch, int)
         self._epoch = epoch
-        # A worker left sealed, a terminated node that came back sealed
-        # included, is opened again on the way out of `v2_controller`.
-        if self not in self._sealed_workers:
-            self._sealed_workers.append(self)
         self._fixture.record("drain_epoch", epoch)
         return epoch
-
-    def reopen(self, *, timeout: float = 600) -> None:
-        """Open the worker's sandbox-manager again through the control plane,
-        the only caller a node's `DrainNode` accepts: `:undrain` a drain still
-        in a phase; else start a fresh v2 drain, whose newer epoch moves the
-        seal forward, wait until the node reports sealed under it, and
-        `:undrain` that. Either way the controller clears the v2 columns only
-        once its cancel answered the node unsealed."""
-
-        node = next((n for n in self._control.admin_nodes() if n.id == self.node_id), None)
-        if node is None:
-            return
-        status = self._control.drain_v2_status(self.node_id)
-        cancelling = (
-            node.drain_phase is None
-            and status is not None
-            and isinstance(status.status, dict)
-            and bool(status.status.get("cancel"))
-        )
-        if node.drain_phase is None and not cancelling:
-            self._control.drain_node_v2(self.node_id)
-            status = self._control.drain_v2_status(self.node_id)
-            epoch = None if status is None or status.status is None else status.status.get("epoch")
-            self._fixture.verify(
-                isinstance(epoch, int),
-                "the reopening v2 :drain recorded no epoch",
-                drain_status=drain_status_evidence(status),
-            )
-            assert isinstance(epoch, int)
-            self._epoch = epoch
-            self.wait_for_report(
-                lambda report: report.get("sealed_epoch") == epoch,
-                "the node never reported sealed under the reopening drain's epoch",
-                timeout=timeout,
-            )
-        if not cancelling:
-            self._control.undrain_node(self.node_id)
-        self.expect_cancelled(timeout=timeout)
-        self._fixture.record(f"reopened_{self.node_name}", True)
 
     def _undrain_if_draining(self, node_id: str) -> None:
         node = next((n for n in self._control.admin_nodes() if n.id == node_id), None)
@@ -1372,19 +1304,35 @@ class DrainV2Assertions:
 
         self._expect_row_deleted_without_tombstone(timeout=timeout)
 
-    def _come_back(self, restart: Compensation, replacement: str, *, timeout: float) -> bool:
-        """Start the worker again as a same-name replacement, wait until its
-        row records the new instance, and open it again (`reopen`): it comes
-        back sealed under the old epoch, as no fresh machine would, and only
-        the control plane may cancel a seal."""
+    def _come_back(self, restart: Compensation, replacement: str, *, timeout: float) -> int | None:
+        """Start the worker again as a same-name replacement, a new machine
+        with an empty sandbox-manager database, wait until its row records the
+        new instance, and verify through the admin preview that it answers
+        unsealed: the epoch it is sealed under, None."""
 
         restart.release()
         self._instance = replacement
         await_recorded_instance(
             self._fixture, self._control, self.node_name, self.node_id, replacement, timeout=timeout
         )
-        self.reopen(timeout=timeout)
-        return True
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                sealed = self.preview().get("sealed_epoch")
+                break
+            except Exception as error:  # noqa: BLE001 - its node services may still be starting
+                self._fixture.verify(
+                    time.monotonic() < deadline,
+                    "the replacement never answered a drain preview",
+                    error=repr(error)[:300],
+                )
+                self._fixture.wait(5)
+        self._fixture.verify(
+            sealed is None,
+            "the same-name replacement came back sealed",
+            sealed_epoch=sealed,
+        )
+        return sealed
 
     def terminate(self, *, timeout: float = 600) -> None:
         """`:terminate` reaches the worker's instance through the `aws`
@@ -1405,7 +1353,7 @@ class DrainV2Assertions:
             {
                 "node_row_deleted_without_tombstone": True,
                 "replacement_instance": replacement,
-                "reopened_after_replacement": self._come_back(restart, replacement, timeout=timeout),
+                "sealed_epoch_after_replacement": self._come_back(restart, replacement, timeout=timeout),
             },
         )
 
@@ -1430,7 +1378,7 @@ class DrainV2Assertions:
         created_at = self._control.node_created_at(node_id)
         restart, _, replacement = self._terminate_and_dispatch()
         self._control.stop_kind_worker(self.node_name)
-        reopened = self._come_back(restart, replacement, timeout=timeout)
+        sealed = self._come_back(restart, replacement, timeout=timeout)
         deadline = time.monotonic() + timeout
         while (columns := self._control.drain_v2_status(node_id)) is not None and (
             columns.engine is not None
@@ -1494,7 +1442,7 @@ class DrainV2Assertions:
         )
         self._fixture.record(
             "after_replacement",
-            {"replacement_instance": replacement, "reopened_after_replacement": reopened, **after},
+            {"replacement_instance": replacement, "sealed_epoch_after_replacement": sealed, **after},
         )
 
     def terminate_keeping_the_node(self, *, timeout: float = 600) -> None:
@@ -1524,9 +1472,69 @@ class DrainV2Assertions:
             "after_lingering_node",
             {
                 "replacement_instance": replacement,
-                "reopened_after_replacement": self._come_back(restart, replacement, timeout=timeout),
+                "sealed_epoch_after_replacement": self._come_back(restart, replacement, timeout=timeout),
             },
         )
+
+    def give_stale_instance(self, *, timeout: float = 300) -> str:
+        """The pinned worker under Kind's own providerID, which names no EC2
+        instance, with a fake instance written into its node row: the stale
+        instance an older registration writer leaves across a Node UID
+        change, which registration keeps while the Node names none.
+        Re-registering deletes the pods on the worker. Returns the instance;
+        clearing it is armed."""
+
+        node_name, node_id = self.node_name, self.node_id
+        if self._control.kind_node_provider_id(node_name).startswith(_FAKE_PROVIDER_PREFIX):
+            labels = self._control.kind_node_labels(node_name)
+            self._control.restore_kind_worker_provider_id(node_name, labels, timeout=timeout)
+        _, stale = fake_provider_id()
+        self._scope.defer(
+            f"clear the stale instance recorded for {node_name}",
+            lambda: self._control.set_node_recorded_instance(node_id, None),
+            critical=True,
+        )
+        # Registration of the re-created Node records its instance, none, on
+        # its first sync; the stale value is written until it holds across a
+        # few syncs.
+        deadline = time.monotonic() + timeout
+        held = 0
+        while held < 3:
+            if self._control.node_recorded_instance(node_id) == stale:
+                held += 1
+            else:
+                held = 0
+                self._fixture.verify(
+                    time.monotonic() < deadline,
+                    "registration never kept the stale instance",
+                    worker=node_name,
+                )
+                self._control.set_node_recorded_instance(node_id, stale)
+            self._fixture.wait(10)
+        self._instance = stale
+        self._fixture.record("stale_instance", stale)
+        return stale
+
+    def stop_keeping_node(self) -> Compensation:
+        """The pinned worker's machine stops answering while its Kubernetes
+        Node stays: the harness stops its container and keeps the Node.
+        Returns the armed start of the same machine."""
+
+        node_name = self.node_name
+        labels = self._control.kind_node_labels(node_name)
+        restart = self._scope.defer(
+            f"start Kind worker {node_name} again",
+            lambda: self._control.start_kind_worker(node_name, labels, timeout=300),
+            critical=True,
+        )
+        self._control.stop_kind_worker(node_name, keep_node=True)
+        self._fixture.record("stopped_at", time.time())
+        return restart
+
+    def fake_ec2_terminate(self, instance_id: str) -> None:
+        """Kind's fake EC2 lists `instance_id` terminated from now on."""
+
+        self._control.fake_ec2_terminate(instance_id)
 
     def die(self) -> Compensation:
         """The drained worker dies mid-drain: Kind's fake EC2 marks its
@@ -1587,7 +1595,7 @@ class DrainV2Assertions:
         if self._replacement is None:
             raise RuntimeError("die() must run first")
         self._fixture.record(
-            "reopened_after_replacement",
+            "sealed_epoch_after_replacement",
             self._come_back(restart, self._replacement, timeout=timeout),
         )
 
@@ -1766,8 +1774,6 @@ class DrainV2Assertions:
         while True:
             status = self._control.drain_v2_status(self.node_id)
             if status is not None and status.engine is None and status.status is None:
-                if self in self._sealed_workers:
-                    self._sealed_workers.remove(self)
                 break
             self._fixture.verify(
                 time.monotonic() < deadline,

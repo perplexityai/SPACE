@@ -656,6 +656,11 @@ SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '
 # Where kubeadm keeps the kubelet's flags on a Kind node, `--provider-id`
 # among them.
 KIND_KUBELET_FLAGS = "/var/lib/kubelet/kubeadm-flags.env"
+# sandbox-manager's SQLite database on a node, and its WAL and shared-memory
+# files (`pplx_space_host_layout::paths::SANDBOX_MANAGER_DB`).
+SANDBOX_MANAGER_DB_FILES = tuple(
+    "/space/run/sandbox-manager/sbx-manager.db" + suffix for suffix in ("", "-wal", "-shm")
+)
 SANDBOX_ROW_STATES_SQL = """\
 SELECT id, lifecycle, placement, coalesce(active_node_id::text, ''),
        coalesce(target_node_id::text, ''), updated_at
@@ -5704,10 +5709,17 @@ ON CONFLICT (key_hash) DO NOTHING;
         listed = self.kubectl("get", "node", node, "-o", "jsonpath={.spec.providerID}", timeout=15)
         return _require_ok(listed, f"read the providerID of {node}").strip()
 
-    def _rewritten_kubelet_flags(self, flags: str, provider_id: str) -> str:
-        """kubeadm's kubelet flags with `--provider-id` set to `provider_id`."""
+    def _kind_provider_id(self, container: str) -> str:
+        """The providerID Kind gives a node, which names no EC2 instance."""
 
-        validate_fake_provider_id(provider_id)
+        return f"kind://docker/{self.config.cluster}/{container}"
+
+    def _rewritten_kubelet_flags(self, flags: str, provider_id: str, container: str) -> str:
+        """kubeadm's kubelet flags with `--provider-id` set to `provider_id`:
+        a fake AWS one, or Kind's own for `container`."""
+
+        if provider_id != self._kind_provider_id(container):
+            validate_fake_provider_id(provider_id)
         rewritten, count = re.subn(r"--provider-id=[^\s\"]*", f"--provider-id={provider_id}", flags)
         if count != 1:
             raise RuntimeError(
@@ -5724,7 +5736,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             ["docker", "exec", container, "cat", KIND_KUBELET_FLAGS], timeout=30
         )
         flags = self._rewritten_kubelet_flags(
-            _require_ok(read, f"read the kubelet flags of {container}"), provider_id
+            _require_ok(read, f"read the kubelet flags of {container}"), provider_id, container
         )
         # A Node's providerID can't change once set, so the kubelet registers
         # a new Node: delete the old one, then restart the kubelet with the
@@ -5754,6 +5766,14 @@ ON CONFLICT (key_hash) DO NOTHING;
                 f"Kind worker {container} registered providerID {registered!r}, "
                 f"not {provider_id!r}"
             )
+
+    def restore_kind_worker_provider_id(
+        self, node_name: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        container = self._kind_worker_container(node_name)
+        self.set_kind_worker_provider_id(
+            node_name, self._kind_provider_id(container), labels, timeout=timeout
+        )
 
     def fake_ec2_terminate(self, instance_id: str) -> None:
         self._require_isolated_kind("terminating a fake EC2 instance")
@@ -5802,6 +5822,16 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         _require_ok(result, f"read {instance_id} in the fake EC2")
         return result.stdout.strip()
+
+    def set_node_recorded_instance(self, node_id: str, instance_id: str | None) -> None:
+        self._require_isolated_kind("writing a node's recorded instance")
+        if instance_id is not None:
+            validate_fake_instance_id(instance_id)
+        value = "NULL" if instance_id is None else f"'{instance_id}'"
+        self._psql(
+            f"UPDATE node_k8s SET instance_id = {value} WHERE node_id = '{_sql_uuid(node_id)}';",
+            action="write the node's recorded instance",
+        )
 
     def node_recorded_instance(self, node_id: str) -> str | None:
         out = self._psql(
@@ -5895,7 +5925,9 @@ ON CONFLICT (key_hash) DO NOTHING;
                     ),
                     f"copy the kubelet flags out of {container}",
                 )
-                local.write_text(self._rewritten_kubelet_flags(local.read_text(), provider_id))
+                local.write_text(
+                    self._rewritten_kubelet_flags(local.read_text(), provider_id, container)
+                )
                 _require_ok(
                     self.executor.run(
                         ["docker", "cp", str(local), f"{container}:{KIND_KUBELET_FLAGS}"],
@@ -5907,6 +5939,21 @@ ON CONFLICT (key_hash) DO NOTHING;
             self.executor.run(["docker", "start", container], timeout=120),
             f"start Kind worker container {container}",
         )
+        if provider_id is not None:
+            # A same-name replacement stands for a new machine, which starts
+            # with an empty sandbox-manager database: the one the stopped
+            # machine left would come back sealed under its drain, holding the
+            # drain's records. Its Node was deleted, and sandbox-manager's
+            # DaemonSet runs only on a Node with the bring-up labels, which go
+            # back on below, so nothing has the database open yet. The cache
+            # it described is reformatted on every start of the node.
+            _require_ok(
+                self.executor.run(
+                    ["docker", "exec", container, "rm", "-f", *SANDBOX_MANAGER_DB_FILES],
+                    timeout=30,
+                ),
+                f"remove the sandbox-manager database the stopped {container} left",
+            )
         self._await_reregistered(container, labels, timeout=timeout)
 
     def _await_reregistered(

@@ -1790,6 +1790,20 @@ class KindWorkerControl(NodeDrainControl, Protocol):
         """`node_k8s.instance_id` of the node, None when it records none or has no row."""
         ...
 
+    def set_node_recorded_instance(self, node_id: str, instance_id: str | None) -> None:
+        """Write the node's `node_k8s.instance_id` directly: the stale instance
+        an older registration writer leaves across a Node UID change, which no
+        public path sets up. A fake instance id, or None."""
+        ...
+
+    def restore_kind_worker_provider_id(
+        self, node_name: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        """Re-register the worker under Kind's own providerID, which names no
+        EC2 instance; as `set_kind_worker_provider_id`, it deletes the pods on
+        the worker."""
+        ...
+
     def node_row_exists(self, node_id: str) -> bool: ...
 
     def node_created_at(self, node_id: str) -> str | None:
