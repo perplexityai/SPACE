@@ -118,14 +118,20 @@ teardown_all() {
   git -C "$REPO_ROOT" worktree prune
 }
 
+kind_bench_platform
 kind_bench_lock
 if [[ "$COMMAND" == teardown ]]; then
+  sudo -n true 2>/dev/null || die "teardown needs passwordless sudo"
   teardown_all
   # The registries' data stays in $CACHE_ROOT for the next run.
   docker rm -f "$MIRROR_NAME" "$CACHE_NAME" >/dev/null 2>&1 || true
   sudo -n ip link del "$REGISTRY_LINK" 2>/dev/null || true
   exit 0
 fi
+
+# Refusals (no sudo, no KVM, a missing tool, a loopback resolver) print here,
+# not into a log.
+kind_bench_preflight
 
 # Default N: a bench is one 16-core CI runner's work, but mostly waiting. What
 # it holds is about 50 GB of disk under $KIND_BENCH_ROOT at its peak, 6 GiB of
@@ -159,6 +165,10 @@ fi
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-n${BENCHES}"
 OUT="${OUT:-$HOME/.space-devbox/kind-parallel/$RUN_ID}"
+# An earlier run's host/<step>.ok markers would satisfy this run's waits.
+if [[ -d "$OUT" && -n "$(ls -A "$OUT" 2>/dev/null)" ]]; then
+  die "--out $OUT is not empty; give each run a directory of its own"
+fi
 mkdir -p "$OUT/host"
 OUT="$(cd "$OUT" && pwd)"
 HOST="$OUT/host"
@@ -447,12 +457,14 @@ seed() {
   SPACE_SEED_OUTPUT_DIR="$SEED_DIR" bash "$REPO_ROOT/infra/space/kind/scripts/build-seed.sh" || return 1
 }
 
-# The full inventory, for the coverage check, and a synced project
-# environment, so N benches' first `uv run` do not race to create it.
+# The full inventory, for the coverage check: the typed runner's own registry
+# and partition, read in this checkout's project environment. Written whole or
+# not at all, so the summary never reads a partial file as the inventory.
 inventory() {
   (cd "$REPO_ROOT" && SPACE_SMOKE_BROWSER_SCENARIOS="${SPACE_SMOKE_BROWSER_SCENARIOS:-withhold}" \
     uv run --frozen --python 3.11 python "$SCRIPT_DIR/lib/kind_parallel_report.py" inventory \
-      --benches "$BENCHES" >"$HOST/inventory.json")
+      --benches "$BENCHES" >"$HOST/inventory.json.tmp") || return 1
+  mv "$HOST/inventory.json.tmp" "$HOST/inventory.json" || return 1
 }
 
 # --- benches ---------------------------------------------------------------
@@ -495,8 +507,11 @@ bench_docker() {
 run_bench() {
   local i="$1" dir="$OUT/benches/$1" env_file
   exec >"$dir/bench.log" 2>&1
-  local result=up_failed
-  trap 'printf "%s\n" "$result" >"$dir/result"' EXIT
+  # Globals, not locals: the EXIT trap runs after run_bench has returned and
+  # its locals are gone. Each bench runs in a subshell of its own.
+  BENCH_RESULT=up_failed
+  BENCH_RESULT_FILE="$dir/result"
+  trap 'printf "%s\n" "$BENCH_RESULT" >"$BENCH_RESULT_FILE"' EXIT
   phase "bench$i" docker bench_docker "$i" || return 1
   env_file="$(bench_env "$i")" || return 1
   local src
@@ -539,10 +554,10 @@ run_bench() {
       "$HOME/.space-devbox/kind/ssh" "$SEED_DIR" || true
   fi
   await build-cache || true
-  result=baseline_failed
+  BENCH_RESULT=baseline_failed
   phase "bench$i" baseline bx env BOOTSTRAP_TIMEOUT=1800 DATA_PLANE_URL=http://127.0.0.1:8090 \
     bash "$src/scripts/tests/smoke-kind-e2e.sh" || return 1
-  result=typed_failed
+  BENCH_RESULT=typed_failed
   local rc=0
   phase "bench$i" typed bx env \
       SMOKE_SHARD="$i/$BENCHES" \
@@ -550,7 +565,7 @@ run_bench() {
       SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE="$dir/admin-token" \
       SPACE_SMOKE_KIND_COLD_RECEIPTS="$dir/cold-receipts" \
       bash "$src/scripts/tests/lib/kind-parallel-typed.sh" "$dir/typed.log" || rc=$?
-  result="typed_exit_$rc"
+  BENCH_RESULT="typed_exit_$rc"
 }
 
 # --- run -------------------------------------------------------------------

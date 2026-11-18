@@ -95,6 +95,9 @@ SURFACE = re.compile(r"^--- typed smoke on the (\S+) API surface$")
 SUITE = re.compile(r"^SUITE: (\d+) passed, (\d+) warned, (\d+) failed, (\d+) inconclusive")
 SHARD = re.compile(r"^SHARD \d+/\d+: ")
 SKIPPED = re.compile(r"^SKIPPED (\S+): (.*)$")
+# smoke-kind-typed.sh `all` repeats both passes' SUITE lines after this; read
+# as part of the last pass they would replace its counts with the first's.
+SUMMARY = "=== typed smoke summary"
 VERDICT = {0: "pass", 42: "warn", 1: "fail"}
 
 
@@ -108,6 +111,8 @@ def parse_typed(log: Path) -> dict:
         return surfaces
     for raw in log.read_text(errors="replace").splitlines():
         line = raw.rstrip()
+        if line.startswith(SUMMARY):
+            break
         if match := SURFACE.match(line):
             current = surfaces.setdefault(
                 match[1], {"run": [], "exits": {}, "skipped": {}, "suite": None}
@@ -240,7 +245,10 @@ def summarize(out: Path) -> int:
     benches = [str(index) for index in range(1, count + 1)]
     timings = read_timings(out)
     inventory_path = out / "host" / "inventory.json"
-    inventory_data = json.loads(inventory_path.read_text()) if inventory_path.exists() else None
+    try:
+        inventory_data = json.loads(inventory_path.read_text())
+    except (OSError, ValueError):
+        inventory_data = None
 
     per_bench = {}
     seen: dict[str, Counter] = {surface: Counter() for surface in SURFACES}
@@ -265,6 +273,7 @@ def summarize(out: Path) -> int:
         }
         if not result.startswith("typed_exit_"):
             status = 2
+        bench_not_passed = 0
         for surface, data in typed.items():
             seen.setdefault(surface, Counter()).update(data["run"])
             skipped.setdefault(surface, {}).update(data["skipped"])
@@ -272,6 +281,7 @@ def summarize(out: Path) -> int:
                 code = data["exits"].get(scenario)
                 if code not in (0, 42):
                     verdict = VERDICT.get(code, "inconclusive") if code is not None else "unfinished"
+                    bench_not_passed += 1
                     not_passed.append(
                         {
                             "bench": bench,
@@ -283,7 +293,9 @@ def summarize(out: Path) -> int:
                         }
                     )
                     status = max(status, 1 if verdict == "fail" else 2)
-        if result.startswith("typed_exit_") and result != "typed_exit_0" and not not_passed:
+        # A shard that exited nonzero with every scenario passing failed
+        # outside them (its bootstrap, a missing tool): inconclusive.
+        if result.startswith("typed_exit_") and result != "typed_exit_0" and not bench_not_passed:
             status = max(status, 2)
 
     coverage = {"checked": inventory_data is not None, "surfaces": {}}

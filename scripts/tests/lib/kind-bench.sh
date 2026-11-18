@@ -9,9 +9,10 @@
 #   - a network namespace `space-bench-<i>`, joined to the host namespace by a
 #     veth pair and masqueraded out through it, so every bench can bind the same
 #     loopback ports and every kind network can keep Docker's defaults;
-#   - a dockerd of its own started inside that namespace, with its own data and
-#     exec roots, socket, containerd namespaces and cgroup parent, so Kind node
-#     names, images and container state never meet another bench's;
+#   - a dockerd and containerd of its own started inside that namespace, with
+#     their own data and exec roots, sockets, containerd namespaces and cgroup
+#     parent, so Kind node names, images and container state never meet
+#     another bench's;
 #   - its own HOME and TMPDIR, so kubeconfig, Tilt state, the rendered cluster
 #     config and `.kind-data` stay apart;
 #   - its own PID namespace for the bench's commands, held open by a holder
@@ -22,24 +23,26 @@
 #     namespace a bench sees only its processes, as a runner does. Killing the
 #     holder ends every process the bench started.
 #
-# The mount namespace stays shared with the host: the checkout, the staged
-# Firecracker vendor tree, /dev/kvm and the shared caches have the same paths in
-# every bench, which is what the cluster config's bind mounts need. Commands run
-# in a bench through `nsenter --net` rather than `ip netns exec`, which remounts
-# /sys for the namespace and leaves /sys/fs/cgroup out of it; dockerd needs the
-# cgroup tree. The host's /etc/resolv.conf is used unchanged, so a loopback
-# resolver there would be unreachable from a bench: kind_bench_preflight
-# refuses that rather than letting every pull fail later.
+# The bench's daemons run in the host's mount namespace, and its commands in
+# the holder's, a copy of the host's that only remounts /proc and receives the
+# host's later mounts (slave propagation): the checkout, the staged Firecracker
+# vendor tree, /dev/kvm and the shared caches have the same paths in every
+# bench, which is what the cluster config's bind mounts need. Bench processes
+# enter the network namespace with `nsenter --net` rather than `ip netns exec`,
+# which remounts /sys for the namespace and leaves /sys/fs/cgroup out of it;
+# dockerd needs the cgroup tree. The host's /etc/resolv.conf is used unchanged,
+# so a loopback resolver there would be unreachable from a bench:
+# kind_bench_preflight refuses that rather than letting every pull fail later.
 #
 # Sourced, never executed. Needs passwordless sudo; the benches' commands run as
 # the calling user.
 
 KIND_BENCH_PREFIX="${KIND_BENCH_PREFIX:-space-bench}"
 KIND_BENCH_ROOT="${KIND_BENCH_ROOT:-$HOME/.space-benches}"
-# Docker's static release, for hosts whose own daemon is not a local binary
-# (a Docker sidecar, a remote DOCKER_HOST). Pinned to the version the bench
-# daemons were measured with; any 25+ release with the containerd image store
-# works.
+# The bench daemons are always Docker's static release, installed once, so
+# every bench runs the version they were measured with whatever the host's own
+# Docker is (a sidecar, a remote DOCKER_HOST or a local package); any 25+
+# release with the containerd image store works.
 KIND_BENCH_DOCKER_VERSION="${KIND_BENCH_DOCKER_VERSION:-29.8.2}"
 KIND_BENCH_DOCKER_DIR="${KIND_BENCH_DOCKER_DIR:-/opt/space-bench-docker/bin}"
 # The release archive's SHA-256 per architecture, for the pinned version;
@@ -100,6 +103,12 @@ kind_bench_claim() {
   sudo -n install -d -m 0755 "$run" && sudo -n touch "$run/$KIND_BENCH_MARKER" || return 1
 }
 
+# The platform a bench needs before anything else, the lock included.
+kind_bench_platform() {
+  [[ "$(uname -s)" == Linux ]] || kind_bench_die "benches need Linux (network and PID namespaces, cgroup v2)"
+  command -v flock >/dev/null 2>&1 || kind_bench_die "benches need flock (util-linux)"
+}
+
 # Refuse a host that cannot hold benches, before anything is created.
 kind_bench_preflight() {
   sudo -n true 2>/dev/null || kind_bench_die "benches need passwordless sudo (network namespaces, dockerd)"
@@ -120,8 +129,7 @@ kind_bench_preflight() {
   done
 }
 
-# The daemon binaries each bench runs: the host's own when it has a local
-# dockerd, else Docker's static release unpacked once.
+# The daemon binaries each bench runs: Docker's static release, unpacked once.
 kind_bench_ensure_docker() {
   if [[ -x "$KIND_BENCH_DOCKER_DIR/dockerd" ]]; then
     return 0
