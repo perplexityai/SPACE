@@ -90,6 +90,16 @@ doesn't bundle. Whether a release can run on a newer schema depends on that
 release's code, so the operator rolling back decides, for the release they
 roll back to:
 
+The `sqlite3` commands in this section need the `sqlite3` command-line tool,
+which a store's own image may not include. Run them where it is available,
+against the database file on the node. In the charts in this repository, a
+store's pods mount the node's `/space/run` directory, so one way is an
+ephemeral debug container on the node:
+`kubectl debug node/<node> -it --image=<an image with sqlite3>` mounts the
+node's root filesystem at `/host`, which puts sandbox-manager's database at
+`/host/space/run/sandbox-manager/sbx-manager.db`. Run `space-db-migrator`
+itself from the store's image, as in step 1.
+
 1. Find the entries before the rollback deploy, without starting the older
    release on the node: take a consistent copy of the store's database with
    SQLite's backup, `sqlite3 -readonly <db> ".backup <copy>"`, which is safe
