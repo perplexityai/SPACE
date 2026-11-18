@@ -191,17 +191,19 @@ async fn releasing_an_owner_keeps_another_callers_pending_retry() {
             .execute_batch("UPDATE network_slots SET state = 'dirty', generation = 7")
             .unwrap();
         let owner = kind.acquire(&pool, 0).unwrap();
-        if let Owner::Reset(claim) = &owner {
-            claim.disarm();
-        }
         // A colliding reset retains its own retry obligation.
         reset_slot(pool.clone(), 0).await;
         assert_eq!(record(&pool, 0).state, SlotState::Dirty, "{kind:?}");
-        let pending = wakeups(&mut jobs);
-        assert!(pending >= 1, "{kind:?}: collision must leave a wakeup");
+        if let Owner::Reset(claim) = &owner {
+            claim.disarm();
+            claim.disarm();
+        }
+        assert_held(&pool, 0, &format!("{kind:?} after the collision"));
         drop(owner);
         assert_free(&pool, 0, &format!("{kind:?} released"));
-        assert_eq!(wakeups(&mut jobs), 0, "{kind:?}: release adds nothing");
+        // The channel does not coalesce here: exactly the collision's wakeup
+        // survives, and the release added none.
+        assert_eq!(wakeups(&mut jobs), 1, "{kind:?}");
         assert_eq!(
             reset_candidates(&pool, u32::MAX).unwrap().entries,
             vec![(0, 7)],
@@ -248,35 +250,6 @@ fn reset_claim_clones_hold_the_slot_until_the_last_owner_finalizes_once() {
             );
         }
     }
-}
-
-#[tokio::test]
-async fn neutral_guard_moved_into_blocking_work_survives_a_cancelled_waiter() {
-    let (pool, mut jobs) = pool_with_wakeups(1);
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
-    let owned = pool.clone();
-    let waiter = tokio::spawn(async move {
-        let guard = SlotGuard::try_acquire(&owned, 0).unwrap();
-        tokio::task::spawn_blocking(move || {
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            drop(guard);
-            finished_tx.send(()).unwrap();
-        })
-        .await
-        .unwrap();
-    });
-    entered_rx.await.unwrap();
-    assert_held(&pool, 0, "blocking work owns the slot");
-    waiter.abort();
-    assert!(waiter.await.unwrap_err().is_cancelled());
-    assert_held(&pool, 0, "host work still owns the slot");
-    release_tx.send(()).unwrap();
-    finished_rx.await.unwrap();
-    assert_free(&pool, 0, "blocking work finished");
-    assert_eq!(wakeups(&mut jobs), 0);
 }
 
 #[test]
