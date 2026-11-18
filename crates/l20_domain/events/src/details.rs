@@ -419,8 +419,10 @@ impl std::fmt::Display for SandboxRestoreProvenance {
 
 /// Where a create's vCPU and memory came from, reported on `create_completed`.
 /// A partial request reports the fallback that filled the gap (`build` or
-/// `default`), not `request`. `default` means the node shim boots the unset
-/// fields at its fixed defaults.
+/// `default`), not `request`. `default` means the release has no recorded
+/// build shape, so the unset fields reach the node unset, and a cold boot
+/// there takes them from the template's metadata (2 vCPU and 1024 MiB when it
+/// has none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateShapeSource {
     Request,

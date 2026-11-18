@@ -572,10 +572,11 @@ struct ColdCreateShapeInput<'a> {
 /// shape of the template's preferred enabled warm-pool policy when the release
 /// has no materialized pool config. Otherwise
 /// a Kubernetes create fills the vCPU and memory the request left unset from
-/// the template's build shape: the node shim boots a pod without those
-/// annotations at fixed defaults (2 vCPU, 1024 MiB), whatever the template
-/// was built for. The filled values do not make the request a custom shape;
-/// the boot mode was already chosen from the request alone. Forks and direct
+/// the template's build shape, so the row and the pod's annotations carry
+/// them; the shim leaves unset values to sandbox-manager, which takes them
+/// from the template's metadata on the node. The filled values do not make
+/// the request a custom shape; the boot mode was already chosen from the
+/// request alone. Forks and direct
 /// creates are unchanged: a snapshot fixes their shape on the node, and a
 /// direct cold boot already falls back to the template's metadata.
 async fn resolve_cold_create_resources(
@@ -592,6 +593,8 @@ async fn resolve_cold_create_resources(
         requested,
         restoring,
     } = input;
+    // Direct's lack of this shape resolution is its "Cold create shape" gap
+    // row (`controllers/substrate/direct.rs`).
     if !capabilities.resolves_cold_create_shape || runtime != RuntimeKind::Firecracker {
         return Ok((requested, DiskIoLimits::default(), None));
     }
