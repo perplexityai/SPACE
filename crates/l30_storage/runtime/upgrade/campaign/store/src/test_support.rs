@@ -38,11 +38,33 @@ impl Default for CampaignSeed {
     }
 }
 
+/// A campaign kind outside [`CampaignKind::RUNTIME`](crate::CampaignKind::RUNTIME),
+/// standing in for another subsystem's campaigns in the same table.
+pub const FOREIGN_KIND: &str = "test_foreign";
+
 /// Insert `seed`, with `finished_at` set exactly when its phase is terminal,
 /// as the schema requires.
 pub async fn insert_campaign(
     executor: impl sqlx::PgExecutor<'_>,
     seed: CampaignSeed,
+) -> Result<CampaignId, sqlx::Error> {
+    let kind = seed.kind.as_str();
+    insert(executor, seed, kind).await
+}
+
+/// Insert `seed` as a campaign of [`FOREIGN_KIND`] in place of its kind,
+/// otherwise as [`insert_campaign`] would.
+pub async fn insert_foreign_campaign(
+    executor: impl sqlx::PgExecutor<'_>,
+    seed: CampaignSeed,
+) -> Result<CampaignId, sqlx::Error> {
+    insert(executor, seed, FOREIGN_KIND).await
+}
+
+async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    seed: CampaignSeed,
+    kind: &str,
 ) -> Result<CampaignId, sqlx::Error> {
     let id = sqlx::query_scalar::<_, uuid::Uuid>(sql!(
         "INSERT INTO runtime_upgrade_campaigns (
@@ -56,7 +78,7 @@ pub async fn insert_campaign(
     ))
     .bind(seed.from.to_string())
     .bind(seed.to.to_string())
-    .bind(seed.kind.as_str())
+    .bind(kind)
     .bind(seed.phase.as_str())
     .bind(seed.per_node)
     .bind(seed.per_cluster)

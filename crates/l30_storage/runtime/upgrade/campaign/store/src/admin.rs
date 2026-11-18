@@ -1,6 +1,8 @@
 //! Operator phase changes: pause, resume and abort.
 //!
-//! Each locks the campaign row, refuses a transition its phase doesn't allow,
+//! Each locks the campaign row, answering [`ChangePhaseError::NotFound`] for a
+//! campaign of a kind outside [`crate::CampaignKind::RUNTIME`] as for an
+//! absent one, refuses a transition its phase doesn't allow,
 //! then compares the generation the caller expects, and writes the phase. The
 //! schema's trigger raises the generation in the same statement, and the
 //! verb returns the raised value. A refused transition, and a resume refused
@@ -46,7 +48,7 @@ use pplx_space_accounts::UserId;
 use pplx_space_common_core::sql;
 use sqlx::{Acquire, PgConnection, Postgres};
 
-use crate::{CampaignId, CampaignPhase, ItemPhase, UnknownValue, end_transaction};
+use crate::{CampaignId, CampaignPhase, ItemPhase, UnknownValue, end_transaction, runtime_kinds};
 
 /// Who asks for a phase change, and the generation they read.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -104,9 +106,11 @@ async fn lock(tx: &mut PgConnection, campaign_id: CampaignId) -> Result<Locked, 
         "SELECT phase, generation, failure_budget
          FROM runtime_upgrade_campaigns
          WHERE id = $1
+           AND kind = ANY($2)
          FOR UPDATE"
     ))
     .bind(campaign_id)
+    .bind(runtime_kinds())
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ChangePhaseError::NotFound)?;

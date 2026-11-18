@@ -19,6 +19,7 @@ use uuid::Uuid;
 use super::*;
 
 mod disabled;
+mod foreign;
 mod leases;
 
 fn environment(byte: u8) -> EnvironmentReference {

@@ -17,6 +17,7 @@ use pplx_space_node_status_store::test_support::{SnapshotSeed, upsert_snapshot};
 use super::test_support::{CampaignSeed, insert_campaign};
 use super::*;
 
+mod foreign;
 mod kinds;
 mod operator;
 

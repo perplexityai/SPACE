@@ -4,7 +4,9 @@
 use axum::http::Method;
 use pplx_space_common_core::sql;
 use pplx_space_content_digest::Digest;
-use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
+use pplx_space_runtime_upgrade_campaign_store::test_support::{
+    CampaignSeed, insert_campaign, insert_foreign_campaign,
+};
 use pplx_space_runtime_upgrade_campaign_store::{CampaignPhase, ItemPhase, SubjectKind};
 use serde_json::{Value, json};
 
@@ -701,5 +703,203 @@ async fn an_abort_of_a_paused_campaign_succeeds_and_a_stale_one_answers_412() ->
     assert_eq!(body["generation"], 2);
     let record = store::get_record(&h.db.pool, campaign).await?.unwrap();
     assert_eq!(record.updated_by, Some(h.operator.id));
+    Ok(())
+}
+
+/// A campaign row and its items, read raw.
+async fn snapshot(
+    h: &AdminRouterHarness,
+    campaign: CampaignId,
+) -> TestResult<(String, Vec<String>)> {
+    let row = sqlx::query_scalar::<_, String>(sql!(
+        "SELECT row_to_json(c)::text FROM runtime_upgrade_campaigns c WHERE id = $1"
+    ))
+    .bind(campaign)
+    .fetch_one(&h.db.pool)
+    .await?;
+    let items = sqlx::query_scalar::<_, String>(sql!(
+        "SELECT row_to_json(i)::text FROM runtime_upgrade_items i
+         WHERE campaign_id = $1
+         ORDER BY subject_id"
+    ))
+    .bind(campaign)
+    .fetch_all(&h.db.pool)
+    .await?;
+    Ok((row, items))
+}
+
+/// Seed `count` items of `campaign` in `phase` whose subjects are of a kind
+/// outside the runtime vocabulary, as a foreign campaign's would be.
+async fn foreign_items(
+    h: &AdminRouterHarness,
+    campaign: CampaignId,
+    phase: ItemPhase,
+    count: usize,
+) -> TestResult {
+    for _ in 0..count {
+        sqlx::query(sql!(
+            "INSERT INTO runtime_upgrade_items (campaign_id, subject_kind, subject_id, phase)
+             VALUES ($1, 'test_foreign_subject', $2, $3)"
+        ))
+        .bind(campaign)
+        .bind(uuid::Uuid::now_v7())
+        .bind(phase.as_str())
+        .execute(&h.db.pool)
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_foreign_campaign_reads_and_acts_as_an_absent_one() -> TestResult {
+    let Some(h) = driven().await? else {
+        return Ok(());
+    };
+    // Each in a phase that allows the change asked of it: a rolling campaign
+    // pauses and aborts, and a paused one with a done item and failed items at
+    // its budget resumes when they're retried.
+    let rolling = insert_foreign_campaign(&h.db.pool, CampaignSeed::default()).await?;
+    foreign_items(&h, rolling, ItemPhase::Pending, 2).await?;
+    let paused = insert_foreign_campaign(
+        &h.db.pool,
+        CampaignSeed {
+            phase: CampaignPhase::Paused,
+            failure_budget: 1,
+            from: environment(9),
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+    foreign_items(&h, paused, ItemPhase::Done, 1).await?;
+    foreign_items(&h, paused, ItemPhase::Failed, 1).await?;
+    let before = [snapshot(&h, rolling).await?, snapshot(&h, paused).await?];
+    let absent = CampaignId(uuid::Uuid::now_v7());
+    // The foreign answer, with the foreign id written as the absent one.
+    let as_absent = |foreign: CampaignId, body: &Value| -> Value {
+        serde_json::from_str(
+            &body
+                .to_string()
+                .replace(&foreign.to_string(), &absent.to_string()),
+        )
+        .unwrap()
+    };
+
+    for foreign in [rolling, paused] {
+        let path = |id: CampaignId| format!("/runtime-upgrade-campaigns/{id}");
+        let (status, body) = h.as_operator(Method::GET, &path(foreign), &[], None).await;
+        let (absent_status, absent_body) =
+            h.as_operator(Method::GET, &path(absent), &[], None).await;
+        assert_eq!(absent_status, StatusCode::NOT_FOUND, "{absent_body}");
+        assert_eq!(
+            (status, as_absent(foreign, &body)),
+            (absent_status, absent_body)
+        );
+    }
+    for (foreign, verb, body) in [
+        (rolling, "pause", json!({"reason": "r"})),
+        (
+            paused,
+            "resume",
+            json!({"reason": "r", "retry_failed": true}),
+        ),
+        (rolling, "abort", json!({"reason": "r"})),
+    ] {
+        let (status, refused) = action(&h, foreign, verb, Some("0"), body.clone()).await;
+        let (absent_status, absent_body) = action(&h, absent, verb, Some("0"), body).await;
+        assert_eq!(
+            absent_status,
+            StatusCode::NOT_FOUND,
+            "{verb}: {absent_body}"
+        );
+        assert_eq!(
+            (status, as_absent(foreign, &refused)),
+            (absent_status, absent_body),
+            "{verb}"
+        );
+    }
+    assert_eq!(
+        [snapshot(&h, rolling).await?, snapshot(&h, paused).await?,],
+        before,
+        "phase, generation, actor and items are unchanged"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_list_holds_only_runtime_campaigns_and_their_counts() -> TestResult {
+    let Some(h) = driven().await? else {
+        return Ok(());
+    };
+    // Each a millisecond or more after the last, so their ids sort in this
+    // order with the foreign one between the two runtime ones.
+    let first = insert_campaign(&h.db.pool, CampaignSeed::default()).await?;
+    items(&h, first, SubjectKind::Sandbox, ItemPhase::Pending, 1).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let foreign = insert_foreign_campaign(
+        &h.db.pool,
+        CampaignSeed {
+            from: environment(8),
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+    foreign_items(&h, foreign, ItemPhase::Failed, 3).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let second = insert_campaign(
+        &h.db.pool,
+        CampaignSeed {
+            from: environment(9),
+            kind: CampaignKind::Templates,
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+    items(&h, second, SubjectKind::TemplateRelease, ItemPhase::Done, 2).await?;
+    assert!(first < foreign && foreign < second);
+
+    for path in [
+        "/runtime-upgrade-campaigns",
+        "/runtime-upgrade-campaigns?unfinished=true",
+    ] {
+        let (status, body) = h.as_operator(Method::GET, path, &[], None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed: Vec<(String, Value)> = body["campaigns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["id"].as_str().unwrap().to_owned(),
+                    entry["items"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (
+                    first.to_string(),
+                    json!({"pending": 1, "in_flight": 0, "done": 0, "failed": 0, "skipped": 0})
+                ),
+                (
+                    second.to_string(),
+                    json!({"pending": 0, "in_flight": 0, "done": 2, "failed": 0, "skipped": 0})
+                ),
+            ],
+            "{path}"
+        );
+        assert_eq!(body["next_after"], Value::Null, "{path}");
+    }
+    let (status, body) = h
+        .as_operator(
+            Method::GET,
+            &format!("/runtime-upgrade-campaigns?after={first}"),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["campaigns"].as_array().unwrap().len(), 1);
+    assert_eq!(body["campaigns"][0]["id"], json!(second.to_string()));
     Ok(())
 }

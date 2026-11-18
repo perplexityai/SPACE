@@ -65,6 +65,12 @@
 //!   locked until that connection's next statement. Run inside a
 //!   caller's transaction, a verb ends only its savepoint, and its locks last
 //!   until the caller's transaction ends.
+//! * **Runtime kinds only.** The table can hold campaigns of kinds this
+//!   subsystem doesn't drive. The reads ([`list_unfinished`],
+//!   [`get_record`], [`list_records`]), the operator's phase changes and
+//!   [`release_lapsed_in_finished`] see only campaigns of
+//!   [`CampaignKind::RUNTIME`], filtered in SQL, so a campaign of any other
+//!   kind is absent to them: not listed, not found, and never changed.
 //! * **One unfinished campaign per kind and source.** [`create_campaign`]
 //!   refuses a second, so two campaigns don't compete for the same subjects
 //!   on that source. Campaigns from different sources can name one subject;
@@ -265,6 +271,11 @@ impl SubjectKind {
 }
 
 impl CampaignKind {
+    /// The kinds the runtime upgrade subsystem drives (**Runtime kinds
+    /// only**). Named one by one rather than taken from [`Self::ALL`], so a
+    /// kind added later becomes a runtime upgrade only when it's added here.
+    pub const RUNTIME: &'static [Self] = &[Self::Templates, Self::Sandboxes];
+
     /// The kind of subject this campaign's items name.
     pub const fn subject_kind(self) -> SubjectKind {
         match self {
@@ -272,6 +283,15 @@ impl CampaignKind {
             Self::Sandboxes => SubjectKind::Sandbox,
         }
     }
+}
+
+/// [`CampaignKind::RUNTIME`] as stored, to bind as a `text[]` for
+/// `kind = ANY(..)`.
+pub(crate) fn runtime_kinds() -> Vec<&'static str> {
+    CampaignKind::RUNTIME
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect()
 }
 
 /// A campaign, as the reconciler drives it.
@@ -418,8 +438,9 @@ impl TryFrom<CampaignRecordRow> for CampaignRecord {
     }
 }
 
-/// Every campaign that hasn't finished (canary, rolling or paused), oldest
-/// first. One unreadable row fails the whole read. Takes no lock.
+/// Every runtime campaign that hasn't finished (canary, rolling or paused),
+/// oldest first. One unreadable runtime row fails the whole read. Takes no
+/// lock.
 pub async fn list_unfinished(
     executor: impl sqlx::PgExecutor<'_>,
 ) -> Result<Vec<Campaign>, ReadCampaignError> {
@@ -429,14 +450,16 @@ pub async fn list_unfinished(
                 include_running, generation
          FROM runtime_upgrade_campaigns
          WHERE finished_at IS NULL
+           AND kind = ANY($1)
          ORDER BY created_at, id"
     ))
+    .bind(runtime_kinds())
     .fetch_all(executor)
     .await?;
     rows.into_iter().map(Campaign::try_from).collect()
 }
 
-/// `campaign_id` with its provenance, or `None` when there's no such
+/// `campaign_id` with its provenance, or `None` when there's no such runtime
 /// campaign. Takes no lock.
 pub async fn get_record(
     executor: impl sqlx::PgExecutor<'_>,
@@ -448,18 +471,21 @@ pub async fn get_record(
                 include_running, generation, reason, created_at, created_by_user_id,
                 updated_at, updated_by_user_id, finished_at
          FROM runtime_upgrade_campaigns
-         WHERE id = $1"
+         WHERE id = $1
+           AND kind = ANY($2)"
     ))
     .bind(campaign_id)
+    .bind(runtime_kinds())
     .fetch_optional(executor)
     .await?;
     row.map(CampaignRecord::try_from).transpose()
 }
 
-/// Up to `limit` campaigns after `after`, in id order. Ids are UUIDv7, so
-/// that's creation order to the millisecond; campaigns created within one
+/// Up to `limit` runtime campaigns after `after`, in id order. Ids are
+/// UUIDv7, so that's creation order to the millisecond; campaigns created within one
 /// millisecond come in no particular order. With `unfinished_only`, only canary, rolling and
-/// paused ones. One unreadable row fails the whole read. Takes no lock.
+/// paused ones. One unreadable runtime row fails the whole read. Takes no
+/// lock.
 pub async fn list_records(
     executor: impl sqlx::PgExecutor<'_>,
     unfinished_only: bool,
@@ -474,12 +500,14 @@ pub async fn list_records(
          FROM runtime_upgrade_campaigns
          WHERE (NOT $1 OR finished_at IS NULL)
            AND ($2::uuid IS NULL OR id > $2)
+           AND kind = ANY($4)
          ORDER BY id
          LIMIT $3"
     ))
     .bind(unfinished_only)
     .bind(after)
     .bind(i64::from(limit))
+    .bind(runtime_kinds())
     .fetch_all(executor)
     .await?;
     rows.into_iter().map(CampaignRecord::try_from).collect()

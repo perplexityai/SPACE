@@ -14,7 +14,7 @@ use sqlx::{Acquire, PgConnection, Postgres};
 
 use crate::{
     CampaignId, CampaignKind, CampaignPhase, ItemError, ItemPhase, SubjectKind, clamp_lease,
-    end_transaction,
+    end_transaction, runtime_kinds,
 };
 
 /// `attempts` of a retired item: above any `max_attempts` a caller passes,
@@ -771,8 +771,9 @@ pub async fn redrive_expired(
     })
 }
 
-/// Return the in-flight items of finished campaigns whose leases lapsed to
-/// pending, as [`redrive_expired`] does for an unfinished one. Only an
+/// Return the in-flight items of finished runtime campaigns whose leases
+/// lapsed to pending, as [`redrive_expired`] does for an unfinished one. A
+/// campaign of a kind outside [`CampaignKind::RUNTIME`] is left alone. Only an
 /// aborted campaign can have one: completion needs no item in flight. An aborted
 /// campaign keeps an item in flight until its worker's lease lapses, so no
 /// other campaign leases the subject while that worker may still be on it
@@ -791,12 +792,14 @@ pub async fn release_lapsed_in_finished(
            AND campaign_id IN (
                SELECT id
                FROM runtime_upgrade_campaigns
-               WHERE phase = $4)"
+               WHERE phase = $4
+                 AND kind = ANY($5))"
     ))
     .bind(ItemPhase::InFlight.as_str())
     .bind(ItemPhase::Pending.as_str())
     .bind(LEASE_EXPIRED)
     .bind(CampaignPhase::Aborted.as_str())
+    .bind(runtime_kinds())
     .execute(executor)
     .await?
     .rows_affected())
