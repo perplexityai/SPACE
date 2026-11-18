@@ -104,7 +104,7 @@ pub use store::NodeGroupDbStore;
 pub use tick::Reconciler;
 
 /// Node label that binds a kube Node to its SPACE node group, re-exported from
-/// the canonical definition in `common-core`'s placement module.
+/// the canonical definition in `pplx-space-sandbox-pod`'s placement module.
 ///
 /// Not defined here on purpose: `build_sandbox_pod` renders required
 /// nodeAffinity over this same key, so the writer and the reader must be the
@@ -113,7 +113,8 @@ pub use tick::Reconciler;
 pub use pplx_space_sandbox_pod::SANDBOX_NODE_GROUP_LABEL as NODE_GROUP_LABEL;
 
 /// Taint key carried by dedicated (org-owned) node-group nodes, re-exported
-/// from `common-core`'s placement module. The value is the owning org's UUID.
+/// from `pplx-space-sandbox-pod`'s placement module. The value is the owning
+/// org's UUID.
 ///
 /// Deliberately not `space.pplx.net/dedicated`, which is the cred-authority
 /// fence: only one taint per key+effect is allowed, and a reconciler enumerating

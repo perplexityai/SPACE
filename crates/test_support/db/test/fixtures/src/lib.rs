@@ -238,7 +238,7 @@ pub async fn raise_sqlstate(pool: &PgPool, sqlstate: &str) -> sqlx::Error {
         sqlstate.len() == 5 && sqlstate.bytes().all(|byte| byte.is_ascii_alphanumeric()),
         "a SQLSTATE is five alphanumeric characters, got {sqlstate:?}"
     );
-    // No `sql!` locator: this crate has `pplx-space-common-core` only as a
+    // No `sql!` locator: this crate has `pplx-space-sql-locator` only as a
     // dev-dependency, which is also why its other runtime-built statements go
     // unwrapped. The locator exists to attribute production SQL in
     // `pg_stat_activity`; nothing here runs outside a test.

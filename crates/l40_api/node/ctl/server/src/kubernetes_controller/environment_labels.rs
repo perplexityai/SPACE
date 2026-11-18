@@ -1,8 +1,8 @@
 //! This node's environment labels: one per environment its latest complete
 //! execution inventory lists as usable (`environment_label_key` in
-//! common-core). With the environment placement gate on, a sandbox pod bound
-//! to an environment requires its label, so these labels are what lets
-//! kube-scheduler place bound work.
+//! `pplx-space-sandbox-pod`). With the environment placement gate on, a
+//! sandbox pod bound to an environment requires its label, so these labels
+//! are what lets kube-scheduler place bound work.
 //!
 //! The labels follow node-manager's own report, the same observation node-ctl
 //! publishes to the cluster:

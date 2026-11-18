@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Regression test for affected_lint_crates, isolated_crate_shard and
-# isolated_crates_to_lint in ci/scripts/lib/rust-isolated-crates.sh, on a
-# synthetic workspace: `a`, `b`
+# Regression test for isolated_crates, affected_lint_crates,
+# isolated_crate_shard and isolated_crates_to_lint in
+# ci/scripts/lib/rust-isolated-crates.sh. isolated_crates is checked on a
+# small workspace of its own; the others on a synthetic workspace: `a`, `b`
 # depending on `a`, `e` depending on `b`, `c` on its own, and `d`, which
 # includes a file from `a`'s directory by a literal path and another through
 # CARGO_MANIFEST_DIR. A local directory registry stands in for crates.io: `b`
@@ -82,6 +83,35 @@ listed=$'a\nb\nc\nd\ne'
 
 # Every case runs; those that fail are named at the end.
 failures=()
+
+# isolated_crates names every library, whatever its crate type, and no
+# package without one, on a workspace of its own so the other cases keep
+# theirs: `lib`, a plain library, `cdylib`, a cdylib-only library, `macro`, a
+# proc-macro library, and `bin`, a binary with no library.
+kinds="${tmp_dir}/kinds"
+mkdir -p "${kinds}"
+cat >"${kinds}/Cargo.toml" <<'EOF'
+[workspace]
+members = ["lib", "cdylib", "macro", "bin"]
+resolver = "2"
+EOF
+for name in lib cdylib macro bin; do
+    mkdir -p "${kinds}/${name}/src"
+    printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n' "${name}" \
+        >"${kinds}/${name}/Cargo.toml"
+done
+: >"${kinds}/lib/src/lib.rs"
+: >"${kinds}/cdylib/src/lib.rs"
+printf '\n[lib]\ncrate-type = ["cdylib"]\n' >>"${kinds}/cdylib/Cargo.toml"
+: >"${kinds}/macro/src/lib.rs"
+printf '\n[lib]\nproc-macro = true\n' >>"${kinds}/macro/Cargo.toml"
+printf 'fn main() {}\n' >"${kinds}/bin/src/main.rs"
+(cd "${kinds}" && cargo metadata --offline --format-version 1 --no-deps) >"${tmp_dir}/kinds.json"
+selected="$(isolated_crates "${tmp_dir}/kinds.json" | tr '\n' ' ')"
+if [[ "${selected% }" != "cdylib lib macro" ]]; then
+    echo "isolated_crates: expected 'cdylib lib macro', got '${selected% }'" >&2
+    failures+=("isolated_crates")
+fi
 
 # Commits, on the base, what COMMAND changes in the fixture, and checks that
 # affected_lint_crates names EXPECTED for it; its log stays in stderr.

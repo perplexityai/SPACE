@@ -6,9 +6,6 @@
 //! contract shared with the Go shim ([`env`]), the positive durations that
 //! time sandbox readiness, retries, uptime and snapshots ([`time`]), and the
 //! spaced guest socket paths ([`linux::paths`]).
-//!
-//! It is its own crate so that code can name these values without depending
-//! on `pplx-space-common-core`: import them from here.
 
 pub mod env;
 pub mod linux;

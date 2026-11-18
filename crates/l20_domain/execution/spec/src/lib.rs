@@ -8,8 +8,7 @@
 //! `execution` and `environment` refer to each other (execution metadata names
 //! its environment reference, and an environment is built from execution
 //! identities), so they share a crate with the runtime, compute and host CPU
-//! types they are built from. It is its own crate so that code can name these
-//! types without depending on `pplx-space-common-core`: import them from here.
+//! types they are built from.
 
 use pplx_space_byte_size as size;
 use pplx_space_content_digest::{Digest, DigestParseError};

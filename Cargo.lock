@@ -5507,16 +5507,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-common-core"
-version = "0.8.2"
-dependencies = [
- "pplx-space-byte-size",
- "pplx-space-execution-spec",
- "pplx-space-sandbox-model",
- "pplx-space-template-model",
-]
-
-[[package]]
 name = "pplx-space-common-grpc"
 version = "0.8.2"
 dependencies = [

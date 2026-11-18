@@ -799,10 +799,10 @@ mod kubernetes_tests {
     ///
     /// Driven through `eligible_start_node_count` rather than the matcher
     /// directly: equality-on-every-entry is owned and tested one layer down,
-    /// in `common-core`'s `node_selector::tests`, so what this asserts is the
-    /// api-crate delta — that the count admission actually gates on carries
-    /// the extra labels through, and reports a confident zero rather than
-    /// counting a partially-labeled worker.
+    /// in `pplx-space-sandbox-pod`'s `node_selector::tests`, so what this
+    /// asserts is the api-crate delta — that the count admission actually
+    /// gates on carries the extra labels through, and reports a confident zero
+    /// rather than counting a partially-labeled worker.
     #[tokio::test(flavor = "current_thread")]
     async fn sandbox_start_candidate_selector_requires_extra_labels() {
         let capacity_class = "space.pplx.net/capacity-class";
@@ -1404,7 +1404,7 @@ mod kubernetes_tests {
             .and_then(serde_json::Value::as_object)
             .expect("created pod request should carry annotations");
         // Golden snapshots pin the rest of the restore-branch annotation set
-        // (`sandbox_pod_restore*.snap` in `pplx-space-common-core`), so it is
+        // (`sandbox_pod_restore*.snap` in `pplx-space-sandbox-pod`), so it is
         // not re-asserted here.
         assert_eq!(
             annotation_value(annotations, SANDBOX_CHECKPOINT_ANNOTATION),

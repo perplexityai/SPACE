@@ -5,9 +5,6 @@
 //! address can all be encoded as small numbers or IPv4 addresses, but they mean
 //! different things when configuring NAT, firewall rules, and guest interfaces.
 //!
-//! They are their own crate so that code can name them without depending on
-//! `pplx-space-common-core`: import them from here.
-//!
 //! # Examples
 //!
 //! ```rust
