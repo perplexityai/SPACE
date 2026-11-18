@@ -366,6 +366,13 @@ impl CompiledEnvironment {
                 "12.0.0",
                 true,
             ),
+            (
+                "fc-1.17.0-linux-6.1.155-bpf-modsig-nft",
+                "1.17.0",
+                "6.1.155-bpf-modsig-nft",
+                "12.0.0",
+                true,
+            ),
         ]
         .into_iter()
         .map(|(name, runtime, kernel, state_version, memory_state)| {
