@@ -12,7 +12,8 @@ environment (`uv run`), and reads the same variables the runner reads.
 summary.md, summary.json and timeline.txt there, and exits as the typed suite
 ranks a suite (space_smoke/suite.py, suite_exit_code): 1 when any scenario
 failed; else 2 when a bench did not come up, a scenario was inconclusive or did
-not finish, or the benches did not cover the inventory exactly once; else 42
+not finish, a pass exited 2 outside any scenario, or the benches did not cover
+the inventory exactly once; else 42
 when a scenario warned; else 0. A failure the known-failures list excused
 (`KNOWN FAILURE <id>` in its pass) is listed and does not count as one, and a
 scenario a bench's mode skipped after the partition counts as covered. It

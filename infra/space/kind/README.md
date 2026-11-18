@@ -357,7 +357,8 @@ inventory exactly once: each (surface, scenario) pair has one `=== RUN`, or was
 skipped by a bench's mode after the partition, which counts as covered. The
 script exits as the typed suite ranks a suite: 1 when any scenario failed;
 else 2 when a bench did not come up, a scenario was inconclusive or did not
-finish, or the coverage check failed; else 42 when a scenario warned; else 0.
+finish, a pass exited 2 outside any scenario, or the coverage check failed;
+else 42 when a scenario warned; else 0.
 A failure the known-failures list (`SPACE_SMOKE_KNOWN_FAILURES`) excused is
 listed but does not fail the run. Without `--benches` it picks N
 from the host's CPUs, available memory, free disk and a short write-throughput
@@ -382,8 +383,9 @@ benches' links, and two registry containers on the host's Docker that keep
 running between runs. A run's exit removes its benches; `teardown` also stops
 the registries and removes the interface and the chain. The registries' data
 and the seed stay in `<bench root>/cache` (default `~/.space-benches/cache`);
-delete that directory yourself (with `sudo`: the registries write as root) to
-reclaim the space. The registries take no credentials: the layer cache is
+to reclaim the space, run `teardown` first (the registries keep running between
+runs with that directory mounted), then delete it yourself (with `sudo`: the
+registries write as root). The registries take no credentials: the layer cache is
 local to the host, and any local user can write it. The loop nodes, the raised limits, the modules,
 the static Docker release and the lock directory stay.
 

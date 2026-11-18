@@ -36,8 +36,9 @@
 #                (default: ~/.space-devbox/kind-parallel/<run id>)
 #
 # Exit status: as the typed suite ranks a suite: 1 a scenario failed; else 2
-# a bench did not come up, a scenario was inconclusive or unfinished, or the
-# coverage check failed; else 42 a scenario warned; else 0.
+# a bench did not come up, a scenario was inconclusive or unfinished, a pass
+# exited 2 outside any scenario, or the coverage check failed; else 42 a
+# scenario warned; else 0.
 #
 # Env: SPACE_KIND_SUBSTRATE, SPACE_KIND_STORAGE_CREDENTIALS, SPACE_KIND_RUST_BUILD,
 # SPACE_SMOKE_TIERS (default routine), SPACE_SMOKE_INCLUDE_SCENARIOS,
@@ -424,7 +425,11 @@ on_exit() {
     log "--keep: benches left up; remove them with: $0 teardown"
   elif (( KEEP == 0 )); then
     keep_failed_bench_logs
-    phase run teardown teardown_all >"$OUT/teardown.log" 2>&1 || true
+    # A log that can't be written (a full volume, OUT removed) must not skip the
+    # teardown: fall back to discarding its output.
+    local teardown_log="$OUT/teardown.log"
+    : >>"$teardown_log" 2>/dev/null || teardown_log=/dev/null
+    phase run teardown teardown_all >"$teardown_log" 2>&1 || true
     rm -f "$HOST/shared-images.tar" "$HOST/rust/kind-rust.tar.gz"
   fi
   if (( ! FINISHED )); then
@@ -797,7 +802,9 @@ FINISHED=1
 # Torn down before the summary, so its time is in it.
 if (( ! KEEP )); then
   keep_failed_bench_logs || true
-  phase run teardown teardown_all >"$OUT/teardown.log" 2>&1 || true
+  teardown_log="$OUT/teardown.log"
+  : >>"$teardown_log" 2>/dev/null || teardown_log=/dev/null
+  phase run teardown teardown_all >"$teardown_log" 2>&1 || true
   rm -f "$HOST/shared-images.tar" "$HOST/rust/kind-rust.tar.gz"
   KEEP=2
 fi
