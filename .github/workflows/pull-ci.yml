@@ -92,7 +92,10 @@ jobs:
           SPACE_KIND_CONSOLE_SMOKE: 'off'
         run: |
           set -euo pipefail
-          needed="$(bash ci/scripts/kind-pull-needed.sh "${PULL_REQUEST_HEAD}")"
+          # Only the main path list honours the label's force: placement and
+          # console scenarios still run only for their own paths.
+          needed="$(SPACE_KIND_PULL_FORCE="${SPACE_KIND_PULL_OPT_IN}" \
+            bash ci/scripts/kind-pull-needed.sh "${PULL_REQUEST_HEAD}")"
           placement="$(SPACE_KIND_PULL_PATHS=ci/kind-placement-paths.txt \
             bash ci/scripts/kind-pull-needed.sh "${PULL_REQUEST_HEAD}")"
           if [[ "${needed}" == false ]]; then
@@ -112,13 +115,6 @@ jobs:
             off) ;;
             *) echo "SPACE_KIND_CONSOLE_SMOKE must be on or off, not '${SPACE_KIND_CONSOLE_SMOKE}'." >&2; exit 1 ;;
           esac
-          # The kind-smoke label runs the smoke when no path list selected
-          # it. It changes only `needed`: placement and console scenarios
-          # still run only for their own paths.
-          if [[ "${needed}" == false && "${SPACE_KIND_PULL_OPT_IN}" == true ]]; then
-            echo "::notice title=Kind smoke forced::No Kind smoke path changed; the kind-smoke label requires the smoke anyway." >&2
-            needed=true
-          fi
           printf 'needed=%s\nconsole=%s\nplacement=%s\n' "${needed}" "${console}" "${placement}" >>"${GITHUB_OUTPUT}"
 
       # Named here, where the synthetic merge is checked out; space-pull-ci
