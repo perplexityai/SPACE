@@ -342,6 +342,11 @@ const FIRECRACKER_KERNELS: &[CompiledKernel] = &[
     },
 ];
 
+/// Firecracker guest kernels SPACE builds itself from
+/// `templates/firecracker/kernel/`, not Firecracker CI images. Only the
+/// opt-in SPACE-published kernel source offers them.
+const SPACE_FIRECRACKER_KERNELS: &[CompiledKernel] = &[];
+
 /// One file of a pinned release, at its release-layout path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PinnedFile {
@@ -671,6 +676,7 @@ impl RuntimeCatalog {
         }
         for (runtime, compiled) in FIRECRACKER_KERNELS
             .iter()
+            .chain(SPACE_FIRECRACKER_KERNELS)
             .map(|pin| (RuntimeKind::Firecracker, pin))
             .chain(
                 CLOUD_HYPERVISOR_KERNELS
@@ -678,29 +684,20 @@ impl RuntimeCatalog {
                     .map(|pin| (RuntimeKind::CloudHypervisor, pin)),
             )
         {
-            let entry = || format!("kernel {} {}", compiled.version, compiled.architecture);
-            let field = |field, value| CatalogError::Compiled {
-                entry: entry(),
-                field,
-                value,
-            };
-            catalog.kernels.push(PinnedKernel {
-                version: ArtifactVersion::parse(compiled.version)
-                    .map_err(|_| field("version", compiled.version))?,
-                runtime,
-                runtime_line: RuntimeVersion::parse(compiled.runtime_line)
-                    .map_err(|_| field("runtime_line", compiled.runtime_line))?,
-                architecture: compiled
-                    .architecture
-                    .parse()
-                    .map_err(|_| field("architecture", compiled.architecture))?,
-                size: compiled.size,
-                sha256: sha256_hex(compiled.sha256)
-                    .ok_or_else(|| field("sha256", compiled.sha256))?,
-            });
+            catalog.kernels.push(compiled_kernel(runtime, compiled)?);
         }
         catalog.boot_artifacts.push(uefi::firmware()?);
         Ok(catalog)
+    }
+
+    /// The Firecracker kernels SPACE builds and publishes itself, which an
+    /// operator-configured SPACE kernel source may offer. Exactly the compiled
+    /// pins: catalog files cannot add to this allowlist.
+    pub fn space_published_kernels() -> Result<Vec<PinnedKernel>, CatalogError> {
+        SPACE_FIRECRACKER_KERNELS
+            .iter()
+            .map(|compiled| compiled_kernel(RuntimeKind::Firecracker, compiled))
+            .collect()
     }
 
     /// The compiled table plus every `*.json` file in `dir`. A missing
@@ -950,6 +947,30 @@ impl RuntimeCatalog {
                 && pinned.architecture == architecture
         })
     }
+}
+
+fn compiled_kernel(
+    runtime: RuntimeKind,
+    compiled: &'static CompiledKernel,
+) -> Result<PinnedKernel, CatalogError> {
+    let field = |field, value| CatalogError::Compiled {
+        entry: format!("kernel {} {}", compiled.version, compiled.architecture),
+        field,
+        value,
+    };
+    Ok(PinnedKernel {
+        version: ArtifactVersion::parse(compiled.version)
+            .map_err(|_| field("version", compiled.version))?,
+        runtime,
+        runtime_line: RuntimeVersion::parse(compiled.runtime_line)
+            .map_err(|_| field("runtime_line", compiled.runtime_line))?,
+        architecture: compiled
+            .architecture
+            .parse()
+            .map_err(|_| field("architecture", compiled.architecture))?,
+        size: compiled.size,
+        sha256: sha256_hex(compiled.sha256).ok_or_else(|| field("sha256", compiled.sha256))?,
+    })
 }
 
 /// A catalog file, as written.

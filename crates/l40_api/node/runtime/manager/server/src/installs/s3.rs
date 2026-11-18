@@ -3,8 +3,8 @@
 //! sources retain `<prefix>/v<line>/<arch>/vmlinux-<version>`.
 //!
 //! The shared object-store crate signs every request and has no listing
-//! call, so this talks to the SDK directly; a signed source for SPACE's own
-//! bucket belongs in that crate.
+//! call, so this talks to the SDK directly. SPACE's own published kernels
+//! are read, signed, by [`super::space_kernels`].
 
 use std::time::Duration;
 
@@ -195,39 +195,47 @@ impl KernelSource for S3KernelSource {
                 location: Box::new(kernel.location.clone()),
             });
         }
-        let request = self
-            .client
-            .get_object()
-            .bucket(&location.bucket)
-            .key(&location.key_prefix)
-            .send();
-        let object = tokio::time::timeout(REQUEST_TIMEOUT, request)
-            .await
-            .map_err(|_| SourceError::TimedOut {
-                location: Box::new(kernel.location.clone()),
-                after: REQUEST_TIMEOUT,
-            })?
-            .map_err(|error| SourceError::Download {
-                location: Box::new(kernel.location.clone()),
-                source: Box::new(error),
-            })?;
-        Ok(Box::pin(futures_util::stream::unfold(
-            (object.body, kernel.location.clone()),
-            |(mut body, location)| async move {
-                match body.next().await {
-                    None => None,
-                    Some(Ok(chunk)) => Some((Ok(chunk), (body, location))),
-                    Some(Err(error)) => Some((
-                        Err(SourceError::Download {
-                            location: Box::new(location.clone()),
-                            source: Box::new(error),
-                        }),
-                        (body, location),
-                    )),
-                }
-            },
-        )))
+        download(&self.client, location, &kernel.location).await
     }
+}
+
+/// Stream the object at `location`, which `kernel` records, from `client`.
+pub(super) async fn download(
+    client: &aws_sdk_s3::Client,
+    location: &StorageUri,
+    kernel: &super::source::KernelLocation,
+) -> Result<ByteChunks, SourceError> {
+    let request = client
+        .get_object()
+        .bucket(&location.bucket)
+        .key(&location.key_prefix)
+        .send();
+    let object = tokio::time::timeout(REQUEST_TIMEOUT, request)
+        .await
+        .map_err(|_| SourceError::TimedOut {
+            location: Box::new(kernel.clone()),
+            after: REQUEST_TIMEOUT,
+        })?
+        .map_err(|error| SourceError::Download {
+            location: Box::new(kernel.clone()),
+            source: Box::new(error),
+        })?;
+    Ok(Box::pin(futures_util::stream::unfold(
+        (object.body, kernel.clone()),
+        |(mut body, location)| async move {
+            match body.next().await {
+                None => None,
+                Some(Ok(chunk)) => Some((Ok(chunk), (body, location))),
+                Some(Err(error)) => Some((
+                    Err(SourceError::Download {
+                        location: Box::new(location.clone()),
+                        source: Box::new(error),
+                    }),
+                    (body, location),
+                )),
+            }
+        },
+    )))
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 use super::release_source::ReleasePayload;
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use futures_util::StreamExt as _;
 use md5::{Digest as _, Md5};
@@ -54,21 +54,35 @@ pub(crate) struct FakeSource {
     root: StorageUri,
     offered: Mutex<Vec<Offered>>,
     opens: AtomicUsize,
+    unavailable: AtomicBool,
 }
 
 impl Default for FakeSource {
     fn default() -> Self {
-        Self {
-            root: "s3://fake/firecracker-ci?region=us-east-1"
+        Self::at(
+            "s3://fake/firecracker-ci?region=us-east-1"
                 .parse()
                 .expect("fake source root is valid"),
-            offered: Mutex::default(),
-            opens: AtomicUsize::default(),
-        }
+        )
     }
 }
 
 impl FakeSource {
+    /// A source whose kernels sit under `root`'s bucket and endpoint.
+    pub(crate) fn at(root: StorageUri) -> Self {
+        Self {
+            root,
+            offered: Mutex::default(),
+            opens: AtomicUsize::default(),
+            unavailable: AtomicBool::default(),
+        }
+    }
+
+    /// Fail every listing from now on.
+    pub(crate) fn go_down(&self) {
+        self.unavailable.store(true, Ordering::SeqCst);
+    }
+
     /// Offer `bytes` as `version` for `line`, listed with their true size
     /// and MD5.
     pub(crate) fn offer(&self, line: &str, version: &str, bytes: &[u8]) -> SourceKernel {
@@ -179,6 +193,12 @@ impl KernelSource for FakeSource {
         line: RuntimeLine,
         architecture: Arch,
     ) -> Result<Vec<SourceKernel>, SourceError> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(SourceError::List {
+                location: Box::new(self.root()),
+                source: "the fake source is down".into(),
+            });
+        }
         Ok(self
             .offered
             .lock()
@@ -444,6 +464,7 @@ pub(crate) fn release_archive(version: &str, fill: u8) -> Vec<u8> {
 /// bytes it serves, and releases as a test pins them.
 pub(crate) struct TestPins {
     kernels: Arc<FakeSource>,
+    other_kernels: Mutex<Vec<PinnedKernel>>,
     releases: Mutex<Vec<PinnedRelease>>,
 }
 
@@ -451,8 +472,14 @@ impl TestPins {
     pub(crate) fn new(kernels: Arc<FakeSource>) -> Arc<Self> {
         Arc::new(Self {
             kernels,
+            other_kernels: Mutex::default(),
             releases: Mutex::default(),
         })
+    }
+
+    /// Pin a kernel the fake source does not offer.
+    pub(crate) fn pin_kernel(&self, pin: PinnedKernel) {
+        self.other_kernels.lock().expect("test pins lock").push(pin);
     }
 
     pub(crate) fn pin_release(&self, pin: PinnedRelease) {
@@ -471,7 +498,17 @@ impl PinSource for TestPins {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
-            self.kernels.pins(),
+            self.kernels
+                .pins()
+                .into_iter()
+                .chain(
+                    self.other_kernels
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter()
+                        .cloned(),
+                )
+                .collect(),
         ))
     }
 }
