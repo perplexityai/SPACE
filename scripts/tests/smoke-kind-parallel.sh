@@ -107,27 +107,37 @@ UI_CACHE_SCOPE="$(space_kind_layer_scope ui-deps)"
 # The seed the benches copy instead of building one each.
 SEED_DIR="$CACHE_ROOT/seed"
 
+# Remove every bench the host has. Returns 1, naming them, when any is left.
 teardown_all() {
-  local i pids=()
+  local i pids=() left
   for i in $(kind_bench_existing); do
     log "tearing down bench $i"
-    kind_bench_teardown "$i" &
+    # Errexit off: each step tolerates what an interrupted run left (no
+    # holder.pid, no firewall rule), and under the caller's `set -e` the first
+    # such miss ended the teardown before the bench was removed.
+    ( set +e; kind_bench_teardown "$i" ) &
     pids+=("$!")
   done
   wait ${pids[@]+"${pids[@]}"} || true
   # The benches' checkouts went with their directories.
   git -C "$REPO_ROOT" worktree prune
+  left="$(kind_bench_existing | tr '\n' ' ')"
+  if [[ -n "${left// /}" ]]; then
+    log "benches still present after teardown: $left"
+    return 1
+  fi
 }
 
 kind_bench_platform
 kind_bench_lock
 if [[ "$COMMAND" == teardown ]]; then
   sudo -n true 2>/dev/null || die "teardown needs passwordless sudo"
-  teardown_all
+  status=0
+  teardown_all || status=2
   # The registries' data stays in $CACHE_ROOT for the next run.
   docker rm -f "$MIRROR_NAME" "$CACHE_NAME" >/dev/null 2>&1 || true
   sudo -n ip link del "$REGISTRY_LINK" 2>/dev/null || true
-  exit 0
+  exit "$status"
 fi
 
 # Refusals (no sudo, no KVM, a missing tool, a loopback resolver) print here,
@@ -205,7 +215,7 @@ mkdir -p "$KIND_BENCH_ROOT" 2>/dev/null || sudo -n install -d -o "$(id -u)" -g "
 stale="$(kind_bench_existing | tr '\n' ' ')"
 if [[ -n "${stale// /}" ]]; then
   log "removing benches left by an earlier run: $stale"
-  teardown_all
+  teardown_all || die "could not remove the benches an earlier run left; see the lines above"
 fi
 
 if [[ -z "$BENCHES" ]]; then
