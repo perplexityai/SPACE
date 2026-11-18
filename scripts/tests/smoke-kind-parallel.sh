@@ -119,9 +119,9 @@ CACHE_PORT=5001
 LAYER_CACHE="localhost:$CACHE_PORT/space-kind-build-cache"
 # The whole UI build goes into the scope of its cached deps stage
 # (runtime-image-cache.sh), which every UI build already imports, so a bench's
-# Tilt build of the UI is a cache hit without a pre-build. A scope of its own
-# beside that one measured as a miss on two of four benches: BuildKit took the
-# deps stage's result from either import, and only one led on to the rest.
+# Tilt build of the UI is a cache hit without a pre-build. Not a scope of its
+# own beside that one: BuildKit may then take the deps stage's result from
+# either import, and only one leads on to the rest of the build.
 # shellcheck source=../../infra/space/kind/lib/build-cache.sh
 source "$REPO_ROOT/infra/space/kind/lib/build-cache.sh"
 UI_CACHE_SCOPE="$(space_kind_layer_scope ui-deps)"
@@ -218,8 +218,7 @@ teardown_all() {
   for i in $(kind_bench_existing); do
     log "tearing down bench $i"
     # Errexit off: each step tolerates what an interrupted run left (no
-    # holder.pid, no firewall rule), and under the caller's `set -e` the first
-    # such miss ended the teardown before the bench was removed.
+    # holder.pid, no firewall rule), so no such miss may end the teardown.
     ( set +e; kind_bench_teardown "$i" ) &
     pids+=("$!")
   done
@@ -275,21 +274,15 @@ kind_bench_preflight
 # Default N: the smallest of what the host's CPUs, available memory, free disk
 # and the bench volume's write throughput allow, at most 6. A bench is one
 # 16-core CI runner's work but mostly waits; it holds about 50 GB of disk at its
-# peak and 6 GiB of memory, and comes up in bursts of CPU and disk writes, all
-# N at once. Measured (see "The whole suite on one host" in
-# infra/space/kind/README.md):
+# peak and 6 GiB of memory, and all N come up at once, in bursts of CPU and of
+# disk writes, so N bring-ups take as long as the volume needs to write N
+# benches' data while the typed phase shrinks as 1/N. Hence:
 #   - CPUs / 8 and available memory / 16 GiB (MemAvailable, so other work on
-#     the host counts); free disk / 60 GB under $KIND_BENCH_ROOT.
-#   - Write throughput / 70 MB/s. A bench writes 55-60 GB while it comes up
-#     (55.5, 55.9, 57.0 and 59.8 GB per bench at N=1, 4, 5 and 4), and N
-#     bring-ups take as long as the volume needs for N times that: on a volume
-#     measured at 326 MB/s here (about 410 MB/s sustained with the page cache)
-#     the last baseline passed after 4:56 at N=1, 9:13 at N=4, 11:22 at N=5
-#     and 13:50 at N=6, while the typed phase shrinks as 48 min / N. The sum
-#     was lowest at N=4-5 (22:43-23:49) and N=6 no faster (25:12): about
-#     326 / 4.7 = 70 MB/s of the probe's figure per bench.
-#   - At most 6: the most benches measured, and N=6 was already slower than
-#     N=4-5 on that volume; only a faster volume would justify more.
+#     the host counts); free disk / 60 GB under $KIND_BENCH_ROOT;
+#   - the probed write throughput / 70 MB/s;
+#   - at most 6, the most benches that have run.
+# "The whole suite on one host" in infra/space/kind/README.md has the
+# measurements behind each figure.
 # The probe writes 1 GiB with O_DIRECT into a temporary file it removes, so
 # it measures the volume rather than the page cache (a few seconds).
 write_probe_mbps() {
@@ -398,8 +391,8 @@ log "run $RUN_ID: output in $OUT"
 # A step's status is its own: every step runs as `phase ... || ...` or under
 # `if`, where bash ignores `set -e` for the whole step body, a subshell's
 # `set -e` and an asynchronous one's included (tried). So every command in a
-# step that can fail is followed by `|| return 1`: without it a failed Rust
-# build went on to save and hand over the image the host already had.
+# step that can fail is followed by `|| return 1`, or the step goes on past
+# the failure.
 TIMINGS="$OUT/timings.tsv"
 : >"$TIMINGS"
 phase() {
@@ -567,7 +560,7 @@ prepare_host() {
   # N benches' node caches, encrypted sandboxes and seed builds take indices
   # far past the eight a fresh host has, and a seed build whose container
   # lacks the node for the index it was handed fails ("cannot mount seed
-  # image"); measured with four benches. Staged before any bench container
+  # image"). Staged before any bench container
   # exists, every container's /dev has the nodes.
   # shellcheck source=../lib/space-loop-devices.sh
   SPACE_LOOP_DEVICE_TARGET="${SPACE_LOOP_DEVICE_TARGET:-$(( 64 + 128 * BENCHES ))}" \

@@ -276,8 +276,8 @@ kind_bench_pidns_up() {
 # runners take their CPU and memory where the bench's Kind nodes do, not from
 # the cgroup of the shell that started the run. On a host whose own Docker
 # keeps containers outside the caller's limits (a Docker sidecar does), that
-# caller may be capped well below the host; a 16-CPU cap throttled four
-# benches' image loads (measured with cpu.stat). Prints the cgroup directory.
+# caller may be capped well below the host, and every bench would share its
+# cap. Prints the cgroup directory.
 kind_bench_cgroup() { # <i> <leaf>
   local dir
   dir="/sys/fs/cgroup/$(kind_bench_ns "$1")/$2"
