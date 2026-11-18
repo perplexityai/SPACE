@@ -9,8 +9,12 @@
 # Usage: ci/scripts/kind-pull-needed.sh <pull-request-head-sha>
 #
 # SPACE_KIND_PULL_DRAFT=true marks a draft; SPACE_KIND_PULL_OPT_IN=true, which
-# Pull CI sets from the kind-smoke label, opts it in. Each is `true`, `false`
-# or unset, which is `false`.
+# Pull CI sets from the kind-smoke label, opts it in. SPACE_KIND_PULL_FORCE=true,
+# which Pull CI also sets from that label for the main path list only, prints
+# `true` when no listed path changed: the label asks for the smoke whatever the
+# pull request changes, so an author can get Kind evidence for a runtime change
+# the path list does not select. Each is `true`, `false` or unset, which is
+# `false`.
 #
 # Run from GitHub's synthetic merge of the PR (the default pull_request
 # checkout) with its parents fetched. The change set is that merge against its
@@ -24,7 +28,9 @@ PATHS_FILE="${SPACE_KIND_PULL_PATHS:-${SCRIPT_DIR}/../kind-pull-paths.txt}"
 pull_request_head="${1:-}"
 draft="${SPACE_KIND_PULL_DRAFT:-false}"
 opt_in="${SPACE_KIND_PULL_OPT_IN:-false}"
-for flag in "SPACE_KIND_PULL_DRAFT=${draft}" "SPACE_KIND_PULL_OPT_IN=${opt_in}"; do
+force="${SPACE_KIND_PULL_FORCE:-false}"
+for flag in "SPACE_KIND_PULL_DRAFT=${draft}" "SPACE_KIND_PULL_OPT_IN=${opt_in}" \
+    "SPACE_KIND_PULL_FORCE=${force}"; do
     case "${flag#*=}" in
         true | false) ;;
         *) echo "${flag%%=*} must be true or false, not '${flag#*=}'." >&2; exit 1 ;;
@@ -69,6 +75,9 @@ if [[ -n "${changed}" ]]; then
         printf 'deferred\n'
         exit 0
     fi
+    printf 'true\n'
+elif [[ "${force}" == true ]]; then
+    echo "No Kind smoke path changed; the kind-smoke label requires the smoke anyway." >&2
     printf 'true\n'
 else
     echo "No Kind smoke path changed." >&2
