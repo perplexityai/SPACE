@@ -44,6 +44,7 @@ fn test_admin_node_row() -> AdminNodeRow {
         drain_started_at: None,
         drain_last_error: None,
         drain_engine: None,
+        drain_status: None,
         terminate_decrement_capacity: false,
         node_group_id: None,
         metadata: None,
@@ -3097,4 +3098,26 @@ async fn node_holds_reports_each_row_with_its_gates_and_refuses_as_its_siblings(
     member.role = UserRole::Member;
     assert_eq!(holds(member, node_id).await.status(), StatusCode::FORBIDDEN);
     Ok(())
+}
+
+#[test]
+fn the_evacuation_cap_is_validated_only_while_drain_v2_is_on() {
+    for raw in ["0", "1025", "four", ""] {
+        assert!(
+            drain_v2_max_evacuating_nodes(true, Some(raw)).is_err(),
+            "{raw:?} must stop an API with drain v2 on from starting"
+        );
+        assert_eq!(
+            drain_v2_max_evacuating_nodes(false, Some(raw)),
+            Ok(drain_v2::DEFAULT_DRAIN_V2_MAX_EVACUATING_NODES),
+            "{raw:?} must be ignored while drain v2 is off"
+        );
+    }
+    for enabled in [true, false] {
+        assert_eq!(drain_v2_max_evacuating_nodes(enabled, Some(" 2 ")), Ok(2));
+        assert_eq!(
+            drain_v2_max_evacuating_nodes(enabled, None),
+            Ok(drain_v2::DEFAULT_DRAIN_V2_MAX_EVACUATING_NODES)
+        );
+    }
 }
