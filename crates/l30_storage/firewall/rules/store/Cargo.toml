@@ -9,8 +9,8 @@ publish.workspace = true
 
 [package.metadata.space.state]
 postgres = [
-    "firewall_rollouts",
-    "firewall_rollout_items",
+    "firewall_rules_rollouts",
+    "firewall_rules_rollout_items",
     "firewall_rules_revisions",
     "firewall_rules_control",
     "firewall_rules_node_assignments",
