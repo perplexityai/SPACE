@@ -16,6 +16,7 @@ use pplx_space_node_model::{
     NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId, NodeManagedBy,
     NodeRole,
 };
+use pplx_space_node_registration_store::drain_v2;
 use pplx_space_sandbox_model::SandboxId;
 #[cfg(test)]
 use pplx_space_sandbox_portability::drain_gate_blocker_pairs;
@@ -72,6 +73,8 @@ pub(super) struct AdminNodeRow {
     pub(super) drain_mode: Option<String>,
     pub(super) drain_started_at: Option<OffsetDateTime>,
     pub(super) drain_last_error: Option<String>,
+    pub(super) drain_engine: Option<String>,
+    pub(super) drain_status: Option<sqlx::types::Json<serde_json::Value>>,
     pub(super) terminate_decrement_capacity: bool,
     pub(super) node_group_id: Option<NodeGroupId>,
     pub(super) metadata: Option<sqlx::types::Json<serde_json::Value>>,
@@ -372,6 +375,8 @@ const ADMIN_NODE_SELECT: &str = "SELECT n.id,
        n.drain_mode,
        n.drain_started_at,
        n.drain_last_error,
+       n.drain_engine,
+       n.drain_status,
        n.terminate_decrement_capacity,
        n.node_group_id,
        nd.metadata,
@@ -1204,14 +1209,21 @@ pub(super) async fn is_node_wake_gate_closed(
     pool: &PgPool,
     node_id: NodeId,
 ) -> Result<bool, sqlx::Error> {
-    let row: Option<(Option<NodeDrainPhase>, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT drain_phase, drain_mode FROM nodes WHERE id = $1"
-    ))
-    .bind(node_id)
-    .fetch_optional(pool)
-    .await?;
+    static DRAIN_COLUMNS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let drain_v2_waiting = drain_v2::GATE_COLUMN;
+        sql!(format!(
+            "SELECT n.drain_phase, n.drain_mode, {drain_v2_waiting} FROM nodes n WHERE n.id = $1"
+        ))
+    });
+    type Row = (Option<NodeDrainPhase>, Option<String>, Option<bool>);
+    let row: Option<Row> = sqlx::query_as(sqlx::AssertSqlSafe(DRAIN_COLUMNS.as_str()))
+        .bind(node_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row
-        .and_then(|(phase, mode)| NodeDrainState::from_columns(phase, mode.as_deref()))
+        .and_then(|(phase, mode, v2_waiting)| {
+            drain_v2::gate_drain_state(phase, mode.as_deref(), v2_waiting)
+        })
         .is_some_and(NodeDrainState::blocks_placement))
 }
 

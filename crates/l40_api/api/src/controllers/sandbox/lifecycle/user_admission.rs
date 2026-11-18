@@ -10,6 +10,8 @@ use super::SandboxAction;
 
 #[cfg(test)]
 pub(crate) mod recorded;
+#[cfg(test)]
+mod supersession_tests;
 
 /// A lifecycle request a user made, named for what they asked. A wake that their command or
 /// access implies counts too, even when it is queued as the system's wake, with no actor.
@@ -111,4 +113,94 @@ pub(crate) fn admit_user_lifecycle(
     #[cfg(test)]
     recorded::record(sandbox_id, request);
     UserLifecycleAdmission::Admitted
+}
+
+/// The lifecycle verb a user's call `action` supersedes a drain restore of
+/// the sandbox as, if it does: the same rule an operation's kind follows at
+/// admission ([`crate::public_operations::supersedes_drain_restore`]). It
+/// changes the lifecycle of a `suspended` sandbox, the only one a drain
+/// restore waits for, or asks for one. An implicit wake supersedes as a
+/// wake.
+pub(crate) fn drain_restore_superseding_action(
+    action: SandboxAction,
+) -> Option<pplx_space_public_api::SandboxLifecycleAction> {
+    use pplx_space_public_api::SandboxLifecycleAction as Verb;
+    match action {
+        SandboxAction::Start => Some(Verb::Start),
+        SandboxAction::Wake | SandboxAction::ImplicitWake(_) => Some(Verb::Wake),
+        SandboxAction::Restore => Some(Verb::Restore),
+        SandboxAction::Suspend => Some(Verb::Suspend),
+        SandboxAction::Stop => Some(Verb::Stop),
+        SandboxAction::Kill => Some(Verb::Kill),
+        // Both need a resident VM, which a suspended sandbox doesn't have:
+        // the call gets the answer it would get without a drain, and the
+        // restore brings back the VM it can act on.
+        SandboxAction::Resume | SandboxAction::Pause => None,
+        // A checkpoint answers unavailable on a suspended sandbox without
+        // waking it; the snapshot settings are metadata.
+        SandboxAction::Checkpoint
+        | SandboxAction::EnableSnapshots
+        | SandboxAction::DisableSnapshots => None,
+        // `action` refuses these; a rollback and an update run through their
+        // own operations, whose kinds are judged at admission.
+        SandboxAction::Stats
+        | SandboxAction::OpenPort
+        | SandboxAction::Rollback
+        | SandboxAction::Spaced
+        | SandboxAction::Update => None,
+    }
+}
+
+/// Whether `sandbox_id` has a drain restore queued or running: the only
+/// thing a user's call on a `suspended` sandbox can supersede, and what its
+/// cancel then waits on and locks. One read of `public_operations` by its
+/// target index; nothing enqueues a drain restore unless a v2 drain runs.
+pub(crate) async fn drain_restore_active(
+    pool: &sqlx::PgPool,
+    org_id: pplx_space_accounts::OrgId,
+    sandbox_id: SandboxId,
+) -> Result<bool, sqlx::Error> {
+    use crate::public_operations::StoredOperationKind;
+    use pplx_space_public_api::{OperationState, OperationTargetType, PublicSandboxId};
+    sqlx::query_scalar(pplx_space_sql_locator::sql!(
+        "SELECT EXISTS (
+           SELECT 1
+             FROM public_operations
+            WHERE org_id = $1
+              AND target_type = $2
+              AND target_id = $3
+              AND kind = $4
+              AND state IN ($5, $6)
+         )"
+    ))
+    .bind(org_id)
+    .bind(OperationTargetType::Sandbox.as_str())
+    .bind(PublicSandboxId::from(sandbox_id).to_string())
+    .bind(StoredOperationKind::DrainRestoreSandbox.as_str())
+    .bind(OperationState::Queued.as_str())
+    .bind(OperationState::Running.as_str())
+    .fetch_one(pool)
+    .await
+}
+
+/// Whether a user's call on a `suspended` sandbox goes on to cancel the
+/// drain restores it supersedes, from [`drain_restore_active`]'s answer:
+/// only when one is active. A lookup that fails is logged and the call goes
+/// on as it would without drain v2, cancelling nothing, rather than failing
+/// a call that has nothing of the drain's to cancel.
+pub(crate) fn cancels_drain_restores(
+    sandbox_id: SandboxId,
+    active: Result<bool, sqlx::Error>,
+) -> bool {
+    match active {
+        Ok(active) => active,
+        Err(error) => {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                %error,
+                "could not look up the sandbox's drain restores; the call cancels none"
+            );
+            false
+        }
+    }
 }

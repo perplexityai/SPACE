@@ -116,6 +116,7 @@ pplx-space-sandbox-pod = { workspace = true, optional = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-registration-store = { workspace = true }
+pplx-space-node-drain = { workspace = true, features = ["serde"] }
 pplx-space-cluster-trigger-queue = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }

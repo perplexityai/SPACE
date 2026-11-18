@@ -13,7 +13,8 @@ use pplx_space_k8s_ids::PodUid;
 use pplx_space_network_roles::GuestPort;
 use pplx_space_node_api_client::{NodeApiClient, WorkerApiClient};
 use pplx_space_node_mgr_client::proto::{AllowPortRequest, NetworkProtocol};
-use pplx_space_node_model::{NodeDrainPhase, NodeDrainState, NodeManagedBy};
+use pplx_space_node_model::{NodeDrainPhase, NodeManagedBy};
+use pplx_space_node_registration_store::drain_v2;
 use pplx_space_sandbox_model::{
     ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
 };
@@ -85,18 +86,24 @@ async fn ensure_sandbox_service_route_node_not_draining(
     // guard and the user-API drain gates cannot drift: `forced` + `draining`
     // races the evacuation pipeline, and `drained` / `terminating` block in
     // either mode because the node is about to be destroyed.
-    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT drain_phase, drain_mode FROM nodes WHERE id = $1"
-    ))
-    .bind(active_node_id.as_uuid())
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| {
-        Status::internal(format!(
-            "load sandbox service route node drain state: {error}"
+    static DRAIN_COLUMNS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let drain_v2_waiting = drain_v2::GATE_COLUMN;
+        sql!(format!(
+            "SELECT n.drain_phase, n.drain_mode, {drain_v2_waiting} FROM nodes n WHERE n.id = $1"
         ))
-    })?;
-    let Some((drain_phase, drain_mode)) = row else {
+    });
+    // The phase, the mode and drain_v2::GATE_COLUMN.
+    type DrainColumns = (Option<String>, Option<String>, Option<bool>);
+    let row: Option<DrainColumns> = sqlx::query_as(sqlx::AssertSqlSafe(DRAIN_COLUMNS.as_str()))
+        .bind(active_node_id.as_uuid())
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "load sandbox service route node drain state: {error}"
+            ))
+        })?;
+    let Some((drain_phase, drain_mode, drain_v2_waiting)) = row else {
         return Ok(());
     };
     let drain_phase = drain_phase
@@ -104,7 +111,8 @@ async fn ensure_sandbox_service_route_node_not_draining(
         .map(NodeDrainPhase::parse)
         .transpose()
         .map_err(|err| Status::internal(format!("node has an unrecognized drain phase: {err}")))?;
-    let drain_state = NodeDrainState::from_columns(drain_phase, drain_mode.as_deref());
+    let drain_state =
+        drain_v2::gate_drain_state(drain_phase, drain_mode.as_deref(), drain_v2_waiting);
     if let Some(state) = drain_state.filter(|state| state.blocks_placement()) {
         return Err(Status::failed_precondition(format!(
             "sandbox service route cannot open port while sandbox {sandbox_id} is on a \

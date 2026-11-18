@@ -110,6 +110,70 @@ fn only_forced_mode_evacuates_and_blocks_user_calls() {
     assert!(!NodeDrainMode::Gentle.blocks_user_calls_while_draining());
 }
 
+/// Which drains close the user-API gate: every phase and mode, with the
+/// v2 drain's wait for an evacuation slot on and off. A drain waiting for a
+/// slot closes it only once its node is past `draining`.
+#[test]
+fn a_drain_waiting_for_an_evacuation_slot_leaves_the_gate_open() {
+    use NodeDrainMode::{Forced, Gentle};
+    use NodeDrainPhase::{Drained, Draining, Terminating};
+    for (phase, mode, awaiting, blocks) in [
+        (Draining, Forced, false, true),
+        (Draining, Forced, true, false),
+        (Draining, Gentle, false, false),
+        (Draining, Gentle, true, false),
+        (Drained, Forced, false, true),
+        (Drained, Forced, true, true),
+        (Drained, Gentle, true, true),
+        (Terminating, Forced, true, true),
+        (Terminating, Gentle, false, true),
+    ] {
+        for engine in [NodeDrainEngine::V1, NodeDrainEngine::V2] {
+            let state = NodeDrainState::from_columns(Some(phase), Some(mode.as_str()), engine)
+                .expect("a phase was supplied")
+                .awaiting_evacuation(awaiting);
+            assert_eq!(
+                state.blocks_placement(),
+                blocks,
+                "{phase}/{mode}/{engine:?} awaiting={awaiting}"
+            );
+        }
+    }
+}
+
+/// Which drains refuse a VM activation: every drain that closes the gate,
+/// and an admitted gentle v2 drain, whose node is sealed. A gentle v1
+/// drain, and a v2 drain still waiting for its slot, refuse none while
+/// `draining`.
+#[test]
+fn an_admitted_gentle_v2_drain_refuses_activations_only() {
+    use NodeDrainEngine::{V1, V2};
+    use NodeDrainMode::{Forced, Gentle};
+    use NodeDrainPhase::{Drained, Draining};
+    for (phase, mode, engine, awaiting, refuses) in [
+        (Draining, Gentle, V2, false, true),
+        (Draining, Gentle, V2, true, false),
+        (Draining, Gentle, V1, false, false),
+        (Draining, Forced, V2, false, true),
+        (Draining, Forced, V1, false, true),
+        (Draining, Forced, V2, true, false),
+        (Drained, Gentle, V1, false, true),
+        (Drained, Gentle, V2, true, true),
+    ] {
+        let state = NodeDrainState::from_columns(Some(phase), Some(mode.as_str()), engine)
+            .expect("a phase was supplied")
+            .awaiting_evacuation(awaiting);
+        assert_eq!(
+            state.refuses_activation(),
+            refuses,
+            "{phase}/{mode}/{engine:?} awaiting={awaiting}"
+        );
+        if mode == Gentle && phase == Draining {
+            assert!(!state.blocks_placement(), "{phase}/{mode}/{engine:?}");
+        }
+    }
+}
+
 #[cfg(feature = "serde")]
 mod drain_request {
     use super::*;

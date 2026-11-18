@@ -1,6 +1,7 @@
 use super::DrainRestoreRetry;
 
 mod executor;
+mod supersession;
 
 /// The backoff doubles from its base to its cap.
 #[test]

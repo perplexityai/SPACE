@@ -125,12 +125,16 @@ impl<'r> pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres> for No
     }
 }
 
-/// A node's drain state as the placement guards see it: the phase, plus the mode
-/// chosen for that drain.
+/// A node's drain state as the placement guards see it: the phase, the mode
+/// chosen for that drain, the engine it runs under, and whether a v2 drain
+/// still waits for an evacuation slot.
 ///
-/// Carried as one value because every question worth asking depends on both — a
-/// `draining` node blocks user calls only in forced mode, while `drained` and
-/// `terminating` block in either.
+/// Carried as one value because every question worth asking depends on all of
+/// them: a `draining` node blocks placement only under an admitted forced
+/// drain, an admitted gentle v2 drain still refuses VM activations because its
+/// node is sealed, and `drained` and `terminating` block under either mode and
+/// engine. Every reader names the engine it read ([`Self::from_columns`]), so
+/// none can leave a v2 drain's seal out by omission.
 ///
 /// Lives here rather than in either consumer because there are two, and they must
 /// agree: the api-server's user-API drain gate, and the admin
@@ -140,16 +144,39 @@ impl<'r> pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres> for No
 pub struct NodeDrainState {
     pub phase: NodeDrainPhase,
     pub mode: NodeDrainMode,
+    /// A v2 drain still waiting for one of the cluster's evacuation slots
+    /// (`drain_status.waiting`): the node is fenced, but nothing on it is
+    /// sealed or evacuated yet.
+    pub awaiting_evacuation: bool,
+    /// The engine the drain runs under (`nodes.drain_engine`). A v2 drain
+    /// seals the node once admitted.
+    pub engine: NodeDrainEngine,
 }
 
 impl NodeDrainState {
-    /// Resolve a `(drain_phase, drain_mode)` column pair. `None` when the node
-    /// has no drain in progress.
-    pub fn from_columns(phase: Option<NodeDrainPhase>, mode: Option<&str>) -> Option<Self> {
+    /// Resolve a node's `(drain_phase, drain_mode)` column pair under the
+    /// engine its `drain_engine` column names. `None` when the node has no
+    /// drain in progress.
+    pub fn from_columns(
+        phase: Option<NodeDrainPhase>,
+        mode: Option<&str>,
+        engine: NodeDrainEngine,
+    ) -> Option<Self> {
         phase.map(|phase| Self {
             phase,
             mode: NodeDrainMode::from_column_str(mode),
+            awaiting_evacuation: false,
+            engine,
         })
+    }
+
+    /// Note whether the node's v2 drain still waits for an evacuation slot,
+    /// as `COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE)` reads it. A
+    /// reader that never says so keeps the gate closed for a waiting drain.
+    #[must_use]
+    pub const fn awaiting_evacuation(mut self, awaiting: bool) -> Self {
+        self.awaiting_evacuation = awaiting;
+        self
     }
 
     /// Should a placement-affecting or access call against a sandbox resolved to
@@ -165,20 +192,30 @@ impl NodeDrainState {
     ///   residents, and an unguarded user call would race that pipeline — a wake
     ///   could re-pin a pod to the cordoned source node between the suspend and
     ///   the restore, or resume a VM the reconciler just paused to snapshot.
-    /// - **Gentle** does not block. There is no pipeline to race: the reconciler
-    ///   only cordons and waits, and the point of the mode is that residents keep
-    ///   serving traffic normally until they leave on their own. Blocking here
+    /// - **Gentle** does not block. Running residents keep serving traffic until
+    ///   they leave on their own, which is the point of the mode; blocking here
     ///   would manufacture exactly the disruption the mode exists to avoid, for a
-    ///   drain that may legitimately last days.
+    ///   drain that may legitimately last days. Under v1 the reconciler only
+    ///   cordons and waits, so there is no pipeline to race. Under v2 the node is
+    ///   sealed once the drain is admitted and makes every resident but a
+    ///   running one durable elsewhere, so a VM activation there is refused
+    ///   instead, by [`Self::refuses_activation`].
     ///
-    /// Two consequences of not blocking in gentle mode are intended. A wake of a
-    /// suspended sandbox whose only snapshot is still local-only lands back on
-    /// the draining node, adding a resident that has to leave again — accepted,
-    /// because the alternative is 409ing a user's sandbox for the whole drain,
-    /// and promotion keeps making those snapshots S3-backed, after which restore
-    /// affinity sends them elsewhere. And a gentle drain an operator escalates
-    /// to forced starts blocking from that moment, because the guards read the
-    /// live mode rather than the mode at drain start.
+    /// Two consequences of not blocking in gentle mode are intended. Under v1, a
+    /// wake of a suspended sandbox whose only snapshot is still local-only lands
+    /// back on the draining node, adding a resident that has to leave again —
+    /// accepted, because the alternative is 409ing a user's sandbox for the whole
+    /// drain, and promotion keeps making those snapshots S3-backed, after which
+    /// restore affinity sends them elsewhere. And a gentle drain that turns
+    /// forced, by an operator's escalation or at a v2 drain's deadline, starts
+    /// blocking from that moment, because the guards read the live mode rather
+    /// than the mode the drain started with.
+    ///
+    /// A forced v2 drain waiting for an evacuation slot doesn't block either:
+    /// its node is cordoned and out of placement, but nothing seals or
+    /// evacuates it until the slot frees, so there is no pipeline to race,
+    /// exactly as under a gentle v1 drain. It blocks once the controller
+    /// admits it.
     ///
     /// The inverse reading matters too, and is why this is shared: anything whose
     /// safety depends on wakes being refused (the legacy sandbox-id-only snapshot
@@ -186,9 +223,32 @@ impl NodeDrainState {
     /// when this returns `true`.
     pub const fn blocks_placement(self) -> bool {
         match self.phase {
-            NodeDrainPhase::Draining => self.mode.blocks_user_calls_while_draining(),
+            NodeDrainPhase::Draining => {
+                !self.awaiting_evacuation && self.mode.blocks_user_calls_while_draining()
+            }
             NodeDrainPhase::Drained | NodeDrainPhase::Terminating => true,
         }
+    }
+
+    /// Should a VM activation (a start, wake, restore or resume) of a
+    /// sandbox resolved to this node, and not running there, be rejected?
+    /// Wherever [`Self::blocks_placement`] says so, and under an admitted
+    /// v2 drain of either mode: its node is sealed and refuses every
+    /// activation itself. An admitted gentle v2 drain keeps its running VMs
+    /// running and their calls open, so it refuses only what could activate
+    /// a sandbox that isn't running; a v2 drain still waiting for its slot,
+    /// and a gentle v1 drain, refuse none while `draining`.
+    ///
+    /// The user-API drain gate reads this only for a sandbox with no durable
+    /// snapshot of its current state: a `suspended` or `restoring` sandbox
+    /// whose current snapshot is durable gets no drain state there, whatever
+    /// its node, and restores elsewhere. A refused call gets a 409, or a 503
+    /// with `Retry-After` while the drain still makes the sandbox durable.
+    pub const fn refuses_activation(self) -> bool {
+        self.blocks_placement()
+            || (matches!(self.phase, NodeDrainPhase::Draining)
+                && matches!(self.engine, NodeDrainEngine::V2)
+                && !self.awaiting_evacuation)
     }
 }
 
@@ -198,9 +258,10 @@ impl NodeDrainState {
 /// admin `:drain` request body. Orthogonal to `nodes.drain_phase`: a node in
 /// either mode is cordoned, is excluded from placement, advances
 /// `draining → drained` on the same zero-blockers gate, and terminates through
-/// the same path. The mode governs only what the reconciler does to sandboxes
-/// that are already resident, and whether the user-API drain gates reject
-/// calls against them.
+/// the same path. The mode governs only what the drain does to sandboxes that
+/// are already resident, and which calls against them the user-API drain
+/// gates reject; under v2 it also decides what the node's own drain does, and
+/// a gentle v2 drain has a deadline at which it turns forced.
 ///
 /// [`Self::Gentle`] is the answer everywhere a mode is missing or unreadable
 /// rather than chosen — a `:drain` body with no `mode` (see
@@ -225,14 +286,20 @@ impl NodeDrainState {
 ///   placement-affecting and access path to a resident sandbox for the whole
 ///   drain window, so users cannot race the evacuation pipeline. Per-node
 ///   disruption is proportional to resident live-sandbox count.
-/// - [`Self::Gentle`] — no proactive evacuation. Residents keep serving
-///   traffic and leave on their own (auto-suspend on inactivity, a user
-///   suspend, or a delete). The local-snapshot promotion machinery still runs,
-///   so local-only suspended artifacts become S3-backed and their restores
-///   redirect off the node. Trades drain latency for zero user-visible
-///   disruption; a node hosting a sandbox that never suspends never converges
-///   on its own, which is what the admin `:drain` endpoint's in-place
-///   escalation is for — a second `:drain` with `mode: forced` against a node
+/// - [`Self::Gentle`] — no proactive evacuation of a running sandbox. Under
+///   v1, residents keep serving traffic and leave on their own (auto-suspend on
+///   inactivity, a user suspend, or a delete), and the local-snapshot promotion
+///   machinery still runs, so local-only suspended artifacts become S3-backed
+///   and their restores redirect off the node. Under v2 the node is sealed once
+///   the drain is admitted: every resident but a running one is made durable
+///   and moved as under a forced drain, a running sandbox keeps running and
+///   answering calls until it leaves `started` on its own, and a VM activation
+///   of a sandbox that isn't running is refused; at its required deadline the
+///   drain turns forced. Trades drain latency for leaving running sandboxes
+///   undisturbed; a node hosting a sandbox that never suspends converges only
+///   at a v2 drain's deadline, and never under v1, which is what the admin
+///   `:drain` endpoint's in-place escalation is for — a second `:drain` with
+///   `mode: forced` against a node
 ///   already `draining` rewrites this column without disturbing `drain_phase`
 ///   or `drain_started_at`, so the drain becomes destructive without losing
 ///   its age.

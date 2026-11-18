@@ -6,7 +6,7 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_drain::NodeDrainEngine;
-use pplx_space_node_model::SubstrateKind;
+use pplx_space_node_model::{NodeDrainPhase, NodeDrainState, SubstrateKind};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
@@ -16,6 +16,43 @@ use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 /// build's terminator acted on it, `drain_status.terminated`.
 pub const FENCED: &str = "(n.drain_status ? 'terminate_instance'
      OR COALESCE((n.drain_status->>'terminated')::BOOLEAN, FALSE))";
+
+/// SQL expression over the `nodes` row aliased `n`, the one column the drain
+/// gates read beside `drain_phase` and `drain_mode`: NULL unless a v2 drain
+/// runs on the node (`drain_engine` is NULL for every other row), else
+/// whether it still waits for an evacuation slot (`drain_status.waiting`).
+/// [`gate_drain_state`] reads the three.
+pub const GATE_COLUMN: &str = "CASE WHEN n.drain_engine = 'v2'
+    THEN COALESCE((n.drain_status->>'waiting')::BOOLEAN, FALSE)
+END";
+
+/// [`GATE_COLUMN`] over a node's `drain_engine` and `drain_status` as read.
+pub fn gate_column(engine: Option<&str>, status: Option<&serde_json::Value>) -> Option<bool> {
+    (NodeDrainEngine::from_column(engine) == NodeDrainEngine::V2).then(|| {
+        status
+            .and_then(|status| status.get("waiting"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+/// The drain state the gates act on, from a node's `drain_phase`,
+/// `drain_mode` and [`GATE_COLUMN`]: the engine is v2 where the column is
+/// not NULL, and a v2 drain waits for its slot where it is true. `None` when
+/// the node has no drain phase.
+pub fn gate_drain_state(
+    phase: Option<NodeDrainPhase>,
+    mode: Option<&str>,
+    v2_waiting: Option<bool>,
+) -> Option<NodeDrainState> {
+    let engine = if v2_waiting.is_some() {
+        NodeDrainEngine::V2
+    } else {
+        NodeDrainEngine::V1
+    };
+    NodeDrainState::from_columns(phase, mode, engine)
+        .map(|state| state.awaiting_evacuation(v2_waiting.unwrap_or(false)))
+}
 
 /// SQL expression over a `nodes` row, unqualified: the epoch the row's v2
 /// drain is sealed under, `drain_status.epoch`, or `gentle_epoch` while it

@@ -1,4 +1,7 @@
 use pplx_space_accounts::NodeId;
+#[cfg(test)]
+use pplx_space_node_drain::NodeDrainEngine;
+use pplx_space_node_registration_store::drain_v2 as node_drain_v2;
 
 use axum::{
     Extension, Json,
@@ -2214,7 +2217,14 @@ async fn apply_force_upload_local_snapshots(
         .map(NodeDrainPhase::parse)
         .transpose()
     {
-        Ok(phase) => NodeDrainState::from_columns(phase, node.drain_mode.as_deref()),
+        Ok(phase) => node_drain_v2::gate_drain_state(
+            phase,
+            node.drain_mode.as_deref(),
+            node_drain_v2::gate_column(
+                node.drain_engine.as_deref(),
+                node.drain_status.as_ref().map(|status| &status.0),
+            ),
+        ),
         Err(err) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
