@@ -221,16 +221,16 @@ kind_bench_network_up() {
   sudo -n ip -n "$ns" link set eth0 up || return 1
   sudo -n ip -n "$ns" link set lo up || return 1
   sudo -n ip -n "$ns" route add default via "$(kind_bench_host_ip "$i")" || return 1
-  sudo -n iptables -t nat -A POSTROUTING -s "$(kind_bench_link_net "$i")" ! -o "$veth" \
+  sudo -n iptables -w -t nat -A POSTROUTING -s "$(kind_bench_link_net "$i")" ! -o "$veth" \
     -m comment --comment "$comment" -j MASQUERADE || return 1
   # A host Docker daemon's FORWARD policy may be DROP; DOCKER-USER is the chain
   # it leaves to its operator, evaluated before its own rules.
   local chain=FORWARD
-  if sudo -n iptables -n -L DOCKER-USER >/dev/null 2>&1; then
+  if sudo -n iptables -w -n -L DOCKER-USER >/dev/null 2>&1; then
     chain=DOCKER-USER
   fi
-  sudo -n iptables -I "$chain" -i "$veth" -m comment --comment "$comment" -j ACCEPT || return 1
-  sudo -n iptables -I "$chain" -o "$veth" -m comment --comment "$comment" -j ACCEPT || return 1
+  sudo -n iptables -w -I "$chain" -i "$veth" -m comment --comment "$comment" -j ACCEPT || return 1
+  sudo -n iptables -w -I "$chain" -o "$veth" -m comment --comment "$comment" -j ACCEPT || return 1
 }
 
 # Bench <i>'s PID namespace (with its own /proc), inside its network
@@ -542,10 +542,12 @@ kind_bench_teardown() {
   while IFS= read -r mount; do
     if [[ -n "$mount" ]]; then sudo -n umount -l "$mount" 2>/dev/null || true; fi
   done < <(awk -v a="$dir/" -v b="$run/" 'index($2, a) == 1 || index($2, b) == 1 { print $2 }' /proc/self/mounts | sort -r)
-  sudo -n iptables -S 2>/dev/null | grep -F -- "--comment $comment " | sed 's/^-A /-D /' \
-    | while IFS= read -r rule; do eval "sudo -n iptables $rule" 2>/dev/null || true; done
-  sudo -n iptables -t nat -S 2>/dev/null | grep -F -- "--comment $comment " | sed 's/^-A /-D /' \
-    | while IFS= read -r rule; do eval "sudo -n iptables -t nat $rule" 2>/dev/null || true; done
+  # -w everywhere: on an iptables-legacy host the benches' parallel setup and
+  # teardown would otherwise lose the xtables lock to each other.
+  sudo -n iptables -w -S 2>/dev/null | grep -F -- "--comment $comment " | sed 's/^-A /-D /' \
+    | while IFS= read -r rule; do eval "sudo -n iptables -w $rule" 2>/dev/null || true; done
+  sudo -n iptables -w -t nat -S 2>/dev/null | grep -F -- "--comment $comment " | sed 's/^-A /-D /' \
+    | while IFS= read -r rule; do eval "sudo -n iptables -w -t nat $rule" 2>/dev/null || true; done
   sudo -n ip link del "$veth" 2>/dev/null || true
   sudo -n ip netns del "$ns" 2>/dev/null || true
   # The daemon's cgroup parent, leaves first; a cgroup still holding a process
