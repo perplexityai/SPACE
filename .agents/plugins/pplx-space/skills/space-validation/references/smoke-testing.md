@@ -68,8 +68,9 @@ shared images once, and picks N from the host's CPUs, available memory, free
 disk and a short write-throughput probe of the bench volume (`--benches N`
 overrides). It needs passwordless sudo and takes about 23 minutes at N=4 or 5
 on a 32-CPU host with a warm Rust target directory, holding about 50 GB of disk
-per bench. A scenario that fails there and passes on a clean single bench
-(`--benches 1`) is contention from its neighbours until shown otherwise. "The
+per bench. A scenario that fails here fails the run. If it passes when
+rerun, report both runs. Call a failure contention only when it fails beside
+other benches more than once and passes each time with `--benches 1`. "The
 whole suite on one host" in `infra/space/kind/README.md` describes what each
 bench shares and what it costs.
 

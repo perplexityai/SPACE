@@ -15,8 +15,10 @@
 #     auto mode, so the host's persistent target dir is reused) and handed to
 #     each bench as CI hands it to its shards (rust-artifact-handoff.py
 #     record/load, then SPACE_KIND_RUST_ARTIFACTS=prebuilt);
-#   - the SPACE Kind node image, the kindest/node base and the pre-built UI
-#     image, saved once and loaded into every bench's daemon;
+#   - the SPACE Kind node image, the kindest/node base and the build bases,
+#     saved once and loaded into every bench's daemon; the seed, built once
+#     and copied into each bench; the runtime images' dependency stages and
+#     the whole UI build, exported once into the layer cache below;
 #   - Docker Hub: one pull-through mirror for every bench daemon, so an image
 #     costs one pull from the host's egress, not one per bench, against the
 #     anonymous rate limit that egress shares.
