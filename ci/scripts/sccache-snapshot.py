@@ -10,7 +10,8 @@ merge queue restore the newest snapshot and never save.
   decide  log what main does with the job's snapshot, and write `save` and
           `trim` step outputs; every event logs it, only main acts on it. It
           also warns, never fails, when the cache ended nearly full or a run
-          that restored a snapshot for its own inputs hit few compilations
+          that restored a snapshot for its own inputs hit few compilations,
+          and advises a larger cache only when it also ended nearly full
   prune   delete every snapshot on a ref except the newest of each job family;
           Cargo target-directory snapshots (ci/scripts/rust-target-cache.sh)
           keep the newest of each recent build-inputs hash instead
@@ -108,11 +109,28 @@ FULL_PERCENT = 90
 WARM_HIT_PERCENT = 50
 
 
+def nearly_full(stats_json: str | None) -> bool:
+    """Whether the cache ended at FULL_PERCENT of its maximum or more."""
+    sizes = cache_sizes(stats_json)
+    return sizes is not None and 100 * sizes[0] >= FULL_PERCENT * sizes[1]
+
+
+def missed_warm(restored_key: str, inputs_prefix: str, stats_json: str | None) -> bool:
+    """Whether a run that restored a snapshot built for its own inputs hit
+    under WARM_HIT_PERCENT of its Rust compilations."""
+    counts = rust_counts(stats_json)
+    warm = bool(restored_key and inputs_prefix and restored_key.startswith(inputs_prefix))
+    if not warm or counts is None or sum(counts) == 0:
+        return False
+    return 100 * counts[0] < WARM_HIT_PERCENT * sum(counts)
+
+
 def cache_warnings(restored_key: str, inputs_prefix: str, stats_json: str | None) -> list[str]:
     """Return advisory warnings about how well the cache served this run."""
     warnings = []
     sizes = cache_sizes(stats_json)
-    if sizes is not None and 100 * sizes[0] >= FULL_PERCENT * sizes[1]:
+    full = nearly_full(stats_json)
+    if full and sizes is not None:
         size, maximum = sizes
         warnings.append(
             f"The Rust compiler cache ended at {size / 2**30:.2f} GiB of its "
@@ -121,15 +139,25 @@ def cache_warnings(restored_key: str, inputs_prefix: str, stats_json: str | None
             "Raise the job's rust_cache_size."
         )
     counts = rust_counts(stats_json)
-    warm = bool(restored_key and inputs_prefix and restored_key.startswith(inputs_prefix))
-    if warm and counts is not None and sum(counts) > 0:
+    if missed_warm(restored_key, inputs_prefix, stats_json) and counts is not None:
         hits, total = counts[0], sum(counts)
-        if 100 * hits < WARM_HIT_PERCENT * total:
-            warnings.append(
-                f"Only {hits} of {total} Rust compilations ({100 * hits / total:.0f}%) "
-                f"hit the cache, though the run restored {restored_key}, built for "
-                "these inputs: one pass may no longer fit in the cache."
+        # sccache evicts only to make room at its maximum, so a cache that
+        # ended short of FULL_PERCENT evicted nothing this run, and a larger
+        # one would have hit no more.
+        if full:
+            cause = "with the cache nearly full, one pass may no longer fit in it."
+        elif sizes is None:
+            cause = "sccache reported no cache size, so whether it evicted entries is unknown."
+        else:
+            cause = (
+                "the cache did not fill, so it likely evicted nothing: source changes "
+                "since the snapshot are the likely cause, not rust_cache_size."
             )
+        warnings.append(
+            f"Only {hits} of {total} Rust compilations ({100 * hits / total:.0f}%) "
+            f"hit the cache, though the run restored {restored_key}, built for "
+            f"these inputs; {cause}"
+        )
     return warnings
 
 

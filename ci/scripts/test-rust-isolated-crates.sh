@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Regression test for affected_lint_crates and isolated_crate_shard in
-# ci/scripts/lib/rust-isolated-crates.sh, on a synthetic workspace: `a`, `b`
+# Regression test for affected_lint_crates, isolated_crate_shard and
+# isolated_crates_to_lint in ci/scripts/lib/rust-isolated-crates.sh, on a
+# synthetic workspace: `a`, `b`
 # depending on `a`, `e` depending on `b`, `c` on its own, and `d`, which
 # includes a file from `a`'s directory by a literal path and another through
 # CARGO_MANIFEST_DIR. A local directory registry stands in for crates.io: `b`
 # uses its `leaf` and `c` its `mid`, which uses `leaf`. The shards are also
-# checked on a synthetic cost table and against the workflow's entries.
+# checked on synthetic metadata, for the crates each shard gets.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -228,9 +229,44 @@ for spec in 0/2 3/2 1/0 2 x/y 1/2/3 ""; do
     fi
 done
 
-# Balance by cost, on a synthetic cost table. A crate costs one plus the
-# workspace packages its lint builds: its own dependencies of every kind,
-# optional ones included, and their normal and build dependencies, not their
+# A job lints shard K of the whole list, then the crates of it the change
+# affects: a crate lints in the shard Main CI, which passes no base, puts it
+# in. d is not in shard 1, where a split of only the affected crates would put
+# it whenever a change affects it alone.
+git -C "${fixture}" checkout -q --detach "${base}"
+printf 'change\n' >>"${fixture}/crates/d/src/lib.rs"
+git -C "${fixture}" commit -q -am d
+to_lint() {
+    (cd "${fixture}" && SPACE_RUST_ISOLATED_SHARD="$1" SPACE_RUST_LINT_BASE="$2" \
+        isolated_crates_to_lint "${tmp_dir}/metadata.json" "${listed}" 2>/dev/null)
+}
+main_shards=() change_shards=()
+for ((index = 1; index <= ISOLATED_CRATE_SHARDS; index++)); do
+    if grep -qx d <<<"$(to_lint "${index}/${ISOLATED_CRATE_SHARDS}" "")"; then
+        main_shards+=("${index}")
+    fi
+    part="$(to_lint "${index}/${ISOLATED_CRATE_SHARDS}" "${base}")"
+    case "${part}" in
+        d) change_shards+=("${index}") ;;
+        "") ;;
+        *) fail "shard ${index} lints '${part}' for a change to d alone" ;;
+    esac
+done
+[[ "${main_shards[*]}" =~ ^[0-9]+$ && "${main_shards[*]}" != 1 ]] ||
+    fail "main puts d in shards '${main_shards[*]}', not in one shard other than 1"
+[[ "${change_shards[*]}" == "${main_shards[*]}" ]] ||
+    fail "a change to d lints it in shards '${change_shards[*]}', not main's '${main_shards[*]}'"
+# Each job is given its own K of ISOLATED_CRATE_SHARDS; another N fails rather
+# than lint a different split.
+for spec in "1/$((ISOLATED_CRATE_SHARDS - 1))" "1/$((ISOLATED_CRATE_SHARDS + 1))"; do
+    if to_lint "${spec}" "" >/dev/null; then
+        fail "shard ${spec} is accepted, though the lint has ${ISOLATED_CRATE_SHARDS} shards"
+    fi
+done
+
+# Balance by cost, on synthetic metadata. A crate costs one plus the workspace
+# packages its lint builds: its own dependencies of every kind, optional ones
+# included, and their normal and build dependencies, not their
 # dev-dependencies; a package outside the workspace counts for nothing.
 python3 - "${tmp_dir}/costs.json" <<'PY'
 import json
@@ -247,16 +283,37 @@ for name, cost in {"big": 12, "large": 10, "mid1": 6, "mid2": 5, "mid3": 4}.item
     packages[name] = [dep(f"leaf{i:02}") for i in range(1, cost)]
 for i in range(1, 7):
     packages[f"s{i}"] = [dep("serde")]
-packages["helper"] = [dep("leaf01"), dep("leaf02", "build"), dep("leaf03", "dev")]
-packages["tested"] = [dep("helper", "dev"), dep("leaf04", optional=True), dep("serde")]
+for cost in (2, 4, 5):
+    packages[f"cost{cost}"] = [dep(f"leaf{i:02}") for i in range(1, cost)]
+# tested costs 3: itself, its dev-dependency helper and helper's leaf01, but
+# not helper's own dev-dependencies, which would make it 7.
+packages["helper"] = [dep("leaf01")] + [dep(f"leaf{i:02}", "dev") for i in range(2, 6)]
+packages["tested"] = [dep("helper", "dev"), dep("serde")]
+# generated costs 6: itself, gen, gen's build-dependency codegen and
+# codegen's three leaves; 2 without the build-dependency.
+packages["codegen"] = [dep(f"leaf{i:02}") for i in range(1, 4)]
+packages["gen"] = [dep("codegen", "build")]
+packages["generated"] = [dep("gen")]
+# featured costs 5: itself, its optional extra, which its all-features lint
+# builds, and extra's three leaves; 1 without the optional dependency.
+packages["extra"] = [dep(f"leaf{i:02}") for i in range(1, 4)]
+packages["featured"] = [dep("extra", optional=True)]
 with open(sys.argv[1], "w") as out:
     json.dump({"packages": [{"name": n, "dependencies": d} for n, d in packages.items()]}, out)
 PY
-costs_of() {
-    isolated_crate_shard "${tmp_dir}/costs.json" "$1" "$2" 2>&1 >/dev/null | sed -n 's/^  //p' | tr '\n' ';'
+# Of two crates in two shards, the costlier gets 1/2. Each pair puts a crate
+# beside one whose cost lies between the crate's and what a miscount would
+# give it, so the miscount moves the crate to the other shard.
+assert_split() {
+    local label="$1" pair="$2" expected="$3" actual
+    actual="$(shard "${tmp_dir}/costs.json" 1/2 "${pair}" | tr '\n' ' ')"
+    actual="${actual% }|$(shard "${tmp_dir}/costs.json" 2/2 "${pair}" | tr '\n' ' ')"
+    [[ "${actual% }" == "${expected}" ]] || fail "${label}: expected '${expected}', got '${actual% }'"
 }
-[[ "$(costs_of 1/1 tested)" == "1/1: 1 crates, cost 5;" ]] ||
-    fail "tested should cost 5 (itself, helper, leaf01, leaf02, leaf04): $(costs_of 1/1 tested)"
+assert_split "a dev-dependency's dev-dependencies count for nothing" $'tested\ncost5' "cost5|tested"
+assert_split "a crate's own dev-dependency counts" $'tested\ncost2' "tested|cost2"
+assert_split "a dependency's build-dependency counts" $'generated\ncost4' "generated|cost4"
+assert_split "an optional dependency counts" $'featured\ncost4' "featured|cost4"
 table=$'big\nlarge\nmid1\nmid2\nmid3\ns1\ns2\ns3\ns4\ns5\ns6'
 # Largest first, each to the cheapest shard so far: no shard costs more than
 # another by more than its largest crate. Three by count would put big,
@@ -265,8 +322,6 @@ for expected in "1/3=big s2 s4 s6" "2/3=large mid3" "3/3=mid1 mid2 s1 s3 s5"; do
     part="$(shard "${tmp_dir}/costs.json" "${expected%%=*}" "${table}" | tr '\n' ' ')"
     [[ "${part% }" == "${expected#*=}" ]] || fail "shard ${expected%%=*}: expected '${expected#*=}', got '${part% }'"
 done
-[[ "$(costs_of 1/3 "${table}")" == "1/3: 4 crates, cost 15;2/3: 2 crates, cost 14;3/3: 5 crates, cost 14;" ]] ||
-    fail "unexpected shard costs: $(costs_of 1/3 "${table}")"
 
 if [[ "${#failures[@]}" -ne 0 ]]; then
     printf 'rust-isolated-crates.sh: failed: %s\n' "${failures[@]}" >&2

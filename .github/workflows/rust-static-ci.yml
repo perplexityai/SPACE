@@ -51,8 +51,10 @@ jobs:
           # Lints libraries one at a time (ci/scripts/lib/rust-isolated-crates.sh)
           # in jobs of their own, so it lengthens neither clippy nor the tests.
           # The libraries are split by cost into shards K/N (isolated_crate_shard
-          # there); test-rust-isolated-crates.sh checks that these entries are
-          # shards 1/N to N/N, each with a cache family of its own.
+          # there). N is ISOLATED_CRATE_SHARDS there, and a shard given another
+          # N fails. These entries are kept by hand, one for each K with cache
+          # key isolated-crates-K: nothing checks that every K has one or that
+          # no two share a key, so change them together, with the shard count.
           #
           # Size the limits for a full pass. Main CI passes no base and lints
           # every selected library, and a pull request does too when it changes

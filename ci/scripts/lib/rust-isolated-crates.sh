@@ -14,7 +14,14 @@
 #
 #   bash -euo pipefail -c 'source ci/scripts/lib/rust-isolated-crates.sh; run_isolated_crate_checks'
 #
-# and with SPACE_RUST_ISOLATED_SHARD=K/N in the environment to run one shard.
+# and with SPACE_RUST_ISOLATED_SHARD=K/N in the environment, N being
+# ISOLATED_CRATE_SHARDS, to run one shard.
+
+# The number of shards GitHub CI splits this lint into. rust-static-ci.yml
+# keeps one `Rust isolated crates (K/N)` entry for each K by hand; a shard
+# given another N fails (isolated_crates_to_lint), so the entries cannot split
+# the crates into a count this file does not name.
+ISOLATED_CRATE_SHARDS=5
 
 # The workspace libraries run_isolated_crate_checks lints, one per line: every
 # library, other than common-core, that reaches common-core at most directly.
@@ -425,11 +432,11 @@ print(
 PY
 }
 
-# The crates of LISTED (one per line) that shard SHARD of the job lints, in
-# LISTED's order, one per line. SHARD is K/N, the Kth of N shards. Every
-# shard computes the same partition from the same inputs and keeps its own
-# part, so the N parts together hold each listed crate exactly once; a shard
-# can get none, when fewer crates than shards are listed.
+# The crates of LISTED (one per line) in shard SHARD, in LISTED's order, one
+# per line. SHARD is K/N, the Kth of N shards. Every shard computes the same
+# partition from the same inputs and keeps its own part, so the N parts
+# together hold each listed crate exactly once; a shard can get none, when
+# fewer crates than shards are listed.
 #
 # The parts are balanced by cost, not count: one crate can cost as much as a
 # hundred small ones. A crate's cost is one plus the workspace crates its
@@ -516,6 +523,43 @@ lint_affects_any() {
     [ -n "${affected}" ]
 }
 
+# The crates of LISTED, isolated_crates' list, that this job lints alone, one
+# per line. With SPACE_RUST_ISOLATED_SHARD=K/N, as in GitHub CI, it keeps
+# shard K of the whole list, so a crate lints in the shard Main CI puts it in
+# and restores the compiler cache built for that shard's crates, whatever the
+# change. Then, with SPACE_RUST_LINT_BASE, it keeps the crates of that shard
+# the change can affect (affected_lint_crates). The shards of an affected-only
+# run can be far from balanced; a balanced split of only the affected crates
+# would put a crate in another shard than Main CI does, with a cache built for
+# other crates. Unset, as in a local run, either keeps every crate.
+isolated_crates_to_lint() {
+    local metadata="$1" listed="$2"
+    if [ -n "${SPACE_RUST_ISOLATED_SHARD:-}" ]; then
+        if [[ "${SPACE_RUST_ISOLATED_SHARD}" != */"${ISOLATED_CRATE_SHARDS}" ]]; then
+            echo "::error::Shard ${SPACE_RUST_ISOLATED_SHARD} is not K/${ISOLATED_CRATE_SHARDS}: the lint has ISOLATED_CRATE_SHARDS shards (ci/scripts/lib/rust-isolated-crates.sh); keep the rust-static-ci.yml entries in step with it." >&2
+            return 1
+        fi
+        if ! listed="$(isolated_crate_shard "${metadata}" "${SPACE_RUST_ISOLATED_SHARD}" "${listed}")"; then
+            echo "::error::Cannot pick shard ${SPACE_RUST_ISOLATED_SHARD}'s crates." >&2
+            return 1
+        fi
+    fi
+    # Pull CI and the merge queue pass the base check-needed.sh decided
+    # against (ci/check-scopes/README.md); Main CI passes none.
+    if [ -n "${SPACE_RUST_LINT_BASE:-}" ] && [ -n "${listed}" ]; then
+        local affected
+        # A failed selection lints every crate, whether or not set -e applies.
+        if ! affected="$(affected_lint_crates "${metadata}" "${SPACE_RUST_LINT_BASE}" "${listed}")"; then
+            echo "Cannot tell which crates the change affects: linting them all." >&2
+            affected="${listed}"
+        fi
+        listed="${affected}"
+    fi
+    if [ -n "${listed}" ]; then
+        printf '%s\n' "${listed}"
+    fi
+}
+
 # Lint each crate isolated_crates names on its own, with its minimum supported
 # features and with all of them. Use one Cargo invocation per crate and
 # configuration so Cargo cannot unify features across packages. `--all-targets`
@@ -532,42 +576,18 @@ run_isolated_crate_checks() {
     cargo metadata --locked --format-version 1 --no-deps >"${target_dir}/metadata.json"
     local listed crates=()
     listed="$(isolated_crates "${target_dir}/metadata.json")"
-    mapfile -t crates <<<"${listed}"
     if [ -z "${listed}" ]; then
         echo "::error::No workspace crate qualifies to be linted alone; the selection is broken." >&2
         return 1
     fi
-    # Pull CI and the merge queue pass the base check-needed.sh decided
-    # against (ci/check-scopes/README.md); Main CI passes none.
-    local affected
-    if [ -n "${SPACE_RUST_LINT_BASE:-}" ]; then
-        # A failed selection lints every crate, whether or not set -e applies.
-        if ! affected="$(affected_lint_crates "${target_dir}/metadata.json" \
-            "${SPACE_RUST_LINT_BASE}" "${listed}")"; then
-            echo "Cannot tell which crates the change affects: linting them all." >&2
-            affected="${listed}"
-        fi
-        listed="${affected}"
-        if [ -z "${listed}" ]; then
-            echo "The change affects no crate linted alone."
-            return 0
-        fi
-        mapfile -t crates <<<"${listed}"
+    if ! listed="$(isolated_crates_to_lint "${target_dir}/metadata.json" "${listed}")"; then
+        return 1
     fi
-    # GitHub CI splits the crates across the job's shards; unset, as in a
-    # local run, this lints them all.
-    if [ -n "${SPACE_RUST_ISOLATED_SHARD:-}" ]; then
-        if ! listed="$(isolated_crate_shard "${target_dir}/metadata.json" \
-            "${SPACE_RUST_ISOLATED_SHARD}" "${listed}")"; then
-            echo "::error::Cannot pick shard ${SPACE_RUST_ISOLATED_SHARD}'s crates." >&2
-            return 1
-        fi
-        if [ -z "${listed}" ]; then
-            echo "Shard ${SPACE_RUST_ISOLATED_SHARD} has no crate to lint alone."
-            return 0
-        fi
-        mapfile -t crates <<<"${listed}"
+    if [ -z "${listed}" ]; then
+        echo "This job has no crate to lint alone for this change."
+        return 0
     fi
+    mapfile -t crates <<<"${listed}"
     echo "Linting ${#crates[@]} crates alone: ${crates[*]}"
 
     local crate config flags=() failures=() run_count=0
