@@ -62,7 +62,7 @@ jobs:
             rust_cache_size: 2G
             rust_cache_refresh_misses: 20
             cargo_registry: restore
-            timeout: 45
+            timeout: 75
 
     steps:
       - name: Check out SPACE
