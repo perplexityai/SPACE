@@ -156,6 +156,27 @@ registry_firewall_remove() {
   "${mangle[@]}" -X "$REGISTRY_CHAIN" 2>/dev/null || true
 }
 
+# A registry container is this script's when it runs the registry image on
+# that registry's data directory: a container of that name and any other
+# configuration is someone else's, and is neither reused nor removed.
+registry_state() { # name data-dir; prints running, stopped, absent or foreign
+  local seen
+  seen="$(docker inspect -f '{{.Config.Image}} {{.State.Running}} {{range .Mounts}}{{if eq .Destination "/var/lib/registry"}}{{.Source}}{{end}}{{end}}' \
+    "$1" 2>/dev/null)" || { echo absent; return; }
+  case "$seen" in
+    "$REGISTRY_IMAGE true $2") echo running ;;
+    "$REGISTRY_IMAGE false $2") echo stopped ;;
+    *) echo foreign ;;
+  esac
+}
+
+remove_registry() { # name data-dir
+  case "$(registry_state "$1" "$2")" in
+    running | stopped) docker rm -f "$1" >/dev/null 2>&1 || true ;;
+    foreign) log "leaving the container $1: it is not this script's registry on $2" ;;
+  esac
+}
+
 # The benches' checkouts went with their directories; drop their entries from
 # the repository's worktree list. Only entries whose checkout was a bench's,
 # <bench root>/<i>/src, and is gone: `git worktree prune` would also drop the
@@ -237,7 +258,8 @@ if [[ "$COMMAND" == teardown ]]; then
   status=0
   teardown_all || status=2
   # The registries' data stays in $CACHE_ROOT for the next run.
-  docker rm -f "$MIRROR_NAME" "$CACHE_NAME" >/dev/null 2>&1 || true
+  remove_registry "$MIRROR_NAME" "$CACHE_ROOT/hub-mirror"
+  remove_registry "$CACHE_NAME" "$CACHE_ROOT/layer-cache"
   registry_firewall_remove
   sudo -n ip link del "$REGISTRY_LINK" 2>/dev/null || true
   exit "$status"
@@ -550,10 +572,15 @@ prepare_host() {
 }
 
 start_registry() { # name port data-dir [env...]
-  local name="$1" port="$2" data="$3" binds=()
+  local name="$1" port="$2" data="$3" binds=() state
   shift 3
-  if [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != true ]]; then
-    docker rm -f "$name" >/dev/null 2>&1 || true
+  state="$(registry_state "$name" "$data")"
+  if [[ "$state" == foreign ]]; then
+    log "a container named $name exists and is not this script's registry on $data; remove or rename it"
+    return 1
+  fi
+  if [[ "$state" != running ]]; then
+    [[ "$state" == absent ]] || docker rm -f "$name" >/dev/null || return 1
     mkdir -p "$data" || return 1
     binds=(-p "$REGISTRY_IP:$port:5000")
     [[ "$port" == "$CACHE_PORT" ]] && binds+=(-p "127.0.0.1:$port:5000")
@@ -572,11 +599,15 @@ start_registry() { # name port data-dir [env...]
 }
 
 start_registries() {
-  if ! ip link show "$REGISTRY_LINK" >/dev/null 2>&1; then
+  # Each step whatever an interrupted run left of the interface.
+  if ip link show "$REGISTRY_LINK" >/dev/null 2>&1; then
+    ip -d link show "$REGISTRY_LINK" | grep -qw dummy \
+      || { log "$REGISTRY_LINK exists and is not a dummy interface; remove it"; return 1; }
+  else
     sudo -n ip link add "$REGISTRY_LINK" type dummy || return 1
-    sudo -n ip addr add "$REGISTRY_IP/32" dev "$REGISTRY_LINK" || return 1
-    sudo -n ip link set "$REGISTRY_LINK" up || return 1
   fi
+  sudo -n ip addr replace "$REGISTRY_IP/32" dev "$REGISTRY_LINK" || return 1
+  sudo -n ip link set "$REGISTRY_LINK" up || return 1
   registry_firewall || return 1
   start_registry "$MIRROR_NAME" "$MIRROR_PORT" "$CACHE_ROOT/hub-mirror" \
     REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io || return 1
