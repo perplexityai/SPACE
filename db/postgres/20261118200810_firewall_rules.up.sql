@@ -104,7 +104,6 @@ CREATE TABLE firewall_rules_rollouts (
     -- squawk-ignore prefer-bigint-over-smallint
     unfinished_slot SMALLINT,
     max_in_flight_per_cluster BIGINT NOT NULL,
-    failure_budget BIGINT NOT NULL,
     reason TEXT NOT NULL,
     generation BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -127,9 +126,6 @@ CREATE TABLE firewall_rules_rollouts (
         UNIQUE (created_by_receipt_id),
     CONSTRAINT firewall_rules_rollouts_max_in_flight_per_cluster_check CHECK (
         max_in_flight_per_cluster >= 1
-    ),
-    CONSTRAINT firewall_rules_rollouts_failure_budget_check CHECK (
-        failure_budget >= 1
     ),
     CONSTRAINT firewall_rules_rollouts_reason_check CHECK (
         char_length(reason) BETWEEN 1 AND 1024
@@ -174,8 +170,6 @@ COMMENT ON COLUMN firewall_rules_rollouts.unfinished_slot IS
     '1 while the phase is canary, rolling or paused, NULL once it is completed or aborted; unique, so one rollout is unfinished at a time';
 COMMENT ON COLUMN firewall_rules_rollouts.max_in_flight_per_cluster IS
     'Items of this rollout in flight at once across the cluster';
-COMMENT ON COLUMN firewall_rules_rollouts.failure_budget IS
-    'Failed items at which the rollout pauses itself';
 COMMENT ON COLUMN firewall_rules_rollouts.generation IS
     'Raised by one by the runtime_upgrade_campaigns_raise_generation trigger on every update that changes another column (not updated_at); unrelated to node assignment generations';
 
@@ -193,7 +187,6 @@ CREATE TABLE firewall_rules_rollout_items (
     issued_assignment_generation BIGINT,
     issued_at TIMESTAMPTZ,
     next_check_at TIMESTAMPTZ,
-    last_counted_failure_round BIGINT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT firewall_rules_rollout_items_pkey PRIMARY KEY (rollout_id, node_id),
     CONSTRAINT firewall_rules_rollout_items_attempts_check CHECK (attempts >= 0),
@@ -221,9 +214,6 @@ CREATE TABLE firewall_rules_rollout_items (
     CONSTRAINT firewall_rules_rollout_items_next_check_at_check CHECK (
         next_check_at IS NULL OR isfinite(next_check_at)
     ),
-    CONSTRAINT firewall_rules_rollout_items_last_counted_failure_round_check CHECK (
-        last_counted_failure_round IS NULL OR last_counted_failure_round >= 0
-    ),
     CONSTRAINT firewall_rules_rollout_items_rollout_id_fkey
         FOREIGN KEY (rollout_id) REFERENCES firewall_rules_rollouts(id) ON DELETE CASCADE
 );
@@ -247,8 +237,6 @@ COMMENT ON COLUMN firewall_rules_rollout_items.issued_assignment_generation IS
     'Node assignment generation this item issued, set with issued_at';
 COMMENT ON COLUMN firewall_rules_rollout_items.next_check_at IS
     'Earliest time the item is next considered; NULL when none is scheduled';
-COMMENT ON COLUMN firewall_rules_rollout_items.last_counted_failure_round IS
-    'Latest observation round whose failure was charged to the failure budget, so a round is charged once';
 
 -- node_id isn't a foreign key here either: deleting a node doesn't reach into
 -- firewall state.

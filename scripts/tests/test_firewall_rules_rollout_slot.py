@@ -144,8 +144,8 @@ class FirewallRulesRolloutSlotTest(unittest.TestCase):
         conn.execute(
             "INSERT INTO firewall_rules_rollouts"
             " (id, to_revision_id, created_by_receipt_id, phase, unfinished_slot,"
-            "  max_in_flight_per_cluster, failure_budget, reason)"
-            " VALUES (%s, %s, %s, %s, %s, 1, 1, 'test')",
+            "  max_in_flight_per_cluster, reason)"
+            " VALUES (%s, %s, %s, %s, %s, 1, 'test')",
             (
                 rollout,
                 self.revision,
