@@ -1964,7 +1964,7 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
     assert_eq!(
         shape(&resources),
         (Some(4), Some(4096), None),
-        "an unshaped Kubernetes create must not boot at the shim's fixed defaults"
+        "an unshaped Kubernetes create takes the template's build shape"
     );
 
     let (resources, _, source) = resolve(
@@ -2022,7 +2022,7 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
     );
     assert_eq!(source, Some(CreateShapeSource::PoolConfig));
 
-    // A release with no build shape falls back to the shim default.
+    // A release with no build shape leaves the unset fields to the node.
     let (resources, _, source) = resolve_cold_create_resources(
         &db.pool,
         ColdCreateShapeInput {

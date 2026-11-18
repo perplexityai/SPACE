@@ -1140,10 +1140,13 @@ pub enum NodeAddressing {
     SubstrateNodeId,
 }
 
-/// Static facts about what a substrate supports. Shared code reads these
-/// instead of matching on which substrate is active. Each substrate returns
-/// one of the constants below; behavior that needs the substrate to act stays
-/// a [`SubstrateAdapter`] method.
+/// Static facts about the substrate. A new field states an infrastructure
+/// fact, never that a SPACE feature is off here: a missing feature is a gap
+/// row in the substrate's module doc, and an existing field that gates one is
+/// debt, not precedent (see this directory's `AGENTS.md`). Shared code reads
+/// these instead of matching on which substrate is active. Each substrate
+/// returns one of the constants below; behavior that needs the substrate to
+/// act stays a [`SubstrateAdapter`] method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubstrateCapabilities {
     /// Every restore-shaped wake (from `suspended` or `restoring`) claims
@@ -1174,16 +1177,30 @@ pub struct SubstrateCapabilities {
     pub start_of_suspended_claims_restoring: bool,
     /// How node-api targets are addressed.
     pub node_addressing: NodeAddressing,
-    /// Nodes live in the admin API's node registry: they are registered,
-    /// updated and deleted there, and their templates are pulled and deleted
-    /// there, rather than discovered by the substrate.
+    /// Nodes are registered through the admin API's node registry, not
+    /// discovered by the substrate: the registry's register and update routes
+    /// store each node's `node_api_endpoint` in its registry row, and the node
+    /// template pull and delete routes use the endpoints stored there. Without
+    /// it, the register, update and delete routes and the node template pull
+    /// and delete routes answer 501 after the admin check, before reading a
+    /// node.
     pub registers_nodes_via_admin_api: bool,
-    /// The control plane resolves a cold Firecracker create's shape: a
-    /// fallthrough create takes a configured or policy pool shape, and
-    /// otherwise vCPU and memory the request left unset come from the
-    /// template's build shape. Without it, the requested shape goes to the
-    /// node unchanged; Direct sends a custom vCPU or memory on its separate
-    /// start call (see the [`direct`] module doc).
+    /// The control plane resolves a cold Firecracker create's shape before
+    /// launch. A fallthrough create takes the vCPU, memory, disk size and disk
+    /// I/O limits of an enabled, non-encryptable pool config for its release,
+    /// or else of the template's preferred enabled warm-pool policy, when there
+    /// is one. Otherwise a create that is not a fork fills the vCPU and memory
+    /// it left unset from the template's build shape, when the template
+    /// inventory records one, so the sandbox row and the pod's annotations
+    /// carry them. Without it, the requested shape goes to the node unchanged;
+    /// Direct sends a custom vCPU or memory on its separate start call (see the
+    /// [`direct`] module doc).
+    ///
+    /// This is a SPACE feature, not an infrastructure fact: on a cold boot,
+    /// sandbox-manager takes the vCPU and memory a launch left unset from the
+    /// template's metadata on either substrate (2 vCPU and 1024 MiB when the
+    /// metadata has none). The field is debt; Direct's lack of the feature is
+    /// the "Cold create shape" gap row in the [`direct`] module doc.
     pub resolves_cold_create_shape: bool,
     /// Create requests may carry a Kubernetes node-pool placement pin.
     pub supports_node_pool_placement: bool,
