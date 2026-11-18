@@ -1,32 +1,27 @@
 use std::collections::{HashMap, HashSet};
+use std::mem::{Discriminant, discriminant};
+use std::net::Ipv4Addr;
+use std::num::NonZeroU64;
 
 use super::*;
 use crate::test_fixtures::{
-    ACCEPTANCE_ADMIN, ACCEPTANCE_BASE, ACCEPTANCE_PROBE, ACCEPTANCE_WEB_PRIME, ids, payload_eq,
-    port_rule, revision,
+    acceptance_admin, acceptance_base, acceptance_probe, acceptance_web_prime, header, id, ids,
+    payload_eq, port_rule, revision,
 };
-use crate::{Match, Value};
-
-fn rule_json(text: &str) -> Rule {
-    Rule::from_json_str(text).unwrap()
-}
-
-fn id(value: &str) -> RuleId {
-    RuleId::new(value)
-}
+use crate::{IntegerRange, Ipv4Prefix, Match, Read, TcpOptionName, Value};
 
 fn acceptance_edits() -> Vec<Edit> {
     vec![
-        Edit::Replace(rule_json(ACCEPTANCE_WEB_PRIME)),
+        Edit::Replace(acceptance_web_prime()),
         Edit::Remove(id("dns")),
-        Edit::Add(rule_json(ACCEPTANCE_ADMIN)),
-        Edit::Add(rule_json(ACCEPTANCE_PROBE)),
+        Edit::Add(acceptance_admin()),
+        Edit::Add(acceptance_probe()),
     ]
 }
 
 #[test]
 fn acceptance_batch_replaces_in_place_removes_and_appends() {
-    let base = FirewallRuleRevision::from_json_str(ACCEPTANCE_BASE).unwrap();
+    let base = acceptance_base();
     let original = base.clone();
 
     let change = base.apply(&acceptance_edits()).unwrap();
@@ -41,10 +36,10 @@ fn acceptance_batch_replaces_in_place_removes_and_appends() {
     assert_eq!(
         change.candidate().rules(),
         [
-            rule_json(ACCEPTANCE_WEB_PRIME),
+            acceptance_web_prime(),
             metrics.clone(),
-            rule_json(ACCEPTANCE_ADMIN),
-            rule_json(ACCEPTANCE_PROBE),
+            acceptance_admin(),
+            acceptance_probe(),
         ]
     );
     // Base order first (dns, web), then additions; metrics is unchanged and
@@ -55,17 +50,17 @@ fn acceptance_batch_replaces_in_place_removes_and_appends() {
             RuleChange::Removed(base.rule(&id("dns")).unwrap().clone()),
             RuleChange::Replaced {
                 before: web.clone(),
-                after: rule_json(ACCEPTANCE_WEB_PRIME),
+                after: acceptance_web_prime(),
             },
-            RuleChange::Added(rule_json(ACCEPTANCE_ADMIN)),
-            RuleChange::Added(rule_json(ACCEPTANCE_PROBE)),
+            RuleChange::Added(acceptance_admin()),
+            RuleChange::Added(acceptance_probe()),
         ]
     );
 }
 
 #[test]
 fn acceptance_batch_with_an_invalid_fifth_edit_fails_whole() {
-    let base = FirewallRuleRevision::from_json_str(ACCEPTANCE_BASE).unwrap();
+    let base = acceptance_base();
     let original = base.clone();
 
     for (fifth, expected) in [
@@ -337,16 +332,12 @@ fn removing_the_last_rule_yields_an_explicit_empty_snapshot() {
     let change = base.apply(&[Edit::Remove(id("only"))]).unwrap();
 
     assert!(change.candidate().rules().is_empty());
-    assert_eq!(
-        change.candidate().to_json_string(),
-        r#"{"schema_version":1,"rules":[]}"#
-    );
     assert_eq!(change.diff().changes(), [RuleChange::Removed(only)]);
 }
 
 #[test]
 fn identical_replacement_and_empty_batch_show_no_change() {
-    let base = FirewallRuleRevision::from_json_str(ACCEPTANCE_BASE).unwrap();
+    let base = acceptance_base();
     let web = base.rule(&id("web")).unwrap().clone();
 
     let replaced = base.apply(&[Edit::Replace(web)]).unwrap();
@@ -356,48 +347,6 @@ fn identical_replacement_and_empty_batch_show_no_change() {
     let empty = base.apply(&[]).unwrap();
     assert_eq!(empty.candidate(), &base);
     assert!(empty.diff().is_empty());
-}
-
-#[test]
-fn equivalent_inputs_give_identical_candidates_and_diffs() {
-    let base = FirewallRuleRevision::from_json_str(ACCEPTANCE_BASE).unwrap();
-    let expected = base.apply(&acceptance_edits()).unwrap();
-
-    // Same base and edits with other key order and whitespace.
-    let reformatted_base = FirewallRuleRevision::from_json_str(
-        r#"{"rules":[{"all_of":[{"op":"==","right":53,"left":{"payload":{"field":"dport","protocol":"udp"}}}],"id":"dns"},
-        {"all_of":[{"right":{"prefix":{"len":24,"addr":"198.51.100.0"}},"op":"==","left":{"payload":{"field":"daddr","protocol":"ip"}}},
-                   {"op":"==","left":{"payload":{"field":"dport","protocol":"tcp"}},"right":80}],"id":"web"},
-        {"id":"metrics","all_of":[{"right":{"range":[9100,9199]},"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"=="}]}],
-        "schema_version":1}"#,
-    )
-    .unwrap();
-    let reformatted_edits = vec![
-        Edit::Replace(rule_json(
-            r#"{"all_of":[{"op":"==","left":{"payload":{"field":"daddr","protocol":"ip"}},"right":{"prefix":{"len":24,"addr":"198.51.100.0"}}},
-            {"right":{"range":[80,443]},"op":"==","left":{"payload":{"field":"dport","protocol":"tcp"}}}],"id":"web"}"#,
-        )),
-        Edit::Remove(id("dns")),
-        Edit::Add(Rule::from_json_str(&rule_json(ACCEPTANCE_ADMIN).to_json_string()).unwrap()),
-        Edit::Add(Rule::from_json_str(&rule_json(ACCEPTANCE_PROBE).to_json_string()).unwrap()),
-    ];
-    assert_eq!(reformatted_base, base);
-    assert_eq!(
-        reformatted_base.apply(&reformatted_edits),
-        Ok(expected.clone())
-    );
-
-    // Repeated runs agree.
-    for _ in 0..3 {
-        assert_eq!(base.apply(&acceptance_edits()), Ok(expected.clone()));
-    }
-
-    // Serializing both sides and decoding them again changes nothing.
-    let base_again = FirewallRuleRevision::from_json_str(&base.to_json_string()).unwrap();
-    let candidate_again =
-        FirewallRuleRevision::from_json_str(&expected.candidate().to_json_string()).unwrap();
-    assert_eq!(&candidate_again, expected.candidate());
-    assert_eq!(base_again.apply(&acceptance_edits()), Ok(expected));
 }
 
 /// A small deterministic generator (xorshift64*), so the generated cases are
@@ -412,11 +361,56 @@ impl Generator {
         self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % bound
     }
 
-    fn rule(&mut self, id: &str) -> Rule {
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[self.below(items.len() as u64) as usize]
+    }
+
+    /// A read of any kind, from small pools so that equal rules recur.
+    fn read(&mut self) -> Read {
+        let header = header(self.pick(&["ip", "tcp"]), self.pick(&["daddr", "dport"]));
+        match self.below(3) {
+            0 => Read::Payload(header),
+            1 => Read::TcpOption(TcpOptionName::new(self.pick(&["mptcp", "sack-perm"])).unwrap()),
+            _ => Read::MaskedPayload {
+                header,
+                mask: NonZeroU64::new(1 + self.below(2)).unwrap(),
+            },
+        }
+    }
+
+    /// A value of any kind, from small pools so that equal rules recur.
+    fn value(&mut self) -> Value {
+        match self.below(5) {
+            0 => Value::Integer(self.below(3)),
+            1 => Value::Ipv4(Ipv4Addr::new(192, 0, 2, self.pick(&[1, 2]))),
+            2 => Value::True,
+            3 => Value::Ipv4Prefix(
+                Ipv4Prefix::new(Ipv4Addr::new(198, 51, 100, 0), self.pick(&[24, 32])).unwrap(),
+            ),
+            _ => {
+                let start = self.below(3);
+                Value::Range(IntegerRange::new(start, start + self.below(2)).unwrap())
+            }
+        }
+    }
+
+    fn rule(&mut self, name: &str) -> Rule {
         let matches = (0..=self.below(2))
-            .map(|_| payload_eq("tcp", "dport", Value::Integer(self.below(4))))
+            .map(|_| Match::new(self.read(), self.value()))
             .collect();
-        Rule::new(RuleId::new(id), matches).unwrap()
+        Rule::new(id(name), matches).unwrap()
+    }
+}
+
+/// Records the kind of every read and value in `rules`.
+fn record_kinds<'a>(
+    rules: impl IntoIterator<Item = &'a Rule>,
+    reads: &mut HashSet<Discriminant<Read>>,
+    values: &mut HashSet<Discriminant<Value>>,
+) {
+    for comparison in rules.into_iter().flat_map(Rule::all_of) {
+        reads.insert(discriminant(comparison.left()));
+        values.insert(discriminant(comparison.right()));
     }
 }
 
@@ -454,6 +448,7 @@ fn expected_failure(base: &FirewallRuleRevision, edits: &[Edit]) -> Option<EditE
 fn generated_batches_keep_the_edit_and_diff_invariants() {
     let mut generator = Generator(0x5eed_f5ac);
     let (mut successes, mut failures) = (0, 0);
+    let (mut reads, mut values) = (HashSet::new(), HashSet::new());
     for _ in 0..2000 {
         let base_ids: Vec<&str> = ID_POOL
             .iter()
@@ -468,10 +463,16 @@ fn generated_batches_keep_the_edit_and_diff_invariants() {
                 match generator.below(3) {
                     0 => Edit::Add(generator.rule(name)),
                     1 => Edit::Replace(generator.rule(name)),
-                    _ => Edit::Remove(RuleId::new(name)),
+                    _ => Edit::Remove(id(name)),
                 }
             })
             .collect();
+        record_kinds(base.rules(), &mut reads, &mut values);
+        let edited = edits.iter().filter_map(|edit| match edit {
+            Edit::Add(rule) | Edit::Replace(rule) => Some(rule),
+            Edit::Remove(_) => None,
+        });
+        record_kinds(edited, &mut reads, &mut values);
 
         let result = base.apply(&edits);
         assert_eq!(base, original, "apply changed its base");
@@ -488,7 +489,9 @@ fn generated_batches_keep_the_edit_and_diff_invariants() {
             (expected, result) => panic!("expected failure {expected:?}, got {result:?}"),
         }
     }
-    // Both outcomes are exercised in quantity.
+    // Every read and value kind is generated, and both outcomes are
+    // exercised in quantity.
+    assert_eq!((reads.len(), values.len()), (3, 5));
     assert!(
         successes > 300 && failures > 300,
         "{successes} / {failures}"

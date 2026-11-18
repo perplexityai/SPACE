@@ -1,68 +1,41 @@
-//! The strict JSON decoder.
+//! The strict, versioned JSON decoder.
 //!
-//! `serde_json` only tokenizes here. Its generic maps keep the last of two
-//! repeated keys, so the text is first read into [`Json`], which keeps every
-//! object entry in order, and the grammar is then checked by hand with the
-//! JSON path of each element.
+//! `serde_json` only tokenizes here. The text is read into [`Json`], which
+//! keeps every object entry in document order, repeated keys included, and the
+//! grammar is then checked by hand. A derived `Deserialize` would be shorter,
+//! but its errors are free text classified only as syntax or data, located at
+//! the enclosing element, and inconsistent across shapes: a repeated key is
+//! `duplicate field` in a struct, `expected value` in an externally tagged
+//! enum, and lost in `did not match any variant` inside an untagged one. The
+//! hand-written grammar gives every failure a typed [`DecodeErrorKind`] at the
+//! exact [`JsonPath`] that the CLI and the Admin API can both map, and checks
+//! repeated keys the same way in every object.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 
-use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
-
-use crate::model::{
-    FirewallRuleRevision, HeaderField, HeaderProtocol, IntegerRange, Ipv4Prefix, Match,
+use pplx_space_firewall_rules::{
+    FirewallRuleRevision, HeaderField, HeaderProtocol, IntegerRange, Ipv4Prefix, Match, NameError,
     PayloadHeader, Read, Rule, RuleId, RuleRevisionError, TcpOptionName, Value,
 };
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
-/// The only firewall rules schema version this crate reads and writes.
-pub const SCHEMA_VERSION: u64 = 1;
+use crate::SCHEMA_VERSION;
 
 const EQUALITY: &str = "==";
 
-impl FirewallRuleRevision {
-    /// Decodes one complete revision document.
-    pub fn from_json_str(text: &str) -> Result<Self, DecodeError> {
-        let json = serde_json::from_str(text).map_err(DecodeError::syntax)?;
-        decode_revision(&json)
-    }
-
-    /// Decodes one complete revision document from UTF-8 bytes.
-    pub fn from_json_slice(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let json = serde_json::from_slice(bytes).map_err(DecodeError::syntax)?;
-        decode_revision(&json)
-    }
-
-    /// The canonical JSON form, which [`FirewallRuleRevision::from_json_str`]
-    /// reads back unchanged.
-    pub fn to_json_string(&self) -> String {
-        to_json_string(self)
-    }
+/// Decodes one complete revision document.
+pub fn decode_revision(text: &str) -> Result<FirewallRuleRevision, DecodeError> {
+    let json = serde_json::from_str(text).map_err(DecodeError::syntax)?;
+    decode_document(&json)
 }
 
-impl Rule {
-    /// Decodes one rule object, as an `Add` or `Replace` edit carries it.
-    pub fn from_json_str(text: &str) -> Result<Self, DecodeError> {
-        let json = serde_json::from_str(text).map_err(DecodeError::syntax)?;
-        decode_rule(&json, &JsonPath::root())
-    }
-
-    /// The canonical JSON form, which [`Rule::from_json_str`] reads back
-    /// unchanged.
-    pub fn to_json_string(&self) -> String {
-        to_json_string(self)
-    }
-}
-
-fn to_json_string(value: &impl serde::Serialize) -> String {
-    match serde_json::to_string(value) {
-        Ok(text) => text,
-        // Every map key is a string and no Serialize impl in this crate
-        // returns an error, so writing to a String cannot fail.
-        Err(error) => unreachable!("revision serialization failed: {error}"),
-    }
+/// Decodes one complete revision document from UTF-8 bytes.
+pub fn decode_revision_bytes(bytes: &[u8]) -> Result<FirewallRuleRevision, DecodeError> {
+    let json = serde_json::from_slice(bytes).map_err(DecodeError::syntax)?;
+    decode_document(&json)
 }
 
 /// A firewall rules document that does not follow the grammar.
@@ -106,7 +79,7 @@ pub enum DecodeErrorKind {
     /// JSON or holds a number too large for a 64-bit float such as `1e400`.
     /// This fails before any element has a path, so the path is the root and
     /// the error's line and column give the location.
-    #[error("malformed JSON")]
+    #[error("malformed JSON at line {line}, column {column}", line = .0.line(), column = .0.column())]
     Syntax(#[source] serde_json::Error),
     #[error("expected {expected}, found {found}")]
     WrongType {
@@ -141,6 +114,8 @@ pub enum DecodeErrorKind {
     ReversedRange { start: u64, end: u64 },
     #[error("rule ID {id:?} repeats the rule at index {first_index}", id = .id.as_str())]
     DuplicateRuleId { id: RuleId, first_index: usize },
+    #[error(transparent)]
+    InvalidName(NameError),
 }
 
 /// The JSON type found where another was expected.
@@ -258,6 +233,15 @@ enum Json {
 }
 
 impl Json {
+    /// The value of an integer of either sign.
+    fn integer(&self) -> Option<i128> {
+        match *self {
+            Self::Unsigned(value) => Some(i128::from(value)),
+            Self::Negative(value) => Some(i128::from(value)),
+            _ => None,
+        }
+    }
+
     fn kind(&self) -> JsonKind {
         match self {
             Self::Null => JsonKind::Null,
@@ -418,43 +402,53 @@ fn wrong_type(path: &JsonPath, expected: &'static str, found: &Json) -> DecodeEr
     )
 }
 
-fn decode_revision(json: &Json) -> Result<FirewallRuleRevision, DecodeError> {
+const REVISION: &str = "a revision object";
+
+/// Reads the schema version, then decodes the rest with that version's
+/// grammar. The version is read before any other field is checked, so a newer
+/// document is reported as an unsupported version, not as unexpected fields.
+fn decode_document(json: &Json) -> Result<FirewallRuleRevision, DecodeError> {
     let root = JsonPath::root();
-    let fields = Fields::new(
-        json,
-        &root,
-        "a revision object",
-        &["schema_version", "rules"],
-    )?;
-
-    let (version, version_path) = fields.required("schema_version")?;
-    match version {
-        Json::Unsigned(SCHEMA_VERSION) => {}
-        Json::Unsigned(found) => {
-            return Err(DecodeError::new(
-                &version_path,
-                DecodeErrorKind::UnsupportedSchemaVersion {
-                    found: i128::from(*found),
-                },
-            ));
-        }
-        Json::Negative(found) => {
-            return Err(DecodeError::new(
-                &version_path,
-                DecodeErrorKind::UnsupportedSchemaVersion {
-                    found: i128::from(*found),
-                },
-            ));
-        }
-        other => {
-            return Err(wrong_type(
-                &version_path,
-                "an integer schema version",
-                other,
-            ));
-        }
+    let Json::Object(entries) = json else {
+        return Err(wrong_type(&root, REVISION, json));
+    };
+    let version_path = root.key("schema_version");
+    let mut versions = entries.iter().filter(|(key, _)| key == "schema_version");
+    let Some((_, version)) = versions.next() else {
+        return Err(DecodeError::new(
+            &root,
+            DecodeErrorKind::MissingField {
+                field: "schema_version",
+            },
+        ));
+    };
+    if versions.next().is_some() {
+        return Err(DecodeError::new(
+            &version_path,
+            DecodeErrorKind::DuplicateField {
+                field: "schema_version".to_owned(),
+            },
+        ));
     }
+    let Some(found) = version.integer() else {
+        return Err(wrong_type(
+            &version_path,
+            "an integer schema version",
+            version,
+        ));
+    };
+    match u64::try_from(found) {
+        Ok(SCHEMA_VERSION) => decode_v1(json, &root),
+        _ => Err(DecodeError::new(
+            &version_path,
+            DecodeErrorKind::UnsupportedSchemaVersion { found },
+        )),
+    }
+}
 
+/// Schema version 1: `{"schema_version": 1, "rules": [<rule>, ...]}`.
+fn decode_v1(json: &Json, root: &JsonPath) -> Result<FirewallRuleRevision, DecodeError> {
+    let fields = Fields::new(json, root, REVISION, &["schema_version", "rules"])?;
     let (rules, rules_path) = fields.required("rules")?;
     let Json::Array(rules) = rules else {
         return Err(wrong_type(&rules_path, "an array of rules", rules));
@@ -480,7 +474,7 @@ fn decode_revision(json: &Json) -> Result<FirewallRuleRevision, DecodeError> {
 fn decode_rule(json: &Json, path: &JsonPath) -> Result<Rule, DecodeError> {
     let fields = Fields::new(json, path, "a rule object", &["id", "all_of"])?;
     let (id, id_path) = fields.required("id")?;
-    let id = RuleId::new(decode_string(id, &id_path, "a string rule ID")?);
+    let id = decode_name(id, &id_path, "a string rule ID", RuleId::new)?;
 
     let (all_of, all_of_path) = fields.required("all_of")?;
     let Json::Array(all_of) = all_of else {
@@ -528,8 +522,8 @@ fn decode_read(json: &Json, path: &JsonPath) -> Result<Read, DecodeError> {
         "tcp option" => {
             let fields = Fields::new(value, &path, "a TCP option object", &["name"])?;
             let (name, name_path) = fields.required("name")?;
-            let name = decode_string(name, &name_path, "a string option name")?;
-            Ok(Read::TcpOption(TcpOptionName::new(name)))
+            let name = decode_name(name, &name_path, "a string option name", TcpOptionName::new)?;
+            Ok(Read::TcpOption(name))
         }
         "&" => decode_masked_payload(value, &path),
         other => Err(unexpected_field(&path, other)),
@@ -561,13 +555,15 @@ fn decode_payload_header(json: &Json, path: &JsonPath) -> Result<PayloadHeader, 
         &["protocol", "field"],
     )?;
     let (protocol, protocol_path) = fields.required("protocol")?;
-    let protocol = decode_string(protocol, &protocol_path, "a string protocol name")?;
+    let protocol = decode_name(
+        protocol,
+        &protocol_path,
+        "a string protocol name",
+        HeaderProtocol::new,
+    )?;
     let (field, field_path) = fields.required("field")?;
-    let field = decode_string(field, &field_path, "a string field name")?;
-    Ok(PayloadHeader::new(
-        HeaderProtocol::new(protocol),
-        HeaderField::new(field),
-    ))
+    let field = decode_name(field, &field_path, "a string field name", HeaderField::new)?;
+    Ok(PayloadHeader::new(protocol, field))
 }
 
 const VALUE: &str = "an unsigned integer, IPv4 address string, true, prefix object or range object";
@@ -640,6 +636,17 @@ fn decode_string(
         Json::String(value) => Ok(value.clone()),
         other => Err(wrong_type(path, expected, other)),
     }
+}
+
+/// Reads a string and checks it against its name's syntax rule.
+fn decode_name<T>(
+    json: &Json,
+    path: &JsonPath,
+    expected: &'static str,
+    new: impl FnOnce(String) -> Result<T, NameError>,
+) -> Result<T, DecodeError> {
+    let text = decode_string(json, path, expected)?;
+    new(text).map_err(|error| DecodeError::new(path, DecodeErrorKind::InvalidName(error)))
 }
 
 fn decode_u64(json: &Json, path: &JsonPath, expected: &'static str) -> Result<u64, DecodeError> {

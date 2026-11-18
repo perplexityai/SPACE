@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::diff::{RuleChange, RuleRevisionDiff};
-use crate::model::{FirewallRuleRevision, Rule, RuleId, RuleRevisionError};
+use crate::model::{FirewallRuleRevision, Rule, RuleId};
 
 /// One requested change to a revision, naming a rule by ID.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,8 +97,6 @@ pub enum EditError {
     ReplaceMissing { id: RuleId, index: usize },
     #[error("edit {index} removes rule {id:?}, which the base revision does not have", id = .id.as_str())]
     RemoveMissing { id: RuleId, index: usize },
-    #[error("the edited revision is invalid")]
-    InvalidCandidate(#[source] RuleRevisionError),
 }
 
 impl FirewallRuleRevision {
@@ -107,9 +105,8 @@ impl FirewallRuleRevision {
     /// Edits are checked in batch order and the first failure is returned;
     /// on failure there is no candidate and no partial diff. `self` is only
     /// read. The candidate keeps the base order, with each replaced rule in its
-    /// original position and added rules appended in batch order; it is
-    /// validated as a complete revision before it is returned. An empty batch
-    /// yields an unchanged candidate and an empty diff.
+    /// original position and added rules appended in batch order. An empty
+    /// batch yields an unchanged candidate and an empty diff.
     pub fn apply(&self, edits: &[Edit]) -> Result<RuleRevisionChange, EditError> {
         let present: HashSet<&RuleId> = self.rules().iter().map(Rule::id).collect();
         let mut named: HashMap<&RuleId, (usize, EditKind)> = HashMap::with_capacity(edits.len());
@@ -183,7 +180,13 @@ impl FirewallRuleRevision {
             rules.push(rule.clone());
         }
 
-        let candidate = FirewallRuleRevision::new(rules).map_err(EditError::InvalidCandidate)?;
+        // The complete candidate is validated again. A failure is a bug here,
+        // not bad input: an add needs an absent ID and no two edits share one,
+        // so the candidate's IDs are unique.
+        let candidate = match FirewallRuleRevision::new(rules) {
+            Ok(candidate) => candidate,
+            Err(error) => unreachable!("the batch checks keep candidate rule IDs unique: {error}"),
+        };
         Ok(RuleRevisionChange {
             candidate,
             diff: RuleRevisionDiff::new(changes),

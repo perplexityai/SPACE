@@ -1,11 +1,15 @@
 use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 
-use super::*;
-use crate::test_fixtures::{
-    document_with_left, document_with_match, document_with_right, header, payload_eq,
+use pplx_space_firewall_rules::{
+    IntegerRange, Ipv4Prefix, MAX_NAME_LEN, NameError, NameKind, TcpOptionName,
 };
-use crate::{IntegerRange, Ipv4Prefix, TcpOptionName};
+
+use super::*;
+use crate::encode_revision;
+use crate::test_fixtures::{
+    document_with_left, document_with_match, document_with_right, header, id, payload_eq,
+};
 
 type KindCheck = fn(&DecodeErrorKind) -> bool;
 
@@ -13,26 +17,20 @@ type KindCheck = fn(&DecodeErrorKind) -> bool;
 /// kind, and that none decodes to a revision.
 fn assert_rejections(cases: Vec<(String, &str, KindCheck)>) {
     for (document, path, check) in cases {
-        let error = FirewallRuleRevision::from_json_str(&document)
-            .expect_err(&format!("accepted {document}"));
+        let error = decode_revision(&document).expect_err(&format!("accepted {document}"));
         assert_eq!(error.path().to_string(), path, "{document}: {error}");
         assert!(check(error.kind()), "{document}: unexpected {error:?}");
     }
 }
 
 fn decode(document: &str) -> FirewallRuleRevision {
-    FirewallRuleRevision::from_json_str(document)
-        .unwrap_or_else(|error| panic!("{document}: {error}"))
+    decode_revision(document).unwrap_or_else(|error| panic!("{document}: {error}"))
 }
 
 /// Decodes a document, writes it back canonically, and decodes that again.
 fn assert_round_trips(revision: &FirewallRuleRevision) {
-    let text = revision.to_json_string();
-    assert_eq!(
-        &FirewallRuleRevision::from_json_str(&text).unwrap(),
-        revision,
-        "{text}"
-    );
+    let text = encode_revision(revision);
+    assert_eq!(&decode_revision(&text).unwrap(), revision, "{text}");
 }
 
 const ALL_VARIANTS: &str = r#"{
@@ -56,10 +54,13 @@ fn valid_document_decodes_every_read_and_value_in_order() {
 
     let expected = FirewallRuleRevision::new(vec![
         Rule::new(
-            RuleId::new("first"),
+            id("first"),
             vec![
                 payload_eq("ip", "daddr", Value::Ipv4(Ipv4Addr::new(192, 0, 2, 1))),
-                Match::new(Read::TcpOption(TcpOptionName::new("mptcp")), Value::True),
+                Match::new(
+                    Read::TcpOption(TcpOptionName::new("mptcp").unwrap()),
+                    Value::True,
+                ),
                 Match::new(
                     Read::MaskedPayload {
                         header: header("tcp", "flags"),
@@ -71,7 +72,7 @@ fn valid_document_decodes_every_read_and_value_in_order() {
         )
         .unwrap(),
         Rule::new(
-            RuleId::new("second"),
+            id("second"),
             vec![
                 payload_eq(
                     "ip",
@@ -96,7 +97,7 @@ fn valid_document_decodes_every_read_and_value_in_order() {
 fn canonical_form_is_stable_and_keeps_rule_and_match_order() {
     let revision = decode(ALL_VARIANTS);
     assert_eq!(
-        revision.to_json_string(),
+        encode_revision(&revision),
         concat!(
             r#"{"schema_version":1,"rules":["#,
             r#"{"id":"first","all_of":["#,
@@ -127,8 +128,8 @@ fn key_order_and_whitespace_do_not_change_the_revision() {
     let revision = decode(reordered);
     assert_eq!(revision, decode(ALL_VARIANTS));
     assert_eq!(
-        revision.to_json_string(),
-        decode(ALL_VARIANTS).to_json_string()
+        encode_revision(&revision),
+        encode_revision(&decode(ALL_VARIANTS))
     );
 }
 
@@ -137,7 +138,7 @@ fn explicit_empty_rule_list_is_a_snapshot() {
     let revision = decode(r#"{"schema_version":1,"rules":[]}"#);
     assert!(revision.rules().is_empty());
     assert_eq!(
-        revision.to_json_string(),
+        encode_revision(&revision),
         r#"{"schema_version":1,"rules":[]}"#
     );
 }
@@ -331,6 +332,41 @@ fn rejects_documents_that_are_not_v1_snapshots() {
             "$.schema_version",
             |k| matches!(k, DecodeErrorKind::UnsupportedSchemaVersion { found: -1 }),
         ),
+        // The version is read first, so a newer document is reported as one
+        // whatever else it holds.
+        (
+            r#"{"schema_version":2,"rules":[],"x":{}}"#.into(),
+            "$.schema_version",
+            |k| matches!(k, DecodeErrorKind::UnsupportedSchemaVersion { found: 2 }),
+        ),
+        (
+            r#"{"x":{},"rules":"none","rules":1,"schema_version":2}"#.into(),
+            "$.schema_version",
+            |k| matches!(k, DecodeErrorKind::UnsupportedSchemaVersion { found: 2 }),
+        ),
+        (
+            r#"{"schema_version":1,"rules":[],"x":{}}"#.into(),
+            "$.x",
+            |k| matches!(k, DecodeErrorKind::UnexpectedField { field } if field == "x"),
+        ),
+        (r#"{"rules":[],"x":{}}"#.into(), "$", |k| {
+            matches!(
+                k,
+                DecodeErrorKind::MissingField {
+                    field: "schema_version"
+                }
+            )
+        }),
+        (
+            r#"{"schema_version":1,"rules":[],"schema_version":1}"#.into(),
+            "$.schema_version",
+            |k| matches!(k, DecodeErrorKind::DuplicateField { field } if field == "schema_version"),
+        ),
+        (
+            r#"{"schema_version":2,"schema_version":1,"rules":[]}"#.into(),
+            "$.schema_version",
+            |k| matches!(k, DecodeErrorKind::DuplicateField { field } if field == "schema_version"),
+        ),
         (r#"{"schema_version":1}"#.into(), "$", |k| {
             matches!(k, DecodeErrorKind::MissingField { field: "rules" })
         }),
@@ -404,10 +440,7 @@ fn decodes_one_or_several_rules_and_matches() {
     ]));
     assert_eq!(revision.rules().len(), 3);
     assert_eq!(revision.rules()[2].all_of().len(), 2);
-    assert_eq!(
-        revision.rule(&RuleId::new("b")).unwrap().id(),
-        &RuleId::new("b")
-    );
+    assert_eq!(revision.rule(&id("b")).unwrap().id(), &id("b"));
 }
 
 #[test]
@@ -1025,7 +1058,7 @@ fn rejects_unsupported_operators() {
     let cases = ["!=", "eq", "in", "<", "", " =="];
     for op in cases {
         let document = document_with_match(&format!(r#"{{{read},"op":"{op}","right":1}}"#));
-        let error = FirewallRuleRevision::from_json_str(&document).unwrap_err();
+        let error = decode_revision(&document).unwrap_err();
         assert_eq!(error.path().to_string(), "$.rules[0].all_of[0].op");
         assert!(
             matches!(error.kind(), DecodeErrorKind::UnsupportedOperator { op: found } if found == op),
@@ -1208,31 +1241,8 @@ fn rejects_repeated_keys_instead_of_keeping_the_last() {
 }
 
 #[test]
-fn rule_decoder_applies_the_same_grammar() {
-    let rule = Rule::from_json_str(&good_rule("a")).unwrap();
-    assert_eq!(rule.id().as_str(), "a");
-    assert_eq!(Rule::from_json_str(&rule.to_json_string()).unwrap(), rule);
-
-    for (text, path) in [
-        (
-            format!(r#"{{"id":"a","id":"b","all_of":[{GOOD_MATCH}]}}"#),
-            "$.id",
-        ),
-        (
-            format!(r#"{{"id":"a","all_of":[{GOOD_MATCH}],"verdict":"accept"}}"#),
-            "$.verdict",
-        ),
-        (r#"{"id":"a","all_of":[]}"#.to_owned(), "$.all_of"),
-        ("null".to_owned(), "$"),
-    ] {
-        let error = Rule::from_json_str(&text).unwrap_err();
-        assert_eq!(error.path().to_string(), path, "{text}: {error}");
-    }
-}
-
-#[test]
 fn error_display_names_the_location() {
-    let error = FirewallRuleRevision::from_json_str(&document_with_left(
+    let error = decode_revision(&document_with_left(
         r#"{"&":[{"payload":{"protocol":"tcp","field":"flags"}},0]}"#,
     ))
     .unwrap_err();
@@ -1241,15 +1251,146 @@ fn error_display_names_the_location() {
         r#"$.rules[0].all_of[0].left["&"][1]: mask must be nonzero"#
     );
 
-    let duplicate = FirewallRuleRevision::from_json_str(&document_with_rules(&[
-        good_rule("a"),
-        good_rule("a"),
-    ]))
-    .unwrap_err();
+    let duplicate =
+        decode_revision(&document_with_rules(&[good_rule("a"), good_rule("a")])).unwrap_err();
     assert_eq!(
         duplicate.to_string(),
         r#"$.rules[1].id: rule ID "a" repeats the rule at index 0"#
     );
+
+    let overflow = decode_revision(&document_with_right("1e400")).unwrap_err();
+    assert_eq!(
+        overflow.to_string(),
+        "$: malformed JSON at line 1, column 127"
+    );
+
+    // A refused character is written escaped, never raw.
+    let escape = decode_revision(&document_with_rules(&[good_rule(r"\u001b[31mweb")])).unwrap_err();
+    assert_eq!(
+        escape.to_string(),
+        r"$.rules[0].id: a rule ID may hold only printable ASCII other than space, found '\u{1b}' at byte 0"
+    );
+}
+
+#[test]
+fn rejects_names_that_break_their_syntax_rule() {
+    let long = "a".repeat(MAX_NAME_LEN + 1);
+    let id_at = "$.rules[0].id";
+    let invalid = |kind, index, found| NameError::InvalidCharacter { kind, index, found };
+    let cases: Vec<(String, &str, NameError)> = vec![
+        (
+            document_with_rules(&[good_rule("")]),
+            id_at,
+            NameError::Empty {
+                kind: NameKind::RuleId,
+            },
+        ),
+        (
+            document_with_rules(&[good_rule(&long)]),
+            id_at,
+            NameError::TooLong {
+                kind: NameKind::RuleId,
+                len: MAX_NAME_LEN + 1,
+            },
+        ),
+        (
+            document_with_rules(&[good_rule("a b")]),
+            id_at,
+            invalid(NameKind::RuleId, 1, ' '),
+        ),
+        (
+            document_with_rules(&[good_rule(r"a\nb")]),
+            id_at,
+            invalid(NameKind::RuleId, 1, '\n'),
+        ),
+        (
+            document_with_rules(&[good_rule(r"\u001b[31mweb")]),
+            id_at,
+            invalid(NameKind::RuleId, 0, '\u{1b}'),
+        ),
+        (
+            document_with_rules(&[good_rule(r"web\u200b")]),
+            id_at,
+            invalid(NameKind::RuleId, 3, '\u{200b}'),
+        ),
+        (
+            document_with_rules(&[good_rule("w\u{e9}b")]),
+            id_at,
+            invalid(NameKind::RuleId, 1, '\u{e9}'),
+        ),
+        (
+            document_with_left(r#"{"payload":{"protocol":"","field":"dport"}}"#),
+            "$.rules[0].all_of[0].left.payload.protocol",
+            NameError::Empty {
+                kind: NameKind::HeaderProtocol,
+            },
+        ),
+        (
+            document_with_left(r#"{"payload":{"protocol":"tcp","field":"d\tport"}}"#),
+            "$.rules[0].all_of[0].left.payload.field",
+            invalid(NameKind::HeaderField, 1, '\t'),
+        ),
+        (
+            document_with_left(&format!(r#"{{"tcp option":{{"name":"{long}"}}}}"#)),
+            r#"$.rules[0].all_of[0].left["tcp option"].name"#,
+            NameError::TooLong {
+                kind: NameKind::TcpOptionName,
+                len: MAX_NAME_LEN + 1,
+            },
+        ),
+        (
+            document_with_left(r#"{"&":[{"payload":{"protocol":"\u001b[0m","field":"flags"}},1]}"#),
+            r#"$.rules[0].all_of[0].left["&"][0].payload.protocol"#,
+            invalid(NameKind::HeaderProtocol, 0, '\u{1b}'),
+        ),
+    ];
+    for (document, path, expected) in cases {
+        let error = decode_revision(&document).expect_err(&format!("accepted {document}"));
+        assert_eq!(error.path().to_string(), path, "{document}: {error}");
+        assert!(
+            matches!(error.kind(), DecodeErrorKind::InvalidName(found) if *found == expected),
+            "{document}: {error:?}"
+        );
+    }
+
+    // The limits themselves are accepted.
+    let longest = "a".repeat(MAX_NAME_LEN);
+    let revision = decode(&document_with_rules(&[good_rule(&longest)]));
+    assert_eq!(revision.rules()[0].id().as_str(), longest);
+    // Every printable character other than space, split into IDs that fit.
+    // Quote and backslash are left out only because `good_rule` writes the ID
+    // into the JSON unescaped; the encoder tests cover them.
+    let printable: String = (0x21u8..=0x7e)
+        .map(char::from)
+        .filter(|c| !matches!(c, '"' | '\\'))
+        .collect();
+    let ids: Vec<&str> = printable
+        .as_bytes()
+        .chunks(MAX_NAME_LEN)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap())
+        .collect();
+    let rules: Vec<String> = ids.iter().map(|id| good_rule(id)).collect();
+    let revision = decode(&document_with_rules(&rules));
+    let decoded: Vec<&str> = revision.rules().iter().map(|r| r.id().as_str()).collect();
+    assert_eq!(decoded, ids);
+}
+
+#[test]
+fn deep_nesting_is_rejected_while_tokenizing() {
+    // Far beyond serde_json's recursion limit of 128: rejected as malformed
+    // JSON at the root, without overflowing the stack.
+    let depth = 100_000;
+    for right in [
+        format!("{}{}", "[".repeat(depth), "]".repeat(depth)),
+        format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth)),
+    ] {
+        let error = decode_revision(&document_with_right(&right)).unwrap_err();
+        assert_eq!(error.path().to_string(), "$");
+        assert!(
+            matches!(error.kind(), DecodeErrorKind::Syntax(inner) if inner.is_syntax()),
+            "{error:?}"
+        );
+    }
 }
 
 #[test]
@@ -1262,7 +1403,7 @@ fn paths_bracket_keys_that_dot_shorthand_cannot_name() {
         (r#""_x9""#, "$._x9"),
     ] {
         let document = format!(r#"{{"schema_version":1,"rules":[],{key}:1}}"#);
-        let error = FirewallRuleRevision::from_json_str(&document).unwrap_err();
+        let error = decode_revision(&document).unwrap_err();
         assert_eq!(error.path().to_string(), path, "{document}: {error}");
         assert!(
             matches!(error.kind(), DecodeErrorKind::UnexpectedField { .. }),
@@ -1274,13 +1415,13 @@ fn paths_bracket_keys_that_dot_shorthand_cannot_name() {
 #[test]
 fn from_slice_matches_from_str() {
     assert_eq!(
-        FirewallRuleRevision::from_json_slice(ALL_VARIANTS.as_bytes()).unwrap(),
+        decode_revision_bytes(ALL_VARIANTS.as_bytes()).unwrap(),
         decode(ALL_VARIANTS)
     );
-    assert!(matches!(
-        FirewallRuleRevision::from_json_slice(b"\xff")
-            .unwrap_err()
-            .kind(),
-        DecodeErrorKind::Syntax(_)
-    ));
+    for bytes in [&b"\xff"[..], br#"{"schema_version":1,"rules":[]} x"#] {
+        assert!(matches!(
+            decode_revision_bytes(bytes).unwrap_err().kind(),
+            DecodeErrorKind::Syntax(_)
+        ));
+    }
 }

@@ -1,37 +1,35 @@
-//! Builders shared by the decoder and edit tests.
+//! Builders and documents shared by the protocol tests.
 
-use crate::{
-    FirewallRuleRevision, HeaderField, HeaderProtocol, Match, PayloadHeader, Read, Rule, RuleId,
-    Value,
+use pplx_space_firewall_rules::{
+    HeaderField, HeaderProtocol, Match, PayloadHeader, Read, Rule, RuleId, Value,
 };
 
+use crate::decode_revision;
+
+pub(crate) fn id(value: &str) -> RuleId {
+    RuleId::new(value).unwrap()
+}
+
 pub(crate) fn header(protocol: &str, field: &str) -> PayloadHeader {
-    PayloadHeader::new(HeaderProtocol::new(protocol), HeaderField::new(field))
+    PayloadHeader::new(
+        HeaderProtocol::new(protocol).unwrap(),
+        HeaderField::new(field).unwrap(),
+    )
 }
 
 pub(crate) fn payload_eq(protocol: &str, field: &str, value: Value) -> Match {
     Match::new(Read::Payload(header(protocol, field)), value)
 }
 
-/// A rule dropping traffic to one destination port.
-pub(crate) fn port_rule(id: &str, protocol: &str, port: u64) -> Rule {
-    Rule::new(
-        RuleId::new(id),
-        vec![payload_eq(protocol, "dport", Value::Integer(port))],
-    )
-    .unwrap()
-}
-
-pub(crate) fn revision(rules: Vec<Rule>) -> FirewallRuleRevision {
-    FirewallRuleRevision::new(rules).unwrap()
-}
-
-pub(crate) fn ids(snapshot: &FirewallRuleRevision) -> Vec<&str> {
-    snapshot
-        .rules()
-        .iter()
-        .map(|rule| rule.id().as_str())
-        .collect()
+/// Decodes one rule object by wrapping it in a single-rule v1 document, so
+/// the tests read rules only through the public, versioned entry point.
+pub(crate) fn rule_json(rule: &str) -> Rule {
+    let document = format!(r#"{{"schema_version":1,"rules":[{rule}]}}"#);
+    let mut rules = decode_revision(&document)
+        .unwrap_or_else(|error| panic!("{rule}: {error}"))
+        .into_rules();
+    assert_eq!(rules.len(), 1);
+    rules.remove(0)
 }
 
 /// Wraps one comparison in a single-rule v1 document.
