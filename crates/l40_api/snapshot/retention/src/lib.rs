@@ -114,7 +114,7 @@
 //! scheduling, singleton authority, and shutdown. SPACE currently hosts it in
 //! `space-cluster-controller`; API servers do not start background loops.
 
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::num::NonZeroU32;
 use std::sync::Arc;

@@ -11,7 +11,7 @@ use crate::materialization::MaterializationMode;
 use pplx_space_accounts::OrgId;
 use pplx_space_common_core::types::{KekProvider, MasterKeyIdentifier};
 use pplx_space_common_core::types::{
-    SnapshotArtifact, StorageUri, SubjectId, TransferScopeId, parse_snapshot_object_key,
+    SnapshotArtifact, StorageUri, SubjectId, parse_snapshot_object_key,
 };
 use pplx_space_common_jobs::{
     BackgroundWorker, JobExecutor, JobFailure, JobFailureReason, JobPriority, PriorityBand,
@@ -19,6 +19,7 @@ use pplx_space_common_jobs::{
 };
 use pplx_space_host_layout::{identities::user_names, identities::users};
 use pplx_space_sandbox_grpc::record_sandbox_id;
+use pplx_space_snapshot_model::TransferScopeId;
 use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };

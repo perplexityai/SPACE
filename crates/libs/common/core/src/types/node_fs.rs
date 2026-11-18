@@ -20,9 +20,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use super::snapshot::SnapshotName;
 use pplx_space_host_layout::paths::{SANDBOX_CACHE_DIR, SANDBOX_RUN_DIR, TEMPLATE_DIR};
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotName;
 use pplx_space_template_model::TemplateBuildId;
 
 /// Directory name used under a sandbox cache directory for snapshots.
@@ -265,6 +265,7 @@ impl NodeTemplateRootfsPath {
 /// ```rust
 /// # use pplx_space_common_core::types::*;
 /// # use pplx_space_sandbox_model::*;
+/// # use pplx_space_snapshot_model::SnapshotName;
 /// let root = NodeSpacePath::parse("/space")?;
 /// let id = SandboxId::from_uuid(uuid::Uuid::nil());
 /// let name = SnapshotName::parse("before-upgrade")?;
@@ -284,6 +285,7 @@ impl NodeSnapshotDir {
     /// ```rust
     /// # use pplx_space_common_core::types::*;
     /// # use pplx_space_sandbox_model::*;
+    /// # use pplx_space_snapshot_model::SnapshotName;
     /// let root = NodeSpacePath::parse("/space")?;
     /// let name = SnapshotName::parse("base")?;
     /// let dir = NodeSnapshotDir::new(&root, SandboxId::from_uuid(uuid::Uuid::nil()), &name);
@@ -307,6 +309,7 @@ impl NodeSnapshotDir {
     /// ```rust
     /// # use pplx_space_common_core::types::*;
     /// # use pplx_space_sandbox_model::*;
+    /// # use pplx_space_snapshot_model::SnapshotName;
     /// let root = NodeSpacePath::parse("/space")?;
     /// let name = SnapshotName::parse("base")?;
     /// let dir = NodeSnapshotDir::new(&root, SandboxId::from_uuid(uuid::Uuid::nil()), &name);

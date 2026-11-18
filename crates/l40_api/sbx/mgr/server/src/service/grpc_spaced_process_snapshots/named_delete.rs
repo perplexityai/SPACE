@@ -76,8 +76,7 @@ impl SandboxManagerService {
                 .ok()
                 .flatten()
                 .filter(|artifact| {
-                    artifact.artifact_origin
-                        != pplx_space_common_core::types::ArtifactOrigin::Snapshot
+                    artifact.artifact_origin != pplx_space_snapshot_model::ArtifactOrigin::Snapshot
                 })
                 .map(|artifact| artifact.local_path)
         });

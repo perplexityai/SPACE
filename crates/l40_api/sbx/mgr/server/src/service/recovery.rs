@@ -1,6 +1,6 @@
 //! Startup and periodic repair of interrupted lifecycle operations.
 
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::cache_cleanup::{ReconcileSource, cleanup_orphaned_dirs, ensure_sandbox_cache_root_in};
 use super::cleanup_support::{CleanupCompletion, CleanupLockTryResult, CleanupRecoveryTarget};

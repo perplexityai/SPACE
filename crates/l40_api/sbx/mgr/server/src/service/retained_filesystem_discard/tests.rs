@@ -2,13 +2,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_accounts::{JobId, NodeId};
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::NodeManagedBy;
 use pplx_space_sandbox_model::{
     ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
     SpaceApiRouteIdentity,
 };
+use pplx_space_snapshot_model::LocalArtifactId;
 use tonic::Request;
 
 use super::*;

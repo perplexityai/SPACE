@@ -32,12 +32,12 @@ use pplx_space_accounts::SandboxOwnerSource;
 use pplx_space_auto_lifecycle::{
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
 };
-#[cfg(feature = "kubernetes")]
-use pplx_space_common_core::types::SnapshotId;
 use pplx_space_ecw_credential::EcwCredentialKeyring;
 use pplx_space_sandbox_model::SandboxLifecycle;
 #[cfg(feature = "kubernetes")]
 use pplx_space_sandbox_pod::SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION;
+#[cfg(feature = "kubernetes")]
+use pplx_space_snapshot_model::SnapshotId;
 use pplx_space_template_model::{DEFAULT_TEMPLATE_TAG, TemplateVisibility};
 
 use super::{

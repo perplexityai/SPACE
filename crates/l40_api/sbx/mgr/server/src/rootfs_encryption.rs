@@ -75,7 +75,7 @@ pub(crate) async fn prepare_encrypted_rootfs(
                 let meta: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&bytes)?;
                 if meta.encrypted
                     && crate::snapshot_upload::artifact_kind_from_meta(&meta)
-                        == pplx_space_common_core::types::ArtifactKind::Disk
+                        == pplx_space_snapshot_model::ArtifactKind::Disk
                 {
                     if meta.sandbox_id != sandbox_id {
                         return Err(EncryptedRootfsPrepareError::MetadataIdentity);

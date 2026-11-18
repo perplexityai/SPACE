@@ -858,8 +858,8 @@ async fn abandoned_capture_handler_finishes_queued_running_and_stopping_attempts
     use crate::service::tests::service_tests::{
         allocate_test_lease, bind_test_execution, root_request,
     };
-    use pplx_space_common_core::types::LocalArtifactId;
     use pplx_space_node_mgr_client::capture_receipt::{COMMITTED, INTENT, STAGING_PREFIX};
+    use pplx_space_snapshot_model::LocalArtifactId;
     use std::{
         future::{Future, poll_fn},
         sync::{
@@ -1060,7 +1060,7 @@ async fn cloud_hypervisor_pre_capture_refusal_never_stops_the_runtime() {
     use pplx_space_sandbox_model::SandboxId;
     let mut service = service_for_unit_tests().await;
     let sandbox = SandboxId::new();
-    let artifact = pplx_space_common_core::types::LocalArtifactId::new();
+    let artifact = pplx_space_snapshot_model::LocalArtifactId::new();
     let root = tempfile::tempdir().unwrap();
     let staging = root
         .path()

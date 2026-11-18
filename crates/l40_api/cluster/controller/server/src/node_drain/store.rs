@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 use pplx_space_sql_locator::sql;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -17,7 +17,6 @@ use pplx_space_api::controllers::substrate::{
     enqueue_artifact_backup_with_node_api, sandbox_state_with_node_api,
 };
 use pplx_space_api::reconcile_queue::{ReconcileRef, enqueue_sandbox_reconcile};
-use pplx_space_common_core::types::{ArtifactKind, BackupSource, LocalArtifactId};
 use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -40,6 +39,7 @@ use pplx_space_sandbox_store::drain::{
     self, StoppedEvacuationClaim, claim_evacuation_suspend, claim_stopped_evacuation,
     gone_node_identity_guards, record_stopped_evacuation_artifact, revert_evacuation_suspend_claim,
 };
+use pplx_space_snapshot_model::{ArtifactKind, BackupSource, LocalArtifactId};
 
 use pplx_space_api::metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_node_api_client::NodeApiClient;

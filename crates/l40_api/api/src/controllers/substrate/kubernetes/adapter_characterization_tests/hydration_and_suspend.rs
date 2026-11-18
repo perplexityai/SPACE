@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::http::{Method, StatusCode};
-use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId};
 use pplx_space_sbx_mgr_client::proto as sbx;
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId};
 
 use super::super::pod_ops::ExecutionHydrationOutcome;
 use super::super::scripted_test_doubles::{

@@ -1,6 +1,6 @@
 //! Abandoned suspend directories are the cleanup record, including after the
 //! lifecycle row has returned to a stable state. The inventory loop owns retry.
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::*;
 use std::collections::VecDeque;

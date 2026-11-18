@@ -44,9 +44,6 @@ use pplx_space_accounts::{Email, NodeId, OrgId, SandboxOwner, UserId};
 use pplx_space_api_route::wait_ready_lifecycle_request;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_bearer_token::SpaceBearerToken;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, BackupAttemptId, BackupSource, LocalArtifactId,
-};
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
@@ -57,6 +54,9 @@ use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodePoolName, NodeRole};
 use pplx_space_rpc_auth::SpaceBearerInterceptor;
 use pplx_space_sandbox_model::{
     SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
+};
+use pplx_space_snapshot_model::{
+    ArtifactKind, ArtifactOrigin, BackupAttemptId, BackupSource, LocalArtifactId,
 };
 use pplx_space_template_model::TemplateName;
 

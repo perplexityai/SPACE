@@ -1,6 +1,6 @@
 //! Parse and authorize the storage-specific RFC 8693 token exchange contract.
 
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::fmt;
 

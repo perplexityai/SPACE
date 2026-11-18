@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::{CatalogEnvironment, RecordedExecution};
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_execution_spec::{ArtifactComponentKind, EnvironmentReference};
+use pplx_space_snapshot_model::LocalArtifactId;
 
 /// An execution the control plane recorded, with the identity of what it
 /// records: the checkpoint's snapshot for a restore, the published execution

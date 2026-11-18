@@ -1,6 +1,6 @@
 //! Snapshot-retention behavior and Postgres contract tests.
-use pplx_space_common_core::types::SnapshotId;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -1185,11 +1185,11 @@ async fn t14_dry_run_counts_would_prune_without_side_effects() {
 
 #[cfg(test)]
 mod postgres {
-    use pplx_space_common_core::types::SnapshotId;
     use pplx_space_db_test_fixtures::{
         SEED_ORG_ID as SEEDED_ORG_ID, SEED_USER_ID as SEEDED_USER_ID, try_pg_test_db,
     };
     use pplx_space_sandbox_model::SandboxId;
+    use pplx_space_snapshot_model::SnapshotId;
     use pplx_space_sql_locator::sql;
     use sqlx::PgPool;
     use uuid::Uuid;

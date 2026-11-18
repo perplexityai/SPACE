@@ -598,9 +598,9 @@ fn persisted_route_stream_epoch(
     let identity = &sandbox.space_api_route_identity;
     let has_suspend_artifact = sandbox.current_local_artifact_id.is_some()
         && sandbox.current_local_artifact_kind
-            == Some(pplx_space_common_core::types::ArtifactKind::Full)
+            == Some(pplx_space_snapshot_model::ArtifactKind::Full)
         && sandbox.current_local_artifact_origin
-            == Some(pplx_space_common_core::types::ArtifactOrigin::Suspend);
+            == Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend);
     // A completed full suspend keeps the producing execution generation and
     // pod UID as artifact provenance after its live routing fields are cleared.
     // That exact partial shape is not an attachable route epoch; a subsequent

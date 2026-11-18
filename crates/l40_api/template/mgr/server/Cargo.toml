@@ -24,6 +24,7 @@ pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-execution-catalog = { workspace = true }
+pplx-space-snapshot-model = { workspace = true }
 pplx-space-template-model = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 async-trait = { workspace = true }

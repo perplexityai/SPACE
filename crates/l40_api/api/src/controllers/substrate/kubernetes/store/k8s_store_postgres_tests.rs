@@ -1,7 +1,7 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 use pplx_space_node_model::{NODE_DRAIN_MODE_GENTLE, NodeDrainPhase};
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use std::time::Duration;
 

@@ -14,13 +14,12 @@ use crate::db::Connection;
 use crate::state::{CleanupState, SandboxStatus, Teardown};
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExactStorageUri, LocalArtifactId, TransferScopeId,
-};
+use pplx_space_common_core::types::ExactStorageUri;
 use pplx_space_sandbox_model::{
     ExecutionGeneration, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRuntimeLabel,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, TransferScopeId};
 use rusqlite::params;
 
 use crate::db::{

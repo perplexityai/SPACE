@@ -54,14 +54,15 @@ pub mod proto {
     ///
     /// Every caller that puts an artifact kind on the wire needs it, and the
     /// crate that owns the generated enum is the only place a single copy
-    /// can live: `pplx-space-common-core` cannot depend on the proto crate.
+    /// can live: `pplx-space-snapshot-model`, a model, cannot depend on a
+    /// protocol crate.
     /// Several sites in `pplx-space-sbx-mgr` still inline the same two-arm
     /// match; they can move onto this without any behavior change.
-    impl From<pplx_space_common_core::types::ArtifactKind> for ArtifactKind {
-        fn from(artifact_kind: pplx_space_common_core::types::ArtifactKind) -> Self {
+    impl From<pplx_space_snapshot_model::ArtifactKind> for ArtifactKind {
+        fn from(artifact_kind: pplx_space_snapshot_model::ArtifactKind) -> Self {
             match artifact_kind {
-                pplx_space_common_core::types::ArtifactKind::Disk => Self::Disk,
-                pplx_space_common_core::types::ArtifactKind::Full => Self::Full,
+                pplx_space_snapshot_model::ArtifactKind::Disk => Self::Disk,
+                pplx_space_snapshot_model::ArtifactKind::Full => Self::Full,
             }
         }
     }

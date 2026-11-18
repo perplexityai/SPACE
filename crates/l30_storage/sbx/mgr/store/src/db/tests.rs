@@ -2532,7 +2532,7 @@ fn materializing_a_stopped_sandbox_keeps_the_artifact_pin_it_was_evacuated_with(
         insert_restore_transfer_scope(
             &conn,
             "sandbox-1",
-            pplx_space_common_core::types::TransferScopeId::new(),
+            pplx_space_snapshot_model::TransferScopeId::new(),
             None,
             None,
             "/space/cache/restore-staging/evacuated-stopped",
@@ -2991,7 +2991,7 @@ fn restored_disk_as_new_becomes_a_stopped_sandbox_without_donor_runtime_identity
         insert_restore_transfer_scope(
             &conn,
             "sandbox-1",
-            pplx_space_common_core::types::TransferScopeId::new(),
+            pplx_space_snapshot_model::TransferScopeId::new(),
             None,
             None,
             "/space/cache/restore-staging/artifact-as-new",
@@ -6095,7 +6095,7 @@ fn orphan_quarantine_recovery_clears_staging_failure() {
         is_orphan_quarantine_recovery_state(&conn, &sandbox_id_string, SandboxState::Restoring,)
             .unwrap()
     );
-    let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let transfer_scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     assert!(
         insert_restore_transfer_scope(
             &conn,
@@ -6179,7 +6179,7 @@ fn canonical_restore_reclaim_requires_the_exact_attempt_and_no_runtime() {
     .unwrap();
     let generation = ExecutionGeneration::new(7).unwrap();
     let activation_attempt_id = SandboxActivationAttemptId::new();
-    let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let transfer_scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     assert!(
         insert_restore_transfer_scope(
             &conn,
@@ -6265,7 +6265,7 @@ fn retryable_restore_scope_handoff_rejects_a_after_b_and_admits_c() {
     let attempt_c = SandboxActivationAttemptId::from_uuid(
         Uuid::parse_str("019c0000-0000-7000-8000-000000000003").unwrap(),
     );
-    let scope_a = pplx_space_common_core::types::TransferScopeId::new();
+    let scope_a = pplx_space_snapshot_model::TransferScopeId::new();
     assert!(
         insert_restore_transfer_scope(
             &conn,
@@ -6393,7 +6393,7 @@ fn authoritative_restore_attempt_claims_legacy_unowned_retryable_scope() {
     )
     .unwrap();
 
-    let legacy_scope = pplx_space_common_core::types::TransferScopeId::new();
+    let legacy_scope = pplx_space_snapshot_model::TransferScopeId::new();
     assert!(
         insert_restore_transfer_scope(
             &conn,
@@ -6479,7 +6479,7 @@ fn exchanged_restore_cleanup_owner_advances_without_moving_the_scope() {
     let attempt_c = SandboxActivationAttemptId::from_uuid(
         Uuid::parse_str("019c0000-0000-7000-8000-000000000003").unwrap(),
     );
-    let exchanged_scope = pplx_space_common_core::types::TransferScopeId::new();
+    let exchanged_scope = pplx_space_snapshot_model::TransferScopeId::new();
     let staging_dir = "/space/cache/restore-staging/exchanged";
     assert!(
         insert_restore_transfer_scope(

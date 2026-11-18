@@ -79,7 +79,7 @@
 //! observability (events, metrics, logs) before any writes happen.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use std::time::{Duration, Instant};
 

@@ -9,13 +9,11 @@
 //! adoption statement itself.
 
 use crate::db::Connection;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, TransferScopeId,
-};
 use pplx_space_sandbox_model::{
     SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
     SandboxQuarantineSource,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, TransferScopeId};
 use rusqlite::params;
 
 use super::state_write_fixtures::{

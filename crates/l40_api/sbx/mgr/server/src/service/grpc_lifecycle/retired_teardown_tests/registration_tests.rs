@@ -809,7 +809,7 @@ async fn legacy_capture_recovery_adopts_without_inventing_capture_order() {
                 &conn,
                 &sandbox_id,
                 generation(GENERATION),
-                pplx_space_common_core::types::LocalArtifactId::new(),
+                pplx_space_snapshot_model::LocalArtifactId::new(),
             )
             .unwrap();
             // Only legacy plaintext recovery may adopt an unrelated capture.

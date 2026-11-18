@@ -1055,7 +1055,7 @@ fn project_snapshot_inventory(
         if is_internal_snapshot_name(&snapshot.name) {
             continue;
         }
-        pplx_space_common_core::types::SnapshotName::parse(&snapshot.name).map_err(|error| {
+        pplx_space_snapshot_model::SnapshotName::parse(&snapshot.name).map_err(|error| {
             Status::data_loss(format!("invalid snapshot inventory name: {error}"))
         })?;
         snapshots.insert(
@@ -1150,9 +1150,9 @@ fn project_snapshot_inventory(
             snapshot.state = "incomplete".into();
         } else if full || transfer_binding.is_some() {
             let kind = if full {
-                pplx_space_common_core::types::ArtifactKind::Full
+                pplx_space_snapshot_model::ArtifactKind::Full
             } else {
-                pplx_space_common_core::types::ArtifactKind::Disk
+                pplx_space_snapshot_model::ArtifactKind::Disk
             };
             let publication = publications.get(&snapshot.id).filter(|publication| {
                 publication.artifact_kind == kind
@@ -1240,7 +1240,7 @@ impl SandboxManagerService {
         snapshot_name: &str,
     ) -> Result<Option<crate::local_artifacts::RestoreLease>, Status> {
         let name = snapshot_name
-            .parse::<pplx_space_common_core::types::SnapshotName>()
+            .parse::<pplx_space_snapshot_model::SnapshotName>()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let Some(publication) = self
             .local_artifacts
@@ -1327,7 +1327,7 @@ impl SandboxManagerService {
         // don't restore from it: a running sandbox is stopped first, and a
         // stopped row's pin is dropped before the disk is rewritten.
         let pins_suspend_artifact = sandbox.current_local_artifact_origin
-            == Some(pplx_space_common_core::types::ArtifactOrigin::Suspend);
+            == Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend);
         if sandbox.state.is_unowned(SandboxState::Suspended)
             || sandbox.cleanup_completion == Some(CleanupCompletion::MarkSuspended)
             || (pins_suspend_artifact

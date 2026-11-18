@@ -370,7 +370,7 @@ pub enum CancelTransferScopeError {
 /// attempt that gets no answer, is bounded by [`VOLUME_MANAGER_RESTART_BUDGET`].
 pub async fn cancel_transfer_scope(
     client: ConnectedVolumeManagerClient,
-    scope: pplx_space_common_core::types::TransferScopeId,
+    scope: pplx_space_snapshot_model::TransferScopeId,
 ) -> Result<Vec<proto::TransferJob>, CancelTransferScopeError> {
     cancel_transfer_scope_with(scope, move |request| {
         let mut client = client.clone();
@@ -380,7 +380,7 @@ pub async fn cancel_transfer_scope(
 }
 
 async fn cancel_transfer_scope_with<F, Fut>(
-    scope: pplx_space_common_core::types::TransferScopeId,
+    scope: pplx_space_snapshot_model::TransferScopeId,
     mut cancel: F,
 ) -> Result<Vec<proto::TransferJob>, CancelTransferScopeError>
 where

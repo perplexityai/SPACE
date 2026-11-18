@@ -2842,11 +2842,11 @@ async fn fetch_template_snapshot_defaults(
         row.as_ref()
             .and_then(|row| row.vcpu)
             .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(pplx_space_common_core::types::MIN_BASE_SNAPSHOT_VCPU),
+            .unwrap_or(pplx_space_snapshot_model::MIN_BASE_SNAPSHOT_VCPU),
         row.as_ref()
             .and_then(|row| row.memory_mib)
             .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(pplx_space_common_core::types::MIN_BASE_SNAPSHOT_MEMORY_MIB),
+            .unwrap_or(pplx_space_snapshot_model::MIN_BASE_SNAPSHOT_MEMORY_MIB),
     ))
 }
 

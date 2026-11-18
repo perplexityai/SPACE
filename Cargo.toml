@@ -170,6 +170,7 @@ members = [
     "crates/l20_domain/template/runtime",
     "crates/l20_domain/template/manifest",
     "crates/l20_domain/template/model",
+    "crates/l20_domain/snapshot/model",
     "crates/l20_domain/policy/authority",
     "crates/l10_foundation/linux/ids",
     "crates/l10_foundation/host/linux",
@@ -473,6 +474,7 @@ pplx-space-execution-spec = { path = "crates/l20_domain/execution/spec" }
 pplx-space-template-runtime = { path = "crates/l20_domain/template/runtime" }
 pplx-space-template-manifest = { path = "crates/l20_domain/template/manifest" }
 pplx-space-template-model = { path = "crates/l20_domain/template/model" }
+pplx-space-snapshot-model = { path = "crates/l20_domain/snapshot/model" }
 pplx-space-policy-authority = { path = "crates/l20_domain/policy/authority" }
 pplx-space-linux-ids = { path = "crates/l10_foundation/linux/ids" }
 pplx-space-host-linux = { path = "crates/l10_foundation/host/linux" }

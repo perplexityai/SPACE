@@ -42,8 +42,8 @@
 //! sweep has its own outcome enum, and the [`OutcomeEvent`] constructors pin
 //! the triple together.
 
-use pplx_space_common_core::types::SnapshotId;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::fmt;
 use std::time::Instant;

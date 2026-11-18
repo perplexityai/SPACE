@@ -17,9 +17,6 @@ use crate::service::network_policy::EffectiveNetworkPolicy;
 use crate::service::tests::service_tests::insert_test_sandbox;
 use crate::service::{SandboxManagerService, SandboxManagerServiceOptions};
 use crate::state::{SandboxState, SandboxStatus};
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, BackupAttemptId, LocalArtifactId, SnapshotName,
-};
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto as policy_proto;
 use pplx_space_rpc_contracts::node_drain_signals::{
@@ -27,6 +24,9 @@ use pplx_space_rpc_contracts::node_drain_signals::{
 };
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
+use pplx_space_snapshot_model::{
+    ArtifactKind, ArtifactOrigin, BackupAttemptId, LocalArtifactId, SnapshotName,
+};
 use std::ffi::OsStr;
 use std::sync::Arc;
 

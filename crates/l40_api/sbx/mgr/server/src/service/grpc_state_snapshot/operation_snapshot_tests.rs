@@ -67,8 +67,8 @@ fn operation_snapshot_replay_uses_the_server_generated_artifact_identity() {
     let artifact = crate::db::LocalArtifactRow {
         local_artifact_id,
         sandbox_id: sandbox_id.clone(),
-        artifact_kind: pplx_space_common_core::types::ArtifactKind::Disk,
-        artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Snapshot,
+        artifact_kind: pplx_space_snapshot_model::ArtifactKind::Disk,
+        artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Snapshot,
         snapshot_name: Some(snapshot_name.clone()),
         local_path: paths.artifact.clone(),
     };

@@ -183,8 +183,8 @@ fn durable_teardown_suspend_prepare_response(
         Status::internal("durable teardown suspend is missing its published artifact")
     })?;
     let artifact_kind = match artifact.artifact_kind {
-        pplx_space_common_core::types::ArtifactKind::Disk => crate::proto::ArtifactKind::Disk,
-        pplx_space_common_core::types::ArtifactKind::Full => crate::proto::ArtifactKind::Full,
+        pplx_space_snapshot_model::ArtifactKind::Disk => crate::proto::ArtifactKind::Disk,
+        pplx_space_snapshot_model::ArtifactKind::Full => crate::proto::ArtifactKind::Full,
     };
     let mut response = teardown_suspend_prepare_response(
         TeardownSuspendOutcome::Durable,

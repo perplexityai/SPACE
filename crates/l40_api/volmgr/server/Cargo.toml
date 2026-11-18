@@ -56,6 +56,7 @@ pplx-space-local-health = { workspace = true }
 pplx-space-page-cache = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }
+pplx-space-snapshot-model = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-sqlite = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }

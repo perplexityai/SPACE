@@ -122,7 +122,6 @@ use std::{fmt, sync::LazyLock, time::Duration};
 
 use pplx_space_accounts::NodeId;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::ArtifactOrigin;
 use pplx_space_k8s_ids::{PodUid, PodUidParseError};
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyV1 as NetworkPolicyProto};
 use pplx_space_node_model::{
@@ -141,6 +140,7 @@ use pplx_space_sandbox_store::direct as direct_store;
 use pplx_space_sbx_mgr_client::proto::{
     BootMode, StartRequest, SuspendRequest, WakeResponse, WakeTransition,
 };
+use pplx_space_snapshot_model::ArtifactOrigin;
 use sqlx::{FromRow, PgPool};
 use tonic::{Code, transport::Endpoint};
 use tracing::Instrument;

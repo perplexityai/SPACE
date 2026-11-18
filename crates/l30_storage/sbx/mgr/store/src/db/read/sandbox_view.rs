@@ -18,12 +18,12 @@
 //! A view is not a snapshot: two accessors are two reads. Callers that compare
 //! their answers hold the connection guard, or a transaction, across both.
 
-use pplx_space_common_core::types::{LocalArtifactId, TransferScopeId};
 use pplx_space_node_mgr_protocol::execution_fence::ExecutionFence;
 use pplx_space_sandbox_model::{
     ExecutionGeneration, SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId,
     SandboxRuntimeLabel,
 };
+use pplx_space_snapshot_model::{LocalArtifactId, TransferScopeId};
 use rusqlite::params;
 
 use crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt;

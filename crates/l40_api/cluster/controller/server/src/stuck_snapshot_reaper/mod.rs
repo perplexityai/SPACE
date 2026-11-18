@@ -80,7 +80,7 @@
 //! and Kubernetes modes.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

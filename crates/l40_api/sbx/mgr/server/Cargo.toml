@@ -71,6 +71,7 @@ pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-node-model = { workspace = true }
 pplx-space-rpc-contracts = { workspace = true }
+pplx-space-snapshot-model = { workspace = true }
 pplx-space-template-runtime = { workspace = true }
 pplx-space-template-model = { workspace = true }
 pplx-space-btrfs = { workspace = true }

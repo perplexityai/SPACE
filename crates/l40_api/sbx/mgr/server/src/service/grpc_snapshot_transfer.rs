@@ -143,7 +143,7 @@ impl SandboxManagerService {
         );
         let writer = self.state_writer_lease("ExportSnapshot")?;
         let snapshot_key = snapshot_name
-            .parse::<pplx_space_common_core::types::SnapshotName>()
+            .parse::<pplx_space_snapshot_model::SnapshotName>()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let lease = self
             .local_artifacts

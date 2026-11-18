@@ -3,8 +3,8 @@
 //! Startup and periodic repair stay in `recovery`; this module owns activation
 //! request parsing, placement and memory-policy resolution, and launch sequencing.
 
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_execution_spec::{RateLimiter, TokenBucket};
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::activation_support::{
     ActivationFailureStage, IdentityFreeDirectActivationAuthority, NodeIdentitySource,
@@ -213,7 +213,7 @@ impl DeferredRestoreStart {
 /// whose expectation disagrees with the artifact its own URI resolved to.
 fn verify_stopped_materialization(
     sandbox: &crate::db::SandboxRow,
-    expected: pplx_space_common_core::types::LocalArtifactId,
+    expected: pplx_space_snapshot_model::LocalArtifactId,
 ) -> Result<(), Status> {
     if !sandbox.state.is_unowned(SandboxState::Stopped) {
         return Err(Status::failed_precondition(format!(
@@ -363,7 +363,7 @@ impl StartSandboxContext {
         let expected_local_artifact_id = req
             .expected_local_artifact_id
             .as_deref()
-            .map(str::parse::<pplx_space_common_core::types::LocalArtifactId>)
+            .map(str::parse::<pplx_space_snapshot_model::LocalArtifactId>)
             .transpose()
             .map_err(|error| {
                 Status::invalid_argument(format!("invalid expected_local_artifact_id: {error}"))
@@ -582,7 +582,7 @@ async fn prepare_suspend_restore_dir(
     activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
 ) -> Result<crate::snapshot_restore::RestorePrepared, crate::snapshot_restore::RestoreError> {
     let retire_scope = |
-        transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+        transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
     | -> Result<(), crate::snapshot_restore::RestoreError> {
         let db = service.db.lock().map_err(|_| {
             crate::snapshot_restore::RestoreError::Other(
@@ -1011,7 +1011,7 @@ impl SandboxManagerService {
     fn materialized_stopped_response(
         &self,
         sandbox: &crate::db::SandboxRow,
-        expected: pplx_space_common_core::types::LocalArtifactId,
+        expected: pplx_space_snapshot_model::LocalArtifactId,
     ) -> Result<Response<StartResponse>, Status> {
         tracing::Span::current().record(
             "start_execution_path",

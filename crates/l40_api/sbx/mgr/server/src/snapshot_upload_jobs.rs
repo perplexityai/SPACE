@@ -847,8 +847,8 @@ async fn converge_failed_upload(payload: &SnapshotUploadJobs, reason: &'static s
 /// prove the on-disk file is the uploaded bytes.
 fn stream_reclaim_applies(meta: &SnapshotMeta) -> bool {
     format_from_meta(meta) == SuspendSnapshotFormat::BtrfsSend
-        && artifact_kind_from_meta(meta) == pplx_space_common_core::types::ArtifactKind::Full
-        && meta.artifact_origin == Some(pplx_space_common_core::types::ArtifactOrigin::Suspend)
+        && artifact_kind_from_meta(meta) == pplx_space_snapshot_model::ArtifactKind::Full
+        && meta.artifact_origin == Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend)
         && meta.local_artifact_id.is_some()
 }
 
@@ -1353,8 +1353,8 @@ fn bytes_uploaded_i64(log_id: &str, bytes_uploaded: u64) -> i64 {
 pub(crate) struct BeginArtifactBackup<'a> {
     pub(crate) sandbox_id: &'a str,
     pub(crate) local_artifact_id: &'a str,
-    pub(crate) artifact_kind: pplx_space_common_core::types::ArtifactKind,
-    pub(crate) artifact_origin: pplx_space_common_core::types::ArtifactOrigin,
+    pub(crate) artifact_kind: pplx_space_snapshot_model::ArtifactKind,
+    pub(crate) artifact_origin: pplx_space_snapshot_model::ArtifactOrigin,
     pub(crate) snapshot_name: Option<&'a str>,
     pub(crate) backup_attempt_id: &'a str,
     pub(crate) storage_uri: &'a str,
@@ -1408,26 +1408,26 @@ fn begin_artifact_backup_request(
         sandbox_id: request.sandbox_id.to_string(),
         local_artifact_id: request.local_artifact_id.to_string(),
         artifact_kind: match request.artifact_kind {
-            pplx_space_common_core::types::ArtifactKind::Disk => {
+            pplx_space_snapshot_model::ArtifactKind::Disk => {
                 pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32
             }
-            pplx_space_common_core::types::ArtifactKind::Full => {
+            pplx_space_snapshot_model::ArtifactKind::Full => {
                 pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32
             }
         },
         backup_attempt_id: request.backup_attempt_id.to_string(),
         storage_uri: request.storage_uri.to_string(),
         artifact_origin: match request.artifact_origin {
-            pplx_space_common_core::types::ArtifactOrigin::Stop => {
+            pplx_space_snapshot_model::ArtifactOrigin::Stop => {
                 pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Stop as i32
             }
-            pplx_space_common_core::types::ArtifactOrigin::Suspend => {
+            pplx_space_snapshot_model::ArtifactOrigin::Suspend => {
                 pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend as i32
             }
-            pplx_space_common_core::types::ArtifactOrigin::Snapshot => {
+            pplx_space_snapshot_model::ArtifactOrigin::Snapshot => {
                 pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Snapshot as i32
             }
-            pplx_space_common_core::types::ArtifactOrigin::Fork => {
+            pplx_space_snapshot_model::ArtifactOrigin::Fork => {
                 pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Fork as i32
             }
         },
@@ -1479,7 +1479,7 @@ fn suspend_uncommitted(
 
     if meta
         .artifact_origin
-        .is_some_and(|origin| origin != pplx_space_common_core::types::ArtifactOrigin::Suspend)
+        .is_some_and(|origin| origin != pplx_space_snapshot_model::ArtifactOrigin::Suspend)
     {
         return Ok(false);
     }

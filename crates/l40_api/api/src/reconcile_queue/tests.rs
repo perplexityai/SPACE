@@ -4,10 +4,10 @@ use super::*;
 
 mod postgres_tests {
 
-    use pplx_space_common_core::types::SnapshotId;
     use pplx_space_db_test_fixtures::{
         insert_pool_slot_receipt, pg_test_db, pool_slot_receipt_state,
     };
+    use pplx_space_snapshot_model::SnapshotId;
     use uuid::Uuid;
 
     use super::*;

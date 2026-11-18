@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::*;
 
@@ -895,7 +895,7 @@ fn rowless_restore_scope_defers_materialization_until_retired() {
     let run_dir = tempfile::tempdir().expect("create run directory");
     let sandbox_id = SandboxId::new();
     let sandbox_id_string = sandbox_id.to_string();
-    let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let transfer_scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     let sandbox_root = cache_dir.path().join(&sandbox_id_string);
     std::fs::create_dir_all(sandbox_root.join("instance")).expect("create sandbox cache");
     std::fs::write(sandbox_root.join("instance/rootfs.ext4"), b"rootfs")

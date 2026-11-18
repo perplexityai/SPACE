@@ -1,15 +1,16 @@
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::suspend_snapshot_publication::{
     canonical_suspend_snapshot_dir, recovered_sandbox_row_fields,
 };
 use super::*;
 use crate::service::start_support::start_stage;
-use pplx_space_common_core::types::{ArtifactKind, ExactStorageUri, SnapshotId, StorageUri};
+use pplx_space_common_core::types::{ExactStorageUri, StorageUri};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{ArtifactKind, SnapshotId};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
@@ -346,7 +347,7 @@ pub(super) enum CrossNodeRestoreTarget {
     /// a disagreement found after the publication has already written the pin
     /// costs a multi-gigabyte pull and leaves a row the boundary then refuses.
     StoppedDiskArtifact {
-        expected: pplx_space_common_core::types::LocalArtifactId,
+        expected: pplx_space_snapshot_model::LocalArtifactId,
     },
 }
 
@@ -867,11 +868,11 @@ fn transition_restored_sandbox_to_suspended_parts(
     conn: &crate::db::Connection,
     canonical_id: &str,
     local_artifact_id: Option<LocalArtifactId>,
-    artifact_kind: Option<pplx_space_common_core::types::ArtifactKind>,
+    artifact_kind: Option<pplx_space_snapshot_model::ArtifactKind>,
     snapshot_dir: &str,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
     if let Some(local_artifact_id) = local_artifact_id {
-        if artifact_kind != Some(pplx_space_common_core::types::ArtifactKind::Full) {
+        if artifact_kind != Some(pplx_space_snapshot_model::ArtifactKind::Full) {
             return Err(crate::snapshot_restore::RestoreError::Other(
                 "checkpoint restore backup metadata must identify a full artifact".to_string(),
             ));
@@ -904,11 +905,11 @@ fn transition_restored_sandbox_to_suspended_parts(
 /// left pinning. Shared by the staged-sidecar check and the local-row check so
 /// the two can't disagree on what "evacuated disk" means.
 pub(super) fn is_stop_origin_disk(
-    kind: Option<pplx_space_common_core::types::ArtifactKind>,
-    origin: Option<pplx_space_common_core::types::ArtifactOrigin>,
+    kind: Option<pplx_space_snapshot_model::ArtifactKind>,
+    origin: Option<pplx_space_snapshot_model::ArtifactOrigin>,
 ) -> bool {
-    kind == Some(pplx_space_common_core::types::ArtifactKind::Disk)
-        && origin == Some(pplx_space_common_core::types::ArtifactOrigin::Stop)
+    kind == Some(pplx_space_snapshot_model::ArtifactKind::Disk)
+        && origin == Some(pplx_space_snapshot_model::ArtifactOrigin::Stop)
 }
 
 /// The artifact a same-id stopped materialization is allowed to pin.
@@ -921,8 +922,8 @@ pub(super) fn is_stop_origin_disk(
 /// pinned to bytes that are not the disk it was evacuated with.
 fn stopped_materialization_pin(
     meta: &crate::snapshot_upload::SnapshotMeta,
-    expected: pplx_space_common_core::types::LocalArtifactId,
-) -> Result<pplx_space_common_core::types::LocalArtifactId, crate::snapshot_restore::RestoreError> {
+    expected: pplx_space_snapshot_model::LocalArtifactId,
+) -> Result<pplx_space_snapshot_model::LocalArtifactId, crate::snapshot_restore::RestoreError> {
     let unsuitable =
         || crate::snapshot_restore::RestoreError::StoppedMaterializationArtifactUnsuitable {
             kind: meta.artifact_kind,
@@ -982,7 +983,7 @@ pub(super) fn transition_restored_sandbox_to_stopped(
     conn: &crate::db::Connection,
     canonical_id: &str,
     meta: &crate::snapshot_upload::SnapshotMeta,
-    expected: pplx_space_common_core::types::LocalArtifactId,
+    expected: pplx_space_snapshot_model::LocalArtifactId,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
     let local_artifact_id = stopped_materialization_pin(meta, expected)?;
     crate::db::publish_restored_stopped_artifact(
@@ -1226,9 +1227,9 @@ impl SandboxManagerService {
         sandbox_id: &str,
         execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
         activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
-    ) -> Result<pplx_space_common_core::types::TransferScopeId, crate::snapshot_restore::RestoreError>
+    ) -> Result<pplx_space_snapshot_model::TransferScopeId, crate::snapshot_restore::RestoreError>
     {
-        let scope = pplx_space_common_core::types::TransferScopeId::new();
+        let scope = pplx_space_snapshot_model::TransferScopeId::new();
         let staging_dir =
             crate::snapshot_restore::remote_restore_metadata_staging_dir(sandbox_id, scope);
         let inserted = {
@@ -1264,7 +1265,7 @@ impl SandboxManagerService {
         execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) -> Result<
-        Option<pplx_space_common_core::types::TransferScopeId>,
+        Option<pplx_space_snapshot_model::TransferScopeId>,
         crate::snapshot_restore::RestoreError,
     > {
         // Pre-fencing releases wrote scopes without attempt ownership. A
@@ -2327,10 +2328,10 @@ fn validate_artifact_restore_as_new(
         ));
     }
     let expected_kind = match context.artifact_kind {
-        pplx_space_common_core::types::ArtifactKind::Disk => {
-            pplx_space_common_core::types::ArtifactKind::Disk
+        pplx_space_snapshot_model::ArtifactKind::Disk => {
+            pplx_space_snapshot_model::ArtifactKind::Disk
         }
-        pplx_space_common_core::types::ArtifactKind::Full => {
+        pplx_space_snapshot_model::ArtifactKind::Full => {
             return Err(crate::snapshot_restore::RestoreError::Other(
                 "full artifact restore-as-new is not implemented".to_string(),
             ));
@@ -2344,8 +2345,8 @@ fn validate_artifact_restore_as_new(
     }
     match meta.artifact_origin {
         Some(
-            pplx_space_common_core::types::ArtifactOrigin::Snapshot
-            | pplx_space_common_core::types::ArtifactOrigin::Fork,
+            pplx_space_snapshot_model::ArtifactOrigin::Snapshot
+            | pplx_space_snapshot_model::ArtifactOrigin::Fork,
         ) => {}
         _ => {
             return Err(crate::snapshot_restore::RestoreError::Other(

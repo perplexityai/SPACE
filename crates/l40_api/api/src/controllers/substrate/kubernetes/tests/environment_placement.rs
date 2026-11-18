@@ -71,7 +71,7 @@ async fn sandbox(
     .bind(binding(release_environment))
     .execute(pool)
     .await?;
-    let snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    let snapshot_id = pplx_space_snapshot_model::SnapshotId::new();
     sqlx::query(sql!(
         "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, org_id, execution_metadata)
          VALUES ($1, $2, 'full', 'ready', NOW(), $3, $4)"
@@ -452,7 +452,7 @@ async fn a_stopped_replacement_requires_its_pinned_disk_environment_while_restor
     substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
     let restoring = sandbox(&db.pool, "restoring", Some(E1), Some(E1), Some(E0)).await?;
     let excluded: Vec<String> = Vec::new();
-    let artifact_id = pplx_space_common_core::types::LocalArtifactId::new();
+    let artifact_id = pplx_space_snapshot_model::LocalArtifactId::new();
     let evacuation = |stopped| {
         PodCreateContext::Restore(RestoreContext::Evacuation {
             stopped_materialization: stopped,
@@ -488,7 +488,7 @@ async fn a_stopped_replacement_requires_its_pinned_disk_environment_while_restor
                                 execution_metadata)
          VALUES ($1, $2, 'disk', 'ready', NOW(), $3, $4, 'disk', 'stop', $5)"
     ))
-    .bind(pplx_space_common_core::types::SnapshotId::new())
+    .bind(pplx_space_snapshot_model::SnapshotId::new())
     .bind(restoring.id)
     .bind(SEED_ORG_ID)
     .bind(artifact_id.as_uuid())
@@ -738,7 +738,7 @@ async fn a_stopped_start_requires_its_disk_environment_after_the_published_execu
     let mut substrate = substrate_with_store(db.pool.clone());
     substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
     let stopped = sandbox(&db.pool, "stopped", Some(E0), Some(E0), Some(E0)).await?;
-    let artifact_id = pplx_space_common_core::types::LocalArtifactId::new();
+    let artifact_id = pplx_space_snapshot_model::LocalArtifactId::new();
     sqlx::query(sql!(
         "UPDATE sandboxes
             SET current_local_artifact_id = $2,
@@ -756,7 +756,7 @@ async fn a_stopped_start_requires_its_disk_environment_after_the_published_execu
                                 execution_metadata)
          VALUES ($1, $2, 'disk', 'ready', NOW(), $3, $4, 'disk', 'stop', $5)"
     ))
-    .bind(pplx_space_common_core::types::SnapshotId::new())
+    .bind(pplx_space_snapshot_model::SnapshotId::new())
     .bind(stopped.id)
     .bind(SEED_ORG_ID)
     .bind(artifact_id.as_uuid())

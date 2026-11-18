@@ -302,7 +302,7 @@ async fn ensure_file_replica_stops_waiting_for_an_unreachable_volume_manager() {
 
 #[tokio::test(start_paused = true)]
 async fn cancel_transfer_scope_waits_through_a_volume_manager_handoff() {
-    let scope = pplx_space_common_core::types::TransferScopeId::new();
+    let scope = pplx_space_snapshot_model::TransferScopeId::new();
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_cancel = Arc::clone(&calls);
 
@@ -364,10 +364,9 @@ async fn cancel_transfer_scope_gives_up_on_a_volume_manager_that_never_answers()
 
     let error = tokio::time::timeout(
         VOLUME_MANAGER_RESTART_BUDGET + Duration::from_secs(60),
-        cancel_transfer_scope_with(
-            pplx_space_common_core::types::TransferScopeId::new(),
-            |_| std::future::pending(),
-        ),
+        cancel_transfer_scope_with(pplx_space_snapshot_model::TransferScopeId::new(), |_| {
+            std::future::pending()
+        }),
     )
     .await
     .expect("an unanswered cancellation is bounded by the restart budget")

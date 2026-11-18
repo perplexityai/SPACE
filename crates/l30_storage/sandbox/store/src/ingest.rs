@@ -30,13 +30,13 @@
 //! names the record columns its statement reads.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::{
     ExecutionGeneration, SandboxId, SandboxQuarantineHistoryAction, SandboxQuarantineReasonCode,
     SandboxQuarantineSource, SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
 use std::sync::LazyLock;
 

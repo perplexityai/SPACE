@@ -96,7 +96,7 @@ pub(crate) const DEFAULT_CONCURRENCY: usize = 8;
 /// still-uploading prefix would leave late-arriving objects without
 /// a DB anchor for any future sweep.
 pub(crate) const DEFAULT_MIN_AGE: Duration = Duration::from_secs(
-    pplx_space_common_core::types::SNAPSHOT_STORAGE_SWEEPER_DEFAULT_MIN_AGE_SECONDS,
+    pplx_space_snapshot_model::SNAPSHOT_STORAGE_SWEEPER_DEFAULT_MIN_AGE_SECONDS,
 );
 
 #[derive(Debug, Clone)]

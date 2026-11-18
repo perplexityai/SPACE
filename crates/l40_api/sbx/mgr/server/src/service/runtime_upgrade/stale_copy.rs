@@ -19,7 +19,7 @@
 //! before replacement existed. An encrypted copy is left too, since an
 //! encrypted checkpoint staged here can't be cold-booted.
 
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use tonic::Status;
 
 use crate::db::RuntimeUpgradeOperationId;
@@ -181,7 +181,7 @@ impl crate::service::SandboxManagerService {
         // compares two ready backups' capture generations.
         match crate::sandbox_eviction::prove_captured_after(
             sandbox_id,
-            (decided, pplx_space_common_core::types::ArtifactKind::Full),
+            (decided, pplx_space_snapshot_model::ArtifactKind::Full),
             (pinned.artifact_id, pinned.artifact_kind),
         )
         .await

@@ -6,8 +6,8 @@
 //! that expects a pin to be dropped seeds one first, so a writer that left it
 //! in place would fail the case.
 
-use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 use pplx_space_sandbox_model::SandboxQuarantineReasonCode;
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
 use super::state_write_fixtures::{
     Cell, ExpectedDiff, admit_stop, assert_accepts, backdate, begin_cold_start, complete_stop,

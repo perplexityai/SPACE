@@ -1,6 +1,6 @@
 use pplx_space_accounts::{JobId, UserId};
-use pplx_space_common_core::types::SnapshotId;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use super::activation::{
     WAKE_ROUTE_SECURITY_CONNECT_RETRY_POLICY, WAKE_ROUTE_SECURITY_SYNC_TIMEOUT,
@@ -102,9 +102,9 @@ fn startup_cleanup_discovery_reports_database_failure_instead_of_empty_inventory
 async fn restore_scope_cleanup_rejects_paths_not_owned_by_its_identity_before_remote_calls() {
     let service = SandboxManagerService::for_test(crate::db::test_conn());
     let id = SandboxId::new().to_string();
-    let scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     let other_id = SandboxId::new().to_string();
-    let other_scope = pplx_space_common_core::types::TransferScopeId::new();
+    let other_scope = pplx_space_snapshot_model::TransferScopeId::new();
     for staging_dir in [
         "/".to_string(),
         crate::snapshot_restore::remote_restore_metadata_staging_dir(&other_id, scope_id)
@@ -284,7 +284,6 @@ pub(crate) mod service_tests {
         AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
     };
     use pplx_space_cluster_id::ClusterId;
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
     use pplx_space_host_layout::identities::{user_names, users};
     use pplx_space_k8s_ids::PodUid;
     use pplx_space_k8s_node_id::space_k8s_node_id;
@@ -294,6 +293,7 @@ pub(crate) mod service_tests {
         SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
         SandboxQuarantineSource, SandboxRouteIdentity, SpaceApiRouteIdentity,
     };
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
     use prost::Message as _;
 
@@ -6263,8 +6263,8 @@ pub(crate) mod service_tests {
             Some(crate::db::LocalArtifactRow {
                 local_artifact_id,
                 sandbox_id: sandbox_id_string,
-                artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
-                artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Suspend,
+                artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
+                artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Suspend,
                 snapshot_name: None,
                 local_path: snapshot_dir.to_string_lossy().into_owned(),
             })
@@ -13786,7 +13786,7 @@ pub(crate) mod service_tests {
                     current_local_artifact_origin = 'suspend'
               WHERE id = ?2",
             crate::db::fixture::params![
-                pplx_space_common_core::types::LocalArtifactId::new().to_string(),
+                pplx_space_snapshot_model::LocalArtifactId::new().to_string(),
                 sandbox_id
             ],
         )
@@ -13825,7 +13825,7 @@ pub(crate) mod service_tests {
             "s3://test-bucket/prefix?region=us-east-1",
         )
         .unwrap();
-        let first_attempt = pplx_space_common_core::types::BackupAttemptId::new();
+        let first_attempt = pplx_space_snapshot_model::BackupAttemptId::new();
 
         let first = service
             .submit_artifact_backup_for_test(
@@ -13837,7 +13837,7 @@ pub(crate) mod service_tests {
             )
             .await
             .unwrap();
-        let second_attempt = pplx_space_common_core::types::BackupAttemptId::new();
+        let second_attempt = pplx_space_snapshot_model::BackupAttemptId::new();
         let second = service
             .submit_artifact_backup_for_test(
                 &sandbox,
@@ -13889,7 +13889,7 @@ pub(crate) mod service_tests {
             "s3://test-bucket/prefix?region=us-east-1",
         )
         .unwrap();
-        let attempt_id = pplx_space_common_core::types::BackupAttemptId::new();
+        let attempt_id = pplx_space_snapshot_model::BackupAttemptId::new();
 
         let error = service
             .submit_artifact_backup_for_test(
@@ -14644,11 +14644,11 @@ pub(crate) mod service_tests {
         assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
         assert_eq!(
             row.current_local_artifact_kind,
-            Some(pplx_space_common_core::types::ArtifactKind::Full)
+            Some(pplx_space_snapshot_model::ArtifactKind::Full)
         );
         assert_eq!(
             row.current_local_artifact_origin,
-            Some(pplx_space_common_core::types::ArtifactOrigin::Suspend)
+            Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend)
         );
         assert_eq!(
             row.cleanup_completion,
@@ -15588,7 +15588,7 @@ pub(crate) mod service_tests {
         crate::db::insert_restore_transfer_scope(
             &conn,
             &transfer,
-            pplx_space_common_core::types::TransferScopeId::new(),
+            pplx_space_snapshot_model::TransferScopeId::new(),
             None,
             None,
             "/retained/staging",
@@ -16534,11 +16534,11 @@ pub(crate) mod service_tests {
             assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
             assert_eq!(
                 row.current_local_artifact_kind,
-                Some(pplx_space_common_core::types::ArtifactKind::Full)
+                Some(pplx_space_snapshot_model::ArtifactKind::Full)
             );
             assert_eq!(
                 row.current_local_artifact_origin,
-                Some(pplx_space_common_core::types::ArtifactOrigin::Suspend)
+                Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend)
             );
             assert!(row.failure_reason.is_none());
             assert!(
@@ -18264,7 +18264,7 @@ pub(crate) mod service_tests {
                     suspend_restore_storage_uri: populated.then(|| "s3://bucket/checkpoint".into()),
                     suspend_restore_source_node: populated.then(|| "source-node".into()),
                     expected_local_artifact_id: populated
-                        .then(|| pplx_space_common_core::types::LocalArtifactId::new().to_string()),
+                        .then(|| pplx_space_snapshot_model::LocalArtifactId::new().to_string()),
                     operation_activation_attempt_id: populated
                         .then(SandboxActivationAttemptId::new),
                     ..Default::default()
@@ -19370,7 +19370,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
-        let pin = pplx_space_common_core::types::LocalArtifactId::new();
+        let pin = pplx_space_snapshot_model::LocalArtifactId::new();
         conn.execute(
             "UPDATE sandboxes
              SET current_local_artifact_id = ?1,
@@ -19402,7 +19402,7 @@ pub(crate) mod service_tests {
         // for, and the row is left exactly as found.
         let mut stale = crate::service::start::tests::materialize_stopped_request_for(&sandbox_id);
         stale.expected_local_artifact_id =
-            Some(pplx_space_common_core::types::LocalArtifactId::new().to_string());
+            Some(pplx_space_snapshot_model::LocalArtifactId::new().to_string());
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             service.start_sandbox(stale, false),
@@ -19479,7 +19479,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
-        let pin = pplx_space_common_core::types::LocalArtifactId::new();
+        let pin = pplx_space_snapshot_model::LocalArtifactId::new();
         conn.execute(
             "UPDATE sandboxes
              SET current_local_artifact_id = ?1,
@@ -19542,7 +19542,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
-            let pin = pplx_space_common_core::types::LocalArtifactId::new();
+            let pin = pplx_space_snapshot_model::LocalArtifactId::new();
             conn.execute(
                 "UPDATE sandboxes
                  SET current_local_artifact_id = ?1,

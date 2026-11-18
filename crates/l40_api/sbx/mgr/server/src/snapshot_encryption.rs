@@ -37,9 +37,9 @@ pub(crate) fn snapshot_backing_path(sandbox_id: &str) -> String {
 pub(crate) fn capture_volume_is_fresh(sandbox: &crate::db::SandboxRow) -> bool {
     !(sandbox.current_local_artifact_id.is_some()
         && sandbox.current_local_artifact_kind
-            == Some(pplx_space_common_core::types::ArtifactKind::Full)
+            == Some(pplx_space_snapshot_model::ArtifactKind::Full)
         && sandbox.current_local_artifact_origin
-            == Some(pplx_space_common_core::types::ArtifactOrigin::Suspend))
+            == Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend))
 }
 
 /// Rootfs COW backing file (the encrypted rootfs delta), staged alongside the

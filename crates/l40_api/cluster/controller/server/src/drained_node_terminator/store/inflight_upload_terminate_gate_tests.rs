@@ -1,7 +1,7 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SnapshotId;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sql_locator::sql;

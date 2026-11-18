@@ -19,6 +19,7 @@ pplx-space-durations = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
 pplx-space-guest-process = { workspace = true }
 pplx-space-net-common = { workspace = true }
+pplx-space-snapshot-model = { workspace = true }
 pplx-space-template-model = { workspace = true }
 regex = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }

@@ -32,11 +32,8 @@ pub mod client_id;
 pub mod kek;
 pub mod node_fs;
 pub mod object_store;
-#[cfg(feature = "sqlx")]
-mod postgres;
 #[cfg(feature = "serde")]
 pub mod sandbox_artifact;
-pub mod snapshot;
 pub mod subject;
 
 #[cfg(feature = "serde")]
@@ -47,7 +44,6 @@ pub use node_fs::*;
 pub use object_store::*;
 #[cfg(feature = "serde")]
 pub use sandbox_artifact::*;
-pub use snapshot::*;
 pub use subject::{SubjectId, SubjectIdParseError, SubjectKind};
 
 /// Transitional: `SandboxId` lives in `pplx-space-sandbox-model`. This re-export keeps the

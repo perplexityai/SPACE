@@ -4,12 +4,12 @@
 
 use crate::db::Connection;
 use crate::state::SandboxStatus;
-use pplx_space_common_core::types::{LocalArtifactId, TransferScopeId};
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_sandbox_model::{
     SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
     SandboxQuarantineSource,
 };
+use pplx_space_snapshot_model::{LocalArtifactId, TransferScopeId};
 use rusqlite::params;
 
 use super::accepted_shapes_quarantine::{adoptable, insert_claimed_adoptable};

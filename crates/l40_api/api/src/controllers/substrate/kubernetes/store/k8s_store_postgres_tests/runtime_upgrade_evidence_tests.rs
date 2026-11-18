@@ -2,8 +2,8 @@
 //! upgrade is decided from (`store/runtime_upgrade.rs`).
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use super::*;
 use pplx_space_db_test_fixtures::SEED_ORG_ID;

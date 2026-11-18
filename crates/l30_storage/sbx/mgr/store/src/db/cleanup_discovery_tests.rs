@@ -37,9 +37,9 @@ fn recovery_scope_discovery_retains_bad_evidence_and_retires_valid_siblings() {
     let conn = test_conn();
     let bad = SandboxId::new().to_string();
     let good = SandboxId::new().to_string();
-    let good_scope = pplx_space_common_core::types::TransferScopeId::new();
+    let good_scope = pplx_space_snapshot_model::TransferScopeId::new();
     for (id, scope) in [
-        (&bad, pplx_space_common_core::types::TransferScopeId::new()),
+        (&bad, pplx_space_snapshot_model::TransferScopeId::new()),
         (&good, good_scope),
     ] {
         insert_restore_transfer_scope(&conn, id, scope, None, None, "/retained/staging").unwrap();

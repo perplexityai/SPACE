@@ -29,6 +29,7 @@ pplx-space-events = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
+pplx-space-snapshot-model = { workspace = true }
 pplx-space-snapshot-storage = { workspace = true, optional = true }
 pplx-space-snapshot-store = { workspace = true }
 pplx-space-sql-locator = { workspace = true }

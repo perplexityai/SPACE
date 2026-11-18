@@ -1200,8 +1200,8 @@ impl SandboxManagerService {
                 let staged_artifact = crate::db::LocalArtifactRow {
                     local_artifact_id,
                     sandbox_id: sandbox.id.clone(),
-                    artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
-                    artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Suspend,
+                    artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
+                    artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Suspend,
                     snapshot_name: None,
                     local_path: snapshot_dir_string.clone(),
                 };

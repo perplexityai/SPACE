@@ -599,7 +599,7 @@ async fn node_local_handoff(
         crate::db::begin_suspend(
             &conn,
             &id,
-            pplx_space_common_core::types::LocalArtifactId::new()
+            pplx_space_snapshot_model::LocalArtifactId::new()
         )
         .unwrap()
     );
@@ -1115,7 +1115,7 @@ async fn upload_after_refused_handoff(after: AfterRefusedHandoff) -> String {
                 crate::db::begin_suspend(
                     &db,
                     &id,
-                    pplx_space_common_core::types::LocalArtifactId::new()
+                    pplx_space_snapshot_model::LocalArtifactId::new()
                 )
                 .unwrap()
             );

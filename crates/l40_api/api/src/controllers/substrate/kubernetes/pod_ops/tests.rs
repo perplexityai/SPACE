@@ -697,12 +697,12 @@ mod stopped_restore_plan_tests {
     use crate::controllers::substrate::kubernetes::tests::{
         mock_kubernetes_client, substrate_with_store_and_client,
     };
-    use pplx_space_common_core::types::LocalArtifactId;
     use pplx_space_db_test_fixtures::{
         SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node, publish_ready_disk_artifact,
     };
     use pplx_space_node_model::NodeRole;
     use pplx_space_sandbox_model::SandboxId;
+    use pplx_space_snapshot_model::LocalArtifactId;
     use pplx_space_test_env::TestResult;
     use sqlx::PgPool;
     use std::sync::Mutex;

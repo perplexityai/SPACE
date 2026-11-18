@@ -107,10 +107,7 @@ async fn full_snapshot_capture_serializes_resume_on_wake_lock() {
     let coordinator = AutoLifecycleCoordinator::default();
     let sandbox_id = "sandbox-full-snapshot-race";
     let (_wake_guard, _artifact_guard) = coordinator
-        .artifact_publication_locks(
-            sandbox_id,
-            pplx_space_common_core::types::ArtifactKind::Full,
-        )
+        .artifact_publication_locks(sandbox_id, pplx_space_snapshot_model::ArtifactKind::Full)
         .await;
 
     let (resumed_tx, mut resumed_rx) = oneshot::channel();

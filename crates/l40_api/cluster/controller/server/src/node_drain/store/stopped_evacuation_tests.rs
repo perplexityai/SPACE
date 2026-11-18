@@ -1287,7 +1287,7 @@ pub(super) fn enqueued(pin: LocalArtifactId) -> EnqueuedArtifactBackup {
             id: pin,
             kind: ArtifactKind::Disk,
         },
-        attempt_id: pplx_space_common_core::types::BackupAttemptId::new(),
+        attempt_id: pplx_space_snapshot_model::BackupAttemptId::new(),
     }
 }
 

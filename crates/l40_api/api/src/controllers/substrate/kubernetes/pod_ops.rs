@@ -1,7 +1,8 @@
 use crate::controllers::substrate::{KeyResolution, RecoveryCharge};
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{ClientId, LocalArtifactId};
+use pplx_space_common_core::types::ClientId;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::support::*;
 use super::*;

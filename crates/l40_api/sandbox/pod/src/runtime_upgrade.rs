@@ -57,7 +57,7 @@ pub struct PodRuntimeUpgrade<'a> {
     pub target_state: PodRuntimeUpgradeTargetState,
     /// Required for a suspended source, which the node refuses to upgrade
     /// from any other checkpoint; absent for a stopped one.
-    pub checkpoint_local_artifact_id: Option<pplx_space_common_core::types::LocalArtifactId>,
+    pub checkpoint_local_artifact_id: Option<pplx_space_snapshot_model::LocalArtifactId>,
 }
 
 /// The lifecycle a pod's runtime upgrade leaves the sandbox in. `Started`

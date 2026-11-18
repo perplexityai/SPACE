@@ -1,8 +1,8 @@
 //! The delete receipt a cleanup's row delete writes, which a teardown poll
 //! reads to answer DELETED once the row is gone.
 
-use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_sandbox_model::ExecutionGeneration;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::state_write_fixtures::insert_row;
 use crate::db::{begin_teardown_suspend, test_conn};
