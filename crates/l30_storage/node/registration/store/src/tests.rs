@@ -215,24 +215,39 @@ async fn a_tombstoned_node_refuses_without_recording_an_instance() -> TestDbResu
     Ok(())
 }
 
-/// A UID change clears drain state, and an instance change alone does not.
+/// A UID change clears drain state, a v2 drain's engine and status with it,
+/// and an instance change alone does not. A v2 drain survives a UID change
+/// on the same instance: the same machine, still sealed; any other instance
+/// is a replacement (none reported is deferred:
+/// `a_v2_rows_new_uid_is_decided_by_its_instance`). A v1 drain clears on any
+/// UID change.
 #[tokio::test]
 async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
     let db = db().await?;
     let (a, b) = (instance(INSTANCE_A), instance(INSTANCE_B));
     let mut conn = db.pool.acquire().await?;
-    for (uid, instance_id, cleared_expected) in
-        [("uid-2", Some(&a), true), ("uid-1", Some(&b), false)]
-    {
+    for (engine, uid, instance_id, cleared_expected) in [
+        (Some("v2"), "uid-1", Some(&a), false),
+        (Some("v2"), "uid-2", Some(&a), false),
+        (Some("v2"), "uid-1", Some(&b), false),
+        (Some("v2"), "uid-2", Some(&b), true),
+        (None, "uid-2", Some(&a), true),
+        (None, "uid-1", Some(&b), false),
+    ] {
         let node_id = NodeId::new();
         registered(&db.pool, registration(node_id, "uid-1", Some(&a))).await?;
         sqlx::query(sql!(
             "UPDATE nodes
-             SET drain_phase = 'draining', drain_mode = 'forced',
-                 drain_started_at = NOW(), drain_last_error = 'seeded'
+             SET drain_phase = 'draining',
+                 drain_mode = CASE WHEN $2::TEXT IS NULL THEN 'forced' END,
+                 drain_started_at = NOW(), drain_last_error = 'seeded',
+                 drain_engine = $2,
+                 drain_status = CASE WHEN $2::TEXT IS NULL THEN NULL
+                                     ELSE '{\"generation\": 7, \"deadline_at\": 0}'::JSONB END
              WHERE id = $1"
         ))
         .bind(node_id)
+        .bind(engine)
         .execute(&mut *conn)
         .await?;
 
@@ -244,20 +259,31 @@ async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
         .await?;
         tx.commit().await?;
 
-        let drain: (Option<String>, Option<String>) = sqlx::query_as(sql!(
-            "SELECT drain_phase, drain_mode FROM nodes WHERE id = $1"
+        let drain: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(sql!(
+            "SELECT drain_phase, drain_mode, drain_engine, drain_status::TEXT
+                   FROM nodes WHERE id = $1"
         ))
         .bind(node_id)
         .fetch_one(&mut *conn)
         .await?;
-        let case = format!("{uid} {instance_id:?}");
+        let case = format!("{engine:?} {uid} {instance_id:?}");
         assert_eq!(cleared, cleared_expected, "{case}");
         assert_eq!(
             drain,
             if cleared_expected {
-                (None, None)
+                (None, None, None, None)
             } else {
-                (Some("draining".to_string()), Some("forced".to_string()))
+                (
+                    Some("draining".to_string()),
+                    engine.is_none().then(|| "forced".to_string()),
+                    engine.map(str::to_owned),
+                    engine.map(|_| r#"{"generation": 7, "deadline_at": 0}"#.to_string()),
+                )
             },
             "{case}"
         );
@@ -267,9 +293,103 @@ async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
                 .unwrap()
                 .instance_id
                 .as_deref(),
-            instance_id.map(Ec2InstanceId::as_str),
+            // A new Node takes the instance it reports, none included; the
+            // same Node keeps the recorded one when it reports none.
+            match (uid, instance_id) {
+                ("uid-1", None) => Some(INSTANCE_A),
+                (_, reported) => reported.map(Ec2InstanceId::as_str),
+            },
             "{case}"
         );
+    }
+    Ok(())
+}
+
+/// For every v2 row, a registration under a new UID is decided by the
+/// instance it reports, read against the recorded one
+/// (`node_k8s.instance_id`), never the drain's status: none yet is deferred,
+/// as a tombstone refuses, writing nothing; the recorded instance is the same
+/// machine, which keeps the drain; any other is a replacement, which takes
+/// the row and clears it. Without a UID change nothing is deferred. Each v2
+/// phase decides the same, a cancel pending and a fenced row included.
+#[tokio::test]
+async fn a_v2_rows_new_uid_is_decided_by_its_instance() -> TestDbResult<()> {
+    let db = db().await?;
+    let mut conn = db.pool.acquire().await?;
+    let (a, b) = (instance(INSTANCE_A), instance(INSTANCE_B));
+    let cases = [
+        ("unknown", "uid-2", None, "deferred"),
+        ("the recorded instance", "uid-2", Some(&a), "kept"),
+        ("another instance", "uid-2", Some(&b), "cleared"),
+        ("same uid, no instance", "uid-1", None, "kept"),
+    ];
+    let fenced =
+        format!(r#"{{"generation": 7, "deadline_at": 0, "terminate_instance": "{INSTANCE_B}"}}"#);
+    let unfenced = r#"{"generation": 7, "deadline_at": 0}"#;
+    let statuses = [
+        (Some("terminating"), fenced.as_str()),
+        (Some("draining"), unfenced),
+        (Some("drained"), unfenced),
+        (None, unfenced),
+    ];
+    for ((phase, fenced_status), (case, uid, instance_id, outcome)) in statuses
+        .into_iter()
+        .flat_map(|status| cases.map(|case| (status, case)))
+    {
+        let case = format!("{phase:?} {fenced_status} {case}");
+        let node_id = NodeId::new();
+        registered(&db.pool, registration(node_id, "uid-1", Some(&a))).await?;
+        sqlx::query(sql!(
+            "UPDATE nodes
+             SET drain_phase = $3, drain_mode = NULL,
+                 drain_started_at = NOW(), drain_engine = 'v2',
+                 drain_status = $2::JSONB
+             WHERE id = $1"
+        ))
+        .bind(node_id)
+        .bind(fenced_status)
+        .bind(phase)
+        .execute(&mut *conn)
+        .await?;
+        let before = node_k8s(&mut conn, node_id).await?.unwrap();
+
+        let result = register(&db.pool, registration(node_id, uid, instance_id)).await?;
+        let drain: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(sql!(
+            "SELECT drain_phase, drain_engine, drain_status::TEXT FROM nodes WHERE id = $1"
+        ))
+        .bind(node_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        let after = node_k8s(&mut conn, node_id).await?.unwrap();
+        match outcome {
+            "deferred" => {
+                assert!(
+                    matches!(result, Err(K8sNodeRegistrationError::AwaitingInstance)),
+                    "{case}: {result:?}"
+                );
+                assert_eq!(after, before, "{case}");
+            }
+            "kept" => {
+                assert!(result.is_ok(), "{case}: {result:?}");
+                assert_eq!(after.k8s_node_uid.as_deref(), Some(uid), "{case}");
+                assert_eq!(after.instance_id.as_deref(), Some(INSTANCE_A), "{case}");
+            }
+            _ => {
+                assert!(result.is_ok(), "{case}: {result:?}");
+                assert_eq!(after.k8s_node_uid.as_deref(), Some(uid), "{case}");
+                assert_eq!(after.instance_id.as_deref(), Some(INSTANCE_B), "{case}");
+            }
+        }
+        let expected = if outcome == "cleared" {
+            (None, None, None)
+        } else {
+            (
+                phase.map(str::to_owned),
+                Some("v2".to_owned()),
+                Some(fenced_status.to_owned()),
+            )
+        };
+        assert_eq!(drain, expected, "{case}");
     }
     Ok(())
 }
