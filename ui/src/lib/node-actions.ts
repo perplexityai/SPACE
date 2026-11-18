@@ -50,10 +50,36 @@ export const FORCED_DRAIN_EVACUATES =
 export const TERMINATE_ENDS =
   'The node moves to terminating, and the node-drain reconciler then terminates it and removes it from SPACE. A terminating node cannot be undrained. The `space.pplx.net/drain-keep` annotation does not stop this. Whether a replacement node is started was fixed when the drain began. The API refuses while sandboxes still occupy the node or are held for it.';
 
+// A v2 drain (`:drain {engine: v2, hold_seconds}`): the node drains itself.
+// It takes no mode, and its deadline moves only earlier.
+export const V2_DRAIN_STARTS =
+  'Cordons the node and seals it against new VM activations: the node makes every sandbox on it durable elsewhere, keeps running sandboxes running until the deadline, the hold after now, and then suspends them the way an idle auto-pause does. A call that would start or restore a sandbox on the node is refused with a retryable 503 until the sandbox is durable, and then lands on another node; nothing restores a suspended sandbox before its next call. The drain holds one of the cluster\'s evacuation slots until it reaches drained or is undrained, and is refused when every slot is held.';
+
+export const V2_SHORTEN_HOLD =
+  'Moves this v2 drain\'s deadline earlier, to the hold after the drain\'s start, so it may end at once. From the deadline the node suspends the running sandboxes it was holding. The deadline can\'t be moved later: the API refuses a longer hold.';
+
+export const V2_END_HOLD =
+  'Moves this v2 drain\'s deadline to now: the node suspends the running sandboxes it was holding and makes them durable elsewhere, and calls to them are refused until each restores on another node on its next call. The deadline can\'t be moved back; Undrain cancels the drain, and a sandbox it suspended stays suspended.';
+
+// What :terminate does to a drained v2 node: it moves to terminating at
+// once, and the cluster controller asks the node once more before it fences
+// the instance.
+export const V2_TERMINATE_ENDS =
+  'The node moves to terminating. The cluster controller then asks the node once more, and terminates it only if nothing is pending or blocked and no sandbox or execution still names it. Otherwise the node returns to drained, with why in Last error, and you can terminate again once it is resolved. Until the instance is fenced the node can still be undrained.';
+
+// What happens to a drained v2 node: the drained-node terminator skips v2
+// drains, so only Terminate ends one.
+export const V2_DRAIN_ENDS =
+  'Once the node is drained, Terminate ends it; the automatic drained-node terminator leaves v2 drains alone.';
+
 export type NodeAction = {
   action: string;
   label: string;
   body?: unknown;
+  // The action asks for a v2 drain's hold, whose `:drain` body is
+  // `v2DrainBody(hold)` (`drain-progress.ts`): `start` counts it from now,
+  // `shorten` from the drain's start.
+  hold?: 'start' | 'shorten';
   dangerous?: boolean;
   // The operator types the node's name (or ID) before the action is sent.
   typed?: boolean;
@@ -65,17 +91,27 @@ export type NodeAction = {
 // (the Direct substrate answers 501), except undrain, which clears a phase an
 // earlier drain left. Forced drain and terminate need a typed confirmation.
 // Forced drain is offered on an idle node and on a gentle drain, which the
-// API escalates in place; the API refuses to downgrade a forced drain.
+// API escalates in place; the API refuses to downgrade a forced drain. An
+// idle worker also offers a v2 drain, beside the v1 choices; the plain Drain
+// stays v1's gentle one. A v2 drain takes no mode: while it is draining,
+// Shorten hold moves its deadline earlier and End hold now moves it to now.
 // Terminate is offered only on a drained node, the one phase the API accepts
 // it from.
 export function nodeActions(
-  n: Pick<AdminNodeResponse, 'role' | 'drain_phase' | 'drain_mode'>,
+  n: Pick<AdminNodeResponse, 'role' | 'drain_phase' | 'drain_mode' | 'drain_engine'> & {
+    drain?: Pick<NonNullable<AdminNodeResponse['drain']>, 'fenced'> | null;
+  },
   substrate: string | null,
 ): NodeAction[] {
   const drainable = n.role === 'worker' || n.role === 'builder';
   if (!drainable) return [];
   const supportsDrain = substrate !== 'space';
   const actions: NodeAction[] = [];
+  const v2 = n.drain_engine === 'v2';
+  // An undrained v2 drain whose cancel hasn't reached the node yet keeps its
+  // engine with no phase; the API refuses every drain until the cancel
+  // finishes ("undrain still finishing").
+  const v2Cancelling = v2 && !n.drain_phase;
   if (supportsDrain && !n.drain_phase) {
     actions.push(
       {
@@ -83,6 +119,10 @@ export function nodeActions(
         confirm: 'New sandboxes stop being placed on this node; running sandboxes are not touched. The admin API does not report whether a node is cordoned, so Cordon and Uncordon are both offered.',
       },
       { action: 'uncordon', label: 'Uncordon', confirm: 'The node accepts new sandboxes again. Has no effect if it is not cordoned.' },
+    );
+  }
+  if (supportsDrain && !n.drain_phase && !v2Cancelling) {
+    actions.push(
       {
         action: 'drain', label: 'Drain', body: { mode: 'gentle' }, dangerous: true,
         confirm: `Cordons the node and waits for its sandboxes to leave on their own. ${DRAIN_TERMINATES} Use Forced drain to evacuate sandboxes immediately instead.`,
@@ -93,23 +133,50 @@ export function nodeActions(
       },
     );
   }
+  if (supportsDrain && !n.drain_phase && !v2Cancelling) {
+    // A v2 drain is a sandbox worker's; the API drains Kubernetes nodes only
+    // and answers anything else with its refusal.
+    if (n.role === 'worker') {
+      actions.push({
+        action: 'drain', label: 'v2 drain', hold: 'start', dangerous: true, typed: true,
+        confirm: `${V2_DRAIN_STARTS} ${V2_DRAIN_ENDS}`,
+      });
+    }
+  }
+  if (supportsDrain && v2 && n.drain_phase === 'draining') {
+    actions.push(
+      {
+        action: 'drain', label: 'Shorten hold', hold: 'shorten', dangerous: true, typed: true,
+        confirm: `${V2_SHORTEN_HOLD} ${V2_DRAIN_ENDS}`,
+      },
+      {
+        action: 'drain', label: 'End hold now', body: { engine: 'v2', hold_seconds: 0 }, dangerous: true, typed: true,
+        confirm: `${V2_END_HOLD} ${V2_DRAIN_ENDS}`,
+      },
+    );
+  }
   // A missing mode on a draining node is gentle, as everywhere else.
-  if (supportsDrain && n.drain_phase === 'draining' && n.drain_mode !== 'forced') {
+  if (supportsDrain && !v2 && n.drain_phase === 'draining' && n.drain_mode !== 'forced') {
     actions.push({
       action: 'drain', label: 'Forced drain', body: { mode: 'forced' }, dangerous: true, typed: true,
       confirm: `Switches this gentle drain to forced in place: the node stays cordoned and the drain keeps its start time. ${FORCED_DRAIN_EVACUATES} A forced drain cannot be switched back to gentle; Undrain cancels it. ${DRAIN_TERMINATES}`,
     });
   }
-  if (n.drain_phase === 'draining' || n.drain_phase === 'drained') {
+  // A v2 node in terminating can be undrained until its instance is fenced.
+  const v2Unfenced = v2 && n.drain_phase === 'terminating' && n.drain?.fenced !== true;
+  if (n.drain_phase === 'draining' || n.drain_phase === 'drained' || v2Unfenced) {
     actions.push({ action: 'undrain', label: 'Undrain', confirm: 'The drain is cancelled and the node accepts new sandboxes again.' });
   }
   if (supportsDrain && n.drain_phase === 'drained') {
-    actions.push({ action: 'terminate', label: 'Terminate', dangerous: true, typed: true, confirm: TERMINATE_ENDS });
+    actions.push({
+      action: 'terminate', label: 'Terminate', dangerous: true, typed: true,
+      confirm: v2 ? V2_TERMINATE_ENDS : TERMINATE_ENDS,
+    });
   }
-  // The API accepts this only while the drain gate blocks wakes: drained,
-  // terminating, or a forced drain.
+  // The API accepts this only while the drain gate refuses wakes: drained,
+  // terminating, a forced v1 drain, or any v2 drain, whose node is sealed.
   const uploadOpen =
-    n.drain_phase === 'drained' || n.drain_phase === 'terminating' || (n.drain_phase === 'draining' && n.drain_mode === 'forced');
+    v2 || n.drain_phase === 'drained' || n.drain_phase === 'terminating' || (n.drain_phase === 'draining' && n.drain_mode === 'forced');
   if (supportsDrain && uploadOpen) {
     actions.push({
       action: 'force-upload-local-snapshots', label: 'Upload local snapshots', dangerous: true,

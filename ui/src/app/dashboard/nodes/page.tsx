@@ -6,6 +6,19 @@ import { adminApi } from '@/lib/api';
 import { nodeActions, type NodeAction } from '@/lib/node-actions';
 import { confirmationPhrase, formatDuration, heartbeat as nodeHeartbeat, terminateRefusal } from '@/lib/node-drain';
 import { TypedConfirmModal } from '@/components/typed-confirm-modal';
+import { DrainPreviewAll } from '@/components/drain-preview';
+import { compactDrainCell, isV2Drain, readDrain, unknownEngine, v2DrainRefusal, v2TerminateRefusal } from '@/lib/drain-progress';
+import {
+  DRAIN_PREVIEW_TIMEOUT_MS,
+  PREVIEW_ALL_CONCURRENCY,
+  PREVIEW_TOOLTIP,
+  previewPath,
+  previewRow,
+  runBounded,
+  type DrainPreview,
+  type PreviewRow,
+} from '@/lib/drain-preview';
+import { withTimeout } from '@/lib/serial-reads';
 import { useAuth } from '@/lib/auth';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import {
@@ -40,7 +53,7 @@ import {
   Tooltip,
 } from 'antd';
 import {
-  DeleteOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, PoweroffOutlined, ReloadOutlined, SyncOutlined, ThunderboltOutlined,
+  DeleteOutlined, EyeOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, PoweroffOutlined, ReloadOutlined, SyncOutlined, ThunderboltOutlined,
 } from '@ant-design/icons';
 import { runtimeInstallationLines } from '@/lib/node-state';
 import type { ColumnsType } from 'antd/es/table';
@@ -412,6 +425,11 @@ export default function NodesPage() {
   // A forced drain or terminate waiting on its typed confirmation.
   const [typedAction, setTypedAction] = useState<{ node: NodeView; item: NodeAction } | null>(null);
   const [nodeAgeReferenceMs, setNodeAgeReferenceMs] = useState(() => Date.now());
+  // The last "Preview v2 drain on all workers": its rows in the order of the
+  // nodes it previewed, filled in as each answers.
+  const [previewAll, setPreviewAll] = useState<{ total: number; rows: (PreviewRow | undefined)[]; running: boolean } | null>(null);
+  const previewAllAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => previewAllAbort.current?.abort(), []);
   const [form] = Form.useForm();
   const selectedRole = Form.useWatch('role', form) as NodeRole | undefined;
   const endpointPlaceholder =
@@ -460,6 +478,8 @@ export default function NodesPage() {
     drain_mode: admin.drain_mode,
     drain_started_at: admin.drain_started_at,
     drain_last_error: admin.drain_last_error,
+    drain_engine: admin.drain_engine,
+    drain: admin.drain,
     sandboxes_active: admin.sandboxes_active,
     sandboxes_local_snapshots: admin.sandboxes_local_snapshots,
     last_heartbeat: admin.last_heartbeat,
@@ -661,14 +681,18 @@ export default function NodesPage() {
     }
   };
 
-  // Forced drain and terminate, once typed. A refused terminate lists its
-  // reasons rather than the API's JSON.
+  // Forced drain, End hold now and terminate, once typed. A refused
+  // terminate, and a v2 drain's refusal, lists its reasons rather than the
+  // API's JSON.
   const handleTypedAction = async (node: NodeView, item: NodeAction) => {
     try {
       await adminApi.post(`/v1/nodes/${node.id}:${item.action}`, item.body);
       message.success(`${item.label} requested`);
     } catch (err: any) {
-      const refused = item.action === 'terminate' ? terminateRefusal(err) : null;
+      const v2 = isV2Drain(node) || (item.body as { engine?: unknown } | undefined)?.engine === 'v2';
+      const refused = item.action === 'terminate'
+        ? terminateRefusal(err) ?? v2TerminateRefusal(err)
+        : v2 && item.action === 'drain' ? v2DrainRefusal(err) : null;
       if (refused) {
         modal.error({
           title: refused.title,
@@ -691,6 +715,42 @@ export default function NodesPage() {
   const visibleNodes = heartbeatFilter === 'all'
     ? nodes
     : nodes.filter((node) => node.role !== 'cluster' && isNodeHeartbeatStale(node, nodeAgeReferenceMs) === (heartbeatFilter === 'stale'));
+
+  // Previews every listed worker node, at most PREVIEW_ALL_CONCURRENCY at
+  // once. Each is read-only on its node, so nothing asks for confirmation.
+  const startPreviewAll = () => {
+    previewAllAbort.current?.abort();
+    const abort = new AbortController();
+    previewAllAbort.current = abort;
+    const targets = visibleNodes.filter((node) => node.role === 'worker');
+    setPreviewAll({ total: targets.length, rows: [], running: true });
+    void runBounded(
+      targets,
+      PREVIEW_ALL_CONCURRENCY,
+      (node) => withTimeout(DRAIN_PREVIEW_TIMEOUT_MS, (signal) => (
+        adminApi.get<DrainPreview>(previewPath(node.id), { signal: AbortSignal.any([signal, abort.signal]) })
+      )),
+      (index, result) => {
+        if (abort.signal.aborted) return;
+        setPreviewAll((current) => {
+          if (!current) return current;
+          const rows = [...current.rows];
+          rows[index] = previewRow(targets[index], result);
+          return { ...current, rows };
+        });
+      },
+      abort.signal,
+    ).then(() => {
+      if (previewAllAbort.current === abort) {
+        setPreviewAll((current) => (current ? { ...current, running: false } : current));
+      }
+    });
+  };
+
+  const stopPreviewAll = () => {
+    previewAllAbort.current?.abort();
+    setPreviewAll((current) => (current ? { ...current, running: false } : current));
+  };
 
   const nodeColumns: ColumnsType<NodeView> = [
     {
@@ -759,10 +819,34 @@ export default function NodesPage() {
       title: 'Drain',
       width: 170,
       render: (_, record) => {
+        // A v2 drain, its cancel included, which has no phase: the node's
+        // last report in one line, and its phase as v1 shows it.
+        const v2 = isV2Drain(record) ? readDrain(record.drain) ?? undefined : undefined;
         if (!record.drain_phase) {
-          return <Text type="secondary">—</Text>;
+          return v2 ? <Tag>{compactDrainCell(v2, nodeAgeReferenceMs)}</Tag> : <Text type="secondary">—</Text>;
         }
         const phase = record.drain_phase;
+        const otherEngine = unknownEngine(record);
+        if (otherEngine) return <Tag color={drainPhaseColor(phase)}>{`${phase} · ${otherEngine}`}</Tag>;
+        if (isV2Drain(record)) {
+          const elapsedV2 = record.drain_started_at ? formatIsoAge(record.drain_started_at, nodeAgeReferenceMs) : null;
+          const tooltipV2 = [
+            'v2: the node drains itself; running sandboxes keep running until the deadline',
+            v2?.deadline ? `deadline: ${new Date(v2.deadline).toLocaleString()}` : null,
+            record.drain_last_error ? `error: ${record.drain_last_error}` : null,
+            record.drain_started_at ? `started: ${new Date(record.drain_started_at).toLocaleString()}` : null,
+          ]
+            .filter(Boolean)
+            .join('\n');
+          return (
+            <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{tooltipV2}</span>}>
+              <Space orientation="vertical" size={2}>
+                <Tag color={drainPhaseColor(phase)}>{elapsedV2 ? `${phase} · v2 · ${elapsedV2}` : `${phase} · v2`}</Tag>
+                {v2 ? <Text style={{ fontSize: 12 }}>{compactDrainCell(v2, nodeAgeReferenceMs)}</Text> : null}
+              </Space>
+            </Tooltip>
+          );
+        }
         const elapsed = record.drain_started_at
           ? formatIsoAge(record.drain_started_at, nodeAgeReferenceMs)
           : null;
@@ -866,7 +950,8 @@ export default function NodesPage() {
         // 501 and the phases each action is accepted from live in one place.
         const offered = nodeActions(record, substrate);
         const gentleDrain = offered.find((a) => a.label === 'Drain');
-        const forcedDrain = offered.find((a) => a.label === 'Forced drain');
+        // A v1 drain's switch to forced, or a v2 drain's end of its hold.
+        const forcedDrain = offered.find((a) => a.label === 'Forced drain' || a.label === 'End hold now');
         const terminate = offered.find((a) => a.action === 'terminate');
         const canDrain = !!gentleDrain;
         const canUndrain = offered.some((a) => a.action === 'undrain');
@@ -913,14 +998,18 @@ export default function NodesPage() {
               </Popconfirm>
             )}
             {forcedDrain && (
-              <Tooltip title={record.drain_phase === 'draining' ? 'Switch to a forced drain' : 'Forced drain'}>
+              <Tooltip
+                title={forcedDrain.label === 'End hold now'
+                  ? 'End the v2 drain\'s hold now'
+                  : record.drain_phase === 'draining' ? 'Switch to a forced drain' : 'Forced drain'}
+              >
                 <Button
                   type="text"
                   size="small"
                   className="icon-action-btn"
                   danger
                   icon={<ThunderboltOutlined />}
-                  aria-label="Forced drain"
+                  aria-label={forcedDrain.label}
                   onClick={() => setTypedAction({ node: record, item: forcedDrain })}
                 />
               </Tooltip>
@@ -1008,6 +1097,11 @@ export default function NodesPage() {
       <Space align="center" style={{ width: '100%', justifyContent: 'space-between' }}>
         <Title level={3}>Nodes</Title>
         <Space>
+          <Tooltip title={PREVIEW_TOOLTIP}>
+            <Button icon={<EyeOutlined />} loading={previewAll?.running} onClick={startPreviewAll}>
+              Preview v2 drain on all workers
+            </Button>
+          </Tooltip>
           <Button
             icon={<ReloadOutlined />}
             loading={refreshingNodeStatus || loadingNodes}
@@ -1058,6 +1152,15 @@ export default function NodesPage() {
           </Form>
         </Card>
       )}
+      {previewAll ? (
+        <DrainPreviewAll
+          total={previewAll.total}
+          rows={previewAll.rows.filter((row): row is PreviewRow => row !== undefined)}
+          running={previewAll.running}
+          onCancel={stopPreviewAll}
+          onClose={() => setPreviewAll(null)}
+        />
+      ) : null}
       <Space style={{ marginBottom: 12 }}>
         <Text strong>Registered nodes</Text>
         <Select

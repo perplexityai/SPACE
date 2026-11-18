@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { Input, Modal, Space, Typography } from 'antd';
 
 import { typedConfirmationMatches } from '@/lib/node-drain';
@@ -9,7 +9,9 @@ const { Text } = Typography;
 
 // A confirmation for an action that cannot be taken back: OK, and Enter in
 // the box, do nothing until the operator types `phrase` exactly, so neither a
-// misclick nor a reflexive Enter sends the action.
+// misclick nor a reflexive Enter sends the action. `children`, when given,
+// are the action's own inputs, shown above the phrase; `ready` false holds
+// OK until they are valid.
 export function TypedConfirmModal({
   open,
   title,
@@ -18,6 +20,8 @@ export function TypedConfirmModal({
   okText,
   onConfirm,
   onCancel,
+  children,
+  ready = true,
 }: {
   open: boolean;
   title: string;
@@ -26,13 +30,15 @@ export function TypedConfirmModal({
   okText: string;
   onConfirm: () => Promise<void>;
   onCancel: () => void;
+  children?: ReactNode;
+  ready?: boolean;
 }) {
   const [typed, setTyped] = useState('');
   const [sending, setSending] = useState(false);
   useEffect(() => {
     if (open) setTyped('');
   }, [open, phrase]);
-  const matches = typedConfirmationMatches(typed, phrase);
+  const matches = typedConfirmationMatches(typed, phrase) && ready;
 
   const confirm = async () => {
     if (!matches || sending) return;
@@ -58,6 +64,7 @@ export function TypedConfirmModal({
     >
       <Space orientation="vertical" size={8} style={{ width: '100%' }}>
         <Text>{explanation}</Text>
+        {children}
         <Text>
           Type <Text code>{phrase}</Text> to confirm.
         </Text>
