@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use pplx_space_execution_spec::RuntimeKind;
 
 #[cfg(all(target_os = "linux", feature = "experimental-wasm"))]
-mod wasi_guest;
+pub(crate) mod wasi_guest;
 
 /// The default preserves the exec contract of serialized VM launch requests.
 /// The guest entrypoint is the supervisor's already-loaded, trusted service

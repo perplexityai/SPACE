@@ -455,9 +455,13 @@ impl RuntimeSupervisor for RuntimeSupervisorService {
         self.authorize_peer(&request, "LaunchRuntime")?;
         let caller = Some(execution::pin_caller(&request)?);
         let request = request.into_inner();
-        if request.runtime
-            == pplx_space_execution_common::proto::RuntimeKind::CloudHypervisor as i32
-        {
+        if matches!(
+            pplx_space_execution_common::proto::RuntimeKind::try_from(request.runtime),
+            Ok(
+                pplx_space_execution_common::proto::RuntimeKind::CloudHypervisor
+                    | pplx_space_execution_common::proto::RuntimeKind::Wasmtime
+            )
+        ) {
             let service = self.clone();
             return self
                 .run_owned_operation(async move {

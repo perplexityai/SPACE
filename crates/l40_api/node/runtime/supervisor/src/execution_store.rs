@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use pplx_space_common_core::types::{SandboxActivationAttemptId, SandboxId};
 use pplx_space_execution_spec::VcpuCount;
 
+mod runtime_environment;
 #[cfg(test)]
 mod tests;
 
@@ -219,7 +220,12 @@ impl ExecutionStore {
         };
         // Retirement already checked identity and quiescence under the write
         // lock, so it cannot erase a replacement execution's budget.
-        for name in [format!(".{sandbox}.cpu.new"), format!("{sandbox}.cpu")] {
+        for name in [
+            format!(".{sandbox}.cpu.new"),
+            format!("{sandbox}.cpu"),
+            format!(".{sandbox}.environment.new"),
+            format!("{sandbox}.environment"),
+        ] {
             match fs::remove_file(self.root.join(name)) {
                 Ok(()) => directory.sync_all()?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}

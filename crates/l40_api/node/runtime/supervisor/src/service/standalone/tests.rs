@@ -12,6 +12,7 @@ fn standalone_configuration_refuses_unconfined_locators() {
     let release = environment.release();
     let request = LaunchRuntimeRequest {
         sandbox_id: sandbox.to_string(),
+        runtime: pplx_space_execution_common::proto::RuntimeKind::CloudHypervisor as i32,
         workspace_root: "/synthetic/jails".into(),
         network_namespace: "/synthetic/netns".into(),
         console_path: format!("/synthetic/jails/cloud-hypervisor/{sandbox}/root/console.log"),
@@ -57,13 +58,27 @@ fn standalone_configuration_refuses_unconfined_locators() {
                 Err(error) => assert_eq!(error.code(), tonic::Code::InvalidArgument),
             }
         }
+        for runtime in [
+            pplx_space_execution_common::proto::RuntimeKind::Firecracker,
+            pplx_space_execution_common::proto::RuntimeKind::Wasmtime,
+            pplx_space_execution_common::proto::RuntimeKind::Unspecified,
+        ] {
+            let mut invalid = valid.clone();
+            invalid.runtime = runtime as i32;
+            assert_eq!(
+                standalone_config_for_environment(&invalid, sandbox, environment)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
         let firecracker = environments
             .iter()
             .find(|e| e.release().release.kind == RuntimeKind::Firecracker)
             .unwrap();
         match standalone_config_for_environment(&valid, sandbox, firecracker) {
             Ok(_) => panic!("accepted a different runtime's contract"),
-            Err(error) => assert_eq!(error.code(), tonic::Code::FailedPrecondition),
+            Err(error) => assert_eq!(error.code(), tonic::Code::InvalidArgument),
         }
     }
 }

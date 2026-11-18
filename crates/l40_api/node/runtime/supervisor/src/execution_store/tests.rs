@@ -2,6 +2,88 @@ use super::*;
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 #[test]
+fn runtime_environment_survives_restart_without_relabeling_or_crossing_executions() {
+    use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::EnvironmentReference;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("executions");
+    let store = ExecutionStore::at(root.clone());
+    let sandbox = SandboxId::new();
+    let first = SandboxActivationAttemptId::new();
+    let second = SandboxActivationAttemptId::new();
+    let environment = EnvironmentReference::new(Digest::sha256([1; 32]));
+    let replacement = EnvironmentReference::new(Digest::sha256([2; 32]));
+    assert!(
+        store
+            .record_runtime_environment(sandbox, first, environment)
+            .is_err()
+    );
+    store.write(sandbox, first).unwrap();
+    assert_eq!(store.runtime_environment(sandbox, first).unwrap(), None);
+    fs::write(
+        root.join(format!(".{sandbox}.environment.new")),
+        b"interrupted",
+    )
+    .unwrap();
+    store
+        .record_runtime_environment(sandbox, first, environment)
+        .unwrap();
+    let restarted = ExecutionStore::at(root.clone());
+    assert_eq!(restarted.read(sandbox).unwrap(), Some(first));
+    assert_eq!(
+        restarted.runtime_environment(sandbox, first).unwrap(),
+        Some(environment)
+    );
+    restarted
+        .record_runtime_environment(sandbox, first, environment)
+        .unwrap();
+    assert!(
+        restarted
+            .record_runtime_environment(sandbox, first, replacement)
+            .is_err()
+    );
+    restarted.write(sandbox, second).unwrap();
+    assert_eq!(
+        restarted.runtime_environment(sandbox, second).unwrap(),
+        None
+    );
+    assert!(
+        restarted
+            .record_runtime_environment(sandbox, first, environment)
+            .is_err()
+    );
+    restarted
+        .record_runtime_environment(sandbox, second, replacement)
+        .unwrap();
+    assert_eq!(restarted.runtime_environment(sandbox, first).unwrap(), None);
+    assert_eq!(
+        restarted.runtime_environment(sandbox, second).unwrap(),
+        Some(replacement)
+    );
+    let path = root.join(format!("{sandbox}.environment"));
+    let original = fs::read(&path).unwrap();
+    let mut unknown_version = original.clone();
+    unknown_version[..4].copy_from_slice(b"ENV9");
+    for corruption in [b"partial".to_vec(), unknown_version] {
+        fs::write(&path, corruption).unwrap();
+        assert_eq!(
+            restarted
+                .runtime_environment(sandbox, second)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+    fs::write(&path, &original).unwrap();
+    let staging = root.join(format!(".{sandbox}.environment.new"));
+    fs::write(&staging, b"interrupted").unwrap();
+    restarted.remove(sandbox).unwrap();
+    assert!(!path.exists());
+    assert!(!staging.exists());
+    assert_eq!(restarted.read(sandbox).unwrap(), None);
+}
+
+#[test]
 fn execution_store_recovers_atomic_writes_and_rejects_unsafe_entries() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("executions");

@@ -1,5 +1,5 @@
-//! Standalone VMM process admission. The runtime's control protocol and guest
-//! boot configuration remain owned by the node-manager adapter.
+//! Standalone runtime admission. VM control and boot configuration remain owned
+//! by the node-manager adapter; WASI boot inputs come from the admitted catalog.
 use super::*;
 use pplx_space_execution_spec::{EnvironmentReference, RuntimeKind};
 use pplx_space_node_runtime_core::{
@@ -10,6 +10,9 @@ use pplx_space_node_runtime_core::{
     runtime_inventory::host_arch,
 };
 use std::path::Path;
+
+#[cfg(all(target_os = "linux", feature = "experimental-wasm"))]
+mod wasi;
 
 impl RuntimeSupervisorService {
     pub(super) async fn launch_standalone_owned(
@@ -50,10 +53,26 @@ impl RuntimeSupervisorService {
         let config = standalone_config(&req, sandbox_id, reference)
             .map_err(pplx_space_node_runtime_core::launch_admission::admission_refusal)?;
         if let Some(pid) = live_runtime_pid(&sandbox_id, "fc.pid")? {
+            let recorded = self
+                .execution_io(move |store| {
+                    store
+                        .runtime_environment(sandbox_id, execution)
+                        .map_err(|error| Status::failed_precondition(error.to_string()))
+                })
+                .await?;
+            // Existing VM readers had no companion binding. Keep that rolling
+            // upgrade path; a WASI service has never had an unbound launch path.
+            if recorded != Some(reference)
+                && (recorded.is_some() || config.runtime == RuntimeKind::Wasmtime)
+            {
+                return Err(Status::failed_precondition(
+                    "resident runtime has no matching environment binding",
+                ));
+            }
             let process = launch::ProcessHandle::open(pid)
                 .map_err(|error| Status::unavailable(format!("pin resident runtime: {error}")))?;
             if process
-                .program_matches("cloud-hypervisor")
+                .program_matches(resident_program(&config.entrypoint))
                 .map_err(|error| Status::unavailable(error.to_string()))?
                 != Some(true)
                 || process
@@ -84,11 +103,28 @@ impl RuntimeSupervisorService {
         let budget = limits.cpu_budget().map_err(cgroup_update_error_to_status)?;
         let path = config.executable.clone();
         let pins = config.executable_source;
+        let boot_sources: Vec<(std::path::PathBuf, SourcePins)> = match &config.entrypoint {
+            crate::contained_launcher::Entrypoint::Runtime => Vec::new(),
+            #[cfg(all(target_os = "linux", feature = "experimental-wasm"))]
+            crate::contained_launcher::Entrypoint::WasiGuest(guest) => vec![
+                (guest.module.clone(), guest.module_source),
+                (
+                    guest.standard_library.clone(),
+                    guest.standard_library_source,
+                ),
+            ],
+        };
         self.execution_io(move |store| {
             // Authenticate before publishing intent. The fresh launcher repeats
             // this check on the descriptor it executes, closing path replacement.
             crate::verified_launch::open_catalog_executable(&path, pins)
                 .map_err(pplx_space_node_runtime_core::launch_admission::admission_refusal)?;
+            for (path, pins) in boot_sources {
+                pplx_space_node_runtime_core::authenticated_source::AuthenticatedFile::open_catalog(
+                    &path, pins,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            }
             if !cgroup::firecracker_is_quiescent(&sandbox_id.to_string())
                 .map_err(|e| Status::unavailable(format!("VM occupancy: {e}")))?
             {
@@ -100,6 +136,11 @@ impl RuntimeSupervisorService {
                 .record_cpu_budget(sandbox_id, execution, budget)
                 .map_err(|e| {
                     Status::failed_precondition(format!("record CPU launch budget: {e}"))
+                })?;
+            store
+                .record_runtime_environment(sandbox_id, execution, reference)
+                .map_err(|error| {
+                    Status::failed_precondition(format!("record runtime environment: {error}"))
                 })?;
             cgroup::create_vm_cgroup(&sandbox_id, &limits)
                 .map_err(|e| Status::internal(format!("prepare VM cgroup: {e}")))?;
@@ -178,11 +219,23 @@ fn standalone_config_for_environment(
     environment: &CompiledEnvironment,
 ) -> Result<crate::contained_launcher::Config, Status> {
     let release = environment.release();
-    if release.release.kind != RuntimeKind::CloudHypervisor {
-        return Err(Status::failed_precondition(
-            "environment does not select standalone runtime",
+    let runtime = release.release.kind;
+    let wire_runtime: pplx_space_execution_common::proto::RuntimeKind = runtime.into();
+    if req.runtime != wire_runtime as i32 {
+        return Err(Status::invalid_argument(
+            "runtime differs from admitted environment",
         ));
     }
+    let executable = match runtime {
+        RuntimeKind::CloudHypervisor => "bin/cloud-hypervisor",
+        #[cfg(all(target_os = "linux", feature = "experimental-wasm"))]
+        RuntimeKind::Wasmtime => "bin/wasmtime",
+        _ => {
+            return Err(Status::failed_precondition(
+                "environment does not select an implemented standalone runtime",
+            ));
+        }
+    };
     let binary = Path::new(&req.runtime_binary);
     let root = binary
         .parent()
@@ -193,7 +246,7 @@ fn standalone_config_for_environment(
         || !directories
             .iter()
             .any(|directory| root.file_name() == Some(std::ffi::OsStr::new(directory)))
-        || binary != root.join("bin/cloud-hypervisor")
+        || binary != root.join(executable)
     {
         return Err(Status::invalid_argument(
             "runtime source must name its compiled release directory",
@@ -202,7 +255,7 @@ fn standalone_config_for_environment(
     let file = release
         .binaries
         .iter()
-        .find(|f| f.path == "bin/cloud-hypervisor")
+        .find(|f| f.path == executable)
         .ok_or_else(|| Status::failed_precondition("compiled release lacks runtime executable"))?;
     let digest = compiled_verity_digest(file.sha256)
         .map_err(|e| Status::failed_precondition(e.to_string()))?
@@ -218,8 +271,10 @@ fn standalone_config_for_environment(
             "workspace must be an absolute canonical path",
         ));
     }
+    #[cfg(all(target_os = "linux", feature = "experimental-wasm"))]
+    let release_root = root;
     let root = workspace
-        .join(RuntimeKind::CloudHypervisor.as_str())
+        .join(runtime.as_str())
         .join(sandbox.to_string())
         .join("root");
     // Paths are locators from node-manager, not executable arguments supplied
@@ -229,9 +284,21 @@ fn standalone_config_for_environment(
             "runtime output must be inside its isolation root",
         ));
     }
+    let entrypoint = match runtime {
+        #[cfg(all(target_os = "linux", feature = "experimental-wasm"))]
+        RuntimeKind::Wasmtime => wasi::entrypoint(req, environment, release_root, &root)?,
+        _ => crate::contained_launcher::Entrypoint::Runtime,
+    };
+    // The engine is not the resident service in a contained WASI sandbox.
+    // Generated code runs in separate, bounded Wasmtime children.
+    let arguments = match &entrypoint {
+        crate::contained_launcher::Entrypoint::Runtime => vec!["--seccomp".into(), "true".into()],
+        #[cfg(all(target_os = "linux", feature = "experimental-wasm"))]
+        crate::contained_launcher::Entrypoint::WasiGuest(_) => Vec::new(),
+    };
     Ok(crate::contained_launcher::Config {
-        runtime: RuntimeKind::CloudHypervisor,
-        entrypoint: crate::contained_launcher::Entrypoint::Runtime,
+        runtime,
+        entrypoint,
         root,
         registration_directory: pplx_space_host_layout::paths::sandbox_run_dir(
             &sandbox.to_string(),
@@ -249,8 +316,16 @@ fn standalone_config_for_environment(
             &sandbox.to_string(),
         ),
         output: req.console_path.clone().into(),
-        arguments: vec!["--seccomp".into(), "true".into()],
+        arguments,
     })
+}
+
+fn resident_program(entrypoint: &crate::contained_launcher::Entrypoint) -> &'static str {
+    match entrypoint {
+        crate::contained_launcher::Entrypoint::Runtime => "cloud-hypervisor",
+        #[cfg(all(target_os = "linux", feature = "experimental-wasm"))]
+        crate::contained_launcher::Entrypoint::WasiGuest(_) => "space-runtime-supervisor-svc",
+    }
 }
 
 #[cfg(test)]
