@@ -15,12 +15,21 @@
 //! A write that commits also queues a `runtime-provisioning` reconcile on
 //! every worker and builder ([`enqueue_policy_reconcile`]).
 //!
+//! A block also needs `strand: true` while an unfinished template runtime
+//! upgrade campaign moves the environment's releases: blocking it mid-campaign
+//! stops the releases the campaign hasn't given a twin on its target yet. As
+//! for bound work, a block of an environment that already doesn't execute
+//! stops nothing new and needs no `strand`, unless another policy write lands
+//! while it waits, when the check runs in full.
+//!
 //! Not yet checked: that every node can run a new default (per-node usable
 //! environments are recorded, but a default change doesn't consult them yet),
-//! that a template
-//! campaign finished before a block (campaigns don't exist yet), and which
-//! nodes can't enforce a block (node status reports each node's applied
-//! generation; refusing on it is a later change).
+//! that no unfinished template runtime upgrade campaign moves releases off an
+//! environment the first default stops (only a block checks campaigns), or
+//! onto the environment a block stops (a block checks a campaign's source,
+//! not its target), and
+//! which nodes can't enforce a block (node status reports each node's
+//! applied generation; refusing on it is a later change).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,21 +52,20 @@ use pplx_space_runtime_environment_policy_store::{
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use pplx_space_runtime_upgrade_campaign_store::{self as campaign_store, CampaignId, CampaignKind};
+
 use super::audit::{self, AdminRuntimeEnvironmentAuditEntry};
 use super::node_store::{AdminNodeRow, AdminNodeStore};
 use super::runtime_environment_store as store;
 use super::support::{
-    api_error, db_error, format_time, parse_if_match_generation, parse_json_body, read_db_error,
-    require_managing_org_admin,
+    ApiError, api_error, db_error, format_time, parse_environment_ref, parse_if_match_generation,
+    parse_json_body, read_db_error, require_managing_org_admin,
 };
 use super::templates::requeue_reconcile_targets_tx;
 use crate::middleware::auth::AuthUser;
 use crate::models::User;
 use crate::reconcile_queue::{ReconcileFacet, ReconcileReason, ReconcileRef};
 use crate::routes::AppState;
-
-/// A refusal from a parse helper, in the admin error shape.
-type ApiError = (StatusCode, Json<serde_json::Value>);
 
 /// Rows per `GET /runtime-environments/nodes` page, matching
 /// `GET /nodes/{node_id}/sandboxes`.
@@ -199,15 +207,6 @@ struct SetStateResponse {
     state: &'static str,
 }
 
-fn parse_environment_ref(value: &str) -> Result<EnvironmentReference, ApiError> {
-    value.parse().map_err(|err| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            format!("invalid environment reference {value:?}: {err}"),
-        )
-    })
-}
-
 fn parse_state(value: &str) -> Result<RuntimeEnvironmentState, ApiError> {
     value.parse().map_err(|_| {
         let accepted = RuntimeEnvironmentState::ALL
@@ -309,6 +308,34 @@ impl AuditContext<'_> {
             Json(serde_json::json!({ "error": message, "at_risk": at_risk })),
         )
             .into_response()
+    }
+
+    /// Audit and answer a block refused because an unfinished template
+    /// campaign still moves `environment`'s releases. `at_risk` is the work
+    /// the block would also stop, if any, since the `strand: true` that
+    /// overrides this refusal waives that check too.
+    fn refuse_template_campaign(
+        &self,
+        campaign_id: CampaignId,
+        environment: EnvironmentReference,
+        at_risk: Option<AtRisk>,
+    ) -> Response {
+        let message = format!(
+            "template runtime upgrade campaign {campaign_id} still moves environment \
+             {environment}'s releases; let it complete or abort it before blocking, or pass \
+             strand: true to block anyway{}",
+            if at_risk.is_some() {
+                ", which also stops the work at_risk counts"
+            } else {
+                ""
+            }
+        );
+        self.record(None, Some(&message));
+        let body = match at_risk {
+            Some(at_risk) => serde_json::json!({ "error": message, "at_risk": at_risk }),
+            None => serde_json::json!({ "error": message }),
+        };
+        (StatusCode::CONFLICT, Json(body)).into_response()
     }
 
     /// Audit and answer a write whose `If-Match` named a generation other than
@@ -674,17 +701,20 @@ pub(super) async fn set_runtime_environment_state(
         drop(tx);
         return audit.refuse_stale(expected, generation);
     }
+    // This write raised the generation by exactly one, so nothing changed
+    // the policy since it read the environment as stopped: the block stops
+    // nothing new.
+    let stops_nothing_new = matches!(
+        check,
+        Ok(BlockCheck::AlreadyStopped { generation: stopped_at }) if generation == stopped_at + 1
+    );
     // Refused only after the store's own refusals, which the write above has
     // already returned, so an operator isn't asked to acknowledge stranding
     // work for a block that would be refused anyway. Dropping the transaction
     // rolls the write back.
     let at_risk = match check {
         Ok(BlockCheck::Checked(at_risk)) => at_risk.map(|at_risk| *at_risk),
-        // This write raised the generation by exactly one, so nothing changed
-        // the policy since it read the environment as stopped.
-        Ok(BlockCheck::AlreadyStopped {
-            generation: stopped_at,
-        }) if generation == stopped_at + 1 => None,
+        Ok(BlockCheck::AlreadyStopped { .. }) if stops_nothing_new => None,
         // Another write landed in between, possibly letting the environment
         // execute again. Check now, under the policy row lock this write holds; a
         // rare path, so the scan's time under the lock is acceptable.
@@ -705,6 +735,32 @@ pub(super) async fn set_runtime_environment_state(
             return audit.fail("couldn't check what the write would stop", *response);
         }
     };
+    // Read inside the write's transaction under the advisory lock every
+    // template campaign start for this environment takes, so no campaign can
+    // start between this read and the block's commit. After the store's
+    // refusals, the generation check and the read of what the block would
+    // stop, so the refusal reports that work too: `strand: true` waives both.
+    let template_campaign =
+        if requested == RuntimeEnvironmentState::Blocked && !request.strand && !stops_nothing_new {
+            campaign_store::unfinished_from_locked(&mut tx, CampaignKind::Templates, environment)
+                .await
+        } else {
+            Ok(None)
+        };
+    match template_campaign {
+        Ok(None) => {}
+        Ok(Some(campaign_id)) => {
+            drop(tx);
+            return audit.refuse_template_campaign(campaign_id, environment, at_risk);
+        }
+        Err(err) => {
+            drop(tx);
+            return audit.fail(
+                "couldn't check for an unfinished template campaign",
+                db_error(err).into_response(),
+            );
+        }
+    }
     if let Some(at_risk) = at_risk {
         drop(tx);
         return audit.refuse_strand(at_risk);

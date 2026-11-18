@@ -130,6 +130,51 @@ pub async fn list_unretired_within(
         .collect()
 }
 
+/// For each `(source, target)` in `edges`, in order, whether the catalog
+/// certifies a cold-boot upgrade edge from `source` to `target`: `source` is
+/// unretired and lists `target` in its `upgrade_edges`. `false` when `source`
+/// isn't in the catalog. One query however many edges. Accepts a pool or a
+/// transaction connection; takes no lock.
+pub async fn upgrade_edges_certified(
+    executor: impl sqlx::PgExecutor<'_>,
+    edges: &[(EnvironmentReference, EnvironmentReference)],
+) -> Result<Vec<bool>, sqlx::Error> {
+    if edges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (sources, targets): (Vec<String>, Vec<String>) = edges
+        .iter()
+        .map(|(source, target)| (source.to_string(), target.to_string()))
+        .unzip();
+    // The 1-based positions in `edges` of the certified ones.
+    let certified = sqlx::query_scalar::<_, i64>(sql!(
+        "SELECT edge.position
+         FROM unnest($1::text[], $2::text[]) WITH ORDINALITY
+             AS edge(source, target, position)
+         WHERE EXISTS (
+             SELECT 1
+             FROM runtime_environments
+             WHERE environment_ref = edge.source
+               AND retired_at IS NULL
+               AND edge.target = ANY(upgrade_edges)
+         )"
+    ))
+    .bind(sources)
+    .bind(targets)
+    .fetch_all(executor)
+    .await?;
+    let mut answers = vec![false; edges.len()];
+    for position in certified {
+        if let Some(answer) = usize::try_from(position - 1)
+            .ok()
+            .and_then(|index| answers.get_mut(index))
+        {
+            *answer = true;
+        }
+    }
+    Ok(answers)
+}
+
 /// Which of `environments` the catalog holds as retired. Accepts a pool or a
 /// transaction connection; takes no lock.
 pub async fn retired_among(

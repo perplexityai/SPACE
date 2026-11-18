@@ -547,3 +547,31 @@ pub(super) fn record_runtime_environment(entry: AdminRuntimeEnvironmentAuditEntr
         error = entry.error.unwrap_or(""),
     );
 }
+
+/// Parameters for a runtime upgrade campaign write's audit entry.
+pub(super) struct AdminRuntimeUpgradeCampaignAuditEntry<'a> {
+    pub actor: &'a User,
+    pub action: &'a str,
+    /// Empty for a start that was refused before a campaign existed.
+    pub campaign_id: &'a str,
+    pub reason: &'a str,
+    /// The generation the write left; `None` when it was refused.
+    pub generation: Option<u64>,
+    pub success: bool,
+    pub error: Option<&'a str>,
+}
+
+pub(super) fn record_runtime_upgrade_campaign(entry: AdminRuntimeUpgradeCampaignAuditEntry<'_>) {
+    tracing::info!(
+        target: "space.admin.audit",
+        event = "admin_audit",
+        actor_user_id = %entry.actor.id,
+        actor_email = %entry.actor.email,
+        action = entry.action,
+        campaign_id = entry.campaign_id,
+        reason = entry.reason,
+        generation = entry.generation,
+        success = entry.success,
+        error = entry.error.unwrap_or(""),
+    );
+}
