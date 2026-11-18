@@ -5,9 +5,11 @@
 //! - `managed_by = 'k8s'` — leaves direct-managed SPACE nodes alone. Kubernetes
 //!   nodes whose instances disappear outside the drain path can leave orphan
 //!   rows; direct-managed rows are owned by a different lifecycle.
-//! - `drain_phase IS NULL` — rows in any drain phase belong to `node_drain`
-//!   and `drained_node_terminator`. Touching them out from under those
-//!   reconcilers would strand the drain pipeline.
+//! - `drain_phase IS NULL` and no v2 drain (`drain_engine = 'v2'`, whose
+//!   cancel pending has no phase) — rows in any drain phase belong to
+//!   `node_drain` and `drained_node_terminator`, and a v2 drain's row to the
+//!   node drain's v2 loop. Touching them out from under those reconcilers
+//!   would strand the drain pipeline.
 //! - `NOT EXISTS (sandboxes pinned to this node, non-terminal lifecycle)` —
 //!   even after the EC2 instance is gone, a row may still have suspended
 //!   sandboxes pinned to it via `target_node_id`. Those snapshots live on
@@ -82,6 +84,7 @@ impl OrphanedNodesSink for NodeDbStore {
              JOIN node_k8s k ON k.node_id = n.id
              WHERE n.managed_by = $3
                AND n.drain_phase IS NULL
+               AND n.drain_engine IS DISTINCT FROM 'v2'
                AND k.k8s_node_name IS NOT NULL
                AND ($1::UUID IS NULL OR n.id > $1)
                AND NOT EXISTS (
@@ -127,6 +130,7 @@ impl OrphanedNodesSink for NodeDbStore {
              WHERE n.id = $1
                AND n.managed_by = $3
                AND n.drain_phase IS NULL
+               AND n.drain_engine IS DISTINCT FROM 'v2'
                AND COALESCE(
                    (SELECT k8s_node_uid FROM node_k8s WHERE node_id = $1),
                    ''
@@ -148,5 +152,70 @@ impl OrphanedNodesSink for NodeDbStore {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use pplx_space_db_test_fixtures::pg_test_db;
+    use pplx_space_test_env::TestResult;
+
+    use super::*;
+
+    /// A node row with its Kubernetes identity, under `engine` with no phase.
+    async fn node(pool: &PgPool, engine: Option<&str>) -> TestResult<NodeId> {
+        let node_id = NodeId::new();
+        sqlx::query(sql!(
+            "INSERT INTO nodes (id, address, role, managed_by, state, drain_engine, drain_status)
+             VALUES ($1, '10.0.0.83', 'worker', 'k8s', 'ready', $2,
+                     CASE WHEN $2::TEXT IS NOT NULL
+                          THEN '{\"generation\": 1, \"deadline_at\": 0}'::JSONB END)"
+        ))
+        .bind(node_id)
+        .bind(engine)
+        .execute(pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
+             VALUES ($1, $2, 'uid')"
+        ))
+        .bind(node_id)
+        .bind(format!(
+            "worker-{}.synthetic.internal",
+            node_id.as_uuid().simple()
+        ))
+        .execute(pool)
+        .await?;
+        Ok(node_id)
+    }
+
+    /// A v2 drain's row is never an orphan candidate, its cancel pending
+    /// (a v2 engine with no phase) included, and its DELETE refuses it; a
+    /// row with no drain is both, as before.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_v2_drains_row_is_never_an_orphan() -> TestResult {
+        let db = pg_test_db().await?;
+        let store = NodeDbStore::new(db.pool.clone());
+        let v2 = node(&db.pool, Some("v2")).await?;
+        let plain = node(&db.pool, None).await?;
+        let candidates: Vec<NodeId> = store
+            .list_candidates(100, None)
+            .await?
+            .into_iter()
+            .map(|candidate| candidate.node_id)
+            .collect();
+        assert!(candidates.contains(&plain), "{candidates:?}");
+        assert!(!candidates.contains(&v2), "{candidates:?}");
+        assert!(
+            !store
+                .delete_node_if_orphan(v2, Some("uid".to_owned()))
+                .await?
+        );
+        assert!(
+            store
+                .delete_node_if_orphan(plain, Some("uid".to_owned()))
+                .await?
+        );
+        Ok(())
     }
 }

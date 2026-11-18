@@ -305,7 +305,8 @@ fn set_drain_phase_query(residency: ResidencyEvidence, scope: GuardScope) -> Str
             SET drain_phase = $2,
                 drain_last_error = $3
           WHERE id = $1
-            AND drain_phase = $4{resident_guard}"
+            AND drain_phase = $4
+            AND drain_engine IS NULL{resident_guard}"
     )
 }
 
@@ -1483,6 +1484,19 @@ impl SubstrateSink {
             evacuate_stopped_residents,
             replace_stopped_evacuations,
         }
+    }
+
+    /// The v2 drain loop's sink ([`super::v2::DrainV2Sink`]). It reads none
+    /// of v1's drain configuration, so it carries the defaults.
+    pub fn v2(pool: PgPool, substrate: Arc<KubernetesSubstrate>) -> Self {
+        Self::new(
+            pool,
+            substrate,
+            ResidencyEvidence::default(),
+            false,
+            false,
+            false,
+        )
     }
 
     #[cfg(test)]
@@ -4910,6 +4924,10 @@ async fn connect_restore_listener(
 /// `shutting-down` (the `m5d.metal` shutdown is slow), and for a recycled-IP
 /// fresh EC2 instance that joins under the same hostname before an operator
 /// clears the tombstone.
+///
+/// A v1 writer: a v2 drain's node is never deleted here and gets no
+/// tombstone. The v2 loop deletes it, with none, once EC2 says the instance
+/// it fenced is terminated and its Node is gone (`node_drain::v2`).
 pub(crate) async fn delete_terminating_node_and_record_tombstone(
     pool: &PgPool,
     node_id: NodeId,
@@ -4926,7 +4944,8 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
         "DELETE FROM nodes
          WHERE id = $1
            AND drain_phase = 'terminating'
-           AND managed_by = $2"
+           AND managed_by = $2
+           AND drain_engine IS NULL"
     ))
     .bind(node_id)
     .bind(SubstrateKind::Kubernetes)
@@ -4964,6 +4983,8 @@ mod tests;
 mod tombstone_tests;
 
 #[cfg(test)]
+mod v2_skip_tests;
+
 pub(crate) mod v2_sink;
 
 /// Postgres-backed regression tests for the durable-upload drain gate: a node

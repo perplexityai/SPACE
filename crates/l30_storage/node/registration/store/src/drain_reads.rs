@@ -55,14 +55,16 @@ pub async fn drain_phase_counts(
     .await
 }
 
-/// Every node of `managed_by` in drain phase `phase`.
+/// Every node of `managed_by` in v1 drain phase `phase`. A v2 drain's node
+/// (`drain_engine` set) is left to the node drain's v2 loop.
 pub async fn nodes_in_drain_phase(
     executor: impl PgExecutor<'_>,
     phase: NodeDrainPhase,
     managed_by: SubstrateKind,
 ) -> Result<Vec<NodeId>, sqlx::Error> {
     sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = $2"
+        "SELECT id FROM nodes
+          WHERE drain_phase = $1 AND managed_by = $2 AND drain_engine IS NULL"
     ))
     .bind(phase.as_str())
     .bind(managed_by)
@@ -78,7 +80,9 @@ pub struct NodeInDrainPhase {
     pub drain_mode: Option<String>,
 }
 
-/// Every node of `managed_by` in drain phase `phase`, with its drain mode.
+/// Every node of `managed_by` in v1 drain phase `phase`, with its drain
+/// mode. A v2 drain's node (`drain_engine` set) is left to the node drain's
+/// v2 loop.
 pub async fn nodes_in_drain_phase_with_mode(
     executor: impl PgExecutor<'_>,
     phase: NodeDrainPhase,
@@ -86,7 +90,7 @@ pub async fn nodes_in_drain_phase_with_mode(
 ) -> Result<Vec<NodeInDrainPhase>, sqlx::Error> {
     sqlx::query_as::<_, NodeInDrainPhase>(sql!(
         "SELECT id, drain_mode FROM nodes
-          WHERE drain_phase = $1 AND managed_by = $2"
+          WHERE drain_phase = $1 AND managed_by = $2 AND drain_engine IS NULL"
     ))
     .bind(phase.as_str())
     .bind(managed_by)
