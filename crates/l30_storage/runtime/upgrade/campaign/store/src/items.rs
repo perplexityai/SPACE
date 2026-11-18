@@ -7,7 +7,7 @@
 //! on these tables, and an outcome or a lapse does what
 //! [`pplx_space_rollout_queue::Outcome`] says.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -223,6 +223,7 @@ pub async fn lease_items(
     let mut leasing = Leasing {
         tx: &mut tx,
         campaign_id,
+        on_node: HashMap::new(),
     };
     let leased = pplx_space_rollout_queue::claim(&mut leasing, lease, scan_limit).await;
     end_transaction(tx, leased).await
@@ -236,21 +237,32 @@ pub enum LeaseError {
     Database(#[from] sqlx::Error),
 }
 
-/// [`lease_items`]'s steps.
+/// [`lease_items`]'s steps. The shared claim paces by the cluster cap; the
+/// per-node cap is this store's, applied in [`ClaimStore::claim`].
 struct Leasing<'c> {
     tx: &'c mut PgConnection,
     campaign_id: CampaignId,
+    /// Items in flight by the node that last published each sandbox,
+    /// counting those this lease takes.
+    on_node: HashMap<NodeId, u64>,
+}
+
+/// What [`lease_items`] read of the campaign under its lock that it needs
+/// after.
+struct LeaseHeader {
+    subject_kind: SubjectKind,
+    per_node: u64,
 }
 
 impl ClaimStore for Leasing<'_> {
-    /// The kind of subject the campaign's items name.
-    type Header = SubjectKind;
+    type Header = LeaseHeader;
     type Subject = uuid::Uuid;
-    type Node = NodeId;
+    /// The node that last published the subject, if it has one.
+    type Placement = Option<NodeId>;
     type Claimed = LeasedItem;
     type Error = LeaseError;
 
-    async fn lock_leasable(&mut self) -> Result<Option<(SubjectKind, Pacing)>, LeaseError> {
+    async fn lock_leasable(&mut self) -> Result<Option<(LeaseHeader, Pacing)>, LeaseError> {
         let leasing: Vec<&str> = CampaignPhase::ALL
             .iter()
             .filter(|phase| phase.leases())
@@ -275,10 +287,12 @@ impl ClaimStore for Leasing<'_> {
         };
         let subject_kind = kind.parse::<CampaignKind>()?.subject_kind();
         Ok(Some((
-            subject_kind,
+            LeaseHeader {
+                subject_kind,
+                per_node: u64::try_from(per_node).unwrap_or(0),
+            },
             Pacing {
                 canary,
-                per_node: u64::try_from(per_node).unwrap_or(0),
                 per_cluster: u64::try_from(per_cluster).unwrap_or(0),
                 failure_budget: u64::try_from(failure_budget).unwrap_or(0),
             },
@@ -300,26 +314,40 @@ impl ClaimStore for Leasing<'_> {
         Ok((canary_done, u64::try_from(canary_in_flight).unwrap_or(0)))
     }
 
-    async fn lock_handoff(&mut self, subject_kind: &SubjectKind) -> Result<(), LeaseError> {
-        Ok(lock_lease_handoff(self.tx, *subject_kind, Handoff::Lease).await?)
+    async fn lock_handoff(&mut self, header: &LeaseHeader) -> Result<(), LeaseError> {
+        Ok(lock_lease_handoff(self.tx, header.subject_kind, Handoff::Lease).await?)
     }
 
     async fn held_elsewhere(
         &mut self,
-        subject_kind: &SubjectKind,
+        header: &LeaseHeader,
     ) -> Result<HashSet<uuid::Uuid>, LeaseError> {
-        Ok(held_by_other_campaigns(self.tx, self.campaign_id, *subject_kind).await?)
+        Ok(held_by_other_campaigns(self.tx, self.campaign_id, header.subject_kind).await?)
     }
 
     async fn candidates(
         &mut self,
-        subject_kind: &SubjectKind,
+        header: &LeaseHeader,
         scan_limit: u32,
-    ) -> Result<ItemCandidates, LeaseError> {
-        Ok(if subject_kind.has_node() {
-            node_bound_candidates(self.tx, self.campaign_id, *subject_kind, scan_limit).await?
+    ) -> Result<Candidates<uuid::Uuid, Option<NodeId>>, LeaseError> {
+        let subject_kind = header.subject_kind;
+        let (in_flight, pending) = if subject_kind.has_node() {
+            node_bound_candidates(self.tx, self.campaign_id, subject_kind, scan_limit).await?
         } else {
-            nodeless_candidates(self.tx, self.campaign_id, *subject_kind, scan_limit).await?
+            nodeless_candidates(self.tx, self.campaign_id, subject_kind, scan_limit).await?
+        };
+        let mut in_cluster = 0_u64;
+        for (node_id, count) in in_flight {
+            // count(*) is never negative.
+            let count = u64::try_from(count).unwrap_or(0);
+            in_cluster += count;
+            if let Some(node_id) = node_id {
+                *self.on_node.entry(node_id).or_default() += count;
+            }
+        }
+        Ok(Candidates {
+            in_flight: in_cluster,
+            pending,
         })
     }
 
@@ -329,12 +357,20 @@ impl ClaimStore for Leasing<'_> {
 
     async fn claim(
         &mut self,
-        subject_kind: &SubjectKind,
+        header: &LeaseHeader,
         subject_id: uuid::Uuid,
-        node_id: Option<NodeId>,
+        node_id: &Option<NodeId>,
         lease_token: uuid::Uuid,
         lease: Duration,
     ) -> Result<Option<LeasedItem>, LeaseError> {
+        let node_id = *node_id;
+        // Only a sandbox published on a node has one; it counts against
+        // the cluster cap alone otherwise.
+        if let Some(node_id) = node_id
+            && self.on_node.get(&node_id).copied().unwrap_or(0) >= header.per_node
+        {
+            return Ok(None);
+        }
         let attempts = sqlx::query_scalar::<_, i64>(sql!(
             "UPDATE runtime_upgrade_items
              SET phase = $4,
@@ -348,7 +384,7 @@ impl ClaimStore for Leasing<'_> {
              RETURNING attempts"
         ))
         .bind(self.campaign_id)
-        .bind(subject_kind.as_str())
+        .bind(header.subject_kind.as_str())
         .bind(subject_id)
         .bind(ItemPhase::InFlight.as_str())
         .bind(lease_token)
@@ -356,9 +392,15 @@ impl ClaimStore for Leasing<'_> {
         .bind(ItemPhase::Pending.as_str())
         .fetch_optional(&mut *self.tx)
         .await?;
-        Ok(attempts.map(|attempts| LeasedItem {
+        let Some(attempts) = attempts else {
+            return Ok(None);
+        };
+        if let Some(node_id) = node_id {
+            *self.on_node.entry(node_id).or_default() += 1;
+        }
+        Ok(Some(LeasedItem {
             campaign_id: self.campaign_id,
-            subject_kind: *subject_kind,
+            subject_kind: header.subject_kind,
             subject_id,
             lease_token,
             attempts: u64::try_from(attempts).unwrap_or(0),
@@ -441,7 +483,10 @@ async fn lock_lease_handoff(
 
 /// In-flight counts by node, and the pending items to consider with their
 /// nodes.
-type ItemCandidates = Candidates<uuid::Uuid, NodeId>;
+type NodeCandidates = (
+    Vec<(Option<NodeId>, i64)>,
+    Vec<(uuid::Uuid, Option<NodeId>)>,
+);
 
 /// For sandbox items: in flight by the node that last published each
 /// sandbox, and pending items whose node qualifies or that have none.
@@ -450,7 +495,7 @@ async fn node_bound_candidates(
     campaign_id: CampaignId,
     subject_kind: SubjectKind,
     scan_limit: u32,
-) -> Result<ItemCandidates, sqlx::Error> {
+) -> Result<NodeCandidates, sqlx::Error> {
     debug_assert_eq!(subject_kind, SubjectKind::Sandbox);
     // One statement, so one snapshot: the in-flight counts and the pending
     // items see each sandbox on the same node. Read in two, a sandbox
@@ -505,15 +550,14 @@ async fn node_bound_candidates(
     let mut pending = Vec::new();
     for (node_id, items, subject_id) in rows {
         match (items, subject_id) {
-            // count(*) is never negative.
-            (Some(items), _) => in_flight.push((node_id, u64::try_from(items).unwrap_or(0))),
+            (Some(items), _) => in_flight.push((node_id, items)),
             (None, Some(subject_id)) => pending.push((subject_id, node_id)),
             (None, None) => {}
         }
     }
     // UNION ALL doesn't promise the branch's order.
     pending.sort_unstable_by_key(|(subject_id, _)| *subject_id);
-    Ok(Candidates { in_flight, pending })
+    Ok((in_flight, pending))
 }
 
 /// For items with no node: the in-flight count and the first pending items.
@@ -522,7 +566,7 @@ async fn nodeless_candidates(
     campaign_id: CampaignId,
     subject_kind: SubjectKind,
     scan_limit: u32,
-) -> Result<ItemCandidates, sqlx::Error> {
+) -> Result<NodeCandidates, sqlx::Error> {
     let in_flight = sqlx::query_scalar::<_, i64>(sql!(
         "SELECT count(*)
          FROM runtime_upgrade_items
@@ -550,11 +594,10 @@ async fn nodeless_candidates(
     .bind(i64::from(scan_limit))
     .fetch_all(&mut *tx)
     .await?;
-    Ok(Candidates {
-        // count(*) is never negative.
-        in_flight: vec![(None, u64::try_from(in_flight).unwrap_or(0))],
-        pending: pending.into_iter().map(|id| (id, None)).collect(),
-    })
+    Ok((
+        vec![(None, in_flight)],
+        pending.into_iter().map(|id| (id, None)).collect(),
+    ))
 }
 
 /// Extend `item`'s lease to `lease` from now (clamped as for
