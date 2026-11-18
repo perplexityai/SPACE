@@ -750,9 +750,11 @@ async fn a_lease_runs_on_the_database_clock() -> TestResult {
     pending_on(&db, campaign, None, 1).await?;
     // Inside a transaction whose now() is a tenth of a second old, a lease
     // on the transaction clock would end before an hour from the lease.
+    // Instants in whole microseconds, Postgres's resolution, so the renewal
+    // bounds compare exactly.
     let mut caller = db.pool.begin().await?;
-    let started = sqlx::query_scalar::<_, f64>(sql!(
-        "SELECT extract(epoch FROM clock_timestamp())::float8 FROM pg_sleep(0.1)"
+    let started = sqlx::query_scalar::<_, i64>(sql!(
+        "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::int8 FROM pg_sleep(0.1)"
     ))
     .fetch_one(&mut *caller)
     .await?;
@@ -761,28 +763,49 @@ async fn a_lease_runs_on_the_database_clock() -> TestResult {
         .await?
         .remove(0);
     let expires_at = async |caller: &mut sqlx::PgConnection| {
-        sqlx::query_scalar::<_, f64>(sql!(
-            "SELECT extract(epoch FROM lease_expires_at)::float8
+        sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT (extract(epoch FROM lease_expires_at) * 1000000)::int8
              FROM runtime_upgrade_items WHERE campaign_id = $1"
         ))
         .bind(campaign)
         .fetch_one(caller)
         .await
     };
+    let clock = async |caller: &mut sqlx::PgConnection| {
+        sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::int8"
+        ))
+        .fetch_one(caller)
+        .await
+    };
     let expires = expires_at(&mut caller).await?;
-    // A renewal is clamped the same way.
-    assert!(renew_lease(&mut *caller, &leased, Duration::from_secs(10 * 3600)).await?);
-    let renewed = expires_at(&mut caller).await?;
-    caller.rollback().await?;
     // An hour, the documented bound.
     assert_eq!(MAX_LEASE, Duration::from_secs(3600));
-    for (verb, expires) in [("lease", expires), ("renewal", renewed)] {
-        let remaining = expires - started;
-        assert!(
-            (3600.0..3660.0).contains(&remaining),
-            "{verb} runs {remaining}s from a clock read just before it"
-        );
-    }
+    let hour = 3_600_000_000;
+    let remaining = expires - started;
+    assert!(
+        (hour..hour + 60_000_000).contains(&remaining),
+        "lease runs {remaining}us from a clock read just before it"
+    );
+    // A renewal is clamped the same way, and writes a new expiry: from a
+    // shorter live lease, one that writes nothing stays a minute out.
+    sqlx::query(sql!(
+        "UPDATE runtime_upgrade_items
+         SET lease_expires_at = clock_timestamp() + interval '1 minute'
+         WHERE campaign_id = $1"
+    ))
+    .bind(campaign)
+    .execute(&mut *caller)
+    .await?;
+    let before = clock(&mut caller).await?;
+    assert!(renew_lease(&mut *caller, &leased, Duration::from_secs(10 * 3600)).await?);
+    let after = clock(&mut caller).await?;
+    let renewed = expires_at(&mut caller).await?;
+    caller.rollback().await?;
+    assert!(
+        (before + hour..=after + hour).contains(&renewed),
+        "renewal expires at {renewed}us, not an hour after a clock read in [{before}, {after}]us"
+    );
     Ok(())
 }
 
