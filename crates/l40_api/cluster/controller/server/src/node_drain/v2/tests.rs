@@ -19,6 +19,13 @@ struct FakeSink {
     calls: Mutex<Vec<String>>,
     /// When set, each `DrainNode` call waits here before it answers.
     barrier: Option<tokio::sync::Barrier>,
+    /// The terminate transaction's answer; `Fenced` on the node's recorded
+    /// instance when unset.
+    fence: Option<Fence>,
+    /// Whether a Node of the name exists; none when unset.
+    nodes_present: Vec<String>,
+    /// The terminated delete's answer; `Deleted` when unset.
+    delete: Option<TerminatedDelete>,
 }
 
 impl FakeSink {
@@ -111,23 +118,86 @@ impl DrainV2Sink for FakeSink {
     async fn record_error(&self, node_id: NodeId, message: &str) {
         self.log(format!("error {node_id} {message}"));
     }
+
+    async fn release_suspended(
+        &self,
+        node_id: NodeId,
+        epoch: u64,
+    ) -> Result<Vec<SandboxId>, String> {
+        self.log(format!("release {node_id} {epoch}"));
+        Ok(Vec::new())
+    }
+
+    async fn fence(&self, node_id: NodeId, epoch: u64) -> Result<Fence, String> {
+        self.log(format!("fence {node_id} {epoch}"));
+        Ok(self
+            .fence
+            .clone()
+            .unwrap_or_else(|| Fence::Fenced(INSTANCE.to_owned())))
+    }
+
+    async fn record_dispatched(
+        &self,
+        node_id: NodeId,
+        epoch: u64,
+        instance_id: &str,
+    ) -> Result<bool, String> {
+        self.log(format!("dispatched {node_id} {epoch} {instance_id}"));
+        Ok(true)
+    }
+
+    async fn record_terminated_observed(
+        &self,
+        node_id: NodeId,
+        epoch: u64,
+        instance_id: &str,
+    ) -> Result<bool, String> {
+        self.log(format!("observed {node_id} {epoch} {instance_id}"));
+        Ok(true)
+    }
+
+    async fn node_exists(&self, k8s_node_name: &str) -> Result<bool, String> {
+        self.log(format!("node_exists {k8s_node_name}"));
+        Ok(self.nodes_present.iter().any(|name| name == k8s_node_name))
+    }
+
+    async fn delete_terminated(
+        &self,
+        node: &V2Node,
+        epoch: u64,
+        fence: &str,
+    ) -> Result<TerminatedDelete, String> {
+        self.log(format!("delete {} {epoch} {fence}", node.id));
+        Ok(self.delete.clone().unwrap_or(TerminatedDelete::Deleted))
+    }
+
+    async fn let_go(&self, node: &V2Node, epoch: u64, trace: &str) -> Result<bool, String> {
+        self.log(format!("let_go {} {epoch} {trace}", node.id));
+        Ok(true)
+    }
 }
 
 /// The instance every test node records.
 const INSTANCE: &str = "i-0000000000000c0c0";
 
-/// EC2, scripted: each instance answers `running` unless scripted
-/// otherwise.
+/// EC2 and Auto Scaling, scripted: each instance answers `running` unless
+/// scripted otherwise.
 struct FakeAuthority {
+    terminates: bool,
     answers: HashMap<String, InstanceEvidence>,
+    terminate: Result<(), String>,
     described: Mutex<Vec<String>>,
+    terminated: Mutex<Vec<(String, bool)>>,
 }
 
 impl FakeAuthority {
     fn ok() -> Self {
         Self {
+            terminates: true,
             answers: HashMap::new(),
+            terminate: Ok(()),
             described: Mutex::default(),
+            terminated: Mutex::default(),
         }
     }
 
@@ -141,9 +211,17 @@ impl FakeAuthority {
     fn described(&self) -> Vec<String> {
         self.described.lock().unwrap().clone()
     }
+
+    fn terminated(&self) -> Vec<(String, bool)> {
+        self.terminated.lock().unwrap().clone()
+    }
 }
 
 impl V2InstanceAuthority for FakeAuthority {
+    fn terminates(&self) -> bool {
+        self.terminates
+    }
+
     async fn describe_instance(&self, instance_id: &str) -> InstanceEvidence {
         self.described.lock().unwrap().push(instance_id.to_owned());
         self.answers
@@ -151,9 +229,21 @@ impl V2InstanceAuthority for FakeAuthority {
             .cloned()
             .unwrap_or_else(|| InstanceEvidence::Listed("running".to_owned()))
     }
+
+    async fn terminate_instance(
+        &self,
+        instance_id: &str,
+        decrement_capacity: bool,
+    ) -> Result<(), String> {
+        self.terminated
+            .lock()
+            .unwrap()
+            .push((instance_id.to_owned(), decrement_capacity));
+        self.terminate.clone()
+    }
 }
 
-/// One tick with a fresh state, as a controller that just started runs it.
+/// One tick with a fresh backoff, as a controller that just started runs it.
 async fn run_tick<S: DrainV2Sink, A: V2InstanceAuthority>(
     sink: &S,
     authority: &A,
@@ -171,8 +261,29 @@ fn node(phase: Option<&str>, epoch: Option<u64>, cancel: bool) -> V2Node {
         cancel,
         unrecorded_since: BTreeMap::new(),
         waiting: false,
+        k8s_node_name: Some(format!(
+            "worker-{}.synthetic.internal",
+            id.as_uuid().simple()
+        )),
+        k8s_node_uid: Some("uid".to_owned()),
         instance_id: Some(INSTANCE.to_owned()),
         heartbeat_fresh: true,
+        fence: None,
+        dispatched: false,
+        dispatched_at: None,
+        terminated_observed_at: None,
+        decrement_capacity: false,
+    }
+}
+
+/// A `terminating` node fenced on [`INSTANCE`], dispatched or not.
+fn fenced(dispatched: bool) -> V2Node {
+    V2Node {
+        fence: Some(INSTANCE.to_owned()),
+        dispatched,
+        dispatched_at: dispatched.then(super::unix_now),
+        heartbeat_fresh: false,
+        ..node(Some("terminating"), Some(5), false)
     }
 }
 
@@ -287,11 +398,7 @@ async fn a_node_holds_its_slot_until_it_leaves_v2() {
             Some(node(Some("drained"), Some(5), false)),
             false,
         ),
-        (
-            "terminating",
-            Some(node(Some("terminating"), Some(5), false)),
-            false,
-        ),
+        ("terminating", Some(fenced(true)), false),
         ("left v2", None, false),
     ] {
         // The oldest drain, so a waiting one beside it comes second.
@@ -566,14 +673,16 @@ async fn an_undrained_node_is_cancelled_until_unsealed() {
 }
 
 /// With new v2 drains not admitted, the loop still owns the persisted ones:
-/// it drains a draining node to `drained` and cancels an undrained one, with
-/// no terminator to ask EC2.
+/// it drains a draining node to `drained` and cancels an undrained one. With
+/// no terminator that terminates, it never fences a `terminating` node,
+/// which waits unfenced with the refusal as its error.
 #[tokio::test]
-async fn the_loop_owns_persisted_drains_without_a_terminator() {
+async fn the_loop_owns_persisted_drains_without_terminating() {
     let draining = node(Some("draining"), Some(5), false);
     let undrained = node(None, Some(5), true);
+    let terminating = node(Some("terminating"), Some(5), false);
     let sink = FakeSink {
-        nodes: vec![draining.clone(), undrained.clone()],
+        nodes: vec![draining.clone(), undrained.clone(), terminating.clone()],
         responses: HashMap::from([
             ((draining.id, false), Ok(response(Some(5), true, &[]))),
             ((undrained.id, true), Ok(response(None, false, &[]))),
@@ -583,6 +692,16 @@ async fn the_loop_owns_persisted_drains_without_a_terminator() {
     let report = run_tick(&sink, &V2Terminator::Refuse, DEFAULT_MAX_EVACUATING_NODES).await;
     assert_eq!(report.drained, [draining.id]);
     assert_eq!(report.cancelled, [undrained.id]);
+    assert!(report.fenced.is_empty());
+    let calls = sink.calls();
+    assert!(
+        calls.contains(&format!("error {} {REFUSED_TERMINATE}", terminating.id)),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|call| call.starts_with("fence ")),
+        "{calls:?}"
+    );
 }
 
 /// A draining node that doesn't answer its `DrainNode` call reads 1 on the
@@ -936,6 +1055,517 @@ fn a_row_is_reported_once_however_many_reasons_name_it() {
     assert_eq!(json["unrecorded"].as_array().unwrap().len(), 3);
 }
 
+/// Whether the sink saw a call starting `prefix` for `node`.
+fn called(sink: &FakeSink, prefix: &str, node: &V2Node) -> bool {
+    sink.calls()
+        .iter()
+        .any(|call| call.starts_with(&format!("{prefix} {}", node.id)))
+}
+
+/// A `drained` node's tick releases the durably suspended rows still naming
+/// it; a `draining` one's doesn't.
+#[tokio::test]
+async fn a_drained_tick_releases_and_a_draining_one_does_not() {
+    let drained = node(Some("drained"), Some(5), false);
+    let draining = node(Some("draining"), Some(6), false);
+    let sink = FakeSink {
+        responses: HashMap::from([
+            ((drained.id, false), Ok(response(Some(5), true, &[]))),
+            ((draining.id, false), Ok(response(Some(6), false, &[]))),
+        ]),
+        nodes: vec![drained.clone(), draining.clone()],
+        ..FakeSink::default()
+    };
+    run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
+    assert!(called(&sink, "release", &drained), "{:?}", sink.calls());
+    assert!(!called(&sink, "release", &draining), "{:?}", sink.calls());
+}
+
+/// An unfenced `terminating` node runs the terminate transaction, and
+/// nothing else: no cordon and no node call, so the loop writes no
+/// Kubernetes object there. A transaction the require-empty predicate holds
+/// fences nothing.
+#[tokio::test]
+async fn an_unfenced_terminating_node_runs_only_the_terminate_transaction() {
+    for (case, answer, fences) in [
+        ("fenced", None, true),
+        (
+            "held",
+            Some(Fence::Held("terminate held".to_owned())),
+            false,
+        ),
+        ("moved", Some(Fence::Moved), false),
+    ] {
+        let terminating = node(Some("terminating"), Some(5), false);
+        let sink = FakeSink {
+            nodes: vec![terminating.clone()],
+            fence: answer,
+            ..FakeSink::default()
+        };
+        let authority = FakeAuthority::ok();
+        let report = run_tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES).await;
+        assert_eq!(report.fenced == [terminating.id], fences, "{case}");
+        assert_eq!(
+            sink.calls(),
+            [format!("fence {} 5", terminating.id)],
+            "{case}"
+        );
+        assert!(authority.described().is_empty() && authority.terminated().is_empty());
+    }
+}
+
+/// A fenced node with no dispatch is dispatched only after EC2 lists the
+/// fenced instance in a state other than `shutting-down` or `terminated`:
+/// by the fenced id, with the node's decrement, recording `dispatched_at`.
+/// A `shutting-down`, unlisted or unknown answer dispatches nothing and
+/// says why; a `terminated` one lets the node go, since the drain can't
+/// claim the termination.
+#[tokio::test]
+async fn a_fenced_node_is_dispatched_only_after_ec2_answers() {
+    for (case, evidence, dispatches, lets_go) in [
+        (
+            "running",
+            InstanceEvidence::Listed("running".into()),
+            true,
+            false,
+        ),
+        (
+            "stopped",
+            InstanceEvidence::Listed("stopped".into()),
+            true,
+            false,
+        ),
+        ("not listed", InstanceEvidence::NotListed, false, false),
+        (
+            "shutting-down",
+            InstanceEvidence::ShuttingDown,
+            false,
+            false,
+        ),
+        (
+            "unknown",
+            InstanceEvidence::Unknown("timeout".into()),
+            false,
+            false,
+        ),
+        ("terminated", InstanceEvidence::Terminated, false, true),
+    ] {
+        let node = V2Node {
+            decrement_capacity: true,
+            ..fenced(false)
+        };
+        let sink = FakeSink {
+            nodes: vec![node.clone()],
+            ..FakeSink::default()
+        };
+        let authority = FakeAuthority::answering(evidence);
+        let report = run_tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES).await;
+        assert_eq!(authority.described(), [INSTANCE], "{case}");
+        let expected: &[(String, bool)] = if dispatches {
+            &[(INSTANCE.to_owned(), true)]
+        } else {
+            &[]
+        };
+        assert_eq!(authority.terminated(), expected, "{case}");
+        assert_eq!(report.dispatched == [node.id], dispatches, "{case}");
+        assert_eq!(
+            sink.calls()
+                .contains(&format!("dispatched {} 5 {INSTANCE}", node.id)),
+            dispatches,
+            "{case}"
+        );
+        assert_eq!(report.let_go == [node.id], lets_go, "{case}");
+        if lets_go {
+            assert!(
+                sink.calls().contains(&format!(
+                    "let_go {} 5 v2 drain let go: fenced instance {INSTANCE} terminated; \
+                     dispatch unconfirmed",
+                    node.id
+                )),
+                "{:?}",
+                sink.calls()
+            );
+        }
+        assert_eq!(
+            sink.calls()
+                .iter()
+                .any(|call| call.starts_with(&format!("error {}", node.id))
+                    && call.ends_with("not dispatching its termination")),
+            !dispatches && !lets_go,
+            "{case}: {:?}",
+            sink.calls()
+        );
+        assert!(!called(&sink, "delete", &node), "{case}");
+    }
+}
+
+/// Once EC2 has been seen to list the fenced instance `terminated`, an
+/// instance it no longer lists reads as terminated: an undispatched node is
+/// let go, as on `terminated`, and dispatches nothing.
+#[tokio::test]
+async fn an_unlisted_instance_after_a_recorded_terminated_reads_terminated() {
+    let node = V2Node {
+        terminated_observed_at: Some(super::unix_now()),
+        ..fenced(false)
+    };
+    let sink = FakeSink {
+        nodes: vec![node.clone()],
+        ..FakeSink::default()
+    };
+    let authority = FakeAuthority::answering(InstanceEvidence::NotListed);
+    let report = run_tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES).await;
+    assert_eq!(report.let_go, [node.id], "{:?}", sink.calls());
+    assert!(authority.terminated().is_empty());
+    assert!(!called(&sink, "observed", &node), "{:?}", sink.calls());
+}
+
+/// Once `dispatched_at` is recorded the loop never dispatches again,
+/// whatever EC2 answers; past the bound it says the termination was
+/// accepted and the instance still runs. A row an earlier build's
+/// terminator marked `terminated` is dispatched with no time, and is never
+/// dispatched again either. No answer from EC2 is said on every check,
+/// with the dispatch's age only where the row records one.
+#[tokio::test]
+async fn a_dispatched_node_is_never_dispatched_again() {
+    let past_bound = super::unix_now() - i64::try_from(TERMINATE_BOUND.as_secs()).unwrap() - 60;
+    let unknown = || InstanceEvidence::Unknown("the EC2 call timed out".to_owned());
+    let running = || InstanceEvidence::Listed("running".to_owned());
+    for (case, dispatched_at, evidence, says) in [
+        ("just dispatched", Some(super::unix_now()), running(), None),
+        (
+            "past the bound",
+            Some(past_bound),
+            running(),
+            Some("EC2 still answers running after 16 minutes"),
+        ),
+        (
+            "an earlier build's terminated marker",
+            None,
+            running(),
+            None,
+        ),
+        (
+            "just dispatched, no answer",
+            Some(super::unix_now()),
+            unknown(),
+            Some("was dispatched 0 minutes ago; EC2 answers unknown (the EC2 call timed out)"),
+        ),
+        (
+            "past the bound, no answer",
+            Some(past_bound),
+            unknown(),
+            Some("was dispatched 16 minutes ago; EC2 answers unknown"),
+        ),
+        (
+            "an earlier build's terminated marker, no answer",
+            None,
+            unknown(),
+            Some(
+                "the termination of fenced instance i-0000000000000c0c0 was dispatched; EC2 \
+                 answers unknown (the EC2 call timed out)",
+            ),
+        ),
+    ] {
+        let node = V2Node {
+            dispatched_at,
+            ..fenced(true)
+        };
+        let sink = FakeSink {
+            nodes: vec![node.clone()],
+            ..FakeSink::default()
+        };
+        let authority = FakeAuthority::answering(evidence);
+        let report = run_tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES).await;
+        assert!(authority.terminated().is_empty(), "{case}");
+        assert_eq!(report, V2TickReport::default(), "{case}");
+        let errors: Vec<String> = sink
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with(&format!("error {}", node.id)))
+            .collect();
+        match says {
+            Some(says) => assert!(
+                errors.len() == 1 && errors[0].contains(says),
+                "{case}: {errors:?}"
+            ),
+            None => assert!(errors.is_empty(), "{case}: {errors:?}"),
+        }
+    }
+}
+
+/// A refused dispatch counts on `node_drain.v2.terminate_failures` and
+/// records its error; the backoff keeps the next tick from asking again at
+/// once, and a later one asks again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_refused_dispatch_counts_and_backs_off() {
+    let node = fenced(false);
+    let sink = FakeSink {
+        nodes: vec![node.clone()],
+        ..FakeSink::default()
+    };
+    let authority = FakeAuthority {
+        terminate: Err("denied".into()),
+        ..FakeAuthority::ok()
+    };
+    let state = V2LoopState::default();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
+    tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES, &state).await;
+    let counted = counters.finish();
+    assert!(
+        counted
+            .iter()
+            .any(|counter| counter.name == "node_drain.v2.terminate_failures"
+                && counter.tags.contains(&format!("node:{}", node.id))),
+        "{counted:?}"
+    );
+    assert!(
+        sink.calls()
+            .iter()
+            .any(|call| call.contains(&format!("terminating fenced instance {INSTANCE} failed"))),
+        "{:?}",
+        sink.calls()
+    );
+    tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES, &state).await;
+    assert_eq!(
+        authority.terminated().len(),
+        1,
+        "the backoff holds the retry"
+    );
+    tokio::time::advance(DISPATCH_BACKOFF_BASE).await;
+    tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES, &state).await;
+    assert_eq!(authority.terminated().len(), 2, "the backoff ran out");
+}
+
+/// A dispatched node whose fenced instance EC2 says is terminated is
+/// deleted once a direct GET finds its Node gone. A Node still there waits
+/// for it; an instance not yet terminated asks nothing of Kubernetes; a
+/// guard that refuses the delete lets the node go; a row a registration
+/// took has nothing left to do. The first `terminated` is recorded before
+/// anything else; after it, an instance EC2 no longer lists is deleted as a
+/// terminated one, and without it an unlisted instance never is, saying
+/// why. A row an earlier build's terminator marked `terminated` is deleted
+/// as a dispatched one.
+#[tokio::test]
+async fn a_dispatched_node_is_deleted_once_terminated_with_its_node_gone() {
+    struct Case {
+        name: &'static str,
+        evidence: InstanceEvidence,
+        observed: bool,
+        legacy: bool,
+        node_present: bool,
+        delete: Option<TerminatedDelete>,
+        looks_up: bool,
+        deletes: Option<bool>,
+    }
+    let case = |name, evidence| Case {
+        name,
+        evidence,
+        observed: false,
+        legacy: false,
+        node_present: false,
+        delete: None,
+        looks_up: true,
+        deletes: Some(true),
+    };
+    let cases = [
+        case("deleted", InstanceEvidence::Terminated),
+        Case {
+            node_present: true,
+            deletes: None,
+            ..case("node lingers", InstanceEvidence::Terminated)
+        },
+        Case {
+            looks_up: false,
+            deletes: None,
+            ..case("still running", InstanceEvidence::Listed("running".into()))
+        },
+        Case {
+            looks_up: false,
+            deletes: None,
+            ..case("shutting down", InstanceEvidence::ShuttingDown)
+        },
+        Case {
+            delete: Some(TerminatedDelete::LetGo("trace".into())),
+            deletes: Some(false),
+            ..case("guard refused", InstanceEvidence::Terminated)
+        },
+        Case {
+            delete: Some(TerminatedDelete::Unfenced),
+            deletes: Some(false),
+            ..case("unfenced", InstanceEvidence::Terminated)
+        },
+        Case {
+            observed: true,
+            ..case("terminated again", InstanceEvidence::Terminated)
+        },
+        Case {
+            observed: true,
+            ..case(
+                "not listed after a recorded terminated",
+                InstanceEvidence::NotListed,
+            )
+        },
+        Case {
+            looks_up: false,
+            deletes: None,
+            ..case(
+                "not listed, never seen terminated",
+                InstanceEvidence::NotListed,
+            )
+        },
+        Case {
+            legacy: true,
+            ..case(
+                "an earlier build's terminated marker",
+                InstanceEvidence::Terminated,
+            )
+        },
+    ];
+    for case in cases {
+        let name = case.name;
+        let node = V2Node {
+            terminated_observed_at: case.observed.then(super::unix_now),
+            dispatched_at: if case.legacy {
+                None
+            } else {
+                Some(super::unix_now())
+            },
+            ..fenced(true)
+        };
+        let k8s_name = node.k8s_node_name.clone().unwrap();
+        let sink = FakeSink {
+            nodes: vec![node.clone()],
+            nodes_present: if case.node_present {
+                vec![k8s_name.clone()]
+            } else {
+                Vec::new()
+            },
+            delete: case.delete.clone(),
+            ..FakeSink::default()
+        };
+        let authority = FakeAuthority::answering(case.evidence.clone());
+        let report = run_tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES).await;
+        let calls = sink.calls();
+        assert_eq!(
+            calls.contains(&format!("node_exists {k8s_name}")),
+            case.looks_up,
+            "{name}: {calls:?}"
+        );
+        assert_eq!(
+            called(&sink, "delete", &node),
+            case.deletes.is_some(),
+            "{name}"
+        );
+        assert_eq!(
+            report.deleted == [node.id],
+            case.deletes == Some(true),
+            "{name}"
+        );
+        assert_eq!(
+            report.let_go == [node.id],
+            matches!(case.delete, Some(TerminatedDelete::LetGo(_))),
+            "{name}"
+        );
+        assert!(authority.terminated().is_empty(), "{name}");
+        let records = case.evidence == InstanceEvidence::Terminated && !case.observed;
+        let observed = format!("observed {} 5 {INSTANCE}", node.id);
+        assert_eq!(
+            calls.first() == Some(&observed),
+            records,
+            "{name}: {calls:?}"
+        );
+        assert_eq!(calls.contains(&observed), records, "{name}: {calls:?}");
+        assert_eq!(
+            calls
+                .iter()
+                .any(|call| call
+                    .ends_with("was never seen to list it terminated; not deleting the row")),
+            name == "not listed, never seen terminated",
+            "{name}: {calls:?}"
+        );
+    }
+}
+
+/// Every unfenced v2 state lets go once EC2 answers `terminated` for the
+/// recorded instance of a node whose heartbeat is stale, with the trace
+/// naming it, and calls the node for nothing. Any other answer only records
+/// what EC2 said, and a fresh heartbeat asks EC2 nothing.
+#[tokio::test]
+async fn every_unfenced_v2_state_lets_go_once_ec2_says_terminated() {
+    type Build = fn() -> V2Node;
+    let states: [(&str, Build); 5] = [
+        ("terminating", || node(Some("terminating"), Some(5), false)),
+        ("drained", || node(Some("drained"), Some(5), false)),
+        ("draining", || node(Some("draining"), Some(5), false)),
+        ("waiting", || V2Node {
+            waiting: true,
+            ..node(Some("draining"), Some(5), false)
+        }),
+        ("cancel pending", || node(None, Some(5), true)),
+    ];
+    for (state, build) in states {
+        for (answer, evidence, lets_go) in [
+            ("terminated", Some(InstanceEvidence::Terminated), true),
+            ("shutting-down", Some(InstanceEvidence::ShuttingDown), false),
+            (
+                "stopped",
+                Some(InstanceEvidence::Listed("stopped".into())),
+                false,
+            ),
+            ("not listed", Some(InstanceEvidence::NotListed), false),
+            (
+                "unknown",
+                Some(InstanceEvidence::Unknown("timeout".into())),
+                false,
+            ),
+            ("fresh heartbeat", None, false),
+        ] {
+            let case = format!("{state} {answer}");
+            let node = V2Node {
+                heartbeat_fresh: evidence.is_none(),
+                ..build()
+            };
+            let sink = FakeSink {
+                nodes: vec![node.clone()],
+                fence: Some(Fence::Moved),
+                ..FakeSink::default()
+            };
+            let authority = FakeAuthority::answering(
+                evidence
+                    .clone()
+                    .unwrap_or(InstanceEvidence::Listed("running".into())),
+            );
+            let report = run_tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES).await;
+            assert_eq!(report.let_go == [node.id], lets_go, "{case}");
+            let trace = format!(
+                "let_go {} 5 v2 drain let go: instance {INSTANCE} terminated outside the drain",
+                node.id
+            );
+            assert_eq!(
+                sink.calls().contains(&trace),
+                lets_go,
+                "{case}: {:?}",
+                sink.calls()
+            );
+            if lets_go {
+                assert_eq!(sink.calls(), [trace], "{case}");
+            }
+            assert_eq!(
+                authority.described().is_empty(),
+                evidence.is_none(),
+                "{case}"
+            );
+            assert_eq!(
+                sink.calls().iter().any(|call| call.contains("EC2 answers")),
+                evidence.is_some() && !lets_go,
+                "{case}: {:?}",
+                sink.calls()
+            );
+            assert!(authority.terminated().is_empty(), "{case}");
+        }
+    }
+}
+
 /// A waiting drain is admitted only while its own heartbeat is fresh, and a
 /// node holding a slot frees it early only when EC2 lists its instance
 /// `shutting-down` or `terminated`: a stopped or unlisted instance, or no
@@ -954,14 +1584,8 @@ async fn slots_follow_the_heartbeat_and_irreversible_ec2_evidence() {
         nodes: vec![stale.clone(), fresh.clone()],
         ..FakeSink::default()
     };
-    let authority = FakeAuthority::ok();
-    let report = run_tick(&sink, &authority, 1).await;
+    let report = run_tick(&sink, &FakeAuthority::ok(), 1).await;
     assert_eq!(report.admitted, [fresh.id], "only a fresh waiting node");
-    assert_eq!(
-        authority.described(),
-        [INSTANCE],
-        "EC2 is asked about the stale node only"
-    );
 
     for (case, evidence, frees) in [
         ("shutting-down", InstanceEvidence::ShuttingDown, true),

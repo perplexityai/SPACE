@@ -181,12 +181,12 @@ async fn each_terminator_kind_loads_its_backend() {
     }
 }
 
-/// The v2 loop asks EC2 only under the `aws` backend; every other backend's
-/// authority reads every instance unknown.
+/// The v2 loop terminates a node only through EC2: the `aws` backend's
+/// authority is EC2 and Auto Scaling, every other backend's refuses.
 #[test]
-fn the_v2_loop_asks_ec2_only_under_aws() {
+fn the_v2_loop_terminates_only_through_ec2() {
     use crate::node_drain::v2::V2Terminator;
-    for (case, backend, asks_ec2) in [
+    for (case, backend, terminates) in [
         (
             "aws",
             TerminatorBackend::Aws(Box::new(aws_config::SdkConfig::builder().build())),
@@ -198,7 +198,7 @@ fn the_v2_loop_asks_ec2_only_under_aws() {
         let terminator = backend.v2_terminator();
         assert_eq!(
             matches!(terminator, V2Terminator::Ec2 { .. }),
-            asks_ec2,
+            terminates,
             "{case}"
         );
     }

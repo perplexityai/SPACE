@@ -175,10 +175,12 @@ fn publish_report(node: &V2Node, response: &DrainNodeResponse, recording: &Recor
     crate::metrics::node_drain::v2_report(&node.id.to_string(), blocked, pending);
 }
 
-pub(super) async fn step<S: DrainV2Sink>(
+pub(super) async fn step<S: DrainV2Sink, A: V2InstanceAuthority>(
     sink: &S,
+    authority: &A,
     node: &V2Node,
     evidence: Option<&InstanceEvidence>,
+    backoff: &DispatchBackoff,
 ) -> Option<NodeStep> {
     let Some(epoch) = node.epoch else {
         // The admin route writes the epoch with the phase; a row without
@@ -186,8 +188,20 @@ pub(super) async fn step<S: DrainV2Sink>(
         tracing::warn!(node_id = %node.id, "node_drain v2: drain_status has no epoch");
         return None;
     };
+    if let Some(fence) = node.fenced() {
+        let evidence = evidence?;
+        return terminated_or_dispatch(sink, authority, node, epoch, fence, evidence, backoff)
+            .await;
+    }
     if let Some(evidence) = evidence {
         let instance = node.instance_id.as_deref().unwrap_or("<none>");
+        if *evidence == InstanceEvidence::Terminated {
+            let trace =
+                format!("v2 drain let go: instance {instance} terminated outside the drain");
+            return let_go(sink, node, epoch, &trace)
+                .await
+                .then_some(NodeStep::LetGo);
+        }
         sink.record_error(
             node.id,
             &format!(
@@ -210,8 +224,13 @@ pub(super) async fn step<S: DrainV2Sink>(
             None
         }
         Some("draining") | Some("drained") => {
-            drain(sink, node, epoch).await.then_some(NodeStep::Drained)
+            let drained = drain(sink, node, epoch).await;
+            if node.phase.as_deref() == Some("drained") {
+                release(sink, node.id, epoch).await;
+            }
+            drained.then_some(NodeStep::Drained)
         }
+        Some("terminating") => fence(sink, authority, node.id, epoch).await,
         Some(other) => {
             tracing::warn!(node_id = %node.id, phase = other, "node_drain v2: unknown phase");
             None

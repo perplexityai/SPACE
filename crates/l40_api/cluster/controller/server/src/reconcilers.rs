@@ -195,13 +195,16 @@ impl TerminatorBackend {
         }
     }
 
-    /// The v2 loop's authority: EC2 under the `aws` backend, which says what
-    /// became of a v2 node's instance once its heartbeat is stale. Under any
-    /// other every instance reads unknown.
+    /// The v2 loop's authority: EC2 and Auto Scaling under the `aws`
+    /// backend, which terminate a node `:terminate` moved to `terminating`
+    /// and say when a v2 node's instance is gone. Under any other it never
+    /// fences, and the node waits for an operator, who may still undrain
+    /// it.
     fn v2_terminator(&self) -> node_drain::v2::V2Terminator {
         match self {
             Self::Aws(aws_config) => node_drain::v2::V2Terminator::Ec2 {
                 ec2: pplx_space_aws_client::ec2::Client::from_config(aws_config),
+                autoscaling: pplx_space_aws_client::autoscaling::Client::from_config(aws_config),
             },
             Self::KubeDelete | Self::Noop => node_drain::v2::V2Terminator::Refuse,
         }
@@ -752,8 +755,8 @@ pub async fn run_reconcilers(
                 // The v2 drain's loop, beside v1's: it acts only on the rows
                 // `:drain {engine: v2}` marked, which v1's writers skip. It
                 // runs whether or not new v2 drains are admitted, so a
-                // persisted one is still drained or cancelled; it asks EC2
-                // only under the `aws` terminator
+                // persisted one is still drained or cancelled; it terminates
+                // a node only through EC2
                 // ([`TerminatorBackend::v2_terminator`]).
                 handles.push(tokio::spawn(node_drain::v2::run(
                     node_drain::SubstrateSink::v2(pool.clone(), kube.clone()),

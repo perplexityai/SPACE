@@ -1399,3 +1399,33 @@ mod pinned_local_only_plan_tests;
 /// otherwise the agreement proves nothing.
 #[cfg(test)]
 pub(super) mod terminate_gate_agreement_tests;
+
+/// What resolves the node's node-api: its role, substrate and Kubernetes
+/// name. `None` when the row is gone.
+pub(super) async fn node_api_target(
+    pool: &sqlx::PgPool,
+    node_id: NodeId,
+) -> Result<Option<crate::controllers::substrate::OwnedNodeApiTarget>, sqlx::Error> {
+    type Row = (
+        pplx_space_common_core::types::NodeRole,
+        pplx_space_common_core::types::NodeManagedBy,
+        Option<String>,
+    );
+    let row: Option<Row> = sqlx::query_as(sql!(
+        "SELECT n.role, n.managed_by, nk.k8s_node_name
+           FROM nodes n
+           LEFT JOIN node_k8s nk ON nk.node_id = n.id
+          WHERE n.id = $1"
+    ))
+    .bind(node_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(role, managed_by, substrate_node_id)| {
+        crate::controllers::substrate::OwnedNodeApiTarget {
+            managed_by,
+            role,
+            direct_endpoint: None,
+            substrate_node_id,
+        }
+    }))
+}

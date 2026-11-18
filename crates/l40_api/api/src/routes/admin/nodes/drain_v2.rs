@@ -90,3 +90,108 @@ pub(super) fn drain_v2_write(
         _ => Ok(DrainV2Write::None),
     }
 }
+
+/// How many sandbox ids of each guard a refused v2 `:terminate` names.
+pub(super) const V2_TERMINATE_REFERENCE_SAMPLE: u32 = 10;
+
+/// `:undrain` of a v2 node in `terminating`, which no other engine allows:
+/// before the controller fences the instance, it moves the node to no phase
+/// like any undrain, and the controller cancels the epoch on the node; once
+/// fenced, it is refused, since the termination may already be accepted.
+/// The fence write takes the node's row lock, as this request does, so the
+/// two are ordered. `None` for every other request, which
+/// [`validate_drain_transition`] decides.
+pub(super) fn v2_undrain_transition(
+    action: DrainAction,
+    phase: Option<&str>,
+    columns: &node_drain_v2::DrainV2Columns,
+) -> Option<Result<DrainTransition, TransitionError>> {
+    if !matches!(action, DrainAction::Undrain)
+        || phase != Some(PHASE_TERMINATING)
+        || columns.engine != NodeDrainEngine::V2
+    {
+        return None;
+    }
+    Some(if node_drain_v2::drain_v2_fenced(columns.status.as_ref()) {
+        Err(TransitionError::Conflict {
+            current: phase.map(str::to_owned),
+            allowed: &[
+                PHASE_DRAINING,
+                PHASE_DRAINED,
+                "terminating (v2, before its instance is fenced)",
+            ],
+        })
+    } else {
+        Ok(DrainTransition::Move {
+            new: None,
+            set_started_at: false,
+            clear_started_at: true,
+        })
+    })
+}
+
+/// What a fresh `DrainNode` call reported, as `:terminate` reads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct V2DrainReport {
+    pub sealed_epoch: Option<u64>,
+    pub done: bool,
+}
+
+/// The `DrainNode` call `:terminate` makes of a v2 node under its drain's
+/// epoch, right before it lets the node go. Production calls the node through
+/// its node-api ([`NodeApiV2DrainProbe`]); tests script it.
+pub trait V2DrainProbe: Send + Sync {
+    fn drain_node<'a>(
+        &'a self,
+        state: &'a AppState,
+        node_id: NodeId,
+        epoch: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<V2DrainReport, String>> + Send + 'a>,
+    >;
+}
+
+/// [`V2DrainProbe`] through the node's internal node-api.
+pub struct NodeApiV2DrainProbe;
+
+/// How long `:terminate` waits for the node's answer; it answers without
+/// waiting for anything.
+pub(super) const DRAIN_NODE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl V2DrainProbe for NodeApiV2DrainProbe {
+    fn drain_node<'a>(
+        &'a self,
+        state: &'a AppState,
+        node_id: NodeId,
+        epoch: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<V2DrainReport, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let target = node_store::node_api_target(&state.pool, node_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("node {node_id} not found"))?;
+            let mut client =
+                crate::controllers::substrate::connect_internal_node_api_client_for_target(
+                    state.sandbox_controller.substrate(),
+                    &target.as_target(),
+                    DRAIN_NODE_PROBE_TIMEOUT,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let response = client
+                .drain_node(pplx_space_sbx_mgr_client::proto::DrainNodeRequest {
+                    epoch,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|status| status.to_string())?
+                .into_inner();
+            Ok(V2DrainReport {
+                sealed_epoch: response.sealed_epoch,
+                done: response.done,
+            })
+        })
+    }
+}

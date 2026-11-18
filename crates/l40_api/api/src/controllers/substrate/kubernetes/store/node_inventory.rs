@@ -152,6 +152,14 @@ impl K8sStore {
                     ),
                 }
             }
+            // The same per-node skip as a tombstone: the next sync retries.
+            K8sNodeRegistrationError::AwaitingInstance => SubstrateError::NodeTombstoned {
+                message: format!(
+                    "kube node {node_name} role {role} has a new uid {node_uid} and no instance \
+                     yet, and its v2 drain fenced the instance it had for termination; \
+                     deferring its registration until the Node reports its providerID"
+                ),
+            },
             K8sNodeRegistrationError::NotKubernetes => SubstrateError::Failed {
                 message: format!(
                     "Kubernetes node uid {node_uid} role {role} for {node_name} conflicts with a non-Kubernetes node"
@@ -165,6 +173,9 @@ impl K8sStore {
                     }
                     K8sNodeRegistrationStep::RecheckOwnership => {
                         "failed to re-check Kubernetes node ownership"
+                    }
+                    K8sNodeRegistrationStep::CheckFence => {
+                        "failed to check the node's v2 drain fence"
                     }
                     K8sNodeRegistrationStep::ClearDrain => {
                         "failed to clear drain state on UID change"

@@ -1706,6 +1706,22 @@ class NodeDrainControl(NodeFaultControl, Protocol):
     def ready_full_snapshots(self, sandbox_id: str) -> list[SnapshotRecord]: ...
 
 
+@dataclass(frozen=True)
+class SandboxRowState:
+    """The `sandboxes` columns a node cleanup would change, and `updated_at`.
+
+    `updated_at` is trigger-maintained: an update that changes any column
+    other than `last_used_at`, `last_access_at` and `last_command_at` moves it.
+    """
+
+    sandbox_id: str
+    lifecycle: str
+    placement: str
+    active_node_id: str | None
+    target_node_id: str | None
+    updated_at: str
+
+
 class KindWorkerControl(NodeDrainControl, Protocol):
     """Kind-only operations on a worker's instance and on the controller's env.
 
@@ -1749,15 +1765,72 @@ class KindWorkerControl(NodeDrainControl, Protocol):
         and its node services to be Ready."""
         ...
 
+    def fake_ec2_terminate(self, instance_id: str) -> None:
+        """Mark the instance terminated in Kind's fake EC2, through its loopback test control."""
+        ...
+
+    def set_fake_ec2_terminate_delay(self, seconds: int) -> None:
+        """How long each instance Kind's fake EC2 marks terminated from now on
+        reads `shutting-down` first (0 to 3600), through its loopback test
+        control; 0 puts the default back."""
+        ...
+
+    def release_fake_ec2_instance(self, instance_id: str) -> None:
+        """End the `shutting-down` delay of an instance Kind's fake EC2 already
+        marked terminated, so it reads `terminated` from now on, through its
+        loopback test control."""
+        ...
+
+    def fake_ec2_instance_state(self, instance_id: str) -> str:
+        """What Kind's fake EC2 lists for the instance ID, as DescribeInstances
+        answers it: its states, comma-separated, or `no instance`."""
+        ...
 
     def node_recorded_instance(self, node_id: str) -> str | None:
         """`node_k8s.instance_id` of the node, None when it records none or has no row."""
         ...
 
+    def node_row_exists(self, node_id: str) -> bool: ...
+
+    def node_created_at(self, node_id: str) -> str | None:
+        """`nodes.created_at` of the node, as text; None without a row."""
+        ...
 
     def kind_node_labels(self, node_name: str) -> dict[str, str]:
         """The Kind worker's Node labels, which deleting the Node discards."""
         ...
+
+    def stop_kind_worker(self, node_name: str, *, keep_node: bool = False) -> None:
+        """Stop the Kind worker's container, then delete its Kubernetes Node
+        unless `keep_node`, which leaves the Node behind its machine as a
+        cloud controller that lags would."""
+        ...
+
+    def kube_node_uid(self, node_name: str) -> str | None:
+        """The uid of the Kubernetes Node of that name, None when there is none."""
+        ...
+
+    def delete_kube_node(self, node_name: str, *, uid: str) -> None:
+        """Delete the Kubernetes Node of that name with a uid precondition, so
+        a replacement under the same name is never the one deleted."""
+        ...
+
+    def start_kind_worker(
+        self,
+        node_name: str,
+        labels: Mapping[str, str],
+        *,
+        timeout: float,
+        provider_id: str | None = None,
+    ) -> None:
+        """Start the Kind worker's container, under `provider_id` when given
+        (the kubelet's `--provider-id` rewritten while it is stopped), put
+        back the `labels` its re-registered Node lacks as soon as it exists,
+        then wait, each with the whole `timeout`, for the Node and the node
+        services on it to be Ready."""
+        ...
+
+    def sandbox_row_states(self, sandbox_ids: Sequence[str]) -> list[SandboxRowState]: ...
 
 
 class DrainRestoreControl(Protocol):
@@ -1810,6 +1883,9 @@ class DrainV2Control(KindWorkerControl, DrainRestoreControl, Protocol):
         """The node's v2 drain columns; `None` once its row is gone."""
         ...
 
+    def terminate_node(self, node_id: str) -> int:
+        """`POST :terminate`; the HTTP status it answered."""
+        ...
 
     def seal_activations(self, node_name: str, epoch: int) -> int | None:
         """`space-sbxmgr drain-node --epoch` on the worker, under the caller's
@@ -1840,6 +1916,9 @@ class DrainV2Control(KindWorkerControl, DrainRestoreControl, Protocol):
 
     def stopped_residency(self, sandbox_id: str) -> StoppedResidency: ...
 
+    def node_tombstoned(self, node_id: str) -> bool:
+        """Whether `node_k8s_tombstones` holds a tombstone for the node id."""
+        ...
 
     def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None:
         """The sandbox's row state in that node's sandbox-manager, or None without a row."""

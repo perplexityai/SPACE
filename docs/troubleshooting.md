@@ -247,13 +247,55 @@ reports while the control plane has no pod for it.
 
 ## A v2 node drain that waits
 
-A v2 drain (`:drain {mode: forced, engine: v2}`) keeps its state in the admin node listing: `drain_phase`, `drain_engine: v2`, `drain_status` (the epoch and the node's last report) and `drain_last_error`, which says what the cluster controller is waiting for.
+A v2 drain (`:drain {mode: forced, engine: v2}`) keeps its state in the admin node listing: `drain_phase`, `drain_engine: v2`, `drain_status` (the epoch, the node's last report, and after `:terminate` the fenced instance `terminate_instance`, `dispatched_at`, and `terminated_observed_at` once EC2 has listed that instance `terminated`) and `drain_last_error`, which says what the cluster controller is waiting for.
 
 | What the listing shows | What it means and what to do |
 |---|---|
-| `drained`, and `:terminate` answers 409 | This version doesn't terminate a v2 node: its drain stays `drained`, the node sealed, until `:undrain`, which cancels the epoch on the node. |
-| `the node's heartbeat is stale; EC2 answers ... for its instance ...` | The node stopped reporting, and the controller asked EC2 about its recorded instance. Nothing changes on that answer, except that a node EC2 lists `shutting-down` or `terminated` frees its evacuation slot. |
+| `:terminate` answers 409 with `held_by` | Rows or executions still name the node. Durably suspended rows are released on every `drained` tick, and a row whose restore is in flight settles once the restore lands elsewhere. These holders don't settle on their own and hold the node until someone resolves them: a phantom row, which the control plane places on the node though the node doesn't host it, so the drain never evacuates it; a `quarantined` row naming the node; a row the drain can't make durable, such as a suspended row whose snapshot isn't durable and that the node doesn't report; and a `failed` or `deleted` row whose execution on the node is still active. Retry once `held_by` is empty. While the node itself reports a sandbox `blocked`, its drain is never `done`, so `:terminate` gives the not-done 409 instead of `held_by`. |
+| `terminating`, `drain_last_error` names the `aws` terminator | The cluster runs another terminator. Under it the v2 loop never asks EC2 about a node's instance and writes no fence, so it never lets a dead v2 node go itself. `:undrain` hands back a node it hasn't fenced; terminate that one another way. A fence written while the cluster ran `aws` stays when the terminator changes, and `:undrain` is refused once a fence exists. The node leaves the drain one of these ways: a same-name Node that registers under a new uid and reports another instance takes the row and clears the drain, and on an unfenced row so does one that reports no instance yet; the guarded let-go below; or, after `:undrain`, which leaves no phase, `orphaned_nodes`, where it is enabled, deletes the row once EC2 lists no live instance under the node's name and nothing pins the node. An `:undrain` of an admitted node leaves its cancel pending, holding its evacuation slot, until the node answers or the row leaves the drain one of those ways. |
+| `terminating`, `terminate held: ...` | The same hold, found by the controller's terminate transaction. It retries every tick. |
+| `terminating` with `terminate_instance`, no `dispatched_at`, a dispatch error | Auto Scaling refuses the termination; the controller retries with backoff. There is no undrain after the fence, since a termination may already be accepted. Terminate the fenced instance in AWS: once EC2 says it is `terminated`, the drain lets the node go. |
+| `EC2 does not list fenced instance ..., and was never seen to list it terminated` | EC2 doesn't list the fenced instance, and the drain never saw it `terminated`, so it neither dispatches the termination nor deletes the row. Check the instance in AWS. If the machine is gone, use the guarded let-go below. |
+| `terminating`, `the termination of fenced instance ... was dispatched[ N minutes ago]; EC2 answers unknown (...)` | The termination was dispatched, or an earlier build's terminator acted on the row, and EC2 gave no answer: an EC2 error or timeout, or the cluster now runs another terminator, which never asks EC2. The drain can't tell whether the instance is gone, so it keeps the row and says so on every check. Restore EC2 access or the `aws` terminator; if you have confirmed the machine gone in AWS, use the guarded let-go below. |
+| `dispatched_at` set, `still answers running after N minutes` | Auto Scaling accepted the termination and EC2 still lists the instance. Check the instance in AWS. |
+| `waiting for its Kubernetes Node ... to go` | EC2 says the fenced instance is `terminated` but its Node object stays. Confirm EC2 reports that instance `terminated` and that the Node's `providerID` names it, then delete the Node with a uid precondition. The drain's next check, after its backoff of up to two minutes, deletes the row if its heartbeat is stale and nothing names the node; a row or execution that still names it has the drain let the node go instead. EC2 stops listing a terminated instance after a while; once `terminated_observed_at` is set, that no longer holds the delete. A Node with another `providerID`, or none yet, is not the terminated machine; leave it. |
+| `drain_last_error` starts `v2 drain let go` | The drain released the node: its instance terminated outside the drain, a fenced instance terminated with no dispatch confirmed, or the delete found a row or execution still naming the node (`v2 drain let go after terminating ...`). The phase and drain columns are cleared, and the gone-node loops handle the node as any crashed node. |
 | A sandbox that was `paused` before the drain is `suspended`, with no drain restore | Expected: the drain restores only a sandbox that was `started`. One that was `paused` is made durable and left `suspended`; its next resume or wake restores it on another node. |
+
+A v2 node whose machine you have confirmed gone in AWS, but which the drain doesn't let go, keeps its drain, and an evacuating or undrained one keeps its evacuation slot. That happens when EC2 never reports its instance `terminated`, doesn't list it, or gives no answer, or when the cluster runs another terminator, under which the v2 loop never asks EC2. Let it go by hand. First read what the row records:
+
+```sql
+SELECT n.drain_phase, n.drain_status->>'epoch' AS epoch,
+       n.drain_status->>'terminate_instance' AS fence,
+       k.instance_id, k.k8s_node_uid
+  FROM nodes n JOIN node_k8s k ON k.node_id = n.id
+ WHERE n.id = '<node id>';
+```
+
+Confirm in AWS that this instance is the machine that is gone, then fill in the values you verified. Write `NULL`, unquoted, for an undrained node's phase or an unfenced node's fence. The statement locks the row, and clears the drain only if every value still matches, so a same-name replacement that registered in the meantime, or a drain that moved on, is left as it is. It touches no sandbox row.
+
+```sql
+WITH verified AS (
+  SELECT n.id
+    FROM nodes n JOIN node_k8s k ON k.node_id = n.id
+   WHERE n.id = '<node id>'
+     AND n.drain_engine = 'v2'
+     AND k.instance_id = '<instance id>'
+     AND k.k8s_node_uid = '<k8s node uid>'
+     AND (n.drain_status->>'epoch')::BIGINT = <epoch>
+     AND n.drain_phase IS NOT DISTINCT FROM '<phase>'
+     AND n.drain_status->>'terminate_instance' IS NOT DISTINCT FROM '<fence>'
+     FOR UPDATE OF n, k
+)
+UPDATE nodes n
+   SET drain_phase = NULL, drain_mode = NULL, drain_started_at = NULL,
+       drain_engine = NULL, drain_status = NULL,
+       drain_last_error = 'v2 drain let go by an operator: machine gone'
+  FROM verified
+ WHERE n.id = verified.id;
+```
+
+`UPDATE 1` let the node go. `UPDATE 0` means the row no longer matches what you verified: read it again, verify it again in AWS, and only then retry with the new values.
 
 ## Timeouts mean different things
 

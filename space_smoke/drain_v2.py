@@ -38,16 +38,18 @@ from __future__ import annotations
 import re
 import secrets
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 from space_smoke.capabilities import (
+    CommandSandbox,
     DrainV2Control,
     DrainV2Status,
     DurableLifecycleSandbox,
     KindWorkerControl,
     ResidentLifecycleSandbox,
+    SandboxRowState,
     SnapshotRecord,
     StoppableLifecycleSandbox,
 )
@@ -202,6 +204,9 @@ def validate_drain_v2_overrides(overrides: Mapping[str, str]) -> None:
             raise ValueError(f"refusing {key}={value!r}")
 
 
+# How long after the fake EC2's delay a scenario waits to see that nothing
+# deleted a replacement's row: a few of the v2 loop's dispatch backoffs.
+DELETE_SETTLE_SECONDS = 90
 # The sandbox-manager row states in which a node may hold the sandbox's VM.
 _VM_STATES = frozenset({"started", "paused", "pausing", "resuming", "starting", "suspending"})
 # Guest memory a resident holds in tmpfs, random so its snapshot can't shrink it.
@@ -738,6 +743,12 @@ class DrainV2Assertions:
             )
             self._fixture.wait(3)
 
+    def row_states(self, sandboxes: Sequence[CommandSandbox]) -> dict[str, SandboxRowState]:
+        """Each sandbox's row lifecycle and placement, by bare id."""
+
+        rows = self._control.sandbox_row_states([self.bare_id(s.sandbox_id) for s in sandboxes])
+        return {row.sandbox_id: row for row in rows}
+
     def residency(self, sandbox_id: str) -> tuple[str, str | None]:
         """The sandbox row's lifecycle and active node."""
 
@@ -766,6 +777,23 @@ class DrainV2Assertions:
             )
             self._fixture.wait(3)
 
+    def expect_lifecycle(self, sandbox_id: str, lifecycle: str, *, timeout: float = 600) -> None:
+        """The sandbox reaches `lifecycle` on some node."""
+
+        deadline = time.monotonic() + timeout
+        while True:
+            current, node = self.residency(sandbox_id)
+            if current == lifecycle and node is not None:
+                return
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                f"the sandbox never reached {lifecycle}",
+                sandbox_id=sandbox_id,
+                lifecycle=current,
+                active_node_id=node,
+            )
+            self._fixture.wait(3)
+
     def expect_lifecycle_back(self, sandbox_id: str, lifecycle: str, *, timeout: float) -> None:
         """The sandbox row goes back to `lifecycle`, wherever it is placed."""
 
@@ -787,6 +815,11 @@ class DrainV2Assertions:
     def drain_phase(self) -> str | None:
         node = next((n for n in self._control.admin_nodes() if n.id == self.node_id), None)
         return None if node is None else node.drain_phase
+
+    def terminate_status(self) -> int:
+        """`POST :terminate`; the HTTP status it answered."""
+
+        return self._control.terminate_node(self.node_id)
 
     def report(self) -> dict[str, Any]:
         status = self._control.drain_v2_status(self.node_id)
@@ -1096,6 +1129,313 @@ class DrainV2Assertions:
             sandbox_id=bare,
             residency=residency.__dict__,
             restores=restores,
+        )
+
+    @contextmanager
+    def fake_ec2_delay(self, seconds: int) -> Iterator[None]:
+        """Run the body with each instance Kind's fake EC2 marks terminated
+        reading `shutting-down` for `seconds` first; 0 goes back after."""
+
+        reset = self._scope.defer(
+            "put the fake EC2's termination delay back",
+            lambda: self._control.set_fake_ec2_terminate_delay(0),
+            critical=True,
+        )
+        self._control.set_fake_ec2_terminate_delay(seconds)
+        try:
+            yield
+        finally:
+            reset.release()
+
+    def wait_for_dispatch(self, *, timeout: float = 600) -> dict[str, Any]:
+        """Wait until the controller records that Auto Scaling accepted the
+        termination of the fenced instance (`dispatched_at`), under the
+        drain's epoch and on the instance the run gave the worker; the
+        stored status."""
+
+        node_id = self.node_id
+        deadline = time.monotonic() + timeout
+        while True:
+            columns = self._control.drain_v2_status(node_id)
+            record = None if columns is None else columns.status
+            if record is not None and record.get("dispatched_at") is not None:
+                break
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "the controller never recorded the dispatch of the termination",
+                drain_status=drain_status_evidence(columns),
+                last_error=self.last_error(),
+            )
+            self._fixture.wait(2)
+        self._fixture.record("dispatched_status", record)
+        self._fixture.verify(
+            record.get("epoch") == self.epoch
+            and record.get("terminate_instance") == self._instance,
+            "the termination was dispatched under another epoch or for another instance",
+            record=record,
+            instance=self._instance,
+        )
+        return record
+
+    def _terminate_and_dispatch(self) -> tuple[Compensation, str, str]:
+        """`:terminate` the drained worker and wait for the dispatch; the
+        armed replacement start, its providerID and its instance."""
+
+        node_name, node_id = self.node_name, self.node_id
+        if self._instance is None:
+            raise RuntimeError("give_fake_instance() must run first")
+        labels = self._control.kind_node_labels(node_name)
+        provider_id, replacement = fake_provider_id()
+        self._fixture.record("replacement_instance", replacement)
+        restart = self._scope.defer(
+            f"start Kind worker {node_name} again as a same-name replacement",
+            lambda: self._control.start_kind_worker(
+                node_name, labels, timeout=300, provider_id=provider_id
+            ),
+            critical=True,
+        )
+        status = self._control.terminate_node(node_id)
+        self._fixture.verify(status in (200, 202), ":terminate of a drained v2 node was refused", status=status)
+        self.wait_for_dispatch()
+        return restart, provider_id, replacement
+
+    def _expect_row_deleted_without_tombstone(self, *, timeout: float) -> None:
+        node_id = self.node_id
+        deadline = time.monotonic() + timeout
+        while self._control.node_row_exists(node_id):
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "the terminated node's row was never deleted",
+                drain_status=drain_status_evidence(self._control.drain_v2_status(node_id)),
+                last_error=self.last_error(),
+            )
+            self._fixture.wait(3)
+        self._fixture.verify(
+            not self._control.node_tombstoned(node_id),
+            "the terminated v2 node was tombstoned",
+        )
+
+    def expect_node_row_deleted_without_tombstone(self, *, timeout: float) -> None:
+        """Wait until the node's row is gone, deleted by whoever owns it
+        then, and verify nothing tombstoned it."""
+
+        self._expect_row_deleted_without_tombstone(timeout=timeout)
+
+    def _come_back(self, restart: Compensation, replacement: str, *, timeout: float) -> int | None:
+        """Start the worker again as a same-name replacement, wait until its
+        row records the new instance, and unseal it; the epoch it is still
+        sealed under afterwards."""
+
+        restart.release()
+        self._instance = replacement
+        await_recorded_instance(
+            self._fixture, self._control, self.node_name, self.node_id, replacement, timeout=timeout
+        )
+        return self._control.unseal_activations(self.node_name, self.epoch)
+
+    def terminate(self, *, timeout: float = 600) -> None:
+        """`:terminate` reaches the worker's instance through the `aws`
+        terminator and Kind's fake EC2. Once the controller records the
+        dispatch, the harness plays the cloud's part, stopping the worker and
+        deleting its Node; once EC2 says the instance is terminated and a GET
+        finds the Node gone, the drain deletes the row, with no tombstone.
+        The worker comes back as a same-name replacement, unsealed.
+
+        Runs inside `v2_controller` after `give_fake_instance`.
+        """
+
+        restart, _, replacement = self._terminate_and_dispatch()
+        self._control.stop_kind_worker(self.node_name)
+        self._expect_row_deleted_without_tombstone(timeout=timeout)
+        self._fixture.record(
+            "after_terminate",
+            {
+                "node_row_deleted_without_tombstone": True,
+                "replacement_instance": replacement,
+                "sealed_epoch_after_unseal": self._come_back(restart, replacement, timeout=timeout),
+            },
+        )
+
+    def terminate_replaced_while_shutting_down(self, *, timeout: float = 600) -> None:
+        """`:terminate`, holding the fenced instance `shutting-down` (run
+        inside `fake_ec2_delay` with a delay longer than the run), and the
+        worker comes back under the same name with a new instance. Its
+        registration takes the same row, its `created_at` unchanged, and
+        clears the drain, fence included, while the old instance still reads
+        `shutting-down`: no tombstone, nothing deleted. Only then is the old
+        instance released; once the fake lists it `terminated`, the
+        controller's loops run past it and the replacement still holds the
+        row, undrained, under its own instance.
+
+        Runs inside `v2_controller` after `give_fake_instance`.
+        """
+
+        node_id = self.node_id
+        old = self._instance
+        if old is None:
+            raise RuntimeError("give_fake_instance() must run first")
+        created_at = self._control.node_created_at(node_id)
+        restart, _, replacement = self._terminate_and_dispatch()
+        self._control.stop_kind_worker(self.node_name)
+        sealed = self._come_back(restart, replacement, timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while (columns := self._control.drain_v2_status(node_id)) is not None and (
+            columns.engine is not None
+        ):
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "the replacement's registration never took the fenced row",
+                drain_status=drain_status_evidence(columns),
+            )
+            self._fixture.wait(2)
+        old_state = self._control.fake_ec2_instance_state(old)
+        held = {
+            "old_instance_state": old_state,
+            "created_at": self._control.node_created_at(node_id),
+            "created_at_before": created_at,
+            "recorded": self._control.node_recorded_instance(node_id),
+            "tombstoned": self._control.node_tombstoned(node_id),
+        }
+        self._fixture.record("fence_cleared_while_shutting_down", held)
+        self._fixture.verify(
+            old_state == "shutting-down",
+            "the old instance left shutting-down before the replacement cleared the fence",
+            **held,
+        )
+        self._fixture.verify(
+            created_at is not None
+            and held["created_at"] == created_at
+            and held["recorded"] == replacement
+            and not held["tombstoned"],
+            "the replacement doesn't hold the same row under its own instance",
+            **held,
+        )
+        self._control.release_fake_ec2_instance(old)
+        deadline = time.monotonic() + timeout
+        while (old_state := self._control.fake_ec2_instance_state(old)) != "terminated":
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "the released old instance never read terminated",
+                old_instance_state=old_state,
+            )
+            self._fixture.wait(2)
+        # The controller's loops, past the old instance's `terminated`: the
+        # row, the replacement's now, stays.
+        self._fixture.wait(DELETE_SETTLE_SECONDS)
+        columns = self._control.drain_v2_status(node_id)
+        after = {
+            "created_at": self._control.node_created_at(node_id),
+            "recorded": self._control.node_recorded_instance(node_id),
+            "drain_phase": self.drain_phase(),
+            "drain_status": drain_status_evidence(columns),
+            "tombstoned": self._control.node_tombstoned(node_id),
+        }
+        self._fixture.verify(
+            after["created_at"] == created_at
+            and after["recorded"] == replacement
+            and after["drain_phase"] is None
+            and (columns is None or columns.status is None)
+            and not after["tombstoned"],
+            "the replacement's row was deleted, replaced or drained after the old instance terminated",
+            **after,
+        )
+        self._fixture.record(
+            "after_replacement",
+            {"replacement_instance": replacement, "sealed_epoch_after_unseal": sealed, **after},
+        )
+
+    def terminate_keeping_the_node(self, *, timeout: float = 600) -> None:
+        """`:terminate`; the worker stops but its Node stays, as behind a
+        cloud controller that lags. Once EC2 says the fenced instance is
+        terminated the row still waits, saying why; deleting the Node with a
+        uid precondition, as the runbook says, lets the drain delete the row
+        with no tombstone. The worker comes back as a same-name replacement.
+
+        Runs inside `v2_controller` after `give_fake_instance`.
+        """
+
+        node_name, node_id = self.node_name, self.node_id
+        restart, _, replacement = self._terminate_and_dispatch()
+        uid = self._control.kube_node_uid(node_name)
+        self._fixture.verify(uid is not None, "the worker's Node is gone before the stop")
+        assert uid is not None
+        self._control.stop_kind_worker(node_name, keep_node=True)
+        self.wait_for_last_error("waiting for its Kubernetes Node", timeout=timeout)
+        self._fixture.verify(
+            self._control.node_row_exists(node_id),
+            "the row was deleted while its Node lingered",
+        )
+        self._control.delete_kube_node(node_name, uid=uid)
+        self._expect_row_deleted_without_tombstone(timeout=timeout)
+        self._fixture.record(
+            "after_lingering_node",
+            {
+                "replacement_instance": replacement,
+                "sealed_epoch_after_unseal": self._come_back(restart, replacement, timeout=timeout),
+            },
+        )
+
+    def die(self) -> Compensation:
+        """The drained worker dies mid-drain: Kind's fake EC2 marks its
+        instance terminated (after the delay `fake_ec2_delay` set, if any)
+        and the harness stops its container and deletes its Node. Returns
+        the armed start of the worker as a same-name replacement.
+
+        Runs inside `v2_controller` after `give_fake_instance`.
+        """
+
+        node_name = self.node_name
+        if self._instance is None:
+            raise RuntimeError("give_fake_instance() must run first")
+        labels = self._control.kind_node_labels(node_name)
+        provider_id, replacement = fake_provider_id()
+        self._replacement = replacement
+        restart = self._scope.defer(
+            f"start Kind worker {node_name} again as a same-name replacement",
+            lambda: self._control.start_kind_worker(
+                node_name, labels, timeout=300, provider_id=provider_id
+            ),
+            critical=True,
+        )
+        self._control.fake_ec2_terminate(self._instance)
+        self._control.stop_kind_worker(node_name)
+        self._fixture.record("died_at", time.time())
+        return restart
+
+    def expect_let_go(self, *, timeout: float = 900) -> str:
+        """Wait until the drain lets the dead node go: its phase and v2
+        columns cleared, the row kept, and the trace naming its instance in
+        `drain_last_error`; the trace."""
+
+        node_id = self.node_id
+        trace = f"v2 drain let go: instance {self._instance} terminated outside the drain"
+        deadline = time.monotonic() + timeout
+        while True:
+            columns = self._control.drain_v2_status(node_id)
+            if columns is not None and columns.engine is None and self.last_error() == trace:
+                break
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "the drain never let the dead node go",
+                drain_status=drain_status_evidence(columns),
+                last_error=self.last_error(),
+            )
+            self._fixture.wait(3)
+        self._fixture.verify(
+            self.drain_phase() is None and not self._control.node_tombstoned(node_id),
+            "the let-go left a phase or a tombstone",
+        )
+        self._fixture.record("let_go", {"trace": trace, "at": time.time()})
+        return trace
+
+    def come_back_after_death(self, restart: Compensation, *, timeout: float = 600) -> None:
+        """Start the dead worker again as a same-name replacement and unseal it."""
+
+        if self._replacement is None:
+            raise RuntimeError("die() must run first")
+        self._fixture.record(
+            "sealed_epoch_after_unseal",
+            self._come_back(restart, self._replacement, timeout=timeout),
         )
 
     def undrain(self) -> None:

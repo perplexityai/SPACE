@@ -58,6 +58,7 @@ from space_smoke.capabilities import (
     SandboxPodRender,
     AdminNodeView,
     SandboxResidency,
+    SandboxRowState,
     StoppedResidency,
     EncryptedSnapshotObservation,
     ExecutionRow,
@@ -116,6 +117,7 @@ from space_smoke.drain_v2 import (
     DRAIN_V2_ENV_KEYS,
     validate_drain_v2_keys,
     validate_drain_v2_overrides,
+    validate_fake_instance_id,
     validate_fake_provider_id,
 )
 from space_smoke.execution_environment import ALLOWED_ENVIRONMENTS_ENV
@@ -487,6 +489,7 @@ SELECT node_id, facet, dead_at IS NOT NULL FROM node_reconcile_queue
  WHERE node_id IN ('{live_id}', '{gone_id}') ORDER BY 1, 2;
 COMMIT;
 """
+
 
 
 def _reconcile_queue_refs(out: str) -> list[ReconcileQueueRef]:
@@ -5322,6 +5325,19 @@ ON CONFLICT (key_hash) DO NOTHING;
             status=json.loads(status) if status.strip() else None,
         )
 
+    def terminate_node(self, node_id: str) -> int:
+        self._require_isolated_kind("admin node operations")
+        request = Request(
+            self.config.api_url.rstrip("/")
+            + f"/admin/api/v1/nodes/{quote(_sql_uuid(node_id), safe='')}:terminate",
+            method="POST",
+            headers={"Authorization": "Bearer " + self._admin_token()},
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                return int(response.status)
+        except HTTPError as error:
+            return int(error.code)
 
     def drain_restore_operations(self, sandbox_id: str) -> list[tuple[str, int]]:
         rows = self._psql(
@@ -5338,6 +5354,13 @@ ON CONFLICT (key_hash) DO NOTHING;
                 operations.append((state, int(attempts)))
         return operations
 
+    def node_tombstoned(self, node_id: str) -> bool:
+        out = self._psql(
+            "SELECT count(*) FROM node_k8s_tombstones"
+            f" WHERE node_id = '{_sql_uuid(node_id)}';",
+            action="read the node's tombstone",
+        )
+        return out.strip() != "0"
 
     def set_drain_keep(self, node_name: str, value: str) -> None:
         self._require_isolated_kind("drain-keep override")
@@ -5739,6 +5762,53 @@ ON CONFLICT (key_hash) DO NOTHING;
                 f"not {provider_id!r}"
             )
 
+    def fake_ec2_terminate(self, instance_id: str) -> None:
+        self._require_isolated_kind("terminating a fake EC2 instance")
+        validate_fake_instance_id(instance_id)
+        _require_ok(
+            self.kubectl(
+                "exec", "deployment/space-kind-fake-ec2", "--",
+                "space-kind-fake-ec2", "terminate", instance_id,
+                timeout=30,
+            ),
+            f"terminate {instance_id} in the fake EC2",
+        )
+
+    def set_fake_ec2_terminate_delay(self, seconds: int) -> None:
+        self._require_isolated_kind("setting the fake EC2's termination delay")
+        if not 0 <= seconds <= 3600:
+            raise ValueError(f"refusing a termination delay of {seconds}s")
+        _require_ok(
+            self.kubectl(
+                "exec", "deployment/space-kind-fake-ec2", "--",
+                "space-kind-fake-ec2", "delay", str(seconds),
+                timeout=30,
+            ),
+            f"set the fake EC2's termination delay to {seconds}s",
+        )
+
+    def release_fake_ec2_instance(self, instance_id: str) -> None:
+        self._require_isolated_kind("releasing a fake EC2 instance")
+        validate_fake_instance_id(instance_id)
+        _require_ok(
+            self.kubectl(
+                "exec", "deployment/space-kind-fake-ec2", "--",
+                "space-kind-fake-ec2", "release", instance_id,
+                timeout=30,
+            ),
+            f"release {instance_id} in the fake EC2",
+        )
+
+    def fake_ec2_instance_state(self, instance_id: str) -> str:
+        self._require_isolated_kind("reading a fake EC2 instance")
+        validate_fake_instance_id(instance_id)
+        result = self.kubectl(
+            "exec", "deployment/space-kind-fake-ec2", "--",
+            "space-kind-fake-ec2", "state", instance_id,
+            timeout=30,
+        )
+        _require_ok(result, f"read {instance_id} in the fake EC2")
+        return result.stdout.strip()
 
     def node_recorded_instance(self, node_id: str) -> str | None:
         out = self._psql(
@@ -5747,6 +5817,19 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         return out.strip() or None
 
+    def node_row_exists(self, node_id: str) -> bool:
+        out = self._psql(
+            f"SELECT count(*) FROM nodes WHERE id = '{_sql_uuid(node_id)}';",
+            action="read the node row",
+        )
+        return out.strip() == "1"
+
+    def node_created_at(self, node_id: str) -> str | None:
+        out = self._psql(
+            f"SELECT created_at FROM nodes WHERE id = '{_sql_uuid(node_id)}';",
+            action="read the node row's creation time",
+        )
+        return out.strip() or None
 
     def _kind_worker_container(self, node_name: str) -> str:
         container = self._kind_node_container(_kube_node_name(node_name))
@@ -5760,6 +5843,157 @@ ON CONFLICT (key_hash) DO NOTHING;
         labels = json.loads(_require_ok(listed, f"read the labels of {container}") or "{}")
         return {str(key): str(value) for key, value in labels.items()}
 
+    def stop_kind_worker(self, node_name: str, *, keep_node: bool = False) -> None:
+        self._require_isolated_kind("stopping a Kind worker")
+        container = self._kind_worker_container(node_name)
+        stopped = self.executor.run(["docker", "stop", container], timeout=120)
+        _require_ok(stopped, f"stop Kind worker container {container}")
+        if keep_node:
+            return
+        _require_ok(
+            self.kubectl("delete", "node", container, "--wait=true", timeout=120),
+            f"delete the Kubernetes Node {container}",
+        )
+
+    def kube_node_uid(self, node_name: str) -> str | None:
+        container = self._kind_worker_container(node_name)
+        listed = self.kubectl(
+            "get", "node", container, "--ignore-not-found", "-o", "jsonpath={.metadata.uid}",
+            timeout=15,
+        )
+        return _require_ok(listed, f"read the uid of {container}").strip() or None
+
+    def delete_kube_node(self, node_name: str, *, uid: str) -> None:
+        self._require_isolated_kind("deleting a Kind worker's Node")
+        container = self._kind_worker_container(node_name)
+        if not re.fullmatch(r"[0-9a-f-]{36}", uid):
+            raise ValueError(f"refusing Node uid {uid!r}")
+        body = json.dumps(
+            {"kind": "DeleteOptions", "apiVersion": "v1", "preconditions": {"uid": uid}}
+        )
+        _require_ok(
+            self.kubectl(
+                "delete", "--raw", f"/api/v1/nodes/{container}", "-f", "-",
+                input_text=body,
+                timeout=60,
+            ),
+            f"delete the Kubernetes Node {container} with uid {uid}",
+        )
+
+    def start_kind_worker(
+        self,
+        node_name: str,
+        labels: Mapping[str, str],
+        *,
+        timeout: float,
+        provider_id: str | None = None,
+    ) -> None:
+        self._require_isolated_kind("starting a Kind worker")
+        container = self._kind_worker_container(node_name)
+        if provider_id is not None:
+            # A same-name replacement: the stopped container's kubelet starts
+            # under a new providerID, so it registers a new instance.
+            with tempfile.TemporaryDirectory() as scratch:
+                local = Path(scratch) / "kubeadm-flags.env"
+                _require_ok(
+                    self.executor.run(
+                        ["docker", "cp", f"{container}:{KIND_KUBELET_FLAGS}", str(local)],
+                        timeout=30,
+                    ),
+                    f"copy the kubelet flags out of {container}",
+                )
+                local.write_text(self._rewritten_kubelet_flags(local.read_text(), provider_id))
+                _require_ok(
+                    self.executor.run(
+                        ["docker", "cp", str(local), f"{container}:{KIND_KUBELET_FLAGS}"],
+                        timeout=30,
+                    ),
+                    f"copy the kubelet flags into {container}",
+                )
+        _require_ok(
+            self.executor.run(["docker", "start", container], timeout=120),
+            f"start Kind worker container {container}",
+        )
+        self._await_reregistered(container, labels, timeout=timeout)
+
+    def _await_reregistered(
+        self, container: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        """Wait for the kubelet to re-register the Node it lost, put back the
+        bring-up's labels, then wait for the Node and its node services."""
+
+        deadline = time.monotonic() + timeout
+        while not self.kube_node_exists(container):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Kind worker {container} did not re-register its Node")
+            time.sleep(2)
+        # The kubelet registers only the labels it was started with; the
+        # bring-up labels the node after that, and the delete took those. Put
+        # them back first, so a wait below that fails leaves them in place.
+        current = self.kind_node_labels(container)
+        missing = [f"{key}={value}" for key, value in labels.items() if key not in current]
+        if missing:
+            _require_ok(
+                self.kubectl("label", "node", container, *missing, timeout=30),
+                f"restore the labels of {container}",
+            )
+        # Each wait has the whole budget.
+        budget = max(int(timeout), 1)
+        _require_ok(
+            self.kubectl(
+                "wait", "--for=condition=Ready", f"node/{container}", f"--timeout={budget}s",
+                timeout=budget + 30,
+            ),
+            f"await Kind worker {container} Ready",
+        )
+        # The node services' DaemonSet pods come back with the Node; a sandbox
+        # on it can't be deleted until they serve.
+        _require_ok(
+            self.kubectl(
+                "wait", "--for=condition=Ready", "pod", "--all",
+                "--field-selector", f"spec.nodeName={container}", f"--timeout={budget}s",
+                timeout=budget + 30,
+            ),
+            f"await the node services on {container}",
+        )
+        # node-ctl advertises the sandbox network slots on the new Node a
+        # moment after its pods are Ready; until then a sandbox pod can't be
+        # scheduled there.
+        while True:
+            listed = self.kubectl(
+                "get", "node", container, "-o",
+                "jsonpath={.status.allocatable.space\\.pplx\\.net/network-slots}",
+                timeout=15,
+            )
+            slots = _require_ok(listed, f"read the network slots of {container}").strip()
+            if slots.isdigit() and int(slots) > 0:
+                break
+            if time.monotonic() >= deadline + budget:
+                raise RuntimeError(f"Kind worker {container} never advertised network slots")
+            time.sleep(2)
+
+    def sandbox_row_states(self, sandbox_ids: Sequence[str]) -> list[SandboxRowState]:
+        ids = ",".join(_sql_uuid(sandbox_id) for sandbox_id in sandbox_ids)
+        out = self._psql(
+            SANDBOX_ROW_STATES_SQL.format(sandbox_ids=ids), action="read sandbox row states"
+        )
+        rows = []
+        for line in out.splitlines():
+            fields = line.strip().split("|")
+            if len(fields) != 6:
+                continue
+            sandbox_id, lifecycle, placement, active, target, updated_at = fields
+            rows.append(
+                SandboxRowState(
+                    sandbox_id=sandbox_id,
+                    lifecycle=lifecycle,
+                    placement=placement,
+                    active_node_id=active or None,
+                    target_node_id=target or None,
+                    updated_at=updated_at,
+                )
+            )
+        return rows
 
     def controller_log_records(self, *, since_time: str) -> list[dict[str, Any]]:
         listing = self.kubectl(
@@ -7815,6 +8049,8 @@ def _snapshot_reaper_config_from_env(env: Mapping[str, str | None]) -> SnapshotR
     )
 
 
+
+
 def _redact_storage_uris(text: str) -> str:
     """`text` with every storage URI replaced by its scheme, for attached evidence."""
 
@@ -8256,6 +8492,7 @@ def _parse_tcp_probes(output: str, targets: Sequence[TcpTarget]) -> list[TcpProb
         TcpProbe(target=target, connected=results[target.name] == "connected", detail=results[target.name])
         for target in targets
     ]
+
 
 
 def _controller_lease(document: Mapping[str, Any]) -> ControllerLease:

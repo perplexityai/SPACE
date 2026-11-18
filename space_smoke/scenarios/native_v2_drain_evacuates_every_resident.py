@@ -22,7 +22,8 @@ PATH = "/tmp/space-smoke-v2-drain.txt"
 # stopped until a user start boots it there. A
 # suspended resident whose upload is still pending and a warm-pool member
 # are planner rows only: Kind's uploads land before a drain can see one
-# pending, and it runs no warm pool.
+# pending, and it runs no warm pool. The terminate that follows a drain is
+# `native.v2_drain_terminates_its_worker`.
 @smoke.scenario(
     "native.v2_drain_evacuates_every_resident",
     api_surfaces=("native",),

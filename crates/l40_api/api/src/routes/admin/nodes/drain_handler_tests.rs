@@ -40,7 +40,7 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 
 use super::tests::enter_direct_test_process;
-use super::{DrainAction, apply_drain_action};
+use super::{DrainAction, V2DrainProbe, V2DrainReport, apply_drain_action};
 use crate::controllers::sandbox::SandboxController;
 use crate::controllers::substrate::Substrate;
 use crate::controllers::substrate::kubernetes::tests::substrate_with_store_and_client;
@@ -71,7 +71,24 @@ async fn kubernetes_state(pool: &PgPool) -> TestResult<AppState> {
     state.sandbox_controller = SandboxController::new(Substrate::from_kubernetes(
         substrate_with_store_and_client(pool.clone(), client),
     ));
+    state.v2_drain_probe = std::sync::Arc::new(ScriptedProbe(Err("no node answers".into())));
     Ok(state)
+}
+
+/// A [`V2DrainProbe`] that answers every `DrainNode` call with its script.
+struct ScriptedProbe(Result<V2DrainReport, String>);
+
+impl V2DrainProbe for ScriptedProbe {
+    fn drain_node<'a>(
+        &'a self,
+        _state: &'a AppState,
+        _node_id: NodeId,
+        _epoch: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<V2DrainReport, String>> + Send + 'a>,
+    > {
+        Box::pin(std::future::ready(self.0.clone()))
+    }
 }
 
 /// An actor the admin authz accepts.
@@ -1038,11 +1055,12 @@ async fn undrain_marks_a_v2_epoch_for_cancel() -> TestResult {
     Ok(())
 }
 
-/// `:terminate` of a v2 node is refused, writing nothing, even with its
-/// report `done`: this version doesn't terminate a v2 drain, which stays
-/// `drained` until `:undrain`. A v1 node still answers as before.
+/// A drained v2 node is terminable only when its stored report and a fresh
+/// `DrainNode` call both say `done` under its drain's epoch, and then a
+/// resident row doesn't hold it; otherwise the request is refused and the
+/// phase stays `drained`.
 #[tokio::test(flavor = "current_thread")]
-async fn terminate_of_a_v2_node_is_refused() -> TestResult {
+async fn terminate_of_a_v2_node_needs_a_done_report_for_its_epoch() -> TestResult {
     if !enter_direct_test_process() {
         return Ok(());
     }
@@ -1050,39 +1068,73 @@ async fn terminate_of_a_v2_node_is_refused() -> TestResult {
         return Ok(());
     };
     let actor = managing_org_admin(&db.pool).await?;
-    let state = kubernetes_state(&db.pool).await?;
-    let status = serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": true}});
-    let node_id =
-        insert_k8s_node(&db.pool, Some("drained"), Some("v2"), Some(status.clone())).await?;
-    let answer = post_drain(
-        &state,
-        &actor,
-        node_id,
-        DrainAction::Terminate,
-        DrainRequest::default(),
-    )
-    .await;
-    assert_eq!(answer, StatusCode::CONFLICT);
-    assert_eq!(
-        v2_columns(&db.pool, node_id).await?.0.as_deref(),
-        Some("drained")
-    );
-    assert_eq!(v2_columns(&db.pool, node_id).await?.2, Some(status));
-
-    let v1 = insert_k8s_node(&db.pool, Some("drained"), None, None).await?;
-    let answer = post_drain(
-        &state,
-        &actor,
-        v1,
-        DrainAction::Terminate,
-        DrainRequest::default(),
-    )
-    .await;
-    assert_ne!(
-        answer,
-        StatusCode::CONFLICT,
-        "a v1 node isn't refused for its engine"
-    );
+    let stored_done =
+        serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": true}});
+    let fresh = |sealed_epoch, done| Ok(V2DrainReport { sealed_epoch, done });
+    for (case, status, probe, terminable) in [
+        (
+            "no report",
+            serde_json::json!({"epoch": 42}),
+            fresh(Some(42), true),
+            false,
+        ),
+        (
+            "stale epoch",
+            serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 41, "done": true}}),
+            fresh(Some(42), true),
+            false,
+        ),
+        (
+            "not done",
+            serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": false}}),
+            fresh(Some(42), true),
+            false,
+        ),
+        (
+            "fresh not done",
+            stored_done.clone(),
+            fresh(Some(42), false),
+            false,
+        ),
+        (
+            "fresh other epoch",
+            stored_done.clone(),
+            fresh(Some(43), true),
+            false,
+        ),
+        (
+            "fresh unsealed",
+            stored_done.clone(),
+            fresh(None, true),
+            false,
+        ),
+        (
+            "node unreachable",
+            stored_done.clone(),
+            Err("refused".into()),
+            false,
+        ),
+        ("done", stored_done.clone(), fresh(Some(42), true), true),
+    ] {
+        let mut state = kubernetes_state(&db.pool).await?;
+        state.v2_drain_probe = std::sync::Arc::new(ScriptedProbe(probe));
+        let node_id = insert_k8s_node(&db.pool, Some("drained"), Some("v2"), Some(status)).await?;
+        let answer = post_drain(
+            &state,
+            &actor,
+            node_id,
+            DrainAction::Terminate,
+            DrainRequest::default(),
+        )
+        .await;
+        let phase = v2_columns(&db.pool, node_id).await?.0;
+        if terminable {
+            assert_eq!(phase.as_deref(), Some("terminating"), "{case}: {answer}");
+        } else {
+            assert_eq!(answer, StatusCode::CONFLICT, "{case}");
+            assert_eq!(phase.as_deref(), Some("drained"), "{case}");
+        }
+    }
     Ok(())
 }
 
@@ -1172,6 +1224,71 @@ async fn a_node_reads_back_its_drain_engine_and_status() -> TestResult {
     Ok(())
 }
 
+/// A [`V2DrainProbe`] that answers `done` for `epoch` only if it can take
+/// the node row's lock at once: the handler must not hold it while it asks.
+struct LockCheckingProbe(u64);
+
+impl V2DrainProbe for LockCheckingProbe {
+    fn drain_node<'a>(
+        &'a self,
+        state: &'a AppState,
+        node_id: NodeId,
+        _epoch: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<V2DrainReport, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut tx = state.pool.begin().await.map_err(|e| e.to_string())?;
+            sqlx::query(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR UPDATE NOWAIT"))
+                .bind(node_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| format!("the node row is locked: {error}"))?;
+            tx.rollback().await.map_err(|e| e.to_string())?;
+            Ok(V2DrainReport {
+                sealed_epoch: Some(self.0),
+                done: true,
+            })
+        })
+    }
+}
+
+/// `:terminate` asks a v2 node before it locks the node's row, so the call
+/// holds up no write to the row; the node then moves to `terminating`.
+#[tokio::test(flavor = "current_thread")]
+async fn terminate_asks_the_node_before_it_locks_the_row() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let actor = managing_org_admin(&db.pool).await?;
+    let mut state = kubernetes_state(&db.pool).await?;
+    state.v2_drain_probe = std::sync::Arc::new(LockCheckingProbe(42));
+    let node_id = insert_k8s_node(
+        &db.pool,
+        Some("drained"),
+        Some("v2"),
+        Some(serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": true}})),
+    )
+    .await?;
+    let answer = post_drain(
+        &state,
+        &actor,
+        node_id,
+        DrainAction::Terminate,
+        DrainRequest::default(),
+    )
+    .await;
+    assert_eq!(
+        v2_columns(&db.pool, node_id).await?.0.as_deref(),
+        Some("terminating"),
+        "{answer}"
+    );
+    Ok(())
+}
+
 /// `:terminate` of a node that doesn't exist answers 404, as every other
 /// action does.
 #[tokio::test(flavor = "current_thread")]
@@ -1193,5 +1310,146 @@ async fn terminate_of_an_unknown_node_is_not_found() -> TestResult {
     )
     .await;
     assert_eq!(answer, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// A v2 `:terminate` with a done report is refused, writing nothing, while
+/// anything still names the node: a row outside `failed` and `deleted`
+/// naming it active or target, or an execution active on its name. The
+/// answer names what holds it. A terminal row holds nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn terminate_of_a_v2_node_needs_nothing_naming_it() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let actor = managing_org_admin(&db.pool).await?;
+    let done = serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": true}});
+    for (case, lifecycle, column, held) in [
+        ("active", "started", "active_node_id", true),
+        ("target", "suspended", "target_node_id", true),
+        ("execution", "started", "", true),
+        ("terminal", "failed", "target_node_id", false),
+    ] {
+        let mut state = kubernetes_state(&db.pool).await?;
+        state.v2_drain_probe = std::sync::Arc::new(ScriptedProbe(Ok(V2DrainReport {
+            sealed_epoch: Some(42),
+            done: true,
+        })));
+        let node_id =
+            insert_k8s_node(&db.pool, Some("drained"), Some("v2"), Some(done.clone())).await?;
+        let sandbox_id = pplx_space_common_core::types::SandboxId::new();
+        crate::controllers::substrate::kubernetes::tests::insert_test_sandbox_row(
+            &db.pool, sandbox_id, lifecycle,
+        )
+        .await?;
+        if column.is_empty() {
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_k8s_executions
+                    (sandbox_id, generation, pod_name, pod_namespace, k8s_node_name, state, active)
+                 VALUES ($1, 1, 'space-sbx-synthetic', 'sandboxes', $2, 'running', TRUE)"
+            ))
+            .bind(sandbox_id)
+            .bind(format!("ip-10-0-0-46-{node_id}"))
+            .execute(&db.pool)
+            .await?;
+        } else {
+            sqlx::query(sqlx::AssertSqlSafe(sql!(format!(
+                "UPDATE sandboxes SET {column} = $2 WHERE id = $1"
+            ))))
+            .bind(sandbox_id)
+            .bind(node_id)
+            .execute(&db.pool)
+            .await?;
+        }
+        let (status, body) = post_drain_response(
+            &state,
+            &actor,
+            node_id,
+            DrainAction::Terminate,
+            DrainRequest::default(),
+        )
+        .await?;
+        let phase = v2_columns(&db.pool, node_id).await?.0;
+        if held {
+            assert_eq!(status, StatusCode::CONFLICT, "{case}: {body}");
+            assert_eq!(phase.as_deref(), Some("drained"), "{case}");
+            assert!(
+                body["held_by"]
+                    .as_str()
+                    .is_some_and(|held_by| held_by.contains(&sandbox_id.to_string())),
+                "{case}: {body}"
+            );
+        } else {
+            assert_eq!(phase.as_deref(), Some("terminating"), "{case}: {body}");
+        }
+    }
+    Ok(())
+}
+
+/// `:undrain` of a v2 node in `terminating` moves it to no phase and marks
+/// its epoch for cancel, as any v2 undrain does, until the controller fences
+/// its instance; a fenced one is refused and left as it was, and so is one
+/// an earlier build's terminator marked `terminated`, which is fenced and
+/// dispatched. A v1 node in `terminating` is refused as before.
+#[tokio::test(flavor = "current_thread")]
+async fn undrain_of_a_terminating_v2_node_runs_only_before_the_fence() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = kubernetes_state(&db.pool).await?;
+    let actor = managing_org_admin(&db.pool).await?;
+    let unfenced = serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": true}});
+    let mut fenced = unfenced.clone();
+    fenced["terminate_instance"] = serde_json::json!("i-0a1b2c3d");
+    let mut legacy = unfenced.clone();
+    legacy["terminated"] = serde_json::json!(true);
+    let mut legacy_false = unfenced.clone();
+    legacy_false["terminated"] = serde_json::json!(false);
+    for (case, engine, status, undrains) in [
+        ("unfenced v2", Some("v2"), Some(unfenced.clone()), true),
+        ("fenced v2", Some("v2"), Some(fenced.clone()), false),
+        (
+            "earlier build's terminated marker",
+            Some("v2"),
+            Some(legacy),
+            false,
+        ),
+        (
+            "a false terminated marker",
+            Some("v2"),
+            Some(legacy_false),
+            true,
+        ),
+        ("v1", None, None, false),
+    ] {
+        let node_id =
+            insert_k8s_node(&db.pool, Some("terminating"), engine, status.clone()).await?;
+        let answer = post_drain(
+            &state,
+            &actor,
+            node_id,
+            DrainAction::Undrain,
+            DrainRequest::default(),
+        )
+        .await;
+        let (phase, stored_engine, stored, _) = v2_columns(&db.pool, node_id).await?;
+        if undrains {
+            assert_eq!(phase, None, "{case}: {answer}");
+            assert_eq!(stored_engine.as_deref(), Some("v2"), "{case}");
+            let mut cancelled = status.clone().ok_or("a v2 status")?;
+            cancelled["cancel"] = serde_json::json!(true);
+            assert_eq!(stored, Some(cancelled), "{case}");
+        } else {
+            assert_eq!(answer, StatusCode::CONFLICT, "{case}");
+            assert_eq!(phase.as_deref(), Some("terminating"), "{case}");
+            assert_eq!(stored, status, "{case}");
+        }
+    }
     Ok(())
 }
