@@ -487,6 +487,15 @@ required_glibc() {
 }
 
 runtime_glibc() {
+  # A plain `docker run` gets no --build-context, so GitHub CI first takes the
+  # image from its GHCR mirror (ci/mirrored-images.txt), which tags it under
+  # its own name; the anonymous public.ecr.aws pull is rate limited there. The
+  # pull never fails the build: on a miss, `docker run` pulls the source as
+  # before. Its output goes to stderr because the caller captures stdout.
+  if [[ -n "${SPACE_CI_IMAGE_MIRROR:-}" ]]; then
+    bash "$REPO_ROOT/ci/scripts/mirror-images.sh" pull "$RUNTIME_LIBC_IMAGE" >&2 ||
+      log "the image mirror could not pull $RUNTIME_LIBC_IMAGE; docker run pulls it" >&2
+  fi
   docker run --rm --entrypoint sh "$RUNTIME_LIBC_IMAGE" -c 'ldd --version 2>&1 | head -1' \
     | grep -oE '[0-9]+\.[0-9]+$'
 }
