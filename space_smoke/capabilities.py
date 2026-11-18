@@ -913,7 +913,29 @@ class NodeCtlFacetRun:
     last_error: str
 
 
-class UnansweredTemplateEvictionControl(Protocol):
+class NodeCtlFacetControl(Protocol):
+    """Run a worker node-ctl inbound facet on demand and read its latest run.
+
+    Both go through the production `space-nodectl` CLI on the node; see
+    `space_smoke.node_ctl_facets.sync_node_ctl_facet`.
+    """
+
+    def reconcile_node_ctl_facet(self, node_name: str, facet: str) -> None:
+        """Have that node's node-ctl run inbound `facet` at full scope now (`space-nodectl reconcile`).
+
+        node-ctl's `RefreshFacetState` with no element: the run a poll makes
+        for that facet, followed by an outbound sync. It only enqueues the
+        run; read `node_ctl_facet_run` to see it finish. Raises if node-ctl
+        did not take the request.
+        """
+        ...
+
+    def node_ctl_facet_run(self, node_name: str, facet: str) -> NodeCtlFacetRun:
+        """That node's node-ctl status for inbound `facet`'s latest run."""
+        ...
+
+
+class UnansweredTemplateEvictionControl(NodeCtlFacetControl, Protocol):
     """Kind-only operations for node-ctl's unanswered-template cleanup scenario.
 
     A worker's node-ctl waits an hour before deleting a local template the
@@ -962,20 +984,6 @@ class UnansweredTemplateEvictionControl(Protocol):
         ...
 
     def node_template_presence(self, node_name: str) -> NodeTemplatePresence: ...
-
-    def reconcile_node_ctl_facet(self, node_name: str, facet: str) -> None:
-        """Have that node's node-ctl run inbound `facet` at full scope now (`space-nodectl reconcile`).
-
-        node-ctl's `RefreshFacetState` with no element: the run a poll makes
-        for that facet, followed by an outbound sync. It only enqueues the
-        run; read `node_ctl_facet_run` to see it finish. Raises if node-ctl
-        did not take the request.
-        """
-        ...
-
-    def node_ctl_facet_run(self, node_name: str, facet: str) -> NodeCtlFacetRun:
-        """That node's node-ctl status for inbound `facet`'s latest run."""
-        ...
 
     def node_ctl_log(self, node_name: str, *, since_time: str) -> str:
         """That worker's node-ctl log since `since_time`. Failure evidence only."""
