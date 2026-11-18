@@ -122,6 +122,7 @@ pub struct SimState {
     transition_after_state_read: Arc<Mutex<HashMap<String, String>>>,
     failing_wakes: Arc<Mutex<HashSet<String>>>,
     refused_artifact_backups: Arc<Mutex<HashMap<String, tonic::Code>>>,
+    refused_resource_updates: Arc<Mutex<HashMap<String, tonic::Code>>>,
     snapshot_dir: PathBuf,
     node_id: String,
     fs: crate::fs::SandboxFs,
@@ -166,6 +167,7 @@ impl SimState {
             transition_after_state_read: Default::default(),
             failing_wakes: Default::default(),
             refused_artifact_backups: Default::default(),
+            refused_resource_updates: Default::default(),
             snapshot_dir,
             node_id,
             fs: crate::fs::SandboxFs::new(sandbox_fs_dir),
@@ -316,6 +318,26 @@ impl SimState {
         sandbox_id: &str,
     ) -> Option<tonic::Code> {
         self.refused_artifact_backups
+            .lock()
+            .await
+            .remove(sandbox_id)
+    }
+
+    /// Refuse the next resource update of `sandbox_id` with `code`, as
+    /// sandbox-manager refuses one the node will not apply, such as a lower
+    /// memory limit for a running VM.
+    pub async fn refuse_next_resource_update(&self, sandbox_id: String, code: tonic::Code) {
+        self.refused_resource_updates
+            .lock()
+            .await
+            .insert(sandbox_id, code);
+    }
+
+    pub(crate) async fn take_resource_update_refusal(
+        &self,
+        sandbox_id: &str,
+    ) -> Option<tonic::Code> {
+        self.refused_resource_updates
             .lock()
             .await
             .remove(sandbox_id)

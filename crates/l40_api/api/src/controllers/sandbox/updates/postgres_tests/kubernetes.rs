@@ -148,3 +148,71 @@ async fn live_cpu_update_preserves_allocation_across_cold_restart() -> TestResul
     }
     Ok(())
 }
+
+/// A memory update is saved for the sandbox's later boots only once its node
+/// applied it. A node refuses to lower a running VM's memory limit, and that
+/// refusal leaves the saved memory as it was, so no later activation starts
+/// at the refused size.
+#[tokio::test(flavor = "current_thread")]
+async fn a_memory_update_the_node_refuses_leaves_the_saved_memory() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let actor = insert_actor(pool).await?;
+    let (worker, node_id) = start_kubernetes_sim_worker(pool).await?;
+    let sandbox_id = seed_sandbox(pool, &actor).await?.id;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+         SET active_node_id = $2, placement = 'on_node', lifecycle = 'started',
+             memory_mib = 1024
+         WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    let LiveExecution {
+        pod,
+        route_activation_id,
+    } = insert_live_execution(pool, sandbox_id, RouteIdentity::Published).await?;
+    insert_kubernetes_resident(worker.state(), sandbox_id, "running", route_activation_id).await?;
+    let (substrate, _log) = substrate_over_pods(pool, worker.port(), vec![pod])?;
+    let controller = SandboxController::new(kubernetes(substrate));
+    let memory = |memory_mib| UpdateSandboxRequest {
+        metadata: None,
+        vcpu: None,
+        memory_mib: Some(memory_mib),
+        pids_max: None,
+        auto_lifecycle: None,
+        network_policy: None,
+    };
+    let saved = || async {
+        TestResult::Ok(
+            fetch_sandbox(pool, sandbox_id)
+                .await?
+                .expect("sandbox row")
+                .memory_mib,
+        )
+    };
+
+    let sandbox = fetch_sandbox(pool, sandbox_id).await?.expect("sandbox row");
+    controller
+        .update(pool, &sandbox, sandbox_id, memory(2048), None)
+        .await?;
+    assert_eq!(saved().await?, Some(2048));
+
+    worker
+        .state()
+        .refuse_next_resource_update(sandbox_id.to_string(), tonic::Code::FailedPrecondition)
+        .await;
+    let sandbox = fetch_sandbox(pool, sandbox_id).await?.expect("sandbox row");
+    let error = controller
+        .update(pool, &sandbox, sandbox_id, memory(512), None)
+        .await
+        .expect_err("the node refused the update");
+    assert!(error.status().is_client_error(), "{error}");
+    assert_eq!(saved().await?, Some(2048));
+    Ok(())
+}

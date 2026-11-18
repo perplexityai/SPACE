@@ -5,6 +5,7 @@
 //! decided here.
 
 use pplx_space_events::CreateShapeSource;
+use pplx_space_public_api::limits::MAX_SANDBOX_MEMORY_MIB;
 use pplx_space_sandbox_metrics::admission::AdmissionDecision;
 
 use super::ControllerError;
@@ -151,9 +152,14 @@ fn defaulted(source: CreateShapeSource) -> bool {
 }
 
 /// The stored vCPU and memory a sandbox runs with, or `None` when either is
-/// unset or not positive.
+/// unset or not positive. Memory past [`MAX_SANDBOX_MEMORY_MIB`], the most a
+/// create admits, records that bound: a row stored before the bound, when ECW
+/// admitted up to the column's range, must not land as a PiB-scale sample.
+/// A node's own guest maximum is configured on the node, which the API does
+/// not read, so the bound is the closest value the API knows.
 fn effective(vcpu: Option<i32>, memory_mib: Option<i32>) -> Option<(u32, u32)> {
-    Some((positive(vcpu)?, positive(memory_mib)?))
+    let memory_mib = positive(memory_mib)?.min(MAX_SANDBOX_MEMORY_MIB);
+    Some((positive(vcpu)?, memory_mib))
 }
 
 fn positive(value: Option<i32>) -> Option<u32> {

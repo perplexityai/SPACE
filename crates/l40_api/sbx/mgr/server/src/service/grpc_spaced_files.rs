@@ -438,13 +438,29 @@ impl SandboxManagerService {
             let mut node_client = connect_node(&self.node_manager)
                 .await
                 .map_err(|e| Status::unavailable(format!("cannot connect to node-manager: {e}")))?;
+            // The request names guest memory; node-manager takes the host
+            // cgroup limit, which launch sets to the guest's memory plus the
+            // node's headroom. Sending the guest's value would leave the VM
+            // no headroom.
+            let cgroup_memory_mib = match req.memory_mib {
+                Some(guest_memory_mib) => {
+                    let policy = Self::node_sandbox_memory_policy(&mut node_client).await?;
+                    let limit = self
+                        .resolve_sandbox_memory_policy(guest_memory_mib, policy)
+                        .cgroup_memory_mib;
+                    Some(u32::try_from(limit).map_err(|_| {
+                        Status::internal(format!("sandbox cgroup memory exceeds u32: {limit} MiB"))
+                    })?)
+                }
+                None => None,
+            };
 
             node_client
                 .update_cgroup(pplx_space_node_mgr_client::proto::UpdateCgroupRequest {
                     execution_fence: sandbox.node_execution_fence(),
                     sandbox_id: sandbox.id.clone(),
                     vcpu_count: req.vcpu,
-                    memory_mib: req.memory_mib,
+                    memory_mib: cgroup_memory_mib,
                     pids_max: req.pids_max,
                 })
                 .await

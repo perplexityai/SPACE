@@ -1802,6 +1802,12 @@ fn create_translation_applies_resource_overrides() {
         // the API still admits it.
         (r#"{"memory_mib":16896}"#, None, Some(16896), None),
         (
+            r#"{"vcpu":16,"memory_mib":33280}"#,
+            Some(16),
+            Some(33280),
+            None,
+        ),
+        (
             r#"{"vcpu":32,"memory_mib":65536,"disk_mib":131072}"#,
             Some(32),
             Some(65536),
