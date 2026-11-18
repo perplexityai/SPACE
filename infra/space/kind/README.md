@@ -362,7 +362,7 @@ A failure the known-failures list (`SPACE_SMOKE_KNOWN_FAILURES`) excused is
 listed but does not fail the run. Without `--benches` it picks N
 from the host's CPUs, available memory, free disk and a short write-throughput
 probe of the bench volume, and prints each factor. One run or teardown
-holds the host at a time (`/run/space-bench.d/lock`), and a run first
+holds the host at a time (a lock on `/run/space-bench.d`), and a run first
 removes the benches an interrupted or `--keep` run left; only directories
 marked as a bench's when it was created are ever deleted.
 
