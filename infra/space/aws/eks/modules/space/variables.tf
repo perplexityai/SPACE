@@ -843,6 +843,18 @@ variable "builders_update_strategy" {
     instance of the same type in the old node's Availability Zone; without
     one the roll fails and EKS rolls it back. Never null: EKS cannot clear a
     strategy once set, so null would plan a diff on every run.
+
+    Upgrade: an existing builders group keeps its nodes when the strategy
+    changes and rolls under `MINIMAL` at its next roll. On a single-node
+    group, template build submissions then fail as unavailable until the
+    replacement joins, so callers must retry them. Set `DEFAULT` to keep the
+    previous behavior, but only where a spare instance of the same type is
+    available in the group's Availability Zones.
+
+    Apply a strategy change on its own, before any launch template or AMI
+    change to the group. In a combined apply the provider updates the node
+    group version first, so the roll runs under the old strategy, and if it
+    fails the strategy change is never sent.
   EOT
   type        = string
   default     = "MINIMAL"
