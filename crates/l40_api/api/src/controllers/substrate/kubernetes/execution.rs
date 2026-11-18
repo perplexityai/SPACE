@@ -275,6 +275,14 @@ impl RestoreClaimHandling {
     }
 }
 
+/// What [`KubernetesSubstrate::restore_execution_activation`] produced.
+enum RestoreActivation {
+    /// The restore joined another caller's, which finishes it.
+    Joined,
+    /// This caller's restore, with its binding and the attempt it ran under.
+    Owned(Box<ExecutionActivation>),
+}
+
 impl KubernetesSubstrate {
     /// Decide a lease winner's live cap (`CapPolicy::ReserveAtClaim`, RFC
     /// Decision 6). A fresh claim from `suspended` gives the sandbox a new
@@ -1405,6 +1413,26 @@ impl KubernetesSubstrate {
         options: ActivationOptions,
         intent: RestoreIntent,
     ) -> Result<ActivationCompletion, SubstrateError> {
+        Ok(
+            match self
+                .restore_execution_activation(metric_identity, sandbox_id, options, intent)
+                .await?
+            {
+                RestoreActivation::Joined => ActivationCompletion::Joined,
+                RestoreActivation::Owned(activation) => activation.completion,
+            },
+        )
+    }
+
+    /// [`Self::restore_execution_inner`], keeping the activation an owned
+    /// restore produced: its binding and the attempt it ran under.
+    async fn restore_execution_activation(
+        &self,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
+        sandbox_id: SandboxId,
+        options: ActivationOptions,
+        intent: RestoreIntent,
+    ) -> Result<RestoreActivation, SubstrateError> {
         let target_state = intent.target.state();
         if !options.blocking {
             return Err(SubstrateError::Conflict {
@@ -1471,7 +1499,7 @@ impl KubernetesSubstrate {
                         .await?
                     {
                         UserRestoreJoin::Completed(_) => {
-                            return Ok(ActivationCompletion::Joined);
+                            return Ok(RestoreActivation::Joined);
                         }
                         UserRestoreJoin::Claimable => {
                             crate::metrics::sandbox::api::restore_claim_lap(
@@ -1489,7 +1517,7 @@ impl KubernetesSubstrate {
                         .await?
                         .is_some()
                     {
-                        return Ok(ActivationCompletion::Joined);
+                        return Ok(RestoreActivation::Joined);
                     }
                     return Err(err);
                 }
@@ -1529,7 +1557,7 @@ impl KubernetesSubstrate {
                 RestoreClaimHandling::preclaimed_with_cleanup(restore_claim),
             )
             .await?;
-        Ok(activation.completion)
+        Ok(RestoreActivation::Owned(Box::new(activation)))
     }
 
     pub(super) async fn wake_execution_with_metric_identity(
