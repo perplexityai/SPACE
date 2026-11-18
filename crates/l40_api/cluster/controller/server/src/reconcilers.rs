@@ -8,6 +8,82 @@
 //!    helper for deploy-time knobs and a `run(pool, substrate, shutdown)` entry.
 //! 2. Spawn it from `run_reconcilers` below as a `tokio::spawn(...)` line.
 //! 3. Wire its env vars into the owning deployment configuration.
+//!
+//! # Kubernetes-only loops
+//!
+//! `run_reconcilers` starts the loops below only when the substrate is
+//! Kubernetes. They are sorted by the substrate contract
+//! (`controllers/substrate/AGENTS.md` in `pplx-space-api`), read as follows.
+//! A state loop repairs, drains or collects sandbox, node or queue rows, or
+//! runs other core logic the contract names, such as warm-pool policy;
+//! running it on one substrate is debt, to move into substrate-neutral code
+//! over the adapter, and not precedent. A Kubernetes-object loop manages or
+//! observes pods, Nodes or DaemonSets, or mirrors them into rows, and stays.
+//! A loop that does both is listed as a state loop, naming the part that
+//! stays. Classify a loop added to that arm here.
+//!
+//! State loops (debt):
+//!
+//! - `orphaned_sandboxes`: finalizes deletion of, recovers to `suspended` or
+//!   quarantines non-terminal Kubernetes sandbox rows whose pod is missing,
+//!   finished or unready, whose execution was forgotten, or that an old
+//!   cleanup left `deleting`, deleting a leftover pod it observed before it
+//!   acts.
+//! - `suspended_execution_reaper`: retires active `sandbox_k8s_executions`
+//!   rows on `suspended` sandboxes and unplaces them, clearing
+//!   `active_node_id` and the local-artifact marker, once the pod is
+//!   confirmed gone, first deleting a pod that finished `Succeeded`.
+//! - `failed_restorable_repair`: moves `failed` Kubernetes sandboxes with a
+//!   restorable suspend snapshot back to `suspended`. Postgres only.
+//! - `lost_started_sandboxes`: fails `started` Kubernetes sandboxes whose
+//!   recovery found no restore source once their node is gone.
+//! - `kube_node_sync`: demotes `ready` node rows outside any drain to
+//!   `registered` once their Node is missing from the cluster's full Node
+//!   list (not only the labeled Nodes), their heartbeat is missing or older
+//!   than a grace period, and their `node_k8s` row is older than it. Its
+//!   upsert of Nodes into `nodes` and `node_k8s`, which also sets
+//!   `nodes.state` from each Node's Ready condition, is Kubernetes
+//!   registration, which Direct does through its node registry; that part
+//!   stays.
+//! - `warm_pool`: its autoscaling of `kubernetes_pool_configs` from
+//!   `warm_pool_policies` and recent sandbox demand is warm-pool policy, and
+//!   its delete of a cleanup-pending slot's reserved sandbox
+//!   (`delete_execution`, then `delete_with_dependents`) collects sandbox
+//!   rows; both are debt. Creating, probing and deleting warm-pool pods and
+//!   the `kubernetes_pool_slots` rows that track them stays. Direct adopts
+//!   pool members node-side and has no cluster pool configs (a gap row in
+//!   `direct.rs`).
+//! - `orphaned_nodes`: deletes Kubernetes `nodes` rows outside any drain whose
+//!   EC2 instance is gone. Reads EC2, not Kubernetes.
+//! - `reconcile_queue_gc`, both detectors: prunes live `node_reconcile_queue`
+//!   and `node_reconcile_triggers` rows of Kubernetes nodes reported gone.
+//!   The EC2 instance, off by default (`SPACE_RECONCILE_QUEUE_GC_ENABLED`),
+//!   also prunes dead rows of both tables past their retention for every
+//!   substrate. No loop started on Direct prunes dead `node_reconcile_queue`
+//!   rows by age; trigger fanout prunes dead triggers for both substrates.
+//! - `node_drain`: moves `nodes.drain_phase` from `draining` to `drained`,
+//!   evacuating residents in forced mode, and deletes a `terminating` node's
+//!   row once its terminator (`aws`, `kube-delete` or `noop`) succeeds.
+//! - `drained_node_terminator`: moves `drained` nodes to `terminating` unless
+//!   their Node carries the keep annotation. Under the `aws` terminator, when
+//!   the Node is gone and EC2 reports the instance terminated, it deletes the
+//!   `drained` row instead, or fails the unrecoverable suspended sandboxes
+//!   that block that delete.
+//!
+//! Kubernetes-object loops (stay):
+//!
+//! - `environment_placement_census`: read-only gauges over the pod and Node
+//!   reflectors.
+//! - `stuck_container_creating_gc`: deletes sandbox pods stuck in
+//!   `ContainerCreating`. No Postgres.
+//! - `orphaned_restore_pod_gc`: deletes restore pods their sandbox row has
+//!   superseded. Reads rows, writes none.
+//! - `node_service_readiness`: labels worker Nodes with the readiness of their
+//!   node-local DaemonSet pods.
+//! - `node_group_labeler`: labels shared worker Nodes with their node group and
+//!   seeds the default `node_groups` row.
+//! - `node_group_mirror`: copies each Node's node-group label into
+//!   `nodes.node_group_id`.
 
 use std::sync::Arc;
 use std::time::Duration;
