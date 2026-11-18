@@ -304,6 +304,32 @@ kind_bench_exec() {
     env -i "${vars[@]}" "$@"
 }
 
+# A bench's own copy of the checkout <repo> at <dest>, as each CI runner
+# checks out its own: the bring-up writes into the tree (Helm vendors chart
+# dependencies into charts/ through a tmpcharts-<pid> directory, uv keeps
+# .venv), and N benches writing one tree raced; with a PID namespace each,
+# their Helm runs even chose the same temporary names. A worktree at <repo>'s
+# HEAD with everything that differs from HEAD copied over, staged or not, and
+# its untracked files, so a bench tests exactly the files checked out there.
+# --no-renames lists a rename as the deletion and the addition it is.
+kind_bench_checkout() {
+  local repo="$1" dest="$2" lists path status=0
+  # NUL-separated lists in files: a shell variable cannot hold a NUL.
+  lists="$(mktemp -d)" || return 1
+  { git -C "$repo" diff -z --no-renames --name-only --diff-filter=d HEAD >"$lists/changed" \
+      && git -C "$repo" ls-files -z --others --exclude-standard >>"$lists/changed" \
+      && git -C "$repo" diff -z --no-renames --name-only --diff-filter=D HEAD >"$lists/deleted" \
+      && git -C "$repo" worktree add --quiet --detach --force "$dest" HEAD \
+      && rsync -a --from0 --files-from="$lists/changed" "$repo/" "$dest/"; } || status=1
+  if (( ! status )); then
+    while IFS= read -r -d '' path; do
+      rm -f -- "$dest/$path" || status=1
+    done <"$lists/deleted"
+  fi
+  rm -rf "$lists"
+  return "$status"
+}
+
 # Every bench this host has, running or left by an earlier run: namespaces,
 # run directories and data directories alike.
 kind_bench_existing() {

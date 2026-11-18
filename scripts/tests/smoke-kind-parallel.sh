@@ -495,23 +495,6 @@ bench_docker() {
   KIND_BENCH_MIRROR="http://$REGISTRY_IP:$MIRROR_PORT" kind_bench_docker_up "$i"
 }
 
-# Bench i's own copy of the checkout, as each CI runner checks out its own:
-# the bring-up writes into the tree (Helm vendors chart dependencies into
-# charts/ through a tmpcharts-<pid> directory, uv keeps .venv), and N benches
-# writing one tree raced; with a PID namespace each, their Helm runs even
-# chose the same temporary names. A worktree at this checkout's commit, with
-# its uncommitted and untracked changes copied over, so the benches test
-# exactly what is checked out here.
-bench_checkout() {
-  local src="$1" path
-  git -C "$REPO_ROOT" worktree add --quiet --detach --force "$src" HEAD || return 1
-  (cd "$REPO_ROOT" && git ls-files -z --modified --others --exclude-standard) \
-    | rsync -a --from0 --files-from=- "$REPO_ROOT/" "$src/" || return 1
-  while IFS= read -r -d '' path; do
-    rm -f -- "$src/$path"
-  done < <(cd "$REPO_ROOT" && git ls-files -z --deleted)
-}
-
 # One bench, start to finish. Its log is the bench directory's bench.log; its
 # outcome is the `result` file the summary reads.
 run_bench() {
@@ -523,7 +506,7 @@ run_bench() {
   env_file="$(bench_env "$i")" || return 1
   local src
   src="$(kind_bench_dir "$i")/src"
-  phase "bench$i" checkout bench_checkout "$src" || return 1
+  phase "bench$i" checkout kind_bench_checkout "$REPO_ROOT" "$src" || return 1
   # Bench commands start in the bench's checkout (kind_bench_exec keeps $PWD).
   cd "$src" || return 1
   bx() { kind_bench_exec "$i" "$env_file" "$@"; }
