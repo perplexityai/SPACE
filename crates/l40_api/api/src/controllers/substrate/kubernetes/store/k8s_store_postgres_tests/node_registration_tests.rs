@@ -33,14 +33,15 @@ impl RegistrationCaller {
     ) -> Result<(), SubstrateError> {
         let address = Some("10.0.0.70");
         let inventory = |state| {
-            store.persist_k8s_node_inventory(
+            store.persist_k8s_node_inventory(K8sNodeRoleUpsert {
                 node_name,
-                "uid-registration",
+                node_uid: "uid-registration",
                 node_id,
-                NodeRole::Worker,
+                role: NodeRole::Worker,
                 address,
                 state,
-            )
+                instance_id: None,
+            })
         };
         match self {
             Self::NodeSync => inventory(NodeStateWrite::Manage(NodeLifecycleState::Ready))
@@ -53,14 +54,15 @@ impl RegistrationCaller {
             }
             Self::PodPlacement => {
                 store
-                    .persist_pod_node_placement(
+                    .persist_pod_node_placement(PodNodePlacement {
                         sandbox_id,
                         node_name,
-                        "uid-registration",
+                        node_uid: "uid-registration",
                         node_id,
-                        NodeRole::Worker,
+                        role: NodeRole::Worker,
                         address,
-                    )
+                        instance_id: None,
+                    })
                     .await
             }
         }
@@ -160,14 +162,15 @@ async fn only_a_managed_state_write_overwrites_an_existing_node_state() -> TestR
             let node_id = NodeId::new();
             let node_name = format!("space-test-state-write-{}", node_id.as_uuid().simple());
             let persist = |address, state| {
-                fixture.store.persist_k8s_node_inventory(
-                    &node_name,
-                    "uid-state-write",
+                fixture.store.persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                    node_name: &node_name,
+                    node_uid: "uid-state-write",
                     node_id,
-                    NodeRole::Worker,
-                    Some(address),
+                    role: NodeRole::Worker,
+                    address: Some(address),
                     state,
-                )
+                    instance_id: None,
+                })
             };
             if let Some(existing) = existing {
                 persist("10.0.0.71", NodeStateWrite::Manage(existing)).await?;
@@ -194,14 +197,15 @@ async fn only_a_managed_state_write_overwrites_an_existing_node_state() -> TestR
                 let node_id = NodeId::new();
                 let node_name = format!("space-test-state-write-{}", node_id.as_uuid().simple());
                 let persist = |address, state| {
-                    fixture.store.persist_k8s_node_inventory(
-                        &node_name,
-                        "uid-state-write",
+                    fixture.store.persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                        node_name: &node_name,
+                        node_uid: "uid-state-write",
                         node_id,
-                        NodeRole::Worker,
-                        Some(address),
+                        role: NodeRole::Worker,
+                        address: Some(address),
                         state,
-                    )
+                        instance_id: None,
+                    })
                 };
                 persist("10.0.0.71", NodeStateWrite::Manage(existing)).await?;
                 persist("10.0.0.72", write).await?;

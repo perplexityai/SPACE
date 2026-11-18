@@ -20,6 +20,7 @@ use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_k8s_node_id::Ec2InstanceId;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_node_model::NodeRole;
 use pplx_space_sandbox_model::{
@@ -79,6 +80,10 @@ pub(super) struct PodNodePlacement<'a> {
     pub node_id: NodeId,
     pub role: NodeRole,
     pub address: Option<&'a str>,
+    /// The EC2 instance the Node's `providerID` names. `None` keeps the
+    /// recorded instance while the Node's UID is unchanged; on a UID change
+    /// it clears it, since a new Node may be another machine.
+    pub instance_id: Option<&'a Ec2InstanceId>,
 }
 
 /// What a caller's retry of the *whole operation* would do, for statements that
@@ -294,13 +299,14 @@ pub(super) enum NodeStateWrite {
     InsertOnly(NodeLifecycleState),
 }
 
-struct K8sNodeRoleUpsert<'a> {
-    node_name: &'a str,
-    node_uid: &'a str,
-    node_id: NodeId,
-    role: NodeRole,
-    address: Option<&'a str>,
-    state: NodeStateWrite,
+pub(super) struct K8sNodeRoleUpsert<'a> {
+    pub node_name: &'a str,
+    pub node_uid: &'a str,
+    pub node_id: NodeId,
+    pub role: NodeRole,
+    pub address: Option<&'a str>,
+    pub state: NodeStateWrite,
+    pub instance_id: Option<&'a Ec2InstanceId>,
 }
 
 #[derive(sqlx::FromRow)]

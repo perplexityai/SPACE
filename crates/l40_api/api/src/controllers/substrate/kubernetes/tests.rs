@@ -27,6 +27,7 @@ pub(crate) use kubernetes_tests::{
 mod activating_client;
 pub(super) mod environment_placement;
 mod native_pod_failover;
+mod node_instance;
 mod runtime_upgrade_dispatch;
 mod slot_headroom;
 mod substrate_scope;

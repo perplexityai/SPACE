@@ -276,13 +276,17 @@ impl K8sStore {
 
     pub(in crate::controllers::substrate::kubernetes) async fn persist_pod_node_placement(
         &self,
-        sandbox_id: SandboxId,
-        node_name: &str,
-        node_uid: &str,
-        node_id: NodeId,
-        role: NodeRole,
-        address: Option<&str>,
+        placement: PodNodePlacement<'_>,
     ) -> Result<(), SubstrateError> {
+        let PodNodePlacement {
+            sandbox_id,
+            node_name,
+            node_uid,
+            node_id,
+            role,
+            address,
+            instance_id,
+        } = placement;
         let mut tx = self
             .pool
             .begin()
@@ -298,6 +302,7 @@ impl K8sStore {
                 role,
                 address,
                 state: NodeStateWrite::InsertOnly(NodeLifecycleState::Registered),
+                instance_id,
             },
         )
         .await?;
@@ -349,17 +354,7 @@ impl K8sStore {
         placement: PodNodePlacement<'_>,
         retry: PlacementRetryDisposition,
     ) -> Result<(), SubstrateError> {
-        let PodNodePlacement {
-            sandbox_id,
-            node_name,
-            node_uid,
-            node_id,
-            role,
-            address,
-        } = placement;
-        let result = self
-            .persist_pod_node_placement(sandbox_id, node_name, node_uid, node_id, role, address)
-            .await;
+        let result = self.persist_pod_node_placement(placement).await;
         match retry {
             PlacementRetryDisposition::RetryDuplicatesExecution => {
                 result.map_err(SubstrateError::demoted_after_side_effect)

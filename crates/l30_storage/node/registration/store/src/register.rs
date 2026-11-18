@@ -2,6 +2,7 @@
 //! the caller's transaction.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_k8s_node_id::Ec2InstanceId;
 use pplx_space_node_model::{NodeRole, SubstrateKind};
 use pplx_space_sql_locator::sql;
 use sqlx::PgConnection;
@@ -20,6 +21,10 @@ pub struct K8sNodeRegistration<'a> {
     /// Whether registering an existing row also writes `state`. Only the
     /// node's lifecycle owner does; every other writer leaves it alone.
     pub manage_state: bool,
+    /// The EC2 instance the Node's `providerID` names. `None` keeps the
+    /// recorded instance while the Node's UID is unchanged; on a UID change
+    /// it clears it, since a new Node may be another machine.
+    pub instance_id: Option<&'a Ec2InstanceId>,
 }
 
 /// The statement of [`register_k8s_node`] that failed.
@@ -92,7 +97,8 @@ impl<T> Step<T> for Result<T, sqlx::Error> {
 
 /// Register a Kubernetes node: refuse a tombstoned node, upsert its `nodes`
 /// row, clear its drain state when its Kubernetes Node UID changed, upsert its
-/// `node_k8s` row, and refuse it again if a tombstone committed meanwhile.
+/// `node_k8s` row with the instance its Node names, and refuse it again if a
+/// tombstone committed meanwhile.
 /// Returns whether any of those writes changed a row.
 ///
 /// Runs on the caller's connection, inside the caller's transaction: on an error,
@@ -111,6 +117,7 @@ pub async fn register_k8s_node(
         address,
         state,
         manage_state,
+        instance_id,
     } = registration;
 
     // Tombstone gate. Inventory upserts (kube_node_sync, late pod placement
@@ -230,19 +237,38 @@ pub async fn register_k8s_node(
         on_drain_cleared();
     }
 
+    // A registration with no instance keeps the recorded one, unless the
+    // Node's uid changed: a new Node may be a replacement on another machine,
+    // so it takes no instance until one is reported. An instance alone
+    // doesn't date the row: `updated_at` dates its Kubernetes metadata,
+    // which absence demotion reads. The `nodes` upsert above locked the
+    // node's row, so concurrent registrations of this node id apply in turn.
     let node_k8s_changed = sqlx::query(sql!(
-        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
-             VALUES ($1, $2, $3)
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid, instance_id)
+             VALUES ($1, $2, $3, $4)
              ON CONFLICT (node_id) DO UPDATE
              SET k8s_node_name = EXCLUDED.k8s_node_name,
                  k8s_node_uid = EXCLUDED.k8s_node_uid,
-                 updated_at = NOW()
+                 instance_id = CASE
+                     WHEN node_k8s.k8s_node_uid IS DISTINCT FROM EXCLUDED.k8s_node_uid
+                     THEN EXCLUDED.instance_id
+                     ELSE COALESCE(EXCLUDED.instance_id, node_k8s.instance_id)
+                 END,
+                 updated_at = CASE
+                     WHEN node_k8s.k8s_node_name IS DISTINCT FROM EXCLUDED.k8s_node_name
+                       OR node_k8s.k8s_node_uid IS DISTINCT FROM EXCLUDED.k8s_node_uid
+                     THEN NOW()
+                     ELSE node_k8s.updated_at
+                 END
              WHERE node_k8s.k8s_node_name IS DISTINCT FROM EXCLUDED.k8s_node_name
-                OR node_k8s.k8s_node_uid IS DISTINCT FROM EXCLUDED.k8s_node_uid"
+                OR node_k8s.k8s_node_uid IS DISTINCT FROM EXCLUDED.k8s_node_uid
+                OR (EXCLUDED.instance_id IS NOT NULL
+                    AND node_k8s.instance_id IS DISTINCT FROM EXCLUDED.instance_id)"
     ))
     .bind(node_id)
     .bind(node_name)
     .bind(node_uid)
+    .bind(instance_id.map(Ec2InstanceId::as_str))
     .execute(&mut *conn)
     .await
     .step(K8sNodeRegistrationStep::UpsertNodeK8s)?

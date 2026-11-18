@@ -899,14 +899,15 @@ async fn missing_k8s_inventory_demotes_only_stale_ready_nodes() -> TestResult {
     ] {
         fixture
             .store
-            .persist_k8s_node_inventory(
+            .persist_k8s_node_inventory(K8sNodeRoleUpsert {
                 node_name,
-                &format!("uid-{node_id}"),
-                NodeId::from_uuid(node_id),
-                NodeRole::Worker,
-                Some("10.0.0.20"),
-                NodeStateWrite::Manage(NodeLifecycleState::Ready),
-            )
+                node_uid: &format!("uid-{node_id}"),
+                node_id: NodeId::from_uuid(node_id),
+                role: NodeRole::Worker,
+                address: Some("10.0.0.20"),
+                state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                instance_id: None,
+            })
             .await?;
     }
 
@@ -1012,28 +1013,30 @@ async fn inventory_listing_insert_only_does_not_downgrade_ready_node() -> TestRe
     let node_name = format!("space-test-inventory-node-{}", node_id.as_uuid().simple());
     fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-inv",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-inv",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.50"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.50"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
 
     // The inventory listing observes an unready node-api pod (rollout) and
     // writes with insert-only semantics.
     fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-inv",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-inv",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.50"),
-            NodeStateWrite::InsertOnly(NodeLifecycleState::from_ready(false)),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.50"),
+            state: NodeStateWrite::InsertOnly(NodeLifecycleState::from_ready(false)),
+            instance_id: None,
+        })
         .await?;
 
     let state: String = sqlx::query_scalar(sql!("SELECT state FROM nodes WHERE id = $1"))
@@ -1063,14 +1066,15 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
     let node_name = format!("space-test-ready-node-{}", node_id.as_uuid().simple());
     fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-ready",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-ready",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.30"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.30"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
 
     let sandbox_id = SandboxId::new();
@@ -1079,14 +1083,15 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
     // A pod lands on the node.
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_pod_node_placement(PodNodePlacement {
             sandbox_id,
-            &node_name,
-            "uid-ready",
+            node_name: &node_name,
+            node_uid: "uid-ready",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.30"),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.30"),
+            instance_id: None,
+        })
         .await?;
 
     let state: String = sqlx::query_scalar(sql!("SELECT state FROM nodes WHERE id = $1"))
@@ -1104,14 +1109,15 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
     // state.
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_pod_node_placement(PodNodePlacement {
             sandbox_id,
-            &node_name,
-            "uid-ready",
+            node_name: &node_name,
+            node_uid: "uid-ready",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.99"),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.99"),
+            instance_id: None,
+        })
         .await?;
     let (state, address): (String, String) =
         sqlx::query_as(sql!("SELECT state, host(address) FROM nodes WHERE id = $1"))
@@ -1135,14 +1141,15 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
     insert_sandbox(&fixture.pool, fresh_sandbox, "started").await?;
     fixture
         .store
-        .persist_pod_node_placement(
-            fresh_sandbox,
-            &fresh_name,
-            "uid-fresh",
-            fresh_id,
-            NodeRole::Worker,
-            Some("10.0.0.31"),
-        )
+        .persist_pod_node_placement(PodNodePlacement {
+            sandbox_id: fresh_sandbox,
+            node_name: &fresh_name,
+            node_uid: "uid-fresh",
+            node_id: fresh_id,
+            role: NodeRole::Worker,
+            address: Some("10.0.0.31"),
+            instance_id: None,
+        })
         .await?;
     let fresh_state: String = sqlx::query_scalar(sql!("SELECT state FROM nodes WHERE id = $1"))
         .bind(fresh_id)
@@ -1945,14 +1952,15 @@ async fn concurrent_pod_placement_and_cleanup_do_not_deadlock() -> TestResult {
     let placement_store = fixture.store.clone();
     let placement = tokio::spawn(async move {
         placement_store
-            .persist_pod_node_placement(
+            .persist_pod_node_placement(PodNodePlacement {
                 sandbox_id,
-                "worker-node-placement-race",
-                "worker-node-placement-race-uid",
+                node_name: "worker-node-placement-race",
+                node_uid: "worker-node-placement-race-uid",
                 node_id,
-                NodeRole::Worker,
-                Some("10.90.0.11"),
-            )
+                role: NodeRole::Worker,
+                address: Some("10.90.0.11"),
+                instance_id: None,
+            })
             .await
     });
     wait_for_blocked_query_count(
@@ -2034,14 +2042,15 @@ async fn pod_placement_survives_concurrent_insert_of_same_node() -> TestResult {
     let placement_name = node_name.clone();
     let placement = tokio::spawn(async move {
         placement_store
-            .persist_pod_node_placement(
+            .persist_pod_node_placement(PodNodePlacement {
                 sandbox_id,
-                &placement_name,
-                "uid-race",
+                node_name: &placement_name,
+                node_uid: "uid-race",
                 node_id,
-                NodeRole::Worker,
-                Some("10.0.0.40"),
-            )
+                role: NodeRole::Worker,
+                address: Some("10.0.0.40"),
+                instance_id: None,
+            })
             .await
     });
     wait_until_blocked_by(&fixture.pool, inserter_pid).await?;
@@ -3365,14 +3374,15 @@ async fn failed_started_recovery_with_node_placement_stays_started(
     };
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_pod_node_placement(PodNodePlacement {
             sandbox_id,
-            "placed-recovery-node",
-            "placed-recovery-node-uid",
+            node_name: "placed-recovery-node",
+            node_uid: "placed-recovery-node-uid",
             node_id,
-            NodeRole::Worker,
-            Some("10.90.0.10"),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.90.0.10"),
+            instance_id: None,
+        })
         .await?;
 
     fixture
@@ -5559,14 +5569,15 @@ async fn forget_pod_tracking_recovers_started_suspended_by_node_after_current_ba
         .await?;
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_pod_node_placement(PodNodePlacement {
             sandbox_id,
-            "worker-node-a",
-            "worker-node-a-uid",
+            node_name: "worker-node-a",
+            node_uid: "worker-node-a-uid",
             node_id,
-            NodeRole::Worker,
-            Some("10.90.0.10"),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.90.0.10"),
+            instance_id: None,
+        })
         .await?;
     sqlx::query(sql!(
         "UPDATE sandboxes
@@ -5803,14 +5814,15 @@ async fn unchanged_pod_node_placement_does_not_touch_current_rows(
 
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_pod_node_placement(PodNodePlacement {
             sandbox_id,
-            &node_name,
-            "node-uid",
+            node_name: &node_name,
+            node_uid: "node-uid",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.9"),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.9"),
+            instance_id: None,
+        })
         .await?;
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
@@ -5831,14 +5843,15 @@ async fn unchanged_pod_node_placement_does_not_touch_current_rows(
 
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_pod_node_placement(PodNodePlacement {
             sandbox_id,
-            &node_name,
-            "node-uid",
+            node_name: &node_name,
+            node_uid: "node-uid",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.9"),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.9"),
+            instance_id: None,
+        })
         .await?;
 
     let (execution_unchanged, sandbox_unchanged): (bool, bool) = sqlx::query_as(sql!(
@@ -9071,14 +9084,15 @@ async fn persist_k8s_node_inventory_stores_canonical_role(fixture: &PostgresStor
         }
         fixture
             .store
-            .persist_k8s_node_inventory(
-                &node_name,
-                "uid-A",
-                space_k8s_node_id(&node_name, role.as_str()),
+            .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                node_name: &node_name,
+                node_uid: "uid-A",
+                node_id: space_k8s_node_id(&node_name, role.as_str()),
                 role,
-                Some("10.0.0.12"),
-                NodeStateWrite::Manage(NodeLifecycleState::Ready),
-            )
+                address: Some("10.0.0.12"),
+                state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                instance_id: None,
+            })
             .await?;
     }
 
@@ -9238,14 +9252,15 @@ async fn upsert_clears_drain_state_when_k8s_node_uid_changes(
         ] {
             fixture
                 .store
-                .persist_k8s_node_inventory(
-                    name,
-                    uid,
-                    id,
-                    NodeRole::Worker,
-                    Some("10.0.0.1"),
-                    NodeStateWrite::Manage(NodeLifecycleState::Ready),
-                )
+                .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                    node_name: name,
+                    node_uid: uid,
+                    node_id: id,
+                    role: NodeRole::Worker,
+                    address: Some("10.0.0.1"),
+                    state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                    instance_id: None,
+                })
                 .await?;
         }
         set_drain_state(&fixture.pool, node_id, phase).await?;
@@ -9264,14 +9279,15 @@ async fn upsert_clears_drain_state_when_k8s_node_uid_changes(
         // is the inventory reflector's normal upsert path.
         let changed = fixture
             .store
-            .persist_k8s_node_inventory(
-                &node_name,
-                "uid-B",
+            .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                node_name: &node_name,
+                node_uid: "uid-B",
                 node_id,
-                NodeRole::Worker,
-                Some("10.0.0.1"),
-                NodeStateWrite::Manage(NodeLifecycleState::Ready),
-            )
+                role: NodeRole::Worker,
+                address: Some("10.0.0.1"),
+                state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                instance_id: None,
+            })
             .await?;
         assert!(changed, "{phase:?}: a UID replacement must report changed");
 
@@ -9329,28 +9345,30 @@ async fn upsert_preserves_drain_state_when_k8s_node_uid_unchanged(
 
         fixture
             .store
-            .persist_k8s_node_inventory(
-                &node_name,
-                "uid-A",
+            .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                node_name: &node_name,
+                node_uid: "uid-A",
                 node_id,
-                NodeRole::Worker,
-                Some("10.0.0.2"),
-                NodeStateWrite::Manage(NodeLifecycleState::Ready),
-            )
+                role: NodeRole::Worker,
+                address: Some("10.0.0.2"),
+                state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                instance_id: None,
+            })
             .await?;
         let drain = set_drain_state(&fixture.pool, node_id, phase).await?;
 
         // Re-observation with the same UID (every reflector tick).
         let changed = fixture
             .store
-            .persist_k8s_node_inventory(
-                &node_name,
-                "uid-A",
+            .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                node_name: &node_name,
+                node_uid: "uid-A",
                 node_id,
-                NodeRole::Worker,
-                Some("10.0.0.2"),
-                NodeStateWrite::Manage(NodeLifecycleState::Ready),
-            )
+                role: NodeRole::Worker,
+                address: Some("10.0.0.2"),
+                state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                instance_id: None,
+            })
             .await?;
         assert!(
             !changed,
@@ -9368,14 +9386,15 @@ async fn upsert_preserves_drain_state_when_k8s_node_uid_unchanged(
     let node_id = NodeId::new();
     let node_name = format!("space-test-node-{}", node_id.as_uuid().simple());
     let register = || {
-        fixture.store.persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
+        fixture.store.persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-A",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.2"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.2"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
     };
     register().await?;
     let seeded: NodeDrainColumns = sqlx::query_as(sql!(
@@ -9417,14 +9436,15 @@ async fn persist_k8s_node_inventory_repairs_missing_and_stale_address(
 
     let changed = fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-A",
             node_id,
-            NodeRole::Worker,
-            None,
-            NodeStateWrite::Manage(NodeLifecycleState::Registered),
-        )
+            role: NodeRole::Worker,
+            address: None,
+            state: NodeStateWrite::Manage(NodeLifecycleState::Registered),
+            instance_id: None,
+        })
         .await?;
     assert!(changed, "initial inventory insert must report changed");
 
@@ -9437,14 +9457,15 @@ async fn persist_k8s_node_inventory_repairs_missing_and_stale_address(
 
     let changed = fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-A",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.33"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.33"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
     assert!(changed, "address and state backfill must report changed");
 
@@ -9467,14 +9488,15 @@ async fn persist_k8s_node_inventory_repairs_missing_and_stale_address(
 
     let changed = fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-A",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.33"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.33"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
     assert!(
         !changed,
@@ -9493,14 +9515,15 @@ async fn persist_k8s_node_inventory_repairs_missing_and_stale_address(
 
     let changed = fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-A",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.44"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.44"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
     assert!(changed, "stale address repair must report changed");
 
@@ -9535,14 +9558,15 @@ async fn azrebalance_variant_uid_change_does_not_leak_stale_drain_state_or_drain
 
     fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "instance-A-uid",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "instance-A-uid",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.20"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.20"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
     sqlx::query(sql!(
         "UPDATE nodes
@@ -9557,14 +9581,15 @@ async fn azrebalance_variant_uid_change_does_not_leak_stale_drain_state_or_drain
 
     fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "instance-B-uid",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "instance-B-uid",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.20"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.20"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
 
     let stored_uid: String =
@@ -9849,6 +9874,7 @@ async fn placement_retryability_follows_the_operation_not_the_statement() -> Tes
                 node_id,
                 role: NodeRole::Worker,
                 address: Some("10.0.0.1"),
+                instance_id: None,
             },
             retry,
         )
