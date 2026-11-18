@@ -4,9 +4,6 @@
 //! path-safe names for node-local artifacts. `SnapshotConfig` records the
 //! compute shape and optional disk shape needed to create or resume a snapshot.
 //!
-//! These types are their own crate so that code can name them without
-//! depending on `pplx-space-common-core`.
-//!
 //! # Examples
 //!
 //! ```rust

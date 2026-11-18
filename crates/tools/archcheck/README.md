@@ -282,10 +282,9 @@ service: `sbx-mgr` beside `sbx-mgr-client` is at
 directories are listed by layer in `[rules.layers.unmoved]` until they move;
 a new crate goes in a layer directory, and a crate changes layer by moving
 into that layer's directory, not by editing its entry. `[rules.layers]
-legacy` names the crates being dissolved, such as `pplx-space-common-core`,
-which predate the layers and mix SPACE-specific code in until they are split
-up: every check covers them like any other crate, with today's edges
-baselined.
+legacy`, an optional list, names the crates being dissolved, which predate
+the layers and mix SPACE-specific code in until they are split up: every
+check covers them like any other crate, with today's edges baselined.
 
 Normal and build dependencies follow this matrix; the checks below say what
 each finding means and how to fix it.
@@ -317,7 +316,7 @@ helpers = ["pplx-space-s3-http-client", "pplx-space-sqlite"]  # every storage he
 sqlx = ["Type", "postgres::PgTypeInfo"]   # paths below each driver's root, each exactly
 
 [rules.layers]
-legacy = ["pplx-space-common-core"]    # crates being dissolved; see Storage access below
+legacy = ["pplx-space-old-models"]     # optional: crates being dissolved; see Storage access below
 protocols = ["pplx-space-events"]      # protocols without a *-protocol or *-proto name; see Domain
 
 [rules.layers.domain_fences]           # packages no Domain crate depends on, by family
@@ -592,7 +591,7 @@ keyed by package:
   on that dependency's or `[features]` item's line and says which driver the
   feature reaches. `[layers.codec_features]` maps each package to the
   `<package>/<feature>` entries it enables, such as `pplx-space-api =
-  ["pplx-space-common-core/sqlx"]`. A store's own driver features are not
+  ["pplx-space-sandbox-model/sqlx"]`. A store's own driver features are not
   checked: depending on a store is how an API crate reaches storage, and a
   feature that reaches a driver only through a store's is no driver feature.
 
@@ -885,11 +884,11 @@ so a new table is declared by its owner before its migration lands (see
   before: its dependents get `storage_access` findings only once it is
   listed. Stores, other helpers, test support and tools are exempt.
 - `codec_features` reads the feature requests in each crate's own manifest,
-  not the features Cargo unifies for a build. A crate that enables
-  `common-core/sqlx` makes its dependents build against `common-core`'s
-  `sqlx` impls whatever they request; one that drops `"sqlx"` from its own
-  manifest loses its baseline entry, which `stale_entries` reports, but
-  keeps the impls.
+  not the features Cargo unifies for a build. A store that enables
+  `sandbox-model/sqlx` makes every crate that depends on it build against
+  `sandbox-model`'s `sqlx` impls whatever they request; one that drops
+  `"sqlx"` from its own manifest loses its baseline entry, which
+  `stale_entries` reports, but keeps the impls.
 - The drivers are a hand-kept list, and `cargo metadata` runs with
   `--no-deps`, so a crate outside the workspace that wraps or re-exports a
   driver is not seen unless it is listed. A workspace crate that does is a

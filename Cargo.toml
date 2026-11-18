@@ -112,7 +112,6 @@ members = [
     "crates/l40_api/api",
     "crates/l20_domain/api/route",
     "crates/l10_foundation/byte/size",
-    "crates/libs/common/core",
     "crates/l10_foundation/semver",
     "crates/l10_foundation/durations",
     "crates/l10_foundation/stopwatch",

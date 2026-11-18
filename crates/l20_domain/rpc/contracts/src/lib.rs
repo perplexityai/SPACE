@@ -7,9 +7,6 @@
 //! inventory limits on unary requests and responses and on SQLite and sidecar
 //! reads; and the per-operation runtime RPC budgets. Producer and consumer
 //! must name the same constant, never restate the literal.
-//!
-//! It is its own crate so that services can share these contracts without
-//! depending on `pplx-space-common-core`: import them from here.
 
 pub mod inventory;
 pub mod operation_budget;

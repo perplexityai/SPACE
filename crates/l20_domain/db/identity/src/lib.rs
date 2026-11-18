@@ -1,8 +1,7 @@
 //! Control-plane Postgres identities used by application connection pools.
 //!
 //! It is its own crate so that connection-pool code can name the closed set of
-//! application Postgres logins without depending on `pplx-space-common-core`:
-//! import [`DatabaseIdentity`] from here.
+//! application Postgres logins without depending on a SPACE model crate.
 
 use std::fmt;
 
