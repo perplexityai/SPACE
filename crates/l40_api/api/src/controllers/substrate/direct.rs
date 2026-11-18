@@ -3930,16 +3930,16 @@ impl DirectSubstrate {
     /// [`Self::adopt_live_source_record`] for an execution on `node` at
     /// `execution_generation`, `started` when its worker runs it.
     ///
-    /// One transaction takes the `sandboxes` row lock, reads the route
-    /// identity and the last reservation in one statement, so they come from
-    /// one snapshot as the joined `UPDATE ... FROM` read them, and makes the
-    /// guarded write ([`direct_store::adopt_live_execution`]) with the two
-    /// facts they give. The read takes no row locks. Locking the route rows
+    /// One transaction selects the candidate with the full guard in one
+    /// statement, locks only that `sandboxes` row, and makes the guarded
+    /// write ([`direct_store::adopt_live_execution`]) with the two facts the
+    /// route identity and the last reservation give. The joined `UPDATE ...
+    /// FROM` it replaced locked only a row its snapshot matched, and so does
+    /// this: a row another restore owns under a live lease returns no row
+    /// without waiting, so Wake still reports the restore in flight. The
+    /// route rows take no lock and come from the same snapshot. Locking them
     /// would order the adoption against writers that take the route identity
-    /// and the provenance in different orders, and the joined statement did
-    /// not lock them either: it read them from a snapshot taken before it
-    /// waited on the row. Read after the row lock, they are at least as fresh
-    /// as that snapshot.
+    /// and the provenance in different orders.
     async fn adopt_live_execution(
         &self,
         sandbox_id: SandboxId,
@@ -3956,45 +3956,43 @@ impl DirectSubstrate {
         // `NO KEY UPDATE` is the lock an update of the row takes. `FOR UPDATE`
         // would also block the foreign-key check of an insert into the route
         // tables, which a route writer can reach while holding its route row.
-        let locked = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT TRUE
-               FROM sandboxes
-              WHERE id = $1
-              FOR NO KEY UPDATE"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_optional(&mut *transaction)
-        .await
-        .db_context("failed to lock the sandbox for the live record's adoption")?;
-        let route = sqlx::query_as::<_, (NodeId, i64, i64)>(sql!(
-            "SELECT route.current_node_id,
-                    route.execution_generation,
+        // A row that passes the guard after a wait is re-checked against its
+        // new version, as the joined `UPDATE` re-checked it.
+        let route = sqlx::query_as::<_, (i64, i64)>(sql!(
+            "SELECT route.execution_generation,
                     provenance.last_execution_generation
-               FROM sandbox_direct_route_identities route
-               JOIN sandbox_direct_route_provenance provenance
-                 ON provenance.sandbox_id = route.sandbox_id
-              WHERE route.sandbox_id = $1"
+               FROM sandboxes s
+               JOIN sandbox_direct_route_identities route ON route.sandbox_id = s.id
+               JOIN sandbox_direct_route_provenance provenance ON provenance.sandbox_id = s.id
+              WHERE s.id = $1
+                AND s.managed_by = $2
+                AND s.active_node_id IS NULL
+                AND LOWER(TRIM(s.lifecycle)) = $3
+                AND (s.restore_lease_expires_at IS NULL OR s.restore_lease_expires_at <= NOW())
+                AND route.current_node_id = $4
+                AND route.execution_generation <= $5
+                AND provenance.last_execution_generation >= $5
+                AND (
+                    s.restore_lease_token IS NULL
+                    OR (route.execution_generation = $5
+                        AND provenance.last_execution_generation = $5)
+                )
+              FOR NO KEY UPDATE OF s"
         ))
         .bind(sandbox_id.as_uuid())
+        .bind(SubstrateKind::Space)
+        .bind(read_lifecycle.as_str())
+        .bind(node.id)
+        .bind(execution_generation)
         .fetch_optional(&mut *transaction)
         .await
-        .db_context(
-            "failed to read the route identity and provenance for the live record's adoption",
-        )?;
-        let adoptable = match (locked, route) {
-            (Some(_), Some((route_node_id, route_generation, last_generation)))
-                if route_node_id == node.id
-                    && route_generation <= execution_generation
-                    && last_generation >= execution_generation =>
-            {
-                Some((
-                    route_generation == execution_generation
-                        && last_generation == execution_generation,
-                    started && route_generation == execution_generation,
-                ))
-            }
-            _ => None,
-        };
+        .db_context("failed to select the sandbox for the live record's adoption")?;
+        let adoptable = route.map(|(route_generation, last_generation)| {
+            (
+                route_generation == execution_generation && last_generation == execution_generation,
+                started && route_generation == execution_generation,
+            )
+        });
         let adopted = match adoptable {
             Some((one_generation, started_now)) => direct_store::adopt_live_execution(
                 &mut *transaction,

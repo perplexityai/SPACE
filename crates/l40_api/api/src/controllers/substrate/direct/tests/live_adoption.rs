@@ -425,3 +425,50 @@ async fn adoption_does_not_wait_on_route_or_provenance_writers() -> TestResult {
     );
     Ok(())
 }
+
+/// A row another restore owns under a live lease fails the guard in the
+/// adoption's snapshot, so the adoption returns no row without waiting on
+/// that owner's row lock, as the joined `UPDATE` it replaced did, and Wake
+/// can still report the restore in flight.
+#[tokio::test(flavor = "current_thread")]
+async fn adoption_does_not_wait_on_a_sandbox_another_restore_owns() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let source_id = NodeId::new();
+    let other_id = NodeId::new();
+    insert_ready_worker(&fixture.pool, source_id, "http://127.0.0.1:1", "9.0.0").await?;
+    insert_ready_worker(&fixture.pool, other_id, "http://127.0.0.1:2", "9.0.0").await?;
+    let source = fixture.substrate.direct_node_by_id(source_id).await?;
+    let sandbox_id = SandboxId::new();
+    let case = CASES
+        .iter()
+        .find(|case| matches!(case.seed, Seed::LiveLease))
+        .expect("the guard matrix seeds a live lease");
+    let seeded = seed(&fixture.pool, case, sandbox_id, source_id, other_id).await?;
+
+    let mut holder = fixture.pool.begin().await?;
+    sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
+        .bind(sandbox_id.as_uuid())
+        .fetch_one(&mut *holder)
+        .await?;
+
+    let adopted = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.substrate.adopt_live_execution(
+            sandbox_id,
+            case.seed.read_lifecycle(),
+            &source,
+            GENERATION,
+            case.started,
+        ),
+    )
+    .await;
+    holder.rollback().await?;
+    let placed_on = adopted
+        .expect("the adoption must not wait on the restore owner's row lock")?
+        .map(|node| node.id);
+    assert_eq!(placed_on, None);
+    assert_eq!(row(&fixture.pool, sandbox_id).await?, seeded);
+    Ok(())
+}
