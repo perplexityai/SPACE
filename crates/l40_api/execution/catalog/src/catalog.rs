@@ -343,9 +343,17 @@ const FIRECRACKER_KERNELS: &[CompiledKernel] = &[
 ];
 
 /// Firecracker guest kernels SPACE builds itself from
-/// `templates/firecracker/kernel/`, not Firecracker CI images. Only the
-/// opt-in SPACE-published kernel source offers them.
-const SPACE_FIRECRACKER_KERNELS: &[CompiledKernel] = &[];
+/// `templates/firecracker/kernel/`, not Firecracker CI images.
+const SPACE_FIRECRACKER_KERNELS: &[CompiledKernel] = &[
+    // The BPF/module-signing profile of 6.1.155 with built-in nf_tables.
+    CompiledKernel {
+        version: "6.1.155-bpf-modsig-nft",
+        runtime_line: "1.17",
+        architecture: "x86_64",
+        size: 60_975_280,
+        sha256: "6e7fc9417db2b53cc4af5915a6734368875ea44dc897cd7eeff398da27423592",
+    },
+];
 
 /// One file of a pinned release, at its release-layout path.
 #[derive(Clone, Debug, Eq, PartialEq)]

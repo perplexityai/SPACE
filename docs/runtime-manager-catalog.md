@@ -18,8 +18,9 @@ policy permission.
 | 1.16.0, 1.16.1 | 10.0.0 | 5.10.253, 6.1.172 | `20260603-e656faf58d6c-0` |
 | 1.16.2 | 11.0.0 | 5.10.253, 6.1.172 | `20260603-e656faf58d6c-0` |
 | 1.17.0 | 12.0.0 | 6.1.186, 6.18.44 | `20260909-a8e1c3830545-0` |
+| 1.17.0 | 12.0.0 | 6.1.155-bpf-modsig-nft | SPACE-published, not upstream |
 
-Kernel directories are relative to `s3://spec.ccfc.min/firecracker-ci`, with
+Upstream kernel directories are relative to `s3://spec.ccfc.min/firecracker-ci`, with
 objects named `<directory>/<architecture>/vmlinux-<version>`. The dated
 snapshots were available immediately before the corresponding release line
 shipped. Every patch release within a line uses the same options. These are
@@ -57,6 +58,18 @@ The September snapshot's `vmlinux-5.10.260` is deliberately excluded: both
 architectures report `Linux version 5.10.255-260`, which contradicts the listed
 version and would be rejected by the installer. Debug and no-ACPI variants are
 not included in these additions.
+
+`6.1.155-bpf-modsig-nft` is not an upstream image. It is SPACE's build from
+`templates/firecracker/kernel/` with the optional BPF/module-signing profile and
+built-in nf_tables, 60,975,280 bytes with SHA-256
+`6e7fc9417db2b53cc4af5915a6734368875ea44dc897cd7eeff398da27423592`, and its
+banner names release 6.1.155. Unlike the rows above, the upstream S3 source
+never offers it: it is installable only through the opt-in
+[SPACE-published kernel source](#space-published-kernels). A node without that
+source reports the artifact as not offered and its runtime provisioning as
+blocked for it; its other installs, readiness and scheduling are unaffected.
+Configure the source before this catalog reaches a provisioning-enabled
+cluster, as that section's rollout order describes.
 
 Multipart S3 ETags are not content MD5 hashes. An absent MD5 is supported, while
 catalog SHA-256 and size checks remain mandatory in runtime-manager and

@@ -59,6 +59,10 @@ fn compiled_pins() -> Result<&'static BTreeMap<Digest, VerityDigest>, &'static s
             "sha256:d8ced68bd61e27b6813e2c993cc53a4029c59e13210672180591c84109684fe4",
             "sha256:45ef19d3bc9a6ff4c929ff5dcc462a8052cee82c68043d9067f2ee57a5f6df8e",
         ),
+        (
+            "sha256:6e7fc9417db2b53cc4af5915a6734368875ea44dc897cd7eeff398da27423592",
+            "sha256:78f0f932b5407ad76266e336f74883614e16e969b14359cc7537ed0cd4ae65b6",
+        ),
     ];
     static PINS_CACHE: std::sync::OnceLock<
         Result<BTreeMap<Digest, VerityDigest>, super::CatalogError>,
