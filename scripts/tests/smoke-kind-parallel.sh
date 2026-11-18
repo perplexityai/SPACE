@@ -27,13 +27,11 @@
 #
 # Usage:
 #   scripts/tests/smoke-kind-parallel.sh [run] [--benches N] [--keep] [--out DIR]
-#   scripts/tests/smoke-kind-parallel.sh teardown [--purge-cache]
+#   scripts/tests/smoke-kind-parallel.sh teardown
 #
 #   --benches N  benches to run (default: from the host's CPUs, available
 #                memory, free disk and a write probe of the bench volume, printed)
 #   --keep       leave the benches up afterwards; `teardown` removes them
-#   --purge-cache  with `teardown`, also delete the registries' data (the Docker
-#                Hub mirror's and the layer cache's) under ~/.space-benches-cache
 #   --out DIR    where logs, timings and the summary go
 #                (default: ~/.space-devbox/kind-parallel/<run id>)
 #
@@ -66,7 +64,6 @@ cd "$REPO_ROOT"
 COMMAND=run
 BENCHES=""
 KEEP=0
-PURGE_CACHE=0
 OUT=""
 if [[ "${1:-}" == run || "${1:-}" == teardown ]]; then
   COMMAND="$1"
@@ -77,7 +74,6 @@ while (( $# > 0 )); do
     --benches) BENCHES="${2:?--benches needs a count}"; shift 2 ;;
     --benches=*) BENCHES="${1#*=}"; shift ;;
     --keep) KEEP=1; shift ;;
-    --purge-cache) PURGE_CACHE=1; shift ;;
     --out) OUT="${2:?--out needs a directory}"; shift 2 ;;
     --out=*) OUT="${1#*=}"; shift ;;
     -h|--help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -99,11 +95,14 @@ done
 # repository besides GHCR, so each bench forwards its own
 # 127.0.0.1:$CACHE_PORT to the host's. Neither takes credentials: the layer
 # cache is local to this host, its benches and later runs read it, and any
-# local user can write it. `teardown --purge-cache` deletes their data.
+# local user can write it. Their data and the seed stay in
+# <bench root>/cache between runs; delete that directory to reclaim the space.
 REGISTRY_LINK="${KIND_BENCH_PREFIX:0:8}0"
 REGISTRY_IP=192.168.241.1
 REGISTRY_IMAGE="public.ecr.aws/docker/library/registry:2"
-CACHE_ROOT="$KIND_BENCH_ROOT-cache"
+# Inside the bench root, which is the caller's (a bench's own directories are
+# numbered and marked, so nothing treats this one as a bench).
+CACHE_ROOT="$KIND_BENCH_ROOT/cache"
 MIRROR_NAME="${KIND_BENCH_PREFIX}-hub-mirror"
 MIRROR_PORT=5000
 CACHE_NAME="${KIND_BENCH_PREFIX}-layer-cache"
@@ -209,16 +208,10 @@ if [[ "$COMMAND" == teardown ]]; then
   sudo -n true 2>/dev/null || die "teardown needs passwordless sudo"
   status=0
   teardown_all || status=2
-  # The registries' data stays in $CACHE_ROOT for the next run, unless
-  # --purge-cache: the layer cache trusts every local user (any of them can
-  # push to it) and nothing else collects what runs add to it.
+  # The registries' data stays in $CACHE_ROOT for the next run.
   docker rm -f "$MIRROR_NAME" "$CACHE_NAME" >/dev/null 2>&1 || true
   registry_firewall_remove
   sudo -n ip link del "$REGISTRY_LINK" 2>/dev/null || true
-  if (( PURGE_CACHE )); then
-    log "removing the registries' data under $CACHE_ROOT"
-    sudo -n rm -rf -- "$CACHE_ROOT" || status=2
-  fi
   exit "$status"
 fi
 

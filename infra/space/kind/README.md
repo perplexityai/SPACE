@@ -380,10 +380,11 @@ checkout. It also adds a dummy interface holding 192.168.241.1, a mangle-table
 chain that accepts connections to that address only from the host and the
 benches' links, and two registry containers on the host's Docker that keep
 running between runs. A run's exit removes its benches; `teardown` also stops
-the registries and removes the interface and the chain, and `teardown
---purge-cache` also deletes the registries' data under `~/.space-benches-cache`.
-The registries take no credentials: the layer cache is local to the host, and
-any local user can write it. The loop nodes, the raised limits, the modules,
+the registries and removes the interface and the chain. The registries' data
+and the seed stay in `<bench root>/cache` (default `~/.space-benches/cache`);
+delete that directory yourself (with `sudo`: the registries write as root) to
+reclaim the space. The registries take no credentials: the layer cache is
+local to the host, and any local user can write it. The loop nodes, the raised limits, the modules,
 the static Docker release and the lock directory stay.
 
 Each bench keeps every default name and port (`space-local`, API
@@ -415,7 +416,7 @@ seed is built once and copied in; the host's loop-device pool and inotify
 limits are raised before any bench starts (loop devices are kernel-global, but
 a container's `/dev` holds only the nodes its host had when it was created; see
 `scripts/lib/space-loop-devices.sh`). Two registries on the host's
-Docker, kept across runs under `~/.space-benches-cache`, serve every bench: a
+Docker, kept across runs under `<bench root>/cache`, serve every bench: a
 pull-through Docker Hub mirror, so an image costs one pull from the host's
 egress rather than one per bench, and the layer cache
 ([CI layer cache](#ci-layer-cache)) as a loopback registry, into which the host
