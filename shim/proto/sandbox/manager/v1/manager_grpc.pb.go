@@ -64,6 +64,8 @@ const (
 	SandboxManager_ListAutoLifecycleDeleteReceipts_FullMethodName        = "/space.sandbox.manager.v1.SandboxManager/ListAutoLifecycleDeleteReceipts"
 	SandboxManager_AcknowledgeAutoLifecycleDeleteReceipts_FullMethodName = "/space.sandbox.manager.v1.SandboxManager/AcknowledgeAutoLifecycleDeleteReceipts"
 	SandboxManager_ListPendingLocalBackups_FullMethodName                = "/space.sandbox.manager.v1.SandboxManager/ListPendingLocalBackups"
+	SandboxManager_DrainNode_FullMethodName                              = "/space.sandbox.manager.v1.SandboxManager/DrainNode"
+	SandboxManager_PreviewDrainNode_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/PreviewDrainNode"
 	SandboxManager_GetNetworkPolicy_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/GetNetworkPolicy"
 	SandboxManager_SetNetworkPolicy_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/SetNetworkPolicy"
 	SandboxManager_TemplateNetworkPolicyUpdated_FullMethodName           = "/space.sandbox.manager.v1.SandboxManager/TemplateNetworkPolicyUpdated"
@@ -311,6 +313,13 @@ type SandboxManagerClient interface {
 	// the call rather than silently shrinking the set, because a caller
 	// cannot distinguish a short answer from a complete one.
 	ListPendingLocalBackups(ctx context.Context, in *ListPendingLocalBackupsRequest, opts ...grpc.CallOption) (*ListPendingLocalBackupsResponse, error)
+	// Level-triggered: each call states the desired drain and gets the node's state back;
+	// repeating a call is safe. One DrainNode call at a time per node: a call that arrives
+	// while another is in progress (drain or cancel, scans included) fails at once with
+	// ABORTED and DRAIN_CALL_IN_PROGRESS_MARKER and changes nothing.
+	DrainNode(ctx context.Context, in *DrainNodeRequest, opts ...grpc.CallOption) (*DrainNodeResponse, error)
+	// Read-only: what an evacuating drain would find on this unsealed node now.
+	PreviewDrainNode(ctx context.Context, in *PreviewDrainNodeRequest, opts ...grpc.CallOption) (*PreviewDrainNodeResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(ctx context.Context, in *GetNetworkPolicyRequest, opts ...grpc.CallOption) (*GetNetworkPolicyResponse, error)
 	// Apply a sandbox's desired network policy on the node.
@@ -821,6 +830,26 @@ func (c *sandboxManagerClient) ListPendingLocalBackups(ctx context.Context, in *
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListPendingLocalBackupsResponse)
 	err := c.cc.Invoke(ctx, SandboxManager_ListPendingLocalBackups_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) DrainNode(ctx context.Context, in *DrainNodeRequest, opts ...grpc.CallOption) (*DrainNodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DrainNodeResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_DrainNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) PreviewDrainNode(ctx context.Context, in *PreviewDrainNodeRequest, opts ...grpc.CallOption) (*PreviewDrainNodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PreviewDrainNodeResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_PreviewDrainNode_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1525,6 +1554,13 @@ type SandboxManagerServer interface {
 	// the call rather than silently shrinking the set, because a caller
 	// cannot distinguish a short answer from a complete one.
 	ListPendingLocalBackups(context.Context, *ListPendingLocalBackupsRequest) (*ListPendingLocalBackupsResponse, error)
+	// Level-triggered: each call states the desired drain and gets the node's state back;
+	// repeating a call is safe. One DrainNode call at a time per node: a call that arrives
+	// while another is in progress (drain or cancel, scans included) fails at once with
+	// ABORTED and DRAIN_CALL_IN_PROGRESS_MARKER and changes nothing.
+	DrainNode(context.Context, *DrainNodeRequest) (*DrainNodeResponse, error)
+	// Read-only: what an evacuating drain would find on this unsealed node now.
+	PreviewDrainNode(context.Context, *PreviewDrainNodeRequest) (*PreviewDrainNodeResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error)
 	// Apply a sandbox's desired network policy on the node.
@@ -1730,6 +1766,12 @@ func (UnimplementedSandboxManagerServer) AcknowledgeAutoLifecycleDeleteReceipts(
 }
 func (UnimplementedSandboxManagerServer) ListPendingLocalBackups(context.Context, *ListPendingLocalBackupsRequest) (*ListPendingLocalBackupsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListPendingLocalBackups not implemented")
+}
+func (UnimplementedSandboxManagerServer) DrainNode(context.Context, *DrainNodeRequest) (*DrainNodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DrainNode not implemented")
+}
+func (UnimplementedSandboxManagerServer) PreviewDrainNode(context.Context, *PreviewDrainNodeRequest) (*PreviewDrainNodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PreviewDrainNode not implemented")
 }
 func (UnimplementedSandboxManagerServer) GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetNetworkPolicy not implemented")
@@ -2645,6 +2687,42 @@ func _SandboxManager_ListPendingLocalBackups_Handler(srv interface{}, ctx contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxManager_DrainNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DrainNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).DrainNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_DrainNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).DrainNode(ctx, req.(*DrainNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_PreviewDrainNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PreviewDrainNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).PreviewDrainNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_PreviewDrainNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).PreviewDrainNode(ctx, req.(*PreviewDrainNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SandboxManager_GetNetworkPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetNetworkPolicyRequest)
 	if err := dec(in); err != nil {
@@ -3482,6 +3560,14 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListPendingLocalBackups",
 			Handler:    _SandboxManager_ListPendingLocalBackups_Handler,
+		},
+		{
+			MethodName: "DrainNode",
+			Handler:    _SandboxManager_DrainNode_Handler,
+		},
+		{
+			MethodName: "PreviewDrainNode",
+			Handler:    _SandboxManager_PreviewDrainNode_Handler,
 		},
 		{
 			MethodName: "GetNetworkPolicy",
