@@ -28,7 +28,9 @@ use sha2::{Digest as _, Sha256};
 use crate::layout::ReleaseLayout;
 
 mod boot_artifact;
-pub use boot_artifact::{BOOT_ARTIFACT_IMAGE, BootArtifactPinError, PinnedBootArtifact};
+pub use boot_artifact::{
+    AUXILIARY_BOOT_KINDS, BOOT_ARTIFACT_IMAGE, BootArtifactPinError, PinnedBootArtifact,
+};
 mod environment;
 mod uefi;
 mod verity;

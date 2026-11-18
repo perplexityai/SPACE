@@ -24,7 +24,9 @@ pub(crate) fn mark_managed_store(
             }),
             ArtifactKind::Component(kind) => roots.managed_kernels.as_ref().is_some_and(|root| {
                 let root = match kind {
-                    pplx_space_execution_spec::ArtifactComponentKind::Firmware => {
+                    kind if pplx_space_node_runtime_core::catalog::AUXILIARY_BOOT_KINDS
+                        .contains(&kind) =>
+                    {
                         pplx_space_node_runtime_core::artifact_layout::boot_artifacts_root(root)
                     }
                     _ => root.clone(),

@@ -116,6 +116,8 @@ pub struct ArtifactKinds {
     pub runtimes: bool,
     pub kernels: bool,
     pub firmware: bool,
+    pub wasm_modules: bool,
+    pub guest_tools: bool,
 }
 
 impl ArtifactKinds {
@@ -123,12 +125,16 @@ impl ArtifactKinds {
         runtimes: true,
         kernels: true,
         firmware: true,
+        wasm_modules: true,
+        guest_tools: true,
     };
 
     pub const fn includes_component(self, kind: ArtifactComponentKind) -> bool {
         match kind {
             ArtifactComponentKind::Kernel => self.kernels,
             ArtifactComponentKind::Firmware => self.firmware,
+            ArtifactComponentKind::WasmModule => self.wasm_modules,
+            ArtifactComponentKind::GuestTools => self.guest_tools,
             _ => false,
         }
     }
@@ -665,8 +671,10 @@ pub fn scan(
 
     if let Some(kernels) = &roots.managed_kernels {
         let root = crate::artifact_layout::boot_artifacts_root(kernels);
-        if kinds.includes_component(ArtifactComponentKind::Firmware) {
-            scanner.scan_boot_artifacts(&root, ArtifactComponentKind::Firmware);
+        for &kind in crate::catalog::AUXILIARY_BOOT_KINDS {
+            if kinds.includes_component(kind) {
+                scanner.scan_boot_artifacts(&root, kind);
+            }
         }
     }
 

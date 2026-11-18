@@ -272,6 +272,64 @@ async fn component_kinds_narrow_the_components_listed() {
         [ExecutionArtifactKind::Runtime as i32]
     );
 
+    // Immutable program/data files share the managed auxiliary store, not the
+    // kernel tree. Selecting one kind must not return another kind's payload.
+    let mut managed = roots;
+    managed.managed_kernels = Some(dir.path().join("managed/kernels"));
+    let store = pplx_space_node_runtime_core::artifact_layout::boot_artifacts_root(
+        managed.managed_kernels.as_ref().unwrap(),
+    );
+    let bytes = b"opaque program data";
+    let digest = {
+        use sha2::{Digest as _, Sha256};
+        Digest::sha256(Sha256::digest(bytes).into())
+    };
+    let auxiliary = RuntimeManagerService::new(
+        managed,
+        dir.path().join("managed/state"),
+        LIMITS,
+        Duration::from_millis(50),
+    );
+    for kind in [
+        ArtifactComponentKind::WasmModule,
+        ArtifactComponentKind::GuestTools,
+    ] {
+        let identity = pplx_space_node_runtime_manager_client::proto::ComponentIdentity {
+            kind: kind as i32,
+            version: "test-program-1".into(),
+            digest: digest.to_string(),
+        };
+        let component = parse_component(Some(&identity)).unwrap();
+        let directory =
+            pplx_space_node_runtime_core::artifact_store::boot_artifact_directory(&component);
+        write(&store.join(directory).join("image"), bytes);
+    }
+    for kind in [
+        ArtifactComponentKind::WasmModule,
+        ArtifactComponentKind::GuestTools,
+    ] {
+        let response = auxiliary
+            .list_execution_artifacts(peer_request(
+                ListExecutionArtifactsRequest {
+                    kinds: vec![ExecutionArtifactKind::Component as i32],
+                    component_kinds: vec![kind as i32],
+                },
+                0,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.complete);
+        assert_eq!(response.artifacts.len(), 1);
+        let artifact = &response.artifacts[0];
+        assert_eq!(artifact.component_kind, kind as i32);
+        assert_eq!(artifact.management, ArtifactManagement::SpaceManaged as i32);
+        assert_eq!(
+            artifact.digest.as_deref(),
+            Some(digest.to_string().as_str())
+        );
+    }
+
     for kind in [ArtifactComponentKind::Unspecified as i32, 42] {
         let status = list(Vec::new(), vec![kind]).await.unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument, "{kind}");

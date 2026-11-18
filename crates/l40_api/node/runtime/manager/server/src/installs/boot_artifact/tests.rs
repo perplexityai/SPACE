@@ -61,6 +61,10 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_kind(ArtifactComponentKind::Firmware).await
+    }
+
+    async fn with_kind(kind: ArtifactComponentKind) -> Self {
         let dir = tempfile::tempdir().unwrap();
         for name in [
             "state",
@@ -80,7 +84,7 @@ impl Fixture {
         let architecture = crate::installs::host_arch().unwrap();
         let pin = PinnedBootArtifact::new(
             ComponentIdentity {
-                kind: ArtifactComponentKind::Firmware,
+                kind,
                 version: "1.0-test".parse().unwrap(),
                 digest: Digest::sha256(Sha256::digest(b"boot bytes").into()),
             },
@@ -173,47 +177,53 @@ impl Fixture {
 
 #[tokio::test]
 async fn auxiliary_install_replays_lost_publication_without_a_source_and_removes() {
-    let fixture = Fixture::new().await;
-    let executor = &fixture.installer.executor;
-    let job = fixture.install_job();
-    fixture.publisher.lose.store(true, Ordering::SeqCst);
-    executor
-        .execute(&job, CancellationToken::new())
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        store::get_job_result(&executor.db(), &job.job_id).unwrap(),
-        Some(JobResult::InProgress { .. })
-    ));
-    std::fs::remove_file(&fixture.source).unwrap();
-    executor
-        .execute(&job, CancellationToken::new())
-        .await
-        .unwrap();
-    let target = executor
-        .target(&NodeArtifactRef::Boot(fixture.pin.identity().clone()))
-        .unwrap();
-    assert_eq!(
-        std::fs::read(target.join(BOOT_ARTIFACT_IMAGE)).unwrap(),
-        b"boot bytes"
-    );
-    assert!(matches!(
-        store::get_job_result(&executor.db(), &job.job_id).unwrap(),
-        Some(JobResult::Done {
-            outcome: JobOutcome::AlreadyInstalled,
-            ..
-        })
-    ));
-    let remove = fixture.job(InstallOperation::UninstallBootArtifact {
-        identity: fixture.pin.identity().clone(),
-    });
-    executor
-        .execute(&remove, CancellationToken::new())
-        .await
-        .unwrap();
-    assert!(!target.exists());
-    assert!(fixture.dir.path().join("node/kernels").is_dir());
-    fixture.installer.shutdown().await;
+    for kind in [
+        ArtifactComponentKind::Firmware,
+        ArtifactComponentKind::WasmModule,
+        ArtifactComponentKind::GuestTools,
+    ] {
+        let fixture = Fixture::with_kind(kind).await;
+        let executor = &fixture.installer.executor;
+        let job = fixture.install_job();
+        fixture.publisher.lose.store(true, Ordering::SeqCst);
+        executor
+            .execute(&job, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            store::get_job_result(&executor.db(), &job.job_id).unwrap(),
+            Some(JobResult::InProgress { .. })
+        ));
+        std::fs::remove_file(&fixture.source).unwrap();
+        executor
+            .execute(&job, CancellationToken::new())
+            .await
+            .unwrap();
+        let target = executor
+            .target(&NodeArtifactRef::Boot(fixture.pin.identity().clone()))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(target.join(BOOT_ARTIFACT_IMAGE)).unwrap(),
+            b"boot bytes"
+        );
+        assert!(matches!(
+            store::get_job_result(&executor.db(), &job.job_id).unwrap(),
+            Some(JobResult::Done {
+                outcome: JobOutcome::AlreadyInstalled,
+                ..
+            })
+        ));
+        let remove = fixture.job(InstallOperation::UninstallBootArtifact {
+            identity: fixture.pin.identity().clone(),
+        });
+        executor
+            .execute(&remove, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!target.exists());
+        assert!(fixture.dir.path().join("node/kernels").is_dir());
+        fixture.installer.shutdown().await;
+    }
 }
 
 #[tokio::test]

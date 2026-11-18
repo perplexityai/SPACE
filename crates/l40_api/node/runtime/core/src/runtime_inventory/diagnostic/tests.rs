@@ -96,6 +96,8 @@ impl ScanClock for SettledClock {
 
 const KERNELS_ONLY: ArtifactKinds = ArtifactKinds {
     firmware: false,
+    wasm_modules: false,
+    guest_tools: false,
     runtimes: false,
     kernels: true,
 };
@@ -674,6 +676,8 @@ fn a_deadline_during_hashing_leaves_the_digest_unknown() {
         limits,
         ArtifactKinds {
             firmware: false,
+            wasm_modules: false,
+            guest_tools: false,
             runtimes: false,
             kernels: true,
         },
@@ -697,6 +701,8 @@ fn digests_are_reused_until_the_image_changes() {
     let mut cache = DigestCache::default();
     let kernels_only = ArtifactKinds {
         firmware: false,
+        wasm_modules: false,
+        guest_tools: false,
         runtimes: false,
         kernels: true,
     };
@@ -722,6 +728,8 @@ fn digests_are_reused_until_the_image_changes() {
     // A runtime-only scan leaves kernel digests alone.
     let runtimes_only = ArtifactKinds {
         firmware: false,
+        wasm_modules: false,
+        guest_tools: false,
         runtimes: true,
         kernels: false,
     };
@@ -884,6 +892,8 @@ fn no_supported_kinds_skips_even_damaged_roots() {
         LIMITS,
         ArtifactKinds {
             firmware: false,
+            wasm_modules: false,
+            guest_tools: false,
             runtimes: false,
             kernels: false,
         },
@@ -915,6 +925,8 @@ fn the_kind_filter_skips_other_roots() {
         LIMITS,
         ArtifactKinds {
             firmware: false,
+            wasm_modules: false,
+            guest_tools: false,
             runtimes: true,
             kernels: false,
         },
@@ -1275,6 +1287,8 @@ fn filtered_listings_retain_the_other_kinds_bounded_digest_cache() {
     for kinds in [
         ArtifactKinds {
             firmware: false,
+            wasm_modules: false,
+            guest_tools: false,
             runtimes: true,
             kernels: false,
         },
@@ -1359,13 +1373,30 @@ fn managed_auxiliary_files_are_filtered_hashed_and_never_inferred_as_kernels() {
     for kind in [
         ArtifactComponentKind::Initrd,
         ArtifactComponentKind::Firmware,
+        ArtifactComponentKind::WasmModule,
+        ArtifactComponentKind::GuestTools,
     ] {
         let path = store.join(format!("{kind}-{directory}"));
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join(crate::catalog::BOOT_ARTIFACT_IMAGE), bytes).unwrap();
     }
     let mut cache = DigestCache::default();
-    for firmware in [false, true] {
+    for (firmware, wasm_modules, guest_tools, expected) in [
+        (false, false, false, vec![]),
+        (true, false, false, vec![ArtifactComponentKind::Firmware]),
+        (false, true, false, vec![ArtifactComponentKind::WasmModule]),
+        (false, false, true, vec![ArtifactComponentKind::GuestTools]),
+        (
+            true,
+            true,
+            true,
+            vec![
+                ArtifactComponentKind::Firmware,
+                ArtifactComponentKind::WasmModule,
+                ArtifactComponentKind::GuestTools,
+            ],
+        ),
+    ] {
         let scan = scan(
             &roots,
             LIMITS,
@@ -1373,28 +1404,29 @@ fn managed_auxiliary_files_are_filtered_hashed_and_never_inferred_as_kernels() {
                 runtimes: false,
                 kernels: false,
                 firmware,
+                wasm_modules,
+                guest_tools,
             },
             &SettledClock,
             &mut cache,
         );
         assert!(scan.is_complete());
-        assert_eq!(scan.artifacts.len(), usize::from(firmware));
-        if !firmware {
-            continue;
+        assert_eq!(scan.artifacts.len(), expected.len());
+        for kind in expected {
+            let artifact = scan
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.origin.kind == ArtifactKind::Component(kind))
+                .expect("requested auxiliary file is listed");
+            assert_eq!(artifact.digest, Some(digest));
+            assert_eq!(
+                artifact.version,
+                Some(ScannedVersion::Component(version.clone()))
+            );
+            assert_eq!(artifact.status, ArtifactStatus::Valid);
+            assert!(artifact.architecture.is_none());
+            assert!(artifact.role.is_none());
         }
-        let artifact = &scan.artifacts[0];
-        assert_eq!(
-            artifact.origin.kind,
-            ArtifactKind::Component(ArtifactComponentKind::Firmware)
-        );
-        assert_eq!(artifact.digest, Some(digest));
-        assert_eq!(
-            artifact.version,
-            Some(ScannedVersion::Component(version.clone()))
-        );
-        assert_eq!(artifact.status, ArtifactStatus::Valid);
-        assert!(artifact.architecture.is_none());
-        assert!(artifact.role.is_none());
     }
     let firmware = store
         .join(format!("firmware-{directory}"))

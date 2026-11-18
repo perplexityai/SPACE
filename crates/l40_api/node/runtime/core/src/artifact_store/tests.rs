@@ -680,8 +680,11 @@ fn auxiliary_boot_publication_authenticates_bytes_and_keeps_separate_inodes() {
     use pplx_space_execution_spec::{ArtifactComponentKind, ComponentIdentity};
     let fixture = Fixture::new();
     fixture.store.prepare_roots().unwrap();
-    {
-        let kind = ArtifactComponentKind::Firmware;
+    for kind in [
+        ArtifactComponentKind::Firmware,
+        ArtifactComponentKind::WasmModule,
+        ArtifactComponentKind::GuestTools,
+    ] {
         let bytes = binary(13);
         let pin = PinnedBootArtifact::new(
             ComponentIdentity {

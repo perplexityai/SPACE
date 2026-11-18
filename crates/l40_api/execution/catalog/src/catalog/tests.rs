@@ -300,6 +300,28 @@ fn every_qualified_environment_has_pinned_verity_sources() {
 #[test]
 fn auxiliary_boot_pins_are_typed_and_cannot_conflict() {
     use pplx_space_execution_spec::{ArtifactComponentKind, ComponentIdentity};
+    // Auxiliary bytes are independently pinned; a native host can install a
+    // wasm32 program and its data without qualifying either for execution.
+    for kind in [
+        ArtifactComponentKind::WasmModule,
+        ArtifactComponentKind::GuestTools,
+    ] {
+        let dir = catalog_dir();
+        let identity = ComponentIdentity {
+            kind,
+            version: "test-program-1".parse().unwrap(),
+            digest: HEX_A.parse().unwrap(),
+        };
+        let pin = PinnedBootArtifact::new(identity.clone(), Arch::X86_64, 4096).unwrap();
+        write(
+            dir.path(),
+            "program.json",
+            &serde_json::json!({"schema": 1, "boot_artifacts": [pin]}),
+        );
+        let catalog = RuntimeCatalog::load_owned_by(dir.path(), owner(dir.path())).unwrap();
+        assert_eq!(catalog.boot_artifact(&identity, Arch::X86_64), Some(&pin));
+        assert!(catalog.boot_artifact(&identity, Arch::Aarch64).is_none());
+    }
     let dir = catalog_dir();
     let identity = ComponentIdentity {
         kind: ArtifactComponentKind::Firmware,

@@ -5,6 +5,14 @@ pub const BOOT_ARTIFACT_IMAGE: &str = "image";
 use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_spec::{ArtifactComponentKind, ComponentIdentity};
 
+/// Opaque immutable files supported by the auxiliary installer. These are
+/// installation capabilities, never environment or executable admission.
+pub const AUXILIARY_BOOT_KINDS: &[ArtifactComponentKind] = &[
+    ArtifactComponentKind::Firmware,
+    ArtifactComponentKind::WasmModule,
+    ArtifactComponentKind::GuestTools,
+];
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "BootArtifactPin", into = "BootArtifactPin")]
 pub struct PinnedBootArtifact {
@@ -37,7 +45,7 @@ impl PinnedBootArtifact {
         architecture: Arch,
         size: u64,
     ) -> Result<Self, BootArtifactPinError> {
-        if !matches!(identity.kind, ArtifactComponentKind::Firmware) {
+        if !AUXILIARY_BOOT_KINDS.contains(&identity.kind) {
             return Err(BootArtifactPinError::Kind(identity.kind));
         }
         if identity.version.as_str().starts_with('.')

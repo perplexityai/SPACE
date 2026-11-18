@@ -176,6 +176,12 @@ fn parse_component(
         Ok(ArtifactComponentKind::Firmware) => {
             pplx_space_execution_spec::ArtifactComponentKind::Firmware
         }
+        Ok(ArtifactComponentKind::WasmModule) => {
+            pplx_space_execution_spec::ArtifactComponentKind::WasmModule
+        }
+        Ok(ArtifactComponentKind::GuestTools) => {
+            pplx_space_execution_spec::ArtifactComponentKind::GuestTools
+        }
         Ok(ArtifactComponentKind::Unspecified) | Err(_) => {
             return Err(Status::invalid_argument("a component kind is required"));
         }
@@ -285,10 +291,14 @@ fn parse_kinds(request: &ListExecutionArtifactsRequest) -> Result<ArtifactKinds,
     }
     let mut kernels = request.component_kinds.is_empty();
     let mut firmware = request.component_kinds.is_empty();
+    let mut wasm_modules = request.component_kinds.is_empty();
+    let mut guest_tools = request.component_kinds.is_empty();
     for kind in &request.component_kinds {
         match ArtifactComponentKind::try_from(*kind) {
             Ok(ArtifactComponentKind::Kernel) => kernels = true,
             Ok(ArtifactComponentKind::Firmware) => firmware = true,
+            Ok(ArtifactComponentKind::WasmModule) => wasm_modules = true,
+            Ok(ArtifactComponentKind::GuestTools) => guest_tools = true,
             Ok(ArtifactComponentKind::Unspecified) | Err(_) => {
                 return Err(Status::invalid_argument(format!(
                     "unsupported artifact component kind {kind}"
@@ -301,6 +311,8 @@ fn parse_kinds(request: &ListExecutionArtifactsRequest) -> Result<ArtifactKinds,
         runtimes,
         kernels: components && kernels,
         firmware: components && firmware,
+        wasm_modules: components && wasm_modules,
+        guest_tools: components && guest_tools,
     })
 }
 
@@ -414,8 +426,10 @@ impl RuntimeManager for RuntimeManagerService {
         self.peer_authorizer
             .authorize_request(&request, "ListAvailableArtifacts", ALLOW_READ)?;
         let filter = request.into_inner();
-        let boot_kinds: Vec<_> = [ArtifactComponentKind::Firmware]
-            .into_iter()
+        let boot_kinds: Vec<_> = pplx_space_node_runtime_core::catalog::AUXILIARY_BOOT_KINDS
+            .iter()
+            .copied()
+            .map(execution::ArtifactComponentKind::from)
             .filter(|kind| {
                 filter.runtime_kind == execution::RuntimeKind::Unspecified as i32
                     && filter.runtime_version.is_none()
