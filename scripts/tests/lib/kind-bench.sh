@@ -126,12 +126,17 @@ kind_bench_preflight() {
   if awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf | grep -Eq '^(127\.|::1$)'; then
     kind_bench_die "/etc/resolv.conf names a loopback resolver, which a bench's network namespace cannot reach"
   fi
-  local route
-  for route in $(ip -4 route show | awk '{print $1}'); do
+  # A route on a bench's own veth is a bench an earlier run left, which the
+  # stale-bench cleanup removes; any other 192.168 route would collide.
+  local route device
+  while read -r route device; do
     case "$route" in
-      192.168.*) kind_bench_die "host route $route overlaps the benches' 192.168.0.0/16 addresses" ;;
+      192.168.*)
+        [[ "$device" =~ ^sb[0-9]+h$ ]] \
+          || kind_bench_die "host route $route overlaps the benches' 192.168.0.0/16 addresses"
+        ;;
     esac
-  done
+  done < <(ip -4 -o route show | awk '{ dev = ""; for (i = 2; i < NF; i++) if ($i == "dev") dev = $(i + 1); print $1, dev }')
 }
 
 # The daemon binaries each bench runs: Docker's static release, unpacked once.
