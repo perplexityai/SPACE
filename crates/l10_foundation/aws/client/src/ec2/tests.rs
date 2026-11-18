@@ -116,6 +116,98 @@ async fn describe_instances_paginates_and_preserves_filter_shape() {
     assert_eq!(second_body["NextToken"], "token-2");
 }
 
+/// The private-DNS lookup sends the same form, byte for byte and in the same
+/// order, through the filter it shares with the id lookup.
+#[tokio::test]
+async fn describe_instances_by_private_dns_sends_the_same_form() {
+    let transport = RecordingTransport::new(vec![
+        QueryResponse::new(StatusCode::OK, PAGE_ONE),
+        QueryResponse::new(StatusCode::OK, PAGE_TWO),
+    ]);
+    let client = Client::with_transport("us-west-2", credentials_provider(), transport.clone());
+
+    client
+        .describe_instances_by_private_dns("ip-10-0-0-1.us-west-2.compute.internal")
+        .await
+        .unwrap();
+
+    let bodies: Vec<String> = transport
+        .requests()
+        .iter()
+        .map(|request| request.body.clone())
+        .collect();
+    assert_eq!(
+        bodies,
+        [
+            "Action=DescribeInstances&Version=2016-11-15&Filter.1.Name=private-dns-name\
+             &Filter.1.Value.1=ip-10-0-0-1.us-west-2.compute.internal&MaxResults=1000",
+            "Action=DescribeInstances&Version=2016-11-15&Filter.1.Name=private-dns-name\
+             &Filter.1.Value.1=ip-10-0-0-1.us-west-2.compute.internal&MaxResults=1000\
+             &NextToken=token-2",
+        ]
+    );
+}
+
+/// The id lookup filters on `instance-id` with one value per id, pages
+/// within a call, and splits more ids than one filter takes into calls of at
+/// most [`MAX_FILTER_VALUES`].
+#[tokio::test]
+async fn describe_instances_by_ids_filters_pages_and_chunks() {
+    let ids: Vec<String> = (0..=MAX_FILTER_VALUES)
+        .map(|n| format!("i-{n:017x}"))
+        .collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let transport = RecordingTransport::new(vec![
+        QueryResponse::new(StatusCode::OK, PAGE_ONE),
+        QueryResponse::new(StatusCode::OK, PAGE_TWO),
+        QueryResponse::new(StatusCode::OK, PAGE_TWO),
+    ]);
+    let client = Client::with_transport("us-west-2", credentials_provider(), transport.clone());
+
+    let instances = client.describe_instances_by_ids(&ids).await.unwrap();
+
+    assert_eq!(
+        instances
+            .iter()
+            .map(|instance| instance.instance_id.as_str())
+            .collect::<Vec<_>>(),
+        ["i-old", "i-live", "i-unknown", "i-unknown"]
+    );
+    let bodies: Vec<_> = transport
+        .requests()
+        .iter()
+        .map(|request| parse_body(&request.body))
+        .collect();
+    assert_eq!(bodies.len(), 3);
+    for body in &bodies {
+        assert_eq!(body["Action"], "DescribeInstances");
+        assert_eq!(body["Filter.1.Name"], "instance-id");
+        assert!(!body.contains_key("InstanceId.1"), "{body:?}");
+    }
+    let values = |body: &std::collections::HashMap<String, String>| {
+        (1..)
+            .map_while(|n| body.get(&format!("Filter.1.Value.{n}")).cloned())
+            .collect::<Vec<_>>()
+    };
+    // The first call's two pages carry the first chunk; the second call
+    // carries the one id left.
+    assert_eq!(values(&bodies[0]), ids[..MAX_FILTER_VALUES]);
+    assert!(!bodies[0].contains_key("NextToken"));
+    assert_eq!(values(&bodies[1]), ids[..MAX_FILTER_VALUES]);
+    assert_eq!(bodies[1]["NextToken"], "token-2");
+    assert_eq!(values(&bodies[2]), ids[MAX_FILTER_VALUES..]);
+    assert!(!bodies[2].contains_key("NextToken"));
+}
+
+/// No ids asks nothing.
+#[tokio::test]
+async fn describe_instances_by_no_ids_sends_no_request() {
+    let transport = RecordingTransport::new(vec![]);
+    let client = Client::with_transport("us-west-2", credentials_provider(), transport.clone());
+    assert_eq!(client.describe_instances_by_ids(&[]).await.unwrap(), vec![]);
+    assert!(transport.requests().is_empty());
+}
+
 #[tokio::test]
 async fn aws_error_response_includes_code_and_message() {
     let transport = RecordingTransport::new(vec![QueryResponse::new(

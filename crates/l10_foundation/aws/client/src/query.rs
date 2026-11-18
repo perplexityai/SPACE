@@ -207,16 +207,20 @@ impl<T: QueryTransport> AwsQueryClient<T> {
         }
     }
 
-    pub(crate) async fn send_action(
+    pub(crate) async fn send_action<K: AsRef<str>>(
         &self,
         action: &'static str,
         version: &'static str,
-        params: Vec<(&'static str, String)>,
+        params: Vec<(K, String)>,
     ) -> Result<String, AwsClientError> {
         let mut all_params = Vec::with_capacity(params.len() + 2);
         all_params.push(("Action", action.to_string()));
         all_params.push(("Version", version.to_string()));
-        all_params.extend(params);
+        all_params.extend(
+            params
+                .iter()
+                .map(|(name, value)| (name.as_ref(), value.clone())),
+        );
 
         let body = encode_form(&all_params);
         let request = self.sign_request(body).await?;
