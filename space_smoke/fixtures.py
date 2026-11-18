@@ -27,6 +27,7 @@ from space_smoke.capabilities import (
     NodeGroupControl,
     NodeFenceControl,
     NodeSelectorExtrasControl,
+    NodeCtlFacetControl,
     PendingBackupControl,
     RetainedOnlyCopyControl,
     TeardownRestartControl,
@@ -100,6 +101,7 @@ from space_smoke.adapters import (
     NODE_MANAGER,
     NODE_TEMPLATE_MANAGER,
     RESTORE_STORAGE_URI_ANNOTATION,
+    SANDBOX_CACHE_ROOT,
     SUSPEND_ROOTFS_OBJECTS,
     template_received_uuid,
 )
@@ -128,6 +130,7 @@ from space_smoke.config import DEFAULT_SANDBOX_TIMEOUT_SECONDS
 from space_smoke.identity import EcwIdentityAssertions
 from space_smoke.invariants.lifecycle import prove_idle_deadline_reset
 from space_smoke.network_policy import NetworkPolicyAssertions
+from space_smoke.node_ctl_facets import sync_node_ctl_facet
 from space_smoke.runtime import (
     Compensation,
     InconclusiveSmoke,
@@ -152,6 +155,18 @@ SANDBOX_CLEANUP_RETRY_SECONDS = 1.0
 # row's idle time in.
 LOCAL_CLEANUP_MAX_QUIESCENCE_SECONDS = 60
 LOCAL_CLEANUP_QUIESCENCE_MARGIN_SECONDS = 2
+# After the delete, the retained rootfs has this long to leave the worker:
+# node-ctl's 60 s poll (`DEFAULT_NODE_CTL_POLL_INTERVAL`, which Kind renders)
+# and, should the eviction be refused, its retry a poll later, plus margin.
+# The on-demand runs below spend from it; they never extend it.
+LOCAL_CLEANUP_DEADLINE_SECONDS = 180
+# The facet that evicts cluster-deleted sandboxes, and how long one on-demand
+# run may take: it waits behind a poll already running, so a poll period.
+LOCAL_CLEANUP_FACET = "sandbox-desired-state"
+LOCAL_CLEANUP_FACET_RUN_SECONDS = 60
+# sandbox-manager tears an evicted sandbox down detached from the eviction
+# call, so the rootfs may outlive the run that claimed it by a moment.
+LOCAL_CLEANUP_TEARDOWN_SECONDS = 10
 
 
 def snapshot_reap_residue(before: Iterable[str], after: Iterable[str]) -> list[str]:
@@ -947,6 +962,7 @@ class CommandSandboxFixture(ScenarioFixture):
     _resident_lifecycle: ResidentLifecycleSandbox | None = None
     _stoppable_lifecycle: StoppableLifecycleSandbox | None = None
     _local_cleanup_control: ColdEvictionControl | None = None
+    _node_ctl_facet_control: NodeCtlFacetControl | None = None
     _encrypted_resuspend_control: EncryptedResuspendControl | None = None
     _stopped_replacement_control: StoppedReplacementControl | None = None
     _processes: ProcessSandbox | None = None
@@ -1341,19 +1357,31 @@ class CommandSandboxFixture(ScenarioFixture):
         since_time = _log_since_time()
         self.delete_sandbox()
         self.wait_until_deleted()
+        deleted_at = time.monotonic()
         # Allow a node-ctl poll and, should the row have moved after the stop
         # after all, the refused eviction's retry a poll later. The retained
         # rootfs leaving the worker is the outcome, whichever reclaim path
         # removed it: the eviction itself, or the durable cleanup that retries
         # an eviction refused while node-manager reset the network slot the
         # stop released.
-        deadline = time.monotonic() + 180
-        while control.sandbox_cache_dir_present(worker, sandbox_id):
+        deadline = deleted_at + LOCAL_CLEANUP_DEADLINE_SECONDS
+        facets = self._node_ctl_facet_control
+        present = control.sandbox_cache_dir_present(worker, sandbox_id)
+        # A rootfs a poll already removed needs no run, and no second probe.
+        if present and facets is not None:
+            # Probed again unless the run saw it go: a failed or timed-out run
+            # says nothing about the rootfs, which may have gone meanwhile.
+            gone = self._run_cluster_deleted_eviction(facets, control, worker, sandbox_id, deadline)
+            present = not gone and control.sandbox_cache_dir_present(worker, sandbox_id)
+        while present:
             self.verify(
                 time.monotonic() < deadline,
-                "deleted stopped sandbox was not reclaimed by node reconciliation",
+                "deleted stopped sandbox was not reclaimed by node reconciliation: "
+                f"{SANDBOX_CACHE_ROOT}/{sandbox_id} is still on {worker} "
+                f"{LOCAL_CLEANUP_DEADLINE_SECONDS} s after the delete",
                 worker=worker,
                 sandbox_id=sandbox_id,
+                cache_dir=f"{SANDBOX_CACHE_ROOT}/{sandbox_id}",
                 failure_evidence=lambda: {
                     "sandbox_manager_log": control.sandbox_manager_log(
                         sandbox_id, node_names=[worker], since_time=since_time
@@ -1361,7 +1389,74 @@ class CommandSandboxFixture(ScenarioFixture):
                 },
             )
             self._context.wait(2)
+            present = control.sandbox_cache_dir_present(worker, sandbox_id)
         self.record("stopped_delete_local_cleanup", "retained rootfs removed")
+        self.record("stopped_delete_local_cleanup_seconds", round(time.monotonic() - deleted_at, 1))
+
+    def _run_cluster_deleted_eviction(
+        self,
+        facets: NodeCtlFacetControl,
+        control: ColdEvictionControl,
+        worker: str,
+        sandbox_id: str,
+        deadline: float,
+    ) -> bool:
+        """Run the worker's sandbox desired-state facet now rather than wait for its poll;
+        return whether the rootfs was seen gone.
+
+        The facet's full-scope run is what node-ctl's poll makes, and the one
+        that evicts a cluster-deleted local row, so the rootfs leaves through
+        the same eviction. That the facet also runs on node-ctl's timer, which
+        this no longer waits for, is pinned by
+        `policy_facets_pull_periodically_but_do_not_publish_unprompted`
+        (crates/l40_api/node/ctl/server/src/facets/tests.rs). The run is
+        asked for only after the quiescence wait: one inside the window would
+        be refused and backed off past the following poll. A run that still
+        left the rootfs, such as an element-scoped run for another sandbox or
+        an eviction deferred to the next sync, is asked for once more. Nothing
+        here fails the scenario: a request or run that fails is recorded, and
+        the caller's poll, within the same deadline, decides.
+        """
+
+        for attempt in (1, 2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 1:
+                return False
+            try:
+                sync = sync_node_ctl_facet(
+                    facets,
+                    worker,
+                    LOCAL_CLEANUP_FACET,
+                    timeout=LOCAL_CLEANUP_FACET_RUN_SECONDS,
+                    deadline=deadline,
+                    wait=self.wait,
+                )
+            except (ScenarioTimedOut, SmokeConfigurationError):
+                raise
+            except Exception as error:  # noqa: BLE001 - recorded; the caller's poll decides
+                failure = f"{type(error).__name__}: {error}"
+            else:
+                if sync.completed_at is None:
+                    failure = f"no run finished: {asdict(sync.latest)}"
+                elif not sync.succeeded:
+                    failure = f"the run failed: {asdict(sync.latest)}"
+                else:
+                    failure = None
+            if failure is not None:
+                self.record(
+                    "stopped_delete_eviction_run_failure",
+                    {"attempt": attempt, "facet": LOCAL_CLEANUP_FACET, "error": failure[:1_000]},
+                )
+                return False
+            self.record("stopped_delete_eviction_runs", attempt)
+            settled = min(time.monotonic() + LOCAL_CLEANUP_TEARDOWN_SECONDS, deadline)
+            while control.sandbox_cache_dir_present(worker, sandbox_id):
+                if time.monotonic() >= settled:
+                    break
+                self._context.wait(1)
+            else:
+                return True
+        return False
 
     def start_background_process(
         self, command: str, *, timeout: int = 60

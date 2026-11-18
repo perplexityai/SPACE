@@ -20,8 +20,9 @@ The scenario does not wait for node-ctl's poll. It runs the facet on
 demand with `space-nodectl reconcile --facet template-desired-state`, which
 runs it at full scope, the only scope that deletes, and reads the facet's
 status to know when a run that started after the request has finished (see
-`full_sync`). Every timing claim is then made against such a run's monotonic
-bounds rather than against the poll period.
+`full_sync` and `space_smoke.node_ctl_facets`). Every timing claim is then
+made against such a run's monotonic bounds rather than against the poll
+period.
 
 The observables are what an operator reads on the worker:
 `space-tmplmgr list`, the template's digest directories, and the Node's
@@ -39,6 +40,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from space_smoke.capabilities import UnansweredTemplateEvictionControl
+from space_smoke.node_ctl_facets import sync_node_ctl_facet
 from space_smoke.runtime import Compensation, ResourceScope
 
 if TYPE_CHECKING:
@@ -249,50 +251,39 @@ class UnansweredTemplateEvictionAssertions:
         that started after this call has finished and succeeded, with a monotonic time no
         earlier than its end.
 
-        The facet's status has one-second resolution and also moves for
-        node-ctl's own poll. The status read first names the latest run's
-        start second; the request goes out a second after that read, so the
-        run it starts has a later start second; and the call returns only on
-        a finished, successful run with a later start second than the read's,
-        which therefore started after the read. That run is the requested one
-        or a poll that began in between, which is also a full-scope run.
-        Element-scoped runs of this facet come from cluster triggers for a
-        template's admin writes or its first appearance in the node's
-        inventory, neither of which overlaps the scenario's syncs. A failed
-        run fails the call: it may have stopped before the deletes, and a
-        check after it would show nothing.
+        `sync_node_ctl_facet` says which run counts. Element-scoped runs of
+        this facet come from cluster triggers for a template's admin writes or
+        its first appearance in the node's inventory, neither of which
+        overlaps the scenario's syncs, so the run is a full-scope one. A
+        failed run fails the call: it may have stopped before the deletes,
+        and a check after it would show nothing.
         """
 
-        before = self._control.node_ctl_facet_run(node_name, TEMPLATE_DESIRED_STATE_FACET)
-        self._fixture.wait(1)
-        self._control.reconcile_node_ctl_facet(node_name, TEMPLATE_DESIRED_STATE_FACET)
-        deadline = time.monotonic() + FULL_SYNC_SECONDS
-        while True:
-            run = self._control.node_ctl_facet_run(node_name, TEMPLATE_DESIRED_STATE_FACET)
-            if (
-                run.last_started_at > before.last_started_at
-                and not run.running
-                and run.last_completed_at >= run.last_started_at
-            ):
-                completed_at = time.monotonic()
-                self._fixture.verify(
-                    run.last_success_at == run.last_completed_at,
-                    "worker node-ctl's on-demand template desired-state run failed",
-                    node=node_name,
-                    run=asdict(run),
-                    failure_evidence=lambda: self._evidence(node_name),
-                )
-                return completed_at
-            self._fixture.verify(
-                time.monotonic() < deadline,
-                "worker node-ctl did not finish an on-demand template desired-state run "
-                f"within {FULL_SYNC_SECONDS} s",
-                node=node_name,
-                before=asdict(before),
-                latest=asdict(run),
-                failure_evidence=lambda: self._evidence(node_name),
-            )
-            self._fixture.wait(0.5)
+        sync = sync_node_ctl_facet(
+            self._control,
+            node_name,
+            TEMPLATE_DESIRED_STATE_FACET,
+            timeout=FULL_SYNC_SECONDS,
+            wait=self._fixture.wait,
+        )
+        self._fixture.verify(
+            sync.completed_at is not None,
+            "worker node-ctl did not finish an on-demand template desired-state run "
+            f"within {FULL_SYNC_SECONDS} s",
+            node=node_name,
+            before=asdict(sync.before),
+            latest=asdict(sync.latest),
+            failure_evidence=lambda: self._evidence(node_name),
+        )
+        assert sync.completed_at is not None
+        self._fixture.verify(
+            sync.succeeded,
+            "worker node-ctl's on-demand template desired-state run failed",
+            node=node_name,
+            run=asdict(sync.latest),
+            failure_evidence=lambda: self._evidence(node_name),
+        )
+        return sync.completed_at
 
     def expect_held_past_wait(self, copy: LocalTemplate) -> None:
         """While a sandbox of the template runs: a full sync, the wait, another, and the copy unchanged.
