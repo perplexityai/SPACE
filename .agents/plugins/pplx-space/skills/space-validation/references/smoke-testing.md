@@ -56,7 +56,9 @@ A full Kubernetes Kind validation is `bash scripts/tests/smoke-kind-parallel.sh`
 on one Linux/KVM host, and its `summary.md` (with `summary.json`) is the
 evidence: one table across benches, every scenario that did not pass with its
 log, and a check that both API surfaces' inventory ran exactly once. Its exit
-status is the typed suite's `0` / `1` / `2`. Don't run the CI shards one after
+status ranks as a typed suite's does: `1` when a scenario failed, else `2` for an
+incomplete run (a bench down, an inconclusive scenario, a coverage gap), else
+`42` for a warning, else `0`. Don't run the CI shards one after
 another on one stack instead. `smoke-kind-typed.sh all [i/N]` remains the way
 to run against a stack that is already up, or to reproduce one shard.
 

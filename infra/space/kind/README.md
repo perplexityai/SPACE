@@ -352,10 +352,14 @@ Bench `i` of `N` is one CI shard runner: it runs the baseline
 together run both API surfaces' inventory once each. The summary
 (`summary.md`, `summary.json` and `timeline.txt` in the run's output directory,
 printed at the end) lists each bench's phase times and SUITE counts, every
-scenario that did not pass with its log, and checks that the benches' `=== RUN`
-ids cover the inventory exactly once. The script exits 0 when every bench
-passed, 1 when a scenario failed and 2 when a bench did not come up, a scenario
-was inconclusive or the coverage check failed. Without `--benches` it picks N
+scenario that did not pass with its log, and checks that the benches cover the
+inventory exactly once: each (surface, scenario) pair has one `=== RUN`, or was
+skipped by a bench's mode after the partition, which counts as covered. The
+script exits as the typed suite ranks a suite: 1 when any scenario failed;
+else 2 when a bench did not come up, a scenario was inconclusive or did not
+finish, or the coverage check failed; else 42 when a scenario warned; else 0.
+A failure the known-failures list (`SPACE_SMOKE_KNOWN_FAILURES`) excused is
+listed but does not fail the run. Without `--benches` it picks N
 from the host's CPUs, available memory, free disk and a short write-throughput
 probe of the bench volume, and prints each factor. One run or teardown
 holds the host at a time (`/run/lock/space-bench.lock`), and a run first

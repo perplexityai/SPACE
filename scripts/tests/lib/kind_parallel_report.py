@@ -7,10 +7,14 @@ and partition (space_smoke.sharding.select_shard). It needs the project
 environment (`uv run`), and reads the same variables the runner reads.
 
 `summarize OUT` reads the run directory smoke-kind-parallel.sh wrote, writes
-summary.md, summary.json and timeline.txt there, and exits 0 when every bench
-passed, 1 when a scenario failed, and 2 when a bench did not come up, a
-scenario was inconclusive, or the benches did not cover the inventory exactly
-once. It needs only the standard library.
+summary.md, summary.json and timeline.txt there, and exits as the typed suite
+ranks a suite (space_smoke/suite.py, suite_exit_code): 1 when any scenario
+failed; else 2 when a bench did not come up, a scenario was inconclusive or did
+not finish, or the benches did not cover the inventory exactly once; else 42
+when a scenario warned; else 0. A failure the known-failures list excused
+(`KNOWN FAILURE <id>` in its pass) is listed and does not count as one, and a
+scenario a bench's mode skipped after the partition counts as covered. It
+needs only the standard library.
 """
 
 from __future__ import annotations
@@ -95,6 +99,8 @@ SURFACE = re.compile(r"^--- typed smoke on the (\S+) API surface$")
 SUITE = re.compile(r"^SUITE: (\d+) passed, (\d+) warned, (\d+) failed, (\d+) inconclusive")
 SHARD = re.compile(r"^SHARD \d+/\d+: ")
 SKIPPED = re.compile(r"^SKIPPED (\S+): (.*)$")
+# The runner's report of a failure SPACE_SMOKE_KNOWN_FAILURES excused.
+KNOWN_FAILURE = re.compile(r"^  KNOWN FAILURE (\S+): ")
 # smoke-kind-typed.sh `all` repeats both passes' SUITE lines after this; read
 # as part of the last pass they would replace its counts with the first's.
 SUMMARY = "=== typed smoke summary"
@@ -115,7 +121,7 @@ def parse_typed(log: Path) -> dict:
             break
         if match := SURFACE.match(line):
             current = surfaces.setdefault(
-                match[1], {"run": [], "exits": {}, "skipped": {}, "suite": None}
+                match[1], {"run": [], "exits": {}, "skipped": {}, "known": set(), "suite": None}
             )
             partitioned = False
             continue
@@ -127,6 +133,8 @@ def parse_typed(log: Path) -> dict:
             current["run"].append(match[1])
         elif match := END.match(line):
             current["exits"][match[1]] = int(match[2])
+        elif match := KNOWN_FAILURE.match(line):
+            current["known"].add(match[1])
         elif (match := SKIPPED.match(line)) and partitioned:
             current["skipped"][match[1]] = match[2]
         elif match := SUITE.match(line):
@@ -254,7 +262,9 @@ def summarize(out: Path) -> int:
     seen: dict[str, Counter] = {surface: Counter() for surface in SURFACES}
     skipped: dict[str, dict[str, str]] = {surface: {} for surface in SURFACES}
     not_passed = []
-    status = 0
+    # The suite's ranking (suite_exit_code): a failure outranks an incomplete
+    # result, which outranks a warning.
+    failed = incomplete = warned = False
     for bench in benches:
         directory = out / "benches" / bench
         result = (directory / "result").read_text().strip() if (directory / "result").exists() else "unknown"
@@ -272,16 +282,28 @@ def summarize(out: Path) -> int:
             "surfaces": {s: v["suite"] for s, v in typed.items()},
         }
         if not result.startswith("typed_exit_"):
-            status = 2
+            incomplete = True
         bench_not_passed = 0
         for surface, data in typed.items():
             seen.setdefault(surface, Counter()).update(data["run"])
             skipped.setdefault(surface, {}).update(data["skipped"])
             for scenario in data["run"]:
                 code = data["exits"].get(scenario)
-                if code not in (0, 42):
-                    verdict = VERDICT.get(code, "inconclusive") if code is not None else "unfinished"
-                    bench_not_passed += 1
+                if code != 0:
+                    if code is None:
+                        verdict = "unfinished"
+                    elif code == 1 and scenario in data["known"]:
+                        verdict = "known failure"
+                    else:
+                        verdict = VERDICT.get(code, "inconclusive")
+                    if verdict == "fail":
+                        failed = True
+                    elif verdict in ("inconclusive", "unfinished"):
+                        incomplete = True
+                    elif verdict == "warn":
+                        warned = True
+                    if verdict != "known failure":
+                        bench_not_passed += 1
                     not_passed.append(
                         {
                             "bench": bench,
@@ -292,15 +314,15 @@ def summarize(out: Path) -> int:
                             "log": str(directory / "typed.log"),
                         }
                     )
-                    status = max(status, 1 if verdict == "fail" else 2)
-        # A shard that exited nonzero with every scenario passing failed
-        # outside them (its bootstrap, a missing tool): inconclusive.
+        # A shard that exited nonzero with nothing but passes and excused
+        # failures failed outside its scenarios (its bootstrap, a missing
+        # tool): inconclusive.
         if result.startswith("typed_exit_") and result != "typed_exit_0" and not bench_not_passed:
-            status = max(status, 2)
+            incomplete = True
 
     coverage = {"checked": inventory_data is not None, "surfaces": {}}
     if inventory_data is None:
-        status = 2
+        incomplete = True
     else:
         for surface in SURFACES:
             expected = set(inventory_data["surfaces"][surface])
@@ -318,7 +340,8 @@ def summarize(out: Path) -> int:
             entry["exactly_once"] = not (entry["missing"] or entry["unexpected"] or entry["duplicated"])
             coverage["surfaces"][surface] = entry
             if not entry["exactly_once"]:
-                status = 2
+                incomplete = True
+    status = 1 if failed else 2 if incomplete else 42 if warned else 0
 
     host_rows = [row for row in timings if row["owner"] in ("host", "run")]
     ended = max((row["end"] for row in timings), default=start)

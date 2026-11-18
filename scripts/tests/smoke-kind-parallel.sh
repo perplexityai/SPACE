@@ -32,8 +32,9 @@
 #   --out DIR    where logs, timings and the summary go
 #                (default: ~/.space-devbox/kind-parallel/<run id>)
 #
-# Exit status: 0 every bench passed; 1 a scenario failed; 2 inconclusive, or a
-# bench did not come up.
+# Exit status: as the typed suite ranks a suite: 1 a scenario failed; else 2
+# a bench did not come up, a scenario was inconclusive or unfinished, or the
+# coverage check failed; else 42 a scenario warned; else 0.
 #
 # Env: SPACE_KIND_SUBSTRATE, SPACE_KIND_STORAGE_CREDENTIALS, SPACE_KIND_RUST_BUILD,
 # SPACE_SMOKE_TIERS (default routine), SPACE_SMOKE_INCLUDE_SCENARIOS,
