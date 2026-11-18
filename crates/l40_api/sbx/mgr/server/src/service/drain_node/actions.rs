@@ -153,6 +153,16 @@ impl DrainActions {
         failures.1.clone()
     }
 
+    /// The counts under `epoch`, without forgetting another epoch's.
+    pub(super) fn failures_under(&self, epoch: u64) -> DrainFailures {
+        let failures = lock(&self.failures);
+        if failures.0 == Some(epoch) {
+            failures.1.clone()
+        } else {
+            DrainFailures::new()
+        }
+    }
+
     /// Forget the failures of every sandbox the drain no longer works on.
     pub(super) fn keep_failures_of(&self, working: &BTreeSet<String>) {
         lock(&self.failures)
@@ -181,11 +191,33 @@ impl DrainActions {
             if entry.0 != *state {
                 *entry = (*state, now);
             }
-            if now.saturating_duration_since(entry.1) >= SETTLE_BOUND {
+            if past_settle_bound(now.saturating_duration_since(entry.1)) {
                 unchanged.insert(sandbox_id.clone());
             }
         }
         unchanged
+    }
+
+    /// The rows a call under `epoch` would find unchanged since the bound
+    /// ([`Self::unchanged_since_bound`]) at `now`, without noting anything.
+    pub(super) fn seen_unchanged_past_bound(
+        &self,
+        epoch: u64,
+        rows: &[(String, SandboxStatus)],
+        now: tokio::time::Instant,
+    ) -> BTreeSet<String> {
+        let guard = lock(&self.seen);
+        if guard.0 != Some(epoch) {
+            return BTreeSet::new();
+        }
+        rows.iter()
+            .filter(|(sandbox_id, state)| {
+                guard.1.get(sandbox_id).is_some_and(|(seen, since)| {
+                    seen == state && past_settle_bound(now.saturating_duration_since(*since))
+                })
+            })
+            .map(|(sandbox_id, _)| sandbox_id.clone())
+            .collect()
     }
 
     /// The rows that have waited for cache disk for [`SETTLE_BOUND`] or
@@ -202,7 +234,7 @@ impl DrainActions {
         guard
             .1
             .iter()
-            .filter(|(_, since)| now.saturating_duration_since(**since) >= SETTLE_BOUND)
+            .filter(|(_, since)| past_settle_bound(now.saturating_duration_since(**since)))
             .map(|(sandbox_id, _)| sandbox_id.clone())
             .collect()
     }

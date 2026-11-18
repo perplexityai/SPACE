@@ -1559,6 +1559,17 @@ impl WorkerApiInternal for WorkerApiService {
         )
         .await
     }
+
+    async fn preview_drain_node(
+        &self,
+        r: Request<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeRequest>,
+    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeResponse>, Status> {
+        // Changes nothing, but answers what a drain would find on the whole
+        // node, so it takes the drain's authority. Node-wide, so it takes no
+        // sandbox's permit; it only reads, so it replays as a read.
+        require_node_drain_authority(&r, "PreviewDrainNode")?;
+        fwd_sbx_read!(self, "PreviewDrainNode", preview_drain_node, r)
+    }
 }
 
 #[cfg(test)]

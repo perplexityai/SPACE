@@ -420,6 +420,12 @@ impl ActivationSeal {
         Ok(())
     }
 
+    /// Why the seal row couldn't be read, while the last read failed and no
+    /// seal or cancel has read it since; a preview can't report it then.
+    pub(crate) fn read_error(&self) -> Option<String> {
+        self.lock_state().record.as_ref().err().cloned()
+    }
+
     /// Whether the node may hold a drain record. A record is written only
     /// while sealed, after the seal row it needs, and no cancel removes that
     /// row, so a node with no row holds none and a caller's suspend skips

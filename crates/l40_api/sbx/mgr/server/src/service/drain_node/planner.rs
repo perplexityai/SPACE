@@ -28,6 +28,11 @@ pub(super) const MAX_ACTION_FAILURES: u32 = 3;
 /// moving them on.
 pub(super) const SETTLE_BOUND: Duration = Duration::from_secs(15 * 60);
 
+/// Whether a row that has waited `waited` has reached [`SETTLE_BOUND`].
+pub(super) fn past_settle_bound(waited: Duration) -> bool {
+    waited >= SETTLE_BOUND
+}
+
 /// The bytes of cache disk the drain may still commit to snapshots before
 /// the cache reaches the floor its disk admission keeps free, the margin
 /// every new allocation leaves; none while admission refuses allocations.

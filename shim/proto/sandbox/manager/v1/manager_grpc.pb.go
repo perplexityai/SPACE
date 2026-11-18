@@ -65,6 +65,7 @@ const (
 	SandboxManager_AcknowledgeAutoLifecycleDeleteReceipts_FullMethodName = "/space.sandbox.manager.v1.SandboxManager/AcknowledgeAutoLifecycleDeleteReceipts"
 	SandboxManager_ListPendingLocalBackups_FullMethodName                = "/space.sandbox.manager.v1.SandboxManager/ListPendingLocalBackups"
 	SandboxManager_DrainNode_FullMethodName                              = "/space.sandbox.manager.v1.SandboxManager/DrainNode"
+	SandboxManager_PreviewDrainNode_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/PreviewDrainNode"
 	SandboxManager_GetNetworkPolicy_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/GetNetworkPolicy"
 	SandboxManager_SetNetworkPolicy_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/SetNetworkPolicy"
 	SandboxManager_TemplateNetworkPolicyUpdated_FullMethodName           = "/space.sandbox.manager.v1.SandboxManager/TemplateNetworkPolicyUpdated"
@@ -388,6 +389,26 @@ type SandboxManagerClient interface {
 	// gentle drains reads `epoch` 0 and refuses the call before it seals
 	// anything, so a gentle drain never runs on it as a forced one.
 	DrainNode(ctx context.Context, in *DrainNodeRequest, opts ...grpc.CallOption) (*DrainNodeResponse, error)
+	// Report what a forced v2 drain would find on this node now, changing
+	// nothing: it runs a drain call's planner and its cache disk measurement,
+	// but never seals or unseals, starts no work and writes nothing, the
+	// drain's memory of earlier calls included. It plans as a forced drain. A gentle drain holds each
+	// started sandbox whose suspend is neither refused nor already running: it
+	// lists it `pending` with the action `hold`, whatever this preview lists
+	// for it (`suspend`, `queued`, `disk`, or blocked after repeated suspend
+	// failures), and the window slots that frees can start other work sooner.
+	// A row that has already sat in a transition the drain doesn't drive for
+	// over 15 minutes counts as blocked, as a drain would report it after
+	// waiting that long. A preview doesn't read node-manager's orphan inventory
+	// (untracked runtime processes, orphan cache and run directories), which a
+	// drain call does: node-manager keeps a few inventory scans for every
+	// caller on the node and evicts the least recently used, so a preview's
+	// scan could cut short a drain call's or node-ctl's. The answer names it in
+	// `unchecked`, and `would_finish` doesn't account for it. While the node's
+	// seal row couldn't be read at startup and nothing has read it since, a
+	// preview answers `Internal` with why rather than report a seal it can't
+	// see. A sandbox-manager that predates this RPC answers `Unimplemented`.
+	PreviewDrainNode(ctx context.Context, in *PreviewDrainNodeRequest, opts ...grpc.CallOption) (*PreviewDrainNodeResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(ctx context.Context, in *GetNetworkPolicyRequest, opts ...grpc.CallOption) (*GetNetworkPolicyResponse, error)
 	// Apply a sandbox's desired network policy on the node.
@@ -908,6 +929,16 @@ func (c *sandboxManagerClient) DrainNode(ctx context.Context, in *DrainNodeReque
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DrainNodeResponse)
 	err := c.cc.Invoke(ctx, SandboxManager_DrainNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) PreviewDrainNode(ctx context.Context, in *PreviewDrainNodeRequest, opts ...grpc.CallOption) (*PreviewDrainNodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PreviewDrainNodeResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_PreviewDrainNode_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1688,6 +1719,26 @@ type SandboxManagerServer interface {
 	// gentle drains reads `epoch` 0 and refuses the call before it seals
 	// anything, so a gentle drain never runs on it as a forced one.
 	DrainNode(context.Context, *DrainNodeRequest) (*DrainNodeResponse, error)
+	// Report what a forced v2 drain would find on this node now, changing
+	// nothing: it runs a drain call's planner and its cache disk measurement,
+	// but never seals or unseals, starts no work and writes nothing, the
+	// drain's memory of earlier calls included. It plans as a forced drain. A gentle drain holds each
+	// started sandbox whose suspend is neither refused nor already running: it
+	// lists it `pending` with the action `hold`, whatever this preview lists
+	// for it (`suspend`, `queued`, `disk`, or blocked after repeated suspend
+	// failures), and the window slots that frees can start other work sooner.
+	// A row that has already sat in a transition the drain doesn't drive for
+	// over 15 minutes counts as blocked, as a drain would report it after
+	// waiting that long. A preview doesn't read node-manager's orphan inventory
+	// (untracked runtime processes, orphan cache and run directories), which a
+	// drain call does: node-manager keeps a few inventory scans for every
+	// caller on the node and evicts the least recently used, so a preview's
+	// scan could cut short a drain call's or node-ctl's. The answer names it in
+	// `unchecked`, and `would_finish` doesn't account for it. While the node's
+	// seal row couldn't be read at startup and nothing has read it since, a
+	// preview answers `Internal` with why rather than report a seal it can't
+	// see. A sandbox-manager that predates this RPC answers `Unimplemented`.
+	PreviewDrainNode(context.Context, *PreviewDrainNodeRequest) (*PreviewDrainNodeResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error)
 	// Apply a sandbox's desired network policy on the node.
@@ -1896,6 +1947,9 @@ func (UnimplementedSandboxManagerServer) ListPendingLocalBackups(context.Context
 }
 func (UnimplementedSandboxManagerServer) DrainNode(context.Context, *DrainNodeRequest) (*DrainNodeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DrainNode not implemented")
+}
+func (UnimplementedSandboxManagerServer) PreviewDrainNode(context.Context, *PreviewDrainNodeRequest) (*PreviewDrainNodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PreviewDrainNode not implemented")
 }
 func (UnimplementedSandboxManagerServer) GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetNetworkPolicy not implemented")
@@ -2829,6 +2883,24 @@ func _SandboxManager_DrainNode_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxManager_PreviewDrainNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PreviewDrainNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).PreviewDrainNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_PreviewDrainNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).PreviewDrainNode(ctx, req.(*PreviewDrainNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SandboxManager_GetNetworkPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetNetworkPolicyRequest)
 	if err := dec(in); err != nil {
@@ -3670,6 +3742,10 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DrainNode",
 			Handler:    _SandboxManager_DrainNode_Handler,
+		},
+		{
+			MethodName: "PreviewDrainNode",
+			Handler:    _SandboxManager_PreviewDrainNode_Handler,
 		},
 		{
 			MethodName: "GetNetworkPolicy",

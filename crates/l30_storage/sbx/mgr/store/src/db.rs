@@ -180,6 +180,7 @@ pub mod scan {
     mod resolve_selector;
     mod rowless_restore_scopes;
     mod sandbox_pages;
+    mod status_entered;
     mod teardown_owned_suspending;
     mod unbound_executions;
     mod unsettled_runtime_upgrades;
@@ -197,6 +198,7 @@ pub mod scan {
     pub use resolve_selector::*;
     pub use rowless_restore_scopes::*;
     pub use sandbox_pages::*;
+    pub use status_entered::*;
     pub use teardown_owned_suspending::*;
     pub use unbound_executions::*;
     pub use unsettled_runtime_upgrades::*;

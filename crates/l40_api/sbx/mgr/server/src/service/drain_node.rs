@@ -49,6 +49,21 @@
 //! a resume that was already in flight at the seal and finished `started`
 //! before the suspend ran is held, not suspended. A forced call under the
 //! same epoch continues the same drain and holds nothing.
+//!
+//! `PreviewDrainNode` ([`crate::service::SandboxManagerService::finish_preview`]) reports
+//! what a forced v2 drain would find on this node now, without being one: it runs
+//! the drain call's planner and cache disk measurement, but takes no seal,
+//! starts no work and writes nothing, the drain's memory of earlier calls
+//! included. It doesn't read node-manager's orphan inventory, whose few scans
+//! every caller on the node shares, and names it unchecked. A row that
+//! has already sat in a transition the drain doesn't drive for over 15
+//! minutes counts as blocked, as a drain would report it after waiting that
+//! long ([`crate::service::SandboxManagerService::read_preview_plan`]). It plans as a forced
+//! drain. A gentle drain holds each started sandbox whose suspend is neither
+//! refused nor already running: it lists it `pending` with the action
+//! [`planner::HOLD`], whatever this preview lists for it (`suspend`, `queued`, `disk`,
+//! or blocked after repeated suspend failures), and the window slots that
+//! frees can start other work sooner.
 
 mod actions;
 mod planner;
