@@ -371,8 +371,8 @@ impl CompiledEnvironment {
                 "1.17.0",
                 "6.1.155-bpf-modsig-nft",
                 "12.0.0",
-                // Not yet qualified for suspend/restore on this kernel.
-                false,
+                // TEST-ONLY: enabled to qualify suspend/restore; not for merge.
+                true,
             ),
         ]
         .into_iter()

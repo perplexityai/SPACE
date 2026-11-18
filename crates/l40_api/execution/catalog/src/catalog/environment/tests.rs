@@ -72,7 +72,7 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         ("1.15.1", "6.1.155", "9.0.0", true),
         ("1.17.0", "6.18.44", "12.0.0", true),
         ("1.17.0", "6.1.155", "12.0.0", true),
-        ("1.17.0", "6.1.155-bpf-modsig-nft", "12.0.0", false),
+        ("1.17.0", "6.1.155-bpf-modsig-nft", "12.0.0", true),
     ]) {
         let definition = environment.definition();
         let requirements = definition.execution_requirements().unwrap();
