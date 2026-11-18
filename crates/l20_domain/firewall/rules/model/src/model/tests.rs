@@ -3,30 +3,14 @@ use crate::test_fixtures::{id, port_rule};
 
 #[test]
 fn a_revision_rejects_a_repeated_rule_id() {
-    // So a base with a repeated ID can never reach `apply`.
+    // So the diff's match by ID is never ambiguous.
     assert_eq!(
         FirewallRuleRevision::new(vec![
             port_rule("a", "tcp", 1),
             port_rule("b", "tcp", 2),
             port_rule("a", "tcp", 3),
         ]),
-        Err(RuleRevisionError::DuplicateRuleId {
-            id: id("a"),
-            first_index: 0,
-            duplicate_index: 2,
-        })
-    );
-    assert_eq!(
-        FirewallRuleRevision::new(vec![
-            port_rule("a", "tcp", 1),
-            port_rule("b", "tcp", 2),
-            port_rule("b", "tcp", 3),
-        ]),
-        Err(RuleRevisionError::DuplicateRuleId {
-            id: id("b"),
-            first_index: 1,
-            duplicate_index: 2,
-        })
+        Err(RuleRevisionError::DuplicateRuleId { id: id("a") })
     );
 }
 

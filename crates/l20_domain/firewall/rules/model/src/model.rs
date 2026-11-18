@@ -1,12 +1,12 @@
 //! The typed firewall rules: revisions, rules, comparisons, reads and values.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 
 /// The longest name, in bytes, that any [`NameKind`] allows.
-pub const MAX_NAME_LEN: usize = 64;
+const MAX_NAME_LEN: usize = 64;
 
 /// Declares a name kept byte for byte as the caller wrote it, once it passes
 /// its kind's syntax rule. Runtime qualification decides whether a valid name
@@ -69,7 +69,8 @@ macro_rules! name {
 }
 
 name!(
-    /// The stable identity of a rule within a revision, which edits name.
+    /// The stable identity of a rule within a revision, by which a diff
+    /// matches rules.
     RuleId,
     NameKind::RuleId
 );
@@ -89,8 +90,9 @@ name!(
     NameKind::TcpOptionName
 );
 
-/// The kinds of name, each with its syntax rule: 1 to [`MAX_NAME_LEN`] bytes
-/// of printable ASCII, where a rule ID also excludes the space.
+/// The kinds of name, each with its syntax rule: 1 to 64 bytes of printable
+/// ASCII, 0x21 to 0x7E for a rule ID and 0x20 to 0x7E, which adds the space,
+/// for every other name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NameKind {
     RuleId,
@@ -109,9 +111,7 @@ impl NameKind {
         }
     }
 
-    /// Whether a name of this kind may contain `c`: 0x21 to 0x7E for a rule
-    /// ID, and 0x20 to 0x7E, which adds the space, for every other name.
-    pub const fn allows(self, c: char) -> bool {
+    const fn allows(self, c: char) -> bool {
         match self {
             Self::RuleId => c.is_ascii_graphic(),
             Self::HeaderProtocol | Self::HeaderField | Self::TcpOptionName => {
@@ -194,36 +194,23 @@ impl FirewallRuleRevision {
     pub fn rule(&self, id: &RuleId) -> Option<&Rule> {
         self.rules.iter().find(|rule| rule.id() == id)
     }
-
-    pub fn into_rules(self) -> Vec<Rule> {
-        self.rules
-    }
 }
 
 fn validate_unique_ids(rules: &[Rule]) -> Result<(), RuleRevisionError> {
-    let mut first_index = HashMap::with_capacity(rules.len());
-    for (index, rule) in rules.iter().enumerate() {
-        if let Some(&first) = first_index.get(rule.id()) {
-            return Err(RuleRevisionError::DuplicateRuleId {
-                id: rule.id().clone(),
-                first_index: first,
-                duplicate_index: index,
-            });
-        }
-        first_index.insert(rule.id(), index);
+    let mut seen = HashSet::with_capacity(rules.len());
+    match rules.iter().find(|rule| !seen.insert(rule.id())) {
+        Some(rule) => Err(RuleRevisionError::DuplicateRuleId {
+            id: rule.id().clone(),
+        }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// A rule list that cannot form a revision.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuleRevisionError {
-    #[error("rule ID {id:?} at index {duplicate_index} repeats the rule at index {first_index}", id = .id.as_str())]
-    DuplicateRuleId {
-        id: RuleId,
-        first_index: usize,
-        duplicate_index: usize,
-    },
+    #[error("rule ID {id:?} appears more than once", id = .id.as_str())]
+    DuplicateRuleId { id: RuleId },
 }
 
 /// A rule that drops a packet when every comparison in `all_of` matches.
@@ -237,7 +224,7 @@ impl Rule {
     /// Builds a rule, keeping comparison order. `all_of` must be nonempty.
     pub fn new(id: RuleId, all_of: Vec<Match>) -> Result<Self, EmptyAllOfError> {
         if all_of.is_empty() {
-            return Err(EmptyAllOfError { id });
+            return Err(EmptyAllOfError);
         }
         Ok(Self { id, all_of })
     }
@@ -253,10 +240,8 @@ impl Rule {
 
 /// A rule was given no comparisons, which would match every packet.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("rule {id:?} has an empty all_of", id = .id.as_str())]
-pub struct EmptyAllOfError {
-    pub id: RuleId,
-}
+#[error("all_of must contain at least one comparison")]
+pub struct EmptyAllOfError;
 
 /// An equality comparison between a packet read and a value. Equality is the
 /// only operator the grammar allows.
@@ -265,22 +250,8 @@ pub struct EmptyAllOfError {
 /// the field is runtime qualification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Match {
-    left: Read,
-    right: Value,
-}
-
-impl Match {
-    pub fn new(left: Read, right: Value) -> Self {
-        Self { left, right }
-    }
-
-    pub fn left(&self) -> &Read {
-        &self.left
-    }
-
-    pub fn right(&self) -> &Value {
-        &self.right
-    }
+    pub left: Read,
+    pub right: Value,
 }
 
 /// The packet data a comparison reads.
@@ -300,22 +271,8 @@ pub enum Read {
 /// A protocol header field, named as the caller wrote it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadHeader {
-    protocol: HeaderProtocol,
-    field: HeaderField,
-}
-
-impl PayloadHeader {
-    pub fn new(protocol: HeaderProtocol, field: HeaderField) -> Self {
-        Self { protocol, field }
-    }
-
-    pub fn protocol(&self) -> &HeaderProtocol {
-        &self.protocol
-    }
-
-    pub fn field(&self) -> &HeaderField {
-        &self.field
-    }
+    pub protocol: HeaderProtocol,
+    pub field: HeaderField,
 }
 
 /// The value a read is compared with.

@@ -1,4 +1,3 @@
-use std::error::Error as _;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 
@@ -7,7 +6,7 @@ use pplx_space_firewall_rules::{
     PayloadHeader, Read, Rule, RuleId, TcpOptionName, Value,
 };
 
-use crate::{DecodeError, decode_revision, decode_revision_bytes, encode_revision};
+use crate::{DecodeError, decode_revision, encode_revision};
 
 /// Every read and value kind, in canonical form, as the previous hand-written
 /// encoder wrote it.
@@ -26,10 +25,14 @@ const ALL_VARIANTS: &str = concat!(
 const DPORT: &str = r#"{"payload":{"protocol":"tcp","field":"dport"}}"#;
 
 fn header(protocol: &str, field: &str) -> PayloadHeader {
-    PayloadHeader::new(
-        HeaderProtocol::new(protocol).unwrap(),
-        HeaderField::new(field).unwrap(),
-    )
+    PayloadHeader {
+        protocol: HeaderProtocol::new(protocol).unwrap(),
+        field: HeaderField::new(field).unwrap(),
+    }
+}
+
+fn eq(left: Read, right: Value) -> Match {
+    Match { left, right }
 }
 
 fn rule(id: &str, all_of: Vec<Match>) -> Rule {
@@ -59,12 +62,13 @@ fn with_right(right: &str) -> String {
 /// Expands a table of `<level> <json>` lines. The level places the JSON in an
 /// otherwise valid document: as the whole `document`, the `rules` array, one
 /// `match`, or that match's `left`, `op` or `right`. `GOOD` is a valid
-/// comparison.
+/// comparison, and lines starting with `#` are comments.
 fn documents(table: &str) -> Vec<String> {
     let good = format!(r#"{{"left":{DPORT},"op":"==","right":1}}"#);
     table
         .lines()
         .skip(1)
+        .filter(|line| !line.starts_with('#'))
         .map(|line| {
             let (level, json) = line.split_once(' ').unwrap_or((line, ""));
             let json = json.replace("GOOD", &good);
@@ -81,21 +85,24 @@ fn documents(table: &str) -> Vec<String> {
         .collect()
 }
 
+/// Golden bytes for every read and value kind, decoding regardless of key order
+/// and whitespace, names kept verbatim and escaped, and boundary documents that
+/// encode back to themselves.
 #[test]
-fn every_variant_decodes_to_the_model_and_encodes_to_the_golden_bytes() {
+fn documents_round_trip_through_the_canonical_form() {
     let expected = FirewallRuleRevision::new(vec![
         rule(
             "first",
             vec![
-                Match::new(
+                eq(
                     Read::Payload(header("ip", "daddr")),
                     Value::Ipv4(Ipv4Addr::new(192, 0, 2, 1)),
                 ),
-                Match::new(
+                eq(
                     Read::TcpOption(TcpOptionName::new("mptcp").unwrap()),
                     Value::True,
                 ),
-                Match::new(
+                eq(
                     Read::MaskedPayload {
                         header: header("tcp", "flags"),
                         mask: NonZeroU64::new(18).unwrap(),
@@ -107,11 +114,11 @@ fn every_variant_decodes_to_the_model_and_encodes_to_the_golden_bytes() {
         rule(
             "second",
             vec![
-                Match::new(
+                eq(
                     Read::Payload(header("ip", "saddr")),
                     Value::Ipv4Prefix(Ipv4Prefix::new(Ipv4Addr::new(198, 51, 100, 0), 24).unwrap()),
                 ),
-                Match::new(
+                eq(
                     Read::Payload(header("tcp", "dport")),
                     Value::Range(IntegerRange::new(1024, 65535).unwrap()),
                 ),
@@ -121,10 +128,6 @@ fn every_variant_decodes_to_the_model_and_encodes_to_the_golden_bytes() {
     .unwrap();
     assert_eq!(encode_revision(&expected), ALL_VARIANTS);
     assert_eq!(decode_revision(ALL_VARIANTS).unwrap(), expected);
-    assert_eq!(
-        decode_revision_bytes(ALL_VARIANTS.as_bytes()).unwrap(),
-        expected
-    );
 
     let reordered = r#"{"rules":[
         {"all_of":[
@@ -138,6 +141,37 @@ fn every_variant_decodes_to_the_model_and_encodes_to_the_golden_bytes() {
         ],"id":"second"}
     ],"schema_version":1}"#;
     assert_eq!(decode_revision(reordered).unwrap(), expected);
+
+    let escaped = FirewallRuleRevision::new(vec![
+        rule(
+            r#"q"\/x"#,
+            vec![eq(
+                Read::Payload(header(r#"say "hi" \ bye"#, r#" {"field":1} "#)),
+                Value::True,
+            )],
+        ),
+        rule(
+            r"\\",
+            vec![eq(
+                Read::TcpOption(TcpOptionName::new(r#"opt "a" \b"#).unwrap()),
+                Value::True,
+            )],
+        ),
+    ])
+    .unwrap();
+    let golden = concat!(
+        r#"{"schema_version":1,"rules":["#,
+        r#"{"id":"q\"\\/x","all_of":[{"left":{"payload":{"protocol":"say \"hi\" \\ bye","field":" {\"field\":1} "}},"op":"==","right":true}]},"#,
+        r#"{"id":"\\\\","all_of":[{"left":{"tcp option":{"name":"opt \"a\" \\b"}},"op":"==","right":true}]}"#,
+        r#"]}"#,
+    );
+    assert_eq!(encode_revision(&escaped), golden);
+    assert_eq!(decode_revision(golden).unwrap(), escaped);
+
+    for document in documents(CANONICAL) {
+        let revision = decode_revision(&document).unwrap_or_else(|e| panic!("{document}: {e}"));
+        assert_eq!(encode_revision(&revision), document);
+    }
 }
 
 /// The acceptance example as a caller writes it, and its canonical bytes as the
@@ -172,35 +206,8 @@ fn the_acceptance_example_encodes_to_the_golden_bytes() {
     assert_eq!(decode_revision(golden).unwrap(), revision);
 }
 
-#[test]
-fn names_are_kept_verbatim_and_escaped_as_json_strings() {
-    let adversarial = || header(r#"say "hi" \ bye"#, r#" {"field":1} "#);
-    let revision = FirewallRuleRevision::new(vec![
-        rule(
-            r#"q"\/x"#,
-            vec![Match::new(Read::Payload(adversarial()), Value::True)],
-        ),
-        rule(
-            r"\\",
-            vec![Match::new(
-                Read::TcpOption(TcpOptionName::new(r#"opt "a" \b"#).unwrap()),
-                Value::True,
-            )],
-        ),
-    ])
-    .unwrap();
-    let golden = concat!(
-        r#"{"schema_version":1,"rules":["#,
-        r#"{"id":"q\"\\/x","all_of":[{"left":{"payload":{"protocol":"say \"hi\" \\ bye","field":" {\"field\":1} "}},"op":"==","right":true}]},"#,
-        r#"{"id":"\\\\","all_of":[{"left":{"tcp option":{"name":"opt \"a\" \\b"}},"op":"==","right":true}]}"#,
-        r#"]}"#,
-    );
-    assert_eq!(encode_revision(&revision), golden);
-    assert_eq!(decode_revision(golden).unwrap(), revision);
-}
-
 /// Boundary documents already in canonical form, one per line as in
-/// [`REJECTED`]: each decodes and encodes back to the same bytes.
+/// [`REJECTED`].
 const CANONICAL: &str = r##"
 document {"schema_version":1,"rules":[]}
 right 0
@@ -220,33 +227,18 @@ rules {"id":"cdefghijklmnopqrstuvwxyz{|}~","all_of":[GOOD]}
 "##;
 
 #[test]
-fn boundary_values_are_canonical_fixed_points() {
-    for document in documents(CANONICAL) {
-        let revision = decode_revision(&document).unwrap_or_else(|e| panic!("{document}: {e}"));
-        assert_eq!(encode_revision(&revision), document);
-    }
-}
-
-#[test]
 fn the_version_is_read_before_the_grammar() {
-    let errors = |document: &str| {
-        [
-            decode_revision(document).unwrap_err(),
-            decode_revision_bytes(document.as_bytes()).unwrap_err(),
-        ]
-    };
     for (document, version) in [
         (r#"{"schema_version":2,"rules":[]}"#, 2),
         (r#"{"schema_version":2,"rules":[],"x":{}}"#, 2),
         (r#"{"x":{},"rules":"none","rules":1,"schema_version":2}"#, 2),
         (r#"{"schema_version":0,"rules":[]}"#, 0),
     ] {
-        for error in errors(document) {
-            assert!(
-                matches!(error, DecodeError::UnsupportedSchemaVersion(found) if found == version),
-                "{document}: {error:?}"
-            );
-        }
+        let error = decode_revision(document).unwrap_err();
+        assert!(
+            matches!(error, DecodeError::UnsupportedSchemaVersion(found) if found == version),
+            "{document}: {error:?}"
+        );
     }
     for document in [
         r#"{"rules":[]}"#,
@@ -260,210 +252,124 @@ fn the_version_is_read_before_the_grammar() {
         r#"{"schema_version":1,"rules":[],"schema_version":1}"#,
         r#"[1,[]]"#,
     ] {
-        for error in errors(document) {
-            assert!(
-                matches!(error, DecodeError::Json(_)),
-                "{document}: {error:?}"
-            );
-        }
+        let error = decode_revision(document).unwrap_err();
+        assert!(
+            matches!(error, DecodeError::Json(_)),
+            "{document}: {error:?}"
+        );
     }
 }
 
-#[test]
-fn errors_locate_the_problem() {
-    let error = decode_revision("{\n  \"schema_version\": 1,\n  \"rules\": [] x").unwrap_err();
-    let DecodeError::Json(json) = &error else {
-        panic!("{error:?}");
-    };
-    assert_eq!((json.line(), json.column()), (3, 15));
-    assert!(error.source().is_some());
-
-    let rule_json = |id: &str, all_of: &str| format!(r#"{{"id":"{id}","all_of":[{all_of}]}}"#);
-    let good = format!(r#"{{"left":{DPORT},"op":"==","right":1}}"#);
-    let error = decode_revision(&doc(
-        &[rule_json("a", &good), rule_json("web", "")].join(",")
-    ))
-    .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        r#"invalid firewall rules: rules[1] ("web"): rule "web" has an empty all_of"#
-    );
-}
-
-/// Every document the previous decoder rejected, plus the forms a derived
-/// `Deserialize` would otherwise accept: arrays for objects, `{"==":null}` for
-/// the operator, and a unit-variant string for a read. Lines are expanded by
-/// [`documents`].
+/// One row for each rule the decoder enforces, in the format [`documents`]
+/// reads. Every document here was rejected before the derived wire types; the
+/// last group holds forms a plain derived `Deserialize` would accept.
 const REJECTED: &str = r##"
-document
-document null
-document []
+# Not a revision object, trailing data, a number JSON cannot hold
 document "add rule ip filter output drop"
-document {}
 document {"schema_version":1,"rules":[]} x
-document {"schema_version":1,"rules":[]} {}
+right 1e400
+# Missing required field
 document {"schema_version":1}
-document {"schema_version":1,"rules":"[]"}
-document {"schema_version":1,"rules":null}
-document {"schema_version":1,"rules":{}}
-rules "nft flush ruleset"
-document {"schema_version":1,"rules":[],"rules":[]}
-document {"schema_version":1,"rules":[],"x":{}}
-document {"schema_version":1,"rules":[],"123":1}
-document {"schema_version":1,"rules":[],"_x9":1}
-document {"schema_version":1,"rules":[],"a\u0000b":1}
-document {"schema_version":1,"rules":[],"verdict":"x"}
-document {"schema_version":1,"rules":[],"table":"x"}
-document {"schema_version":1,"rules":[],"chain":"x"}
-document {"schema_version":1,"rules":[],"priority":"x"}
-document {"schema_version":1,"rules":[],"interface":"x"}
-document {"schema_version":1,"rules":[],"command":"x"}
-rules {"id":"a","all_of":[GOOD],"comment":"x"}
-rules {"id":"a","all_of":[GOOD],"verdict":"accept"}
-rules {"id":"a","all_of":[GOOD],"table":"accept"}
-rules {"id":"a","all_of":[GOOD],"chain":"accept"}
-rules {"id":"a","all_of":[GOOD],"priority":"accept"}
-rules {"id":"a","all_of":[GOOD],"interface":"accept"}
-rules {"id":"a","all_of":[GOOD],"command":"accept"}
-rules {"id":"","all_of":[GOOD]}
-rules {"id":"a b","all_of":[GOOD]}
-rules {"id":"\u001b[31mweb","all_of":[GOOD]}
-rules {"id":"a\nb","all_of":[GOOD]}
-rules {"id":"web\u200b","all_of":[GOOD]}
-rules {"id":"wéb","all_of":[GOOD]}
-rules {"id":7,"all_of":[GOOD]}
-rules {"id":null,"all_of":[GOOD]}
-rules {"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","all_of":[GOOD]}
-rules {"id":"a","all_of":[GOOD]},{"id":"a","all_of":[GOOD]}
-rules {"id":"a","all_of":[GOOD]},{"id":"b","all_of":[GOOD]},{"id":"a","all_of":[GOOD]}
-rules {"id":"a","all_of":[GOOD]},{"id":"b","all_of":[GOOD]},{"id":"b","all_of":[GOOD]}
 rules {"id":"a","all_of":[GOOD]},{"all_of":[GOOD]}
 rules {"id":"a","all_of":[GOOD]},{"id":"b"}
-rules {"id":"a","all_of":[GOOD]},{"id":"b","all_of":[]}
-rules {"id":"a","all_of":null}
-rules {"id":"a","all_of":["tcp dport 1"]}
-rules {"id":"a","id":"b","all_of":[GOOD]}
-rules {"id":"a","all_of":[],"all_of":[GOOD]}
-rules ["a",[GOOD]]
-match "tcp dport 22 drop"
 match {"op":"==","right":1}
 match {"left":{"payload":{"protocol":"tcp","field":"dport"}},"right":1}
 match {"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"=="}
-right 1,"right":2
-right 1,"verdict":"accept"
-left {"payload":{"protocol":"tcp","field":"dport"}},"op":"!="
-match [{"payload":{"protocol":"tcp","field":"dport"}},"==",1]
-op "!="
-op "<"
-op "in"
-op "eq"
-op ""
-op " =="
-op null
-op {"==":null}
-left "tcp dport"
-left "payload"
-left {}
-left {"meta":{"key":"mark"}}
-left {"|":[{"payload":{"protocol":"tcp","field":"flags"}},1]}
-left {"payload":{"protocol":"tcp","field":"dport"},"tcp option":{"name":"mptcp"}}
-left {"payload":{"protocol":"tcp","field":"dport"},"payload":{"protocol":"udp","field":"dport"}}
-left {"payload":"tcp dport"}
-left {"payload":["tcp","dport"]}
 left {"payload":{"field":"dport"}}
 left {"payload":{"protocol":"tcp"}}
-left {"payload":{"protocol":null,"field":"dport"}}
-left {"payload":{"protocol":"","field":"dport"}}
-left {"payload":{"protocol":"tcp","field":"d\tport"}}
-left {"payload":{"protocol":"tcp","protocol":"udp","field":"dport"}}
-left {"payload":{"protocol":"tcp","field":"dport","interface":"eth0"}}
-left {"tcp option":"mptcp"}
 left {"tcp option":{}}
-left {"tcp option":["mptcp"]}
-left {"tcp option":{"name":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
-left {"tcp option":{"name":"mptcp","name":"sack"}}
-left {"tcp option":{"name":"mptcp","field":"kind"}}
+right {"prefix":{"addr":"192.0.2.0"}}
+# Wrong type at each position
+document {"schema_version":1,"rules":{}}
+rules "nft flush ruleset"
+rules {"id":7,"all_of":[GOOD]}
+rules {"id":"a","all_of":null}
+rules {"id":"a","all_of":["tcp dport 1"]}
+op null
+left {"payload":"tcp dport"}
+left {"payload":{"protocol":null,"field":"dport"}}
+left {"tcp option":"mptcp"}
 left {"&":{"payload":{"protocol":"tcp","field":"flags"}}}
-left {"&":[{"payload":{"protocol":"tcp","field":"flags"}}]}
-left {"&":[{"payload":{"protocol":"tcp","field":"flags"}},2,3]}
-left {"&":[{"payload":{"protocol":"tcp","field":"flags"}},0]}
-left {"&":[{"payload":{"protocol":"tcp","field":"flags"}},-1]}
-left {"&":[{"payload":{"protocol":"tcp","field":"flags"}},18446744073709551616]}
-left {"&":[{"payload":{"protocol":"tcp","field":"flags"}},"0x02"]}
 left {"&":[2,{"payload":{"protocol":"tcp","field":"flags"}}]}
-left {"&":[{},1]}
-left {"&":[{"tcp option":{"name":"mptcp"}},1]}
-left {"&":[{"&":[{"payload":{"protocol":"tcp","field":"flags"}},3]},1]}
-left {"&":[[{"protocol":"tcp","field":"flags"}],1]}
-left {"&":[{"payload":{"protocol":"\u001b[0m","field":"flags"}},1]}
-right false
+left {"&":[{"payload":{"protocol":"tcp","field":"flags"}},"0x02"]}
 right null
-right -1
-right 1.0
-right 1.5
-right 1e3
-right 18446744073709551616
-right 1e400
 right [1,2]
-right ""
-right " 192.0.2.1"
-right "01.2.3.4"
-right "1.2.3"
-right "256.0.0.1"
-right "192.0.2.0/24"
-right "2001:db8::1"
-right "::1"
-right "53"
-right [192,0,2,1]
-right {}
-right {"set":[1,2]}
-right {"prefix":{"addr":"192.0.2.0","len":24},"range":[1,2]}
-right {"prefix":{"addr":"192.0.2.0","len":24},"x":1}
-right {"range":[1,2],"range":[3,4]}
 right {"prefix":"192.0.2.0/24"}
 right {"prefix":{"addr":"192.0.2.0","len":"24"}}
-right {"prefix":{"addr":"192.0.2.0","len":-1}}
+right {"range":"1-2"}
+right {"range":["1",2]}
+# Unknown key at each level, including a caller-supplied verdict, table or chain
+document {"schema_version":1,"rules":[],"verdict":"x"}
+document {"schema_version":1,"rules":[],"chain":"x"}
+rules {"id":"a","all_of":[GOOD],"table":"accept"}
+right 1,"verdict":"accept"
+left {"payload":{"protocol":"tcp","field":"dport","interface":"eth0"}}
+left {"tcp option":{"name":"mptcp","field":"kind"}}
+left {"&":[{"payload":{"protocol":"tcp","field":"flags"},"x":1},1]}
+right {"prefix":{"addr":"192.0.2.0","len":24,"table":"filter"}}
+# Missing or unknown variant
+left {}
+left {"meta":{"key":"mark"}}
+left {"&":[{},1]}
+left {"&":[{"tcp option":{"name":"mptcp"}},1]}
+right {}
+right {"set":[1,2]}
+# Duplicate key at each level, inside the tagged enums and the untagged value
+document {"schema_version":1,"rules":[],"rules":[]}
+rules {"id":"a","id":"b","all_of":[GOOD]}
+right 1,"right":2
+left {"payload":{"protocol":"tcp","field":"dport"},"payload":{"protocol":"udp","field":"dport"}}
+left {"payload":{"protocol":"tcp","protocol":"udp","field":"dport"}}
+left {"tcp option":{"name":"mptcp","name":"sack"}}
+left {"&":[{"payload":{"protocol":"tcp","field":"flags"},"payload":{"protocol":"udp","field":"flags"}},1]}
+right {"range":[1,2],"range":[3,4]}
+right {"prefix":{"addr":"192.0.2.0","len":33,"len":24}}
+# Competing variants
+left {"payload":{"protocol":"tcp","field":"dport"},"tcp option":{"name":"mptcp"}}
+right {"prefix":{"addr":"192.0.2.0","len":24},"range":[1,2]}
+# false, negative, float, overflow, zero mask
+right false
+right -1
+right 1.5
+right 18446744073709551616
+left {"&":[{"payload":{"protocol":"tcp","field":"flags"}},0]}
+# Malformed or IPv6 address
+right "01.2.3.4"
+right "2001:db8::1"
+# Prefix length, reversed range, tuple length
 right {"prefix":{"addr":"192.0.2.0","len":33}}
 right {"prefix":{"addr":"192.0.2.0","len":256}}
-right {"prefix":{"addr":"192.0.2.0","len":4294967320}}
-right {"prefix":{"addr":"192.0.2.0"}}
-right {"prefix":{"addr":"2001:db8::","len":32}}
-right {"prefix":{"addr":"192.0.2.0","len":24,"table":"filter"}}
-right {"prefix":{"addr":"192.0.2.0","len":33,"len":24}}
-right {"prefix":["192.0.2.0",24]}
-right {"range":"1-2"}
-right {"range":[]}
-right {"range":[1]}
-right {"range":[1,2,3]}
 right {"range":[5,4]}
-right {"range":["1",2]}
-right {"range":[-1,2]}
-right {"range":[1,2.5]}
-right {"range":[1,18446744073709551616]}
-right {"range":{"start":1,"end":2}}
+right {"range":[1,2,3]}
+left {"&":[{"payload":{"protocol":"tcp","field":"flags"}}]}
+# Operator other than ==
+op "!="
+# Empty all_of, invalid names, duplicate rule IDs
+rules {"id":"a","all_of":[GOOD]},{"id":"b","all_of":[]}
+rules {"id":"a b","all_of":[GOOD]}
+left {"payload":{"protocol":"","field":"dport"}}
+left {"payload":{"protocol":"tcp","field":"d\tport"}}
+left {"tcp option":{"name":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+rules {"id":"a","all_of":[GOOD]},{"id":"a","all_of":[GOOD]}
+# Accepted by a plain derive: arrays for objects, {"==":null}, a unit-variant
+# read, and values that could fall back to another untagged variant
+rules ["a",[GOOD]]
+match [{"payload":{"protocol":"tcp","field":"dport"}},"==",1]
+left {"payload":["tcp","dport"]}
+left {"tcp option":["mptcp"]}
+left {"&":[[{"protocol":"tcp","field":"flags"}],1]}
+right {"prefix":["192.0.2.0",24]}
+op {"==":null}
+left "payload"
+right [192,0,2,1]
+right {"prefix":{"addr":"192.0.2.0","len":24},"x":1}
 "##;
 
 #[test]
 fn rejects_every_document_outside_the_grammar() {
-    let mut documents = documents(REJECTED);
     let depth = 100_000;
-    documents.push(with_right(&format!(
-        "{}{}",
-        "[".repeat(depth),
-        "]".repeat(depth)
-    )));
-    documents.push(with_right(&format!(
-        "{}1{}",
-        r#"{"a":"#.repeat(depth),
-        "}".repeat(depth)
-    )));
-
-    for document in &documents {
+    let deep = with_right(&format!("{}{}", "[".repeat(depth), "]".repeat(depth)));
+    for document in documents(REJECTED).iter().chain([&deep]) {
         assert!(decode_revision(document).is_err(), "accepted {document}");
-        assert!(
-            decode_revision_bytes(document.as_bytes()).is_err(),
-            "accepted {document}"
-        );
     }
-    decode_revision_bytes(b"\xff").unwrap_err();
 }

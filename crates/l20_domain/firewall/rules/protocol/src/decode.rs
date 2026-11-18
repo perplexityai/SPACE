@@ -21,14 +21,6 @@ pub fn decode_revision(text: &str) -> Result<FirewallRuleRevision, DecodeError> 
     decode_v1(revision)
 }
 
-/// Decodes one complete revision document from UTF-8 bytes.
-pub fn decode_revision_bytes(bytes: &[u8]) -> Result<FirewallRuleRevision, DecodeError> {
-    let Object(version) = serde_json::from_slice::<Object<Version>>(bytes)?;
-    check_version(version)?;
-    let Object(revision) = serde_json::from_slice(bytes)?;
-    decode_v1(revision)
-}
-
 /// A firewall rules document that does not decode.
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
@@ -41,7 +33,7 @@ pub enum DecodeError {
     #[error("unsupported schema version {0}; only {SCHEMA_VERSION} is supported")]
     UnsupportedSchemaVersion(u64),
     /// A rule that fails a model check or compares with `false`, named by its
-    /// index and, once it is valid, its ID.
+    /// index and, once it is valid, its ID. A repeated ID is named by the ID.
     #[error("invalid firewall rules: {0}")]
     Invalid(String),
 }
@@ -96,10 +88,10 @@ impl TryFrom<MatchV1> for Match {
     type Error = InvalidMatch;
 
     fn try_from(comparison: MatchV1) -> Result<Self, Self::Error> {
-        Ok(Match::new(
-            comparison.left.try_into()?,
-            comparison.right.try_into()?,
-        ))
+        Ok(Match {
+            left: comparison.left.try_into()?,
+            right: comparison.right.try_into()?,
+        })
     }
 }
 
@@ -129,10 +121,10 @@ impl TryFrom<HeaderV1> for PayloadHeader {
     type Error = NameError;
 
     fn try_from(header: HeaderV1) -> Result<Self, Self::Error> {
-        Ok(PayloadHeader::new(
-            HeaderProtocol::new(header.protocol)?,
-            HeaderField::new(header.field)?,
-        ))
+        Ok(PayloadHeader {
+            protocol: HeaderProtocol::new(header.protocol)?,
+            field: HeaderField::new(header.field)?,
+        })
     }
 }
 

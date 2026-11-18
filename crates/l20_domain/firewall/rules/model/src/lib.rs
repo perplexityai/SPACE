@@ -1,5 +1,5 @@
-//! The runtime drop-only firewall rules: their typed model, atomic edits, and
-//! the diff between two revisions, shared by the CLI and the Admin API.
+//! The runtime drop-only firewall rules: their typed model and the [`diff`]
+//! between two revisions, shared by the CLI and the Admin API.
 //!
 //! This crate has no wire format; `pplx-space-firewall-rules-protocol` owns the
 //! only canonical bytes. Validation checks shape only: there is no catalog of
@@ -14,16 +14,14 @@
 //! to the base it was computed from.
 
 mod diff;
-mod edit;
 mod model;
 
 #[cfg(test)]
 mod test_fixtures;
 
-pub use diff::{RuleChange, RuleRevisionDiff};
-pub use edit::{Edit, EditError, EditKind, RuleRevisionChange};
+pub use diff::{RuleChange, RuleRevisionDiff, diff};
 pub use model::{
     EmptyAllOfError, FirewallRuleRevision, HeaderField, HeaderProtocol, IntegerRange, Ipv4Prefix,
-    MAX_NAME_LEN, Match, NameError, NameKind, PayloadHeader, PrefixLengthError, Read,
-    ReversedRangeError, Rule, RuleId, RuleRevisionError, TcpOptionName, Value,
+    Match, NameError, NameKind, PayloadHeader, PrefixLengthError, Read, ReversedRangeError, Rule,
+    RuleId, RuleRevisionError, TcpOptionName, Value,
 };

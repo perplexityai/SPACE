@@ -49,9 +49,9 @@ impl From<&Rule> for RuleV1 {
 impl From<&Match> for MatchV1 {
     fn from(comparison: &Match) -> Self {
         Self {
-            left: comparison.left().into(),
+            left: (&comparison.left).into(),
             op: Op::Eq,
-            right: comparison.right().into(),
+            right: (&comparison.right).into(),
         }
     }
 }
@@ -76,8 +76,8 @@ impl From<&Read> for ReadV1 {
 impl From<&PayloadHeader> for HeaderV1 {
     fn from(header: &PayloadHeader) -> Self {
         Self {
-            protocol: header.protocol().as_str().to_owned(),
-            field: header.field().as_str().to_owned(),
+            protocol: header.protocol.as_str().to_owned(),
+            field: header.field.as_str().to_owned(),
         }
     }
 }

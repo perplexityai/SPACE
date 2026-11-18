@@ -1,4 +1,4 @@
-//! Builders shared by the model and edit tests.
+//! Builders shared by the model and diff tests.
 
 use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
@@ -13,14 +13,17 @@ pub(crate) fn id(value: &str) -> RuleId {
 }
 
 pub(crate) fn header(protocol: &str, field: &str) -> PayloadHeader {
-    PayloadHeader::new(
-        HeaderProtocol::new(protocol).unwrap(),
-        HeaderField::new(field).unwrap(),
-    )
+    PayloadHeader {
+        protocol: HeaderProtocol::new(protocol).unwrap(),
+        field: HeaderField::new(field).unwrap(),
+    }
 }
 
 pub(crate) fn payload_eq(protocol: &str, field: &str, value: Value) -> Match {
-    Match::new(Read::Payload(header(protocol, field)), value)
+    Match {
+        left: Read::Payload(header(protocol, field)),
+        right: value,
+    }
 }
 
 pub(crate) fn rule(name: &str, all_of: Vec<Match>) -> Rule {
@@ -37,14 +40,6 @@ pub(crate) fn port_rule(name: &str, protocol: &str, port: u64) -> Rule {
 
 pub(crate) fn revision(rules: Vec<Rule>) -> FirewallRuleRevision {
     FirewallRuleRevision::new(rules).unwrap()
-}
-
-pub(crate) fn ids(snapshot: &FirewallRuleRevision) -> Vec<&str> {
-    snapshot
-        .rules()
-        .iter()
-        .map(|rule| rule.id().as_str())
-        .collect()
 }
 
 fn web_prefix() -> Match {
@@ -74,7 +69,7 @@ pub(crate) fn acceptance_base() -> FirewallRuleRevision {
     ])
 }
 
-/// The replacement for `web` in the acceptance batch.
+/// `web` as the acceptance candidate changes it.
 pub(crate) fn acceptance_web_prime() -> Rule {
     rule(
         "web",
@@ -103,17 +98,17 @@ pub(crate) fn acceptance_probe() -> Rule {
     rule(
         "probe",
         vec![
-            Match::new(
-                Read::TcpOption(TcpOptionName::new("mptcp").unwrap()),
-                Value::True,
-            ),
-            Match::new(
-                Read::MaskedPayload {
+            Match {
+                left: Read::TcpOption(TcpOptionName::new("mptcp").unwrap()),
+                right: Value::True,
+            },
+            Match {
+                left: Read::MaskedPayload {
                     header: header("tcp", "flags"),
                     mask: NonZeroU64::new(2).unwrap(),
                 },
-                Value::Integer(2),
-            ),
+                right: Value::Integer(2),
+            },
         ],
     )
 }
