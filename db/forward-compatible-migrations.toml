@@ -19,3 +19,15 @@ store = "sandbox-manager"
 version = 20261114020000
 checksum = "98f25d61b0439360b174dc09f876f2760bd08f758fcd18ecb08ea674fe2706d5820a0fbaa1ee0a4a2ba9793ab2bd8dcc"
 reason = "drops the generated legacy_state column, which this release never names"
+
+[[migrations]]
+store = "sandbox-manager"
+version = 20261117234108
+checksum = "e7dda82664602aaf6adab2e670c6603c19672f2be70a0565ec0b4b4d9c17c64c60f707d0202370bd02058b4deb52ce3a"
+reason = "creates the activation_seal table, which this release never names"
+
+[[migrations]]
+store = "sandbox-manager"
+version = 20261117234200
+checksum = "d20aaffad460a55de0412a46099267ddd0c3aeda58aa2529c2216dd659b2963690b28fc6731f9358b283725e331cd4e9"
+reason = "creates the drain_evacuations table, which this release never names"
