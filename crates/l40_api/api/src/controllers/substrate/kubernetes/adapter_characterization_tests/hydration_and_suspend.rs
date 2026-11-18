@@ -544,6 +544,89 @@ async fn suspend_execution_resumes_retirement_of_a_committed_suspend() -> TestRe
     Ok(())
 }
 
+/// On Kubernetes, a suspend requested through `Substrate`, as the sandbox
+/// controller does, finishes after its request waiter disconnects:
+/// `KubernetesSubstrate`'s inherent `suspend_execution` stops with its caller,
+/// and the adapter dispatch must reach the tracked one instead.
+#[tokio::test(flavor = "current_thread")]
+async fn substrate_suspend_finishes_after_its_waiter_disconnects() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    let pod_name = "space-sbx-detached-suspend-g1";
+    let artifact = LocalArtifactId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "suspending").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(artifact.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    insert_execution(
+        &db.pool,
+        sandbox_id,
+        ExecutionSeed {
+            k8s_node_name: None,
+            state: "suspended",
+            ..ExecutionSeed::running(pod_name, "detached-suspend-uid")
+        },
+    )
+    .await?;
+    // The pod DELETE holds until the waiter is gone.
+    let delete_seen = Arc::new(tokio::sync::Notify::new());
+    let release_delete = Arc::new(tokio::sync::Semaphore::new(0));
+    let (client, _log) = scripted_kube_client_async({
+        let delete_seen = Arc::clone(&delete_seen);
+        let release_delete = Arc::clone(&release_delete);
+        move |request| {
+            let delete_seen = Arc::clone(&delete_seen);
+            let release_delete = Arc::clone(&release_delete);
+            async move {
+                if request.path != pod_path(pod_name) {
+                    return kube_status(StatusCode::BAD_REQUEST, "BadRequest");
+                }
+                match request.method {
+                    Method::DELETE => {
+                        delete_seen.notify_one();
+                        let _permit = release_delete.acquire().await;
+                        kube_status(StatusCode::OK, "Success")
+                    }
+                    _ => kube_status(StatusCode::NOT_FOUND, "NotFound"),
+                }
+            }
+        }
+    });
+    let mut kubernetes = substrate_with_store_and_client(db.pool.clone(), client);
+    kubernetes.k8s.k8s_blocking_delete_timeout = BLOCKING_DELETE_TIMEOUT;
+    let task_tracker = kubernetes.task_tracker.clone();
+    let substrate = Substrate::from_kubernetes(kubernetes);
+
+    let waiter = tokio::spawn(async move { substrate.suspend_execution(sandbox_id).await });
+    tokio::time::timeout(Duration::from_secs(5), delete_seen.notified())
+        .await
+        .map_err(|_| "the suspend never reached its pod retirement")?;
+    waiter.abort();
+    assert!(
+        waiter
+            .await
+            .expect_err("the waiter was aborted")
+            .is_cancelled()
+    );
+    release_delete.add_permits(1);
+    task_tracker.close();
+    tokio::time::timeout(Duration::from_secs(5), task_tracker.wait())
+        .await
+        .map_err(|_| "the detached suspend never finished")?;
+
+    assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "suspended");
+    assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 0);
+    Ok(())
+}
+
 /// Records a ready full suspend snapshot of `artifact`, taken by the
 /// sandbox's active node after the suspend claim this test is about to make,
 /// with a live storage location: the control plane's evidence that a suspend

@@ -1389,76 +1389,6 @@ pub trait SubstrateAdapter: Send + Sync {
         delete_observed_execution_via_node_api(self, sandbox_id, target).await
     }
 
-    async fn enqueue_artifact_backup(
-        &self,
-        sandbox_id: SandboxId,
-        expected_kind: ArtifactKind,
-        source: BackupSource,
-        target: &NodeApiTarget<'_>,
-    ) -> Result<EnqueuedArtifactBackup, SubstrateError> {
-        let endpoint_addr = self.resolve_node_api_endpoint(target).await?;
-        enqueue_artifact_backup_via_retrying_node_api(
-            &endpoint_addr,
-            sandbox_id,
-            expected_kind,
-            source,
-        )
-        .await
-    }
-
-    async fn create_snapshot_from_durable_artifact(
-        &self,
-        target: &NodeApiTarget<'_>,
-        operation_id: OperationId,
-        source_sandbox_id: SandboxId,
-        target_sandbox_id: SandboxId,
-        source_storage_uri: String,
-        destination_storage_uri: String,
-    ) -> Result<PublishedDurableSnapshot, DurableSnapshotError> {
-        let endpoint_addr = self.resolve_node_api_endpoint(target).await?;
-        let mut node_api = retrying_worker_node_api(&endpoint_addr, Duration::from_secs(30))?;
-        let mut client = RetryingWorkerApiClient::new(&mut node_api);
-        let response = client
-            .create_sandbox_snapshot(
-                pplx_space_sbx_mgr_client::proto::CreateSnapshotRequest {
-                    sandbox_id: source_sandbox_id.to_string(),
-                    r#type: pplx_space_sbx_mgr_client::proto::SnapshotType::Disk as i32,
-                    label: None,
-                    creation_identity: Some(
-                        pplx_space_sbx_mgr_client::proto::SnapshotCreationIdentity {
-                            request_id: operation_id.as_uuid().to_string(),
-                        },
-                    ),
-                    source: Some(pplx_space_sbx_mgr_client::proto::CreateSnapshotSource {
-                        source: Some(
-                            pplx_space_sbx_mgr_client::proto::create_snapshot_source::Source::DurableArtifact(
-                                pplx_space_sbx_mgr_client::proto::DurableArtifactSnapshotSource {
-                                    source_storage_uri,
-                                    destination_storage_uri,
-                                    destination_sandbox_id: target_sandbox_id.to_string(),
-                                    destination_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Fork as i32,
-                                },
-                            ),
-                        ),
-                    }),
-                },
-                Duration::from_secs(600),
-            )
-            .await
-            .map_err(durable_snapshot_rpc_error)?
-            .into_inner();
-        let published =
-            response
-                .published_durable_artifact
-                .ok_or_else(|| SubstrateError::Failed {
-                    message: "durable snapshot response omitted its storage identity".to_string(),
-                })?;
-        Ok(PublishedDurableSnapshot {
-            storage_uri: published.storage_uri,
-            bytes_published: published.bytes_published,
-        })
-    }
-
     /// Ensure the active execution object exists and is usable for runtime calls.
     ///
     /// This is the substrate reconciliation point for start: it may create,
@@ -1722,26 +1652,15 @@ pub trait SubstrateAdapter: Send + Sync {
         Ok(PooledPrepareFailureCleanup::FinalizeSandboxDbDelete)
     }
 
-    async fn apply_pooled_execution_auto_lifecycle(
-        &self,
-        _claim: &PooledExecutionClaim,
-        _policy: &AutoLifecyclePolicy,
-    ) -> Result<(), ControllerError> {
-        Ok(())
-    }
-
     async fn prepare_pooled_execution(
         &self,
-        _metric_identity: SandboxApiMetricIdentity,
-        _request: &PooledExecutionClaimRequest<'_>,
+        metric_identity: SandboxApiMetricIdentity,
+        request: &PooledExecutionClaimRequest<'_>,
         claim: &PooledExecutionClaim,
         policy: &AutoLifecyclePolicy,
-        _wait_until_ready: bool,
-        _timeout: Duration,
-    ) -> Result<(), ControllerError> {
-        self.apply_pooled_execution_auto_lifecycle(claim, policy)
-            .await
-    }
+        wait_until_ready: bool,
+        timeout: Duration,
+    ) -> Result<(), ControllerError>;
 
     async fn list_pool_configs(&self) -> Result<Vec<ClusterPoolConfigResponse>, ControllerError> {
         Err(SubstrateError::Unsupported {
@@ -1926,6 +1845,81 @@ impl Substrate {
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.try_resolve_node_api_endpoint(target),
         }
+    }
+
+    /// Ask the node behind `target` to back up one of its artifacts. Shared
+    /// over any substrate: the adapter only says how to reach the node.
+    pub async fn enqueue_artifact_backup(
+        &self,
+        sandbox_id: SandboxId,
+        expected_kind: ArtifactKind,
+        source: BackupSource,
+        target: &NodeApiTarget<'_>,
+    ) -> Result<EnqueuedArtifactBackup, SubstrateError> {
+        let endpoint_addr = self.resolve_node_api_endpoint(target).await?;
+        enqueue_artifact_backup_via_retrying_node_api(
+            &endpoint_addr,
+            sandbox_id,
+            expected_kind,
+            source,
+        )
+        .await
+    }
+
+    /// Copy a durable artifact into a new sandbox's snapshot on the node
+    /// behind `target`. Shared over any substrate: the adapter only says how
+    /// to reach the node.
+    pub async fn create_snapshot_from_durable_artifact(
+        &self,
+        target: &NodeApiTarget<'_>,
+        operation_id: OperationId,
+        source_sandbox_id: SandboxId,
+        target_sandbox_id: SandboxId,
+        source_storage_uri: String,
+        destination_storage_uri: String,
+    ) -> Result<PublishedDurableSnapshot, DurableSnapshotError> {
+        let endpoint_addr = self.resolve_node_api_endpoint(target).await?;
+        let mut node_api = retrying_worker_node_api(&endpoint_addr, Duration::from_secs(30))?;
+        let mut client = RetryingWorkerApiClient::new(&mut node_api);
+        let response = client
+            .create_sandbox_snapshot(
+                pplx_space_sbx_mgr_client::proto::CreateSnapshotRequest {
+                    sandbox_id: source_sandbox_id.to_string(),
+                    r#type: pplx_space_sbx_mgr_client::proto::SnapshotType::Disk as i32,
+                    label: None,
+                    creation_identity: Some(
+                        pplx_space_sbx_mgr_client::proto::SnapshotCreationIdentity {
+                            request_id: operation_id.as_uuid().to_string(),
+                        },
+                    ),
+                    source: Some(pplx_space_sbx_mgr_client::proto::CreateSnapshotSource {
+                        source: Some(
+                            pplx_space_sbx_mgr_client::proto::create_snapshot_source::Source::DurableArtifact(
+                                pplx_space_sbx_mgr_client::proto::DurableArtifactSnapshotSource {
+                                    source_storage_uri,
+                                    destination_storage_uri,
+                                    destination_sandbox_id: target_sandbox_id.to_string(),
+                                    destination_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Fork as i32,
+                                },
+                            ),
+                        ),
+                    }),
+                },
+                Duration::from_secs(600),
+            )
+            .await
+            .map_err(durable_snapshot_rpc_error)?
+            .into_inner();
+        let published =
+            response
+                .published_durable_artifact
+                .ok_or_else(|| SubstrateError::Failed {
+                    message: "durable snapshot response omitted its storage identity".to_string(),
+                })?;
+        Ok(PublishedDurableSnapshot {
+            storage_uri: published.storage_uri,
+            bytes_published: published.bytes_published,
+        })
     }
 
     pub async fn from_env(pool: &sqlx::PgPool) -> Result<Self, SubstrateError> {
@@ -2818,69 +2812,15 @@ impl SubstrateAdapter for Substrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
-        match &self.inner {
-            Inner::Direct(substrate) => substrate.suspend_execution(sandbox_id).await,
-            #[cfg(feature = "kubernetes")]
-            Inner::Kubernetes(substrate) => substrate.suspend_execution_tracked(sandbox_id).await,
-        }
-    }
-
-    async fn enqueue_artifact_backup(
-        &self,
-        sandbox_id: SandboxId,
-        expected_kind: ArtifactKind,
-        source: BackupSource,
-        target: &NodeApiTarget<'_>,
-    ) -> Result<EnqueuedArtifactBackup, SubstrateError> {
+        // A path, not method syntax: `KubernetesSubstrate` has an inherent
+        // `suspend_execution` that method resolution would pick instead.
         match &self.inner {
             Inner::Direct(substrate) => {
-                substrate
-                    .enqueue_artifact_backup(sandbox_id, expected_kind, source, target)
-                    .await
+                SubstrateAdapter::suspend_execution(substrate.as_ref(), sandbox_id).await
             }
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => {
-                substrate
-                    .enqueue_artifact_backup(sandbox_id, expected_kind, source, target)
-                    .await
-            }
-        }
-    }
-
-    async fn create_snapshot_from_durable_artifact(
-        &self,
-        target: &NodeApiTarget<'_>,
-        operation_id: OperationId,
-        source_sandbox_id: SandboxId,
-        target_sandbox_id: SandboxId,
-        source_storage_uri: String,
-        destination_storage_uri: String,
-    ) -> Result<PublishedDurableSnapshot, DurableSnapshotError> {
-        match &self.inner {
-            Inner::Direct(substrate) => {
-                SubstrateAdapter::create_snapshot_from_durable_artifact(
-                    substrate.as_ref(),
-                    target,
-                    operation_id,
-                    source_sandbox_id,
-                    target_sandbox_id,
-                    source_storage_uri,
-                    destination_storage_uri,
-                )
-                .await
-            }
-            #[cfg(feature = "kubernetes")]
-            Inner::Kubernetes(substrate) => {
-                SubstrateAdapter::create_snapshot_from_durable_artifact(
-                    substrate.as_ref(),
-                    target,
-                    operation_id,
-                    source_sandbox_id,
-                    target_sandbox_id,
-                    source_storage_uri,
-                    destination_storage_uri,
-                )
-                .await
+                SubstrateAdapter::suspend_execution(substrate.as_ref(), sandbox_id).await
             }
         }
     }
@@ -3161,26 +3101,6 @@ impl SubstrateAdapter for Substrate {
             Inner::Direct(substrate) => substrate.cleanup_failed_pooled_prepare(claim).await,
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.cleanup_failed_pooled_prepare(claim).await,
-        }
-    }
-
-    async fn apply_pooled_execution_auto_lifecycle(
-        &self,
-        claim: &PooledExecutionClaim,
-        policy: &AutoLifecyclePolicy,
-    ) -> Result<(), ControllerError> {
-        match &self.inner {
-            Inner::Direct(substrate) => {
-                substrate
-                    .apply_pooled_execution_auto_lifecycle(claim, policy)
-                    .await
-            }
-            #[cfg(feature = "kubernetes")]
-            Inner::Kubernetes(substrate) => {
-                substrate
-                    .apply_pooled_execution_auto_lifecycle(claim, policy)
-                    .await
-            }
         }
     }
 

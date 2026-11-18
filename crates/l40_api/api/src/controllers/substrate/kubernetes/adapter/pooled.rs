@@ -201,7 +201,7 @@ pub(super) enum PooledPodEnvironment {
 }
 
 impl KubernetesSubstrate {
-    pub(super) async fn apply_pooled_execution_auto_lifecycle_with_client(
+    async fn apply_pooled_execution_auto_lifecycle_with_client(
         client: &mut RetryingWorkerApiClient<'_>,
         claim: &PooledExecutionClaim,
         policy: &AutoLifecyclePolicy,

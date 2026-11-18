@@ -3,7 +3,7 @@ use super::super::scripted_test_doubles::{
 };
 use super::super::tests::{node_api_pod_on_node, substrate_with_inventory_caches_and_pool};
 use super::*;
-use crate::controllers::substrate::{DurableSnapshotError, NodeApiTarget, SubstrateAdapter};
+use crate::controllers::substrate::{DurableSnapshotError, NodeApiTarget, Substrate};
 use pplx_space_common_core::types::{NodeManagedBy, NodeRole};
 use pplx_space_public_api::OperationId;
 use pplx_space_sbx_mgr_client::proto as sbx;
@@ -41,6 +41,7 @@ async fn durable_copy_refusal_can_be_replayed_with_the_same_identity() -> TestRe
     pod.status.as_mut().unwrap().pod_ip = Some("127.0.0.1".to_string());
     let mut substrate = substrate_with_inventory_caches_and_pool(vec![pod], Vec::new(), pool);
     substrate.k8s.node_api_port = worker.port;
+    let substrate = Substrate::from_kubernetes(substrate);
     let target = NodeApiTarget {
         managed_by: NodeManagedBy::Kubernetes,
         role: NodeRole::Worker,
