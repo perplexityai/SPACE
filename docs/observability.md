@@ -1132,8 +1132,7 @@ A process names at most 64 override-only callers over its lifetime; past that,
 a new override-only caller keeps its own limiter bucket but reports
 `client_id:overflow`. Which callers fit is first-come per process, so replicas
 can disagree once the cap fills. While the limiter is off it resolves against
-the static list only. Reconnects through the data-plane entrypoint aren't
-attributed and report `unknown`.
+the static list only.
 
 Every other `sandbox.api.*` metric built from an API metric identity also
 carries `client_id`: route latency and errors (`sandbox.api.latency_ms`,

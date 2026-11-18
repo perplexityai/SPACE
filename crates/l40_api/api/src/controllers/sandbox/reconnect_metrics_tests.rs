@@ -37,98 +37,8 @@ fn tags_for_controller_error(
     initial_lifecycle: &str,
     err: ControllerError,
 ) -> ReconnectTagTuple {
-    let (outcome, terminal_phase, reason) =
-        reconnect_controller_error_outcome(initial_lifecycle, &err);
+    let (outcome, terminal_phase, reason) = reconnect_admission_refusal_outcome(&err);
     tags_for_outcome(identity, initial_lifecycle, outcome, terminal_phase, reason)
-}
-
-fn retryable_timeout(message: &str, phase: Option<WaitReadyTimeoutPhase>) -> ControllerError {
-    ControllerError::from(SubstrateError::Timeout {
-        message: message.to_string(),
-        phase,
-    })
-}
-
-#[test]
-fn reconnect_tags_classify_restore_lease_already_in_flight() {
-    let tags = tags_for_controller_error(
-        SandboxApiMetricIdentity::ecw("connect"),
-        "restoring",
-        ControllerError::from(SubstrateError::restore_in_flight(
-            "another recovery owner still holds the restore lease",
-        )),
-    );
-
-    assert_eq!(
-        tags,
-        (
-            "wake_in_progress",
-            "restore",
-            "restore_in_flight",
-            "connect",
-            "restoring",
-        )
-    );
-}
-
-#[test]
-fn reconnect_tags_classify_outer_restore_and_wake_budget_exhaustion() {
-    for (initial_lifecycle, terminal_phase) in [("suspended", "restore"), ("paused", "wake")] {
-        let tags = tags_for_controller_error(
-            SandboxApiMetricIdentity::ecw("connect"),
-            initial_lifecycle,
-            retryable_timeout("sandbox wake did not finish before API wait budget", None),
-        );
-
-        assert_eq!(
-            tags,
-            (
-                "exhausted",
-                terminal_phase,
-                "wait_budget",
-                "connect",
-                initial_lifecycle,
-            )
-        );
-    }
-}
-
-#[test]
-fn reconnect_tags_preserve_wait_ready_timeout_phase_for_dataplane() {
-    for (phase, terminal_phase, reason) in [
-        (
-            WaitReadyTimeoutPhase::PodNeverReady,
-            "pod_never_ready",
-            "pod_never_ready",
-        ),
-        (
-            WaitReadyTimeoutPhase::ProxyUnreachable,
-            "proxy_unreachable",
-            "proxy_unreachable",
-        ),
-        (
-            WaitReadyTimeoutPhase::GuestNotReady,
-            "guest_not_ready",
-            "guest_not_ready",
-        ),
-    ] {
-        let tags = tags_for_controller_error(
-            SandboxApiMetricIdentity::native("access"),
-            "suspended",
-            retryable_timeout("sandbox readiness wait timed out", Some(phase)),
-        );
-
-        assert_eq!(
-            tags,
-            (
-                "exhausted",
-                terminal_phase,
-                reason,
-                "dataplane",
-                "suspended"
-            )
-        );
-    }
 }
 
 #[test]
@@ -202,7 +112,7 @@ fn reconnect_tags_classify_cluster_admission_rejection() {
     // of 429ing silently, so a control-plane-throttled retry storm stays
     // visible to the monitor.
     // These build the two *actual* admission error shapes (see
-    // `cluster_activation_admission_error`): the rate-limited case carries a
+    // `ActivationRejectionKind::controller_error`): the rate-limited case carries a
     // `ClusterActivationAdmission` cause; the empty-cluster case is a bare
     // 429 with only a Retry-After header (no cause). Both must classify as
     // admission exhaustion, never `wake_failed`/`substrate`.
@@ -221,7 +131,6 @@ fn reconnect_tags_classify_cluster_admission_rejection() {
         &rate_limited as &dyn Fn() -> ControllerError,
         &empty_cluster as &dyn Fn() -> ControllerError,
     ] {
-        // Wake path — ECW connect entrypoint.
         assert_eq!(
             tags_for_controller_error(
                 SandboxApiMetricIdentity::ecw("connect"),
@@ -229,16 +138,6 @@ fn reconnect_tags_classify_cluster_admission_rejection() {
                 build(),
             ),
             ("exhausted", "api", "wait_budget", "connect", "suspended")
-        );
-
-        // Data-plane access path — dataplane entrypoint.
-        assert_eq!(
-            tags_for_controller_error(
-                SandboxApiMetricIdentity::native("access"),
-                "paused",
-                build(),
-            ),
-            ("exhausted", "api", "wait_budget", "dataplane", "paused")
         );
     }
 }
@@ -313,52 +212,6 @@ fn reconnect_tags_classify_a_lost_database_lock_race() {
     let (admission_outcome, _, admission_reason) = reconnect_error_outcome("suspended", &admission);
     assert_eq!(admission_outcome.as_str(), outcome.as_str());
     assert_ne!(reason.as_str(), admission_reason.as_str());
-}
-
-/// The `ControllerError` half of the same rule, asserted because leaving one
-/// half of a mirrored pair classified is how the other half silently
-/// regresses.
-///
-/// Two properties: a contention error must not be labelled `wake_failed`, and
-/// it must not be folded into `wait_budget`. The fold is guarded twice over —
-/// the `is_lock_contention()` arm below returns before the `retry_after`
-/// branch, *and* `lock_contention()` leaves the converging marker unset — so
-/// either guard alone would hold today. Both are asserted because each is one
-/// edit away from being the only one, and the failure would be silent: a
-/// contention error filed under `reason:wait_budget` looks like ordinary
-/// restore-budget exhaustion, which is precisely the signal the `lock_timeout`
-/// rollout needs to see separately.
-#[test]
-fn reconnect_controller_tags_classify_a_lost_database_lock_race() {
-    let mut contended = ControllerError::service_unavailable("contended");
-    contended.mark_lock_contention_for_test();
-
-    // The marker the fold would key off must be absent...
-    assert_eq!(
-        contended.retry_after(),
-        None,
-        "the converging marker is the other half of the wait_budget guard"
-    );
-    // ...and the pacing hint must still be present, since an un-hinted
-    // retryable 503 is retried at RTT.
-    assert_eq!(
-        contended.retry_after_header(),
-        Some(crate::controllers::substrate::LOCK_CONTENTION_RETRY_AFTER)
-    );
-
-    let (outcome, terminal_phase, reason) =
-        reconnect_controller_error_outcome("suspended", &contended);
-    assert_eq!(
-        (outcome.as_str(), terminal_phase.as_str(), reason.as_str()),
-        ("exhausted", "restore", "lock_contention")
-    );
-
-    // A fleet 503 on the same path keeps the wake-fault label, so the branch
-    // is discriminating on the marking and not on the status code.
-    let fleet = ControllerError::service_unavailable("no capacity");
-    let (fleet_outcome, _, fleet_reason) = reconnect_controller_error_outcome("suspended", &fleet);
-    assert_eq!(fleet_outcome.as_str(), "wake_failed");
-    assert_eq!(fleet_reason.as_str(), "unavailable");
 }
 
 #[test]

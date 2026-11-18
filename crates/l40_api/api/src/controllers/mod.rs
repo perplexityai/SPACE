@@ -48,7 +48,6 @@ pub struct ControllerError {
 enum ControllerErrorKind {
     General,
     SandboxAlreadyExists,
-    RestoreContextUnavailable,
     /// A database statement lost a race for a lock. Carried so the public and
     /// ECW translators can keep the 503 attributed to this service's own
     /// database: they otherwise re-label every controller 503 as a fleet
@@ -310,14 +309,8 @@ impl ControllerError {
         matches!(self.kind, ControllerErrorKind::LockContention)
     }
 
-    pub(crate) fn is_restore_context_unavailable(&self) -> bool {
-        matches!(self.kind, ControllerErrorKind::RestoreContextUnavailable)
-    }
-
     pub(crate) fn restore_context_unavailable(message: impl Into<String>) -> Self {
-        let mut error = Self::precondition_failed(message);
-        error.kind = ControllerErrorKind::RestoreContextUnavailable;
-        error
+        Self::precondition_failed(message)
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
@@ -346,17 +339,15 @@ impl ControllerError {
         // lock wait with a burst of round-trips against the row that is
         // already contended.
         //
-        // Be precise about what this does *not* rest on. Neither production
-        // reader of `retry_after()` can observe the difference for a
-        // contention error today: `sandbox::reconnect_controller_error_outcome`
-        // and `translate::controller_error` each return on
-        // `is_lock_contention()` before reaching their `retry_after` branch.
+        // Be precise about what this does *not* rest on. The production
+        // reader of `retry_after()` can't observe the difference for a
+        // contention error today: `translate::controller_error` returns on
+        // `is_lock_contention()` before reaching its `retry_after` branch.
         // So this is the semantically correct choice rather than a load-bearing
-        // one — and it is one deletion away from being load-bearing, since
-        // removing either guard would route every contention error into
-        // `reason:wait_budget` or
-        // into the SDK's `sandbox_timeout`. That is what the assertions in
-        // `controllers::tests` and `sandbox::reconnect_metrics_tests` pin.
+        // one — and it is one deletion away from being load-bearing: were this
+        // hint set with `with_retry_after` instead, removing that guard would
+        // route every contention error into the SDK's `sandbox_timeout`. That
+        // is what the assertions in `controllers::tests` pin.
         .with_retry_after_header(substrate::LOCK_CONTENTION_RETRY_AFTER);
         error.kind = ControllerErrorKind::LockContention;
         error

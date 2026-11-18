@@ -1612,7 +1612,6 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     ),
                     Duration::from_secs(120),
                     charge,
-                    None,
                 )
                 .await?;
             return connect_worker(binding.runtime_endpoint).await;
@@ -1762,7 +1761,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 .await;
         }
         let binding = self
-            .ensure_execution_ready_for_access(&sandbox, metric_identity, timeout, charge, None)
+            .ensure_execution_ready_for_access(&sandbox, metric_identity, timeout, charge)
             .await?;
         connect_worker(binding.runtime_endpoint).await
     }
