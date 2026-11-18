@@ -69,6 +69,21 @@ Mount references likewise resolve capacity from the organization-scoped volume
 record before admission, then compare it again in the binding transaction.
 They cannot reset a grown disk to the creation-time default.
 
+The manual `native.independent_volume_retention_and_reuse` smoke uses one
+standalone volume throughout create/replay, inspect/list, mount-by-reference,
+suspend/restore, deletion of the first sandbox, read-only reuse at a different
+mount path, and explicit volume deletion/replay. It verifies the continuing
+process and original open descriptor across restore, filesystem identity and
+contents across owners, and denial of filesystem/raw writes after read-only
+reuse. Suspend must keep its logical reservation even after physical detach.
+The native fixture tracks independent creates before sending them, resolves
+uncertain creates with the same body/key, and cleans owned sandboxes before
+owned independent disks. Referencing an existing disk does not authorize its
+deletion during fixture cleanup.
+This scenario does not force worker placement or exercise growth. It must run
+against a qualified deployment with separate cloud identity/deletion checks;
+registration and local framework checks are not deployed qualification.
+
 ## Legacy sandbox-created contract
 
 The following sections describe inline-created disk behavior. Their fixed-size

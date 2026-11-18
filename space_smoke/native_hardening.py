@@ -2,7 +2,8 @@
 
 These probes deliberately do not retry mutations: scenarios must distinguish
 first-attempt behavior from successful recovery. Teardown may replay an
-ambiguous create with its original key before removing its owned sandbox.
+ambiguous create with its original key, then removes owned sandboxes before
+their independently created volumes. Referenced pre-existing disks are not owned.
 """
 
 from __future__ import annotations
@@ -126,6 +127,9 @@ class NativeHardeningFixture:
         self._creates: dict[str, dict[str, object]] = {}
         self._create_origins: dict[str, str] = {}
         self._uncertain_creates: set[str] = set()
+        self._volume_creates: dict[str, dict[str, object]] = {}
+        self._uncertain_volume_creates: set[str] = set()
+        self._volumes: set[str] = set()
         self._sandboxes: set[str] = set()
         self._operations: set[str] = set()
         self._journal: list[dict[str, object]] = []
@@ -187,8 +191,19 @@ class NativeHardeningFixture:
             raise ValueError("Native request timeout must be positive")
         payload = dict(body) if body is not None else None
         create = method == "POST" and path == "/v1/sandboxes"
-        if create and token is not None and token != self.config.token:
+        volume_create = method == "POST" and path == "/v1/volumes"
+        first_volume_create = False
+        if (create or volume_create) and token is not None and token != self.config.token:
             raise ValueError("Create probes must use the fixture owner credential")
+        if volume_create:
+            if origin != _safe_origin(self.config.api_url):
+                raise ValueError("Volume creates must use the fixture API origin")
+            idempotency_key = idempotency_key or self.key("create-volume")
+            with self._lock:
+                first_volume_create = idempotency_key not in self._volume_creates
+                if first_volume_create:
+                    self._volume_creates[idempotency_key] = dict(payload or {})
+                    self._uncertain_volume_creates.add(idempotency_key)
         if create:
             idempotency_key = idempotency_key or self.key("create")
             with self._lock:
@@ -251,6 +266,16 @@ class NativeHardeningFixture:
                 operation_id = result.body.get("operation_id")
                 sandbox_id = result.body.get("sandbox_id")
                 if 200 <= status < 300:
+                    if (
+                        (path == "/v1/volumes" or path.startswith("/v1/volumes/"))
+                        and method in {"POST", "DELETE"}
+                    ):
+                        operation_id = result.body.get("id")
+                    if volume_create:
+                        volume_id = result.body.get("target_id")
+                        if isinstance(operation_id, str) and isinstance(volume_id, str):
+                            self._volumes.add(volume_id)
+                            self._uncertain_volume_creates.discard(idempotency_key)
                     if isinstance(operation_id, str):
                         self._operations.add(operation_id)
                         observation["operation_id"] = operation_id
@@ -263,7 +288,16 @@ class NativeHardeningFixture:
                 # request. Only definitive rejection of a first request is final.
                 elif create and 400 <= status < 500 and status not in {408, 409, 429}:
                     self._uncertain_creates.discard(idempotency_key)
+                elif (
+                    first_volume_create
+                    and 400 <= status < 500 and status not in {408, 409, 429}
+                ):
+                    self._uncertain_volume_creates.discard(idempotency_key)
+                    # Validation may reject before claiming the key. A later
+                    # corrected request must keep its own body if its reply is lost.
+                    self._volume_creates.pop(idempotency_key)
                 self.context.record("native_sandbox_ids", sorted(self._sandboxes))
+                self.context.record("native_volume_ids", sorted(self._volumes))
                 self.context.record("native_operation_ids", sorted(self._operations))
             error_body = result.body.get("error")
             if isinstance(error_body, dict):
@@ -512,6 +546,15 @@ class NativeHardeningFixture:
                 )
             except Exception as error:
                 failures.append(f"ambiguous create: {type(error).__name__}")
+        for key in sorted(self._uncertain_volume_creates):
+            try:
+                self.request(
+                    "POST", "/v1/volumes", body=self._volume_creates[key],
+                    idempotency_key=key,
+                    timeout=min(self.config.request_timeout_seconds, remaining()),
+                )
+            except Exception as error:
+                failures.append(f"ambiguous volume create: {type(error).__name__}")
         for operation_id in sorted(self._operations):
             try:
                 self.wait_operation(operation_id, timeout=remaining(), require_success=False)
@@ -519,11 +562,13 @@ class NativeHardeningFixture:
                 failures.append(f"{operation_id}: {type(error).__name__}")
         # Do not delete under an unfinished create: it can recreate its sandbox
         # after a transient absence. Leave its identity and fail cleanup instead.
-        if failures or self._uncertain_creates:
+        if failures or self._uncertain_creates or self._uncertain_volume_creates:
             self.context.record("native_cleanup_incomplete", {
                 "operations": sorted(self._operations),
                 "sandboxes": sorted(self._sandboxes),
+                "volumes": sorted(self._volumes),
                 "ambiguous_create_count": len(self._uncertain_creates),
+                "ambiguous_volume_create_count": len(self._uncertain_volume_creates),
                 "failures": failures,
             })
             raise RuntimeError("Native cleanup could not establish terminal mutations")
@@ -554,8 +599,45 @@ class NativeHardeningFixture:
                     time.sleep(min(1, remaining()))
             except Exception as error:
                 failures.append(f"{sandbox_id}: {type(error).__name__}")
+        # Standalone disks outlive their sandboxes. Delete only fixture-created
+        # identities, after sandbox cleanup has released logical reservations.
+        for volume_id in sorted(self._volumes):
+            try:
+                path = f"/v1/volumes/{quote(volume_id, safe='')}"
+                key = self.key("cleanup-volume")
+                while True:
+                    terminal = self.request(
+                        "GET", path,
+                        timeout=min(self.config.request_timeout_seconds, remaining()),
+                    ).require(200)
+                    if terminal.get("state") == "deleted":
+                        break
+                    response = self.request(
+                        "DELETE", path, idempotency_key=key,
+                        timeout=min(self.config.request_timeout_seconds, remaining()),
+                    )
+                    if response.status == 202:
+                        operation = self.wait_operation(
+                            _string(response.body.get("id"), "id"),
+                            timeout=remaining(), require_success=False,
+                        )
+                        if operation.get("state") == "succeeded":
+                            terminal = self.request(
+                                "GET", path,
+                                timeout=min(self.config.request_timeout_seconds, remaining()),
+                            ).require(200)
+                            if terminal.get("state") == "deleted":
+                                break
+                    elif response.status not in {409, 429, 500, 502, 503, 504}:
+                        raise RuntimeError(
+                            f"Native volume cleanup DELETE returned {response.status}"
+                        )
+                    time.sleep(min(1, remaining()))
+            except Exception as error:
+                failures.append(f"{volume_id}: {type(error).__name__}")
         self.context.record("native_cleanup", {
             "sandbox_count": len(self._sandboxes),
+            "volume_count": len(self._volumes),
             "operation_count": len(self._operations),
             "failures": failures,
         })
