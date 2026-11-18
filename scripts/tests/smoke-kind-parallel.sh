@@ -539,7 +539,9 @@ run_bench() {
   # Where the GHCR mirror is unreadable each image falls back to its source.
   phase "bench$i" prepare_cluster bx env SPACE_CI_IMAGE_MIRROR="${SPACE_CI_IMAGE_MIRROR:-ghcr}" \
     bash "$src/infra/space/kind/scripts/prepare-cluster.sh" || return 1
+  # As CI's step runs it: a failed preflight fails the bench.
   phase "bench$i" observability bx env SPACE_KIND_CLUSTER=space-local bash -c '
+      set -euo pipefail
       python3 infra/space/kind/scripts/datadog_backend.py preflight --for-deployment >/dev/null
       bash infra/space/kind/scripts/install-observability.sh' || return 1
   await rust || return 1
@@ -547,14 +549,22 @@ run_bench() {
     load "$HOST/rust" || return 1
   cat "$dir/handoff.env" >>"$env_file" || return 1
   # The host's seed and the key it was built with, where the bench's own seed
-  # build looks (build-seed.sh); without them the bench builds its own.
+  # build looks (build-seed.sh); without them the bench builds its own. Each
+  # is copied under a temporary name and moved into place whole, so a failed
+  # copy leaves neither, never a partial seed whose stamp still matches.
   if await seed; then
     # shellcheck disable=SC2016 # expanded by the bench's shell
     phase "bench$i" seed_copy bx bash -c '
-        install -d -m 0755 "$HOME/.space-devbox/kind/ssh" "$HOME/.space-devbox/kind/seed"
-        cp -a "$1/." "$HOME/.space-devbox/kind/ssh/"
-        cp -a --sparse=always "$2" "$HOME/.space-devbox/kind/seed/build"' _ \
-      "$HOME/.space-devbox/kind/ssh" "$SEED_DIR" || true
+        set -euo pipefail
+        kind="$HOME/.space-devbox/kind"
+        trap '\''rm -rf "$kind/ssh.copy" "$kind/seed/build.copy"'\'' EXIT
+        install -d -m 0755 "$kind/seed"
+        cp -a "$1" "$kind/ssh.copy"
+        cp -a --sparse=always "$2" "$kind/seed/build.copy"
+        mv -T "$kind/seed/build.copy" "$kind/seed/build"
+        mv -T "$kind/ssh.copy" "$kind/ssh"' _ \
+      "$HOME/.space-devbox/kind/ssh" "$SEED_DIR" \
+      || log "bench $i: could not copy the host's seed; the bench builds its own"
   fi
   await build-cache || true
   BENCH_RESULT=baseline_failed
