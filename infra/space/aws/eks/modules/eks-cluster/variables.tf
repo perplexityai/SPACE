@@ -141,7 +141,13 @@ variable "node_pools" {
     group also stays on its launch-template version, so a template change
     doesn't roll it; the comment on `aws_eks_node_group.managed` gives the
     ways to move it. A custom-AMI pool keeps all three sizes and its launch
-    template version under Terraform, and a template change rolls it.
+    template version under Terraform, and a template change rolls it unless
+    `launch_template_version` pins it. `launch_template_version` applies to a
+    custom-AMI pool only: null tracks the template's latest version; a number
+    keeps the group on that version, so a template change only publishes a new
+    version. Changing a pin on a group with nodes starts an EKS rolling update
+    of the whole group: EKS marks every existing node unschedulable up front,
+    then replaces nodes one at a time.
     `update_strategy` is the group's rolling-update strategy: null leaves
     EKS's default, which launches replacements before draining; `MINIMAL`
     drains first, so a roll never runs more nodes than the group's size.
@@ -171,9 +177,24 @@ variable "node_pools" {
     additional_policy_arns                  = optional(map(string), {})
     volume_tags                             = optional(map(string), {})
     update_strategy                         = optional(string)
+    launch_template_version                 = optional(string)
     launch_template_and_role_only           = optional(bool, false)
   }))
   default = {}
+
+  validation {
+    condition = alltrue([
+      for pool in values(var.node_pools) : pool.launch_template_version == null ? true : can(regex("^[1-9][0-9]*$", pool.launch_template_version))
+    ])
+    error_message = "A node pool's launch_template_version must be null or a launch template version number."
+  }
+
+  validation {
+    condition = alltrue([
+      for pool in values(var.node_pools) : pool.launch_template_version == null || pool.ami_id != null
+    ])
+    error_message = "launch_template_version applies only to a custom-AMI pool (ami_id set); an EKS-managed-AMI pool's node group already stays on its launch-template version."
+  }
 
   validation {
     condition = alltrue([

@@ -71,8 +71,16 @@ resource "aws_launch_template" "node_group" {
   })
 }
 
-# Custom-AMI pools. Terraform owns the launch template version here, so a
-# template change rolls the group at max_unavailable = 1.
+# Custom-AMI pools. Terraform owns the launch template version here. Unpinned
+# (`launch_template_version` null), the group tracks the template's latest
+# version, so a template change rolls the group at max_unavailable = 1. Pinned,
+# a template change only publishes a new version; the group adopts it when the
+# pin moves. Moving the pin on a group with nodes is that same EKS rolling
+# update: EKS first marks every existing node in the group unschedulable, then
+# replaces them max_unavailable at a time. Each replacement takes minutes, so a
+# large group takes hours. With the default update strategy each replacement
+# launches before its predecessor terminates, so it needs spare capacity of
+# the same instance type in the same availability zone.
 resource "aws_eks_node_group" "custom" {
   for_each = {
     for key, value in var.node_pools : key => value
@@ -90,7 +98,7 @@ resource "aws_eks_node_group" "custom" {
 
   launch_template {
     id      = aws_launch_template.node_group[each.key].id
-    version = aws_launch_template.node_group[each.key].latest_version
+    version = each.value.launch_template_version != null ? each.value.launch_template_version : aws_launch_template.node_group[each.key].latest_version
   }
 
   labels = each.value.labels
@@ -129,6 +137,25 @@ resource "aws_eks_node_group" "custom" {
   # Default 60min is too short for large pools rolling at max_unavailable=1.
   timeouts {
     update = var.node_group_update_timeout
+  }
+}
+
+# A warning, not an error: a pinned custom-AMI group behind its template's
+# latest version is intended until someone moves the pin, but it keeps
+# launching nodes from the older version, including on scale-out. During a
+# plan that changes the template, the latest version isn't known until apply,
+# so the check reports as unknown.
+locals {
+  custom_node_groups_behind_launch_template = {
+    for name, group in aws_eks_node_group.custom : name => group.launch_template[0].version
+    if group.launch_template[0].version != tostring(aws_launch_template.node_group[name].latest_version)
+  }
+}
+
+check "custom_node_groups_on_latest_launch_template" {
+  assert {
+    condition     = length(local.custom_node_groups_behind_launch_template) == 0
+    error_message = "Node groups ${join(", ", [for name, version in local.custom_node_groups_behind_launch_template : "${name} (pinned to version ${version}, latest ${aws_launch_template.node_group[name].latest_version})"])} are pinned behind their launch template's latest version. Moving a pin rolls every node in that group; see the comment on aws_eks_node_group.custom in the eks-cluster module."
   }
 }
 

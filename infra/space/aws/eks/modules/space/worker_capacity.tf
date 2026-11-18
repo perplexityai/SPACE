@@ -1,8 +1,28 @@
 # Permanent worker-fleet groups use the next generic workers-N names and share
 # the steady-state worker AMI, launch template, identity, bootstrap, and base
 # scheduling labels. Environment tfvars select only the instance type,
-# optional named subnet pool, and per-group ceiling. Every group is created at
-# zero nodes; scaling remains an explicit operator action outside Terraform.
+# optional named subnet pool, per-group ceiling, and optional launch template
+# version pin. Every group is created at zero nodes; scaling remains an
+# explicit operator action outside Terraform.
+#
+# Launch template adoption. An unpinned group (`launch_template_version`
+# null) tracks the shared worker template's latest version, so an empty or
+# dormant group never scales out later on an obsolete bootstrap. A populated
+# group should be pinned to the version it runs: a template change then only
+# publishes a new version, which unpinned (empty) groups adopt at no cost,
+# and the populated group's plan stays empty.
+#
+# Changing a populated group's pin, or leaving a populated group unpinned
+# while the template changes, starts an EKS managed node group update. EKS
+# marks every existing node in the group unschedulable up front, then
+# replaces nodes max_unavailable (1) at a time. Each replacement drains its
+# node through Kubernetes eviction rather than SPACE's sandbox-aware drain and
+# takes minutes, so a group near the 99-node ceiling stays mostly
+# unschedulable for hours. Move a populated group to a new version with the
+# sandbox-aware two-MNG rollout instead (`../rollout-mng/README.md`,
+# `scripts/space-rollout-mng.py`), or drain it to zero first and then move the
+# pin. The worker_capacity_groups_on_latest_launch_template check warns while
+# any pin lags the latest version.
 #
 # A 99-node MNG ceiling limits one group's operational blast radius. It does
 # not restore full scheduler scoring once a sandbox pod can match more than
@@ -35,9 +55,12 @@ resource "aws_eks_node_group" "worker_capacity" {
   capacity_type  = var.workers_capacity_type
   instance_types = each.value.instance_types
 
+  # A pin holds the group on that version; null tracks the latest. Changing
+  # the resolved version of a populated group rolls every node in it; see the
+  # top of this file.
   launch_template {
     id      = aws_launch_template.workers.id
-    version = aws_launch_template.workers.latest_version
+    version = each.value.launch_template_version != null ? each.value.launch_template_version : aws_launch_template.workers.latest_version
   }
 
   # The same isolation taints as every other worker pool.
@@ -98,9 +121,10 @@ resource "aws_eks_node_group" "worker_capacity" {
     # The cluster-controller owns current fleet size. Terraform still owns the
     # <=99 ceiling and launch-template version: ignoring either would let a
     # dormant group scale months later with an obsolete AMI or an unbounded
-    # ASG. A plan that changes the LT of a nonempty group is a worker rollout;
-    # drain/zero the group or use the sandbox-aware rollout procedure before
-    # applying it.
+    # ASG. Pin a populated group's version instead (launch_template_version).
+    # A plan that changes the launch template version of a nonempty group is
+    # a worker rollout of the whole group; drain/zero the group or use the
+    # sandbox-aware rollout procedure before applying it.
     ignore_changes = [
       scaling_config[0].desired_size,
       scaling_config[0].min_size,
@@ -125,6 +149,25 @@ resource "aws_eks_node_group" "worker_capacity" {
     aws_iam_role_policy_attachment.workers_pool_s3_read,
     aws_eks_access_entry.workers_pool,
   ]
+}
+
+# A warning, as for the general groups: a pinned group behind the template's
+# latest version is intended until someone moves it, but it keeps launching
+# nodes from its pinned version, including on scale-out. During a plan that
+# changes the template, the latest version isn't known until apply, so the
+# check reports as unknown.
+locals {
+  worker_capacity_groups_behind_launch_template = {
+    for name, group in aws_eks_node_group.worker_capacity : name => group.launch_template[0].version
+    if group.launch_template[0].version != tostring(aws_launch_template.workers.latest_version)
+  }
+}
+
+check "worker_capacity_groups_on_latest_launch_template" {
+  assert {
+    condition     = length(local.worker_capacity_groups_behind_launch_template) == 0
+    error_message = "Worker capacity groups ${join(", ", [for name, version in local.worker_capacity_groups_behind_launch_template : "${name} (pinned to version ${version})"])} run an older version of the worker launch template than its latest, ${aws_launch_template.workers.latest_version}, and an apply doesn't move them. Moving a populated group's pin rolls every node in it; the comment at the top of worker_capacity.tf in the space module describes how to move them."
+  }
 }
 
 locals {
