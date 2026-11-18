@@ -36,11 +36,15 @@ no sandbox reservation. Existing inline-created volumes preserve their old
 delete-with-sandbox behavior and authorization.
 
 Read-only reuse requires a clean ext4 journal. Before terminating a live
-volume-backed execution, a compatible manager/host/guest combination freezes
+volume-backed execution through ordinary stop or sandbox deletion, a compatible
+manager/host/guest combination freezes
 the data filesystem with `FIFREEZE`, which blocks writers and checkpoints the
 journal before VM exit. This is distinct from suspend: memory capture keeps
 the filesystem unfrozen, and its post-capture teardown must not change disk
-state. Ordinary diskless stop flushes are unchanged.
+state. Explicit kill still forbids the cooperative flush; diskless deletion
+still skips it, and ordinary diskless stop flushes are unchanged. The decision
+is made at termination, including cleanup retries and persistence-failure
+fallbacks, rather than only at the ordinary-stop admission path.
 
 The stop-only request requires the explicitly advertised
 `BLOCK_VOLUME_QUIESCE` guest capability. Older guests retain their normal flush

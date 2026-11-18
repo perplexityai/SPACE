@@ -2586,7 +2586,7 @@ impl SandboxManagerService {
                         .await?,
                     ),
                     Some(GuestShutdown::AgentFlush) => {
-                        self.flush_guest_before_termination(sandbox_id, guest_flush)
+                        self.flush_guest_before_termination(sandbox_id, guest_flush, completion)
                             .await;
                         None
                     }
@@ -2940,8 +2940,12 @@ impl SandboxManagerService {
             request,
             &admission,
             || async move {
-                self.flush_guest_before_termination(dispatch_sandbox_id, dispatch_guest_flush)
-                    .await;
+                self.flush_guest_before_termination(
+                    dispatch_sandbox_id,
+                    dispatch_guest_flush,
+                    dispatch_completion,
+                )
+                .await;
                 let mut node_client = connect_node(&self.node_manager).await.map_err(|error| {
                     Status::internal(format!(
                         "{dispatch_context}: cannot connect to node-manager: {error}"
@@ -3190,20 +3194,32 @@ fn guest_flush_is_qualified(
             .is_ok_and(|profile| profile.agent_protocol().supports_filesystem_flush())
 }
 
+fn termination_requires_guest_flush(
+    requested: crate::db::cleanup_jobs::GuestFlush,
+    completion: CleanupCompletion,
+    retained_block: bool,
+) -> bool {
+    use crate::db::cleanup_jobs::GuestFlush;
+    match requested {
+        GuestFlush::BeforeTermination => true,
+        GuestFlush::Forbidden => false,
+        GuestFlush::Unrequested => completion == CleanupCompletion::DeleteRow && retained_block,
+    }
+}
+
 impl SandboxManagerService {
-    /// Attempt the guest flush an ordinary stop asked for, immediately before
-    /// terminating its VM. A failed flush is recorded, and the stop proceeds.
+    /// Flush an ordinary stop or a volume-bearing deletion immediately before
+    /// terminating its VM. Deletion can retain independent storage for another
+    /// owner. Failure is recorded and teardown proceeds within the stop budget.
     async fn flush_guest_before_termination(
         &self,
         sandbox_id: &str,
         guest_flush: crate::db::cleanup_jobs::GuestFlush,
+        completion: CleanupCompletion,
     ) {
-        if guest_flush != crate::db::cleanup_jobs::GuestFlush::BeforeTermination {
-            return;
-        }
-        if self.lookup_sandbox(sandbox_id).is_ok_and(|sandbox| {
-            !guest_flush_is_qualified(sandbox.guest_image, sandbox.execution_metadata.as_ref())
-        }) {
+        // Avoid even a disk-dependency lookup for suspend teardown and explicit
+        // kill. Neither may freeze or otherwise modify the captured disk.
+        if !termination_requires_guest_flush(guest_flush, completion, true) {
             return;
         }
         let quiesce_data_drive_for_stop = match self.has_retained_block(sandbox_id) {
@@ -3217,6 +3233,13 @@ impl SandboxManagerService {
                 true
             }
         };
+        if !termination_requires_guest_flush(guest_flush, completion, quiesce_data_drive_for_stop)
+            || self.lookup_sandbox(sandbox_id).is_ok_and(|sandbox| {
+                !guest_flush_is_qualified(sandbox.guest_image, sandbox.execution_metadata.as_ref())
+            })
+        {
+            return;
+        }
         let flushed = within_stop_flush_budget(
             crate::guest_filesystem_flush::GUEST_FILESYSTEM_FLUSH_TIMEOUT,
             self.resume_paused_vm_before_flush(sandbox_id),

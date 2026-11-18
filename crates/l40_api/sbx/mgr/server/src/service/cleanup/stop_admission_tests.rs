@@ -37,6 +37,68 @@ use crate::state::{CleanupState, SandboxState, SandboxStatus};
 
 const WAIT: Duration = Duration::from_secs(30);
 
+#[test]
+fn retained_disk_delete_flushes_without_freezing_suspend_or_kill() {
+    use crate::db::cleanup_jobs::GuestFlush;
+
+    for (requested, completion, retained, expected) in [
+        (
+            GuestFlush::Unrequested,
+            CleanupCompletion::DeleteRow,
+            true,
+            true,
+        ),
+        (
+            GuestFlush::Unrequested,
+            CleanupCompletion::DeleteRow,
+            false,
+            false,
+        ),
+        (
+            GuestFlush::Unrequested,
+            CleanupCompletion::MarkSuspended,
+            true,
+            false,
+        ),
+        (
+            GuestFlush::Unrequested,
+            CleanupCompletion::MarkStopped,
+            true,
+            false,
+        ),
+        (
+            GuestFlush::Forbidden,
+            CleanupCompletion::DeleteRow,
+            true,
+            false,
+        ),
+        (
+            GuestFlush::Forbidden,
+            CleanupCompletion::MarkStopped,
+            true,
+            false,
+        ),
+        (
+            GuestFlush::BeforeTermination,
+            CleanupCompletion::MarkStopped,
+            true,
+            true,
+        ),
+        (
+            GuestFlush::BeforeTermination,
+            CleanupCompletion::MarkStopped,
+            false,
+            true,
+        ),
+    ] {
+        assert_eq!(
+            super::termination_requires_guest_flush(requested, completion, retained),
+            expected,
+            "{requested:?}, {completion:?}, retained={retained}",
+        );
+    }
+}
+
 /// A test service whose host dependencies resolve under `scratch`, with node
 /// cleanup held by a test dispatch.
 fn isolated_service(
