@@ -1921,6 +1921,13 @@ impl WorkerApiInternal for SimWorkerApiInternalService {
         Err(Status::unimplemented("the simulator has no node drain"))
     }
 
+    async fn preview_drain_node(
+        &self,
+        _request: Request<sbx::PreviewDrainNodeRequest>,
+    ) -> Result<Response<sbx::PreviewDrainNodeResponse>, Status> {
+        Err(Status::unimplemented("the simulator has no node drain"))
+    }
+
     async fn adopt_pool_sandbox(
         &self,
         request: Request<sbx::AdoptPoolSandboxRequest>,

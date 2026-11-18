@@ -6,7 +6,10 @@ use super::planner::*;
 use super::rpc::*;
 use crate::activation_seal::ActivationSealStatus;
 use crate::db::activation_seal::{DrainEvacuation, DrainPrior};
-use crate::proto::{DrainEvacuated, DrainNodeRequest, DrainNodeResponse, DrainPending};
+use crate::proto::{
+    DrainBlocked, DrainEvacuated, DrainNodeRequest, DrainNodeResponse, DrainPending,
+    PreviewDrainNodeRequest,
+};
 use crate::service::*;
 use pplx_space_common_core::types::ArtifactKind;
 
@@ -1582,6 +1585,38 @@ async fn only_root_and_node_api_drain_the_node() {
     service.drain_node(drain_request(8, false)).await.unwrap();
 }
 
+/// A preview answers what a drain would find on the whole node, so only
+/// root and node-api, which relays the control plane's, may ask for one;
+/// node-ctl, which may read sandbox state, may not.
+#[tokio::test]
+async fn only_root_and_node_api_preview_the_node() {
+    let inventory = orphan_inventory(Default::default());
+    let service = service_with_node_manager(crate::db::test_conn(), &inventory);
+    let refused = service
+        .preview_drain_node(crate::service::tests::service_tests::node_ctl_request(
+            PreviewDrainNodeRequest {},
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        inventory.calls(),
+        Vec::<String>::new(),
+        "a refused call scans nothing"
+    );
+    let relayed = service
+        .preview_drain_node(
+            crate::service::tests::service_tests::node_api_trusted_lifecycle_request(
+                PreviewDrainNodeRequest {},
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(relayed.would_finish, "{relayed:?}");
+    service.preview_drain_node(preview_request()).await.unwrap();
+}
+
 /// Every drain action holds a state-writer lease while it runs, so a
 /// restart handoff waits for it.
 #[tokio::test]
@@ -2584,4 +2619,551 @@ async fn a_gentle_request_without_its_field_seals_and_suspends_nothing() {
         assert!(service.drain_actions.running().is_empty());
         assert_eq!(node_manager.calls(), Vec::<String>::new(), "{request:?}");
     }
+}
+
+fn preview_request() -> Request<PreviewDrainNodeRequest> {
+    crate::service::activation_support::internal_request(PreviewDrainNodeRequest {})
+}
+
+/// A preview can't report a seal it can't read: while the startup read of
+/// the row has failed and no drain call has read it since, it answers
+/// `Internal`, and once a drain call has read it, the preview reports it.
+#[tokio::test]
+async fn a_preview_refuses_while_the_seal_is_unreadable() {
+    let conn = crate::db::test_conn();
+    conn.execute_batch("ALTER TABLE activation_seal RENAME TO activation_seal_hidden")
+        .unwrap();
+    let inventory = orphan_inventory(Default::default());
+    let service = service_with_node_manager(conn, &inventory);
+    let refused = service
+        .preview_drain_node(preview_request())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Internal, "{refused:?}");
+    assert!(
+        refused
+            .message()
+            .starts_with("activation seal unreadable: ")
+            && refused.message().contains("activation_seal"),
+        "the refusal says why: {refused:?}"
+    );
+
+    service
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch("ALTER TABLE activation_seal_hidden RENAME TO activation_seal")
+        .unwrap();
+    service.activation_seal.seal(&service.db, 3).unwrap();
+    let report = service
+        .preview_drain_node(preview_request())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(report.sealed_epoch, Some(3), "{report:?}");
+}
+
+/// What a preview must leave as it found it on one row: its lifecycle, when
+/// it entered it, and when the row was last written.
+fn row_witness(
+    service: &SandboxManagerService,
+    id: &str,
+) -> (SandboxStatus, String, Option<String>) {
+    let row = service.lookup_sandbox(id).unwrap();
+    let entered =
+        crate::db::read::state_changed_at_witness(&service.db.lock().unwrap(), id).unwrap();
+    (row.state, row.updated_at, entered)
+}
+
+/// A preview of a node with a started VM reports the suspend a drain would
+/// start, and seals nothing: an unsealed node stays unsealed and a sealed
+/// one stays sealed under its epoch, which the preview reports. It starts
+/// no suspend, even under a seal whose drain would, and writes neither the
+/// row nor an evacuation record. Node-manager is asked nothing.
+#[tokio::test]
+async fn a_preview_seals_nothing_starts_nothing_and_writes_nothing() {
+    let conn = crate::db::test_conn();
+    let id = pplx_space_common_core::types::SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Started);
+    let inventory = orphan_inventory(Default::default());
+    let service = service_with_node_manager(conn, &inventory);
+    let before = row_witness(&service, &id);
+    // Through the call, the host's cache disk decides between `suspend` and
+    // `disk`; either names only the VM.
+    let preview = || async {
+        let report = service
+            .preview_drain_node(preview_request())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            report.pending.len() == 1 && report.pending[0].sandbox_id == id,
+            "{report:?}"
+        );
+        assert!(
+            report.blocked.is_empty() && !report.would_finish,
+            "{report:?}"
+        );
+        report.sealed_epoch
+    };
+
+    assert_eq!(preview().await, None);
+    assert_eq!(service.activation_seal.status().sealed_epoch, None);
+
+    service.activation_seal.seal(&service.db, 7).unwrap();
+    assert_eq!(preview().await, Some(7));
+    assert_eq!(service.activation_seal.status().sealed_epoch, Some(7));
+    // A suspend started now would wait here, in flight, for this lock.
+    let wake_lock = service.auto_lifecycle.wake_lock(&id);
+    let held = wake_lock.lock_owned().await;
+    let report = service.finish_preview(DrainScans::default());
+    assert_eq!(
+        report.pending,
+        [DrainPending {
+            sandbox_id: id.clone(),
+            action: "suspend".into(),
+            reason: String::new(),
+        }]
+    );
+    assert!(service.drain_actions.running().is_empty());
+    assert!(
+        service.active_state_transition_methods().is_empty(),
+        "{:?}",
+        service.active_state_transition_methods()
+    );
+    drop(held);
+
+    assert_eq!(row_witness(&service, &id), before);
+    assert!(
+        crate::db::read::drain_evacuations(&service.db.lock().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(inventory.calls(), Vec::<String>::new());
+}
+
+/// A preview opens no scan of node-manager's orphan inventory, which a drain
+/// call shares with every other caller on the node, and says so: a cache
+/// directory no row accounts for, which blocks a drain call, doesn't show in
+/// a preview, which names the inventory unchecked. The drain call on the
+/// same node still reads it.
+#[tokio::test]
+async fn a_preview_opens_no_orphan_inventory_scan() {
+    let inventory = orphan_inventory(
+        pplx_space_node_mgr_client::proto::ListOrphanCandidatesResponse {
+            orphaned_cache_dirs: vec!["/space/cache/sandboxes/sbx-orphan".into()],
+            ..Default::default()
+        },
+    );
+    let service = service_with_node_manager(crate::db::test_conn(), &inventory);
+    for _ in 0..2 {
+        let report = service
+            .preview_drain_node(preview_request())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(report.blocked.is_empty(), "{report:?}");
+        assert_eq!(report.unchecked, [ORPHAN_INVENTORY_SCAN]);
+        assert_eq!(inventory.calls(), Vec::<String>::new());
+    }
+    assert_eq!(service.activation_seal.status().sealed_epoch, None);
+
+    let drained = service
+        .drain_node(drain_request(7, false))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        drained.blocked,
+        [DrainBlocked {
+            sandbox_id: Some("sbx-orphan".into()),
+            reason: "orphan cache directory /space/cache/sandboxes/sbx-orphan".into(),
+        }]
+    );
+    assert_eq!(inventory.calls(), ["ListOrphanCandidates"]);
+}
+
+/// A preview says a drain would finish only when it found nothing pending and
+/// nothing blocked: on an empty node, and not once a scan blocks or a row
+/// waits for work.
+#[tokio::test]
+async fn a_preview_would_finish_only_with_nothing_pending_or_blocked() {
+    let conn = crate::db::test_conn();
+    let service = SandboxManagerService::for_test(conn);
+    let empty = service.finish_preview(DrainScans::default());
+    assert!(
+        empty.would_finish && empty.pending.is_empty() && empty.blocked.is_empty(),
+        "{empty:?}"
+    );
+    let scan_failed = service.finish_preview(DrainScans {
+        blocked: vec![(
+            None,
+            "orphan inventory scan failed: CacheDirs: denied".into(),
+        )],
+        ..DrainScans::default()
+    });
+    assert!(
+        !scan_failed.would_finish && scan_failed.pending.is_empty(),
+        "{scan_failed:?}"
+    );
+    let stopped = insert_in_status(&service.db.lock().unwrap(), SandboxState::Stopped.into());
+    let waiting = service.finish_preview(DrainScans::default());
+    assert_eq!(
+        (waiting.would_finish, waiting.pending, waiting.blocked),
+        (
+            false,
+            vec![DrainPending {
+                sandbox_id: stopped,
+                action: "publish_disk".into(),
+                reason: String::new(),
+            }],
+            Vec::new()
+        )
+    );
+}
+
+/// Under a seal, a preview plans with the memory the drain's own calls
+/// built: an action that failed the bound times, a transition the drain has
+/// watched past the bound, and a wait for cache disk past it each block with
+/// the drain's reason. A drain call after the preview reports the same
+/// blockers, so the preview consumed none of that memory.
+#[tokio::test(start_paused = true)]
+async fn a_sealed_preview_reports_what_the_drains_memory_blocks_on() {
+    let conn = crate::db::test_conn();
+    let failing = pplx_space_common_core::types::SandboxId::new().to_string();
+    let settling = pplx_space_common_core::types::SandboxId::new().to_string();
+    let waiting = pplx_space_common_core::types::SandboxId::new().to_string();
+    for (id, state) in [
+        (&failing, SandboxState::Stopped),
+        (&settling, SandboxState::Created),
+        (&waiting, SandboxState::Started),
+    ] {
+        crate::service::tests::service_tests::insert_test_sandbox(&conn, id, state);
+    }
+    // A node-manager that answers nothing fails every disk publication.
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default().serve();
+    let service = service_with_node_manager(conn, &node_manager);
+    service.activation_seal.seal(&service.db, 7).unwrap();
+    let no_disk = || DrainScans {
+        disk_headroom: Some(0),
+        ..DrainScans::default()
+    };
+    let blocked = |blocked: Vec<DrainBlocked>| {
+        let mut blocked: Vec<_> = blocked
+            .into_iter()
+            .map(|entry| (entry.sandbox_id, entry.reason))
+            .collect();
+        blocked.sort();
+        blocked
+    };
+    for _ in 0..MAX_ACTION_FAILURES {
+        let first = service.activation_seal.status();
+        service.finish_drain(7, false, &first, no_disk());
+        service.drain_actions.wait_idle().await;
+    }
+    tokio::time::advance(SETTLE_BOUND).await;
+
+    let preview = blocked(service.finish_preview(no_disk()).blocked);
+    let first = service.activation_seal.status();
+    let drain = blocked(service.finish_drain(7, false, &first, no_disk()).blocked);
+    service.drain_actions.wait_idle().await;
+    assert_eq!(preview, drain);
+    let reasons: BTreeMap<_, _> = preview
+        .into_iter()
+        .map(|(id, reason)| (id.unwrap(), reason))
+        .collect();
+    assert!(
+        reasons[&failing].starts_with(&format!(
+            "publish_disk failed {MAX_ACTION_FAILURES} times: "
+        )),
+        "{reasons:?}"
+    );
+    assert_eq!(
+        reasons[&settling],
+        "created for over 15 minutes, a transition the drain doesn't drive"
+    );
+    assert!(
+        reasons[&waiting].starts_with("the cache disk hasn't had room for a "),
+        "{reasons:?}"
+    );
+    assert_eq!(reasons.len(), 3, "{reasons:?}");
+}
+
+/// A drain call after a preview plans with its own memory of earlier calls,
+/// not one the preview started: a row the preview saw in a transition, and
+/// one it saw waiting for cache disk, are still pending once the bound has
+/// passed since the preview, because the drain saw neither before.
+#[tokio::test(start_paused = true)]
+async fn a_drain_after_a_preview_starts_its_memory_fresh() {
+    let conn = crate::db::test_conn();
+    let settling = pplx_space_common_core::types::SandboxId::new().to_string();
+    let waiting = pplx_space_common_core::types::SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &settling,
+        SandboxState::Created,
+    );
+    crate::service::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &waiting,
+        SandboxState::Started,
+    );
+    let (service, first) = sealed_service_with(conn, 7);
+    let no_disk = || DrainScans {
+        disk_headroom: Some(0),
+        ..DrainScans::default()
+    };
+    let mut expected = vec![
+        DrainPending {
+            sandbox_id: settling.clone(),
+            action: "settle:created".into(),
+            reason: String::new(),
+        },
+        DrainPending {
+            sandbox_id: waiting.clone(),
+            action: "disk".into(),
+            reason: String::new(),
+        },
+    ];
+    expected.sort_by(|left, right| left.sandbox_id.cmp(&right.sandbox_id));
+    let sorted = |mut pending: Vec<DrainPending>, blocked: Vec<DrainBlocked>| {
+        pending.sort_by(|left, right| left.sandbox_id.cmp(&right.sandbox_id));
+        (pending, blocked)
+    };
+
+    let preview = service.finish_preview(no_disk());
+    assert_eq!(
+        sorted(preview.pending, preview.blocked),
+        (expected.clone(), Vec::new())
+    );
+    tokio::time::advance(SETTLE_BOUND).await;
+    let drain = service.finish_drain(7, false, &first, no_disk());
+    assert_eq!(sorted(drain.pending, drain.blocked), (expected, Vec::new()));
+}
+
+/// A row in `status`, as the store would hold it: a cleanup's teardown
+/// transition carries the completion that leads to it.
+fn insert_in_status(conn: &crate::db::Connection, status: SandboxStatus) -> String {
+    let id = pplx_space_common_core::types::SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(conn, &id, SandboxState::Started);
+    match status {
+        SandboxStatus::Unowned(lifecycle) => {
+            crate::db::test_fixtures::state_write_fixtures::write_status(conn, &id, lifecycle);
+        }
+        SandboxStatus::Owned { teardown, cleanup } => {
+            let completion = match teardown {
+                crate::state::Teardown::Stopping => None,
+                crate::state::Teardown::Deleting => Some("delete_row"),
+                crate::state::Teardown::Suspending => Some("mark_suspended"),
+            };
+            conn.execute(
+                "UPDATE sandboxes SET state = ?1, cleanup_state = ?2, cleanup_completion = ?3
+                  WHERE id = ?4",
+                crate::db::fixture::params![
+                    teardown.lifecycle().as_str(),
+                    cleanup.as_str(),
+                    completion,
+                    id
+                ],
+            )
+            .unwrap();
+        }
+    }
+    id
+}
+
+/// Seal `service` under 7 after a preview, make a drain call over the same
+/// rows and scans, and answer the preview's items once they are the drain
+/// call's: each blocker and each pending item, sorted.
+async fn preview_then_drain(
+    service: &SandboxManagerService,
+    scans: DrainScans,
+) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+    let items = |blocked: &[DrainBlocked], pending: &[DrainPending]| {
+        let mut items: Vec<_> = blocked
+            .iter()
+            .map(|entry| (entry.sandbox_id.clone(), Some(entry.reason.clone()), None))
+            .chain(pending.iter().map(|entry| {
+                (
+                    Some(entry.sandbox_id.clone()),
+                    None,
+                    Some(entry.action.clone()),
+                )
+            }))
+            .collect();
+        items.sort();
+        items
+    };
+    let preview = service.finish_preview(scans.clone());
+    let preview = items(&preview.blocked, &preview.pending);
+    service.activation_seal.seal(&service.db, 7).unwrap();
+    let first = service.activation_seal.status();
+    let drain = service.finish_drain(7, false, &first, scans);
+    let drain = items(&drain.blocked, &drain.pending);
+    service.drain_actions.wait_idle().await;
+    assert_eq!(preview, drain, "a preview reports what the drain call does");
+    preview
+}
+
+/// Every status a row can be in, a row and a warm-pool member each, and
+/// every arm that comes from elsewhere (an encrypted stopped sandbox, a
+/// local-only artifact without a row, an orphan directory, a failed scan
+/// and a refused suspend): a preview reports each item as a drain call over
+/// the same rows and scans does, and as the planner's table says.
+#[tokio::test]
+async fn a_preview_reports_every_arm_as_a_drain_call_does() {
+    use SandboxState as S;
+    use SandboxStatus::{Owned, Unowned};
+    type Item = (Option<String>, Option<String>, Option<String>);
+    let blocked =
+        |id: &str, reason: &str| -> Item { (Some(id.to_owned()), Some(reason.to_owned()), None) };
+    let pending =
+        |id: &str, action: &str| -> Item { (Some(id.to_owned()), None, Some(action.to_owned())) };
+    let conn = crate::db::test_conn();
+    let mut expected = Vec::new();
+    for status in SandboxStatus::all() {
+        let id = insert_in_status(&conn, status);
+        expected.extend(match status {
+            Unowned(S::Started | S::Paused) => Some(pending(&id, "suspend")),
+            Unowned(S::Stopped) => Some(pending(&id, "publish_disk")),
+            Unowned(S::Quarantined) => Some(blocked(&id, "quarantined")),
+            Owned {
+                cleanup: CleanupState::Failed,
+                ..
+            } => Some(blocked(&id, "cleanup failed")),
+            // Its row pins no artifact, so nothing proves it durable.
+            Unowned(S::Suspended) => Some(pending(&id, "publish_snapshot")),
+            Unowned(S::Failed) => None,
+            other => Some(pending(&id, &format!("settle:{}", other.legacy_label()))),
+        });
+        let member = insert_in_status(&conn, status);
+        conn.execute(
+            "UPDATE sandboxes SET pool_template = 'seed' WHERE id = ?1",
+            [&member],
+        )
+        .unwrap();
+        if status.cleanup() == Some(CleanupState::Failed) {
+            expected.push(blocked(&member, "cleanup failed"));
+        } else if may_hold_vm(status) {
+            expected.push(pending(&member, "warm_pool_eviction"));
+        }
+    }
+    let encrypted = insert_in_status(&conn, S::Stopped.into());
+    conn.execute(
+        "UPDATE sandboxes SET volume_encryption = 1 WHERE id = ?1",
+        [&encrypted],
+    )
+    .unwrap();
+    expected.push(blocked(
+        &encrypted,
+        "an encrypted stopped sandbox's disk can't be published",
+    ));
+    let gone = pplx_space_common_core::types::SandboxId::new().to_string();
+    conn.execute(
+        "INSERT INTO local_artifacts (
+             local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
+             snapshot_name, local_path, created_at, backup_completed_at, state
+         ) VALUES (?1, ?2, 'disk', 'stop', NULL, '/tmp/a', '0', NULL, 'ready')",
+        crate::db::fixture::params![NAMED_ARTIFACT, gone],
+    )
+    .unwrap();
+    expected.push(blocked(
+        &gone,
+        &format!("local-only artifact {NAMED_ARTIFACT} has no sandbox row"),
+    ));
+    let orphan = pplx_space_common_core::types::SandboxId::new().to_string();
+    let scan_failure = "orphan inventory scan failed: CacheDirs: denied";
+    expected.push(blocked(
+        &orphan,
+        &format!("orphan cache directory {orphan}"),
+    ));
+    expected.push((None, Some(scan_failure.to_owned()), None));
+    let scans = DrainScans {
+        blocked: vec![(None, scan_failure.into())],
+        orphan_dirs: vec![(orphan.clone(), format!("orphan cache directory {orphan}"))],
+        disk_headroom: None,
+    };
+    expected.sort();
+    let service = SandboxManagerService::for_test(conn);
+    assert_eq!(preview_then_drain(&service, scans).await, expected);
+
+    // A node whose snapshots need file-backed memory refuses every suspend.
+    let conn = crate::db::test_conn();
+    let refused = insert_in_status(&conn, S::Started.into());
+    let service = SandboxManagerService::new_with_config(
+        conn,
+        crate::service::SandboxManagerServiceOptions::for_test(),
+        crate::config::SandboxConfig {
+            hugepages: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        preview_then_drain(&service, DrainScans::default()).await,
+        [blocked(
+            &refused,
+            "can't be made durable: snapshot restore requires file-backed memory; set \
+             hugepages = false"
+        )]
+    );
+}
+
+/// A preview has watched no row, so it reads how long one has sat in its
+/// lifecycle from the store: a row in a transition the drain doesn't drive
+/// whose lifecycle last changed past the bound is blocked, as a drain that
+/// had watched it that long would report it, while a drain's first call
+/// still waits for it. A warm-pool member's bound is on its eviction, which
+/// only a drain's cordon starts, so it stays pending however long it ran.
+#[tokio::test]
+async fn a_preview_judges_a_long_transition_by_when_the_row_entered_it() {
+    use pplx_space_common_core::types::SandboxId;
+    let conn = crate::db::test_conn();
+    let stuck = SandboxId::new().to_string();
+    let pool_member = SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &stuck,
+        SandboxState::Restoring,
+    );
+    crate::service::tests::service_tests::insert_test_sandbox(
+        &conn,
+        &pool_member,
+        SandboxState::Started,
+    );
+    let long_ago =
+        crate::db::now_epoch_i64().unwrap() - i64::try_from(SETTLE_BOUND.as_secs()).unwrap() - 60;
+    conn.execute(
+        "UPDATE sandboxes SET state_changed_at = ?1",
+        [long_ago.to_string()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sandboxes SET pool_template = 'seed' WHERE id = ?1",
+        [&pool_member],
+    )
+    .unwrap();
+    let service = SandboxManagerService::for_test(conn);
+
+    let preview = service.finish_preview(DrainScans::default());
+    assert_eq!(
+        preview.blocked,
+        [DrainBlocked {
+            sandbox_id: Some(stuck.clone()),
+            reason: "restoring for over 15 minutes, a transition the drain doesn't drive".into(),
+        }]
+    );
+    assert_eq!(
+        preview.pending,
+        [DrainPending {
+            sandbox_id: pool_member.clone(),
+            action: "warm_pool_eviction".into(),
+            reason: String::new(),
+        }]
+    );
+
+    service.activation_seal.seal(&service.db, 7).unwrap();
+    let first = service.activation_seal.status();
+    let drain = service.finish_drain(7, false, &first, DrainScans::default());
+    assert!(drain.blocked.is_empty(), "{drain:?}");
+    assert_eq!(drain.pending.len(), 2, "{drain:?}");
 }

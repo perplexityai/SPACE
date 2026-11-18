@@ -125,4 +125,7 @@ service WorkerApiInternal {
   // Relays sandbox-manager's `DrainNode`, for the cluster controller's node
   // drain.
   rpc DrainNode(space.sandbox.manager.v1.DrainNodeRequest) returns (space.sandbox.manager.v1.DrainNodeResponse);
+  // Relays sandbox-manager's `PreviewDrainNode`, for the admin API's drain
+  // preview. It only reads.
+  rpc PreviewDrainNode(space.sandbox.manager.v1.PreviewDrainNodeRequest) returns (space.sandbox.manager.v1.PreviewDrainNodeResponse);
 }
