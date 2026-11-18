@@ -73,7 +73,8 @@ For new work:
   Kubernetes objects themselves (pods, Nodes, DaemonSets) belongs to the
   Kubernetes adapter side, and its module doc says so. The state loops
   `run_reconcilers` (`cluster/controller/server/src/reconcilers.rs`) starts
-  only for Kubernetes are debt, not precedent or a Direct retry path.
+  only for Kubernetes, classified in its module doc, are debt, not
+  precedent or a Direct retry path.
 - Make a new `SubstrateAdapter` operation a required method, so the compiler
   demands each implementation and its arm in `impl SubstrateAdapter for
   Substrate`: with a default, a forgotten forwarding arm silently gives both
