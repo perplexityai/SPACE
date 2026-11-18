@@ -4938,6 +4938,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
+ "pplx-space-node-drain",
  "pplx-space-node-mgr-client",
  "pplx-space-node-model",
  "pplx-space-node-registration-store",

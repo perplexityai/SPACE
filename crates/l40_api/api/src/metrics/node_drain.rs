@@ -1,6 +1,7 @@
 //! Local snapshot promotion, which the cluster controller's drain reconciler
-//! records and the API server's admin force-upload route records too. The
-//! drain reconciler's other metrics are the controller's `metrics::node_drain`.
+//! records and the API server's admin force-upload route records too, and
+//! the API's view of a v2 drain's seal. The drain reconciler's other metrics
+//! are the controller's `metrics::node_drain`.
 
 use pplx_space_metrics_emit::{counter, tag};
 
@@ -38,5 +39,17 @@ pub fn local_snapshot_promotion(node_id: &str, outcome: &str) {
         "node_drain.local_snapshot_promotion",
         1,
         &[tag("node", node_id), tag("outcome", outcome)],
+    );
+}
+
+/// A node refused a call because it is sealed against VM activations, a
+/// drain preview included, while Postgres records no v2 drain of it: an
+/// orphaned seal, which nothing heals on its own (a `:drain` then
+/// `:undrain` does). The API warns with the same facts.
+pub fn v2_orphaned_seal_refusal(node_id: &str) {
+    counter(
+        "node_drain.v2.orphaned_seal_refusals",
+        1,
+        &[tag("node_id", node_id)],
     );
 }
