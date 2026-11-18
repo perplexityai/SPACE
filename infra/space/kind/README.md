@@ -363,8 +363,28 @@ listed but does not fail the run. Without `--benches` it picks N
 from the host's CPUs, available memory, free disk and a short write-throughput
 probe of the bench volume, and prints each factor. One run or teardown
 holds the host at a time (`/run/space-bench.d/lock`), and a run first
-removes the benches an interrupted one left; only directories marked as a
-bench's when it was created are ever deleted.
+removes the benches an interrupted or `--keep` run left; only directories
+marked as a bench's when it was created are ever deleted.
+
+It needs Linux with cgroup v2, read-write `/dev/kvm`, passwordless sudo and the
+host's Docker with the containerd image store, and refuses a host whose
+`/etc/resolv.conf` names a loopback resolver (such as systemd-resolved's
+`127.0.0.53` stub) or that has a route in 192.168.0.0/16 other than its own
+benches'. It raises the inotify and aio limits and sets
+`net.ipv4.ip_forward=1`, loads the device-mapper crypt and snapshot modules,
+installs socat and rsync (and the Kind prerequisites) when they are missing,
+installs Docker's static release under `/opt/space-bench-docker`, and stages
+loop-device nodes. Per bench it creates a network namespace, a veth, iptables
+rules, cgroups under `/sys/fs/cgroup/space-bench-<i>` and a worktree of the
+checkout. It also adds a dummy interface holding 192.168.241.1, a mangle-table
+chain that accepts connections to that address only from the host and the
+benches' links, and two registry containers on the host's Docker that keep
+running between runs. A run's exit removes its benches; `teardown` also stops
+the registries and removes the interface and the chain, and `teardown
+--purge-cache` also deletes the registries' data under `~/.space-benches-cache`.
+The registries take no credentials: the layer cache is local to the host, and
+any local user can write it. The loop nodes, the raised limits, the modules,
+the static Docker release and the lock directory stay.
 
 Each bench keeps every default name and port (`space-local`, API
 `127.0.0.1:8080`, data plane `:8090`, Tilt `:10350`), so the bring-up and the
