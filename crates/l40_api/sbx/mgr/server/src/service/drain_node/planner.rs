@@ -9,6 +9,12 @@ use super::actions::DEFAULT_DRAIN_NODE_WINDOW;
 use crate::db::activation_seal::{DrainEvacuation, DrainPrior};
 use crate::service::*;
 
+/// The pending action of a running sandbox a gentle drain holds.
+pub(super) const HOLD: &str = "hold";
+
+/// Why a sandbox is pending with [`HOLD`], reported as its `reason`.
+pub(super) const HOLD_REASON: &str = "running; waits for the sandbox to go idle";
+
 /// How many times one kind of the drain's work on a sandbox may fail, under
 /// one epoch, before the drain reports it `blocked` with the last failure.
 /// A success doesn't reset the count: an upload's cycle alternates a failed
@@ -92,6 +98,10 @@ pub(super) struct DrainRow {
 pub(super) enum PlannedAction {
     Suspend {
         sandbox_id: String,
+        /// The lifecycles it may suspend from, checked again under the wake
+        /// lock: a row planned `paused` may be `started` by the time the
+        /// suspend runs.
+        from: SuspendFrom,
     },
     PublishDisk {
         sandbox_id: String,
@@ -104,6 +114,37 @@ pub(super) enum PlannedAction {
         artifact_id: String,
         kind: pplx_space_common_core::types::ArtifactKind,
     },
+}
+
+/// The lifecycles a drain suspend may suspend a VM from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SuspendFrom {
+    /// A forced drain's: `started` or `paused`.
+    StartedOrPaused,
+    /// A gentle drain's: `paused` only, since it holds a started sandbox.
+    Paused,
+}
+
+impl SuspendFrom {
+    fn for_drain(gentle: bool) -> Self {
+        if gentle {
+            Self::Paused
+        } else {
+            Self::StartedOrPaused
+        }
+    }
+
+    /// The prior to record for a row in `state`, or `None` when this
+    /// suspend doesn't apply to it.
+    pub(super) fn prior(self, state: Option<SandboxState>) -> Option<DrainPrior> {
+        match (self, state?) {
+            (Self::StartedOrPaused, SandboxState::Started) => Some(DrainPrior::Started),
+            (Self::StartedOrPaused | Self::Paused, SandboxState::Paused) => {
+                Some(DrainPrior::Paused)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// What one call decided, from the rows it read.
@@ -165,6 +206,8 @@ pub(super) struct PlanInputs {
     /// The rows that have waited for cache disk for [`SETTLE_BOUND`] or
     /// longer.
     pub(super) disk_waits: BTreeSet<String>,
+    /// A gentle drain: hold every sandbox in `started`.
+    pub(super) gentle: bool,
 }
 
 impl Default for PlanInputs {
@@ -180,6 +223,7 @@ impl Default for PlanInputs {
             disk_headroom: None,
             active_uploads: BTreeSet::new(),
             disk_waits: BTreeSet::new(),
+            gentle: false,
         }
     }
 }
@@ -375,7 +419,7 @@ pub(super) enum WindowOrder {
 impl PlannedAction {
     pub(super) fn target(&self) -> (&str, DrainAction) {
         match self {
-            Self::Suspend { sandbox_id } => (sandbox_id, DrainAction::Suspend),
+            Self::Suspend { sandbox_id, .. } => (sandbox_id, DrainAction::Suspend),
             Self::PublishDisk { sandbox_id } => (sandbox_id, DrainAction::PublishDisk),
             Self::PublishSnapshot { sandbox_id } => (sandbox_id, DrainAction::PublishSnapshot),
             Self::Upload { sandbox_id, .. } => (sandbox_id, DrainAction::Upload),
@@ -452,12 +496,18 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
             SandboxStatus::Unowned(SandboxState::Started | SandboxState::Paused) => {
                 let suspend = PlannedAction::Suspend {
                     sandbox_id: id.clone(),
+                    from: SuspendFrom::for_drain(inputs.gentle),
                 };
                 match &row.suspend_refusal {
                     Some(refusal) if !running => {
                         plan.blocked.push((Some(id.clone()), refusal.clone()));
                     }
                     _ if running => plan.drive(inputs, suspend),
+                    // A gentle drain leaves it running; once it leaves
+                    // `started` on its own, the row is planned from there.
+                    _ if inputs.gentle && row.lifecycle.is_unowned(SandboxState::Started) => {
+                        plan.pending.push((id.clone(), HOLD.to_owned()));
+                    }
                     _ => windowed.push((
                         if row.lifecycle.is_unowned(SandboxState::Paused) {
                             WindowOrder::PausedVm

@@ -1,4 +1,4 @@
-//! `DrainNode`: the node's own half of a forced drain.
+//! `DrainNode`: the node's own half of a drain, forced or gentle.
 //!
 //! The control plane names an epoch; the node seals itself under it (see
 //! [`crate::activation_seal`]) and, on every call, makes each of its
@@ -35,6 +35,20 @@
 //! flight at its first read. Every row that keeps `done` false says why: work
 //! that keeps failing, and a row stuck in a transition the drain doesn't
 //! drive, turn from `pending` into `blocked` after a bound.
+//!
+//! A gentle call (`gentle_epoch`) plans the same way, except that it holds a
+//! sandbox in `started` the node can make durable: it reports it `pending`
+//! ([`planner::HOLD`]) and suspends nothing for it, so it keeps running until
+//! the node's idle auto-lifecycle, or its user, moves it on. One the node
+//! can't make durable is reported `blocked` with why, and one whose drain
+//! suspend is already running is waited for, as under a forced call. The seal refuses activations only, so that
+//! suspend, stop or delete goes ahead. A sandbox that suspends on its own has
+//! no drain record and is never reported evacuated; its upload is finished
+//! like any artifact without a durable copy. A gentle drain's suspend
+//! suspends a VM only from `paused`: it checks again under the wake lock, so
+//! a resume that was already in flight at the seal and finished `started`
+//! before the suspend ran is held, not suspended. A forced call under the
+//! same epoch continues the same drain and holds nothing.
 
 mod actions;
 mod planner;
