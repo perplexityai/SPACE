@@ -145,6 +145,15 @@ through the admin terminal route, and type into it. They create no objects,
 but they open terminal sessions, and the admin route records an admin audit
 row for each of the second's, so `--no-mutate` skips them too. The steps are in [`src/steps.ts`](src/steps.ts).
 
+Two `nodes` `flows` steps preview a v2 drain, which changes nothing on a node:
+`node-drain-preview` runs Preview v2 drain on the node page of the worker
+with the most sandboxes and checks the panel against the API's answer, and
+`nodes-drain-preview-all` runs Preview v2 drain on all workers and checks that
+every listed worker gets a row, with at most four previews in flight. Both
+fail on any admin write the page sends while they run and check that each
+worker keeps its drain phase. They create nothing, so `--no-mutate` keeps
+them.
+
 Two `nodes` steps are `flows` that drain a node: `node-forced-drain-undrain`
 forced-drains a Kind worker through the node page and undrains it, and
 `node-terminate-refused` drains one, shows a terminate refusal the step
@@ -218,7 +227,7 @@ what the console under test has, and the detail step then requires the
 A prefix is up to 32 lowercase letters, digits and dashes. `npm run seed`
 also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs`.
 `npm run loop` also takes `--label NAME`, `--slow-ms N` (default 1500),
-`--compare RUN`, `--headed`, and `--video`, which records the run as
+`--compare RUN`, `--headed`, `--loopback-hosts` (see below), and `--video`, which records the run as
 `run.webm` in its run directory. Run `npm run typecheck` and `npm test` (unit
 tests that need no stack) after changing the scripts; the SPACE Guide job of
 Pull CI runs both. The tool lives under `scripts/`, outside the paths that
@@ -335,6 +344,25 @@ This signs in, records the routes at 1280×800, and writes
 `out/media/nodes-page.webm`, plus `nodes-page.gif` when `ffmpeg` is installed.
 Step screenshots from a run are in its run directory. Attach media to the pull
 request instead of committing it.
+
+`--loopback-hosts`, on `npm run loop` and `npm run capture`, rewrites each
+IPv4 literal outside `127.0.0.0/8` in the JSON responses it intercepts (the
+page's `/admin/` and `/api/` requests) to `127.0.0.<last octet>` before the
+page sees it, a Kind node's address included. That is all it rewrites:
+hostnames, IPv6 addresses, any other response, event streams and anything
+the page renders from elsewhere reach screenshots and videos as they are,
+so check the media before you share it. A step's checks that read the API
+through the page see the same rewritten answers. The tool's own requests
+outside the browser (the seed, `clean` and the stack identity check) are not
+rewritten.
+
+`--click LABEL` clicks the button LABEL names on each route that has one and
+records what it shows, for an action whose result is the point, such as
+`--click 'Preview v2 drain'` on a node page. LABEL is the button's visible
+text, or its whole accessible name, which an icon's label leads ("eye Preview
+v2 drain"); either must match exactly, so a label never picks a longer button.
+A LABEL that more than one button on a page matches stops the capture with
+the buttons it matched.
 
 A new API key's secret is shown once, in a dialog. The API-key step sends
 every POST through `page.route`: it fetches the answer without following a
