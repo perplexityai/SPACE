@@ -899,6 +899,31 @@ fn controller_create_request_threads_node_pool() {
 }
 
 #[test]
+fn controller_create_request_keeps_block_volume_reference_and_mount_permissions() {
+    let mut request = public_create_request();
+    let volume = Uuid::now_v7();
+    request.volume_mounts = serde_json::from_value(serde_json::json!([{
+        "volume_id": volume,
+        "mount": "/data",
+        "permissions": "read_only"
+    }]))
+    .unwrap();
+
+    let controller = controller_create_request(request, None);
+    assert_eq!(controller.block_volume_id, Some(volume));
+    assert_eq!(controller.boot_mode.as_deref(), Some("cold"));
+    assert_eq!(
+        serde_json::to_value(controller.volume_mounts).unwrap(),
+        serde_json::json!([{
+            "type": "ebs",
+            "size_gib": 128,
+            "mount": "/data",
+            "permissions": "read_only"
+        }])
+    );
+}
+
+#[test]
 fn create_operation_payload_is_wire_compatible_with_old_shape() {
     // Unpinned payloads must serialize byte-identically to a pre-placement
     // producer: no `node_pool` key at all, so old executors accept them.

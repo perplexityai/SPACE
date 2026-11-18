@@ -75,6 +75,16 @@ pub(crate) fn block_volume_mounts(_: &mut SchemaGenerator) -> Schema {
         "type": "array",
         "maxItems": 1,
         "items": {
+          "oneOf": [{
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["volume_id", "permissions", "mount"],
+            "properties": {
+                "volume_id": {"type": "string", "format": "uuid"},
+                "permissions": {"type": "string", "enum": ["read_write", "read_only"]},
+                "mount": {"type": "string", "minLength": 2, "maxLength": 4095}
+            }
+          }, {
             "type": "object",
             "additionalProperties": false,
             "required": ["type", "size_gib", "permissions", "mount"],
@@ -85,6 +95,7 @@ pub(crate) fn block_volume_mounts(_: &mut SchemaGenerator) -> Schema {
                 "mount": {"type": "string", "minLength": 2, "maxLength": 4095,
                     "description": "Absolute canonical guest path outside reserved system directories. Must be empty and symlink-free."}
             }
+          }]
         }
     }))
 }

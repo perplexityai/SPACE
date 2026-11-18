@@ -1,5 +1,63 @@
 # Retained block-volume experiment
 
+## Independent volume API
+
+The next contract is independently created, retained EBS storage, mounted by
+logical ID at sandbox creation. Runtime hotplug is not required. This source
+change is under validation; it is not a claim of deployed qualification.
+
+`POST /v1/volumes` accepts `{"type":"ebs","size_gib":128}` and an
+`Idempotency-Key`. It returns an asynchronous operation whose `target_id`
+identifies the volume. Provisioning completion means EBS backing is available;
+filesystem initialization still happens under the fenced first-attachment
+claim, and sandbox readiness requires a successful guest mount.
+
+`GET /v1/volumes` lists independently retained resources in the local
+organization, at most 100 per page, with `after` and `next_after` UUID cursors.
+`GET /v1/volumes/{volume_id}` includes an optional sandbox reservation.
+Independent resources currently reject federated-subject access.
+
+```json
+{
+  "template": "seed",
+  "volume_mounts": [{
+    "volume_id": "019a9000-0000-7000-8000-000000000001",
+    "permissions": "read_write",
+    "mount": "/data"
+  }]
+}
+```
+
+Permissions and mount paths belong to each sandbox reservation. Only one sandbox
+may reserve a volume, including while suspended and physically detached.
+Deleting the sandbox retains independent storage and releases its reservation
+only after safe teardown and observed detach. Explicit volume deletion requires
+no sandbox reservation. Existing inline-created volumes preserve their old
+delete-with-sandbox behavior and authorization.
+
+Independent creation/mounting requires `independent_volumes: true` and
+`volume_management: true` in the default-off admission policy, as well as the
+organization allowlist. Upgrade compatible API and controller lifecycle support
+before enabling it. A versioned reconciliation scope protects new records from
+old controllers, while a database constraint prevents old implicit cleanup
+writers from deleting retained data. Rollback requires retaining compatible
+lifecycle support for all independent records.
+
+Set `resource_limit` on both admission and controller policies to the approved
+qualification cap. It accepts 1 or 2; omission preserves the older two-resource
+ceiling. Reservations count all non-deleted resources, including retained
+and cleanup-pending disks, rather than only currently attached disks.
+
+Dynamic grow-only resize is the next implementation gate, not an implemented
+PATCH endpoint in this checkpoint. Success must include running-guest device
+and ext4 growth, not only backing-volume expansion. Same-node/cross-node restore,
+live resize, retained reuse and paired NVMe/EBS fio require deployed proof.
+
+## Legacy sandbox-created contract
+
+The following sections describe inline-created disk behavior. Their fixed-size
+and sandbox-owned restrictions do not redefine the independent-volume target.
+
 ## Client-managed deletion
 
 `GET /v1/volumes/{volume_id}` inspects a sandbox-created volume using the same

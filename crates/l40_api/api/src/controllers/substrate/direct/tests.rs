@@ -2963,6 +2963,7 @@ async fn direct_create_fixture_with(
 /// boots cold.
 fn one_shot_create_request() -> TestResult<crate::models::CreateSandboxRequest> {
     Ok(crate::models::CreateSandboxRequest {
+        block_volume_id: None,
         volume_mounts: Vec::new(),
         name: None,
         template: Some("seed:latest".parse()?),

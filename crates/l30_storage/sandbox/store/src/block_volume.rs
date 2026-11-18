@@ -7,6 +7,8 @@ use pplx_space_execution_spec::BlockVolumeMount;
 use sqlx::{PgExecutor, Postgres, Transaction, types::Json};
 use uuid::Uuid;
 
+pub mod resource;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum VolumePhase {
@@ -31,6 +33,7 @@ pub enum Initialization {
 
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct BlockVolume {
+    pub retained: bool,
     pub id: Uuid,
     pub sandbox_id: SandboxId,
     pub org_id: OrgId,
@@ -91,18 +94,16 @@ pub async fn current_execution(
     executor: impl PgExecutor<'_>,
     sandbox: SandboxId,
 ) -> Result<Option<CurrentExecution>, sqlx::Error> {
-    sqlx::query_as::<_, CurrentExecution>(sql!(
-        "SELECT COALESCE(e.generation, r.execution_generation) AS execution_generation,
-                COALESCE(e.route_activation_id, r.activation_attempt_id) AS execution_id,
-                s.active_node_id, s.target_node_id
-         FROM sandboxes s
-         LEFT JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id AND e.active
-         LEFT JOIN sandbox_direct_route_identities r ON r.sandbox_id = s.id
-         WHERE s.id = $1"
-    ))
-    .bind(sandbox)
-    .fetch_optional(executor)
-    .await
+    // Reuse the owning execution projection rather than reaching through the
+    // Direct substrate's tables from a second storage module.
+    Ok(super::auto_lifecycle_execution(executor, sandbox)
+        .await?
+        .map(|row| CurrentExecution {
+            execution_generation: row.execution_generation,
+            execution_id: row.route_activation_id,
+            active_node_id: row.active_node_id,
+            target_node_id: row.target_node_id,
+        }))
 }
 
 /// The advisory lock serializes admissions, including creates whose AWS result
@@ -159,7 +160,7 @@ pub async fn get(
     sandbox_id: SandboxId,
 ) -> Result<Option<BlockVolume>, sqlx::Error> {
     sqlx::query_as(sql!(
-        "SELECT id, sandbox_id, org_id, managed_by, mount_spec, availability_zone,
+        "SELECT retained, id, sandbox_id, org_id, managed_by, mount_spec, availability_zone,
                 aws_volume_id, phase, delete_requested, attachment_epoch,
                 node_id, instance_id, device_name, execution_id, released_epoch,
                 filesystem_uuid, initialization, initialization_claim, ever_exposed,
@@ -273,14 +274,14 @@ pub async fn lock_next(
     managed_by: &str,
 ) -> Result<Option<BlockVolume>, sqlx::Error> {
     sqlx::query_as(sql!(
-        "SELECT id, sandbox_id, org_id, managed_by, mount_spec, availability_zone,
+        "SELECT retained, id, sandbox_id, org_id, managed_by, mount_spec, availability_zone,
                 aws_volume_id, phase, delete_requested, attachment_epoch,
                 node_id, instance_id, device_name, execution_id, released_epoch,
                 filesystem_uuid, initialization, initialization_claim, ever_exposed,
                 disk_generation, checkpoint_id, checkpoint_generation, activation_id,
                 activated_epoch, revision
          FROM sandbox_block_volumes
-         WHERE managed_by = $1 AND phase != 'deleted'
+         WHERE managed_by = $1 AND phase != 'deleted' AND sandbox_id IS NOT NULL
          ORDER BY updated_at, id LIMIT 1 FOR UPDATE SKIP LOCKED"
     ))
     .bind(managed_by)
@@ -567,7 +568,7 @@ pub async fn request_delete(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(sql!(
         "UPDATE sandbox_block_volumes
-         SET delete_requested = TRUE, checkpoint_id = NULL, checkpoint_generation = NULL,
+         SET delete_requested = NOT retained, checkpoint_id = NULL, checkpoint_generation = NULL,
              revision = revision + 1, updated_at = NOW()
          WHERE sandbox_id = $1 AND phase != 'deleted'"
     ))
@@ -588,7 +589,7 @@ pub async fn request_orphan_deletion(
         "UPDATE sandbox_block_volumes v
          SET delete_requested = TRUE, checkpoint_id = NULL, checkpoint_generation = NULL,
              revision = revision + 1, updated_at = NOW()
-         WHERE id = $1 AND NOT delete_requested AND phase != 'deleted'
+         WHERE id = $1 AND NOT retained AND NOT delete_requested AND phase != 'deleted'
            AND NOT EXISTS (SELECT 1 FROM sandboxes s WHERE s.id = v.sandbox_id)"
     ))
     .bind(volume_id)

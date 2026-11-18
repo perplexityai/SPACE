@@ -591,6 +591,7 @@ wire_enum_open_schema!(OperationKind, "operation kind", {
     RollbackSandbox => "rollback_sandbox",
     DeleteTemplate => "delete_template",
     DeleteVolume => "delete_volume",
+    CreateVolume => "create_volume",
     CreateSession => "create_session",
 });
 
@@ -1239,7 +1240,7 @@ pub struct CreateSandboxRequest {
         feature = "schema",
         schemars(schema_with = "schema::block_volume_mounts")
     )]
-    pub volume_mounts: Vec<pplx_space_execution_spec::BlockVolumeMount>,
+    pub volume_mounts: Vec<VolumeMountRequest>,
     #[cfg_attr(
         feature = "schema",
         schemars(schema_with = "schema::template_reference")
@@ -1480,14 +1481,44 @@ pub struct PublicSandboxVolumeMount {
     pub state: SandboxBlockVolumeState,
 }
 
-/// A sandbox-created storage resource, independently addressable for management.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", serde(untagged))]
+pub enum VolumeMountRequest {
+    Existing(ExistingVolumeMount),
+    Inline(pplx_space_execution_spec::BlockVolumeMount),
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct ExistingVolumeMount {
+    pub volume_id: Uuid,
+    pub mount: pplx_space_execution_spec::GuestBlockMountPath,
+    pub permissions: pplx_space_execution_spec::BlockVolumePermissions,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct CreateVolumeRequest {
+    #[cfg_attr(feature = "serde", serde(rename = "type"))]
+    pub backend: pplx_space_execution_spec::BlockVolumeBackend,
+    pub size_gib: pplx_space_execution_spec::BlockVolumeSizeGiB,
+}
+
+/// Organization-owned storage, optionally reserved by one sandbox.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PublicVolume {
     pub volume_id: Uuid,
-    pub sandbox_id: PublicSandboxId,
-    #[cfg_attr(feature = "serde", serde(flatten))]
-    pub mount_spec: pplx_space_execution_spec::BlockVolumeMount,
+    pub sandbox_id: Option<PublicSandboxId>,
+    #[cfg_attr(feature = "serde", serde(rename = "type"))]
+    pub backend: pplx_space_execution_spec::BlockVolumeBackend,
+    pub size_gib: u32,
+    pub mount: Option<pplx_space_execution_spec::GuestBlockMountPath>,
+    pub permissions: Option<pplx_space_execution_spec::BlockVolumePermissions>,
+    pub retained: bool,
     pub state: SandboxBlockVolumeState,
     pub delete_requested: bool,
 }

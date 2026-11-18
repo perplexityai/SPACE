@@ -313,6 +313,7 @@ const NATIVE_PUBLIC_OPERATION_KINDS: &[OperationKind] = &[
     OperationKind::RollbackSandbox,
     OperationKind::DeleteTemplate,
     OperationKind::DeleteVolume,
+    OperationKind::CreateVolume,
     OperationKind::ForkSandbox,
 ];
 
@@ -331,8 +332,8 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
             OperationKind::CreateSandbox => self.create_sandbox.execute(&operation).await.into(),
             OperationKind::UpdateSandbox => self.update_sandbox.execute(&operation).await.into(),
             OperationKind::DeleteTemplate => self.delete_template.execute(&operation).await.into(),
-            OperationKind::DeleteVolume => {
-                pplx_space_api::block_volumes::execute_delete(&self.volume_pool, &operation)
+            OperationKind::DeleteVolume | OperationKind::CreateVolume => {
+                pplx_space_api::block_volumes::observe_operation(&self.volume_pool, &operation)
                     .await
                     .into()
             }

@@ -11,6 +11,236 @@ const DEVICE: &str = "/dev/sdf";
 const CLOUD_ID: &str = "vol-00000000000000001";
 
 #[tokio::test]
+async fn block_volume_authority_outlives_the_temporary_activation_claim() -> TestResult {
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
+    let db = pg_test_db().await?;
+    let sandbox = SandboxId::new();
+    let route = Uuid::now_v7();
+    let attempt = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id,user_id,org_id,network_policy_generation)
+         VALUES ($1,$2,$3,1)"
+    ))
+    .bind(sandbox)
+    .bind(SEED_USER_ID)
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+         (sandbox_id,generation,pod_name,pod_namespace,state,active,
+          activation_attempt_id,route_activation_id)
+         VALUES ($1,7,'execution-test','test','running',TRUE,$2,$3)"
+    ))
+    .bind(sandbox)
+    .bind(attempt)
+    .bind(route)
+    .execute(&db.pool)
+    .await?;
+    for temporary_claim in [Some(attempt), None] {
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET activation_attempt_id = $2
+             WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox)
+        .bind(temporary_claim)
+        .execute(&db.pool)
+        .await?;
+        let authority = current_execution(&db.pool, sandbox).await?.unwrap();
+        let lifecycle = crate::auto_lifecycle_execution(&db.pool, sandbox)
+            .await?
+            .unwrap();
+        assert_eq!(authority.execution_generation, Some(7));
+        assert_eq!(authority.execution_id, Some(route));
+        assert_eq!(lifecycle.activation_attempt_id, temporary_claim);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn independent_reservation_survives_detach_and_releases_only_with_deleted_owner() -> TestResult
+{
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
+    let db = pg_test_db().await?;
+    let org = OrgId::from_uuid(SEED_ORG_ID);
+    let volume = Uuid::now_v7();
+    let a = SandboxId::new();
+    let b = SandboxId::new();
+    for sandbox in [a, b] {
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (id,user_id,org_id,lifecycle,network_policy_generation)
+             VALUES ($1,$2,$3,'stopped',1)"
+        ))
+        .bind(sandbox)
+        .bind(SEED_USER_ID)
+        .bind(org)
+        .execute(&db.pool)
+        .await?;
+    }
+    let mut tx = db.pool.begin().await?;
+    resource::reserve(
+        &mut tx,
+        resource::NewResource {
+            id: volume,
+            org_id: org,
+            managed_by: "test",
+            availability_zone: ZONE,
+            resource_limit: 1,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    let row = resource::get(&db.pool, org, volume).await?.unwrap();
+    assert!(row.sandbox_id.is_none() && row.mount_spec.is_none());
+    assert!(
+        resource::get(&db.pool, OrgId::from_uuid(Uuid::now_v7()), volume)
+            .await?
+            .is_none()
+    );
+    assert!(resource::observe(&db.pool, &row, VolumePhase::Available, Some(CLOUD_ID), None).await?);
+    let mut tx = db.pool.begin().await?;
+    // A pre-upgrade reconciler must never deserialize an unbound resource.
+    assert!(lock_next(&mut tx, "test").await?.is_none());
+    assert!(matches!(
+        resource::reserve(
+            &mut tx,
+            resource::NewResource {
+                id: Uuid::now_v7(),
+                org_id: org,
+                managed_by: "test",
+                availability_zone: ZONE,
+                resource_limit: 1,
+            }
+        )
+        .await,
+        Err(VolumeStoreError::Capacity)
+    ));
+    tx.rollback().await?;
+    let mount: BlockVolumeMount = serde_json::from_value(serde_json::json!({
+        "type":"ebs", "size_gib":128, "permissions":"read_write", "mount":"/data"
+    }))?;
+    let mut tx = db.pool.begin().await?;
+    assert!(matches!(
+        resource::bind(&mut tx, OrgId::new(), volume, a, "test", ZONE, &mount).await,
+        Err(VolumeStoreError::Conflict)
+    ));
+    resource::bind(&mut tx, org, volume, a, "test", ZONE, &mount).await?;
+    tx.commit().await?;
+    let mut tx = db.pool.begin().await?;
+    assert!(matches!(
+        resource::bind(&mut tx, org, volume, b, "test", ZONE, &mount).await,
+        Err(VolumeStoreError::Conflict)
+    ));
+    assert!(!resource::request_delete(&mut tx, org, volume, Uuid::now_v7()).await?);
+    tx.commit().await?;
+    let execution_a = Uuid::now_v7();
+    let bound_a = attach(&db.pool, a, execution_a).await?;
+    let initialization = Uuid::now_v7();
+    assert!(claim_initialization(&db.pool, volume, execution_a, 1, initialization).await?);
+    assert!(
+        complete_initialization(
+            &db.pool,
+            volume,
+            execution_a,
+            1,
+            initialization,
+            bound_a.filesystem_uuid,
+        )
+        .await?
+    );
+    assert!(activate(&db.pool, volume, execution_a, 1, Uuid::now_v7(), None).await?);
+    let checkpoint = Uuid::now_v7();
+    assert!(publish_checkpoint(&db.pool, volume, execution_a, 1, 1, checkpoint).await?);
+    assert!(acknowledge_release(&db.pool, volume, execution_a, 1).await?);
+    let detaching = get(&db.pool, a).await?.unwrap();
+    assert!(finish_detach(&db.pool, &detaching).await?);
+    assert!(!resource::release_deleted_owner(&db.pool, volume).await?);
+    // Physical availability with a suspended dependency is not free storage.
+    assert_eq!(
+        resource::get(&db.pool, org, volume)
+            .await?
+            .unwrap()
+            .sandbox_id,
+        Some(a)
+    );
+    let mut old_writer = db.pool.begin().await?;
+    let error = sqlx::query(sql!(
+        "UPDATE sandbox_block_volumes SET delete_requested = TRUE WHERE id = $1"
+    ))
+    .bind(volume)
+    .execute(&mut *old_writer)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
+    old_writer.rollback().await?;
+    request_delete(&db.pool, a).await?;
+    assert!(!get(&db.pool, a).await?.unwrap().delete_requested);
+    sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
+        .bind(a)
+        .execute(&db.pool)
+        .await?;
+    assert!(!request_orphan_deletion(&db.pool, volume).await?);
+    assert!(resource::release_deleted_owner(&db.pool, volume).await?);
+    let readonly = BlockVolumeMount {
+        permissions: BlockVolumePermissions::ReadOnly,
+        ..mount
+    };
+    let mut tx = db.pool.begin().await?;
+    resource::bind(&mut tx, org, volume, b, "test", ZONE, &readonly).await?;
+    tx.commit().await?;
+    assert_eq!(
+        get(&db.pool, b).await?.unwrap().mount_spec.permissions,
+        BlockVolumePermissions::ReadOnly
+    );
+    let execution_b = Uuid::now_v7();
+    let bound_b = attach(&db.pool, b, execution_b).await?;
+    assert_eq!(bound_b.filesystem_uuid, bound_a.filesystem_uuid);
+    assert!(!claim_initialization(&db.pool, volume, execution_b, 2, Uuid::now_v7()).await?);
+    assert!(
+        activate_with_source(
+            &db.pool,
+            volume,
+            execution_b,
+            2,
+            Uuid::now_v7(),
+            ActivationSource::RetainedColdStart,
+        )
+        .await?
+    );
+    assert_eq!(get(&db.pool, b).await?.unwrap().disk_generation, 2);
+    assert!(!acknowledge_release(&db.pool, volume, execution_a, 1).await?);
+    assert!(acknowledge_release(&db.pool, volume, execution_b, 2).await?);
+    let detaching = get(&db.pool, b).await?.unwrap();
+    assert!(finish_detach(&db.pool, &detaching).await?);
+    sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
+        .bind(b)
+        .execute(&db.pool)
+        .await?;
+    assert!(resource::release_deleted_owner(&db.pool, volume).await?);
+    let mut tx = db.pool.begin().await?;
+    assert!(resource::request_delete(&mut tx, org, volume, Uuid::now_v7()).await?);
+    assert!(
+        resource::bind(&mut tx, org, volume, a, "test", ZONE, &readonly)
+            .await
+            .is_err()
+    );
+    tx.commit().await?;
+    assert!(
+        resource::get(&db.pool, org, volume)
+            .await?
+            .unwrap()
+            .delete_requested
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn client_delete_requires_stopped_detached_checkpoint_free_owner_and_fences_attach()
 -> TestResult {
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};

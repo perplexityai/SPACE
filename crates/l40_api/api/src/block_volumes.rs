@@ -9,7 +9,7 @@ use pplx_space_execution_spec::{BlockVolumeMount, RuntimeKind};
 use serde::Deserialize;
 
 pub(crate) fn public_volume(
-    row: pplx_space_sandbox_store::block_volume::BlockVolume,
+    row: pplx_space_sandbox_store::block_volume::resource::Resource,
 ) -> pplx_space_public_api::PublicVolume {
     use pplx_space_public_api::SandboxBlockVolumeState as Public;
     use pplx_space_sandbox_store::block_volume::VolumePhase as Stored;
@@ -26,23 +26,28 @@ pub(crate) fn public_volume(
     };
     pplx_space_public_api::PublicVolume {
         volume_id: row.id,
-        sandbox_id: row.sandbox_id.into(),
-        mount_spec: row.mount_spec.0,
+        sandbox_id: row.sandbox_id.map(Into::into),
+        backend: pplx_space_execution_spec::BlockVolumeBackend::Ebs,
+        size_gib: u32::try_from(row.size_gib)
+            .expect("database constraints require positive block-volume capacity"),
+        mount: row.mount_spec.as_ref().map(|mount| mount.mount.clone()),
+        permissions: row.mount_spec.as_ref().map(|mount| mount.permissions),
+        retained: row.retained,
         state,
         delete_requested: row.delete_requested,
     }
 }
 
-/// Observe, rather than initiate, deletion. The cloud reconciler owns cleanup
+/// Observe, rather than initiate, cloud work. The reconciler owns cleanup
 /// even if the public operation exhausts its deadline or is cancelled.
-pub async fn execute_delete(
+pub async fn observe_operation(
     pool: &sqlx::PgPool,
     operation: &crate::public_operations::ClaimedPublicOperation,
 ) -> crate::public_sandbox_operations::PublicOperationExecutionResult {
     use crate::public_sandbox_operations::PublicOperationExecutionResult as Result;
     use pplx_space_public_api::{OperationState, PublicErrorCode};
     use pplx_space_sandbox_store::block_volume as store;
-    let result: std::result::Result<Option<store::BlockVolume>, sqlx::Error> = async {
+    let result: std::result::Result<Option<store::resource::Resource>, sqlx::Error> = async {
         let Some(id) = operation
             .target_id
             .as_deref()
@@ -50,39 +55,51 @@ pub async fn execute_delete(
         else {
             return Ok(None);
         };
-        let Some(sandbox) = store::sandbox_for_volume(pool, operation.org_id, id).await? else {
-            return Ok(None);
-        };
-        store::get(pool, sandbox).await
+        store::resource::get(pool, operation.org_id, id).await
     }
     .await;
     match result {
-        Ok(Some(row)) if row.phase == store::VolumePhase::Deleted => Result {
-            state: OperationState::Succeeded,
-            progress_message: "volume backing deletion confirmed".into(),
-            // The stable result union has no volume variant. Keep it absent:
-            // target_id identifies this volume and GET retains its tombstone.
-            result_json: None,
-            terminal_error_code: None,
-            terminal_error_json: None,
-            retry_after: None,
-            requeue_reason:
-                crate::public_operations::PublicOperationRequeueReason::WorkflowProgress,
-        },
-        Ok(Some(row)) if row.delete_requested => Result::workflow_progress(
-            "waiting for confirmed volume backing deletion",
-            std::time::Duration::from_secs(2),
-        ),
-        Err(error) => {
-            tracing::warn!(%error, operation_id = %operation.id, "volume deletion observation failed");
+        Ok(Some(row))
+            if (operation.kind == pplx_space_public_api::OperationKind::CreateVolume
+                && !matches!(
+                    row.phase,
+                    store::VolumePhase::Requested | store::VolumePhase::Provisioning
+                ))
+                || (operation.kind == pplx_space_public_api::OperationKind::DeleteVolume
+                    && row.phase == store::VolumePhase::Deleted) =>
+        {
+            Result {
+                state: OperationState::Succeeded,
+                progress_message: "volume backing operation confirmed".into(),
+                // The stable result union has no volume variant. Keep it absent:
+                // target_id identifies this volume and GET retains its tombstone.
+                result_json: None,
+                terminal_error_code: None,
+                terminal_error_json: None,
+                retry_after: None,
+                requeue_reason:
+                    crate::public_operations::PublicOperationRequeueReason::WorkflowProgress,
+            }
+        }
+        Ok(Some(row))
+            if row.delete_requested
+                || operation.kind == pplx_space_public_api::OperationKind::CreateVolume =>
+        {
             Result::workflow_progress(
-                "volume deletion observation is temporarily unavailable",
+                "waiting for confirmed volume backing operation",
+                std::time::Duration::from_secs(2),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(%error, operation_id = %operation.id, "volume operation observation failed");
+            Result::workflow_progress(
+                "volume operation observation is temporarily unavailable",
                 std::time::Duration::from_secs(2),
             )
         }
         Ok(_) => Result {
             state: OperationState::Failed,
-            progress_message: "volume deletion authority is unavailable".into(),
+            progress_message: "volume operation authority is unavailable".into(),
             result_json: None,
             terminal_error_code: Some(PublicErrorCode::Internal),
             terminal_error_json: Some(serde_json::json!({"reason":"volume_authority_unavailable"})),
@@ -94,6 +111,54 @@ pub async fn execute_delete(
 }
 
 const POLICY_ENV: &str = "SPACE_EBS_ADMISSION_POLICY";
+
+pub(crate) fn independent_admission(
+    env: &dyn pplx_space_env_vars::Environment,
+    org: OrgId,
+    byok: bool,
+) -> Result<Admission, ControllerError> {
+    let raw = env
+        .var_os(POLICY_ENV)
+        .ok_or_else(|| ControllerError::bad_request("independent volume admission is disabled"))?;
+    let policy: Admission = serde_json::from_str(
+        raw.to_str()
+            .ok_or_else(|| ControllerError::internal("invalid volume policy"))?,
+    )
+    .map_err(|_| ControllerError::internal("invalid volume policy"))?;
+    if !policy.independent_volumes
+        || !policy.volume_management
+        || !(1..=2).contains(&policy.resource_limit)
+        || !policy.organization_ids.contains(&org)
+        || byok
+        || policy.availability_zone.is_empty()
+        || !policy
+            .availability_zone
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(ControllerError::bad_request(
+            "independent volume admission is disabled",
+        ));
+    }
+    Ok(policy)
+}
+
+pub(crate) fn mount_spec(request: &pplx_space_public_api::VolumeMountRequest) -> BlockVolumeMount {
+    use pplx_space_public_api::VolumeMountRequest;
+    match request {
+        VolumeMountRequest::Inline(mount) => mount.clone(),
+        VolumeMountRequest::Existing(mount) => BlockVolumeMount {
+            backend: pplx_space_execution_spec::BlockVolumeBackend::Ebs,
+            // Independent resources are fixed-size until the resize state
+            // machine is implemented; binding rechecks the durable capacity.
+            size_gib: 128_u32
+                .try_into()
+                .expect("128 GiB is a valid volume capacity"),
+            permissions: mount.permissions,
+            mount: mount.mount.clone(),
+        },
+    }
+}
 
 pub(crate) fn management_organizations(
     env: &dyn pplx_space_env_vars::Environment,
@@ -149,12 +214,20 @@ pub(crate) async fn populate_status(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Admission {
+    #[serde(default = "default_resource_limit")]
+    pub(crate) resource_limit: u32,
+    #[serde(default)]
+    pub(crate) independent_volumes: bool,
     #[serde(default)]
     volume_management: bool,
     organization_ids: BTreeSet<OrgId>,
     pub(crate) availability_zone: String,
     #[serde(default)]
     qualified_guest_images: BTreeMap<ContentHash, u32>,
+}
+
+fn default_resource_limit() -> u32 {
+    2
 }
 
 impl Admission {
@@ -209,6 +282,7 @@ pub(crate) fn admit(
     )
     .map_err(|_| ControllerError::internal("invalid block-volume admission policy"))?;
     if admission.organization_ids.is_empty()
+        || !(1..=2).contains(&admission.resource_limit)
         || !admission.organization_ids.contains(&org)
         || admission.availability_zone.is_empty()
         || !admission

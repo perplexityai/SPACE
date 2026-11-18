@@ -639,6 +639,8 @@ pub struct UpdateUserRoleRequest {
 pub struct CreateSandboxRequest {
     #[serde(default)]
     pub volume_mounts: Vec<pplx_space_execution_spec::BlockVolumeMount>,
+    #[serde(default)]
+    pub block_volume_id: Option<uuid::Uuid>,
     pub name: Option<String>,
     pub template: Option<TemplateReference>,
     pub runtime: Option<String>,

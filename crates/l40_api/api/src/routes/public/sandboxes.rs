@@ -96,12 +96,29 @@ pub async fn create_sandbox(
     let idempotency_key = idempotency_key(&headers)?;
     crate::block_volumes::admit(
         &pplx_space_env_vars::ProcessEnvironment,
-        &request.volume_mounts,
+        &request
+            .volume_mounts
+            .iter()
+            .map(crate::block_volumes::mount_spec)
+            .collect::<Vec<_>>(),
         org.id,
         pplx_space_execution_spec::RuntimeKind::Firecracker,
         org.byok_enabled,
     )
     .map_err(controller_error)?;
+    if request.volume_mounts.iter().any(|mount| {
+        matches!(
+            mount,
+            pplx_space_public_api::VolumeMountRequest::Existing(_)
+        )
+    }) {
+        crate::block_volumes::independent_admission(
+            &pplx_space_env_vars::ProcessEnvironment,
+            org.id,
+            org.byok_enabled,
+        )
+        .map_err(controller_error)?;
+    }
     let template_name = request.template.name().as_str().to_owned();
     let owner = federated
         .as_ref()
@@ -220,6 +237,18 @@ pub(crate) async fn create_native_sandbox_operation(
     sandbox_quota: Option<SandboxQuota>,
     inline: Option<&InlineLifecycle>,
 ) -> Result<SandboxOperationResponse, PublicApiError> {
+    if federated_create.is_some()
+        && request.volume_mounts.iter().any(|mount| {
+            matches!(
+                mount,
+                pplx_space_public_api::VolumeMountRequest::Existing(_)
+            )
+        })
+    {
+        return Err(PublicApiError::forbidden(
+            "federated independent volumes are unsupported",
+        ));
+    }
     let (request, mut fingerprint) = prepare_native_create_request(request)?;
     // A live warm VM has no second drive. Disk-backed creates are always
     // queued cold, never adopted or run inline while cloud work converges.

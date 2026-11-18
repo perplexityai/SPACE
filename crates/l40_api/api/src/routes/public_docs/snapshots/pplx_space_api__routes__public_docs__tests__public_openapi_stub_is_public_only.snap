@@ -176,6 +176,10 @@ expression: paths_by_method
   "/templates/{template_name}": [
     "get"
   ],
+  "/volumes": [
+    "get",
+    "post"
+  ],
   "/volumes/{volume_id}": [
     "delete",
     "get"

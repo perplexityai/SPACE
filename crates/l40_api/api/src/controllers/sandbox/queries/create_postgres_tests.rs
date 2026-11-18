@@ -627,6 +627,7 @@ fn pooled_create_request(
     network_policy: Option<NetworkPolicyV1>,
 ) -> CreateSandboxRequest {
     CreateSandboxRequest {
+        block_volume_id: None,
         volume_mounts: Vec::new(),
         name: Some(name.to_string()),
         template: None,
@@ -1667,7 +1668,8 @@ async fn postgres_cold_create_on_a_full_cluster_is_refused_before_its_row() -> T
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn postgres_cold_federated_create_is_atomic_with_grant_upsert() -> TestResult {
+async fn postgres_cold_federated_create_rejects_block_volume_and_keeps_grant_upsert_atomic()
+-> TestResult {
     let db = pg_test_db().await?;
     let actor = insert_actor(&db.pool).await?;
     let release_id = insert_template_release(&db.pool, "seed", "sha256:federated-cold").await?;
@@ -1679,6 +1681,29 @@ async fn postgres_cold_federated_create_is_atomic_with_grant_upsert() -> TestRes
     req.template = Some("seed:latest".parse()?);
     let federated_owner = test_federated_owner("8a3f64c2-1f2b-4c4e-9a90-1f0d4f6f5a01")?;
     let federated_service_grant = test_service_grant()?;
+
+    req.block_volume_id = Some(Uuid::now_v7());
+    let error = controller
+        .create(
+            &db.pool,
+            &actor,
+            &req,
+            SandboxApiMetricIdentity::native("create"),
+            FederatedSandboxCreateContext::new(
+                Some(&federated_owner),
+                Some(&federated_service_grant),
+            ),
+            crate::controllers::substrate::ActivationClient::Native,
+        )
+        .await
+        .expect_err("a federated subject cannot reserve organization-owned storage");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        error
+            .to_string()
+            .contains("federated independent volumes are unsupported")
+    );
+    req.block_volume_id = None;
 
     let result = controller
         .create(

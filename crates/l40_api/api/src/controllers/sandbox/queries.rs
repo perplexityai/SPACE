@@ -1208,6 +1208,11 @@ impl SandboxController {
         }
         let federated_owner = federated.owner;
         let federated_service_grant = federated.service_grant;
+        if req.block_volume_id.is_some() && federated_owner.is_some() {
+            return Err(ControllerError::bad_request(
+                "federated independent volumes are unsupported",
+            ));
+        }
         if federated_owner.is_some() != federated_service_grant.is_some() {
             return Err(ControllerError::bad_request(
                 "federated sandbox creates require a federated service grant",
@@ -1297,6 +1302,18 @@ impl SandboxController {
             runtime,
             org_byok,
         )?;
+        if req.block_volume_id.is_some() {
+            crate::block_volumes::independent_admission(
+                &pplx_space_env_vars::ProcessEnvironment,
+                create_owner.org_id,
+                org_byok,
+            )?;
+            if block_volume_admission.is_none() {
+                return Err(ControllerError::bad_request(
+                    "volume reference requires a mount",
+                ));
+            }
+        }
         if let Some(admission) = &block_volume_admission {
             admission.require_guest(&resolved_content_hash)?;
             if !self
@@ -1516,21 +1533,40 @@ impl SandboxController {
                             "admitted block-volume request must have one mount",
                         ));
                     };
-                    pplx_space_sandbox_store::block_volume::reserve(
-                        &mut tx,
-                        pplx_space_sandbox_store::block_volume::NewBlockVolume {
-                            sandbox_id: sandbox_uuid,
-                            org_id: create_owner.org_id,
-                            managed_by: self.substrate.managed_by(),
+                    let reservation = if let Some(volume_id) = req.block_volume_id {
+                        pplx_space_sandbox_store::block_volume::resource::bind(
+                            &mut tx,
+                            create_owner.org_id,
+                            volume_id,
+                            sandbox_uuid,
+                            self.substrate.managed_by(),
+                            &admission.availability_zone,
                             mount_spec,
-                            availability_zone: &admission.availability_zone,
-                            resource_limit: 2,
-                        },
-                    )
-                    .await
-                    .map_err(|error| match error {
+                        )
+                        .await
+                        .map(|()| volume_id)
+                    } else {
+                        pplx_space_sandbox_store::block_volume::reserve(
+                            &mut tx,
+                            pplx_space_sandbox_store::block_volume::NewBlockVolume {
+                                sandbox_id: sandbox_uuid,
+                                org_id: create_owner.org_id,
+                                managed_by: self.substrate.managed_by(),
+                                mount_spec,
+                                availability_zone: &admission.availability_zone,
+                                resource_limit: admission.resource_limit,
+                            },
+                        )
+                        .await
+                    };
+                    reservation.map_err(|error| match error {
                         pplx_space_sandbox_store::block_volume::VolumeStoreError::Capacity => {
                             ControllerError::service_unavailable(error.to_string())
+                        }
+                        pplx_space_sandbox_store::block_volume::VolumeStoreError::Conflict => {
+                            ControllerError::bad_request(
+                                "volume is unavailable in this owner scope",
+                            )
                         }
                         _ => ControllerError::internal(error.to_string()),
                     })?;

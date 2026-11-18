@@ -156,20 +156,48 @@ pub(super) fn insert_sandbox_operation_paths(
     insert_credential_reference_paths(paths);
     insert_public_route(
         paths,
+        pplx_space_public_api::routes::CREATE_VOLUME,
+        json!({
+            "summary":"Create an independent retained volume",
+            "description":"Default-off, local-organization scope. Provision encrypted gp3 backing asynchronously. The operation target_id is the logical volume UUID. The disk is initialized under a fenced first-attachment claim, not by this HTTP request. Sandbox deletion does not delete this resource.",
+            "parameters":[idempotency_key_parameter.clone()],
+            "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                "type":"object","additionalProperties":false,"required":["type","size_gib"],
+                "properties":{"type":{"type":"string","enum":["ebs"]},"size_gib":{"type":"integer","enum":[128]}}
+            }}}},
+            "responses":{"202":{"description":"Provisioning operation","content":{"application/json":{"schema":{"$ref":"#/components/schemas/PublicOperationRecord"}}}},
+                "400":{"description":"Unsupported specification or admission disabled"},
+                "403":{"description":"Unsupported federated owner"},
+                "409":{"description":"Idempotency conflict or resource capacity exhausted"}}
+        }),
+    );
+    insert_public_route(
+        paths,
+        pplx_space_public_api::routes::LIST_VOLUMES,
+        json!({
+            "summary":"List independent retained volumes",
+            "description":"Local organization-owned independent resources only. Returns volumes and next_after, at most 100 per page. Legacy sandbox-created resources remain inspectable by ID under their sandbox authorization.",
+            "parameters":[{"name":"after","in":"query","schema":{"type":"string","format":"uuid"}}],
+            "responses":{"200":{"description":"Page of volumes and optional next_after cursor"},"403":{"description":"Unsupported federated owner"}}
+        }),
+    );
+    insert_public_route(
+        paths,
         pplx_space_public_api::routes::GET_VOLUME,
         json!({
-            "summary":"Inspect a sandbox-created volume",
-            "description":"Authorizes against the owning sandbox, including its federated subject. Returns the logical resource and required mount; provider attachment identifiers are not exposed.",
+            "summary":"Inspect a volume",
+            "description":"Independent resources authorize against their local organization; legacy resources retain sandbox-owner authorization. A null sandbox_id means no logical reservation. Provider attachment identifiers are not exposed.",
             "responses":{"200":{"description":"Volume state","content":{"application/json":{"schema":{
                 "type":"object",
-                "required":["volume_id","sandbox_id","type","size_gib","mount","permissions","state","delete_requested"],
+                "required":["volume_id","sandbox_id","type","size_gib","mount","permissions","retained","state","delete_requested"],
                 "properties":{
                     "volume_id":{"type":"string","format":"uuid"},
-                    "sandbox_id":{"type":"string"},
+                    "sandbox_id":{"type":["string","null"]},
                     "type":{"type":"string","enum":["ebs"]},
                     "size_gib":{"type":"integer","minimum":128,"maximum":128},
-                    "mount":{"type":"string"},
-                    "permissions":{"type":"string","enum":["read_write","read_only"]},
+                    "mount":{"type":["string","null"]},
+                    "permissions":{"type":["string","null"],"enum":["read_write","read_only",null]},
+                    "retained":{"type":"boolean"},
                     "state":{"$ref":"#/components/schemas/SandboxBlockVolumeState"},
                     "delete_requested":{"type":"boolean"}
                 }
@@ -180,8 +208,8 @@ pub(super) fn insert_sandbox_operation_paths(
         paths,
         pplx_space_public_api::routes::DELETE_VOLUME,
         json!({
-            "summary":"Delete a detached sandbox-created volume",
-            "description":"Default-off experimental management. Requires stopped owner, no retained RAM checkpoint, released device references and observed detach. Marks durable deletion intent and prevents restart of the owning sandbox. Completion means provider deletion was confirmed, not merely requested. Sandbox deletion and expiry retain their existing cleanup semantics.",
+            "summary":"Delete an unused volume",
+            "description":"Default-off management. Independent storage requires no sandbox reservation, no retained checkpoint and observed detach. Legacy inline storage requires a stopped owner and no checkpoint; its deletion prevents restart. Completion confirms provider deletion. Sandbox deletion retains independent storage but deletes legacy inline storage.",
             "parameters":[idempotency_key_parameter.clone()],
             "responses":{
                 "202":{"description":"Deletion operation","content":{"application/json":{"schema":{"$ref":"#/components/schemas/PublicOperationRecord"}}}},

@@ -116,6 +116,7 @@ fn proves_no_execution_only_for_kubernetes_rows() {
     ] {
         let execution = AutoLifecycleExecution {
             activation_attempt_id: None,
+            route_activation_id: None,
             managed_by,
             lifecycle: "started".to_owned(),
             placement: "unplaced".to_owned(),

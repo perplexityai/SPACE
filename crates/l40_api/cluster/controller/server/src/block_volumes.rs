@@ -22,6 +22,9 @@ const MAX_INVENTORY_PAGES: usize = 64;
 const RESOURCE_LIMIT: usize = 2;
 const LOGICAL_ID_TAG: &str = "space:volume-id";
 const SANDBOX_ID_TAG: &str = "space:sandbox-id";
+const RETAINED_TAG: &str = "space:retained";
+
+mod independent;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +35,12 @@ pub(crate) struct Policy {
     cluster: String,
     experiment: String,
     instance_ids: BTreeSet<String>,
+    #[serde(default = "default_resource_limit")]
+    resource_limit: usize,
+}
+
+fn default_resource_limit() -> usize {
+    RESOURCE_LIMIT
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +79,7 @@ impl Policy {
             || !identifier(&policy.experiment)
             || policy.instance_ids.is_empty()
             || policy.instance_ids.len() > RESOURCE_LIMIT
+            || !(1..=RESOURCE_LIMIT).contains(&policy.resource_limit)
             || policy.instance_ids.iter().any(|id| {
                 !id.strip_prefix("i-").is_some_and(|suffix| {
                     suffix.len() == 17 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -139,7 +149,11 @@ fn matches_resource(policy: &Policy, row: &BlockVolume, volume: &Volume) -> bool
             .iter()
             .all(|(key, value)| volume.tags.get(key) == Some(value))
         && volume.tags.get(LOGICAL_ID_TAG) == Some(&row.id.to_string())
-        && volume.tags.get(SANDBOX_ID_TAG) == Some(&row.sandbox_id.to_string())
+        && if row.retained {
+            volume.tags.get(RETAINED_TAG).map(String::as_str) == Some("true")
+        } else {
+            volume.tags.get(SANDBOX_ID_TAG) == Some(&row.sandbox_id.to_string())
+        }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -268,6 +282,10 @@ async fn tick<T: QueryTransport>(
     let Some(mut row) = store::lock_next(&mut tx, managed_by).await? else {
         return Ok(());
     };
+    if store::resource::release_deleted_owner(&mut *tx, row.id).await? {
+        tx.commit().await?;
+        return Ok(());
+    }
     if store::request_orphan_deletion(&mut *tx, row.id).await? {
         row = store::get(&mut *tx, row.sandbox_id)
             .await?
@@ -326,7 +344,7 @@ async fn tick<T: QueryTransport>(
                     .await?
                     .into_iter()
                     .collect();
-                if reservations.len() > RESOURCE_LIMIT
+                if reservations.len() > policy.resource_limit
                     || observed.iter().any(|volume| {
                         !volume
                             .tags
@@ -341,7 +359,11 @@ async fn tick<T: QueryTransport>(
                 }
                 let mut tags = policy.tags();
                 tags.insert(LOGICAL_ID_TAG.into(), row.id.to_string());
-                tags.insert(SANDBOX_ID_TAG.into(), row.sandbox_id.to_string());
+                if row.retained {
+                    tags.insert(RETAINED_TAG.into(), "true".into());
+                } else {
+                    tags.insert(SANDBOX_ID_TAG.into(), row.sandbox_id.to_string());
+                }
                 let receipt = client
                     .create_encrypted_gp3_volume(&CreateEncryptedGp3Volume {
                         availability_zone: &row.availability_zone,
@@ -453,7 +475,10 @@ pub(crate) async fn run(
                     tick(&pool, &client, &policy, &managed_by),
                     tick(&pool, &client, &policy, &managed_by),
                 );
-                for result in [a, b] {
+                let scope = store::resource::controller_scope(&managed_by);
+                let c = tick(&pool, &client, &policy, &scope).await;
+                let d = independent::tick(&pool, &client, &policy, &managed_by).await;
+                for result in [a, b, c, d] {
                     if let Err(error) = result {
                         tracing::warn!(%error, "block-volume reconciliation did not converge");
                     }

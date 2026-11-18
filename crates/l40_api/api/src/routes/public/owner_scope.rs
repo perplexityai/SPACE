@@ -129,17 +129,25 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
         let id = raw
             .parse()
             .map_err(|_| PublicApiError::bad_request("invalid volume_id"))?;
-        let sandbox =
-            pplx_space_sandbox_store::block_volume::sandbox_for_volume(&state.pool, org_id, id)
+        let resource =
+            pplx_space_sandbox_store::block_volume::resource::get(&state.pool, org_id, id)
                 .await
                 .map_err(database_error)?
                 .ok_or_else(|| PublicApiError::not_found("volume not found"))?;
         // Apply exactly the owning sandbox's federated/local authorization,
         // rather than granting org-wide access to another subject's volume.
-        params.insert(
-            "sandbox_id".into(),
-            PublicSandboxId::from(sandbox).to_string(),
-        );
+        if resource.retained {
+            // Independent resources currently belong to local organizations,
+            // not arbitrary federated subjects within those organizations.
+            if owner.is_some() {
+                return Err(PublicApiError::not_found("volume not found"));
+            }
+        } else if let Some(sandbox) = resource.sandbox_id {
+            params.insert(
+                "sandbox_id".into(),
+                PublicSandboxId::from(sandbox).to_string(),
+            );
+        }
     }
     if let Some(raw) = params.get("sandbox_id") {
         // Lifecycle actions share the {sandbox_id} mount with point reads.

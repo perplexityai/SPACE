@@ -82,6 +82,8 @@ where
 fn mounted_operations() -> Vec<(NativeOperation, MethodRouter<AppState>)> {
     vec![
         mount(native::GET_VOLUME, volumes::get),
+        mount(native::CREATE_VOLUME, volumes::create),
+        mount(native::LIST_VOLUMES, volumes::list),
         mount(native::DELETE_VOLUME, volumes::delete),
         mount(
             native::REGISTER_CREDENTIAL_REFERENCE,

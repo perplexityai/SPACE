@@ -143,6 +143,7 @@ pub(super) fn translate_create_request(
 
     Ok(CreateSandboxTranslation {
         native: CreateSandboxRequest {
+            block_volume_id: None,
             volume_mounts: Vec::new(),
             name: None,
             template: Some(template),

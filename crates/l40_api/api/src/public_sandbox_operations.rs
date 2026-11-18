@@ -959,7 +959,15 @@ pub(crate) fn controller_create_request(
         });
     ControllerCreateSandboxRequest {
         boot_mode: (!request.volume_mounts.is_empty()).then(|| "cold".to_owned()),
-        volume_mounts: request.volume_mounts,
+        block_volume_id: request.volume_mounts.iter().find_map(|mount| match mount {
+            pplx_space_public_api::VolumeMountRequest::Existing(mount) => Some(mount.volume_id),
+            pplx_space_public_api::VolumeMountRequest::Inline(_) => None,
+        }),
+        volume_mounts: request
+            .volume_mounts
+            .iter()
+            .map(crate::block_volumes::mount_spec)
+            .collect(),
         name: request.name,
         template: Some(request.template),
         runtime: request.runtime.map(|runtime| runtime.alias().to_string()),
