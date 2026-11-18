@@ -849,12 +849,18 @@ mod slot_pool_tests {
         holder.disarm();
         // The holder is about to exit after observing a non-resettable row.
         // A release can enqueue another attempt before that holder drops.
+        // An ephemeral row reaches host networking only through the teardown.
         pool.db
             .lock()
             .unwrap()
-            .execute_batch("UPDATE network_slots SET state = 'dirty', generation = 7")
+            .execute_batch(
+                "UPDATE network_slots
+                 SET state = 'dirty', generation = 7, lease_kind = 'ephemeral'",
+            )
             .unwrap();
-        reset_slot(pool.clone(), 0).await;
+        let (teardown, teardowns) = refusing_teardown!();
+        reset_slot_with(pool.clone(), 0, teardown).await;
+        assert_eq!(teardowns.load(Ordering::SeqCst), 0);
         assert!(
             reset_candidates(&pool, u32::MAX)
                 .unwrap()
@@ -882,8 +888,14 @@ mod slot_pool_tests {
                     [state],
                 )
                 .unwrap();
+            // Neutral guards share the registry, so they hide slots the same way.
             let owners: Vec<_> = (0..20)
+                .step_by(2)
                 .map(|slot| ResetClaim::acquire(&pool, slot).unwrap())
+                .collect();
+            let neutral_owners: Vec<_> = (1..20)
+                .step_by(2)
+                .map(|slot| SlotGuard::try_acquire(&pool, slot).unwrap())
                 .collect();
             let mut cursor = u32::MAX;
             let mut discovered = std::collections::BTreeSet::new();
@@ -918,43 +930,57 @@ mod slot_pool_tests {
             for owner in owners {
                 owner.disarm();
             }
+            drop(neutral_owners);
         }
     }
 
     #[tokio::test]
     async fn reset_claim_survives_cancelled_waiter_until_blocking_work_finishes() {
-        let pool = test_pool(NetworkPoolConfig::new(1));
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
-        let owned = pool.clone();
-        let waiter = tokio::spawn(async move {
-            let claim = ResetClaim::acquire(&owned, 0).unwrap();
-            let blocking_claim = claim.clone();
-            tokio::task::spawn_blocking(move || {
-                let _claim = blocking_claim;
-                entered_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                drop(_claim);
-                finished_tx.send(()).unwrap();
-            })
-            .await
-            .unwrap();
-        });
-        entered_rx.await.unwrap();
-        assert!(ResetClaim::acquire(&pool, 0).is_none());
-        waiter.abort();
-        assert!(waiter.await.unwrap_err().is_cancelled());
-        assert!(
-            ResetClaim::acquire(&pool, 0).is_none(),
-            "host work still owns the slot"
-        );
-        release_tx.send(()).unwrap();
-        finished_rx.await.unwrap();
-        assert!(
-            ResetClaim::acquire(&pool, 0).is_some(),
-            "abandoned durable claim is recoverable"
-        );
+        // A neutral guard is moved, not cloned, into the blocking work.
+        for neutral in [false, true] {
+            let mut pool = test_pool(NetworkPoolConfig::new(1));
+            let (sender, mut jobs) = mpsc::channel(1);
+            std::sync::Arc::get_mut(&mut pool).unwrap().job_tx = sender;
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+            let owned = pool.clone();
+            let waiter = tokio::spawn(async move {
+                let claim = (!neutral).then(|| ResetClaim::acquire(&owned, 0).unwrap());
+                let guard = neutral.then(|| SlotGuard::try_acquire(&owned, 0).unwrap());
+                let blocking_owner = (claim.clone(), guard);
+                tokio::task::spawn_blocking(move || {
+                    let _owner = blocking_owner;
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    drop(_owner);
+                    finished_tx.send(()).unwrap();
+                })
+                .await
+                .unwrap();
+            });
+            let held = || {
+                ResetClaim::acquire(&pool, 0).is_none()
+                    && SlotGuard::try_acquire(&pool, 0).is_none()
+            };
+            entered_rx.await.unwrap();
+            assert!(held(), "neutral {neutral}");
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+            assert!(held(), "host work still owns the slot; neutral {neutral}");
+            assert!(jobs.try_recv().is_err(), "neutral {neutral}");
+            release_tx.send(()).unwrap();
+            finished_rx.await.unwrap();
+            assert_eq!(
+                jobs.try_recv().is_ok(),
+                !neutral,
+                "only the armed claim retries"
+            );
+            assert!(
+                SlotGuard::try_acquire(&pool, 0).is_some(),
+                "abandoned durable claim is recoverable; neutral {neutral}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2685,7 +2711,9 @@ mod slot_pool_tests {
             .unwrap();
         }
 
-        reset_slot(std::sync::Arc::clone(&pool), 0).await;
+        let (teardown, teardowns) = refusing_teardown!();
+        reset_slot_with(std::sync::Arc::clone(&pool), 0, teardown).await;
+        assert_eq!(teardowns.load(Ordering::SeqCst), 0);
 
         let stale = record(&pool, 0);
         assert_eq!(stale.state, SlotState::Resetting);
@@ -2736,7 +2764,9 @@ mod slot_pool_tests {
             .unwrap();
         }
 
-        reset_slot(std::sync::Arc::clone(&pool), 0).await;
+        let (teardown, teardowns) = refusing_teardown!();
+        reset_slot_with(std::sync::Arc::clone(&pool), 0, teardown).await;
+        assert_eq!(teardowns.load(Ordering::SeqCst), 0);
 
         let stale = record(&pool, 0);
         assert_eq!(stale.state, SlotState::Dirty);
@@ -2791,14 +2821,17 @@ mod slot_pool_tests {
             .unwrap();
         }
 
+        let (teardown, teardowns) = refusing_teardown!();
         for _ in 1..MAX_SLOT_CLEANUP_RESET_RETRIES {
-            reset_slot(std::sync::Arc::clone(&pool), 0).await;
+            reset_slot_with(std::sync::Arc::clone(&pool), 0, teardown).await;
+            assert_eq!(teardowns.load(Ordering::SeqCst), 0);
             let stale = record(&pool, 0);
             assert_eq!(stale.state, SlotState::Dirty);
             assert_eq!(stale.health, SlotHealth::Degraded);
         }
 
-        reset_slot(std::sync::Arc::clone(&pool), 0).await;
+        reset_slot_with(std::sync::Arc::clone(&pool), 0, teardown).await;
+        assert_eq!(teardowns.load(Ordering::SeqCst), 0);
 
         let quarantined = record(&pool, 0);
         let expected_error = format!(
