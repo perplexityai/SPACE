@@ -99,8 +99,6 @@ CREATE TABLE firewall_rules_rollouts (
     id UUID NOT NULL,
     from_revision_id UUID NOT NULL,
     to_revision_id UUID NOT NULL,
-    rollback_revision_id UUID NOT NULL,
-    predecessor_rollout_id UUID,
     created_by_receipt_id UUID NOT NULL,
     phase TEXT NOT NULL,
     -- Only ever 1 or NULL.
@@ -130,13 +128,6 @@ CREATE TABLE firewall_rules_rollouts (
         UNIQUE (unfinished_slot),
     CONSTRAINT firewall_rules_rollouts_created_by_receipt_id_key
         UNIQUE (created_by_receipt_id),
-    CONSTRAINT firewall_rules_rollouts_distinct_revisions_check CHECK (
-        from_revision_id <> to_revision_id
-        AND rollback_revision_id <> to_revision_id
-    ),
-    CONSTRAINT firewall_rules_rollouts_predecessor_check CHECK (
-        predecessor_rollout_id <> id
-    ),
     CONSTRAINT firewall_rules_rollouts_max_in_flight_per_cluster_check CHECK (
         max_in_flight_per_cluster >= 1
     ),
@@ -157,10 +148,6 @@ CREATE TABLE firewall_rules_rollouts (
         FOREIGN KEY (from_revision_id) REFERENCES firewall_rules_revisions(id),
     CONSTRAINT firewall_rules_rollouts_to_revision_id_fkey
         FOREIGN KEY (to_revision_id) REFERENCES firewall_rules_revisions(id),
-    CONSTRAINT firewall_rules_rollouts_rollback_revision_id_fkey
-        FOREIGN KEY (rollback_revision_id) REFERENCES firewall_rules_revisions(id),
-    CONSTRAINT firewall_rules_rollouts_predecessor_rollout_id_fkey
-        FOREIGN KEY (predecessor_rollout_id) REFERENCES firewall_rules_rollouts(id),
     CONSTRAINT firewall_rules_rollouts_created_by_receipt_id_fkey
         FOREIGN KEY (created_by_receipt_id) REFERENCES firewall_rules_mutation_receipts(id),
     CONSTRAINT firewall_rules_rollouts_created_by_user_id_fkey
@@ -183,10 +170,6 @@ CREATE TRIGGER firewall_rules_rollouts_raise_generation
 
 COMMENT ON TABLE firewall_rules_rollouts IS
     'Paced moves of nodes from one firewall revision to another; at most one is unfinished';
-COMMENT ON COLUMN firewall_rules_rollouts.rollback_revision_id IS
-    'Revision a rollback of this rollout assigns, recorded when the rollout starts';
-COMMENT ON COLUMN firewall_rules_rollouts.predecessor_rollout_id IS
-    'Rollout this one replaced, such as the one it rolls back';
 COMMENT ON COLUMN firewall_rules_rollouts.created_by_receipt_id IS
     'Receipt of the request that started the rollout';
 COMMENT ON COLUMN firewall_rules_rollouts.phase IS

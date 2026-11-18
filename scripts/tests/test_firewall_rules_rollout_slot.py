@@ -130,9 +130,14 @@ class FirewallRulesRolloutSlotTest(unittest.TestCase):
         return conn
 
     def insert_header(
-        self, conn: psycopg.Connection, phase: str, unfinished_slot: int | None
+        self,
+        conn: psycopg.Connection,
+        phase: str,
+        unfinished_slot: int | None,
+        to_revision: uuid.UUID | None = None,
     ) -> uuid.UUID:
-        """Insert a rollout header with its own new receipt, in conn's open
+        """Insert a rollout header from from_revision to to_revision (by default
+        the fixture's other revision) with its own new receipt, in conn's open
         transaction."""
         receipt = uuid.uuid4()
         conn.execute(
@@ -144,15 +149,14 @@ class FirewallRulesRolloutSlotTest(unittest.TestCase):
         rollout = uuid.uuid4()
         conn.execute(
             "INSERT INTO firewall_rules_rollouts"
-            " (id, from_revision_id, to_revision_id, rollback_revision_id,"
-            "  created_by_receipt_id, phase, unfinished_slot,"
-            "  max_in_flight_per_cluster, failure_budget, reason)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, 1, 1, 'test')",
+            " (id, from_revision_id, to_revision_id, created_by_receipt_id,"
+            "  phase, unfinished_slot, max_in_flight_per_cluster, failure_budget,"
+            "  reason)"
+            " VALUES (%s, %s, %s, %s, %s, %s, 1, 1, 'test')",
             (
                 rollout,
                 self.from_revision,
-                self.to_revision,
-                self.from_revision,
+                to_revision or self.to_revision,
                 receipt,
                 phase,
                 unfinished_slot,
@@ -290,6 +294,13 @@ class FirewallRulesRolloutSlotTest(unittest.TestCase):
         self.assertCountEqual(
             terminal_rows, list(zip(finished, ("completed", "aborted")))
         )
+        self.assertEqual(self.unfinished(), [rollout])
+
+    def test_from_and_to_may_be_the_same_revision(self) -> None:
+        with self.connect() as conn:
+            rollout = self.insert_header(conn, "canary", 1, to_revision=self.from_revision)
+            conn.commit()
+
         self.assertEqual(self.unfinished(), [rollout])
 
     def test_null_slot_cannot_bypass_the_key(self) -> None:
