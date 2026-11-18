@@ -44,9 +44,10 @@ KIND_BENCH_ROOT="${KIND_BENCH_ROOT:-$HOME/.space-benches}"
 # The bench daemons are always Docker's static release, installed once, so
 # every bench runs the version they were measured with whatever the host's own
 # Docker is (a sidecar, a remote DOCKER_HOST or a local package); any 25+
-# release with the containerd image store works.
+# release with the containerd image store works. One directory per version,
+# so a host that installed one release never runs it for another.
 KIND_BENCH_DOCKER_VERSION="${KIND_BENCH_DOCKER_VERSION:-29.8.2}"
-KIND_BENCH_DOCKER_DIR="${KIND_BENCH_DOCKER_DIR:-/opt/space-bench-docker/bin}"
+KIND_BENCH_DOCKER_DIR="${KIND_BENCH_DOCKER_DIR:-/opt/space-bench-docker/$KIND_BENCH_DOCKER_VERSION}"
 # The release archive's SHA-256 per architecture, for the pinned version;
 # another version needs KIND_BENCH_DOCKER_SHA256.
 declare -A KIND_BENCH_DOCKER_SHA256S=(
@@ -156,6 +157,8 @@ kind_bench_preflight() {
 }
 
 # The daemon binaries each bench runs: Docker's static release, unpacked once.
+# Installed beside its directory and moved into place whole, so a directory
+# holding dockerd holds the complete release.
 kind_bench_ensure_docker() {
   if [[ -x "$KIND_BENCH_DOCKER_DIR/dockerd" ]]; then
     return 0
@@ -178,8 +181,11 @@ kind_bench_ensure_docker() {
     || status=1
   (( status )) || printf '%s  %s\n' "$sha256" "$tmp/docker.tgz" | sha256sum -c --quiet - || status=1
   (( status )) || tar -C "$tmp" -xzf "$tmp/docker.tgz" || status=1
-  (( status )) || sudo -n install -d -m 0755 "$KIND_BENCH_DOCKER_DIR" || status=1
-  (( status )) || sudo -n install -m 0755 "$tmp"/docker/* "$KIND_BENCH_DOCKER_DIR/" || status=1
+  local partial="$KIND_BENCH_DOCKER_DIR.partial"
+  (( status )) || sudo -n rm -rf "$partial" || status=1
+  (( status )) || sudo -n install -d -m 0755 "$partial" || status=1
+  (( status )) || sudo -n install -m 0755 "$tmp"/docker/* "$partial/" || status=1
+  (( status )) || sudo -n mv -T "$partial" "$KIND_BENCH_DOCKER_DIR" || status=1
   rm -rf "$tmp"
   return "$status"
 }
