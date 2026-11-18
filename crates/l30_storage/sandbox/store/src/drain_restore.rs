@@ -371,3 +371,63 @@ pub async fn stopped_handoff_state(
         pending,
     }))
 }
+
+/// Land a start's re-placement of handed-off stopped sandbox `sandbox_id`,
+/// in the caller's transaction: `stopped`, `on_node`, the marker cleared, as
+/// v1's [`crate::drain::finalize_evacuation_restore`] does toward `stopped`,
+/// but only for the claim that drove it. Returns whether the row moved.
+/// Writes an **operation step** (the re-placement's end).
+///
+/// v1's claim writes no lease and takes a claimed row again, so two starts of
+/// the same row can both hold it. Each claim drives its own execution, and
+/// `execution_generation` names this one's: the row lands only while that
+/// execution is still the row's active one, so an earlier start can't land
+/// a row a later claim is re-placing. It locks the sandbox row, then that
+/// execution `FOR SHARE`, the order execution mutations lock in: a later
+/// claim's drive that retires it commits first, or waits for this to end.
+/// The row must still be `restoring` with v1's `stopped` marker.
+///
+/// v1's controller keeps its own finalize, unchanged: with the switch on it
+/// drives no marked stopped row, and with it off a start drives none.
+pub async fn finalize_stopped_handoff_restore(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sandbox_id: SandboxId,
+    execution_generation: i64,
+) -> Result<bool, sqlx::Error> {
+    let row: Option<Uuid> =
+        sqlx::query_scalar(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
+            .bind(sandbox_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if row.is_none() {
+        return Ok(false);
+    }
+    let claimed: Option<Uuid> = sqlx::query_scalar(sql!(
+        "SELECT id
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1
+            AND generation = $2
+            AND active
+          FOR SHARE"
+    ))
+    .bind(sandbox_id)
+    .bind(execution_generation)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if claimed.is_none() {
+        return Ok(false);
+    }
+    let finalized = sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'stopped',
+                placement = 'on_node',
+                evacuation_restore_target = NULL
+          WHERE id = $1
+            AND lifecycle = 'restoring'
+            AND evacuation_restore_target = 'stopped'"
+    ))
+    .bind(sandbox_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(finalized.rows_affected() == 1)
+}

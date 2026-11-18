@@ -138,6 +138,8 @@ pub(super) fn assemble_substrate(
                 crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::Off,
             activation_client_attribution: ActivationClientAttribution::Enabled,
             restore_dispatch_fence: super::RestoreDispatchFence::Disabled,
+            stopped_handoff_at_start:
+                crate::controllers::substrate::StoppedHandoffAtStart::Disabled,
             caches,
         },
         restore_waiters: RestoreWaiters::with_max_poll_interval(

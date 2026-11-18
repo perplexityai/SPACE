@@ -57,6 +57,7 @@ pub(super) use runtime_attribution::attribution_update;
 mod restore_dispatch_fence;
 mod runtime_upgrade;
 mod started_recovery;
+mod stopped_handoff;
 mod suspend;
 
 pub(super) use restore_source::RestoreSnapshotChoice;

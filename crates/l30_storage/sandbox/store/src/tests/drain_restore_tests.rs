@@ -4,7 +4,9 @@
 //! one compares the whole row, and its executions, before and after.
 
 use super::*;
-use crate::drain_restore::{StoppedHandoff, hand_off_stopped, stopped_handoff_state};
+use crate::drain_restore::{
+    StoppedHandoff, finalize_stopped_handoff_restore, hand_off_stopped, stopped_handoff_state,
+};
 
 /// When the fixtures' sandboxes stopped.
 const STOPPED_AT: &str = "2026-01-01T00:00:00Z";
@@ -825,5 +827,98 @@ async fn an_unplaced_row_with_no_marker_and_no_pin_has_moved_on() -> TestResult 
     assert_eq!(hand_off(pool, id, node).await?, StoppedHandoff::MovedOn);
     assert_eq!(row_json(pool, id).await?, before);
     assert_eq!(executions_image(pool, id).await?, executions);
+    Ok(())
+}
+
+/// Insert active execution `generation` of `id` on another node, as a
+/// claim's drive does.
+async fn claimed_execution(
+    conn: &mut sqlx::PgConnection,
+    id: SandboxId,
+    generation: i64,
+) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace, state, k8s_node_name, active
+         )
+         VALUES ($1, $2, $3, 'space', 'running', 'worker-target.synthetic.internal', TRUE)"
+    ))
+    .bind(id)
+    .bind(generation)
+    .bind(format!("pod-{id}-g{generation}"))
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+async fn land(pool: &PgPool, id: SandboxId, generation: i64) -> TestResult<bool> {
+    let mut tx = pool.begin().await?;
+    let landed = finalize_stopped_handoff_restore(&mut tx, id, generation).await?;
+    tx.commit().await?;
+    Ok(landed)
+}
+
+/// A start's landing is fenced to the execution its claim drove: while a
+/// later claim's drive retires that execution and replaces it, the landing
+/// waits for it, then finds the execution replaced and writes nothing. The
+/// later claim's execution lands the row: `stopped`, `on_node`, unmarked. A
+/// row that isn't a claimed handoff never lands.
+#[tokio::test(flavor = "current_thread")]
+async fn the_starts_landing_is_fenced_to_its_claims_execution() -> TestResult {
+    // The later drive, the landing and the lock-wait poll each hold a
+    // connection.
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections(3).await?
+    else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node = drained_node(pool).await?;
+    let id = stopped_at_home(pool, node, Uuid::now_v7(), NEWER).await?;
+    assert!(
+        !land(pool, id, 1).await?,
+        "a row that isn't handed off never lands"
+    );
+    assert!(matches!(
+        hand_off(pool, id, node).await?,
+        StoppedHandoff::HandedOff(_)
+    ));
+    assert_eq!(v1_claim(pool, id).await?.as_deref(), Some("stopped"));
+    claimed_execution(&mut *pool.acquire().await?, id, 2).await?;
+    assert_eq!(
+        v1_claim(pool, id).await?.as_deref(),
+        Some("restoring"),
+        "a later start claims the row again"
+    );
+
+    let mut later = pool.begin().await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET active = FALSE, state = 'replaced', terminated_at = NOW()
+          WHERE sandbox_id = $1 AND generation = 2"
+    ))
+    .bind(id)
+    .execute(&mut *later)
+    .await?;
+    claimed_execution(&mut later, id, 3).await?;
+    let later_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *later)
+        .await?;
+    let before = row_json(pool, id).await?;
+    let earlier = tokio::spawn({
+        let pool = pool.clone();
+        async move { land(&pool, id, 2).await }
+    });
+    wait_until_blocked_by(pool, later_pid).await?;
+    assert!(!earlier.is_finished(), "the landing waits for the drive");
+    later.commit().await?;
+    assert!(!earlier.await??, "the earlier claim's landing is fenced");
+    assert_eq!(row_json(pool, id).await?, before, "nothing written");
+
+    assert!(land(pool, id, 3).await?, "the later claim lands the row");
+    let after = row_json(pool, id).await?;
+    assert_eq!(after["lifecycle"], "stopped");
+    assert_eq!(after["placement"], "on_node");
+    assert_eq!(after["evacuation_restore_target"], serde_json::Value::Null);
+    assert!(!land(pool, id, 3).await?, "a landed row lands once");
     Ok(())
 }
