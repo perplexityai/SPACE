@@ -257,6 +257,35 @@ fn the_version_is_read_before_the_grammar() {
     }
 }
 
+/// serde_json reports decode errors by line and column, not by field path, so
+/// a number it cannot hold, such as `1e400`, is located that way: here in the
+/// second comparison of the second rule. Malformed JSON is a JSON error too.
+#[test]
+fn an_out_of_range_number_is_located_by_line_and_column() {
+    let document = r#"{
+  "schema_version": 1,
+  "rules": [
+    {"id": "dns", "all_of": [
+      {"left": {"payload": {"protocol": "udp", "field": "dport"}}, "op": "==", "right": 53}
+    ]},
+    {"id": "web", "all_of": [
+      {"left": {"payload": {"protocol": "tcp", "field": "dport"}}, "op": "==", "right": 80},
+      {"left": {"payload": {"protocol": "tcp", "field": "sport"}}, "op": "==", "right": 1e400}
+    ]}
+  ]
+}"#;
+    let error = decode_revision(document).unwrap_err();
+    let DecodeError::Json(json) = &error else {
+        panic!("{error:?}");
+    };
+    // Line 9 holds the second rule's second comparison; column 93 is the last
+    // digit of `1e400`.
+    assert_eq!((json.line(), json.column()), (9, 93));
+
+    let truncated = decode_revision(r#"{"schema_version": 1, "rules": ["#).unwrap_err();
+    assert!(matches!(truncated, DecodeError::Json(_)), "{truncated:?}");
+}
+
 /// One row for each rule the decoder enforces, in the format [`documents`]
 /// reads. The last group holds forms a plain derived `Deserialize` would
 /// accept.
