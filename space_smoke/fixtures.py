@@ -21,6 +21,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
+    DrainV2Control,
     ConcurrentRestoreControl,
     ConsoleControl,
     DrainGateControl,
@@ -106,6 +107,7 @@ from space_smoke.adapters import (
     SUSPEND_ROOTFS_OBJECTS,
     template_received_uuid,
 )
+from space_smoke.drain_v2 import DrainV2Assertions
 from space_smoke.concurrent_restore import ConcurrentRestoreAssertions
 from space_smoke.node_drain import NodeDrainAssertions
 from space_smoke.node_groups import NodeGroupAssertions
@@ -992,6 +994,8 @@ class CommandSandboxFixture(ScenarioFixture):
     _node_ctl_facet_control: NodeCtlFacetControl | None = None
     _encrypted_resuspend_control: EncryptedResuspendControl | None = None
     _stopped_replacement_control: StoppedReplacementControl | None = None
+    _drain_v2_control: DrainV2Control | None = None
+    _create_sandbox: Callable[..., DurableLifecycleSandbox] | None = None
     _processes: ProcessSandbox | None = None
 
     fixture_name: ClassVar[str] = "command_sandbox"
@@ -1036,6 +1040,23 @@ class CommandSandboxFixture(ScenarioFixture):
             )
         return StoppedReplacementAssertions(
             self, self._stopped_replacement_control, self._context.scope
+        )
+
+    @property
+    def drain_v2(self) -> DrainV2Assertions:
+        """Drain the sandbox's worker with the v2 engine and judge what follows.
+
+        Each access builds fresh assertions that own the scenario's cordon,
+        drain and unseal compensations, so a scenario takes it once.
+        """
+
+        if self._drain_v2_control is None or self._create_sandbox is None:
+            raise SmokeConfigurationError(
+                "drain v2 control is only available on the kind backend "
+                "with a native sandbox collection"
+            )
+        return DrainV2Assertions(
+            self, self._drain_v2_control, self._create_sandbox, self._context.scope
         )
 
     def delete_sandbox(self, sandbox: CommandSandbox | None = None) -> int:

@@ -33,6 +33,9 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
+    CallAnswer,
+    DrainV2Status,
+    NodeCliOutcome,
     ControllerLease,
     ControllerPod,
     NodeContainer,
@@ -57,6 +60,7 @@ from space_smoke.capabilities import (
     SandboxPodRender,
     AdminNodeView,
     SandboxResidency,
+    SandboxRowState,
     StoppedResidency,
     EncryptedSnapshotObservation,
     ExecutionRow,
@@ -111,6 +115,23 @@ from space_smoke.capabilities import (
     WarmPoolSelection,
 )
 from space_smoke.credmgr_socket import exchange_token, relay_argv
+from space_smoke.drain_v2 import (
+    DRAIN_HOLD_FIELD,
+    DRAIN_V2_API_ENV_KEYS,
+    DRAIN_V2_ENABLED_ENV,
+    DRAIN_V2_ENV_KEYS,
+    DRAIN_V2_HOOK_KEYS,
+    DRAIN_VIEW_FIELD,
+    PREVIEW_BUSY_REASON,
+    PREVIEW_BUSY_RETRY_SECONDS,
+    PREVIEW_BUSY_STATUS,
+    validate_drain_v2_api_keys,
+    validate_drain_v2_api_overrides,
+    validate_drain_v2_keys,
+    validate_drain_v2_overrides,
+    validate_fake_instance_id,
+    validate_fake_provider_id,
+)
 from space_smoke.environment_placement_gate import (
     GATE_ENV as ENVIRONMENT_PLACEMENT_GATE_ENV,
     RUNTIME_UPGRADE_ENV as RUNTIME_UPGRADE_AT_ACTIVATION_ENV,
@@ -177,6 +198,45 @@ def _serialize_network_config(
     if network.deny_out:
         network_options["deny_out"] = list(network.deny_out)
     return network_options
+
+
+# A sandbox-manager snapshot name, as `space-sbxmgr snapshot` prints it.
+_NODE_SNAPSHOT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+
+def _preview_busy_retry_after(status: int, headers: Any, detail: str) -> float | None:
+    """Seconds to wait before asking for a drain preview again, when the
+    admin API's answer is the node busy with another drain call; None for
+    any other answer. Classified by the answer's status and `reason`, never
+    its message."""
+
+    if status != PREVIEW_BUSY_STATUS:
+        return None
+    try:
+        body = json.loads(detail)
+    except ValueError:
+        return None
+    if not isinstance(body, dict) or body.get("reason") != PREVIEW_BUSY_REASON:
+        return None
+    value = None if headers is None else headers.get("Retry-After")
+    try:
+        return max(1.0, float(value)) if value is not None else 1.0
+    except ValueError:
+        return 1.0
+
+
+def _call_answer(status: int, headers: Any, raw: bytes) -> CallAnswer:
+    """An HTTP answer as `CallAnswer` carries it."""
+
+    try:
+        body = json.loads(raw) if raw else {}
+    except ValueError:
+        body = {"raw": raw[:2000].decode(errors="replace")}
+    return CallAnswer(
+        status=status,
+        retry_after=None if headers is None else headers.get("Retry-After"),
+        body=body if isinstance(body, dict) else {"value": body},
+    )
 
 
 def _require_ok(result: CommandResult, action: str) -> str:
@@ -700,6 +760,19 @@ KIND_WORKER_NODE_SELECTOR = f"!{CONTROL_PLANE_LABEL}"
 SANDBOX_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
 """
+# Where kubeadm keeps the kubelet's flags on a Kind node, `--provider-id`
+# among them.
+KIND_KUBELET_FLAGS = "/var/lib/kubelet/kubeadm-flags.env"
+# sandbox-manager's SQLite database on a node, and its WAL and shared-memory
+# files (`pplx_space_host_layout::paths::SANDBOX_MANAGER_DB`).
+SANDBOX_MANAGER_DB_FILES = tuple(
+    "/space/run/sandbox-manager/sbx-manager.db" + suffix for suffix in ("", "-wal", "-shm")
+)
+SANDBOX_ROW_STATES_SQL = """\
+SELECT id, lifecycle, placement, coalesce(active_node_id::text, ''),
+       coalesce(target_node_id::text, ''), updated_at
+  FROM sandboxes WHERE id = ANY('{{{sandbox_ids}}}'::uuid[]) ORDER BY id;
+"""
 STOPPED_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, ''), placement, coalesce(evacuation_restore_target, '')
 FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
@@ -800,6 +873,10 @@ K8S_CONTROL_PLANE_ENV = "SPACE_K8S_CONTROL_PLANE"
 KIND_REDIS_DEPLOYMENT = "space-redis"
 KIND_OBJECT_STORE_DEPLOYMENT = "space-object-store"
 KIND_OBJECT_STORE_POD_SELECTOR = "app.kubernetes.io/name=space-object-store"
+KIND_NODE_API_PORT = 9800
+# The node-local paths `block_node_traffic` cuts.
+NODE_TRAFFIC_OBJECT_STORE = "object-store"
+NODE_TRAFFIC_NODE_API = "node-api"
 KIND_INTERNAL_API_SELECTOR = "app.kubernetes.io/name=space-internal-api"
 PENDING_BACKUP_QUEUE_SQL = """\
 SELECT artifact_id::text, artifact_kind FROM node_local_backup_pending
@@ -4538,6 +4615,112 @@ ON CONFLICT (key_hash) DO NOTHING;
             "await the object-store rollout",
         )
 
+    # --- node-local traffic faults (drain v2) -----------------------------------
+    #
+    # A REJECT or DROP rule in one Kind node's own netfilter, tagged so the
+    # unblock removes exactly what the block added: the node's pods and host
+    # processes lose the path, every other node keeps it.
+
+    def block_node_traffic(self, node_name: str, path: str) -> None:
+        self._require_isolated_kind("node traffic faults")
+        for rule in self._node_traffic_rules(node_name, path):
+            if self._docker_exec(node_name, "iptables", "-C", *rule).returncode != 0:
+                _require_ok(
+                    self._docker_exec(node_name, "iptables", "-I", *rule),
+                    f"block {path} on {node_name}",
+                )
+
+    def unblock_node_traffic(self, node_name: str, path: str) -> None:
+        self._require_isolated_kind("node traffic faults")
+        for rule in self._node_traffic_rules(node_name, path):
+            while self._docker_exec(node_name, "iptables", "-C", *rule).returncode == 0:
+                _require_ok(
+                    self._docker_exec(node_name, "iptables", "-D", *rule),
+                    f"unblock {path} on {node_name}",
+                )
+
+    def _node_traffic_rules(self, node_name: str, path: str) -> list[tuple[str, ...]]:
+        tag = ("-m", "comment", "--comment", f"space-smoke-{path}")
+        if path == NODE_TRAFFIC_OBJECT_STORE:
+            # The object store's pod, as the node's pods (FORWARD) and host
+            # processes (OUTPUT) reach it once its Service is translated.
+            listing = self.kubectl(
+                "get", "pods", "-l", KIND_OBJECT_STORE_POD_SELECTOR, "-o", "json", timeout=15
+            )
+            ips = [
+                str((item.get("status") or {}).get("podIP"))
+                for item in json.loads(_require_ok(listing, "list object-store pods") or "{}").get(
+                    "items", []
+                )
+                if (item.get("status") or {}).get("podIP")
+            ]
+            if not ips:
+                raise RuntimeError("the object store has no pod IP to block")
+            return [
+                (chain, "-d", ip, "-p", "tcp", *tag, "-j", "REJECT", "--reject-with", "tcp-reset")
+                for ip in ips
+                for chain in ("FORWARD", "OUTPUT")
+            ]
+        if path == NODE_TRAFFIC_NODE_API:
+            # node-api's host port, unanswered rather than refused: a node
+            # that is up but unreachable.
+            return [("INPUT", "-p", "tcp", "--dport", str(KIND_NODE_API_PORT), *tag, "-j", "DROP")]
+        raise ValueError(f"refusing unknown node traffic path {path!r}")
+
+    def scale_controller(self, replicas: int, *, timeout: float) -> int:
+        """Scale the cluster-controller Deployment and await it; the replicas it had."""
+
+        self._require_isolated_kind("cluster-controller scaling")
+        if not 0 <= replicas <= 2:
+            raise ValueError(f"refusing to scale the cluster-controller to {replicas} replicas")
+        ownership = self._retention_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                "refusing a cluster-controller scale without the caller's live mutation Lease"
+            )
+        self._assert_lease_owned(ownership, "a cluster-controller scale")
+        previous = self.controller_replicas()
+        name = self._controller_deployment()
+        _require_ok(
+            self.kubectl("scale", f"deploy/{name}", f"--replicas={replicas}", timeout=30),
+            f"scale the cluster-controller to {replicas}",
+        )
+        if replicas == 0:
+            deadline = time.monotonic() + timeout
+            while self.controller_pods():
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"the cluster-controller pods outlived {timeout:.0f}s")
+                time.sleep(2)
+        else:
+            self._await_deployment_rollout(name, timeout=timeout)
+        return previous
+
+    def restart_controller(self, *, timeout: float) -> list[str]:
+        """Kill every cluster-controller pod at once and await its replacements; the killed pods' names."""
+
+        self._require_isolated_kind("cluster-controller restarts")
+        killed = [pod.name for pod in self.controller_pods() if not pod.deleting]
+        _require_ok(
+            self.kubectl(
+                "delete", "pod", "-l", KIND_CONTROLLER_SELECTOR, "--grace-period=1", "--wait=false",
+                timeout=60,
+            ),
+            "delete the cluster-controller pods",
+        )
+        replicas = self.controller_replicas()
+        deadline = time.monotonic() + timeout
+        while True:
+            pods = [pod for pod in self.controller_pods() if not pod.deleting]
+            fresh = [pod for pod in pods if pod.name not in killed and pod.ready]
+            if len(fresh) >= replicas and all(pod.name not in killed for pod in pods):
+                return killed
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"the cluster-controller did not come back within {timeout:.0f}s "
+                    f"(killed {killed}, now {[(pod.name, pod.ready) for pod in pods]})"
+                )
+            time.sleep(2)
+
     def log_since_time(self) -> str:
         return (datetime.now(UTC) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -5329,6 +5512,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             active = item.get("sandboxes_active")
             phase = item.get("drain_phase")
             mode = item.get("drain_mode")
+            engine = item.get("drain_engine")
             nodes.append(
                 AdminNodeView(
                     id=str(item.get("id", "")),
@@ -5336,6 +5520,12 @@ ON CONFLICT (key_hash) DO NOTHING;
                     drain_phase=phase if isinstance(phase, str) else None,
                     drain_mode=mode if isinstance(mode, str) else None,
                     sandboxes_active=active if isinstance(active, int) else None,
+                    drain_last_error=(
+                        item["drain_last_error"]
+                        if isinstance(item.get("drain_last_error"), str)
+                        else None
+                    ),
+                    drain_engine=engine if isinstance(engine, str) else None,
                 )
             )
         return nodes
@@ -5353,6 +5543,176 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def undrain_node(self, node_id: str) -> None:
         self._admin("POST", f"nodes/{quote(_sql_uuid(node_id), safe='')}:undrain", expect=(200, 202))
+
+    def drain_node_v2(self, node_id: str, *, hold_seconds: int) -> None:
+        if not 0 <= hold_seconds <= 86400:
+            raise ValueError(f"refusing a drain hold of {hold_seconds}s")
+        self._admin(
+            "POST",
+            f"nodes/{quote(_sql_uuid(node_id), safe='')}:drain",
+            expect=(200, 202),
+            body={"engine": "v2", DRAIN_HOLD_FIELD: hold_seconds},
+        )
+
+    def drain_node_answer(self, node_id: str, body: Mapping[str, object]) -> CallAnswer:
+        self._require_isolated_kind("admin node operations")
+        request = Request(
+            self.config.api_url.rstrip("/")
+            + f"/admin/api/v1/nodes/{quote(_sql_uuid(node_id), safe='')}:drain",
+            method="POST",
+            headers={
+                "Authorization": "Bearer " + self._admin_token(),
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(dict(body)).encode(),
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                return _call_answer(int(response.status), response.headers, response.read())
+        except HTTPError as error:
+            return _call_answer(int(error.code), error.headers, error.read())
+
+    _ADMIN_SANDBOX_ACTIONS = frozenset({"stop", "kill"})
+
+    def admin_sandbox_action_answer(self, sandbox_id: str, action: str) -> CallAnswer:
+        if action not in self._ADMIN_SANDBOX_ACTIONS:
+            raise ValueError(f"unsupported admin sandbox action {action!r}")
+        self._require_isolated_kind("admin sandbox actions")
+        request = Request(
+            self.config.api_url.rstrip("/")
+            + f"/admin/api/v1/sandboxes/sbx_{_sql_uuid(sandbox_id.removeprefix('sbx_'))}:force-{action}",
+            method="POST",
+            headers={
+                "Authorization": "Bearer " + self._admin_token(),
+                "Idempotency-Key": f"space-smoke-force-{action}-{secrets.token_hex(8)}",
+            },
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                return _call_answer(int(response.status), response.headers, response.read())
+        except HTTPError as error:
+            return _call_answer(int(error.code), error.headers, error.read())
+
+    def admin_operation(self, operation_id: str) -> dict[str, Any]:
+        payload = self._admin("GET", f"operations/{quote(operation_id, safe='')}", expect=(200,))
+        if not isinstance(payload, dict):
+            raise RuntimeError("the admin operation response was not an object")
+        return payload
+
+    def admin_node_drain(self, node_id: str) -> dict[str, Any] | None:
+        node = self._admin("GET", f"nodes/{quote(_sql_uuid(node_id), safe='')}", expect=(200,))
+        if not isinstance(node, dict):
+            raise RuntimeError("the admin node response was not an object")
+        view = node.get(DRAIN_VIEW_FIELD)
+        return view if isinstance(view, dict) else None
+
+    def drain_started_at(self, node_id: str) -> int | None:
+        out = self._psql(
+            "SELECT COALESCE(floor(extract(epoch FROM drain_started_at))::bigint::text, '')"
+            f" FROM nodes WHERE id = '{_sql_uuid(node_id)}';",
+            action="read the node's drain_started_at",
+        ).strip()
+        return int(out) if out else None
+
+    def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
+        row = self._psql(
+            "SELECT COALESCE(drain_engine, ''), COALESCE(drain_status::TEXT, '') "
+            f"FROM nodes WHERE id = '{_sql_uuid(node_id)}'",
+            action="read the node's v2 drain columns",
+        )
+        if not row:
+            return None
+        engine, _, status = row.partition("|")
+        return DrainV2Status(
+            engine=engine.strip() or None,
+            status=json.loads(status) if status.strip() else None,
+        )
+
+    def terminate_node(self, node_id: str) -> int:
+        self._require_isolated_kind("admin node operations")
+        request = Request(
+            self.config.api_url.rstrip("/")
+            + f"/admin/api/v1/nodes/{quote(_sql_uuid(node_id), safe='')}:terminate",
+            method="POST",
+            headers={"Authorization": "Bearer " + self._admin_token()},
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                return int(response.status)
+        except HTTPError as error:
+            return int(error.code)
+
+    def drain_v2_preview(self, node_id: str) -> dict[str, Any]:
+        self._require_isolated_kind("admin node operations")
+        request = Request(
+            self.config.api_url.rstrip("/")
+            + f"/admin/api/v1/nodes/{quote(_sql_uuid(node_id), safe='')}/drain-v2-preview",
+            method="GET",
+            headers={"Authorization": "Bearer " + self._admin_token()},
+        )
+        # The API bounds a preview at 60 s once it has authorized the caller,
+        # its reads and the node call together; wait longer, so its own
+        # answer arrives first. A node busy with another drain call is
+        # contention, not an answer: ask again after its `Retry-After`.
+        give_up_at = time.monotonic() + PREVIEW_BUSY_RETRY_SECONDS
+        while True:
+            try:
+                with urlopen(request, timeout=75) as response:
+                    body = json.loads(response.read() or b"null")
+                break
+            except HTTPError as error:
+                detail = error.read()[:2000].decode(errors="replace")
+                retry_after = _preview_busy_retry_after(error.code, error.headers, detail)
+                if retry_after is not None and time.monotonic() + retry_after < give_up_at:
+                    time.sleep(retry_after)
+                    continue
+                raise RuntimeError(f"admin drain preview returned HTTP {error.code}: {detail}") from None
+            except (URLError, OSError):
+                raise RuntimeError("admin drain preview failed") from None
+        if not isinstance(body, dict):
+            raise RuntimeError("the admin drain preview was not an object")
+        return body
+
+    def plant_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> str:
+        path = f"{SANDBOX_CACHE_ROOT}/{uuid.UUID(sandbox_id)}"
+        _require_ok(
+            self._docker_exec(node_name, "mkdir", path),
+            f"plant an orphan cache directory on {node_name}",
+        )
+        return path
+
+    def remove_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> None:
+        canonical = str(uuid.UUID(sandbox_id))
+        # sandbox-manager's inventory makes a quarantined row of a cache
+        # directory no row owns; that row is the plant's as well. Refused for
+        # an id the cluster knows, which no planted one is.
+        if self.node_sandbox_state(node_name, canonical) is not None:
+            if self._psql(
+                SANDBOX_LIVE_SQL.format(sandbox_id=canonical), action="probe sandbox liveness"
+            ).strip():
+                raise SmokeConfigurationError(
+                    f"sandbox {canonical} exists on the cluster; its row on {node_name} is not a plant's"
+                )
+            _require_ok(
+                self._node_shell_exec(
+                    node_name, f"space-sbxmgr delete --blocking {canonical}", timeout=180
+                ),
+                f"delete the planted sandbox's quarantined row on {node_name}",
+            )
+        path = shlex.quote(f"{SANDBOX_CACHE_ROOT}/{canonical}")
+        # `rmdir`: only the empty directory the plant made, never a real one.
+        _require_ok(
+            self._docker_exec(node_name, "sh", "-c", f"test ! -e {path} || rmdir {path}"),
+            f"remove the planted cache directory on {node_name}",
+        )
+
+    def node_tombstoned(self, node_id: str) -> bool:
+        out = self._psql(
+            "SELECT count(*) FROM node_k8s_tombstones"
+            f" WHERE node_id = '{_sql_uuid(node_id)}';",
+            action="read the node's tombstone",
+        )
+        return out.strip() != "0"
 
     def set_drain_keep(self, node_name: str, value: str) -> None:
         self._require_isolated_kind("drain-keep override")
@@ -5384,6 +5744,19 @@ ON CONFLICT (key_hash) DO NOTHING;
     def kube_node_exists(self, node_name: str) -> bool:
         node = _kube_node_name(node_name)
         return self.kubectl("get", "node", node, "-o", "name", timeout=15).returncode == 0
+
+    def sandbox_placements(self, sandbox_ids: Sequence[str]) -> dict[str, tuple[str, str | None]]:
+        rows = self._psql(
+            "SELECT id, lifecycle, coalesce(active_node_id::text, '') FROM sandboxes"
+            f" WHERE id IN ({_sql_uuid_list(sandbox_ids)});\n",
+            action="read the sandboxes' lifecycles and nodes",
+        )
+        placements: dict[str, tuple[str, str | None]] = {}
+        for line in rows.splitlines():
+            if line.strip():
+                sandbox_id, lifecycle, node = (part.strip() for part in line.split("|", 2))
+                placements[sandbox_id] = (lifecycle, node or None)
+        return placements
 
     def sandbox_residency(self, sandbox_id: str) -> SandboxResidency:
         row = self._psql(
@@ -5647,19 +6020,439 @@ ON CONFLICT (key_hash) DO NOTHING;
         self._apply_orphaned_restore_pod_gc_env(standing)
 
     def _apply_orphaned_restore_pod_gc_env(self, values: Mapping[str, str | None]) -> None:
-        self._require_isolated_kind("orphaned-restore-pod GC env override")
+        self._set_controller_env(values, "an orphaned-restore-pod GC controller deployment write")
+
+    # --- controller env for the drain ---------------------------------------
+    #
+    # The key/value lists live in `space_smoke.drain_v2`.
+
+    def _set_controller_env(self, values: Mapping[str, str | None], purpose: str) -> None:
+        """Write `values` (None unsets) to the cluster-controller Deployment and
+        await its rollout, under the caller's live controller-mutation Lease.
+
+        At the charts' pace, not `_fast_rollout`'s: the loops these values
+        configure run on the Lease holder, so the rollout's end is when they
+        run under them.
+        """
+
+        self._require_isolated_kind(purpose)
         ownership = self._retention_lease_ownership
         if ownership is None:
             raise SmokeConfigurationError(
-                "refusing an orphaned-restore-pod GC controller deployment write without the "
-                "caller's live mutation Lease"
+                f"refusing {purpose} without the caller's live mutation Lease"
             )
-        self._assert_lease_owned(ownership, "an orphaned-restore-pod GC controller deployment write")
-        # At the charts' pace, not `_fast_rollout`'s, as for the retention
-        # sweeper: the GC runs on the Lease holder, and the fast rollout's
-        # earlier return was spent waiting for the new holder's first reaps
-        # (bench: 125-127 s at this pace, 123-126 s at the fast one).
+        self._assert_lease_owned(ownership, purpose)
         self._set_deployment_env(self._controller_deployment(), values, timeout=180)
+
+    def drain_v2_switches(self) -> dict[str, str | None]:
+        api = self._deployment_env_literals(self._public_api_deployment(), (DRAIN_V2_ENABLED_ENV,))
+        controller = self._deployment_env_literals(
+            self._controller_deployment(), (DRAIN_V2_ENABLED_ENV,)
+        )
+        return {"api": api[DRAIN_V2_ENABLED_ENV], "controller": controller[DRAIN_V2_ENABLED_ENV]}
+
+    def drain_v2_test_hooks(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(self._controller_deployment(), DRAIN_V2_HOOK_KEYS)
+
+    def drain_v2_env(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(self._controller_deployment(), DRAIN_V2_ENV_KEYS)
+
+    def set_drain_v2_env(self, overrides: Mapping[str, str]) -> None:
+        validate_drain_v2_overrides(overrides)
+        self._apply_drain_v2_env(overrides)
+
+    def restore_drain_v2_env(self, standing: Mapping[str, str | None]) -> None:
+        validate_drain_v2_keys(standing)
+        self._apply_drain_v2_env(standing)
+        restored = self.drain_v2_env()
+        if restored != dict(standing):
+            raise RuntimeError(
+                f"the controller's drain v2 env is {restored}, not the standing {dict(standing)}"
+            )
+
+    def _apply_drain_v2_env(self, values: Mapping[str, str | None]) -> None:
+        self._set_controller_env(values, "a drain v2 controller deployment write")
+
+    # --- public API env for the drain -----------------------------------------
+    #
+    # The evacuation cap is read by the API that answers `:drain`: the shared
+    # surface's Deployment, which the harness's admin calls reach.
+
+    def drain_v2_api_env(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(self._public_api_deployment(), DRAIN_V2_API_ENV_KEYS)
+
+    def set_drain_v2_api_env(self, overrides: Mapping[str, str]) -> None:
+        validate_drain_v2_api_overrides(overrides)
+        self._apply_drain_v2_api_env(overrides, "set the drain v2 public API env")
+
+    def restore_drain_v2_api_env(self, standing: Mapping[str, str | None]) -> None:
+        validate_drain_v2_api_keys(standing)
+        self._apply_drain_v2_api_env(standing, "restore the drain v2 public API env")
+        restored = self.drain_v2_api_env()
+        if restored != dict(standing):
+            raise RuntimeError(
+                f"the public API's drain v2 env is {restored}, not the standing {dict(standing)}"
+            )
+
+    def _apply_drain_v2_api_env(self, values: Mapping[str, str | None], action: str) -> None:
+        """Write `values` (None unsets) to the public API Deployment and await
+        its rollout, under the caller's live public-API mutation Lease."""
+
+        self._require_isolated_kind(action)
+        ownership = self._held_public_api_lease(action)
+        self._renew_lease(ownership, action)
+        assignments = [f"{k}-" if v is None else f"{k}={v}" for k, v in values.items()]
+        if not assignments:
+            return
+        name = self._public_api_deployment()
+        container = self._public_api_container(name)
+        with self._fast_rollout(name, ownership):
+            _require_ok(
+                self.kubectl("set", "env", f"deploy/{name}", "-c", container, *assignments, timeout=30),
+                action,
+            )
+            self.wait_public_api_rollout(timeout=240)
+        self.wait_public_api_ready(timeout=120)
+
+    def kind_node_provider_id(self, node_name: str) -> str:
+        node = _kube_node_name(node_name)
+        listed = self.kubectl("get", "node", node, "-o", "jsonpath={.spec.providerID}", timeout=15)
+        return _require_ok(listed, f"read the providerID of {node}").strip()
+
+    def _kind_provider_id(self, container: str) -> str:
+        """The providerID Kind gives a node, which names no EC2 instance."""
+
+        return f"kind://docker/{self.config.cluster}/{container}"
+
+    def _rewritten_kubelet_flags(self, flags: str, provider_id: str, container: str) -> str:
+        """kubeadm's kubelet flags with `--provider-id` set to `provider_id`:
+        a fake AWS one, or Kind's own for `container`."""
+
+        if provider_id != self._kind_provider_id(container):
+            validate_fake_provider_id(provider_id)
+        rewritten, count = re.subn(r"--provider-id=[^\s\"]*", f"--provider-id={provider_id}", flags)
+        if count != 1:
+            raise RuntimeError(
+                "the Kind worker's kubeadm-flags.env does not set --provider-id exactly once"
+            )
+        return rewritten
+
+    def set_kind_worker_provider_id(
+        self, node_name: str, provider_id: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        self._require_isolated_kind("re-registering a Kind worker")
+        container = self._kind_worker_container(node_name)
+        read = self.executor.run(
+            ["docker", "exec", container, "cat", KIND_KUBELET_FLAGS], timeout=30
+        )
+        flags = self._rewritten_kubelet_flags(
+            _require_ok(read, f"read the kubelet flags of {container}"), provider_id, container
+        )
+        # A Node's providerID can't change once set, so the kubelet registers
+        # a new Node: delete the old one, then restart the kubelet with the
+        # rewritten flag.
+        _require_ok(
+            self.executor.run(
+                ["docker", "exec", "-i", container, "sh", "-c", f"cat > {KIND_KUBELET_FLAGS}"],
+                timeout=30,
+                input_text=flags,
+            ),
+            f"write the kubelet flags of {container}",
+        )
+        _require_ok(
+            self.kubectl("delete", "node", container, "--wait=true", timeout=120),
+            f"delete the Kubernetes Node {container}",
+        )
+        _require_ok(
+            self.executor.run(
+                ["docker", "exec", container, "systemctl", "restart", "kubelet"], timeout=60
+            ),
+            f"restart the kubelet of {container}",
+        )
+        self._await_reregistered(container, labels, timeout=timeout)
+        registered = self.kind_node_provider_id(container)
+        if registered != provider_id:
+            raise RuntimeError(
+                f"Kind worker {container} registered providerID {registered!r}, "
+                f"not {provider_id!r}"
+            )
+
+    def restore_kind_worker_provider_id(
+        self, node_name: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        container = self._kind_worker_container(node_name)
+        self.set_kind_worker_provider_id(
+            node_name, self._kind_provider_id(container), labels, timeout=timeout
+        )
+
+    def fake_ec2_terminate(self, instance_id: str) -> None:
+        self._require_isolated_kind("terminating a fake EC2 instance")
+        validate_fake_instance_id(instance_id)
+        _require_ok(
+            self.kubectl(
+                "exec", "deployment/space-kind-fake-ec2", "--",
+                "space-kind-fake-ec2", "terminate", instance_id,
+                timeout=30,
+            ),
+            f"terminate {instance_id} in the fake EC2",
+        )
+
+    def set_fake_ec2_terminate_delay(self, seconds: int) -> None:
+        self._require_isolated_kind("setting the fake EC2's termination delay")
+        if not 0 <= seconds <= 3600:
+            raise ValueError(f"refusing a termination delay of {seconds}s")
+        _require_ok(
+            self.kubectl(
+                "exec", "deployment/space-kind-fake-ec2", "--",
+                "space-kind-fake-ec2", "delay", str(seconds),
+                timeout=30,
+            ),
+            f"set the fake EC2's termination delay to {seconds}s",
+        )
+
+    def release_fake_ec2_instance(self, instance_id: str) -> None:
+        self._require_isolated_kind("releasing a fake EC2 instance")
+        validate_fake_instance_id(instance_id)
+        _require_ok(
+            self.kubectl(
+                "exec", "deployment/space-kind-fake-ec2", "--",
+                "space-kind-fake-ec2", "release", instance_id,
+                timeout=30,
+            ),
+            f"release {instance_id} in the fake EC2",
+        )
+
+    def fake_ec2_instance_state(self, instance_id: str) -> str:
+        self._require_isolated_kind("reading a fake EC2 instance")
+        validate_fake_instance_id(instance_id)
+        result = self.kubectl(
+            "exec", "deployment/space-kind-fake-ec2", "--",
+            "space-kind-fake-ec2", "state", instance_id,
+            timeout=30,
+        )
+        _require_ok(result, f"read {instance_id} in the fake EC2")
+        return result.stdout.strip()
+
+    def set_node_recorded_instance(self, node_id: str, instance_id: str | None) -> None:
+        self._require_isolated_kind("writing a node's recorded instance")
+        if instance_id is not None:
+            validate_fake_instance_id(instance_id)
+        value = "NULL" if instance_id is None else f"'{instance_id}'"
+        self._psql(
+            f"UPDATE node_k8s SET instance_id = {value} WHERE node_id = '{_sql_uuid(node_id)}';",
+            action="write the node's recorded instance",
+        )
+
+    def node_recorded_instance(self, node_id: str) -> str | None:
+        out = self._psql(
+            f"SELECT coalesce(instance_id, '') FROM node_k8s WHERE node_id = '{_sql_uuid(node_id)}';",
+            action="read the node's recorded instance",
+        )
+        return out.strip() or None
+
+    def node_row_exists(self, node_id: str) -> bool:
+        out = self._psql(
+            f"SELECT count(*) FROM nodes WHERE id = '{_sql_uuid(node_id)}';",
+            action="read the node row",
+        )
+        return out.strip() == "1"
+
+    def creating_snapshots_from_node(self, node_id: str) -> list[str]:
+        out = self._psql(
+            "SELECT id FROM snapshots"
+            f" WHERE source_node_id = '{_sql_uuid(node_id)}' AND state = 'creating'"
+            " ORDER BY id;",
+            action="read the node's creating snapshots",
+        )
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    def node_created_at(self, node_id: str) -> str | None:
+        out = self._psql(
+            f"SELECT created_at FROM nodes WHERE id = '{_sql_uuid(node_id)}';",
+            action="read the node row's creation time",
+        )
+        return out.strip() or None
+
+    def _kind_worker_container(self, node_name: str) -> str:
+        container = self._kind_node_container(_kube_node_name(node_name))
+        if not re.fullmatch(rf"{re.escape(self.config.cluster)}-worker[0-9]*", container):
+            raise ValueError(f"refusing to stop {container!r}: not a Kind worker")
+        return container
+
+    def kind_node_labels(self, node_name: str) -> dict[str, str]:
+        container = self._kind_worker_container(node_name)
+        listed = self.kubectl("get", "node", container, "-o", "jsonpath={.metadata.labels}", timeout=15)
+        labels = json.loads(_require_ok(listed, f"read the labels of {container}") or "{}")
+        return {str(key): str(value) for key, value in labels.items()}
+
+    def stop_kind_worker(self, node_name: str, *, keep_node: bool = False) -> None:
+        self._require_isolated_kind("stopping a Kind worker")
+        container = self._kind_worker_container(node_name)
+        stopped = self.executor.run(["docker", "stop", container], timeout=120)
+        _require_ok(stopped, f"stop Kind worker container {container}")
+        if keep_node:
+            return
+        _require_ok(
+            self.kubectl("delete", "node", container, "--wait=true", timeout=120),
+            f"delete the Kubernetes Node {container}",
+        )
+
+    def kube_node_uid(self, node_name: str) -> str | None:
+        container = self._kind_worker_container(node_name)
+        listed = self.kubectl(
+            "get", "node", container, "--ignore-not-found", "-o", "jsonpath={.metadata.uid}",
+            timeout=15,
+        )
+        return _require_ok(listed, f"read the uid of {container}").strip() or None
+
+    def delete_kube_node(self, node_name: str, *, uid: str) -> None:
+        self._require_isolated_kind("deleting a Kind worker's Node")
+        container = self._kind_worker_container(node_name)
+        if not re.fullmatch(r"[0-9a-f-]{36}", uid):
+            raise ValueError(f"refusing Node uid {uid!r}")
+        body = json.dumps(
+            {"kind": "DeleteOptions", "apiVersion": "v1", "preconditions": {"uid": uid}}
+        )
+        _require_ok(
+            self.kubectl(
+                "delete", "--raw", f"/api/v1/nodes/{container}", "-f", "-",
+                input_text=body,
+                timeout=60,
+            ),
+            f"delete the Kubernetes Node {container} with uid {uid}",
+        )
+
+    def start_kind_worker(
+        self,
+        node_name: str,
+        labels: Mapping[str, str],
+        *,
+        timeout: float,
+        provider_id: str | None = None,
+    ) -> None:
+        self._require_isolated_kind("starting a Kind worker")
+        container = self._kind_worker_container(node_name)
+        if provider_id is not None:
+            # A same-name replacement: the stopped container's kubelet starts
+            # under a new providerID, so it registers a new instance.
+            with tempfile.TemporaryDirectory() as scratch:
+                local = Path(scratch) / "kubeadm-flags.env"
+                _require_ok(
+                    self.executor.run(
+                        ["docker", "cp", f"{container}:{KIND_KUBELET_FLAGS}", str(local)],
+                        timeout=30,
+                    ),
+                    f"copy the kubelet flags out of {container}",
+                )
+                local.write_text(
+                    self._rewritten_kubelet_flags(local.read_text(), provider_id, container)
+                )
+                _require_ok(
+                    self.executor.run(
+                        ["docker", "cp", str(local), f"{container}:{KIND_KUBELET_FLAGS}"],
+                        timeout=30,
+                    ),
+                    f"copy the kubelet flags into {container}",
+                )
+        _require_ok(
+            self.executor.run(["docker", "start", container], timeout=120),
+            f"start Kind worker container {container}",
+        )
+        if provider_id is not None:
+            # A same-name replacement stands for a new machine, which starts
+            # with an empty sandbox-manager database: the one the stopped
+            # machine left would come back sealed under its drain, holding the
+            # drain's records. Its Node was deleted, and sandbox-manager's
+            # DaemonSet runs only on a Node with the bring-up labels, which go
+            # back on below, so nothing has the database open yet. The cache
+            # it described is reformatted on every start of the node.
+            _require_ok(
+                self.executor.run(
+                    ["docker", "exec", container, "rm", "-f", *SANDBOX_MANAGER_DB_FILES],
+                    timeout=30,
+                ),
+                f"remove the sandbox-manager database the stopped {container} left",
+            )
+        self._await_reregistered(container, labels, timeout=timeout)
+
+    def _await_reregistered(
+        self, container: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        """Wait for the kubelet to re-register the Node it lost, put back the
+        bring-up's labels, then wait for the Node and its node services."""
+
+        deadline = time.monotonic() + timeout
+        while not self.kube_node_exists(container):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Kind worker {container} did not re-register its Node")
+            time.sleep(2)
+        # The kubelet registers only the labels it was started with; the
+        # bring-up labels the node after that, and the delete took those. Put
+        # them back first, so a wait below that fails leaves them in place.
+        current = self.kind_node_labels(container)
+        missing = [f"{key}={value}" for key, value in labels.items() if key not in current]
+        if missing:
+            _require_ok(
+                self.kubectl("label", "node", container, *missing, timeout=30),
+                f"restore the labels of {container}",
+            )
+        # Each wait has the whole budget.
+        budget = max(int(timeout), 1)
+        _require_ok(
+            self.kubectl(
+                "wait", "--for=condition=Ready", f"node/{container}", f"--timeout={budget}s",
+                timeout=budget + 30,
+            ),
+            f"await Kind worker {container} Ready",
+        )
+        # The node services' DaemonSet pods come back with the Node; a sandbox
+        # on it can't be deleted until they serve.
+        _require_ok(
+            self.kubectl(
+                "wait", "--for=condition=Ready", "pod", "--all",
+                "--field-selector", f"spec.nodeName={container}", f"--timeout={budget}s",
+                timeout=budget + 30,
+            ),
+            f"await the node services on {container}",
+        )
+        # node-ctl advertises the sandbox network slots on the new Node a
+        # moment after its pods are Ready; until then a sandbox pod can't be
+        # scheduled there.
+        while True:
+            listed = self.kubectl(
+                "get", "node", container, "-o",
+                "jsonpath={.status.allocatable.space\\.pplx\\.net/network-slots}",
+                timeout=15,
+            )
+            slots = _require_ok(listed, f"read the network slots of {container}").strip()
+            if slots.isdigit() and int(slots) > 0:
+                break
+            if time.monotonic() >= deadline + budget:
+                raise RuntimeError(f"Kind worker {container} never advertised network slots")
+            time.sleep(2)
+
+    def sandbox_row_states(self, sandbox_ids: Sequence[str]) -> list[SandboxRowState]:
+        ids = ",".join(_sql_uuid(sandbox_id) for sandbox_id in sandbox_ids)
+        out = self._psql(
+            SANDBOX_ROW_STATES_SQL.format(sandbox_ids=ids), action="read sandbox row states"
+        )
+        rows = []
+        for line in out.splitlines():
+            fields = line.strip().split("|")
+            if len(fields) != 6:
+                continue
+            sandbox_id, lifecycle, placement, active, target, updated_at = fields
+            rows.append(
+                SandboxRowState(
+                    sandbox_id=sandbox_id,
+                    lifecycle=lifecycle,
+                    placement=placement,
+                    active_node_id=active or None,
+                    target_node_id=target or None,
+                    updated_at=updated_at,
+                )
+            )
+        return rows
 
     def controller_log_records(self, *, since_time: str) -> list[dict[str, Any]]:
         listing = self.kubectl(
@@ -6005,6 +6798,15 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
 
     def running_controller_stopped_replacement_envs(self) -> list[dict[str, str | None]]:
+        return self._running_controller_env_literals(
+            STOPPED_REPLACEMENT_ENV_KEYS, value_from_refusal="; the scenario reads only literal flags"
+        )
+
+    def _running_controller_env_literals(
+        self, keys: Sequence[str], *, value_from_refusal: str
+    ) -> list[dict[str, str | None]]:
+        """The literals of `keys` on every running, not-terminating controller pod."""
+
         listing = self.kubectl(
             "get", "pods", "-l", KIND_CONTROLLER_SELECTOR, "-o", "json", timeout=15
         )
@@ -6020,9 +6822,9 @@ ON CONFLICT (key_hash) DO NOTHING;
             envs.append(
                 _env_literals(
                     containers[0].get("env") or [],
-                    STOPPED_REPLACEMENT_ENV_KEYS,
+                    keys,
                     owner=str(metadata.get("name", "a cluster-controller pod")),
-                    value_from_refusal="; the scenario reads only literal flags",
+                    value_from_refusal=value_from_refusal,
                 )
             )
         return envs
@@ -6216,6 +7018,29 @@ ON CONFLICT (key_hash) DO NOTHING;
                 f"sandbox {sandbox_id}'s row on {node_name} has no recognizable state: {state!r}"
             )
         return state
+
+    def node_disk_snapshot(self, node_name: str, sandbox_id: str) -> str:
+        canonical = _sql_uuid(sandbox_id)
+        result = self._node_shell_exec(
+            node_name, f"space-sbxmgr snapshot --disk {canonical}", timeout=120
+        )
+        out = _require_ok(result, f"take a disk snapshot of {canonical} on {node_name}")
+        # `Disk snapshot: <label> -> <name>`
+        name = out.strip().rsplit("->", 1)[-1].strip()
+        if not _NODE_SNAPSHOT_NAME.fullmatch(name):
+            raise RuntimeError(f"space-sbxmgr snapshot printed no snapshot name: {out.strip()!r}")
+        return name
+
+    def node_rollback(self, node_name: str, sandbox_id: str, snapshot: str) -> NodeCliOutcome:
+        canonical = _sql_uuid(sandbox_id)
+        if not _NODE_SNAPSHOT_NAME.fullmatch(snapshot):
+            raise ValueError(f"refusing snapshot name {snapshot!r}")
+        result = self._node_shell_exec(
+            node_name, f"space-sbxmgr rollback {canonical} {shlex.quote(snapshot)}", timeout=180
+        )
+        return NodeCliOutcome(
+            exit_code=result.returncode, stdout=result.stdout, stderr=result.stderr
+        )
 
     def pause_in_memory(self, sandbox_id: str) -> None:
         """Native `:pause`: keep the VM resident, paused. Returns once accepted."""

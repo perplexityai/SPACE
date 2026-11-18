@@ -130,6 +130,35 @@ _DURATION_SECONDS = {
         "native.network_policy_live_update": 7,
         "native.resident_pause": 5,
         "native.stopped_restart_preserves_rootfs": 68,
+        # The drain set, routine and manual alike, which runs by name and
+        # splits across benches with `space_smoke list --prefix native.v2_
+        # --shard I/N`: one local Kind run each (2026-11-20, a 32-core
+        # bench, Kind's drain v2 values); the median of two for the undrain.
+        # The stopped-sandbox refusal is one local Kind run (2026-11-24, four
+        # benches on a 32-core host): four refused stops' retry budgets and
+        # a drain held for an hour that the scenario undrains. Replace with
+        # CI medians once CI runs them.
+        "native.v2_drain_evacuates_every_resident": 191,
+        "native.v2_drain_holds_running_until_its_deadline": 291,
+        "native.v2_drain_keeps_a_live_node_with_a_stale_instance": 294,
+        "native.v2_drain_meets_user_calls": 330,
+        "native.v2_drain_moves_ten_residents": 214,
+        "native.v2_drain_outlived_by_a_dead_worker": 710,
+        "native.v2_drain_paces_a_full_worker": 648,
+        "native.v2_drain_preview_changes_nothing": 46,
+        "native.v2_drain_refused_at_the_cap": 213,
+        "native.v2_drain_refuses_stopped_sandboxes": 644,
+        "native.v2_drain_replaced_while_shutting_down": 154,
+        "native.v2_drain_survives_controller_restarts": 1052,
+        "native.v2_drain_survives_sandbox_manager_restarts": 532,
+        "native.v2_drain_terminates_its_worker": 343,
+        "native.v2_drain_waits_for_a_lingering_node": 213,
+        "native.v2_drain_waits_for_an_unreachable_node": 211,
+        "native.v2_drain_waits_out_blocked_uploads": 509,
+        "native.v2_refuses_v1_drains": 30,
+        "native.v2_undrain_mid_suspend": 170,
+        "native.v2_undrain_unseals_the_worker": 128,
+        "native.v2_undrain_with_the_controller_down": 47,
         "native_concurrency.command_idempotency": 4,
         "native_concurrency.create_idempotency": 4,
         "native_concurrency.independent_commands": 4,
