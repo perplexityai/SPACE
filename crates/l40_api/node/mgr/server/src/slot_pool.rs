@@ -589,7 +589,8 @@ pub struct NetworkPool {
     // with the time (secs) their grace ends. Fixed at open: later health
     // writes must not extend it.
     startup_young_leases: HashMap<LeaseKey, u64>,
-    // Slots owned by a live `reset::SlotGuard`; only that guard removes its entry.
+    // Slots owned by a live `reset::SlotGuard`; only a guard inserts or removes
+    // an entry. The scheduler and worker read it directly; one test seeds it.
     active_resets: Mutex<HashSet<u32>>,
     sandbox_mutations: std::sync::Arc<Mutex<HashMap<String, SandboxMutationOwnership>>>,
     sandbox_mutations_released: std::sync::Arc<tokio::sync::Notify>,

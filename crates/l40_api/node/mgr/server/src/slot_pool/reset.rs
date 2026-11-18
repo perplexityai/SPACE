@@ -118,6 +118,12 @@ fn classify_slot_validation_error(error: SlotValidationError) -> SlotResetError 
 
 /// Exclusive process-local ownership of one slot's `active_resets` entry.
 /// Dropping it only releases the entry; it never wakes the reset scheduler.
+/// A reset that collides with a held guard is not re-nudged on release. The
+/// scheduler's colliding attempt keeps that slot generation in its retry
+/// backoff (`POOL_FILL_RETRY_DELAY`, 30 s); only then can rediscovery, which
+/// scans one page every `REDISCOVERY_INTERVAL` (5 s) while reset capacity is
+/// free, pick it up, possibly after several pages to wrap back to it. A
+/// holder whose release latency matters must handle that itself.
 /// Not `Clone`: the one value that inserted the entry is the one that removes it.
 pub(super) struct SlotGuard {
     pool: std::sync::Arc<NetworkPool>,
@@ -199,6 +205,7 @@ impl ResetClaim {
 
 impl Drop for ResetClaim {
     fn drop(&mut self) {
+        // The release-then-notify order lives in `release_then_notify`; keep it there.
         // Covers early DB errors, cancellation and panics as well as normal
         // retries. A completed/nontransitional row makes the next probe a no-op.
         if let Some(guard) = self.guard.take() {
@@ -237,8 +244,10 @@ pub(super) enum ResetAttempt {
 }
 
 /// Expands to a teardown that refuses and the count of its calls, for tests
-/// whose reset must never reach host networking. Each expansion owns its
-/// static, so concurrently running tests never share a count.
+/// whose reset must never reach host networking. Each expansion site owns its
+/// own static, so concurrently running tests never share a count; an expansion
+/// inside a loop shares one counter across iterations, which is fine because
+/// every assertion expects zero.
 #[cfg(test)]
 macro_rules! refusing_teardown {
     () => {{

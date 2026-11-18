@@ -182,7 +182,11 @@ fn disarming_never_releases_early_and_suppresses_only_this_retry() {
 }
 
 #[tokio::test]
-async fn releasing_an_owner_keeps_another_callers_pending_retry() {
+async fn releasing_an_owner_leaves_a_colliding_resets_queued_wakeup() {
+    // Shows only that the release neither erases nor consumes the wakeup the
+    // collision already queued. No worker drains it here, so this does not show
+    // a prompt reset: the scheduler would skip the still-held slot, and a
+    // neutral release adds no wakeup of its own (see `SlotGuard`).
     for kind in Kind::ALL {
         let (pool, mut jobs) = pool_with_wakeups(1);
         // An ephemeral row reaches host networking only through the teardown.
@@ -195,7 +199,7 @@ async fn releasing_an_owner_keeps_another_callers_pending_retry() {
             )
             .unwrap();
         let owner = kind.acquire(&pool, 0).unwrap();
-        // A colliding reset retains its own retry obligation.
+        // A colliding reset queues its wakeup while the owner still holds the slot.
         let (teardown, teardowns) = refusing_teardown!();
         reset_slot_with(pool.clone(), 0, teardown).await;
         assert_eq!(teardowns.load(Ordering::SeqCst), 0, "{kind:?}");
@@ -290,7 +294,9 @@ fn early_return_and_unwind_release_with_each_kinds_retry_behavior() {
 }
 
 #[test]
-fn poisoned_registry_still_excludes_and_releases() {
+fn guards_still_exclude_and_release_through_a_poisoned_registry() {
+    // Covers the guards only. The scheduler's discovery scans return
+    // `LockPoisoned`, so discovery stops after poisoning; that predates `SlotGuard`.
     for kind in Kind::ALL {
         let (pool, mut jobs) = pool_with_wakeups(1);
         let poisoner = pool.clone();
