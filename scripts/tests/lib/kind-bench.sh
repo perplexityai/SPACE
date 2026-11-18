@@ -271,6 +271,15 @@ kind_bench_cgroup() { # <i> <leaf>
   sudo -n mkdir -p "$dir" && printf '%s\n' "$dir"
 }
 
+# Whether <pid> runs in bench <i>'s network namespace, so a teardown signals
+# only the bench's own processes whatever a pidfile names.
+kind_bench_pid_is_benchs() { # <i> <pid>
+  local netns
+  [[ "$2" =~ ^[0-9]+$ ]] || return 1
+  netns="$(sudo -n stat -L -c %i "/run/netns/$(kind_bench_ns "$1")" 2>/dev/null)" || return 1
+  [[ -n "$netns" && "$(sudo -n stat -L -c %i "/proc/$2/ns/net" 2>/dev/null)" == "$netns" ]]
+}
+
 kind_bench_holder() {
   sudo -n cat "$(kind_bench_run_dir "$1")/holder.pid" 2>/dev/null
 }
@@ -471,7 +480,7 @@ kind_bench_teardown() {
   # with its PID namespace's holder.
   local holder
   holder="$(kind_bench_holder "$i")"
-  if [[ -n "$holder" ]]; then
+  if kind_bench_pid_is_benchs "$i" "$holder"; then
     sudo -n kill -KILL "$holder" 2>/dev/null || true
   fi
   # Kind nodes have network namespaces of their own, so what is left in the
@@ -492,7 +501,7 @@ kind_bench_teardown() {
       DOCKER_HOST="unix://$sock" timeout 180 docker rm -f $ids >/dev/null 2>&1 || true
     fi
   fi
-  if [[ -n "$dockerd_pid" ]] && sudo -n kill -0 "$dockerd_pid" 2>/dev/null; then
+  if kind_bench_pid_is_benchs "$i" "$dockerd_pid"; then
     sudo -n kill -TERM "$dockerd_pid" 2>/dev/null || true
     local _
     for _ in $(seq 1 30); do
@@ -503,7 +512,7 @@ kind_bench_teardown() {
   fi
   local containerd_pid=""
   containerd_pid="$(sudo -n cat "$run/containerd.pid" 2>/dev/null || true)"
-  if [[ -n "$containerd_pid" ]] && sudo -n kill -0 "$containerd_pid" 2>/dev/null; then
+  if kind_bench_pid_is_benchs "$i" "$containerd_pid"; then
     sudo -n kill -TERM "$containerd_pid" 2>/dev/null || true
     for _ in $(seq 1 15); do
       sudo -n kill -0 "$containerd_pid" 2>/dev/null || break
@@ -511,6 +520,7 @@ kind_bench_teardown() {
     done
     sudo -n kill -KILL "$containerd_pid" 2>/dev/null || true
   fi
+  sudo -n rm -f "$run/holder.pid" "$run/docker.pid" "$run/containerd.pid"
   if [[ -e "/run/netns/$ns" ]]; then
     for pid in $(sudo -n ip netns pids "$ns" 2>/dev/null); do
       sudo -n kill -KILL "$pid" 2>/dev/null || true
