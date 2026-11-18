@@ -272,8 +272,12 @@ macro_rules! closed_wire_enum_impls {
             where
                 D: Deserializer<'de>,
             {
+                // serde's own unknown-variant error, which names the values
+                // it expected; the API answers it without the value sent.
                 let value = String::deserialize(deserializer)?;
-                value.parse().map_err(de::Error::custom)
+                value
+                    .parse()
+                    .map_err(|_| de::Error::unknown_variant(&value, Self::KNOWN_VALUES))
             }
         }
     };

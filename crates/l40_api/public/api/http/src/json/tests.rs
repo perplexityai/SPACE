@@ -14,9 +14,24 @@ use tower::ServiceExt;
 use super::PublicJson;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[expect(dead_code, reason = "only deserialized")]
 struct Resources {
     vcpu: Option<u32>,
+}
+
+/// A value whose own `Deserialize` quotes what it refused, as a duration or
+/// id parser does.
+#[derive(Debug)]
+struct Timeout;
+
+impl<'de> Deserialize<'de> for Timeout {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Err(serde::de::Error::custom(format!(
+            "invalid duration '{value}'"
+        )))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +45,7 @@ struct CreateRequest {
     resources: Option<Resources>,
     visibility: Option<Visibility>,
     separator: Option<char>,
+    timeout: Option<Timeout>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +148,24 @@ async fn a_refused_body_says_what_is_wrong_and_where() {
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid request body: visibility: unknown variant, expected `public` or `private` at line 1 column 77",
             field("visibility"),
+        ),
+        (
+            "a type's own error is not answered back",
+            "/create",
+            JSON,
+            r#"{"template":"seed","timeout":"SECRET"}"#,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid request body: timeout: invalid value at line 1 column 38",
+            field("timeout"),
+        ),
+        (
+            "an unknown field names the key",
+            "/create",
+            JSON,
+            r#"{"template":"seed","resources":{"gpu":1}}"#,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid request body: resources.gpu: unknown field `gpu`, expected `vcpu` at line 1 column 37",
+            field("resources.gpu"),
         ),
         (
             "a long map key is cut short",

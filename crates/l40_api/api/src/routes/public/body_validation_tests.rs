@@ -10,9 +10,9 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
 };
-use pplx_space_sql_locator::sql;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDbResult, pg_test_db};
 use pplx_space_public_api::PublicSandboxId;
+use pplx_space_sql_locator::sql;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -21,8 +21,10 @@ use crate::routes::AppState;
 
 const KEY: &str = "native-body-validation-key";
 
-#[tokio::test]
-async fn a_body_that_does_not_match_the_schema_names_the_field() -> TestDbResult<()> {
+/// A Native router over a fresh database, with an API key for `KEY` and a
+/// stopped sandbox for the routes under it.
+async fn native_app() -> TestDbResult<(pplx_space_db_test_fixtures::TestDb, Router, PublicSandboxId)>
+{
     let db = pg_test_db().await?;
     sqlx::query(sql!(
         "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
@@ -47,6 +49,35 @@ async fn a_body_that_does_not_match_the_schema_names_the_field() -> TestDbResult
     let app = Router::new()
         .nest("/v1", crate::routes::public::v1_router(state.clone()))
         .with_state(state);
+    Ok((db, app, sandbox))
+}
+
+/// Sends `body` as JSON to `path` and returns the status and answer.
+async fn send(
+    app: &Router,
+    method: Method,
+    path: &str,
+    body: &Value,
+) -> TestDbResult<(StatusCode, Value)> {
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {KEY}"))
+        .header("content-type", "application/json")
+        .header(
+            "idempotency-key",
+            format!("body-validation-{}", Uuid::now_v7()),
+        )
+        .body(Body::from(serde_json::to_vec(body)?))?;
+    let response = app.clone().oneshot(request).await?;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+    Ok((status, serde_json::from_slice(&bytes)?))
+}
+
+#[tokio::test]
+async fn a_body_that_does_not_match_the_schema_names_the_field() -> TestDbResult<()> {
+    let (_db, app, sandbox) = native_app().await?;
 
     let files = |action: &str| format!("/v1/sandboxes/{sandbox}/files:{action}");
     let cases = [
@@ -144,20 +175,7 @@ async fn a_body_that_does_not_match_the_schema_names_the_field() -> TestDbResult
         ),
     ];
     for (method, path, body, field) in cases {
-        let request = Request::builder()
-            .method(method.clone())
-            .uri(&path)
-            .header("authorization", format!("Bearer {KEY}"))
-            .header("content-type", "application/json")
-            .header(
-                "idempotency-key",
-                format!("body-validation-{}", Uuid::now_v7()),
-            )
-            .body(Body::from(serde_json::to_vec(&body)?))?;
-        let response = app.clone().oneshot(request).await?;
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
-        let answer: Value = serde_json::from_slice(&bytes)?;
+        let (status, answer) = send(&app, method.clone(), &path, &body).await?;
         assert_eq!(
             status,
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -171,6 +189,44 @@ async fn a_body_that_does_not_match_the_schema_names_the_field() -> TestDbResult
             answer["details"],
             json!([{"key": "field", "value": field}]),
             "{method} {path}: {answer}"
+        );
+    }
+    Ok(())
+}
+
+/// A value the schema refuses is not answered back, whether serde refused it
+/// (a closed wire enum) or the field's own parser did (a duration). Either
+/// could be a secret sent to the wrong field. The answer names the field,
+/// and for the enum the values it expected.
+#[tokio::test]
+async fn a_refused_value_is_not_answered_back() -> TestDbResult<()> {
+    const SENT: &str = "SECRET-VALUE-1234";
+    let (_db, app, sandbox) = native_app().await?;
+
+    let cases = [
+        (
+            format!("/v1/sandboxes/{sandbox}/port-sessions"),
+            json!({"port": 8080, "protocol": SENT}),
+            "invalid request body: protocol: unknown variant, expected `http` or `tcp` at line 1 column 44",
+            "protocol",
+        ),
+        (
+            "/v1/sandboxes".to_string(),
+            json!({"template": "seed", "idle_timeout": SENT}),
+            "invalid request body: idle_timeout: invalid value at line 1 column 54",
+            "idle_timeout",
+        ),
+    ];
+    for (path, body, message, field) in cases {
+        let (status, answer) = send(&app, Method::POST, &path, &body).await?;
+        assert!(!answer.to_string().contains(SENT), "{path}: {answer}");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}: {answer}");
+        assert_eq!(answer["code"], "invalid_request", "{path}: {answer}");
+        assert_eq!(answer["message"], message, "{path}: {answer}");
+        assert_eq!(
+            answer["details"],
+            json!([{"key": "field", "value": field}]),
+            "{path}: {answer}"
         );
     }
     Ok(())
