@@ -152,12 +152,9 @@ _DURATION_SECONDS = {
         "native_contract.token_scope": 3,
         "native_recovery.attached_stream_drains_through_data_plane_restart": 17,
         "native_recovery.command_survives_data_plane_restart": 16,
-        "native_recovery.inline_fallback_at_one_permit_loses_no_operation": 42,
         "native_recovery.inline_load_survives_leader_failover": 62,
         "native_recovery.inline_wake_survives_api_pod_kill": 98,
-        "native_recovery.queued_create_survives_api_restart": 18,
         "native_recovery.slow_operation_does_not_block_later_work": 21,
-        "native_recovery.stale_queued_work_expires_after_controller_outage": 51,
     },
 }
 

@@ -30,8 +30,6 @@ from space_smoke.adapters import (
     LEADER_ELECTION_FALSE_VALUES as FALSE_VALUES,
     KindConfig,
     KindHarness,
-    NATIVE_OPERATION_AGE_ENV as M1_AGE_ENV,
-    NATIVE_OPERATION_READY_ENVS as READINESS_BUDGET_ENVS,
 )
 from space_smoke.runtime import ScenarioContext, SmokeConfigurationError, SubprocessExecutor
 
@@ -417,17 +415,6 @@ class NativeRecoveryControl:
                 if primary is None:
                     raise
                 primary.add_note(f"Restoring {label} also failed: {error}")
-
-    @contextmanager
-    def operation_age_limit(self, *, seconds: int = 5, readiness_seconds: int | None = None) -> Iterator[None]:
-        """Shorten only probe deadlines and restore their exact deployment entries."""
-        if not 1 <= seconds <= 30 or readiness_seconds is not None and not 1 <= readiness_seconds <= 30:
-            raise ValueError("probe operation budgets must be between 1 and 30 seconds")
-        values = {M1_AGE_ENV: str(seconds)}
-        if readiness_seconds is not None:
-            values.update({key: str(readiness_seconds) for key in READINESS_BUDGET_ENVS})
-        with self._scoped_env("space-cluster-controller", values, "native_probe_budgets"):
-            yield
 
     @contextmanager
     def one_upload_per_sandbox(self) -> Iterator[None]:
