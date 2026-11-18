@@ -5893,14 +5893,18 @@ mod kubernetes_tests {
         )
         .execute(&pool)
         .await?;
-        sqlx::query(
+        // A row trigger needs the table, which a schema variant may have
+        // renamed out from under a compatibility view.
+        let create_trigger = format!(
             "CREATE TRIGGER take_over_on_fence
-                 AFTER UPDATE OF restore_dispatch_fence_token ON sandbox_k8s_executions
+                 AFTER UPDATE OF restore_dispatch_fence_token ON {}
                  FOR EACH ROW WHEN (NEW.restore_dispatch_fence_token IS NOT NULL)
                  EXECUTE FUNCTION take_over_on_fence()",
-        )
-        .execute(&pool)
-        .await?;
+            pplx_space_db_test_fixtures::physical_table("sandbox_k8s_executions")?
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql!(create_trigger.as_str())))
+            .execute(&pool)
+            .await?;
         let wake_attempts = Arc::new(AtomicUsize::new(0));
         let worker = start_sequenced_wake_worker(Arc::clone(&wake_attempts), Some(1), true).await?;
         let mut substrate = substrate_with_store_client_and_proxy_port(
