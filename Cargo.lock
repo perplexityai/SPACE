@@ -7434,6 +7434,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-runtime-upgrade-campaign-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-common-core",
+ "pplx-space-content-digest",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-execution-spec",
+ "pplx-space-node-status-store",
+ "pplx-space-test-env",
+ "sqlx",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-rustls-provider"
 version = "0.8.2"
 dependencies = [
