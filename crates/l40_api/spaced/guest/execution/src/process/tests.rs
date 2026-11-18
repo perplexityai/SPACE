@@ -1405,26 +1405,81 @@ async fn a_repeated_start_whose_process_is_gone_says_its_replay_expired() {
     shut_down(&service).await;
 }
 
-// A permission error can be the executable's, the working directory's or a
-// parent's, and a directory the account cannot search looks missing, so it
-// names no field however the directory looks.
+fn start_reason(status: &Status) -> Option<&str> {
+    status
+        .metadata()
+        .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
+        .and_then(|reason| reason.to_str().ok())
+}
+
+/// Spawn `program` in `working_dir` with the hooks a start registers, run
+/// `after_spawn` once the spawn has failed, and return the start's status.
+fn failed_spawn_status(
+    program: &std::path::Path,
+    working_dir: &std::path::Path,
+    after_spawn: impl FnOnce(),
+) -> Status {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        .expect("current user lookup")
+        .expect("process tests require a passwd entry for the current uid");
+    let user = GuestUserName::parse(user.name).expect("valid current user");
+    let account = GuestAccount::resolve(user).expect("current account");
+    let progress = SpawnProgress::new().expect("spawn stage mapping");
+    let mut command = Command::new(program);
+    account
+        .configure_child_credentials(&mut command, IdentityPolicy::Guest, working_dir, &progress)
+        .expect("current account's credentials");
+    progress.record_exec(&mut command);
+    let error = command.spawn().expect_err("the spawn must fail");
+    after_spawn();
+    spawn_error_status(error, progress.stage())
+}
+
+// The kernel says ENOENT for a missing working directory and a missing
+// executable alike. The field named is the one the child failed on, however
+// the directory looks by the time the failure is answered.
 #[tokio::test]
-async fn a_spawn_permission_error_names_no_field() {
-    use pplx_space_guest_process::status::{ERROR_REASON_METADATA_KEY, PROCESS_START_CWD};
-    let missing = std::path::Path::new("/nonexistent-space-test-dir/cwd");
-    let reason = |status: &Status| {
-        status
-            .metadata()
-            .get(ERROR_REASON_METADATA_KEY)
-            .and_then(|reason| reason.to_str().ok())
-            .map(str::to_string)
-    };
-    for errno in [libc::EACCES, libc::EPERM] {
-        let status = spawn_error_status(io::Error::from_raw_os_error(errno), missing).await;
-        assert_eq!(reason(&status), None, "errno {errno}: {status:?}");
+async fn a_failed_spawn_names_the_field_it_failed_on() {
+    use pplx_space_guest_process::status::{PROCESS_START_COMMAND, PROCESS_START_CWD};
+    let directory = tempfile::tempdir().unwrap();
+
+    let created_after = directory.path().join("created-after-the-spawn");
+    let status = failed_spawn_status(std::path::Path::new("/bin/true"), &created_after, || {
+        std::fs::create_dir(&created_after).unwrap();
+    });
+    assert_eq!(start_reason(&status), Some(PROCESS_START_CWD), "{status:?}");
+
+    let removed_after = directory.path().join("removed-after-the-spawn");
+    std::fs::create_dir(&removed_after).unwrap();
+    let missing_executable = directory.path().join("missing-executable");
+    let status = failed_spawn_status(&missing_executable, &removed_after, || {
+        std::fs::remove_dir(&removed_after).unwrap();
+    });
+    assert_eq!(
+        start_reason(&status),
+        Some(PROCESS_START_COMMAND),
+        "{status:?}"
+    );
+}
+
+// A permission error can be the executable's, the working directory's or a
+// parent's, so it names no field whichever step failed.
+#[test]
+fn a_spawn_permission_error_names_no_field() {
+    for stage in [SpawnStage::Setup, SpawnStage::WorkingDir, SpawnStage::Exec] {
+        for errno in [libc::EACCES, libc::EPERM] {
+            let status = spawn_error_status(io::Error::from_raw_os_error(errno), stage);
+            assert_eq!(start_reason(&status), None, "{stage:?}, errno {errno}");
+        }
     }
-    let status = spawn_error_status(io::Error::from_raw_os_error(libc::ENOENT), missing).await;
-    assert_eq!(reason(&status).as_deref(), Some(PROCESS_START_CWD));
+    let status = spawn_error_status(
+        io::Error::from_raw_os_error(libc::ENOENT),
+        SpawnStage::WorkingDir,
+    );
+    assert_eq!(
+        start_reason(&status),
+        Some(pplx_space_guest_process::status::PROCESS_START_CWD)
+    );
 }
 
 // A spawn can stall for seconds under memory or I/O pressure. It must hold up

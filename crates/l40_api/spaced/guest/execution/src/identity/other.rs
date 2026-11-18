@@ -53,6 +53,7 @@ impl GuestAccount {
         command: &mut Command,
         _policy: crate::IdentityPolicy,
         cwd: &Path,
+        _progress: &crate::process::SpawnProgress,
     ) -> Result<(), Status> {
         command.current_dir(cwd);
         Err(Status::failed_precondition(format!(

@@ -17,6 +17,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 mod pty;
 use pty::PtyIo;
+mod spawn_stage;
+pub(crate) use spawn_stage::SpawnProgress;
+use spawn_stage::SpawnStage;
 
 const DEFAULT_LOGIN_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const DEFAULT_PTY_ROWS: u32 = 24;
@@ -236,9 +239,9 @@ impl ProcessSupervision {
 /// tracked owner task runs it, so it completes even if the request goes away.
 struct ProcessLaunch {
     command: Command,
-    /// The directory the child starts in, which a failed spawn is checked
-    /// against to tell the caller which request field to fix.
-    working_dir: std::path::PathBuf,
+    /// What the child's setup recorded, which tells the caller of a failed
+    /// spawn which request field to fix.
+    spawn_progress: SpawnProgress,
     prepared_pty: Option<PreparedPty>,
     stdin_enabled: bool,
     /// What `list` reports; the pid is filled in once the child exists.
@@ -351,7 +354,7 @@ impl ProcessLaunch {
     async fn publish(self) -> Result<LaunchedProcess, Status> {
         let ProcessLaunch {
             command,
-            working_dir,
+            spawn_progress,
             prepared_pty,
             stdin_enabled,
             mut info,
@@ -384,7 +387,7 @@ impl ProcessLaunch {
         let (spawn_result, mut prepared_pty) = spawned?;
         let mut child = match spawn_result {
             Ok(child) => child,
-            Err(error) => return Err(spawn_error_status(error, &working_dir).await),
+            Err(error) => return Err(spawn_error_status(error, spawn_progress.stage())),
         };
         let Some(pid) = child.id() else {
             terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
@@ -913,35 +916,22 @@ static PTY_INHERITANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// request sets these: the values E2B-compatible terminal clients send.
 const PTY_DEFAULT_ENV: [(&str, &str); 2] = [("TERM", "xterm-256color"), ("LANG", "C.UTF-8")];
 
-/// How long a failed spawn may spend looking at its working directory to say
-/// which field failed. A directory that does not answer in time names none,
-/// so the start still finishes and releases what it holds.
-const WORKING_DIR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
-
 /// The status of a spawn that failed: its errno's, tagged with the request
-/// field to fix when that is certain. The kernel reports a missing working
-/// directory and a missing executable with the same ENOENT, so the directory
-/// is looked at after the fact. A permission error stays untagged: either
-/// could be what the account may not use, and a directory the account cannot
-/// search looks missing to that lookup.
-async fn spawn_error_status(error: io::Error, working_dir: &std::path::Path) -> Status {
+/// field to fix when the step that failed, as the child recorded it, says so.
+/// A permission error stays untagged, as before the child recorded its steps:
+/// either field could be what the account may not use.
+fn spawn_error_status(error: io::Error, stage: SpawnStage) -> Status {
     let errno = error.raw_os_error();
     let status = map_io_error(error);
-    if matches!(errno, Some(libc::EACCES | libc::EPERM)) {
-        return status;
-    }
-    let lookup =
-        tokio::time::timeout(WORKING_DIR_LOOKUP_TIMEOUT, tokio::fs::metadata(working_dir)).await;
-    let Ok(metadata) = lookup else {
-        return status;
-    };
-    let working_dir_usable = metadata.is_ok_and(|metadata| metadata.is_dir());
-    let reason = if !working_dir_usable {
-        Some(pplx_space_guest_process::status::PROCESS_START_CWD)
-    } else if matches!(errno, Some(libc::ENOENT | libc::ENOEXEC | libc::ENOTDIR)) {
-        Some(pplx_space_guest_process::status::PROCESS_START_COMMAND)
-    } else {
-        None
+    let reason = match (stage, errno) {
+        (_, Some(libc::EACCES | libc::EPERM)) => None,
+        (SpawnStage::WorkingDir, Some(libc::ENOENT | libc::ENOTDIR)) => {
+            Some(pplx_space_guest_process::status::PROCESS_START_CWD)
+        }
+        (SpawnStage::Exec, Some(libc::ENOENT | libc::ENOEXEC | libc::ENOTDIR)) => {
+            Some(pplx_space_guest_process::status::PROCESS_START_COMMAND)
+        }
+        _ => None,
     };
     match reason {
         Some(reason) => with_start_reason(status, reason),
@@ -2449,10 +2439,12 @@ impl Process for ExecutionService {
             .map(|cwd| std::path::Path::new(cwd.expose()))
             .unwrap_or(account.home())
             .to_path_buf();
+        let spawn_progress = SpawnProgress::new().map_err(map_io_error)?;
         account.configure_child_credentials(
             &mut command,
             self.inner.identity_policy,
             &working_dir,
+            &spawn_progress,
         )?;
         let mut prepared_pty = pty_config
             .map(|pty_config| prepare_pty(pty_config.size))
@@ -2473,6 +2465,8 @@ impl Process for ExecutionService {
             command.stdout(std::process::Stdio::piped());
             command.stderr(std::process::Stdio::piped());
         }
+        // The last hook, so it runs only once every other one has.
+        spawn_progress.record_exec(&mut command);
 
         let reservation = match self
             .inner
@@ -2545,7 +2539,7 @@ impl Process for ExecutionService {
         let request_lifetime = _start_admission.request_lifetime();
         let launch = ProcessLaunch {
             command,
-            working_dir,
+            spawn_progress,
             prepared_pty,
             stdin_enabled,
             info: ProcessInfo {

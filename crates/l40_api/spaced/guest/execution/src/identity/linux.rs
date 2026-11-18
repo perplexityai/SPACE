@@ -131,29 +131,39 @@ impl GuestAccount {
         command: &mut Command,
         policy: crate::IdentityPolicy,
         cwd: &Path,
+        progress: &crate::process::SpawnProgress,
     ) -> Result<(), Status> {
         use nix::unistd::{Gid, Uid};
 
         self.validate_policy(policy)?;
+        let cwd = CString::new(cwd.as_os_str().as_bytes())
+            .map_err(|_| Status::invalid_argument("working directory contains a NUL byte"))?;
         if policy == crate::IdentityPolicy::Restricted {
-            let cwd = CString::new(cwd.as_os_str().as_bytes())
-                .map_err(|_| Status::invalid_argument("working directory contains a NUL byte"))?;
             let uid = self.uid;
             let gid = self.gid;
             let groups = self.supplementary_groups.clone();
-            // Command::current_dir runs before pre_exec. Enter the directory
-            // after dropping authority so every ancestor is checked as the user.
+            let progress = progress.clone();
+            // Enter the directory after dropping authority so every ancestor
+            // is checked as the user.
             // SAFETY: all storage is prepared before fork; the hook only uses
             // credential/capability syscalls and async-signal-safe chdir.
             unsafe {
                 command.pre_exec(move || {
                     assume_restricted_credentials(uid, gid, &groups)?;
-                    nix::unistd::chdir(cwd.as_c_str()).map_err(std::io::Error::from)
+                    progress.enter_working_dir(&cwd)
                 });
             }
             return Ok(());
         }
-        command.current_dir(cwd);
+        // In a hook rather than through Command::current_dir, so a failure
+        // is recorded as the working directory's. Before the credentials
+        // below are dropped, as Command::current_dir would be.
+        let entering = progress.clone();
+        // SAFETY: the hook only uses async-signal-safe chdir and an atomic
+        // store, on storage prepared before fork.
+        unsafe {
+            command.pre_exec(move || entering.enter_working_dir(&cwd));
+        }
 
         // An unprivileged test harness can already run as the requested
         // identity, but cannot call setgroups. Reusing it is safe only if its
