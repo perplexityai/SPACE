@@ -40,7 +40,7 @@ use tonic::Status;
 use crate::db::SharedConnection;
 use crate::db::activation_seal::ActivationSealRecord;
 #[cfg(test)]
-use crate::db::activation_seal::write_activation_seal;
+use crate::db::activation_seal::{DrainPrior, write_activation_seal};
 
 /// The marker in the `FailedPrecondition` status a sealed node refuses a VM
 /// activation with. The node refuses the same activation until it is
@@ -355,10 +355,41 @@ impl ActivationSeal {
         Ok(())
     }
 
+    /// Record that a drain suspend of `sandbox_id` under `epoch` begins from
+    /// `prior`, if the node is still sealed under `epoch`, keeping an earlier
+    /// attempt's record; the prior the record holds, or `None` when the node
+    /// is not sealed under `epoch`. Under the state lock, which every seal
+    /// and cancel holds, so no record is written once a cancel or a later
+    /// seal has taken over from `epoch`.
+    #[cfg(test)]
+    pub(crate) fn record_drain_suspend(
+        &self,
+        db: &SharedConnection,
+        epoch: u64,
+        sandbox_id: &str,
+        prior: DrainPrior,
+    ) -> Result<Option<DrainPrior>, Status> {
+        let state = self.lock_state();
+        if state.sealed_epoch() != Some(epoch) {
+            return Ok(None);
+        }
+        let conn = db
+            .lock()
+            .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
+        let recorded = crate::db::activation_seal::record_drain_suspend(&conn, sandbox_id, prior)
+            .map_err(|error| {
+            Status::internal(format!("record the drain suspend of {sandbox_id}: {error}"))
+        })?;
+        drop(conn);
+        drop(state);
+        Ok(Some(recorded))
+    }
+
     /// Cancel `epoch`: clear the seal if it is under `epoch` or an earlier
     /// one, and remember `epoch` so no seal at or below it is taken again,
-    /// even one whose call arrives after this cancel. An epoch below the
-    /// current seal's is refused and changes nothing.
+    /// even one whose call arrives after this cancel. Every drain evacuation
+    /// is kept, for the cancel to hand back. An epoch below the current
+    /// seal's is refused and changes nothing.
     #[cfg(test)]
     pub(crate) fn unseal(&self, db: &SharedConnection, epoch: u64) -> Result<(), Status> {
         validate_epoch(epoch)?;
@@ -464,7 +495,8 @@ fn persist(db: &SharedConnection, record: ActivationSealRecord) -> Result<(), St
         .map_err(|error| Status::internal(format!("persist the activation seal: {error}")))
 }
 
-/// Persist a cancel.
+/// Persist a cancel. Every drain evacuation is kept, for the cancel calls to
+/// hand back until the control plane names each in `forget`.
 #[cfg(test)]
 fn persist_cancel(db: &SharedConnection, record: ActivationSealRecord) -> Result<(), Status> {
     let conn = db
