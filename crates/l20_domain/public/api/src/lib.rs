@@ -590,6 +590,7 @@ wire_enum_open_schema!(OperationKind, "operation kind", {
     DisableSandboxSnapshots => "disable_sandbox_snapshots",
     RollbackSandbox => "rollback_sandbox",
     DeleteTemplate => "delete_template",
+    DeleteVolume => "delete_volume",
     CreateSession => "create_session",
 });
 
@@ -1477,6 +1478,18 @@ pub struct PublicSandboxVolumeMount {
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub mount_spec: pplx_space_execution_spec::BlockVolumeMount,
     pub state: SandboxBlockVolumeState,
+}
+
+/// A sandbox-created storage resource, independently addressable for management.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PublicVolume {
+    pub volume_id: Uuid,
+    pub sandbox_id: PublicSandboxId,
+    #[cfg_attr(feature = "serde", serde(flatten))]
+    pub mount_spec: pplx_space_execution_spec::BlockVolumeMount,
+    pub state: SandboxBlockVolumeState,
+    pub delete_requested: bool,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

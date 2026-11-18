@@ -71,6 +71,7 @@ pub struct AppState {
     /// Orgs the environment enables for hidden native operations; see
     /// [`public::hidden_operations`].
     pub native_hidden_operations: public::hidden_operations::HiddenOperationsGate,
+    pub volume_management_organizations: std::collections::BTreeSet<pplx_space_accounts::OrgId>,
     pub ecw_credential_keyring: std::sync::Arc<pplx_space_ecw_credential::EcwCredentialKeyring>,
 }
 
@@ -272,6 +273,9 @@ impl AppState {
             command_stream,
             feature_flags,
             native_hidden_operations,
+            volume_management_organizations: crate::block_volumes::management_organizations(
+                &pplx_space_env_vars::ProcessEnvironment,
+            ),
             ecw_credential_keyring,
         })
     }

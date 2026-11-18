@@ -1,5 +1,41 @@
 # Retained block-volume experiment
 
+## Client-managed deletion
+
+`GET /v1/volumes/{volume_id}` inspects a sandbox-created volume using the same
+owner authorization as its sandbox. Responses expose logical identity, the
+required mount, resource state and `delete_requested`, not cloud identifiers.
+
+`DELETE /v1/volumes/{volume_id}` requires `Idempotency-Key` and returns a
+`PublicOperationRecord` with HTTP 202. Poll the existing operation endpoint:
+success requires confirmed backing deletion. The operation can time out while
+durable cleanup continues; inspect the volume before retrying with a new key.
+The operation's target identifies the volume; its optional `result` remains
+absent to preserve the stable operation-result union. Inspect the retained
+volume tombstone for resource state.
+Deletion requires a stopped owner, no retained memory checkpoint, no device
+owner and observed detach. A suspended sandbox is not eligible. A deleted
+required volume remains a tombstone and prevents sandbox restart; it is not
+silently replaced and its mount is never redirected to rootfs.
+
+Mutation admission additionally requires `volume_management: true` in the
+existing `SPACE_EBS_ADMISSION_POLICY` for the allowlisted organization. It
+defaults false. Deploy compatible API and operation-dispatcher consumers
+before enabling it; disable admission and finish outstanding volume operations
+before rolling back a dispatcher. Older API binaries cannot decode the new
+operation kind: retain compatible readers until those records
+have aged out of operation retention, including terminal operations.
+
+The opt-in typed scenario
+`native.retained_volume_delete_blocks_restart` exercises inspection, active-use
+rejection, stop/detach, idempotent explicit deletion and rejected subsequent
+wake. It requires separately approved deployment admission and an EBS resource
+budget. Merely adding or discovering the scenario is not deployed qualification;
+independent provider inventory checks are still required.
+This is source-level management work, not authorization to reopen an experiment
+or resize provisioned disks. Resize and retained-disk cold restart are not yet
+qualified.
+
 This is a default-off experiment, not a generally available storage API. The
 native sandbox-create request accepts one creation-time disk:
 

@@ -180,6 +180,67 @@ pub async fn live_reservations(executor: impl PgExecutor<'_>) -> Result<Vec<Uuid
     .await
 }
 
+/// Resolve a tenant-visible identifier without exposing provider identity.
+pub async fn sandbox_for_volume(
+    executor: impl PgExecutor<'_>,
+    org: OrgId,
+    volume: Uuid,
+) -> Result<Option<SandboxId>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT sandbox_id FROM sandbox_block_volumes WHERE id = $1 AND org_id = $2"
+    ))
+    .bind(volume)
+    .bind(org)
+    .fetch_optional(executor)
+    .await
+}
+
+/// The sandbox lock serializes this admission with execution activation.
+/// A detached disk is necessary but not sufficient: saved RAM still owns its
+/// filesystem view, even when there is no live device attachment.
+pub async fn request_detached_delete(
+    tx: &mut Transaction<'_, Postgres>,
+    org: OrgId,
+    volume: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let Some(sandbox) = sandbox_for_volume(&mut **tx, org, volume).await? else {
+        return Ok(false);
+    };
+    let stopped: Option<bool> = sqlx::query_scalar(sql!(
+        "SELECT lifecycle = 'stopped' FROM sandboxes WHERE id = $1 AND org_id = $2 FOR UPDATE"
+    ))
+    .bind(sandbox)
+    .bind(org)
+    .fetch_optional(&mut **tx)
+    .await?;
+    // A new operation cannot join sandbox/expiry cleanup while execution is
+    // still live or uncertain. Exact operation replays bypass this admission.
+    if stopped != Some(true) {
+        return Ok(false);
+    }
+    let deleted: bool = sqlx::query_scalar(sql!(
+        "SELECT delete_requested FROM sandbox_block_volumes WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(volume)
+    .fetch_one(&mut **tx)
+    .await?;
+    if deleted {
+        return Ok(true);
+    }
+    Ok(sqlx::query(sql!(
+        "UPDATE sandbox_block_volumes
+         SET delete_requested = TRUE, revision = revision + 1, updated_at = NOW()
+         WHERE id = $1 AND org_id = $2 AND phase = 'available'
+           AND node_id IS NULL AND checkpoint_id IS NULL"
+    ))
+    .bind(volume)
+    .bind(org)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
 #[derive(sqlx::FromRow)]
 pub struct BlockVolumeStatus {
     pub id: Uuid,

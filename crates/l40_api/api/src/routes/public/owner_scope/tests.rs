@@ -354,6 +354,60 @@ async fn native_resources_and_capability_minting_deny_other_subjects() -> TestDb
     let second = create(&fixture, ORG, "102").await?;
     let sandbox = seed_target(&fixture, &first).await?;
     let other_sandbox = seed_target(&fixture, &second).await?;
+    let owner_org: OrgId = sqlx::query_scalar(sql!("SELECT org_id FROM sandboxes WHERE id = $1"))
+        .bind(sandbox.as_uuid())
+        .fetch_one(&fixture.db.pool)
+        .await?;
+    let mount = serde_json::from_value(json!({
+        "type":"ebs","size_gib":128,"permissions":"read_write","mount":"/data"
+    }))?;
+    let mut tx = fixture.db.pool.begin().await?;
+    let volume = pplx_space_sandbox_store::block_volume::reserve(
+        &mut tx,
+        pplx_space_sandbox_store::block_volume::NewBlockVolume {
+            sandbox_id: sandbox.into(),
+            org_id: owner_org,
+            managed_by: "test",
+            mount_spec: &mount,
+            availability_zone: "test-region-1a",
+            resource_limit: 2,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    let volume_path = format!("/v1/volumes/{volume}");
+    assert_eq!(
+        send(
+            &fixture.app,
+            Method::GET,
+            &volume_path,
+            owner_headers(ORG, "101"),
+            Value::Null
+        )
+        .await?
+        .0,
+        StatusCode::OK
+    );
+    for method in [Method::GET, Method::DELETE] {
+        for headers in [
+            owner_headers(ORG, "102"),
+            owner_headers(OTHER_ORG, "101"),
+            HeaderMap::new(),
+        ] {
+            assert_eq!(
+                send(
+                    &fixture.app,
+                    method.clone(),
+                    &volume_path,
+                    headers,
+                    Value::Null
+                )
+                .await?
+                .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
     let path = format!("/v1/sandboxes/{sandbox}");
     let (status, body) = send(
         &fixture.app,

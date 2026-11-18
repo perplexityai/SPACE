@@ -2,6 +2,28 @@ use super::*;
 use pplx_space_test_env::TestEnv;
 
 #[test]
+fn management_requires_explicit_opt_in_and_an_allowlisted_owner() {
+    let owner = OrgId::new();
+    let mut env = TestEnv::default();
+    assert!(management_organizations(&env).is_empty());
+    for enabled in [false, true] {
+        env.set(
+            POLICY_ENV,
+            serde_json::json!({
+                "organization_ids":[owner],
+                "availability_zone":"test-region-1a",
+                "volume_management":enabled
+            })
+            .to_string(),
+        );
+        assert_eq!(management_organizations(&env).contains(&owner), enabled);
+        assert!(!management_organizations(&env).contains(&OrgId::new()));
+    }
+    env.set(POLICY_ENV, "malformed");
+    assert!(management_organizations(&env).is_empty());
+}
+
+#[test]
 fn block_volume_admission_is_opt_in_and_owner_scoped() {
     let owner = OrgId::new();
     let other = OrgId::new();

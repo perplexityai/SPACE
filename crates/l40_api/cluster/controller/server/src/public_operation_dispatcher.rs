@@ -211,6 +211,7 @@ pub trait PublicOperationExecutor: Send + Sync + 'static {
 
 #[derive(Clone)]
 pub struct NativePublicOperationExecutor {
+    volume_pool: PgPool,
     /// The cluster activation limiter the executors below admit through. Held
     /// only so the caller has a limiter to start a liveness heartbeat from
     /// without constructing a second one (which would build a second, lazy
@@ -272,6 +273,7 @@ impl NativePublicOperationExecutor {
                 .with_tls_interception_exemptions(tls_interception_exemptions)
                 .with_egress_profiles(egress_profiles);
         Self {
+            volume_pool: pool.clone(),
             cluster_admission,
             create_sandbox: CreateSandboxOperationExecutor::new(pool.clone(), controller.clone()),
             update_sandbox: UpdateSandboxOperationExecutor::new(pool.clone(), controller.clone()),
@@ -310,6 +312,7 @@ const NATIVE_PUBLIC_OPERATION_KINDS: &[OperationKind] = &[
     OperationKind::DisableSandboxSnapshots,
     OperationKind::RollbackSandbox,
     OperationKind::DeleteTemplate,
+    OperationKind::DeleteVolume,
     OperationKind::ForkSandbox,
 ];
 
@@ -328,6 +331,11 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
             OperationKind::CreateSandbox => self.create_sandbox.execute(&operation).await.into(),
             OperationKind::UpdateSandbox => self.update_sandbox.execute(&operation).await.into(),
             OperationKind::DeleteTemplate => self.delete_template.execute(&operation).await.into(),
+            OperationKind::DeleteVolume => {
+                pplx_space_api::block_volumes::execute_delete(&self.volume_pool, &operation)
+                    .await
+                    .into()
+            }
             OperationKind::ForkSandbox => self
                 .fork_sandbox
                 .execute(claim_token, &operation)

@@ -9,7 +9,7 @@
 
 pub mod api_surface;
 pub mod auth;
-mod block_volumes;
+pub mod block_volumes;
 pub mod client_classification;
 pub mod client_concurrency;
 pub mod client_live_cap;

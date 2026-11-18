@@ -186,6 +186,8 @@ use NativeHttpMethod::{Delete, Get, Patch, Post};
 use NativeOperationStatus::{Incubating, IncubatingHidden, M1Supported};
 
 native_operations! {
+    GET_VOLUME = NativeOperation::new("/v1/volumes/{volume_id}", Get, "unstableGetVolume", Incubating);
+    DELETE_VOLUME = NativeOperation::new("/v1/volumes/{volume_id}", Delete, "unstableDeleteVolume", Incubating);
     REGISTER_CREDENTIAL_REFERENCE = NativeOperation::new("/v1/credential-references", Post, "unstableRegisterCredentialReference", Incubating);
     DELETE_CREDENTIAL_REFERENCE = NativeOperation::new("/v1/credential-references/{credential_reference_id}", Delete, "unstableDeleteCredentialReference", Incubating);
     GET_OPERATION = NativeOperation::new("/v1/operations/{operation_id}", Get, "getOperation", M1Supported);

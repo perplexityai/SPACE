@@ -156,6 +156,43 @@ pub(super) fn insert_sandbox_operation_paths(
     insert_credential_reference_paths(paths);
     insert_public_route(
         paths,
+        pplx_space_public_api::routes::GET_VOLUME,
+        json!({
+            "summary":"Inspect a sandbox-created volume",
+            "description":"Authorizes against the owning sandbox, including its federated subject. Returns the logical resource and required mount; provider attachment identifiers are not exposed.",
+            "responses":{"200":{"description":"Volume state","content":{"application/json":{"schema":{
+                "type":"object",
+                "required":["volume_id","sandbox_id","type","size_gib","mount","permissions","state","delete_requested"],
+                "properties":{
+                    "volume_id":{"type":"string","format":"uuid"},
+                    "sandbox_id":{"type":"string"},
+                    "type":{"type":"string","enum":["ebs"]},
+                    "size_gib":{"type":"integer","minimum":128,"maximum":128},
+                    "mount":{"type":"string"},
+                    "permissions":{"type":"string","enum":["read_write","read_only"]},
+                    "state":{"$ref":"#/components/schemas/SandboxBlockVolumeState"},
+                    "delete_requested":{"type":"boolean"}
+                }
+            }}}},"404":{"description":"Volume not found in the caller's owner scope"}}
+        }),
+    );
+    insert_public_route(
+        paths,
+        pplx_space_public_api::routes::DELETE_VOLUME,
+        json!({
+            "summary":"Delete a detached sandbox-created volume",
+            "description":"Default-off experimental management. Requires stopped owner, no retained RAM checkpoint, released device references and observed detach. Marks durable deletion intent and prevents restart of the owning sandbox. Completion means provider deletion was confirmed, not merely requested. Sandbox deletion and expiry retain their existing cleanup semantics.",
+            "parameters":[idempotency_key_parameter.clone()],
+            "responses":{
+                "202":{"description":"Deletion operation","content":{"application/json":{"schema":{"$ref":"#/components/schemas/PublicOperationRecord"}}}},
+                "403":{"description":"Volume management admission is disabled"},
+                "404":{"description":"Volume not found in the caller's owner scope"},
+                "409":{"description":"Volume is in use, has a checkpoint, or the idempotency key conflicts"}
+            }
+        }),
+    );
+    insert_public_route(
+        paths,
         CREATE_SANDBOX,
         json!({
             "summary": "Create a sandbox",
@@ -500,7 +537,7 @@ pub(super) fn path_parameter_names(path: &str) -> impl Iterator<Item = &str> {
 fn path_parameter_schema(name: &str) -> Value {
     match name {
         "sandbox_id" => prefixed_uuid_schema(PublicSandboxId::PREFIX),
-        "credential_reference_id" => {
+        "credential_reference_id" | "volume_id" => {
             json!({ "type": "string", "format": "uuid", "pattern": format!("^{UUID_PATTERN}$") })
         }
         "operation_id" => prefixed_uuid_schema(OperationId::PREFIX),

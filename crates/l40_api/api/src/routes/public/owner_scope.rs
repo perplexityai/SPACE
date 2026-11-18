@@ -122,9 +122,25 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
             "federated sandbox creation requires an asserted owner and grant",
         ));
     }
-    let Path(params) = Path::<HashMap<String, String>>::from_request_parts(&mut parts, state)
+    let Path(mut params) = Path::<HashMap<String, String>>::from_request_parts(&mut parts, state)
         .await
         .map_err(|_| PublicApiError::bad_request("invalid resource path"))?;
+    if let Some(raw) = params.get("volume_id") {
+        let id = raw
+            .parse()
+            .map_err(|_| PublicApiError::bad_request("invalid volume_id"))?;
+        let sandbox =
+            pplx_space_sandbox_store::block_volume::sandbox_for_volume(&state.pool, org_id, id)
+                .await
+                .map_err(database_error)?
+                .ok_or_else(|| PublicApiError::not_found("volume not found"))?;
+        // Apply exactly the owning sandbox's federated/local authorization,
+        // rather than granting org-wide access to another subject's volume.
+        params.insert(
+            "sandbox_id".into(),
+            PublicSandboxId::from(sandbox).to_string(),
+        );
+    }
     if let Some(raw) = params.get("sandbox_id") {
         // Lifecycle actions share the {sandbox_id} mount with point reads.
         let raw = raw.split_once(':').map_or(raw.as_str(), |(id, _)| id);

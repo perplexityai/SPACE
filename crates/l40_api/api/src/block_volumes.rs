@@ -2,14 +2,111 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::controllers::ControllerError;
 use pplx_space_accounts::OrgId;
 use pplx_space_content_digest::ContentHash;
 use pplx_space_execution_spec::{BlockVolumeMount, RuntimeKind};
 use serde::Deserialize;
 
-use crate::controllers::ControllerError;
+pub(crate) fn public_volume(
+    row: pplx_space_sandbox_store::block_volume::BlockVolume,
+) -> pplx_space_public_api::PublicVolume {
+    use pplx_space_public_api::SandboxBlockVolumeState as Public;
+    use pplx_space_sandbox_store::block_volume::VolumePhase as Stored;
+    let state = match row.phase {
+        Stored::Requested => Public::Requested,
+        Stored::Provisioning => Public::Provisioning,
+        Stored::Available => Public::Available,
+        Stored::Attaching => Public::Attaching,
+        Stored::Attached => Public::Attached,
+        Stored::Releasing => Public::Releasing,
+        Stored::Detaching => Public::Detaching,
+        Stored::Deleting => Public::Deleting,
+        Stored::Deleted => Public::Deleted,
+    };
+    pplx_space_public_api::PublicVolume {
+        volume_id: row.id,
+        sandbox_id: row.sandbox_id.into(),
+        mount_spec: row.mount_spec.0,
+        state,
+        delete_requested: row.delete_requested,
+    }
+}
+
+/// Observe, rather than initiate, deletion. The cloud reconciler owns cleanup
+/// even if the public operation exhausts its deadline or is cancelled.
+pub async fn execute_delete(
+    pool: &sqlx::PgPool,
+    operation: &crate::public_operations::ClaimedPublicOperation,
+) -> crate::public_sandbox_operations::PublicOperationExecutionResult {
+    use crate::public_sandbox_operations::PublicOperationExecutionResult as Result;
+    use pplx_space_public_api::{OperationState, PublicErrorCode};
+    use pplx_space_sandbox_store::block_volume as store;
+    let result: std::result::Result<Option<store::BlockVolume>, sqlx::Error> = async {
+        let Some(id) = operation
+            .target_id
+            .as_deref()
+            .and_then(|id| id.parse().ok())
+        else {
+            return Ok(None);
+        };
+        let Some(sandbox) = store::sandbox_for_volume(pool, operation.org_id, id).await? else {
+            return Ok(None);
+        };
+        store::get(pool, sandbox).await
+    }
+    .await;
+    match result {
+        Ok(Some(row)) if row.phase == store::VolumePhase::Deleted => Result {
+            state: OperationState::Succeeded,
+            progress_message: "volume backing deletion confirmed".into(),
+            // The stable result union has no volume variant. Keep it absent:
+            // target_id identifies this volume and GET retains its tombstone.
+            result_json: None,
+            terminal_error_code: None,
+            terminal_error_json: None,
+            retry_after: None,
+            requeue_reason:
+                crate::public_operations::PublicOperationRequeueReason::WorkflowProgress,
+        },
+        Ok(Some(row)) if row.delete_requested => Result::workflow_progress(
+            "waiting for confirmed volume backing deletion",
+            std::time::Duration::from_secs(2),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, operation_id = %operation.id, "volume deletion observation failed");
+            Result::workflow_progress(
+                "volume deletion observation is temporarily unavailable",
+                std::time::Duration::from_secs(2),
+            )
+        }
+        Ok(_) => Result {
+            state: OperationState::Failed,
+            progress_message: "volume deletion authority is unavailable".into(),
+            result_json: None,
+            terminal_error_code: Some(PublicErrorCode::Internal),
+            terminal_error_json: Some(serde_json::json!({"reason":"volume_authority_unavailable"})),
+            retry_after: None,
+            requeue_reason:
+                crate::public_operations::PublicOperationRequeueReason::TransientFailure,
+        },
+    }
+}
 
 const POLICY_ENV: &str = "SPACE_EBS_ADMISSION_POLICY";
+
+pub(crate) fn management_organizations(
+    env: &dyn pplx_space_env_vars::Environment,
+) -> BTreeSet<OrgId> {
+    env.var_os(POLICY_ENV)
+        .and_then(|raw| {
+            raw.to_str()
+                .and_then(|raw| serde_json::from_str::<Admission>(raw).ok())
+        })
+        .filter(|policy| policy.volume_management)
+        .map(|policy| policy.organization_ids)
+        .unwrap_or_default()
+}
 
 pub(crate) async fn populate_status(
     pool: &sqlx::PgPool,
@@ -52,6 +149,8 @@ pub(crate) async fn populate_status(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Admission {
+    #[serde(default)]
+    volume_management: bool,
     organization_ids: BTreeSet<OrgId>,
     pub(crate) availability_zone: String,
     #[serde(default)]

@@ -32,6 +32,7 @@ pub(crate) mod sessions;
 pub(crate) mod snapshots;
 mod templates;
 mod timeout;
+mod volumes;
 
 fn method_filter(method: NativeHttpMethod) -> MethodFilter {
     match method {
@@ -80,6 +81,8 @@ where
 /// silently unmount the whole group.
 fn mounted_operations() -> Vec<(NativeOperation, MethodRouter<AppState>)> {
     vec![
+        mount(native::GET_VOLUME, volumes::get),
+        mount(native::DELETE_VOLUME, volumes::delete),
         mount(
             native::REGISTER_CREDENTIAL_REFERENCE,
             credential_references::register,

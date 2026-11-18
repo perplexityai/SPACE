@@ -10,6 +10,135 @@ const INSTANCE: &str = "i-00000000000000001";
 const DEVICE: &str = "/dev/sdf";
 const CLOUD_ID: &str = "vol-00000000000000001";
 
+#[tokio::test]
+async fn client_delete_requires_stopped_detached_checkpoint_free_owner_and_fences_attach()
+-> TestResult {
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
+    let db = pg_test_db().await?;
+    let sandbox = SandboxId::new();
+    let org = OrgId::from_uuid(SEED_ORG_ID);
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id,user_id,org_id,lifecycle,network_policy_generation)
+        VALUES ($1,$2,$3,'stopped',1)"
+    ))
+    .bind(sandbox)
+    .bind(SEED_USER_ID)
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    let volume = reserve_volume(&db.pool, sandbox, 2).await?;
+    let row = get(&db.pool, sandbox).await?.unwrap();
+    assert!(observe(&db.pool, &row, VolumePhase::Available, Some(CLOUD_ID), None).await?);
+    // Activation's sandbox-row fence must serialize even while the volume
+    // still looks detached. Exercise a real competing PostgreSQL transaction.
+    let mut activation = db.pool.begin().await?;
+    sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
+        .bind(sandbox)
+        .execute(&mut *activation)
+        .await?;
+    let mut deletion = db.pool.begin().await?;
+    sqlx::query(sql!("SET LOCAL lock_timeout = '50ms'"))
+        .execute(&mut *deletion)
+        .await?;
+    let error = request_detached_delete(&mut deletion, org, volume)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55P03")
+    );
+    deletion.rollback().await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'starting' WHERE id = $1"
+    ))
+    .bind(sandbox)
+    .execute(&mut *activation)
+    .await?;
+    activation.commit().await?;
+    let mut deletion = db.pool.begin().await?;
+    assert!(!request_detached_delete(&mut deletion, org, volume).await?);
+    deletion.commit().await?;
+    for lifecycle in [
+        "started",
+        "paused",
+        "suspended",
+        "starting",
+        "stopping",
+        "suspending",
+    ] {
+        sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
+            .bind(sandbox)
+            .bind(lifecycle)
+            .execute(&db.pool)
+            .await?;
+        let mut tx = db.pool.begin().await?;
+        assert!(
+            !request_detached_delete(&mut tx, org, volume).await?,
+            "{lifecycle}"
+        );
+        tx.commit().await?;
+        assert!(!get(&db.pool, sandbox).await?.unwrap().delete_requested);
+    }
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1"
+    ))
+    .bind(sandbox)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_block_volumes
+        SET checkpoint_id = $2, checkpoint_generation = disk_generation WHERE id = $1"
+    ))
+    .bind(volume)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    let mut tx = db.pool.begin().await?;
+    assert!(!request_detached_delete(&mut tx, org, volume).await?);
+    tx.commit().await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_block_volumes
+        SET checkpoint_id = NULL, checkpoint_generation = NULL WHERE id = $1"
+    ))
+    .bind(volume)
+    .execute(&db.pool)
+    .await?;
+    let mut tx = db.pool.begin().await?;
+    assert!(!request_detached_delete(&mut tx, OrgId::new(), volume).await?);
+    assert!(request_detached_delete(&mut tx, org, volume).await?);
+    tx.commit().await?;
+    let mut tx = db.pool.begin().await?;
+    assert!(
+        !reserve_attachment(
+            &mut tx,
+            sandbox,
+            AttachmentTarget {
+                node_id: NodeId::new(),
+                instance_id: INSTANCE,
+                device_name: DEVICE,
+                execution_id: Uuid::now_v7(),
+                availability_zone: ZONE,
+                host_attachment_limit: 1,
+            }
+        )
+        .await?
+    );
+    assert!(request_detached_delete(&mut tx, org, volume).await?);
+    tx.commit().await?;
+    assert_eq!(
+        get(&db.pool, sandbox).await?.unwrap().phase,
+        VolumePhase::Available
+    );
+    assert!(matches!(
+        reserve_volume(&db.pool, SandboxId::new(), 1).await,
+        Err(VolumeStoreError::Capacity)
+    ));
+    Ok(())
+}
+
 fn mount_spec() -> BlockVolumeMount {
     BlockVolumeMount {
         backend: BlockVolumeBackend::Ebs,
