@@ -15,6 +15,23 @@ pub mod proto {
     tonic::include_proto!("space.execution.v1");
 }
 
+impl proto::BlockVolumeBinding {
+    /// Bindings from before explicit geometry had exactly 128 GiB of backing.
+    /// Normalize only that legacy omission; reject unsupported explicit sizes.
+    pub fn capacity(
+        &self,
+    ) -> Result<
+        pplx_space_execution_spec::BlockVolumeSizeGiB,
+        pplx_space_execution_spec::BlockVolumeSpecError,
+    > {
+        match self.size_gib {
+            0 => 128,
+            size => size,
+        }
+        .try_into()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionProtoError {
     #[error("execution metadata is missing runtime identity")]

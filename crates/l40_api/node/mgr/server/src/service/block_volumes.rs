@@ -201,7 +201,10 @@ impl NodeManagerService {
                 let verify = binding.clone();
                 service
                     .off_runtime("verify retained block device", move || {
-                        device::pin(&verify.aws_volume_id).map(drop)
+                        let capacity = verify.capacity().map_err(|error| {
+                            Status::failed_precondition(format!("invalid disk geometry: {error}"))
+                        })?;
+                        device::pin(&verify.aws_volume_id, capacity).map(drop)
                     })
                     .await?;
                 if !service

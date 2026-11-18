@@ -6,7 +6,7 @@ use std::path::Path;
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
 use pplx_space_execution_common::proto::BlockVolumeBinding;
-use pplx_space_execution_spec::{GuestBlockMountPath, GuestDataDrive};
+use pplx_space_execution_spec::{BlockVolumeSizeGiB, GuestBlockMountPath, GuestDataDrive};
 use tonic::Status;
 
 fn unsafe_device(error: impl std::fmt::Display) -> Status {
@@ -20,6 +20,7 @@ pub(super) fn validate_binding(binding: &BlockVolumeBinding) -> Result<(), Statu
         return Err(unsafe_device("unsupported or unfenced drive topology"));
     }
     uuid::Uuid::parse_str(&binding.filesystem_uuid).map_err(unsafe_device)?;
+    binding.capacity().map_err(unsafe_device)?;
     GuestBlockMountPath::try_from(binding.mount.clone()).map_err(unsafe_device)?;
     serial(&binding.aws_volume_id)?;
     Ok(())
@@ -42,7 +43,7 @@ fn serial(volume: &str) -> Result<String, Status> {
 /// Pin the whole EBS namespace, never a partition, pathname alias, instance
 /// store or arbitrary caller device. Re-identify through the opened inode's
 /// major/minor, rather than trusting a name observed before the open.
-pub(super) fn pin(volume: &str) -> Result<File, Status> {
+pub(super) fn pin(volume: &str, capacity: BlockVolumeSizeGiB) -> Result<File, Status> {
     let expected = serial(volume)?;
     let mut found = None;
     for entry in std::fs::read_dir("/sys/class/block").map_err(unsafe_device)? {
@@ -84,7 +85,7 @@ pub(super) fn pin(volume: &str) -> Result<File, Status> {
             .parse()
             .map_err(unsafe_device)?;
         if model.trim() != "Amazon Elastic Block Store"
-            || sectors.checked_mul(512) != Some(128 * 1024 * 1024 * 1024)
+            || sectors.checked_mul(512) != Some(u64::from(capacity.get()) * 1024 * 1024 * 1024)
             || sys.join("partition").try_exists().map_err(unsafe_device)?
         {
             return Err(unsafe_device(
@@ -108,7 +109,10 @@ pub(super) fn format_fresh(binding: &BlockVolumeBinding) -> Result<(), Status> {
             "format requires a fresh durable initialization claim",
         ));
     }
-    let file = pin(&binding.aws_volume_id)?;
+    let file = pin(
+        &binding.aws_volume_id,
+        binding.capacity().map_err(unsafe_device)?,
+    )?;
     // The child opens the parent's retained descriptor, not a replaceable /dev
     // name. The parent holds this file and mutation ownership through reap.
     let pinned = format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd());
@@ -134,7 +138,10 @@ pub(super) fn format_fresh(binding: &BlockVolumeBinding) -> Result<(), Status> {
 
 pub(super) fn bind(binding: &BlockVolumeBinding, jail: &str) -> Result<(), Status> {
     validate_binding(binding)?;
-    let source = pin(&binding.aws_volume_id)?;
+    let source = pin(
+        &binding.aws_volume_id,
+        binding.capacity().map_err(unsafe_device)?,
+    )?;
     let root = super::super::trusted_paths::open_directory(Path::new(jail))?;
     let directory =
         super::super::trusted_paths::open_bind_directory(&root, "block-volumes".as_ref())?;

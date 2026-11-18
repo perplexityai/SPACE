@@ -53,6 +53,22 @@ PATCH endpoint in this checkpoint. Success must include running-guest device
 and ext4 growth, not only backing-volume expansion. Same-node/cross-node restore,
 live resize, retained reuse and paired NVMe/EBS fio require deployed proof.
 
+Device preparation now checks capacity from the authenticated binding rather
+than assuming a fixed host-device size. A missing capacity on an older binding
+means exactly 128 GiB; unsupported explicit capacities fail closed. Checkpoint
+dependencies also compare capacity. Original 128-GiB dependencies retain their
+existing serialized shape, while grown dependencies include `size_gib`, which
+older dependency readers reject. This plumbing does not enable growth or make
+an AWS size change sufficient for successful resize.
+Larger-capacity admission must remain disabled until all eligible node and
+sandbox managers understand the geometry. Older node preparers reject a grown
+device, and older checkpoint readers cannot restore its dependency; rolling
+back to those binaries would leave the grown resource unavailable, not resized
+back down.
+Mount references likewise resolve capacity from the organization-scoped volume
+record before admission, then compare it again in the binding transaction.
+They cannot reset a grown disk to the creation-time default.
+
 ## Legacy sandbox-created contract
 
 The following sections describe inline-created disk behavior. Their fixed-size

@@ -1,6 +1,76 @@
 use super::*;
 use pplx_space_test_env::TestEnv;
 
+#[tokio::test]
+async fn block_volume_reference_geometry_uses_only_the_owners_live_resource()
+-> pplx_space_test_env::TestResult {
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, pg_test_db};
+    use pplx_space_sandbox_store::block_volume::{VolumePhase, resource};
+    let db = pg_test_db().await?;
+    let org = OrgId::from_uuid(SEED_ORG_ID);
+    let volume = uuid::Uuid::now_v7();
+    let mut tx = db.pool.begin().await?;
+    resource::reserve(
+        &mut tx,
+        resource::NewResource {
+            id: volume,
+            org_id: org,
+            managed_by: "test",
+            availability_zone: "test-region-1a",
+            resource_limit: 1,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    // Deliberately stale translated geometry must not override the resource.
+    let mount: BlockVolumeMount = serde_json::from_value(serde_json::json!({
+        "type":"ebs", "size_gib":256, "permissions":"read_only", "mount":"/data"
+    }))?;
+    let mounts = [mount.clone()];
+    let resolved = resolve_reference_mount(&db.pool, org, Some(volume), &mounts)
+        .await?
+        .unwrap();
+    assert_eq!(u32::from(resolved.size_gib), 128);
+    assert_eq!(resolved.mount, mount.mount);
+    assert_eq!(resolved.permissions, mount.permissions);
+    for (caller, id) in [(OrgId::new(), volume), (org, uuid::Uuid::now_v7())] {
+        assert_eq!(
+            resolve_reference_mount(&db.pool, caller, Some(id), &mounts)
+                .await
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+    assert!(
+        resolve_reference_mount(&db.pool, org, None, &mounts)
+            .await?
+            .is_none()
+    );
+    let row = resource::get(&db.pool, org, volume).await?.unwrap();
+    assert!(
+        resource::observe(
+            &db.pool,
+            &row,
+            VolumePhase::Available,
+            Some("vol-00000000000000001"),
+            None,
+        )
+        .await?
+    );
+    let mut tx = db.pool.begin().await?;
+    assert!(resource::request_delete(&mut tx, org, volume, uuid::Uuid::now_v7()).await?);
+    tx.commit().await?;
+    assert_eq!(
+        resolve_reference_mount(&db.pool, org, Some(volume), &mounts)
+            .await
+            .unwrap_err()
+            .status(),
+        axum::http::StatusCode::NOT_FOUND
+    );
+    Ok(())
+}
+
 #[test]
 fn management_requires_explicit_opt_in_and_an_allowlisted_owner() {
     let owner = OrgId::new();

@@ -334,6 +334,7 @@ impl ClusterApiService {
                 initialization_ready: row.initialization == Initialization::Ready,
                 initialization_claim: row.initialization_claim.map(|id| id.to_string()),
                 topology_version: GuestDataDrive::TOPOLOGY_VERSION,
+                size_gib: row.mount_spec.size_gib.into(),
             }),
         }))
     }

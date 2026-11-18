@@ -1295,25 +1295,30 @@ impl SandboxController {
         // It gates the pool bypass below, lands on the control-plane row, and
         // rides the substrate create to the node row.
         let org_byok = org_byok_enabled(pool, create_owner.org_id).await?;
-        let block_volume_admission = crate::block_volumes::admit(
-            &pplx_space_env_vars::ProcessEnvironment,
-            &req.volume_mounts,
-            create_owner.org_id,
-            runtime,
-            org_byok,
-        )?;
         if req.block_volume_id.is_some() {
             crate::block_volumes::independent_admission(
                 &pplx_space_env_vars::ProcessEnvironment,
                 create_owner.org_id,
                 org_byok,
             )?;
-            if block_volume_admission.is_none() {
-                return Err(ControllerError::bad_request(
-                    "volume reference requires a mount",
-                ));
-            }
         }
+        let reference_mount = crate::block_volumes::resolve_reference_mount(
+            pool,
+            create_owner.org_id,
+            req.block_volume_id,
+            &req.volume_mounts,
+        )
+        .await?;
+        let volume_mounts = reference_mount
+            .as_ref()
+            .map_or(req.volume_mounts.as_slice(), std::slice::from_ref);
+        let block_volume_admission = crate::block_volumes::admit(
+            &pplx_space_env_vars::ProcessEnvironment,
+            volume_mounts,
+            create_owner.org_id,
+            runtime,
+            org_byok,
+        )?;
         if let Some(admission) = &block_volume_admission {
             admission.require_guest(&resolved_content_hash)?;
             if !self
@@ -1528,7 +1533,7 @@ impl SandboxController {
                 .await
                 .map_err(|err| sandbox_insert_error(err.into()))?;
                 if let Some(admission) = &block_volume_admission {
-                    let [mount_spec] = req.volume_mounts.as_slice() else {
+                    let [mount_spec] = volume_mounts else {
                         return Err(ControllerError::internal(
                             "admitted block-volume request must have one mount",
                         ));

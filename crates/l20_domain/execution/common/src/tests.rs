@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn block_volume_binding_geometry_preserves_legacy_capacity_without_defaulting_invalid_sizes() {
+    for (wire_size, expected) in [
+        (0, Some(128)),
+        (128, Some(128)),
+        (256, Some(256)),
+        (129, None),
+    ] {
+        let binding = proto::BlockVolumeBinding {
+            size_gib: wire_size,
+            ..Default::default()
+        };
+        assert_eq!(binding.capacity().ok().map(u32::from), expected);
+    }
+}
+
+#[test]
 fn unspecified_enum_values_are_rejected() {
     let wire = proto::ExecutionMetadata {
         runtime: Some(proto::RuntimeIdentity {

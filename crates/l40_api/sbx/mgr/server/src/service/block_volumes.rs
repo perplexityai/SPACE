@@ -14,6 +14,10 @@ pub struct RetainedLiveDisk {
     pub checkpoint_id: uuid::Uuid,
     pub disk_generation: u64,
     pub topology_version: u32,
+    /// Omitted only for the original fixed-size checkpoint representation.
+    /// Old readers reject a grown checkpoint instead of restoring stale geometry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_gib: Option<pplx_space_execution_spec::BlockVolumeSizeGiB>,
 }
 
 impl RetainedLiveDisk {
@@ -21,6 +25,9 @@ impl RetainedLiveDisk {
         binding: &BlockVolumeBinding,
         checkpoint: LocalArtifactId,
     ) -> Result<Self, Status> {
+        let capacity = binding.capacity().map_err(|error| {
+            Status::failed_precondition(format!("invalid disk geometry: {error}"))
+        })?;
         Ok(Self {
             volume_id: binding
                 .fence
@@ -35,6 +42,7 @@ impl RetainedLiveDisk {
                 .map_err(|_| Status::internal("invalid checkpoint identity"))?,
             disk_generation: binding.disk_generation,
             topology_version: binding.topology_version,
+            size_gib: (capacity.get() != 128).then_some(capacity),
         })
     }
 
@@ -45,6 +53,9 @@ impl RetainedLiveDisk {
             .is_some_and(|f| f.volume_id == self.volume_id.to_string())
             && binding.disk_generation == self.disk_generation
             && binding.topology_version == self.topology_version
+            && binding
+                .capacity()
+                .is_ok_and(|capacity| capacity.get() == self.size_gib.map_or(128, u32::from))
     }
 }
 
@@ -285,6 +296,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(decoded.matches(&binding));
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("size_gib")
+                .is_none()
+        );
+        binding.size_gib = 256;
+        assert!(!decoded.matches(&binding));
+        let grown = RetainedLiveDisk::for_capture(&binding, checkpoint_id).unwrap();
+        let grown_json = serde_json::to_value(&grown).unwrap();
+        assert_eq!(grown_json["size_gib"], 256);
+        let grown_decoded: RetainedLiveDisk = serde_json::from_value(grown_json).unwrap();
+        assert!(grown_decoded.matches(&binding));
+        binding.size_gib = 0;
+        assert!(!grown_decoded.matches(&binding));
         binding.disk_generation += 1;
         assert!(!decoded.matches(&binding));
         binding.disk_generation -= 1;

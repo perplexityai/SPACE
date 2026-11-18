@@ -30,6 +30,9 @@ message BlockVolumeBinding {
   bool initialization_ready = 7;
   optional string initialization_claim = 8;
   uint32 topology_version = 9;
+  // Authoritative backing capacity, not a guest-reported filesystem size.
+  // Zero is the legacy fixed 128-GiB binding, never an unknown-size wildcard.
+  uint32 size_gib = 10;
 }
 
 enum RuntimeKind {

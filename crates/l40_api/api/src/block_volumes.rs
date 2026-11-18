@@ -149,8 +149,8 @@ pub(crate) fn mount_spec(request: &pplx_space_public_api::VolumeMountRequest) ->
         VolumeMountRequest::Inline(mount) => mount.clone(),
         VolumeMountRequest::Existing(mount) => BlockVolumeMount {
             backend: pplx_space_execution_spec::BlockVolumeBackend::Ebs,
-            // Independent resources are fixed-size until the resize state
-            // machine is implemented; binding rechecks the durable capacity.
+            // This translation has no database authority. Before admission,
+            // resolve_reference_mount replaces this with durable geometry.
             size_gib: 128_u32
                 .try_into()
                 .expect("128 GiB is a valid volume capacity"),
@@ -158,6 +158,37 @@ pub(crate) fn mount_spec(request: &pplx_space_public_api::VolumeMountRequest) ->
             mount: mount.mount.clone(),
         },
     }
+}
+
+/// Resolve reference geometry before admission. The later transactional bind
+/// still compares capacity, so a concurrent mutation cannot admit stale intent.
+pub(crate) async fn resolve_reference_mount(
+    pool: &sqlx::PgPool,
+    org: OrgId,
+    volume: Option<uuid::Uuid>,
+    mounts: &[BlockVolumeMount],
+) -> Result<Option<BlockVolumeMount>, ControllerError> {
+    let Some(volume) = volume else {
+        return Ok(None);
+    };
+    let [mount] = mounts else {
+        return Err(ControllerError::bad_request(
+            "volume reference requires exactly one mount",
+        ));
+    };
+    let resource = pplx_space_sandbox_store::block_volume::resource::get(pool, org, volume)
+        .await
+        .map_err(|error| crate::controllers::db_contention_error("read volume capacity", &error))?
+        .filter(|resource| resource.retained && !resource.delete_requested)
+        .ok_or_else(|| ControllerError::not_found("volume"))?;
+    let capacity = u32::try_from(resource.size_gib)
+        .ok()
+        .and_then(|size| size.try_into().ok())
+        .ok_or_else(|| ControllerError::internal("invalid durable volume capacity"))?;
+    Ok(Some(BlockVolumeMount {
+        size_gib: capacity,
+        ..mount.clone()
+    }))
 }
 
 pub(crate) fn management_organizations(
