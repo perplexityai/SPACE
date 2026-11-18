@@ -107,8 +107,11 @@ REGISTRY_LINK="${KIND_BENCH_PREFIX:0:8}0"
 REGISTRY_IP=192.168.241.1
 REGISTRY_IMAGE="public.ecr.aws/docker/library/registry:2"
 # Inside the bench root, which is the caller's (a bench's own directories are
-# numbered and marked, so nothing treats this one as a bench).
-CACHE_ROOT="$KIND_BENCH_ROOT/cache"
+# numbered and marked, so nothing treats this one as a bench). Resolved, since
+# the host's Docker bind-mounts it: where that daemon does not share the bench
+# volume (a sidecar with its own /tmp, say), the cache can be a link to a
+# directory it does share.
+CACHE_ROOT="$(realpath -m -- "$KIND_BENCH_ROOT/cache")"
 MIRROR_NAME="${KIND_BENCH_PREFIX}-hub-mirror"
 MIRROR_PORT=5000
 CACHE_NAME="${KIND_BENCH_PREFIX}-layer-cache"
