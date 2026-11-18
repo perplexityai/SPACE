@@ -1,49 +1,15 @@
 #!/usr/bin/env bash
-# Lints workspace libraries one at a time, so a crate that uses a dependency
-# feature it gets only through workspace feature unification fails; the
-# workspace clippy cannot see that. GitHub CI runs this as jobs of their own,
-# `run-rust-checks.sh isolated-crates` with SPACE_RUST_ISOLATED_SHARD set to
-# each shard K/N (isolated_crate_shard), beside the clippy and test jobs.
+# Which workspace crates a change can affect, so that the clippy job skips a
+# lint of named crates that the change cannot reach: run_clippy_checks asks
+# lint_affects_any whether to run the sbx-mgr production checks. Pull CI and
+# the merge queue pass the base check-needed.sh decided against as
+# SPACE_RUST_LINT_BASE (ci/check-scopes/README.md); Main CI passes none, and
+# every check runs.
 #
 # It lives apart from run-rust-checks.sh so that a change to which crates it
 # picks keeps the Rust caches: their keys hash run-rust-checks.sh (see "Name
 # the Cargo target directory" and "Name the Rust compiler cache" in
-# .github/workflows/common-ci.yml). It builds in its own directory,
-# target/buildkite-isolated-crates, which is never cached. To run it locally,
-# from the repository root:
-#
-#   bash -euo pipefail -c 'source ci/scripts/lib/rust-isolated-crates.sh; run_isolated_crate_checks'
-#
-# and with SPACE_RUST_ISOLATED_SHARD=K/N in the environment, N being
-# ISOLATED_CRATE_SHARDS, to run one shard.
-
-# The number of shards GitHub CI splits this lint into. rust-static-ci.yml
-# keeps one `Rust isolated crates (K/N)` entry for each K by hand; a shard
-# given another N fails (isolated_crates_to_lint), so the entries cannot split
-# the crates into a count this file does not name.
-ISOLATED_CRATE_SHARDS=5
-
-# Every workspace library, one per line. run_isolated_crate_checks lints each
-# alone in its configurations, so a new library joins without a CI edit.
-isolated_crates() {
-    local metadata="$1"
-    python3 - "${metadata}" <<'PY'
-import json
-import sys
-
-# Every kind a library target can have: its crate types, or proc-macro.
-LIBRARY_KINDS = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
-
-with open(sys.argv[1]) as metadata_file:
-    packages = json.load(metadata_file)["packages"]
-for name in sorted(
-    package["name"]
-    for package in packages
-    if any(LIBRARY_KINDS.intersection(target["kind"]) for target in package["targets"])
-):
-    print(name)
-PY
-}
+# .github/workflows/common-ci.yml).
 
 # The crates of LISTED (one per line) that the change since BASE can affect,
 # one per line: those whose own directory changed, those that include a
@@ -52,7 +18,7 @@ PY
 # dependency. A change to Cargo.lock affects the workspace crates whose
 # resolved dependency tree holds a package it changed (see
 # lock_affected_crates below). Prints every listed crate when the change
-# touches any other path outside all crates that such a lint may read (the
+# touches any other path outside all crates that a crate's lint may read (the
 # root manifest, the toolchain, Cargo's configuration, proto/, db/,
 # templates/, ...), since Cargo, a build script or an include can read it;
 # ci/check-scopes/rust.skip and UNREAD_BY_LINT below name the paths none
@@ -104,9 +70,9 @@ def unread_by_rust(path):
 
 
 # Outside every crate, paths that a Rust check may read but no crate's lint
-# alone does: archcheck's files, nextest's configuration, the workflows, and
-# CI scripts other than this lint's own (run-rust-checks.sh, this file and
-# the image it runs in, ci/Dockerfile.ci).
+# does: archcheck's files, nextest's configuration, the workflows, and CI
+# scripts other than the lint's own (run-rust-checks.sh, this file and the
+# image it runs in, ci/Dockerfile.ci).
 UNREAD_BY_LINT = (
     "architecture-baseline.toml",
     "ARCHITECTURE.toml",
@@ -121,7 +87,7 @@ LINT_INPUTS_IN_CI = (
     ".github/workflows/rust-static-ci.yml",
     "ci/Dockerfile.ci",
     "ci/scripts/run-rust-checks.sh",
-    "ci/scripts/lib/rust-isolated-crates.sh",
+    "ci/scripts/lib/rust-affected-crates.sh",
 )
 
 
@@ -342,77 +308,6 @@ print(
 PY
 }
 
-# The crates of LISTED (one per line) in shard SHARD, in LISTED's order, one
-# per line. SHARD is K/N, the Kth of N shards. Every shard computes the same
-# partition from the same inputs and keeps its own part, so the N parts
-# together hold each listed crate exactly once; a shard can get none, when
-# fewer crates than shards are listed.
-#
-# The parts are balanced by cost, not count: one crate can cost as much as a
-# hundred small ones. A crate's cost is one plus the workspace crates its
-# lint builds, read from the declared dependencies in METADATA (cargo
-# metadata --no-deps): its own of every kind, and the normal and build
-# dependencies of those, optional ones included. Unlike a checked-in table, it
-# follows every Cargo.toml change, and it predicts a crate's cold lint time
-# better than the count of every package Cargo resolves for it: the workspace
-# crates are the ones built with that crate's own feature set. Largest first,
-# each crate joins the cheapest part so far, the lowest-numbered on a tie, so
-# no part costs more than any other by more than its largest crate. The
-# parts' sizes and costs go to stderr, so every shard's log shows the split.
-isolated_crate_shard() {
-    local metadata="$1" shard="$2" listed="$3"
-    python3 - "${metadata}" "${shard}" "${listed}" <<'PY'
-import json
-import re
-import sys
-
-metadata, shard, listed = sys.argv[1], sys.argv[2], sys.argv[3].split()
-match = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", shard)
-if not match or int(match[1]) > int(match[2]):
-    sys.exit(f"isolated_crate_shard: shard '{shard}' is not K/N with 1 <= K <= N")
-index, count = int(match[1]), int(match[2])
-with open(metadata) as metadata_file:
-    packages = {p["name"]: p for p in json.load(metadata_file)["packages"]}
-
-
-def cost(name):
-    if name not in packages:
-        return 1
-    seen = set()
-    pending = [d["name"] for d in packages[name]["dependencies"] if d["name"] in packages]
-    while pending:
-        dependency = pending.pop()
-        if dependency in seen or dependency == name:
-            continue
-        seen.add(dependency)
-        pending.extend(
-            d["name"]
-            for d in packages[dependency]["dependencies"]
-            if d["name"] in packages and d["kind"] in (None, "build")
-        )
-    return 1 + len(seen)
-
-
-crates = list(dict.fromkeys(listed))
-costs = {name: cost(name) for name in crates}
-parts = [{"cost": 0, "crates": set()} for _ in range(count)]
-for name in sorted(crates, key=lambda name: (-costs[name], name)):
-    part = min(parts, key=lambda part: part["cost"])
-    part["cost"] += costs[name]
-    part["crates"].add(name)
-print(
-    f"Shard {shard} of {len(crates)} crates; each shard's crates and cost "
-    f"(one plus the workspace crates each builds):",
-    file=sys.stderr,
-)
-for number, part in enumerate(parts, 1):
-    print(f"  {number}/{count}: {len(part['crates'])} crates, cost {part['cost']}", file=sys.stderr)
-for name in crates:
-    if name in parts[index - 1]["crates"]:
-        print(name)
-PY
-}
-
 # Whether the change since SPACE_RUST_LINT_BASE can affect any of the crates
 # named after TARGET_DIR, per affected_lint_crates; always without a base, as
 # in Main CI. run_clippy_checks uses it for its per-crate configurations.
@@ -431,100 +326,4 @@ lint_affects_any() {
         return 0
     fi
     [ -n "${affected}" ]
-}
-
-# The crates of LISTED, isolated_crates' list, that this job lints alone, one
-# per line. With SPACE_RUST_ISOLATED_SHARD=K/N, as in GitHub CI, it keeps
-# shard K of the whole list, so a crate lints in the shard Main CI puts it in
-# and restores the compiler cache built for that shard's crates, whatever the
-# change. Then, with SPACE_RUST_LINT_BASE, it keeps the crates of that shard
-# the change can affect (affected_lint_crates). The shards of an affected-only
-# run can be far from balanced; a balanced split of only the affected crates
-# would put a crate in another shard than Main CI does, with a cache built for
-# other crates. Unset, as in a local run, either keeps every crate.
-isolated_crates_to_lint() {
-    local metadata="$1" listed="$2"
-    if [ -n "${SPACE_RUST_ISOLATED_SHARD:-}" ]; then
-        if [[ "${SPACE_RUST_ISOLATED_SHARD}" != */"${ISOLATED_CRATE_SHARDS}" ]]; then
-            echo "::error::Shard ${SPACE_RUST_ISOLATED_SHARD} is not K/${ISOLATED_CRATE_SHARDS}: the lint has ISOLATED_CRATE_SHARDS shards (ci/scripts/lib/rust-isolated-crates.sh); keep the rust-static-ci.yml entries in step with it." >&2
-            return 1
-        fi
-        if ! listed="$(isolated_crate_shard "${metadata}" "${SPACE_RUST_ISOLATED_SHARD}" "${listed}")"; then
-            echo "::error::Cannot pick shard ${SPACE_RUST_ISOLATED_SHARD}'s crates." >&2
-            return 1
-        fi
-    fi
-    # Pull CI and the merge queue pass the base check-needed.sh decided
-    # against (ci/check-scopes/README.md); Main CI passes none.
-    if [ -n "${SPACE_RUST_LINT_BASE:-}" ] && [ -n "${listed}" ]; then
-        local affected
-        # A failed selection lints every crate, whether or not set -e applies.
-        if ! affected="$(affected_lint_crates "${metadata}" "${SPACE_RUST_LINT_BASE}" "${listed}")"; then
-            echo "Cannot tell which crates the change affects: linting them all." >&2
-            affected="${listed}"
-        fi
-        listed="${affected}"
-    fi
-    if [ -n "${listed}" ]; then
-        printf '%s\n' "${listed}"
-    fi
-}
-
-# Lint each crate isolated_crates names on its own, with its minimum supported
-# features and with all of them. Use one Cargo invocation per crate and
-# configuration so Cargo cannot unify features across packages. `--all-targets`
-# builds the library with its dev-dependencies' features too, so the library is also
-# linted alone with `--lib`. That run is a no-op taking a fraction of a second
-# when the dev-dependencies change nothing, which is less than asking
-# `cargo tree` whether they do. Every crate runs, and every failing crate and
-# configuration is named at the end. A new crate needs no step in
-# run-rust-checks.sh: this finds it.
-run_isolated_crate_checks() {
-    local target_dir="target/buildkite-isolated-crates"
-    mkdir -p "${target_dir}"
-    echo "--- :rust: Finding the workspace crates to lint alone"
-    cargo metadata --locked --format-version 1 --no-deps >"${target_dir}/metadata.json"
-    local listed crates=()
-    listed="$(isolated_crates "${target_dir}/metadata.json")"
-    if [ -z "${listed}" ]; then
-        echo "::error::No workspace crate qualifies to be linted alone; the selection is broken." >&2
-        return 1
-    fi
-    if ! listed="$(isolated_crates_to_lint "${target_dir}/metadata.json" "${listed}")"; then
-        return 1
-    fi
-    if [ -z "${listed}" ]; then
-        echo "This job has no crate to lint alone for this change."
-        return 0
-    fi
-    mapfile -t crates <<<"${listed}"
-    echo "Linting ${#crates[@]} crates alone: ${crates[*]}"
-
-    local crate config flags=() failures=() run_count=0
-    local minimal_features
-    for crate in "${crates[@]}"; do
-        minimal_features="--no-default-features"
-        # Cluster controller requires its Kubernetes client even in Direct mode
-        # for leader election when the controller runs inside a pod.
-        if [[ "${crate}" == pplx-space-cluster-controller-server ]]; then
-            minimal_features+=" --features kubernetes"
-        fi
-        for config in "${minimal_features} --all-targets" "${minimal_features} --lib" \
-            "--all-features --all-targets" "--all-features --lib"; do
-            echo "--- :rust: Linting ${crate} alone (${config})"
-            run_count=$((run_count + 1))
-            read -ra flags <<<"${config}"
-            if ! CARGO_TARGET_DIR="${target_dir}" cargo clippy --locked -p "${crate}" \
-                "${flags[@]}" -- -D warnings; then
-                echo "::error::${crate} fails clippy built alone (${config})." >&2
-                failures+=("${crate} (${config})")
-            fi
-        done
-    done
-    echo "Linted ${#crates[@]} crates alone in ${run_count} configurations."
-    if [ "${#failures[@]}" -ne 0 ]; then
-        echo "Built alone, these fail clippy; declare the dependency features they use:" >&2
-        printf '  %s\n' "${failures[@]}" >&2
-        return 1
-    fi
 }

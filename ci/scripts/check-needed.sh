@@ -36,7 +36,7 @@ if [[ -z "${scope}" ]]; then
 fi
 
 # Prints the answer, and the base it was decided against once there is one,
-# which a check can use to narrow its own work (rust-isolated-crates.sh).
+# which a check can use to narrow its own work (rust-affected-crates.sh).
 answer() {
     printf 'needed=%s\n' "$1"
     if [[ -n "${decided_base:-}" ]]; then
