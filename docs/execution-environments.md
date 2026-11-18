@@ -2621,3 +2621,21 @@ stop and drain all CH sandboxes and withdraw CH template use. Preserve the
 upgraded supervisor when compact execution-cache paths exist. The SHA-256
 fallback remains a distinct authenticated integrity mode on filesystems lacking
 fs-verity; a capable filesystem with an invalid or missing seal still fails closed.
+
+## Optional Python/WASI boot payload
+
+The bundle builder accepts an explicit `wasi-python` feature. It is not part of
+the default bundle selection and does not change worker images or environment
+admission. The scratch image carries a Python/WASI command module, an uncompressed
+standard-library zip, the upstream license, and a provenance manifest.
+`ci/wasi-python-pins.json` independently pins the source archive and both output
+payloads. Standard-library zip entries have sorted names, fixed timestamps and
+read-only Unix modes; storing entries without compression avoids host-zlib
+variation and a guest-zlib bootstrap dependency.
+
+The image's `/boot-artifacts` directory is an offline auxiliary installation
+feed, not an execution root. Copy it only into the runtime manager's configured
+boot-artifact source; the owning installer must still authenticate and publish
+the files. Its manifest does not approve an environment, provide a managed
+workspace, or establish fs-verity trust. Runtime catalog qualification and a
+complete create/execute/delete smoke remain separate requirements.

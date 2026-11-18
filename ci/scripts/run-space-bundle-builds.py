@@ -1120,6 +1120,7 @@ class BundleBuilder:
             / "docker/Dockerfile.cluster-controller",
             "ui": self.source_root / "docker/Dockerfile.ui",
             "rollout-mng": self.source_root / "docker/Dockerfile.space-rollout-mng",
+            "wasi-python": self.source_root / "docker/Dockerfile.wasi-python",
         }
         try:
             return dockerfiles[feature]
@@ -2068,6 +2069,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "cluster-controller",
         "ui",
         "rollout-mng",
+        "wasi-python",
     }
     unknown_features = sorted(set(args.features) - supported_features)
     if unknown_features:

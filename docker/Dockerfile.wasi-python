@@ -1,0 +1,10 @@
+# Explicit, opt-in boot payload. No runtime or scheduler environment is admitted.
+FROM public.ecr.aws/docker/library/python:3.14-slim AS payload
+COPY ci/wasi-python-pins.json /build/pins.json
+COPY scripts/build/wasi-python-bundle.py /build/bundle.py
+RUN python3 /build/bundle.py --pins /build/pins.json --output /bundle
+
+FROM scratch
+LABEL org.opencontainers.image.title="space-wasi-python"
+LABEL org.opencontainers.image.description="Pinned Python/WASI module and reproducible standard-library boot feed"
+COPY --from=payload /bundle/ /

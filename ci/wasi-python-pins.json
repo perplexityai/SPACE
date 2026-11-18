@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "source_url": "https://github.com/brettcannon/cpython-wasi-build/releases/download/v3.15.2/python-3.15.2-wasi_sdk-33.zip",
+  "source_sha256": "b8a63559c56760bbdc310dedb74fd69d10bcbafae26b705bea0ad353ad256888",
+  "library_prefix": "lib/python3.15/",
+  "module": {
+    "kind": "wasm_module",
+    "version": "cpython-3.15.2-wasi33",
+    "sha256": "dd076791fb6d1286a5dfe105852dfb3367e10562de68ca0a618e615625cdf636",
+    "size": 32444705
+  },
+  "library": {
+    "kind": "guest_tools",
+    "version": "cpython-3.15.2-stdlib-zip-v1",
+    "sha256": "9482150cf98254943a8f5e1af04f4ee8d433fbba3e0d140eb238118794f6dbbb",
+    "size": 11713852
+  }
+}
