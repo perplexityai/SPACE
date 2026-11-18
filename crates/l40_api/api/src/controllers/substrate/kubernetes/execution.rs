@@ -1479,7 +1479,6 @@ impl KubernetesSubstrate {
                     self.store.begin_restore_lifecycle(sandbox_id, false).await
                 }
                 // Claimed by `restore_drained_execution` before this.
-                #[cfg(test)]
                 RestoreClaimMode::DrainOperation(restore) => Ok(RestoreClaim::FreshFromSuspended {
                     restore_lease_token: Some(restore.restore_lease_token),
                 }),
@@ -1552,6 +1551,16 @@ impl KubernetesSubstrate {
         // reservation into the wake's detached leader.
         let mut intent = intent;
         intent.charge = charge.with_live(&crate::client_live_cap::LiveHandoff::new(live));
+        // Holds a claimed drain restore before any node work, so a test can
+        // act while it holds the row.
+        #[cfg(feature = "test-hooks")]
+        if matches!(intent.claim, RestoreClaimMode::DrainOperation(_))
+            && let Some(hold) =
+                pplx_space_test_hooks::test_hook_var("SPACE_DRAIN_RESTORE_TEST_HOLD_SECS")
+                    .and_then(|secs| secs.parse::<u64>().ok())
+        {
+            tokio::time::sleep(Duration::from_secs(hold)).await;
+        }
         let sandbox = self.store.require_sandbox(sandbox_id).await?;
         let activation = self
             .wake_execution_inner(
@@ -2513,12 +2522,20 @@ impl KubernetesSubstrate {
         )
         .await;
 
-        if cleanup_on_failure
-            && restore_failure_should_revert_to_suspended(
+        let drain_timeout = drain_restore_timeout_reverts(
+            &intent.claim,
+            prepared.restore_claim,
+            result.as_ref().err(),
+            wake_dispatch,
+        );
+        let reverts = drain_timeout
+            || restore_failure_should_revert_to_suspended(
                 prepared.restore_claim,
                 result.as_ref().err(),
                 wake_dispatch,
-            )
+            );
+        if cleanup_on_failure
+            && reverts
             && let Some(restore_claim) = prepared.restore_claim
         {
             self.revert_failed_restore_claim(
@@ -2527,13 +2544,18 @@ impl KubernetesSubstrate {
                 activation_assignment.assigned(),
             )
             .await;
+            // The retry runs under an attempt of its own; this one's lease
+            // would refuse it until it lapsed.
+            if drain_timeout && let Some((attempt, generation)) = activation_assignment.assigned() {
+                self.store
+                    .release_finished_activation_attempt_best_effort(
+                        sandbox_id, generation, attempt,
+                    )
+                    .await;
+            }
         }
         if cleanup_on_failure
-            && !restore_failure_should_revert_to_suspended(
-                prepared.restore_claim,
-                result.as_ref().err(),
-                wake_dispatch,
-            )
+            && !reverts
             && wake_failure_should_revert_to_suspended(result.as_ref().err(), wake_dispatch)
             && let Some(restore_lease_token) = prepared
                 .restore_claim
@@ -2619,7 +2641,25 @@ impl KubernetesSubstrate {
                 ),
             }
         }
-        result.map(|(binding, _)| ExecutionActivation::owned(binding))
+        // The attempt this wake owned, for the one caller that commits the
+        // lifecycle itself and releases it then: the drain restore
+        // operation. Every other wake hands back none, so a start that
+        // delegates here leaves its attempt to the release above or to the
+        // node's receipt.
+        let hands_back_attempt = matches!(intent.claim, RestoreClaimMode::DrainOperation(_));
+        result.map(|(binding, owned_attempt)| {
+            let mut activation = ExecutionActivation::owned(binding);
+            activation.lease_completion =
+                owned_attempt
+                    .filter(|_| hands_back_attempt)
+                    .map(|(attempt_id, generation)| {
+                        crate::controllers::substrate::ActivationLeaseCompletion {
+                            generation,
+                            attempt_id,
+                        }
+                    });
+            activation
+        })
     }
 }
 
@@ -2671,6 +2711,28 @@ pub(super) fn wake_failure_should_revert_to_suspended(
         ))
 }
 
+/// A drain restore's fresh claim whose attempt timed out before any Wake was
+/// sent is reverted as a failed one is, so the operation's retry claims the
+/// row at once instead of waiting out the lease and the sweeper. A user's
+/// timed-out restore stays claimed: its caller retries the same sandbox and
+/// converges on the restore that may still land. A drain restore whose Wake
+/// was sent stays claimed too, for the reason
+/// [`wake_failure_should_revert_to_suspended`] gives: the Wake may have
+/// landed, and `suspended` would orphan the live pod. Its operation's next
+/// attempt finds the row held under the lease and waits, until the node's
+/// receipt lands it or the lease lapses and the sweeper settles the row.
+pub(super) fn drain_restore_timeout_reverts(
+    mode: &RestoreClaimMode,
+    claim: Option<RestoreClaim>,
+    err: Option<&SubstrateError>,
+    dispatch: WakeDispatchStatus,
+) -> bool {
+    matches!(mode, RestoreClaimMode::DrainOperation(_))
+        && dispatch.operation_release_is_safe()
+        && matches!(claim, Some(RestoreClaim::FreshFromSuspended { .. }))
+        && matches!(err, Some(SubstrateError::Timeout { .. }))
+}
+
 /// Root rollback invariant for failed restores: only a fresh
 /// `suspended -> restoring` claim may return to `suspended`, and only on a
 /// clean failure.
@@ -2683,7 +2745,6 @@ pub(super) fn restore_failure_should_revert_to_suspended(
         && wake_failure_should_revert_to_suspended(err, dispatch)
 }
 
-#[cfg(test)]
 mod drain_restore;
 
 #[cfg(test)]

@@ -25,6 +25,7 @@ pub(crate) use kubernetes_tests::{
 };
 
 mod activating_client;
+pub(crate) mod drain_restore;
 pub(super) mod environment_placement;
 mod native_pod_failover;
 mod node_instance;
@@ -2033,6 +2034,8 @@ mod kubernetes_tests {
             Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
         /// When set, every Wake is answered with this status instead.
         pub(crate) rejection: Arc<std::sync::Mutex<Option<tonic::Status>>>,
+        /// How long each Wake waits before it answers.
+        pub(crate) wake_delay: Arc<std::sync::Mutex<Option<Duration>>>,
     }
 
     #[tonic::async_trait]
@@ -2088,6 +2091,10 @@ mod kubernetes_tests {
             if let Some(rejection) = self.rejection.lock().unwrap().clone() {
                 return Err(rejection);
             }
+            let delay = *self.wake_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             if self
                 .succeed_after_attempt
                 .is_none_or(|succeed_after| attempt < succeed_after)
@@ -2124,13 +2131,25 @@ mod kubernetes_tests {
     // `SimWorkerHarness`.
     pub(crate) struct SequencedWakeWorkerHandle {
         pub(crate) port: u16,
+        /// The simulator behind the worker's public RPCs (`PauseSandbox`,
+        /// `SandboxState`), which a test seeds with the VM it expects.
+        pub(crate) sim_state: SimState,
         pub(crate) received:
             Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
         pub(crate) rejection: Arc<std::sync::Mutex<Option<tonic::Status>>>,
+        wake_delay: Arc<std::sync::Mutex<Option<Duration>>>,
         health_reporter: tonic_health::server::HealthReporter,
         shutdown: CancellationToken,
         task: JoinHandle<()>,
         _dir: tempfile::TempDir,
+    }
+
+    impl SequencedWakeWorkerHandle {
+        /// Make every later Wake wait `delay` before it answers, as a node
+        /// still bringing the VM up does.
+        pub(crate) fn delay_wakes(&self, delay: Duration) {
+            *self.wake_delay.lock().unwrap() = Some(delay);
+        }
     }
 
     impl Drop for SequencedWakeWorkerHandle {
@@ -2170,15 +2189,17 @@ mod kubernetes_tests {
             dir.path().join("sandboxes"),
             "node-a".to_string(),
         );
-        let worker_service = SimWorkerApiService::new(sim_state);
+        let worker_service = SimWorkerApiService::new(sim_state.clone());
         let received = Arc::default();
         let rejection = Arc::default();
+        let wake_delay = Arc::default();
         let service = SequencedWakeWorker {
             wake_attempts,
             succeed_after_attempt,
             echo_route_identity,
             received: Arc::clone(&received),
             rejection: Arc::clone(&rejection),
+            wake_delay: Arc::clone(&wake_delay),
         };
         let (health_reporter, health_service) = pplx_space_grpc_server::grpc_health_service();
         health_reporter
@@ -2211,8 +2232,10 @@ mod kubernetes_tests {
         });
         Ok(SequencedWakeWorkerHandle {
             port,
+            sim_state,
             received,
             rejection,
+            wake_delay,
             health_reporter,
             shutdown,
             task,

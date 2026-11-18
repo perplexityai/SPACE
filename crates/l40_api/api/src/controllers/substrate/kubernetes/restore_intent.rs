@@ -63,7 +63,6 @@ pub(super) enum RestoreClaimMode {
     /// `suspended` row whose restore selector loads the snapshot, moved to
     /// `restoring` under the operation's lease. It joins nothing and fails
     /// fast: the operation owns its retries.
-    #[cfg(test)]
     DrainOperation(DrainRestore),
 }
 
@@ -182,7 +181,6 @@ impl RestoreIntent {
     /// The drain restore operation's restore, placed as the drain's
     /// evacuation is ([`Self::drain`]) and exempt from the charge. It wakes
     /// the VM `started`, and its caller commits the row.
-    #[cfg(test)]
     pub(super) fn drain_operation(
         cohort: Option<EvacuationPlacement>,
         restore: DrainRestore,

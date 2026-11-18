@@ -362,7 +362,6 @@ impl K8sStore {
     /// The drain restore operation's claim
     /// ([`pplx_space_sandbox_store::drain_restore::claim_drain_restore`]),
     /// under the operation's own lease token, taken before the activation.
-    #[cfg(test)]
     pub(in crate::controllers::substrate::kubernetes) async fn claim_drain_restore(
         &self,
         sandbox_id: SandboxId,
@@ -384,7 +383,6 @@ impl K8sStore {
     /// from execution `generation`, releasing the activation attempt it ran
     /// under
     /// ([`pplx_space_sandbox_store::drain_restore::complete_drain_restore`]).
-    #[cfg(test)]
     pub(in crate::controllers::substrate::kubernetes) async fn complete_drain_restore(
         &self,
         sandbox_id: SandboxId,

@@ -416,6 +416,7 @@ pub(super) async fn start_scripted_worker(
             echo_route_identity: true,
             received: Arc::default(),
             rejection: Arc::default(),
+            wake_delay: Arc::default(),
         }),
         replies: Arc::clone(&replies),
         observers: Arc::clone(&observers),
