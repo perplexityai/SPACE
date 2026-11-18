@@ -324,6 +324,15 @@ inlineOperations:
   enabled: "false"
   kinds: create_sandbox,wake_sandbox,resume_sandbox,start_sandbox
 
+# SPACE_DRAIN_V2_ENABLED: whether `:drain {engine: v2}` may start a drain the
+# node runs itself. Off, as in the binary: the caller-provided-cluster chart
+# (infra/space/cluster/chart) keeps this default, and drain v2 stays off
+# outside Kind until it is ready to enable. The Kind bench turns it on in
+# values-kind.yaml; each drain v2 scenario turns the cluster-controller's
+# side on for its own run.
+drainV2:
+  enabled: "false"
+
 # Node-census residency discount. **Must equal
 # `reconcilers.nodeDrain.env.SPACE_NODE_DRAIN_NODE_CENSUS_RESIDENCY` in
 # `charts/space-cluster-controller-local/values.yaml`** — that chart turns the

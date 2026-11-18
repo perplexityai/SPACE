@@ -15,6 +15,13 @@ k8s:
   # template, in about 4 s, so 45 s keeps a margin of ten times that.
   createDataPlaneReadyTimeoutSecs: "45"
 
+# Drain v2 on the API (SPACE_DRAIN_V2_ENABLED), so the drain v2 scenarios can
+# start one; off in the chart default. Inert until a drain asks for engine
+# v2, and the cluster-controller's side stays off until a scenario turns it
+# on for its run.
+drainV2:
+  enabled: "true"
+
 # Kind's data plane serves Native files (space-data-plane-local's nativeFiles),
 # deciding each request through the listener. Helm replaces a list, so this
 # names internal-api again.

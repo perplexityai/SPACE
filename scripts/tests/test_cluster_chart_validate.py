@@ -18,7 +18,7 @@ import tempfile
 
 import pytest
 import yaml
-from kind_chart_render import HELM_BIN, REPO_ROOT
+from kind_chart_render import API_CHART, HELM_BIN, REPO_ROOT, env_by_name, object_named, render
 
 CLUSTER_DIR = REPO_ROOT / "infra/space/cluster"
 CHART = CLUSTER_DIR / "chart"
@@ -168,3 +168,36 @@ def test_mode_off_needs_no_telemetry_identity() -> None:
     assert _render("space", values).returncode == 0
     values["global"]["observability"]["mode"] = "datadog"
     _assert_refused("space", values, "global.observability.environment")
+
+
+API_DEPLOYMENTS = ("space-api", "space-admin-api")
+
+
+def _drain_v2_values(documents: list[dict]) -> set[str]:
+    return {
+        env_by_name(object_named(documents, "Deployment", name))["SPACE_DRAIN_V2_ENABLED"]["value"]
+        for name in API_DEPLOYMENTS
+    }
+
+
+@pytest.mark.parametrize("value", ["true", True, "1"])
+def test_drain_v2_switch_is_refused(value: object) -> None:
+    # Drain v2 stays off outside Kind until it is ready to enable.
+    _assert_refused(
+        "space", _with(("space-api-local", "drainV2", "enabled"), value), "space-api-local.drainV2.enabled"
+    )
+
+
+def test_the_example_renders_drain_v2_off() -> None:
+    result = _render("space", copy.deepcopy(EXAMPLE))
+    assert result.returncode == 0, result.stderr
+    documents = [document for document in yaml.safe_load_all(result.stdout) if document]
+    assert _drain_v2_values(documents) == {"false"}
+
+
+def test_only_the_kind_bring_up_turns_drain_v2_on() -> None:
+    # The chart default is off; values-kind.yaml, which the Tiltfile passes and
+    # this umbrella never reads, turns it on for the Kind bench.
+    assert _drain_v2_values(render(API_CHART, "space")) == {"false"}
+    kind = render(API_CHART, "space", "-f", str(API_CHART / "values-kind.yaml"))
+    assert _drain_v2_values(kind) == {"true"}

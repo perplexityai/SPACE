@@ -120,7 +120,9 @@ The render fails, listing every gap, unless the file supplies:
 
 The Kind bring-up also passes `space-api-local`'s `values-kind.yaml`, which
 holds bench-only settings that are not test hooks, such as a 45 s
-`SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS`. This chart does not read that
+`SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS` and drain v2 on the API
+(`drainV2.enabled`, `SPACE_DRAIN_V2_ENABLED`), which `templates/validate.yaml`
+refuses here until drain v2 is ready to enable. This chart does not read that
 file, so those settings keep their binary defaults here. Kind's data plane
 serves Native files, so that file and `space-sandbox-network-policy`'s
 `values-kind.yaml` admit it to the activation listener and to sandbox pods'

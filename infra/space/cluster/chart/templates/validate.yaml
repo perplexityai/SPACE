@@ -137,6 +137,12 @@ rejects the Kind value itself.
 {{- if (($cc.ec2 | default dict).fakeEndpoint | default dict).enabled -}}
 {{- $fail = append $fail "space-cluster-controller-local.ec2.fakeEndpoint.enabled must be false: it points EC2 at the Kind fake EC2 endpoint (fake-ec2), which is not installed" -}}
 {{- end -}}
+{{- /* Drain v2 stays off outside Kind until it is ready to enable; Kind turns
+       it on in space-api-local's values-kind.yaml, which this chart never
+       reads. */ -}}
+{{- if ne (toString (($api.drainV2 | default dict).enabled | default "false")) "false" -}}
+{{- $fail = append $fail "space-api-local.drainV2.enabled must be \"false\": drain v2 is not enabled outside Kind yet" -}}
+{{- end -}}
 {{- /* The rate limiters' Redis is optional; this installer provides none. */ -}}
 {{- $apiRedis := toString (($api.redis | default dict).url | default "") -}}
 {{- $ccRedis := toString (($cc.redis | default dict).url | default "") -}}
