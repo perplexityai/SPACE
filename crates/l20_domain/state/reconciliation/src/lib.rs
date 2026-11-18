@@ -183,8 +183,48 @@ pub enum ReconcileReason {
     TemplatePoolPolicyDeleted,
     NodeSandboxInventoryPublished,
     NodeTemplateInventoryPublished,
-    /// The node's firewall rules revision changed. Like every reason it only
-    /// wakes the node to drain its queue; it carries no rules.
+    /// The node's firewall rules changed. Like every reason it only wakes the
+    /// node to drain its queue; it carries no rules.
+    ///
+    /// Nothing may enqueue it while a controller you could roll back to
+    /// predates #1622 (706cab44): a claim from before it decodes the reasons
+    /// as the enum and fails its whole batch on a label it does not know.
+    FirewallRulesChanged,
+}
+
+/// Lists every reason once for [`ReconcileReason::ALL`] and matches on the
+/// same list, so a new reason fails to compile until it is listed here.
+macro_rules! all_reconcile_reasons {
+    ($($reason:ident,)+) => {
+        impl ReconcileReason {
+            /// Every reason, once.
+            pub const ALL: &[Self] = &[$(Self::$reason,)+];
+        }
+
+        const _: fn(ReconcileReason) = |reason| match reason {
+            $(ReconcileReason::$reason => {})+
+        };
+    };
+}
+
+all_reconcile_reasons! {
+    NodeRegistered,
+    NodeUpdated,
+    ManualNodeStatusRefresh,
+    ManualNodeReconcile,
+    ManualNodeNetworkPolicyReconcile,
+    NodeTemplatePulled,
+    SandboxRegistered,
+    SandboxPortExposureUpdated,
+    SandboxNetworkPolicyUpdated,
+    SandboxDesiredStateUpdated,
+    TemplateNetworkPolicyUpdated,
+    TemplateDesiredStateUpdated,
+    TemplateBaseSnapshotPolicyUpdated,
+    TemplatePoolPolicyUpdated,
+    TemplatePoolPolicyDeleted,
+    NodeSandboxInventoryPublished,
+    NodeTemplateInventoryPublished,
     FirewallRulesChanged,
 }
 

@@ -143,3 +143,51 @@ async fn all_postgres_migrations_apply_to_fresh_database() -> TestResult {
     assert!(upgraded);
     Ok(())
 }
+
+/// The firewall_rules_changed down keeps its enum label, so applying the up
+/// again must succeed without adding a second one.
+#[tokio::test]
+async fn firewall_rules_changed_reapplies_after_its_down_with_one_label() -> TestResult {
+    const VERSION: i64 = 20261118160040;
+    let Some(fixture) = try_raw_pg_test_db().await? else {
+        return Ok(());
+    };
+    let migrator = Migrator::with_migrations(
+        POSTGRES_MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= VERSION)
+            .cloned()
+            .collect(),
+    );
+    let previous = migrator
+        .iter()
+        .map(|migration| migration.version)
+        .filter(|version| *version < VERSION)
+        .max()
+        .expect("a migration precedes firewall_rules_changed");
+    let labels = async || {
+        sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT COUNT(*) FROM pg_enum
+             WHERE enumtypid = 'public.state_reconciliation_reason'::regtype
+               AND enumlabel = 'firewall_rules_changed'"
+        ))
+        .fetch_one(&fixture.pool)
+        .await
+    };
+
+    migrator.run(&fixture.pool).await?;
+    assert_eq!(labels().await?, 1);
+    migrator.undo(&fixture.pool, previous).await?;
+    assert_eq!(labels().await?, 1);
+    assert!(
+        !sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = $1)"
+        ))
+        .bind(VERSION)
+        .fetch_one(&fixture.pool)
+        .await?
+    );
+    migrator.run(&fixture.pool).await?;
+    assert_eq!(labels().await?, 1);
+    Ok(())
+}

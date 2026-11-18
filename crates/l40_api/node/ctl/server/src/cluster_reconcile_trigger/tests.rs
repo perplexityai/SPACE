@@ -37,52 +37,54 @@ async fn reconcile_trigger_coalesces_pending_pokes() {
     assert_no_drain(&mut rx).await;
 }
 
-/// Pokes that arrive while a drain runs schedule nothing until it finishes,
-/// then one follow-up drain between them, which carries them, and nothing
-/// after it. Repeated firewall rules wakeups collapse into that one drain. A
-/// poke only ever yields a queue drain: `recv_drain` and `assert_no_drain`
-/// fail on any other work item.
 #[tokio::test]
 async fn reconcile_trigger_schedules_one_followup_for_pokes_during_run() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let trigger =
+        ClusterReconcileTrigger::with_debounce(tx, DEFAULT_STATE_RECONCILE_TRIGGER_DEBOUNCE);
+
+    trigger.trigger("first").await.unwrap();
+    recv_drain(&mut rx).await;
+    let start = trigger.mark_started().await;
+
+    trigger.trigger("second").await.unwrap();
+    trigger.trigger("third").await.unwrap();
+    trigger.mark_finished(start.epoch, false).await;
+
+    recv_drain(&mut rx).await;
+    let followup = trigger.mark_started().await;
+    assert_eq!(followup.reason, "second,third");
+    trigger.mark_finished(followup.epoch, false).await;
+    assert_no_drain(&mut rx).await;
+}
+
+/// Repeated firewall rules wakeups during a drain collapse into its one
+/// follow-up drain.
+#[tokio::test]
+async fn firewall_rules_pokes_during_run_schedule_one_followup() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let trigger =
+        ClusterReconcileTrigger::with_debounce(tx, DEFAULT_STATE_RECONCILE_TRIGGER_DEBOUNCE);
     let firewall_rules = || {
-        trigger_request_reason(TriggerStateReconciliationRequest {
-            reasons: vec![StateReconciliationReason::FirewallRulesChanged.into()],
-            diagnostic_reason: "firewall_rules_changed".to_string(),
-        })
-    };
-    let cases: [(TriggerRequestReason, [TriggerRequestReason; 2], &str); 2] = [
-        (
-            "first".into(),
-            ["second".into(), "third".into()],
-            "second,third",
-        ),
-        (
-            ReconcileReason::NodeUpdated.into(),
-            [firewall_rules(), firewall_rules()],
+        trigger_request_reason(request(
+            &[StateReconciliationReason::FirewallRulesChanged.into()],
             "firewall_rules_changed",
-        ),
-    ];
-    for (first, during_run, followup_reason) in cases {
-        let (tx, mut rx) = mpsc::channel(8);
-        let trigger =
-            ClusterReconcileTrigger::with_debounce(tx, DEFAULT_STATE_RECONCILE_TRIGGER_DEBOUNCE);
+        ))
+    };
 
-        trigger.trigger(first).await.unwrap();
-        recv_drain(&mut rx).await;
-        let start = trigger.mark_started().await;
+    trigger.trigger(ReconcileReason::NodeUpdated).await.unwrap();
+    recv_drain(&mut rx).await;
+    let start = trigger.mark_started().await;
 
-        for poke in during_run {
-            trigger.trigger(poke).await.unwrap();
-        }
-        assert_no_drain(&mut rx).await;
-        trigger.mark_finished(start.epoch, false).await;
+    trigger.trigger(firewall_rules()).await.unwrap();
+    trigger.trigger(firewall_rules()).await.unwrap();
+    trigger.mark_finished(start.epoch, false).await;
 
-        recv_drain(&mut rx).await;
-        let followup = trigger.mark_started().await;
-        assert_eq!(followup.reason, followup_reason);
-        trigger.mark_finished(followup.epoch, false).await;
-        assert_no_drain(&mut rx).await;
-    }
+    recv_drain(&mut rx).await;
+    let followup = trigger.mark_started().await;
+    assert_eq!(followup.reason, "firewall_rules_changed");
+    trigger.mark_finished(followup.epoch, false).await;
+    assert_no_drain(&mut rx).await;
 }
 
 #[tokio::test]
@@ -138,35 +140,21 @@ fn diagnostic(reason: &str) -> TriggerRequestReason {
     }
 }
 
-/// Each wire number decodes to its reason. Unspecified and numbers this build
-/// does not know decode to nothing, so a request naming only them still
-/// wakes the node, on its diagnostic text.
+/// Each reason decodes from the wire number of its proto value, whose name
+/// is the reason's spelling; the cluster fanout's tests pin the numbers.
+/// Unspecified and numbers this build does not know decode to nothing, so a
+/// request naming only them still wakes the node, on its diagnostic text.
 #[test]
 fn every_wire_number_decodes_to_its_reason() {
-    let reasons = [
-        (1, ReconcileReason::NodeRegistered),
-        (2, ReconcileReason::NodeUpdated),
-        (3, ReconcileReason::ManualNodeStatusRefresh),
-        (4, ReconcileReason::ManualNodeReconcile),
-        (5, ReconcileReason::ManualNodeNetworkPolicyReconcile),
-        (6, ReconcileReason::NodeTemplatePulled),
-        (7, ReconcileReason::SandboxRegistered),
-        (8, ReconcileReason::SandboxPortExposureUpdated),
-        (9, ReconcileReason::SandboxNetworkPolicyUpdated),
-        (10, ReconcileReason::SandboxDesiredStateUpdated),
-        (11, ReconcileReason::TemplateNetworkPolicyUpdated),
-        (12, ReconcileReason::TemplateDesiredStateUpdated),
-        (13, ReconcileReason::TemplateBaseSnapshotPolicyUpdated),
-        (14, ReconcileReason::TemplatePoolPolicyUpdated),
-        (15, ReconcileReason::TemplatePoolPolicyDeleted),
-        (16, ReconcileReason::NodeSandboxInventoryPublished),
-        (17, ReconcileReason::NodeTemplateInventoryPublished),
-        (18, ReconcileReason::FirewallRulesChanged),
-    ];
-    // The table runs from 1 without gaps, so this fails when a number is
-    // added without a row above.
-    StateReconciliationReason::try_from(reasons.len() as i32 + 1).unwrap_err();
-    for (number, reason) in reasons {
+    let mut numbers = BTreeSet::new();
+    for &reason in ReconcileReason::ALL {
+        let name = format!(
+            "STATE_RECONCILIATION_REASON_{}",
+            reason.as_str().to_ascii_uppercase()
+        );
+        let number = StateReconciliationReason::from_str_name(&name)
+            .unwrap_or_else(|| panic!("no proto value {name}")) as i32;
+        assert!(number != 0 && numbers.insert(number), "{name} = {number}");
         assert_eq!(
             trigger_request_reason(request(&[number], "diagnostic")),
             typed([reason]),

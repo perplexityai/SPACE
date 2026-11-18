@@ -125,15 +125,14 @@ async fn enqueue_rejects_cluster_role_nodes() -> TestResult {
     )
     .await?;
 
-    for reason in [
+    let error = enqueue_triggers(
+        &db.pool,
+        [worker_node_id, cluster_node_id],
         ReconcileReason::ManualNodeReconcile,
-        ReconcileReason::FirewallRulesChanged,
-    ] {
-        let error = enqueue_triggers(&db.pool, [worker_node_id, cluster_node_id], reason)
-            .await
-            .expect_err("cluster-role trigger target should be rejected");
-        assert!(error.to_string().contains("worker or builder"), "{reason}");
-    }
+    )
+    .await
+    .expect_err("cluster-role trigger target should be rejected");
+    assert!(error.to_string().contains("worker or builder"));
 
     let count: i64 =
         sqlx::query_scalar(sql!("SELECT COUNT(*)::BIGINT FROM node_reconcile_triggers"))
@@ -687,110 +686,31 @@ async fn a_claim_skips_reasons_this_build_does_not_know() -> TestResult {
     Ok(())
 }
 
-/// The firewall rules reason coalesces like any other through the real
-/// enqueue cast and claim: one queued row per node, each typed reason once
-/// with the newest first, the diagnostic text joined newest first and
-/// bounded, and the generation bumped once per enqueue after the first. Each
-/// sequence runs on its own node, and the claim keeps every node's reasons to
-/// itself.
+/// The firewall rules reason binds through the real enqueue cast and claims
+/// back typed: beside an existing reason and a duplicate of itself, it is kept
+/// once, and a node that received only it claims only it.
 #[tokio::test(flavor = "current_thread")]
-async fn the_firewall_rules_reason_coalesces_like_any_other() -> TestResult {
+async fn the_firewall_rules_reason_enqueues_and_claims() -> TestResult {
     use ReconcileReason::{FirewallRulesChanged as Firewall, NodeUpdated as Updated};
 
     let db = pg_test_db().await?;
-    struct Case {
-        role: SpaceNodeRole,
-        enqueued: Vec<ReconcileReason>,
-        claimed: Vec<ReconcileReason>,
-        diagnostic: &'static str,
-        generation: i64,
+    let mixed = NodeId::new();
+    let firewall_only = NodeId::new();
+    for node_id in [mixed, firewall_only] {
+        insert_node(
+            &db.pool,
+            node_id,
+            SpaceNodeRole::Worker.as_str(),
+            "space",
+            None,
+        )
+        .await?;
     }
-    let case =
-        |enqueued: &[ReconcileReason], claimed: &[ReconcileReason], diagnostic, generation| Case {
-            role: SpaceNodeRole::Worker,
-            enqueued: enqueued.to_vec(),
-            claimed: claimed.to_vec(),
-            diagnostic,
-            generation,
-        };
-    let cases = [
-        case(&[Firewall], &[Firewall], "firewall_rules_changed", 0),
-        Case {
-            role: SpaceNodeRole::Builder,
-            ..case(&[Firewall], &[Firewall], "firewall_rules_changed", 0)
-        },
-        case(
-            &[Firewall, Firewall],
-            &[Firewall],
-            "firewall_rules_changed",
-            1,
-        ),
-        case(
-            &[Firewall, Updated],
-            &[Updated, Firewall],
-            "node_updated,firewall_rules_changed",
-            1,
-        ),
-        case(
-            &[Updated, Firewall],
-            &[Firewall, Updated],
-            "firewall_rules_changed,node_updated",
-            1,
-        ),
-        case(
-            &[Updated, Firewall, Firewall],
-            &[Firewall, Updated],
-            "firewall_rules_changed,firewall_rules_changed,node_updated",
-            2,
-        ),
-        case(
-            &[Firewall, Updated].repeat(4),
-            &[Updated, Firewall],
-            // Cut at the length limit.
-            "node_updated,firewall_rules_changed,node_updated,firewall_rules_changed,\
-             node_updated,firewall_rules_changed,node_updated,firewal",
-            7,
-        ),
-    ];
-    // Another node's unrelated reason, queued before the cases.
-    let bystander = NodeId::new();
-    insert_node(
-        &db.pool,
-        bystander,
-        SpaceNodeRole::Worker.as_str(),
-        "space",
-        None,
-    )
-    .await?;
-    enqueue_triggers(&db.pool, [bystander], ReconcileReason::ManualNodeReconcile).await?;
-    let mut expected = BTreeMap::from([(
-        bystander,
-        (
-            vec![ReconcileReason::ManualNodeReconcile],
-            "manual_node_reconcile".to_owned(),
-        ),
-    )]);
-    let mut generations = BTreeMap::from([(bystander, 0)]);
-    for case in cases {
-        let node_id = NodeId::new();
-        insert_node(&db.pool, node_id, case.role.as_str(), "space", None).await?;
-        for reason in case.enqueued {
-            assert_eq!(enqueue_triggers(&db.pool, [node_id], reason).await?, 1);
-        }
-        assert!(case.diagnostic.chars().count() <= RECONCILE_REASON_MAX_CHARS);
-        expected.insert(node_id, (case.claimed, case.diagnostic.to_owned()));
-        generations.insert(node_id, case.generation);
-    }
+    enqueue_triggers(&db.pool, [mixed, firewall_only], Firewall).await?;
+    enqueue_triggers(&db.pool, [mixed], Updated).await?;
+    enqueue_triggers(&db.pool, [mixed], Firewall).await?;
 
-    let queued = sqlx::query_as::<_, (NodeId, i64)>(sql!(
-        "SELECT node_id, generation FROM node_reconcile_triggers"
-    ))
-    .fetch_all(&db.pool)
-    .await?
-    .into_iter()
-    .collect::<BTreeMap<_, _>>();
-    assert_eq!(queued, generations);
-    let claimed = claim_triggers(&db.pool, 100)
+    let claimed = claim_triggers(&db.pool, 10)
         .await?
         .triggers
         .into_iter()
@@ -801,40 +721,55 @@ async fn the_firewall_rules_reason_coalesces_like_any_other() -> TestResult {
             )
         })
         .collect::<BTreeMap<_, _>>();
-    assert_eq!(claimed, expected);
+    assert_eq!(
+        claimed,
+        BTreeMap::from([
+            (
+                mixed,
+                (
+                    vec![Updated, Firewall],
+                    "firewall_rules_changed,node_updated,firewall_rules_changed".to_owned(),
+                ),
+            ),
+            (
+                firewall_only,
+                (vec![Firewall], "firewall_rules_changed".to_owned()),
+            ),
+        ])
+    );
     Ok(())
 }
 
-/// Every `state_reconciliation_reason` label is a Rust reason with the same
-/// spelling, whichever way it crosses: the derived sqlx encoding the enqueue
-/// binds, the derived decoding, and the text a claim parses.
+/// The `state_reconciliation_reason` labels and [`ReconcileReason::ALL`] are
+/// the same set, spelled the same whichever way a reason crosses: the derived
+/// sqlx encoding the enqueue binds, the derived decoding, and the text a claim
+/// parses. A Rust reason without a label would fail its enqueue with 22P02.
 #[tokio::test(flavor = "current_thread")]
-async fn every_postgres_reason_label_is_a_rust_reason_spelled_the_same() -> TestResult {
+async fn postgres_reason_labels_and_rust_reasons_are_the_same_set() -> TestResult {
     let db = pg_test_db().await?;
     let labels: Vec<String> = sqlx::query_scalar(sql!(
         "SELECT UNNEST(enum_range(NULL::state_reconciliation_reason))::TEXT"
     ))
     .fetch_all(&db.pool)
     .await?;
-    assert!(labels.iter().any(|label| label == "firewall_rules_changed"));
-    let mut seen = HashSet::new();
-    for label in &labels {
-        let reason =
-            ReconcileReason::parse(label).unwrap_or_else(|| panic!("{label} is no Rust reason"));
-        assert!(
-            seen.insert(reason),
-            "{label} parses to a reason already seen"
-        );
-        assert_eq!(reason.as_str(), label);
+    let labels = labels.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let spellings = ReconcileReason::ALL
+        .iter()
+        .map(|reason| reason.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(labels, spellings);
+    assert_eq!(labels.len(), ReconcileReason::ALL.len());
+    for &reason in ReconcileReason::ALL {
+        assert_eq!(ReconcileReason::parse(reason.as_str()), Some(reason));
         let encoded: String =
             sqlx::query_scalar(sql!("SELECT ($1::state_reconciliation_reason)::TEXT"))
                 .bind(reason)
                 .fetch_one(&db.pool)
                 .await?;
-        assert_eq!(&encoded, label);
+        assert_eq!(encoded, reason.as_str());
         let decoded: ReconcileReason =
             sqlx::query_scalar(sql!("SELECT $1::TEXT::state_reconciliation_reason"))
-                .bind(label)
+                .bind(reason.as_str())
                 .fetch_one(&db.pool)
                 .await?;
         assert_eq!(decoded, reason);

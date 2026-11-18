@@ -166,9 +166,9 @@ async fn fanout_resolves_live_nodes_once_and_dead_letters_ghosts_without_resolvi
     Ok(())
 }
 
-/// Each reason's wire number. Numbers are only ever appended: a node decodes
-/// the number a controller of any version sends, so none may move or be
-/// reused.
+/// Each reason's wire number, pinned here because no proto compatibility
+/// check runs in CI. A node decodes the number a controller of any version
+/// sends, so none may move or be reused.
 #[test]
 fn every_reason_encodes_to_its_wire_number() {
     let wire_numbers = [
@@ -191,9 +191,18 @@ fn every_reason_encodes_to_its_wire_number() {
         (ReconcileReason::NodeTemplateInventoryPublished, 17),
         (ReconcileReason::FirewallRulesChanged, 18),
     ];
-    // The numbers run from 1 without gaps, so this fails when a number is
-    // added without a row above.
-    ProtoReconcileReason::try_from(wire_numbers.len() as i32 + 1).unwrap_err();
+    assert_eq!(
+        wire_numbers.map(|(reason, _)| reason),
+        ReconcileReason::ALL,
+        "a reason without a row"
+    );
+    let numbers = wire_numbers.map(|(_, number)| number);
+    assert!(!numbers.contains(&0), "0 is unspecified");
+    assert_eq!(
+        BTreeSet::from(numbers).len(),
+        numbers.len(),
+        "a reused number"
+    );
     for (reason, number) in wire_numbers {
         assert_eq!(
             i32::from(proto_reconcile_reason(reason)),
