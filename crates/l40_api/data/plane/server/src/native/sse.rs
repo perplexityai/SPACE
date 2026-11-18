@@ -1024,7 +1024,7 @@ fn process_frame_has_event_id(frame: &DataPlaneServerFrame) -> bool {
 /// continues at the live tail. A cursor past the output restarts at the
 /// start, which a guest may in turn report as evicted, so two in a row are
 /// expected.
-const PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS: u32 = 3;
+pub(super) const PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS: u32 = 3;
 
 /// Why the guest ended a process stream because its cursor is outside the
 /// output it retains.
@@ -1079,7 +1079,7 @@ pub(super) fn output_window_miss(status: &tonic::Status) -> Option<OutputWindowM
 /// long its whole search may: a few dozen connects at most, each a round trip
 /// to the guest, so a guest slower than this follows the live tail instead.
 const RETAINED_START_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const RETAINED_START_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const RETAINED_START_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where the output that an exited process still retains starts, asked of a
 /// guest too old to say so: it ends a stream from an evicted cursor with a
@@ -1091,7 +1091,7 @@ const RETAINED_START_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// one connect per cursor. Such a guest lists only running processes, so one
 /// it lists is still running; that, or any answer other than these, gives
 /// `None`, and the stream follows the live tail as before.
-async fn exited_process_retained_start(
+pub(super) async fn exited_process_retained_start(
     client: &mut WorkerApiClient<GrpcClientTrace<Channel>>,
     sandbox_id: &SandboxId,
     process_id: &ProcessId,

@@ -531,20 +531,49 @@ pub(super) fn websocket_keepalive_interval(state: &DataPlaneState) -> tokio::tim
     interval
 }
 
-/// Where a process stream reopens after the guest refused `cursor` as outside
-/// the output it retains: the start of the output for a cursor past it, and
-/// the oldest output retained when the guest reports that one is past the
-/// cursor. Each reopen moves to a cursor the guest cannot refuse the same way
-/// again, so they end. `None` leaves the refusal to end the stream.
-pub(super) fn window_miss_reopen_cursor(status: &tonic::Status, cursor: u64) -> Option<u64> {
-    match output_window_miss(status)? {
-        OutputWindowMiss::CursorAhead => (cursor > 0).then_some(0),
-        OutputWindowMiss::Evicted {
-            first_retained: Some(first),
-        } => (first > cursor).then_some(first),
-        OutputWindowMiss::Evicted {
-            first_retained: None,
-        } => None,
+/// Where a process stream reopens after the guest refused its position as
+/// outside the output it retains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WindowMissReopen {
+    /// At this cursor: the start of the output for a cursor past it, or the
+    /// oldest output retained when the guest reports one past the cursor.
+    At(u64),
+    /// At the oldest output retained, from a guest too old to report it: the
+    /// stream finds it once the process has exited
+    /// ([`exited_process_retained_start`]), and follows the live tail
+    /// otherwise.
+    Unlocated,
+    /// At the live tail, which a stream already following it fell behind.
+    LiveTail,
+}
+
+/// How a process stream at `cursor`, `None` while it follows the live tail,
+/// reopens after the window miss `status` reports. `None` leaves the refusal
+/// to end the stream. The guest can refuse a reopen the same way again, so
+/// the stream caps reopens without output at
+/// [`PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS`].
+pub(super) fn window_miss_reopen(
+    status: &tonic::Status,
+    cursor: Option<u64>,
+) -> Option<WindowMissReopen> {
+    match (output_window_miss(status)?, cursor) {
+        (OutputWindowMiss::CursorAhead, Some(cursor)) => {
+            (cursor > 0).then_some(WindowMissReopen::At(0))
+        }
+        (
+            OutputWindowMiss::Evicted {
+                first_retained: Some(first),
+            },
+            Some(cursor),
+        ) => (first > cursor).then_some(WindowMissReopen::At(first)),
+        (
+            OutputWindowMiss::Evicted {
+                first_retained: None,
+            },
+            Some(_),
+        ) => Some(WindowMissReopen::Unlocated),
+        (OutputWindowMiss::Evicted { .. }, None) => Some(WindowMissReopen::LiveTail),
+        (OutputWindowMiss::CursorAhead, None) => None,
     }
 }
 
@@ -562,7 +591,10 @@ pub(crate) async fn bridge_process_session(
     // a client that attaches again on any replica with the last one it
     // received continues after it. Without `after_seq` the stream starts at
     // the beginning of the retained output, as an SSE stream does without
-    // `Last-Event-ID`.
+    // `Last-Event-ID`. A stream that follows the live tail, behind a
+    // `resync_required`, because a guest too old to say where its retained
+    // output starts evicted it while the process runs, cannot learn the
+    // tail's position, and numbers its output on from where it was.
     let mut output_seq = after_seq.unwrap_or(0);
     let open = open_native_process_stream(
         &state,
@@ -622,6 +654,12 @@ pub(crate) async fn bridge_process_session(
     // Moving past output the guest no longer retains skips it, which
     // `process_exited` then reports as `output_truncated`.
     let mut output_skipped = false;
+    // The stream follows the live tail, so `output_seq` is no position the
+    // guest can reopen at.
+    let mut live_tail = false;
+    // Reopens after a window miss since the last output, capped at
+    // `PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS`.
+    let mut window_reopens_without_progress = 0_u32;
 
     // Raced as a whole, as in `bridge_raw_service_session`, so a stalled
     // revocation check, route refresh, backend reopen or control RPC doesn't
@@ -708,6 +746,15 @@ pub(crate) async fn bridge_process_session(
                             }
                             let batch = process_event_frames(event, &mut output_seq);
                             if batch.frames.iter().any(|frame| {
+                                matches!(
+                                    frame,
+                                    DataPlaneServerFrame::Stdout { .. }
+                                        | DataPlaneServerFrame::Stderr { .. }
+                                )
+                            }) {
+                                window_reopens_without_progress = 0;
+                            }
+                            if batch.frames.iter().any(|frame| {
                                 matches!(frame, DataPlaneServerFrame::ProcessExited { .. })
                             }) {
                                 settle_process_binding(&mut binding).await?;
@@ -755,11 +802,40 @@ pub(crate) async fn bridge_process_session(
                         }
                         Err(status) => {
                             if let Some(current_process_id) = process_id.clone()
-                                && let Some(reopen_at) =
-                                    window_miss_reopen_cursor(&status, output_seq)
+                                && window_reopens_without_progress
+                                    < PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS
+                                && let Some(reopen) = window_miss_reopen(
+                                    &status,
+                                    (!live_tail).then_some(output_seq),
+                                )
                             {
-                                output_skipped |= reopen_at > output_seq;
-                                output_seq = reopen_at;
+                                let reopen_at = match reopen {
+                                    WindowMissReopen::At(cursor) => Some(cursor),
+                                    WindowMissReopen::LiveTail => None,
+                                    WindowMissReopen::Unlocated => tokio::time::timeout(
+                                        RETAINED_START_SEARCH_TIMEOUT,
+                                        exited_process_retained_start(
+                                            &mut client,
+                                            &attached.sandbox_id,
+                                            &current_process_id,
+                                            attached.space_api_route_token.as_ref(),
+                                            output_seq,
+                                        ),
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten(),
+                                };
+                                // A restart from the start of the output
+                                // repeats output; a later cursor, or the live
+                                // tail, skips some.
+                                output_skipped |=
+                                    reopen_at.is_none_or(|cursor| cursor > output_seq);
+                                live_tail = reopen_at.is_none();
+                                if let Some(cursor) = reopen_at {
+                                    output_seq = cursor;
+                                }
+                                window_reopens_without_progress += 1;
                                 send_server_frame(
                                     &mut sink,
                                     &resync_required_frame(
@@ -773,7 +849,7 @@ pub(crate) async fn bridge_process_session(
                                     &mut client,
                                     &attached.sandbox_id,
                                     &current_process_id,
-                                    Some(output_seq),
+                                    reopen_at,
                                     attached.space_api_route_token.as_ref(),
                                 )
                                 .await
@@ -808,7 +884,7 @@ pub(crate) async fn bridge_process_session(
                                 )
                                 .await?;
                                 // The reopened stream continues where this
-                                // one stopped.
+                                // one stopped, or at the live tail it followed.
                                 let reopened = async {
                                     let channel = state
                                         .backend_channels
@@ -819,7 +895,7 @@ pub(crate) async fn bridge_process_session(
                                         &mut reconnect_client,
                                         &refreshed.sandbox_id,
                                         &current_process_id,
-                                        Some(output_seq),
+                                        (!live_tail).then_some(output_seq),
                                         refreshed.space_api_route_token.as_ref(),
                                     )
                                     .await?;

@@ -2974,7 +2974,7 @@ async fn websocket_backend_reconnect_continues_at_its_position() {
 
     assert_eq!(
         websocket_stdout(&frames),
-        [(1, "one\n"), (2, "two\n"), (3, "three\n"), (4, "four\n")]
+        seq_lines(&[(1, "one\n"), (2, "two\n"), (3, "three\n"), (4, "four\n")])
     );
     assert_eq!(websocket_resyncs(&frames), Vec::<String>::new());
     assert_eq!(websocket_output_truncated(&frames), Some(false));
@@ -2982,7 +2982,7 @@ async fn websocket_backend_reconnect_continues_at_its_position() {
 }
 
 /// Each output `seq` and the text it carries.
-fn websocket_stdout(frames: &[serde_json::Value]) -> Vec<(u64, &str)> {
+fn websocket_stdout(frames: &[serde_json::Value]) -> Vec<(u64, String)> {
     frames
         .iter()
         .filter(|frame| frame["type"] == "stdout")
@@ -2990,12 +2990,19 @@ fn websocket_stdout(frames: &[serde_json::Value]) -> Vec<(u64, &str)> {
             let data = BASE64_STANDARD
                 .decode(frame["data_base64"].as_str().unwrap())
                 .unwrap();
-            let text = JOURNAL
-                .into_iter()
-                .find(|line| line.as_bytes() == data)
-                .expect("output is a journal line");
-            (frame["seq"].as_u64().unwrap(), text)
+            (
+                frame["seq"].as_u64().unwrap(),
+                String::from_utf8(data).unwrap(),
+            )
         })
+        .collect()
+}
+
+/// `stdout` as [`websocket_stdout`] returns it.
+fn seq_lines(stdout: &[(u64, &str)]) -> Vec<(u64, String)> {
+    stdout
+        .iter()
+        .map(|(seq, line)| (*seq, (*line).to_string()))
         .collect()
 }
 
@@ -3019,7 +3026,10 @@ fn websocket_output_truncated(frames: &[serde_json::Value]) -> Option<bool> {
 /// are the output's positions, so the attaches of a session carry each output
 /// once. Output no longer retained, an `after_seq` past the output, and one
 /// from before this attach started the process are each reported with
-/// `resync_required`.
+/// `resync_required`. A guest too old to say where its retained output
+/// starts answers an evicted cursor with a bare lag status: the stream finds
+/// that start once the process has exited, and follows the live tail while it
+/// runs, as an SSE stream does.
 #[tokio::test]
 async fn websocket_reattach_continues_after_the_last_seq_received() {
     if !binding_fake_test_process() {
@@ -3028,37 +3038,62 @@ async fn websocket_reattach_continues_after_the_last_seq_received() {
     struct Case {
         name: &'static str,
         bound: bool,
+        running: bool,
         replies: FakeReplies,
         query: &'static str,
         stdout: &'static [(u64, &'static str)],
         resyncs: &'static [&'static str],
         truncated: bool,
-        opens: Vec<FakeOpen>,
+        /// `None` where the stream's search for retained output makes
+        /// connects of its own.
+        opens: Option<Vec<FakeOpen>>,
+    }
+    // An older guest that evicted the output before `FIRST_RETAINED` of a
+    // process that wrote `LINES`; without a cursor it sends live output.
+    const LINES: [&str; 8] = ["1\n", "2\n", "3\n", "4\n", "5\n", "6\n", "7\n", "8\n"];
+    const FIRST_RETAINED: u64 = 5;
+    fn older_guest(open: FakeOpen) -> Vec<FakeReply> {
+        match open {
+            FakeOpen::Connect(Some(cursor)) if cursor < FIRST_RETAINED => {
+                vec![connected(), untagged_lagged()]
+            }
+            FakeOpen::Connect(Some(cursor)) => {
+                let mut replies = vec![connected()];
+                replies.extend(LINES.iter().skip(cursor as usize).map(|line| stdout(line)));
+                replies.push(exited());
+                replies
+            }
+            FakeOpen::Connect(None) => vec![connected(), stdout("live\n"), exited()],
+            FakeOpen::Start => panic!("the process is already bound"),
+        }
     }
     let cases = [
         Case {
             name: "reattach without after_seq",
             bound: true,
+            running: true,
             replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
             query: "",
             stdout: &[(1, "one\n"), (2, "two\n"), (3, "three\n"), (4, "four\n")],
             resyncs: &[],
             truncated: false,
-            opens: connects(&[Some(0)]),
+            opens: Some(connects(&[Some(0)])),
         },
         Case {
             name: "reattach after the second output",
             bound: true,
+            running: true,
             replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
             query: "?after_seq=2",
             stdout: &[(3, "three\n"), (4, "four\n")],
             resyncs: &[],
             truncated: false,
-            opens: connects(&[Some(2)]),
+            opens: Some(connects(&[Some(2)])),
         },
         Case {
             name: "reattach after evicted output",
             bound: true,
+            running: true,
             replies: Arc::new(|_, open| match open {
                 FakeOpen::Connect(Some(cursor)) if cursor < 3 => {
                     let mut replies = vec![connected_at(3)];
@@ -3075,38 +3110,90 @@ async fn websocket_reattach_continues_after_the_last_seq_received() {
             stdout: &[(4, "four\n")],
             resyncs: &["cursor_out_of_window"],
             truncated: true,
-            opens: connects(&[Some(1)]),
+            opens: Some(connects(&[Some(1)])),
         },
         Case {
             name: "reattach past the output",
             bound: true,
+            running: true,
             replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
             query: "?after_seq=9",
             stdout: &[(1, "one\n"), (2, "two\n"), (3, "three\n"), (4, "four\n")],
             resyncs: &["cursor_out_of_window"],
             truncated: false,
-            opens: connects(&[Some(9), Some(0)]),
+            opens: Some(connects(&[Some(9), Some(0)])),
         },
         Case {
             name: "attach that starts the process",
             bound: false,
+            running: true,
             replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
             query: "?after_seq=2",
             stdout: &[(1, "one\n"), (2, "two\n"), (3, "three\n"), (4, "four\n")],
             resyncs: &["cursor_out_of_window"],
             truncated: false,
-            opens: vec![FakeOpen::Start],
+            opens: Some(vec![FakeOpen::Start]),
+        },
+        Case {
+            name: "older guest evicted a running process's output, without after_seq",
+            bound: true,
+            running: true,
+            replies: Arc::new(|_, open| older_guest(open)),
+            query: "",
+            stdout: &[(1, "live\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: true,
+            opens: Some(connects(&[Some(0), None])),
+        },
+        Case {
+            name: "older guest evicted a running process's output, after_seq before it",
+            bound: true,
+            running: true,
+            replies: Arc::new(|_, open| older_guest(open)),
+            query: "?after_seq=2",
+            stdout: &[(3, "live\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: true,
+            opens: Some(connects(&[Some(2), None])),
+        },
+        Case {
+            name: "older guest evicted an exited process's output, without after_seq",
+            bound: true,
+            running: false,
+            replies: Arc::new(|_, open| older_guest(open)),
+            query: "",
+            stdout: &[(6, "6\n"), (7, "7\n"), (8, "8\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: true,
+            opens: None,
+        },
+        Case {
+            name: "older guest evicted an exited process's output, after_seq before it",
+            bound: true,
+            running: false,
+            replies: Arc::new(|_, open| older_guest(open)),
+            query: "?after_seq=2",
+            stdout: &[(6, "6\n"), (7, "7\n"), (8, "8\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: true,
+            opens: None,
         },
     ];
     for case in cases {
         let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
         let fake = spawn_journal_fake(session_id, case.bound, case.replies).await;
+        fake.running.store(case.running, Ordering::SeqCst);
 
         let mut tcp =
             attach_native_websocket_with(&fake.endpoint, session_id, case.query, None).await;
         let frames = websocket_frames_to_close(&mut tcp).await;
 
-        assert_eq!(websocket_stdout(&frames), case.stdout, "{}", case.name);
+        assert_eq!(
+            websocket_stdout(&frames),
+            seq_lines(case.stdout),
+            "{}",
+            case.name
+        );
         assert_eq!(websocket_resyncs(&frames), case.resyncs, "{}", case.name);
         assert_eq!(
             websocket_output_truncated(&frames),
@@ -3114,8 +3201,80 @@ async fn websocket_reattach_continues_after_the_last_seq_received() {
             "{}",
             case.name
         );
-        assert_eq!(*fake.opens.lock().unwrap(), case.opens, "{}", case.name);
+        if let Some(opens) = case.opens {
+            assert_eq!(*fake.opens.lock().unwrap(), opens, "{}", case.name);
+        }
     }
+}
+
+/// A guest can refuse each reopen after a window miss the same way before
+/// any output arrives, as one that keeps evicting past the stream would. The
+/// stream stops reopening after `PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS`
+/// and ends with an error, as an SSE stream does; reopens between which
+/// output arrives are not counted together.
+#[tokio::test]
+async fn websocket_window_miss_reopens_without_output_are_bounded() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let limit = PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS as usize;
+
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| match open {
+            FakeOpen::Connect(Some(cursor)) => vec![connected(), lagged(Some(cursor + 1))],
+            open => panic!("unexpected open {open:?}"),
+        }),
+    )
+    .await;
+    let mut tcp = attach_native_websocket(&fake.endpoint, session_id).await;
+    let mut seen = String::new();
+    read_websocket_until(&mut tcp, &mut seen, "backend_stream_error").await;
+    assert_eq!(
+        *fake.opens.lock().unwrap(),
+        connects(&(0..=limit as u64).map(Some).collect::<Vec<_>>()),
+        "{seen}"
+    );
+    assert_eq!(
+        seen.matches("cursor_out_of_window").count(),
+        limit,
+        "{seen}"
+    );
+
+    // Each reopen here follows output, so the stream reopens more often than
+    // the cap and reaches the exit: every other output is evicted.
+    const LINES: [&str; 10] = [
+        "1\n", "2\n", "3\n", "4\n", "5\n", "6\n", "7\n", "8\n", "9\n", "10\n",
+    ];
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| match open {
+            FakeOpen::Connect(Some(cursor)) if (cursor as usize) < LINES.len() => vec![
+                connected(),
+                stdout(LINES[cursor as usize]),
+                lagged(Some(cursor + 2)),
+            ],
+            FakeOpen::Connect(Some(_)) => vec![connected(), exited()],
+            open => panic!("unexpected open {open:?}"),
+        }),
+    )
+    .await;
+    let mut tcp = attach_native_websocket(&fake.endpoint, session_id).await;
+    let frames = websocket_frames_to_close(&mut tcp).await;
+    assert_eq!(
+        websocket_stdout(&frames),
+        seq_lines(&[(1, "1\n"), (3, "3\n"), (5, "5\n"), (7, "7\n"), (9, "9\n")]),
+        "{frames:?}"
+    );
+    assert_eq!(websocket_output_truncated(&frames), Some(true));
+    assert_eq!(
+        *fake.opens.lock().unwrap(),
+        connects(&[Some(0), Some(2), Some(4), Some(6), Some(8), Some(10)])
+    );
 }
 
 /// An attached process or file-watch socket is pinged while its session is
