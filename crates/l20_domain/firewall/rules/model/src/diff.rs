@@ -7,7 +7,8 @@ use crate::model::{FirewallRuleRevision, Rule, RuleId};
 /// The rules that differ between a base and its candidate, in canonical order:
 /// replaced and removed rules in base order, then added rules in candidate
 /// order. Unchanged rules are absent. An addition carries no position; the
-/// candidate revision holds the full order.
+/// candidate revision holds the full order. The diff carries no identity of
+/// its base; the caller binds it to the base it was computed from.
 ///
 /// Rule order is part of a revision, so the diff also reports whether the
 /// rules both revisions hold changed order: a revision is the exact document

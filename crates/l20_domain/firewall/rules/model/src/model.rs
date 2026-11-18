@@ -11,7 +11,8 @@ const MAX_NAME_LEN: usize = 64;
 /// The stable identity of a rule within a revision, by which a diff matches
 /// rules: 1 to 64 bytes, an ASCII letter or digit and then ASCII letters,
 /// digits, `.`, `_` or `-` (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`), kept as
-/// written.
+/// written. Loosening this later still accepts stored revisions; tightening
+/// would reject some.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RuleId(String);
 
@@ -35,6 +36,8 @@ impl RuleId {
 /// `sack-perm`: 1 to 64 bytes, a lowercase ASCII letter or digit and then
 /// lowercase ASCII letters, digits, `_` or `-` (`[a-z0-9][a-z0-9_-]{0,63}`).
 /// Runtime qualification decides whether a valid name means anything.
+/// Loosening this later still accepts stored revisions; tightening would
+/// reject some.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Name(String);
 
