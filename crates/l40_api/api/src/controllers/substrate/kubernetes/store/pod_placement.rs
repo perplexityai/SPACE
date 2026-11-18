@@ -274,17 +274,19 @@ impl K8sStore {
         Ok(Some(resulting_state))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::controllers::substrate::kubernetes) async fn persist_pod_node_placement(
         &self,
-        sandbox_id: SandboxId,
-        node_name: &str,
-        node_uid: &str,
-        node_id: NodeId,
-        role: NodeRole,
-        address: Option<&str>,
-        instance_id: Option<&Ec2InstanceId>,
+        placement: PodNodePlacement<'_>,
     ) -> Result<(), SubstrateError> {
+        let PodNodePlacement {
+            sandbox_id,
+            node_name,
+            node_uid,
+            node_id,
+            role,
+            address,
+            instance_id,
+        } = placement;
         let mut tx = self
             .pool
             .begin()
@@ -352,26 +354,7 @@ impl K8sStore {
         placement: PodNodePlacement<'_>,
         retry: PlacementRetryDisposition,
     ) -> Result<(), SubstrateError> {
-        let PodNodePlacement {
-            sandbox_id,
-            node_name,
-            node_uid,
-            node_id,
-            role,
-            address,
-            instance_id,
-        } = placement;
-        let result = self
-            .persist_pod_node_placement(
-                sandbox_id,
-                node_name,
-                node_uid,
-                node_id,
-                role,
-                address,
-                instance_id,
-            )
-            .await;
+        let result = self.persist_pod_node_placement(placement).await;
         match retry {
             PlacementRetryDisposition::RetryDuplicatesExecution => {
                 result.map_err(SubstrateError::demoted_after_side_effect)

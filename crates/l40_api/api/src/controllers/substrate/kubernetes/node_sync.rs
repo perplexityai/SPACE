@@ -21,7 +21,7 @@ use pplx_space_k8s_node_id::space_k8s_node_id;
 use pplx_space_node_model::NodeRole;
 
 use super::{
-    KubernetesSubstrate, NodeLifecycleState, NodeStateWrite,
+    K8sNodeRoleUpsert, KubernetesSubstrate, NodeLifecycleState, NodeStateWrite,
     support::{k8s_node_instance_id, k8s_node_internal_ip},
 };
 
@@ -109,15 +109,15 @@ pub(super) async fn sync_labeled_nodes_to_db(
 
         let inventory_changed = match substrate
             .store
-            .persist_k8s_node_inventory(
-                name,
-                uid,
+            .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                node_name: name,
+                node_uid: uid,
                 node_id,
                 role,
-                Some(address.as_str()),
+                address: Some(address.as_str()),
                 state,
-                instance_id.as_ref(),
-            )
+                instance_id: instance_id.as_ref(),
+            })
             .await
         {
             Ok(changed) => changed,

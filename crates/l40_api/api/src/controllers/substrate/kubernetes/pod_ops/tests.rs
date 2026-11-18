@@ -959,15 +959,15 @@ mod stopped_restore_plan_tests {
             .await?;
         substrate
             .store
-            .persist_pod_node_placement(
-                evacuated,
-                "since-terminated-node",
-                "since-terminated-node-uid",
+            .persist_pod_node_placement(PodNodePlacement {
+                sandbox_id: evacuated,
+                node_name: "since-terminated-node",
+                node_uid: "since-terminated-node-uid",
                 node_id,
-                NodeRole::Worker,
-                None,
-                None,
-            )
+                role: NodeRole::Worker,
+                address: None,
+                instance_id: None,
+            })
             .await?;
         sqlx::query(
             "UPDATE sandboxes SET active_node_id = NULL, target_node_id = NULL WHERE id = $1",
@@ -1109,15 +1109,15 @@ mod stopped_restore_plan_tests {
             .await?;
         substrate
             .store
-            .persist_pod_node_placement(
+            .persist_pod_node_placement(PodNodePlacement {
                 sandbox_id,
-                "drained-node",
-                "drained-node-uid",
+                node_name: "drained-node",
+                node_uid: "drained-node-uid",
                 node_id,
-                NodeRole::Worker,
-                None,
-                None,
-            )
+                role: NodeRole::Worker,
+                address: None,
+                instance_id: None,
+            })
             .await?;
         sqlx::query("UPDATE sandboxes SET evacuation_restore_target = 'stopped' WHERE id = $1")
             .bind(sandbox_id)
@@ -1346,15 +1346,15 @@ mod stopped_restore_plan_tests {
             .await?;
         substrate
             .store
-            .persist_pod_node_placement(
+            .persist_pod_node_placement(PodNodePlacement {
                 sandbox_id,
-                "drained-node",
-                "drained-node-uid",
+                node_name: "drained-node",
+                node_uid: "drained-node-uid",
                 node_id,
-                NodeRole::Worker,
-                None,
-                None,
-            )
+                role: NodeRole::Worker,
+                address: None,
+                instance_id: None,
+            })
             .await?;
         sqlx::query("UPDATE sandbox_k8s_executions SET active = FALSE WHERE sandbox_id = $1")
             .bind(sandbox_id)
