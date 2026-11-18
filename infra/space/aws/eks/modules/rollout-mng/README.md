@@ -8,6 +8,10 @@ the new MNG while sandboxes migrate from the incumbent MNG, then is
 dropped in the cleanup PR once the incumbent is empty and gets
 destroyed.
 
+For when to use a blue-green rollout instead of an EKS in-place node
+group update, see
+[Worker node-update strategies](../../../../../../docs/space/aws/node-update-strategies.md).
+
 ## What this module does
 
 Declares a single `aws_eks_node_group` carrying a cohort taint
