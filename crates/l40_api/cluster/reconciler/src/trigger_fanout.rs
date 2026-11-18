@@ -17,16 +17,13 @@ use pplx_space_node_api_client::proto::{
 use pplx_space_node_api_client::{BuilderApiClient, NodeApiClient, WorkerApiClient};
 use pplx_space_node_model::{NodeManagedBy, NodeRole as SpaceNodeRole};
 use pplx_space_state_reconciliation::ReconcileReason;
-use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Endpoint;
 
 use pplx_space_cluster_trigger_queue::{
-    ClaimedStateReconciliationTrigger, StateReconciliationTriggerClaim, TriggerTargetRow,
-    claim_triggers, complete_claim as complete_claim_rows,
-    dead_letter_claim as dead_letter_claim_rows, fetch_trigger_targets,
-    sweep_dead_triggers as sweep_dead_trigger_rows,
+    ClaimedStateReconciliationTrigger, StateReconciliationTriggerClaim, TriggerQueueStore,
+    TriggerTargetRow,
 };
 
 const DEFAULT_INTERVAL: Duration = Duration::from_millis(500);
@@ -209,7 +206,7 @@ impl TriggerNodeApiClientCache {
 }
 
 pub async fn run<R>(
-    pool: PgPool,
+    store: TriggerQueueStore,
     resolver: Arc<R>,
     config: ReconcilerConfig,
     shutdown_token: CancellationToken,
@@ -236,14 +233,14 @@ pub async fn run<R>(
         tokio::select! {
             _ = interval.tick() => {
                 let started = Instant::now();
-                drain_ready_triggers(&pool, resolver.clone(), client_cache.clone(), &config).await;
+                drain_ready_triggers(&store, resolver.clone(), client_cache.clone(), &config).await;
                 tracing::debug!(
                     elapsed_ms = started.elapsed().as_millis(),
                     "state-reconciliation trigger fanout tick completed"
                 );
             }
             _ = dead_reap_interval.tick() => {
-                sweep_dead_trigger_rows_for_config(&pool, &config).await;
+                sweep_dead_trigger_rows_for_config(&store, &config).await;
             }
             _ = shutdown_token.cancelled() => {
                 tracing::info!("state-reconciliation trigger fanout stopping");
@@ -254,7 +251,7 @@ pub async fn run<R>(
 }
 
 async fn drain_ready_triggers<R>(
-    pool: &PgPool,
+    store: &TriggerQueueStore,
     resolver: Arc<R>,
     client_cache: Arc<TriggerNodeApiClientCache>,
     config: &ReconcilerConfig,
@@ -262,7 +259,7 @@ async fn drain_ready_triggers<R>(
     R: TriggerEndpointResolver + 'static,
 {
     for _ in 0..config.max_batches_per_tick {
-        let claim = match claim_triggers(pool, config.batch_size).await {
+        let claim = match store.claim_triggers(config.batch_size).await {
             Ok(claim) => claim,
             Err(error) => {
                 tracing::warn!(%error, "failed to claim state-reconciliation triggers");
@@ -273,7 +270,7 @@ async fn drain_ready_triggers<R>(
             return;
         }
         process_claim(
-            pool,
+            store,
             resolver.clone(),
             client_cache.clone(),
             claim,
@@ -288,7 +285,7 @@ async fn drain_ready_triggers<R>(
 }
 
 async fn process_claim<R>(
-    pool: &PgPool,
+    store: &TriggerQueueStore,
     resolver: Arc<R>,
     client_cache: Arc<TriggerNodeApiClientCache>,
     claim: StateReconciliationTriggerClaim,
@@ -305,14 +302,17 @@ async fn process_claim<R>(
     let claimed = reason_by_node.len() as u64;
     let node_ids = reason_by_node.keys().copied().collect::<Vec<_>>();
     let live_node_names = resolver.live_node_names();
-    let targets = match fetch_trigger_targets(pool, &node_ids, live_node_names.as_ref()).await {
+    let targets = match store
+        .fetch_trigger_targets(&node_ids, live_node_names.as_ref())
+        .await
+    {
         Ok(targets) => targets,
         Err(error) => {
             let failed = node_ids
                 .into_iter()
                 .map(|node_id| (node_id, format!("load trigger target: {error}")))
                 .collect::<Vec<_>>();
-            complete_claim_best_effort(pool, &claim.claim_token, &[], &failed).await;
+            complete_claim_best_effort(store, &claim.claim_token, &[], &failed).await;
             crate::metrics::reconcile::trigger_fanout_batch(claimed, started);
             return;
         }
@@ -412,8 +412,8 @@ async fn process_claim<R>(
             }
         }
     }
-    dead_letter_permanent_claim_failures(pool, &claim.claim_token, &permanent_failed).await;
-    complete_claim_best_effort(pool, &claim.claim_token, &succeeded, &failed).await;
+    dead_letter_permanent_claim_failures(store, &claim.claim_token, &permanent_failed).await;
+    complete_claim_best_effort(store, &claim.claim_token, &succeeded, &failed).await;
 
     if !failed.is_empty() {
         for (node_id, error) in &failed {
@@ -503,25 +503,25 @@ fn trigger_request(reason: &TriggerReasonPayload) -> TriggerStateReconciliationR
 }
 
 async fn complete_claim_best_effort(
-    pool: &PgPool,
+    store: &TriggerQueueStore,
     claim_token: &str,
     succeeded: &[NodeId],
     failed: &[(NodeId, String)],
 ) {
-    if let Err(error) = complete_claim_rows(pool, claim_token, succeeded, failed).await {
+    if let Err(error) = store.complete_claim(claim_token, succeeded, failed).await {
         tracing::warn!(%error, "failed to complete state-reconciliation trigger claim");
     }
 }
 
 async fn dead_letter_permanent_claim_failures(
-    pool: &PgPool,
+    store: &TriggerQueueStore,
     claim_token: &str,
     failed: &[(NodeId, String)],
 ) {
     if failed.is_empty() {
         return;
     }
-    if let Err(error) = dead_letter_claim_rows(pool, claim_token, failed).await {
+    if let Err(error) = store.dead_letter_claim(claim_token, failed).await {
         tracing::warn!(
             claim_token,
             %error,
@@ -530,13 +530,13 @@ async fn dead_letter_permanent_claim_failures(
     }
 }
 
-async fn sweep_dead_trigger_rows_for_config(pool: &PgPool, config: &ReconcilerConfig) {
-    match sweep_dead_trigger_rows(
-        pool,
-        i64::try_from(config.dead_trigger_reap_after.as_secs()).unwrap_or(i64::MAX),
-        config.dead_trigger_reap_limit,
-    )
-    .await
+async fn sweep_dead_trigger_rows_for_config(store: &TriggerQueueStore, config: &ReconcilerConfig) {
+    match store
+        .sweep_dead_triggers(
+            i64::try_from(config.dead_trigger_reap_after.as_secs()).unwrap_or(i64::MAX),
+            config.dead_trigger_reap_limit,
+        )
+        .await
     {
         Ok(0) => {}
         Ok(deleted) => {

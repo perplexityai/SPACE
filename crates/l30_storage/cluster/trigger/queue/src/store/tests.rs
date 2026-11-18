@@ -3,13 +3,16 @@ use pplx_space_accounts::NodeId;
 use std::collections::BTreeMap;
 
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
+use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_INVENTORY,
+    NODE_RECONCILE_CLAIM_STALE_SECS, RECONCILE_FACETS,
 };
+use sqlx::PgPool;
 
 use super::*;
 
-use pplx_space_test_env::TestResult;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn insert_node(pool: &PgPool, node_id: NodeId) -> TestResult {
     insert_ready_worker_node(pool, node_id).await
@@ -52,7 +55,7 @@ async fn insert_queue_row(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn node_queue_metrics_cover_depth_and_stale_claim_counts() -> TestResult {
+async fn node_queue_reads_cover_depth_and_stale_claim_counts() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -78,10 +81,12 @@ async fn node_queue_metrics_cover_depth_and_stale_claim_counts() -> TestResult {
     .await?;
     insert_queue_row(&db.pool, node_id, FACET_NODE_STATUS, "dead", "dead").await?;
 
-    let depth = node_queue_depth_counts(&db.pool)
+    let store = TriggerQueueStore::new(db.pool.clone());
+    let depth = store
+        .node_queue_depth_counts()
         .await?
         .into_iter()
-        .map(|(facet, state, count)| ((facet, state), count))
+        .map(|row| ((row.facet, row.state), row.count))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(
         depth.get(&(FACET_NETWORK_POLICY.to_string(), "ready".to_string())),
@@ -107,15 +112,14 @@ async fn node_queue_metrics_cover_depth_and_stale_claim_counts() -> TestResult {
         Some(&1)
     );
 
-    let stale_claims = node_queue_stale_claim_counts(&db.pool)
+    let stale_claims = store
+        .node_queue_stale_claim_counts()
         .await?
         .into_iter()
+        .map(|row| (row.facet, row.count))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(stale_claims.len(), 1);
     assert_eq!(stale_claims.get(FACET_NETWORK_POLICY), Some(&1));
-
-    emit_node_queue_depth(&db.pool).await;
-    emit_node_queue_stale_claims(&db.pool).await;
     Ok(())
 }
 
@@ -157,7 +161,9 @@ async fn node_queue_lag_only_includes_ready_nodes() -> TestResult {
     .execute(&db.pool)
     .await?;
 
-    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE, QueueLagStage::Claim).await?;
+    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE)
+        .await?
+        .claim_lag_seconds;
     assert!(
         claim_lag < 60.0,
         "inactive node ref inflated actionable lag to {claim_lag}s"
@@ -204,8 +210,12 @@ async fn retrying_ref_does_not_inflate_claim_stage_lag() -> TestResult {
     )
     .await?;
 
-    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE, QueueLagStage::Claim).await?;
-    let retry_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE, QueueLagStage::Retry).await?;
+    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE)
+        .await?
+        .claim_lag_seconds;
+    let retry_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE)
+        .await?
+        .retry_lag_seconds;
     assert!(
         claim_lag < 60.0,
         "retrying ref inflated claim-stage lag to {claim_lag}s"
@@ -249,13 +259,17 @@ async fn retry_ref_past_its_backoff_window_surfaces_as_claim_lag() -> TestResult
     .execute(&db.pool)
     .await?;
 
-    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE, QueueLagStage::Claim).await?;
+    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE)
+        .await?
+        .claim_lag_seconds;
     assert!(
         (1_100.0..1_300.0).contains(&claim_lag),
         "claim lag must be the ~1200s wait since the backoff window opened, got {claim_lag}s"
     );
     // The same row still reports its full lifetime on the retry clock.
-    let retry_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE, QueueLagStage::Retry).await?;
+    let retry_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE)
+        .await?
+        .retry_lag_seconds;
     assert!(
         retry_lag > 1_400.0,
         "retry lag must be the ref's total lifetime, got {retry_lag}s"
@@ -292,12 +306,16 @@ async fn ref_inside_its_backoff_window_is_not_claim_lag() -> TestResult {
     .execute(&db.pool)
     .await?;
 
-    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE, QueueLagStage::Claim).await?;
+    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE)
+        .await?
+        .claim_lag_seconds;
     assert!(
         claim_lag <= 0.0,
         "a ref inside its backoff window inflated claim lag to {claim_lag}s"
     );
-    let retry_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE, QueueLagStage::Retry).await?;
+    let retry_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE)
+        .await?
+        .retry_lag_seconds;
     assert!(
         retry_lag > 1_700.0,
         "retry lag lost the backing-off ref: {retry_lag}s"
@@ -336,7 +354,9 @@ async fn re_enqueueing_an_unclaimed_ref_does_not_restart_claim_lag() -> TestResu
     .execute(&db.pool)
     .await?;
 
-    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE, QueueLagStage::Claim).await?;
+    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE)
+        .await?
+        .claim_lag_seconds;
     assert!(
         claim_lag > 500.0,
         "re-enqueue restarted the claim clock: {claim_lag}s, expected ~600s"
@@ -374,7 +394,9 @@ async fn actively_claimed_ref_is_not_claim_lag() -> TestResult {
     .execute(&db.pool)
     .await?;
 
-    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE, QueueLagStage::Claim).await?;
+    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE)
+        .await?
+        .claim_lag_seconds;
     assert!(
         claim_lag <= 0.0,
         "an actively claimed ref inflated claim lag to {claim_lag}s"
@@ -412,7 +434,9 @@ async fn stale_claim_counts_as_claim_lag_from_when_it_went_stale() -> TestResult
     .execute(&db.pool)
     .await?;
 
-    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE, QueueLagStage::Claim).await?;
+    let claim_lag = lag_for(&db.pool, FACET_SANDBOX_DESIRED_STATE)
+        .await?
+        .claim_lag_seconds;
     let expected = 600.0 - NODE_RECONCILE_CLAIM_STALE_SECS as f64;
     assert!(
         (claim_lag - expected).abs() < 60.0,
@@ -427,11 +451,14 @@ async fn every_facet_emits_both_stages_when_queue_is_empty() -> TestResult {
         return Ok(());
     };
     for facet in RECONCILE_FACETS {
-        for stage in [QueueLagStage::Claim, QueueLagStage::Retry] {
-            // `lag_for` panics unless the facet emitted a row at all, so
-            // this covers both halves of the zero-fill contract: the series
-            // exists, and it carries no lag.
-            let lag = lag_for(&db.pool, facet.as_str(), stage).await?;
+        // `lag_for` panics unless the facet emitted a row at all, so this
+        // covers both halves of the zero-fill contract: the series exists,
+        // and it carries no lag.
+        let row = lag_for(&db.pool, facet.as_str()).await?;
+        for (stage, lag) in [
+            ("claim", row.claim_lag_seconds),
+            ("retry", row.retry_lag_seconds),
+        ] {
             assert!(
                 lag <= 0.0,
                 "facet {facet} stage {stage} must emit zero with an empty queue, got {lag}s"
@@ -441,14 +468,11 @@ async fn every_facet_emits_both_stages_when_queue_is_empty() -> TestResult {
     Ok(())
 }
 
-async fn lag_for(pool: &PgPool, facet: &str, stage: QueueLagStage) -> TestResult<f64> {
-    let (_, claim_seconds, retry_seconds) = node_queue_lag_seconds(pool)
+async fn lag_for(pool: &PgPool, facet: &str) -> TestResult<NodeQueueLagRow> {
+    Ok(TriggerQueueStore::new(pool.clone())
+        .node_queue_lag_seconds()
         .await?
         .into_iter()
-        .find(|(row_facet, _, _)| row_facet == facet)
-        .unwrap_or_else(|| panic!("known facet {facet} must emit a lag value"));
-    Ok(match stage {
-        QueueLagStage::Claim => claim_seconds,
-        QueueLagStage::Retry => retry_seconds,
-    })
+        .find(|row| row.facet == facet)
+        .unwrap_or_else(|| panic!("known facet {facet} must emit a lag value")))
 }

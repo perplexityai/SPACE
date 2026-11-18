@@ -95,6 +95,7 @@ use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_cluster_reconciler::{
     TriggerEndpointResolver, TriggerFanoutConfig, TriggerNodeApiTarget, metrics, trigger_fanout,
 };
+use pplx_space_cluster_trigger_queue::TriggerQueueStore;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
@@ -294,15 +295,16 @@ pub async fn run_reconcilers(
             )
             .map_err(ReconcilerRuntimeError::from)
         })?;
+    let trigger_queue = TriggerQueueStore::new(pool.clone());
     let mut handles = vec![
         tokio::spawn(trigger_fanout::run(
-            pool.clone(),
+            trigger_queue.clone(),
             trigger_substrate,
             TriggerFanoutConfig::default(),
             shutdown_token.child_token(),
         )),
         tokio::spawn(metrics::run_queue_metrics(
-            pool.clone(),
+            trigger_queue,
             metrics::QueueMetricsConfig::default(),
             shutdown_token.child_token(),
         )),

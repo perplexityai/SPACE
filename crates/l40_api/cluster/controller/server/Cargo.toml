@@ -75,6 +75,7 @@ pplx-space-bearer-token = { workspace = true }
 pplx-space-cluster-id = { workspace = true }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-cluster-reconciler = { workspace = true }
+pplx-space-cluster-trigger-queue = { workspace = true }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-env-vars = { workspace = true }
