@@ -1,12 +1,38 @@
 //! What a restore through the shared executor decides differently for the
-//! user restore and wake paths and for the node drain's evacuation, built
-//! once when the restore is asked for.
+//! user restore and wake paths, for the node drain's evacuation, and for the
+//! drain restore operation, built once when the restore is asked for.
 
 use super::RestoreSnapshotChoice;
 use super::execution::WakeTarget;
 use crate::controllers::substrate::{ActivationAttribution, ChargeState, RecoveryCharge};
 use pplx_space_sandbox_model::SandboxLifecycle;
 use pplx_space_sandbox_pod::EvacuationPlacement;
+use uuid::Uuid;
+
+/// The restore a drain restore operation asks for: the suspend snapshot it
+/// restores `started`, and the restore lease it claims under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrainRestore {
+    /// S, the snapshot the drain's suspend left. The claim takes the row only
+    /// while the restore selector would load it.
+    pub snapshot_id: Uuid,
+    /// The lease token every attempt of the operation claims under: the
+    /// operation's own id.
+    pub restore_lease_token: Uuid,
+}
+
+/// What one drain restore attempt did
+/// (`KubernetesSubstrate::restore_drained_execution`).
+#[derive(Clone, Debug)]
+pub enum DrainRestoreAttempt {
+    /// The sandbox is `started`.
+    Landed,
+    /// The node brought the VM up, but something moved the row before the
+    /// commit: the next attempt reads it again.
+    Lost,
+    /// The claim took nothing, for this reason; nothing was written.
+    Refused(pplx_space_sandbox_store::drain_restore::DrainRestoreRefusal),
+}
 
 /// How a restore claims the sandbox row, and what it does when the claim is
 /// taken.
@@ -31,6 +57,14 @@ pub(super) enum RestoreClaimMode {
     /// target may take. It joins nothing and fails fast: the drain owns its
     /// retry loop.
     EvacuationMarker,
+    /// The drain restore operation's claim
+    /// (`pplx_space_sandbox_store::drain_restore::claim_drain_restore`),
+    /// which the operation's attempt takes before the activation: a
+    /// `suspended` row whose restore selector loads the snapshot, moved to
+    /// `restoring` under the operation's lease. It joins nothing and fails
+    /// fast: the operation owns its retries.
+    #[cfg(test)]
+    DrainOperation(DrainRestore),
 }
 
 impl RestoreClaimMode {
@@ -142,6 +176,21 @@ impl RestoreIntent {
             coalesces: false,
             owner_commits_started: false,
             redrives_started_recovery: false,
+        }
+    }
+
+    /// The drain restore operation's restore, placed as the drain's
+    /// evacuation is ([`Self::drain`]) and exempt from the charge. It wakes
+    /// the VM `started`, and its caller commits the row.
+    #[cfg(test)]
+    pub(super) fn drain_operation(
+        cohort: Option<EvacuationPlacement>,
+        restore: DrainRestore,
+    ) -> Self {
+        Self {
+            target: WakeTarget::Explicit(SandboxLifecycle::Started),
+            claim: RestoreClaimMode::DrainOperation(restore),
+            ..Self::drain(cohort, SandboxLifecycle::Started)
         }
     }
 

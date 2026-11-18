@@ -1478,6 +1478,11 @@ impl KubernetesSubstrate {
                 RestoreClaimMode::UserLease { .. } => {
                     self.store.begin_restore_lifecycle(sandbox_id, false).await
                 }
+                // Claimed by `restore_drained_execution` before this.
+                #[cfg(test)]
+                RestoreClaimMode::DrainOperation(restore) => Ok(RestoreClaim::FreshFromSuspended {
+                    restore_lease_token: Some(restore.restore_lease_token),
+                }),
             };
             match claim {
                 Ok(restore_claim) => break restore_claim,
@@ -2677,6 +2682,9 @@ pub(super) fn restore_failure_should_revert_to_suspended(
     matches!(claim, Some(RestoreClaim::FreshFromSuspended { .. }))
         && wake_failure_should_revert_to_suspended(err, dispatch)
 }
+
+#[cfg(test)]
+mod drain_restore;
 
 #[cfg(test)]
 mod tests;
