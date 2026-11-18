@@ -740,12 +740,14 @@ async fn the_firewall_rules_reason_enqueues_and_claims() -> TestResult {
     Ok(())
 }
 
-/// The `state_reconciliation_reason` labels and [`ReconcileReason::ALL`] are
-/// the same set, spelled the same whichever way a reason crosses: the derived
-/// sqlx encoding the enqueue binds, the derived decoding, and the text a claim
-/// parses. A Rust reason without a label would fail its enqueue with 22P02.
+/// Every [`ReconcileReason`] has a `state_reconciliation_reason` label, spelled
+/// the same whichever way the reason crosses: the derived sqlx encoding the
+/// enqueue binds, the derived decoding, and the text a claim parses. A Rust
+/// reason without a label would fail its enqueue with 22P02. A label without a
+/// Rust reason is not checked: a new label ships in a migration of its own
+/// before the build that adds its reason, and a claim skips it until then.
 #[tokio::test(flavor = "current_thread")]
-async fn postgres_reason_labels_and_rust_reasons_are_the_same_set() -> TestResult {
+async fn every_rust_reason_has_a_postgres_label() -> TestResult {
     let db = pg_test_db().await?;
     let labels: Vec<String> = sqlx::query_scalar(sql!(
         "SELECT UNNEST(enum_range(NULL::state_reconciliation_reason))::TEXT"
@@ -757,8 +759,11 @@ async fn postgres_reason_labels_and_rust_reasons_are_the_same_set() -> TestResul
         .iter()
         .map(|reason| reason.as_str())
         .collect::<BTreeSet<_>>();
-    assert_eq!(labels, spellings);
-    assert_eq!(labels.len(), ReconcileReason::ALL.len());
+    assert!(
+        spellings.is_subset(&labels),
+        "reasons without a label: {:?}",
+        spellings.difference(&labels).collect::<Vec<_>>()
+    );
     for &reason in ReconcileReason::ALL {
         assert_eq!(ReconcileReason::parse(reason.as_str()), Some(reason));
         let encoded: String =
