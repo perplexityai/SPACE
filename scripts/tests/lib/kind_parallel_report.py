@@ -6,6 +6,8 @@ and each bench's share of them, computed with the typed runner's own registry
 and partition (space_smoke.sharding.select_shard). It needs the project
 environment (`uv run`), and reads the same variables the runner reads.
 
+`source REPO FILE` records the checkout a run starts from (see `source`).
+
 `summarize OUT` reads the run directory smoke-kind-parallel.sh wrote, writes
 summary.md, summary.json and timeline.txt there, and exits as the typed suite
 ranks a suite (space_smoke/suite.py, suite_exit_code): 1 when any scenario
@@ -20,9 +22,11 @@ needs only the standard library.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -471,14 +475,54 @@ def summarize(out: Path) -> int:
     return status
 
 
+def source(repo: Path, destination: Path) -> int:
+    """Record the checkout a run starts from: its commit, whether the tree
+    differs from it, a fingerprint of how, and the lane settings.
+
+    The fingerprint covers the diff from HEAD and every untracked entry the
+    benches' checkouts copy, without following links: a symlink's target text,
+    a regular file's content, and otherwise (an embedded repository, say) the
+    path alone.
+    """
+
+    def git(*args: str) -> bytes:
+        return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True).stdout
+
+    untracked = hashlib.sha256()
+    for name in sorted(filter(None, git("ls-files", "-z", "--others", "--exclude-standard").split(b"\0"))):
+        path = repo / os.fsdecode(name)
+        untracked.update(name + b"\0")
+        if path.is_symlink():
+            untracked.update(b"link\0" + os.fsencode(os.readlink(path)))
+        elif path.is_file():
+            untracked.update(b"file\0" + path.read_bytes())
+        untracked.update(b"\0")
+    record = {
+        "head": git("rev-parse", "HEAD").decode().strip(),
+        "dirty": bool(git("status", "--porcelain").strip()),
+        "diff_from_head_sha256": hashlib.sha256(git("diff", "HEAD", "--binary")).hexdigest(),
+        "untracked_sha256": untracked.hexdigest(),
+        "substrate": os.environ.get("SPACE_KIND_SUBSTRATE") or "kubernetes",
+        "rust_build": os.environ.get("SPACE_KIND_RUST_BUILD") or "test-hooks",
+        "tiers": os.environ.get("SPACE_SMOKE_TIERS") or "routine",
+    }
+    destination.write_text(json.dumps(record, indent=2) + "\n")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("inventory").add_argument("--benches", type=int, required=True)
     commands.add_parser("summarize").add_argument("out", type=Path)
+    recorded = commands.add_parser("source")
+    recorded.add_argument("repo", type=Path)
+    recorded.add_argument("destination", type=Path)
     args = parser.parse_args()
     if args.command == "inventory":
         return inventory(args.benches)
+    if args.command == "source":
+        return source(args.repo, args.destination)
     return summarize(args.out)
 
 
