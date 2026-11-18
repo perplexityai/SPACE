@@ -385,8 +385,10 @@ on_exit() {
   local rc=$?
   trap - EXIT INT TERM
   local pid
+  # Only jobs still this shell's children: a finished one's PID may since
+  # belong to anything.
   for pid in ${BACKGROUND[@]+"${BACKGROUND[@]}"}; do
-    kill_tree "$pid"
+    [[ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" == "$$" ]] && kill_tree "$pid"
   done
   if (( KEEP == 1 )); then
     log "--keep: benches left up; remove them with: $0 teardown"
