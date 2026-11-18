@@ -47,7 +47,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-KIND_BENCH_ROOT="${SPACE_KIND_BENCH_ROOT:-$HOME/.space-benches}"
+# Canonical, so the bench paths compare equal to the mount table's and to the
+# worktree list's.
+KIND_BENCH_ROOT="$(realpath -m -- "${SPACE_KIND_BENCH_ROOT:-$HOME/.space-benches}")"
 # shellcheck source=lib/kind-bench.sh
 source "$SCRIPT_DIR/lib/kind-bench.sh"
 
@@ -107,6 +109,22 @@ UI_CACHE_SCOPE="$(space_kind_layer_scope ui-deps)"
 # The seed the benches copy instead of building one each.
 SEED_DIR="$CACHE_ROOT/seed"
 
+# The benches' checkouts went with their directories; drop their entries from
+# the repository's worktree list. Only entries whose checkout was under
+# KIND_BENCH_ROOT and is gone: `git worktree prune` would also drop the
+# caller's own worktrees whose directories are missing just now (an unmounted
+# volume, a moved checkout), with their index and HEAD.
+prune_bench_worktrees() {
+  local common entry gitdir
+  common="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)" || return 0
+  for entry in "$common"/worktrees/*; do
+    [[ -f "$entry/gitdir" ]] || continue
+    gitdir="$(<"$entry/gitdir")"
+    [[ "$gitdir" == "$KIND_BENCH_ROOT/"* && ! -e "$gitdir" ]] || continue
+    rm -rf -- "$entry"
+  done
+}
+
 # Remove every bench the host has. Returns 1, naming them, when any is left.
 teardown_all() {
   local i pids=() left
@@ -119,8 +137,7 @@ teardown_all() {
     pids+=("$!")
   done
   wait ${pids[@]+"${pids[@]}"} || true
-  # The benches' checkouts went with their directories.
-  git -C "$REPO_ROOT" worktree prune
+  prune_bench_worktrees
   left="$(kind_bench_existing | tr '\n' ' ')"
   if [[ -n "${left// /}" ]]; then
     log "benches still present after teardown: $left"
@@ -204,11 +221,15 @@ default_benches() {
 }
 
 # The benches' directories are the caller's; only their Docker data roots are
-# root's. Created before the default N reads its free disk.
-mkdir -p "$KIND_BENCH_ROOT" 2>/dev/null || sudo -n install -d -o "$(id -u)" -g "$(id -g)" "$KIND_BENCH_ROOT" \
-  || die "cannot create $KIND_BENCH_ROOT"
-[[ -O "$KIND_BENCH_ROOT" ]] || sudo -n chown "$(id -u):$(id -g)" "$KIND_BENCH_ROOT" \
-  || die "cannot own $KIND_BENCH_ROOT"
+# root's. Created before the default N reads its free disk; an existing root
+# must already be the caller's, since nothing here would give it back.
+if [[ ! -e "$KIND_BENCH_ROOT" ]]; then
+  mkdir -p "$KIND_BENCH_ROOT" 2>/dev/null \
+    || sudo -n install -d -o "$(id -u)" -g "$(id -g)" "$KIND_BENCH_ROOT" \
+    || die "cannot create $KIND_BENCH_ROOT"
+fi
+[[ -d "$KIND_BENCH_ROOT" && -O "$KIND_BENCH_ROOT" ]] \
+  || die "SPACE_KIND_BENCH_ROOT must be a directory you own (or a path this script can create): $KIND_BENCH_ROOT"
 
 # Before the default N reads the free disk, which an earlier run's benches
 # still hold.
