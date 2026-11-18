@@ -1,5 +1,5 @@
 //! The v2 loop's statements against Postgres: the evacuation record, the
-//! report, the admission and the `drained` edge.
+//! report, the `drained` edge and the cancel.
 
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_test_env::TestResult;
@@ -362,7 +362,34 @@ async fn the_report_and_the_drained_edge_need_the_rows_own_epoch() -> TestResult
     Ok(())
 }
 
-/// A drain left waiting is listed waiting, and admitted
+/// The cancel clears only an undrained row marked for it, under its epoch.
+#[tokio::test(flavor = "current_thread")]
+async fn the_cancel_clears_only_an_undrained_row_of_its_epoch() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let marked = serde_json::json!({"epoch": 5, "cancel": true});
+    let undrained = v2_node(pool, None, marked.clone()).await?;
+    let still_draining = v2_node(pool, Some("draining"), marked).await?;
+    let unmarked = v2_node(pool, None, serde_json::json!({"epoch": 5})).await?;
+    assert!(!finish_v2_cancel(pool, undrained, 4).await?);
+    assert!(!finish_v2_cancel(pool, still_draining, 5).await?);
+    assert!(!finish_v2_cancel(pool, unmarked, 5).await?);
+    assert!(finish_v2_cancel(pool, undrained, 5).await?);
+    let listed: Vec<NodeId> = list_v2_nodes(pool)
+        .await?
+        .into_iter()
+        .map(|node| node.id)
+        .collect();
+    assert!(
+        !listed.contains(&undrained) && listed.contains(&still_draining),
+        "{listed:?}"
+    );
+    Ok(())
+}
+
+/// A drain the admin route left waiting is listed waiting, and admitted
 /// once, under its own epoch and only while it is `draining`: the row then
 /// reads `waiting: false`. A row without the key isn't waiting.
 #[tokio::test(flavor = "current_thread")]

@@ -69,6 +69,7 @@ pplx-space-reconcile-metrics = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
+pplx-space-node-registration-store = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-postgres-pool = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }

@@ -3,6 +3,7 @@ use super::{
     wake_lifecycle_allows_started_update,
 };
 use pplx_space_common_core::types::{NodeDrainMode, NodeDrainPhase, SandboxLifecycle};
+use pplx_space_node_drain::NodeDrainEngine;
 
 #[test]
 fn placement_affecting_actions_match_design() {
@@ -211,7 +212,12 @@ fn wake_entry_accepts_recoverable_states_and_rejects_teardown_states() {
 }
 
 fn state(phase: NodeDrainPhase, mode: NodeDrainMode) -> NodeDrainState {
-    NodeDrainState { phase, mode }
+    NodeDrainState {
+        phase,
+        mode,
+        awaiting_evacuation: false,
+        engine: NodeDrainEngine::V1,
+    }
 }
 
 #[test]

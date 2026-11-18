@@ -75,6 +75,11 @@ pub enum ReconcilerRuntimeError {
     InvalidTerminatorKind(String),
     #[error("invalid or missing SPACE API route signing configuration: {0}")]
     RouteSigningConfiguration(#[from] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
+    /// The drain's v2 runs in the node drain's loop.
+    #[error(
+        "SPACE_DRAIN_V2_ENABLED needs SPACE_NODE_DRAIN_ENABLED: the node drain runs the v2 loop"
+    )]
+    DrainV2NeedsNodeDrain,
 }
 
 /// How [`run_reconcilers`] wound down on a requested shutdown — whether every
@@ -138,6 +143,26 @@ impl TerminatorKind {
             Self::Noop => "noop",
         }
     }
+}
+
+/// Whether new v2 drains are admitted: `SPACE_DRAIN_V2_ENABLED`, refused
+/// unless the node drain runs, since its v2 loop drives them. The loop
+/// itself runs wherever the node drain does, flag or not, so a v2 drain
+/// already persisted still has an owner.
+fn drain_v2_enabled(
+    env: &dyn pplx_space_env_vars::Environment,
+    node_drain_enabled: bool,
+) -> Result<bool, ReconcilerRuntimeError> {
+    let enabled = pplx_space_env_vars::env_flag(
+        env.var(pplx_space_api::routes::admin::nodes::DRAIN_V2_ENABLED_ENV)
+            .ok()
+            .as_deref(),
+        false,
+    );
+    if enabled && !node_drain_enabled {
+        return Err(ReconcilerRuntimeError::DrainV2NeedsNodeDrain);
+    }
+    Ok(enabled)
 }
 
 /// The terminator backend a [`TerminatorKind`] selects, with the AWS
@@ -457,6 +482,12 @@ pub async fn run_reconcilers(
             tracing::info!("skipping Kubernetes-only reconcilers on direct substrate");
         }
         Some(kube) => {
+            // Admission is the API's; here the flag is only checked against
+            // what a v2 drain needs.
+            drain_v2_enabled(
+                &pplx_space_env_vars::ProcessEnvironment,
+                node_drain::ReconcilerConfig::from_env().enabled,
+            )?;
             let environment_placement = substrate.environment_placement();
             let warm_pool_token = shutdown_token.child_token();
             let warm_pool_store = WarmPoolStore::new(pool.clone());
@@ -719,10 +750,11 @@ pub async fn run_reconcilers(
                 );
                 let backend = TerminatorBackend::load(kind).await;
                 // The v2 drain's loop, beside v1's: it acts only on the rows
-                // whose `drain_engine` is `v2`, which v1's writers skip. It
-                // runs wherever the node drain does, so a persisted v2 drain
-                // always has an owner; it asks EC2 only under the `aws`
-                // terminator ([`TerminatorBackend::v2_terminator`]).
+                // `:drain {engine: v2}` marked, which v1's writers skip. It
+                // runs whether or not new v2 drains are admitted, so a
+                // persisted one is still drained or cancelled; it asks EC2
+                // only under the `aws` terminator
+                // ([`TerminatorBackend::v2_terminator`]).
                 handles.push(tokio::spawn(node_drain::v2::run(
                     node_drain::SubstrateSink::v2(pool.clone(), kube.clone()),
                     backend.v2_terminator(),

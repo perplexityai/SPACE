@@ -214,21 +214,36 @@ pub async fn register_k8s_node(
     // set is worse than meaningless: the admin listing and `space-admin-cli get-node`
     // read the column independently of the phase, so a surviving mode makes
     // a node that is not draining report `drain_phase: null` next to
-    // `drain_mode: gentle`.
+    // `drain_mode: gentle`. A v2 drain's engine and status go with them for
+    // the same reason: its epoch and report are the replaced machine's.
+    //
+    // A v2 drain is the exception when the instance is unchanged: the same
+    // machine re-created its Node (a `kubectl delete node`, a kubelet
+    // restart), and its sandbox-manager is still sealed under the drain's
+    // epoch, which only that drain's undrain settles. Both instances must be
+    // known and equal: the recorded one and the one the Node reports. An
+    // unreported one counts as a replacement.
     let drain_cleared = sqlx::query(sql!(
-        "UPDATE nodes
+        "UPDATE nodes n
              SET drain_phase = NULL,
                  drain_mode = NULL,
                  drain_started_at = NULL,
-                 drain_last_error = NULL
-             WHERE id = $1
-               AND EXISTS (
-                 SELECT 1 FROM node_k8s
-                 WHERE node_id = $1 AND k8s_node_uid IS DISTINCT FROM $2
+                 drain_last_error = NULL,
+                 drain_engine = NULL,
+                 drain_status = NULL
+             FROM node_k8s k
+             WHERE n.id = $1
+               AND k.node_id = n.id
+               AND k.k8s_node_uid IS DISTINCT FROM $2
+               AND NOT COALESCE(
+                 n.drain_engine = 'v2'
+                   AND k.instance_id = $3::TEXT,
+                 FALSE
                )"
     ))
     .bind(node_id)
     .bind(node_uid)
+    .bind(instance_id.map(Ec2InstanceId::as_str))
     .execute(&mut *conn)
     .await
     .step(K8sNodeRegistrationStep::ClearDrain)?

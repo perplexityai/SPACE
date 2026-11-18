@@ -57,6 +57,39 @@ async fn gentle_draining_node_does_not_block_a_service_port_open() -> TestResult
     Ok(())
 }
 
+/// A forced v2 drain still waiting for an evacuation slot leaves ingress
+/// open, as the user-API gates do; once admitted, it refuses.
+#[tokio::test(flavor = "current_thread")]
+async fn a_v2_drain_waiting_for_a_slot_does_not_block_a_service_port_open() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    set_drain(&db.pool, node_id, Some("draining"), Some("forced")).await?;
+    let set_waiting = |waiting: bool| {
+        sqlx::query(
+            "UPDATE nodes SET drain_engine = 'v2',
+                    drain_status = jsonb_build_object('epoch', 1, 'waiting', $2::BOOLEAN)
+              WHERE id = $1",
+        )
+        .bind(node_id)
+        .bind(waiting)
+        .execute(&db.pool)
+    };
+    set_waiting(true).await?;
+    ensure_sandbox_service_route_node_not_draining(&db.pool, sandbox_id, node_id)
+        .await
+        .expect("a waiting v2 drain must not block opening a service port");
+    set_waiting(false).await?;
+    let err = ensure_sandbox_service_route_node_not_draining(&db.pool, sandbox_id, node_id)
+        .await
+        .expect_err("an admitted v2 drain refuses");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    Ok(())
+}
+
 /// The cases that must still be refused, so the fix above cannot be mistaken
 /// for removing the guard.
 ///

@@ -1,4 +1,6 @@
 use pplx_space_accounts::NodeId;
+use pplx_space_node_drain::NodeDrainEngine;
+use pplx_space_node_registration_store::drain_v2 as node_drain_v2;
 
 use axum::{
     Extension, Json,
@@ -37,8 +39,11 @@ use crate::middleware::auth::AuthUser;
 use crate::models::User;
 use crate::routes::AppState;
 
+mod drain_v2;
 mod holds;
 mod read_state;
+pub use drain_v2::DRAIN_V2_ENABLED_ENV;
+use drain_v2::{DrainV2Write, drain_v2_write};
 pub(super) use holds::list_node_holds;
 use read_state::attach_node_read_state;
 
@@ -513,6 +518,8 @@ fn admin_node_response(
             .map(|raw| NodeDrainMode::from_column_str(Some(raw))),
         drain_started_at: format_optional_time(row.drain_started_at),
         drain_last_error: row.drain_last_error,
+        drain_engine: row.drain_engine,
+        drain_status: row.drain_status.map(|status| status.0),
         terminate_decrement_capacity: row.terminate_decrement_capacity,
         node_group_id: row.node_group_id,
         k8s_node_name: row.substrate_node_id,
@@ -1692,6 +1699,14 @@ async fn apply_drain_action(
             .into_response();
     }
 
+    // The drain v2 columns, read under the same lock as the phase write.
+    let v2_columns = match node_drain_v2::drain_v2_columns(&mut *tx, node_id).await {
+        Ok(Some(columns)) => columns,
+        // The row is locked above, so it can't be gone here.
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "Node not found").into_response(),
+        Err(err) => return db_error(err).into_response(),
+    };
+
     let transition = match validate_drain_transition(
         current.drain_phase.as_deref(),
         current_mode,
@@ -1797,6 +1812,67 @@ async fn apply_drain_action(
                 "error": replace_conflict_message(stored_replace, requested_replace),
                 "current_replace_after_terminate": stored_replace,
                 "requested_replace_after_terminate": requested_replace,
+            })),
+        )
+            .into_response();
+    }
+
+    // The drain v2 engine: refuse what it can't run, and decide its write,
+    // under the same lock as the phase write.
+    let v2_write = match drain_v2_write(
+        action,
+        drain_request
+            .engine
+            .filter(|_| matches!(action, DrainAction::Drain)),
+        requested_mode,
+        current.managed_by,
+        v2_columns.engine,
+        v2_columns.recorded_instance,
+        transition_starts_a_drain(&transition),
+        state.drain_v2_enabled,
+    ) {
+        Ok(write) => write,
+        Err((status, message)) => {
+            audit::record(AdminAuditEntry {
+                actor: &actor,
+                action: action.label(),
+                node_id,
+                node_name: current.substrate_node_id.as_deref(),
+                from_phase: current.drain_phase.as_deref(),
+                to_phase: None,
+                from_drain_mode: mode_in_progress,
+                replace_after_terminate: requested_replace_after_terminate,
+                drain_mode: requested_mode,
+                success: false,
+                error: Some(message),
+                outcome_counts: None,
+            });
+            return (status, Json(serde_json::json!({ "error": message }))).into_response();
+        }
+    };
+    // This version doesn't terminate a v2 node: its drain reaches `drained`
+    // and waits there, still sealed, until `:undrain`.
+    if matches!(action, DrainAction::Terminate) && v2_columns.engine == NodeDrainEngine::V2 {
+        audit::record(AdminAuditEntry {
+            actor: &actor,
+            action: action.label(),
+            node_id,
+            node_name: current.substrate_node_id.as_deref(),
+            from_phase: current.drain_phase.as_deref(),
+            to_phase: None,
+            from_drain_mode: mode_in_progress,
+            replace_after_terminate: requested_replace_after_terminate,
+            drain_mode: requested_mode,
+            success: false,
+            error: Some("conflict: a v2 drain is not terminated by this version"),
+            outcome_counts: None,
+        });
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "the node's drain runs on engine v2, which this version does not \
+                          terminate; :undrain it",
+                "drain_status": v2_columns.status,
             })),
         )
             .into_response();
@@ -1915,6 +1991,14 @@ async fn apply_drain_action(
             }
         }
         DrainTransition::NoChange => {}
+    }
+    let v2_written = match v2_write {
+        DrainV2Write::None => Ok(()),
+        DrainV2Write::Start => node_drain_v2::start_v2_drain(&mut tx, node_id).await,
+        DrainV2Write::Cancel => node_drain_v2::mark_v2_drain_cancel(&mut tx, node_id).await,
+    };
+    if let Err(err) = v2_written {
+        return db_error(err).into_response();
     }
     let new_phase = phase_after(&transition, current.drain_phase.as_deref());
 
@@ -2205,7 +2289,14 @@ async fn apply_force_upload_local_snapshots(
         .map(NodeDrainPhase::parse)
         .transpose()
     {
-        Ok(phase) => NodeDrainState::from_columns(phase, node.drain_mode.as_deref()),
+        Ok(phase) => node_drain_v2::gate_drain_state(
+            phase,
+            node.drain_mode.as_deref(),
+            node_drain_v2::gate_column(
+                node.drain_engine.as_deref(),
+                node.drain_status.as_ref().map(|status| &status.0),
+            ),
+        ),
         Err(err) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -15,7 +15,8 @@ use pplx_space_sbx_mgr_client::proto::{
 use uuid::Uuid;
 
 use pplx_space_node_registration_store::drain_v2::{
-    admit_v2_evacuation, advance_v2_drained, list_v2_node_rows, record_v2_error, record_v2_report,
+    admit_v2_evacuation, advance_v2_drained, finish_v2_cancel, list_v2_node_rows, record_v2_error,
+    record_v2_report,
 };
 
 use super::*;
@@ -34,6 +35,7 @@ pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Er
                 id: row.id,
                 phase: row.drain_phase,
                 epoch,
+                cancel: row.cancel,
                 waiting: row.waiting,
                 unrecorded_since: unrecorded_since(
                     row.report
@@ -228,7 +230,13 @@ impl DrainV2Sink for SubstrateSink {
             .map_err(|error| error.to_string())
     }
 
-    async fn drain_node(&self, node_id: NodeId, epoch: u64) -> Result<DrainNodeResponse, String> {
+    async fn drain_node(
+        &self,
+        node_id: NodeId,
+        epoch: u64,
+        cancel: bool,
+        forget: &[String],
+    ) -> Result<DrainNodeResponse, String> {
         let target = node_api_row(&self.pool, node_id)
             .await
             .map_err(|error| format!("node endpoint lookup failed: {error}"))?
@@ -243,6 +251,8 @@ impl DrainV2Sink for SubstrateSink {
         client
             .drain_node(DrainNodeRequest {
                 epoch,
+                cancel,
+                forget: forget.to_vec(),
                 ..DrainNodeRequest::default()
             })
             .await
@@ -277,6 +287,12 @@ impl DrainV2Sink for SubstrateSink {
 
     async fn advance_drained(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
         advance_v2_drained(&self.pool, node_id, epoch_i64(epoch)?)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn finish_cancel(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
+        finish_v2_cancel(&self.pool, node_id, epoch_i64(epoch)?)
             .await
             .map_err(|error| error.to_string())
     }

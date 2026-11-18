@@ -245,6 +245,16 @@ newer copy, so the reconciler leaves the sandbox to that node in two ways.
 The listing's skip has no metric of its own: such a sandbox is one the node
 reports while the control plane has no pod for it.
 
+## A v2 node drain that waits
+
+A v2 drain (`:drain {mode: forced, engine: v2}`) keeps its state in the admin node listing: `drain_phase`, `drain_engine: v2`, `drain_status` (the epoch and the node's last report) and `drain_last_error`, which says what the cluster controller is waiting for.
+
+| What the listing shows | What it means and what to do |
+|---|---|
+| `drained`, and `:terminate` answers 409 | This version doesn't terminate a v2 node: its drain stays `drained`, the node sealed, until `:undrain`, which cancels the epoch on the node. |
+| `the node's heartbeat is stale; EC2 answers ... for its instance ...` | The node stopped reporting, and the controller asked EC2 about its recorded instance. Nothing changes on that answer, except that a node EC2 lists `shutting-down` or `terminated` frees its evacuation slot. |
+| A sandbox that was `paused` before the drain is `suspended`, with no drain restore | Expected: the drain restores only a sandbox that was `started`. One that was `paused` is made durable and left `suspended`; its next resume or wake restores it on another node. |
+
 ## Timeouts mean different things
 
 A client deadline limits how long the client waits; it does not cancel a lifecycle operation or establish that a process stopped. Inspect the resource before retrying or issuing another command.

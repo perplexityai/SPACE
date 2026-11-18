@@ -3,10 +3,18 @@
 use super::*;
 
 impl V2Node {
-    /// Holding an evacuation slot: admitted and not yet `drained`. The slot
-    /// frees once the node reaches `drained` or leaves v2.
+    /// Holding an evacuation slot: admitted and not yet `drained`, or
+    /// undrained after its admission with its cancel not yet finished, which
+    /// lets the node's running suspends and uploads finish. The slot frees
+    /// once the node leaves v2: its cancel finished, or its row deleted.
     fn evacuating(&self) -> bool {
-        self.epoch.is_some() && !self.waiting && self.phase.as_deref() == Some("draining")
+        self.epoch.is_some()
+            && !self.waiting
+            && match self.phase.as_deref() {
+                Some("draining") => true,
+                None => self.cancel,
+                Some(_) => false,
+            }
     }
 
     /// [`Self::evacuating`], unless EC2 has said the node's instance is

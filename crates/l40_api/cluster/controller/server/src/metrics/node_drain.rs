@@ -34,8 +34,8 @@ pub fn v2_unanswered(node_id: &str) {
     gauge("node_drain.v2.unanswered", 1.0, &[tag("node", node_id)]);
 }
 
-/// Zero a node's v2 gauges once it is no longer a v2 drain's: its row left
-/// the loop's listing. Left at their last values, a blocked or
+/// Zero a node's v2 gauges once it is no longer a v2 drain's: its cancel
+/// finished, or its row is gone. Left at their last values, a blocked or
 /// unanswered node would page after its drain ended. Only the v2 loop
 /// calls it, for nodes it listed, so a node no v2 drain touched never gets
 /// a v2 series.

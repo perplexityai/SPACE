@@ -52,6 +52,14 @@ pub struct AdminNodeResponse {
     pub drain_mode: Option<NodeDrainMode>,
     pub drain_started_at: Option<String>,
     pub drain_last_error: Option<String>,
+    /// `v2` for a drain the node runs itself (`:drain {engine: v2}`), until
+    /// it ends; absent for a v1 drain or none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_engine: Option<String>,
+    /// A v2 drain's epoch and the node's last report: what it evacuated, what
+    /// is still pending, and what blocks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_status: Option<serde_json::Value>,
     /// Value the cluster controller passes to AWS Auto Scaling's
     /// `should_decrement_desired_capacity` when terminating this node. `false`
     /// is the single-node-drain default (the ASG auto-replaces the terminated
@@ -498,98 +506,7 @@ pub struct AdminNodeReconciliationStatus {
     pub last_error: String,
 }
 
-/// Optional JSON body for `POST /admin/api/v1/nodes/{id}:drain`.
-///
-/// `replace_after_terminate` controls whether the eventual ASG
-/// `TerminateInstanceInAutoScalingGroup` call decrements the desired capacity:
-///
-/// - `true` (default) — preserve current single-node behavior: the ASG
-///   auto-replaces the terminated instance.
-/// - `false` — two-MNG blue-green rollout: the incumbent ASG must shrink
-///   monotonically. Persisted on the node row so the terminator honors the
-///   operator's original intent regardless of when the actual termination
-///   call runs.
-///
-/// `mode` selects how aggressively the reconciler empties the node:
-///
-/// - `gentle` (default) — cordon and wait. Resident sandboxes keep serving
-///   traffic and leave on their own (auto-suspend on inactivity, a user
-///   suspend, or a delete); the user-API drain gates stay open for them.
-/// - `forced` — evacuate every resident `started`/`paused` sandbox
-///   immediately, and 409 every placement-affecting and access path to a
-///   resident sandbox for the whole drain window. Per-node disruption is
-///   proportional to resident live-sandbox count, so this is the opt-in.
-///
-/// Persisted on the node row, so the reconciler and the user-API gates both
-/// read the operator's original intent rather than a process-wide setting.
-///
-/// `deny_unknown_fields` so a misspelled or camelCase key (e.g.
-/// `replaceAfterTerminate`) surfaces as a 400 instead of silently falling
-/// back to the default `true`. A rollout script that thinks it asked for
-/// monotonic shrink and got auto-replace instead is the exact failure mode
-/// this flag exists to avoid. The same reasoning covers `mode`: a typo'd
-/// `"mode": "gentel"` is a 400, not a silent forced drain.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DrainRequest {
-    /// `None` means the request expressed no opinion, which is **not** the same
-    /// as `Some(true)` even though both start a drain that auto-replaces.
-    ///
-    /// `:drain` has two edges, and the distinction is what keeps them both
-    /// honest. On the edge that *starts* a drain, `None` resolves to the default
-    /// `true` (see [`Self::replace_after_terminate_or_default`]). On a node
-    /// already draining the intent is fixed — the terminator may act on it at
-    /// any moment once the node reaches `drained`, so there is no window in
-    /// which changing it has a defined meaning — and `None` is what lets an
-    /// escalation say nothing about it. `Some(v)` disagreeing with the stored
-    /// value is a 409 rather than a silent overwrite.
-    ///
-    /// A bare `bool` cannot express that. With no way to tell an omitted field
-    /// from an explicit `true`, the endpoint has to choose between refusing
-    /// every bodiless repeat against a shrinking node, silently applying a stale
-    /// client's default (every `space-admin-cli` older than this field sends an
-    /// explicit `!no_replace_after_terminate`), and silently dropping a
-    /// deliberate correction. None of those surfaces as an error, which is
-    /// exactly the case [`Option`] exists for.
-    ///
-    /// `skip_serializing_if` is load-bearing, not tidiness. `space-admin-cli` serializes
-    /// this struct whole, and serde's `default` fires only on an **absent** key —
-    /// an explicit `null` against an api-server that still types the field as
-    /// `bool` is `invalid type: null, expected a boolean`, i.e. a 400 on every
-    /// bodiless drain. CLI binaries roll independently of the api-server, so that
-    /// skew window is real; omitting the key keeps the request byte-identical to
-    /// what the previous release accepts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replace_after_terminate: Option<bool>,
-    /// `NodeDrainMode`'s own `Default` is gentle, and it is the single statement
-    /// of "a missing mode is gentle" that the NULL-column read also defers to —
-    /// so this does not restate the policy.
-    #[serde(default)]
-    pub mode: NodeDrainMode,
-    /// `true` makes `:drain` a start-only request: it succeeds only against a
-    /// node with no drain phase, and any existing drain is a 409 instead of
-    /// being escalated or repeated. The check runs under the handler's row
-    /// lock, so it is atomic with the write. That is what an orchestrator
-    /// needs to start drains without ever escalating one somebody else
-    /// started between its read and its POST.
-    ///
-    /// `false` (the default) keeps the escalate-in-place and same-mode edges.
-    /// Skipped when `false`, so a request that doesn't ask for it stays
-    /// byte-identical to what the previous release accepts. One that does ask
-    /// is a 400 from an api-server that predates the field (this struct is
-    /// `deny_unknown_fields`), which fails closed.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub require_undrained: bool,
-}
-
-impl DrainRequest {
-    /// The replacement intent to persist when *starting* a drain: an unexpressed
-    /// opinion means the ASG auto-replaces the terminated instance, which
-    /// preserves single-node-drain semantics.
-    pub fn replace_after_terminate_or_default(&self) -> bool {
-        self.replace_after_terminate.unwrap_or(true)
-    }
-}
+pub use pplx_space_node_drain::DrainRequest;
 
 /// Response body for `POST /admin/api/v1/nodes/{id}:force-upload-local-snapshots`.
 ///

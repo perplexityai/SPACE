@@ -25,6 +25,7 @@ pplx-space-job-id = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-linux-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
+pplx-space-node-drain = { workspace = true }
 pplx-space-rpc-contracts = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-sql-codec = { workspace = true, optional = true }
@@ -56,6 +57,7 @@ serde = [
     "pplx-space-accounts/serde",
     "pplx-space-execution-spec/serde",
     "pplx-space-linux-ids/serde",
+    "pplx-space-node-drain/serde",
 ]
 sqlx = [
     "dep:pplx-space-sql-codec",
@@ -63,4 +65,5 @@ sqlx = [
     "pplx-space-semver/sqlx",
     "pplx-space-k8s-ids/sqlx",
     "pplx-space-accounts/sqlx",
+    "pplx-space-node-drain/sqlx",
 ]

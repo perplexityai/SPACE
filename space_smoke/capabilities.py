@@ -216,6 +216,22 @@ class StoppableLifecycleSandbox(CommandSandbox, Protocol):
     def start(self) -> None: ...
 
 
+class OperationLifecycleSandbox(CommandSandbox, Protocol):
+    """Command sandbox whose lifecycle calls are recorded operations a caller can follow."""
+
+    def request_lifecycle(self, verb: str) -> str:
+        """Ask for `verb` (`wake`, `resume`, ...) without waiting; the operation's id."""
+        ...
+
+    def operation(self, operation_id: str) -> dict[str, object]:
+        """The operation as `GET /v1/operations/{id}` answers it."""
+        ...
+
+    def state(self) -> str:
+        """The sandbox's state as the public API reports it."""
+        ...
+
+
 class ProcessHandle(Protocol):
     @property
     def process_id(self) -> str: ...
@@ -1641,6 +1657,7 @@ class AdminNodeView:
     drain_phase: str | None
     drain_mode: str | None
     sandboxes_active: int | None
+    drain_last_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1687,6 +1704,174 @@ class NodeDrainControl(NodeFaultControl, Protocol):
     def sandbox_residency(self, sandbox_id: str) -> SandboxResidency: ...
 
     def ready_full_snapshots(self, sandbox_id: str) -> list[SnapshotRecord]: ...
+
+
+class KindWorkerControl(NodeDrainControl, Protocol):
+    """Kind-only operations on a worker's instance and on the controller's env.
+
+    A scenario overrides cluster-controller Deployment env (closed key list,
+    closed value vocabulary) under the controller-mutation Lease, and puts
+    the captured standing values back. A Kind worker gets a fake AWS
+    providerID by re-registering its Node with the kubelet's `--provider-id`
+    rewritten, so its EC2 instance is recorded and Kind's fake EC2 can answer
+    for it. The node fault is named: stop one Kind worker's container, delete
+    its Kubernetes Node or keep it, and mark its instance terminated in the
+    fake EC2; then start the container again, under a new providerID for a
+    same-name replacement.
+    """
+
+    def acquire_controller_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible controller-deployment Lease; returns its release."""
+        ...
+
+    def drain_v2_env(self) -> dict[str, str | None]:
+        """The literal value of every drain v2 env key on the controller Deployment."""
+        ...
+
+    def set_drain_v2_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply smoke overrides and await the controller rollout; refuses keys or values off the lists."""
+        ...
+
+    def restore_drain_v2_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literals back (None unsets) and await the controller rollout."""
+        ...
+
+    def kind_node_provider_id(self, node_name: str) -> str:
+        """The Kind worker's Node `spec.providerID`."""
+        ...
+
+    def set_kind_worker_provider_id(
+        self, node_name: str, provider_id: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        """Re-register the running Kind worker's Node under `provider_id`, a
+        fake AWS providerID: rewrite the kubelet's `--provider-id`, delete the
+        Node, restart the kubelet, put back `labels`, and wait for the Node
+        and its node services to be Ready."""
+        ...
+
+
+    def node_recorded_instance(self, node_id: str) -> str | None:
+        """`node_k8s.instance_id` of the node, None when it records none or has no row."""
+        ...
+
+
+    def kind_node_labels(self, node_name: str) -> dict[str, str]:
+        """The Kind worker's Node labels, which deleting the Node discards."""
+        ...
+
+
+class DrainRestoreControl(Protocol):
+    """The drain restore operation's test hold and slot budget on Kind.
+
+    A scoped override of two cluster-controller env keys (closed key list,
+    bounded integers), under the controller-mutation Lease the retention, GC,
+    drain and stopped-replacement scenarios share.
+    """
+
+    def acquire_controller_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible controller-deployment Lease; returns its release."""
+        ...
+
+    def drain_restore_hold_env(self) -> dict[str, str | None]:
+        """The hold's and the slots' literals on the controller Deployment, None if unset."""
+        ...
+
+    def running_controller_drain_restore_hold_envs(self) -> list[dict[str, str | None]]:
+        """The same literals on every running, not-terminating controller pod."""
+        ...
+
+    def set_drain_restore_hold_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply the hold or the slots and await the controller rollout; refuses keys or values off the lists."""
+        ...
+
+    def restore_drain_restore_hold_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literals back (None unsets) and await the controller rollout."""
+        ...
+
+
+@dataclass(frozen=True)
+class DrainV2Status:
+    """`nodes.drain_engine` and `nodes.drain_status` of one node; `status` is the JSON object."""
+
+    engine: str | None
+    status: dict[str, Any] | None
+
+
+class DrainV2Control(KindWorkerControl, DrainRestoreControl, Protocol):
+    """Kind-only operations for the drain v2 scenarios, with the controller's
+    drain env, the drain restore hold, and the Kind worker's instance, stop
+    and replacement."""
+
+    def drain_node_v2(self, node_id: str) -> None:
+        """`POST :drain` with `mode: forced` and `engine: v2`."""
+        ...
+
+    def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
+        """The node's v2 drain columns; `None` once its row is gone."""
+        ...
+
+
+    def seal_activations(self, node_name: str, epoch: int) -> int | None:
+        """`space-sbxmgr drain-node --epoch` on the worker, under the caller's
+        worker-cordon Lease; the epoch it answers sealed under.
+
+        The seal is recorded on the Lease before it is sent, and a successful
+        unseal clears it, so the Lease's next holder unseals a worker a killed
+        run left sealed.
+        """
+        ...
+
+    def node_drain_report(self, node_name: str, epoch: int) -> dict[str, Any]:
+        """`space-sbxmgr drain-node --epoch` on the worker, already sealed
+        under `epoch`, under the caller's worker-cordon Lease: the node's own
+        report, in `drain_status.report`'s shape, which no controller sees."""
+        ...
+
+    def unseal_activations(self, node_name: str, epoch: int) -> int | None:
+        """`space-sbxmgr drain-node --cancel` on the worker; the epoch it is
+        still sealed under, None once unsealed. An unsealed worker stays
+        unsealed."""
+        ...
+
+    def drain_restore_operations(self, sandbox_id: str) -> list[tuple[str, int]]:
+        """Each `drain_restore_sandbox` operation of the sandbox, oldest first:
+        its state and attempts."""
+        ...
+
+    def stopped_residency(self, sandbox_id: str) -> StoppedResidency: ...
+
+
+    def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None:
+        """The sandbox's row state in that node's sandbox-manager, or None without a row."""
+        ...
+
+    def restart_node_service(self, node_name: str, component: str, *, timeout: float) -> str:
+        """Delete that node service's pod and wait for its Ready replacement on the same node."""
+        ...
+
+    def block_node_traffic(self, node_name: str, path: str) -> None:
+        """Cut one node-local path on the Kind node (`object-store`: its pods'
+        and host processes' connections to the object store are reset;
+        `node-api`: connections to its node-api go unanswered)."""
+        ...
+
+    def unblock_node_traffic(self, node_name: str, path: str) -> None:
+        """Remove exactly the rules `block_node_traffic` added for `path`."""
+        ...
+
+    def restart_controller(self, *, timeout: float) -> list[str]:
+        """Kill every cluster-controller pod at once and await Ready
+        replacements; the killed pods' names."""
+        ...
+
+    def scale_controller(self, replicas: int, *, timeout: float) -> int:
+        """Scale the cluster-controller Deployment (0..2) under the caller's
+        controller-mutation Lease and await it; the replicas it had."""
+        ...
+
+    def sandbox_placements(self, sandbox_ids: Sequence[str]) -> dict[str, tuple[str, str | None]]:
+        """Each sandbox's lifecycle and active node id, by bare id, in one read."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -1978,6 +2163,19 @@ class ConcurrentRestoreControl(Protocol):
 
     def delete_sandbox_pod(self, pod_name: str) -> None:
         """Delete one sandbox execution pod out from under the API (kind-only fault)."""
+        ...
+
+
+class EcwLifecycleProbe(Protocol):
+    """One raw ECW `pause` or `resume` call, without the SDK's own handling.
+
+    The scenario judges the answer itself (a refusal is the expected outcome
+    while a restore holds the row), so it is returned rather than raised:
+    `status` is the HTTP status, 0 for a transport failure.
+    """
+
+    def lifecycle_request(self, action: str, *, timeout: float) -> RestoreCallerOutcome:
+        """`POST /sandboxes/{id}/<action>` with no body; `action` is `pause` or `resume`."""
         ...
 
 

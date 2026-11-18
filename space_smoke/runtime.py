@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import json
 import signal
 import subprocess
 import sys
@@ -373,12 +374,63 @@ class ResourceScope:
         return tuple(failures)
 
 
+UNENCODABLE_EVIDENCE = "unencodable_evidence"
+"""The evidence key naming the values a failing verdict kept as `repr`."""
+
+
+def _json_error(value: object) -> Exception | None:
+    """Why the runner can't print `value`, encoding as it does, if it can't."""
+
+    try:
+        json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError) as error:
+        return error
+    return None
+
+
+def require_json_evidence(evidence: Mapping[str, object]) -> None:
+    """Refuse evidence the runner can't print. It writes each verdict's
+    evidence as JSON once the scenario ends, so a value it can't encode ends
+    even a passed run with a traceback; refused here, it fails the call that
+    recorded it, by name."""
+
+    for name, value in evidence.items():
+        error = _json_error(value)
+        if error is not None:
+            raise TypeError(
+                f"evidence {name!r} is not JSON-serializable ({type(value).__name__}): {error}"
+            ) from error
+
+
+def printable_evidence(
+    evidence: Mapping[str, object], already: Mapping[str, object]
+) -> dict[str, object]:
+    """`evidence` as a failing verdict keeps it: each value the runner can't
+    print becomes its `repr`, and `UNENCODABLE_EVIDENCE` lists those names
+    beside the ones `already` lists, so the verdict and its message stand."""
+
+    printable: dict[str, object] = {}
+    unencodable: list[str] = []
+    for name, value in evidence.items():
+        if _json_error(value) is None:
+            printable[name] = value
+        else:
+            printable[name] = repr(value)
+            unencodable.append(name)
+    if unencodable:
+        listed = already.get(UNENCODABLE_EVIDENCE)
+        earlier = [str(name) for name in listed] if isinstance(listed, list) else []
+        printable[UNENCODABLE_EVIDENCE] = sorted({*earlier, *unencodable})
+    return printable
+
+
 @dataclass
 class ScenarioContext:
     scope: ResourceScope
     evidence: dict[str, object]
 
     def record(self, name: str, value: object) -> None:
+        require_json_evidence({name: value})
         self.evidence[name] = value
 
     def verify(
@@ -387,12 +439,23 @@ class ScenarioContext:
         message: str,
         **evidence: object,
     ) -> None:
-        self.evidence.update(evidence)
-        if not condition:
-            raise InvariantViolation(message)
+        """Keep `evidence` and raise `message` unless `condition` holds. A
+        held check refuses evidence the runner can't print, naming it; a
+        failing one keeps such a value as its `repr` instead, so the failure
+        and its message are what the run reports."""
+
+        if condition:
+            require_json_evidence(evidence)
+            self.evidence.update(evidence)
+            return
+        self.evidence.update(printable_evidence(evidence, self.evidence))
+        raise InvariantViolation(message)
 
     def warn(self, message: str, **evidence: object) -> None:
-        self.evidence.update(evidence)
+        """Keep `evidence`, each value the runner can't print as its `repr`,
+        and end the run with a warning saying `message`."""
+
+        self.evidence.update(printable_evidence(evidence, self.evidence))
         raise QuarantinedSmoke(message)
 
     def wait(self, seconds: float) -> None:

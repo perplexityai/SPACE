@@ -4918,6 +4918,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
+ "pplx-space-node-drain",
  "pplx-space-node-mgr-client",
  "pplx-space-node-registration-store",
  "pplx-space-node-status-store",
@@ -5294,6 +5295,7 @@ dependencies = [
  "pplx-space-metrics-emit",
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
+ "pplx-space-node-drain",
  "pplx-space-node-registration-store",
  "pplx-space-observability",
  "pplx-space-policy-authority",
@@ -5441,6 +5443,7 @@ dependencies = [
  "pplx-space-k8s-ids",
  "pplx-space-linux-ids",
  "pplx-space-net-common",
+ "pplx-space-node-drain",
  "pplx-space-rpc-contracts",
  "pplx-space-semver",
  "pplx-space-sql-codec",
@@ -6190,6 +6193,7 @@ dependencies = [
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
  "pplx-space-node-mgr-client",
+ "pplx-space-node-registration-store",
  "pplx-space-observability",
  "pplx-space-policy-authority",
  "pplx-space-postgres-pool",
@@ -6838,6 +6842,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-node-drain"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-sql-codec",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "pplx-space-node-mgr"
 version = "0.8.2"
 dependencies = [
@@ -6979,6 +6993,7 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-k8s-ids",
  "pplx-space-k8s-node-id",
+ "pplx-space-node-drain",
  "pplx-space-sandbox-residency",
  "pplx-space-sql-locator",
  "serde_json",

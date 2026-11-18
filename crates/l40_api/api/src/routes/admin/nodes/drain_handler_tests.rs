@@ -518,6 +518,7 @@ async fn require_undrained_refuses_an_existing_drain_and_starts_a_new_one() -> T
         replace_after_terminate: Some(false),
         mode: NodeDrainMode::Forced,
         require_undrained: true,
+        engine: None,
     };
 
     // A gentle drain whose stored intent agrees with the posted `false`.
@@ -745,5 +746,452 @@ async fn a_cordon_on_a_draining_node_promises_the_retry_the_reconciler_performs(
         body["db_state"]["drain_phase"], "draining",
         "and the echoed state must be the phase the row actually holds"
     );
+    Ok(())
+}
+
+/// An undrained Kubernetes node in `drain_phase` (NULL for none), with its
+/// `node_k8s` row, under drain `engine` with `status`.
+async fn insert_k8s_node(
+    pool: &PgPool,
+    drain_phase: Option<&str>,
+    engine: Option<&str>,
+    status: Option<serde_json::Value>,
+) -> TestResult<NodeId> {
+    let node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (
+             id, address, role, managed_by, state, drain_phase, drain_mode,
+             drain_started_at, terminate_decrement_capacity, drain_engine, drain_status
+         )
+         VALUES (
+             $1, '10.0.0.46'::INET, 'worker', 'k8s', 'registered', $2,
+             CASE WHEN $2::TEXT IS NULL THEN NULL ELSE 'forced' END,
+             CASE WHEN $2::TEXT IS NULL THEN NULL ELSE NOW() - INTERVAL '1 hour' END,
+             false, $3, $4
+         )"
+    ))
+    .bind(node_id)
+    .bind(drain_phase)
+    .bind(engine)
+    .bind(status)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, instance_id) VALUES ($1, $2, 'i-0a1b2c3d')"
+    ))
+    .bind(node_id)
+    .bind(format!("ip-10-0-0-46-{node_id}"))
+    .execute(pool)
+    .await?;
+    Ok(node_id)
+}
+
+/// The phase, engine, status and the drain's start in microseconds.
+async fn v2_columns(
+    pool: &PgPool,
+    node_id: NodeId,
+) -> TestResult<(
+    Option<String>,
+    Option<String>,
+    Option<serde_json::Value>,
+    Option<i64>,
+)> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT drain_phase, drain_engine, drain_status,
+                (EXTRACT(EPOCH FROM drain_started_at) * 1000000)::BIGINT
+           FROM nodes WHERE id = $1"
+    ))
+    .bind(node_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+fn v2_request(mode: NodeDrainMode) -> DrainRequest {
+    DrainRequest {
+        replace_after_terminate: None,
+        mode,
+        require_undrained: false,
+        engine: Some(pplx_space_node_drain::NodeDrainEngine::V2),
+    }
+}
+
+/// A v2 `:drain` records the engine and the epoch, the drain's start in
+/// microseconds, in the transaction that moves the phase, and starts the
+/// drain waiting for an evacuation slot; a repeat keeps the epoch, and
+/// doesn't send a drain the controller admitted back to waiting.
+#[tokio::test(flavor = "current_thread")]
+async fn a_v2_drain_records_its_epoch_with_the_phase() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let mut state = kubernetes_state(&db.pool).await?;
+    state.drain_v2_enabled = true;
+    let actor = managing_org_admin(&db.pool).await?;
+    let node_id = insert_k8s_node(&db.pool, None, None, None).await?;
+
+    post_drain(
+        &state,
+        &actor,
+        node_id,
+        DrainAction::Drain,
+        v2_request(NodeDrainMode::Forced),
+    )
+    .await;
+    let (phase, engine, status, started_us) = v2_columns(&db.pool, node_id).await?;
+    assert_eq!(phase.as_deref(), Some("draining"));
+    assert_eq!(engine.as_deref(), Some("v2"));
+    let epoch = status
+        .as_ref()
+        .and_then(|status| status.get("epoch"))
+        .and_then(serde_json::Value::as_i64);
+    assert_eq!(epoch, started_us, "{status:?}");
+    assert_eq!(
+        status.as_ref().and_then(|status| status.get("waiting")),
+        Some(&serde_json::Value::Bool(true)),
+        "{status:?}"
+    );
+
+    post_drain(
+        &state,
+        &actor,
+        node_id,
+        DrainAction::Drain,
+        v2_request(NodeDrainMode::Forced),
+    )
+    .await;
+    assert_eq!(
+        v2_columns(&db.pool, node_id).await?.2,
+        status,
+        "a repeat keeps the epoch"
+    );
+
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_status = drain_status || '{\"waiting\": false}'::JSONB
+          WHERE id = $1"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    post_drain(
+        &state,
+        &actor,
+        node_id,
+        DrainAction::Drain,
+        v2_request(NodeDrainMode::Forced),
+    )
+    .await;
+    let admitted = v2_columns(&db.pool, node_id).await?.2;
+    assert_eq!(
+        admitted.as_ref().and_then(|status| status.get("waiting")),
+        Some(&serde_json::Value::Bool(false)),
+        "a repeat leaves an admitted drain admitted: {admitted:?}"
+    );
+    Ok(())
+}
+
+/// A v2 `:drain` is refused, writing nothing, without the flag, on a Direct
+/// node, as a gentle drain, against a v1 drain in flight, and on a node
+/// with no recorded instance; the control, a v1 drain, still starts.
+#[tokio::test(flavor = "current_thread")]
+async fn a_v2_drain_it_cant_run_is_refused_and_writes_nothing() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let enabled = {
+        let mut state = kubernetes_state(&db.pool).await?;
+        state.drain_v2_enabled = true;
+        state
+    };
+    let disabled = kubernetes_state(&db.pool).await?;
+    let actor = managing_org_admin(&db.pool).await?;
+
+    let cases = [
+        (
+            "flag off",
+            &disabled,
+            insert_k8s_node(&db.pool, None, None, None).await?,
+            NodeDrainMode::Forced,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "direct node",
+            &enabled,
+            insert_node(&db.pool, None, None, true).await?,
+            NodeDrainMode::Forced,
+            StatusCode::CONFLICT,
+        ),
+        (
+            "gentle",
+            &enabled,
+            insert_k8s_node(&db.pool, None, None, None).await?,
+            NodeDrainMode::Gentle,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "v1 in flight",
+            &enabled,
+            insert_k8s_node(&db.pool, Some("draining"), None, None).await?,
+            NodeDrainMode::Forced,
+            StatusCode::CONFLICT,
+        ),
+        (
+            "no recorded instance",
+            &enabled,
+            {
+                let node_id = insert_k8s_node(&db.pool, None, None, None).await?;
+                sqlx::query(sql!(
+                    "UPDATE node_k8s SET instance_id = NULL WHERE node_id = $1"
+                ))
+                .bind(node_id)
+                .execute(&db.pool)
+                .await?;
+                node_id
+            },
+            NodeDrainMode::Forced,
+            StatusCode::CONFLICT,
+        ),
+    ];
+    for (case, state, node_id, mode, expected) in cases {
+        let before = v2_columns(&db.pool, node_id).await?;
+        let status = post_drain(state, &actor, node_id, DrainAction::Drain, v2_request(mode)).await;
+        assert_eq!(status, expected, "{case}");
+        assert_eq!(
+            v2_columns(&db.pool, node_id).await?,
+            before,
+            "{case}: wrote"
+        );
+    }
+
+    let control = insert_k8s_node(&db.pool, None, None, None).await?;
+    post_drain(
+        &disabled,
+        &actor,
+        control,
+        DrainAction::Drain,
+        DrainRequest {
+            engine: None,
+            ..v2_request(NodeDrainMode::Forced)
+        },
+    )
+    .await;
+    let (phase, engine, status, _) = v2_columns(&db.pool, control).await?;
+    assert_eq!(
+        (phase.as_deref(), engine, status),
+        (Some("draining"), None, None)
+    );
+    Ok(())
+}
+
+/// `:undrain` of a v2 node clears the phase and keeps the epoch, marked for
+/// the controller to cancel on the node; a v1 node's undrain writes no v2
+/// column.
+#[tokio::test(flavor = "current_thread")]
+async fn undrain_marks_a_v2_epoch_for_cancel() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = kubernetes_state(&db.pool).await?;
+    let actor = managing_org_admin(&db.pool).await?;
+    let v2 = insert_k8s_node(
+        &db.pool,
+        Some("draining"),
+        Some("v2"),
+        Some(serde_json::json!({"epoch": 42})),
+    )
+    .await?;
+    let v1 = insert_k8s_node(&db.pool, Some("draining"), None, None).await?;
+
+    post_drain(
+        &state,
+        &actor,
+        v2,
+        DrainAction::Undrain,
+        DrainRequest::default(),
+    )
+    .await;
+    post_drain(
+        &state,
+        &actor,
+        v1,
+        DrainAction::Undrain,
+        DrainRequest::default(),
+    )
+    .await;
+    let (phase, engine, status, _) = v2_columns(&db.pool, v2).await?;
+    assert_eq!(phase, None);
+    assert_eq!(engine.as_deref(), Some("v2"));
+    assert_eq!(
+        status,
+        Some(serde_json::json!({"epoch": 42, "cancel": true}))
+    );
+    let (phase, engine, status, _) = v2_columns(&db.pool, v1).await?;
+    assert_eq!((phase, engine, status), (None, None, None));
+    Ok(())
+}
+
+/// `:terminate` of a v2 node is refused, writing nothing, even with its
+/// report `done`: this version doesn't terminate a v2 drain, which stays
+/// `drained` until `:undrain`. A v1 node still answers as before.
+#[tokio::test(flavor = "current_thread")]
+async fn terminate_of_a_v2_node_is_refused() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let actor = managing_org_admin(&db.pool).await?;
+    let state = kubernetes_state(&db.pool).await?;
+    let status = serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": true}});
+    let node_id =
+        insert_k8s_node(&db.pool, Some("drained"), Some("v2"), Some(status.clone())).await?;
+    let answer = post_drain(
+        &state,
+        &actor,
+        node_id,
+        DrainAction::Terminate,
+        DrainRequest::default(),
+    )
+    .await;
+    assert_eq!(answer, StatusCode::CONFLICT);
+    assert_eq!(
+        v2_columns(&db.pool, node_id).await?.0.as_deref(),
+        Some("drained")
+    );
+    assert_eq!(v2_columns(&db.pool, node_id).await?.2, Some(status));
+
+    let v1 = insert_k8s_node(&db.pool, Some("drained"), None, None).await?;
+    let answer = post_drain(
+        &state,
+        &actor,
+        v1,
+        DrainAction::Terminate,
+        DrainRequest::default(),
+    )
+    .await;
+    assert_ne!(
+        answer,
+        StatusCode::CONFLICT,
+        "a v1 node isn't refused for its engine"
+    );
+    Ok(())
+}
+
+/// A drain of an undrained v2 node whose cancel hasn't reached the node is
+/// refused unless it runs under v2, which starts a new epoch; a default
+/// `:drain` would inherit the old epoch and its cancel. The new drain takes
+/// over the slot an admitted drain's cancel holds, starting admitted, and
+/// waits for one when the cancelled drain was still waiting.
+#[tokio::test(flavor = "current_thread")]
+async fn a_drain_over_a_pending_v2_cancel_runs_under_v2_only() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let mut state = kubernetes_state(&db.pool).await?;
+    state.drain_v2_enabled = true;
+    let actor = managing_org_admin(&db.pool).await?;
+
+    for (cancelled, waiting) in [
+        (serde_json::json!({"epoch": 42, "cancel": true}), false),
+        (
+            serde_json::json!({"epoch": 42, "cancel": true, "waiting": false}),
+            false,
+        ),
+        (
+            serde_json::json!({"epoch": 42, "cancel": true, "waiting": true}),
+            true,
+        ),
+    ] {
+        let node_id = insert_k8s_node(&db.pool, None, Some("v2"), Some(cancelled.clone())).await?;
+        let before = v2_columns(&db.pool, node_id).await?;
+        let answer = post_drain(
+            &state,
+            &actor,
+            node_id,
+            DrainAction::Drain,
+            DrainRequest {
+                engine: None,
+                ..v2_request(NodeDrainMode::Forced)
+            },
+        )
+        .await;
+        assert_eq!(answer, StatusCode::CONFLICT);
+        assert_eq!(v2_columns(&db.pool, node_id).await?, before, "wrote");
+
+        post_drain(
+            &state,
+            &actor,
+            node_id,
+            DrainAction::Drain,
+            v2_request(NodeDrainMode::Forced),
+        )
+        .await;
+        let (phase, engine, status, started_us) = v2_columns(&db.pool, node_id).await?;
+        assert_eq!(
+            (phase.as_deref(), engine.as_deref()),
+            (Some("draining"), Some("v2"))
+        );
+        assert_eq!(
+            status,
+            started_us.map(|epoch| serde_json::json!({"epoch": epoch, "waiting": waiting})),
+            "a new epoch without the old cancel, over {cancelled}"
+        );
+    }
+    Ok(())
+}
+
+/// A node's listing carries its drain engine and the drain's status, as the
+/// columns hold them.
+#[tokio::test(flavor = "current_thread")]
+async fn a_node_reads_back_its_drain_engine_and_status() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let status = serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": true}});
+    let node_id =
+        insert_k8s_node(&db.pool, Some("drained"), Some("v2"), Some(status.clone())).await?;
+    let row = super::AdminNodeStore::new(db.pool.clone())
+        .fetch(node_id)
+        .await?
+        .ok_or("the node reads back")?;
+    let response = super::admin_node_response(row, None, None);
+    assert_eq!(response.drain_engine.as_deref(), Some("v2"));
+    assert_eq!(response.drain_status, Some(status));
+    Ok(())
+}
+
+/// `:terminate` of a node that doesn't exist answers 404, as every other
+/// action does.
+#[tokio::test(flavor = "current_thread")]
+async fn terminate_of_an_unknown_node_is_not_found() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = kubernetes_state(&db.pool).await?;
+    let actor = managing_org_admin(&db.pool).await?;
+    let answer = post_drain(
+        &state,
+        &actor,
+        NodeId::new(),
+        DrainAction::Terminate,
+        DrainRequest::default(),
+    )
+    .await;
+    assert_eq!(answer, StatusCode::NOT_FOUND);
     Ok(())
 }

@@ -197,6 +197,9 @@ pub(super) async fn step<S: DrainV2Sink>(
         .await;
     }
     match node.phase.as_deref() {
+        None if node.cancel => cancel(sink, node, epoch)
+            .await
+            .then_some(NodeStep::Cancelled),
         None => None,
         Some("draining") if node.waiting => {
             // Fenced, but not sealed: it waits for a slot.
@@ -227,7 +230,7 @@ async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
     if let Some(error) = &cordon_error {
         sink.record_error(node.id, error).await;
     }
-    let response = match sink.drain_node(node.id, epoch).await {
+    let response = match sink.drain_node(node.id, epoch, false, &[]).await {
         Ok(response) => response,
         Err(error) => {
             crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
@@ -279,6 +282,80 @@ async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
         Ok(moved) => moved,
         Err(error) => {
             sink.record_error(node.id, &format!("advancing to drained failed: {error}"))
+                .await;
+            false
+        }
+    }
+}
+
+/// Cancel an undrained node's epoch and take back what the drain
+/// evacuated: record each sandbox the node hands back, which enqueues its
+/// restore, and have the node forget the ones recorded. Clear the v2 columns
+/// once the node no longer holds the seal and has nothing left to hand back.
+/// Returns whether the columns were cleared.
+async fn cancel<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
+    let call = |forget: Vec<String>| async move {
+        let answer = sink.drain_node(node.id, epoch, true, &forget).await;
+        if let Err(error) = &answer {
+            crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
+            sink.record_error(node.id, &format!("DrainNode cancel failed: {error}"))
+                .await;
+        }
+        answer.ok()
+    };
+    let Some(response) = call(Vec::new()).await else {
+        return false;
+    };
+    if response.sealed_epoch == Some(epoch) {
+        return false;
+    }
+    let recording = record_evacuations(sink, node, &response).await;
+    let recorded: Vec<String> = recording
+        .records
+        .iter()
+        .filter(|(_, record)| record.is_recorded())
+        .map(|(sandbox_id, _)| sandbox_id.clone())
+        .collect();
+    let response = if recorded.is_empty() {
+        response
+    } else {
+        let Some(response) = call(recorded).await else {
+            return false;
+        };
+        response
+    };
+    match sink
+        .record_report(node.id, epoch, report_json(&response, &recording))
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(error) => {
+            sink.record_error(
+                node.id,
+                &format!("storing the cancel's report failed: {error}"),
+            )
+            .await;
+            return false;
+        }
+    }
+    // An earlier node answers a cancel with none of these lists: it has
+    // nothing to hand back.
+    let handed_back =
+        response.evacuated.is_empty() && response.pending.is_empty() && response.blocked.is_empty();
+    if !handed_back {
+        publish_report(node, &response, &recording);
+        return false;
+    }
+    match sink.finish_cancel(node.id, epoch).await {
+        Ok(cleared) => {
+            if cleared {
+                crate::metrics::node_drain::clear_v2_gauges(&node.id.to_string());
+            }
+            cleared
+        }
+        Err(error) => {
+            sink.record_error(node.id, &format!("clearing the cancel failed: {error}"))
                 .await;
             false
         }

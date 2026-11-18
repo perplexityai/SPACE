@@ -1,6 +1,6 @@
 use super::{
     ReconcilerRuntimeError, Supervision, TerminatorBackend, TerminatorKind, build_if_enabled,
-    supervise_reconcilers,
+    drain_v2_enabled, supervise_reconcilers,
 };
 use std::future::Future;
 use tokio::task::JoinError;
@@ -126,6 +126,36 @@ fn terminator_kind_rejects_unrecognized_value() {
         err,
         ReconcilerRuntimeError::InvalidTerminatorKind(ref value) if value == "kube_delete"
     ));
+}
+
+/// New v2 drains are admitted only with the node drain running; off,
+/// nothing is refused.
+#[test]
+fn the_drain_v2_runs_only_with_the_node_drain() {
+    let mut env = pplx_space_test_env::TestEnv::default();
+    for (flag, node_drain, expected) in [
+        (None, false, Some(false)),
+        (Some("false"), false, Some(false)),
+        (Some("true"), false, None),
+        (Some("true"), true, Some(true)),
+    ] {
+        match flag {
+            Some(flag) => env.set(
+                pplx_space_api::routes::admin::nodes::DRAIN_V2_ENABLED_ENV,
+                flag,
+            ),
+            None => env.remove(pplx_space_api::routes::admin::nodes::DRAIN_V2_ENABLED_ENV),
+        }
+        let got = drain_v2_enabled(&env, node_drain);
+        let case = format!("{flag:?} node_drain={node_drain}");
+        match expected {
+            Some(enabled) => assert_eq!(got.ok(), Some(enabled), "{case}"),
+            None => assert!(
+                matches!(got, Err(ReconcilerRuntimeError::DrainV2NeedsNodeDrain)),
+                "{case}"
+            ),
+        }
+    }
 }
 
 /// Each terminator kind loads its own backend, and only `aws` loads the

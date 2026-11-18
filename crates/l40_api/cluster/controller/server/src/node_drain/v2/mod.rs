@@ -1,17 +1,17 @@
 //! The node drain's v2 loop.
 //!
-//! A v2 drain is a forced drain a node row carries as
-//! `nodes.drain_engine = 'v2'`, with the epoch the node is sealed under
-//! (`drain_status.epoch`), written with the phase before any node call. The
-//! node does the work: sandbox-manager's
+//! A v2 drain is a forced drain the admin route started with `engine: v2`
+//! (`nodes.drain_engine = 'v2'`), which wrote the epoch the node is sealed
+//! under (`drain_status.epoch`) in the transaction that moved the phase,
+//! before any node call. The node does the work: sandbox-manager's
 //! `DrainNode` seals it and makes every resident durable elsewhere. This loop
 //! asks it, each tick, and records what it reports:
 //!
-//! - **`draining`, waiting**: every v2 drain starts waiting for one of the
-//!   cluster's evacuation slots (`drain_status.waiting`). At most
-//!   [`DEFAULT_MAX_EVACUATING_NODES`] nodes evacuate at once (admitted and
-//!   not yet `drained`); a waiting node whose heartbeat is fresh is admitted,
-//!   oldest
+//! - **`draining`, waiting**: the admin route starts every v2 drain waiting
+//!   for one of the cluster's evacuation slots (`drain_status.waiting`).
+//!   At most [`DEFAULT_MAX_EVACUATING_NODES`] nodes evacuate at once
+//!   (admitted and not yet `drained`, or undrained with their cancel not yet
+//!   finished); a waiting node whose heartbeat is fresh is admitted, oldest
 //!   drain first, once one frees. Until then it stays cordoned and gets no
 //!   `DrainNode` call, so it isn't sealed and the drain gate refuses no user
 //!   call on it.
@@ -27,6 +27,16 @@
 //!   `done` under the row's own epoch and every evacuation is recorded. A
 //!   `drained` node stays there, its report stored again every tick; nothing
 //!   terminates a v2 node yet.
+//! - **undrained** (no phase, `drain_status.cancel`): cancel the epoch on the
+//!   node, and take back what the drain evacuated: the node hands back each
+//!   sandbox the drain suspended, the loop records it as a drain records it
+//!   (enqueueing the restore of one that was `started`, which may land on
+//!   the node again), and the node forgets the ones recorded. Once the node is
+//!   unsealed with nothing left to hand back, clear the v2 columns. Until
+//!   then the node keeps its evacuation slot, as its running suspends and
+//!   uploads finish; a drain that never left waiting holds none, and its
+//!   cancel finishes on the first call the node answers with nothing to hand
+//!   back.
 //!
 //! A node whose heartbeat is stale is asked about at EC2, by its recorded
 //! instance, each tick; the answer is recorded in `drain_last_error` and
@@ -163,6 +173,8 @@ pub struct V2Node {
     pub phase: Option<String>,
     /// `drain_status.epoch`; the admin route writes it with the phase.
     pub epoch: Option<u64>,
+    /// `drain_status.cancel`: the drain was undrained.
+    pub cancel: bool,
     /// Since when, in Unix seconds, each evacuation the last stored report
     /// names unrecorded has been.
     pub unrecorded_since: BTreeMap<String, i64>,
@@ -185,7 +197,8 @@ pub struct V2LoopState {
 
 impl V2LoopState {
     /// Remember `listed` as this tick's listing. Returns the nodes the last
-    /// listing returned that this one doesn't.
+    /// listing returned that this one doesn't: deleted, cancelled, or taken
+    /// by a registration.
     fn relist(&self, listed: HashSet<NodeId>) -> Vec<NodeId> {
         let mut last = self
             .listed
@@ -232,11 +245,14 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         &self,
         node_id: NodeId,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
-    /// Call the node's `DrainNode` under `epoch`.
+    /// `forget`, with `cancel`: the evacuations recorded since a cancel call
+    /// reported them, for the node to forget.
     fn drain_node(
         &self,
         node_id: NodeId,
         epoch: u64,
+        cancel: bool,
+        forget: &[String],
     ) -> impl std::future::Future<Output = Result<DrainNodeResponse, String>> + Send;
     fn record_evacuation(
         &self,
@@ -257,6 +273,12 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         node_id: NodeId,
         epoch: u64,
     ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
+    /// Clear an undrained row's v2 columns once its epoch is cancelled.
+    fn finish_cancel(
+        &self,
+        node_id: NodeId,
+        epoch: u64,
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
     fn record_error(
         &self,
         node_id: NodeId,
@@ -269,6 +291,7 @@ pub trait DrainV2Sink: Send + Sync + 'static {
 pub struct V2TickReport {
     pub admitted: Vec<NodeId>,
     pub drained: Vec<NodeId>,
+    pub cancelled: Vec<NodeId>,
 }
 
 /// Unix seconds now, the clock `Recording::since` is kept in.
@@ -286,6 +309,7 @@ const NODE_CONCURRENCY: usize = 8;
 
 /// What one tick did to a node.
 enum NodeStep {
+    Cancelled,
     Drained,
 }
 
@@ -340,6 +364,7 @@ pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
     .await;
     for (node_id, step) in steps {
         match step {
+            Some(NodeStep::Cancelled) => report.cancelled.push(node_id),
             Some(NodeStep::Drained) => report.drained.push(node_id),
             None => {}
         }
