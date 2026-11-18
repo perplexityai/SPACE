@@ -209,6 +209,12 @@ func (NetworkPolicyErrorKind) EnumDescriptor() ([]byte, []int) {
 	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{2}
 }
 
+// Control-plane substrate that owns the sandbox's route: the owning node's
+// `nodes.managed_by`, so DIRECT is `space` and KUBERNETES is `k8s`.
+// UNSPECIFIED means the sender has no substrate to report for the route,
+// for example route provenance recorded before nodes stored the substrate.
+// It is not a hosting kind (pod or node-local VM). The two coincide today;
+// code must not infer hosting from this value once they can differ.
 type SandboxSubstrateKind int32
 
 const (

@@ -3893,9 +3893,13 @@ type SandboxInfo struct {
 	PodUid              *string `protobuf:"bytes,50,opt,name=pod_uid,json=podUid,proto3,oneof" json:"pod_uid,omitempty"`
 	// Highest current or retained node-local route generations. These remain
 	// available after the active runtime identity is cleared.
-	RouteProvenanceGeneration          *uint64                  `protobuf:"varint,51,opt,name=route_provenance_generation,json=routeProvenanceGeneration,proto3,oneof" json:"route_provenance_generation,omitempty"`
-	RouteProvenanceExecutionGeneration *int64                   `protobuf:"varint,52,opt,name=route_provenance_execution_generation,json=routeProvenanceExecutionGeneration,proto3,oneof" json:"route_provenance_execution_generation,omitempty"`
-	RouteProvenanceSubstrateKind       v12.SandboxSubstrateKind `protobuf:"varint,53,opt,name=route_provenance_substrate_kind,json=routeProvenanceSubstrateKind,proto3,enum=space.net.gateway.v1.SandboxSubstrateKind" json:"route_provenance_substrate_kind,omitempty"`
+	RouteProvenanceGeneration          *uint64 `protobuf:"varint,51,opt,name=route_provenance_generation,json=routeProvenanceGeneration,proto3,oneof" json:"route_provenance_generation,omitempty"`
+	RouteProvenanceExecutionGeneration *int64  `protobuf:"varint,52,opt,name=route_provenance_execution_generation,json=routeProvenanceExecutionGeneration,proto3,oneof" json:"route_provenance_execution_generation,omitempty"`
+	// Substrate recorded for the sandbox's current or retained route, not how
+	// the sandbox is hosted: KUBERNETES if any of those records names
+	// Kubernetes, else DIRECT if any names Direct, else UNSPECIFIED (none
+	// recorded, or the node could not read them).
+	RouteProvenanceSubstrateKind v12.SandboxSubstrateKind `protobuf:"varint,53,opt,name=route_provenance_substrate_kind,json=routeProvenanceSubstrateKind,proto3,enum=space.net.gateway.v1.SandboxSubstrateKind" json:"route_provenance_substrate_kind,omitempty"`
 	// Time the node-local state last changed. Carried with the matching state so
 	// cluster publication can measure node-to-Postgres convergence.
 	StateChangedAt     *timestamppb.Timestamp         `protobuf:"bytes,54,opt,name=state_changed_at,json=stateChangedAt,proto3,oneof" json:"state_changed_at,omitempty"`
