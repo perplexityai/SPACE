@@ -457,6 +457,58 @@ async fn postgres_claim_and_bind_pool_slot() -> TestResult {
     Ok(())
 }
 
+/// A builder registered under the slot's Kubernetes node name is not the
+/// slot's node: node ids are scoped by role, so the claim places the sandbox
+/// on the worker row for that name, or on no node when only a builder has it.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_claim_resolves_the_worker_sharing_a_builder_node_name() -> TestResult {
+    let db = pg_test_db().await?;
+    let slot = insert_ready_pool_slot(&db.pool).await?;
+    let builder_id = NodeId::new();
+    // Re-register the worker after the builder so a name-only read meets the
+    // builder first.
+    sqlx::query(sql!("DELETE FROM node_k8s WHERE node_id = $1"))
+        .bind(slot.node_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.10'::inet, 'builder', 'k8s', 'registered')"
+    ))
+    .bind(builder_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
+         VALUES ($1, 'pool-node-1', 'node-uid'), ($2, 'pool-node-1', 'node-uid')"
+    ))
+    .bind(builder_id)
+    .bind(slot.node_id)
+    .execute(&db.pool)
+    .await?;
+    let actor = ActorRef::new(slot.user_id, slot.org_id, Email::parse("pool@example.com")?);
+    let env = BTreeMap::new();
+    let auto_lifecycle = AutoLifecyclePolicy::disabled();
+    let template_network_policy = NetworkPolicyV1::deny_all();
+    let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
+
+    let claim = claim_pooled_execution(&db.pool, &request, "space")
+        .await?
+        .claim
+        .expect("ready pool slot should be claimed");
+    assert_eq!(claim.active_node_id, Some(slot.node_id));
+
+    sqlx::query(sql!("DELETE FROM node_k8s WHERE node_id = $1"))
+        .bind(slot.node_id)
+        .execute(&db.pool)
+        .await?;
+    let mut tx = db.pool.begin().await?;
+    let builder_only = resolve_pool_slot_node_id(&mut tx, Some("pool-node-1")).await?;
+    assert_eq!(builder_only, None);
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn postgres_claim_requires_matching_disk_capacity_and_reports_it() -> TestResult {
     let db = pg_test_db().await?;
