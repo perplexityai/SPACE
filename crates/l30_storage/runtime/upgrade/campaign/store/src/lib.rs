@@ -91,7 +91,7 @@ pub use admin::{
     ChangePhaseError, PhaseChange, PhaseChanged, abort_campaign, pause_campaign, resume_campaign,
 };
 pub use create::{
-    CreateCampaignError, NewCampaign, REASON_MAX_CHARS, check_reason, create_campaign,
+    CreateCampaignError, NewCampaign, REASON_MAX_CHARS, check_reason, create_campaign, validate,
 };
 pub use items::{
     ItemOutcome, LeaseError, LeasedItem, RETIRED_ATTEMPTS, RedriveReport, finish_item,

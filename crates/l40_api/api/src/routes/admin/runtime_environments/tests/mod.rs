@@ -13,7 +13,9 @@ use uuid::Uuid;
 use super::*;
 use pplx_space_db_test_fixtures::insert_ready_worker_node;
 
-use crate::routes::admin::test_fixtures::{Fixture, TestResult, postgres_fixture};
+use crate::routes::admin::test_fixtures::{
+    Fixture, TestResult, assert_error_contains, postgres_fixture,
+};
 
 /// The managing org the migrations seed.
 const SEED_ORG: Uuid = Uuid::from_u128(0x1);
@@ -651,12 +653,6 @@ async fn call_with_if_match(
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
     };
     (status, value)
-}
-
-#[track_caller]
-fn assert_error_contains(body: &Value, needle: &str) {
-    let error = body["error"].as_str().unwrap_or_default();
-    assert!(error.contains(needle), "expected {needle:?} in {body}");
 }
 
 fn state_path_suffix(environment: EnvironmentReference) -> String {

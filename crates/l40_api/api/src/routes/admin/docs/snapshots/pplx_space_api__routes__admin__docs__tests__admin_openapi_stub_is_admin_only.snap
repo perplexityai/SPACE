@@ -111,6 +111,22 @@ expression: paths_by_method
   "/runtime-environments/{environment_ref}/state": [
     "put"
   ],
+  "/runtime-upgrade-campaigns": [
+    "get",
+    "post"
+  ],
+  "/runtime-upgrade-campaigns/{campaign_id}": [
+    "get"
+  ],
+  "/runtime-upgrade-campaigns/{campaign_id}:abort": [
+    "post"
+  ],
+  "/runtime-upgrade-campaigns/{campaign_id}:pause": [
+    "post"
+  ],
+  "/runtime-upgrade-campaigns/{campaign_id}:resume": [
+    "post"
+  ],
   "/sandboxes": [
     "get",
     "post"

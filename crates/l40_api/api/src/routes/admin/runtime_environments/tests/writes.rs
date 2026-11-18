@@ -729,3 +729,98 @@ async fn only_releases_still_in_use_gate_a_block() -> TestResult {
     assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_block_is_refused_while_an_unfinished_template_campaign_moves_the_environment()
+-> TestResult {
+    use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
+    use pplx_space_runtime_upgrade_campaign_store::{CampaignKind, CampaignPhase};
+
+    let Some(h) = harness().await? else {
+        return Ok(());
+    };
+    let (e0, e1) = (environment(0), environment(1));
+    let (status, _) = h.set_default(e1).await;
+    assert_eq!(status, StatusCode::OK);
+    // Allowed, so a block stops it and the campaign check runs: with no
+    // state under a default it already doesn't execute.
+    let (status, body) = h
+        .set_state(e0, json!({"state": "allowed", "reason": "keep it"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let campaign = |kind, phase| CampaignSeed {
+        from: e0,
+        to: e1,
+        kind,
+        phase,
+        ..CampaignSeed::default()
+    };
+    let block = || h.set_state(e0, json!({"state": "blocked", "reason": "0-day"}));
+
+    // A finished template campaign and an unfinished sandbox campaign don't
+    // hold the block.
+    insert_campaign(
+        &h.db.pool,
+        campaign(CampaignKind::Templates, CampaignPhase::Completed),
+    )
+    .await?;
+    insert_campaign(
+        &h.db.pool,
+        campaign(CampaignKind::Sandboxes, CampaignPhase::Rolling),
+    )
+    .await?;
+    let (status, body) = block().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .set_state(e0, json!({"state": "allowed", "reason": "undo"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // An unfinished template campaign does, and the refusal names it.
+    let holding = insert_campaign(
+        &h.db.pool,
+        campaign(CampaignKind::Templates, CampaignPhase::Paused),
+    )
+    .await?;
+    let generation = h.generation().await?;
+    let (status, body) = block().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error_contains(
+        &body,
+        &format!("template runtime upgrade campaign {holding} still moves"),
+    );
+    assert!(body.get("at_risk").is_none(), "nothing else stops: {body}");
+    assert_eq!(h.generation().await?, generation, "nothing changed");
+
+    // With work bound to the environment too, the refusal reports it, since
+    // the strand: true that overrides the campaign also waives that work.
+    let tagged = insert_template_release(&h.db.pool, "tagged", Some(metadata(Some(e0)))).await?;
+    tag_release(&h.db.pool, tagged, "tagged", "latest").await?;
+    let (status, body) = block().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error_contains(&body, &format!("campaign {holding}"));
+    assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
+
+    // Deprecating doesn't stop the releases, so it isn't held.
+    let (status, body) = h
+        .set_state(e0, json!({"state": "deprecated", "reason": "superseded"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .set_state(
+            e0,
+            json!({"state": "blocked", "reason": "0-day", "strand": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Blocking it again, say to update the reason, stops nothing new.
+    let (status, body) = h
+        .set_state(
+            e0,
+            json!({"state": "blocked", "reason": "0-day, confirmed"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(())
+}

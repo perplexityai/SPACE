@@ -632,6 +632,14 @@ async fn a_subject_skipped_after_its_page_is_upgraded_before_the_campaign_comple
 }
 
 #[test]
+fn the_api_starts_campaigns_of_exactly_the_kinds_this_build_drives() {
+    assert_eq!(
+        cluster_drivers().kinds(),
+        pplx_space_api::routes::admin::RUNTIME_UPGRADE_DRIVEN_KINDS
+    );
+}
+
+#[test]
 fn the_reconciler_is_off_unless_switched_on() {
     let mut env = TestEnv::default();
     assert_eq!(

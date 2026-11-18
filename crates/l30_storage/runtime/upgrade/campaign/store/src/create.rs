@@ -74,27 +74,25 @@ pub fn check_reason(reason: &str) -> Result<(), &'static str> {
     }
 }
 
-pub(crate) fn validate(campaign: &NewCampaign) -> Result<(), CreateCampaignError> {
+/// Why `campaign` can't be started whatever else the database holds.
+/// [`create_campaign`] checks this first, as [`CreateCampaignError::Invalid`];
+/// a caller that refuses starts for its own reasons checks it before them, so
+/// an invalid start is reported as invalid.
+pub fn validate(campaign: &NewCampaign) -> Result<(), &'static str> {
     if campaign.from == campaign.to {
-        Err(CreateCampaignError::Invalid(
-            "the source and target must differ",
-        ))
+        Err("the source and target must differ")
+    } else if campaign.max_in_flight_per_cluster == 0 {
+        Err("max_in_flight_per_cluster must be at least 1")
     } else if campaign.max_in_flight_per_node == 0
         || campaign.max_in_flight_per_node > campaign.max_in_flight_per_cluster
     {
-        Err(CreateCampaignError::Invalid(
-            "max_in_flight_per_node must be at least 1 and at most max_in_flight_per_cluster",
-        ))
+        Err("max_in_flight_per_node must be at least 1 and at most max_in_flight_per_cluster")
     } else if campaign.failure_budget == 0 {
-        Err(CreateCampaignError::Invalid(
-            "failure_budget must be at least 1",
-        ))
+        Err("failure_budget must be at least 1")
     } else if campaign.include_running && campaign.kind != CampaignKind::Sandboxes {
-        Err(CreateCampaignError::Invalid(
-            "include_running applies only to sandbox campaigns",
-        ))
+        Err("include_running applies only to sandbox campaigns")
     } else {
-        check_reason(&campaign.reason).map_err(CreateCampaignError::Invalid)
+        check_reason(&campaign.reason)
     }
 }
 
@@ -108,7 +106,7 @@ pub async fn create_campaign(
     conn: impl Acquire<'_, Database = Postgres>,
     campaign: &NewCampaign,
 ) -> Result<CampaignId, CreateCampaignError> {
-    validate(campaign)?;
+    validate(campaign).map_err(CreateCampaignError::Invalid)?;
     let mut tx = conn.begin().await?;
     let created = create_in(&mut tx, campaign).await;
     end_transaction(tx, created).await

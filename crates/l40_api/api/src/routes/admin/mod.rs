@@ -32,6 +32,7 @@ use crate::{
     middleware::auth::{AuthOrg, AuthUser, bearer_token},
     routes::public::error::PublicApiError,
 };
+pub use runtime_upgrade_campaigns::RUNTIME_UPGRADE_DRIVEN_KINDS;
 
 mod api_key_store;
 mod api_keys;
@@ -46,6 +47,7 @@ pub mod nodes;
 mod operations;
 mod runtime_environment_store;
 mod runtime_environments;
+mod runtime_upgrade_campaigns;
 // `pub(in crate::routes)`: the debug route takes the same sandbox ID forms.
 pub(in crate::routes) mod sandbox_id;
 mod sandbox_list;
@@ -180,6 +182,16 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         .route(
             "/runtime-environments/{environment_ref}/state",
             put(runtime_environments::set_runtime_environment_state),
+        )
+        .route(
+            "/runtime-upgrade-campaigns",
+            get(runtime_upgrade_campaigns::list_campaigns)
+                .post(runtime_upgrade_campaigns::start_campaign),
+        )
+        .route(
+            "/runtime-upgrade-campaigns/{spec}",
+            get(runtime_upgrade_campaigns::get_campaign)
+                .post(runtime_upgrade_campaigns::dispatch_campaign_action),
         )
         .route(
             "/warm-pools",

@@ -2,9 +2,9 @@
 //! sandboxes to another, paced per cluster and, where subjects have a node,
 //! per node.
 //!
-//! An operator starts a campaign (a `runtime_upgrade_campaigns` row) naming
-//! the kind, the environment to move off, the target, the pacing and a
-//! failure budget. What a kind's subjects are and how one is
+//! An operator starts a campaign (`runtime_upgrade_campaigns`, through the
+//! admin API) naming the kind, the environment to move off, the target, the
+//! pacing and a failure budget. What a kind's subjects are and how one is
 //! upgraded belong to that kind's [`CampaignDriver`]; this loop owns what's
 //! common. Each tick, for every unfinished campaign whose kind has a driver
 //! in [`Drivers`]:
@@ -45,7 +45,9 @@
 //! A campaign whose kind has no driver is reported (its phase and items) but
 //! not driven: nothing reads its subjects, and the only write to its items
 //! is the one every aborted campaign gets, returning in-flight items whose
-//! leases lapsed to pending.
+//! leases lapsed to pending. The admin API refuses to start one, so only a
+//! campaign started some other way, or by a newer API during a rollout, can
+//! be in that state.
 //!
 //! An operator's abort leaves a campaign's in-flight items to drain: their
 //! workers can't renew a finished campaign's lease, so each drops its work
@@ -265,7 +267,9 @@ impl Drivers {
     }
 }
 
-/// The drivers this build runs: none yet.
+/// The drivers this build runs: none yet. A driver added here adds its kind
+/// to `pplx_space_api::routes::admin::RUNTIME_UPGRADE_DRIVEN_KINDS` too, so
+/// the admin API starts campaigns of it; a test holds the two equal.
 pub fn cluster_drivers() -> Drivers {
     Drivers::default()
 }

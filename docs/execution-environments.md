@@ -1288,6 +1288,13 @@ execution still active or holding a pod IP) that the repair loop, which runs
 only on Kubernetes, has nothing to revert to. Later defaults stop nothing, and
 nor does blocking an environment that already doesn't execute, so neither is
 checked, unless another policy write lands while the block waits for the lock.
+A block also needs `strand: true` while an unfinished template runtime upgrade
+campaign moves releases off the environment, since it would stop the releases
+the campaign hasn't given a twin on its target yet; that refusal carries the
+same `at_risk` report when work is bound to the environment too. It skips an
+environment that already doesn't execute in the same way. The first default
+doesn't check campaigns yet, and a block checks a campaign's source, not its
+target.
 Both writes take an optional `If-Match: <generation>` (`--if-generation` in the
 CLI) and answer 412 without changing anything unless the policy is still at
 that generation, so an operator writing from a stale read can't undo another's
