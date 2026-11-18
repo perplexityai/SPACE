@@ -3931,14 +3931,15 @@ impl DirectSubstrate {
     /// `execution_generation`, `started` when its worker runs it.
     ///
     /// One transaction takes the `sandboxes` row lock, reads the route
-    /// identity and provenance rows, and makes the guarded write
-    /// ([`direct_store::adopt_live_execution`]) with the two facts they give.
-    /// The route rows are read without locks. Locking them would order the
-    /// adoption against writers that take the route identity and the
-    /// provenance in different orders, and one `UPDATE ... FROM` joining them
-    /// would not lock them either: it reads them from a snapshot taken before
-    /// it waits on the row. Read after the row lock, they are at least as
-    /// fresh as that snapshot.
+    /// identity and the last reservation in one statement, so they come from
+    /// one snapshot as the joined `UPDATE ... FROM` read them, and makes the
+    /// guarded write ([`direct_store::adopt_live_execution`]) with the two
+    /// facts they give. The read takes no row locks. Locking the route rows
+    /// would order the adoption against writers that take the route identity
+    /// and the provenance in different orders, and the joined statement did
+    /// not lock them either: it read them from a snapshot taken before it
+    /// waited on the row. Read after the row lock, they are at least as fresh
+    /// as that snapshot.
     async fn adopt_live_execution(
         &self,
         sandbox_id: SandboxId,
@@ -3965,26 +3966,23 @@ impl DirectSubstrate {
         .fetch_optional(&mut *transaction)
         .await
         .db_context("failed to lock the sandbox for the live record's adoption")?;
-        let route = sqlx::query_as::<_, (NodeId, i64)>(sql!(
-            "SELECT current_node_id, execution_generation
-               FROM sandbox_direct_route_identities
-              WHERE sandbox_id = $1"
+        let route = sqlx::query_as::<_, (NodeId, i64, i64)>(sql!(
+            "SELECT route.current_node_id,
+                    route.execution_generation,
+                    provenance.last_execution_generation
+               FROM sandbox_direct_route_identities route
+               JOIN sandbox_direct_route_provenance provenance
+                 ON provenance.sandbox_id = route.sandbox_id
+              WHERE route.sandbox_id = $1"
         ))
         .bind(sandbox_id.as_uuid())
         .fetch_optional(&mut *transaction)
         .await
-        .db_context("failed to read the route identity for the live record's adoption")?;
-        let last_execution_generation = sqlx::query_scalar::<_, i64>(sql!(
-            "SELECT last_execution_generation
-               FROM sandbox_direct_route_provenance
-              WHERE sandbox_id = $1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_optional(&mut *transaction)
-        .await
-        .db_context("failed to read the route provenance for the live record's adoption")?;
-        let adoptable = match (locked, route, last_execution_generation) {
-            (Some(_), Some((route_node_id, route_generation)), Some(last_generation))
+        .db_context(
+            "failed to read the route identity and provenance for the live record's adoption",
+        )?;
+        let adoptable = match (locked, route) {
+            (Some(_), Some((route_node_id, route_generation, last_generation)))
                 if route_node_id == node.id
                     && route_generation <= execution_generation
                     && last_generation >= execution_generation =>
