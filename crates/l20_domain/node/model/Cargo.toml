@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 pplx-space-accounts = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
+pplx-space-node-drain = { workspace = true }
 pplx-space-sql-codec = { workspace = true, optional = true }
 pplx-space-template-model = { workspace = true }
 pplx-space-uuid-id = { workspace = true, optional = true }
@@ -22,7 +23,7 @@ uuid = { workspace = true, features = ["v7"] }
 
 [features]
 default = []
-serde = ["dep:serde"]
+serde = ["dep:serde", "pplx-space-node-drain/serde"]
 # Forwards TemplateVisibility's codec, which api's node-group SQL gets through
 # sandbox-store, as Cargo unifies features.
 sqlx = [
@@ -30,4 +31,5 @@ sqlx = [
     "dep:pplx-space-uuid-id",
     "pplx-space-sql-codec/postgres",
     "pplx-space-template-model/sqlx",
+    "pplx-space-node-drain/sqlx",
 ]

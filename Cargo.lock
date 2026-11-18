@@ -4878,6 +4878,7 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
  "pplx-space-execution-spec",
+ "pplx-space-node-drain",
  "pplx-space-node-model",
  "pplx-space-sandbox-model",
  "pplx-space-template-model",
@@ -7084,6 +7085,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-node-drain"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-sql-codec",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "pplx-space-node-execution-inventory-store"
 version = "0.8.2"
 dependencies = [
@@ -7257,6 +7268,7 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
  "pplx-space-k8s-ids",
+ "pplx-space-node-drain",
  "pplx-space-sql-codec",
  "pplx-space-template-model",
  "pplx-space-uuid-id",

@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 pplx-space-accounts = { workspace = true, optional = true }
 pplx-space-execution-spec = { workspace = true, optional = true }
+pplx-space-node-drain = { workspace = true, optional = true }
 pplx-space-node-model = { workspace = true, optional = true }
 pplx-space-sandbox-model = { workspace = true, optional = true }
 pplx-space-template-model = { workspace = true, optional = true }
@@ -28,6 +29,8 @@ serde = [
     "dep:thiserror",
     "pplx-space-accounts/serde",
     "pplx-space-execution-spec/serde",
+    "dep:pplx-space-node-drain",
+    "pplx-space-node-drain/serde",
     "pplx-space-node-model/serde",
     "pplx-space-sandbox-model/serde",
     "pplx-space-template-model/serde",
