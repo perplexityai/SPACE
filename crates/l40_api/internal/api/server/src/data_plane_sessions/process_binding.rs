@@ -52,8 +52,12 @@ pub(crate) async fn bind_session_process(
                      ELSE d.backend_process_bound_at
                  END,
                  -- The bound process has started: the session is open until
-                 -- a stream reports its exit or the session is revoked.
-                 state = CASE WHEN d.state = 'pending' THEN 'open' ELSE d.state END,
+                 -- the caller reports its exit or the session is revoked. A
+                 -- caller that does not report exits leaves it pending.
+                 state = CASE
+                     WHEN $4::BOOLEAN AND d.state = 'pending' THEN 'open'
+                     ELSE d.state
+                 END,
                  updated_at = NOW()
              FROM target
              WHERE d.session_id = target.session_id
@@ -71,6 +75,7 @@ pub(crate) async fn bind_session_process(
     .bind(&session_id)
     .bind(protocol_session_id.as_deref())
     .bind(&process_id)
+    .bind(request.records_exit)
     .fetch_optional(pool)
     .await
     .map_err(|error| Status::internal(format!("bind data-plane session process: {error}")))?;

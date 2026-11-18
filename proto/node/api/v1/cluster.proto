@@ -678,6 +678,11 @@ message BindDataPlaneSessionProcessRequest {
   string session_id = 1;
   optional string protocol_session_id = 2;
   string process_id = 3;
+  // Set by a caller that records the process's exit with
+  // RecordDataPlaneSessionProcessExited. Only then does the bind move a
+  // pending session to `open`: a caller that never records the exit would
+  // leave the session `open` after the process is gone.
+  bool records_exit = 4;
 }
 
 message BindDataPlaneSessionProcessResponse {
@@ -717,8 +722,8 @@ message RecordDataPlaneSessionProcessExitedRequest {
 }
 
 message RecordDataPlaneSessionProcessExitedResponse {
-  // Whether this call closed the session; false when it was already closed,
-  // revoked, or bound to another process.
+  // Whether this call closed the session; false when no pending or open
+  // terminal or process session bound to `process_id` matched.
   bool closed = 1;
 }
 

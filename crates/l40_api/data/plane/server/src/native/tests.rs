@@ -705,6 +705,9 @@ async fn process_start_reaches_the_client_before_its_binding_commits() {
         vec![pplx_space_public_api::process_id_for_session(session_id).to_string()],
         "bound exactly once, to the derived process id"
     );
+    // The stream records the exit, so its bind may move the session to
+    // `open`.
+    assert_eq!(*fake.binds_record_exit.lock().unwrap(), [true]);
 }
 
 #[tokio::test]
@@ -2569,6 +2572,8 @@ struct ProcessFake {
     release: Arc<tokio::sync::Semaphore>,
     bind_started: Arc<tokio::sync::Notify>,
     bound_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Each bind's `records_exit`, in order.
+    binds_record_exit: Arc<std::sync::Mutex<Vec<bool>>>,
     /// The process id of each exit a stream recorded, in order.
     exited_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
     /// Set to take exit records without ever answering them.
@@ -2633,6 +2638,7 @@ async fn spawn_process_fake(
         release: Arc::new(tokio::sync::Semaphore::new(0)),
         bind_started: Arc::new(tokio::sync::Notify::new()),
         bound_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+        binds_record_exit: Arc::new(std::sync::Mutex::new(Vec::new())),
         exited_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         exit_records_unanswered: Arc::new(AtomicBool::new(false)),
         exit_record_refusals: Arc::new(AtomicUsize::new(0)),
@@ -2647,6 +2653,7 @@ async fn spawn_process_fake(
     let release = Arc::clone(&fake.release);
     let bind_started = Arc::clone(&fake.bind_started);
     let bound_process_ids = Arc::clone(&fake.bound_process_ids);
+    let binds_record_exit = Arc::clone(&fake.binds_record_exit);
     let running = Arc::clone(&fake.running);
     let exited_process_ids = Arc::clone(&fake.exited_process_ids);
     let exit_records_unanswered = Arc::clone(&fake.exit_records_unanswered);
@@ -2660,6 +2667,7 @@ async fn spawn_process_fake(
         let release = Arc::clone(&release);
         let bind_started = Arc::clone(&bind_started);
         let bound_process_ids = Arc::clone(&bound_process_ids);
+        let binds_record_exit = Arc::clone(&binds_record_exit);
         let exited_process_ids = Arc::clone(&exited_process_ids);
         let exit_records_unanswered = Arc::clone(&exit_records_unanswered);
         let exit_record_refusals = Arc::clone(&exit_record_refusals);
@@ -2686,6 +2694,7 @@ async fn spawn_process_fake(
                 let body = request.into_body().collect().await.unwrap().to_bytes();
                 let request = BindDataPlaneSessionProcessRequest::decode(&body[5..]).unwrap();
                 bound_process_ids.lock().unwrap().push(request.process_id);
+                binds_record_exit.lock().unwrap().push(request.records_exit);
                 if let Some(bind) = gated_bind {
                     bind_started.notify_one();
                     release.acquire().await.unwrap().forget();

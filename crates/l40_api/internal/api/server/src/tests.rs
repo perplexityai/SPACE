@@ -2791,6 +2791,7 @@ async fn data_plane_process_binding_is_idempotent_and_conflict_checked() -> Test
             session_id: session_id.clone(),
             protocol_session_id: None,
             process_id: "proc_1".to_string(),
+            records_exit: false,
         }))
         .await?
         .into_inner();
@@ -2803,6 +2804,7 @@ async fn data_plane_process_binding_is_idempotent_and_conflict_checked() -> Test
             session_id: session_id.clone(),
             protocol_session_id: None,
             process_id: "proc_1".to_string(),
+            records_exit: false,
         }))
         .await?
         .into_inner();
@@ -2828,6 +2830,7 @@ async fn data_plane_process_binding_is_idempotent_and_conflict_checked() -> Test
             session_id,
             protocol_session_id: None,
             process_id: "proc_2".to_string(),
+            records_exit: false,
         }))
         .await
         .expect_err("second process id should be rejected");
@@ -2837,8 +2840,10 @@ async fn data_plane_process_binding_is_idempotent_and_conflict_checked() -> Test
 
 /// A session's public state follows its process: `pending` until a stream
 /// binds the process it started, `open` while it runs, and `closed` once a
-/// stream reports its exit. A report about another process, a repeated one,
-/// and one for a revoked session leave the state as it is.
+/// stream reports its exit. A bind from a caller that does not report exits
+/// leaves the session `pending`. A report about another process, a repeated
+/// one, and one for a revoked session leave the state as it is, and so does
+/// a repeated bind of a closed or revoked session.
 #[tokio::test(flavor = "current_thread")]
 async fn data_plane_session_state_follows_its_process() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
@@ -2859,6 +2864,14 @@ async fn data_plane_session_state_follows_its_process() -> TestResult {
             .await
         }
     };
+    let bind = |session_id: &str, records_exit: bool| {
+        Request::new(BindDataPlaneSessionProcessRequest {
+            session_id: session_id.to_string(),
+            protocol_session_id: None,
+            process_id: "proc_1".to_string(),
+            records_exit,
+        })
+    };
     let exited = |session_id: &str, process_id: &str| {
         Request::new(RecordDataPlaneSessionProcessExitedRequest {
             session_id: session_id.to_string(),
@@ -2869,7 +2882,12 @@ async fn data_plane_session_state_follows_its_process() -> TestResult {
 
     let session_id = format!("proc_{}", Uuid::now_v7());
     let revoked_id = format!("proc_{}", Uuid::now_v7());
-    for session_id in [&session_id, &revoked_id] {
+    let untracked_id = format!("proc_{}", Uuid::now_v7());
+    for (session_id, records_exit) in [
+        (&session_id, true),
+        (&revoked_id, true),
+        (&untracked_id, false),
+    ] {
         insert_data_plane_session_with_protocol(
             &fixture.service.pool,
             session_id,
@@ -2885,14 +2903,11 @@ async fn data_plane_session_state_follows_its_process() -> TestResult {
             .await?;
         fixture
             .service
-            .bind_data_plane_session_process(Request::new(BindDataPlaneSessionProcessRequest {
-                session_id: session_id.clone(),
-                protocol_session_id: None,
-                process_id: "proc_1".to_string(),
-            }))
+            .bind_data_plane_session_process(bind(session_id, records_exit))
             .await?;
     }
     assert_eq!(state(session_id.clone()).await?, "open");
+    assert_eq!(state(untracked_id).await?, "pending");
 
     let other = fixture
         .service
@@ -2916,6 +2931,11 @@ async fn data_plane_session_state_follows_its_process() -> TestResult {
         .into_inner();
     assert!(!again.closed);
     assert_eq!(state(session_id.clone()).await?, "closed");
+    fixture
+        .service
+        .bind_data_plane_session_process(bind(&session_id, true))
+        .await?;
+    assert_eq!(state(session_id.clone()).await?, "closed");
 
     sqlx::query("UPDATE data_plane_sessions SET state = 'revoked' WHERE session_id = $1")
         .bind(&revoked_id)
@@ -2927,6 +2947,11 @@ async fn data_plane_session_state_follows_its_process() -> TestResult {
         .await?
         .into_inner();
     assert!(!revoked.closed);
+    assert_eq!(state(revoked_id.clone()).await?, "revoked");
+    fixture
+        .service
+        .bind_data_plane_session_process(bind(&revoked_id, true))
+        .await?;
     assert_eq!(state(revoked_id).await?, "revoked");
     Ok(())
 }

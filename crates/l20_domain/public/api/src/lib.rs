@@ -2066,12 +2066,16 @@ pub struct PublicCommand {
     pub sandbox_id: PublicSandboxId,
     /// Session state, not proof of command success: `pending` until an
     /// attach starts the command, `open` while it runs, and `closed` once an
-    /// attached stream observes its exit. The stream closes the session as it
-    /// relays the exit, so `closed` does not mean the client received
-    /// `process_exited`. A command that exits while no stream is attached
-    /// stays `open` until a reattach observes the exit. A revoked session is
-    /// `revoked`. Read the process_exited event and exit result from the
-    /// command's stream.
+    /// attached stream records its exit. The stream sends `process_exited`
+    /// without waiting long for that record, so `closed` does not mean the
+    /// client received `process_exited`, and a read right after the exit can
+    /// still return `open`. A command can stay `open` after it exits: when no
+    /// stream was attached at the exit, or the exit could not be recorded. A
+    /// later attach that still reads the exit can close it. A command that a
+    /// data plane without this tracking started reads `pending` while it
+    /// runs, and can go from `pending` to `closed`. A closed session stays
+    /// readable until it expires. A revoked session is `revoked`. Read the
+    /// process_exited event and exit result from the command's stream.
     pub state: SessionState,
     /// Attachment destination and credentials when available.
     pub attach: Option<DataPlaneAttachInfo>,

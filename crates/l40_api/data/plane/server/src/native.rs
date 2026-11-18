@@ -1158,6 +1158,8 @@ pub(super) async fn bind_session_process(
             session_id: session_id.to_string(),
             protocol_session_id: protocol_session_id(session_id),
             process_id: process_id.to_string(),
+            // The stream records the exit when it observes it.
+            records_exit: true,
         })
         .await
         .map_err(StreamBridgeError::ClusterStatus)?;
@@ -1197,6 +1199,7 @@ pub(super) async fn record_session_process_exited(
         tokio::select! {
             () = record_process_exit(&record_state, session_id, request, first_answer) => {}
             () = shutdown.cancelled() => tracing::warn!(
+                session_id = %session_id,
                 "stopped recording a data-plane session's process exit at shutdown"
             ),
         }
@@ -1206,6 +1209,7 @@ pub(super) async fn record_session_process_exited(
         .is_err()
     {
         tracing::warn!(
+            session_id = %session_id,
             timeout_ms = state.process_exit_record_timeout.as_millis() as u64,
             "reporting a process exit before the cluster API recorded it"
         );
@@ -1248,6 +1252,7 @@ async fn record_process_exit(
         );
         if !retryable || attempt == PROCESS_EXIT_RECORD_ATTEMPTS {
             tracing::warn!(
+                session_id = %session_id,
                 code = ?status.code(),
                 message = status.message(),
                 attempt,
@@ -1256,6 +1261,7 @@ async fn record_process_exit(
             return;
         }
         tracing::debug!(
+            session_id = %session_id,
             code = ?status.code(),
             attempt,
             "retrying a data-plane session's process exit record"
