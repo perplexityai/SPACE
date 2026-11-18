@@ -144,6 +144,14 @@ def parse_typed(log: Path) -> dict:
     return surfaces
 
 
+def read_json(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def read_timings(out: Path) -> list[dict]:
     rows = []
     path = out / "timings.tsv"
@@ -343,11 +351,19 @@ def summarize(out: Path) -> int:
                 incomplete = True
     status = 1 if failed else 2 if incomplete else 42 if warned else 0
 
+    source = read_json(out / "source.json") or {}
+    manifest = read_json(out / "host" / "rust" / "manifest.json") or {}
+    reuse = out / "host" / "rust-reuse.out"
+    source["rust_image"] = {
+        key: manifest.get(key) for key in ("image_id", "built_from", "input_key")
+    } | {"reused_from_main": reuse.exists() and "reused=true" in reuse.read_text()}
+
     host_rows = [row for row in timings if row["owner"] in ("host", "run")]
     ended = max((row["end"] for row in timings), default=start)
     summary = {
         "run": out.name,
         "benches": count,
+        "source": source,
         "exit_status": status,
         "wall_clock_seconds": ended - start,
         "host_phases": {f"{r['owner']}:{r['phase']}": {"seconds": r["end"] - r["start"], "rc": r["rc"], "started_after": r["start"] - start} for r in host_rows},
@@ -367,6 +383,18 @@ def summarize(out: Path) -> int:
         f"# Parallel Kind smoke: {out.name}",
         "",
         f"- benches: {count}; exit status {status}; wall-clock {clock(ended - start)} (start to last phase)",
+        f"- checkout: {source.get('head', 'unknown')}"
+        + (
+            f" with uncommitted changes (diff from HEAD sha256 {source.get('diff_from_head_sha256')},"
+            f" untracked files sha256 {source.get('untracked_sha256')})"
+            if source.get("dirty")
+            else " (clean)"
+        ),
+        f"- lane: substrate {source.get('substrate')}, Rust build {source.get('rust_build')},"
+        f" tiers {source.get('tiers')}",
+        f"- Rust image: {source['rust_image'].get('image_id')} built from"
+        f" {source['rust_image'].get('built_from')}"
+        + (" (main's image for the same input key)" if source["rust_image"]["reused_from_main"] else ""),
         "",
         "## Host phases",
         "",

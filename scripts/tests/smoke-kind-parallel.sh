@@ -259,6 +259,27 @@ HOST="$OUT/host"
 RUN_START="$(date +%s)"
 printf '%s\n' "$RUN_START" >"$OUT/started"
 printf '%s\n' "$BENCHES" >"$OUT/bench-count"
+
+# What this run tests, for the summary: the commit, whether the tree differs
+# from it and a fingerprint of how (the diff from HEAD and the untracked files'
+# contents), and the lane settings. The summary is a validation's evidence, so
+# it has to say which tree and build it covers.
+write_source() {
+  local diff_sha untracked_sha dirty=false
+  diff_sha="$(git -C "$REPO_ROOT" diff HEAD --binary | sha256sum | cut -d' ' -f1)" || return 1
+  untracked_sha="$(cd "$REPO_ROOT" && git ls-files -z --others --exclude-standard | sort -z \
+    | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)" || return 1
+  if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
+    dirty=true
+  fi
+  jq -n --arg head "$(git -C "$REPO_ROOT" rev-parse HEAD)" --argjson dirty "$dirty" \
+    --arg diff "$diff_sha" --arg untracked "$untracked_sha" \
+    --arg substrate "${SPACE_KIND_SUBSTRATE:-kubernetes}" --arg build "${SPACE_KIND_RUST_BUILD:-test-hooks}" \
+    --arg tiers "${SPACE_SMOKE_TIERS:-routine}" \
+    '{head: $head, dirty: $dirty, diff_from_head_sha256: $diff, untracked_sha256: $untracked,
+      substrate: $substrate, rust_build: $build, tiers: $tiers}' >"$OUT/source.json"
+}
+write_source || die "could not record the checkout's state"
 log "run $RUN_ID: output in $OUT"
 
 # One line per phase: <owner> <phase> <start epoch> <end epoch> <exit status>.
