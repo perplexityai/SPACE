@@ -631,10 +631,12 @@ fn reconnect_error_outcome(
         ),
         // Only suspend returns `SandboxNoPod` and only a Delete teardown
         // returns `NodeDeleteNotAdmitted`, so a wake never sees either; they
-        // share `Unavailable`'s arm, as they share its 503.
+        // share `Unavailable`'s arm, as they share its 503. A node a drain
+        // sealed refuses the wake for now, with the same 503.
         SubstrateError::Unavailable { .. }
         | SubstrateError::SandboxNoPod { .. }
         | SubstrateError::Unschedulable { .. }
+        | SubstrateError::NodeSealed { .. }
         | SubstrateError::NodeDeleteNotAdmitted { .. } => (
             ReconnectOutcome::WakeFailed,
             initial_lifecycle_terminal_phase(initial_lifecycle),
@@ -1156,6 +1158,14 @@ impl SandboxController {
     /// [`super::substrate::ActivationClientAttribution`]).
     pub fn activation_client_attribution(&self) -> super::substrate::ActivationClientAttribution {
         self.substrate.activation_client_attribution()
+    }
+
+    /// Whether drain v2 is on (see
+    /// [`super::substrate::DrainV2Switch`]): on, a stop or kill of a sandbox
+    /// on a node under a v2 drain is refused, since a v2 drain doesn't move a
+    /// stopped sandbox.
+    pub fn drain_v2_switch(&self) -> super::substrate::DrainV2Switch {
+        self.substrate.drain_v2_switch()
     }
 
     pub async fn set_node_schedulability(

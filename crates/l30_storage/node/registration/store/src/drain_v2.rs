@@ -170,6 +170,27 @@ pub struct DrainV2Columns {
     pub recorded_instance: bool,
 }
 
+/// Whether any of `node_ids` has a v2 drain: its engine is `v2`, in any
+/// phase or with its cancel pending, so the node is sealed (or, fenced, has
+/// nothing left that names it). The API asks it of a sandbox's nodes before a
+/// stop or kill, which would leave the sandbox stopped there, and a v2 drain
+/// doesn't move a stopped sandbox. A read.
+pub async fn any_v2_drain_on(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_ids: &[NodeId],
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+             SELECT 1 FROM nodes
+              WHERE id = ANY($1::UUID[])
+                AND drain_engine = 'v2'
+         )"
+    ))
+    .bind(node_ids)
+    .fetch_one(executor)
+    .await
+}
+
 /// The node's v2 drain columns; `None` when there is no such node. A
 /// `drain_status` that doesn't read as [`StoredV2Status`] is a decode error.
 pub async fn drain_v2_columns(

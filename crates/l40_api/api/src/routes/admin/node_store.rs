@@ -16,7 +16,7 @@ use pplx_space_node_execution_inventory_store::InstallationGuestRow;
 use pplx_space_node_model::{
     NodeAddress, NodeDrain, NodeDrainMode, NodeDrainPhase, NodeGroupId, NodeManagedBy, NodeRole,
 };
-use pplx_space_node_registration_store::drain_reads::{self, NodeDrainColumns};
+use pplx_space_node_registration_store::drain_reads;
 use pplx_space_node_registration_store::drain_write::{self, DrainColumnsUpdate};
 use pplx_space_sandbox_model::SandboxId;
 #[cfg(test)]
@@ -74,6 +74,7 @@ pub(super) struct AdminNodeRow {
     pub(super) drain_mode: Option<String>,
     pub(super) drain_started_at: Option<OffsetDateTime>,
     pub(super) drain_last_error: Option<String>,
+    pub(super) drain_engine: Option<String>,
     pub(super) terminate_decrement_capacity: bool,
     pub(super) node_group_id: Option<NodeGroupId>,
     pub(super) metadata: Option<sqlx::types::Json<serde_json::Value>>,
@@ -363,6 +364,7 @@ const ADMIN_NODE_SELECT: &str = "SELECT n.id,
        n.drain_mode,
        n.drain_started_at,
        n.drain_last_error,
+       n.drain_engine,
        n.terminate_decrement_capacity,
        n.node_group_id,
        nd.metadata,
@@ -1171,31 +1173,22 @@ pub(super) async fn list_pinned_local_only_sandboxes(
 /// serving user traffic by design. Reading the phase alone here would let an
 /// `:undrain` + gentle `:drain` landing mid-fan-out look like the safe regime it
 /// isn't, which is the whole failure this re-check exists to prevent. Resolved
-/// through the same [`NodeDrain::blocks_placement`] the gate itself uses.
+/// through the same [`NodeDrain::refuses_activations`] the gate itself uses,
+/// from the node's shared drain columns.
 pub(super) async fn is_node_wake_gate_closed(
     pool: &PgPool,
     node_id: NodeId,
 ) -> Result<bool, sqlx::Error> {
-    let Some(NodeDrainColumns {
-        drain_phase,
-        drain_mode,
-    }) = drain_reads::drain_columns(pool, node_id).await?
-    else {
-        return Ok(false);
-    };
-    // An unknown phase fails the check with a decode error on column 0, the
-    // phase's position in `drain_columns`, so the fan-out aborts instead of
-    // reading the gate as open.
-    let phase = drain_phase
-        .as_deref()
-        .map(NodeDrainPhase::parse)
-        .transpose()
-        .map_err(|source| sqlx::Error::ColumnDecode {
-            index: "0".to_owned(),
-            source: source.into(),
-        })?;
-    Ok(NodeDrain::from_v1_columns(phase, drain_mode.as_deref())
-        .is_some_and(NodeDrain::blocks_placement))
+    let row = drain_reads::drain_columns(pool, node_id).await?;
+    Ok(row
+        .and_then(|row| {
+            NodeDrain::from_columns(
+                row.drain_engine.as_deref(),
+                row.drain_phase.as_deref(),
+                row.drain_mode.as_deref(),
+            )
+        })
+        .is_some_and(NodeDrain::refuses_activations))
 }
 
 /// The in-place update for a node that is already `draining`: rewrite

@@ -224,6 +224,40 @@ impl ActivationCompletion {
 
 pub use pplx_space_sandbox_model::AbandonedRestoreRetirement;
 
+/// The drain v2 switch, `SPACE_DRAIN_V2_ENABLED`, as the API's gates read
+/// it. On, a stop or kill of a sandbox on a node under a v2 drain is refused
+/// with a retryable 503: a v2 drain doesn't move a stopped sandbox, and never
+/// terminates a node that holds one. Off, every stop and kill takes main's
+/// path. It is the switch that admits v2 drains, and ships off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DrainV2Switch {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl DrainV2Switch {
+    /// `1`, `true`, `yes`, `on` or `enabled`, in any case, turns it on;
+    /// unset or anything else keeps it off.
+    pub const ENV: &'static str = "SPACE_DRAIN_V2_ENABLED";
+
+    pub fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_enabled(pplx_space_env_vars::env_flag_var(Self::ENV, false))
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
 /// Whether SPACE records which client's activation created a sandbox's
 /// runtime: the `sandboxes.activating_client_id` record, the
 /// `space.pplx.net/client-id` pod label and the label patch at warm-pool
@@ -659,6 +693,12 @@ pub enum SubstrateError {
     Unschedulable { message: String },
     #[error("{message}")]
     Conflict { message: String },
+    /// The node refused the activation because a node drain sealed it
+    /// ([`pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER`]),
+    /// before any VM work. Answered as the drain gate's retryable 503: once
+    /// the drain has made the sandbox durable, the same call lands elsewhere.
+    #[error("{message}")]
+    NodeSealed { message: String },
     #[error("{message}")]
     FailedPrecondition { message: String },
     #[error("{message}")]
@@ -981,6 +1021,7 @@ impl From<SubstrateError> for ControllerError {
             SubstrateError::Conflict { message } => {
                 ControllerError::new(axum::http::StatusCode::CONFLICT, message)
             }
+            SubstrateError::NodeSealed { message } => ControllerError::node_draining(message),
             SubstrateError::FailedPrecondition { message } => {
                 ControllerError::new(axum::http::StatusCode::PRECONDITION_FAILED, message)
             }
@@ -1867,6 +1908,17 @@ impl Substrate {
             Inner::Direct(substrate) => substrate.activation_client_attribution(),
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.k8s.activation_client_attribution,
+        }
+    }
+
+    /// The drain v2 switch, `SPACE_DRAIN_V2_ENABLED` (see
+    /// [`DrainV2Switch`]). Direct runs no node drain, so it is off
+    /// there.
+    pub fn drain_v2_switch(&self) -> DrainV2Switch {
+        match &self.inner {
+            Inner::Direct(_) => DrainV2Switch::Disabled,
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.k8s.drain_v2_switch,
         }
     }
 

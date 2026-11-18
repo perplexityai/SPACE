@@ -12,7 +12,7 @@ use pplx_space_k8s_ids::PodUid;
 use pplx_space_network_roles::GuestPort;
 use pplx_space_node_api_client::{NodeApiClient, WorkerApiClient};
 use pplx_space_node_mgr_client::proto::{AllowPortRequest, NetworkProtocol};
-use pplx_space_node_model::{NodeDrain, NodeDrainPhase, NodeManagedBy};
+use pplx_space_node_model::{NodeDrain, NodeManagedBy};
 use pplx_space_node_registration_store::drain_reads::{self, NodeDrainColumns};
 use pplx_space_sandbox_model::{
     ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
@@ -84,7 +84,11 @@ async fn ensure_sandbox_service_route_node_not_draining(
     // `NodeDrain::blocks_placement` is the shared truth table, so this
     // guard and the user-API drain gates cannot drift: `forced` + `draining`
     // races the evacuation pipeline, and `drained` / `terminating` block in
-    // either mode because the node is about to be destroyed.
+    // either mode and under either engine because the node is about to be
+    // destroyed. A v2 drain blocks nothing else here: its sealed node keeps
+    // running sandboxes running, and a port opened on one that isn't running
+    // reaches it through the API's activation, which the user-API gate
+    // refuses while the node is sealed.
     let row = drain_reads::drain_columns(pool, active_node_id)
         .await
         .map_err(|error| {
@@ -93,29 +97,34 @@ async fn ensure_sandbox_service_route_node_not_draining(
             ))
         })?;
     let Some(NodeDrainColumns {
+        drain_engine,
         drain_phase,
         drain_mode,
     }) = row
     else {
         return Ok(());
     };
-    let drain_phase = drain_phase
-        .as_deref()
-        .map(NodeDrainPhase::parse)
-        .transpose()
-        .map_err(|err| Status::internal(format!("node has an unrecognized drain phase: {err}")))?;
-    let drain_state = NodeDrain::from_v1_columns(drain_phase, drain_mode.as_deref());
+    let drain_state = NodeDrain::from_columns(
+        drain_engine.as_deref(),
+        drain_phase.as_deref(),
+        drain_mode.as_deref(),
+    );
     if let Some(state) = drain_state.filter(|state| state.blocks_placement()) {
-        return Err(Status::failed_precondition(match state {
-            NodeDrain::V1 { phase, mode } => format!(
+        return Err(match state {
+            NodeDrain::V1 { phase, mode } => Status::failed_precondition(format!(
                 "sandbox service route cannot open port while sandbox {sandbox_id} is on a \
                  {phase} node draining in {mode} mode"
-            ),
-            state => format!(
+            )),
+            NodeDrain::V2 { .. } => Status::failed_precondition(format!(
                 "sandbox service route cannot open port while sandbox {sandbox_id} is on a \
-                 node that is {state}"
-            ),
-        }));
+                 {state} node under a v2 drain"
+            )),
+            // Fails closed, as an unreadable phase always has here.
+            NodeDrain::Unknown => Status::internal(format!(
+                "node has a drain state this server doesn't know (engine {drain_engine:?}, \
+                 phase {drain_phase:?})"
+            )),
+        });
     }
     Ok(())
 }

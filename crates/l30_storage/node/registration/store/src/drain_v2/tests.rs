@@ -71,6 +71,52 @@ async fn set(
     Ok(())
 }
 
+/// A node has a v2 drain, for a stop's gate, in every v2 phase and with its
+/// cancel pending, and no other drain counts: a v1 drain in any phase, or
+/// none. A set of nodes has one when any of them has.
+#[tokio::test(flavor = "current_thread")]
+async fn a_v2_drain_on_any_node_is_found_in_every_phase() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let mut cases = Vec::new();
+    for (engine, phase, expected) in [
+        (Some("v2"), Some("draining"), true),
+        (Some("v2"), Some("drained"), true),
+        (Some("v2"), Some("terminating"), true),
+        (Some("v2"), None, true),
+        (None, Some("draining"), false),
+        (None, Some("drained"), false),
+        (None, Some("terminating"), false),
+        (None, None, false),
+    ] {
+        let node_id = node(pool, true).await?;
+        sqlx::query(sql!(
+            "UPDATE nodes SET drain_engine = $2, drain_phase = $3 WHERE id = $1"
+        ))
+        .bind(node_id)
+        .bind(engine)
+        .bind(phase)
+        .execute(pool)
+        .await?;
+        assert_eq!(
+            any_v2_drain_on(pool, &[node_id]).await?,
+            expected,
+            "{engine:?} {phase:?}"
+        );
+        cases.push((node_id, expected));
+    }
+    let undrained: Vec<NodeId> = cases
+        .iter()
+        .filter(|(_, v2)| !v2)
+        .map(|(node_id, _)| *node_id)
+        .collect();
+    assert!(!any_v2_drain_on(pool, &undrained).await?);
+    assert!(!any_v2_drain_on(pool, &[]).await?);
+    let mixed = [undrained[0], cases[0].0];
+    assert!(any_v2_drain_on(pool, &mixed).await?);
+    Ok(())
+}
+
 async fn admission(pool: &PgPool, node_id: NodeId) -> TestDbResult<V2StartAdmission> {
     let mut tx = pool.begin().await?;
     let admission = admit_v2_start(&mut tx, node_id).await?;

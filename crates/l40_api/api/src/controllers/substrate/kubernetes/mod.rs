@@ -462,6 +462,9 @@ pub struct KubernetesState {
     /// Whether user restores fence their unsent Wake and re-drives take over
     /// an expired fence (`SPACE_RESTORE_DISPATCH_FENCE_ENABLED`, default off).
     pub restore_dispatch_fence: RestoreDispatchFence,
+    /// The drain v2 switch (`SPACE_DRAIN_V2_ENABLED`, default off), which
+    /// the stop and kill gates read.
+    pub drain_v2_switch: super::DrainV2Switch,
     pub caches: Arc<K8sCaches>,
 }
 
@@ -536,6 +539,7 @@ impl KubernetesState {
                 )?,
             activation_client_attribution: super::ActivationClientAttribution::from_env(),
             restore_dispatch_fence: RestoreDispatchFence::from_env(),
+            drain_v2_switch: super::DrainV2Switch::from_env(),
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
             node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config: SandboxPodConfigValues::from_env()?,

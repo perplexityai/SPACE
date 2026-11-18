@@ -5327,3 +5327,125 @@ async fn a_twin_copy_takes_over_the_autoscalers_config_of_a_manual_shape() -> Te
     );
     Ok(())
 }
+
+/// A ready slot on a node with a v2 drain, in any phase or being cancelled,
+/// is never claimed, though it is the oldest, by a shape's claim or a
+/// release's. A v1 drain's node, in any phase, is claimed as before, oldest
+/// first, and so is an undrained one; with only v2 drains' slots left the
+/// claim finds none.
+#[tokio::test(flavor = "current_thread")]
+async fn a_slot_on_a_v2_draining_node_is_never_claimed() -> TestResult {
+    for by_release in [false, true] {
+        a_slot_on_a_v2_draining_node_is_never_claimed_by(by_release).await?;
+    }
+    Ok(())
+}
+
+async fn a_slot_on_a_v2_draining_node_is_never_claimed_by(by_release: bool) -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let template = TemplateName::parse("seed")?;
+    let (template_release_id, config_id, content_hash) =
+        seed_pool_config(&fixture.pool, 0x12).await?;
+    let (vcpu, memory) = default_shape()?;
+    // Oldest first: every v2 drain phase and a v2 drain being cancelled,
+    // every v1 drain phase, then an undrained node.
+    let nodes = [
+        ("worker-v2-draining", Some("draining"), Some("v2")),
+        ("worker-v2-drained", Some("drained"), Some("v2")),
+        ("worker-v2-terminating", Some("terminating"), Some("v2")),
+        ("worker-v2-cancelling", None, Some("v2")),
+        ("worker-v1-draining", Some("draining"), None),
+        ("worker-v1-drained", Some("drained"), None),
+        ("worker-v1-terminating", Some("terminating"), None),
+        ("worker-undrained", None, None),
+    ];
+    let mut slots = Vec::new();
+    for (index, (node_name, phase, engine)) in nodes.into_iter().enumerate() {
+        let node_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state, drain_phase, drain_engine)
+             VALUES ($1, '10.0.0.50', 'worker', 'k8s', 'registered', $2, $3)",
+        )
+        .bind(node_id)
+        .bind(phase)
+        .bind(engine)
+        .execute(&fixture.pool)
+        .await?;
+        sqlx::query("INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)")
+            .bind(node_id)
+            .bind(node_name)
+            .execute(&fixture.pool)
+            .await?;
+        let slot = fixture
+            .store
+            .insert_warming_slot(NewPoolSlot {
+                reserved_sandbox_id: SandboxId::new(),
+                ..new_slot(
+                    config_id,
+                    template_release_id,
+                    &template,
+                    content_hash,
+                    vcpu,
+                    memory,
+                    &format!("space-sbx-drain-{index}-g1"),
+                )
+            })
+            .await?;
+        sqlx::query(
+            "UPDATE kubernetes_pool_slots
+             SET state = 'ready',
+                 ready_at = NOW() - make_interval(secs => 10 - $2),
+                 pod_uid = 'pod-uid',
+                 pod_ip = '10.90.0.8',
+                 k8s_node_name = $3
+             WHERE id = $1",
+        )
+        .bind(slot.id)
+        .bind(index as i32)
+        .bind(node_name)
+        .execute(&fixture.pool)
+        .await?;
+        slots.push(slot.id);
+    }
+
+    let claim = || async {
+        let mut tx = fixture.pool.begin().await?;
+        let claimed = if by_release {
+            WarmPoolStore::claim_ready_slot_for_release(
+                &mut tx,
+                template_release_id,
+                "space",
+                Uuid::now_v7(),
+                false,
+            )
+            .await?
+        } else {
+            WarmPoolStore::claim_ready_slot(
+                &mut tx,
+                template_release_id,
+                vcpu,
+                memory,
+                "space",
+                Uuid::now_v7(),
+                false,
+            )
+            .await?
+        };
+        tx.commit().await?;
+        TestResult::Ok(claimed.map(|slot| slot.id))
+    };
+    for (index, node) in nodes.iter().enumerate().skip(4) {
+        assert_eq!(
+            claim().await?,
+            slots.get(index).copied(),
+            "by_release={by_release}: {}'s slot",
+            node.0
+        );
+    }
+    assert_eq!(
+        claim().await?,
+        None,
+        "by_release={by_release}: only v2 drains' slots are left"
+    );
+    Ok(())
+}

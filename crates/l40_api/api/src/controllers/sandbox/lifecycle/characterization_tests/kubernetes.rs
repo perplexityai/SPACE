@@ -1000,7 +1000,7 @@ async fn activations_and_suspend_wait_for_a_key_share_lock() -> TestResult {
     let db = pg_test_db_with_max_connections(5).await?;
     let pool = &db.pool;
     let (worker, node_id) = start_kubernetes_sim_worker(pool).await?;
-    let materialization_lock = r"^/\*pplx_space_api::controllers::substrate::kubernetes::store::execution_rows:[0-9]+\*/ SELECT lifecycle FROM sandboxes WHERE id = \$1 FOR UPDATE$";
+    let materialization_lock = r"^/\*pplx_space_api::controllers::substrate::kubernetes::store::execution_rows:[0-9]+\*/ SELECT s\.lifecycle, n\.drain_engine, n\.drain_phase, n\.drain_mode\s+FROM sandboxes s\s+LEFT JOIN nodes n ON n\.id = s\.active_node_id\s+WHERE s\.id = \$1\s+FOR UPDATE OF s$";
     let pod_tracking_lock = r"^/\*pplx_space_api::controllers::substrate::kubernetes::store::execution_rows:[0-9]+\*/ SELECT id FROM sandboxes WHERE id = \$1 FOR UPDATE$";
     let suspend_commit_lock = r"^/\*pplx_space_api::controllers::substrate::kubernetes::store::suspend:[0-9]+\*/ SELECT id\s+FROM sandboxes\s+WHERE id = \$1\s+FOR UPDATE$";
 

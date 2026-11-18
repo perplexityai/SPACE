@@ -1,6 +1,6 @@
 //! Postgres-backed contract for [`is_node_wake_gate_closed`]'s decoding of the
 //! drain columns: a gate-closing state reads closed, and a phase this build
-//! does not know fails the check rather than reading as an open gate.
+//! does not know reads closed too, never as an open gate.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
@@ -55,11 +55,12 @@ async fn wake_gate_reads_the_drain_state() -> TestResult {
     Ok(())
 }
 
-/// An unknown phase is state this build cannot interpret: the check fails with
-/// a column-decode error on the phase column, so the fan-out aborts instead of
-/// treating the gate as open.
+/// An unknown phase is state this build cannot interpret: it reads as an
+/// unknown drain (`NodeDrain::Unknown`), which refuses
+/// activations, as the user-API drain gate refuses every call under it, so the
+/// gate reads closed rather than open.
 #[tokio::test(flavor = "current_thread")]
-async fn unrecognized_drain_phase_fails_the_wake_gate_check() -> TestResult {
+async fn unrecognized_drain_phase_reads_the_wake_gate_closed() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -80,12 +81,9 @@ async fn unrecognized_drain_phase_fails_the_wake_gate_check() -> TestResult {
     )
     .await?;
 
-    let err = is_node_wake_gate_closed(&db.pool, node_id)
-        .await
-        .expect_err("an unrecognized drain phase must fail the check");
     assert!(
-        matches!(&err, sqlx::Error::ColumnDecode { index, .. } if index == "0"),
-        "{err:?}"
+        is_node_wake_gate_closed(&db.pool, node_id).await?,
+        "an unrecognized drain phase reads the gate closed"
     );
     Ok(())
 }
