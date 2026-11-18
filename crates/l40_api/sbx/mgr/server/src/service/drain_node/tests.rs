@@ -2452,6 +2452,81 @@ fn a_gentle_drain_holds_a_started_sandbox_and_plans_the_rest_as_forced() {
     assert!(!forced.pending.iter().any(|(_, action)| action == HOLD));
 }
 
+/// A started sandbox a gentle drain holds still has its pinned artifact's
+/// upload finished: a pin without a durable copy is uploaded, and retried
+/// after a failed attempt, while the row stays held; an upload whose job is
+/// still active is left to it; one that failed too often blocks the drain.
+/// The hold is reported throughout. Planned forced, the row is suspended
+/// instead.
+#[test]
+fn a_held_started_sandbox_still_has_its_pending_pin_uploaded() {
+    let mut held = row("held", SandboxState::Started);
+    held.pin = Some((FULL_ARTIFACT.into(), ArtifactKind::Full));
+    let upload = PlannedAction::Upload {
+        sandbox_id: "held".into(),
+        artifact_id: FULL_ARTIFACT.into(),
+        kind: ArtifactKind::Full,
+    };
+    let inputs = PlanInputs {
+        pending_backups: pending("held", FULL_ARTIFACT),
+        failures: BTreeMap::from([(
+            ("held".to_owned(), DrainAction::Upload),
+            (1, "connection reset".to_owned()),
+        )]),
+        ..PlanInputs::default()
+    };
+    let planned = plan(&[held.clone()], &gentle(inputs.clone()));
+    assert_eq!(planned.actions, [upload], "{planned:?}");
+    assert_eq!(
+        planned.pending,
+        [
+            ("held".to_owned(), "upload".to_owned()),
+            ("held".to_owned(), HOLD.to_owned())
+        ]
+    );
+    assert!(planned.blocked.is_empty(), "{planned:?}");
+
+    let active = plan(
+        &[held.clone()],
+        &gentle(PlanInputs {
+            active_uploads: BTreeSet::from([FULL_ARTIFACT.to_owned()]),
+            ..inputs.clone()
+        }),
+    );
+    assert!(active.actions.is_empty(), "{active:?}");
+    assert!(
+        active
+            .pending
+            .contains(&("held".to_owned(), HOLD.to_owned()))
+    );
+
+    let given_up = plan(
+        &[held.clone()],
+        &gentle(PlanInputs {
+            failures: BTreeMap::from([(
+                ("held".to_owned(), DrainAction::Upload),
+                (MAX_ACTION_FAILURES, "connection reset".to_owned()),
+            )]),
+            ..inputs.clone()
+        }),
+    );
+    assert_eq!(given_up.pending, [("held".to_owned(), HOLD.to_owned())]);
+    assert_eq!(
+        given_up.blocked,
+        [(
+            Some("held".to_owned()),
+            format!("upload failed {MAX_ACTION_FAILURES} times: connection reset")
+        )]
+    );
+
+    let durable = plan(&[held.clone()], &gentle(PlanInputs::default()));
+    assert!(durable.actions.is_empty(), "{durable:?}");
+    assert_eq!(durable.pending, [("held".to_owned(), HOLD.to_owned())]);
+
+    let forced = plan(&[held], &inputs);
+    assert_eq!(forced.actions, [suspend("held")], "{forced:?}");
+}
+
 /// A sandbox that suspends on its own under a gentle drain has no drain
 /// record: its snapshot's upload is finished, and once it is durable the
 /// drain reports nothing for it, so the control plane restores it nowhere.

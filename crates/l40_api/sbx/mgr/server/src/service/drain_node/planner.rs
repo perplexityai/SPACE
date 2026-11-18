@@ -510,7 +510,14 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
                     _ if running => plan.drive(inputs, suspend),
                     // A gentle drain leaves it running; once it leaves
                     // `started` on its own, the row is planned from there.
+                    // Its pin's upload is finished meanwhile, as it is for
+                    // any other row: the artifacts below skip the pin, and
+                    // no suspend will replace it while the drain holds the
+                    // sandbox. The hold keeps the drain pending either way.
                     _ if inputs.gentle && row.lifecycle.is_unowned(SandboxState::Started) => {
+                        if let Some(pin) = pending_pin.clone() {
+                            plan.drive(inputs, upload(pin));
+                        }
                         plan.pending.push((id.clone(), HOLD.to_owned()));
                     }
                     _ => windowed.push((
