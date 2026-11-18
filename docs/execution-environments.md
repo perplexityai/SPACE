@@ -2640,6 +2640,18 @@ the files. Its manifest does not approve an environment, provide a managed
 workspace, or establish fs-verity trust. Runtime catalog qualification and a
 complete create/execute/delete smoke remain separate requirements.
 
+The trusted compiled measurement table includes both pinned payloads, measured
+independently with `fsverity v1.5`, SHA-256, 4096-byte blocks and no salt:
+
+| Payload | fs-verity digest |
+| --- | --- |
+| Python module | `sha256:53e7f17c94e306672e414bdb2e95e028e3afaa959f6e0063f32166030e1d61ba` |
+| Reproducible standard-library zip | `sha256:bb02534625186df9038bc96d2804504bc3ebb1dfdbd2b16540b4f196b1b4748d` |
+
+These measurements let the owning execution cache seal the already-pinned bytes
+on a supporting filesystem. Offline digest calculation is not proof of kernel
+sealing support, a successful managed installation, or environment admission.
+
 The separate explicit `wasi-supervisor` bundle builds only the supervisor with
 its `experimental-wasm` feature and normal host telemetry features. It uses the
 release builder and supervisor compatibility-hash wrapper, and packages the

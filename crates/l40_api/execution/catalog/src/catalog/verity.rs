@@ -23,6 +23,16 @@ fn compiled_pins() -> Result<&'static BTreeMap<Digest, VerityDigest>, &'static s
             "sha256:6eb2fa6ae5f2b785f418da5e8b8063696e288ff6835e81191de7726a7c66e442",
             "sha256:050ef7464a6044d1dc28b1620fc81dba169c62866cf45ee2df44466e384c3a37",
         ),
+        // Python/WASI module and reproducible stdlib from ci/wasi-python-pins.json.
+        // Measurements authenticate these bytes; they do not qualify an environment.
+        (
+            "sha256:dd076791fb6d1286a5dfe105852dfb3367e10562de68ca0a618e615625cdf636",
+            "sha256:53e7f17c94e306672e414bdb2e95e028e3afaa959f6e0063f32166030e1d61ba",
+        ),
+        (
+            "sha256:9482150cf98254943a8f5e1af04f4ee8d433fbba3e0d140eb238118794f6dbbb",
+            "sha256:bb02534625186df9038bc96d2804504bc3ebb1dfdbd2b16540b4f196b1b4748d",
+        ),
         (
             "sha256:dc2fc8f0e43b96712d9fccc52a3a590769606412b3e1bc911d217addd3bef624",
             "sha256:aaea9d4d97292b3313c6bb2ad5c9bc48cc2aa4e3e9bad535fb9aaae2bfa2d667",
