@@ -1,6 +1,6 @@
 //! Campaigns of a kind outside [`CampaignKind::RUNTIME`] sharing the table:
 //! the reads, the operator's phase changes and the finished-campaign sweep
-//! neither see nor change them.
+//! neither see nor change them, and their live leases still hold subjects.
 
 use time::OffsetDateTime;
 
@@ -93,6 +93,25 @@ async fn insert_item(
 
 fn ids(campaigns: &[CampaignRecord]) -> Vec<CampaignId> {
     campaigns.iter().map(|record| record.campaign.id).collect()
+}
+
+#[test]
+fn the_runtime_kinds_are_known_kinds_bound_as_stored() {
+    assert!(
+        CampaignKind::RUNTIME
+            .iter()
+            .all(|kind| CampaignKind::ALL.contains(kind)),
+        "{:?} within {:?}",
+        CampaignKind::RUNTIME,
+        CampaignKind::ALL
+    );
+    assert_eq!(
+        RUNTIME_KINDS,
+        CampaignKind::RUNTIME
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -330,5 +349,53 @@ async fn the_finished_sweep_releases_only_runtime_items() -> TestResult {
     assert_eq!(item_phase(&db.pool, runtime, subject).await?, "pending");
     assert_eq!(items_raw(&db.pool, foreign).await?, foreign_before);
     assert_eq!(foreign_before[0].1, "in_flight");
+    Ok(())
+}
+
+/// Current, conservative behavior: one worker per subject holds across
+/// kinds. Whether another kind's campaigns should hold runtime subjects is
+/// for that kind's design to decide.
+#[tokio::test(flavor = "current_thread")]
+async fn a_foreign_campaigns_live_lease_holds_its_sandbox_from_a_runtime_lease() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let foreign = insert_foreign_campaign(&db.pool, CampaignSeed::default()).await?;
+    let held = insert_item(&db.pool, foreign, "sandbox", ItemPhase::InFlight).await?;
+    sqlx::query(sql!(
+        "UPDATE runtime_upgrade_items
+         SET lease_expires_at = now() + interval '10 minutes'
+         WHERE campaign_id = $1"
+    ))
+    .bind(foreign)
+    .execute(&db.pool)
+    .await?;
+    let runtime = insert_campaign(
+        &db.pool,
+        CampaignSeed {
+            from: environment(21),
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+    let free = Uuid::now_v7();
+    insert_pending(
+        &db.pool,
+        runtime,
+        SubjectKind::Sandbox,
+        &[held, free],
+        MAX_ATTEMPTS,
+    )
+    .await?;
+
+    let leased = lease(&db, runtime).await?;
+    assert_eq!(
+        leased
+            .iter()
+            .map(|item| item.subject_id)
+            .collect::<Vec<_>>(),
+        [free]
+    );
+    assert_eq!(item_phase(&db.pool, runtime, held).await?, "pending");
     Ok(())
 }

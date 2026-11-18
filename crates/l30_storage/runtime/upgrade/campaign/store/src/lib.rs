@@ -69,8 +69,17 @@
 //!   subsystem doesn't drive. The reads ([`list_unfinished`],
 //!   [`get_record`], [`list_records`]), the operator's phase changes and
 //!   [`release_lapsed_in_finished`] see only campaigns of
-//!   [`CampaignKind::RUNTIME`], filtered in SQL, so a campaign of any other
-//!   kind is absent to them: not listed, not found, and never changed.
+//!   [`CampaignKind::RUNTIME`], filtered in SQL, so this subsystem never
+//!   lists, finds or writes a campaign of any other kind. The other verbs
+//!   that take a campaign id don't filter: their callers pass only ids those
+//!   reads returned, as the reconciler and the admin API do. A lease still
+//!   reads every campaign's items, so another kind's live lease on a subject
+//!   holds it from a runtime campaign too (**One worker per subject**).
+//!   Production code writes `kind` only from a [`CampaignKind`], through
+//!   [`create_campaign`], so a runtime row with a mistyped kind can come
+//!   only from a write outside this store. Such a row is invisible here: it
+//!   can't be listed, read, paused or aborted, its lapsed leases aren't
+//!   released, and its live ones still hold their subjects until they lapse.
 //! * **One unfinished campaign per kind and source.** [`create_campaign`]
 //!   refuses a second, so two campaigns don't compete for the same subjects
 //!   on that source. Campaigns from different sources can name one subject;
@@ -272,8 +281,8 @@ impl SubjectKind {
 
 impl CampaignKind {
     /// The kinds the runtime upgrade subsystem drives (**Runtime kinds
-    /// only**). Named one by one rather than taken from [`Self::ALL`], so a
-    /// kind added later becomes a runtime upgrade only when it's added here.
+    /// only**). Equal to [`Self::ALL`] today; kept separate so a kind added
+    /// to `CampaignKind` later isn't a runtime upgrade until it's listed here.
     pub const RUNTIME: &'static [Self] = &[Self::Templates, Self::Sandboxes];
 
     /// The kind of subject this campaign's items name.
@@ -286,13 +295,8 @@ impl CampaignKind {
 }
 
 /// [`CampaignKind::RUNTIME`] as stored, to bind as a `text[]` for
-/// `kind = ANY(..)`.
-pub(crate) fn runtime_kinds() -> Vec<&'static str> {
-    CampaignKind::RUNTIME
-        .iter()
-        .map(|kind| kind.as_str())
-        .collect()
-}
+/// `kind = ANY(..)`. A test holds it to `RUNTIME` through `as_str`.
+pub(crate) const RUNTIME_KINDS: &[&str] = &["templates", "sandboxes"];
 
 /// A campaign, as the reconciler drives it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -453,7 +457,7 @@ pub async fn list_unfinished(
            AND kind = ANY($1)
          ORDER BY created_at, id"
     ))
-    .bind(runtime_kinds())
+    .bind(RUNTIME_KINDS)
     .fetch_all(executor)
     .await?;
     rows.into_iter().map(Campaign::try_from).collect()
@@ -475,17 +479,17 @@ pub async fn get_record(
            AND kind = ANY($2)"
     ))
     .bind(campaign_id)
-    .bind(runtime_kinds())
+    .bind(RUNTIME_KINDS)
     .fetch_optional(executor)
     .await?;
     row.map(CampaignRecord::try_from).transpose()
 }
 
 /// Up to `limit` runtime campaigns after `after`, in id order. Ids are
-/// UUIDv7, so that's creation order to the millisecond; campaigns created within one
-/// millisecond come in no particular order. With `unfinished_only`, only canary, rolling and
-/// paused ones. One unreadable runtime row fails the whole read. Takes no
-/// lock.
+/// UUIDv7, so that's creation order to the millisecond; campaigns created
+/// within one millisecond come in no particular order. With
+/// `unfinished_only`, only canary, rolling and paused ones. One unreadable
+/// runtime row fails the whole read. Takes no lock.
 pub async fn list_records(
     executor: impl sqlx::PgExecutor<'_>,
     unfinished_only: bool,
@@ -507,7 +511,7 @@ pub async fn list_records(
     .bind(unfinished_only)
     .bind(after)
     .bind(i64::from(limit))
-    .bind(runtime_kinds())
+    .bind(RUNTIME_KINDS)
     .fetch_all(executor)
     .await?;
     rows.into_iter().map(CampaignRecord::try_from).collect()

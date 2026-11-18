@@ -13,8 +13,8 @@ use pplx_space_common_core::sql;
 use sqlx::{Acquire, PgConnection, Postgres};
 
 use crate::{
-    CampaignId, CampaignKind, CampaignPhase, ItemError, ItemPhase, SubjectKind, clamp_lease,
-    end_transaction, runtime_kinds,
+    CampaignId, CampaignKind, CampaignPhase, ItemError, ItemPhase, RUNTIME_KINDS, SubjectKind,
+    clamp_lease, end_transaction,
 };
 
 /// `attempts` of a retired item: above any `max_attempts` a caller passes,
@@ -94,6 +94,10 @@ async fn insert_pending_in(
     subject_ids: &[uuid::Uuid],
     max_attempts: u64,
 ) -> Result<u64, sqlx::Error> {
+    // Every kind with this subject kind, from `ALL` rather than `RUNTIME`:
+    // this enforces **Subject kind follows the campaign**. Like the other
+    // verbs that take a campaign id, it leaves **Runtime kinds only** to its
+    // caller, which passes an id from `list_unfinished`.
     let kinds: Vec<&str> = CampaignKind::ALL
         .iter()
         .filter(|kind| kind.subject_kind() == subject_kind)
@@ -799,7 +803,7 @@ pub async fn release_lapsed_in_finished(
     .bind(ItemPhase::Pending.as_str())
     .bind(LEASE_EXPIRED)
     .bind(CampaignPhase::Aborted.as_str())
-    .bind(runtime_kinds())
+    .bind(RUNTIME_KINDS)
     .execute(executor)
     .await?
     .rows_affected())

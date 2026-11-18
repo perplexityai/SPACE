@@ -1,13 +1,13 @@
 //! Operator phase changes: pause, resume and abort.
 //!
-//! Each locks the campaign row, answering [`ChangePhaseError::NotFound`] for a
-//! campaign of a kind outside [`crate::CampaignKind::RUNTIME`] as for an
-//! absent one, refuses a transition its phase doesn't allow,
-//! then compares the generation the caller expects, and writes the phase. The
-//! schema's trigger raises the generation in the same statement, and the
-//! verb returns the raised value. A refused transition, and a resume refused
-//! at the failure budget, are reported before a stale generation, so a caller
-//! learns what the campaign is now.
+//! Each locks the campaign row, answering [`ChangePhaseError::NotFound`] for
+//! a campaign of a kind outside [`crate::CampaignKind::RUNTIME`] as for an
+//! absent one, refuses a transition its phase doesn't allow, then compares
+//! the generation the caller expects, and writes the phase. The schema's
+//! trigger raises the generation in the same statement, and the verb returns
+//! the raised value. A refused transition, and a resume refused at the
+//! failure budget, are reported before a stale generation, so a caller learns
+//! what the campaign is now.
 //!
 //! # Resume and the failure budget
 //!
@@ -48,7 +48,7 @@ use pplx_space_accounts::UserId;
 use pplx_space_common_core::sql;
 use sqlx::{Acquire, PgConnection, Postgres};
 
-use crate::{CampaignId, CampaignPhase, ItemPhase, UnknownValue, end_transaction, runtime_kinds};
+use crate::{CampaignId, CampaignPhase, ItemPhase, RUNTIME_KINDS, UnknownValue, end_transaction};
 
 /// Who asks for a phase change, and the generation they read.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -110,7 +110,7 @@ async fn lock(tx: &mut PgConnection, campaign_id: CampaignId) -> Result<Locked, 
          FOR UPDATE"
     ))
     .bind(campaign_id)
-    .bind(runtime_kinds())
+    .bind(RUNTIME_KINDS)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ChangePhaseError::NotFound)?;
