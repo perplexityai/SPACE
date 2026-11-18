@@ -1344,7 +1344,7 @@ impl SandboxController {
             template_network_policy: &template_network_policy,
             template_network_policy_generation,
             network_policy_override: network_policy_override.as_ref(),
-            boot_mode,
+            boot_mode: boot_mode.for_pool_attempt(req.boot_mode.as_deref(), &requested_resources),
             federated_owner,
             federated_service_grant,
             volume_encryption,

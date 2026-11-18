@@ -156,7 +156,9 @@ sequenceDiagram
 A create can use a slot only when all of the following hold. Otherwise it is
 ineligible and cold-boots.
 
-- The backend is Firecracker and the boot mode allows a pool.
+- The backend is Firecracker and the boot mode allows a pool. A create that
+  leaves the boot mode unset and names both `vcpu` and `memory_mib` tries the
+  pool at exactly that shape; on a miss it boots cold at the requested shape.
 - The create does not request a custom `disk_mib` or file-change tracking.
 - The create waits until the sandbox is ready, or its effective auto-lifecycle
   policy wakes on access or on command. A slot's VM is paused; the public
@@ -229,8 +231,9 @@ back to cold. A boot failure after the claim parks the slot in
 
 ### E2B-compatible and native creates
 
-E2B-compatible creates through ECW let the executor choose the sandbox ID,
-send no shape and always wait for readiness. They claim during execution.
+E2B-compatible creates through ECW let the executor choose the sandbox ID
+and always wait for readiness. They claim during execution, at the shape in
+their `space.resources` metadata when it names both vCPU and memory.
 
 Native `POST /v1/sandboxes` creates publish their sandbox ID when the request
 is admitted, before execution. With admission-time claiming enabled
@@ -403,7 +406,7 @@ are draining during a rollover.
 | Condition | Result |
 | --- | --- |
 | No ready slot, or no matching config | Cold create. |
-| Request ineligible (shape, disk, file changes, lifecycle, env, pinned ID) | Cold create. |
+| Request ineligible (partial shape, disk, file changes, lifecycle, env, pinned ID) | Cold create. |
 | Two creates race for one slot | `SKIP LOCKED` gives each a different slot or a miss. |
 | Claimed pod fails validation before bind | Claim released or invalidated; cold create. |
 | Claim handoff dies before bind | Stale-claim sweep deletes the slot and pod after the claim timeout. |

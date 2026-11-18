@@ -404,6 +404,34 @@ fn api_boot_mode_accepts_explicit_warm_modes_without_custom_shape() {
 }
 
 #[test]
+fn shaped_default_create_tries_the_pool_only_with_a_full_shape_and_no_disk() {
+    let shape = |vcpu, memory_mib, disk_mib| SandboxResources {
+        vcpu,
+        memory_mib,
+        disk_mib,
+    };
+    let full = shape(Some(2), Some(1024), None);
+    assert_eq!(
+        CreateBootMode::Cold.for_pool_attempt(None, &full),
+        CreateBootMode::Fallthrough
+    );
+    assert_eq!(
+        CreateBootMode::Cold.for_pool_attempt(Some("cold"), &full),
+        CreateBootMode::Cold
+    );
+    for partial in [
+        shape(Some(2), Some(1024), Some(4096)),
+        shape(Some(2), None, None),
+        shape(None, Some(1024), None),
+    ] {
+        assert_eq!(
+            CreateBootMode::Cold.for_pool_attempt(None, &partial),
+            CreateBootMode::Cold
+        );
+    }
+}
+
+#[test]
 fn committed_suspend_response_keeps_valid_artifact_identity() {
     let sandbox_id = SandboxId::new();
     let local_artifact_id = LocalArtifactId::new();

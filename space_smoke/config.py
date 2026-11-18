@@ -31,6 +31,8 @@ class SandboxConfig:
     allow_internet_access: bool | None = None
     network: NetworkConfig | None = None
     envs: Mapping[str, str] | None = None
+    metadata: Mapping[str, str] | None = None
+    """Create metadata for the scenario's sandboxes, such as `space.resources`."""
     kind_byok: bool = False
     kind_cold_create: KindColdCreateConfig | None = None
     kind_warm_pool: KindWarmPoolConfig | None = None
