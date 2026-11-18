@@ -356,7 +356,8 @@ scenario that did not pass with its log, and checks that the benches' `=== RUN`
 ids cover the inventory exactly once. The script exits 0 when every bench
 passed, 1 when a scenario failed and 2 when a bench did not come up, a scenario
 was inconclusive or the coverage check failed. Without `--benches` it picks N
-from the host's CPUs, memory and free disk, and prints it. One run or teardown
+from the host's CPUs, available memory, free disk and a short write-throughput
+probe of the bench volume, and prints each factor. One run or teardown
 holds the host at a time (`/run/lock/space-bench.lock`), and a run first
 removes the benches an interrupted one left; only directories marked as a
 bench's when it was created are ever deleted.
@@ -411,8 +412,9 @@ nodes' containerd stores, `kind load` of every image into every node it runs
 on) and holds about 50 GB at its peak, so N bring-ups contend for that volume's
 write throughput (I/O pressure above 60%) and for CPU, and take about two
 minutes longer per bench. On such a host the fastest N is 4 to 5; N=8 does not
-fit 393 GB. The default N is the smallest of CPUs / 8, memory / 16 GiB and free
-disk / 60 GB, at most 6.
+fit 393 GB. The default N is the smallest of CPUs / 8, available memory / 16 GiB, free
+disk / 60 GB and the volume's probed write MB/s / 70, at most 6; on that
+volume the probe reads 320-350 MB/s and chooses 4.
 
 ## Release-build lane
 
