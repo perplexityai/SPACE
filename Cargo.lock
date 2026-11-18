@@ -7098,6 +7098,7 @@ dependencies = [
  "pplx-space-node-drain",
  "pplx-space-node-model",
  "pplx-space-sandbox-model",
+ "pplx-space-sandbox-residency",
  "pplx-space-sql-locator",
  "serde_json",
  "sqlx",
