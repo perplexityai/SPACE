@@ -14,7 +14,10 @@ import { TERMINAL_OPERATION_STATES } from './api.ts';
 import { verifyFixtures } from './fixtures.ts';
 import { SYNTHETIC_HEADER } from './recorder.ts';
 import { orgDisplayName, recordCreated } from './seed.ts';
-import { DRAIN_KEEP_ANNOTATION, KindNodes, drainCandidate, type AdminNode } from './nodes.ts';
+import {
+  CONSOLE_PREVIEW_CONCURRENCY, DRAIN_KEEP_ANNOTATION, KindNodes, drainCandidate, everyPage, previewAllWaitMs, previewResultsMismatches,
+  previewVerdictIn, previewWaitMs, type AdminNode, type ResultVerdict,
+} from './nodes.ts';
 
 export interface Step {
   name: string;
@@ -1792,6 +1795,194 @@ for (const [local, label] of [['acme-admin', 'a tenant organization admin'], ['o
     await signIn(c, c.config.email, c.config.password);
   });
 }
+
+// ------------------------------------------------------- v2 drain preview
+// A preview asks the node what a v2 drain would find and changes nothing on
+// it, so these flows create nothing and need no cleanup. Each records every
+// admin request the page sends while it runs and fails on a write, and
+// checks the node is in the drain phase it started in. They are `flows` for
+// the node they act on, but not `mutates`: --no-mutate keeps them.
+
+// The admin writes the page sends from now until `stop()`, and the preview
+// reads in flight at most at once.
+function watchAdminRequests(page: Page) {
+  const writes: string[] = [];
+  let inFlight = 0;
+  let most = 0;
+  const isPreview = (req: Request) => new URL(req.url()).pathname.endsWith('/drain-v2-preview');
+  const onRequest = (req: Request) => {
+    const path = new URL(req.url()).pathname;
+    if (!path.startsWith('/admin/')) return;
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method())) writes.push(`${req.method()} ${path}`);
+    if (isPreview(req)) most = Math.max(most, ++inFlight);
+  };
+  const onDone = (req: Request) => {
+    if (isPreview(req)) inFlight -= 1;
+  };
+  page.on('request', onRequest);
+  page.on('requestfinished', onDone);
+  page.on('requestfailed', onDone);
+  return {
+    stop: () => {
+      page.off('request', onRequest);
+      page.off('requestfinished', onDone);
+      page.off('requestfailed', onDone);
+      return { writes, most };
+    },
+  };
+}
+
+const previewCard = (page: Page) => page.locator('#drain-preview');
+
+// The node a preview request is for, from its path, or null for another request.
+const previewedNode = (url: string): string | null => {
+  const match = /\/nodes\/([^/]+)\/drain-v2-preview$/.exec(new URL(url).pathname);
+  return match ? decodeURIComponent(match[1]) : null;
+};
+
+// The console's own verdict for a preview (`previewVerdict` in
+// `ui/src/lib/drain-preview.ts`). Loaded at run time: `ui/` is not a module
+// package, so the typecheck can't follow a static import of it.
+async function consolePreviewVerdict(): Promise<(preview: unknown) => ResultVerdict> {
+  const consoleModule = '../../../ui/src/lib/drain-preview.ts';
+  return (await import(consoleModule)).previewVerdict;
+}
+
+// The verdict each node's preview answered while the page ran, as the
+// console reads it: its verdict, or `error` for a preview that failed, the
+// console's own timeout among them. Keyed by node id until `stop()`.
+function watchPreviewAnswers(page: Page, verdictOf: (preview: unknown) => ResultVerdict) {
+  const answers = new Map<string, Promise<ResultVerdict>>();
+  const onResponse = (res: Response) => {
+    const node = previewedNode(res.url());
+    if (node === null) return;
+    const verdict = async (): Promise<ResultVerdict> => {
+      if (!res.ok()) return 'error';
+      try {
+        return verdictOf(await res.json());
+      } catch {
+        return 'error';
+      }
+    };
+    answers.set(node, verdict());
+  };
+  const onFailed = (req: Request) => {
+    const node = previewedNode(req.url());
+    if (node !== null) answers.set(node, Promise.resolve('error'));
+  };
+  page.on('response', onResponse);
+  page.on('requestfailed', onFailed);
+  return {
+    stop: async (): Promise<Map<string, ResultVerdict>> => {
+      page.off('response', onResponse);
+      page.off('requestfailed', onFailed);
+      const settled = new Map<string, ResultVerdict>();
+      for (const [node, verdict] of answers) settled.set(node, await verdict);
+      return settled;
+    },
+  };
+}
+const CHANGES_NOTHING = /A preview changes nothing on the node/;
+
+step('node-drain-preview', ['nodes', 'flows'], async (c) => {
+  const workers = (await adminNodes(c)).filter((n) => n.role === 'worker');
+  if (!workers.length) return c.rec.check(false, 'a worker node exists');
+  const node = workers.sort((a, b) => (b.sandboxes_active ?? 0) - (a.sandboxes_active ?? 0))[0];
+  await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+  const button = content(c.page).getByRole('button', { name: 'Preview v2 drain' });
+  if (!(await button.count())) return c.rec.check(false, 'the node page offers Preview v2 drain');
+  await button.hover();
+  c.rec.check(CHANGES_NOTHING.test(await c.page.locator('.ant-tooltip:visible').innerText().catch(() => '')), 'the action says a preview changes nothing on the node');
+  const watch = watchAdminRequests(c.page);
+  const answered = c.page.waitForResponse((res) => new URL(res.url()).pathname.endsWith(`/nodes/${node.id}/drain-v2-preview`), { timeout: previewWaitMs() }).catch(() => null);
+  await button.click();
+  const answer = await answered;
+  c.rec.check(answer?.request().method() === 'GET' && answer.status() === 200, `the preview is a GET the API answers 200 (${answer?.request().method()} ${answer?.status()})`);
+  await previewCard(c.page).locator('[data-testid="drain-preview-verdict"]').waitFor({ timeout: 15_000 }).catch(() => {});
+  const t = (await previewCard(c.page).innerText().catch(() => '')).replace(/\s+/g, ' ');
+  const body = await jsonOf(answer);
+  const verdict = previewVerdictIn(await previewCard(c.page).locator('[data-testid="drain-preview-verdict"]').innerText().catch(() => ''));
+  const tag = previewVerdictIn(await previewCard(c.page).locator('[data-testid="drain-preview-verdict-tag"]').innerText().catch(() => ''));
+  c.rec.check(CHANGES_NOTHING.test(t), 'the panel says a preview changes nothing on the node');
+  c.rec.check(verdict !== null, `the panel says whether a drain would finish, wait or block (${verdict})`);
+  c.rec.check(tag !== null && tag === verdict, `the verdict is tagged with the same verdict (${tag})`);
+  c.rec.check(/Not sealed|Sealed under epoch \d+/.test(t), "the panel shows the node's seal");
+  c.rec.check(/Blockers \(\d+\)/.test(t) && /What a drain would do \(\d+\)/.test(t), 'the panel lists the blockers and what a drain would do');
+  if (body) {
+    c.rec.check(t.includes(`Blockers (${body.blocked.length})`), `the panel counts the ${body.blocked.length} blockers the API reported`);
+    c.rec.check(t.includes(`What a drain would do (${body.pending.length})`), `the panel counts the ${body.pending.length} items the API reported`);
+    for (const blocked of body.blocked.slice(0, 5)) {
+      c.rec.check(t.includes(blocked.reason), `the panel shows the blocker "${blocked.reason.slice(0, 80)}"`);
+    }
+    c.rec.note(`preview of ${node.name ?? node.id}: would_finish=${body.would_finish}, sealed_epoch=${body.sealed_epoch}, ${body.blocked.length} blocked, ${body.pending.length} pending`);
+  }
+  await previewCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+  await shot(c, 'panel');
+  const { writes } = watch.stop();
+  c.rec.check(writes.length === 0, `the page sent no admin write (${writes.join(', ') || 'none'})`);
+  c.rec.check((await adminNode(c, node.id))?.drain_phase === node.drain_phase, 'the node keeps its drain phase');
+});
+
+step('nodes-drain-preview-all', ['nodes', 'flows'], async (c) => {
+  const workers = (await adminNodes(c)).filter((n) => n.role === 'worker');
+  await visit(c, '/dashboard/nodes', 4000);
+  const button = content(c.page).getByRole('button', { name: 'Preview v2 drain on all workers' });
+  if (!(await button.count())) return c.rec.check(false, 'the nodes list offers Preview v2 drain on all workers');
+  const watch = watchAdminRequests(c.page);
+  const answers = watchPreviewAnswers(c.page, await consolePreviewVerdict());
+  await button.click();
+  const card = c.page.locator('#drain-preview-all');
+  c.rec.check(await card.waitFor({ timeout: 10_000 }).then(() => true, () => false), 'the results card appears');
+  c.rec.check(CHANGES_NOTHING.test(await card.innerText().catch(() => '')), 'the card says a preview changes nothing on the node');
+  const total = workers.length;
+  const progress = card.locator('[data-testid="drain-preview-progress"]');
+  const deadline = Date.now() + previewAllWaitMs(total);
+  let shown = '';
+  while (Date.now() < deadline) {
+    shown = await progress.innerText().catch(() => '');
+    if (shown === `${total} of ${total} previewed`) break;
+    await c.page.waitForTimeout(500);
+  }
+  c.rec.check(shown === `${total} of ${total} previewed`, `progress reaches every listed worker (${shown})`);
+  await settle(c.page, 800);
+  const answered = await answers.stop();
+  const expected = new Map(workers.map((w) => [w.id, answered.get(w.id) ?? null] as const));
+  // The table pages its rows, so every page is read: each row's node, from
+  // its link, and its verdict cell.
+  const nextPage = card.locator('.ant-pagination-next');
+  const activePage = card.locator('.ant-pagination-item-active');
+  let stuck = false;
+  const read = () => card.locator('.ant-table-tbody tr.ant-table-row').evaluateAll((trs) => trs.map((tr) => ({
+    nodeId: tr.querySelector('a[href^="/dashboard/nodes/"]')?.getAttribute('href')?.slice('/dashboard/nodes/'.length) ?? null,
+    verdict: ((tr.querySelectorAll('td')[1] as HTMLElement | undefined)?.innerText ?? '').replace(/\s+/g, ' ').trim(),
+  })));
+  const turn = async () => {
+    if (!(await nextPage.count()) || /\bant-pagination-disabled\b/.test((await nextPage.getAttribute('class')) ?? '')) return false;
+    const before = await activePage.innerText().catch(() => '');
+    await nextPage.click();
+    for (let tries = 0; tries < 40 && (await activePage.innerText().catch(() => before)) === before; tries += 1) {
+      await c.page.waitForTimeout(250);
+    }
+    stuck = (await activePage.innerText().catch(() => before)) === before;
+    return !stuck;
+  };
+  // Every page holds a row, so a table of `total` rows has at most `total`
+  // pages; one more is read to see a table with too many.
+  const { rows, pages, complete } = await everyPage(read, turn, total + 1);
+  c.rec.check(complete && !stuck, `every page of the table could be read (${pages} read${stuck ? ', the next page never showed' : ''})`);
+  const mismatches = previewResultsMismatches(expected, rows);
+  c.rec.check(
+    mismatches.length === 0,
+    `across its ${pages} ${pages === 1 ? 'page' : 'pages'} the table has one row per worker, with the verdict its preview answered (${mismatches.slice(0, 5).join('; ') || `${rows.length} of ${total}`})`,
+  );
+  const { writes, most } = watch.stop();
+  c.rec.check(most > 0 && most <= CONSOLE_PREVIEW_CONCURRENCY, `at most ${CONSOLE_PREVIEW_CONCURRENCY} previews were in flight at once (${most})`);
+  c.rec.check(writes.length === 0, `the page sent no admin write (${writes.join(', ') || 'none'})`);
+  const after = await adminNodes(c);
+  c.rec.check(workers.every((w) => after.find((n) => n.id === w.id)?.drain_phase === w.drain_phase), 'every worker keeps its drain phase');
+  await shot(c, 'results');
+  await card.getByRole('button', { name: 'Close' }).click().catch(() => {});
+});
 
 step('logout', ['auth'], async (c) => {
   await visit(c, '/dashboard', 1500);
