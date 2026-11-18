@@ -184,13 +184,22 @@ not test checkpoint discard or establish cross-host stopped-rootfs portability.
 Record provider volume identity independently; tenant responses intentionally
 do not expose it.
 
-`native.retained_volume_benchmark` uses one sandbox with a 128-MiB guest working
-set. It records single-queue-depth direct sequential read/write throughput,
-4-KiB random read/write IOPS and latency percentiles, and buffered 4-KiB
-write-plus-fsync latency. Each random phase is capped at five seconds or 20,000
-operations, and fsync sampling is limited to 128 writes. Files are private to
-the scenario and removed afterward. A missing direct-I/O capability fails
-rather than silently measuring guest page-cache reads.
+`native.retained_volume_benchmark` compares the local rootfs (`/var/tmp`) and
+retained data disk (`/data`) inside one sandbox. Four pairs alternate which arm
+runs first, recording individual runs and median summaries. Each arm uses a
+48-MiB working set: direct sequential writes, direct 4-KiB random reads,
+direct 4-KiB overwrites with per-write `fdatasync`, buffered 4-KiB appends with
+`fdatasync`, and small-file creation with file and directory `fsync`.
+Latency observations include p50, p95 and p99. Each random phase stops after
+five seconds or 20,000 operations; append and creation phases have 128 samples
+each. Files are private to the scenario and removed afterward. Missing
+direct-I/O support fails rather than silently measuring guest page-cache reads.
+
+The baseline is named `local_rootfs`, not NVMe. Establish its backing device
+independently before reporting an NVMe/EBS comparison. Record filesystem types
+and options (included in the guest evidence), host storage layout and CoW policy:
+this compares complete guest filesystem paths, not just storage media. No
+benchmark results are implied by the existence of the scenario.
 
 These are bounded microbenchmark observations, not steady-state, provider
 saturation, attachment-density or fleet-cost evidence. Include worker type,

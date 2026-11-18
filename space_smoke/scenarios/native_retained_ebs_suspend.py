@@ -89,9 +89,18 @@ class Observation:
     data_hash: str
 
 
-def _run(test: NativeHardeningFixture, sandbox: str, program: str) -> bytes:
-    accepted = test.command(sandbox, ["sudo", "-n", "python3", "-c", program]).require(201)
-    events = test.events(accepted)
+def _run(
+    test: NativeHardeningFixture,
+    sandbox: str,
+    program: str,
+    *,
+    timeout_seconds: int = 60,
+) -> bytes:
+    accepted = test.command(
+        sandbox, ["sudo", "-n", "python3", "-c", program],
+        timeout_seconds=timeout_seconds,
+    ).require(201)
+    events = test.events(accepted, timeout=timeout_seconds + 5)
     test.context.verify(events.status == 200, "guest command attachment failed")
     output, errors = command_output(events.events, limit=32768)
     test.context.verify(not errors, "guest proof command failed", stderr=errors.decode(errors="replace"))
