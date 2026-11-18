@@ -882,8 +882,14 @@ mod slot_pool_tests {
                     [state],
                 )
                 .unwrap();
+            // Neutral guards share the registry, so they hide slots the same way.
             let owners: Vec<_> = (0..20)
+                .step_by(2)
                 .map(|slot| ResetClaim::acquire(&pool, slot).unwrap())
+                .collect();
+            let neutral_owners: Vec<_> = (1..20)
+                .step_by(2)
+                .map(|slot| SlotGuard::try_acquire(&pool, slot).unwrap())
                 .collect();
             let mut cursor = u32::MAX;
             let mut discovered = std::collections::BTreeSet::new();
@@ -918,6 +924,7 @@ mod slot_pool_tests {
             for owner in owners {
                 owner.disarm();
             }
+            drop(neutral_owners);
         }
     }
 

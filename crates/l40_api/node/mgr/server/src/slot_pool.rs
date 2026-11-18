@@ -589,6 +589,7 @@ pub struct NetworkPool {
     // with the time (secs) their grace ends. Fixed at open: later health
     // writes must not extend it.
     startup_young_leases: HashMap<LeaseKey, u64>,
+    // Slots owned by a live `reset::SlotGuard`; only that guard removes its entry.
     active_resets: Mutex<HashSet<u32>>,
     sandbox_mutations: std::sync::Arc<Mutex<HashMap<String, SandboxMutationOwnership>>>,
     sandbox_mutations_released: std::sync::Arc<tokio::sync::Notify>,
@@ -2082,6 +2083,8 @@ mod liveness;
 mod node_status_tests;
 mod reset;
 mod scheduler;
+#[cfg(test)]
+mod slot_guard_tests;
 mod startup_containment;
 use liveness::{LeaseLiveness, lease_liveness, lease_may_be_live};
 #[cfg(test)]

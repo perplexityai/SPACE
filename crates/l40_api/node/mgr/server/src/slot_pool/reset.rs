@@ -116,20 +116,66 @@ fn classify_slot_validation_error(error: SlotValidationError) -> SlotResetError 
     }
 }
 
+/// Exclusive process-local ownership of one slot's `active_resets` entry.
+/// Dropping it only releases the entry; it never wakes the reset scheduler.
+/// Not `Clone`: the one value that inserted the entry is the one that removes it.
+pub(super) struct SlotGuard {
+    pool: std::sync::Arc<NetworkPool>,
+    slot_id: u32,
+}
+
+impl std::fmt::Debug for SlotGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SlotGuard")
+            .field("slot_id", &self.slot_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SlotGuard {
+    /// Fails immediately, without touching the current owner, if the slot is held.
+    pub(super) fn try_acquire(pool: &std::sync::Arc<NetworkPool>, slot_id: u32) -> Option<Self> {
+        let mut active = pool
+            .active_resets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !active.insert(slot_id) {
+            return None;
+        }
+        Some(Self {
+            pool: pool.clone(),
+            slot_id,
+        })
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.pool
+            .active_resets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.slot_id);
+    }
+}
+
+/// A `SlotGuard` whose final drop requests a reset retry unless disarmed.
 /// Process-local ownership complements the durable generation fence. Clones
 /// held by blocking work keep exclusion alive even if the async waiter drops.
 pub(super) struct ResetClaim {
-    pool: std::sync::Arc<NetworkPool>,
-    slot_id: u32,
+    // Always `Some` until `drop` takes it.
+    guard: Option<SlotGuard>,
     retry: AtomicBool,
 }
 
 impl std::fmt::Debug for ResetClaim {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ResetClaim")
-            .field("slot_id", &self.slot_id)
-            .finish_non_exhaustive()
+        let mut debug = formatter.debug_struct("ResetClaim");
+        if let Some(guard) = &self.guard {
+            debug.field("slot_id", &guard.slot_id);
+        }
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -144,16 +190,8 @@ impl ResetClaim {
         pool: &std::sync::Arc<NetworkPool>,
         slot_id: u32,
     ) -> Option<std::sync::Arc<Self>> {
-        let mut active = pool
-            .active_resets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !active.insert(slot_id) {
-            return None;
-        }
         Some(std::sync::Arc::new(Self {
-            pool: pool.clone(),
-            slot_id,
+            guard: Some(SlotGuard::try_acquire(pool, slot_id)?),
             retry: AtomicBool::new(true),
         }))
     }
@@ -161,16 +199,31 @@ impl ResetClaim {
 
 impl Drop for ResetClaim {
     fn drop(&mut self) {
-        self.pool
-            .active_resets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.slot_id);
         // Covers early DB errors, cancellation and panics as well as normal
         // retries. A completed/nontransitional row makes the next probe a no-op.
-        if self.retry.load(Ordering::Relaxed) {
-            schedule_reset_retry(self.pool.clone(), self.slot_id);
+        if let Some(guard) = self.guard.take() {
+            release_then_notify(
+                guard,
+                self.retry.load(Ordering::Relaxed),
+                schedule_reset_retry,
+            );
         }
+    }
+}
+
+/// The retry only nudges the worker to rescan, so release the slot first: a
+/// scan that still sees it claimed would skip it. `Drop::drop` runs before
+/// field destruction, so this order must be explicit.
+pub(super) fn release_then_notify(
+    guard: SlotGuard,
+    armed: bool,
+    notify: impl FnOnce(std::sync::Arc<NetworkPool>, u32),
+) {
+    let pool = guard.pool.clone();
+    let slot_id = guard.slot_id;
+    drop(guard);
+    if armed {
+        notify(pool, slot_id);
     }
 }
 
