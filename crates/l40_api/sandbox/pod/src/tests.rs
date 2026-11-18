@@ -1,8 +1,8 @@
 fn placement_template() -> pplx_space_common_core::types::TemplateCompatSpec {
     pplx_space_common_core::types::TemplateCompatSpec {
-        name: pplx_space_common_core::types::TemplateName::parse("seed").unwrap(),
+        name: pplx_space_template_model::TemplateName::parse("seed").unwrap(),
         org_id: None,
-        visibility: pplx_space_common_core::types::TemplateVisibility::Generic,
+        visibility: pplx_space_template_model::TemplateVisibility::Generic,
     }
 }
 
@@ -39,9 +39,9 @@ fn dedicated_group(name: &str, org_id: OrgId) -> pplx_space_common_core::types::
 fn org_specific_node_group_placement() -> NodeGroupPlacement {
     let org = TEST_ORG_ID;
     let template = pplx_space_common_core::types::TemplateCompatSpec {
-        name: pplx_space_common_core::types::TemplateName::parse(ORG_SPECIFIC_TEMPLATE).unwrap(),
+        name: pplx_space_template_model::TemplateName::parse(ORG_SPECIFIC_TEMPLATE).unwrap(),
         org_id: Some(org),
-        visibility: pplx_space_common_core::types::TemplateVisibility::OrgSpecific,
+        visibility: pplx_space_template_model::TemplateVisibility::OrgSpecific,
     };
     NodeGroupPlacement::for_caller(
         Some(org),

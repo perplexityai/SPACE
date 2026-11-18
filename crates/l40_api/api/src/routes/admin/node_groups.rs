@@ -25,11 +25,12 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use pplx_space_common_core::types::NodeGroupTemplatePolicy;
 use pplx_space_common_core::types::admin::{
     AdminNodeGroupResponse, AssignOrgRequest, CreateNodeGroupRequest, SetCompatRequest,
     SetTemplatePolicyRequest,
 };
-use pplx_space_common_core::types::{NodeGroupTemplatePolicy, TemplateVisibility};
+use pplx_space_template_model::TemplateVisibility;
 use uuid::Uuid;
 
 use super::audit::{self, AdminNodeGroupAuditEntry};

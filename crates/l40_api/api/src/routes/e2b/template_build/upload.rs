@@ -36,7 +36,7 @@ use pplx_space_accounts::OrgId;
 use pplx_space_build_mgr_client::{
     BLOB_UPLOAD_CHUNK_BYTES, BLOB_UPLOAD_LIMIT_BYTES, BlobUploadSender,
 };
-use pplx_space_common_core::types::TemplateName;
+use pplx_space_template_model::TemplateName;
 use serde::Serialize;
 use sha2::Sha256;
 use tokio::{

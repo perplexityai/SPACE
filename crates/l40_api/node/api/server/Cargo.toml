@@ -32,6 +32,7 @@ http = { workspace = true }
 http-body = { workspace = true }
 hyper-util = { workspace = true }
 kube = { workspace = true, default-features = false, features = ["client", "config", "rustls-tls"], optional = true }
+pplx-space-template-model = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 socket2 = { workspace = true }

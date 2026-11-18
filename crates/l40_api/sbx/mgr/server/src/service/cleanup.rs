@@ -456,7 +456,7 @@ pub(super) struct ObservedCleanupClaim {
 
 struct CleanupAdmissionSpec {
     mode: CleanupAdmissionMode,
-    template_filter: Option<pplx_space_common_core::types::TemplateName>,
+    template_filter: Option<pplx_space_template_model::TemplateName>,
     require_template_owner: bool,
     target_state: SandboxState,
     keep_filesystem: bool,
@@ -1053,7 +1053,7 @@ impl SandboxManagerService {
         require_template_owner: bool,
     ) -> Result<CleanupAdmission, CleanupAdmissionError> {
         let template_filter = template_filter
-            .map(pplx_space_common_core::types::TemplateName::parse)
+            .map(pplx_space_template_model::TemplateName::parse)
             .transpose()
             .map_err(|error| {
                 Status::invalid_argument(format!("invalid template filter: {error}"))

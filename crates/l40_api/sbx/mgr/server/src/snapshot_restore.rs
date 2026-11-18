@@ -116,7 +116,7 @@ pub(crate) struct PublishedRemoteRestore {
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveredSandboxRowFieldsError {
     #[error("invalid template in snapshot metadata: {0}")]
-    Template(#[from] pplx_space_common_core::types::TemplateParseError),
+    Template(#[from] pplx_space_template_model::TemplateParseError),
     #[error("invalid runtime in snapshot metadata: {0}")]
     Runtime(#[from] pplx_space_execution_spec::RuntimeKindParseError),
     #[error("invalid template content hash in snapshot metadata: {0}")]

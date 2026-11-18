@@ -8,7 +8,7 @@ fn template_cache_paths_preserve_space_layout() {
         crate::types::template_build_dir(
             "seed",
             "abc",
-            crate::types::TemplateCachePartition::Legacy
+            pplx_space_template_model::TemplateCachePartition::Legacy
         ),
         "/space/cache/firecracker/templates/seed/abc"
     );
@@ -19,7 +19,7 @@ fn template_cache_paths_preserve_space_layout() {
         crate::types::template_snapshot_dir(
             "seed",
             "abc",
-            crate::types::TemplateCachePartition::Environment(environment),
+            pplx_space_template_model::TemplateCachePartition::Environment(environment),
             2,
             1024
         ),

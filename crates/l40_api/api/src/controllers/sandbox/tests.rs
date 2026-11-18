@@ -1,6 +1,7 @@
 use super::*;
-use pplx_space_common_core::types::{SandboxActivationAttemptId, TemplateId};
+use pplx_space_common_core::types::SandboxActivationAttemptId;
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_template_model::TemplateId;
 
 mod activation_timeout_tests {
     use super::*;

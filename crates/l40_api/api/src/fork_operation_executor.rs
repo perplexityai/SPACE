@@ -1621,7 +1621,7 @@ fn create_request(
 fn frozen_source_template_reference(
     source_template_id: &str,
     source_content_hash: Option<&str>,
-) -> Result<pplx_space_common_core::types::TemplateReference, ForkExecutionError> {
+) -> Result<pplx_space_template_model::TemplateReference, ForkExecutionError> {
     let source_content_hash = source_content_hash
         .ok_or_else(|| ForkExecutionError::terminal("source sandbox has no content hash"))?;
     format!("{source_template_id}@{source_content_hash}")

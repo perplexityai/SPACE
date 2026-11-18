@@ -18,9 +18,10 @@ use uuid::Uuid;
 
 use pplx_space_accounts::{ROOT_SANDBOX_OWNER, SandboxOwner};
 use pplx_space_byte_size::MemorySize;
-use pplx_space_common_core::types::{NodePoolName, TemplateReference};
+use pplx_space_common_core::types::NodePoolName;
 use pplx_space_execution_spec::VcpuCount;
 use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_template_model::TemplateReference;
 
 pub mod placement;
 pub use placement::{

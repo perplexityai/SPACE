@@ -263,24 +263,24 @@ pub(crate) struct LoginArgs {
 pub(crate) enum TemplateCommands {
     /// Build the deployed seed or code-runtime recipe and wait for publication.
     Build {
-        template: pplx_space_common_core::types::SystemTemplate,
+        template: pplx_space_template_model::SystemTemplate,
         /// Seed reference for code-runtime (default: seed:latest).
         #[arg(long)]
-        base: Option<pplx_space_common_core::types::TemplateReference>,
+        base: Option<pplx_space_template_model::TemplateReference>,
         /// Exact qualified runtime/kernel pair for the build.
         #[arg(long)]
         environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         /// Assign a release tag, such as latest, after a successful build.
         #[arg(long = "publish-tag")]
-        publish_tags: Vec<pplx_space_common_core::types::TemplateTag>,
+        publish_tags: Vec<pplx_space_template_model::TemplateTag>,
         /// Return the job ID immediately.
         #[arg(long = "async")]
         async_mode: bool,
     },
     /// Inspect a submitted build, including publication failures.
     Status {
-        template: pplx_space_common_core::types::SystemTemplate,
-        job_id: pplx_space_common_core::types::BuildRunId,
+        template: pplx_space_template_model::SystemTemplate,
+        job_id: pplx_space_template_model::BuildRunId,
     },
 }
 

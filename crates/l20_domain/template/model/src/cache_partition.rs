@@ -23,7 +23,7 @@ const ENVIRONMENT_SEPARATOR: char = '@';
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_template_model::*;
 /// # use pplx_space_execution_spec::EnvironmentReference;
 /// # use pplx_space_content_digest::Digest;
 /// let initial = EnvironmentReference::new(Digest::sha256([1; 32]));

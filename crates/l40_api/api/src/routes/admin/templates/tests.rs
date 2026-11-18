@@ -1,6 +1,6 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_accounts::{OrgId, UserId};
-use pplx_space_common_core::types::BuildRunId;
+use pplx_space_template_model::BuildRunId;
 
 use super::*;
 use crate::public_template_operations::tests::{

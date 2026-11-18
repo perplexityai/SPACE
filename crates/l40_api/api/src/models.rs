@@ -14,13 +14,14 @@ use pplx_space_auto_lifecycle::{
 };
 use pplx_space_common_core::types::{
     EcwCredentialEpoch, NodeAddress, NodeManagedBy, NodePoolName, NodeRole,
-    SandboxActivationAttemptId, TemplateReference,
+    SandboxActivationAttemptId,
 };
 use pplx_space_content_digest::Digest;
 use pplx_space_execution_spec::ArtifactVersion;
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
 use pplx_space_semver::SemVer;
+use pplx_space_template_model::TemplateReference;
 
 use crate::user_role::UserRole;
 use pplx_space_cluster_pool::PoolConfigOwner;
@@ -877,7 +878,7 @@ pub struct SystemTemplateBuildRequest {
     #[serde(default)]
     pub environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     #[serde(default)]
-    pub base: Option<pplx_space_common_core::types::TemplateReference>,
+    pub base: Option<pplx_space_template_model::TemplateReference>,
     #[serde(default)]
     pub force: bool,
     #[serde(default)]
@@ -1058,7 +1059,7 @@ pub struct TemplateBuildStartResponse {
     pub template_name: String,
 }
 
-pub use pplx_space_common_core::types::TemplateBuildJobState as TemplateBuildStateResponse;
+pub use pplx_space_template_model::TemplateBuildJobState as TemplateBuildStateResponse;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TemplateBuildStatusResponse {

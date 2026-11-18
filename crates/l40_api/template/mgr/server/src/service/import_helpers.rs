@@ -920,7 +920,7 @@ impl TemplateManagerService {
 
 /// Validate that a template name is safe (no path traversal).
 pub(super) fn validate_template_name(name: &str) -> Result<(), tonic::Status> {
-    name.parse::<pplx_space_common_core::types::TemplateName>()
+    name.parse::<pplx_space_template_model::TemplateName>()
         .map(|_| ())
         .map_err(|err| tonic::Status::invalid_argument(format!("invalid template name: {err}")))
 }

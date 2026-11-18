@@ -50,6 +50,7 @@ k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 kube = { workspace = true, default-features = false, features = ["aws-lc-rs", "client", "config", "rustls-tls", "runtime"], optional = true }
 log = { workspace = true }
 percent-encoding = { workspace = true }
+pplx-space-template-model = { workspace = true }
 rand = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }

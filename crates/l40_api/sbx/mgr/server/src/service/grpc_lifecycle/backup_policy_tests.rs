@@ -1238,7 +1238,7 @@ async fn get_network_policy_reports_each_sandbox_policy_source() {
     conn.execute(
         "UPDATE sandboxes SET template = ?1 WHERE id = ?2",
         crate::db::fixture::params![
-            pplx_space_common_core::types::ORPHANED_SANDBOX_TEMPLATE,
+            pplx_space_template_model::ORPHANED_SANDBOX_TEMPLATE,
             orphaned
         ],
     )

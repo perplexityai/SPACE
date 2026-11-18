@@ -7,10 +7,7 @@ use pplx_space_accounts::{Email, NodeId, OrgId};
 #[cfg(test)]
 use pplx_space_auto_lifecycle::AutoLifecycleRuntimeState;
 use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, SandboxAutoLifecyclePatch};
-use pplx_space_common_core::types::{
-    DEFAULT_TEMPLATE_TAG, NodePoolName, SandboxId, SandboxLifecycle, TemplateDesiredState,
-    TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
-};
+use pplx_space_common_core::types::{NodePoolName, SandboxId, SandboxLifecycle};
 use pplx_space_content_digest::DigestPrefixResolveError;
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
@@ -39,6 +36,10 @@ use pplx_space_sbx_mgr_client::proto::{
 use pplx_space_semver::SemVer;
 use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{NetworkPolicyTarget, ReconcileFacet};
+use pplx_space_template_model::{
+    DEFAULT_TEMPLATE_TAG, TemplateDesiredState, TemplateName, TemplateReference, TemplateTag,
+    TemplateVisibility,
+};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;

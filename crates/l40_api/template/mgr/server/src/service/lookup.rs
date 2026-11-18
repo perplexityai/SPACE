@@ -1074,7 +1074,7 @@ fn cached_template_partitions_in(
     template_root: &std::path::Path,
     template: &str,
     content_hash: &str,
-) -> std::io::Result<Vec<pplx_space_common_core::types::TemplateCachePartition>> {
+) -> std::io::Result<Vec<pplx_space_template_model::TemplateCachePartition>> {
     let entries = match std::fs::read_dir(template_root.join(template)) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1087,7 +1087,7 @@ fn cached_template_partitions_in(
             continue;
         };
         if let Some((hash, partition)) =
-            pplx_space_common_core::types::TemplateCachePartition::parse_build_dir_name(name)
+            pplx_space_template_model::TemplateCachePartition::parse_build_dir_name(name)
             && hash == content_hash
         {
             partitions.push(partition);

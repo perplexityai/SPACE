@@ -3382,7 +3382,7 @@ fn insert_quarantined_orphan(conn: &crate::db::Connection, sandbox_id: &str) {
         "UPDATE sandboxes SET template = ?1, template_hash = NULL, user = ?2,
          pool_template = NULL, process_env_json = '{}' WHERE id = ?3",
         crate::db::fixture::params![
-            pplx_space_common_core::types::ORPHANED_SANDBOX_TEMPLATE,
+            pplx_space_template_model::ORPHANED_SANDBOX_TEMPLATE,
             pplx_space_accounts::ORPHANED_SANDBOX_OWNER.as_str(),
             sandbox_id
         ],

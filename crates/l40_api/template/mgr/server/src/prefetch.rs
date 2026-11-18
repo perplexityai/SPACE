@@ -304,8 +304,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::types::{TemplateName, TemplateReference, TemplateTag};
 use pplx_space_node_api_client::proto::TemplateVisibility;
+use pplx_space_template_model::{TemplateName, TemplateReference, TemplateTag};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 

@@ -24,8 +24,8 @@ use pplx_space_auto_lifecycle::{
 };
 use pplx_space_common_core::types::{
     ExecutionGeneration, IncompleteSandboxRouteIdentityError, NodeManagedBy, NodeRole,
-    ORPHANED_SANDBOX_TEMPLATE, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode,
-    SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
+    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode, SandboxRouteIdentity,
+    SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
 use pplx_space_durations::parse_grpc_timeout;
 use pplx_space_execution_spec::RuntimeKind;
@@ -63,6 +63,7 @@ use pplx_space_template_cache_permissions::{
     normalize_template_cache_tree as normalize_template_cache_tree_io,
     set_template_cache_permissions as set_template_cache_permissions_io,
 };
+use pplx_space_template_model::ORPHANED_SANDBOX_TEMPLATE;
 use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };

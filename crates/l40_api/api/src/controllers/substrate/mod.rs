@@ -47,7 +47,7 @@ use pplx_space_bearer_token::SpaceBearerToken;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, BackupAttemptId, BackupSource, LocalArtifactId, NodeAddress,
     NodeManagedBy, NodePoolName, NodeRole, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
-    SandboxRouteIdentity, TemplateName,
+    SandboxRouteIdentity,
 };
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
@@ -56,6 +56,7 @@ use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyProto;
 use pplx_space_rpc_auth::SpaceBearerInterceptor;
+use pplx_space_template_model::TemplateName;
 
 /// Convert a request override at the V1-only sandbox-manager boundary.
 pub(super) fn override_request_policy(

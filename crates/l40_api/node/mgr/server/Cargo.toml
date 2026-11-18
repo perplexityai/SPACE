@@ -30,6 +30,7 @@ h2 = { workspace = true }
 hyper = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
+pplx-space-template-model = { workspace = true }
 rustix = { workspace = true, features = ["fs", "mount", "process"] }
 nix = { workspace = true, features = ["dir", "fs", "mount", "sched", "process", "resource", "signal", "user"] }
 rusqlite = { workspace = true }

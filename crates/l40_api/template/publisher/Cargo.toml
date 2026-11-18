@@ -25,6 +25,7 @@ pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-object-store = { workspace = true }
 pplx-space-template-manifest = { workspace = true }
+pplx-space-template-model = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

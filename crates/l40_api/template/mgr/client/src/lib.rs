@@ -4,10 +4,10 @@ pub mod proto {
     tonic::include_proto!("space.template.manager.v1");
 }
 
-use pplx_space_common_core::types::{TemplateReference, TemplateSelector};
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
+use pplx_space_template_model::{TemplateReference, TemplateSelector};
 use tonic::transport::{Channel, Endpoint};
 
 /// Unix socket path for the template-manager gRPC service.

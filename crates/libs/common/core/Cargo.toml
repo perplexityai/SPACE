@@ -25,6 +25,7 @@ pplx-space-linux-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-sql-codec = { workspace = true, optional = true }
+pplx-space-template-model = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
@@ -51,6 +52,7 @@ serde = [
     "pplx-space-accounts/serde",
     "pplx-space-execution-spec/serde",
     "pplx-space-linux-ids/serde",
+    "pplx-space-template-model/serde",
 ]
 sqlx = [
     "dep:pplx-space-sql-codec",
@@ -58,4 +60,5 @@ sqlx = [
     "pplx-space-semver/sqlx",
     "pplx-space-k8s-ids/sqlx",
     "pplx-space-accounts/sqlx",
+    "pplx-space-template-model/sqlx",
 ]

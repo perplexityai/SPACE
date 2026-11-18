@@ -2,10 +2,11 @@ use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::SnapshotId;
 
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::{SandboxId, TemplateName};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, TestDbResult, insert_ready_worker_node, pg_test_db,
 };
+use pplx_space_template_model::TemplateName;
 use uuid::Uuid;
 
 use super::*;

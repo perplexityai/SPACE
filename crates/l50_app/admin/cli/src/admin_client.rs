@@ -1,8 +1,9 @@
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
 use pplx_space_common_core::types::{
-    NodeAddress, TemplateReference,
+    NodeAddress,
     admin::{AdminNodeNetworkSlots, AdminNodeResponse, AdminNodeSort, DrainRequest},
 };
+use pplx_space_template_model::TemplateReference;
 use reqwest::{StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -298,7 +299,7 @@ pub(crate) enum CliError {
         hash = .content_hash.as_ref().map_or_else(|| "unavailable".to_string(), ToString::to_string))]
     Build {
         job_id: String,
-        state: pplx_space_common_core::types::TemplateBuildJobState,
+        state: pplx_space_template_model::TemplateBuildJobState,
         content_hash: Option<pplx_space_content_digest::ContentHash>,
         error: String,
     },

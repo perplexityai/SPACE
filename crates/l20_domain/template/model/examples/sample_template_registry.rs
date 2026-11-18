@@ -1,4 +1,4 @@
-//! Minimal in-memory template registry using the common-core template types.
+//! Minimal in-memory template registry using the template model types.
 //!
 //! This example models tags as cross-runtime aliases to a logical template
 //! index. A digest selector is runtime-scoped by definition, so
@@ -10,18 +10,18 @@ use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
 
-use pplx_space_common_core::types::{
+use pplx_space_content_digest::{ContentHash, Digest};
+use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_template_model::{
     DEFAULT_TEMPLATE_TAG, TemplateArtifactDigest, TemplateArtifactDigestPrefix,
     TemplateIndexDigest, TemplateName, TemplateReference, TemplateReferenceParseError,
     TemplateSelector, TemplateTag,
 };
-use pplx_space_content_digest::{ContentHash, Digest};
-use pplx_space_execution_spec::RuntimeKind;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResolvedTemplateSelection {
     index: TemplateIndexDigest,
-    variant: pplx_space_common_core::types::ResolvedTemplateVariant,
+    variant: pplx_space_template_model::ResolvedTemplateVariant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,7 +157,7 @@ impl SampleTemplateRegistry {
 
         Ok(ResolvedTemplateSelection {
             index,
-            variant: pplx_space_common_core::types::ResolvedTemplateVariant::new(
+            variant: pplx_space_template_model::ResolvedTemplateVariant::new(
                 runtime, name, artifact,
             ),
         })
@@ -200,7 +200,7 @@ impl SampleTemplateRegistry {
 
         Ok(ResolvedTemplateSelection {
             index,
-            variant: pplx_space_common_core::types::ResolvedTemplateVariant::new(
+            variant: pplx_space_template_model::ResolvedTemplateVariant::new(
                 runtime, name, artifact,
             ),
         })

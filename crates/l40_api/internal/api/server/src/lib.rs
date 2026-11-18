@@ -55,7 +55,7 @@ use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, BackupAttemptId, ExactStorageUri, ExecutionGeneration,
     LocalArtifactId, NodeRole as SpaceNodeRole, SandboxId,
     SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId, SnapshotKind,
-    SnapshotName, SnapshotState, SubstrateKind, TemplateName,
+    SnapshotName, SnapshotState, SubstrateKind,
 };
 use pplx_space_content_digest::Digest;
 use pplx_space_events::{
@@ -69,6 +69,7 @@ use pplx_space_state_reconciliation::{
     FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY, NODE_RECONCILE_CLAIM_STALE_SECS,
     NetworkPolicyTarget, ReconcileFacet,
 };
+use pplx_space_template_model::TemplateName;
 use uuid::Uuid;
 
 use crate::proto::FacetRef;

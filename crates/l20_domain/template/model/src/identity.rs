@@ -83,7 +83,7 @@ impl TryFrom<String> for TemplateId {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::TemplateName;
+/// # use pplx_space_template_model::TemplateName;
 /// assert!(TemplateName::parse("../seed").is_err());
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -101,7 +101,7 @@ pub enum TemplateParseError {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::TemplateTag;
+/// # use pplx_space_template_model::TemplateTag;
 /// assert!(TemplateTag::parse("release-2026.05").is_ok());
 /// assert!(TemplateTag::parse(":latest").is_err());
 /// ```
@@ -117,7 +117,7 @@ pub struct TemplateTagParseError(&'static str);
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::TemplateName;
+/// # use pplx_space_template_model::TemplateName;
 /// let template = TemplateName::parse("seed").unwrap();
 /// assert_eq!(template.as_str(), "seed");
 /// ```
@@ -132,7 +132,7 @@ impl TemplateName {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::TemplateName;
+    /// # use pplx_space_template_model::TemplateName;
     /// assert!(TemplateName::parse("seed").is_ok());
     /// assert!(TemplateName::parse("..").is_err());
     /// ```
@@ -147,7 +147,7 @@ impl TemplateName {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::TemplateName;
+    /// # use pplx_space_template_model::TemplateName;
     /// let template = TemplateName::parse("seed").unwrap();
     /// assert_eq!(template.as_str(), "seed");
     /// ```
@@ -192,7 +192,7 @@ impl From<TemplateName> for String {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::TemplateTag;
+/// # use pplx_space_template_model::TemplateTag;
 /// let tag = TemplateTag::parse("latest").unwrap();
 /// assert_eq!(tag.as_str(), "latest");
 /// ```
@@ -210,7 +210,7 @@ impl TemplateTag {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::TemplateTag;
+    /// # use pplx_space_template_model::TemplateTag;
     /// assert!(TemplateTag::parse("release_1.2-rc1").is_ok());
     /// assert!(TemplateTag::parse("-bad").is_err());
     /// ```
@@ -225,7 +225,7 @@ impl TemplateTag {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::{DEFAULT_TEMPLATE_TAG, TemplateTag};
+    /// # use pplx_space_template_model::{DEFAULT_TEMPLATE_TAG, TemplateTag};
     /// assert_eq!(TemplateTag::latest().as_str(), DEFAULT_TEMPLATE_TAG);
     /// ```
     pub fn latest() -> Self {
@@ -237,7 +237,7 @@ impl TemplateTag {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::TemplateTag;
+    /// # use pplx_space_template_model::TemplateTag;
     /// let tag = TemplateTag::parse("prod").unwrap();
     /// assert_eq!(tag.as_str(), "prod");
     /// ```

@@ -42,6 +42,7 @@ hex = { workspace = true }
 http = { workspace = true }
 jiff = { workspace = true }
 http-body = { workspace = true }
+pplx-space-template-model = { workspace = true }
 sha2 = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "http1"] }

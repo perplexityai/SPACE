@@ -14,8 +14,9 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use pplx_space_accounts::{NodeId, OrgId, UserId};
-use pplx_space_common_core::types::{SandboxId, TemplateName};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_template_model::TemplateName;
 use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;

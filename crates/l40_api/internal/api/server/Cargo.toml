@@ -27,6 +27,7 @@ datadog-otel = ["otel", "datadog"]
 futures-util = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 kube = { workspace = true, default-features = false, features = ["aws-lc-rs", "client", "config", "rustls-tls"], optional = true }
+pplx-space-template-model = { workspace = true }
 prost-types = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

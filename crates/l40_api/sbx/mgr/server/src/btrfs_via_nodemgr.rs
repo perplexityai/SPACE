@@ -138,7 +138,7 @@ pub(crate) fn codec_environment_build(
 ) -> Option<pplx_space_node_mgr_client::proto::EnvironmentTemplateBuild> {
     let environment = environment?;
     (pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment))
-        != pplx_space_common_core::types::TemplateCachePartition::Legacy)
+        != pplx_space_template_model::TemplateCachePartition::Legacy)
         .then(
             || pplx_space_node_mgr_client::proto::EnvironmentTemplateBuild {
                 content_hash: content_hash.to_string(),

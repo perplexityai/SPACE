@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, SandboxId,
-    SandboxRuntimeLabel, TemplateName,
+    SandboxRuntimeLabel,
 };
 use pplx_space_content_digest::ContentHash;
 use pplx_space_execution_spec::{ExecutionMetadata, RuntimeKind};
 use pplx_space_guest_process::DEFAULT_GUEST_USER;
+use pplx_space_template_model::TemplateName;
 
 use crate::retained_source::{
     RetainedSource, RetainedSourceCheck, RetainedSourceVerdicts, RootfsArtifact,

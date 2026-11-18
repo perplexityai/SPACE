@@ -4846,6 +4846,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-content-digest",
  "pplx-space-execution-spec",
+ "pplx-space-template-model",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
@@ -4945,6 +4946,7 @@ dependencies = [
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
+ "pplx-space-template-model",
  "pplx-space-template-runtime",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
@@ -5128,6 +5130,7 @@ dependencies = [
  "pplx-space-sql-locator",
  "pplx-space-template-manifest",
  "pplx-space-template-mgr-client",
+ "pplx-space-template-model",
  "pplx-space-template-runtime",
  "pplx-space-test-env",
  "pplx-space-uds-peer-auth",
@@ -5317,6 +5320,7 @@ dependencies = [
  "pplx-space-snapshot-store",
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
+ "pplx-space-template-model",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "prost-types",
@@ -5372,6 +5376,7 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-execution-spec",
  "pplx-space-sql-locator",
+ "pplx-space-template-model",
  "serde",
  "sqlx",
  "thiserror 2.0.20",
@@ -5451,6 +5456,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-semver",
  "pplx-space-sql-codec",
+ "pplx-space-template-model",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -5671,6 +5677,7 @@ dependencies = [
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
  "pplx-space-sql-locator",
+ "pplx-space-template-model",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "pplx-space-uds-peer-auth",
@@ -5935,11 +5942,11 @@ dependencies = [
 name = "pplx-space-execution-catalog"
 version = "0.8.2"
 dependencies = [
- "pplx-space-common-core",
  "pplx-space-content-digest",
  "pplx-space-cpu-arch",
  "pplx-space-execution-common",
  "pplx-space-execution-spec",
+ "pplx-space-template-model",
  "semver",
  "serde",
  "serde_json",
@@ -6223,6 +6230,7 @@ dependencies = [
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
+ "pplx-space-template-model",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "prost",
@@ -6657,6 +6665,7 @@ dependencies = [
  "pplx-space-sbx-mgr-client",
  "pplx-space-service-lifecycle",
  "pplx-space-template-mgr-client",
+ "pplx-space-template-model",
  "pplx-space-test-env",
  "pplx-space-unix-socket-bind",
  "prost",
@@ -6805,6 +6814,7 @@ dependencies = [
  "pplx-space-sqlite",
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
+ "pplx-space-template-model",
  "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-bind",
  "prost-types",
@@ -6901,6 +6911,7 @@ dependencies = [
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
  "pplx-space-sqlite",
+ "pplx-space-template-model",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "pplx-space-uds-peer-auth",
@@ -7335,6 +7346,7 @@ dependencies = [
  "pplx-space-execution-spec",
  "pplx-space-guest-process",
  "pplx-space-net-common",
+ "pplx-space-template-model",
  "regex",
  "schemars 1.2.2",
  "serde",
@@ -7510,6 +7522,7 @@ dependencies = [
  "pplx-space-guest-process",
  "pplx-space-net-common",
  "pplx-space-policy-authority",
+ "pplx-space-template-model",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -7682,6 +7695,7 @@ dependencies = [
  "pplx-space-template-cache-permissions",
  "pplx-space-template-manifest",
  "pplx-space-template-mgr-client",
+ "pplx-space-template-model",
  "pplx-space-template-runtime",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
@@ -7823,6 +7837,7 @@ dependencies = [
  "pplx-space-spaced-update",
  "pplx-space-sql-locator",
  "pplx-space-sqlite",
+ "pplx-space-template-model",
  "pplx-space-test-hooks",
  "prost-types",
  "ref-cast",
@@ -7956,6 +7971,7 @@ dependencies = [
  "pplx-space-execution-spec",
  "pplx-space-sandbox-portability",
  "pplx-space-sql-locator",
+ "pplx-space-template-model",
  "pplx-space-test-env",
  "serde_json",
  "sqlx",
@@ -8380,6 +8396,7 @@ name = "pplx-space-state-reconciliation"
 version = "0.8.2"
 dependencies = [
  "pplx-space-common-core",
+ "pplx-space-template-model",
  "sqlx",
  "thiserror 2.0.20",
 ]
@@ -8469,6 +8486,7 @@ dependencies = [
  "pplx-space-template-manifest",
  "pplx-space-template-mgr-client",
  "pplx-space-template-mgr-store",
+ "pplx-space-template-model",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "pplx-space-uds-peer-auth",
@@ -8528,6 +8546,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-observability",
  "pplx-space-sbx-mgr-protocol",
+ "pplx-space-template-model",
  "prost",
  "thiserror 2.0.20",
  "tonic",
@@ -8557,6 +8576,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-template-model"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-content-digest",
+ "pplx-space-execution-spec",
+ "pplx-space-sql-codec",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-template-publish"
 version = "0.8.2"
 dependencies = [
@@ -8580,6 +8613,7 @@ dependencies = [
  "pplx-space-node-api-client",
  "pplx-space-object-store",
  "pplx-space-template-manifest",
+ "pplx-space-template-model",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",

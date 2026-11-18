@@ -122,7 +122,7 @@ fn validate_content_hash(hash: &str) -> Result<(), Status> {
 struct TemplateBuildTarget {
     name: String,
     content_hash: String,
-    partition: pplx_space_common_core::types::TemplateCachePartition,
+    partition: pplx_space_template_model::TemplateCachePartition,
 }
 
 /// The parent template build a sandbox codec request names; see
@@ -246,7 +246,7 @@ fn with_cached_partitions(candidates: Vec<TemplateBuildTarget>) -> Vec<TemplateB
 /// carried no `environment_build`.
 fn names_legacy_build(candidates: &[TemplateBuildTarget]) -> bool {
     candidates.first().is_none_or(|first| {
-        first.partition == pplx_space_common_core::types::TemplateCachePartition::Legacy
+        first.partition == pplx_space_template_model::TemplateCachePartition::Legacy
     })
 }
 
@@ -265,9 +265,7 @@ fn append_partitions(
         .into_iter()
         .filter_map(|dir_name| {
             let (content_hash, partition) =
-                pplx_space_common_core::types::TemplateCachePartition::parse_build_dir_name(
-                    &dir_name,
-                )?;
+                pplx_space_template_model::TemplateCachePartition::parse_build_dir_name(&dir_name)?;
             (content_hash == first.content_hash
                 && !candidates.iter().any(|known| known.partition == partition))
             .then(|| TemplateBuildTarget {
@@ -295,7 +293,7 @@ macro_rules! sandbox_codec_request {
 
             fn parent_candidates(&self) -> Result<Vec<TemplateBuildTarget>, Status> {
                 let primary = self.parent_target()?;
-                if primary.partition == pplx_space_common_core::types::TemplateCachePartition::Legacy {
+                if primary.partition == pplx_space_template_model::TemplateCachePartition::Legacy {
                     return Ok(vec![primary]);
                 }
                 let legacy = TemplateBuildTarget::parse(&self.template_name, &self.content_hash, None)?;
@@ -318,7 +316,7 @@ sandbox_codec_request!(
 /// legacy builds name with `content_hash` alone.
 fn environment_build_partition(
     build: &EnvironmentTemplateBuild,
-) -> Result<pplx_space_common_core::types::TemplateCachePartition, Status> {
+) -> Result<pplx_space_template_model::TemplateCachePartition, Status> {
     let environment = build
         .environment
         .parse::<pplx_space_execution_spec::EnvironmentReference>()
@@ -330,7 +328,7 @@ fn environment_build_partition(
         })?;
     let partition =
         pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment));
-    if partition == pplx_space_common_core::types::TemplateCachePartition::Legacy {
+    if partition == pplx_space_template_model::TemplateCachePartition::Legacy {
         return Err(Status::invalid_argument(
             "environment_build names the initial environment; use content_hash",
         ));
@@ -371,7 +369,7 @@ impl TemplateBuildTarget {
         let (content_hash, partition) = match environment_build {
             None => (
                 content_hash,
-                pplx_space_common_core::types::TemplateCachePartition::Legacy,
+                pplx_space_template_model::TemplateCachePartition::Legacy,
             ),
             Some(build) => {
                 if !content_hash.is_empty() {

@@ -12,7 +12,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
-use pplx_space_common_core::types::TemplateReference;
+use pplx_space_template_model::TemplateReference;
 
 const ENV: &str = "SPACE_OCI_GUEST_SEEDS";
 const MAX_OS_RELEASE_BYTES: u64 = 64 * 1024;

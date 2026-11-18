@@ -5,10 +5,11 @@ use std::{
 };
 
 use pplx_space_byte_size::MemorySize;
-use pplx_space_common_core::types::{SandboxId, TemplateName};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_execution_spec::{
     DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC, DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC, VcpuCount,
 };
+use pplx_space_template_model::TemplateName;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 

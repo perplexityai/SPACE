@@ -40,9 +40,10 @@
 use pplx_space_accounts::OrgId;
 use pplx_space_common_core::types::{
     NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy, NodeGroupTemplatePolicy,
-    TemplateCompatSpec, TemplateName, TemplateVisibility,
+    TemplateCompatSpec,
 };
 use pplx_space_sql_locator::sql;
+use pplx_space_template_model::{TemplateName, TemplateVisibility};
 use uuid::Uuid;
 
 /// A template's compatibility slice together with the cluster's node groups —

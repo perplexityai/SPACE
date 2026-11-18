@@ -10,7 +10,7 @@ use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
     DEFAULT_BASE_SNAPSHOT_MEMORY_MIB, DEFAULT_BASE_SNAPSHOT_VCPU, MIN_BASE_SNAPSHOT_MEMORY_MIB,
     MIN_BASE_SNAPSHOT_VCPU, TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_CODEC,
-    TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateCachePartition,
+    TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL,
 };
 use pplx_space_content_digest::{Digest, HashAlg};
 use pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS;
@@ -26,6 +26,7 @@ use pplx_space_template_cache_permissions::{
     normalize_template_cache_tree as normalize_template_cache_tree_io,
     set_template_cache_permissions as set_template_cache_permissions_io,
 };
+use pplx_space_template_model::TemplateCachePartition;
 use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };

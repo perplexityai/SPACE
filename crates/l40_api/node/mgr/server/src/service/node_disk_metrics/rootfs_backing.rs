@@ -135,7 +135,7 @@ fn collect(sandboxes: &Path, templates: &Path) -> io::Result<Inventory> {
                 // Import, republish and replaced-generation siblings append
                 // dot-separated markers; they are not canonical cache entries.
                 // Every cache partition's build dir is one.
-                pplx_space_common_core::types::TemplateCachePartition::parse_build_dir_name(&name)
+                pplx_space_template_model::TemplateCachePartition::parse_build_dir_name(&name)
                     .is_some()
             }) {
                 inventory.record(Kind::Template, &digest)?;

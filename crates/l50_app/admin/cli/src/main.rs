@@ -9,7 +9,8 @@ mod templates;
 
 use admin_client::{AdminClient, CliError, WarmPoolConfigRequest};
 use cli::{Cli, Commands, EnvConfig, WarmPoolCommands, WarmPoolConfigArgs, WarmPoolUpdateArgs};
-use pplx_space_common_core::types::{NodeDrainMode, TemplateReference, admin::DrainRequest};
+use pplx_space_common_core::types::{NodeDrainMode, admin::DrainRequest};
+use pplx_space_template_model::TemplateReference;
 use std::str::FromStr;
 
 #[tokio::main]

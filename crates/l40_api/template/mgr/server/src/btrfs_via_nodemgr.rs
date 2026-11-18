@@ -14,11 +14,11 @@
 //! (`template_name`, `content_hash`); nodemgr derives the canonical
 //! host paths internally so callers can't smuggle arbitrary paths.
 
-use pplx_space_common_core::types::TemplateCachePartition;
 use pplx_space_node_mgr_client::proto::{
     BtrfsCreateTemplateSubvolumeRequest, BtrfsDeleteTemplateSubvolumeRequest,
     BtrfsFinalizeTemplateSubvolumeRequest, EnvironmentTemplateBuild,
 };
+use pplx_space_template_model::TemplateCachePartition;
 use std::path::PathBuf;
 use thiserror::Error;
 use uuid::Uuid;

@@ -1,7 +1,8 @@
 use super::*;
-use pplx_space_common_core::types::{SandboxId, TemplateName};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_template_model::TemplateName;
 
 #[test]
 fn runtime_dispatch_preserves_absence_and_refuses_corrupt_or_foreign_metadata() {
