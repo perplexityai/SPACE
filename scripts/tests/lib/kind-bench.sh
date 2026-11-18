@@ -434,7 +434,10 @@ kind_bench_exec() {
 # their Helm runs even chose the same temporary names. A worktree at <repo>'s
 # HEAD with everything that differs from HEAD copied over, staged or not, and
 # its untracked files, so a bench tests exactly the files checked out there.
-# --no-renames lists a rename as the deletion and the addition it is.
+# --no-renames lists a rename as the deletion and the addition it is. Every
+# path deleted from HEAD goes first, so a copy can put a file where HEAD has a
+# directory, or the reverse; a path deleted only from the index (`git rm
+# --cached`) is untracked and comes back with the copies, unless ignored.
 kind_bench_checkout() {
   local repo="$1" dest="$2" lists path status=0
   # NUL-separated lists in files: a shell variable cannot hold a NUL.
@@ -442,20 +445,15 @@ kind_bench_checkout() {
   { git -C "$repo" diff -z --no-renames --name-only --diff-filter=d HEAD >"$lists/changed" \
       && git -C "$repo" ls-files -z --others --exclude-standard >>"$lists/changed" \
       && git -C "$repo" diff -z --no-renames --name-only --diff-filter=D HEAD >"$lists/deleted" \
-      && git -C "$repo" worktree add --quiet --detach --force "$dest" HEAD \
-      && rsync -a --from0 --files-from="$lists/changed" "$repo/" "$dest/"; } || status=1
+      && git -C "$repo" worktree add --quiet --detach --force "$dest" HEAD; } || status=1
   if (( ! status )); then
-    # A path removed only from the index (`git rm --cached`) and still in the
-    # working tree is untracked and was copied: keep it. One that is also
-    # ignored was not copied, and like every ignored file it is absent from a
-    # bench, rather than left at HEAD's content.
     while IFS= read -r -d '' path; do
-      if [[ -e "$repo/$path" || -L "$repo/$path" ]] && ! git -C "$repo" check-ignore -q -- "$path"; then
-        continue
-      fi
       rm -f -- "$dest/$path" || status=1
     done <"$lists/deleted"
   fi
+  # --ignore-times: a changed file the same size as HEAD's, written in the
+  # same second as the worktree, would otherwise look unchanged to rsync.
+  (( status )) || rsync -a --ignore-times --from0 --files-from="$lists/changed" "$repo/" "$dest/" || status=1
   rm -rf "$lists"
   return "$status"
 }
