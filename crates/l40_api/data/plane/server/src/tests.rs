@@ -1261,6 +1261,15 @@ fn space_api_route_claims() -> SpaceApiRouteEd25519Claims {
     .unwrap()
 }
 
+/// A route token for a native session's bridge that expires `ttl_secs`
+/// after it is issued, so one inside the refresh window is refreshed when
+/// the session next uses it.
+pub(crate) fn proto_space_api_route_token_expiring_in(ttl_secs: u64) -> ProtoSpaceApiRouteToken {
+    let mut claims = space_api_route_claims();
+    claims.expires_at_unix_secs = claims.issued_at_unix_secs + ttl_secs;
+    proto_space_api_route_token_with_claims(claims)
+}
+
 fn proto_space_api_route_token_with_claims(
     claims: SpaceApiRouteEd25519Claims,
 ) -> ProtoSpaceApiRouteToken {

@@ -829,6 +829,7 @@ async fn spawn_session_fake(session_id: DataPlaneSessionId, session: FakeSession
         FakeRoute {
             adapter_state,
             bound,
+            ..FakeRoute::unbound()
         },
         Some(bind),
         Arc::new(move |_, open| {
@@ -2417,6 +2418,10 @@ struct FakeRoute {
     /// the session; the last answer repeats. Once a bind succeeds, every
     /// lookup reports it bound.
     bound: &'static [bool],
+    /// The route carries a route token inside its refresh window, and each
+    /// lookup reports a new route generation, so the session refreshes its
+    /// route, and finds it moved, whenever it uses the token.
+    refreshing_token: bool,
 }
 
 impl FakeRoute {
@@ -2424,6 +2429,7 @@ impl FakeRoute {
         Self {
             adapter_state: r#"{"command":["true"]}"#,
             bound: &[false],
+            refreshing_token: false,
         }
     }
 
@@ -2487,7 +2493,12 @@ async fn spawn_process_fake(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
-    let mut route = crate::tests::route_response_with_token(session_id, None);
+    let mut route = crate::tests::route_response_with_token(
+        session_id,
+        fake_route
+            .refreshing_token
+            .then(|| crate::tests::proto_space_api_route_token_expiring_in(30)),
+    );
     route.backend.as_mut().unwrap().endpoint = endpoint.clone();
     route.adapter_state_json = fake_route.adapter_state.to_string();
     let lookups = fake_route.bound;
@@ -2534,6 +2545,9 @@ async fn spawn_process_fake(
                 let lookup = route_lookups.fetch_add(1, Ordering::SeqCst);
                 let bound = bound.load(Ordering::SeqCst) || lookups[lookup.min(lookups.len() - 1)];
                 route.backend_process_id = bound.then(|| process_id.clone());
+                if fake_route.refreshing_token {
+                    route.route_generation += lookup as u64;
+                }
                 return crate::tests::grpc_test_response(route.encode_to_vec());
             }
             if path.ends_with("/BindDataPlaneSessionProcess") {
@@ -3029,12 +3043,14 @@ fn websocket_output_truncated(frames: &[serde_json::Value]) -> Option<bool> {
 /// `resync_required`. A guest too old to say where its retained output
 /// starts answers an evicted cursor with a bare lag status: the stream finds
 /// that start once the process has exited, and follows the live tail while it
-/// runs, as an SSE stream does.
+/// runs, as an SSE stream does. The live tail's output has no position, so
+/// its `seq`s are past any, and a reattach after one replays from the start.
 #[tokio::test]
 async fn websocket_reattach_continues_after_the_last_seq_received() {
     if !binding_fake_test_process() {
         return;
     }
+    assert_eq!(UNPOSITIONED_SEQ_BASE + 1, 4_611_686_018_427_387_905);
     struct Case {
         name: &'static str,
         bound: bool,
@@ -3140,7 +3156,7 @@ async fn websocket_reattach_continues_after_the_last_seq_received() {
             running: true,
             replies: Arc::new(|_, open| older_guest(open)),
             query: "",
-            stdout: &[(1, "live\n")],
+            stdout: &[(UNPOSITIONED_SEQ_BASE + 1, "live\n")],
             resyncs: &["cursor_out_of_window"],
             truncated: true,
             opens: Some(connects(&[Some(0), None])),
@@ -3151,10 +3167,22 @@ async fn websocket_reattach_continues_after_the_last_seq_received() {
             running: true,
             replies: Arc::new(|_, open| older_guest(open)),
             query: "?after_seq=2",
-            stdout: &[(3, "live\n")],
+            stdout: &[(UNPOSITIONED_SEQ_BASE + 1, "live\n")],
             resyncs: &["cursor_out_of_window"],
             truncated: true,
             opens: Some(connects(&[Some(2), None])),
+        },
+        Case {
+            name: "reattach after the live tail's output",
+            bound: true,
+            running: true,
+            replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+            // `UNPOSITIONED_SEQ_BASE + 1`, the first live tail output's.
+            query: "?after_seq=4611686018427387905",
+            stdout: &[(1, "one\n"), (2, "two\n"), (3, "three\n"), (4, "four\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: false,
+            opens: Some(connects(&[Some(0)])),
         },
         Case {
             name: "older guest evicted an exited process's output, without after_seq",
@@ -3205,6 +3233,55 @@ async fn websocket_reattach_continues_after_the_last_seq_received() {
             assert_eq!(*fake.opens.lock().unwrap(), opens, "{}", case.name);
         }
     }
+}
+
+/// A stream that follows the live tail of an older guest, and moves to
+/// another worker when its route token is refreshed, reopens at the live tail
+/// there too: its `seq`s are not positions to send the guest, and the
+/// reopened stream's start is no start of the process.
+#[tokio::test]
+async fn websocket_route_token_refresh_keeps_following_the_live_tail() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_process_fake(
+        session_id,
+        FakeRoute {
+            refreshing_token: true,
+            ..FakeRoute::bound()
+        },
+        None,
+        Arc::new(|opened, open| match open {
+            FakeOpen::Connect(Some(_)) => vec![connected(), untagged_lagged()],
+            // The first live tail stays open until the client's next frame.
+            FakeOpen::Connect(None) if opened == 1 => vec![connected(), stdout("one\n")],
+            // Such a guest may answer a connect without a cursor as a start.
+            FakeOpen::Connect(None) => vec![started(), stdout("two\n"), exited()],
+            FakeOpen::Start => panic!("the process is already bound"),
+        }),
+    )
+    .await;
+    let mut tcp = attach_native_websocket(&fake.endpoint, session_id).await;
+    let mut seen = String::new();
+    read_websocket_until(&mut tcp, &mut seen, "stdout").await;
+    send_websocket_text(&mut tcp, r#"{"type":"heartbeat","seq":1}"#).await;
+    let frames = websocket_frames_to_close(&mut tcp).await;
+
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame["type"] == "backend_reconnected"),
+        "{frames:?}"
+    );
+    assert_eq!(
+        websocket_stdout(&frames),
+        seq_lines(&[(UNPOSITIONED_SEQ_BASE + 2, "two\n")])
+    );
+    assert_eq!(
+        *fake.opens.lock().unwrap(),
+        connects(&[Some(0), None, None])
+    );
 }
 
 /// A guest can refuse each reopen after a window miss the same way before

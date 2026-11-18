@@ -531,6 +531,21 @@ pub(super) fn websocket_keepalive_interval(state: &DataPlaneState) -> tokio::tim
     interval
 }
 
+/// The `seq` after which a stream numbers output it cannot place: the live
+/// tail it follows because a guest too old to say where its retained output
+/// starts evicted it while the process runs. Far above any position a
+/// process's output reaches, so a reattach with such a `seq` is told apart
+/// from one with a position, and replays the retained output from its start
+/// behind `resync_required` instead of continuing at a position that output
+/// never had. Below `i64::MAX`, so `after_seq` accepts it.
+pub(super) const UNPOSITIONED_SEQ_BASE: u64 = 1 << 62;
+
+/// The guest cursor of output `seq`, or `None` for output the stream numbered
+/// itself (see [`UNPOSITIONED_SEQ_BASE`]).
+fn output_position(seq: u64) -> Option<u64> {
+    (seq < UNPOSITIONED_SEQ_BASE).then_some(seq)
+}
+
 /// Where a process stream reopens after the guest refused its position as
 /// outside the output it retains.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -591,11 +606,10 @@ pub(crate) async fn bridge_process_session(
     // a client that attaches again on any replica with the last one it
     // received continues after it. Without `after_seq` the stream starts at
     // the beginning of the retained output, as an SSE stream does without
-    // `Last-Event-ID`. A stream that follows the live tail, behind a
-    // `resync_required`, because a guest too old to say where its retained
-    // output starts evicted it while the process runs, cannot learn the
-    // tail's position, and numbers its output on from where it was.
-    let mut output_seq = after_seq.unwrap_or(0);
+    // `Last-Event-ID`, and so does an `after_seq` the stream numbered itself
+    // ([`UNPOSITIONED_SEQ_BASE`]), behind `resync_required`.
+    let resumes_unpositioned = after_seq.is_some_and(|seq| output_position(seq).is_none());
+    let mut output_seq = after_seq.and_then(output_position).unwrap_or(0);
     let open = open_native_process_stream(
         &state,
         session_id,
@@ -646,6 +660,19 @@ pub(crate) async fn bridge_process_session(
             return Err(error);
         }
     };
+    if resumes_unpositioned
+        && send_server_frame(
+            &mut sink,
+            &resync_required_frame(
+                attached.kind.as_str(),
+                DataPlaneResyncReason::CursorOutOfWindow,
+            ),
+        )
+        .await
+        .is_err()
+    {
+        return Ok(BridgeEnd::Completed);
+    }
     let mut process_id = attached.backend_process_id.clone();
     let mut process_bound = attached.backend_process_id.is_some();
     let mut binding: Option<PendingProcessBinding> = None;
@@ -654,9 +681,6 @@ pub(crate) async fn bridge_process_session(
     // Moving past output the guest no longer retains skips it, which
     // `process_exited` then reports as `output_truncated`.
     let mut output_skipped = false;
-    // The stream follows the live tail, so `output_seq` is no position the
-    // guest can reopen at.
-    let mut live_tail = false;
     // Reopens after a window miss since the last output, capped at
     // `PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS`.
     let mut window_reopens_without_progress = 0_u32;
@@ -711,9 +735,11 @@ pub(crate) async fn bridge_process_session(
                             // This attach started the process, so its output
                             // begins here: the position the client resumed
                             // from was another's. Output from the start
-                            // repeats rather than skips.
+                            // repeats rather than skips. A stream past any
+                            // position reopened at the live tail, so its
+                            // start is a reconnect's, not this attach's.
                             if matches!(event.event, Some(spaced_process_event::Event::Started(_)))
-                                && output_seq != 0
+                                && output_position(output_seq).is_some_and(|seq| seq != 0)
                             {
                                 output_seq = 0;
                                 send_server_frame(
@@ -804,10 +830,8 @@ pub(crate) async fn bridge_process_session(
                             if let Some(current_process_id) = process_id.clone()
                                 && window_reopens_without_progress
                                     < PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS
-                                && let Some(reopen) = window_miss_reopen(
-                                    &status,
-                                    (!live_tail).then_some(output_seq),
-                                )
+                                && let Some(reopen) =
+                                    window_miss_reopen(&status, output_position(output_seq))
                             {
                                 let reopen_at = match reopen {
                                     WindowMissReopen::At(cursor) => Some(cursor),
@@ -831,10 +855,10 @@ pub(crate) async fn bridge_process_session(
                                 // tail, skips some.
                                 output_skipped |=
                                     reopen_at.is_none_or(|cursor| cursor > output_seq);
-                                live_tail = reopen_at.is_none();
-                                if let Some(cursor) = reopen_at {
-                                    output_seq = cursor;
-                                }
+                                // The live tail's output gets `seq`s past any
+                                // position.
+                                output_seq =
+                                    reopen_at.unwrap_or(output_seq.max(UNPOSITIONED_SEQ_BASE));
                                 window_reopens_without_progress += 1;
                                 send_server_frame(
                                     &mut sink,
@@ -895,7 +919,7 @@ pub(crate) async fn bridge_process_session(
                                         &mut reconnect_client,
                                         &refreshed.sandbox_id,
                                         &current_process_id,
-                                        (!live_tail).then_some(output_seq),
+                                        output_position(output_seq),
                                         refreshed.space_api_route_token.as_ref(),
                                     )
                                     .await?;
@@ -979,7 +1003,7 @@ pub(crate) async fn bridge_process_session(
                                         &mut client,
                                         &refreshed.sandbox_id,
                                         &current_process_id,
-                                        Some(output_seq),
+                                        output_position(output_seq),
                                         refreshed.space_api_route_token.as_ref(),
                                     )
                                     .await?;
