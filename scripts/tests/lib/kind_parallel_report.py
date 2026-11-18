@@ -2,9 +2,10 @@
 """Inventory, coverage check, summary and timeline of a smoke-kind-parallel.sh run.
 
 `inventory --benches N` prints, as JSON, each API surface's eligible scenarios
-and each bench's share of them, computed with the typed runner's own registry
-and partition (space_smoke.sharding.select_shard). It needs the project
-environment (`uv run`), and reads the same variables the runner reads.
+and each bench's share of them, computed with the typed runner's own
+eligibility and partition (space_smoke.sharding.joint_inventories and
+select_shard). It needs the project environment (`uv run`), and reads the same
+variables the runner reads.
 
 `source REPO FILE` records the checkout a run starts from (see `source`).
 
@@ -38,34 +39,25 @@ SURFACES = ("ecw", "native")
 def inventory(benches: int) -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from space_smoke.scenarios import REGISTRY
-    from space_smoke.sharding import select_shard
+    from space_smoke.sharding import joint_inventories, select_shard
 
-    # The runner's own eligibility, in the order it applies it for a sharded
-    # `--all` pass (space_smoke/__main__.py, _run_all): tiers and extra
-    # scenarios, surface, backend, then browser withholding. Mode-dependent
-    # skips happen after the partition and are read from the logs.
+    # The variables a bench's `--all` pass reads (space_smoke/__main__.py,
+    # _run_all); smoke-kind-parallel.sh runs this with a bench's environment.
     tiers = tuple(
         part.strip() for part in os.environ.get("SPACE_SMOKE_TIERS", "routine").split(",")
     )
-    included = tuple(
-        part.strip()
-        for part in os.environ.get("SPACE_SMOKE_INCLUDE_SCENARIOS", "").split(",")
-        if part.strip()
+    inventories = joint_inventories(
+        REGISTRY,
+        template=os.environ.get("E2B_TEMPLATE") or None,
+        tiers=tiers,
+        include_scenarios=tuple(
+            part.strip()
+            for part in os.environ.get("SPACE_SMOKE_INCLUDE_SCENARIOS", "").split(",")
+            if part.strip()
+        ),
+        backend=os.environ.get("SPACE_SMOKE_BACKEND", "kind"),
+        browser_selection=os.environ.get("SPACE_SMOKE_BROWSER_SCENARIOS") or "run",
     )
-    withhold = os.environ.get("SPACE_SMOKE_BROWSER_SCENARIOS", "run") == "withhold"
-    template = os.environ.get("E2B_TEMPLATE") or None
-    inventories = {
-        surface: tuple(
-            scenario
-            for scenario in REGISTRY.select(
-                category=None, template=template, tiers=tiers, include_scenarios=included
-            )
-            if surface in scenario.api_surfaces
-            and "kind" in scenario.backends
-            and not (withhold and scenario.browser is not None)
-        )
-        for surface in SURFACES
-    }
     shares = {
         str(index): {
             surface: [

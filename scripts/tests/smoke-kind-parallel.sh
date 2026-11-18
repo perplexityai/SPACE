@@ -632,11 +632,29 @@ seed() {
   SPACE_SEED_OUTPUT_DIR="$SEED_DIR" bash "$REPO_ROOT/infra/space/kind/scripts/build-seed.sh" || return 1
 }
 
-# The full inventory, for the coverage check: the typed runner's own registry
-# and partition, read in this checkout's project environment. Written whole or
-# not at all, so the summary never reads a partial file as the inventory.
+# The typed runner's scenario selection, as every bench gets it (bench_env)
+# and the inventory reads it.
+smoke_selection_env() {
+  printf 'SPACE_SMOKE_BROWSER_SCENARIOS=%s\n' "${SPACE_SMOKE_BROWSER_SCENARIOS:-withhold}"
+  printf 'SPACE_SMOKE_TIERS=%s\n' "${SPACE_SMOKE_TIERS:-routine}"
+  [[ -z "${SPACE_SMOKE_INCLUDE_SCENARIOS:-}" ]] \
+    || printf 'SPACE_SMOKE_INCLUDE_SCENARIOS=%s\n' "$SPACE_SMOKE_INCLUDE_SCENARIOS"
+}
+
+# The full inventory, for the coverage check: the typed runner's own
+# eligibility and partition, computed with only what a bench's typed pass
+# reads (its selection and the backend smoke-kind-typed.sh sets), so a
+# variable only the caller has, such as E2B_TEMPLATE, cannot change it.
+# Written whole or not at all, so the summary never reads a partial file as
+# the inventory.
 inventory() {
-  (cd "$REPO_ROOT" && SPACE_SMOKE_BROWSER_SCENARIOS="${SPACE_SMOKE_BROWSER_SCENARIOS:-withhold}" \
+  local listed settings=()
+  listed="$(smoke_selection_env)" || return 1
+  mapfile -t settings <<<"$listed"
+  (cd "$REPO_ROOT" && env -i HOME="$HOME" PATH="$PATH" \
+    UV_CACHE_DIR="${UV_CACHE_DIR:-$HOME/.cache/uv}" \
+    UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$HOME/.local/share/uv/python}" \
+    "${settings[@]}" SPACE_SMOKE_BACKEND=kind \
     uv run --frozen --python 3.11 python "$SCRIPT_DIR/lib/kind_parallel_report.py" inventory \
       --benches "$BENCHES" >"$HOST/inventory.json.tmp") || return 1
   mv "$HOST/inventory.json.tmp" "$HOST/inventory.json" || return 1
@@ -653,13 +671,12 @@ bench_env() {
     # CI's smoke job environment (kind-ci.yml), pinned the same way.
     printf 'SPACE_KIND_TELEMETRY_MODE=%s\n' "${SPACE_KIND_TELEMETRY_MODE:-otel}"
     printf 'SPACE_KIND_OBSERVABILITY_LAYOUT=%s\n' "${SPACE_KIND_OBSERVABILITY_LAYOUT:-ci}"
-    printf 'SPACE_SMOKE_BROWSER_SCENARIOS=%s\n' "${SPACE_SMOKE_BROWSER_SCENARIOS:-withhold}"
-    printf 'SPACE_SMOKE_TIERS=%s\n' "${SPACE_SMOKE_TIERS:-routine}"
+    smoke_selection_env
     printf 'SPACE_KIND_RUST_ARTIFACTS=prebuilt\n'
     printf 'SPACE_KIND_BUILD_CACHE_REPOSITORY=%s\n' "$LAYER_CACHE"
     local name
     # The lanes' settings (README: release build, Direct substrate) too.
-    for name in SPACE_KIND_SUBSTRATE SPACE_SMOKE_INCLUDE_SCENARIOS SPACE_CI_IMAGE_MIRROR \
+    for name in SPACE_KIND_SUBSTRATE SPACE_CI_IMAGE_MIRROR \
         SPACE_KIND_RUST_BUILD SPACE_CONSOLE_PASSWORD SPACE_KIND_STORAGE_CREDENTIALS \
         SPACE_SMOKE_SUBSTRATE SPACE_SMOKE_KNOWN_FAILURES; do
       [[ -n "${!name:-}" ]] && printf '%s=%s\n' "$name" "${!name}"

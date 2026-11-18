@@ -19,7 +19,7 @@ from space_smoke.services import (
     SmokeServices,
     repair_orphaned_kind_faults,
 )
-from space_smoke.sharding import JOINT_SURFACES, select_shard
+from space_smoke.sharding import JOINT_SURFACES, joint_inventories, select_shard
 from space_smoke.suite import (
     KNOWN_FAILURES_ENV,
     RESULT_PREFIX,
@@ -465,19 +465,14 @@ def _run_all(
         # pass of the run computes one partition.
         inventories = None
         if category is None and api_surface in JOINT_SURFACES:
-            inventories = {
-                surface: tuple(
-                    scenario
-                    for scenario in REGISTRY.select(
-                        category=None, template=template, tiers=selected_tiers,
-                        include_scenarios=included,
-                    )
-                    if surface in scenario.api_surfaces
-                    and backend in scenario.backends
-                    and (browser_selection != "withhold" or scenario.browser is None)
-                )
-                for surface in JOINT_SURFACES
-            }
+            inventories = joint_inventories(
+                REGISTRY,
+                template=template,
+                tiers=selected_tiers,
+                include_scenarios=included,
+                backend=backend,
+                browser_selection=browser_selection,
+            )
         inventory = scenarios
         scenarios = select_shard(
             scenarios,
