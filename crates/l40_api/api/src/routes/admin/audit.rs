@@ -1,12 +1,12 @@
 use crate::routes::public::error::database_error;
 use pplx_space_accounts::{ApiKeyId, NodeId, OrgId, UserId};
-use pplx_space_common_core::types::NodeGroupId;
+use pplx_space_node_model::NodeGroupId;
 
 use axum::{
     Json,
     extract::{Query, State},
 };
-use pplx_space_common_core::types::NodeDrainMode;
+use pplx_space_node_model::NodeDrainMode;
 use pplx_space_public_api::{OperationId, PublicSandboxId};
 use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};

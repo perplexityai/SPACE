@@ -29,9 +29,7 @@
 pub mod admin;
 pub mod client_id;
 pub mod kek;
-pub mod node;
 pub mod node_fs;
-pub mod node_group;
 pub mod object_store;
 #[cfg(feature = "sqlx")]
 mod postgres;
@@ -46,9 +44,7 @@ pub mod subject;
 pub use admin::*;
 pub use client_id::*;
 pub use kek::*;
-pub use node::*;
 pub use node_fs::*;
-pub use node_group::*;
 pub use object_store::*;
 pub use restore_retirement::*;
 pub use sandbox::*;

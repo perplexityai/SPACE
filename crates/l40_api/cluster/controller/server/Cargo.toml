@@ -52,6 +52,7 @@ futures-util = { workspace = true }
 jiff = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 kube = { workspace = true, default-features = false, features = ["client"], optional = true }
+pplx-space-node-model = { workspace = true }
 pplx-space-template-model = { workspace = true }
 prost-types = { workspace = true }
 serde_json = { workspace = true }

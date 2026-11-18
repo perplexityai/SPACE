@@ -2,7 +2,7 @@
 //! tombstone checks.
 
 use super::*;
-use pplx_space_common_core::types::SubstrateKind;
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_node_registration_store::{
     K8sNodeRegistration, K8sNodeRegistrationError, K8sNodeRegistrationStep, register_k8s_node,
 };

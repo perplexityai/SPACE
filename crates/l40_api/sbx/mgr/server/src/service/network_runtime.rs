@@ -1412,10 +1412,10 @@ fn route_identity_to_netgtw_proto(
             route_generation: identity.route_generation.map(|value| value.get()),
             current_node_id: identity.current_node_id.map(|value| value.to_string()),
             substrate_kind: match identity.effective_substrate_kind() {
-                Some(pplx_space_common_core::types::NodeManagedBy::Space) => {
+                Some(pplx_space_node_model::NodeManagedBy::Space) => {
                     pplx_space_net_gateway_client::proto::SandboxSubstrateKind::Direct as i32
                 }
-                Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes) => {
+                Some(pplx_space_node_model::NodeManagedBy::Kubernetes) => {
                     pplx_space_net_gateway_client::proto::SandboxSubstrateKind::Kubernetes as i32
                 }
                 None => {

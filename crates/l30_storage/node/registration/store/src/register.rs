@@ -2,7 +2,7 @@
 //! the caller's transaction.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{NodeRole, SubstrateKind};
+use pplx_space_node_model::{NodeRole, SubstrateKind};
 use pplx_space_sql_locator::sql;
 use sqlx::PgConnection;
 

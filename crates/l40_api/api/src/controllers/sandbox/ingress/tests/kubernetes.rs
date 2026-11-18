@@ -16,9 +16,9 @@ use crate::test_support::kubernetes::{
 async fn stored_ingress_access_resumes_paused_execution_before_reporting_ready()
 -> pplx_space_test_env::TestResult {
     use pplx_space_auto_lifecycle::AutoLifecycleWakeSource;
-    use pplx_space_common_core::types::NodeManagedBy;
     use pplx_space_db_test_fixtures::try_pg_test_db;
     use pplx_space_node_api_sim::{SandboxRecord, SimWorkerHarness};
+    use pplx_space_node_model::NodeManagedBy;
     use prost::Message;
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());

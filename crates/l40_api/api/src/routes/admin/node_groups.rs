@@ -14,7 +14,7 @@
 //! cluster-controller mirror reconciler copies it from the live node label.
 
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::NodeGroupId;
+use pplx_space_node_model::NodeGroupId;
 
 use std::str::FromStr;
 
@@ -25,11 +25,11 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use pplx_space_common_core::types::NodeGroupTemplatePolicy;
 use pplx_space_common_core::types::admin::{
     AdminNodeGroupResponse, AssignOrgRequest, CreateNodeGroupRequest, SetCompatRequest,
     SetTemplatePolicyRequest,
 };
+use pplx_space_node_model::NodeGroupTemplatePolicy;
 use pplx_space_template_model::TemplateVisibility;
 use uuid::Uuid;
 

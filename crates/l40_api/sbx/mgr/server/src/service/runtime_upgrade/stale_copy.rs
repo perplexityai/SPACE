@@ -82,7 +82,7 @@ impl crate::service::SandboxManagerService {
         // identity names the substrate: a suspended row keeps none.
         if crate::service::activation_support::space_api_route_identity_from_start_request(staging)?
             .effective_substrate_kind()
-            != Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+            != Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
         {
             return Ok(());
         }

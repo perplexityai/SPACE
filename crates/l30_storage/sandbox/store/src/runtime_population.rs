@@ -4,7 +4,7 @@
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::types::SubstrateKind;
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, no_newer_full_snapshot,
     restore_retry_source_snapshot_is_current, snapshot_is_current_local_artifact,

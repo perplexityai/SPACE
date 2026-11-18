@@ -11,7 +11,7 @@
 use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::NodeGroupId;
+use pplx_space_node_model::NodeGroupId;
 use pplx_space_sandbox_portability::{
     inflight_suspend_upload_from_node_exists, snapshot_durable_for_source_release,
     snapshot_is_current_local_artifact,

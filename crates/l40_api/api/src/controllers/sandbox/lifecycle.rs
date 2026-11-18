@@ -7,10 +7,10 @@ use crate::controllers::substrate::{
     ActivationAttribution, ActivationClient, CapPolicy, RecoveryCharge,
 };
 use crate::metrics::sandbox::api::RequestedKind;
-use pplx_space_common_core::types::{NodeDrainPhase, NodeDrainState, NodeManagedBy, NodeRole};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_node_model::{NodeDrainPhase, NodeDrainState, NodeManagedBy, NodeRole};
 use pplx_space_postgres_pool::contention;
 use pplx_space_sandbox_portability::portable_for_restore_affinity;
 use pplx_space_sandbox_store as sandbox_store;

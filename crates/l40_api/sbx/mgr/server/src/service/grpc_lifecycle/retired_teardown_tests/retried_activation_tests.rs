@@ -98,7 +98,7 @@ fn begin_restore(
         route_generation: Some(RouteGeneration::new(GENERATION as u64).unwrap()),
         execution_generation: Some(generation(GENERATION)),
         current_node_id: Some(crate::service::test_options::test_node_id()),
-        substrate_kind: Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes),
+        substrate_kind: Some(pplx_space_node_model::NodeManagedBy::Kubernetes),
         activation_attempt_id: Some(attempt),
         pod_uid: Some("retried-pod".parse().unwrap()),
     };

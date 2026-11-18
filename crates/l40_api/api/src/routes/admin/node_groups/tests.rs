@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::NodeGroupId;
+use pplx_space_node_model::NodeGroupId;
 
 #[test]
 fn parse_group_spec_accepts_bare_uuid_and_uuid_colon_action() {

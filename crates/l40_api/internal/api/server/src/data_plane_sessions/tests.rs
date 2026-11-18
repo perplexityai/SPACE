@@ -446,7 +446,7 @@ fn a_reattach_asks_for_the_wake_the_node_would_allow() {
 #[tokio::test]
 async fn a_service_route_reset_is_fenced_by_the_current_route_generation()
 -> pplx_space_db_test_fixtures::TestDbResult<()> {
-    use pplx_space_common_core::types::SubstrateKind;
+    use pplx_space_node_model::SubstrateKind;
     use pplx_space_sql_locator::sql;
     const PORT: u16 = 8080;
     const GENERATION: i64 = 3;

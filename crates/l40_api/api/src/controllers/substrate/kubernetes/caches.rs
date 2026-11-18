@@ -12,8 +12,8 @@ use kube::{
         watcher,
     },
 };
-use pplx_space_common_core::types::NodeRole as SpaceNodeRole;
 use pplx_space_kube_client::spawn_reflector;
+use pplx_space_node_model::NodeRole as SpaceNodeRole;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 

@@ -6,12 +6,11 @@ use std::time::Duration;
 use crate::metrics::sandbox::api::{SandboxApiMetricIdentity, scope_request_client_id};
 use axum::http::StatusCode;
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{
-    NodePoolName, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
-};
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SandboxLifecycleParseError};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_node_model::NodePoolName;
 use pplx_space_public_api::{
     OperationKind, OperationState, PublicErrorCode, PublicOperationResult, PublicSandboxId,
     PublicSandboxOperationResult, RollbackSandboxRequest, SandboxLifecycleAction,

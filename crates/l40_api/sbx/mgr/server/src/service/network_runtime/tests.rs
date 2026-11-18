@@ -551,7 +551,7 @@ fn test_route_identity() -> SpaceApiRouteIdentity {
     SpaceApiRouteIdentity {
         route_generation: Some(RouteGeneration::new(42).expect("route generation parses")),
         current_node_id: Some(NodeId::new()),
-        substrate_kind: Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes),
+        substrate_kind: Some(pplx_space_node_model::NodeManagedBy::Kubernetes),
         execution_generation: Some(ExecutionGeneration::new(7).expect("generation parses")),
         pod_uid: Some(PodUid::parse("pod-uid-42").expect("pod uid parses")),
         ..Default::default()

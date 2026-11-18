@@ -1194,7 +1194,7 @@ fn test_route_identity() -> SandboxRouteIdentity {
         SandboxId::new(),
         RouteGeneration::new(7).unwrap(),
         NodeId::new(),
-        pplx_space_common_core::types::NodeManagedBy::Kubernetes,
+        pplx_space_node_model::NodeManagedBy::Kubernetes,
         ExecutionGeneration::new(11).unwrap(),
         SandboxActivationAttemptId::new(),
         Some(PodUid::parse("sandbox-pod-uid").unwrap()),

@@ -284,14 +284,15 @@ pub(crate) mod service_tests {
     };
     use pplx_space_cluster_id::ClusterId;
     use pplx_space_common_core::types::{
-        ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeManagedBy,
-        RouteGeneration, SandboxActivationAttemptId, SandboxQuarantineHistoryAction,
-        SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-        SandboxRouteIdentity, SpaceApiRouteIdentity,
+        ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, RouteGeneration,
+        SandboxActivationAttemptId, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+        SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRouteIdentity,
+        SpaceApiRouteIdentity,
     };
     use pplx_space_host_layout::identities::{user_names, users};
     use pplx_space_k8s_ids::PodUid;
     use pplx_space_k8s_node_id::space_k8s_node_id;
+    use pplx_space_node_model::NodeManagedBy;
 
     use prost::Message as _;
 

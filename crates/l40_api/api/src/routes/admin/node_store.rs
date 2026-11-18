@@ -10,9 +10,12 @@ use std::num::NonZeroUsize;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId, NodeManagedBy,
-    NodeRole, SandboxId,
+    SandboxId,
     admin::{AdminNodeCtlStatus, AdminNodeServiceHealth, ListAdminNodesFilters},
+};
+use pplx_space_node_model::{
+    NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId, NodeManagedBy,
+    NodeRole,
 };
 #[cfg(test)]
 use pplx_space_sandbox_portability::drain_gate_blocker_pairs;

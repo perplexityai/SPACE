@@ -1,5 +1,5 @@
 use pplx_space_accounts::{OrgId, UserId};
-use pplx_space_common_core::types::NodeGroupId;
+use pplx_space_node_model::NodeGroupId;
 
 use pplx_space_observability::test_capture::{CapturedEvent, CapturedEventsLayer, field_value};
 use tracing_subscriber::layer::SubscriberExt;

@@ -1,8 +1,8 @@
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
-use pplx_space_common_core::types::{
-    NodeAddress,
-    admin::{AdminNodeNetworkSlots, AdminNodeResponse, AdminNodeSort, DrainRequest},
+use pplx_space_common_core::types::admin::{
+    AdminNodeNetworkSlots, AdminNodeResponse, AdminNodeSort, DrainRequest,
 };
+use pplx_space_node_model::NodeAddress;
 use pplx_space_template_model::TemplateReference;
 use reqwest::{StatusCode, header};
 use serde::{Deserialize, Serialize};

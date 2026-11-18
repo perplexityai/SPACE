@@ -1,5 +1,6 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{SnapshotId, SubstrateKind};
+use pplx_space_common_core::types::SnapshotId;
+use pplx_space_node_model::SubstrateKind;
 
 use pplx_space_sql_locator::sql;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,10 +16,10 @@ use pplx_space_cluster_trigger_queue::{
     QueuedRefConflict, enqueue_triggers_conn, queue_node_reconcile_refs,
 };
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeRole,
-    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, SandboxActivationAttemptId,
+    SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxTransitionReceipt,
+    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
     SandboxTransitionTargetState,
 };
 use pplx_space_cpu_arch::Arch;
@@ -28,6 +29,7 @@ use pplx_space_events::{
 use pplx_space_execution_spec::{ExecutionMetadata, RuntimeKind};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::proto::NetworkPolicySource;
+use pplx_space_node_model::NodeRole;
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_portability::{
     started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible,

@@ -6,8 +6,8 @@ use super::*;
 #[cfg(feature = "kubernetes")]
 #[tokio::test]
 async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_env::TestResult {
-    use pplx_space_common_core::types::SubstrateKind;
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
+    use pplx_space_node_model::SubstrateKind;
     use pplx_space_public_api::{OperationKind, OperationTargetType};
     use pplx_space_sql_locator::sql;
 
@@ -119,8 +119,9 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
 #[tokio::test]
 async fn ready_capture_completes_in_one_claim_but_pending_upload_still_yields()
 -> pplx_space_test_env::TestResult {
-    use pplx_space_common_core::types::{LocalArtifactId, SubstrateKind};
+    use pplx_space_common_core::types::LocalArtifactId;
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
+    use pplx_space_node_model::SubstrateKind;
     use pplx_space_public_api::{OperationKind, OperationTargetType};
     use pplx_space_sql_locator::sql;
 

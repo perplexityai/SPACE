@@ -14,7 +14,7 @@
 
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
-use pplx_space_common_core::types::{BackupAttemptId, LocalArtifactId, NodeManagedBy};
+use pplx_space_common_core::types::{BackupAttemptId, LocalArtifactId};
 use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
 use pplx_space_net_gateway_client::proto::{ServicePortIngressFrame, service_port_ingress_frame};
 use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
@@ -23,6 +23,7 @@ use pplx_space_node_api_client::proto::{
     ListNodeTemplatesRequest, ListNodeTemplatesResponse, PullTemplateRequest, PullTemplateResponse,
     TriggerStateReconciliationRequest, TriggerStateReconciliationResponse,
 };
+use pplx_space_node_model::NodeManagedBy;
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sbx_mgr_client::proto as sbx;
 use pplx_space_template_mgr_client::proto as tmpl;
@@ -1689,7 +1690,7 @@ async fn sim_wake(
     // observation is only a resume fence and cannot authorize reusing its ID.
     if let Ok(record) = &rec
         && matches!(record.status.as_str(), status::STOPPED | status::SUSPENDED)
-        && record.route_substrate_kind == Some(pplx_space_common_core::types::NodeManagedBy::Space)
+        && record.route_substrate_kind == Some(pplx_space_node_model::NodeManagedBy::Space)
         && let Some(retained) = record.execution_generation
     {
         let Some(identity) = &requested_identity else {
@@ -1804,7 +1805,7 @@ async fn sim_wake(
         sbx::WakeTransition::Noop | sbx::WakeTransition::Resume | sbx::WakeTransition::Wait
             if requested_identity.is_none() =>
         {
-            (rec.route_substrate_kind == Some(pplx_space_common_core::types::NodeManagedBy::Space))
+            (rec.route_substrate_kind == Some(pplx_space_node_model::NodeManagedBy::Space))
                 .then(|| record_route_identity(state.node_id(), &rec))
                 .flatten()
         }

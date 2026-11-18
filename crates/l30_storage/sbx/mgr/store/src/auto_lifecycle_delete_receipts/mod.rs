@@ -3,9 +3,10 @@ use std::str::FromStr;
 
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
 use pplx_space_common_core::types::{
-    AutoLifecycleDeleteReceiptId, ExecutionGeneration, NodeManagedBy, SandboxActivationAttemptId,
-    SandboxId, SpaceApiRouteIdentity,
+    AutoLifecycleDeleteReceiptId, ExecutionGeneration, SandboxActivationAttemptId, SandboxId,
+    SpaceApiRouteIdentity,
 };
+use pplx_space_node_model::NodeManagedBy;
 
 #[cfg(test)]
 mod tests;

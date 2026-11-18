@@ -12,8 +12,8 @@ use std::time::Duration;
 use pplx_space_accounts::{ORPHANED_SANDBOX_OWNER, SandboxOwner};
 use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleRuntimeState};
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeManagedBy,
-    SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineHistoryAction,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, SandboxActivationAttemptId,
+    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineHistoryAction,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
     SandboxRuntimeLabel, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
     SandboxTransitionReceiptKind, SandboxTransitionTargetState, SnapshotName,
@@ -27,6 +27,7 @@ use pplx_space_execution_spec::{ExecutionMetadata, RuntimeIdentity, RuntimeKind}
 #[cfg(test)]
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::{NetworkPolicy, proto::NetworkPolicySource};
+use pplx_space_node_model::NodeManagedBy;
 pub use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sqlite::SqliteU64;
 use pplx_space_template_model::ORPHANED_SANDBOX_TEMPLATE;

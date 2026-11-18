@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{SandboxLifecycle, SubstrateKind};
+use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_node_model::SubstrateKind;
 
 use std::collections::BTreeMap;
 

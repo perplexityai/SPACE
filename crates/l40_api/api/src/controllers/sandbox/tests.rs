@@ -1465,7 +1465,8 @@ mod response_tests {
         ed25519::SpaceApiRouteEd25519Authority,
         ed25519::decode_unverified_space_api_route_ed25519_claims,
     };
-    use pplx_space_common_core::types::{NodeManagedBy, SandboxId};
+    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_node_model::NodeManagedBy;
 
     use sqlx::types::Json;
 

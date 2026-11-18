@@ -593,7 +593,7 @@ async fn node_local_handoff(
     insert_test_sandbox(&conn, &id, SandboxState::Paused);
     let mut fields = runtime_fields(ExecutionGeneration::new(GENERATION).unwrap(), 7);
     fields.space_api_route_identity.substrate_kind =
-        Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+        Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
     crate::db::update_runtime_fields(&conn, sandbox_id, fields).unwrap();
     assert!(
         crate::db::begin_suspend(

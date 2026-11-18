@@ -835,7 +835,7 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
 
     fn check_node_pool_placement(
         &self,
-        _node_pool: &pplx_space_common_core::types::NodePoolName,
+        _node_pool: &pplx_space_node_model::NodePoolName,
     ) -> Result<(), SubstrateError> {
         panic!("unused")
     }
@@ -1186,7 +1186,7 @@ impl SubstrateAdapter for NodeRpcStubbedKubernetes {
 
     fn check_node_pool_placement(
         &self,
-        _node_pool: &pplx_space_common_core::types::NodePoolName,
+        _node_pool: &pplx_space_node_model::NodePoolName,
     ) -> Result<(), SubstrateError> {
         panic!("unused")
     }

@@ -161,13 +161,13 @@ precedent. Node-local `rusqlite` call sites are not annotated today.
 
 Control-plane Postgres `sandboxes.managed_by` and `nodes.managed_by` hold the
 substrate that owns a row, `'k8s'` or `'space'`.
-`pplx_space_common_core::types::SubstrateKind` (an alias of `NodeManagedBy`)
+`pplx_space_node_model::SubstrateKind` (an alias of `NodeManagedBy`)
 names that value and encodes as the column's text, so new code binds it as a
 parameter instead of spelling the literal:
 
 ```rust
-use pplx_space_common_core::types::SubstrateKind;
 use pplx_space_sql_locator::sql;
+use pplx_space_node_model::SubstrateKind;
 
 sqlx::query_scalar::<_, NodeId>(sql!(
     "SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = $2"

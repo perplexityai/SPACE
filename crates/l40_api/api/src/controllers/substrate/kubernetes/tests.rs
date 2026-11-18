@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeGroupId, SnapshotId};
+use pplx_space_common_core::types::SnapshotId;
+use pplx_space_node_model::NodeGroupId;
 
 use super::execution::{ensure_wake_recovery_lifecycle, should_join_started_recovery};
 use super::pod_ops::{
@@ -71,10 +72,8 @@ mod kubernetes_tests {
         ed25519::SpaceApiRouteEd25519Authority,
     };
     use pplx_space_common_core::types::{
-        ArtifactKind, ArtifactOrigin, ExecutionGeneration, NodeAddress, NodeGroup, NodeGroupName,
-        NodeGroupPolicy, NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole,
-        SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
-        TemplateCompatSpec,
+        ArtifactKind, ArtifactOrigin, ExecutionGeneration, SandboxActivationAttemptId,
+        SandboxLifecycle, SandboxTransitionTargetState,
     };
     use pplx_space_internal_api_server::publish_sandbox_states;
     use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
@@ -84,6 +83,10 @@ mod kubernetes_tests {
     };
     use pplx_space_node_api_client::proto::worker_api_server::WorkerApiServer;
     use pplx_space_node_api_sim::{SimState, SimWorkerApiService, SimWorkerHarness};
+    use pplx_space_node_model::{
+        NodeAddress, NodeGroup, NodeGroupName, NodeGroupPolicy,
+        NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole, TemplateCompatSpec,
+    };
     use pplx_space_sandbox_pod::{
         NodeGroupPlacement, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION,
         SANDBOX_NETWORK_SLOTS_RESOURCE, SANDBOX_NODE_GROUP_LABEL,

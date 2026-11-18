@@ -2,7 +2,8 @@ use super::{
     NodeDrainState, SandboxAction, post_wake_lifecycle_allows_started_update,
     wake_lifecycle_allows_started_update,
 };
-use pplx_space_common_core::types::{NodeDrainMode, NodeDrainPhase, SandboxLifecycle};
+use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase};
 
 #[test]
 fn placement_affecting_actions_match_design() {

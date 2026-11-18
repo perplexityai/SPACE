@@ -1,9 +1,10 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeManagedBy, RouteGeneration, SandboxActivationAttemptId, SandboxId,
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
     SandboxRouteIdentity, SandboxRouteIdentityInvariantError,
 };
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::NodeManagedBy;
 use tonic::Status;
 
 pub(crate) struct SandboxRouteIdentityParts {

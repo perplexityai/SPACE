@@ -13,11 +13,10 @@ use pplx_space_api::controllers::substrate::{
     SubstrateAdapter, SubstrateError, connect_node_api_client_for_target,
     sandbox_states_with_client,
 };
-use pplx_space_common_core::types::{
-    NodeManagedBy, NodeRole, SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SubstrateKind,
-};
+use pplx_space_common_core::types::{SandboxActivationAttemptId, SandboxId, SandboxLifecycle};
 use pplx_space_durations::PositiveDuration;
 use pplx_space_k8s_ids::{PodName, PodUid};
+use pplx_space_node_model::{NodeManagedBy, NodeRole, SubstrateKind};
 use pplx_space_sandbox_store::sweeper::{self, unrestorable_restoring_guards};
 use sqlx::PgPool;
 

@@ -16,7 +16,7 @@ use crate::metrics::sandbox::api::RouteIdentityDecisionReason;
 use pplx_space_accounts::{NodeId, SandboxOwner, UserId};
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExactStorageUri, ExecutionGeneration, LocalArtifactId, NodeRole,
+    ArtifactKind, ArtifactOrigin, ExactStorageUri, ExecutionGeneration, LocalArtifactId,
     SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxTransitionTargetState,
     SnapshotState, StorageUri,
 };
@@ -25,6 +25,7 @@ use pplx_space_events::{
 };
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_node_model::NodeRole;
 use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
     restore_retry_source_snapshot_is_current, restore_retry_suspended_revert_snapshot_exists,

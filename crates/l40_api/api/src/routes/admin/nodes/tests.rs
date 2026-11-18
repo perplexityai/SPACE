@@ -11,7 +11,7 @@ use pplx_space_test_env::TestResult;
 use tower::ServiceExt;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{NodeAddress, NodeDrainMode, NodeManagedBy, NodeRole};
+use pplx_space_node_model::{NodeAddress, NodeDrainMode, NodeManagedBy, NodeRole};
 use pplx_space_sandbox_store::node_holds;
 
 use super::holds::{NODE_HOLDS_LIMIT, holds_response};
@@ -170,8 +170,8 @@ fn escalating_a_gentle_drain_keeps_the_drains_age() {
 }
 
 /// That a NULL or unparseable `nodes.drain_mode` is escalatable is a
-/// composition of two properties pinned elsewhere —
-/// `types::node::tests::{absent,unrecognized}_drain_mode_column_reads_as_gentle`
+/// composition of two properties pinned elsewhere — node-model's
+/// `node::tests::{absent,unrecognized}_drain_mode_column_reads_as_gentle`
 /// for the resolution, and `escalating_a_gentle_drain_keeps_the_drains_age` for
 /// the transition. There was a test here restating that composition; it asserted
 /// nothing independently breakable, and its docstring claimed to pin the
@@ -328,7 +328,7 @@ fn force_upload_local_snapshots_never_changes_drain_phase() {
 /// on the source is what gives this an oracle.
 #[test]
 fn force_upload_refusal_text_has_no_embedded_indentation() {
-    use pplx_space_common_core::types::{NodeDrainPhase, NodeDrainState};
+    use pplx_space_node_model::{NodeDrainPhase, NodeDrainState};
 
     let states = [
         None,
@@ -347,7 +347,7 @@ fn force_upload_refusal_text_has_no_embedded_indentation() {
 
 #[test]
 fn force_upload_requires_a_closed_wake_gate() {
-    use pplx_space_common_core::types::{NodeDrainMode, NodeDrainPhase, NodeDrainState};
+    use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase, NodeDrainState};
 
     // No drain at all: the gate is open, so the action is refused.
     assert!(

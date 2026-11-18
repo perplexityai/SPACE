@@ -4,7 +4,7 @@ use super::super::scripted_test_doubles::{
 use super::super::tests::{node_api_pod_on_node, substrate_with_inventory_caches_and_pool};
 use super::*;
 use crate::controllers::substrate::{DurableSnapshotError, NodeApiTarget, Substrate};
-use pplx_space_common_core::types::{NodeManagedBy, NodeRole};
+use pplx_space_node_model::{NodeManagedBy, NodeRole};
 use pplx_space_public_api::OperationId;
 use pplx_space_sbx_mgr_client::proto as sbx;
 

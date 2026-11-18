@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use pplx_space_common_core::types::NodeDrainMode;
+use pplx_space_node_model::NodeDrainMode;
 
 use pplx_space_metrics_emit::{counter, elapsed_ms, gauge, tag, timing_ms};
 

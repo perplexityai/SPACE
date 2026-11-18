@@ -2182,7 +2182,7 @@ mod admission_pool_claim {
 
         let pinned = crate::public_sandbox_operations::controller_create_request(
             fixture.request(),
-            Some(pplx_space_common_core::types::NodePoolName::parse("isolated-test-pool").unwrap()),
+            Some(pplx_space_node_model::NodePoolName::parse("isolated-test-pool").unwrap()),
         );
         assert_eq!(
             controller

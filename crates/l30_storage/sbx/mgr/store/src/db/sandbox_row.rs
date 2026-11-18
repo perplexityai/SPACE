@@ -9,12 +9,12 @@ use std::collections::BTreeMap;
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleRuntimeState};
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeManagedBy,
-    RouteGeneration, SandboxActivationAttemptId, SandboxId, SandboxRuntimeLabel,
-    SpaceApiRouteIdentity,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, RouteGeneration,
+    SandboxActivationAttemptId, SandboxId, SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
 use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
+use pplx_space_node_model::NodeManagedBy;
 use pplx_space_policy_authority::PolicyAuthority;
 use rusqlite::types::Type;
 

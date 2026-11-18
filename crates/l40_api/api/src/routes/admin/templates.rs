@@ -14,9 +14,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::StreamExt as _;
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_cluster_pool::WarmPoolStore;
-use pplx_space_common_core::types::SubstrateKind;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_public_api::{
     OperationKind, OperationTargetType, PublicErrorCode, PublicErrorDetail, PublicErrorEnvelope,
     RequestFingerprint,

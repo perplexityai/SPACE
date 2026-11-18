@@ -92,7 +92,7 @@ async fn seed_timeout_sandbox(
     actor: &User,
     lifecycle: &str,
     policy: &AutoLifecyclePolicy,
-    managed_by: pplx_space_common_core::types::SubstrateKind,
+    managed_by: pplx_space_node_model::SubstrateKind,
     running_on: Option<(
         pplx_space_accounts::NodeId,
         &pplx_space_node_api_sim::SimWorkerHarness,
@@ -233,7 +233,7 @@ struct TimeoutLockFixture {
 }
 
 async fn timeout_lock_fixture() -> TestResult<TimeoutLockFixture> {
-    use pplx_space_common_core::types::SubstrateKind;
+    use pplx_space_node_model::SubstrateKind;
     // The lock holder, the lock-wait observer and the update each need a
     // connection.
     let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(3).await?;
@@ -288,7 +288,7 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock(
     #[case] lifecycle: &str,
     #[case] decision: &str,
 ) -> TestResult {
-    use pplx_space_common_core::types::SubstrateKind;
+    use pplx_space_node_model::SubstrateKind;
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
@@ -406,7 +406,7 @@ async fn an_ineligible_timeout_update_waits_for_the_row_lock(
     #[case] call: Call,
     #[case] decision: &str,
 ) -> TestResult {
-    use pplx_space_common_core::types::SubstrateKind;
+    use pplx_space_node_model::SubstrateKind;
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }

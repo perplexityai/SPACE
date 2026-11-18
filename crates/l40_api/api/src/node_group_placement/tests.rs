@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use k8s_openapi::api::core::v1::Node;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use pplx_space_common_core::types::{
+use pplx_space_node_model::{
     NodeGroupId, NodeGroupName, NodeGroupPolicy, NodeGroupTemplatePolicy, TemplateCompatSpec,
 };
 use pplx_space_sandbox_pod::SANDBOX_NODE_GROUP_LABEL;

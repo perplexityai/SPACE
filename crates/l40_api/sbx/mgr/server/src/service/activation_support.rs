@@ -4,8 +4,8 @@ use super::start_support::ActivationCleanupGuard;
 use super::*;
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeRole as SpaceNodeRole, RouteGeneration, SandboxActivationAttemptId,
-    SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxQuarantineReasonCode,
+    SpaceApiRouteIdentity,
 };
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
@@ -13,6 +13,7 @@ use pplx_space_events::{
 use pplx_space_host_layout::identities::users;
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_k8s_node_id::space_node_id;
+use pplx_space_node_model::NodeRole as SpaceNodeRole;
 use pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER;
 
 const NODE_ID_PATH: &str = "/space/etc/node-id";
@@ -96,8 +97,7 @@ pub(super) fn operation_activation_attempt_id_from_wire(
     route: &SpaceApiRouteIdentity,
 ) -> Result<Option<SandboxActivationAttemptId>, Status> {
     let Some(value) = value else { return Ok(None) };
-    if route.effective_substrate_kind()
-        != Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+    if route.effective_substrate_kind() != Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
         || route.route_generation.is_none()
         || route.execution_generation.is_none()
         || route.pod_uid.is_none()
@@ -144,10 +144,10 @@ pub(super) fn space_api_route_identity_to_wire(
         activation_attempt_id: identity.activation_attempt_id.map(|id| id.to_string()),
         substrate_kind: match identity.substrate_kind {
             None => crate::proto::SandboxSubstrateKind::Unspecified as i32,
-            Some(pplx_space_common_core::types::NodeManagedBy::Space) => {
+            Some(pplx_space_node_model::NodeManagedBy::Space) => {
                 crate::proto::SandboxSubstrateKind::Direct as i32
             }
-            Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes) => {
+            Some(pplx_space_node_model::NodeManagedBy::Kubernetes) => {
                 crate::proto::SandboxSubstrateKind::Kubernetes as i32
             }
         },
@@ -216,7 +216,7 @@ pub(super) fn space_api_route_identity_for_runtime_activation(
     if identity.substrate_kind.is_none() && identity.execution_generation.is_some() {
         identity.substrate_kind = identity
             .effective_substrate_kind()
-            .or(Some(pplx_space_common_core::types::NodeManagedBy::Space));
+            .or(Some(pplx_space_node_model::NodeManagedBy::Space));
     }
     // A runtime activation must publish a complete route identity, so an
     // activation that arrives without an attempt mints a placeholder. On the
@@ -259,7 +259,7 @@ fn direct_route_identity(
         identity: SpaceApiRouteIdentity {
             route_generation: Some(route_generation),
             current_node_id: Some(current_node_id),
-            substrate_kind: Some(pplx_space_common_core::types::NodeManagedBy::Space),
+            substrate_kind: Some(pplx_space_node_model::NodeManagedBy::Space),
             execution_generation: Some(execution_generation),
             activation_attempt_id: Some(SandboxActivationAttemptId::new()),
             ..Default::default()
@@ -304,7 +304,7 @@ pub(super) fn runtime_activation_wire_identity_can_open_claim(
     identity.route_generation.is_some()
         && identity.execution_generation.is_some()
         && identity.activation_attempt_id.is_some()
-        && identity.substrate_kind == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+        && identity.substrate_kind == Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
         && identity.pod_uid.is_some()
 }
 
@@ -626,7 +626,7 @@ impl SandboxManagerService {
         let substrate_kind = provenance
             .current_substrate_kind
             .or(provenance.retained_substrate_kind);
-        if substrate_kind == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes) {
+        if substrate_kind == Some(pplx_space_node_model::NodeManagedBy::Kubernetes) {
             return Err(
                 pplx_space_sbx_mgr_client::authoritative_route_identity_required_status(
                     "Kubernetes-managed sandbox activation requires an authoritative route identity",
@@ -712,10 +712,10 @@ pub(super) fn space_api_route_identity_from_wire(
         {
             crate::proto::SandboxSubstrateKind::Unspecified => None,
             crate::proto::SandboxSubstrateKind::Direct => {
-                Some(pplx_space_common_core::types::NodeManagedBy::Space)
+                Some(pplx_space_node_model::NodeManagedBy::Space)
             }
             crate::proto::SandboxSubstrateKind::Kubernetes => {
-                Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+                Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
             }
         },
         execution_generation: identity

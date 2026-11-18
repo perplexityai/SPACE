@@ -30,10 +30,11 @@ use pplx_space_auto_lifecycle::{
 };
 use pplx_space_cluster_id::{CLUSTER_ID_ENV, ClusterId};
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeManagedBy, RouteGeneration, SandboxActivationAttemptId, SandboxId,
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
     SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::NodeManagedBy;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;

@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 base64 = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_32"] }
+pplx-space-node-model = { workspace = true }
 pplx-space-template-model = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

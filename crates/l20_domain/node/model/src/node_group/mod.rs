@@ -105,7 +105,7 @@ impl TryFrom<String> for NodeGroupId {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::NodeGroupName;
+/// # use pplx_space_node_model::NodeGroupName;
 /// assert!(NodeGroupName::parse("Not-A-Label").is_err());
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -132,7 +132,7 @@ pub enum NodeGroupNameParseError {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::NodeGroupName;
+/// # use pplx_space_node_model::NodeGroupName;
 /// let name = NodeGroupName::parse("org-acme-1").unwrap();
 /// assert_eq!(name.as_str(), "org-acme-1");
 /// ```
@@ -147,7 +147,7 @@ impl NodeGroupName {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::NodeGroupName;
+    /// # use pplx_space_node_model::NodeGroupName;
     /// assert!(NodeGroupName::parse("workers").is_ok());
     /// assert!(NodeGroupName::parse("-workers").is_err());
     /// ```
@@ -216,7 +216,7 @@ impl From<NodeGroupName> for String {
 ///
 /// ```rust
 /// # use std::str::FromStr;
-/// # use pplx_space_common_core::types::NodeGroupTemplatePolicy;
+/// # use pplx_space_node_model::NodeGroupTemplatePolicy;
 /// assert!(NodeGroupTemplatePolicy::from_str("open").is_err());
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -233,7 +233,7 @@ pub struct NodeGroupTemplatePolicyParseError(String);
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::NodeGroupTemplatePolicy;
+/// # use pplx_space_node_model::NodeGroupTemplatePolicy;
 /// let policy: NodeGroupTemplatePolicy = "restricted".parse().unwrap();
 /// assert_eq!(policy, NodeGroupTemplatePolicy::Restricted);
 /// ```
@@ -255,7 +255,7 @@ impl NodeGroupTemplatePolicy {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::NodeGroupTemplatePolicy;
+    /// # use pplx_space_node_model::NodeGroupTemplatePolicy;
     /// assert_eq!(NodeGroupTemplatePolicy::Default.as_str(), "default");
     /// ```
     pub const fn as_str(self) -> &'static str {
@@ -337,7 +337,7 @@ impl TemplateCompatSpec {
     ///
     /// ```rust
     /// # use pplx_space_accounts::OrgId;
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_node_model::*;
     /// # use pplx_space_template_model::{TemplateName, TemplateVisibility};
     /// let org = OrgId::new();
     /// let template = TemplateCompatSpec {
@@ -468,7 +468,7 @@ impl NodeGroup {
     /// ```rust
     /// # use std::collections::BTreeSet;
     /// # use pplx_space_accounts::OrgId;
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_node_model::*;
     /// # use pplx_space_template_model::{TemplateName, TemplateVisibility};
     /// let shared = NodeGroup {
     ///     id: NodeGroupId::new(),

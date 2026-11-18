@@ -4,9 +4,9 @@ use std::str::FromStr;
 use crate::db::{Connection, Error, OptionalExtension};
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
 use pplx_space_common_core::types::{
-    AutoLifecycleDeleteReceiptId, ExecutionGeneration, NodeManagedBy, NodeRole,
-    SandboxActivationAttemptId, SandboxId,
+    AutoLifecycleDeleteReceiptId, ExecutionGeneration, SandboxActivationAttemptId, SandboxId,
 };
+use pplx_space_node_model::{NodeManagedBy, NodeRole};
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sqlite::SqliteU64;
 use rusqlite::{params, types::Type};
