@@ -57,6 +57,8 @@ fn row(id: &str) -> AdminNodeResponse {
         drain_mode: None,
         drain_started_at: None,
         drain_last_error: None,
+        drain_engine: None,
+        drain: None,
         terminate_decrement_capacity: false,
         k8s_node_name: None,
         metadata: serde_json::Value::Null,
