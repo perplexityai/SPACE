@@ -14,6 +14,7 @@ from urllib.parse import quote, urlencode, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from space_smoke.capabilities import (
+    CallAnswer,
     CommandResult,
     CommandSandbox,
     DurableLifecycleSandbox,
@@ -121,15 +122,24 @@ class NativeSandboxFactory:
         return sandbox
 
     def create(
-        self, metadata: Mapping[str, str] | None = None
+        self,
+        metadata: Mapping[str, str] | None = None,
+        *,
+        idle_timeout: str | None = None,
+        auto_lifecycle: Mapping[str, object] | None = None,
     ) -> DurableLifecycleSandbox:
+        body: dict[str, object] = {
+            "template": self._config.template,
+            "metadata": dict(metadata or {}),
+        }
+        if idle_timeout is not None:
+            body["idle_timeout"] = idle_timeout
+        if auto_lifecycle is not None:
+            body["auto_lifecycle"] = dict(auto_lifecycle)
         response = self._json_request(
             "POST",
             "/v1/sandboxes",
-            body={
-                "template": self._config.template,
-                "metadata": dict(metadata or {}),
-            },
+            body=body,
             mutation="create",
             expected_status=202,
         )
@@ -451,6 +461,86 @@ class NativeSandboxFactory:
         )
         self._wait_sandbox_running(sandbox_id)
 
+    _LIFECYCLE_VERBS = frozenset(
+        {"wake", "resume", "restore", "start", "pause", "suspend", "stop", "kill"}
+    )
+
+    def request_lifecycle(self, sandbox_id: str, verb: str) -> str:
+        if verb not in self._LIFECYCLE_VERBS:
+            raise ValueError(f"unsupported lifecycle verb {verb!r}")
+        response = self._json_request(
+            "POST",
+            f"/v1/sandboxes/{quote(sandbox_id, safe='')}:{verb}",
+            mutation=verb,
+            expected_status=202,
+        )
+        return _required_string(response, "operation_id")
+
+    def lifecycle_answer(self, sandbox_id: str, verb: str) -> CallAnswer:
+        if verb not in self._LIFECYCLE_VERBS:
+            raise ValueError(f"unsupported lifecycle verb {verb!r}")
+        return self._answer(
+            "POST", f"/v1/sandboxes/{quote(sandbox_id, safe='')}:{verb}", mutation=verb
+        )
+
+    def command_answer(self, sandbox_id: str, command: str) -> CallAnswer:
+        return self._answer(
+            "POST",
+            f"/v1/sandboxes/{quote(sandbox_id, safe='')}/commands",
+            body={"command": ["sh", "-c", command], "timeout": "60s"},
+            mutation="command",
+        )
+
+    def _answer(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Mapping[str, object] | None = None,
+        mutation: str | None = None,
+    ) -> CallAnswer:
+        """One request, its status, `Retry-After` and JSON body kept as they came."""
+
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {self._config.token}"}
+        if mutation is not None:
+            headers["Idempotency-Key"] = f"space-smoke-{mutation}-{uuid.uuid4().hex}"
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body, separators=(",", ":")).encode()
+        request = Request(
+            f"{self._config.api_url.rstrip('/')}{path}", data=data, headers=headers, method=method
+        )
+        try:
+            with _URL_OPEN(request, timeout=self._config.request_timeout_seconds) as response:
+                status, response_headers, raw = response.status, response.headers, response.read()
+        except HTTPError as error:
+            status, response_headers, raw = error.code, error.headers, error.read()
+        try:
+            payload = json.loads(raw) if raw else {}
+        except ValueError:
+            payload = {"raw": raw[:2000].decode(errors="replace")}
+        return CallAnswer(
+            status=int(status),
+            retry_after=None if response_headers is None else response_headers.get("Retry-After"),
+            body=payload if isinstance(payload, dict) else {"value": payload},
+        )
+
+    def operation(self, operation_id: str) -> dict[str, object]:
+        return self._json_request(
+            "GET",
+            f"/v1/operations/{quote(operation_id, safe='')}",
+            expected_status=200,
+        )
+
+    def state(self, sandbox_id: str) -> str:
+        response = self._json_request(
+            "GET",
+            f"/v1/sandboxes/{quote(sandbox_id, safe='')}",
+            expected_status=200,
+        )
+        return _required_string(response, "state")
+
     def _wait_operation(
         self,
         operation_id: str,
@@ -674,6 +764,21 @@ class _NativeSandbox:
 
     def start(self) -> None:
         self._factory.start(self.sandbox_id)
+
+    def request_lifecycle(self, verb: str) -> str:
+        return self._factory.request_lifecycle(self.sandbox_id, verb)
+
+    def lifecycle_answer(self, verb: str) -> CallAnswer:
+        return self._factory.lifecycle_answer(self.sandbox_id, verb)
+
+    def command_answer(self, command: str) -> CallAnswer:
+        return self._factory.command_answer(self.sandbox_id, command)
+
+    def operation(self, operation_id: str) -> dict[str, object]:
+        return self._factory.operation(operation_id)
+
+    def state(self) -> str:
+        return self._factory.state(self.sandbox_id)
 
     def start_background(self, command: str, *, timeout: int = 60) -> ProcessHandle:
         return self._factory.start_background(self.sandbox_id, command, timeout=timeout)

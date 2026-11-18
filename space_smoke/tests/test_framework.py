@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
@@ -484,6 +486,80 @@ def partner_round_trip(_test: smoke.Ecw) -> None:
         self.assertEqual(result.verdict, Verdict.WARN)
         self.assertEqual(result.exit_code, 42)
         self.assertEqual(result.evidence["category"], "gateway_timeout")
+
+    def test_evidence_the_runner_cannot_print_fails_only_a_call_that_holds(self) -> None:
+        @dataclass
+        class Columns:
+            engine: str
+
+        refused = "evidence 'status' is not JSON-serializable"
+        kept = {"status": repr(Columns("v2")), "unencodable_evidence": ["status"]}
+        # A call, the verdict it ends the run with, text its summary holds,
+        # and the evidence the run keeps for it (`None`: whatever it is).
+        rows = [
+            (
+                "a held verify",
+                lambda context: context.verify(True, "held", status=Columns("v2")),
+                Verdict.INFRA_ERROR,
+                refused,
+                None,
+            ),
+            (
+                "record",
+                lambda context: context.record("status", Columns("v2")),
+                Verdict.INFRA_ERROR,
+                refused,
+                None,
+            ),
+            (
+                "a held verify of a set",
+                lambda context: context.verify(True, "held", status={"v2"}),
+                Verdict.INFRA_ERROR,
+                refused,
+                None,
+            ),
+            # The runner sorts keys, which keys of mixed types can't be.
+            (
+                "a held verify of mixed keys",
+                lambda context: context.verify(True, "held", status={1: "a", "b": 2}),
+                Verdict.INFRA_ERROR,
+                refused,
+                None,
+            ),
+            (
+                "a failing verify",
+                lambda context: context.verify(
+                    False, "the row was never deleted", status=Columns("v2"), phase="terminating"
+                ),
+                Verdict.FAIL,
+                "the row was never deleted",
+                {**kept, "phase": "terminating"},
+            ),
+            (
+                "warn",
+                lambda context: context.warn("known", status=Columns("v2")),
+                Verdict.WARN,
+                "known",
+                kept,
+            ),
+            (
+                "a held verify of printable evidence",
+                lambda context: context.verify(True, "held", status={"engine": "v2"}),
+                Verdict.PASS,
+                "Runtime passed",
+                {"status": {"engine": "v2"}},
+            ),
+        ]
+        for call, body, verdict, summary, evidence in rows:
+            with self.subTest(call=call):
+                result = execute_scenario(title="Runtime", body=body)
+
+                self.assertEqual(result.verdict, verdict, result.summary)
+                self.assertIn(summary, result.summary)
+                # What the runner prints for the verdict still encodes.
+                printed = json.loads(json.dumps(result.evidence, sort_keys=True))
+                if evidence is not None:
+                    self.assertEqual(printed, evidence)
 
     def test_scenario_timeout_still_runs_cleanup(self) -> None:
         trace: list[str] = []
