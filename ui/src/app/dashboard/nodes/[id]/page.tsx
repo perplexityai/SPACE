@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { Alert, App, Button, Card, Collapse, Descriptions, Result, Select, Space, Switch, Table, Tag, Tooltip, Typography, type TableColumnsType } from 'antd';
-import { ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons';
+import { ArrowLeftOutlined, EyeOutlined, ReloadOutlined } from '@ant-design/icons';
 
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
@@ -38,6 +38,35 @@ import {
   type NodeHoldsResponse,
 } from '@/lib/node-drain';
 import { TypedConfirmModal } from '@/components/typed-confirm-modal';
+import { DrainPreviewPanel } from '@/components/drain-preview';
+import { DrainProgressPanel, DrainProgressUnreadable, HoldPicker } from '@/components/drain-progress';
+import {
+  DRAIN_CHANGED,
+  HOLD_PRESETS,
+  controllerTerminateRefusal,
+  closesOnDrainChange,
+  drainSeen,
+  holdDeadlineMs,
+  holdWhy,
+  isV2Drain,
+  isV2DrainBody,
+  parseHoldSeconds,
+  readDrain,
+  shortenLengthens,
+  unknownEngine,
+  v2DrainBodyFor,
+  v2DrainRefusal,
+  v2HoldRefusal,
+  type DrainSeen,
+} from '@/lib/drain-progress';
+import {
+  DRAIN_PREVIEW_TIMEOUT_MS,
+  PREVIEW_TOOLTIP,
+  previewFailure,
+  previewPath,
+  type DrainPreview,
+  type PreviewFailure,
+} from '@/lib/drain-preview';
 import { serialReads, withTimeout, type SerialReads } from '@/lib/serial-reads';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import { STORED_LIFECYCLE_FILTER_STATES } from '@/lib/sandbox-lifecycle';
@@ -138,7 +167,14 @@ export default function NodeDetailPage() {
   const [nowMs, setNowMs] = useState(() => Date.now());
   // The action waiting on a typed confirmation, and the last refused one.
   const [typedAction, setTypedAction] = useState<NodeAction | null>(null);
-  const [refusal, setRefusal] = useState<ActionRefusal | null>(null);
+  // The node's drain when the typed dialog opened: a confirm after it
+  // changed closes the dialog instead.
+  const [typedSeen, setTypedSeen] = useState<DrainSeen | null>(null);
+  // The hold a v2 drain's start or shorten asks for: a preset's seconds, or
+  // `custom` with the typed text.
+  const [holdChoice, setHoldChoice] = useState<number | 'custom'>(HOLD_PRESETS[1].seconds);
+  const [holdCustom, setHoldCustom] = useState('');
+  const [refusal, setRefusal] = useState<(ActionRefusal & { sandboxIds?: string[] }) | null>(null);
   const [events, setEvents] = useState<AuditEventRow[] | null>(null);
   const [eventsError, setEventsError] = useState<string | null>(null);
   const [holds, setHolds] = useState<NodeHoldsResponse | null>(null);
@@ -147,6 +183,12 @@ export default function NodeDetailPage() {
   const [historyLifecycles, setHistoryLifecycles] = useState<string[]>([]);
   const [failedDuringDrain, setFailedDuringDrain] = useState(false);
   const busyRef = useRef(false);
+  // The last v2 drain preview of this node, which only the operator asks for.
+  const [preview, setPreview] = useState<DrainPreview | null>(null);
+  const [previewError, setPreviewError] = useState<PreviewFailure | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewedAt, setPreviewedAt] = useState<number | null>(null);
+  const previewRequest = useRef(0);
 
   // A poll tick skips while a read of the same kind is pending; any other
   // read waits for it.
@@ -318,6 +360,11 @@ export default function NodeDetailPage() {
     setHolds(null);
     setHoldsError(null);
     setRefusal(null);
+    previewRequest.current += 1;
+    setPreview(null);
+    setPreviewError(null);
+    setPreviewing(false);
+    setPreviewedAt(null);
     void loadNode();
     void loadCounts();
     void loadEvents();
@@ -396,7 +443,13 @@ export default function NodeDetailPage() {
         message.success(`${item.label} requested`);
       }
     } catch (err: any) {
-      const refused = item.action === 'terminate' ? terminateRefusal(err) : null;
+      const v2 = !!item.hold || isV2DrainBody(item.body);
+      // A hold body names no engine: refused on a node with no drain left,
+      // the drain it was for has ended.
+      const holdOnly = item.hold === 'shorten' || (v2 && !item.hold && !(item.body as { engine?: unknown }).engine);
+      const refused = item.action === 'terminate'
+        ? terminateRefusal(err)
+        : v2 ? (holdOnly ? v2HoldRefusal(err) : null) ?? v2DrainRefusal(err) : null;
       if (refused) {
         setRefusal(refused);
         message.error(refused.title);
@@ -417,8 +470,39 @@ export default function NodeDetailPage() {
     }
   };
 
+  // Read-only on the node, so it asks no confirmation and leaves the node's
+  // own reads alone.
+  const runPreview = () => {
+    const request = ++previewRequest.current;
+    setPreviewing(true);
+    setPreviewError(null);
+    withTimeout(DRAIN_PREVIEW_TIMEOUT_MS, (signal) => adminApi.get<DrainPreview>(previewPath(id), { signal }))
+      .then((loaded) => {
+        if (request !== previewRequest.current) return;
+        setPreview(loaded);
+        setPreviewedAt(Date.now());
+      })
+      .catch((err: unknown) => {
+        if (request === previewRequest.current) setPreviewError(previewFailure(err));
+      })
+      .finally(() => {
+        if (request === previewRequest.current) setPreviewing(false);
+      });
+  };
+
   const runAction = (item: NodeAction) => {
     if (item.typed) {
+      if (item.hold) {
+        setHoldChoice(HOLD_PRESETS[1].seconds);
+        setHoldCustom('');
+      }
+      if (node) {
+        setTypedSeen(drainSeen({
+          drain_engine: node.drain_engine,
+          drain_phase: node.drain_phase,
+          drain: isV2Drain(node) ? readDrain(node.drain) : null,
+        }));
+      }
       setTypedAction(item);
       return;
     }
@@ -453,6 +537,24 @@ export default function NodeDetailPage() {
   const status = node.status;
   const health: NodeHealthStatus | null = status?.health ?? null;
   const hasHealth = node.role === 'worker' || node.role === 'builder';
+  // Only a worker's node-api serves a drain preview.
+  const previewable = node.role === 'worker';
+  // A v2 drain, its cancel included, which has no phase, and its progress
+  // as the panel can read it; an engine this console doesn't know is named.
+  const v2Drain = isV2Drain(node);
+  const drain = v2Drain ? readDrain(node.drain) : null;
+  const otherEngine = unknownEngine(node);
+  // The cluster controller's refusal of the last `:terminate`, which
+  // returned the node to drained.
+  const terminateRefused = controllerTerminateRefusal(node);
+  // The hold a v2 start or shorten would send; null while the custom value
+  // isn't one.
+  const holdSeconds = holdChoice === 'custom' ? parseHoldSeconds(holdCustom) : holdChoice;
+  // A shorten that would end the drain later, which the API refuses.
+  // Without a readable drain the deadline isn't known, and the API decides.
+  const holdLengthens = typedAction?.hold === 'shorten' && holdSeconds !== null && drain
+    ? shortenLengthens(holdDeadlineMs(holdSeconds, node.drain_started_at, true, nowMs), drain.deadline)
+    : null;
   const cordoned = cordonedText(node.cordoned);
   const runtimeLines = runtimeInstallationLines(node.runtime_installations);
   const beat = heartbeat(node, nowMs);
@@ -486,7 +588,12 @@ export default function NodeDetailPage() {
         </Space>
       ),
     },
-    { title: 'Why', render: (_, h) => holdSentence(h, nowMs, holds?.stuck_transient_after_secs ?? 600, stage, node.drain_phase) },
+    {
+      title: 'Why',
+      // A v2 drain's holds aren't the v1 drain's to act on: its progress
+      // panel says what it waits on.
+      render: (_, h) => holdWhy(node, () => holdSentence(h, nowMs, holds?.stuck_transient_after_secs ?? 600, stage, node.drain_phase)),
+    },
     {
       title: 'Counted by', width: 250,
       render: (_, h) => {
@@ -503,7 +610,7 @@ export default function NodeDetailPage() {
           <Link href="/dashboard/nodes"><ArrowLeftOutlined /> Nodes</Link>
           <Title level={3} style={{ margin: 0 }}>{node.name || node.address || node.id}</Title>
           <Tag>{node.role}</Tag>
-          {node.drain_phase ? <Tag color="orange">{node.drain_phase} · {node.drain_mode ?? 'gentle'}</Tag> : null}
+          {node.drain_phase ? <Tag color="orange">{node.drain_phase} · {v2Drain ? 'v2' : otherEngine ?? node.drain_mode ?? 'gentle'}</Tag> : null}
           {node.cordoned ? <Tag color="orange">cordoned</Tag> : null}
           <Tag color={node.scheduling_status === 'ready' ? 'green' : 'default'}>{node.scheduling_status ?? 'unknown'}</Tag>
         </Space>
@@ -513,6 +620,11 @@ export default function NodeDetailPage() {
               {item.label}
             </Button>
           ))}
+          {previewable ? (
+            <Tooltip title={PREVIEW_TOOLTIP}>
+              <Button icon={<EyeOutlined />} loading={previewing} onClick={runPreview}>Preview v2 drain</Button>
+            </Tooltip>
+          ) : null}
           <Button icon={<ReloadOutlined />} onClick={refreshAll} disabled={!!busy}>Refresh</Button>
         </Space>
       </Space>
@@ -545,6 +657,15 @@ export default function NodeDetailPage() {
                   <ul style={{ margin: 0, paddingInlineStart: 20 }}>
                     {refusal.reasons.map((reason) => <li key={reason}>{reason}</li>)}
                   </ul>
+                  {refusal.sandboxIds?.length ? (
+                    <Space wrap size={4} style={{ marginTop: 8 }} data-testid="drain-refusal-sandboxes">
+                      {refusal.sandboxIds.map((sandboxId) => (
+                        <Link key={sandboxId} href={`/dashboard/sandboxes/${publicSandboxIdFromAny(sandboxId)}`}>
+                          {publicSandboxIdFromAny(sandboxId)}
+                        </Link>
+                      ))}
+                    </Space>
+                  ) : null}
                   {refusal.counts ? (
                     <div style={{ marginTop: 8 }}>
                       <a href="#node-holds">See what holds this node</a>
@@ -568,8 +689,13 @@ export default function NodeDetailPage() {
             <Descriptions.Item label="Phase">
               {node.drain_phase ? <Tag color={drainPhaseColor(node.drain_phase)}>{node.drain_phase}</Tag> : <Text type="secondary">not draining</Text>}
             </Descriptions.Item>
-            {/* A missing mode on a drain is gentle, as the API resolves it. */}
-            <Descriptions.Item label="Mode">{node.drain_phase ? node.drain_mode ?? 'gentle' : '—'}</Descriptions.Item>
+            {/* A missing mode on a drain is gentle, as the API resolves it. A v2
+                drain takes no mode. */}
+            {v2Drain || otherEngine ? (
+              <Descriptions.Item label="Engine">{otherEngine ?? 'v2'}</Descriptions.Item>
+            ) : (
+              <Descriptions.Item label="Mode">{node.drain_phase ? node.drain_mode ?? 'gentle' : '—'}</Descriptions.Item>
+            )}
             <Descriptions.Item label="Started">
               {node.drain_started_at
                 ? `${new Date(node.drain_started_at).toLocaleString()}${elapsed !== null ? ` (${formatDuration(elapsed)} ago)` : ''}`
@@ -704,6 +830,21 @@ export default function NodeDetailPage() {
             The sandboxes the drain and terminate gates count against this node, as the API reads them now. The drain also waits for the evacuations it has in flight, which only the cluster-controller knows; a sandbox an evacuation is moving still shows here, as evacuating. Whether the drain also waits on a row only terminate counts depends on the cluster-controller&apos;s termination-blocking gate, which the API does not report.
           </Text>
         </Card>
+      ) : null}
+
+      {terminateRefused ? (
+        <Alert
+          type="warning"
+          showIcon
+          title={terminateRefused.title}
+          description={terminateRefused.reasons.map((reason) => <div key={reason}>{reason}</div>)}
+          style={{ marginBottom: 16 }}
+        />
+      ) : null}
+      {v2Drain ? (drain ? <DrainProgressPanel drain={drain} nowMs={nowMs} /> : <DrainProgressUnreadable />) : null}
+
+      {previewable && (preview || previewError || previewing) ? (
+        <DrainPreviewPanel preview={preview} failure={previewError} loading={previewing} previewedAt={previewedAt} />
       ) : null}
 
       <Card size="small" title="Node">
@@ -896,12 +1037,38 @@ export default function NodeDetailPage() {
         phrase={confirmationPhrase(node)}
         okText={typedAction?.label ?? 'OK'}
         onCancel={() => setTypedAction(null)}
+        ready={!typedAction?.hold || (holdSeconds !== null && holdLengthens === null)}
         onConfirm={async () => {
           if (!typedAction) return;
-          await send(typedAction);
+          if (typedSeen && closesOnDrainChange(typedAction, typedSeen, drainSeen({ drain_engine: node.drain_engine, drain_phase: node.drain_phase, drain }))) {
+            message.warning(DRAIN_CHANGED);
+            setTypedAction(null);
+            return;
+          }
+          if (typedAction.hold) {
+            if (holdSeconds === null) return;
+            await send({ ...typedAction, body: v2DrainBodyFor(typedAction.hold, holdSeconds) });
+          } else {
+            await send(typedAction);
+          }
           setTypedAction(null);
         }}
-      />
+      >
+        {typedAction?.hold ? (
+          <HoldPicker
+            shorten={typedAction.hold === 'shorten'}
+            startedAt={node.drain_started_at}
+            currentDeadline={drain ? drain.deadline : undefined}
+            nowMs={nowMs}
+            choice={holdChoice}
+            custom={holdCustom}
+            onChange={(choice, custom) => {
+              setHoldChoice(choice);
+              setHoldCustom(custom);
+            }}
+          />
+        ) : null}
+      </TypedConfirmModal>
     </Space>
   );
 }
