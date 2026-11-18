@@ -9,7 +9,7 @@
 # Exit status: smoke-kind-typed.sh's; 2 when a tool is missing, no admin token
 # can be had or the data plane never answers, and a failed command's own
 # status before that.
-# Env:   SMOKE_SHARD, SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE,
+# Env:   SMOKE_SHARD, SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE (removed on exit),
 #        SPACE_SMOKE_KIND_COLD_RECEIPTS, SPACE_CONSOLE_PASSWORD (default password)
 set -euo pipefail
 
@@ -34,11 +34,13 @@ for tool in aws curl jq uv; do
   command -v "$tool" >/dev/null 2>&1 || error "the typed Kind smoke needs $tool"
 done
 install -d -m 0700 "$SPACE_SMOKE_KIND_COLD_RECEIPTS"
+# Created private before the token is written, and gone with the run.
+trap 'rm -f "$SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE"' EXIT
+install -m 0600 /dev/null "$SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE"
 jq -nc --arg password "${SPACE_CONSOLE_PASSWORD:-password}" '{email: "root@local", password: $password}' \
   | curl -fsS -m 30 -X POST http://localhost:8080/auth/v1/sessions \
       -H 'content-type: application/json' --data-binary @- \
   | jq -r '.token // empty' >"$SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE"
-chmod 0600 "$SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE"
 [[ -s "$SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE" ]] || error "could not obtain an admin session token from the Kind API"
 # The scenarios talk to the data plane from their first command.
 for _ in $(seq 1 150); do

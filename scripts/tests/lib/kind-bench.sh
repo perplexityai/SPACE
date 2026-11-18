@@ -384,8 +384,9 @@ kind_bench_docker_up() {
   return 1
 }
 
-# The environment every bench command runs with, one KEY=VALUE per line.
-# Callers append the run's own settings.
+# The environment every bench command runs with, one KEY=VALUE per line, in a
+# file only the caller can read: callers append the run's own settings, which
+# may include a console password.
 kind_bench_write_env() {
   local i="$1" file="$2" dir
   dir="$(kind_bench_dir "$i")"
@@ -394,6 +395,7 @@ kind_bench_write_env() {
   if [[ -s "${DOCKER_CONFIG:-$HOME/.docker}/config.json" ]]; then
     install -m 0600 "${DOCKER_CONFIG:-$HOME/.docker}/config.json" "$dir/home/.docker/config.json" || return 1
   fi
+  install -m 0600 /dev/null "$file" || return 1
   {
     printf 'HOME=%s\n' "$dir/home"
     printf 'USER=%s\n' "$(id -un)"
@@ -410,17 +412,15 @@ kind_bench_write_env() {
     printf 'UV_CACHE_DIR=%s\n' "${UV_CACHE_DIR:-$HOME/.cache/uv}"
     printf 'UV_PYTHON_INSTALL_DIR=%s\n' "${UV_PYTHON_INSTALL_DIR:-$HOME/.local/share/uv/python}"
     printf 'SPACE_KIND_BENCH=%s\n' "$i"
-  } >"$file" || return 1
+  } >>"$file" || return 1
 }
 
 # Run a command in bench <i> as the calling user, with exactly the variables
-# in its env file.
+# in its env file (and those bash sets for itself, such as PWD). The values
+# are read inside the bench, never passed as arguments, which any local user
+# can list.
 kind_bench_exec() {
   local i="$1" env_file="$2"; shift 2
-  local vars=() line
-  while IFS= read -r line; do
-    [[ -n "$line" && "$line" != \#* ]] && vars+=("$line")
-  done <"$env_file"
   local holder
   holder="$(kind_bench_holder "$i")"
   [[ -n "$holder" ]] || { kind_bench_log "bench $i has no PID namespace"; return 2; }
@@ -430,7 +430,12 @@ kind_bench_exec() {
   sudo -n nsenter --target "$holder" --net --pid --mount --wd="$PWD" -- \
     sh -c 'echo $$ >"$1/cgroup.procs" && shift && exec "$@"' _ "$cgroup" \
     setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups -- \
-    env -i "${vars[@]}" "$@" 9>&-
+    env -i bash -c '
+      while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] || export "$line"
+      done <"$1" || exit 2
+      shift
+      exec "$@"' _ "$env_file" "$@" 9>&-
 }
 
 # A bench's own copy of the checkout <repo> at <dest>, as each CI runner
