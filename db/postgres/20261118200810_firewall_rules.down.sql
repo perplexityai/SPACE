@@ -15,10 +15,8 @@ SET LOCAL statement_timeout = '5s';
 -- lease_expires_at NULL) once no worker can still hold it, delete the node
 -- assignments, and set the enrollment default to NULL.
 -- Holding the locks keeps any write from landing between the check and the
--- drop. Users is locked first to match a user deletion's ON DELETE SET NULL
--- cascade into the rollouts.
-LOCK TABLE users,
-    firewall_rules_revisions,
+-- drop.
+LOCK TABLE firewall_rules_revisions,
     firewall_rules_control,
     firewall_rules_mutation_receipts,
     firewall_rules_rollouts,

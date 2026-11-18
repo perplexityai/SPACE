@@ -93,7 +93,8 @@ COMMENT ON COLUMN firewall_rules_mutation_receipts.result IS
 -- unfinished rollout without the slot is refused rather than escaping the key.
 -- A writer changes phase, unfinished_slot and finished_at in one update. The
 -- cap is cluster-wide in-flight items within this rollout; it doesn't admit a
--- second rollout.
+-- second rollout. The creation receipt records who started the rollout and is
+-- never reused.
 CREATE TABLE firewall_rules_rollouts (
     id UUID NOT NULL,
     to_revision_id UUID NOT NULL,
@@ -107,9 +108,7 @@ CREATE TABLE firewall_rules_rollouts (
     reason TEXT NOT NULL,
     generation BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    created_by_user_id UUID,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_by_user_id UUID,
     finished_at TIMESTAMPTZ,
     CONSTRAINT firewall_rules_rollouts_pkey PRIMARY KEY (id),
     CONSTRAINT firewall_rules_rollouts_phase_check
@@ -145,11 +144,7 @@ CREATE TABLE firewall_rules_rollouts (
     CONSTRAINT firewall_rules_rollouts_to_revision_id_fkey
         FOREIGN KEY (to_revision_id) REFERENCES firewall_rules_revisions(id),
     CONSTRAINT firewall_rules_rollouts_created_by_receipt_id_fkey
-        FOREIGN KEY (created_by_receipt_id) REFERENCES firewall_rules_mutation_receipts(id),
-    CONSTRAINT firewall_rules_rollouts_created_by_user_id_fkey
-        FOREIGN KEY (created_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
-    CONSTRAINT firewall_rules_rollouts_updated_by_user_id_fkey
-        FOREIGN KEY (updated_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+        FOREIGN KEY (created_by_receipt_id) REFERENCES firewall_rules_mutation_receipts(id)
 );
 
 CREATE TRIGGER firewall_rules_rollouts_set_updated_at
@@ -158,15 +153,16 @@ CREATE TRIGGER firewall_rules_rollouts_set_updated_at
 
 -- The runtime campaigns' function, shared rather than copied: it raises
 -- generation on any update that changes a column other than generation,
--- updated_at, created_by_user_id and updated_by_user_id, which this table names
--- the same way. Its comment records that both tables use it, so a change to the
--- columns it ignores is weighed for both.
+-- updated_at, created_by_user_id and updated_by_user_id. This table has no user
+-- columns, so of those it ignores only generation and updated_at. Its comment
+-- records that both tables use it, so a change to the columns it ignores is
+-- weighed for both.
 CREATE TRIGGER firewall_rules_rollouts_raise_generation
     BEFORE UPDATE ON firewall_rules_rollouts
     FOR EACH ROW EXECUTE FUNCTION runtime_upgrade_campaigns_raise_generation();
 
 COMMENT ON FUNCTION runtime_upgrade_campaigns_raise_generation() IS
-    'Trigger for runtime_upgrade_campaigns and firewall_rules_rollouts: raises generation by one on every update that changes a column other than generation, updated_at, created_by_user_id and updated_by_user_id. Changing the ignored columns changes both tables';
+    'Trigger for runtime_upgrade_campaigns and firewall_rules_rollouts: raises generation by one on every update that changes a column other than generation, updated_at, created_by_user_id and updated_by_user_id (firewall_rules_rollouts has no user columns). Changing the ignored columns changes both tables';
 
 COMMENT ON TABLE firewall_rules_rollouts IS
     'Paced moves of nodes to a firewall revision; at most one is unfinished';
@@ -181,7 +177,7 @@ COMMENT ON COLUMN firewall_rules_rollouts.max_in_flight_per_cluster IS
 COMMENT ON COLUMN firewall_rules_rollouts.failure_budget IS
     'Failed items at which the rollout pauses itself';
 COMMENT ON COLUMN firewall_rules_rollouts.generation IS
-    'Raised by one by the runtime_upgrade_campaigns_raise_generation trigger on every update that changes another column (not updated_at or the user columns); unrelated to node assignment generations';
+    'Raised by one by the runtime_upgrade_campaigns_raise_generation trigger on every update that changes another column (not updated_at); unrelated to node assignment generations';
 
 -- The nodes a rollout targets, fixed when it starts, and each one's progress.
 -- node_id isn't a foreign key: an item outlives a node that deregisters
