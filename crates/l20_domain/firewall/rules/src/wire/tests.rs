@@ -10,26 +10,27 @@ use crate::{IntegerRange, Ipv4Prefix, TcpOptionName};
 type KindCheck = fn(&DecodeErrorKind) -> bool;
 
 /// Asserts that every document is rejected at the given path with a matching
-/// kind, and that none decodes to a policy.
+/// kind, and that none decodes to a revision.
 fn assert_rejections(cases: Vec<(String, &str, KindCheck)>) {
     for (document, path, check) in cases {
-        let error =
-            PolicyRevision::from_json_str(&document).expect_err(&format!("accepted {document}"));
+        let error = FirewallRuleRevision::from_json_str(&document)
+            .expect_err(&format!("accepted {document}"));
         assert_eq!(error.path().to_string(), path, "{document}: {error}");
         assert!(check(error.kind()), "{document}: unexpected {error:?}");
     }
 }
 
-fn decode(document: &str) -> PolicyRevision {
-    PolicyRevision::from_json_str(document).unwrap_or_else(|error| panic!("{document}: {error}"))
+fn decode(document: &str) -> FirewallRuleRevision {
+    FirewallRuleRevision::from_json_str(document)
+        .unwrap_or_else(|error| panic!("{document}: {error}"))
 }
 
 /// Decodes a document, writes it back canonically, and decodes that again.
-fn assert_round_trips(policy: &PolicyRevision) {
-    let text = policy.to_json_string();
+fn assert_round_trips(revision: &FirewallRuleRevision) {
+    let text = revision.to_json_string();
     assert_eq!(
-        &PolicyRevision::from_json_str(&text).unwrap(),
-        policy,
+        &FirewallRuleRevision::from_json_str(&text).unwrap(),
+        revision,
         "{text}"
     );
 }
@@ -51,9 +52,9 @@ const ALL_VARIANTS: &str = r#"{
 
 #[test]
 fn valid_document_decodes_every_read_and_value_in_order() {
-    let policy = decode(ALL_VARIANTS);
+    let revision = decode(ALL_VARIANTS);
 
-    let expected = PolicyRevision::new(vec![
+    let expected = FirewallRuleRevision::new(vec![
         Rule::new(
             RuleId::new("first"),
             vec![
@@ -87,15 +88,15 @@ fn valid_document_decodes_every_read_and_value_in_order() {
         .unwrap(),
     ])
     .unwrap();
-    assert_eq!(policy, expected);
-    assert_round_trips(&policy);
+    assert_eq!(revision, expected);
+    assert_round_trips(&revision);
 }
 
 #[test]
 fn canonical_form_is_stable_and_keeps_rule_and_match_order() {
-    let policy = decode(ALL_VARIANTS);
+    let revision = decode(ALL_VARIANTS);
     assert_eq!(
-        policy.to_json_string(),
+        revision.to_json_string(),
         concat!(
             r#"{"schema_version":1,"rules":["#,
             r#"{"id":"first","all_of":["#,
@@ -111,7 +112,7 @@ fn canonical_form_is_stable_and_keeps_rule_and_match_order() {
 }
 
 #[test]
-fn key_order_and_whitespace_do_not_change_the_policy() {
+fn key_order_and_whitespace_do_not_change_the_revision() {
     let reordered = r#"{"rules":[
         {"all_of":[
             {"right":"192.0.2.1","op":"==","left":{"payload":{"field":"daddr","protocol":"ip"}}},
@@ -123,20 +124,20 @@ fn key_order_and_whitespace_do_not_change_the_policy() {
             {"left":{"payload":{"field":"dport","protocol":"tcp"}},"right":{"range":[1024,65535]},"op":"=="}
         ],"id":"second"}
     ],"schema_version":1}"#;
-    let policy = decode(reordered);
-    assert_eq!(policy, decode(ALL_VARIANTS));
+    let revision = decode(reordered);
+    assert_eq!(revision, decode(ALL_VARIANTS));
     assert_eq!(
-        policy.to_json_string(),
+        revision.to_json_string(),
         decode(ALL_VARIANTS).to_json_string()
     );
 }
 
 #[test]
 fn explicit_empty_rule_list_is_a_snapshot() {
-    let policy = decode(r#"{"schema_version":1,"rules":[]}"#);
-    assert!(policy.rules().is_empty());
+    let revision = decode(r#"{"schema_version":1,"rules":[]}"#);
+    assert!(revision.rules().is_empty());
     assert_eq!(
-        policy.to_json_string(),
+        revision.to_json_string(),
         r#"{"schema_version":1,"rules":[]}"#
     );
 }
@@ -172,9 +173,13 @@ fn boundary_values_keep_their_meaning() {
         ),
     ];
     for (right, expected) in cases {
-        let policy = decode(&document_with_right(right));
-        assert_eq!(policy.rules()[0].all_of()[0].right(), &expected, "{right}");
-        assert_round_trips(&policy);
+        let revision = decode(&document_with_right(right));
+        assert_eq!(
+            revision.rules()[0].all_of()[0].right(),
+            &expected,
+            "{right}"
+        );
+        assert_round_trips(&revision);
     }
 
     let masked = decode(&document_with_left(
@@ -193,11 +198,11 @@ fn boundary_values_keep_their_meaning() {
 fn names_are_kept_verbatim_without_qualification() {
     // The decoder has no field or option catalog: an unknown name is
     // structurally valid and kept byte for byte.
-    let policy = decode(&document_with_match(
+    let revision = decode(&document_with_match(
         r#"{"left":{"payload":{"protocol":"Not A Protocol","field":" spaced "}},"op":"==","right":1},
            {"left":{"tcp option":{"name":"option-that-does-not-exist"}},"op":"==","right":true}"#,
     ));
-    let all_of = policy.rules()[0].all_of();
+    let all_of = revision.rules()[0].all_of();
     assert_eq!(
         all_of[0].left(),
         &Read::Payload(header("Not A Protocol", " spaced "))
@@ -385,15 +390,15 @@ fn good_rule(id: &str) -> String {
 
 #[test]
 fn decodes_one_or_several_rules_and_matches() {
-    let policy = decode(&document_with_rules(&[
+    let revision = decode(&document_with_rules(&[
         good_rule("a"),
         good_rule("b"),
         format!(r#"{{"id":"c","all_of":[{GOOD_MATCH},{GOOD_MATCH}]}}"#),
     ]));
-    assert_eq!(policy.rules().len(), 3);
-    assert_eq!(policy.rules()[2].all_of().len(), 2);
+    assert_eq!(revision.rules().len(), 3);
+    assert_eq!(revision.rules()[2].all_of().len(), 2);
     assert_eq!(
-        policy.rule(&RuleId::new("b")).unwrap().id(),
+        revision.rule(&RuleId::new("b")).unwrap().id(),
         &RuleId::new("b")
     );
 }
@@ -1001,7 +1006,7 @@ fn rejects_unsupported_operators() {
     let cases = ["!=", "eq", "in", "<", "", " =="];
     for op in cases {
         let document = document_with_match(&format!(r#"{{{read},"op":"{op}","right":1}}"#));
-        let error = PolicyRevision::from_json_str(&document).unwrap_err();
+        let error = FirewallRuleRevision::from_json_str(&document).unwrap_err();
         assert_eq!(error.path().to_string(), "$.rules[0].all_of[0].op");
         assert!(
             matches!(error.kind(), DecodeErrorKind::UnsupportedOperator { op: found } if found == op),
@@ -1208,7 +1213,7 @@ fn rule_decoder_applies_the_same_grammar() {
 
 #[test]
 fn error_display_names_the_location() {
-    let error = PolicyRevision::from_json_str(&document_with_left(
+    let error = FirewallRuleRevision::from_json_str(&document_with_left(
         r#"{"&":[{"payload":{"protocol":"tcp","field":"flags"}},0]}"#,
     ))
     .unwrap_err();
@@ -1217,9 +1222,11 @@ fn error_display_names_the_location() {
         r#"$.rules[0].all_of[0].left["&"][1]: mask must be nonzero"#
     );
 
-    let duplicate =
-        PolicyRevision::from_json_str(&document_with_rules(&[good_rule("a"), good_rule("a")]))
-            .unwrap_err();
+    let duplicate = FirewallRuleRevision::from_json_str(&document_with_rules(&[
+        good_rule("a"),
+        good_rule("a"),
+    ]))
+    .unwrap_err();
     assert_eq!(
         duplicate.to_string(),
         r#"$.rules[1].id: rule ID "a" repeats the rule at index 0"#
@@ -1229,11 +1236,13 @@ fn error_display_names_the_location() {
 #[test]
 fn from_slice_matches_from_str() {
     assert_eq!(
-        PolicyRevision::from_json_slice(ALL_VARIANTS.as_bytes()).unwrap(),
+        FirewallRuleRevision::from_json_slice(ALL_VARIANTS.as_bytes()).unwrap(),
         decode(ALL_VARIANTS)
     );
     assert!(matches!(
-        PolicyRevision::from_json_slice(b"\xff").unwrap_err().kind(),
+        FirewallRuleRevision::from_json_slice(b"\xff")
+            .unwrap_err()
+            .kind(),
         DecodeErrorKind::Syntax(_)
     ));
 }

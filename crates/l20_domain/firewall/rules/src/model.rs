@@ -1,4 +1,4 @@
-//! The typed policy: revisions, rules, comparisons, reads and values.
+//! The typed firewall rules: revisions, rules, comparisons, reads and values.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -11,7 +11,7 @@ use serde::{Serialize, Serializer};
 use crate::wire::SCHEMA_VERSION;
 
 /// Declares an opaque name kept byte for byte as the caller wrote it. The
-/// policy grammar gives these names no syntax, so construction cannot fail;
+/// rule grammar gives these names no syntax, so construction cannot fail;
 /// runtime qualification decides whether a name means anything.
 macro_rules! opaque_name {
     ($(#[$doc:meta])* $name:ident) => {
@@ -68,7 +68,7 @@ macro_rules! opaque_name {
 }
 
 opaque_name!(
-    /// The stable identity of a rule within a policy, which edits name.
+    /// The stable identity of a rule within a revision, which edits name.
     RuleId
 );
 opaque_name!(
@@ -84,18 +84,19 @@ opaque_name!(
     TcpOptionName
 );
 
-/// One complete policy snapshot: an ordered list of rules with unique IDs.
+/// One complete snapshot of the firewall rules: an ordered list of rules with
+/// unique IDs.
 ///
 /// An empty rule list is a real snapshot. There is deliberately no `Default`:
-/// an absent policy is not an empty one.
+/// an absent revision is not an empty one.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PolicyRevision {
+pub struct FirewallRuleRevision {
     rules: Vec<Rule>,
 }
 
-impl PolicyRevision {
+impl FirewallRuleRevision {
     /// Validates a complete rule list, keeping its order.
-    pub fn new(rules: Vec<Rule>) -> Result<Self, PolicyError> {
+    pub fn new(rules: Vec<Rule>) -> Result<Self, RuleRevisionError> {
         validate_unique_ids(&rules)?;
         Ok(Self { rules })
     }
@@ -113,11 +114,11 @@ impl PolicyRevision {
     }
 }
 
-fn validate_unique_ids(rules: &[Rule]) -> Result<(), PolicyError> {
+fn validate_unique_ids(rules: &[Rule]) -> Result<(), RuleRevisionError> {
     let mut first_index = HashMap::with_capacity(rules.len());
     for (index, rule) in rules.iter().enumerate() {
         if let Some(&first) = first_index.get(rule.id()) {
-            return Err(PolicyError::DuplicateRuleId {
+            return Err(RuleRevisionError::DuplicateRuleId {
                 id: rule.id().clone(),
                 first_index: first,
                 duplicate_index: index,
@@ -128,9 +129,9 @@ fn validate_unique_ids(rules: &[Rule]) -> Result<(), PolicyError> {
     Ok(())
 }
 
-impl Serialize for PolicyRevision {
+impl Serialize for FirewallRuleRevision {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut document = serializer.serialize_struct("PolicyRevision", 2)?;
+        let mut document = serializer.serialize_struct("FirewallRuleRevision", 2)?;
         document.serialize_field("schema_version", &SCHEMA_VERSION)?;
         document.serialize_field("rules", &self.rules)?;
         document.end()
@@ -139,7 +140,7 @@ impl Serialize for PolicyRevision {
 
 /// A rule list that cannot form a revision.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum PolicyError {
+pub enum RuleRevisionError {
     #[error("rule ID {id:?} at index {duplicate_index} repeats the rule at index {first_index}", id = .id.as_str())]
     DuplicateRuleId {
         id: RuleId,

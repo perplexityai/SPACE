@@ -1,7 +1,8 @@
 //! Builders shared by the decoder and edit tests.
 
 use crate::{
-    HeaderField, HeaderProtocol, Match, PayloadHeader, PolicyRevision, Read, Rule, RuleId, Value,
+    FirewallRuleRevision, HeaderField, HeaderProtocol, Match, PayloadHeader, Read, Rule, RuleId,
+    Value,
 };
 
 pub(crate) fn header(protocol: &str, field: &str) -> PayloadHeader {
@@ -21,12 +22,12 @@ pub(crate) fn port_rule(id: &str, protocol: &str, port: u64) -> Rule {
     .unwrap()
 }
 
-pub(crate) fn revision(rules: Vec<Rule>) -> PolicyRevision {
-    PolicyRevision::new(rules).unwrap()
+pub(crate) fn revision(rules: Vec<Rule>) -> FirewallRuleRevision {
+    FirewallRuleRevision::new(rules).unwrap()
 }
 
-pub(crate) fn ids(policy: &PolicyRevision) -> Vec<&str> {
-    policy
+pub(crate) fn ids(snapshot: &FirewallRuleRevision) -> Vec<&str> {
+    snapshot
         .rules()
         .iter()
         .map(|rule| rule.id().as_str())

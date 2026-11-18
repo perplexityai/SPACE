@@ -26,7 +26,7 @@ fn acceptance_edits() -> Vec<Edit> {
 
 #[test]
 fn acceptance_batch_replaces_in_place_removes_and_appends() {
-    let base = PolicyRevision::from_json_str(ACCEPTANCE_BASE).unwrap();
+    let base = FirewallRuleRevision::from_json_str(ACCEPTANCE_BASE).unwrap();
     let original = base.clone();
 
     let change = base.apply(&acceptance_edits()).unwrap();
@@ -65,7 +65,7 @@ fn acceptance_batch_replaces_in_place_removes_and_appends() {
 
 #[test]
 fn acceptance_batch_with_an_invalid_fifth_edit_fails_whole() {
-    let base = PolicyRevision::from_json_str(ACCEPTANCE_BASE).unwrap();
+    let base = FirewallRuleRevision::from_json_str(ACCEPTANCE_BASE).unwrap();
     let original = base.clone();
 
     for (fifth, expected) in [
@@ -309,16 +309,16 @@ fn reordering_matches_is_a_replacement() {
 }
 
 #[test]
-fn complete_policies_are_validated_at_every_boundary() {
+fn complete_revisions_are_validated_at_every_boundary() {
     // A base with a repeated ID cannot be built or decoded, so it can never
     // reach `apply` with untouched invalid content.
     assert_eq!(
-        PolicyRevision::new(vec![
+        FirewallRuleRevision::new(vec![
             port_rule("a", "tcp", 1),
             port_rule("b", "tcp", 2),
             port_rule("a", "tcp", 3),
         ]),
-        Err(PolicyError::DuplicateRuleId {
+        Err(RuleRevisionError::DuplicateRuleId {
             id: id("a"),
             first_index: 0,
             duplicate_index: 2,
@@ -329,7 +329,7 @@ fn complete_policies_are_validated_at_every_boundary() {
         {"id":"b","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":2}]},
         {"id":"b","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":3}]}
     ]}"#;
-    let error = PolicyRevision::from_json_str(untouched_duplicate).unwrap_err();
+    let error = FirewallRuleRevision::from_json_str(untouched_duplicate).unwrap_err();
     assert_eq!(error.path().to_string(), "$.rules[2].id");
     assert!(matches!(
         error.kind(),
@@ -339,7 +339,7 @@ fn complete_policies_are_validated_at_every_boundary() {
         {"id":"a","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":1}]},
         {"id":"b","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":{"range":[9,1]}}]}
     ]}"#;
-    let error = PolicyRevision::from_json_str(untouched_invalid).unwrap_err();
+    let error = FirewallRuleRevision::from_json_str(untouched_invalid).unwrap_err();
     assert_eq!(error.path().to_string(), "$.rules[1].all_of[0].right.range");
     assert!(matches!(
         error.kind(),
@@ -363,7 +363,7 @@ fn removing_the_last_rule_yields_an_explicit_empty_snapshot() {
 
 #[test]
 fn identical_replacement_and_empty_batch_show_no_change() {
-    let base = PolicyRevision::from_json_str(ACCEPTANCE_BASE).unwrap();
+    let base = FirewallRuleRevision::from_json_str(ACCEPTANCE_BASE).unwrap();
     let web = base.rule(&id("web")).unwrap().clone();
 
     let replaced = base.apply(&[Edit::Replace(web)]).unwrap();
@@ -377,11 +377,11 @@ fn identical_replacement_and_empty_batch_show_no_change() {
 
 #[test]
 fn equivalent_inputs_give_identical_candidates_and_diffs() {
-    let base = PolicyRevision::from_json_str(ACCEPTANCE_BASE).unwrap();
+    let base = FirewallRuleRevision::from_json_str(ACCEPTANCE_BASE).unwrap();
     let expected = base.apply(&acceptance_edits()).unwrap();
 
     // Same base and edits with other key order and whitespace.
-    let reformatted_base = PolicyRevision::from_json_str(
+    let reformatted_base = FirewallRuleRevision::from_json_str(
         r#"{"rules":[{"all_of":[{"op":"==","right":53,"left":{"payload":{"field":"dport","protocol":"udp"}}}],"id":"dns"},
         {"all_of":[{"right":{"prefix":{"len":24,"addr":"198.51.100.0"}},"op":"==","left":{"payload":{"field":"daddr","protocol":"ip"}}},
                    {"op":"==","left":{"payload":{"field":"dport","protocol":"tcp"}},"right":80}],"id":"web"},
@@ -410,9 +410,9 @@ fn equivalent_inputs_give_identical_candidates_and_diffs() {
     }
 
     // Serializing both sides and decoding them again changes nothing.
-    let base_again = PolicyRevision::from_json_str(&base.to_json_string()).unwrap();
+    let base_again = FirewallRuleRevision::from_json_str(&base.to_json_string()).unwrap();
     let candidate_again =
-        PolicyRevision::from_json_str(&expected.candidate().to_json_string()).unwrap();
+        FirewallRuleRevision::from_json_str(&expected.candidate().to_json_string()).unwrap();
     assert_eq!(&candidate_again, expected.candidate());
     assert_eq!(base_again.apply(&acceptance_edits()), Ok(expected));
 }
@@ -441,7 +441,7 @@ const ID_POOL: [&str; 8] = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"];
 
 /// The first problem a batch has, computed independently of `apply`: for each
 /// edit in order, a repeated ID, then the presence its kind requires.
-fn expected_failure(base: &PolicyRevision, edits: &[Edit]) -> Option<(usize, EditKind)> {
+fn expected_failure(base: &FirewallRuleRevision, edits: &[Edit]) -> Option<(usize, EditKind)> {
     let present: HashSet<&str> = base.rules().iter().map(|r| r.id().as_str()).collect();
     let mut seen = HashSet::new();
     edits.iter().enumerate().find_map(|(index, edit)| {
@@ -507,7 +507,11 @@ fn generated_batches_keep_the_edit_and_diff_invariants() {
     );
 }
 
-fn assert_successful_change(base: &PolicyRevision, edits: &[Edit], change: &PolicyChange) {
+fn assert_successful_change(
+    base: &FirewallRuleRevision,
+    edits: &[Edit],
+    change: &RuleRevisionChange,
+) {
     let candidate = change.candidate();
     let named: HashSet<&RuleId> = edits.iter().map(Edit::id).collect();
 
@@ -519,8 +523,8 @@ fn assert_successful_change(base: &PolicyRevision, edits: &[Edit], change: &Poli
     );
 
     // Untouched rules keep their content and relative order.
-    let untouched = |policy: &PolicyRevision| -> Vec<Rule> {
-        policy
+    let untouched = |snapshot: &FirewallRuleRevision| -> Vec<Rule> {
+        snapshot
             .rules()
             .iter()
             .filter(|rule| !named.contains(rule.id()))

@@ -3,10 +3,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::diff::{PolicyDiff, RuleChange};
-use crate::model::{PolicyError, PolicyRevision, Rule, RuleId};
+use crate::diff::{RuleChange, RuleRevisionDiff};
+use crate::model::{FirewallRuleRevision, Rule, RuleId, RuleRevisionError};
 
-/// One requested change to a policy, naming a rule by ID.
+/// One requested change to a revision, naming a rule by ID.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Edit {
     /// Appends a rule whose ID the base does not have.
@@ -61,21 +61,21 @@ impl fmt::Display for EditKind {
 /// A successfully applied batch: the complete candidate and how it differs
 /// from the base.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PolicyChange {
-    candidate: PolicyRevision,
-    diff: PolicyDiff,
+pub struct RuleRevisionChange {
+    candidate: FirewallRuleRevision,
+    diff: RuleRevisionDiff,
 }
 
-impl PolicyChange {
-    pub fn candidate(&self) -> &PolicyRevision {
+impl RuleRevisionChange {
+    pub fn candidate(&self) -> &FirewallRuleRevision {
         &self.candidate
     }
 
-    pub fn diff(&self) -> &PolicyDiff {
+    pub fn diff(&self) -> &RuleRevisionDiff {
         &self.diff
     }
 
-    pub fn into_parts(self) -> (PolicyRevision, PolicyDiff) {
+    pub fn into_parts(self) -> (FirewallRuleRevision, RuleRevisionDiff) {
         (self.candidate, self.diff)
     }
 }
@@ -91,17 +91,17 @@ pub enum EditError {
         index: usize,
         kind: EditKind,
     },
-    #[error("edit {index} adds rule {id:?}, which the base policy already has", id = .id.as_str())]
+    #[error("edit {index} adds rule {id:?}, which the base revision already has", id = .id.as_str())]
     AddExisting { id: RuleId, index: usize },
-    #[error("edit {index} replaces rule {id:?}, which the base policy does not have", id = .id.as_str())]
+    #[error("edit {index} replaces rule {id:?}, which the base revision does not have", id = .id.as_str())]
     ReplaceMissing { id: RuleId, index: usize },
-    #[error("edit {index} removes rule {id:?}, which the base policy does not have", id = .id.as_str())]
+    #[error("edit {index} removes rule {id:?}, which the base revision does not have", id = .id.as_str())]
     RemoveMissing { id: RuleId, index: usize },
-    #[error("the edited policy is invalid")]
-    InvalidCandidate(#[source] PolicyError),
+    #[error("the edited revision is invalid")]
+    InvalidCandidate(#[source] RuleRevisionError),
 }
 
-impl PolicyRevision {
+impl FirewallRuleRevision {
     /// Applies `edits` to this revision as one operation.
     ///
     /// Edits are checked in batch order and the first failure is returned;
@@ -110,7 +110,7 @@ impl PolicyRevision {
     /// original position and added rules appended in batch order; it is
     /// validated as a complete revision before it is returned. An empty batch
     /// yields an unchanged candidate and an empty diff.
-    pub fn apply(&self, edits: &[Edit]) -> Result<PolicyChange, EditError> {
+    pub fn apply(&self, edits: &[Edit]) -> Result<RuleRevisionChange, EditError> {
         let present: HashSet<&RuleId> = self.rules().iter().map(Rule::id).collect();
         let mut named: HashMap<&RuleId, (usize, EditKind)> = HashMap::with_capacity(edits.len());
         let mut replacements: HashMap<&RuleId, &Rule> = HashMap::new();
@@ -183,10 +183,10 @@ impl PolicyRevision {
             rules.push(rule.clone());
         }
 
-        let candidate = PolicyRevision::new(rules).map_err(EditError::InvalidCandidate)?;
-        Ok(PolicyChange {
+        let candidate = FirewallRuleRevision::new(rules).map_err(EditError::InvalidCandidate)?;
+        Ok(RuleRevisionChange {
             candidate,
-            diff: PolicyDiff::new(changes),
+            diff: RuleRevisionDiff::new(changes),
         })
     }
 }

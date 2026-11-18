@@ -6,11 +6,11 @@ use crate::model::{Rule, RuleId};
 /// replaced and removed rules in base order, then added rules in candidate
 /// order. Unchanged rules are absent.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PolicyDiff {
+pub struct RuleRevisionDiff {
     changes: Vec<RuleChange>,
 }
 
-impl PolicyDiff {
+impl RuleRevisionDiff {
     pub(crate) fn new(changes: Vec<RuleChange>) -> Self {
         Self { changes }
     }

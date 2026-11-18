@@ -13,16 +13,16 @@ use std::num::NonZeroU64;
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::model::{
-    HeaderField, HeaderProtocol, IntegerRange, Ipv4Prefix, Match, PayloadHeader, PolicyError,
-    PolicyRevision, Read, Rule, RuleId, TcpOptionName, Value,
+    FirewallRuleRevision, HeaderField, HeaderProtocol, IntegerRange, Ipv4Prefix, Match,
+    PayloadHeader, Read, Rule, RuleId, RuleRevisionError, TcpOptionName, Value,
 };
 
-/// The only policy schema version this crate reads and writes.
+/// The only firewall rules schema version this crate reads and writes.
 pub const SCHEMA_VERSION: u64 = 1;
 
 const EQUALITY: &str = "==";
 
-impl PolicyRevision {
+impl FirewallRuleRevision {
     /// Decodes one complete revision document.
     pub fn from_json_str(text: &str) -> Result<Self, DecodeError> {
         let json = serde_json::from_str(text).map_err(DecodeError::syntax)?;
@@ -35,8 +35,8 @@ impl PolicyRevision {
         decode_revision(&json)
     }
 
-    /// The canonical JSON form, which [`PolicyRevision::from_json_str`] reads
-    /// back unchanged.
+    /// The canonical JSON form, which [`FirewallRuleRevision::from_json_str`]
+    /// reads back unchanged.
     pub fn to_json_string(&self) -> String {
         to_json_string(self)
     }
@@ -61,11 +61,11 @@ fn to_json_string(value: &impl serde::Serialize) -> String {
         Ok(text) => text,
         // Every map key is a string and no Serialize impl in this crate
         // returns an error, so writing to a String cannot fail.
-        Err(error) => unreachable!("policy serialization failed: {error}"),
+        Err(error) => unreachable!("revision serialization failed: {error}"),
     }
 }
 
-/// A policy document that does not follow the grammar.
+/// A firewall rules document that does not follow the grammar.
 #[derive(Debug, thiserror::Error)]
 #[error("{path}: {kind}")]
 pub struct DecodeError {
@@ -176,7 +176,7 @@ impl fmt::Display for JsonKind {
     }
 }
 
-/// The location of an element in a policy document, such as
+/// The location of an element in a firewall rules document, such as
 /// `$.rules[1].all_of[0].left`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JsonPath(Vec<PathSegment>);
@@ -404,9 +404,14 @@ fn wrong_type(path: &JsonPath, expected: &'static str, found: &Json) -> DecodeEr
     )
 }
 
-fn decode_revision(json: &Json) -> Result<PolicyRevision, DecodeError> {
+fn decode_revision(json: &Json) -> Result<FirewallRuleRevision, DecodeError> {
     let root = JsonPath::root();
-    let fields = Fields::new(json, &root, "a policy object", &["schema_version", "rules"])?;
+    let fields = Fields::new(
+        json,
+        &root,
+        "a revision object",
+        &["schema_version", "rules"],
+    )?;
 
     let (version, version_path) = fields.required("schema_version")?;
     match version {
@@ -446,8 +451,8 @@ fn decode_revision(json: &Json) -> Result<PolicyRevision, DecodeError> {
         .map(|(index, rule)| decode_rule(rule, &rules_path.index(index)))
         .collect::<Result<Vec<_>, _>>()?;
 
-    PolicyRevision::new(rules).map_err(|error| match error {
-        PolicyError::DuplicateRuleId {
+    FirewallRuleRevision::new(rules).map_err(|error| match error {
+        RuleRevisionError::DuplicateRuleId {
             id,
             first_index,
             duplicate_index,
