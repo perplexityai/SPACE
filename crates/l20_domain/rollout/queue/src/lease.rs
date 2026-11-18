@@ -6,6 +6,9 @@ use std::time::Duration;
 
 use crate::{FailedItems, clamp_lease};
 
+#[cfg(test)]
+mod tests;
+
 /// How many items a canary leases: one at a time, until one is done.
 const CANARY_IN_FLIGHT: u64 = 1;
 
