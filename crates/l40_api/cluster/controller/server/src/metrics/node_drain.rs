@@ -10,11 +10,13 @@ use pplx_space_metrics_emit::{counter, elapsed_ms, gauge, tag, timing_ms};
 
 /// What a v2 drain's node reported on the loop's last call, each resident
 /// counted once: residents it can't make durable (`blocked`, which keeps the
-/// drain from ending and is what to page on) and the rest with work still
-/// under way (`pending`, evacuations not yet recorded included).
+/// drain from ending and is what to page on), the ones with work still under
+/// way (`pending`, evacuations not yet recorded included), and the running
+/// sandboxes a gentle drain holds with nothing started for them (`held`,
+/// which go once they go idle or the drain turns forced).
 /// `unanswered` is 1 while the node didn't answer, which keeps the drain from
 /// ending just as `blocked` does.
-pub fn v2_report(node_id: &str, blocked: u64, pending: u64) {
+pub fn v2_report(node_id: &str, blocked: u64, pending: u64, held: u64) {
     gauge("node_drain.v2.unanswered", 0.0, &[tag("node", node_id)]);
     gauge(
         "node_drain.v2.blocked",
@@ -26,6 +28,7 @@ pub fn v2_report(node_id: &str, blocked: u64, pending: u64) {
         pending as f64,
         &[tag("node", node_id)],
     );
+    gauge("node_drain.v2.held", held as f64, &[tag("node", node_id)]);
 }
 
 /// A v2 drain's node didn't answer the loop's `DrainNode` call: dead,
@@ -44,6 +47,7 @@ pub fn clear_v2_gauges(node_id: &str) {
         "node_drain.v2.unanswered",
         "node_drain.v2.blocked",
         "node_drain.v2.pending",
+        "node_drain.v2.held",
     ] {
         gauge(name, 0.0, &[tag("node", node_id)]);
     }

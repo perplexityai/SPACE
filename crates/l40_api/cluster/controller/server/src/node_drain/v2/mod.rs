@@ -1,17 +1,34 @@
 //! The node drain's v2 loop.
 //!
-//! A v2 drain is a forced drain the admin route started with `engine: v2`
+//! A v2 drain is a drain the admin route started with `engine: v2`
 //! (`nodes.drain_engine = 'v2'`), which wrote the epoch the node is sealed
-//! under (`drain_status.epoch`) in the transaction that moved the phase,
-//! before any node call. The node does the work: sandbox-manager's
-//! `DrainNode` seals it and makes every resident durable elsewhere. This loop
-//! asks it, each tick, and records what it reports:
+//! under in the transaction that moved the phase, before any node call. The
+//! node does the work: sandbox-manager's `DrainNode` seals it and makes every
+//! resident durable elsewhere. This loop asks it, each tick, and records what
+//! it reports:
+//!
+//! - **gentle**: a gentle drain (`drain_mode` gentle) keeps its epoch in
+//!   `drain_status.gentle_epoch` rather than `epoch`, with the operator's
+//!   `deadline`, so a controller that predates gentle drains finds no epoch
+//!   and never calls the node for it. Its calls name the epoch in the
+//!   request's `gentle_epoch` with `epoch` 0, which a sandbox-manager or
+//!   node-api relay that predates gentle drains refuses before it seals
+//!   anything ([`drain_request`]); the node holds every `started` sandbox,
+//!   and the loop takes an answer only when it echoes `gentle_epoch`. At the
+//!   deadline, by the database clock (the listing's `deadline_due`), or
+//!   once an operator's `:drain` with `mode: forced` has set `drain_mode`, the loop turns the drain forced in one statement
+//!   (`drain_mode`, `epoch` for `gentle_epoch`, `escalated`), and calls
+//!   forced from then on, under the same epoch. A gentle drain that reaches
+//!   `drained` holds nothing, and its epoch moves to `epoch` in the same
+//!   statement, so everything from `drained` on reads it as a forced one's.
 //!
 //! - **`draining`, waiting**: the admin route starts every v2 drain waiting
 //!   for one of the cluster's evacuation slots (`drain_status.waiting`).
 //!   At most [`DEFAULT_MAX_EVACUATING_NODES`] nodes evacuate at once
 //!   (admitted and not yet `drained`, or undrained with their cancel not yet
-//!   finished); a waiting node whose heartbeat is fresh is admitted, oldest
+//!   finished; an admitted gentle drain not due to turn forced whose stored
+//!   report lists nothing but held sandboxes counts no slot while it does);
+//!   a waiting node whose heartbeat is fresh is admitted, oldest
 //!   drain first, once one frees. Until then it stays cordoned and gets no
 //!   `DrainNode` call, so it isn't sealed and the drain gate refuses no user
 //!   call on it.
@@ -85,16 +102,19 @@
 
 mod admission;
 mod cleanup;
+mod gentle;
 mod step;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_k8s_node_id::Ec2InstanceId;
-use pplx_space_sbx_mgr_client::proto::{DrainEvacuated, DrainNodeResponse, DrainPrior};
+use pplx_space_sbx_mgr_client::proto::{
+    DrainEvacuated, DrainNodeRequest, DrainNodeResponse, DrainPrior,
+};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -104,9 +124,11 @@ use admission::admit;
 use cleanup::{DISPATCH_BACKOFF_BASE, TERMINATE_BOUND};
 use cleanup::{DispatchBackoff, REFUSED_TERMINATE, fence, let_go, release, terminated_or_dispatch};
 pub use cleanup::{Fence, TerminatedDelete};
+pub use gentle::report_holds_only;
+use gentle::{HOLD_ACTION, escalate};
 use step::step;
 #[cfg(test)]
-use step::{Recording, UNRECORDED_BOUND, outstanding_rows, report_json};
+use step::{OutstandingRows, Recording, UNRECORDED_BOUND, outstanding_rows, report_json};
 
 /// How long one EC2 or Auto Scaling call may take.
 const AWS_CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -248,8 +270,26 @@ impl V2InstanceAuthority for V2Terminator {
 pub struct V2Node {
     pub id: NodeId,
     pub phase: Option<String>,
-    /// `drain_status.epoch`; the admin route writes it with the phase.
+    /// `drain_status.epoch`, or `gentle_epoch` for a gentle drain; the admin
+    /// route writes it with the phase.
     pub epoch: Option<u64>,
+    /// The epoch is `drain_status.gentle_epoch`: a gentle drain not yet
+    /// turned forced, nor `drained`.
+    pub gentle: bool,
+    /// `drain_mode` is `forced`: on a gentle drain, an operator escalated it.
+    pub mode_forced: bool,
+    /// `drain_status.deadline`, in Unix seconds: when a gentle drain turns
+    /// forced.
+    pub deadline: Option<i64>,
+    /// The database clock has reached `deadline`. The loop decides a
+    /// deadline by this alone, the clock the escalation's own statement
+    /// reads, so a controller whose clock runs behind doesn't postpone it.
+    pub deadline_due: bool,
+    /// The stored report is the node's gentle answer under this epoch and
+    /// lists nothing but held sandboxes: every `pending` entry's action is
+    /// `hold`, and nothing is `blocked` or `unrecorded`
+    /// ([`report_holds_only`]).
+    pub report_holds_only: bool,
     /// `drain_status.cancel`: the drain was undrained.
     pub cancel: bool,
     /// Since when, in Unix seconds, each evacuation the last stored report
@@ -285,6 +325,36 @@ pub struct V2Node {
     pub terminated_observed_at: Option<i64>,
     /// `nodes.terminate_decrement_capacity`, which the termination passes on.
     pub decrement_capacity: bool,
+}
+
+/// The `DrainNode` request of a drain call under `epoch`. A gentle one names
+/// the epoch in `gentle_epoch` alone and leaves `epoch` 0: a sandbox-manager
+/// that predates gentle drains, or a node-api relay that drops the field it
+/// doesn't know, reads epoch 0 and refuses the call before it seals or
+/// suspends anything, so no node runs a gentle drain as a forced one.
+pub fn drain_request(epoch: u64, gentle: bool) -> DrainNodeRequest {
+    if gentle {
+        DrainNodeRequest {
+            gentle_epoch: epoch,
+            ..DrainNodeRequest::default()
+        }
+    } else {
+        DrainNodeRequest {
+            epoch,
+            ..DrainNodeRequest::default()
+        }
+    }
+}
+
+/// The `DrainNode` request that cancels `epoch`, with the evacuations to
+/// forget.
+pub fn cancel_request(epoch: u64, forget: &[String]) -> DrainNodeRequest {
+    DrainNodeRequest {
+        epoch,
+        cancel: true,
+        forget: forget.to_vec(),
+        ..DrainNodeRequest::default()
+    }
 }
 
 /// What the loop keeps between ticks: the [`DispatchBackoff`], and the
@@ -329,6 +399,43 @@ impl EvacuationRecord {
     }
 }
 
+/// Why a `DrainNode` call failed: the gRPC status the node, or its
+/// node-api relay, answered with, or `None` for a failure before any answer
+/// (the endpoint lookup, the connection), and the error as the loop records
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrainCallError {
+    code: Option<tonic::Code>,
+    status_message: String,
+    text: String,
+}
+
+impl DrainCallError {
+    /// The status the call answered with.
+    pub fn status(status: &tonic::Status) -> Self {
+        Self {
+            code: Some(status.code()),
+            status_message: status.message().to_owned(),
+            text: status.to_string(),
+        }
+    }
+
+    /// A failure before the node answered.
+    pub fn other(text: impl Into<String>) -> Self {
+        Self {
+            code: None,
+            status_message: String::new(),
+            text: text.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DrainCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 /// What the v2 loop reads and writes.
 pub trait DrainV2Sink: Send + Sync + 'static {
     fn list_v2_nodes(
@@ -346,15 +453,23 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         &self,
         node_id: NodeId,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
-    /// `forget`, with `cancel`: the evacuations recorded since a cancel call
-    /// reported them, for the node to forget.
+    /// Call the node's `DrainNode` with `request` ([`drain_request`],
+    /// [`cancel_request`]).
     fn drain_node(
         &self,
         node_id: NodeId,
+        request: DrainNodeRequest,
+    ) -> impl std::future::Future<Output = Result<DrainNodeResponse, DrainCallError>> + Send;
+    /// Turn the gentle `draining` drain under `epoch` forced, once its
+    /// deadline has passed or an operator set `drain_mode` forced:
+    /// `drain_mode` forced, the epoch moved from `gentle_epoch` to `epoch`,
+    /// and `escalated` recorded. False when the row is no longer that
+    /// epoch's gentle `draining` drain due to turn.
+    fn escalate(
+        &self,
+        node_id: NodeId,
         epoch: u64,
-        cancel: bool,
-        forget: &[String],
-    ) -> impl std::future::Future<Output = Result<DrainNodeResponse, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
     fn record_evacuation(
         &self,
         node_id: NodeId,

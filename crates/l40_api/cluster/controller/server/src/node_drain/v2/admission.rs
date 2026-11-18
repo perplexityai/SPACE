@@ -6,12 +6,18 @@ impl V2Node {
     /// Holding an evacuation slot: admitted and not yet `drained`, or
     /// undrained after its admission with its cancel not yet finished, which
     /// lets the node's running suspends and uploads finish. The slot frees
-    /// once the node leaves v2: its cancel finished, or its row deleted.
+    /// once the node leaves v2: its cancel finished, or its row deleted. An
+    /// admitted gentle drain frees it while it only holds
+    /// ([`Self::only_holding`]), and takes it again, whatever the other
+    /// drains hold, whenever its report lists anything else and once it is
+    /// due to turn forced or is escalated: until those finish the cluster
+    /// may evacuate more nodes than the cap, and admission admits none while
+    /// it does.
     fn evacuating(&self) -> bool {
         self.epoch.is_some()
             && !self.waiting
             && match self.phase.as_deref() {
-                Some("draining") => true,
+                Some("draining") => !self.only_holding(),
                 None => self.cancel,
                 Some(_) => false,
             }

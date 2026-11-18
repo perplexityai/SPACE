@@ -11,16 +11,38 @@ pub const DRAIN_V2_ENABLED_ENV: &str = "SPACE_DRAIN_V2_ENABLED";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DrainV2Write {
     None,
-    /// Record the engine and the epoch of the drain this request starts.
-    Start,
+    /// Record the engine and the epoch of the drain this request starts, and
+    /// a gentle one's deadline, in Unix seconds.
+    Start {
+        gentle_deadline: Option<i64>,
+    },
     /// Mark the epoch for the controller to cancel on the node.
     Cancel,
+}
+
+/// A request's `deadline` and the drain's own, in Unix seconds, and now.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct DrainDeadlines<'a> {
+    /// The request's, as it sent it.
+    pub(super) requested: Option<&'a str>,
+    /// The gentle v2 drain in flight's, `drain_status.deadline`.
+    pub(super) stored: Option<i64>,
+    pub(super) now: i64,
+}
+
+/// An RFC 3339 timestamp in Unix seconds.
+pub(super) fn parse_deadline(raw: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(time::OffsetDateTime::unix_timestamp)
 }
 
 /// Decide a request's drain v2 write, or refuse it. `starts_a_drain` is
 /// whether the transition starts a drain; `node_engine` is the engine the
 /// node's drain runs under; `recorded_instance` is whether the node's EC2
-/// instance is recorded.
+/// instance is recorded. A gentle v2 drain needs a deadline in the future to
+/// start; a deadline on any other drain is refused, and one that disagrees
+/// with the gentle v2 drain in flight is a conflict.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one fact of the request or the locked row the decision reads"
@@ -34,7 +56,37 @@ pub(super) fn drain_v2_write(
     recorded_instance: bool,
     starts_a_drain: bool,
     enabled: bool,
+    deadlines: DrainDeadlines<'_>,
 ) -> Result<DrainV2Write, (StatusCode, &'static str)> {
+    let gentle = mode == Some(NodeDrainMode::Gentle);
+    // The drain this request runs under v2: one it names v2, or the v2 drain
+    // in flight it repeats or escalates without naming an engine.
+    let runs_v2 = match requested {
+        Some(NodeDrainEngine::V2) => true,
+        Some(NodeDrainEngine::V1) => false,
+        None => !starts_a_drain && node_engine == NodeDrainEngine::V2,
+    };
+    let deadline = match deadlines.requested {
+        None => None,
+        Some(_) if !(matches!(action, DrainAction::Drain) && runs_v2 && gentle) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "a deadline is for a gentle drain with engine v2 only",
+            ));
+        }
+        Some(raw) => Some(parse_deadline(raw).ok_or((
+            StatusCode::BAD_REQUEST,
+            "the deadline must be an RFC 3339 timestamp",
+        ))?),
+    };
+    let in_flight = |write: DrainV2Write| match deadline {
+        Some(deadline) if deadlines.stored != Some(deadline) => Err((
+            StatusCode::CONFLICT,
+            "a gentle drain in flight keeps its deadline; escalate it with mode forced, or \
+             :undrain and drain again",
+        )),
+        _ => Ok(write),
+    };
     match action {
         DrainAction::Drain => match requested {
             Some(NodeDrainEngine::V2) => {
@@ -50,12 +102,6 @@ pub(super) fn drain_v2_write(
                         "drain engine v2 drains Kubernetes nodes only",
                     ));
                 }
-                if mode != Some(NodeDrainMode::Forced) {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        "drain engine v2 runs forced drains only; a gentle drain is :cordon",
-                    ));
-                }
                 if starts_a_drain && !recorded_instance {
                     // The drain terminates exactly the recorded instance,
                     // and asks EC2 about it to tell a node that died.
@@ -67,9 +113,24 @@ pub(super) fn drain_v2_write(
                     ));
                 }
                 if starts_a_drain {
-                    Ok(DrainV2Write::Start)
+                    let gentle_deadline = if gentle {
+                        let deadline = deadline.ok_or((
+                            StatusCode::BAD_REQUEST,
+                            "a gentle drain with engine v2 needs a deadline, when it turns forced",
+                        ))?;
+                        if deadline <= deadlines.now {
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                "the deadline must be in the future",
+                            ));
+                        }
+                        Some(deadline)
+                    } else {
+                        None
+                    };
+                    Ok(DrainV2Write::Start { gentle_deadline })
                 } else if node_engine == NodeDrainEngine::V2 {
-                    Ok(DrainV2Write::None)
+                    in_flight(DrainV2Write::None)
                 } else {
                     Err((StatusCode::CONFLICT, "a drain in flight keeps its engine"))
                 }
@@ -84,7 +145,7 @@ pub(super) fn drain_v2_write(
                 "the previous v2 drain is still being cancelled on the node; retry, or drain \
                  with engine v2",
             )),
-            _ => Ok(DrainV2Write::None),
+            _ => in_flight(DrainV2Write::None),
         },
         DrainAction::Undrain if node_engine == NodeDrainEngine::V2 => Ok(DrainV2Write::Cancel),
         _ => Ok(DrainV2Write::None),

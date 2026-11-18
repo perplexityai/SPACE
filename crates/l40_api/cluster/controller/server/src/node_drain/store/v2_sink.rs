@@ -15,14 +15,17 @@ use pplx_space_sbx_mgr_client::proto::{
 use uuid::Uuid;
 
 use pplx_space_node_registration_store::drain_v2::{
-    LockedV2Node, admit_v2_evacuation, advance_v2_drained, finish_v2_cancel, let_go_v2_node,
-    list_v2_node_rows, read_locked_v2_node, record_terminate_held, record_v2_dispatched,
-    record_v2_error, record_v2_report, record_v2_terminated_observed, write_fence,
+    LockedV2Node, admit_v2_evacuation, advance_v2_drained, escalate_v2_drain, finish_v2_cancel,
+    let_go_v2_node, list_v2_node_rows, read_locked_v2_node, record_terminate_held,
+    record_v2_dispatched, record_v2_error, record_v2_report, record_v2_terminated_observed,
+    write_fence,
 };
 
 use super::*;
 use crate::node_drain::guarded_delete::{self, GuardedDelete, NodeIdentity};
-use crate::node_drain::v2::{DrainV2Sink, EvacuationRecord, Fence, TerminatedDelete, V2Node};
+use crate::node_drain::v2::{
+    DrainCallError, DrainV2Sink, EvacuationRecord, Fence, TerminatedDelete, V2Node,
+};
 
 /// How long one `DrainNode` call may take; the node answers without waiting.
 const DRAIN_NODE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -49,6 +52,14 @@ pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Er
                 id: row.id,
                 phase: row.drain_phase,
                 epoch,
+                gentle: row.gentle,
+                mode_forced: row.mode_forced,
+                deadline: row.deadline,
+                deadline_due: row.deadline_due,
+                report_holds_only: crate::node_drain::v2::report_holds_only(
+                    row.report.as_ref(),
+                    epoch,
+                ),
                 cancel: row.cancel,
                 waiting: row.waiting,
                 unrecorded_since: unrecorded_since(
@@ -435,31 +446,26 @@ impl DrainV2Sink for SubstrateSink {
     async fn drain_node(
         &self,
         node_id: NodeId,
-        epoch: u64,
-        cancel: bool,
-        forget: &[String],
-    ) -> Result<DrainNodeResponse, String> {
+        request: DrainNodeRequest,
+    ) -> Result<DrainNodeResponse, DrainCallError> {
         let target = node_api_row(&self.pool, node_id)
             .await
-            .map_err(|error| format!("node endpoint lookup failed: {error}"))?
-            .ok_or_else(|| format!("node {node_id} not found"))?;
+            .map_err(|error| {
+                DrainCallError::other(format!("node endpoint lookup failed: {error}"))
+            })?
+            .ok_or_else(|| DrainCallError::other(format!("node {node_id} not found")))?;
         let mut client = connect_internal_node_api_client_for_target(
             self.substrate.kubernetes(),
             &target.as_target(),
             DRAIN_NODE_TIMEOUT,
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| DrainCallError::other(error.to_string()))?;
         client
-            .drain_node(DrainNodeRequest {
-                epoch,
-                cancel,
-                forget: forget.to_vec(),
-                ..DrainNodeRequest::default()
-            })
+            .drain_node(request)
             .await
             .map(tonic::Response::into_inner)
-            .map_err(|status| status.to_string())
+            .map_err(|status| DrainCallError::status(&status))
     }
 
     async fn record_evacuation(
@@ -489,6 +495,12 @@ impl DrainV2Sink for SubstrateSink {
 
     async fn advance_drained(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
         advance_v2_drained(&self.pool, node_id, epoch_i64(epoch)?)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn escalate(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
+        escalate_v2_drain(&self.pool, node_id, epoch_i64(epoch)?)
             .await
             .map_err(|error| error.to_string())
     }

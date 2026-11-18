@@ -1875,8 +1875,10 @@ class DrainV2Control(KindWorkerControl, DrainRestoreControl, Protocol):
     drain env, the drain restore hold, and the Kind worker's instance, stop
     and replacement."""
 
-    def drain_node_v2(self, node_id: str) -> None:
-        """`POST :drain` with `mode: forced` and `engine: v2`."""
+    def drain_node_v2(self, node_id: str, *, gentle_deadline: str | None = None) -> None:
+        """`POST :drain` with `mode: forced` and `engine: v2`; with
+        `gentle_deadline`, an RFC 3339 timestamp, a gentle drain with that
+        deadline instead."""
         ...
 
     def drain_v2_status(self, node_id: str) -> DrainV2Status | None:

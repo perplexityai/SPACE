@@ -101,3 +101,43 @@ fn the_drain_stub_states_what_forced_mode_destroys() {
         "the body description must cover the already-draining edge; got {body:?}"
     );
 }
+
+/// The `:drain` stub documents the gentle v2 drain: its `engine` and
+/// `deadline` fields, that a deadline is required and when it is refused,
+/// that a running sandbox is held, and that the drain turns forced at its
+/// deadline. Facts, not wording.
+#[test]
+fn the_drain_stub_states_the_gentle_v2_contract() {
+    let spec = admin_openapi_value();
+    let drain = &spec["paths"]["/nodes/{node_id}:drain"]["post"];
+    let properties = &drain["requestBody"]["content"]["application/json"]["schema"]["properties"];
+    assert_eq!(
+        properties["engine"]["enum"],
+        serde_json::json!(["v1", "v2"])
+    );
+    assert_eq!(properties["deadline"]["format"], "date-time");
+    let deadline = properties["deadline"]["description"]
+        .as_str()
+        .expect("deadline description");
+    for fact in [
+        "Required",
+        "no default",
+        "400",
+        "409",
+        "drain_status.deadline",
+    ] {
+        assert!(deadline.contains(fact), "{fact:?}: {deadline:?}");
+    }
+    let mode = properties["mode"]["description"]
+        .as_str()
+        .expect("mode description");
+    for fact in ["hold", "keeps running", "deadline", "turns forced"] {
+        assert!(mode.contains(fact), "{fact:?}: {mode:?}");
+    }
+    for (status, fact) in [("400", "deadline"), ("409", "deadline")] {
+        let description = drain["responses"][status]["description"]
+            .as_str()
+            .expect("a response description");
+        assert!(description.contains(fact), "{status}: {description:?}");
+    }
+}

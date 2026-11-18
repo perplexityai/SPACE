@@ -294,3 +294,84 @@ fn unknown_drain_phase_strings_are_rejected_rather_than_guessed() {
         NodeDrainPhase::parse(phase).unwrap();
     }
 }
+
+/// The gate answers with the candidate that blocks placement, wherever it
+/// came from; else one that refuses VM activations, the primary first; else
+/// the primary; else the first sibling.
+#[test]
+fn the_gate_prefers_a_blocking_candidate_then_a_refusing_one() {
+    let gentle = |engine| NodeDrainState {
+        engine,
+        ..state(NodeDrainPhase::Draining, NodeDrainMode::Gentle)
+    };
+    let v1 = gentle(NodeDrainEngine::V1);
+    let v2 = gentle(NodeDrainEngine::V2);
+    let forced = state(NodeDrainPhase::Draining, NodeDrainMode::Forced);
+    for (primary, siblings, expected) in [
+        (Some(v1), &[v2, forced][..], Some(forced)),
+        (Some(forced), &[v2][..], Some(forced)),
+        (Some(v1), &[v1, v2][..], Some(v2)),
+        (None, &[v1, v2][..], Some(v2)),
+        (Some(v2), &[v2][..], Some(v2)),
+        (Some(v1), &[v1][..], Some(v1)),
+        (None, &[v1][..], Some(v1)),
+        (None, &[][..], None),
+    ] {
+        assert_eq!(
+            super::drain_state_precedence(primary, siblings),
+            expected,
+            "{primary:?} with {siblings:?}"
+        );
+    }
+}
+
+/// The one allow-list of actions a sealed node lets through on a sandbox
+/// that isn't running ([`super::activates_no_vm`]), pinned for every
+/// `SandboxAction`. The match below is exhaustive, so a new action fails to
+/// compile here until it is listed with its answer; the gate refuses it
+/// meanwhile, since the allow-list's own match names it nowhere.
+#[test]
+fn every_action_is_listed_for_a_sealed_node() {
+    use crate::controllers::substrate::ExecutionActivityKind;
+    let expected = |action: SandboxAction| match action {
+        SandboxAction::Suspend
+        | SandboxAction::Stop
+        | SandboxAction::Kill
+        | SandboxAction::Pause
+        | SandboxAction::Checkpoint
+        | SandboxAction::EnableSnapshots
+        | SandboxAction::DisableSnapshots
+        | SandboxAction::Stats => true,
+        SandboxAction::Start
+        | SandboxAction::Wake
+        | SandboxAction::ImplicitWake(_)
+        | SandboxAction::Restore
+        | SandboxAction::Resume
+        | SandboxAction::OpenPort
+        | SandboxAction::Rollback
+        | SandboxAction::Spaced
+        | SandboxAction::Update => false,
+    };
+    for action in [
+        SandboxAction::Start,
+        SandboxAction::Wake,
+        SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
+        SandboxAction::ImplicitWake(ExecutionActivityKind::Command),
+        SandboxAction::Resume,
+        SandboxAction::Restore,
+        SandboxAction::Suspend,
+        SandboxAction::Stop,
+        SandboxAction::Kill,
+        SandboxAction::Pause,
+        SandboxAction::Checkpoint,
+        SandboxAction::EnableSnapshots,
+        SandboxAction::DisableSnapshots,
+        SandboxAction::Stats,
+        SandboxAction::OpenPort,
+        SandboxAction::Rollback,
+        SandboxAction::Spaced,
+        SandboxAction::Update,
+    ] {
+        assert_eq!(super::activates_no_vm(action), expected(action), "{action}");
+    }
+}

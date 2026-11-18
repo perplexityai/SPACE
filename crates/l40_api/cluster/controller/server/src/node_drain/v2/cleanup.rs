@@ -2,21 +2,6 @@
 
 use super::*;
 
-impl V2Node {
-    /// `terminating` with its fence written.
-    pub(super) fn fenced(&self) -> Option<&str> {
-        self.fence
-            .as_deref()
-            .filter(|_| self.phase.as_deref() == Some("terminating"))
-    }
-
-    /// The instance to ask EC2 about: the fence once written, else the
-    /// recorded instance.
-    pub(super) fn asked_instance(&self) -> Option<&str> {
-        self.fenced().or(self.instance_id.as_deref())
-    }
-}
-
 /// The `drain_last_error` of a `terminating` node no authority terminates.
 pub const REFUSED_TERMINATE: &str = "a v2 node is terminated only through the aws terminator (SPACE_NODE_DRAIN_TERMINATOR_KIND=aws)";
 
@@ -27,7 +12,6 @@ pub const TERMINATE_BOUND: Duration = Duration::from_secs(15 * 60);
 
 /// The first and longest waits between a fenced node's EC2 checks.
 pub(super) const DISPATCH_BACKOFF_BASE: Duration = Duration::from_secs(10);
-
 const DISPATCH_BACKOFF_CAP: Duration = Duration::from_secs(120);
 
 /// When each fenced node is next asked about: its EC2 check, and the
@@ -99,6 +83,21 @@ pub enum TerminatedDelete {
     Unfenced,
     /// Not yet, and why: a fresh heartbeat, a moved identity or phase.
     Wait(String),
+}
+
+impl V2Node {
+    /// `terminating` with its fence written.
+    pub(super) fn fenced(&self) -> Option<&str> {
+        self.fence
+            .as_deref()
+            .filter(|_| self.phase.as_deref() == Some("terminating"))
+    }
+
+    /// The instance to ask EC2 about: the fence once written, else the
+    /// recorded instance.
+    pub(super) fn asked_instance(&self) -> Option<&str> {
+        self.fenced().or(self.instance_id.as_deref())
+    }
 }
 
 /// Release the durably suspended rows still naming a `drained` node.

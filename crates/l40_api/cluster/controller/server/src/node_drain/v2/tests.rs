@@ -26,6 +26,12 @@ struct FakeSink {
     nodes_present: Vec<String>,
     /// The terminated delete's answer; `Deleted` when unset.
     delete: Option<TerminatedDelete>,
+    /// The escalation's answer; `Ok(true)` when unset.
+    escalate: Option<Result<bool, String>>,
+    /// Every `DrainNode` request, in order.
+    requests: Mutex<Vec<DrainNodeRequest>>,
+    /// When set, every `DrainNode` call answers with this status.
+    refusal: Option<tonic::Status>,
 }
 
 impl FakeSink {
@@ -56,11 +62,20 @@ impl DrainV2Sink for FakeSink {
     async fn drain_node(
         &self,
         node_id: NodeId,
-        epoch: u64,
-        cancel: bool,
-        forget: &[String],
-    ) -> Result<DrainNodeResponse, String> {
-        if forget.is_empty() {
+        request: DrainNodeRequest,
+    ) -> Result<DrainNodeResponse, DrainCallError> {
+        self.requests.lock().unwrap().push(request.clone());
+        let DrainNodeRequest {
+            epoch,
+            cancel,
+            forget,
+            gentle_epoch,
+        } = request;
+        if gentle_epoch != 0 {
+            self.log(format!(
+                "drain_node {node_id} gentle={gentle_epoch} epoch={epoch} cancel={cancel}"
+            ));
+        } else if forget.is_empty() {
             self.log(format!("drain_node {node_id} {epoch} cancel={cancel}"));
         } else {
             self.log(format!(
@@ -71,6 +86,9 @@ impl DrainV2Sink for FakeSink {
         if let Some(barrier) = &self.barrier {
             barrier.wait().await;
         }
+        if let Some(refusal) = &self.refusal {
+            return Err(DrainCallError::status(refusal));
+        }
         if !forget.is_empty()
             && let Some(answer) = self.after_forget.get(&node_id)
         {
@@ -80,6 +98,12 @@ impl DrainV2Sink for FakeSink {
             .get(&(node_id, cancel))
             .cloned()
             .unwrap_or_else(|| Err("unscripted".into()))
+            .map_err(DrainCallError::other)
+    }
+
+    async fn escalate(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
+        self.log(format!("escalate {node_id} {epoch}"));
+        self.escalate.clone().unwrap_or(Ok(true))
     }
 
     async fn record_evacuation(
@@ -258,6 +282,11 @@ fn node(phase: Option<&str>, epoch: Option<u64>, cancel: bool) -> V2Node {
         id,
         phase: phase.map(str::to_owned),
         epoch,
+        gentle: false,
+        mode_forced: false,
+        deadline: None,
+        deadline_due: false,
+        report_holds_only: false,
         cancel,
         unrecorded_since: BTreeMap::new(),
         waiting: false,
@@ -400,6 +429,36 @@ async fn a_node_holds_its_slot_until_it_leaves_v2() {
         ),
         ("terminating", Some(fenced(true)), false),
         ("left v2", None, false),
+        // A gentle drain whose report lists nothing but held sandboxes runs
+        // no suspend or upload, until it turns forced.
+        (
+            "gentle, only holding",
+            Some(holding(gentle_node(600))),
+            false,
+        ),
+        ("gentle, with work under way", Some(gentle_node(600)), true),
+        (
+            "gentle, only holding, escalated by an operator",
+            Some(V2Node {
+                mode_forced: true,
+                ..holding(gentle_node(600))
+            }),
+            true,
+        ),
+        (
+            "gentle, only holding, at its deadline",
+            Some(holding(gentle_node(0))),
+            true,
+        ),
+        (
+            "gentle, only holding, cancelling",
+            Some(V2Node {
+                phase: None,
+                cancel: true,
+                ..holding(gentle_node(600))
+            }),
+            true,
+        ),
     ] {
         // The oldest drain, so a waiting one beside it comes second.
         let next = V2Node {
@@ -775,7 +834,7 @@ async fn a_node_that_leaves_the_listing_has_its_v2_gauges_zeroed() {
         .await;
         let values = capture.finish();
         let zeroed: Vec<(String, f64)> = if cleared {
-            ["unanswered", "blocked", "pending"]
+            ["unanswered", "blocked", "pending", "held"]
                 .map(|name| (format!("node_drain.v2.{name}"), 0.0))
                 .to_vec()
         } else {
@@ -871,6 +930,7 @@ async fn an_undrained_node_hands_back_its_evacuations_before_the_cancel_clears()
                     ("node_drain.v2.unanswered", 0.0),
                     ("node_drain.v2.blocked", 0.0),
                     ("node_drain.v2.pending", 0.0),
+                    ("node_drain.v2.held", 0.0),
                 ],
                 "{case}"
             );
@@ -998,7 +1058,8 @@ async fn an_evacuation_unrecorded_past_the_bound_is_blocked() {
 /// the node reports twice pending (an activation and the window's `queued`)
 /// is one pending row, a row the node blocks whose evacuation is also
 /// overdue is one blocked row with the node's reason alone, and a row both
-/// pending and blocked counts as blocked. The controls: a row only
+/// pending and blocked counts as blocked. A gentle drain's `hold` counts
+/// held, not pending, unless the row is blocked. The controls: a row only
 /// unrecorded past the bound, one within it, one the window holds for disk,
 /// and a blocked entry without a sandbox.
 #[test]
@@ -1019,6 +1080,8 @@ fn a_row_is_reported_once_however_many_reasons_name_it() {
             pending("queued", "queued"),
             pending("disk", "disk"),
             pending("both", "upload"),
+            pending("held", "hold"),
+            pending("blocked", "hold"),
         ],
         blocked: vec![
             blocked(Some("both"), "upload failed 3 times: denied"),
@@ -1043,7 +1106,14 @@ fn a_row_is_reported_once_however_many_reasons_name_it() {
         now: bound + 60,
     };
 
-    assert_eq!(outstanding_rows(&answer, &recording), (4, 3));
+    assert_eq!(
+        outstanding_rows(&answer, &recording),
+        OutstandingRows {
+            blocked: 4,
+            pending: 3,
+            held: 1,
+        }
+    );
     let json = report_json(&answer, &recording);
     let named: Vec<_> = json["blocked"]
         .as_array()
@@ -1079,6 +1149,89 @@ async fn a_drained_tick_releases_and_a_draining_one_does_not() {
     run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
     assert!(called(&sink, "release", &drained), "{:?}", sink.calls());
     assert!(!called(&sink, "release", &draining), "{:?}", sink.calls());
+}
+
+/// A report holds only when it is the node's gentle answer under the
+/// drain's epoch and every entry left is a `hold`.
+#[test]
+fn a_report_holds_only_with_nothing_but_holds_under_its_gentle_epoch() {
+    let report =
+        |sealed: u64, gentle: bool, pending: &[&str], blocked: usize, unrecorded: usize| {
+            serde_json::json!({
+                "sealed_epoch": sealed,
+                "gentle": gentle,
+                "done": false,
+                "evacuated": [{"sandbox_id": "e", "prior": "paused", "artifact_id": "x"}],
+                "pending": pending.iter().enumerate().map(|(n, action)| serde_json::json!({
+                    "sandbox_id": format!("p{n}"), "action": action,
+                })).collect::<Vec<_>>(),
+                "blocked": (0..blocked).map(|n| serde_json::json!({
+                    "sandbox_id": format!("b{n}"), "reason": "upload failed 3 times",
+                })).collect::<Vec<_>>(),
+                "unrecorded": (0..unrecorded).map(|n| serde_json::json!({
+                    "sandbox_id": format!("u{n}"), "reason": "not projected", "since": 0,
+                })).collect::<Vec<_>>(),
+            })
+        };
+    for (case, stored, epoch, holds) in [
+        (
+            "only holds",
+            Some(report(5, true, &["hold", "hold"], 0, 0)),
+            Some(5),
+            true,
+        ),
+        (
+            "nothing left",
+            Some(report(5, true, &[], 0, 0)),
+            Some(5),
+            true,
+        ),
+        (
+            "a suspend",
+            Some(report(5, true, &["hold", "suspend"], 0, 0)),
+            Some(5),
+            false,
+        ),
+        (
+            "a blocked row",
+            Some(report(5, true, &["hold"], 1, 0)),
+            Some(5),
+            false,
+        ),
+        (
+            "an unrecorded row",
+            Some(report(5, true, &["hold"], 0, 1)),
+            Some(5),
+            false,
+        ),
+        (
+            "another epoch",
+            Some(report(4, true, &["hold"], 0, 0)),
+            Some(5),
+            false,
+        ),
+        (
+            "a forced answer",
+            Some(report(5, false, &["hold"], 0, 0)),
+            Some(5),
+            false,
+        ),
+        (
+            "no epoch",
+            Some(report(5, true, &["hold"], 0, 0)),
+            None,
+            false,
+        ),
+        ("no report", None, Some(5), false),
+        (
+            "a report missing a list",
+            Some(serde_json::json!({"sealed_epoch": 5, "gentle": true})),
+            Some(5),
+            false,
+        ),
+    ] {
+        assert_eq!(report_holds_only(stored.as_ref(), epoch), holds, "{case}");
+    }
 }
 
 /// An unfenced `terminating` node runs the terminate transaction, and
@@ -1623,4 +1776,307 @@ async fn slots_follow_the_heartbeat_and_irreversible_ec2_evidence() {
             );
         }
     }
+}
+
+/// A gentle `draining` node under epoch 5, its deadline `deadline` seconds
+/// from now by the controller's clock and the database's alike.
+fn gentle_node(deadline: i64) -> V2Node {
+    V2Node {
+        gentle: true,
+        deadline: Some(super::unix_now() + deadline),
+        deadline_due: deadline <= 0,
+        ..node(Some("draining"), Some(5), false)
+    }
+}
+
+/// `node` with a stored report that lists nothing but held sandboxes.
+fn holding(node: V2Node) -> V2Node {
+    V2Node {
+        report_holds_only: true,
+        ..node
+    }
+}
+
+/// A gentle call names its epoch in `gentle_epoch` alone: `epoch` stays 0,
+/// which a node or relay that predates gentle drains reads as a call it
+/// refuses before it seals anything. A forced call and a cancel name
+/// `epoch`.
+#[test]
+fn a_gentle_request_leaves_the_forced_epoch_zero() {
+    assert_eq!(
+        drain_request(5, true),
+        DrainNodeRequest {
+            epoch: 0,
+            cancel: false,
+            forget: Vec::new(),
+            gentle_epoch: 5,
+        }
+    );
+    assert_eq!(
+        drain_request(5, false),
+        DrainNodeRequest {
+            epoch: 5,
+            ..DrainNodeRequest::default()
+        }
+    );
+    assert_eq!(
+        cancel_request(5, &["a".to_owned()]),
+        DrainNodeRequest {
+            epoch: 5,
+            cancel: true,
+            forget: vec!["a".to_owned()],
+            gentle_epoch: 0,
+        }
+    );
+}
+
+/// A gentle drain calls gently, and doesn't escalate, until its deadline;
+/// once the deadline has passed, or an operator has set `drain_mode`
+/// forced, the loop turns it forced first and calls forced under the same
+/// epoch. An escalation that no longer matches the row leaves this tick's
+/// call gentle.
+#[tokio::test]
+async fn a_gentle_drain_turns_forced_at_its_deadline() {
+    let acknowledged = DrainNodeResponse {
+        gentle_epoch: Some(5),
+        ..response(Some(5), false, &[])
+    };
+    let cases = [
+        ("before the deadline", gentle_node(600), None, false, true),
+        ("at the deadline", gentle_node(0), None, true, false),
+        // The database's clock decides: the escalation's statement reads it.
+        (
+            "past it by the database's clock, the controller's an hour behind",
+            V2Node {
+                deadline_due: true,
+                ..gentle_node(3600)
+            },
+            None,
+            true,
+            false,
+        ),
+        (
+            "past it by the controller's clock, not the database's",
+            V2Node {
+                deadline_due: false,
+                ..gentle_node(-60)
+            },
+            None,
+            false,
+            true,
+        ),
+        (
+            "escalated by an operator",
+            V2Node {
+                mode_forced: true,
+                ..gentle_node(600)
+            },
+            None,
+            true,
+            false,
+        ),
+        (
+            "the row moved on",
+            gentle_node(-60),
+            Some(Ok(false)),
+            true,
+            true,
+        ),
+        (
+            "the escalation failed",
+            gentle_node(-60),
+            Some(Err("db down".to_owned())),
+            true,
+            true,
+        ),
+    ];
+    for (case, node, escalate, escalates, gentle) in cases {
+        let id = node.id;
+        let sink = FakeSink {
+            nodes: vec![node],
+            responses: HashMap::from([(
+                (id, false),
+                Ok(if gentle {
+                    acknowledged.clone()
+                } else {
+                    response(Some(5), false, &[])
+                }),
+            )]),
+            escalate,
+            ..FakeSink::default()
+        };
+        run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
+        let calls = sink.calls();
+        assert_eq!(
+            calls.contains(&format!("escalate {id} 5")),
+            escalates,
+            "{case}: {calls:?}"
+        );
+        assert_eq!(
+            *sink.requests.lock().unwrap(),
+            [drain_request(5, gentle)],
+            "{case}: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|call| call.starts_with("report ")),
+            "{case}: {calls:?}"
+        );
+    }
+}
+
+/// A waiting gentle drain past its deadline turns forced too, so it seals
+/// forced once admitted; it still gets no call.
+#[tokio::test]
+async fn a_waiting_gentle_drain_turns_forced_at_its_deadline() {
+    let node = V2Node {
+        waiting: true,
+        heartbeat_fresh: false,
+        ..gentle_node(-1)
+    };
+    let id = node.id;
+    let sink = FakeSink {
+        nodes: vec![node],
+        ..FakeSink::default()
+    };
+    run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
+    assert!(
+        sink.calls().contains(&format!("escalate {id} 5")),
+        "{:?}",
+        sink.calls()
+    );
+    assert!(sink.requests.lock().unwrap().is_empty());
+}
+
+/// A gentle call's answer counts only when it echoes the epoch: one that
+/// doesn't came from a node that may have drained forced, so nothing of it
+/// is recorded, stored or advanced on, and the error says so. The same
+/// answer with the echo is recorded, stored and advanced on.
+#[tokio::test]
+async fn an_unacknowledged_gentle_answer_records_nothing() {
+    for (echo, taken) in [(None, false), (Some(4), false), (Some(5), true)] {
+        let node = gentle_node(600);
+        let id = node.id;
+        let sink = FakeSink {
+            nodes: vec![node],
+            responses: HashMap::from([(
+                (id, false),
+                Ok(DrainNodeResponse {
+                    gentle_epoch: echo,
+                    ..response(Some(5), true, &["a"])
+                }),
+            )]),
+            ..FakeSink::default()
+        };
+        let report = run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
+        let calls = sink.calls();
+        for step in ["record a", &format!("advance {id} 5")] {
+            assert_eq!(
+                calls.iter().any(|call| call == step),
+                taken,
+                "{echo:?} {step}: {calls:?}"
+            );
+        }
+        assert_eq!(
+            calls.iter().any(|call| call.starts_with("report ")),
+            taken,
+            "{echo:?}: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .any(|call| call.contains("without acknowledging it")),
+            !taken,
+            "{echo:?}: {calls:?}"
+        );
+        assert_eq!(report.drained == [id], taken, "{echo:?}");
+    }
+}
+
+/// A gentle call refused as a sandbox-manager or node-api relay that
+/// predates gentle drains refuses it, by its epoch check's
+/// `InvalidArgument`, is recorded with what to do about it. Any other
+/// failure is recorded as it is, as a forced call's is: another
+/// `InvalidArgument`, another code with the same text, and a failure before
+/// the node answered.
+#[tokio::test]
+async fn a_refused_gentle_call_says_how_to_go_on() {
+    for (case, refusal, unanswered, hinted) in [
+        (
+            "an older node",
+            Some(tonic::Status::invalid_argument(
+                "epoch must be nonzero and at most 2^63 - 1",
+            )),
+            None,
+            true,
+        ),
+        (
+            "another invalid argument",
+            Some(tonic::Status::invalid_argument(
+                "a gentle drain names its epoch in gentle_epoch alone, with epoch 0 and no cancel",
+            )),
+            None,
+            false,
+        ),
+        (
+            "another code",
+            Some(tonic::Status::unavailable(
+                "epoch must be nonzero and at most 2^63 - 1",
+            )),
+            None,
+            false,
+        ),
+        ("no answer", None, Some("connection refused"), false),
+    ] {
+        let node = gentle_node(600);
+        let id = node.id;
+        let sink = FakeSink {
+            nodes: vec![node],
+            responses: unanswered
+                .map(|error| ((id, false), Err(error.to_owned())))
+                .into_iter()
+                .collect(),
+            refusal,
+            ..FakeSink::default()
+        };
+        run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
+        let errors: Vec<_> = sink
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with(&format!("error {id} gentle DrainNode failed: ")))
+            .collect();
+        assert_eq!(errors.len(), 1, "{case}: {:?}", sink.calls());
+        assert_eq!(
+            errors[0].contains("predates gentle drains")
+                && errors[0].contains("escalate the drain with mode forced"),
+            hinted,
+            "{case}: {errors:?}"
+        );
+    }
+}
+
+/// The stored report marks a gentle call's, and gives a held sandbox's
+/// reason.
+#[test]
+fn a_gentle_report_carries_the_hold_and_its_reason() {
+    let answer = DrainNodeResponse {
+        pending: vec![pplx_space_sbx_mgr_client::proto::DrainPending {
+            sandbox_id: "a".into(),
+            action: "hold".into(),
+            reason: "running; waits for the sandbox to go idle".into(),
+        }],
+        gentle_epoch: Some(5),
+        ..response(Some(5), false, &[])
+    };
+    let json = report_json(&answer, &Recording::default());
+    assert_eq!(json["gentle"], true);
+    assert_eq!(
+        json["pending"],
+        serde_json::json!([{
+            "sandbox_id": "a",
+            "action": "hold",
+            "reason": "running; waits for the sandbox to go idle",
+        }])
+    );
+    let forced = report_json(&response(Some(5), false, &[]), &Recording::default());
+    assert_eq!(forced["gentle"], false);
 }

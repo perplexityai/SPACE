@@ -536,6 +536,7 @@ async fn require_undrained_refuses_an_existing_drain_and_starts_a_new_one() -> T
         mode: NodeDrainMode::Forced,
         require_undrained: true,
         engine: None,
+        deadline: None,
     };
 
     // A gentle drain whose stored intent agrees with the posted `false`.
@@ -829,6 +830,7 @@ fn v2_request(mode: NodeDrainMode) -> DrainRequest {
         mode,
         require_undrained: false,
         engine: Some(pplx_space_node_drain::NodeDrainEngine::V2),
+        deadline: None,
     }
 }
 
@@ -910,7 +912,7 @@ async fn a_v2_drain_records_its_epoch_with_the_phase() -> TestResult {
 }
 
 /// A v2 `:drain` is refused, writing nothing, without the flag, on a Direct
-/// node, as a gentle drain, against a v1 drain in flight, and on a node
+/// node, as a gentle drain without a deadline, against a v1 drain in flight, and on a node
 /// with no recorded instance; the control, a v1 drain, still starts.
 #[tokio::test(flavor = "current_thread")]
 async fn a_v2_drain_it_cant_run_is_refused_and_writes_nothing() -> TestResult {
@@ -944,7 +946,7 @@ async fn a_v2_drain_it_cant_run_is_refused_and_writes_nothing() -> TestResult {
             StatusCode::CONFLICT,
         ),
         (
-            "gentle",
+            "gentle without a deadline",
             &enabled,
             insert_k8s_node(&db.pool, None, None, None).await?,
             NodeDrainMode::Gentle,
@@ -1450,6 +1452,187 @@ async fn undrain_of_a_terminating_v2_node_runs_only_before_the_fence() -> TestRe
             assert_eq!(phase.as_deref(), Some("terminating"), "{case}");
             assert_eq!(stored, status, "{case}");
         }
+    }
+    Ok(())
+}
+
+/// An RFC 3339 timestamp `seconds` from now, and the same in Unix seconds.
+fn deadline_in(seconds: i64) -> (String, i64) {
+    let at = OffsetDateTime::now_utc() + time::Duration::seconds(seconds);
+    (
+        at.format(&time::format_description::well_known::Rfc3339)
+            .expect("an RFC 3339 timestamp"),
+        at.unix_timestamp(),
+    )
+}
+
+fn v2_gentle(deadline: Option<&str>) -> DrainRequest {
+    DrainRequest {
+        deadline: deadline.map(str::to_owned),
+        ..v2_request(NodeDrainMode::Gentle)
+    }
+}
+
+/// A gentle v2 `:drain` records its epoch as `gentle_epoch`, with no
+/// `epoch` a cluster controller that predates gentle drains would drain
+/// forced, and its deadline in Unix seconds. A repeat with the same
+/// deadline, or none, keeps the drain; one with another deadline is a 409
+/// and writes nothing; `mode: forced` escalates it, leaving the epoch for
+/// the controller to move.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gentle_v2_drain_records_a_gentle_epoch_and_its_deadline() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let mut state = kubernetes_state(&db.pool).await?;
+    state.drain_v2_enabled = true;
+    let actor = managing_org_admin(&db.pool).await?;
+    let node_id = insert_k8s_node(&db.pool, None, None, None).await?;
+    let (deadline, deadline_secs) = deadline_in(3600);
+
+    post_drain(
+        &state,
+        &actor,
+        node_id,
+        DrainAction::Drain,
+        v2_gentle(Some(&deadline)),
+    )
+    .await;
+    let (phase, engine, status, started_us) = v2_columns(&db.pool, node_id).await?;
+    assert_eq!(
+        (phase.as_deref(), engine.as_deref()),
+        (Some("draining"), Some("v2"))
+    );
+    let status = status.expect("a drain status");
+    assert_eq!(
+        status
+            .get("gentle_epoch")
+            .and_then(serde_json::Value::as_i64),
+        started_us
+    );
+    assert_eq!(status.get("epoch"), None, "{status}");
+    assert_eq!(
+        status.get("deadline").and_then(serde_json::Value::as_i64),
+        Some(deadline_secs)
+    );
+    assert_eq!(status.get("waiting"), Some(&serde_json::Value::Bool(true)));
+    assert_eq!(
+        drain_columns(&db.pool, node_id).await?.mode.as_deref(),
+        Some("gentle")
+    );
+
+    for repeat in [Some(deadline.as_str()), None] {
+        // Accepted: it commits, and the refusing client fails the cordon
+        // after.
+        assert_eq!(
+            post_drain(
+                &state,
+                &actor,
+                node_id,
+                DrainAction::Drain,
+                v2_gentle(repeat)
+            )
+            .await,
+            StatusCode::BAD_GATEWAY,
+            "{repeat:?}"
+        );
+        assert_eq!(
+            v2_columns(&db.pool, node_id).await?.2.as_ref(),
+            Some(&status)
+        );
+    }
+    let (other, _) = deadline_in(7200);
+    assert_eq!(
+        post_drain(
+            &state,
+            &actor,
+            node_id,
+            DrainAction::Drain,
+            v2_gentle(Some(&other))
+        )
+        .await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        v2_columns(&db.pool, node_id).await?.2.as_ref(),
+        Some(&status)
+    );
+
+    post_drain(
+        &state,
+        &actor,
+        node_id,
+        DrainAction::Drain,
+        v2_request(NodeDrainMode::Forced),
+    )
+    .await;
+    assert_eq!(
+        drain_columns(&db.pool, node_id).await?.mode.as_deref(),
+        Some("forced")
+    );
+    assert_eq!(
+        v2_columns(&db.pool, node_id).await?.2.as_ref(),
+        Some(&status)
+    );
+    Ok(())
+}
+
+/// A deadline is refused, writing nothing, when it isn't an RFC 3339
+/// timestamp in the future, and on every drain but a gentle v2 one: a forced
+/// v2 drain, and a gentle v1 drain.
+#[tokio::test(flavor = "current_thread")]
+async fn a_deadline_only_a_gentle_v2_drain_can_take_is_refused() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let mut state = kubernetes_state(&db.pool).await?;
+    state.drain_v2_enabled = true;
+    let actor = managing_org_admin(&db.pool).await?;
+    let (future, _) = deadline_in(3600);
+    let (past, _) = deadline_in(-60);
+    let cases = [
+        ("in the past", v2_gentle(Some(&past))),
+        ("not a timestamp", v2_gentle(Some("in an hour"))),
+        (
+            "forced",
+            DrainRequest {
+                deadline: Some(future.clone()),
+                ..v2_request(NodeDrainMode::Forced)
+            },
+        ),
+        (
+            "gentle v1",
+            DrainRequest {
+                engine: None,
+                ..v2_gentle(Some(&future))
+            },
+        ),
+    ];
+    for (case, request) in cases {
+        let node_id = insert_k8s_node(&db.pool, None, None, None).await?;
+        let before = (
+            v2_columns(&db.pool, node_id).await?,
+            drain_columns(&db.pool, node_id).await?,
+        );
+        assert_eq!(
+            post_drain(&state, &actor, node_id, DrainAction::Drain, request).await,
+            StatusCode::BAD_REQUEST,
+            "{case}"
+        );
+        assert_eq!(
+            (
+                v2_columns(&db.pool, node_id).await?,
+                drain_columns(&db.pool, node_id).await?,
+            ),
+            before,
+            "{case}: wrote"
+        );
     }
     Ok(())
 }

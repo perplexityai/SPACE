@@ -64,16 +64,25 @@ pub fn report_json(response: &DrainNodeResponse, recording: &Recording) -> serde
     };
     serde_json::json!({
         "sealed_epoch": response.sealed_epoch,
+        "gentle": response.gentle_epoch.is_some(),
         "done": response.done,
         "evacuated": response.evacuated.iter().map(|entry| serde_json::json!({
             "sandbox_id": entry.sandbox_id,
             "prior": prior(entry.prior),
             "artifact_id": entry.artifact_id,
         })).collect::<Vec<_>>(),
-        "pending": response.pending.iter().map(|entry| serde_json::json!({
-            "sandbox_id": entry.sandbox_id,
-            "action": entry.action,
-        })).collect::<Vec<_>>(),
+        "pending": response.pending.iter().map(|entry| if entry.reason.is_empty() {
+            serde_json::json!({
+                "sandbox_id": entry.sandbox_id,
+                "action": entry.action,
+            })
+        } else {
+            serde_json::json!({
+                "sandbox_id": entry.sandbox_id,
+                "action": entry.action,
+                "reason": entry.reason,
+            })
+        }).collect::<Vec<_>>(),
         "blocked": response.blocked.iter().map(|entry| serde_json::json!({
             "sandbox_id": entry.sandbox_id,
             "reason": entry.reason,
@@ -137,13 +146,27 @@ fn overdue_unblocked<'a>(
 }
 
 /// How many of the node's rows `response` and the loop's `recording` of it
-/// leave blocked and pending, each row counted once: blocked when the node
-/// reports it blocked or its evacuation is unrecorded past the bound, else
-/// pending when the node reports it pending, its window's `queued` and
-/// `disk` among the reasons, or its evacuation is unrecorded within the
-/// bound. A blocked entry that names no sandbox counts on its own.
-pub(super) fn outstanding_rows(response: &DrainNodeResponse, recording: &Recording) -> (u64, u64) {
-    use std::collections::BTreeSet;
+/// leave blocked, pending and held, each row counted once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct OutstandingRows {
+    /// The node reports the row blocked, or its evacuation is unrecorded
+    /// past the bound. A blocked entry that names no sandbox counts on its
+    /// own.
+    pub(super) blocked: u64,
+    /// Not blocked, and the node reports it pending with work under way,
+    /// its window's `queued` and `disk` among the reasons, or its evacuation
+    /// is unrecorded within the bound.
+    pub(super) pending: u64,
+    /// Not blocked, and every pending entry the node reports for it is a
+    /// gentle drain's `hold`: a running sandbox the drain waits for, with
+    /// nothing started for it.
+    pub(super) held: u64,
+}
+
+pub(super) fn outstanding_rows(
+    response: &DrainNodeResponse,
+    recording: &Recording,
+) -> OutstandingRows {
     let mut blocked: BTreeSet<&str> = recording
         .overdue()
         .into_iter()
@@ -158,21 +181,38 @@ pub(super) fn outstanding_rows(response: &DrainNodeResponse, recording: &Recordi
             None => unnamed += 1,
         }
     }
-    let pending: BTreeSet<&str> = response
+    let working: BTreeSet<&str> = response
         .pending
         .iter()
+        .filter(|entry| entry.action != HOLD_ACTION)
         .map(|entry| entry.sandbox_id.as_str())
         .chain(recording.unrecorded().map(|(sandbox_id, _, _)| sandbox_id))
         .filter(|sandbox_id| !blocked.contains(sandbox_id))
         .collect();
-    (blocked.len() as u64 + unnamed, pending.len() as u64)
+    let held: BTreeSet<&str> = response
+        .pending
+        .iter()
+        .filter(|entry| entry.action == HOLD_ACTION)
+        .map(|entry| entry.sandbox_id.as_str())
+        .filter(|sandbox_id| !blocked.contains(sandbox_id) && !working.contains(sandbox_id))
+        .collect();
+    OutstandingRows {
+        blocked: blocked.len() as u64 + unnamed,
+        pending: working.len() as u64,
+        held: held.len() as u64,
+    }
 }
 
 /// Publish what `response` and the loop's `recording` of it leave to do,
 /// as [`outstanding_rows`] counts it.
 fn publish_report(node: &V2Node, response: &DrainNodeResponse, recording: &Recording) {
-    let (blocked, pending) = outstanding_rows(response, recording);
-    crate::metrics::node_drain::v2_report(&node.id.to_string(), blocked, pending);
+    let rows = outstanding_rows(response, recording);
+    crate::metrics::node_drain::v2_report(
+        &node.id.to_string(),
+        rows.blocked,
+        rows.pending,
+        rows.held,
+    );
 }
 
 pub(super) async fn step<S: DrainV2Sink, A: V2InstanceAuthority>(
@@ -216,6 +256,7 @@ pub(super) async fn step<S: DrainV2Sink, A: V2InstanceAuthority>(
             .then_some(NodeStep::Cancelled),
         None => None,
         Some("draining") if node.waiting => {
+            escalate(sink, node, epoch).await;
             // Fenced, but not sealed: it waits for a slot.
             if let Err(error) = sink.ensure_cordon(node.id).await {
                 sink.record_error(node.id, &format!("cordon convergence failed: {error}"))
@@ -249,15 +290,42 @@ async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
     if let Some(error) = &cordon_error {
         sink.record_error(node.id, error).await;
     }
-    let response = match sink.drain_node(node.id, epoch, false, &[]).await {
+    let gentle = escalate(sink, node, epoch).await;
+    let response = match sink.drain_node(node.id, drain_request(epoch, gentle)).await {
         Ok(response) => response,
         Err(error) => {
             crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
-            sink.record_error(node.id, &format!("DrainNode failed: {error}"))
-                .await;
+            let error = if gentle && error.refused_by_an_older_node() {
+                format!(
+                    "gentle DrainNode failed: {error}; the node's sandbox-manager, or its \
+                     node-api relay, predates gentle drains and refused the call before it \
+                     sealed anything: upgrade the node, or escalate the drain with mode forced"
+                )
+            } else if gentle {
+                format!("gentle DrainNode failed: {error}")
+            } else {
+                format!("DrainNode failed: {error}")
+            };
+            sink.record_error(node.id, &error).await;
             return false;
         }
     };
+    if gentle && response.gentle_epoch != Some(epoch) {
+        // Only a node that drained gently under the epoch says so; one that
+        // didn't may have suspended running sandboxes, and its report isn't
+        // the gentle drain's.
+        crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
+        sink.record_error(
+            node.id,
+            &format!(
+                "the node answered the gentle DrainNode under epoch {epoch} without \
+                 acknowledging it (gentle_epoch {:?}); the drain records nothing from it",
+                response.gentle_epoch
+            ),
+        )
+        .await;
+        return false;
+    }
     let recording = record_evacuations(sink, node, &response).await;
     publish_report(node, &response, &recording);
     let all_recorded = recording.all_recorded();
@@ -314,7 +382,9 @@ async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
 /// Returns whether the columns were cleared.
 async fn cancel<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
     let call = |forget: Vec<String>| async move {
-        let answer = sink.drain_node(node.id, epoch, true, &forget).await;
+        let answer = sink
+            .drain_node(node.id, cancel_request(epoch, &forget))
+            .await;
         if let Err(error) = &answer {
             crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
             sink.record_error(node.id, &format!("DrainNode cancel failed: {error}"))

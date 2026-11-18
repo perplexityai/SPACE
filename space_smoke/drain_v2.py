@@ -35,6 +35,7 @@ crashed node's.
 
 from __future__ import annotations
 
+import datetime
 import re
 import secrets
 import time
@@ -687,8 +688,12 @@ class DrainV2Assertions:
 
     # --- the drain ------------------------------------------------------------
 
-    def drain(self) -> int:
-        """Drain the worker with `engine: v2`; the row records the engine and its epoch."""
+    def drain(self, *, gentle_for: float | None = None) -> int:
+        """Drain the worker with `engine: v2`; the row records the engine and its epoch.
+
+        With `gentle_for`, a gentle drain whose deadline is that many seconds
+        away: the row records its epoch as `gentle_epoch`, which a controller
+        that predates gentle drains doesn't read, and the deadline."""
 
         node_name, node_id = self.node_name, self.node_id
         self._scope.defer(
@@ -697,14 +702,29 @@ class DrainV2Assertions:
         self._undrain = self._scope.defer(
             f"undrain {node_name}", lambda: self._undrain_if_draining(node_id), critical=True
         )
-        self._control.drain_node_v2(node_id)
+        deadline = None
+        if gentle_for is not None:
+            deadline = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=gentle_for)
+            self._control.drain_node_v2(
+                node_id, gentle_deadline=deadline.isoformat(timespec="seconds")
+            )
+        else:
+            self._control.drain_node_v2(node_id)
         status = self._control.drain_v2_status(node_id)
-        epoch = None if status is None or status.status is None else status.status.get("epoch")
+        recorded = {} if status is None or status.status is None else status.status
+        epoch = recorded.get("gentle_epoch" if deadline is not None else "epoch")
         self._fixture.verify(
             status is not None and status.engine == "v2" and isinstance(epoch, int),
             "a v2 :drain must record the engine and the epoch with the phase",
             drain_status=drain_status_evidence(status),
         )
+        if deadline is not None:
+            self._fixture.verify(
+                "epoch" not in recorded
+                and recorded.get("deadline") == int(deadline.timestamp()),
+                "a gentle v2 :drain must record its epoch as gentle_epoch alone, with its deadline",
+                status=recorded,
+            )
         assert isinstance(epoch, int)
         self._epoch = epoch
         # Armed after the epoch is known: a worker left sealed (a terminated
@@ -1437,6 +1457,159 @@ class DrainV2Assertions:
             "sealed_epoch_after_unseal",
             self._come_back(restart, self._replacement, timeout=timeout),
         )
+
+    # --- the gentle drain -----------------------------------------------------
+
+    def drain_mode(self) -> str | None:
+        node = next((n for n in self._control.admin_nodes() if n.id == self.node_id), None)
+        return None if node is None else node.drain_mode
+
+    def expect_held(self, sandbox_id: str, *, timeout: float = 300) -> dict[str, Any]:
+        """A gentle call's report under the drain's epoch holds the sandbox,
+        with why, and the sandbox is still started on the drained worker."""
+
+        bare, epoch = self.bare_id(sandbox_id), self.epoch
+        report = self.wait_for_report(
+            lambda report: report.get("sealed_epoch") == epoch
+            and report.get("gentle") is True
+            and any(
+                entry.get("sandbox_id") == bare
+                and entry.get("action") == "hold"
+                and entry.get("reason") == "running; waits for the sandbox to go idle"
+                for entry in report.get("pending", [])
+                if isinstance(entry, dict)
+            ),
+            "the gentle drain never reported the running sandbox held",
+            timeout=timeout,
+        )
+        lifecycle, node = self.residency(sandbox_id)
+        self._fixture.verify(
+            lifecycle == "started" and node == self.node_id,
+            "a held sandbox must keep running on the drained worker",
+            sandbox_id=bare,
+            lifecycle=lifecycle,
+            active_node_id=node,
+        )
+        self._fixture.record(f"held_report_{bare}", report)
+        return report
+
+    def expect_suspended_in_place(self, sandbox_id: str, *, timeout: float = 600) -> None:
+        """The sandbox suspends on its own, on the drained worker: the drain
+        never reported it evacuated, and no drain restore moves it."""
+
+        bare = self.bare_id(sandbox_id)
+        deadline = time.monotonic() + timeout
+        while True:
+            self.report()
+            lifecycle, node = self.residency(sandbox_id)
+            if lifecycle == "suspended":
+                break
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "the idle sandbox never suspended on the drained worker",
+                sandbox_id=bare,
+                lifecycle=lifecycle,
+                active_node_id=node,
+            )
+            self._fixture.wait(3)
+        self.expect_not_moved(sandbox_id)
+
+    def expect_durable_in_place(self, sandbox_id: str, *, timeout: float = 600) -> None:
+        """The sandbox, suspended on its own on the sealed worker, has a
+        durable snapshot while its row still resolves to that worker
+        (`COALESCE(target_node_id, active_node_id)`, as the drain gate reads
+        it) and the drain is still `draining`: nothing released or moved it,
+        so a wake now passes the drain gate only because its current
+        snapshot is durable."""
+
+        bare = self.bare_id(sandbox_id)
+        deadline = time.monotonic() + timeout
+        while True:
+            rows = self._control.sandbox_row_states([bare])
+            row = rows[0] if rows else None
+            resolved = None if row is None else (row.target_node_id or row.active_node_id)
+            snapshots = self.ready_snapshots(sandbox_id)
+            phase = self.drain_phase()
+            self._fixture.verify(
+                phase == "draining"
+                and row is not None
+                and row.lifecycle == "suspended"
+                and resolved == self.node_id,
+                "the self-suspended sandbox left the sealed worker, or the drain ended, "
+                "before its snapshot was durable",
+                sandbox_id=bare,
+                drain_phase=phase,
+                row=None if row is None else row.__dict__,
+                drained_node_id=self.node_id,
+            )
+            if snapshots and snapshots[-1].storage_location_count > 0:
+                break
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "the self-suspended sandbox's snapshot never became durable",
+                sandbox_id=bare,
+                ready_snapshots=len(snapshots),
+            )
+            self._fixture.wait(3)
+        assert row is not None
+        self._fixture.record(
+            f"durable_in_place_{bare}",
+            {"snapshot_id": snapshots[-1].snapshot_id, "row": row.__dict__},
+        )
+        self.expect_not_moved(sandbox_id)
+
+    def expect_not_moved(self, sandbox_id: str) -> None:
+        """No report this run read named the sandbox evacuated, and it has no
+        drain restore."""
+
+        bare = self.bare_id(sandbox_id)
+        self.report()
+        restores = self.drain_restores(sandbox_id)
+        self._fixture.record(f"self_suspended_{bare}", {"drain_restores": restores})
+        self._fixture.verify(
+            bare not in self._reported_priors and not restores,
+            "a sandbox that suspended on its own was evacuated by the drain",
+            sandbox_id=bare,
+            reported_prior=self._reported_priors.get(bare),
+            drain_restores=restores,
+        )
+
+    def expect_turned_forced(self, why: str, *, timeout: float = 300) -> dict[str, Any]:
+        """The controller turns the gentle drain forced, for `why`
+        (`deadline` or `operator`): `drain_mode` forced, and the epoch moved
+        from `gentle_epoch` to `epoch`."""
+
+        deadline = time.monotonic() + timeout
+        while True:
+            status = self.status()
+            if status.get("escalated") == why:
+                break
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                f"the gentle drain never turned forced at its {why}",
+                status=status,
+            )
+            self._fixture.wait(2)
+        mode = self.drain_mode()
+        self._fixture.verify(
+            status.get("epoch") == self.epoch and "gentle_epoch" not in status and mode == "forced",
+            "a gentle drain turned forced must run forced under the same epoch",
+            status=status,
+            drain_mode=mode,
+        )
+        if why == "deadline":
+            # Both in Unix seconds, by the database's clock.
+            escalated_at, recorded_deadline = status.get("escalated_at"), status.get("deadline")
+            self._fixture.verify(
+                isinstance(escalated_at, int)
+                and isinstance(recorded_deadline, int)
+                and escalated_at >= recorded_deadline,
+                "a gentle drain turned forced at its deadline before the deadline",
+                escalated_at=escalated_at,
+                deadline=recorded_deadline,
+            )
+        self._fixture.record("turned_forced", status)
+        return status
 
     def undrain(self) -> None:
         """`:undrain` the node, without waiting for the cancel."""

@@ -1286,15 +1286,26 @@ pub(super) async fn fetch_active_node_drain_state(
             drain_v2::gate_drain_state(Some(phase), mode.as_deref(), v2_waiting)
         })
         .collect();
-    // Precedence: any blocking candidate wins, whichever side it came from; else
-    // the primary if it had a phase at all (so a caller can still see "draining,
-    // gently"); else any sibling.
-    Ok(siblings
-        .iter()
-        .copied()
+    Ok(drain_state_precedence(primary_state, &siblings))
+}
+
+/// The candidate the gate answers with, of the primary and the siblings of
+/// the latest execution's node: one that blocks placement, whichever side it
+/// came from; else one that refuses VM activations, the primary first; else
+/// the primary if it had a phase at all (so a caller can still see
+/// "draining, gently"); else the first sibling.
+fn drain_state_precedence(
+    primary: Option<NodeDrainState>,
+    siblings: &[NodeDrainState],
+) -> Option<NodeDrainState> {
+    let candidates = || primary.iter().chain(siblings).copied();
+    // A candidate that blocks wins over one that only refuses activations,
+    // which wins over the primary.
+    candidates()
         .find(|state| state.blocks_placement())
-        .or(primary_state)
-        .or_else(|| siblings.first().copied()))
+        .or_else(|| candidates().find(|state| state.refuses_activation()))
+        .or(primary)
+        .or_else(|| siblings.first().copied())
 }
 
 /// Build the 409 returned when a drained-node guard fires. Centralised so
@@ -1339,6 +1350,25 @@ fn drain_durability_unavailable(action: SandboxAction) -> ControllerError {
 /// drain refuses while it still makes the sandbox durable gets a 503 with a
 /// `Retry-After` instead: retried once the sandbox is durable, it lands on
 /// another node.
+///
+/// It refuses nothing for a sandbox whose current state is durable: a
+/// `suspended` or `restoring` row whose current snapshot is durable, or a
+/// stopped row a drain released with its disk durable, gets no drain state
+/// from [`fetch_active_node_drain_state`], whatever its node, and its
+/// activation lands elsewhere.
+///
+/// A **forced** drain, admitted, refuses every call this gate sees on any
+/// other sandbox of the node, running or not, as before
+/// ([`NodeDrainState::blocks_placement`]). An admitted **gentle** v2 drain
+/// blocks no placement, but its node is sealed and would refuse a VM
+/// activation itself ([`NodeDrainState::refuses_activation`]), so it
+/// refuses, the same way, every action on a sandbox that isn't `started`
+/// except the ones that activate no VM ([`activates_no_vm`]). That covers
+/// an access path's call as well (an exec, a `spaced` call, a port open, an
+/// update), whose runtime client wakes a sandbox it finds dormant. Under
+/// it a `started` sandbox's calls go through, and so does every suspend,
+/// stop, kill, pause, checkpoint, snapshot setting and stats read; a
+/// delete doesn't pass this gate.
 pub(super) async fn ensure_resolved_node_not_draining(
     pool: &PgPool,
     sandbox_id: SandboxId,
@@ -1349,8 +1379,17 @@ pub(super) async fn ensure_resolved_node_not_draining(
         .map_err(|err| {
             crate::controllers::db_contention_error("failed to load node drain state", &err)
         })?;
+    let refused = match drain_state {
+        Some(state) if state.blocks_placement() => true,
+        Some(state) if !activates_no_vm(action) && state.refuses_activation() => {
+            !sandbox_started(pool, sandbox_id).await.map_err(|err| {
+                crate::controllers::db_contention_error("failed to load the sandbox", &err)
+            })?
+        }
+        _ => false,
+    };
     if let Some(state) = drain_state
-        && state.blocks_placement()
+        && refused
     {
         if matches!(
             action,
@@ -1376,6 +1415,45 @@ pub(super) async fn ensure_resolved_node_not_draining(
     Ok(())
 }
 
+/// Whether `action` is known to activate no VM, so a sealed node lets it
+/// through on a sandbox that isn't running. Every other action is refused
+/// there: a start, wake, restore or resume, and an access path's call or an
+/// update, whose runtime client wakes a dormant sandbox. A stats read uses
+/// the non-recovering client ([`SandboxController::stats`]), so it wakes
+/// nothing. An allow-list, so a new action is refused until it is known to
+/// activate nothing.
+const fn activates_no_vm(action: SandboxAction) -> bool {
+    match action {
+        SandboxAction::Suspend
+        | SandboxAction::Stop
+        | SandboxAction::Kill
+        | SandboxAction::Pause
+        | SandboxAction::Checkpoint
+        | SandboxAction::EnableSnapshots
+        | SandboxAction::DisableSnapshots
+        | SandboxAction::Stats => true,
+        SandboxAction::Start
+        | SandboxAction::Wake
+        | SandboxAction::ImplicitWake(_)
+        | SandboxAction::Restore
+        | SandboxAction::Resume
+        | SandboxAction::OpenPort
+        | SandboxAction::Rollback
+        | SandboxAction::Spaced
+        | SandboxAction::Update => false,
+    }
+}
+
+/// Whether the sandbox row is `started`.
+async fn sandbox_started(pool: &PgPool, sandbox_id: SandboxId) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT COALESCE((SELECT lifecycle = 'started' FROM sandboxes WHERE id = $1), FALSE)"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Access-path drain gate. Returns 409 when the sandbox's resolved node
 /// (`COALESCE(target_node_id, active_node_id)`) blocks placement, for any
 /// lifecycle. Used by access paths (`spaced_client(activity)`, `exec`,
@@ -1388,10 +1466,14 @@ pub(super) async fn ensure_resolved_node_not_draining(
 /// for the short window before the reconciler suspends + migrates it; users
 /// see a clear "node is draining" error rather than a flaky stuck pod.
 ///
-/// Under a **gentle** drain there is no migration window to protect, so this
-/// does not fire while the node is `draining` — serving traffic normally is
-/// the mode's entire purpose. It still fires once the node reaches `drained`
-/// or `terminating`.
+/// Under a **gentle** drain a running sandbox keeps serving traffic, which is
+/// the mode's entire purpose, so this lets its calls through while the node
+/// is `draining`: under v1 there is no migration window to protect, and
+/// under v2 the sealed node keeps running VMs running. Under an admitted
+/// gentle v2 drain a call on a sandbox that isn't `started` is refused,
+/// with the caller's action in the 409, since its runtime client would wake
+/// the sandbox on the sealed node ([`ensure_resolved_node_not_draining`]).
+/// Every drain fires this once the node reaches `drained` or `terminating`.
 pub(super) async fn ensure_access_path_not_blocked_by_drain(
     pool: &PgPool,
     sandbox: &Sandbox,

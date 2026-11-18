@@ -44,7 +44,8 @@ mod holds;
 mod read_state;
 pub use drain_v2::{DRAIN_V2_ENABLED_ENV, NodeApiV2DrainProbe, V2DrainProbe, V2DrainReport};
 use drain_v2::{
-    DrainV2Write, V2_TERMINATE_REFERENCE_SAMPLE, drain_v2_write, v2_undrain_transition,
+    DrainDeadlines, DrainV2Write, V2_TERMINATE_REFERENCE_SAMPLE, drain_v2_write,
+    v2_undrain_transition,
 };
 pub(super) use holds::list_node_holds;
 use read_state::attach_node_read_state;
@@ -1911,6 +1912,14 @@ async fn apply_drain_action_once(
         v2_columns.recorded_instance,
         transition_starts_a_drain(&transition),
         state.drain_v2_enabled,
+        DrainDeadlines {
+            requested: drain_request
+                .deadline
+                .as_deref()
+                .filter(|_| matches!(action, DrainAction::Drain)),
+            stored: node_drain_v2::drain_v2_deadline(v2_columns.status.as_ref()),
+            now: time::OffsetDateTime::now_utc().unix_timestamp(),
+        },
     ) {
         Ok(write) => write,
         Err((status, message)) => {
@@ -2136,7 +2145,9 @@ async fn apply_drain_action_once(
     }
     let v2_written = match v2_write {
         DrainV2Write::None => Ok(()),
-        DrainV2Write::Start => node_drain_v2::start_v2_drain(&mut tx, node_id).await,
+        DrainV2Write::Start { gentle_deadline } => {
+            node_drain_v2::start_v2_drain(&mut tx, node_id, gentle_deadline).await
+        }
         DrainV2Write::Cancel => node_drain_v2::mark_v2_drain_cancel(&mut tx, node_id).await,
     };
     if let Err(err) = v2_written {

@@ -5303,12 +5303,15 @@ ON CONFLICT (key_hash) DO NOTHING;
     def undrain_node(self, node_id: str) -> None:
         self._admin("POST", f"nodes/{quote(_sql_uuid(node_id), safe='')}:undrain", expect=(200, 202))
 
-    def drain_node_v2(self, node_id: str) -> None:
+    def drain_node_v2(self, node_id: str, *, gentle_deadline: str | None = None) -> None:
+        body: dict[str, object] = {"mode": "forced", "engine": "v2"}
+        if gentle_deadline is not None:
+            body = {"mode": "gentle", "engine": "v2", "deadline": gentle_deadline}
         self._admin(
             "POST",
             f"nodes/{quote(_sql_uuid(node_id), safe='')}:drain",
             expect=(200, 202),
-            body={"mode": "forced", "engine": "v2"},
+            body=body,
         )
 
     def drain_v2_status(self, node_id: str) -> DrainV2Status | None:

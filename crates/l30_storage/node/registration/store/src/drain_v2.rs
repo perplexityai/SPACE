@@ -54,8 +54,9 @@ pub fn gate_drain_state(
 }
 
 /// SQL expression over a `nodes` row, unqualified: the epoch the row's v2
-/// drain is sealed under, `drain_status.epoch`.
-const EPOCH: &str = "(drain_status->>'epoch')::BIGINT";
+/// drain is sealed under, `drain_status.epoch`, or `gentle_epoch` while it
+/// runs gently.
+const EPOCH: &str = "COALESCE(drain_status->>'epoch', drain_status->>'gentle_epoch')::BIGINT";
 
 /// SQL expression over the `nodes` row aliased `n`: the instance its v2
 /// drain fenced, `drain_status.terminate_instance`. A row an earlier build's
@@ -82,6 +83,10 @@ pub struct V2NodeRow {
     pub id: NodeId,
     pub drain_phase: Option<String>,
     pub epoch: Option<i64>,
+    pub gentle: bool,
+    pub mode_forced: bool,
+    pub deadline: Option<i64>,
+    pub deadline_due: bool,
     pub cancel: bool,
     pub waiting: bool,
     pub report: Option<serde_json::Value>,
@@ -97,12 +102,22 @@ pub struct V2NodeRow {
 }
 
 /// Every v2 drain's node of the Kubernetes substrate, with its Kubernetes
-/// identity, recorded instance and heartbeat.
+/// identity, recorded instance and heartbeat. A gentle drain's epoch is
+/// `gentle_epoch` until it turns forced or reaches `drained`. Whether its
+/// deadline is due is read by the database clock, the one the escalation's
+/// statement reads.
 static LIST_V2_NODES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let fresh = pplx_space_sandbox_residency::node_heartbeat_fresh("n.id");
     sql!(format!(
         "SELECT n.id, n.drain_phase,
                 {EPOCH} AS epoch,
+                COALESCE(n.drain_status ? 'gentle_epoch', FALSE) AS gentle,
+                COALESCE(n.drain_mode = 'forced', FALSE) AS mode_forced,
+                (n.drain_status->>'deadline')::BIGINT AS deadline,
+                COALESCE(
+                    (n.drain_status->>'deadline')::BIGINT <= EXTRACT(EPOCH FROM NOW()),
+                    FALSE
+                ) AS deadline_due,
                 COALESCE((n.drain_status->>'cancel')::BOOLEAN, FALSE) AS cancel,
                 COALESCE((n.drain_status->>'waiting')::BOOLEAN, FALSE) AS waiting,
                 n.drain_status->'report' AS report,
@@ -405,7 +420,12 @@ pub async fn record_v2_report(
 static ADVANCE_V2_DRAINED_STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     sql!(format!(
         "UPDATE nodes
-            SET drain_phase = 'drained'
+            SET drain_phase = 'drained',
+                drain_status = CASE
+                    WHEN drain_status ? 'gentle_epoch'
+                    THEN (drain_status - 'gentle_epoch') || jsonb_build_object('epoch', $2)
+                    ELSE drain_status
+                END
           WHERE id = $1
             AND drain_engine = 'v2'
             AND drain_phase = 'draining'
@@ -416,7 +436,10 @@ static ADVANCE_V2_DRAINED_STATEMENT: std::sync::LazyLock<String> = std::sync::La
 });
 
 /// `draining -> drained` for the v2 drain under `epoch`, only with a stored
-/// report that is `done` under that same epoch.
+/// report that is `done` under that same epoch. A gentle drain's epoch moves
+/// to `epoch`: a `drained` node holds nothing, so from here on every reader,
+/// a controller that predates gentle drains included, drains it as a forced
+/// one.
 pub async fn advance_v2_drained(
     pool: &PgPool,
     node_id: NodeId,
@@ -462,6 +485,40 @@ pub async fn finish_v2_cancel(
             .rows_affected()
             == 1,
     )
+}
+
+/// Turn the gentle `draining` drain under `epoch` forced, once its deadline
+/// has passed by the database clock or an operator has set `drain_mode`
+/// forced: `drain_mode` forced, the epoch moved from `gentle_epoch` to
+/// `epoch`, and `escalated` (`deadline` or `operator`) with `escalated_at`, in
+/// Unix seconds. Returns false for a row that is no longer that epoch's
+/// gentle `draining` drain due to turn.
+pub async fn escalate_v2_drain(
+    pool: &PgPool,
+    node_id: NodeId,
+    epoch: i64,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_mode = 'forced',
+                drain_status = (drain_status - 'gentle_epoch') || jsonb_build_object(
+                    'epoch', $2,
+                    'escalated', CASE WHEN drain_mode = 'forced' THEN 'operator' ELSE 'deadline' END,
+                    'escalated_at', EXTRACT(EPOCH FROM NOW())::BIGINT
+                )
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND drain_phase = 'draining'
+            AND (drain_status->>'gentle_epoch')::BIGINT = $2
+            AND (drain_mode = 'forced'
+                 OR (drain_status->>'deadline')::BIGINT <= EXTRACT(EPOCH FROM NOW()))"
+    ))
+    .bind(node_id)
+    .bind(epoch)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
 }
 
 pub async fn record_v2_error(
@@ -525,25 +582,38 @@ pub async fn drain_v2_columns(
 ///
 /// `drain_engine` is bound from [`NodeDrainEngine`], the one closed set of
 /// engines: the column has no CHECK, so no statement spells a value itself.
+///
+/// A gentle drain, with `gentle_deadline`, records its epoch as
+/// `gentle_epoch` rather than `epoch`, and the deadline, in Unix seconds:
+/// a cluster controller that predates gentle drains reads no epoch, so it
+/// never calls the node for one, which it would drain forced. The newer
+/// controller moves the epoch to `epoch` when the drain turns forced or
+/// reaches `drained`.
 pub async fn start_v2_drain(
     tx: &mut Transaction<'_, Postgres>,
     node_id: NodeId,
+    gentle_deadline: Option<i64>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(sql!(
         "UPDATE nodes
-            SET drain_engine = $2::TEXT,
+            SET drain_engine = $3::TEXT,
                 drain_status = jsonb_build_object(
-                    'epoch', (EXTRACT(EPOCH FROM drain_started_at) * 1000000)::BIGINT,
+                    CASE WHEN $2::BIGINT IS NULL THEN 'epoch' ELSE 'gentle_epoch' END,
+                    (EXTRACT(EPOCH FROM drain_started_at) * 1000000)::BIGINT,
                     'waiting', NOT COALESCE(
                         drain_engine = 'v2'
                             AND (drain_status->>'cancel')::BOOLEAN
                             AND NOT COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE),
                         FALSE
                     )
-                )
+                ) || CASE
+                    WHEN $2::BIGINT IS NULL THEN '{}'::JSONB
+                    ELSE jsonb_build_object('deadline', $2::BIGINT)
+                END
           WHERE id = $1 AND drain_phase = 'draining' AND drain_started_at IS NOT NULL"
     ))
     .bind(node_id)
+    .bind(gentle_deadline)
     .bind(NodeDrainEngine::V2.column())
     .execute(&mut **tx)
     .await?;
@@ -617,4 +687,11 @@ pub async fn v2_drain_still_making_durable(
     .bind(sandbox_id)
     .fetch_one(pool)
     .await
+}
+
+/// A gentle v2 drain's deadline, `drain_status.deadline`, in Unix seconds.
+pub fn drain_v2_deadline(status: Option<&serde_json::Value>) -> Option<i64> {
+    status
+        .and_then(|status| status.get("deadline"))
+        .and_then(serde_json::Value::as_i64)
 }
