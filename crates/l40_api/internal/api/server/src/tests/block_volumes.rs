@@ -272,7 +272,7 @@ async fn block_volume_grants_authenticate_origin_and_fence_progress_but_keep_del
         .unwrap();
     assert_eq!(binding.aws_volume_id, CLOUD_DISK);
     assert!(!binding.initialization_ready);
-    let fence = binding.fence.unwrap();
+    let mut fence = binding.fence.unwrap();
     let claim = Uuid::now_v7();
     let initialization = ClaimBlockVolumeInitializationRequest {
         fence: Some(fence.clone()),
@@ -381,6 +381,97 @@ async fn block_volume_grants_authenticate_origin_and_fence_progress_but_keep_del
     let resumed = volumes::get(&pool, sandbox).await?.unwrap();
     assert_eq!(resumed.phase, VolumePhase::Attached);
     assert_eq!(resumed.checkpoint_id, None);
+
+    // Stop the old execution without publishing a new checkpoint. Rebind the
+    // same disk under a new control-plane execution and attachment epoch.
+    fixture
+        .service
+        .release_block_volume_binding(node_request(ReleaseBlockVolumeBindingRequest {
+            fence: Some(fence.clone()),
+        }))
+        .await?;
+    let detached = volumes::get(&pool, sandbox).await?.unwrap();
+    assert!(volumes::finish_detach(&pool, &detached).await?);
+    let cold_attempt = Uuid::now_v7();
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+         SET generation = 2, route_activation_id = $2, activation_attempt_id = $2
+         WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(sandbox)
+    .bind(cold_attempt)
+    .execute(&pool)
+    .await?;
+    let cold_resolve = ResolveBlockVolumeBindingRequest {
+        execution: Some(BlockVolumeExecution {
+            node_id: node.to_string(),
+            sandbox_id: sandbox.to_string(),
+            execution_generation: 2,
+            activation_attempt_id: cold_attempt.to_string(),
+        }),
+    };
+    assert_eq!(
+        fixture
+            .service
+            .resolve_block_volume_binding(node_request(cold_resolve.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
+    let attaching = volumes::get(&pool, sandbox).await?.unwrap();
+    assert!(volumes::observe(&pool, &attaching, VolumePhase::Attached, None, None).await?);
+    let cold_binding = fixture
+        .service
+        .resolve_block_volume_binding(node_request(cold_resolve))
+        .await?
+        .into_inner()
+        .binding
+        .unwrap();
+    assert!(cold_binding.initialization_ready);
+    assert_eq!(
+        cold_binding.filesystem_uuid,
+        resumed.filesystem_uuid.to_string()
+    );
+    fence = cold_binding.fence.unwrap();
+    let cold_activate = ActivateBlockVolumeRequest {
+        fence: Some(fence.clone()),
+        activation_id: cold_attempt.to_string(),
+        checkpoint_id: None,
+    };
+    assert_eq!(
+        fixture
+            .service
+            .activate_block_volume(node_request(cold_activate.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition,
+        "existing host bindings must not implicitly enable cold restart"
+    );
+    env.set(
+        "SPACE_EBS_NODE_BINDINGS",
+        serde_json::json!({
+            node.to_string(): {
+                "instance_id": INSTANCE,
+                "availability_zone": ZONE,
+                "retained_cold_start": true,
+            }
+        })
+        .to_string(),
+    );
+    fixture.service.block_volume_hosts = crate::block_volumes::Hosts::from_environment(&env)?;
+    assert_eq!(
+        fixture
+            .service
+            .activate_block_volume(node_request(cold_activate))
+            .await?
+            .into_inner()
+            .disk_generation,
+        2
+    );
+    publish.fence = Some(fence.clone());
+    publish.disk_generation = 2;
     fixture
         .service
         .publish_block_volume_checkpoint(node_request(publish))

@@ -30,6 +30,8 @@ const HOSTS_ENV: &str = "SPACE_EBS_NODE_BINDINGS";
 struct Host {
     instance_id: String,
     availability_zone: String,
+    #[serde(default)]
+    retained_cold_start: bool,
 }
 
 /// Administrator-verified node -> EC2 identity, kept out of node assertions.
@@ -389,20 +391,32 @@ impl ClusterApiService {
     ) -> Result<Response<BlockVolumeProgressResponse>, Status> {
         let req = request.get_ref();
         let fence = Fence::parse(req.fence.as_ref().ok_or_else(refused)?)?;
-        let (mut tx, _) = self.lock_block_fence(&request, &fence).await?;
+        let (mut tx, row) = self.lock_block_fence(&request, &fence).await?;
         let checkpoint = req
             .checkpoint_id
             .as_deref()
             .map(str::parse)
             .transpose()
             .map_err(invalid)?;
-        if !store::activate(
+        let source = match checkpoint {
+            Some(id) => store::ActivationSource::Checkpoint(id),
+            None if row.ever_exposed
+                && self
+                    .block_volume_hosts
+                    .require(fence.execution.node)?
+                    .retained_cold_start =>
+            {
+                store::ActivationSource::RetainedColdStart
+            }
+            None => store::ActivationSource::Fresh,
+        };
+        if !store::activate_with_source(
             &mut *tx,
             fence.volume,
             fence.execution.attempt,
             fence.epoch,
             req.activation_id.parse().map_err(invalid)?,
-            checkpoint,
+            source,
         )
         .await
         .map_err(database)?

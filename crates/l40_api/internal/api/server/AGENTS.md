@@ -28,6 +28,10 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
 - Retained-disk execution checks use the durable Kubernetes
   `route_activation_id`, not the temporary `activation_attempt_id` claim that
   activation-completion receipts clear while the VM remains resident.
+- Cold activation of an already exposed retained disk additionally requires
+  `retained_cold_start: true` on its administrator-owned
+  `SPACE_EBS_NODE_BINDINGS` entry. Missing flags stay false; a retained
+  checkpoint cannot be silently discarded by this authorization.
 - ClusterApi never creates a node registration. `nodes` and `node_k8s` rows
   come from the cluster controller's Kubernetes node sync, sandbox pod
   placement and Direct admin registration; a request naming an unregistered

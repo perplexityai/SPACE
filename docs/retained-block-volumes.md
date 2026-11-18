@@ -109,8 +109,19 @@ a failed suspend withdraws its checkpoint before allowing more writes.
 Attachment epochs and disk generations are distinct. Moving a disk changes
 attachment ownership; executing writes makes older memory checkpoints stale.
 Fork, rollback, manual/rolling snapshots, export and warm-donor cloning are
-rejected for retained disks. Stop followed by a fresh cold start of an already
-exposed disk is not supported in this experiment; use suspend/restore.
+rejected for retained disks. Existing host bindings continue to reject cold
+restart of an already exposed disk. A binding can explicitly opt into the
+experimental cold-start authority with `retained_cold_start: true` in
+`SPACE_EBS_NODE_BINDINGS`; this defaults false and is not a qualification claim.
+
+That opt-in requires a fresh execution and attachment epoch after positively
+observed detach, completed initialization, and no retained checkpoint. It
+advances the disk generation once and preserves filesystem identity without
+granting another format claim. A missing or incompatible RAM checkpoint never
+falls back to cold boot, and a valid retained checkpoint still prevents cold
+activation. Suspending and then stopping is not yet a qualified checkpoint-
+discard workflow. Cold-start rootfs behavior and mounted data continuity still
+require deployed qualification before enabling this option.
 
 Deleting the sandbox leaves durable cleanup authority. AWS deletion requires
 verified release and an unattached owned volume; a missing heartbeat or a
@@ -163,3 +174,28 @@ unchanged AWS volume ID, detach-before-attach ordering, stale-checkpoint and
 unsupported-operation rejection, and deletion from both SPACE and AWS.
 Compilation, mocked AWS responses and same-node restores are not substitutes
 for this evidence.
+
+The one-disk manual scenario `native.retained_volume_cold_start` writes durable
+root/data markers, stops and waits for observed detach, then cold-starts twice.
+It requires a different guest boot identity on each start and the same ext4
+UUID, logical volume ID and marker hashes. It requires the default-off host
+opt-in described above and a qualified stopped-rootfs retention path. It does
+not test checkpoint discard or establish cross-host stopped-rootfs portability.
+Record provider volume identity independently; tenant responses intentionally
+do not expose it.
+
+`native.retained_volume_benchmark` uses one sandbox with a 128-MiB guest working
+set. It records single-queue-depth direct sequential read/write throughput,
+4-KiB random read/write IOPS and latency percentiles, and buffered 4-KiB
+write-plus-fsync latency. Each random phase is capped at five seconds or 20,000
+operations, and fsync sampling is limited to 128 writes. Files are private to
+the scenario and removed afterward. A missing direct-I/O capability fails
+rather than silently measuring guest page-cache reads.
+
+These are bounded microbenchmark observations, not steady-state, provider
+saturation, attachment-density or fleet-cost evidence. Include worker type,
+provider capacity, IOPS/throughput settings and software versions in deployment
+evidence. Direct I/O bypasses the guest page cache, not every host/provider
+cache. The creation phase measures create-to-ready, not isolated provider
+attachment latency. Offline growth and post-growth benchmarking still require
+their own implemented maintenance path.

@@ -423,6 +423,38 @@ pub async fn activate(
     activation_id: Uuid,
     checkpoint_id: Option<Uuid>,
 ) -> Result<bool, sqlx::Error> {
+    activate_with_source(
+        executor,
+        volume_id,
+        execution_id,
+        epoch,
+        activation_id,
+        checkpoint_id.map_or(ActivationSource::Fresh, ActivationSource::Checkpoint),
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ActivationSource {
+    Fresh,
+    Checkpoint(Uuid),
+    /// A qualified cold boot after a positively observed detach and fresh
+    /// attachment. Never a fallback for a missing or incompatible checkpoint.
+    RetainedColdStart,
+}
+
+pub async fn activate_with_source(
+    executor: impl PgExecutor<'_>,
+    volume_id: Uuid,
+    execution_id: Uuid,
+    epoch: i64,
+    activation_id: Uuid,
+    source: ActivationSource,
+) -> Result<bool, sqlx::Error> {
+    let checkpoint_id = match source {
+        ActivationSource::Checkpoint(id) => Some(id),
+        ActivationSource::Fresh | ActivationSource::RetainedColdStart => None,
+    };
     Ok(sqlx::query(sql!(
         "UPDATE sandbox_block_volumes
          SET disk_generation = CASE WHEN activation_id = $4 AND activated_epoch = $3
@@ -439,6 +471,9 @@ pub async fn activate(
            AND ((activation_id = $4 AND activated_epoch = attachment_epoch)
                 OR (phase = 'attached' AND (
                     (NOT ever_exposed AND $5::uuid IS NULL)
+                    OR ($6 AND ever_exposed AND checkpoint_id IS NULL
+                        AND activated_epoch < attachment_epoch
+                        AND activation_id IS DISTINCT FROM $4)
                     OR (checkpoint_id = $5 AND checkpoint_generation = disk_generation))))"
     ))
     .bind(volume_id)
@@ -446,6 +481,7 @@ pub async fn activate(
     .bind(epoch)
     .bind(activation_id)
     .bind(checkpoint_id)
+    .bind(matches!(source, ActivationSource::RetainedColdStart))
     .execute(executor)
     .await?
     .rows_affected()

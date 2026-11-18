@@ -313,6 +313,18 @@ async fn retained_checkpoint_is_consumed_once_and_old_epochs_cannot_release() ->
     assert!(!acknowledge_release(pool, id, execution_a, 1).await?);
     // Reusing an old activation ID on a new epoch is not an idempotent retry.
     assert!(!activate(pool, id, execution_b, 2, activation_a, None).await?);
+    // Cold boot is never a substitute for a still-valid RAM/disk pairing.
+    assert!(
+        !activate_with_source(
+            pool,
+            id,
+            execution_b,
+            2,
+            Uuid::now_v7(),
+            ActivationSource::RetainedColdStart,
+        )
+        .await?
+    );
     assert!(
         !activate(
             pool,
@@ -331,7 +343,67 @@ async fn retained_checkpoint_is_consumed_once_and_old_epochs_cannot_release() ->
     assert_eq!(activated.disk_generation, 2);
     assert_eq!(activated.checkpoint_id, None);
     assert!(!claim_initialization(pool, id, execution_b, 2, Uuid::now_v7()).await?);
+
+    // A stop without checkpointing permits only a fresh, explicitly qualified
+    // cold activation after observed detach, not replay of saved RAM.
+    assert!(acknowledge_release(pool, id, execution_b, 2).await?);
+    let detaching = get(pool, sandbox_id).await?.unwrap();
+    assert!(finish_detach(pool, &detaching).await?);
+    let execution_c = Uuid::now_v7();
+    let bound_c = attach(pool, sandbox_id, execution_c).await?;
+    let activation_c = Uuid::now_v7();
+    assert_eq!(bound_c.filesystem_uuid, bound_a.filesystem_uuid);
+    assert_eq!(bound_c.aws_volume_id.as_deref(), Some(CLOUD_ID));
+    assert!(!activate(pool, id, execution_c, 3, activation_c, None).await?);
+    assert!(!activate(pool, id, execution_c, 3, activation_c, Some(checkpoint_a)).await?);
+    assert!(
+        !activate_with_source(
+            pool,
+            id,
+            execution_c,
+            3,
+            activation_b,
+            ActivationSource::RetainedColdStart,
+        )
+        .await?
+    );
+    for _ in 0..2 {
+        assert!(
+            activate_with_source(
+                pool,
+                id,
+                execution_c,
+                3,
+                activation_c,
+                ActivationSource::RetainedColdStart,
+            )
+            .await?
+        );
+        assert_eq!(get(pool, sandbox_id).await?.unwrap().disk_generation, 3);
+    }
+    assert!(
+        !activate_with_source(
+            pool,
+            id,
+            execution_c,
+            3,
+            Uuid::now_v7(),
+            ActivationSource::RetainedColdStart,
+        )
+        .await?
+    );
+    assert!(!claim_initialization(pool, id, execution_c, 3, Uuid::now_v7()).await?);
     request_delete(pool, sandbox_id).await?;
-    assert!(!activate(pool, id, execution_b, 2, activation_b, None).await?);
+    assert!(
+        !activate_with_source(
+            pool,
+            id,
+            execution_c,
+            3,
+            activation_c,
+            ActivationSource::RetainedColdStart,
+        )
+        .await?
+    );
     Ok(())
 }
