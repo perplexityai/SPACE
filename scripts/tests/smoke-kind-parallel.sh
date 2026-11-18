@@ -25,10 +25,13 @@
 #
 # Usage:
 #   scripts/tests/smoke-kind-parallel.sh [run] [--benches N] [--keep] [--out DIR]
-#   scripts/tests/smoke-kind-parallel.sh teardown
+#   scripts/tests/smoke-kind-parallel.sh teardown [--purge-cache]
 #
-#   --benches N  benches to run (default: from the host's CPUs and memory, printed)
+#   --benches N  benches to run (default: from the host's CPUs, available
+#                memory, free disk and a write probe of the bench volume, printed)
 #   --keep       leave the benches up afterwards; `teardown` removes them
+#   --purge-cache  with `teardown`, also delete the registries' data (the Docker
+#                Hub mirror's and the layer cache's) under ~/.space-benches-cache
 #   --out DIR    where logs, timings and the summary go
 #                (default: ~/.space-devbox/kind-parallel/<run id>)
 #
@@ -61,6 +64,7 @@ cd "$REPO_ROOT"
 COMMAND=run
 BENCHES=""
 KEEP=0
+PURGE_CACHE=0
 OUT=""
 if [[ "${1:-}" == run || "${1:-}" == teardown ]]; then
   COMMAND="$1"
@@ -71,6 +75,7 @@ while (( $# > 0 )); do
     --benches) BENCHES="${2:?--benches needs a count}"; shift 2 ;;
     --benches=*) BENCHES="${1#*=}"; shift ;;
     --keep) KEEP=1; shift ;;
+    --purge-cache) PURGE_CACHE=1; shift ;;
     --out) OUT="${2:?--out needs a directory}"; shift 2 ;;
     --out=*) OUT="${1#*=}"; shift ;;
     -h|--help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -86,10 +91,13 @@ done
 #     dependency stages and the UI build into it once, and every bench's
 #     builds import them, instead of each bench's BuildKit building them again.
 # Both listen on an address of a dummy interface in the host namespace, which
-# every bench reaches through its default route and nothing outside the host
-# can; the layer cache also on the host's loopback. build-cache.sh accepts only
-# a loopback repository besides GHCR, so each bench forwards its own
-# 127.0.0.1:$CACHE_PORT to the host's.
+# every bench reaches through its default route (registry_firewall accepts
+# connections to it only from the host and the benches' links); the layer
+# cache also on the host's loopback. build-cache.sh accepts only a loopback
+# repository besides GHCR, so each bench forwards its own
+# 127.0.0.1:$CACHE_PORT to the host's. Neither takes credentials: the layer
+# cache is local to this host, its benches and later runs read it, and any
+# local user can write it. `teardown --purge-cache` deletes their data.
 REGISTRY_LINK="${KIND_BENCH_PREFIX:0:8}0"
 REGISTRY_IP=192.168.241.1
 REGISTRY_IMAGE="public.ecr.aws/docker/library/registry:2"
@@ -152,9 +160,16 @@ if [[ "$COMMAND" == teardown ]]; then
   sudo -n true 2>/dev/null || die "teardown needs passwordless sudo"
   status=0
   teardown_all || status=2
-  # The registries' data stays in $CACHE_ROOT for the next run.
+  # The registries' data stays in $CACHE_ROOT for the next run, unless
+  # --purge-cache: the layer cache trusts every local user (any of them can
+  # push to it) and nothing else collects what runs add to it.
   docker rm -f "$MIRROR_NAME" "$CACHE_NAME" >/dev/null 2>&1 || true
+  registry_firewall_remove
   sudo -n ip link del "$REGISTRY_LINK" 2>/dev/null || true
+  if (( PURGE_CACHE )); then
+    log "removing the registries' data under $CACHE_ROOT"
+    sudo -n rm -rf -- "$CACHE_ROOT" || status=2
+  fi
   exit "$status"
 fi
 
@@ -473,12 +488,45 @@ start_registry() { # name port data-dir [env...]
   return 1
 }
 
+# Accept registry traffic only from the host itself and the benches' links:
+# the registry address is a local address, so without this a connection to it
+# arriving on any interface would reach the registries. Checked in the mangle
+# table's PREROUTING, by the destination a packet arrived with and before
+# Docker's port DNAT rewrites it, which every arriving packet passes, whether
+# it is forwarded to a published port or delivered to a proxy. Replies pass:
+# the host's own connections leave with the registry address as their source,
+# so their replies come back to it on Docker's bridge.
+REGISTRY_CHAIN=SPACE-BENCH-REGISTRY
+registry_firewall() {
+  local mangle=(sudo -n iptables -w -t mangle)
+  "${mangle[@]}" -n -L "$REGISTRY_CHAIN" >/dev/null 2>&1 || "${mangle[@]}" -N "$REGISTRY_CHAIN" || return 1
+  "${mangle[@]}" -F "$REGISTRY_CHAIN" || return 1
+  "${mangle[@]}" -A "$REGISTRY_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
+  "${mangle[@]}" -A "$REGISTRY_CHAIN" -i lo -j RETURN || return 1
+  "${mangle[@]}" -A "$REGISTRY_CHAIN" -i sb+ -j RETURN || return 1
+  "${mangle[@]}" -A "$REGISTRY_CHAIN" -j DROP || return 1
+  "${mangle[@]}" -C PREROUTING -d "$REGISTRY_IP/32" -m comment --comment "$REGISTRY_CHAIN" -j "$REGISTRY_CHAIN" \
+    2>/dev/null \
+    || "${mangle[@]}" -I PREROUTING -d "$REGISTRY_IP/32" -m comment --comment "$REGISTRY_CHAIN" -j "$REGISTRY_CHAIN" \
+    || return 1
+}
+
+registry_firewall_remove() {
+  local mangle=(sudo -n iptables -w -t mangle)
+  "${mangle[@]}" -D PREROUTING -d "$REGISTRY_IP/32" -m comment --comment "$REGISTRY_CHAIN" -j "$REGISTRY_CHAIN" \
+    2>/dev/null
+  "${mangle[@]}" -F "$REGISTRY_CHAIN" 2>/dev/null
+  "${mangle[@]}" -X "$REGISTRY_CHAIN" 2>/dev/null
+  return 0
+}
+
 start_registries() {
   if ! ip link show "$REGISTRY_LINK" >/dev/null 2>&1; then
     sudo -n ip link add "$REGISTRY_LINK" type dummy || return 1
     sudo -n ip addr add "$REGISTRY_IP/32" dev "$REGISTRY_LINK" || return 1
     sudo -n ip link set "$REGISTRY_LINK" up || return 1
   fi
+  registry_firewall || return 1
   start_registry "$MIRROR_NAME" "$MIRROR_PORT" "$CACHE_ROOT/hub-mirror" \
     REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io || return 1
   start_registry "$CACHE_NAME" "$CACHE_PORT" "$CACHE_ROOT/layer-cache"
