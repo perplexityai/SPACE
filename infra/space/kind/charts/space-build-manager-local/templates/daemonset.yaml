@@ -91,6 +91,10 @@ spec:
             - |
               install -d -m 0750 -o 0 -g 0 /space/run/build-manager
               exec /opt/space/bin/space-db-migrator build-manager --database-path {{ $db }} up
+          {{- with include "space-node-service.env.sqliteAcceptNewerMigrations" . }}
+          env:
+            {{- . | nindent 12 }}
+          {{- end }}
           securityContext:
             runAsUser: 0
             allowPrivilegeEscalation: false

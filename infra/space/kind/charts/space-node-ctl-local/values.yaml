@@ -68,3 +68,8 @@ nodeFence:
     # SANDBOX_NETWORK_SLOTS_RESOURCE. The only extended resource node-ctl
     # advertises, and the only Node status write from this identity at all.
     - space.pplx.net/network-slots
+
+# SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS for a rollback past a newer SQLite
+# migration (db/README.md "Rolling back past a newer SQLite migration").
+sqlite:
+  acceptNewerMigrations: ""

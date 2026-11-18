@@ -118,6 +118,12 @@ The render fails, listing every gap, unless the file supplies:
   reconcile-queue GC (`SPACE_RECONCILE_QUEUE_GC_ENABLED`), which Kind runs
   against that fake, stays off as it ships.
 
+To roll back past a newer SQLite migration, set
+`<subchart>.sqlite.acceptNewerMigrations` on every node subchart that runs the
+store's migrations, and set it back to empty once a release that bundles them
+is back: a leftover entry accepts its migration again, unchecked, on any later
+rollback ([db/README.md](../../../db/README.md#rolling-back-past-a-newer-sqlite-migration)).
+
 The Kind bring-up also passes `space-api-local`'s `values-kind.yaml`, which
 holds bench-only settings that are not test hooks, such as a 45 s
 `SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS`. This chart does not read that

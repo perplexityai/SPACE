@@ -71,6 +71,9 @@ spec:
             - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
+            {{- with include "space-node-service.env.sqliteAcceptNewerMigrations" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- include "space-node-service.env.identity" . | nindent 12 }}
             {{- include "space-node-service.env.clusterApi" . | nindent 12 }}
             # Snapshot reupload (fork and promotion backups) refuses to start

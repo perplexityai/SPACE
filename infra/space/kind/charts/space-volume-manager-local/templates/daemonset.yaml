@@ -57,6 +57,9 @@ spec:
           # the service path (crates/l40_api/volmgr/server/src/{executor,staging}.rs).
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
+            {{- with include "space-node-service.env.sqliteAcceptNewerMigrations" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- include "space-node-service.env.identity" . | nindent 12 }}
             {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
             # The volume-manager identity is denied the standard credential

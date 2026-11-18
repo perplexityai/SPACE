@@ -219,6 +219,20 @@ service by TokenReview. Pair with the credmgr-token volume below.
 {{- end }}
 {{- end -}}
 
+{{/*
+SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS, from the chart's
+`sqlite.acceptNewerMigrations`, for each container that runs a store's SQLite
+migrations at startup (db/README.md "Rolling back past a newer SQLite
+migration"). Empty renders nothing. The runner parses the entries and refuses
+to start on a malformed one, so they are passed through as given.
+*/}}
+{{- define "space-node-service.env.sqliteAcceptNewerMigrations" -}}
+{{- with .Values.sqlite.acceptNewerMigrations -}}
+- name: SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS
+  value: {{ . | quote }}
+{{- end -}}
+{{- end -}}
+
 {{- define "space-node-service.env.objectStoreCredentials" -}}
 - name: SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID
   valueFrom:

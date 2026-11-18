@@ -58,6 +58,9 @@ spec:
           {{- end }}
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
+            {{- with include "space-node-service.env.sqliteAcceptNewerMigrations" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- include "space-node-service.env.identity" . | nindent 12 }}
           # No instance-local health socket; probe the service socket's
           # standard gRPC health service.

@@ -239,6 +239,9 @@ spec:
           securityContext:
             privileged: true
           env:
+            {{- with include "space-node-service.env.sqliteAcceptNewerMigrations" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- include "space-node-service.env.identity" . | nindent 12 }}
             {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
             {{- if ne (toString .Values.diskIoMaxOperationsPerSec) "" }}

@@ -44,6 +44,9 @@ spec:
             - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
+            {{- with include "space-node-service.env.sqliteAcceptNewerMigrations" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- with .Values.hashAlgorithm }}
             {{- if not (has . (list "sha256" "blake3")) }}
             {{- fail "hashAlgorithm must be sha256 or blake3" }}

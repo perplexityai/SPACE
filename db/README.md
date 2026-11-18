@@ -155,7 +155,12 @@ itself from the store's image, as in step 1.
    doesn't). Put them in the same deploy as the image revert, not after it:
    where a store's daemon migrates itself, a successor can report ready while
    it waits for the service mutex, as Kind's surge rollouts do, so a refused
-   rollback replaces the working pods before the refusal shows.
+   rollback replaces the working pods before the refusal shows. The charts
+   under `infra/space/kind/charts` take the entries as
+   `sqlite.acceptNewerMigrations`, which sets the variable on those
+   containers: set it on every chart that runs the store's migrations. A
+   deployment that renders its own manifests must set the variable on the
+   same containers.
 
    Otherwise, before reverting the image, undo the migrations on every node
    with the newer image's `space-db-migrator <store> … down`. First stop the
@@ -171,10 +176,11 @@ itself from the store's image, as in step 1.
    cache partition migration' first: some earlier releases reverse certain
    newer migrations themselves at startup, with data checks that a manual
    `down` skips, and those sections say which targets need which steps.
-4. Remove the setting once a release that bundles those migrations is back.
-   It has no effect there, but on any later rollback to a release that
-   doesn't bundle them it accepts them again, without the refusal and
-   without anyone checking them against that release.
+4. Remove the setting, or set `sqlite.acceptNewerMigrations` back to empty,
+   once a release that bundles those migrations is back. It has no effect
+   there, but on any later rollback to a release that doesn't bundle them it
+   accepts them again, without the refusal and without anyone checking them
+   against that release.
 
 Only releases with this setting read it; rolling back to an older one still
 needs the `down` first. While a database records a migration accepted through

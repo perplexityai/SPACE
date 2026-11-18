@@ -38,3 +38,8 @@ resources:
   requests:
     cpu: 50m
     memory: 64Mi
+
+# SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS for a rollback past a newer SQLite
+# migration (db/README.md "Rolling back past a newer SQLite migration").
+sqlite:
+  acceptNewerMigrations: ""
