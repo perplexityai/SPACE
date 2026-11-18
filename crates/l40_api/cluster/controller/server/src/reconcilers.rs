@@ -335,6 +335,17 @@ pub async fn run_reconcilers(
             pool.clone(),
             shutdown_token.child_token(),
         )),
+        // Runtime upgrade campaigns. Off unless
+        // `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on; no campaign
+        // kind has a driver yet, so on it only reports campaigns and their
+        // items, and returns an aborted campaign's in-flight items whose
+        // leases lapsed to pending.
+        tokio::spawn(crate::runtime_upgrade::run(
+            crate::runtime_upgrade::ReconcilerConfig::from_env(),
+            pool.clone(),
+            crate::runtime_upgrade::cluster_drivers(),
+            shutdown_token.child_token(),
+        )),
     ];
     if let Some(native_public_operation_executor) = native_public_operation_executor {
         // The cluster activation limiter exists in this process only while the
