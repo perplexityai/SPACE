@@ -19,6 +19,9 @@ from space_smoke.registry import Scenario
 # observation from the latter run. Do not mix old holds/separate scenarios
 # into those estimates. These are scheduling hints, not latency guarantees.
 # Absent diagnostic/browser cases retain their earlier documented hints.
+# The interrupted suspend's only-copy discard uses the median of Main CI runs
+# 44240906228, 44241476455 and 44242726614 (2026-11-18); it had no hint, so
+# the partition counted the default 30 s for it.
 _DURATION_SECONDS = {
     "ecw": {
         "ecw.access_idle_reconnect_preserves_workspace": 21,
@@ -76,6 +79,7 @@ _DURATION_SECONDS = {
         "local.garbage_collectors_reclaim_independent_resources": 138,
         "local.fork_suspended_cross_node": 14,
         "local.gentle_drain_leaves_sandbox_resident": 29,
+        "local.interrupted_suspend_keeps_only_copy_until_discard": 142,
         "local.leader_election_brownout_keeps_one_leader": 205,
         "local.leader_election_refusal_does_not_restart": 162,
         "local.node_ctl_fence_refuses_and_reconciles": 10,
