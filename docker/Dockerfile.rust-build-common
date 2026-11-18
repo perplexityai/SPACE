@@ -111,6 +111,11 @@ COPY infra/space/identity/node-identities.sh infra/space/identity/node-identitie
 RUN --mount=type=secret,id=aws_web_identity_token \
     set -eux; \
       case "${SPACE_RUST_ARTIFACT_SET}" in \
+        wasi-supervisor) \
+          run-cargo-with-sccache cargo chef cook --locked --release --recipe-path recipe.json \
+            --features "pplx-space-node-runtime-supervisor-svc/otel,pplx-space-node-runtime-supervisor-svc/datadog,pplx-space-node-runtime-supervisor-svc/experimental-wasm" \
+            --bin space-runtime-supervisor-svc \
+          ;; \
         worker) \
           run-cargo-with-sccache cargo chef cook --locked --release --recipe-path recipe.json \
             --features "pplx-space-node-api-svc/otel,pplx-space-node-api-svc/datadog,pplx-space-node-api-svc/k8s,pplx-space-internal-api-svc/otel,pplx-space-internal-api-svc/datadog,pplx-space-internal-api-svc/k8s,pplx-space-node-ctl-svc/otel,pplx-space-node-ctl-svc/datadog,pplx-space-node-ctl-svc/kubernetes,pplx-space-node-mgr-svc/otel,pplx-space-node-mgr-svc/datadog,pplx-space-build-mgr-svc/otel,pplx-space-build-mgr-svc/datadog,pplx-space-build-mgr-svc/k8s,pplx-space-node-runtime-supervisor-svc/otel,pplx-space-node-runtime-supervisor-svc/datadog,pplx-space-node-runtime-manager-svc/otel,pplx-space-node-runtime-manager-svc/datadog,pplx-space-sbx-mgr-svc/otel,pplx-space-sbx-mgr-svc/datadog,pplx-space-spaced-host-svc/otel,pplx-space-spaced-host-svc/datadog,pplx-space-net-gateway-svc/otel,pplx-space-net-gateway-svc/datadog,pplx-space-template-mgr-svc/otel,pplx-space-template-mgr-svc/datadog,pplx-space-volmgr-svc/otel,pplx-space-volmgr-svc/datadog" \
@@ -246,6 +251,18 @@ RUN --mount=type=secret,id=aws_web_identity_token \
         -F pplx-space-node-runtime-supervisor-svc/otel,pplx-space-node-runtime-supervisor-svc/datadog \
         --bin space-runtime-supervisor-svc
 
+FROM build-context AS build-wasi-supervisor
+
+# A separate opt-in artifact lane prevents Cargo feature unification from
+# enabling the WASI entrypoint in the ordinary worker or native guest binaries.
+RUN --mount=type=secret,id=aws_web_identity_token \
+    bash scripts/build-runtime-supervisor.sh \
+      target/release/space-runtime-supervisor-svc \
+      target/release/space-runtime-supervisor-compatibility \
+      run-cargo-with-sccache cargo build --locked --release \
+        -F pplx-space-node-runtime-supervisor-svc/otel,pplx-space-node-runtime-supervisor-svc/datadog,pplx-space-node-runtime-supervisor-svc/experimental-wasm \
+        --bin space-runtime-supervisor-svc
+
 FROM build-context AS build-builder
 
 RUN --mount=type=secret,id=aws_web_identity_token \
@@ -333,6 +350,14 @@ COPY --from=build-worker /workspace/target/release/space-buildmgr-svc /artifacts
 COPY --from=build-worker /workspace/target/release/space-tmplmgr /artifacts/bin/space-tmplmgr
 COPY --from=build-worker /workspace/target/release/space-db-migrator /artifacts/bin/space-db-migrator
 COPY --from=grpc-health-probe-downloader /grpc_health_probe /artifacts/bin/grpc_health_probe
+
+FROM scratch AS build-artifacts-wasi-supervisor
+
+LABEL org.opencontainers.image.title="space-rust-build-wasi-supervisor"
+LABEL org.opencontainers.image.description="Opt-in SPACE supervisor with the experimental Python/WASI command profile."
+
+COPY --from=build-wasi-supervisor /workspace/target/release/space-runtime-supervisor-svc /artifacts/bin/space-runtime-supervisor-svc
+COPY --from=build-wasi-supervisor /workspace/target/release/space-runtime-supervisor-compatibility /artifacts/etc/space-runtime-supervisor-compatibility
 
 FROM scratch AS build-artifacts-builder
 

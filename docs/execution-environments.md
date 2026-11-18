@@ -2639,3 +2639,11 @@ boot-artifact source; the owning installer must still authenticate and publish
 the files. Its manifest does not approve an environment, provide a managed
 workspace, or establish fs-verity trust. Runtime catalog qualification and a
 complete create/execute/delete smoke remain separate requirements.
+
+The separate explicit `wasi-supervisor` bundle builds only the supervisor with
+its `experimental-wasm` feature and normal host telemetry features. It uses the
+release builder and supervisor compatibility-hash wrapper, and packages the
+binary and matching compatibility file under `/bundle/space`. It neither replaces
+the default worker lane nor enables the feature in native guest binaries.
+Installing this bundle still requires the normal release and rollback procedure;
+it does not install boot payloads or authorize placement.

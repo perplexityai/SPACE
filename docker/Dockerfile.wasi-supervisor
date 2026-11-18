@@ -1,0 +1,9 @@
+ARG SPACE_RUST_BUILD_IMAGE=space-rust-build-wasi-supervisor:local
+FROM ${SPACE_RUST_BUILD_IMAGE} AS rust-build
+
+FROM scratch
+LABEL org.opencontainers.image.title="space-wasi-supervisor"
+LABEL org.opencontainers.image.description="Opt-in release supervisor bundle; installing it does not admit a WASI environment."
+
+COPY --from=rust-build /artifacts/bin/space-runtime-supervisor-svc /bundle/space/bin/space-runtime-supervisor-svc
+COPY --from=rust-build /artifacts/etc/space-runtime-supervisor-compatibility /bundle/space/etc/space-runtime-supervisor-compatibility

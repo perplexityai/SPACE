@@ -151,6 +151,7 @@ RUST_ARTIFACT_BINARIES = {
     "api": ("space-api-svc", "space-db-migrator", "space-template-publish"),
     "data-plane": ("space-data-plane-svc",),
     "cluster-controller": ("space-cluster-controller",),
+    "wasi-supervisor": ("space-runtime-supervisor-svc",),
 }
 
 RUST_DEPENDENCY_INPUTS = (
@@ -203,6 +204,7 @@ RUST_ARTIFACT_EXTRA_INPUTS = {
         *RUST_ARTIFACT_TEMPLATE_RECIPES,
     ),
     "data-plane": (),
+    "wasi-supervisor": (Path("scripts/build-runtime-supervisor.sh"),),
     "cluster-controller": (
         Path("templates/firecracker/seed/rootfs-builder.sh"),
         *RUST_ARTIFACT_TEMPLATE_RECIPES,
@@ -1121,6 +1123,7 @@ class BundleBuilder:
             "ui": self.source_root / "docker/Dockerfile.ui",
             "rollout-mng": self.source_root / "docker/Dockerfile.space-rollout-mng",
             "wasi-python": self.source_root / "docker/Dockerfile.wasi-python",
+            "wasi-supervisor": self.source_root / "docker/Dockerfile.wasi-supervisor",
         }
         try:
             return dockerfiles[feature]
@@ -1135,6 +1138,7 @@ class BundleBuilder:
             "api": "build-artifacts-api",
             "data-plane": "build-artifacts-data-plane",
             "cluster-controller": "build-artifacts-cluster-controller",
+            "wasi-supervisor": "build-artifacts-wasi-supervisor",
         }
         try:
             return targets[feature]
@@ -1143,7 +1147,9 @@ class BundleBuilder:
 
     @staticmethod
     def is_rust_feature(feature: str) -> bool:
-        return feature in {"worker", "builder", "api", "data-plane", "cluster-controller"}
+        return feature in {
+            "worker", "builder", "api", "data-plane", "cluster-controller", "wasi-supervisor",
+        }
 
     @staticmethod
     def docker_build_args_for_feature(feature: str) -> list[str]:
@@ -2070,6 +2076,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "ui",
         "rollout-mng",
         "wasi-python",
+        "wasi-supervisor",
     }
     unknown_features = sorted(set(args.features) - supported_features)
     if unknown_features:
