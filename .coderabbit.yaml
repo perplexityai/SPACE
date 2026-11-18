@@ -190,8 +190,7 @@ reviews:
     - writing, reconciling, uploading, backing up, or restoring sandboxes,
     snapshots, volumes, or their rows, or locking, cancellation, retries,
     timeouts, or failure handling around it;
-    - SQL in crates/l30_storage, or a domain rule in crates/l20_domain or
-    common-core;
+    - SQL in crates/l30_storage, or a domain rule in crates/l20_domain;
     - code several services link;
     - any other untested behavior change outside ui/.
     Evidence is what Validation reports for this head, trusted once the named
@@ -486,9 +485,14 @@ reviews:
           approvals treat a change: CodeRabbit reads them as review guidance,
           so such an edit would steer its own review.
           A rule, list entry, or guideline text that only follows a crate,
-          file, or test this diff moves or renames weakens nothing, if its new
-          name or path matches where the diff moved it. Check that it does,
-          and fail an entry that no longer covers what it covered.
+          file, or test this diff moves, renames, or deletes weakens nothing
+          if it still covers what it covered: a moved or renamed entry must
+          match where the diff moved it, and a rule about a deleted one must
+          apply at least as widely, for example a ban on one named crate
+          generalized to the kind of crate it was. Check that it does, and
+          fail an entry that no longer covers what it covered. This does not
+          lift the clause above about how reviews, merge-risk ratings, or
+          approvals treat a change.
           Pass otherwise. When failing, list each item with its file and line.
 
       - name: Agent tooling runs no new commands
