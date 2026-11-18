@@ -207,28 +207,33 @@ ensure_base_ref() {
   fi
 }
 
-newly_added_postgres_migration_files() {
+# Lists files under <pathspec> that this branch adds relative to the base.
+# Rename detection is off throughout, so a file moved into <pathspec> is listed
+# as an addition rather than hidden behind a rename entry.
+newly_added_migration_files() {
+  local label="$1"
+  local pathspec="$2"
   local ref
   ref="$(base_ref)"
 
   if git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null; then
     if git merge-base "${ref}" HEAD >/dev/null 2>&1; then
-      git diff --name-only --diff-filter=A "${ref}...HEAD" -- 'db/postgres/*.sql'
+      git diff --name-only --no-renames --diff-filter=A "${ref}...HEAD" -- "${pathspec}"
     else
-      echo "WARN: no merge-base with ${ref}; using a direct tree diff for new Postgres migrations." >&2
-      git diff --name-only --diff-filter=A "${ref}" HEAD -- 'db/postgres/*.sql'
+      echo "WARN: no merge-base with ${ref}; using a direct tree diff for new ${label} migrations." >&2
+      git diff --name-only --no-renames --diff-filter=A "${ref}" HEAD -- "${pathspec}"
     fi
   elif git rev-parse --verify --quiet HEAD^ >/dev/null; then
     # Last resort, and it narrows the guard to a single commit: a bad migration
     # added earlier on a multi-commit branch is outside this diff and passes.
     echo "WARN: ${ref} is unresolvable; inspecting only HEAD's own additions," \
-      "so migrations added earlier on this branch are not checked." >&2
-    git diff --name-only --diff-filter=A HEAD^..HEAD -- 'db/postgres/*.sql'
+      "so ${label} migrations added earlier on this branch are not checked." >&2
+    git diff --name-only --no-renames --diff-filter=A HEAD^..HEAD -- "${pathspec}"
   else
-    echo "WARN: could not establish a committed diff base for new Postgres migrations." >&2
+    echo "WARN: could not establish a committed diff base for new ${label} migrations." >&2
   fi
 
-  git status --porcelain -- 'db/postgres/*.sql' \
+  git status --porcelain --no-renames -- "${pathspec}" \
     | while read -r status file; do
         if [[ "${status}" == "??" || "${status:0:1}" == "A" ]]; then
           printf '%s\n' "${file}"
@@ -236,7 +241,12 @@ newly_added_postgres_migration_files() {
       done
 }
 
-base_postgres_max_version() {
+# Prints the greatest up-migration version directly in <dir> on the base, or 0.
+# Subdirectories such as template-manager's history/ are not part of the
+# catalog, so the listing is deliberately not recursive.
+base_max_up_version() {
+  local dir="$1"
+  local label="$2"
   local ref
   local file
   local filename
@@ -253,33 +263,24 @@ base_postgres_max_version() {
           max_version="${version}"
         fi
       fi
-    done < <(git ls-tree -r --name-only "${ref}" -- db/postgres)
+    done < <(git ls-tree --name-only "${ref}" -- "${dir}/")
   else
     # Returning 0 disables the not-newer-than-base check in the caller, so say
     # so rather than quietly enforcing half the contract. A resolvable base
     # whose tree simply holds no numbered migrations returns 0 too and is not
     # worth warning about — that is a legitimately empty base, not a lost base.
     echo "WARN: base ref ${ref} is unresolvable; skipping the" \
-      "not-newer-than-base check for new Postgres migrations." >&2
+      "not-newer-than-base check for new ${label} migrations." >&2
   fi
 
   printf '%s\n' "${max_version}"
 }
 
-validate_new_postgres_migration_versions() {
-  local file
-  local filename
-  local version_text
-  local version
-  local base_max_version
-  local legacy_cutoff_files=()
-  local invalid_timestamp_files=()
-  local not_newer_than_base_files=()
-
-  # The only freshening call, hoisted so it runs once before either consumer.
-  # Calling it from both instead costs two fetches per run: they each read the
+establish_base_ref() {
+  # The only freshening call, hoisted so it runs once before both consumers.
+  # Calling it from each instead costs a fetch per consumer: they each read the
   # base ref inside a subshell, and while the fetched ref lands on disk and is
-  # perfectly visible from there, nothing dedupes the second fetch.
+  # perfectly visible from there, nothing dedupes the later fetches.
   if ! ensure_base_ref; then
     return 1
   fi
@@ -302,7 +303,7 @@ validate_new_postgres_migration_versions() {
     && [[ "${BUILDKITE_BRANCH:-}" != trunk-merge/* ]] \
     && git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     && ! git rev-parse --verify --quiet "$(base_ref)^{commit}" >/dev/null; then
-    echo "ERROR: no base ref to compare new Postgres migrations against." >&2
+    echo "ERROR: no base ref to compare new migrations against." >&2
     echo "  Wanted: $(base_ref)" >&2
     echo "  Refusing to pass the migration checks with no base in CI; the" >&2
     echo "  not-newer-than-base check cannot run and the newly-added set would" >&2
@@ -312,8 +313,19 @@ validate_new_postgres_migration_versions() {
     echo "  ref that resolves in this checkout." >&2
     return 1
   fi
+}
 
-  base_max_version="$(base_postgres_max_version)"
+validate_new_postgres_migration_versions() {
+  local file
+  local filename
+  local version_text
+  local version
+  local base_max_version
+  local legacy_cutoff_files=()
+  local invalid_timestamp_files=()
+  local not_newer_than_base_files=()
+
+  base_max_version="$(base_max_up_version db/postgres Postgres)"
 
   while IFS= read -r file; do
     [[ -n "${file}" ]] || continue
@@ -337,7 +349,7 @@ validate_new_postgres_migration_versions() {
     if ((base_max_version > 0 && version <= base_max_version)); then
       not_newer_than_base_files+=("${file}")
     fi
-  done < <(newly_added_postgres_migration_files | sort -u)
+  done < <(newly_added_migration_files Postgres 'db/postgres/*.sql' | sort -u)
 
   if ((${#legacy_cutoff_files[@]} == 0 && ${#invalid_timestamp_files[@]} == 0 && ${#not_newer_than_base_files[@]} == 0)); then
     return 0
@@ -365,6 +377,117 @@ validate_new_postgres_migration_versions() {
     echo "  Newly added file(s) not newer than the base branch max Postgres version:" >&2
     printf '    %s\n' "${not_newer_than_base_files[@]}" >&2
   fi
+  return 1
+}
+
+# Prints "<catalog> <max up version>" for each SQLite catalog on the base: every
+# db/<store>/ directory except db/postgres.
+base_sqlite_catalog_max_versions() {
+  local ref
+  local dir
+  ref="$(base_ref)"
+
+  if ! git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null; then
+    echo "WARN: base ref ${ref} is unresolvable; skipping the" \
+      "not-newer-than-base check for new SQLite migrations." >&2
+    return 0
+  fi
+
+  while IFS= read -r dir; do
+    [[ "${dir}" != db/postgres ]] || continue
+    printf '%s %s\n' "${dir}" "$(base_max_up_version "${dir}" "SQLite ${dir}")"
+  done < <(git ls-tree -d --name-only "${ref}" -- db/)
+}
+
+# Node-local SQLite catalogs are every other db/<store>/ directory.
+# `space-db-migrator <store> down` reverts the newest applied version first,
+# across the store's catalog and the shared db/common catalog when the store
+# consumes it, and reverts the store's migration on a tie. A migration that
+# merges at or below a version already on the base is therefore not the first
+# one down reverts, so rolling back to the release before it reverts that
+# release's own migration instead. A new db/common migration is compared with
+# every catalog rather than only the consumers, which the migrator lists; a new
+# migration elsewhere is compared with its catalog and db/common. A catalog
+# absent from the base has no earlier release to roll back to and is skipped.
+validate_new_sqlite_migration_versions() {
+  local file
+  local dir
+  local filename
+  local version
+  local catalog_max
+  local all_max=0
+  local all_max_dir=""
+  local threshold
+  local -a new_files=()
+  local -A base_max_versions=()
+  local -A thresholds=()
+  local -A threshold_dirs=()
+  local -A not_newer_than_base_files=()
+
+  while IFS= read -r file; do
+    [[ -n "${file}" ]] || continue
+    dir="${file%/*}"
+    if [[ ! "${dir}" =~ ^db/[^/]+$ ]] || [[ "${dir}" == db/postgres ]]; then
+      continue
+    fi
+    # The directory checks above already report names without a numeric version.
+    [[ "${file##*/}" =~ ^[0-9]+_.+\.up\.sql$ ]] || continue
+    new_files+=("${file}")
+  done < <(newly_added_migration_files SQLite 'db/*/*.up.sql' | sort -u)
+
+  if ((${#new_files[@]} == 0)); then
+    return 0
+  fi
+
+  while read -r dir catalog_max; do
+    base_max_versions["${dir}"]="${catalog_max}"
+    if ((catalog_max > all_max)); then
+      all_max="${catalog_max}"
+      all_max_dir="${dir}"
+    fi
+  done < <(base_sqlite_catalog_max_versions)
+
+  for dir in "${!base_max_versions[@]}"; do
+    if [[ "${dir}" == db/common ]]; then
+      thresholds["${dir}"]="${all_max}"
+      threshold_dirs["${dir}"]="${all_max_dir}"
+    elif ((${base_max_versions[db/common]:-0} > base_max_versions["${dir}"])); then
+      thresholds["${dir}"]="${base_max_versions[db/common]}"
+      threshold_dirs["${dir}"]=db/common
+    else
+      thresholds["${dir}"]="${base_max_versions["${dir}"]}"
+      threshold_dirs["${dir}"]="${dir}"
+    fi
+  done
+
+  for file in "${new_files[@]}"; do
+    dir="${file%/*}"
+    [[ -n "${thresholds["${dir}"]+set}" ]] || continue
+    threshold="${thresholds["${dir}"]}"
+    filename="${file##*/}"
+    [[ "${filename}" =~ ^([0-9]+)_ ]]
+    version=$((10#${BASH_REMATCH[1]}))
+    if ((threshold > 0 && version <= threshold)); then
+      not_newer_than_base_files["${dir}"]+="${file}"$'\n'
+    fi
+  done
+
+  if ((${#not_newer_than_base_files[@]} == 0)); then
+    return 0
+  fi
+
+  echo "ERROR: new SQLite migrations must be newer than the versions down could revert before them on the base branch." >&2
+  echo "  A db/common migration must be newer than every SQLite catalog's max version;" >&2
+  echo "  any other catalog's must be newer than the max of that catalog and db/common." >&2
+  echo "  Renumber a migration overtaken by a newer one with a fresh UTC timestamp:" >&2
+  echo "  Example:  db/<store>/$(date -u +%Y%m%d%H%M%S)_add_example.up.sql" >&2
+  while IFS= read -r dir; do
+    echo "  New ${dir} versions must be greater than ${thresholds["${dir}"]}, the base branch max version in ${threshold_dirs["${dir}"]}." >&2
+    echo "  Newly added file(s) in ${dir} not newer than ${thresholds["${dir}"]}:" >&2
+    while IFS= read -r file; do
+      [[ -n "${file}" ]] && printf '    %s\n' "${file}" >&2
+    done <<<"${not_newer_than_base_files["${dir}"]}"
+  done < <(printf '%s\n' "${!not_newer_than_base_files[@]}" | sort)
   return 1
 }
 
@@ -443,12 +566,19 @@ for dir in "${migration_dirs[@]}"; do
   fi
 done
 
-if ! validate_new_postgres_migration_versions; then
+if ! establish_base_ref; then
   overall_status=1
+else
+  if ! validate_new_postgres_migration_versions; then
+    overall_status=1
+  fi
+  if ! validate_new_sqlite_migration_versions; then
+    overall_status=1
+  fi
 fi
 
 if ((overall_status != 0)); then
   exit "${overall_status}"
 fi
 
-echo "All SQLx migration directories passed duplicate-version, down-migration, and Postgres timestamp checks."
+echo "All SQLx migration directories passed duplicate-version, down-migration, Postgres timestamp, and SQLite version-order checks."

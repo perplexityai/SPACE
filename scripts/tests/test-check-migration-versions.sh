@@ -37,6 +37,21 @@ SELECT 1;
 SQL
 }
 
+write_sqlite_migration_pair() {
+  local repo="$1"
+  local store="$2"
+  local version="$3"
+  local description="$4"
+
+  mkdir -p "${repo}/db/${store}"
+  cat >"${repo}/db/${store}/${version}_${description}.up.sql" <<'SQL'
+SELECT 1;
+SQL
+  cat >"${repo}/db/${store}/${version}_${description}.down.sql" <<'SQL'
+SELECT 1;
+SQL
+}
+
 write_git_auth_probe() {
   local path="$1"
 
@@ -218,6 +233,144 @@ grep -F "not newer than the base branch max Postgres version" "${tmp_dir}/stale-
 grep -F "Base branch max Postgres version: 20260614000000" "${tmp_dir}/stale-branch.stderr" >/dev/null
 grep -F "db/postgres/20260613000000_older_timestamp.up.sql" "${tmp_dir}/stale-branch.stderr" >/dev/null
 grep -F "db/postgres/20260613000000_older_timestamp.down.sql" "${tmp_dir}/stale-branch.stderr" >/dev/null
+
+# SQLite catalogs get the same not-newer-than-base check. `down` orders a
+# consumer's migrations together with db/common's, so a consumer migration is
+# compared with the max of its catalog and db/common, and a db/common migration
+# with the max of every catalog. history/ holds unbundled migrations that are
+# not part of a catalog and must not raise its max.
+git -C "${work_repo}" checkout --quiet main
+write_sqlite_migration_pair "${work_repo}" "common" "20260930000000" "baseline"
+write_sqlite_migration_pair "${work_repo}" "common" "20261008000000" "shared"
+write_sqlite_migration_pair "${work_repo}" "sandbox-manager" "20260930000000" "baseline"
+write_sqlite_migration_pair "${work_repo}" "sandbox-manager" "20261010000000" "merged_first"
+write_sqlite_migration_pair "${work_repo}" "template-manager" "20260930000000" "baseline"
+mkdir -p "${work_repo}/db/template-manager/history"
+for kind in up down; do
+  cp "${work_repo}/db/template-manager/20260930000000_baseline.${kind}.sql" \
+    "${work_repo}/db/template-manager/history/20261020000000_retired.${kind}.sql"
+  cp "${work_repo}/db/template-manager/20260930000000_baseline.${kind}.sql" \
+    "${work_repo}/db/template-manager/history/20261001000000_withdrawn.${kind}.sql"
+done
+git -C "${work_repo}" add .
+git -C "${work_repo}" commit --quiet -m "SQLite base migrations"
+sqlite_base_commit="$(git -C "${work_repo}" rev-parse HEAD)"
+git -C "${work_repo}" update-ref refs/remotes/origin/main HEAD
+
+# Prints the SQLite section of a scenario's stderr.
+sqlite_findings() {
+  sed -n '/^ERROR: new SQLite/,$p' "${tmp_dir}/$1.stderr"
+}
+
+# Fails unless <scenario>'s SQLite section names <threshold> from <source> for
+# <catalog> and lists <file>.
+expect_sqlite_finding() {
+  local name="$1"
+  local catalog="$2"
+  local threshold="$3"
+  local source="$4"
+  local file="$5"
+
+  if ! sqlite_findings "${name}" \
+    | grep -F "New ${catalog} versions must be greater than ${threshold}, the base branch max version in ${source}." >/dev/null \
+    || ! sqlite_findings "${name}" | grep -F "    ${file}" >/dev/null; then
+    echo "expected ${name} to report ${file} against ${threshold} from ${source}" >&2
+    cat "${tmp_dir}/${name}.stderr" >&2
+    exit 1
+  fi
+}
+
+git -C "${work_repo}" checkout --quiet -B sqlite-in-order "${sqlite_base_commit}"
+write_sqlite_migration_pair "${work_repo}" "sandbox-manager" "20261011000000" "in_order"
+# Older than sandbox-manager's max but newer than its own catalog's and
+# db/common's: consumers are compared only with themselves and db/common.
+write_sqlite_migration_pair "${work_repo}" "template-manager" "20261009000000" "own_catalog"
+# Newer than every catalog's max; history/ does not count toward the max.
+write_sqlite_migration_pair "${work_repo}" "common" "20261011000000" "shared_next"
+git -C "${work_repo}" add .
+git -C "${work_repo}" commit --quiet -m "in-order SQLite migrations"
+expect_guard_success "${work_repo}" "sqlite-in-order"
+
+git -C "${work_repo}" checkout --quiet -B sqlite-out-of-order "${sqlite_base_commit}"
+write_sqlite_migration_pair "${work_repo}" "sandbox-manager" "20261005000000" "authored_early"
+git -C "${work_repo}" add .
+git -C "${work_repo}" commit --quiet -m "out-of-order SQLite migration"
+expect_guard_failure "${work_repo}" "sqlite-out-of-order"
+expect_sqlite_finding "sqlite-out-of-order" "db/sandbox-manager" "20261010000000" \
+  "db/sandbox-manager" "db/sandbox-manager/20261005000000_authored_early.up.sql"
+if grep -F "Postgres" "${tmp_dir}/sqlite-out-of-order.stderr" >/dev/null; then
+  echo "expected a SQLite-only failure not to report a Postgres violation" >&2
+  cat "${tmp_dir}/sqlite-out-of-order.stderr" >&2
+  exit 1
+fi
+
+# A db/common migration newer than db/common's max but below a consumer's.
+git -C "${work_repo}" checkout --quiet -B sqlite-common-below-consumer "${sqlite_base_commit}"
+write_sqlite_migration_pair "${work_repo}" "common" "20261009000000" "shared_early"
+git -C "${work_repo}" add .
+git -C "${work_repo}" commit --quiet -m "db/common migration below a consumer's max"
+expect_guard_failure "${work_repo}" "sqlite-common-below-consumer"
+expect_sqlite_finding "sqlite-common-below-consumer" "db/common" "20261010000000" \
+  "db/sandbox-manager" "db/common/20261009000000_shared_early.up.sql"
+
+# A consumer migration newer than its catalog's max but below db/common's.
+git -C "${work_repo}" checkout --quiet -B sqlite-consumer-below-common "${sqlite_base_commit}"
+write_sqlite_migration_pair "${work_repo}" "template-manager" "20261005000000" "below_common"
+git -C "${work_repo}" add .
+git -C "${work_repo}" commit --quiet -m "consumer migration below db/common's max"
+expect_guard_failure "${work_repo}" "sqlite-consumer-below-common"
+expect_sqlite_finding "sqlite-consumer-below-common" "db/template-manager" "20261008000000" \
+  "db/common" "db/template-manager/20261005000000_below_common.up.sql"
+
+# `down` reverts the service migration on a tie, so equal is not newer.
+git -C "${work_repo}" checkout --quiet -B sqlite-equal-common "${sqlite_base_commit}"
+write_sqlite_migration_pair "${work_repo}" "template-manager" "20261008000000" "equal_common"
+git -C "${work_repo}" add .
+git -C "${work_repo}" commit --quiet -m "consumer migration equal to db/common's max"
+expect_guard_failure "${work_repo}" "sqlite-equal-common"
+expect_sqlite_finding "sqlite-equal-common" "db/template-manager" "20261008000000" \
+  "db/common" "db/template-manager/20261008000000_equal_common.up.sql"
+
+# A migration moved into a catalog is an addition, committed or only staged.
+git -C "${work_repo}" checkout --quiet -B sqlite-moved-in "${sqlite_base_commit}"
+for kind in up down; do
+  git -C "${work_repo}" mv "db/template-manager/history/20261001000000_withdrawn.${kind}.sql" \
+    "db/template-manager/20261001000000_withdrawn.${kind}.sql"
+done
+expect_guard_failure "${work_repo}" "sqlite-moved-in-staged"
+expect_sqlite_finding "sqlite-moved-in-staged" "db/template-manager" "20261008000000" \
+  "db/common" "db/template-manager/20261001000000_withdrawn.up.sql"
+git -C "${work_repo}" commit --quiet -m "move a history migration into its catalog"
+expect_guard_failure "${work_repo}" "sqlite-moved-in"
+expect_sqlite_finding "sqlite-moved-in" "db/template-manager" "20261008000000" \
+  "db/common" "db/template-manager/20261001000000_withdrawn.up.sql"
+
+# Uncommitted additions are checked as well, matching the Postgres check.
+git -C "${work_repo}" checkout --quiet -B sqlite-untracked "${sqlite_base_commit}"
+write_sqlite_migration_pair "${work_repo}" "sandbox-manager" "20261005000000" "untracked"
+expect_guard_failure "${work_repo}" "sqlite-untracked"
+expect_sqlite_finding "sqlite-untracked" "db/sandbox-manager" "20261010000000" \
+  "db/sandbox-manager" "db/sandbox-manager/20261005000000_untracked.up.sql"
+rm "${work_repo}/db/sandbox-manager/20261005000000_untracked."*.sql
+
+# Postgres findings are unchanged alongside SQLite ones, and each check reports
+# only its own files.
+git -C "${work_repo}" checkout --quiet -B mixed-out-of-order "${sqlite_base_commit}"
+write_migration_pair "${work_repo}" "20260613000000" "older_timestamp"
+write_sqlite_migration_pair "${work_repo}" "sandbox-manager" "20261005000000" "authored_early"
+git -C "${work_repo}" add .
+git -C "${work_repo}" commit --quiet -m "out-of-order Postgres and SQLite migrations"
+expect_guard_failure "${work_repo}" "mixed-out-of-order"
+grep -F "Base branch max Postgres version: 20260614000000" \
+  "${tmp_dir}/mixed-out-of-order.stderr" >/dev/null
+expect_sqlite_finding "mixed-out-of-order" "db/sandbox-manager" "20261010000000" \
+  "db/sandbox-manager" "db/sandbox-manager/20261005000000_authored_early.up.sql"
+if sed -n '/^ERROR: new Postgres/,/^ERROR: new SQLite/p' \
+  "${tmp_dir}/mixed-out-of-order.stderr" | grep -F "db/sandbox-manager/" >/dev/null; then
+  echo "expected the Postgres check not to report SQLite files" >&2
+  cat "${tmp_dir}/mixed-out-of-order.stderr" >&2
+  exit 1
+fi
 
 # A present-but-stale cached origin/<base> must be freshened before diffing.
 # Without the fetch, the merge-base falls back to a commit predating the legacy
@@ -533,7 +686,7 @@ if [[ "${nobase_ci_exit}" -eq 0 ]]; then
   cat "${tmp_dir}/no-base-ci.stderr" >&2
   exit 1
 fi
-grep -F "no base ref to compare new Postgres migrations against" \
+grep -F "no base ref to compare new migrations against" \
   "${tmp_dir}/no-base-ci.stderr" >/dev/null
 
 set +e
