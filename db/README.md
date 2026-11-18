@@ -83,47 +83,119 @@ This is not a mechanism for changing schema or data behavior: those
 changes still require a new migration. Rollbacks to versions predating a registry
 entry can reject a database created with the revised SQL.
 
-## Forward-compatible migrations
+## Rolling back past a newer SQLite migration
 
-A node service rolled back by image alone finds its database recording the
-newer release's migrations, which its catalog doesn't bundle. Without more, it
-refuses that history before any write and does not start until the newer image
-returns. `db/forward-compatible-migrations.toml` lists the newer node-store
-migrations a release can run against instead. Each entry names the store (its
-`db/` directory, or `common` for the shared catalog), the version, the SHA-384
-of the up migration exactly as the bundling release ships it, and why the
-listing release keeps working on that schema.
+A SQLite release refuses a database whose history records a migration it
+doesn't bundle. Whether a release can run on a newer schema depends on that
+release's code, so the operator rolling back decides, for the release they
+roll back to:
 
-When every recorded migration a catalog doesn't bundle is listed with the
-recorded checksum, startup and `space-db-migrator <store> up` leave those
-history rows and their schema as they are, apply the release's own pending
-migrations, and continue. They still refuse, before any write, a recorded
-migration that is unlisted, listed for another store or with another checksum,
-or failed. A listing changes nothing for a database that doesn't record the
-migration. `down` and `status` don't consult the list.
+The `sqlite3` commands in this section need the `sqlite3` command-line tool,
+which a store's own image may not include. Run them where it is available,
+against the database file on the node. In the charts in this repository, a
+store's pods mount the node's `/space/run` directory, so one way is an
+ephemeral debug container on the node:
+`kubectl debug node/<node> -it --image=<an image with sqlite3>` mounts the
+node's root filesystem at `/host`, which puts sandbox-manager's database at
+`/host/space/run/sandbox-manager/sbx-manager.db`. Run `space-db-migrator`
+itself from the store's image, as in step 1.
 
-List a migration one release before the release that bundles it, and only if
-it is additive for the listing release: it adds tables, nullable or defaulted
-columns, or indexes that release never trips over, and every read and write
-that release makes stays valid with it applied. The contract step of an
-expand/contract change counts as additive for a release that has already
-stopped naming what it removes, when the removed object holds no data of its
-own and enforces no rule that release relies on: dropping a generated column,
-a view or a plain index that release never names qualifies. Dropping a stored
-column or a table doesn't, because its data is gone after the drop. Neither
-does dropping a unique index, a trigger or a CHECK constraint, because the
-listing release could then write rows the rule would have rejected. The bundling release must ship
-the same up SQL byte for byte, comments included, because the listing release
-accepts only that checksum; `every_listed_forward_migration_matches_the_catalog_that_bundles_it`
-checks it once both are in the tree. Never list a migration that isn't additive
-for the release before it. Rolling back across such a migration stays refused,
-so stage it with expand/contract instead.
+1. Find the entries before the rollback deploy, without starting the older
+   release on the node: take a consistent copy of the store's database with
+   SQLite's backup, `sqlite3 -readonly <db> ".backup <copy>"`, which is safe
+   while the daemon writes (a plain copy of the database and its `-wal` and
+   `-shm` files can mix pages from a write in progress), and run the target
+   image's `space-db-migrator <store> --database-path <copy> up` against the
+   copy, with `SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS` unset (for example
+   `env -u SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS space-db-migrator …`): an entry
+   left over from an earlier rollback would accept its migration and hide it
+   from the list. It changes only the copy. A release with this setting
+   refuses and names each
+   successful migration newer than everything it bundles as a
+   `<store>:<version>` entry, where `<store>` is the database name, such as
+   `sandbox-manager`, `template-manager`, or `common` for the shared catalog.
+   It refuses any other problem row as failed, modified, or unbundled instead,
+   and the setting can't accept that row; see the limits below.
+2. For each one, read the migration in the newer release and check the
+   rollback target's code:
+   - Does the target read or write anything the migration drops or renames?
+     A drop is compatible only when the target no longer names the dropped
+     object, the object holds no data of its own, and it enforces no rule the
+     target relies on: dropping a generated column, a view or a plain index
+     the target never names qualifies. Dropping a stored column or a table
+     doesn't, because its data is gone after the drop. Neither does dropping a
+     unique index, a trigger or a `CHECK` constraint, because the target could
+     then write rows the rule would have rejected.
+   - Does the migration add a constraint the target's writes can violate: a
+     `NOT NULL` column without a default, a unique index, a trigger, a
+     foreign key, or a `CHECK`?
+   - Does the migration rewrite or move existing rows the target reads (an
+     `UPDATE` or `INSERT … SELECT`, or values moved to a new column or
+     table)?
+   - Can the newer release write values the target doesn't handle, such as
+     a new state or reason, into tables or columns the target reads? Answer
+     it from the newer release's code, not from the copy: the newer daemon
+     keeps writing until the revert replaces it.
+   - Will the newer release still work on rows the target writes in the
+     meantime, for when you roll forward again?
 
-Only a release that carries this support and lists a migration can roll back
-over it: an image from before the listing still refuses the database. Listing
-doesn't apply to PostgreSQL, which no service migrates at startup.
-Template-manager reverses the migrations its runner lists, below, before this
-check runs.
+   A `common` entry accepts the shared catalog's migration for the store
+   whose container it is set on, so check it against that store's code in
+   the target. The setting names versions, not checksums, so a newer row is
+   accepted with whatever checksum the newer release recorded. If a node may
+   have run a pre-release build, compare the recorded checksum
+   (`SELECT lower(hex(checksum)) FROM _sqlx_migrations WHERE version = …`, or
+   `_space_common_schema_migrations` for `common`; the warning that accepts the
+   row also logs it as `recorded_checksum`) with `shasum -a 384` of the file
+   you checked.
+3. If the target is compatible, set `SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS` to
+   the comma-separated entries on every container that runs the store's
+   migrations at startup: its `space-db-migrator <store> … up` init container
+   if it has one, and its daemon if the daemon migrates (build-manager's
+   doesn't). Put them in the same deploy as the image revert, not after it:
+   where a store's daemon migrates itself, a successor can report ready while
+   it waits for the service mutex, as Kind's surge rollouts do, so a refused
+   rollback replaces the working pods before the refusal shows.
+
+   Otherwise, before reverting the image, undo the migrations on every node
+   with the newer image's `space-db-migrator <store> … down`. First stop the
+   store's daemon on the node and keep the newer release from restarting it
+   or re-running its migrations until the older release starts: a daemon
+   still serving would read and write a schema being reverted under it. Each
+   run reverts only the newest applied migration, so run it once per
+   migration, newest first. Some down migrations are rollback floors that
+   refuse by design, such as runtime-manager's
+   `20261012064915_artifact_operations`, so read each down script first, and
+   where one refuses, follow its recovery instructions instead. For
+   template-manager, read 'Template cache partition migration' first: some
+   earlier releases reverse certain newer migrations themselves at startup,
+   with data checks that a manual `down` skips, and that section says which
+   targets need which steps.
+4. Remove the setting once a release that bundles those migrations is back.
+   It has no effect there, but on any later rollback to a release that
+   doesn't bundle them it accepts them again, without the refusal and
+   without anyone checking them against that release.
+
+Only releases with this setting read it; rolling back to an older one still
+needs the `down` first. While a database records a migration accepted through
+the setting, an older image's `down` refuses too, because SQLx validates the
+applied history, so undo the accepted rows with the newer image first.
+
+The setting accepts only successful migrations newer than every one the
+release bundles. A failed row stays refused, and so does a bundled row whose
+recorded checksum the release doesn't accept. An unbundled version below the newest
+bundled one is refused as unbundled, and the setting can't accept it: a
+withdrawn one once the release bundles a newer migration, one merged out of
+timestamp order, or an accepted row that a later deploy has overtaken. So
+after an accepted rollback, deploying a release that bundles a newer
+migration in that store, but not the accepted ones, refuses the database
+whatever the setting says: for example, a hotfix of the target that adds its
+own migration, or a release built after a revert deleted an accepted
+migration's file. Undo the accepted migrations with the newer image's `down`
+before deploying such a release. A withdrawn migration stays bundled once any
+environment has applied it, and a forward migration undoes its change, as
+`20261113190000_restore_sandbox_legacy_state` does for
+`20261109120000_drop_sandbox_legacy_state` in sandbox-manager.
 
 ## Unbundled template-manager migrations
 
@@ -416,8 +488,8 @@ writes, then applies common schema before service schema. Failed, modified,
 missing, or unbundled applied versions are rejected without recreating the
 database. A binary rollback therefore requires a catalog compatible with the
 complete applied history, even for an otherwise backward-compatible schema,
-unless the release it returns to lists the newer migrations as described under
-'Forward-compatible migrations'. Use expand/contract sequencing and retain
+unless the operator accepts each newer migration as described under 'Rolling
+back past a newer SQLite migration'. Use expand/contract sequencing and retain
 verified backups. Template-manager's exceptions are described under 'Unbundled
 template-manager migrations'.
 

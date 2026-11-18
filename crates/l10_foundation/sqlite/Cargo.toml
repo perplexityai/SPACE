@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+hex = { workspace = true }
 rusqlite = { workspace = true }
 sqlx = { workspace = true, features = ["derive", "macros", "migrate", "runtime-tokio", "sqlite-bundled", "tls-rustls-aws-lc-rs"] }
 thiserror = { workspace = true }
@@ -21,7 +22,6 @@ pplx-space-migration-checksums = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 
 [dev-dependencies]
-hex = { workspace = true }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

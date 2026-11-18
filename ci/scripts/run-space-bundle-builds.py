@@ -183,7 +183,6 @@ RUST_ARTIFACT_COMMON_INPUTS = (
     # Embedded by pplx-space-migration-checksums, which pplx-space-sqlite and
     # pplx-space-db-migrate depend on.
     Path("db/accepted-checksums.toml"),
-    Path("db/forward-compatible-migrations.toml"),
 )
 RUST_ARTIFACT_TEMPLATE_RECIPES = (
     Path("templates/firecracker/recipes/seed.toml"),
