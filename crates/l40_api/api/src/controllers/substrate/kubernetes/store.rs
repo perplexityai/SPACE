@@ -297,14 +297,14 @@ pub(super) enum NodeStateWrite {
     InsertOnly(NodeLifecycleState),
 }
 
-struct K8sNodeRoleUpsert<'a> {
-    node_name: &'a str,
-    node_uid: &'a str,
-    node_id: NodeId,
-    role: NodeRole,
-    address: Option<&'a str>,
-    state: NodeStateWrite,
-    instance_id: Option<&'a Ec2InstanceId>,
+pub(super) struct K8sNodeRoleUpsert<'a> {
+    pub node_name: &'a str,
+    pub node_uid: &'a str,
+    pub node_id: NodeId,
+    pub role: NodeRole,
+    pub address: Option<&'a str>,
+    pub state: NodeStateWrite,
+    pub instance_id: Option<&'a Ec2InstanceId>,
 }
 
 #[derive(sqlx::FromRow)]

@@ -11,16 +11,9 @@ impl K8sStore {
     /// `instance_id` is the EC2 instance the Node's `providerID` names.
     /// `None` keeps the recorded instance while the Node's UID is unchanged;
     /// on a UID change it clears it, since a new Node may be another machine.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::controllers::substrate::kubernetes) async fn persist_k8s_node_inventory(
         &self,
-        node_name: &str,
-        node_uid: &str,
-        node_id: NodeId,
-        role: NodeRole,
-        address: Option<&str>,
-        state: NodeStateWrite,
-        instance_id: Option<&Ec2InstanceId>,
+        upsert: K8sNodeRoleUpsert<'_>,
     ) -> Result<bool, SubstrateError> {
         let mut tx = self
             .pool
@@ -28,20 +21,7 @@ impl K8sStore {
             .await
             .db_context("failed to start Kubernetes node inventory transaction")?;
 
-        let changed = self
-            .upsert_k8s_node_role(
-                &mut tx,
-                K8sNodeRoleUpsert {
-                    node_name,
-                    node_uid,
-                    node_id,
-                    role,
-                    address,
-                    state,
-                    instance_id,
-                },
-            )
-            .await?;
+        let changed = self.upsert_k8s_node_role(&mut tx, upsert).await?;
 
         tx.commit()
             .await
