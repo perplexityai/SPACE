@@ -37,7 +37,9 @@
 # Sourced, never executed. Needs passwordless sudo; the benches' commands run as
 # the calling user.
 
-KIND_BENCH_PREFIX="${KIND_BENCH_PREFIX:-space-bench}"
+# Fixed, not a knob: the veth names, addresses and the registries' ports are
+# fixed too, so two prefixes on one host would still collide.
+KIND_BENCH_PREFIX=space-bench
 KIND_BENCH_ROOT="${KIND_BENCH_ROOT:-$HOME/.space-benches}"
 # The bench daemons are always Docker's static release, installed once, so
 # every bench runs the version they were measured with whatever the host's own
