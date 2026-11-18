@@ -159,10 +159,14 @@ CREATE TRIGGER firewall_rules_rollouts_set_updated_at
 -- The runtime campaigns' function, shared rather than copied: it raises
 -- generation on any update that changes a column other than generation,
 -- updated_at, created_by_user_id and updated_by_user_id, which this table names
--- the same way.
+-- the same way. Its comment records that both tables use it, so a change to the
+-- columns it ignores is weighed for both.
 CREATE TRIGGER firewall_rules_rollouts_raise_generation
     BEFORE UPDATE ON firewall_rules_rollouts
     FOR EACH ROW EXECUTE FUNCTION runtime_upgrade_campaigns_raise_generation();
+
+COMMENT ON FUNCTION runtime_upgrade_campaigns_raise_generation() IS
+    'Trigger for runtime_upgrade_campaigns and firewall_rules_rollouts: raises generation by one on every update that changes a column other than generation, updated_at, created_by_user_id and updated_by_user_id. Changing the ignored columns changes both tables';
 
 COMMENT ON TABLE firewall_rules_rollouts IS
     'Paced moves of nodes to a firewall revision; at most one is unfinished';

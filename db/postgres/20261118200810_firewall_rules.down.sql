@@ -68,6 +68,10 @@ BEGIN
 END;
 $$;
 
+-- The function had no comment before the up migration gave it one naming both
+-- tables, and runtime_upgrade_campaigns is again its only user.
+COMMENT ON FUNCTION runtime_upgrade_campaigns_raise_generation() IS NULL;
+
 -- Referencing tables first. Dropping a table drops its triggers but not their
 -- functions, so set_updated_at and runtime_upgrade_campaigns_raise_generation
 -- stay for the tables that still use them.
