@@ -5286,6 +5286,9 @@ mod tests;
 #[cfg(test)]
 mod tombstone_tests;
 
+#[cfg(test)]
+pub(crate) mod v2_sink;
+
 /// Postgres-backed regression tests for the durable-upload drain gate: a node
 /// must not be reclaimed (nor its sandbox marked `failed`) while a
 /// suspend-snapshot upload is still in flight *from* that node
