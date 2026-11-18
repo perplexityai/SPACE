@@ -15,7 +15,7 @@ import { pathToFileURL } from 'node:url';
 
 import { chromium } from 'playwright';
 
-import { newContext, takeToasts, type Ctx } from './browser.ts';
+import { newContext, showLoopbackHostsOnly, takeToasts, type Ctx } from './browser.ts';
 import { compareRuns, printComparison, readRun, type RunSummary } from './compare.ts';
 import { flag, guardTargets, loadConfig, option } from './config.ts';
 import { NON_FAILING, Recorder, writeJson, type StepResult } from './recorder.ts';
@@ -74,6 +74,7 @@ async function main(): Promise<number> {
   // --video records the whole run as run.webm in the run directory.
   const video = flag(args, 'video');
   const context = await newContext(browser, video ? { videoDir: path.join(runDir, '.video') } : {});
+  if (flag(args, 'loopback-hosts')) await showLoopbackHostsOnly(context);
   const page = await context.newPage();
   const rec = new Recorder(page, { slowMs, prefix: config.prefix, outDir: runDir });
   const c: Ctx = {

@@ -78,7 +78,9 @@ pub struct AppState {
     /// Whether `:drain` may start a v2 drain (`SPACE_DRAIN_V2_ENABLED`, read
     /// once at startup).
     pub drain_v2_enabled: bool,
-    /// The fresh `DrainNode` call `:terminate` makes of a v2 node.
+    /// The node calls the admin API makes of a v2 node: the fresh
+    /// `DrainNode` call `:terminate` makes, and the `PreviewDrainNode` call
+    /// `GET /nodes/{node_id}/drain-v2-preview` makes.
     pub v2_drain_probe: std::sync::Arc<dyn admin::nodes::V2DrainProbe>,
 }
 

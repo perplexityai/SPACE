@@ -1889,6 +1889,26 @@ class DrainV2Control(KindWorkerControl, DrainRestoreControl, Protocol):
         """`POST :terminate`; the HTTP status it answered."""
         ...
 
+    def drain_v2_preview(self, node_id: str) -> dict[str, Any]:
+        """`GET /nodes/{node_id}/drain-v2-preview`: what a v2 drain would find
+        on the node, which the node answers without changing anything."""
+        ...
+
+    def plant_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> str:
+        """Make an empty sandbox cache directory named `sandbox_id` on the
+        Kind worker, as a sandbox the node lost track of leaves; its path."""
+        ...
+
+    def remove_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> None:
+        """Remove what `plant_orphan_cache_dir` left: the quarantined row
+        sandbox-manager's inventory made of the directory, if it made one,
+        and the directory, if it is still there and empty."""
+        ...
+
+    def disk_snapshot_ids(self, sandbox_id: str) -> list[str]:
+        """The sandbox's disk snapshot ids."""
+        ...
+
     def seal_activations(self, node_name: str, epoch: int) -> int | None:
         """`space-sbxmgr drain-node --epoch` on the worker, under the caller's
         worker-cordon Lease; the epoch it answers sealed under.

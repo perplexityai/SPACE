@@ -5342,6 +5342,62 @@ ON CONFLICT (key_hash) DO NOTHING;
         except HTTPError as error:
             return int(error.code)
 
+    def drain_v2_preview(self, node_id: str) -> dict[str, Any]:
+        self._require_isolated_kind("admin node operations")
+        request = Request(
+            self.config.api_url.rstrip("/")
+            + f"/admin/api/v1/nodes/{quote(_sql_uuid(node_id), safe='')}/drain-v2-preview",
+            method="GET",
+            headers={"Authorization": "Bearer " + self._admin_token()},
+        )
+        # The API bounds a preview at 60 s once it has authorized the caller,
+        # its reads and the node call together; wait longer, so its own
+        # answer arrives first.
+        try:
+            with urlopen(request, timeout=75) as response:
+                body = json.loads(response.read() or b"null")
+        except HTTPError as error:
+            detail = error.read()[:2000].decode(errors="replace")
+            raise RuntimeError(f"admin drain preview returned HTTP {error.code}: {detail}") from None
+        except (URLError, OSError):
+            raise RuntimeError("admin drain preview failed") from None
+        if not isinstance(body, dict):
+            raise RuntimeError("the admin drain preview was not an object")
+        return body
+
+    def plant_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> str:
+        path = f"{SANDBOX_CACHE_ROOT}/{uuid.UUID(sandbox_id)}"
+        _require_ok(
+            self._docker_exec(node_name, "mkdir", path),
+            f"plant an orphan cache directory on {node_name}",
+        )
+        return path
+
+    def remove_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> None:
+        canonical = str(uuid.UUID(sandbox_id))
+        # sandbox-manager's inventory makes a quarantined row of a cache
+        # directory no row owns; that row is the plant's as well. Refused for
+        # an id the cluster knows, which no planted one is.
+        if self.node_sandbox_state(node_name, canonical) is not None:
+            if self._psql(
+                SANDBOX_LIVE_SQL.format(sandbox_id=canonical), action="probe sandbox liveness"
+            ).strip():
+                raise SmokeConfigurationError(
+                    f"sandbox {canonical} exists on the cluster; its row on {node_name} is not a plant's"
+                )
+            _require_ok(
+                self._node_shell_exec(
+                    node_name, f"space-sbxmgr delete --blocking {canonical}", timeout=180
+                ),
+                f"delete the planted sandbox's quarantined row on {node_name}",
+            )
+        path = shlex.quote(f"{SANDBOX_CACHE_ROOT}/{canonical}")
+        # `rmdir`: only the empty directory the plant made, never a real one.
+        _require_ok(
+            self._docker_exec(node_name, "sh", "-c", f"test ! -e {path} || rmdir {path}"),
+            f"remove the planted cache directory on {node_name}",
+        )
+
     def drain_restore_operations(self, sandbox_id: str) -> list[tuple[str, int]]:
         rows = self._psql(
             "SELECT state, attempts FROM public_operations"

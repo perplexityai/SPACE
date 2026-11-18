@@ -564,6 +564,23 @@ fn insert_node_maintenance_paths(paths: &mut Map<String, Value>) {
         }),
     );
     paths.insert(
+        "/nodes/{node_id}/drain-v2-preview".to_string(),
+        json!({
+            "get": {
+                "summary": "Preview what a forced v2 drain would find on one worker node, changing nothing on it",
+                "description": "It reports what a forced v2 drain would find on this node now. It plans as a forced drain. A gentle drain holds each started sandbox whose suspend is neither refused nor already running: it lists it pending with the action hold, whatever this preview lists for it (suspend, queued, disk, or blocked after repeated suspend failures), and the window slots that frees can start other work sooner. A row that has already sat in a transition the drain doesn't drive for over 15 minutes counts as blocked, as a drain would report it after waiting that long. What the admin API would refuse a v2 drain of the node for (a node not managed by Kubernetes, or one without a recorded EC2 instance) is reported as node-level blockers, every refusal, where :drain answers with the first; when the node can't answer, the error lists them as refusals. The preview reads node-manager's orphan inventory as a drain call does. Node-manager serves one page of it at a time and keeps up to 4 scans, evicting the least recently used one when another starts, so on a draining node a preview can delay a drain call's read or cut it short. Once the caller is authorized, the request is bounded at 60 s, its database reads and the node call together.",
+                "responses": {
+                    "200": { "description": "What a drain would report: blocked, pending, evacuated, the node's seal as it stands, and whether a drain would finish at once" },
+                    "400": { "description": "Not a worker node" },
+                    "404": { "description": "Node not found" },
+                    "501": { "description": "The node's sandbox-manager or node-api predates drain previews (reason node_version_unsupported); refusals lists what :drain would refuse the node for" },
+                    "502": { "description": "The node can't be reached or didn't answer within the bound (reason node_unreachable), or failed the preview (node_preview_failed); refusals lists what :drain would refuse the node for" },
+                    "503": { "description": "The admin API's database ended or lost a read. With reason database_timeout, a read of the node's rows timed out, by the 60 s bound or, first under the defaults, by the database's own bounds (the pool's acquire timeout, statement_timeout or a cancel, or lock_timeout); the error names the read. Without a reason, a read lost a serialization, deadlock or lock race; retry." }
+                }
+            }
+        }),
+    );
+    paths.insert(
         "/nodes/templates".to_string(),
         json!({
             "get": {

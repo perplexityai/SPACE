@@ -6,6 +6,18 @@ import { adminApi } from '@/lib/api';
 import { nodeActions, type NodeAction } from '@/lib/node-actions';
 import { confirmationPhrase, formatDuration, heartbeat as nodeHeartbeat, terminateRefusal } from '@/lib/node-drain';
 import { TypedConfirmModal } from '@/components/typed-confirm-modal';
+import { DrainPreviewAll } from '@/components/drain-preview';
+import {
+  DRAIN_PREVIEW_TIMEOUT_MS,
+  PREVIEW_ALL_CONCURRENCY,
+  PREVIEW_TOOLTIP,
+  previewPath,
+  previewRow,
+  runBounded,
+  type DrainPreview,
+  type PreviewRow,
+} from '@/lib/drain-preview';
+import { withTimeout } from '@/lib/serial-reads';
 import { useAuth } from '@/lib/auth';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import {
@@ -40,7 +52,7 @@ import {
   Tooltip,
 } from 'antd';
 import {
-  DeleteOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, PoweroffOutlined, ReloadOutlined, SyncOutlined, ThunderboltOutlined,
+  DeleteOutlined, EyeOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, PoweroffOutlined, ReloadOutlined, SyncOutlined, ThunderboltOutlined,
 } from '@ant-design/icons';
 import { runtimeInstallationLines } from '@/lib/node-state';
 import type { ColumnsType } from 'antd/es/table';
@@ -412,6 +424,11 @@ export default function NodesPage() {
   // A forced drain or terminate waiting on its typed confirmation.
   const [typedAction, setTypedAction] = useState<{ node: NodeView; item: NodeAction } | null>(null);
   const [nodeAgeReferenceMs, setNodeAgeReferenceMs] = useState(() => Date.now());
+  // The last "Preview v2 drain on all workers": its rows in the order of the
+  // nodes it previewed, filled in as each answers.
+  const [previewAll, setPreviewAll] = useState<{ total: number; rows: (PreviewRow | undefined)[]; running: boolean } | null>(null);
+  const previewAllAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => previewAllAbort.current?.abort(), []);
   const [form] = Form.useForm();
   const selectedRole = Form.useWatch('role', form) as NodeRole | undefined;
   const endpointPlaceholder =
@@ -691,6 +708,42 @@ export default function NodesPage() {
   const visibleNodes = heartbeatFilter === 'all'
     ? nodes
     : nodes.filter((node) => node.role !== 'cluster' && isNodeHeartbeatStale(node, nodeAgeReferenceMs) === (heartbeatFilter === 'stale'));
+
+  // Previews every listed worker node, at most PREVIEW_ALL_CONCURRENCY at
+  // once. Each is read-only on its node, so nothing asks for confirmation.
+  const startPreviewAll = () => {
+    previewAllAbort.current?.abort();
+    const abort = new AbortController();
+    previewAllAbort.current = abort;
+    const targets = visibleNodes.filter((node) => node.role === 'worker');
+    setPreviewAll({ total: targets.length, rows: [], running: true });
+    void runBounded(
+      targets,
+      PREVIEW_ALL_CONCURRENCY,
+      (node) => withTimeout(DRAIN_PREVIEW_TIMEOUT_MS, (signal) => (
+        adminApi.get<DrainPreview>(previewPath(node.id), { signal: AbortSignal.any([signal, abort.signal]) })
+      )),
+      (index, result) => {
+        if (abort.signal.aborted) return;
+        setPreviewAll((current) => {
+          if (!current) return current;
+          const rows = [...current.rows];
+          rows[index] = previewRow(targets[index], result);
+          return { ...current, rows };
+        });
+      },
+      abort.signal,
+    ).then(() => {
+      if (previewAllAbort.current === abort) {
+        setPreviewAll((current) => (current ? { ...current, running: false } : current));
+      }
+    });
+  };
+
+  const stopPreviewAll = () => {
+    previewAllAbort.current?.abort();
+    setPreviewAll((current) => (current ? { ...current, running: false } : current));
+  };
 
   const nodeColumns: ColumnsType<NodeView> = [
     {
@@ -1008,6 +1061,11 @@ export default function NodesPage() {
       <Space align="center" style={{ width: '100%', justifyContent: 'space-between' }}>
         <Title level={3}>Nodes</Title>
         <Space>
+          <Tooltip title={PREVIEW_TOOLTIP}>
+            <Button icon={<EyeOutlined />} loading={previewAll?.running} onClick={startPreviewAll}>
+              Preview v2 drain on all workers
+            </Button>
+          </Tooltip>
           <Button
             icon={<ReloadOutlined />}
             loading={refreshingNodeStatus || loadingNodes}
@@ -1058,6 +1116,15 @@ export default function NodesPage() {
           </Form>
         </Card>
       )}
+      {previewAll ? (
+        <DrainPreviewAll
+          total={previewAll.total}
+          rows={previewAll.rows.filter((row): row is PreviewRow => row !== undefined)}
+          running={previewAll.running}
+          onCancel={stopPreviewAll}
+          onClose={() => setPreviewAll(null)}
+        />
+      ) : null}
       <Space style={{ marginBottom: 12 }}>
         <Text strong>Registered nodes</Text>
         <Select
