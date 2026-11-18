@@ -205,19 +205,25 @@ default_benches() {
   mbps="$(write_probe_mbps)" || mbps=""
   probe_seconds="$(awk -v s="$probe_start" -v e="$(date +%s%N)" 'BEGIN {printf "%.1f", (e - s) / 1e9}')"
   local -a factors=()
+  local short=""
   n=6
   by=$(( cpus / 8 )); factors+=("cpus $cpus -> $by"); (( by < n )) && n=$by
   by=$(( mem_gib / 16 )); factors+=("available memory $mem_gib GiB -> $by"); (( by < n )) && n=$by
+  (( by > 0 )) || short="available memory"
   by=$(( disk_gb / 60 )); factors+=("free disk $disk_gb GB -> $by"); (( by < n )) && n=$by
+  (( by > 0 )) || short="${short:+$short and }free disk"
   if [[ -n "$mbps" ]]; then
     by=$(( mbps / 70 )); factors+=("disk $mbps MB/s -> $by (${probe_seconds}s probe)"); (( by < n )) && n=$by
   else
     factors+=("disk write probe failed -> not counted")
   fi
-  (( n < 1 )) && n=1
-  BENCHES="$n"
   local joined
   joined="$(printf '%s, ' "${factors[@]}")"
+  # Too little memory or disk for even one bench fills the host while it comes
+  # up; too few CPUs only makes one bench slower, the ordinary serial flow.
+  [[ -z "$short" ]] || die "not enough $short for one bench (${joined%, }); pass --benches 1 to run anyway"
+  (( n < 1 )) && n=1
+  BENCHES="$n"
   log "benches: $n (${joined%, }; cap 6; --benches overrides)"
 }
 
