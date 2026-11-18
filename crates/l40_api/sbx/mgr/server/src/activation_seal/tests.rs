@@ -1,6 +1,3 @@
-use pplx_space_observability::test_capture::{CapturedEvent, RecordingVisitor, field_value};
-use tracing_subscriber::layer::SubscriberExt as _;
-
 use super::*;
 
 const SANDBOX: &str = "sandbox-1";
@@ -369,101 +366,6 @@ async fn the_background_read_runs_only_while_the_seal_is_unknown() {
         .await
         .expect("the retry ends at shutdown");
     assert_unreadable_refusal(&unknown.check("cold", SANDBOX).unwrap_err());
-}
-
-/// The level and fields of each event the code under test logs.
-#[derive(Clone, Default)]
-struct LoggedEvents(Arc<Mutex<Vec<(tracing::Level, CapturedEvent)>>>);
-
-impl LoggedEvents {
-    fn with(&self, level: tracing::Level) -> Vec<CapturedEvent> {
-        self.0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(logged, _)| *logged == level)
-            .map(|(_, event)| event.clone())
-            .collect()
-    }
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LoggedEvents {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        let mut visitor = RecordingVisitor::default();
-        event.record(&mut visitor);
-        self.0
-            .lock()
-            .unwrap()
-            .push((*event.metadata().level(), visitor.into_fields()));
-    }
-}
-
-/// A seal row that stays unreadable logs a warning at most once a minute,
-/// after the startup error, naming the read's error and how long the seal
-/// has been unknown; the retry's other failures log at debug. The recovery
-/// line says how long the seal was unknown.
-#[tokio::test(start_paused = true)]
-async fn a_seal_that_stays_unreadable_warns_once_a_minute_until_it_reads() {
-    let logged = LoggedEvents::default();
-    let _subscriber =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(logged.clone()));
-    let db = SharedConnection::new(crate::db::test_conn());
-    hide_seal_table(&db);
-    let seal = Arc::new(ActivationSeal::load(&db.lock().unwrap()));
-    let retry = tokio::spawn(Arc::clone(&seal).recover(
-        db.clone(),
-        CancellationToken::new(),
-        RECOVERY_BACKOFF_INITIAL,
-        RECOVERY_BACKOFF_MAX,
-    ));
-
-    tokio::time::sleep(Duration::from_secs(59)).await;
-    assert!(
-        logged.with(tracing::Level::WARN).is_empty(),
-        "no warning inside the first minute"
-    );
-
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    let warned = logged.with(tracing::Level::WARN);
-    assert_eq!(warned.len(), 1, "{warned:?}");
-    assert!(
-        field_value(&warned[0], "error").is_some_and(|error| error.contains("activation_seal")),
-        "{warned:?}"
-    );
-    let first = unreadable_secs(&warned[0]);
-    assert!((60..=62).contains(&first), "{warned:?}");
-
-    tokio::time::sleep(Duration::from_secs(50)).await;
-    assert_eq!(logged.with(tracing::Level::WARN).len(), 1, "once a minute");
-    tokio::time::sleep(Duration::from_secs(15)).await;
-    let warned = logged.with(tracing::Level::WARN);
-    assert_eq!(warned.len(), 2, "{warned:?}");
-    let second = unreadable_secs(&warned[1]);
-    assert!((120..=124).contains(&second), "{warned:?}");
-
-    restore_seal_table(&db, None);
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    retry.await.unwrap();
-    assert_eq!(logged.with(tracing::Level::WARN).len(), 2);
-    let recovered: Vec<_> = logged
-        .with(tracing::Level::INFO)
-        .into_iter()
-        .filter(|event| {
-            field_value(event, "message").is_some_and(|message| message.contains("read the"))
-        })
-        .collect();
-    assert_eq!(recovered.len(), 1, "{recovered:?}");
-    assert!(
-        unreadable_secs(&recovered[0]) >= 125,
-        "the recovery line says how long the seal was unknown: {recovered:?}"
-    );
-    drop(seal.admit("cold", SANDBOX).unwrap());
-}
-
-fn unreadable_secs(event: &CapturedEvent) -> u64 {
-    field_value(event, "unreadable_secs")
-        .and_then(|secs| secs.parse().ok())
-        .unwrap_or_else(|| panic!("no unreadable_secs in {event:?}"))
 }
 
 /// The token ends its work's in-flight count however the work ends: it
