@@ -3242,3 +3242,145 @@ async fn a_preview_judges_a_long_transition_by_when_the_row_entered_it() {
     assert!(drain.blocked.is_empty(), "{drain:?}");
     assert_eq!(drain.pending.len(), 2, "{drain:?}");
 }
+
+/// A failed drain suspend that left its capture pinned with a live upload is
+/// remembered, and its upload ended once a later attempt's publication moves
+/// the pin past it, whether that attempt fails or succeeds. The pin an
+/// attempt leaves is never ended: a successful suspend's own capture keeps
+/// its upload. A failure that pinned nothing new, or whose capture has no
+/// live upload, remembers nothing.
+#[test]
+fn a_failed_drain_suspends_capture_is_ended_once_superseded() {
+    let actions = DrainActions::default();
+    // The first attempt publishes capture `c1` and fails its backup
+    // handoff: `c1` stays pinned, its upload queued.
+    assert!(
+        actions
+            .settle_captures("s", Some("c0"), Some("c1"), true, true)
+            .is_empty()
+    );
+    // The second publishes `c2`, retiring `c1`, and fails before any upload.
+    assert_eq!(
+        actions.settle_captures("s", Some("c1"), Some("c2"), true, false),
+        ["c1"]
+    );
+    // The third succeeds on `c3`: nothing left to end, and `c3` untouched.
+    assert!(
+        actions
+            .settle_captures("s", Some("c2"), Some("c3"), false, true)
+            .is_empty()
+    );
+
+    // A capture remembered across a success that superseded it is ended,
+    // never the success's own.
+    assert!(
+        actions
+            .settle_captures("t", Some("d0"), Some("d1"), true, true)
+            .is_empty()
+    );
+    assert_eq!(
+        actions.settle_captures("t", Some("d1"), Some("d2"), false, true),
+        ["d1"]
+    );
+    assert!(
+        actions
+            .settle_captures("t", Some("d2"), Some("d3"), false, true)
+            .is_empty()
+    );
+
+    // A failure that left the pin where it was, or a new pin with no live
+    // upload, remembers nothing; a capture still pinned is kept.
+    assert!(
+        actions
+            .settle_captures("u", Some("e0"), Some("e0"), true, true)
+            .is_empty()
+    );
+    assert!(
+        actions
+            .settle_captures("u", Some("e0"), Some("e1"), true, false)
+            .is_empty()
+    );
+    assert!(
+        actions
+            .settle_captures("u", Some("e1"), Some("e2"), false, true)
+            .is_empty()
+    );
+    assert!(
+        actions
+            .settle_captures("v", Some("f0"), Some("f1"), true, true)
+            .is_empty()
+    );
+    assert!(
+        actions
+            .settle_captures("v", Some("f1"), Some("f1"), true, true)
+            .is_empty()
+    );
+    assert_eq!(
+        actions.settle_captures("v", Some("f1"), Some("f2"), false, true),
+        ["f1"]
+    );
+}
+
+/// Ending a superseded capture's upload cancels its live job and no other:
+/// the upload of the capture that superseded it, and any other sandbox's,
+/// keep running.
+#[tokio::test]
+async fn ending_a_superseded_capture_cancels_only_its_upload() {
+    use pplx_space_accounts::JobId;
+    use pplx_space_common_core::types::LocalArtifactId;
+    let service = SandboxManagerService::for_test(crate::db::test_conn());
+    let (superseded, kept, other) = (
+        LocalArtifactId::new(),
+        LocalArtifactId::new(),
+        LocalArtifactId::new(),
+    );
+    let insert = |sandbox_id: &str, artifact: LocalArtifactId| {
+        let job_id = JobId::new();
+        let conn = service.db_conn().unwrap();
+        pplx_space_common_jobs::db::insert_job(
+            conn.raw(),
+            pplx_space_common_jobs::db::InsertJob {
+                job_id: &job_id,
+                kind: crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                payload: "{}",
+                subject_id: Some(sandbox_id),
+                dedup_key: Some(&crate::snapshot_upload_jobs::artifact_backup_dedup_key(
+                    artifact,
+                )),
+                max_attempts: 5,
+                traceparent: None,
+                priority: pplx_space_common_jobs::JobPriority::default(),
+            },
+        )
+        .unwrap();
+        job_id
+    };
+    let ended = insert("sbx-a", superseded);
+    let own = insert("sbx-a", kept);
+    let elsewhere = insert("sbx-b", other);
+
+    service.end_superseded_capture_upload("sbx-a", &superseded.to_string());
+    service.end_superseded_capture_upload("sbx-a", &LocalArtifactId::new().to_string());
+
+    let status = |job_id: &JobId| {
+        let conn = service.db_conn().unwrap();
+        pplx_space_common_jobs::db::get_job(conn.raw(), job_id)
+            .unwrap()
+            .unwrap()
+            .status
+    };
+    assert_eq!(
+        status(&ended),
+        pplx_space_common_jobs::JobStatus::Cancelled.as_str()
+    );
+    assert_eq!(
+        status(&own),
+        pplx_space_common_jobs::JobStatus::Pending.as_str()
+    );
+    assert_eq!(
+        status(&elsewhere),
+        pplx_space_common_jobs::JobStatus::Pending.as_str()
+    );
+    assert!(!service.upload_job_active(&superseded.to_string()));
+    assert!(service.upload_job_active(&kept.to_string()));
+}
