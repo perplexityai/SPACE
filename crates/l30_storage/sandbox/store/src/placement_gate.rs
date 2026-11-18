@@ -20,6 +20,8 @@ pub struct PlacementGateRow {
     /// [`portable_for_restore_affinity`] holds for the row (`FALSE` when it
     /// is NULL). The api's gate ignores the node columns when it holds.
     pub portable: bool,
+    /// Raw `nodes.drain_engine`; the caller parses it.
+    pub drain_engine: Option<String>,
     pub drain_phase: Option<NodeDrainPhase>,
     /// Raw `nodes.drain_mode`; the caller parses it.
     pub drain_mode: Option<String>,
@@ -27,11 +29,18 @@ pub struct PlacementGateRow {
     pub primary_found: bool,
     /// Whether that node has a `node_k8s` row.
     pub mapped: bool,
+    /// The drain engines recorded on the sandbox's active and target nodes:
+    /// `v2` for a v2 drain in any phase, its cancel pending included, or an
+    /// engine this build doesn't know. A v1 drain records none.
+    pub drain_engines_named: Vec<String>,
+    /// Whether the sandbox row is `stopped`.
+    pub stopped: bool,
 }
 
 /// Read [`PlacementGateRow`] for `sandbox_id`: the portability check and the
 /// primary node's drain columns, in one statement so both read the same
-/// sandbox row. The primary node is `COALESCE(target_node_id,
+/// sandbox row, with the drain engines its active and target nodes record
+/// and whether it is stopped. The primary node is `COALESCE(target_node_id,
 /// active_node_id)`. `None` when the sandbox row is missing.
 pub async fn placement_gate(
     executor: impl PgExecutor<'_>,
@@ -41,10 +50,17 @@ pub async fn placement_gate(
         let portable_predicate = portable_for_restore_affinity("s");
         sql!(format!(
             "SELECT COALESCE(({portable_predicate}), FALSE) AS portable,
+                n.drain_engine,
                 n.drain_phase,
                 n.drain_mode,
                 n.id IS NOT NULL AS primary_found,
-                EXISTS (SELECT 1 FROM node_k8s nk WHERE nk.node_id = n.id) AS mapped
+                EXISTS (SELECT 1 FROM node_k8s nk WHERE nk.node_id = n.id) AS mapped,
+                ARRAY(
+                    SELECT v.drain_engine FROM nodes v
+                     WHERE v.id IN (s.active_node_id, s.target_node_id)
+                       AND v.drain_engine IS NOT NULL
+                ) AS drain_engines_named,
+                COALESCE(s.lifecycle = 'stopped', FALSE) AS stopped
            FROM sandboxes s
            LEFT JOIN nodes n ON n.id = COALESCE(s.target_node_id, s.active_node_id)
           WHERE s.id = $1"

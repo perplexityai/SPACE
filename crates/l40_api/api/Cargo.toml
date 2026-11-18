@@ -55,6 +55,7 @@ pplx-space-admin-protocol = { workspace = true, features = ["serde"] }
 pplx-space-artifact-model = { workspace = true }
 pplx-space-byok-model = { workspace = true, features = ["serde"] }
 pplx-space-node-model = { workspace = true }
+pplx-space-node-drain = { workspace = true, features = ["serde"] }
 pplx-space-snapshot-model = { workspace = true, features = ["serde"] }
 pplx-space-template-model = { workspace = true }
 rand = { workspace = true }
