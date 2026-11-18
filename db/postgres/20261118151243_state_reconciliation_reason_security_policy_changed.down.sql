@@ -1,0 +1,19 @@
+-- Keeps security_policy_changed in state_reconciliation_reason; this down only
+-- removes the migration's history row.
+--
+-- Postgres cannot drop an enum value. Removing it would mean rebuilding the
+-- type and rewriting node_reconcile_triggers.reasons, which would discard or
+-- rewrite any queued trigger that holds the value.
+--
+-- What a retained value costs depends on the controller that claims a trigger
+-- holding it. A controller whose claim reads the reasons as text skips a value
+-- it does not know, and the trigger still drains, on its other reasons or,
+-- with none, on its diagnostic text. An older controller decodes the reasons
+-- as the enum, so a row holding a value it does not know fails its whole claim
+-- batch. This migration writes no row, so no trigger holds the value until
+-- something enqueues it; nothing may enqueue it while a controller you could
+-- roll back to still decodes the reasons as the enum.
+--
+-- The up migration adds the value IF NOT EXISTS, so applying it again after
+-- this succeeds and leaves the value in place.
+SELECT 1;
