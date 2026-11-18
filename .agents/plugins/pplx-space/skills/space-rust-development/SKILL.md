@@ -1,6 +1,6 @@
 ---
 name: space-rust-development
-description: Develop, review, or diagnose SPACE Rust code under `crates/` and Rust-facing protobufs.
+description: Develop, review, or diagnose SPACE Rust code under `crates/` and Rust-facing protobufs, including substrate adapters, operations and capabilities, loops over sandbox or node state, and code that branches on the substrate.
 ---
 
 # Develop SPACE Rust
@@ -20,6 +20,12 @@ Read only the references that match the task:
   shutdown: [async and Tokio](references/async.md).
 - API handlers, controller placement, reconcilers, or Kubernetes substrate
   behavior: [API services](references/api-services.md).
+- Changing either substrate's adapter; adding a substrate operation, a
+  `SubstrateCapabilities` field, or a loop over sandbox or node state; or
+  writing code that branches on the substrate (`capabilities()`,
+  `as_kubernetes()`, `managed_by()`) or names a Direct-only table
+  (`node_direct`, `sandbox_direct_route_*`): read the substrate contract,
+  `crates/l40_api/api/src/controllers/substrate/AGENTS.md`, first.
 - Before a Rust PR, push, or self-review: [review discipline](references/review-discipline.md).
 
 ## Model the domain
