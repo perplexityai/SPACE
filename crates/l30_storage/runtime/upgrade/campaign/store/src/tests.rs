@@ -757,23 +757,32 @@ async fn a_lease_runs_on_the_database_clock() -> TestResult {
     .fetch_one(&mut *caller)
     .await?;
     // Longer than MAX_LEASE: clamped.
-    lease_items(&mut *caller, campaign, Duration::from_secs(10 * 3600), SCAN).await?;
-
-    let expires = sqlx::query_scalar::<_, f64>(sql!(
-        "SELECT extract(epoch FROM lease_expires_at)::float8
-         FROM runtime_upgrade_items WHERE campaign_id = $1"
-    ))
-    .bind(campaign)
-    .fetch_one(&mut *caller)
-    .await?;
+    let leased = lease_items(&mut *caller, campaign, Duration::from_secs(10 * 3600), SCAN)
+        .await?
+        .remove(0);
+    let expires_at = async |caller: &mut sqlx::PgConnection| {
+        sqlx::query_scalar::<_, f64>(sql!(
+            "SELECT extract(epoch FROM lease_expires_at)::float8
+             FROM runtime_upgrade_items WHERE campaign_id = $1"
+        ))
+        .bind(campaign)
+        .fetch_one(caller)
+        .await
+    };
+    let expires = expires_at(&mut caller).await?;
+    // A renewal is clamped the same way.
+    assert!(renew_lease(&mut *caller, &leased, Duration::from_secs(10 * 3600)).await?);
+    let renewed = expires_at(&mut caller).await?;
     caller.rollback().await?;
     // An hour, the documented bound.
     assert_eq!(MAX_LEASE, Duration::from_secs(3600));
-    let remaining = expires - started;
-    assert!(
-        (3600.0..3660.0).contains(&remaining),
-        "lease runs {remaining}s from a clock read just before it"
-    );
+    for (verb, expires) in [("lease", expires), ("renewal", renewed)] {
+        let remaining = expires - started;
+        assert!(
+            (3600.0..3660.0).contains(&remaining),
+            "{verb} runs {remaining}s from a clock read just before it"
+        );
+    }
     Ok(())
 }
 

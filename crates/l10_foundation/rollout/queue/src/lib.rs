@@ -9,9 +9,9 @@
 //! [`RenewStore`], [`PhaseStore`], [`OperatorStore`]), so no table name or SQL
 //! leaves the store. This crate owns the order of the steps and the rules
 //! between them: the lease bounds, canary and failure-budget pacing, the
-//! per-node and cluster caps, the lease token, and which phase changes are
-//! allowed. The store decides what a step reads (which items are
-//! candidates, what holds a subject) and ends the transaction.
+//! cluster cap, the lease token, and which phase changes are allowed. The
+//! store decides what a step reads (which items are candidates, what holds a
+//! subject), applies any caps of its own, and ends the transaction.
 //!
 //! Each step names the lock it takes. Taken in the order a verb runs them,
 //! the locks follow one order: the header row, then the store's lease

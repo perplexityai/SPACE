@@ -1,6 +1,6 @@
 //! Claiming items under a header's pacing, and renewing a claim.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::Hash;
 use std::time::Duration;
 
@@ -14,21 +14,19 @@ const CANARY_IN_FLIGHT: u64 = 1;
 pub struct Pacing {
     /// The header is in canary.
     pub canary: bool,
-    /// Items in flight on any one node.
-    pub per_node: u64,
     /// Items in flight in all.
     pub per_cluster: u64,
     /// Failed items at which nothing more is leased.
     pub failure_budget: u64,
 }
 
-/// The items a claim weighs: those in flight, counted by node, and the
-/// pending ones it may lease, each with its node, in the order to lease them.
-/// An item with no node counts against the cluster cap only.
+/// The items a claim weighs: how many are in flight, and the pending ones it
+/// may lease, in the order to lease them, each with what the store needs to
+/// decide whether it fits its own caps ([`ClaimStore::claim`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Candidates<S, N> {
-    pub in_flight: Vec<(Option<N>, u64)>,
-    pub pending: Vec<(S, Option<N>)>,
+pub struct Candidates<S, P> {
+    pub in_flight: u64,
+    pub pending: Vec<(S, P)>,
 }
 
 /// The steps of [`claim`], each a statement or two on the store's open
@@ -40,7 +38,9 @@ pub trait ClaimStore {
     /// the kind of subject its items name.
     type Header;
     type Subject: Copy + Eq + Hash;
-    type Node: Copy + Eq + Hash;
+    /// What the store read with each pending item to pace it by beyond the
+    /// cluster cap, such as where the subject runs.
+    type Placement;
     /// A leased item, as the store reports it.
     type Claimed;
     type Error;
@@ -74,25 +74,28 @@ pub trait ClaimStore {
         header: &Self::Header,
     ) -> impl Future<Output = Result<HashSet<Self::Subject>, Self::Error>> + Send;
 
-    /// Up to `scan_limit` pending items and the in-flight counts, from one
-    /// snapshot, so each item's node is the same in both.
+    /// Up to `scan_limit` pending items and the in-flight count, from one
+    /// snapshot, so each item's placement is the same in both. A store with
+    /// caps of its own counts the in-flight items against them here.
     fn candidates(
         &mut self,
         header: &Self::Header,
         scan_limit: u32,
-    ) -> impl Future<Output = Result<Candidates<Self::Subject, Self::Node>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Candidates<Self::Subject, Self::Placement>, Self::Error>> + Send;
 
     /// How many items have failed.
     fn failed(&mut self) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 
-    /// Lease `subject` if it's still pending: in flight under `token`, until
-    /// `lease` after the database clock reads at the write, with one more
-    /// attempt. `None` when it's no longer pending.
+    /// Lease `subject` if `placement` fits the store's own caps and the item
+    /// is still pending: in flight under `token`, until `lease` after the
+    /// database clock reads at the write, with one more attempt, counted
+    /// against those caps. `None` when it doesn't fit or is no longer
+    /// pending; the claim goes on to the next candidate.
     fn claim(
         &mut self,
         header: &Self::Header,
         subject: Self::Subject,
-        node: Option<Self::Node>,
+        placement: &Self::Placement,
         token: uuid::Uuid,
         lease: Duration,
     ) -> impl Future<Output = Result<Option<Self::Claimed>, Self::Error>> + Send;
@@ -104,8 +107,9 @@ pub trait ClaimStore {
 /// * nothing unless the header leases and its failed items, counted last,
 ///   haven't reached its failure budget;
 /// * in canary, one item at a time, and nothing once one is done;
-/// * at most `per_cluster` items in flight in all, and `per_node` on any
-///   node, counting those already in flight;
+/// * at most `per_cluster` items in flight in all, counting those already in
+///   flight;
+/// * only candidates that fit the store's own caps ([`ClaimStore::claim`]);
 /// * never a subject another header holds under a live lease.
 ///
 /// Steps, in order: the header lock, the canary read, the handoff lock, the
@@ -143,34 +147,23 @@ pub async fn claim<S: ClaimStore>(
     if failed >= pacing.failure_budget {
         return Ok(Vec::new());
     }
-    let mut on_node: HashMap<S::Node, u64> = HashMap::new();
-    let mut in_cluster = 0_u64;
-    for (node, count) in candidates.in_flight {
-        in_cluster += count;
-        if let Some(node) = node {
-            *on_node.entry(node).or_default() += count;
-        }
-    }
+    let mut in_cluster = candidates.in_flight;
     let mut claimed = Vec::new();
-    for (subject, node) in pending {
+    for (subject, placement) in pending {
         if in_cluster >= pacing.per_cluster {
             break;
         }
-        if let Some(node) = node
-            && on_node.get(&node).copied().unwrap_or(0) >= pacing.per_node
-        {
-            continue;
-        }
         let token = uuid::Uuid::now_v7();
         // The header lock serializes claims, so an item read as pending is
-        // still pending; a miss means some other writer moved it.
-        let Some(item) = store.claim(&header, subject, node, token, lease).await? else {
+        // still pending; a miss means some other writer moved it, or it
+        // doesn't fit the store's caps.
+        let Some(item) = store
+            .claim(&header, subject, &placement, token, lease)
+            .await?
+        else {
             continue;
         };
         in_cluster += 1;
-        if let Some(node) = node {
-            *on_node.entry(node).or_default() += 1;
-        }
         claimed.push(item);
     }
     Ok(claimed)
