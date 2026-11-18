@@ -94,7 +94,9 @@ def inventory(benches: int) -> int:
 
 
 RUN = re.compile(r"^=== RUN (\S+) ===$")
-END = re.compile(r"^=== END (\S+) \(exit (-?\d+)\) ===$")
+# Searched, not matched: the runner prints a scenario's output as it comes, so
+# output without a final newline puts the END marker mid-line.
+END = re.compile(r"=== END (\S+) \(exit (-?\d+)\) ===$")
 SURFACE = re.compile(r"^--- typed smoke on the (\S+) API surface$")
 SUITE = re.compile(r"^SUITE: (\d+) passed, (\d+) warned, (\d+) failed, (\d+) inconclusive")
 SHARD = re.compile(r"^SHARD \d+/\d+: ")
@@ -131,7 +133,7 @@ def parse_typed(log: Path) -> dict:
             partitioned = True
         elif match := RUN.match(line):
             current["run"].append(match[1])
-        elif match := END.match(line):
+        elif match := END.search(line):
             current["exits"][match[1]] = int(match[2])
         elif match := KNOWN_FAILURE.match(line):
             current["known"].add(match[1])
@@ -226,7 +228,7 @@ def timeline(out: Path, start: int, timings: list[dict], benches: list[str]) -> 
                 surface = match[1]
             elif match := RUN.match(text):
                 running[match[1]] = stamp
-            elif (match := END.match(text)) and match[1] in running:
+            elif (match := END.search(text)) and match[1] in running:
                 spans[bench].append((running.pop(match[1]), stamp, f"{surface}:{match[1]}"))
     end = max((span[1] for values in spans.values() for span in values), default=start)
     columns = ["host", *benches]

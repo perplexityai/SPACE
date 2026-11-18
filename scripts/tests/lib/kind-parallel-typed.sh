@@ -47,10 +47,10 @@ bash "$REPO_ROOT/scripts/tests/smoke-kind-typed.sh" all "$SMOKE_SHARD" 2>&1 \
   | tee "$LOG" \
   | python3 -u -c '
 import re, sys, time
-pattern = re.compile(r"^(=== (RUN|END) |--- typed smoke on |SUITE: |SHARD )")
+pattern = re.compile(r"^(=== RUN |--- typed smoke on |SUITE: |SHARD )|=== END ")
 with open(sys.argv[1], "w") as events:
     for line in sys.stdin:
-        if pattern.match(line):
+        if pattern.search(line):
             events.write(f"{time.time():.0f} {line}")
             events.flush()
 ' "$LOG.events"
