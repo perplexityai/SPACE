@@ -305,6 +305,9 @@ CREATE TABLE firewall_rules_node_observations (
         AND (accepted_round IS NULL) = (accepted_at IS NULL)
         AND (accepted_round IS NULL OR accepted_round >= 0)
         AND (accepted_round_issued_at IS NULL OR isfinite(accepted_round_issued_at))
+    ),
+    CONSTRAINT firewall_rules_node_observations_accepted_report_check CHECK (
+        accepted_report IS NULL OR jsonb_typeof(accepted_report) = 'object'
     )
 );
 
@@ -318,5 +321,7 @@ COMMENT ON COLUMN firewall_rules_node_observations.manager_epoch IS
     'Node manager epoch the record belongs to';
 COMMENT ON COLUMN firewall_rules_node_observations.pending_round_issued_at IS
     'When the pending round was first issued, set with pending_round';
+COMMENT ON COLUMN firewall_rules_node_observations.accepted_report IS
+    'The latest accepted report, a JSON object';
 COMMENT ON COLUMN firewall_rules_node_observations.accepted_round_issued_at IS
     'When the round of the latest accepted report was first issued, set with accepted_round, accepted_report and accepted_at';
