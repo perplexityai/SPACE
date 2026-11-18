@@ -100,10 +100,19 @@ kind_bench_lock() {
 # run ended, and the `teardown` that should remove them would be refused.
 
 # Claim bench <i>'s directories: create them and mark them as a bench's.
+# The stale-bench cleanup has removed every marked one by now, so one that
+# exists was not made by a bench, and marking it would hand it to a teardown's
+# `rm -rf`.
 kind_bench_claim() {
-  local dir run
+  local dir run owned
   dir="$(kind_bench_dir "$1")"
   run="$(kind_bench_run_dir "$1")"
+  for owned in "$dir" "$run"; do
+    if [[ -e "$owned" ]] || sudo -n test -e "$owned"; then
+      kind_bench_log "bench $1: $owned exists and is not a bench's; remove it or choose another KIND_BENCH_ROOT"
+      return 1
+    fi
+  done
   mkdir -p "$dir" && : >"$dir/$KIND_BENCH_MARKER" || return 1
   sudo -n install -d -m 0755 "$run" && sudo -n touch "$run/$KIND_BENCH_MARKER" || return 1
 }
