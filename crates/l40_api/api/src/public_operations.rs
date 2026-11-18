@@ -1993,6 +1993,15 @@ pub struct ClaimLimits {
     pub per_org_non_teardown: Option<OrgSlotLimit>,
 }
 
+/// The longest a drain restore lives, from its enqueue: its executor ends
+/// one past it before any node work, and the claim lets one past it by the
+/// drain restore cap, so the operations queued behind it on its sandbox
+/// wait no longer than this and one attempt's overrun. The claim measures
+/// it from `requested_at`, which is never before the `created_at` the
+/// executor measures from, so a restore the claim lets by is one its
+/// executor ends.
+pub const DRAIN_RESTORE_WINDOW: Duration = Duration::from_secs(20 * 60);
+
 /// How many operations other than teardowns one organization may have
 /// running at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

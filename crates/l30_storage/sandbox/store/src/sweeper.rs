@@ -326,7 +326,8 @@ pub fn evacuation_guards(
 /// A suspend evacuation records the pre-evacuation lifecycle, `started` or
 /// `paused`, and a stopped resident's re-placement records `stopped`
 /// ([`crate::drain`]). These are the values the column's CHECK admits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EvacuationRestoreTarget {
     Started,
     Paused,
