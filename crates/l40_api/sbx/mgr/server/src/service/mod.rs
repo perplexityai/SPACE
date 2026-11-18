@@ -462,9 +462,8 @@ pub struct SandboxManagerService {
     /// Durable worker that drives the poll → metadata → register tail of the
     /// suspend-snapshot pipeline. Persists in sbx-mgr's local SQLite so a
     /// mid-flight process restart resumes the upload instead of orphaning it.
-    snapshot_upload_worker: pplx_space_common_jobs::BackgroundWorker<
-        crate::snapshot_upload_jobs::SnapshotUploadExecutor,
-    >,
+    snapshot_upload_worker:
+        crate::db::jobs::JobWorker<crate::snapshot_upload_jobs::SnapshotUploadExecutor>,
     /// Probe for "does this sandbox have a live Firecracker runtime on this
     /// node right now". Injected so tests can drive the suspend-checkpoint
     /// reattach path without a real `fc.pid` symlink on disk. Production uses
@@ -1965,11 +1964,10 @@ impl SandboxManagerService {
     }
 
     /// Handle to the durable snapshot-upload worker, for the service binary
-    /// to call `recover_and_log` at startup and `shutdown` at exit.
+    /// to call `recover_and_log` at startup and `yield_for_restart` at exit.
     pub fn snapshot_upload_worker(
         &self,
-    ) -> pplx_space_common_jobs::BackgroundWorker<crate::snapshot_upload_jobs::SnapshotUploadExecutor>
-    {
+    ) -> crate::db::jobs::JobWorker<crate::snapshot_upload_jobs::SnapshotUploadExecutor> {
         self.snapshot_upload_worker.clone()
     }
 

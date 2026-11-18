@@ -108,7 +108,7 @@ pub(in crate::service) fn suspend_snapshot_metadata(
 fn suspend_upload_payload(
     sandbox: &crate::db::SandboxRow,
     local_artifact_id: LocalArtifactId,
-    job: &pplx_space_common_jobs::Job,
+    job: &crate::db::jobs::Job,
 ) -> Result<crate::snapshot_upload::SnapshotUploadJobs, ArtifactBackupSubmissionError> {
     let payload = job
         .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
@@ -131,8 +131,7 @@ fn suspend_upload_payload(
     // Do not create another attempt on every cleanup tick. The cleanup
     // owner retains the artifact and ends a terminal handoff explicitly.
     if job.is_terminal()
-        && (job.status != pplx_space_common_jobs::JobStatus::Completed.as_str()
-            || job.failure.is_some())
+        && (job.status != crate::db::jobs::JobStatus::Completed.as_str() || job.failure.is_some())
     {
         return Err(ArtifactBackupSubmissionError::TerminalHandoff(format!(
             "persisted suspend upload requires resolution: {}",
@@ -635,7 +634,7 @@ impl SandboxManagerService {
                         .await
             {
                 return Err(ArtifactBackupSubmissionError::Begin {
-                    error: pplx_space_common_jobs::JobError::permanent(
+                    error: crate::db::jobs::JobError::permanent(
                         persisted.error.as_deref().unwrap_or("unknown error"),
                     ),
                     superseded_generation: Some(generation),

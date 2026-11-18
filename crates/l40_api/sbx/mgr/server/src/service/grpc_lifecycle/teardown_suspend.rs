@@ -59,13 +59,13 @@ pub(in crate::service) const PERMANENTLY_FAILED_UPLOAD_LIMIT: u64 = 2;
 /// lapses, isn't an attempt's failure. The failed jobs it counts persist across
 /// restarts until the jobs retention pruner removes them.
 pub(in crate::service) fn teardown_keyed_upload_use(
-    status: pplx_space_common_jobs::JobStatus,
-    failure: Option<pplx_space_common_jobs::JobFailure>,
+    status: crate::db::jobs::JobStatus,
+    failure: Option<crate::db::jobs::JobFailure>,
     scope: crate::snapshot_upload::UploadFailureScope,
     permanently_failed: u64,
 ) -> KeyedUploadUse {
+    use crate::db::jobs::JobFailure;
     use crate::snapshot_upload::UploadFailureScope;
-    use pplx_space_common_jobs::JobFailure;
     if !status.is_terminal() {
         return KeyedUploadUse::Join;
     }
@@ -1396,7 +1396,7 @@ impl SandboxManagerService {
             // lookup of that rule: the next drive rejoins and marks it then.
             if matches!(
                 job.failure,
-                Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
+                Some(crate::db::jobs::JobFailure::Permanent { .. })
             ) && self
                 .teardown_use_of_upload(&backup, &job)
                 .is_ok_and(|then| then == KeyedUploadUse::Join)
@@ -1412,7 +1412,7 @@ impl SandboxManagerService {
             );
             if matches!(
                 job.failure,
-                Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
+                Some(crate::db::jobs::JobFailure::Permanent { .. })
             ) {
                 error = teardown_backup_failure_status(error, backup.artifact.local_artifact_id);
                 if let Some(verdict) = verdict {
@@ -1439,7 +1439,7 @@ impl SandboxManagerService {
     pub(super) fn teardown_use_of_upload(
         &self,
         backup: &TeardownSuspendBackup<'_>,
-        job: &pplx_space_common_jobs::Job,
+        job: &crate::db::jobs::Job,
     ) -> Result<KeyedUploadUse, Status> {
         #[derive(serde::Deserialize)]
         struct RecordedScope {
@@ -1448,7 +1448,7 @@ impl SandboxManagerService {
         }
         let status = job
             .status
-            .parse::<pplx_space_common_jobs::JobStatus>()
+            .parse::<crate::db::jobs::JobStatus>()
             .map_err(|error| {
                 Status::internal(format!(
                     "persisted artifact backup status is invalid for {}: {error}",

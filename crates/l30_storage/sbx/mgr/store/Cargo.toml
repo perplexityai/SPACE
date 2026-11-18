@@ -57,6 +57,7 @@ serde_json = { workspace = true }
 sqlx = { workspace = true, features = ["migrate"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }

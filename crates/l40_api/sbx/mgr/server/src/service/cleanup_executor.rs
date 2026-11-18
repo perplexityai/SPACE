@@ -9,7 +9,7 @@ use super::*;
 use crate::db::cleanup_jobs::{
     self, CleanupEligibility, CleanupFailure, CleanupOutcome, CleanupWork,
 };
-use pplx_space_common_jobs::{JobPriority, JobStatus};
+use crate::db::jobs::{JobPriority, JobStatus};
 
 type AttemptResult = Result<(), Status>;
 type CleanupResult = Result<CleanupOutcome, Status>;

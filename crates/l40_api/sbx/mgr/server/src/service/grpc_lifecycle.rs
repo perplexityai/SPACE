@@ -351,7 +351,7 @@ enum ArtifactBackupSubmissionError {
     #[error("begin restore-visible snapshot backup: {error}")]
     Begin {
         #[source]
-        error: pplx_space_common_jobs::JobError,
+        error: crate::db::jobs::JobError,
         superseded_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
     },
     #[error(transparent)]
@@ -362,9 +362,7 @@ impl ArtifactBackupSubmissionError {
     fn handoff_is_terminal(&self) -> bool {
         match self {
             Self::TerminalHandoff(_) => true,
-            Self::Begin { error, .. } => {
-                error.kind() == pplx_space_common_jobs::JobFailureKind::Permanent
-            }
+            Self::Begin { error, .. } => error.kind() == crate::db::jobs::JobFailureKind::Permanent,
             Self::Other(_) | Self::RetainedUpload(_) => false,
         }
     }
