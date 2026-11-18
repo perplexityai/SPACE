@@ -12,3 +12,6 @@ workspace = true
 
 [dependencies]
 uuid = { workspace = true, features = ["v7"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

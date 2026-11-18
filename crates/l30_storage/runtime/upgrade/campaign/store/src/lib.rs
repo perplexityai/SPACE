@@ -79,7 +79,7 @@ use std::str::FromStr;
 use pplx_space_accounts::UserId;
 use pplx_space_content_digest::DigestParseError;
 use pplx_space_execution_spec::EnvironmentReference;
-use pplx_space_rollout_queue::{HeaderPhase, ItemState};
+use pplx_space_rollout_queue::HeaderPhase;
 use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
 
@@ -257,18 +257,6 @@ closed_vocabulary!(
         Skipped => "skipped",
     }
 );
-
-impl ItemPhase {
-    const fn from_queue(state: ItemState) -> Self {
-        match state {
-            ItemState::Pending => Self::Pending,
-            ItemState::InFlight => Self::InFlight,
-            ItemState::Done => Self::Done,
-            ItemState::Failed => Self::Failed,
-            ItemState::Skipped => Self::Skipped,
-        }
-    }
-}
 
 closed_vocabulary!(
     /// Which table an item's subject names (`runtime_upgrade_items.subject_kind`).

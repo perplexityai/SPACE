@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::hash::Hash;
 use std::time::Duration;
 
-use crate::clamp_lease;
+use crate::{FailedItems, clamp_lease};
 
 /// How many items a canary leases: one at a time, until one is done.
 const CANARY_IN_FLIGHT: u64 = 1;
@@ -14,7 +14,8 @@ const CANARY_IN_FLIGHT: u64 = 1;
 pub struct Pacing {
     /// The header is in canary.
     pub canary: bool,
-    /// Items in flight in all.
+    /// The most items in flight across the header, counting those already
+    /// leased.
     pub per_cluster: u64,
     /// Failed items at which nothing more is leased.
     pub failure_budget: u64,
@@ -33,7 +34,7 @@ pub struct Candidates<S, P> {
 /// transaction. The transaction must run at `READ COMMITTED`, so each step
 /// reads what committed before it began, the waits for earlier steps' locks
 /// included.
-pub trait ClaimStore {
+pub trait ClaimStore: FailedItems {
     /// What the store read of the header that its later steps need, such as
     /// the kind of subject its items name.
     type Header;
@@ -43,7 +44,6 @@ pub trait ClaimStore {
     type Placement;
     /// A leased item, as the store reports it.
     type Claimed;
-    type Error;
 
     /// Lock the header row exclusively, if it's in a phase that leases
     /// ([`crate::HeaderPhase::leases`]), and read its pacing. `None` leases
@@ -83,9 +83,6 @@ pub trait ClaimStore {
         scan_limit: u32,
     ) -> impl Future<Output = Result<Candidates<Self::Subject, Self::Placement>, Self::Error>> + Send;
 
-    /// How many items have failed.
-    fn failed(&mut self) -> impl Future<Output = Result<u64, Self::Error>> + Send;
-
     /// Lease `subject` if `placement` fits the store's own caps and the item
     /// is still pending: in flight under `token`, until `lease` after the
     /// database clock reads at the write, with one more attempt, counted
@@ -107,8 +104,8 @@ pub trait ClaimStore {
 /// * nothing unless the header leases and its failed items, counted last,
 ///   haven't reached its failure budget;
 /// * in canary, one item at a time, and nothing once one is done;
-/// * at most `per_cluster` items in flight in all, counting those already in
-///   flight;
+/// * at most `per_cluster` items in flight across the header, counting
+///   those already leased;
 /// * only candidates that fit the store's own caps ([`ClaimStore::claim`]);
 /// * never a subject another header holds under a live lease.
 ///

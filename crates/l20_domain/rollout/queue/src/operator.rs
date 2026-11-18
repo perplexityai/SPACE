@@ -7,11 +7,14 @@
 //! now. A refusal writes nothing.
 //!
 //! A resume goes to rolling once any item is done, and otherwise back to
-//! canary, whichever phase it started in: nothing has shown the upgrade works
+//! canary, whichever phase it started in: nothing has shown the rollout works
 //! yet. It refuses while the failed items are at or over the budget, which
 //! would pause the header again, unless the caller asks to retry them.
 
 use crate::HeaderPhase;
+
+#[cfg(test)]
+mod tests;
 
 /// What an operator change read of its header under the header's lock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,19 +24,28 @@ pub struct Locked {
     pub failure_budget: u64,
 }
 
-/// What an operator change left.
+/// What a resume left.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Changed {
+pub struct Resumed {
+    /// Rolling, or canary while no item is done.
     pub phase: HeaderPhase,
     /// The generation the store's write returned.
     pub generation: u64,
-    /// Failed items a resume returned to pending.
+    /// Failed items returned to pending.
     pub retried: u64,
-    /// In-flight items an abort left to drain under their leases.
+}
+
+/// What an abort left.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Aborted {
+    /// The generation the store's write returned.
+    pub generation: u64,
+    /// In-flight items left to drain under their leases.
     pub draining: u64,
 }
 
-/// Why an operator change wrote nothing.
+/// Why an operator change wrote nothing. Each verb returns it as the
+/// store's error ([`OperatorStore::Error`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Refusal {
     NotFound,
@@ -47,7 +59,8 @@ pub enum Refusal {
 /// The steps of [`pause`], [`resume`] and [`abort`], each a statement on the
 /// store's open transaction.
 pub trait OperatorStore {
-    type Error;
+    /// A step's error, or the verb's refusal.
+    type Error: From<Refusal>;
 
     /// Lock the header row exclusively, whatever its phase. `None` when
     /// there's no such header.
@@ -85,31 +98,21 @@ fn check_generation(expected: Option<u64>, generation: u64) -> Result<(), Refusa
 
 /// Pause a canary or rolling header: nothing new is leased, and items in
 /// flight finish under their leases. With `expected_generation`, only at that
-/// generation.
+/// generation. Returns the generation the pause left.
 pub async fn pause<S: OperatorStore>(
     store: &mut S,
     expected_generation: Option<u64>,
-) -> Result<Result<Changed, Refusal>, S::Error> {
-    let Some(locked) = store.lock().await? else {
-        return Ok(Err(Refusal::NotFound));
-    };
+) -> Result<u64, S::Error> {
+    let locked = store.lock().await?.ok_or(Refusal::NotFound)?;
     match locked.phase {
         HeaderPhase::Completed | HeaderPhase::Aborted => {
-            return Ok(Err(Refusal::Finished(locked.phase)));
+            return Err(Refusal::Finished(locked.phase).into());
         }
-        HeaderPhase::Paused => return Ok(Err(Refusal::AlreadyPaused)),
+        HeaderPhase::Paused => return Err(Refusal::AlreadyPaused.into()),
         HeaderPhase::Canary | HeaderPhase::Rolling => {}
     }
-    if let Err(refusal) = check_generation(expected_generation, locked.generation) {
-        return Ok(Err(refusal));
-    }
-    let generation = store.write_phase(HeaderPhase::Paused).await?;
-    Ok(Ok(Changed {
-        phase: HeaderPhase::Paused,
-        generation,
-        retried: 0,
-        draining: 0,
-    }))
+    check_generation(expected_generation, locked.generation)?;
+    store.write_phase(HeaderPhase::Paused).await
 }
 
 /// Resume a paused header, or move a canary whose item is done on to
@@ -119,12 +122,10 @@ pub async fn resume<S: OperatorStore>(
     store: &mut S,
     expected_generation: Option<u64>,
     retry_failed: bool,
-) -> Result<Result<Changed, Refusal>, S::Error> {
-    let Some(locked) = store.lock().await? else {
-        return Ok(Err(Refusal::NotFound));
-    };
+) -> Result<Resumed, S::Error> {
+    let locked = store.lock().await?.ok_or(Refusal::NotFound)?;
     if locked.phase.finished() {
-        return Ok(Err(Refusal::Finished(locked.phase)));
+        return Err(Refusal::Finished(locked.phase).into());
     }
     // Outcomes take no header lock, so a failure recorded after this read
     // can still reach the budget once the header resumes; the budget pause
@@ -133,17 +134,16 @@ pub async fn resume<S: OperatorStore>(
     match locked.phase {
         HeaderPhase::Paused => {}
         HeaderPhase::Canary if any_done => {}
-        phase => return Ok(Err(Refusal::NotResumable(phase))),
+        phase => return Err(Refusal::NotResumable(phase).into()),
     }
     if failed >= locked.failure_budget && !retry_failed {
-        return Ok(Err(Refusal::AtFailureBudget {
+        return Err(Refusal::AtFailureBudget {
             failed,
             failure_budget: locked.failure_budget,
-        }));
+        }
+        .into());
     }
-    if let Err(refusal) = check_generation(expected_generation, locked.generation) {
-        return Ok(Err(refusal));
-    }
+    check_generation(expected_generation, locked.generation)?;
     let retried = if retry_failed {
         store.retry_failed().await?
     } else {
@@ -155,12 +155,11 @@ pub async fn resume<S: OperatorStore>(
         HeaderPhase::Canary
     };
     let generation = store.write_phase(phase).await?;
-    Ok(Ok(Changed {
+    Ok(Resumed {
         phase,
         generation,
         retried,
-        draining: 0,
-    }))
+    })
 }
 
 /// Abort an unfinished header: aborted is final. Items in flight keep their
@@ -168,24 +167,18 @@ pub async fn resume<S: OperatorStore>(
 pub async fn abort<S: OperatorStore>(
     store: &mut S,
     expected_generation: Option<u64>,
-) -> Result<Result<Changed, Refusal>, S::Error> {
-    let Some(locked) = store.lock().await? else {
-        return Ok(Err(Refusal::NotFound));
-    };
+) -> Result<Aborted, S::Error> {
+    let locked = store.lock().await?.ok_or(Refusal::NotFound)?;
     if locked.phase.finished() {
-        return Ok(Err(Refusal::Finished(locked.phase)));
+        return Err(Refusal::Finished(locked.phase).into());
     }
-    if let Err(refusal) = check_generation(expected_generation, locked.generation) {
-        return Ok(Err(refusal));
-    }
+    check_generation(expected_generation, locked.generation)?;
     // Under the header lock, which claims take first, so no lease is
     // granted between this count and the phase write.
     let draining = store.in_flight().await?;
     let generation = store.write_phase(HeaderPhase::Aborted).await?;
-    Ok(Ok(Changed {
-        phase: HeaderPhase::Aborted,
+    Ok(Aborted {
         generation,
-        retried: 0,
         draining,
-    }))
+    })
 }

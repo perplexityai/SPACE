@@ -4,8 +4,7 @@
 //! campaign kind; only the lease's node pacing differs by kind
 //! ([`SubjectKind::has_node`]). Leasing and renewal run the steps of
 //! [`pplx_space_rollout_queue::claim`] and [`pplx_space_rollout_queue::renew`]
-//! on these tables, and an outcome or a lapse does what
-//! [`pplx_space_rollout_queue::Outcome`] says.
+//! on these tables.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -14,7 +13,7 @@ use std::time::Duration;
 use pplx_space_accounts::NodeId;
 pub(crate) use pplx_space_rollout_queue::LEASE_EXPIRED;
 pub use pplx_space_rollout_queue::RedriveReport;
-use pplx_space_rollout_queue::{Candidates, ClaimStore, Outcome, Pacing, RenewStore};
+use pplx_space_rollout_queue::{Candidates, ClaimStore, FailedItems, Pacing, RenewStore};
 use pplx_space_sql_locator::sql;
 use sqlx::{Acquire, PgConnection, Postgres};
 
@@ -220,12 +219,12 @@ pub async fn lease_items(
     scan_limit: u32,
 ) -> Result<Vec<LeasedItem>, LeaseError> {
     let mut tx = conn.begin().await?;
-    let mut leasing = Leasing {
+    let mut claiming = Claiming {
         tx: &mut tx,
         campaign_id,
         on_node: HashMap::new(),
     };
-    let leased = pplx_space_rollout_queue::claim(&mut leasing, lease, scan_limit).await;
+    let leased = pplx_space_rollout_queue::claim(&mut claiming, lease, scan_limit).await;
     end_transaction(tx, leased).await
 }
 
@@ -239,7 +238,7 @@ pub enum LeaseError {
 
 /// [`lease_items`]'s steps. The shared claim paces by the cluster cap; the
 /// per-node cap is this store's, applied in [`ClaimStore::claim`].
-struct Leasing<'c> {
+struct Claiming<'c> {
     tx: &'c mut PgConnection,
     campaign_id: CampaignId,
     /// Items in flight by the node that last published each sandbox,
@@ -254,13 +253,20 @@ struct LeaseHeader {
     per_node: u64,
 }
 
-impl ClaimStore for Leasing<'_> {
+impl FailedItems for Claiming<'_> {
+    type Error = LeaseError;
+
+    async fn failed(&mut self) -> Result<u64, LeaseError> {
+        Ok(crate::phase::count_failed(self.tx, self.campaign_id).await?)
+    }
+}
+
+impl ClaimStore for Claiming<'_> {
     type Header = LeaseHeader;
     type Subject = uuid::Uuid;
     /// The node that last published the subject, if it has one.
     type Placement = Option<NodeId>;
     type Claimed = LeasedItem;
-    type Error = LeaseError;
 
     async fn lock_leasable(&mut self) -> Result<Option<(LeaseHeader, Pacing)>, LeaseError> {
         let leasing: Vec<&str> = CampaignPhase::ALL
@@ -349,10 +355,6 @@ impl ClaimStore for Leasing<'_> {
             in_flight: in_cluster,
             pending,
         })
-    }
-
-    async fn failed(&mut self) -> Result<u64, LeaseError> {
-        Ok(crate::phase::count_failed(self.tx, self.campaign_id).await?)
     }
 
     async fn claim(
@@ -729,13 +731,20 @@ pub enum ItemOutcome {
 }
 
 impl ItemOutcome {
-    const fn kind(&self) -> Outcome {
+    fn phase(&self) -> ItemPhase {
         match self {
-            Self::Done => Outcome::Done,
-            Self::Skipped(_) => Outcome::Skipped,
-            Self::Failed(_) => Outcome::Failed,
-            Self::Retry(_) => Outcome::Retry,
-            Self::Release(_) => Outcome::Release,
+            Self::Done => ItemPhase::Done,
+            Self::Skipped(_) => ItemPhase::Skipped,
+            Self::Failed(_) => ItemPhase::Failed,
+            Self::Retry(_) | Self::Release(_) => ItemPhase::Pending,
+        }
+    }
+
+    /// Attempts to give back: a release undoes its lease's.
+    const fn refunded_attempts(&self) -> i64 {
+        match self {
+            Self::Release(_) => 1,
+            Self::Done | Self::Skipped(_) | Self::Failed(_) | Self::Retry(_) => 0,
         }
     }
 
@@ -760,7 +769,6 @@ pub async fn finish_item(
     item: &LeasedItem,
     outcome: &ItemOutcome,
 ) -> Result<bool, sqlx::Error> {
-    let outcome_kind = outcome.kind();
     let finished = sqlx::query(sql!(
         "UPDATE runtime_upgrade_items
          SET phase = $5,
@@ -778,10 +786,10 @@ pub async fn finish_item(
     .bind(item.subject_kind.as_str())
     .bind(item.subject_id)
     .bind(item.lease_token)
-    .bind(ItemPhase::from_queue(outcome_kind.state()).as_str())
+    .bind(outcome.phase().as_str())
     .bind(outcome.error())
     .bind(ItemPhase::InFlight.as_str())
-    .bind(i64::try_from(outcome_kind.refunded_attempts()).unwrap_or(i64::MAX))
+    .bind(outcome.refunded_attempts())
     .execute(executor)
     .await?
     .rows_affected();
