@@ -569,8 +569,9 @@ impl SandboxManagerService {
             }
             // A Kubernetes sandbox launches in its pod's shim at container
             // create, which never sees this Wake, and the Wake has no pod
-            // namespace to boot in. Its upgrade is the pod's own
-            // `runtime-upgrade` checkpoint, so here it is refused before
+            // namespace to boot in. Reading pod hosting from the substrate
+            // relies on substrate == hosting today. Its upgrade is the pod's
+            // own `runtime-upgrade` checkpoint, so here it is refused before
             // anything is staged, fenced or booted. Whether the sandbox is a
             // Kubernetes one is the request's identity or, for a sandbox the
             // node holds, its row's, so for a sandbox here a request that

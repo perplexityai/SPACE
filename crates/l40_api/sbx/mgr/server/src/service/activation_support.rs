@@ -838,7 +838,8 @@ pub(super) enum WakeNetworkContext {
 impl WakeNetworkContext {
     pub(super) fn for_wake_start_context(start: &crate::proto::WakeStartContext) -> Self {
         // Direct activations use a manager-owned namespace even when the
-        // activation carries resources or a restore source.
+        // activation carries resources or a restore source. Reading node-local
+        // hosting from the substrate relies on substrate == hosting today.
         let direct_route_identity = start.route_identity.as_ref().is_some_and(|identity| {
             identity.route_generation.is_some()
                 && identity.current_node_id.is_some()
