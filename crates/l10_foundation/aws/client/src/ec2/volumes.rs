@@ -7,6 +7,9 @@ use super::{Client, EC2_API_VERSION};
 use crate::query::{AwsClientError, QueryTransport};
 use aws_smithy_xml::decode::{Document, ScopedDecoder, XmlDecodeError, try_data};
 
+mod modification;
+pub use modification::{VolumeModification, VolumeModificationState};
+
 /// A fresh, encrypted gp3 disk. There is deliberately no snapshot source.
 pub struct CreateEncryptedGp3Volume<'a> {
     pub availability_zone: &'a str,

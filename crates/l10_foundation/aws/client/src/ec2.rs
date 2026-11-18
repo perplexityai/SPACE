@@ -6,7 +6,10 @@ use crate::query::{
 };
 
 mod volumes;
-pub use volumes::{CreateEncryptedGp3Volume, CreatedVolume, Volume, VolumeAttachment, VolumePage};
+pub use volumes::{
+    CreateEncryptedGp3Volume, CreatedVolume, Volume, VolumeAttachment, VolumeModification,
+    VolumeModificationState, VolumePage,
+};
 
 const DESCRIBE_INSTANCES_ACTION: &str = "DescribeInstances";
 const EC2_API_VERSION: &str = "2016-11-15";
