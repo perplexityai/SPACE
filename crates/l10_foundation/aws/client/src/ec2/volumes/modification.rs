@@ -94,14 +94,23 @@ impl<T: QueryTransport> Client<T> {
         &self,
         volume_id: &str,
     ) -> Result<Option<VolumeModification>, AwsClientError> {
-        let body = self
+        let body = match self
             .query
             .send_action(
                 "DescribeVolumesModifications",
                 EC2_API_VERSION,
                 vec![("VolumeId.1", volume_id.to_owned())],
             )
-            .await?;
+            .await
+        {
+            Ok(body) => body,
+            Err(AwsClientError::AwsService { code, .. })
+                if code == "InvalidVolumeModification.NotFound" =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let modification = parse_exact_lookup(&body)?;
         if modification
             .as_ref()

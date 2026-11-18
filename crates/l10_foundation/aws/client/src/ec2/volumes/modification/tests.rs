@@ -114,6 +114,32 @@ async fn exact_lookup_distinguishes_absent_history_and_each_provider_state() {
 }
 
 #[tokio::test]
+async fn lookup_service_errors_distinguish_absent_history_from_failed_observation() {
+    for code in [
+        "InvalidVolumeModification.NotFound",
+        "InvalidVolume.NotFound",
+        "UnauthorizedOperation",
+    ] {
+        let body = format!(
+            "<Response><Errors><Error><Code>{code}</Code><Message>lookup failed</Message></Error></Errors></Response>"
+        );
+        let transport =
+            RecordingTransport::new(vec![QueryResponse::new(StatusCode::BAD_REQUEST, body)]);
+        let client = Client::with_transport("us-west-2", credentials_provider(), transport.clone());
+        let observed = client.describe_volume_modification(ID).await;
+        if code == "InvalidVolumeModification.NotFound" {
+            assert_eq!(observed.unwrap(), None);
+        } else {
+            assert!(
+                matches!(observed, Err(AwsClientError::AwsService { code: observed, .. }) if observed == code),
+                "{code} must not authorize submitting a new modification",
+            );
+        }
+        assert_eq!(transport.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn malformed_or_mismatched_receipts_never_establish_a_successful_resize() {
     let cases = [
         MODIFICATION.replace(ID, "vol-11111111111111111"),
