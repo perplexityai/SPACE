@@ -94,6 +94,11 @@ kind_bench_lock() {
   flock -n 9 || kind_bench_die "another bench run or teardown holds $lock"
 }
 
+# Every process a bench starts closes the lock's fd with `9>&-`: sudo stays
+# up as the parent of what it runs and keeps its fds, so a daemon or the PID
+# namespace's holder launched with it open would hold the host after a --keep
+# run ended, and the `teardown` that should remove them would be refused.
+
 # Claim bench <i>'s directories: create them and mark them as a bench's.
 kind_bench_claim() {
   local dir run
@@ -219,7 +224,7 @@ kind_bench_pidns_up() {
   sudo -n install -d -m 0755 "$run" || return 1
   sudo -n nsenter --net="/run/netns/$(kind_bench_ns "$i")" -- \
     setsid unshare --pid --fork --kill-child --mount-proc --propagation slave -- sleep infinity \
-    </dev/null >/dev/null 2>&1 &
+    </dev/null >/dev/null 2>&1 9>&- &
   # The holder is the `sleep` that is PID 1 of a namespace inside this
   # bench's network namespace.
   local netns pid
@@ -305,7 +310,7 @@ kind_bench_docker_up() {
     PATH="$KIND_BENCH_DOCKER_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     setsid sh -c 'echo $$ >"$1/cgroup.procs" && echo $$ >"$2" && shift 2 && exec "$@"' _ \
       "$cgroup" "$run/containerd.pid" containerd --config "$run/containerd.toml" \
-      </dev/null >"$dir/containerd.log" 2>&1 &
+      </dev/null >"$dir/containerd.log" 2>&1 9>&- &
   local _
   for _ in $(seq 1 60); do
     sudo -n test -S "$run/containerd.sock" && break
@@ -328,7 +333,7 @@ kind_bench_docker_up() {
       --containerd-plugins-namespace "$ns-plugins" \
       --cgroup-parent "/$ns" \
       --userland-proxy=false \
-      </dev/null >"$dir/dockerd.log" 2>&1 &
+      </dev/null >"$dir/dockerd.log" 2>&1 9>&- &
   local _
   for _ in $(seq 1 90); do
     # The socket is root:<caller's group> 0660 (--group), like a host
@@ -389,7 +394,7 @@ kind_bench_exec() {
   sudo -n nsenter --target "$holder" --net --pid --mount --wd="$PWD" -- \
     sh -c 'echo $$ >"$1/cgroup.procs" && shift && exec "$@"' _ "$cgroup" \
     setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups -- \
-    env -i "${vars[@]}" "$@"
+    env -i "${vars[@]}" "$@" 9>&-
 }
 
 # A bench's own copy of the checkout <repo> at <dest>, as each CI runner

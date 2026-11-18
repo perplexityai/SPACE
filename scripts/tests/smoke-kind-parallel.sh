@@ -522,8 +522,11 @@ run_bench() {
   bx() { kind_bench_exec "$i" "$env_file" "$@"; }
   # The bench's own loopback end of the host's layer cache, in its namespaces,
   # so it ends with them.
-  bx setsid socat "TCP-LISTEN:$CACHE_PORT,bind=127.0.0.1,fork,reuseaddr" "TCP:$REGISTRY_IP:$CACHE_PORT" \
-    </dev/null >"$dir/cache-forward.log" 2>&1 &
+  # Its subshell outlives the run under --keep, so it lets go of the host lock.
+  (
+    exec 9>&-
+    bx setsid socat "TCP-LISTEN:$CACHE_PORT,bind=127.0.0.1,fork,reuseaddr" "TCP:$REGISTRY_IP:$CACHE_PORT"
+  ) </dev/null >"$dir/cache-forward.log" 2>&1 &
   await shared-images || return 1
   phase "bench$i" load_images bx docker load -q -i "$HOST/shared-images.tar" || return 1
   # Everything up to the Rust handoff is Rust-independent, so it overlaps the
