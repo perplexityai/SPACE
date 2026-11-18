@@ -88,9 +88,13 @@ pub(crate) use responses::ResponseAdmissionError;
 mod response_reservations;
 pub(crate) use response_reservations::ResponseReservation;
 mod sandbox_quota;
+#[cfg(test)]
+mod stored_kind;
 pub use sandbox_quota::{
     SandboxQuota, SandboxQuotaOutcome, SandboxQuotaRefusal, SubjectSandboxQuota,
 };
+#[cfg(test)]
+pub use stored_kind::StoredOperationKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiProduct {
