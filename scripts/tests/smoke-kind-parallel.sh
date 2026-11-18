@@ -120,6 +120,37 @@ UI_CACHE_SCOPE="$(space_kind_layer_scope ui-deps)"
 # The seed the benches copy instead of building one each.
 SEED_DIR="$CACHE_ROOT/seed"
 
+# Accept registry traffic only from the host itself and the benches' links:
+# the registry address is a local address, so without this a connection to it
+# arriving on any interface would reach the registries. Checked in the mangle
+# table's PREROUTING, by the destination a packet arrived with and before
+# Docker's port DNAT rewrites it, which every arriving packet passes, whether
+# it is forwarded to a published port or delivered to a proxy. Replies pass:
+# the host's own connections leave with the registry address as their source,
+# so their replies come back to it on Docker's bridge.
+REGISTRY_CHAIN=SPACE-BENCH-REGISTRY
+registry_firewall() {
+  local mangle=(sudo -n iptables -w -t mangle)
+  "${mangle[@]}" -n -L "$REGISTRY_CHAIN" >/dev/null 2>&1 || "${mangle[@]}" -N "$REGISTRY_CHAIN" || return 1
+  "${mangle[@]}" -F "$REGISTRY_CHAIN" || return 1
+  "${mangle[@]}" -A "$REGISTRY_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
+  "${mangle[@]}" -A "$REGISTRY_CHAIN" -i lo -j RETURN || return 1
+  "${mangle[@]}" -A "$REGISTRY_CHAIN" -i sb+ -j RETURN || return 1
+  "${mangle[@]}" -A "$REGISTRY_CHAIN" -j DROP || return 1
+  "${mangle[@]}" -C PREROUTING -d "$REGISTRY_IP/32" -m comment --comment "$REGISTRY_CHAIN" -j "$REGISTRY_CHAIN" \
+    2>/dev/null \
+    || "${mangle[@]}" -I PREROUTING -d "$REGISTRY_IP/32" -m comment --comment "$REGISTRY_CHAIN" -j "$REGISTRY_CHAIN" \
+    || return 1
+}
+
+registry_firewall_remove() {
+  local mangle=(sudo -n iptables -w -t mangle)
+  "${mangle[@]}" -D PREROUTING -d "$REGISTRY_IP/32" -m comment --comment "$REGISTRY_CHAIN" -j "$REGISTRY_CHAIN" \
+    2>/dev/null || true
+  "${mangle[@]}" -F "$REGISTRY_CHAIN" 2>/dev/null || true
+  "${mangle[@]}" -X "$REGISTRY_CHAIN" 2>/dev/null || true
+}
+
 # The benches' checkouts went with their directories; drop their entries from
 # the repository's worktree list. Only entries whose checkout was under
 # KIND_BENCH_ROOT and is gone: `git worktree prune` would also drop the
@@ -515,38 +546,6 @@ start_registry() { # name port data-dir [env...]
     sleep 1
   done
   return 1
-}
-
-# Accept registry traffic only from the host itself and the benches' links:
-# the registry address is a local address, so without this a connection to it
-# arriving on any interface would reach the registries. Checked in the mangle
-# table's PREROUTING, by the destination a packet arrived with and before
-# Docker's port DNAT rewrites it, which every arriving packet passes, whether
-# it is forwarded to a published port or delivered to a proxy. Replies pass:
-# the host's own connections leave with the registry address as their source,
-# so their replies come back to it on Docker's bridge.
-REGISTRY_CHAIN=SPACE-BENCH-REGISTRY
-registry_firewall() {
-  local mangle=(sudo -n iptables -w -t mangle)
-  "${mangle[@]}" -n -L "$REGISTRY_CHAIN" >/dev/null 2>&1 || "${mangle[@]}" -N "$REGISTRY_CHAIN" || return 1
-  "${mangle[@]}" -F "$REGISTRY_CHAIN" || return 1
-  "${mangle[@]}" -A "$REGISTRY_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN || return 1
-  "${mangle[@]}" -A "$REGISTRY_CHAIN" -i lo -j RETURN || return 1
-  "${mangle[@]}" -A "$REGISTRY_CHAIN" -i sb+ -j RETURN || return 1
-  "${mangle[@]}" -A "$REGISTRY_CHAIN" -j DROP || return 1
-  "${mangle[@]}" -C PREROUTING -d "$REGISTRY_IP/32" -m comment --comment "$REGISTRY_CHAIN" -j "$REGISTRY_CHAIN" \
-    2>/dev/null \
-    || "${mangle[@]}" -I PREROUTING -d "$REGISTRY_IP/32" -m comment --comment "$REGISTRY_CHAIN" -j "$REGISTRY_CHAIN" \
-    || return 1
-}
-
-registry_firewall_remove() {
-  local mangle=(sudo -n iptables -w -t mangle)
-  "${mangle[@]}" -D PREROUTING -d "$REGISTRY_IP/32" -m comment --comment "$REGISTRY_CHAIN" -j "$REGISTRY_CHAIN" \
-    2>/dev/null
-  "${mangle[@]}" -F "$REGISTRY_CHAIN" 2>/dev/null
-  "${mangle[@]}" -X "$REGISTRY_CHAIN" 2>/dev/null
-  return 0
 }
 
 start_registries() {
