@@ -118,13 +118,7 @@ teardown_all() {
   git -C "$REPO_ROOT" worktree prune
 }
 
-# One run or teardown at a time per host: benches are host-global (their
-# namespaces, ports on the registry address, cgroups), and a second run's
-# stale-bench cleanup would tear down the first run's benches under it.
-mkdir -p "$KIND_BENCH_ROOT" 2>/dev/null || sudo -n install -d -o "$(id -u)" -g "$(id -g)" "$KIND_BENCH_ROOT"
-exec 9>>"$KIND_BENCH_ROOT.lock"
-flock -n 9 || die "another smoke-kind-parallel.sh run or teardown holds $KIND_BENCH_ROOT.lock"
-
+kind_bench_lock
 if [[ "$COMMAND" == teardown ]]; then
   teardown_all
   # The registries' data stays in $CACHE_ROOT for the next run.
@@ -490,6 +484,7 @@ bench_env() {
 # Bench i's daemon, configured to pull Docker Hub through the host's mirror.
 bench_docker() {
   local i="$1"
+  kind_bench_claim "$i" || return 1
   kind_bench_network_up "$i" || return 1
   kind_bench_pidns_up "$i" || return 1
   KIND_BENCH_MIRROR="http://$REGISTRY_IP:$MIRROR_PORT" kind_bench_docker_up "$i"

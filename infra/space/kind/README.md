@@ -356,8 +356,9 @@ ids cover the inventory exactly once. The script exits 0 when every bench
 passed, 1 when a scenario failed and 2 when a bench did not come up, a scenario
 was inconclusive or the coverage check failed. Without `--benches` it picks N
 from the host's CPUs, memory and free disk, and prints it. One run or teardown
-holds the host at a time (`~/.space-benches.lock`), and a run first removes
-the benches an interrupted one left.
+holds the host at a time (`/run/lock/space-bench.lock`), and a run first
+removes the benches an interrupted one left; only directories marked as a
+bench's when it was created are ever deleted.
 
 Each bench keeps every default name and port (`space-local`, API
 `127.0.0.1:8080`, data plane `:8090`, Tilt `:10350`), so the bring-up and the

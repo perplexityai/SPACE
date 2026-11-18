@@ -49,6 +49,11 @@ KIND_BENCH_DOCKER_DIR="${KIND_BENCH_DOCKER_DIR:-/opt/space-bench-docker/bin}"
 # leaked route or rule names exactly one bench.
 export KIND_BENCH_MAX=12
 
+# Written into each bench's directories when they are created. Only a directory
+# that carries it is a bench's, so a teardown never deletes a numeric directory
+# that merely sits where benches go.
+KIND_BENCH_MARKER=.space-bench
+
 kind_bench_log() { printf '[kind-bench] %s\n' "$*" >&2; }
 kind_bench_die() { printf '[kind-bench] ERROR: %s\n' "$*" >&2; exit 2; }
 
@@ -62,6 +67,32 @@ kind_bench_ns_ip() { printf '192.168.240.%s\n' $(( ($1 - 1) * 4 + 2 )); }
 kind_bench_link_net() { printf '192.168.240.%s/30\n' $(( ($1 - 1) * 4 )); }
 kind_bench_pool() { printf '192.168.%s.0/20\n' $(( ($1 - 1) * 16 )); }
 kind_bench_comment() { printf '%s-%s\n' "$KIND_BENCH_PREFIX" "$1"; }
+
+# Hold the host for one run or teardown at a time, on fd 9: bench names
+# (namespaces, /run directories, veths, firewall comments, cgroups) are
+# host-wide, whatever KIND_BENCH_ROOT a caller chose, and a run's stale-bench
+# cleanup would tear down another run's benches under it.
+kind_bench_lock() {
+  local lock="${KIND_BENCH_LOCK:-}"
+  if [[ -z "$lock" ]]; then
+    lock="/run/lock/$KIND_BENCH_PREFIX.lock"
+    [[ -d /run/lock ]] || lock="/run/$KIND_BENCH_PREFIX.lock"
+  fi
+  if [[ ! -w "$lock" ]]; then
+    sudo -n sh -c 'touch "$1" && chmod 0666 "$1"' _ "$lock" || kind_bench_die "cannot create the host lock $lock"
+  fi
+  exec 9>>"$lock"
+  flock -n 9 || kind_bench_die "another bench run or teardown holds $lock"
+}
+
+# Claim bench <i>'s directories: create them and mark them as a bench's.
+kind_bench_claim() {
+  local dir run
+  dir="$(kind_bench_dir "$1")"
+  run="$(kind_bench_run_dir "$1")"
+  mkdir -p "$dir" && : >"$dir/$KIND_BENCH_MARKER" || return 1
+  sudo -n install -d -m 0755 "$run" && sudo -n touch "$run/$KIND_BENCH_MARKER" || return 1
+}
 
 # Refuse a host that cannot hold benches, before anything is created.
 kind_bench_preflight() {
@@ -335,9 +366,10 @@ kind_bench_checkout() {
 kind_bench_existing() {
   {
     sudo -n ip netns list 2>/dev/null | awk '{print $1}' | sed -n "s/^${KIND_BENCH_PREFIX}-\([0-9][0-9]*\)$/\1/p"
-    find /run -maxdepth 1 -name "${KIND_BENCH_PREFIX}-*" -printf '%f\n' 2>/dev/null \
-      | sed -n "s/^${KIND_BENCH_PREFIX}-\([0-9][0-9]*\)$/\1/p"
-    find "$KIND_BENCH_ROOT" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$'
+    find /run -maxdepth 2 -path "/run/${KIND_BENCH_PREFIX}-*/$KIND_BENCH_MARKER" 2>/dev/null \
+      | sed -n "s|^/run/${KIND_BENCH_PREFIX}-\([0-9][0-9]*\)/$KIND_BENCH_MARKER$|\1|p"
+    find "$KIND_BENCH_ROOT" -mindepth 2 -maxdepth 2 -name "$KIND_BENCH_MARKER" 2>/dev/null \
+      | sed -n "s|^$KIND_BENCH_ROOT/\([0-9][0-9]*\)/$KIND_BENCH_MARKER$|\1|p"
   } | sort -un || true
 }
 
@@ -414,5 +446,12 @@ kind_bench_teardown() {
     find "/sys/fs/cgroup/$ns" -depth -type d -exec sudo -n rmdir {} \; 2>/dev/null || true
     [[ ! -d "/sys/fs/cgroup/$ns" ]] || kind_bench_log "WARNING: /sys/fs/cgroup/$ns still holds processes"
   fi
-  sudo -n rm -rf "$run" "$dir"
+  local owned
+  for owned in "$run" "$dir"; do
+    if [[ -e "$owned/$KIND_BENCH_MARKER" ]] || sudo -n test -e "$owned/$KIND_BENCH_MARKER"; then
+      sudo -n rm -rf "$owned"
+    elif [[ -e "$owned" ]]; then
+      kind_bench_log "WARNING: leaving $owned: it carries no $KIND_BENCH_MARKER marker"
+    fi
+  done
 }
