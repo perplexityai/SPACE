@@ -6,7 +6,6 @@
 //!   raw strings, UUIDs and IDs are parsed once at the boundary. Value types
 //!   that have their own `pplx-space-*` crate are imported from that crate,
 //!   not through `types`.
-//! - [`guest`] describes platform-specific SPACE runtime contracts.
 //!
 //! # Examples
 //!
@@ -23,8 +22,6 @@ pub mod types;
 
 #[cfg(feature = "archive")]
 pub mod archive;
-
-pub mod guest;
 
 #[cfg(test)]
 mod runtime_contract_tests;

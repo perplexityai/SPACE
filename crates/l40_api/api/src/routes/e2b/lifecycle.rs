@@ -1,6 +1,6 @@
 use crate::controllers::substrate::ActivationClient;
+use pplx_space_accounts::ClientId;
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::ClientId;
 
 use super::*;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;

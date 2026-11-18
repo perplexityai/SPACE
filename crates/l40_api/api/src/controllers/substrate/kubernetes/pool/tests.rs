@@ -1487,7 +1487,7 @@ async fn postgres_label_adopted_execution_patches_the_label_or_gives_up_the_slot
     #[case] slot_after: SlotAfter,
 ) -> TestResult {
     use super::super::scripted_test_doubles::scripted_kube_client;
-    use pplx_space_common_core::types::ClientId;
+    use pplx_space_accounts::ClientId;
 
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
@@ -1517,7 +1517,7 @@ async fn postgres_label_adopted_execution_patches_the_label_or_gives_up_the_slot
 async fn postgres_label_adopted_execution_throttled_then_failed_invalidates_the_slot() -> TestResult
 {
     use super::super::scripted_test_doubles::scripted_kube_client;
-    use pplx_space_common_core::types::ClientId;
+    use pplx_space_accounts::ClientId;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let db = pg_test_db().await?;
@@ -1558,7 +1558,7 @@ async fn postgres_label_adopted_execution_bounds_a_write_the_apiserver_never_ans
     #[case] clear_hangs: bool,
 ) -> TestResult {
     use super::super::scripted_test_doubles::{KubeReply, scripted_kube_client};
-    use pplx_space_common_core::types::ClientId;
+    use pplx_space_accounts::ClientId;
 
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
@@ -1648,7 +1648,7 @@ async fn postgres_rollback_pooled_execution_claim_removes_the_adoption_label(
 #[tokio::test(flavor = "current_thread")]
 async fn postgres_label_adopted_execution_invalidates_a_claim_without_a_pod_uid() -> TestResult {
     use super::super::scripted_test_doubles::{kube_status, scripted_kube_client};
-    use pplx_space_common_core::types::ClientId;
+    use pplx_space_accounts::ClientId;
 
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
@@ -1705,7 +1705,7 @@ async fn label_adopted_execution_without_a_client_sends_nothing() -> TestResult 
 async fn postgres_label_adopted_execution_with_attribution_off_sends_nothing() -> TestResult {
     use super::super::scripted_test_doubles::{kube_status, scripted_kube_client};
     use crate::controllers::substrate::ActivationClientAttribution;
-    use pplx_space_common_core::types::ClientId;
+    use pplx_space_accounts::ClientId;
 
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::watcher::Event;
-use pplx_space_common_core::types::ClientId;
+use pplx_space_accounts::ClientId;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_pod::{
     SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_CLIENT_ID_LABEL, SANDBOX_ID_ANNOTATION,

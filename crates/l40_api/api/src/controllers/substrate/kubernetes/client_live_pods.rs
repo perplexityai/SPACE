@@ -40,7 +40,7 @@ use std::{
 };
 
 use kube::runtime::watcher;
-use pplx_space_common_core::types::ClientId;
+use pplx_space_accounts::ClientId;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_pod::STOPPED_MATERIALIZATION_CHECKPOINT;
 

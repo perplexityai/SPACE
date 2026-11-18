@@ -1,7 +1,7 @@
 //! Pod metadata and node placement persisted onto the active execution row.
 
 use super::*;
-use pplx_space_common_core::types::ClientId;
+use pplx_space_accounts::ClientId;
 
 impl K8sStore {
     /// Persist pod metadata onto the active execution row of `generation`.

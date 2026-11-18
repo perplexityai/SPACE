@@ -20,7 +20,7 @@ use pplx_space_k8s_ids::LabelValue;
 /// turns a header into an id once, at the request boundary.
 ///
 /// ```
-/// # use pplx_space_common_core::types::ClientId;
+/// # use pplx_space_accounts::ClientId;
 /// assert_eq!(ClientId::from_header(Some(" batch-7 ")).as_str(), "batch-7");
 /// assert_eq!(ClientId::from_header(Some("Not A Label!")), ClientId::unknown());
 /// assert_eq!(ClientId::from_header(Some("NATIVE")), ClientId::unknown());

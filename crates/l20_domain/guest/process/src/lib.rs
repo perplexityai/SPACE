@@ -3,13 +3,15 @@
 //! These newtypes describe what a sandbox guest runs and where: process IDs,
 //! commands, signals, guest user names and idempotency keys ([`process`]),
 //! guest paths and watch roots ([`path`]), environment keys, values and maps with their size
-//! contract shared with the Go shim ([`env`]), and the positive durations
-//! that time sandbox readiness, retries, uptime and snapshots ([`time`]).
+//! contract shared with the Go shim ([`env`]), the positive durations that
+//! time sandbox readiness, retries, uptime and snapshots ([`time`]), and the
+//! spaced guest socket paths ([`linux::paths`]).
 //!
 //! It is its own crate so that code can name these values without depending
 //! on `pplx-space-common-core`: import them from here.
 
 pub mod env;
+pub mod linux;
 pub mod path;
 pub mod process;
 pub use pplx_space_guest_status as status;

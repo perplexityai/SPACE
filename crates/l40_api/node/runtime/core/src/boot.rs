@@ -86,9 +86,9 @@ pub fn configuration(
 // Changes apply only on cold boot. Rebuild templates and base snapshots to
 // roll out new boot arguments to workloads restored from memory state.
 fn command_line(input: &GuestBoot<'_>, devices: &str, uart: &str, console: &str) -> String {
-    use pplx_space_common_core::guest::linux::network::PRIMARY_INTERFACE;
-    use pplx_space_common_core::guest::network::{
-        GATEWAY as GATEWAY_IPV4_ADDR, GUEST as IPV4_ADDR, NETMASK as IPV4_NETMASK,
+    use pplx_space_net_common::guest_link::PRIMARY_INTERFACE;
+    use pplx_space_net_common::guest_link::{
+        GATEWAY as GUEST_LINK_GATEWAY, GUEST as GUEST_LINK_GUEST, NETMASK as GUEST_LINK_NETMASK,
     };
     let build = if input.builder {
         format!(
@@ -109,7 +109,7 @@ fn command_line(input: &GuestBoot<'_>, devices: &str, uart: &str, console: &str)
         String::new()
     };
     format!(
-        "reboot=k panic=1 {devices} rw root=/dev/vda{build}{clock} transparent_hugepage=never{uart}{console} ip={IPV4_ADDR}::{GATEWAY_IPV4_ADDR}:{IPV4_NETMASK}:instance:{PRIMARY_INTERFACE}:off"
+        "reboot=k panic=1 {devices} rw root=/dev/vda{build}{clock} transparent_hugepage=never{uart}{console} ip={GUEST_LINK_GUEST}::{GUEST_LINK_GATEWAY}:{GUEST_LINK_NETMASK}:instance:{PRIMARY_INTERFACE}:off"
     )
 }
 

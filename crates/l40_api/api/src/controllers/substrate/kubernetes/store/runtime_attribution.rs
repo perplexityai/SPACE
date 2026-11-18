@@ -17,7 +17,7 @@
 //! execution row) to write it. That happens about once per new pod.
 
 use super::*;
-use pplx_space_common_core::types::ClientId;
+use pplx_space_accounts::ClientId;
 use pplx_space_sandbox_store::attribute_runtime::{UNATTRIBUTED_LIFECYCLES, set_activating_client};
 
 /// The active execution row's tracked pod, read under its row lock, with the

@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use deadpool_redis::{Config as RedisPoolConfig, Pool, Runtime};
-use pplx_space_common_core::types::ClientId;
+use pplx_space_accounts::ClientId;
 use pplx_space_sandbox_model::SandboxId;
 use redis::Script;
 use tracing::Instrument as _;

@@ -1,15 +1,18 @@
 //! Account and tenancy identity types: user, org, node, API key, credential
 //! and publication-grant IDs, sandbox owners, emails, org slugs, user roles
-//! and credential keys (`auth`), and the federated-identity upstream IDs and
-//! sandbox owner source (`federated_identity`). They carry only their own
-//! validation rules and storage codecs. `auth` also re-exports the job ID and
-//! the ID parse error from `pplx-space-job-id`.
+//! and credential keys (`auth`); the federated-identity upstream IDs and
+//! sandbox owner source (`federated_identity`); and the ID of the client whose
+//! activation created a sandbox's runtime (`client_id`). They carry only their
+//! own validation rules and storage codecs. `auth` also re-exports the job ID
+//! and the ID parse error from `pplx-space-job-id`.
 //!
 //! They are their own crate so that code can name them without depending on
 //! `pplx-space-common-core`.
 
 pub mod auth;
+pub mod client_id;
 pub mod federated_identity;
 
 pub use auth::*;
+pub use client_id::*;
 pub use federated_identity::*;

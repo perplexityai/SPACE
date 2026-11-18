@@ -472,9 +472,9 @@ pub fn is_slot_vpeer_ip(ip: std::net::Ipv4Addr) -> bool {
 
 pub const SANDBOX_SUBNET: &str = "10.12.0.0";
 pub const SANDBOX_SUBNET_PREFIX_LEN: u8 = 16;
-pub const GUEST_IP: &str = pplx_space_common_core::guest::linux::network::IPV4_ADDR;
-pub const GUEST_GATEWAY: &str = pplx_space_common_core::guest::linux::network::GATEWAY_IPV4_ADDR;
-pub const TAP_IP: &str = pplx_space_common_core::guest::linux::network::GATEWAY_IPV4_CIDR;
+pub const GUEST_IP: &str = pplx_space_net_common::guest_link::IPV4_ADDR;
+pub const GUEST_GATEWAY: &str = pplx_space_net_common::guest_link::GATEWAY_IPV4_ADDR;
+pub const TAP_IP: &str = pplx_space_net_common::guest_link::GATEWAY_IPV4_CIDR;
 pub const TAP_DEVICE: &str = "tap0";
 
 static ROOT_DEFAULT_IFACE: OnceLock<String> = OnceLock::new();

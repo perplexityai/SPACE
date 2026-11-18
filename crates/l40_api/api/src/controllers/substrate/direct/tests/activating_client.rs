@@ -4,7 +4,7 @@
 //! restore. A receipt that doesn't commit, or that answers for a runtime the
 //! activation didn't create, leaves the record alone.
 
-use pplx_space_common_core::types::ClientId;
+use pplx_space_accounts::ClientId;
 use pplx_space_sandbox_store::attribute_runtime::{activating_client, set_activating_client};
 use pplx_space_sbx_mgr_client::proto::{SandboxSubstrateKind, SpaceApiRouteIdentity};
 
@@ -104,7 +104,7 @@ impl crate::controllers::substrate::ActivationAdmission for AdmitAll {
 
     fn reserve_live(
         &self,
-        _client: pplx_space_common_core::types::ClientId,
+        _client: pplx_space_accounts::ClientId,
         _sandbox: SandboxId,
     ) -> crate::controllers::substrate::LiveCapFuture<'_> {
         Box::pin(async { Ok(None) })
@@ -112,7 +112,7 @@ impl crate::controllers::substrate::ActivationAdmission for AdmitAll {
 
     fn precheck_live(
         &self,
-        _client: pplx_space_common_core::types::ClientId,
+        _client: pplx_space_accounts::ClientId,
         _sandbox: SandboxId,
     ) -> crate::controllers::substrate::ActivationAdmissionFuture<'_> {
         Box::pin(async { Ok(()) })

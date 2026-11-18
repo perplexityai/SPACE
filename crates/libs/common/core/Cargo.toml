@@ -22,7 +22,6 @@ pplx-space-host-layout = { workspace = true }
 pplx-space-job-id = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-linux-ids = { workspace = true }
-pplx-space-net-common = { workspace = true }
 pplx-space-node-model = { workspace = true }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-semver = { workspace = true }

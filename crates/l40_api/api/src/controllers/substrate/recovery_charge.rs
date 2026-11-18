@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::client_live_cap::LiveReservation;
-use pplx_space_common_core::types::ClientId;
+use pplx_space_accounts::ClientId;
 
 /// Capacity classes understood by the substrate admission boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

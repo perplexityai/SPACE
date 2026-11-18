@@ -321,7 +321,7 @@ impl KubernetesSubstrate {
         &self,
         charge: &RecoveryCharge,
         sandbox_id: SandboxId,
-    ) -> Result<Option<pplx_space_common_core::types::ClientId>, SubstrateError> {
+    ) -> Result<Option<pplx_space_accounts::ClientId>, SubstrateError> {
         Ok(match charge.attribution().key() {
             KeyResolution::Unresolved => {
                 self.store

@@ -211,9 +211,9 @@ impl SandboxPodView {
 
     /// The client id whose activation created this pod, from its
     /// `space.pplx.net/client-id` label; `None` for an unlabeled pod.
-    pub fn client_id(&self) -> Option<pplx_space_common_core::types::ClientId> {
+    pub fn client_id(&self) -> Option<pplx_space_accounts::ClientId> {
         self.label(SandboxPodKey::ClientId)
-            .and_then(|value| pplx_space_common_core::types::ClientId::parse(value).ok())
+            .and_then(|value| pplx_space_accounts::ClientId::parse(value).ok())
     }
 
     /// The annotation, falling back to the same-keyed label. The shared pod

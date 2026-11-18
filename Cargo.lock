@@ -4826,6 +4826,7 @@ name = "pplx-space-accounts"
 version = "0.8.2"
 dependencies = [
  "pplx-space-job-id",
+ "pplx-space-k8s-ids",
  "pplx-space-sql-codec",
  "serde",
  "thiserror 2.0.20",
@@ -5466,7 +5467,6 @@ dependencies = [
  "pplx-space-job-id",
  "pplx-space-k8s-ids",
  "pplx-space-linux-ids",
- "pplx-space-net-common",
  "pplx-space-node-model",
  "pplx-space-sandbox-model",
  "pplx-space-semver",
@@ -7096,6 +7096,7 @@ dependencies = [
  "pplx-space-host-linux",
  "pplx-space-linux-ids",
  "pplx-space-metrics-emit",
+ "pplx-space-net-common",
  "pplx-space-network-roles",
  "pplx-space-sandbox-model",
  "pplx-space-template-runtime",
@@ -8148,7 +8149,7 @@ dependencies = [
 name = "pplx-space-spaced-guest-client"
 version = "0.8.2"
 dependencies = [
- "pplx-space-common-core",
+ "pplx-space-guest-process",
  "pplx-space-spaced-client",
  "pplx-space-spaced-guest-protocol",
  "pplx-space-spaced-protocol",

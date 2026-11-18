@@ -76,7 +76,6 @@ pplx-space-service-host = { workspace = true, optional = true }
 pplx-space-service-lifecycle = { workspace = true, optional = true }
 pplx-space-spaced-guest-execution = { workspace = true }
 pplx-space-connection-admission = { workspace = true }
-pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
@@ -94,6 +93,7 @@ tempfile = { workspace = true }
 serde_json = { workspace = true }
 opentelemetry-proto = { workspace = true, features = ["gen-tonic", "metrics"] }
 pplx-space-spaced-guest-client = { workspace = true }
+pplx-space-common-core = { workspace = true }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
 h2 = { workspace = true }
 prost = { workspace = true }

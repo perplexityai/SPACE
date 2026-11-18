@@ -24,8 +24,8 @@ pub use pplx_space_spaced_client::{
 };
 
 pub fn default_guest_uds_path() -> std::path::PathBuf {
-    pplx_space_common_core::guest::linux::paths::default_guest_uds_path(
-        pplx_space_common_core::guest::linux::paths::SPACED_GUEST_SOCKET_FILE,
+    pplx_space_guest_process::linux::paths::default_guest_uds_path(
+        pplx_space_guest_process::linux::paths::SPACED_GUEST_SOCKET_FILE,
     )
 }
 

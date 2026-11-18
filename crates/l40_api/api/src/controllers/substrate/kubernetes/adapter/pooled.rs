@@ -516,7 +516,7 @@ impl KubernetesSubstrate {
         &self,
         claim: &PooledExecutionClaim,
         pod_uid: &str,
-        client_id: Option<&pplx_space_common_core::types::ClientId>,
+        client_id: Option<&pplx_space_accounts::ClientId>,
     ) -> AdoptionLabelWrite {
         use kube::api::{Patch, PatchParams};
         use pplx_space_sandbox_pod::SANDBOX_CLIENT_ID_LABEL;

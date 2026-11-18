@@ -14,8 +14,8 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Error,
     ed25519::space_api_route_ed25519_token_from_metadata,
 };
-use pplx_space_common_core::guest::linux::network::IPV4_ADDR as GUEST_IPV4_ADDR;
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_net_common::guest_link::IPV4_ADDR as GUEST_IPV4_ADDR;
 use pplx_space_net_gateway_client::SERVICE_PORT_INGRESS_START_TIMEOUT;
 use pplx_space_net_gateway_client::proto::{
     NetworkState, SandboxSubstrateKind, ServicePortIngressFrame, ServicePortIngressStart,

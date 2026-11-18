@@ -6082,7 +6082,7 @@ mod kubernetes_tests {
 
         fn reserve_live(
             &self,
-            client: pplx_space_common_core::types::ClientId,
+            client: pplx_space_accounts::ClientId,
             sandbox: SandboxId,
         ) -> crate::controllers::substrate::LiveCapFuture<'_> {
             Box::pin(async move {
@@ -6095,7 +6095,7 @@ mod kubernetes_tests {
 
         fn precheck_live(
             &self,
-            client: pplx_space_common_core::types::ClientId,
+            client: pplx_space_accounts::ClientId,
             sandbox: SandboxId,
         ) -> crate::controllers::substrate::ActivationAdmissionFuture<'_> {
             Box::pin(async move {
@@ -6157,7 +6157,7 @@ mod kubernetes_tests {
             ttl,
         );
         let admission = Arc::new(LiveCapOnly(cap.clone()));
-        let alpha = pplx_space_common_core::types::ClientId::parse("alpha")?;
+        let alpha = pplx_space_accounts::ClientId::parse("alpha")?;
         let charge = crate::controllers::substrate::RecoveryCharge::enforce(
             Some(&admission),
             crate::controllers::substrate::CapPolicy::ReserveAtClaim,
@@ -6265,7 +6265,7 @@ mod kubernetes_tests {
             ttl,
         );
         let admission = Arc::new(LiveCapOnly(cap.clone()));
-        let alpha = pplx_space_common_core::types::ClientId::parse("alpha")?;
+        let alpha = pplx_space_accounts::ClientId::parse("alpha")?;
         // As an entry site does: reserve, mark that the substrate call comes
         // next, and hand the reservation to the charge.
         let mut entry = cap

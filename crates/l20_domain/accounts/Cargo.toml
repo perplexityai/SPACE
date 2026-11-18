@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 pplx-space-job-id = { workspace = true }
+pplx-space-k8s-ids = { workspace = true }
 pplx-space-sql-codec = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 thiserror = { workspace = true }

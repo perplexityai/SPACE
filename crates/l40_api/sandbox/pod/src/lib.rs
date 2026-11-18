@@ -109,7 +109,7 @@ pub const SANDBOX_USER_ANNOTATION: &str = "space.pplx.net/sandbox-user";
 pub const SANDBOX_VOLUME_ENCRYPTION_ANNOTATION: &str = "space.pplx.net/volume-encryption";
 pub const SANDBOX_OWNER_ID_LABEL: &str = "space.pplx.net/user-id";
 pub const SANDBOX_ORG_ID_LABEL: &str = "space.pplx.net/org-id";
-/// The [`ClientId`](pplx_space_common_core::types::ClientId) whose activation created the pod. Set when
+/// The [`ClientId`](pplx_space_accounts::ClientId) whose activation created the pod. Set when
 /// the pod is created and never changed, except that a warm-pool pod, built
 /// before it has an adopter, is labeled when it's adopted. An activation
 /// with no client id to attribute (one inheriting an empty record) leaves the
@@ -528,7 +528,7 @@ pub struct SandboxRuntimePodMetadata<'a> {
     pub user_id: pplx_space_accounts::UserId,
     pub org_id: pplx_space_accounts::OrgId,
     /// Rendered as [`SANDBOX_CLIENT_ID_LABEL`] when `Some`.
-    pub client_id: Option<&'a pplx_space_common_core::types::ClientId>,
+    pub client_id: Option<&'a pplx_space_accounts::ClientId>,
     pub auto_lifecycle_json: &'a str,
     pub auto_lifecycle_authority: PolicyAuthority,
     pub network_policy_json: &'a str,

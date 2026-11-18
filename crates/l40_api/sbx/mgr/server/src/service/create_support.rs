@@ -601,9 +601,8 @@ pub(super) fn update_existing_sandbox_create_auto_lifecycle(
 /// kernel cmdline (`ip=169.254.0.21::169.254.0.22:...` in `recovery.rs`). The
 /// guest always sees these, so response builders that describe an existing
 /// runtime reuse them rather than re-deriving per sandbox.
-pub(super) const GUEST_IP: &str = pplx_space_common_core::guest::linux::network::IPV4_ADDR;
-pub(super) const GUEST_GATEWAY: &str =
-    pplx_space_common_core::guest::linux::network::GATEWAY_IPV4_ADDR;
+pub(super) const GUEST_IP: &str = pplx_space_net_common::guest_link::IPV4_ADDR;
+pub(super) const GUEST_GATEWAY: &str = pplx_space_net_common::guest_link::GATEWAY_IPV4_ADDR;
 
 pub(super) fn create_response_for_existing_sandbox(
     existing: &crate::db::SandboxRow,

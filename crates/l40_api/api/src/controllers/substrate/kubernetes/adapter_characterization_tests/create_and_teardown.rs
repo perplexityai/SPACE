@@ -117,7 +117,7 @@ async fn create_execution_labels_the_pod_with_the_creating_client(
     let substrate = substrate_with_store_and_client(db.pool.clone(), client);
     let inputs = CreateInputs::new();
     let template_ref = inputs.template_ref();
-    let creator = creator.map(|id| pplx_space_common_core::types::ClientId::parse(id).unwrap());
+    let creator = creator.map(|id| pplx_space_accounts::ClientId::parse(id).unwrap());
     let mut request = inputs.create_request(sandbox_id, &template_ref);
     request.client_id = creator.as_ref();
 

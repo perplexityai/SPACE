@@ -12,7 +12,7 @@
 //! identity rows, or under the restore's `sandboxes` row lock, so `sandboxes`
 //! is locked first either way.
 
-use pplx_space_common_core::types::ClientId;
+use pplx_space_accounts::ClientId;
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sql_locator::sql;
 

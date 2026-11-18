@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use pplx_space_common_core::types::ClientId;
+use pplx_space_accounts::ClientId;
 use pplx_space_sandbox_model::{
     SandboxActivationAttemptId, SandboxId, SandboxTransitionTargetState,
 };

@@ -251,13 +251,13 @@ async fn connect_uds_channel_inner(
 mod tests;
 
 pub fn default_bridge_guest_uds_path() -> PathBuf {
-    pplx_space_common_core::guest::linux::paths::default_guest_uds_path(
-        pplx_space_common_core::guest::linux::paths::SPACED_BRIDGE_GUEST_SOCKET_FILE,
+    pplx_space_guest_process::linux::paths::default_guest_uds_path(
+        pplx_space_guest_process::linux::paths::SPACED_BRIDGE_GUEST_SOCKET_FILE,
     )
 }
 
 pub fn default_bridge_host_uds_path() -> PathBuf {
-    pplx_space_common_core::guest::linux::paths::default_guest_uds_path(
-        pplx_space_common_core::guest::linux::paths::SPACED_BRIDGE_HOST_SOCKET_FILE,
+    pplx_space_guest_process::linux::paths::default_guest_uds_path(
+        pplx_space_guest_process::linux::paths::SPACED_BRIDGE_HOST_SOCKET_FILE,
     )
 }

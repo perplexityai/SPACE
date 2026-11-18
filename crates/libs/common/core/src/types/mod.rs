@@ -28,7 +28,6 @@
 //! ```
 
 pub mod admin;
-pub mod client_id;
 pub mod kek;
 pub mod node_fs;
 pub mod object_store;
@@ -38,7 +37,6 @@ pub mod subject;
 
 #[cfg(feature = "serde")]
 pub use admin::*;
-pub use client_id::*;
 pub use kek::*;
 pub use node_fs::*;
 pub use object_store::*;

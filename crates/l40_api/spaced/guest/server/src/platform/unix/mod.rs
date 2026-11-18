@@ -269,8 +269,8 @@ impl Default for SpacedGuestServiceConfig {
         Self {
             host_connector_type: HostConnectorType::default(),
             local_socket_path: Some(
-                pplx_space_common_core::guest::linux::paths::default_guest_uds_path(
-                    pplx_space_common_core::guest::linux::paths::SPACED_GUEST_SOCKET_FILE,
+                pplx_space_guest_process::linux::paths::default_guest_uds_path(
+                    pplx_space_guest_process::linux::paths::SPACED_GUEST_SOCKET_FILE,
                 ),
             ),
             bridge_socket_path: Some(pplx_space_spaced_client::default_bridge_guest_uds_path()),
