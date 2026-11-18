@@ -22,7 +22,7 @@ fn verified_replica_provenance_wire_shape_is_pinned() {
         s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),
         raw: false,
         file_mode: Some(0o600),
-        snapshot_artifact: Some(pplx_space_common_core::types::SnapshotArtifact::Memory),
+        snapshot_artifact: Some(pplx_space_artifact_model::SnapshotArtifact::Memory),
         object_size: 17,
         object_etag: Some("\"etag-a\"".to_string()),
         local_size: 4096,

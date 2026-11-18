@@ -178,7 +178,7 @@ fn restore_key_for(storage_uri: &str, artifact: SnapshotArtifact) -> String {
 fn upload_key_for(sandbox_id: &str, snapshot_id: &str, artifact: SnapshotArtifact) -> String {
     // Mirrors what `snapshot_upload::submit_suspend_snapshot` writes for
     // the bucket-root case (empty cluster key_prefix).
-    pplx_space_common_core::types::snapshot_object_key("", sandbox_id, snapshot_id, artifact)
+    pplx_space_artifact_model::snapshot_object_key("", sandbox_id, snapshot_id, artifact)
 }
 
 #[test]

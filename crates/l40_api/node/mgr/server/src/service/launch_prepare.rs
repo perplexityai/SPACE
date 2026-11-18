@@ -153,10 +153,10 @@ fn parse_execution_selection_mode(value: i32) -> Result<ExecutionSelectionMode, 
 fn sandbox_metadata(
     req: &PrepareSandboxRequest,
     execution: pplx_space_execution_spec::ExecutionMetadata,
-) -> Result<pplx_space_common_core::types::SandboxArtifactMetadata, Status> {
+) -> Result<pplx_space_artifact_model::SandboxArtifactMetadata, Status> {
     use std::str::FromStr;
 
-    use pplx_space_common_core::types::SandboxArtifactMetadata;
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
     use pplx_space_content_digest::ContentHash;
     use pplx_space_sandbox_model::SandboxId;
     use pplx_space_template_model::{ORPHANED_SANDBOX_TEMPLATE, TemplateName};

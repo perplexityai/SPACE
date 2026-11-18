@@ -233,7 +233,7 @@ fn outcome_labels_are_stable() {
 
 use std::sync::Mutex;
 
-use pplx_space_common_core::types::TemplateArtifact;
+use pplx_space_artifact_model::TemplateArtifact;
 use pplx_space_object_store::{ObjectMeta, ObjectStore, ObjectStoreError, ObjectTarget};
 
 /// Object store backed by a `bucket/key -> size` map.

@@ -682,7 +682,7 @@ pub(super) fn validate_suspend_snapshot_artifact_files(
     // mismatch on the stream is rechecked against the retained image below.
     let mut cached_stream: Option<(RetainedSource, u64)> = None;
     for artifact in artifacts {
-        if artifact.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend {
+        if artifact.kind == pplx_space_artifact_model::SnapshotArtifact::RootfsBtrfsSend {
             match RootfsArtifact::resolve_meta(metadata, snapshot_dir).map_err(|error| {
                 SuspendSnapshotValidationError::StatArtifact {
                     path: error.path,
@@ -727,7 +727,7 @@ pub(super) fn validate_suspend_snapshot_artifact_files(
         if !file.file_type().is_file() {
             return Err(SuspendSnapshotValidationError::ArtifactNotRegular { path });
         }
-        if artifact.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend
+        if artifact.kind == pplx_space_artifact_model::SnapshotArtifact::RootfsBtrfsSend
             && let Some((_, stream_len)) = cached_stream.as_mut()
         {
             *stream_len = file.len();

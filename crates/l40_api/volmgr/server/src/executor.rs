@@ -33,8 +33,9 @@ use crate::crypto::{self, CryptoError, decrypted_sibling, encrypted_sibling};
 use crate::materialization::{MaterializationLayout, MaterializationMode};
 use dashmap::DashMap;
 use pplx_space_accounts::OrgId;
+use pplx_space_artifact_model::{SnapshotArtifact, StorageUri};
 use pplx_space_common_core::types::{
-    KekProvider, MasterKeyIdentifier, SnapshotArtifact, StorageUri, SubjectId, SubjectIdParseError,
+    KekProvider, MasterKeyIdentifier, SubjectId, SubjectIdParseError,
 };
 use pplx_space_common_jobs::{
     Job, JobError, JobExecutor, JobFailureKind, JobFailureReason, JobPriority,

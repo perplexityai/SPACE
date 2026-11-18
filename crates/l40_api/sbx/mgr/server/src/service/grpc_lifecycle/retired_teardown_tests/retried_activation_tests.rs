@@ -476,8 +476,8 @@ async fn a_rollback_receipt_for_another_generation_does_not_hold_a_retry_back() 
 async fn a_retry_waiting_on_a_rollback_cleanup_sees_its_receipt() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use pplx_space_accounts::SandboxOwner;
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
     use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-    use pplx_space_common_core::types::SandboxArtifactMetadata;
     use pplx_space_content_digest::ContentHash;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};

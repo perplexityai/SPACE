@@ -20,6 +20,7 @@ datadog-otel = ["otel", "datadog"]
 
 [dependencies]
 pplx-space-accounts = { workspace = true, features = ["serde"] }
+pplx-space-artifact-model = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-sandbox-model = { workspace = true }
 aes-gcm = { workspace = true }

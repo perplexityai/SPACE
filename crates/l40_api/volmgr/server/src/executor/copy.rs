@@ -2,7 +2,8 @@
 //! the caller; this job never rewrites metadata or falls back to a download.
 
 use super::*;
-use pplx_space_common_core::types::{ExactStorageUri, StorageUriParseError, SubjectIdParseError};
+use pplx_space_artifact_model::{ExactStorageUri, StorageUriParseError};
+use pplx_space_common_core::types::SubjectIdParseError;
 use pplx_space_volmgr_client::proto::CopyObjectRequest;
 
 pub(crate) const KIND: &str = "copy_object";

@@ -16,7 +16,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use futures_util::Stream;
-use pplx_space_common_core::types::StorageUri;
+use pplx_space_artifact_model::StorageUri;
 use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_spec::{
@@ -358,7 +358,7 @@ pub enum KernelLocation {
 #[derive(Debug, thiserror::Error)]
 pub enum KernelLocationError {
     #[error(transparent)]
-    S3(#[from] pplx_space_common_core::types::StorageUriParseError),
+    S3(#[from] pplx_space_artifact_model::StorageUriParseError),
     #[error(transparent)]
     Https(#[from] super::release_source::ReleaseUrlParseError),
 }

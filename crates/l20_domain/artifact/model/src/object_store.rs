@@ -14,7 +14,7 @@
 //! # Examples
 //!
 //! ```rust
-//! # use pplx_space_common_core::types::*;
+//! # use pplx_space_artifact_model::*;
 //! # use pplx_space_template_model::TemplateName;
 //! # use pplx_space_content_digest::{ContentHash, Digest};
 //! let template = TemplateName::parse("seed")?;
@@ -54,7 +54,7 @@ const SUSPEND_SNAPSHOT_KEY_SEGMENT: &str = "suspend_snapshots";
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::{snapshot_shard, SNAPSHOT_SHARD_COUNT};
+/// # use pplx_space_artifact_model::{snapshot_shard, SNAPSHOT_SHARD_COUNT};
 /// let s = snapshot_shard("019e3e2d-7038-7c40-b8fa-b226d6a702c3");
 /// assert!((s as u32) < SNAPSHOT_SHARD_COUNT);
 /// // Stable: same input always lands in the same shard.
@@ -121,7 +121,7 @@ impl TemplateArtifact {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_artifact_model::*;
 /// # use pplx_space_template_model::TemplateName;
 /// # use pplx_space_content_digest::{ContentHash, Digest};
 /// let template = TemplateName::parse("seed")?;
@@ -157,7 +157,7 @@ pub fn template_object_key(
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_artifact_model::*;
 /// # use pplx_space_template_model::TemplateName;
 /// # use pplx_space_content_digest::{ContentHash, Digest};
 /// let template = TemplateName::parse("seed")?;
@@ -242,11 +242,11 @@ impl SnapshotArtifact {
     /// directory. Parsing reverses it.
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::SnapshotArtifact;
+    /// # use pplx_space_artifact_model::SnapshotArtifact;
     /// let artifact: SnapshotArtifact = "rootfs.btrfs-send".parse()?;
     /// assert_eq!(artifact.file_name(), "rootfs.btrfs-send");
     /// assert!("../rootfs".parse::<SnapshotArtifact>().is_err());
-    /// # Ok::<(), pplx_space_common_core::types::SnapshotArtifactParseError>(())
+    /// # Ok::<(), pplx_space_artifact_model::SnapshotArtifactParseError>(())
     /// ```
     pub const fn file_name(self) -> &'static str {
         match self {
@@ -310,7 +310,7 @@ impl FromStr for SnapshotArtifact {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_artifact_model::*;
 /// let key = snapshot_object_key("", "abc123", "snap-1", SnapshotArtifact::Memory);
 /// // The shard is a deterministic function of sandbox_id (not snapshot_id),
 /// // so every attempt for a given sandbox lands in the same shard.
@@ -402,7 +402,7 @@ pub fn parse_snapshot_object_key(object_key: &str) -> Option<SnapshotObjectKeyPa
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_artifact_model::*;
 /// let parts = StorageUri::parse(
 ///     "s3://my-bucket/templates/seed?region=us-east-1",
 /// )?;

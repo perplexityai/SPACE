@@ -1685,7 +1685,7 @@ fn restore_adopt_insert_binds_volume_encryption() {
     let user = SandboxOwner::parse("user".to_string()).unwrap();
     let env = BTreeMap::new();
     let lifecycle = AutoLifecyclePolicy::disabled();
-    let restore_source: pplx_space_common_core::types::ExactStorageUri =
+    let restore_source: pplx_space_artifact_model::ExactStorageUri =
         "s3://snapshots/suspend/restore?region=us-east-1"
             .parse()
             .unwrap();
@@ -1805,7 +1805,7 @@ fn restore_adoption_clears_obsolete_auto_lifecycle_delete_block() {
     )
     .unwrap();
 
-    let restore_source: pplx_space_common_core::types::ExactStorageUri =
+    let restore_source: pplx_space_artifact_model::ExactStorageUri =
         "s3://snapshots/suspend/restore?region=us-east-1"
             .parse()
             .unwrap();

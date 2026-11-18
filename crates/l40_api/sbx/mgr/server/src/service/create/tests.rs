@@ -149,7 +149,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
     consumer_definition: pplx_space_execution_common::environment::EnvironmentDefinition,
 ) {
     use crate::node_manager_transport::fake::FakeNodeManager;
-    use pplx_space_common_core::types::SandboxArtifactMetadata;
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
     use pplx_space_content_digest::ContentHash;
     use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
     use pplx_space_node_mgr_client::proto::{
@@ -324,7 +324,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
 #[tokio::test]
 async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation() {
     use crate::node_manager_transport::fake::FakeNodeManager;
-    use pplx_space_common_core::types::SandboxArtifactMetadata;
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
     use pplx_space_content_digest::ContentHash;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
@@ -511,8 +511,8 @@ fn restore_guest_memory_uses_capture_shape_or_legacy_payload_and_rejects_conflic
 async fn suspend_restore_is_admitted_before_the_vm_launches() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use crate::service::start_support::{ActivationAdmissionKind, REQUESTED_VM_ACTIVATIONS};
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
     use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-    use pplx_space_common_core::types::SandboxArtifactMetadata;
     use pplx_space_content_digest::ContentHash;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};

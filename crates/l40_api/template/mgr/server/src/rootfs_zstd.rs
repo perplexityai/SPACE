@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use pplx_space_stopwatch::{Stopwatch, measure};
 
-use pplx_space_common_core::types::{
+use pplx_space_artifact_model::{
     TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL,
 };
 use pplx_space_content_digest::{Digest, DigestParseError, HashAlg};

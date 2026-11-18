@@ -25,7 +25,7 @@ impl OrphanKind {
                     || matches!(
                         name.to_str(),
                         Some(
-                            pplx_space_common_core::types::SNAPSHOT_DIR_NAME
+                            pplx_space_artifact_model::SNAPSHOT_DIR_NAME
                                 | "template-snapshot-staging"
                         )
                     )

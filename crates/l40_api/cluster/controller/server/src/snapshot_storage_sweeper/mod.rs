@@ -31,7 +31,7 @@
 //!   ordered by `id` so a cursor can make forward progress past stuck
 //!   rows) and for each one:
 //!   1. Parses the `storage_connection_string` into a
-//!      [`pplx_space_common_core::types::StorageUri`]. Parse failure is
+//!      [`pplx_space_artifact_model::StorageUri`]. Parse failure is
 //!      logged + counted as `failed{reason:parse_uri}`; the row is
 //!      left in place so the failure stays visible until repaired.
 //!   2. Calls [`pplx_space_snapshot_storage::StorageBackend::delete_prefix`]. The backend lists
@@ -68,7 +68,7 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::snapshot_storage_sweeper as sweeper_metrics;
 use futures_util::stream::{self, StreamExt};
-use pplx_space_common_core::types::StorageUri;
+use pplx_space_artifact_model::StorageUri;
 #[cfg(test)]
 use pplx_space_snapshot_storage::DeletePrefixError;
 use pplx_space_snapshot_storage::{DeletePrefixOutcome, StorageBackend};

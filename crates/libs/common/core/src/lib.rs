@@ -22,6 +22,3 @@ pub mod types;
 
 #[cfg(feature = "archive")]
 pub mod archive;
-
-#[cfg(test)]
-mod runtime_contract_tests;

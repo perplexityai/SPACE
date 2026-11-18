@@ -50,8 +50,8 @@ use time::OffsetDateTime;
 use tonic::{Request, Response, Status};
 
 use pplx_space_accounts::{NodeId, OrgId};
+use pplx_space_artifact_model::{ExactStorageUri, SnapshotArtifact as SnapshotArtifactFile};
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::{ExactStorageUri, SnapshotArtifact as SnapshotArtifactFile};
 use pplx_space_content_digest::Digest;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,

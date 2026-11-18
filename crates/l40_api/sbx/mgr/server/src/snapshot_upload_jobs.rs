@@ -268,7 +268,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                 .find_map(|(artifact, observation)| {
                     matches!(
                         artifact.kind,
-                        pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend
+                        pplx_space_artifact_model::SnapshotArtifact::RootfsBtrfsSend
                     )
                     .then_some(observation.bytes)
                 })
@@ -1902,7 +1902,7 @@ pub(crate) fn rewrite_sidecar_for_reclaim(
     for artifact in
         crate::snapshot_upload::vm_artifacts_for_format(SuspendSnapshotFormat::BtrfsSend)
     {
-        if artifact.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend {
+        if artifact.kind == pplx_space_artifact_model::SnapshotArtifact::RootfsBtrfsSend {
             continue;
         }
         let len = std::fs::metadata(snapshot_dir.join(artifact.local_name))?.len();

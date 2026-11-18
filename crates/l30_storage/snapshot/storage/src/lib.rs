@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-use pplx_space_common_core::types::StorageUri;
+use pplx_space_artifact_model::StorageUri;
 
 #[cfg(feature = "s3")]
 pub mod s3;

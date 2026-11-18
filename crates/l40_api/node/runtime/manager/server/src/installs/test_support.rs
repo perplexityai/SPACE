@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures_util::StreamExt as _;
 use md5::{Digest as _, Md5};
-use pplx_space_common_core::types::StorageUri;
+use pplx_space_artifact_model::StorageUri;
 use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_spec::{RuntimeIdentity, RuntimeKind, RuntimeVersion};

@@ -25,6 +25,7 @@ async-trait = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
 nix = { workspace = true, features = ["time"] }
+pplx-space-artifact-model = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

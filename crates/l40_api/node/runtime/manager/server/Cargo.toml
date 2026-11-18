@@ -30,6 +30,7 @@ jiff = { workspace = true }
 libc = { workspace = true }
 md-5 = { workspace = true }
 nix = { workspace = true, features = ["user"] }
+pplx-space-artifact-model = { workspace = true }
 reqwest = { workspace = true, optional = true }
 rusqlite = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }

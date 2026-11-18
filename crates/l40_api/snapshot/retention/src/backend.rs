@@ -33,7 +33,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 #[cfg(feature = "s3")]
-use pplx_space_common_core::types::StorageUri;
+use pplx_space_artifact_model::StorageUri;
 #[cfg(feature = "s3")]
 use pplx_space_snapshot_storage::s3::S3StorageBackend;
 #[cfg(feature = "s3")]

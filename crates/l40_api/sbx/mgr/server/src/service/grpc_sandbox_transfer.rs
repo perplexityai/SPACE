@@ -264,7 +264,7 @@ pub(super) async fn verify_delta_base(
                 ));
             }
             Ok(std::path::Path::new(&response.template_dir)
-                .join(pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE))
+                .join(pplx_space_artifact_model::TEMPLATE_ROOTFS_FILE))
         }
         Err(crate::template_resolver::TemplateLookupError::Rpc(status))
             if status.code() == tonic::Code::NotFound =>
@@ -676,7 +676,7 @@ async fn write_imported_sandbox_metadata(
     sandbox_id: &str,
     header: &crate::proto::ImportSandboxHeader,
     execution: pplx_space_execution_spec::ExecutionMetadata,
-) -> Result<pplx_space_common_core::types::SandboxArtifactMetadata, Status> {
+) -> Result<pplx_space_artifact_model::SandboxArtifactMetadata, Status> {
     let parsed_sandbox_id = sandbox_id
         .parse::<SandboxId>()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -686,7 +686,7 @@ async fn write_imported_sandbox_metadata(
         .content_hash
         .parse::<pplx_space_content_digest::ContentHash>()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let sandbox_metadata = pplx_space_common_core::types::SandboxArtifactMetadata::new(
+    let sandbox_metadata = pplx_space_artifact_model::SandboxArtifactMetadata::new(
         parsed_sandbox_id,
         execution,
         template,

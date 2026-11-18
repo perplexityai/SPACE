@@ -405,7 +405,7 @@ fn interrupted_restore_as_new_publishes_metadata_and_finalizes_as_stopped() {
         .unwrap(),
         SandboxState::Stopped.as_str(),
     );
-    let published: pplx_space_common_core::types::SandboxArtifactMetadata = serde_json::from_slice(
+    let published: pplx_space_artifact_model::SandboxArtifactMetadata = serde_json::from_slice(
         &std::fs::read(sandbox_dir.path().join("metadata.json"))
             .expect("restore-as-new recovery must publish sandbox metadata"),
     )
@@ -1068,7 +1068,7 @@ fn restore_artifact_as_new_publishes_execution_metadata_for_cold_start() {
     .unwrap();
     publish_rebound_sandbox_artifact_metadata(&meta, temp.path()).unwrap();
 
-    let published: pplx_space_common_core::types::SandboxArtifactMetadata =
+    let published: pplx_space_artifact_model::SandboxArtifactMetadata =
         serde_json::from_slice(&std::fs::read(temp.path().join("metadata.json")).unwrap()).unwrap();
     assert_eq!(
         published.sandbox_id.to_string(),
@@ -1386,7 +1386,7 @@ fn a_superseded_recovery_claim_leaves_no_adopted_row() {
     let orphan_id = SandboxId::new();
     let (mut meta, _) = disk_artifact_meta();
     meta.sandbox_id = orphan_id.to_string();
-    let restore_source = pplx_space_common_core::types::ExactStorageUri::parse(
+    let restore_source = pplx_space_artifact_model::ExactStorageUri::parse(
         "s3://bucket/snapshots/orphan/vmstate?region=us-east-1",
     )
     .expect("the fixture URI should parse");
@@ -1445,7 +1445,7 @@ fn an_adoption_inside_the_claim_transaction_commits_the_row() {
     let orphan_id = SandboxId::new();
     let (mut meta, _) = disk_artifact_meta();
     meta.sandbox_id = orphan_id.to_string();
-    let restore_source = pplx_space_common_core::types::ExactStorageUri::parse(
+    let restore_source = pplx_space_artifact_model::ExactStorageUri::parse(
         "s3://bucket/snapshots/orphan/vmstate?region=us-east-1",
     )
     .expect("the fixture URI should parse");
@@ -1500,7 +1500,7 @@ fn an_ordinary_cross_node_retry_takes_no_write_lock() {
     let sandbox_id = SandboxId::new();
     let (mut meta, _) = disk_artifact_meta();
     meta.sandbox_id = sandbox_id.to_string();
-    let restore_source = pplx_space_common_core::types::ExactStorageUri::parse(
+    let restore_source = pplx_space_artifact_model::ExactStorageUri::parse(
         "s3://bucket/snapshots/orphan/vmstate?region=us-east-1",
     )
     .expect("the fixture URI should parse");
@@ -1556,7 +1556,7 @@ fn a_sandbox_that_left_an_activatable_state_is_refused_before_adoption() {
 
     let (mut meta, _) = disk_artifact_meta();
     meta.sandbox_id = sandbox_id.to_string();
-    let restore_source = pplx_space_common_core::types::ExactStorageUri::parse(
+    let restore_source = pplx_space_artifact_model::ExactStorageUri::parse(
         "s3://bucket/snapshots/orphan/vmstate?region=us-east-1",
     )
     .expect("the fixture URI should parse");

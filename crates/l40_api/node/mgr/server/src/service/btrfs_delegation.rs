@@ -396,7 +396,7 @@ impl TemplateBuildTarget {
     }
 
     fn digest_dir(&self) -> PathBuf {
-        PathBuf::from(pplx_space_common_core::types::template_build_dir(
+        PathBuf::from(pplx_space_artifact_model::template_build_dir(
             &self.name,
             &self.content_hash,
             self.partition,
@@ -458,7 +458,7 @@ fn rootfs_btrfs_send_path(snapshot_dir: &Path) -> PathBuf {
 /// Where the Full-codec rootfs lives — superseded by btrfs-send
 /// stream on the suspend side, removed after a successful encode.
 fn rootfs_ext4_in_snapshot_dir(snapshot_dir: &Path) -> PathBuf {
-    snapshot_dir.join(pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE)
+    snapshot_dir.join(pplx_space_artifact_model::TEMPLATE_ROOTFS_FILE)
 }
 
 struct ValidatedSendParent {

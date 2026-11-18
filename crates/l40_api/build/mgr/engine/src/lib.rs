@@ -1159,15 +1159,15 @@ impl TemplateBuilder {
         let sandbox_metadata_path =
             pplx_space_host_layout::paths::sandbox_metadata_path(&sandbox_id);
         let execution = match tokio::fs::read(&sandbox_metadata_path).await {
-            Ok(bytes) => serde_json::from_slice::<
-                pplx_space_common_core::types::SandboxArtifactMetadata,
-            >(&bytes)
-            .map_err(|error| {
-                BuildError::message(format!(
-                    "invalid sandbox runtime metadata {sandbox_metadata_path}: {error}"
-                ))
-            })
-            .map(|metadata| metadata.execution),
+            Ok(bytes) => {
+                serde_json::from_slice::<pplx_space_artifact_model::SandboxArtifactMetadata>(&bytes)
+                    .map_err(|error| {
+                        BuildError::message(format!(
+                            "invalid sandbox runtime metadata {sandbox_metadata_path}: {error}"
+                        ))
+                    })
+                    .map(|metadata| metadata.execution)
+            }
             Err(source) => Err(BuildError::Io {
                 operation: "read sandbox runtime metadata",
                 source,

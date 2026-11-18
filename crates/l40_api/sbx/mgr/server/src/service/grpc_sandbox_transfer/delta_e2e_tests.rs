@@ -138,7 +138,7 @@ impl Server {
 }
 
 fn template_rootfs(scenario: &Scenario) -> PathBuf {
-    Path::new(&pplx_space_common_core::types::template_build_dir(
+    Path::new(&pplx_space_artifact_model::template_build_dir(
         &scenario.template,
         &scenario.content_hash,
         pplx_space_template_model::TemplateCachePartition::Legacy,

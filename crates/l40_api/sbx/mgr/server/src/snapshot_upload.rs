@@ -35,8 +35,8 @@ use pplx_space_accounts::JobId;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-use pplx_space_common_core::types::snapshot_shard;
-use pplx_space_common_core::types::{SnapshotArtifact, snapshot_object_key};
+use pplx_space_artifact_model::snapshot_shard;
+use pplx_space_artifact_model::{SnapshotArtifact, snapshot_object_key};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotName};
@@ -101,7 +101,7 @@ impl SnapshotUploadConfig {
     /// URI. The org-level override lives in this form on the `organizations`
     /// row and is forwarded through the substrate.
     pub fn from_uri(uri: &str) -> Result<Self, String> {
-        let parsed = pplx_space_common_core::types::StorageUri::parse(uri)
+        let parsed = pplx_space_artifact_model::StorageUri::parse(uri)
             .map_err(|e| format!("invalid snapshot storage uri: {e}"))?;
         Ok(Self {
             bucket: parsed.bucket,
@@ -1333,7 +1333,7 @@ pub(crate) fn build_storage_uri(
     snapshot_id: &str,
     config: &SnapshotUploadConfig,
 ) -> String {
-    let dir_prefix = pplx_space_common_core::types::snapshot_attempt_key_prefix(
+    let dir_prefix = pplx_space_artifact_model::snapshot_attempt_key_prefix(
         &config.key_prefix,
         sandbox_id,
         snapshot_id,

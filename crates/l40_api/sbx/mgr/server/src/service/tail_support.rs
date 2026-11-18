@@ -40,8 +40,7 @@ pub(super) fn host_architecture() -> Result<pplx_space_cpu_arch::Arch, RuntimeAr
 fn sandbox_artifact_metadata_in(
     cache_dir: &std::path::Path,
     sandbox_id: &str,
-) -> Result<Option<pplx_space_common_core::types::SandboxArtifactMetadata>, RuntimeArtifactReadError>
-{
+) -> Result<Option<pplx_space_artifact_model::SandboxArtifactMetadata>, RuntimeArtifactReadError> {
     let path = cache_dir.join(sandbox_id).join("metadata.json");
     match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -129,7 +128,7 @@ pub(super) fn activation_metadata_json(
     cpu_budget: Option<pplx_space_execution_spec::VcpuCount>,
     guest_memory: Option<pplx_space_byte_size::MemorySize>,
 ) -> Result<String, Status> {
-    use pplx_space_common_core::types::SandboxArtifactMetadata;
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
     let invalid = |error: String| Status::failed_precondition(error);
     let execution = match sandbox.execution_metadata.clone() {
         Some(execution) => execution,
