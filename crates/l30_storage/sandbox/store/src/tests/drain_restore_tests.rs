@@ -1,0 +1,699 @@
+//! The drain restore's claim and commit ([`crate::drain_restore`]).
+//!
+//! A refused claim must leave the row exactly as it was: each refusal compares
+//! the whole row before and after, beside a control row that the same claim
+//! takes.
+
+use std::time::Duration;
+
+use pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections;
+
+use super::*;
+use crate::delete::mark_deleting;
+use crate::drain_restore::{
+    DrainRestoreClaim, DrainRestoreCommit, DrainRestoreRefusal, claim_drain_restore,
+    complete_drain_restore,
+};
+
+const LEASE_TTL_SECS: i64 = 60;
+const EXECUTION_OWNERSHIP_TTL_SECS: i64 = 300;
+
+/// When S, the drain's suspend snapshot, was taken in these fixtures.
+const S_TAKEN: &str = "2026-01-01T00:00:00Z";
+const NEWER: &str = "2026-01-02T00:00:00Z";
+const OLDER: &str = "2025-12-01T00:00:00Z";
+
+/// A full snapshot of `sandbox` in `state`, taken at `taken`, carrying
+/// `artifact` when given, stored at a location that is orphaned when asked.
+async fn snapshot(
+    pool: &PgPool,
+    sandbox: SandboxId,
+    artifact: Option<Uuid>,
+    state: &str,
+    taken: &str,
+    orphaned: bool,
+) -> TestResult<Uuid> {
+    let id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, timestamp, local_artifact_id, artifact_kind,
+             artifact_origin, org_id
+         )
+         VALUES ($1, $2, 'full', $3, $4::TIMESTAMPTZ, $5,
+                 CASE WHEN $5::UUID IS NULL THEN NULL ELSE 'full' END,
+                 CASE WHEN $5::UUID IS NULL THEN NULL ELSE 'suspend' END, $6)"
+    ))
+    .bind(id)
+    .bind(sandbox)
+    .bind(state)
+    .bind(taken)
+    .bind(artifact)
+    .bind(SEED_ORG)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (
+             id, snapshot_id, storage_connection_string, org_id, orphaned_at
+         ) VALUES (
+             $1, $2, 's3://test-bucket/snapshots/drained?region=us-east-1', $3,
+             CASE WHEN $4 THEN NOW() END
+         )"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(id)
+    .bind(SEED_ORG)
+    .bind(orphaned)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Point the row's current local artifact at `artifact`, as the suspend that
+/// published it does.
+async fn mark_artifact(pool: &PgPool, sandbox: SandboxId, artifact: Uuid) -> TestResult {
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend'
+          WHERE id = $1"
+    ))
+    .bind(sandbox)
+    .bind(artifact)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Whether the row names its suspend artifact, as a current suspend does, or
+/// is a legacy row that names none.
+#[derive(Clone, Copy, Debug)]
+enum Artifact {
+    Marked,
+    Legacy,
+}
+
+/// A drained sandbox: `lifecycle`, with S, a ready and stored full snapshot,
+/// which the row's artifact marker names when `artifact` is `Marked`.
+async fn drained(
+    pool: &PgPool,
+    lifecycle: &str,
+    artifact: Artifact,
+) -> TestResult<(SandboxId, Uuid, Uuid)> {
+    let id = SandboxId::from_uuid(insert_sandbox(pool, None, lifecycle).await?);
+    let s_artifact = Uuid::now_v7();
+    let s = snapshot(pool, id, Some(s_artifact), "ready", S_TAKEN, false).await?;
+    if matches!(artifact, Artifact::Marked) {
+        mark_artifact(pool, id, s_artifact).await?;
+    }
+    Ok((id, s, s_artifact))
+}
+
+/// The whole row as JSON text: equal before and after a statement iff it
+/// wrote nothing.
+async fn row_image(pool: &PgPool, id: SandboxId) -> TestResult<String> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT row_to_json(s)::TEXT FROM sandboxes s WHERE s.id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Wait until some session of this database waits on a lock.
+async fn wait_for_lock_waiter(pool: &PgPool) -> TestResult {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let waiting: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'
+             )"
+        ))
+        .fetch_one(pool)
+        .await?;
+        if waiting {
+            return Ok(());
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the second claim never waited on the row lock"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// An active execution of `id` at `generation` in `state`, running under
+/// activation attempt `attempt` toward `attempt_target` when given, routed on
+/// a pod IP so a completion receipt can release it.
+async fn execution(
+    pool: &PgPool,
+    id: SandboxId,
+    generation: i64,
+    state: &str,
+    attempt: Option<(Uuid, &str)>,
+) -> TestResult {
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET active = FALSE WHERE sandbox_id = $1"
+    ))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, state, pod_ip,
+              activation_attempt_id, activation_attempt_target_state, route_activation_id)
+         VALUES ($1, $2, $3, 'space', $4, '10.0.0.1', $5, $6, $5)"
+    ))
+    .bind(id)
+    .bind(generation)
+    .bind(format!("pod-{id}-g{generation}"))
+    .bind(state)
+    .bind(attempt.map(|(attempt, _)| attempt))
+    .bind(attempt.map(|(_, target)| target))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The active execution's attempt, as `(attempt, target state)`.
+async fn active_attempt(
+    pool: &PgPool,
+    id: SandboxId,
+) -> TestResult<(Option<Uuid>, Option<String>)> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT activation_attempt_id, activation_attempt_target_state
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Every execution of `id` as JSON text, beside [`row_image`].
+async fn executions_image(pool: &PgPool, id: SandboxId) -> TestResult<String> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY e.generation)::TEXT, '[]')
+           FROM sandbox_k8s_executions e
+          WHERE e.sandbox_id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// The node's activation receipt for `attempt` on generation 1 of `id`,
+/// toward `started`, through the ingest path that projects it.
+async fn receipt(
+    executor: impl sqlx::PgExecutor<'_>,
+    node: NodeId,
+    id: SandboxId,
+    attempt: Uuid,
+) -> TestResult<Vec<SandboxId>> {
+    let rows = sqlx::types::Json(serde_json::json!([{
+        "sandbox_id": id,
+        "published_lifecycle": "started",
+        "transition_receipt_kind": pplx_space_sandbox_model::SandboxTransitionReceiptKind::ActivationCompleted.as_str(),
+        "transition_receipt_target_state": "started",
+        "transition_receipt_execution_generation": 1,
+        "transition_receipt_activation_attempt_id": attempt,
+    }]));
+    Ok(crate::ingest::release_completed_activations(executor, node, rows).await?)
+}
+
+/// A drained row claimed under `token`, on `node`, restored onto
+/// generation 1 under activation attempt `attempt` toward `started`.
+async fn restored(
+    pool: &PgPool,
+    node: NodeId,
+    token: Uuid,
+    attempt: Uuid,
+) -> TestResult<SandboxId> {
+    let (id, s, _) = drained(pool, "suspended", Artifact::Marked).await?;
+    assert_eq!(claim(pool, id, s, token).await?, DrainRestoreClaim::Claimed);
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $2, target_node_id = $2 WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(node)
+    .execute(pool)
+    .await?;
+    execution(pool, id, 1, "running", Some((attempt, "started"))).await?;
+    Ok(id)
+}
+
+async fn claim(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: SandboxId,
+    snapshot: Uuid,
+    token: Uuid,
+) -> TestResult<DrainRestoreClaim> {
+    Ok(claim_drain_restore(
+        executor,
+        id,
+        snapshot,
+        LEASE_TTL_SECS,
+        token,
+        EXECUTION_OWNERSHIP_TTL_SECS,
+    )
+    .await?)
+}
+
+/// The restore columns: lifecycle, lease token, and whether the lease is live.
+async fn lease(pool: &PgPool, id: SandboxId) -> TestResult<(String, Option<Uuid>, bool)> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT lifecycle, restore_lease_token,
+                COALESCE(restore_lease_expires_at > NOW(), FALSE)
+           FROM sandboxes
+          WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// One way to make an otherwise claimable `suspended` row refuse the claim,
+/// and the refusal it names.
+#[derive(Clone, Copy, Debug)]
+enum Case {
+    /// No refusal: the control row.
+    Control,
+    /// The v1 drain's marker is set.
+    EvacuationMarker,
+    /// A full snapshot newer than S, in `state`, on a legacy row.
+    NewerLegacy(&'static str),
+    /// A later suspend's artifact is the row's current one.
+    NewerArtifact,
+    /// S is in `state`.
+    SourceState(&'static str),
+    /// S's only location is orphaned.
+    SourceOrphaned,
+    /// The operation names an older ready snapshot, not S.
+    OlderNamed,
+    /// The operation names another sandbox's snapshot.
+    ForeignNamed,
+    /// An active execution did work just now.
+    FreshExecution,
+    /// A restore holds the row `restoring`.
+    Restoring,
+    /// The sandbox runs again.
+    Started,
+    /// The sandbox is being deleted.
+    Deleting,
+}
+
+impl Case {
+    const ALL: [Self; 14] = [
+        Self::Control,
+        Self::EvacuationMarker,
+        Self::NewerLegacy("creating"),
+        Self::NewerLegacy("failed"),
+        Self::NewerArtifact,
+        Self::SourceState("creating"),
+        Self::SourceState("failed"),
+        Self::SourceOrphaned,
+        Self::OlderNamed,
+        Self::ForeignNamed,
+        Self::FreshExecution,
+        Self::Restoring,
+        Self::Started,
+        Self::Deleting,
+    ];
+
+    fn expected(self) -> DrainRestoreClaim {
+        use DrainRestoreRefusal as R;
+        DrainRestoreClaim::Refused(match self {
+            Self::Control => return DrainRestoreClaim::Claimed,
+            Self::EvacuationMarker
+            | Self::NewerLegacy(_)
+            | Self::NewerArtifact
+            | Self::OlderNamed
+            | Self::ForeignNamed
+            | Self::Started => R::Superseded,
+            Self::SourceState("creating") => R::SourcePending,
+            Self::SourceState(_) | Self::SourceOrphaned => R::SourceLost,
+            Self::FreshExecution | Self::Restoring => R::InFlight,
+            Self::Deleting => R::Deleted,
+        })
+    }
+
+    /// A drained `suspended` row with this case applied, and the snapshot the
+    /// operation names.
+    async fn apply(self, pool: &PgPool) -> TestResult<(SandboxId, Uuid)> {
+        let artifact = if matches!(self, Self::NewerLegacy(_)) {
+            Artifact::Legacy
+        } else {
+            Artifact::Marked
+        };
+        let (id, s, s_artifact) = drained(pool, "suspended", artifact).await?;
+        let mut named = s;
+        let set = |statement: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+            }
+        };
+        match self {
+            Self::Control => {}
+            Self::EvacuationMarker => {
+                set("UPDATE sandboxes SET evacuation_restore_target = 'started' WHERE id = $1")
+                    .await?;
+            }
+            Self::NewerLegacy(state) => {
+                snapshot(pool, id, None, state, NEWER, false).await?;
+            }
+            Self::NewerArtifact => {
+                let newer = Uuid::now_v7();
+                snapshot(pool, id, Some(newer), "ready", NEWER, false).await?;
+                mark_artifact(pool, id, newer).await?;
+            }
+            Self::SourceState(state) => {
+                sqlx::query(sql!("UPDATE snapshots SET state = $2 WHERE id = $1"))
+                    .bind(s)
+                    .bind(state)
+                    .execute(pool)
+                    .await?;
+            }
+            Self::SourceOrphaned => {
+                sqlx::query(sql!(
+                    "UPDATE snapshot_storage_locations SET orphaned_at = NOW()
+                      WHERE snapshot_id = $1"
+                ))
+                .bind(s)
+                .execute(pool)
+                .await?;
+            }
+            Self::OlderNamed => {
+                named = snapshot(pool, id, Some(s_artifact), "ready", OLDER, false).await?;
+            }
+            Self::ForeignNamed => {
+                let (_, foreign, _) = drained(pool, "suspended", Artifact::Marked).await?;
+                named = foreign;
+            }
+            Self::FreshExecution => {
+                execution(pool, id, 1, "running", None).await?;
+            }
+            Self::Restoring => {
+                set("UPDATE sandboxes SET lifecycle = 'restoring' WHERE id = $1").await?;
+            }
+            Self::Started => {
+                set("UPDATE sandboxes SET lifecycle = 'started' WHERE id = $1").await?;
+            }
+            Self::Deleting => {
+                let mut tx = pool.begin().await?;
+                mark_deleting(&mut tx, id).await?;
+                tx.commit().await?;
+            }
+        }
+        Ok((id, named))
+    }
+}
+
+/// A `suspended` row whose restore selector loads S is claimed under the
+/// operation's lease; every other row is refused with the reason the
+/// operation decides from, and left exactly as it was. A missing row reads
+/// deleted.
+#[tokio::test(flavor = "current_thread")]
+async fn the_claim_takes_only_a_suspended_row_loading_s_and_names_every_refusal() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    for case in Case::ALL {
+        let (id, named) = case.apply(pool).await?;
+        let before = row_image(pool, id).await?;
+        let token = Uuid::now_v7();
+        assert_eq!(
+            claim(pool, id, named, token).await?,
+            case.expected(),
+            "{case:?}"
+        );
+        if matches!(case, Case::Control) {
+            assert_eq!(
+                lease(pool, id).await?,
+                ("restoring".to_owned(), Some(token), true)
+            );
+        } else {
+            assert_eq!(row_image(pool, id).await?, before, "{case:?}: row changed");
+        }
+    }
+    assert_eq!(
+        claim(pool, SandboxId::new(), Uuid::now_v7(), Uuid::now_v7()).await?,
+        DrainRestoreClaim::Refused(DrainRestoreRefusal::Deleted)
+    );
+    Ok(())
+}
+
+/// Two claims of one row at once take it once. The second waits on the
+/// first's row lock, then finds the row restoring.
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_claims_take_the_row_once() -> TestResult {
+    // The open claim, the waiting claim and the lock probe each hold a
+    // connection.
+    let Some(db) = try_pg_test_db_with_max_connections(3).await? else {
+        return Ok(());
+    };
+    let pool = db.pool.clone();
+    let (id, s, _) = drained(&pool, "suspended", Artifact::Marked).await?;
+    let first_token = Uuid::now_v7();
+    let mut first = pool.begin().await?;
+    assert_eq!(
+        claim(&mut *first, id, s, first_token).await?,
+        DrainRestoreClaim::Claimed
+    );
+    let second = tokio::spawn({
+        let pool = pool.clone();
+        async move { claim(&pool, id, s, Uuid::now_v7()).await }
+    });
+    wait_for_lock_waiter(&pool).await?;
+    first.commit().await?;
+    assert_eq!(
+        second.await??,
+        DrainRestoreClaim::Refused(DrainRestoreRefusal::InFlight)
+    );
+    assert_eq!(lease(&pool, id).await?.1, Some(first_token));
+    Ok(())
+}
+
+/// The commit lands `started` only under the claim's token and execution,
+/// on its node, clears the lease and releases the restore's attempt.
+#[tokio::test(flavor = "current_thread")]
+async fn the_commit_lands_its_own_restore() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let token = Uuid::now_v7();
+    let attempt = Uuid::now_v7();
+    let id = restored(pool, NodeId::new(), token, attempt).await?;
+    let before = (
+        row_image(pool, id).await?,
+        executions_image(pool, id).await?,
+    );
+    for (case, token, generation) in [
+        ("another lease", Uuid::now_v7(), 1),
+        ("another execution", token, 2),
+    ] {
+        assert_eq!(
+            complete_drain_restore(pool, id, token, generation, Some(attempt)).await?,
+            DrainRestoreCommit::Lost,
+            "{case}"
+        );
+        assert_eq!(
+            (
+                row_image(pool, id).await?,
+                executions_image(pool, id).await?
+            ),
+            before,
+            "{case} wrote"
+        );
+    }
+    assert_eq!(
+        complete_drain_restore(pool, id, token, 1, Some(attempt)).await?,
+        DrainRestoreCommit::Landed
+    );
+    let landed: (String, String, Option<Uuid>, bool) = sqlx::query_as(sql!(
+        "SELECT lifecycle, placement, restore_lease_token, restore_lease_expires_at IS NULL
+           FROM sandboxes
+          WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        landed,
+        ("started".to_owned(), "on_node".to_owned(), None, true)
+    );
+    assert_eq!(active_attempt(pool, id).await?, (None, None));
+    Ok(())
+}
+
+/// The node's activation receipt can land the row before the restore's own
+/// commit runs. The commit then reads the row `started` on the restore's
+/// execution as landed, and writes nothing more.
+#[tokio::test(flavor = "current_thread")]
+async fn a_receipt_that_landed_first_commits_as_already_landed() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node = NodeId::new();
+    let token = Uuid::now_v7();
+    let attempt = Uuid::now_v7();
+    let id = restored(pool, node, token, attempt).await?;
+
+    assert_eq!(receipt(pool, node, id, attempt).await?, [id]);
+    let landed_by_receipt = row_image(pool, id).await?;
+    assert_eq!(
+        complete_drain_restore(pool, id, token, 1, Some(attempt)).await?,
+        DrainRestoreCommit::AlreadyLanded
+    );
+    assert_eq!(
+        row_image(pool, id).await?,
+        landed_by_receipt,
+        "the commit wrote the row"
+    );
+    assert_eq!(active_attempt(pool, id).await?, (None, None));
+    Ok(())
+}
+
+/// The same race with the receipt's transaction still open when the commit
+/// arrives: the commit waits on the row lock, then reads the receipt's
+/// landing, not the `restoring` row it would have seen without the lock.
+#[tokio::test(flavor = "current_thread")]
+async fn a_receipt_committing_while_the_commit_waits_reads_as_already_landed() -> TestResult {
+    // The receipt's transaction, the waiting commit and the lock probe each
+    // hold a connection.
+    let Some(db) = try_pg_test_db_with_max_connections(3).await? else {
+        return Ok(());
+    };
+    let pool = db.pool.clone();
+    let node = NodeId::new();
+    let token = Uuid::now_v7();
+    let attempt = Uuid::now_v7();
+    let id = restored(&pool, node, token, attempt).await?;
+
+    let mut receipt_tx = pool.begin().await?;
+    assert_eq!(receipt(&mut *receipt_tx, node, id, attempt).await?, [id]);
+    let commit = tokio::spawn({
+        let pool = pool.clone();
+        async move { complete_drain_restore(&pool, id, token, 1, Some(attempt)).await }
+    });
+    wait_for_lock_waiter(&pool).await?;
+    receipt_tx.commit().await?;
+    assert_eq!(commit.await??, DrainRestoreCommit::AlreadyLanded);
+    Ok(())
+}
+
+/// A `started` row that isn't this restore's landing is lost and left
+/// exactly as it was: a user restore on a new execution, a user's pause, an
+/// execution that stopped running, the v1 marker, another lease's restore, a
+/// delete. The control row, landed by the receipt, reads as landed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_row_moved_on_is_lost_unchanged() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    for case in [
+        "control",
+        "user restore on a new execution",
+        "user pause",
+        "execution not running",
+        "v1 marker",
+        "another lease's restore",
+        "delete",
+    ] {
+        let node = NodeId::new();
+        let token = Uuid::now_v7();
+        let attempt = Uuid::now_v7();
+        let id = restored(pool, node, token, attempt).await?;
+        if case != "another lease's restore" && case != "delete" {
+            assert_eq!(receipt(pool, node, id, attempt).await?, [id], "{case}");
+        }
+        let set = |statement: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+            }
+        };
+        match case {
+            "control" => {}
+            "user restore on a new execution" => execution(pool, id, 2, "running", None).await?,
+            "user pause" => {
+                set("UPDATE sandboxes SET lifecycle = 'paused' WHERE id = $1").await?;
+            }
+            "execution not running" => {
+                set("UPDATE sandbox_k8s_executions SET state = 'terminating'
+                      WHERE sandbox_id = $1 AND active")
+                .await?;
+            }
+            "v1 marker" => {
+                set("UPDATE sandboxes SET evacuation_restore_target = 'started' WHERE id = $1")
+                    .await?;
+            }
+            "another lease's restore" => {
+                set("UPDATE sandboxes
+                        SET restore_lease_token = gen_random_uuid(),
+                            restore_lease_expires_at = NOW() + INTERVAL '1 minute'
+                      WHERE id = $1")
+                .await?;
+            }
+            "delete" => {
+                let mut tx = pool.begin().await?;
+                mark_deleting(&mut tx, id).await?;
+                tx.commit().await?;
+            }
+            other => unreachable!("{other}"),
+        }
+        let before = (
+            row_image(pool, id).await?,
+            executions_image(pool, id).await?,
+        );
+        let commit = complete_drain_restore(pool, id, token, 1, Some(attempt)).await?;
+        if case == "control" {
+            assert_eq!(commit, DrainRestoreCommit::AlreadyLanded, "{case}");
+        } else {
+            assert_eq!(commit, DrainRestoreCommit::Lost, "{case}");
+            assert_eq!(
+                (
+                    row_image(pool, id).await?,
+                    executions_image(pool, id).await?
+                ),
+                before,
+                "{case}: wrote"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The commit releases the restore's attempt only with a landed row: a lost
+/// commit leaves it, so the attempt still fences the execution the
+/// operation will retry.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_commit_keeps_the_attempt() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let token = Uuid::now_v7();
+    let attempt = Uuid::now_v7();
+    let id = restored(pool, NodeId::new(), token, attempt).await?;
+    assert_eq!(
+        complete_drain_restore(pool, id, Uuid::now_v7(), 1, Some(attempt)).await?,
+        DrainRestoreCommit::Lost
+    );
+    assert_eq!(
+        active_attempt(pool, id).await?,
+        (Some(attempt), Some("started".to_owned()))
+    );
+    Ok(())
+}
