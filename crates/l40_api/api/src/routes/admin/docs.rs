@@ -52,7 +52,7 @@ fn admin_openapi_value() -> Value {
             "/nodes": {
                 "get": {
                     "summary": "List node inventory and optional diagnostic counts",
-                    "description": "Set include_occupancy=false for metadata-only inventory with null occupancy counts. Legacy requests compute counts; sort=drainability always computes diagnostics. Every node also carries runtime_installations and, when recorded, node_group_id and cordoned (the Kubernetes Node's spec.unschedulable from the API's reflector cache). reconcile_trigger is present when the node has a queued state-reconciliation trigger; per-facet work in node_reconcile_queue is not shown.",
+                    "description": "Set include_occupancy=false for metadata-only inventory with null occupancy counts. Legacy requests compute counts; sort=drainability always computes diagnostics. Every node also carries runtime_installations and, when recorded, node_group_id and cordoned (the Kubernetes Node's spec.unschedulable from the API's reflector cache). reconcile_trigger is present when the node has a queued state-reconciliation trigger; per-facet work in node_reconcile_queue is not shown. A node a v2 drain runs on carries drain_engine v2 and drain: the drain's generation and deadline, whether it is being cancelled (an undrain the cluster controller hasn't finished on the node) or fenced for termination, every sandbox recorded as evacuated (evacuated_total), and the node's last report as the cluster controller stored it (evacuated, pending with each sandbox's wait, whether running and whether a warm-pool member, blocked, reported_at, evacuated_grew_at); both are absent for a v1 drain or none, and drain is absent when the stored state can't be read.",
                     "parameters": [
                         { "name": "include_occupancy", "in": "query", "schema": { "type": "boolean", "default": true } }
                     ],
@@ -64,7 +64,7 @@ fn admin_openapi_value() -> Value {
             "/nodes/{node_id}": {
                 "get": {
                     "summary": "Get one node and optional diagnostic counts",
-                    "description": "Set include_occupancy=false to read metadata without sandbox or snapshot accounting; occupancy counts are then null. The node also carries runtime_installations and, when recorded, node_group_id and cordoned (the Kubernetes Node's spec.unschedulable from the API's reflector cache). reconcile_trigger is present when the node has a queued state-reconciliation trigger; per-facet work in node_reconcile_queue is not shown.",
+                    "description": "Set include_occupancy=false to read metadata without sandbox or snapshot accounting; occupancy counts are then null. The node also carries runtime_installations and, when recorded, node_group_id and cordoned (the Kubernetes Node's spec.unschedulable from the API's reflector cache). reconcile_trigger is present when the node has a queued state-reconciliation trigger; per-facet work in node_reconcile_queue is not shown. A node a v2 drain runs on carries drain_engine v2 and drain, as on the node list.",
                     "parameters": [
                         { "name": "include_occupancy", "in": "query", "schema": { "type": "boolean", "default": true } },
                         { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
@@ -96,7 +96,7 @@ fn admin_openapi_value() -> Value {
                     ],
                     "responses": {
                         "200": { "description": "Uncordon accepted" },
-                        "409": { "description": "Node transition conflict" },
+                        "409": { "description": "Node transition conflict: the node is draining, drained or terminating, or its v2 drain's undrain is still being cancelled on the node, which may still be sealed (code drain_v2_cancel_pending); the cluster controller uncordons it once the cancel lands" },
                         "501": { "description": "Not available on the active substrate" }
                     }
                 }
@@ -109,7 +109,7 @@ fn admin_openapi_value() -> Value {
                     ],
                     "requestBody": {
                         "required": false,
-                        "description": "Optional drain options. An omitted body means a gentle drain that auto-replaces the instance on termination. Also accepted against a node already draining: gentle -> forced escalates the drain in place and preserves drain_started_at; the same mode leaves the mode alone but still clears drain_last_error; forced -> gentle is refused. A drain's replace_after_terminate is fixed when it starts: on an already-draining node, omit the field to escalate on the existing terms; one that disagrees with the drain in flight is a 409.",
+                        "description": "Optional drain options. An omitted body means a gentle drain that auto-replaces the instance on termination. Also accepted against a node already draining: gentle -> forced escalates the drain in place and preserves drain_started_at; the same mode leaves the mode alone but still clears drain_last_error; forced -> gentle is refused. A drain's replace_after_terminate is fixed when it starts: on an already-draining node, omit the field to escalate on the existing terms; one that disagrees with the drain in flight is a 409. With engine v2 the node runs the drain itself: once admitted it is sealed against VM activations, every resident but a running or stopped sandbox is made durable elsewhere, and each running sandbox keeps running, its calls open, reported pending with the wait hold, until the drain's deadline, hold_seconds after its start; from the deadline the node suspends them too. A v2 drain takes no mode. While it is draining, or its undrain hasn't finished, a call that could activate a sandbox of the node that isn't running (a start, wake, restore, resume or runtime recovery, or an access path that would wake it) is refused with a 503 and Retry-After; a running sandbox's calls go through. A suspended or restoring sandbox whose current snapshot is durable passes and lands on another node; a v2 drain doesn't move a stopped sandbox, so a stop, a kill or a rollback without restart of a sandbox on the node is refused with a 503 and Retry-After for as long as the drain lasts, its undrain's cancel included, and one that appears anyway is reported pending and keeps the drain from drained; a sandbox the drain suspended stays suspended until a call wakes it. Once drained or terminating, every call against its sandboxes is refused, with a 503 and Retry-After. A repeat on a v2 drain in flight may carry a shorter hold_seconds to move the deadline earlier; hold_seconds 0 suspends the running sandboxes at once.",
                         "content": {
                             "application/json": {
                                 "schema": {
@@ -120,7 +120,18 @@ fn admin_openapi_value() -> Value {
                                             "type": "string",
                                             "enum": ["gentle", "forced"],
                                             "default": "gentle",
-                                            "description": "gentle: cordon the node and wait for resident sandboxes to leave on their own (auto-suspend on inactivity, user suspend, delete); user calls against them keep working. forced: evacuate every resident started/paused sandbox immediately and reject user calls against them with 409 for the whole drain window. forced also enables the stale-transient sweep, which flips any resident wedged in a non-evacuable transient lifecycle past the cluster's abandon age to failed, unrecoverably. That age is measured from the sandbox's own last lifecycle change, not from the drain, so a resident already wedged longer than it is flipped on the first tick after the write — escalating a long-parked gentle drain has no grace period. Read both node_drain.sandboxes_remaining and node_drain.drain_blockers first: neither is a superset of what the sweep destroys (they differ in both the lifecycles and the node-pinning column they count), so two zeros is the only reassuring answer."
+                                            "description": "gentle: cordon the node and wait for resident sandboxes to leave on their own (auto-suspend on inactivity, user suspend, delete); user calls against them keep working. forced: evacuate every resident started/paused sandbox immediately and reject user calls against them with 409 for the whole drain window. forced also enables the stale-transient sweep, which flips any resident wedged in a non-evacuable transient lifecycle past the cluster's abandon age to failed, unrecoverably. That age is measured from the sandbox's own last lifecycle change, not from the drain, so a resident already wedged longer than it is flipped on the first tick after the write — escalating a long-parked gentle drain has no grace period. Read both node_drain.sandboxes_remaining and node_drain.drain_blockers first: neither is a superset of what the sweep destroys (they differ in both the lifecycles and the node-pinning column they count), so two zeros is the only reassuring answer. A v2 drain takes no mode: mode forced on it is refused (400); drain with hold_seconds 0 to suspend its running sandboxes at once."
+                                        },
+                                        "engine": {
+                                            "type": "string",
+                                            "enum": ["v1", "v2"],
+                                            "description": "The drain engine. Omitted, a new drain runs on v1 and a drain in flight keeps its engine; naming another engine than the one in flight is a 409. While SPACE_DRAIN_V2_ENABLED is on, v1 and v2 drains never run together: every v1 :drain, one that names engine v1 or names none and doesn't repeat a v2 drain in flight, is refused with a 409 (code drain_v1_refused_while_v2_enabled); :undrain and :terminate are not. v2 seals the node and lets it make its residents durable itself. It needs SPACE_DRAIN_V2_ENABLED (400 when off), a Kubernetes worker node with its EC2 instance recorded (409), a node whose heartbeat is fresh (409, code drain_v2_node_heartbeat_stale), a node that holds no stopped sandbox, which a v2 drain doesn't move (409, code drain_v2_stopped_sandboxes, with the count: delete them, or start them, then drain again; the start asks the node's own preview which sandboxes it holds, and starts the drain unchecked when the preview can't be read), and one of the cluster's evacuation slots, SPACE_DRAIN_V2_MAX_EVACUATING_NODES of them (409, code drain_v2_evacuation_cap, with Retry-After). A v2 drain holds its slot for the whole drain, its hold included, until it reaches drained or its undrain's cancel finishes on the node; to free one, shorten a drain in flight with hold_seconds 0 or undrain one. A node whose heartbeat is stale is refused with Retry-After 60, and a node whose previous v2 drain's undrain is still finishing with a 409."
+                                        },
+                                        "hold_seconds": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 31536000,
+                                            "description": "How long a v2 drain keeps running sandboxes running, in seconds from its start, at most a year; 0 for none. Required to start a v2 drain; there is no default. Its deadline, drain_started_at plus hold_seconds, is stored as drain_status.deadline_at in Unix seconds. On a v2 drain in flight a shorter hold moves the deadline earlier, the same one changes nothing, and a longer one is a 409. Refused (400) on any other drain."
                                         },
                                         "replace_after_terminate": {
                                             "type": "boolean",
@@ -138,7 +149,8 @@ fn admin_openapi_value() -> Value {
                     },
                     "responses": {
                         "200": { "description": "Drain accepted, escalated in place, or already in the requested mode" },
-                        "409": { "description": "Node transition conflict: the node's drain_phase does not accept :drain, the request asked to downgrade an in-flight forced drain to gentle, it carried a replace_after_terminate disagreeing with the drain already in flight, or it set require_undrained and the node already has a drain phase" },
+                        "409": { "description": "Node transition conflict: the node's drain_phase does not accept :drain, the request asked to downgrade an in-flight forced drain to gentle, it carried a replace_after_terminate disagreeing with the drain already in flight, or it set require_undrained and the node already has a drain phase. A v1 drain (one that doesn't run v2) while SPACE_DRAIN_V2_ENABLED is on (code drain_v1_refused_while_v2_enabled). For engine v2: an engine other than the drain in flight's, a previous v2 drain whose undrain is still finishing on the node (under any engine), a node not managed by Kubernetes, not a worker (a builder's node-api serves no DrainNode) or without its EC2 instance recorded, a start whose node's previous v2 drain finished cancelling while it waited (with Retry-After; retry), a hold_seconds longer than the v2 drain in flight's, a node whose heartbeat is stale (code drain_v2_node_heartbeat_stale, with Retry-After 60), a node that holds stopped sandboxes by its own preview (code drain_v2_stopped_sandboxes, with stopped and stopped_sandbox_ids), or every evacuation slot held (code drain_v2_evacuation_cap, with Retry-After, evacuating and max_evacuating)" },
+                        "400": { "description": "An invalid drain request: engine v2 while SPACE_DRAIN_V2_ENABLED is off, a v2 drain started without hold_seconds, a hold_seconds over 31536000 or on any drain but a v2 one, or mode forced on a v2 drain" },
                         "501": { "description": "Not available on the active substrate" }
                     }
                 }
@@ -146,6 +158,7 @@ fn admin_openapi_value() -> Value {
             "/nodes/{node_id}:undrain": {
                 "post": {
                     "summary": "Cancel a draining or drained node state",
+                    "description": "Under a v2 drain the phase clears at once and the drain's engine stays until the cluster controller has cancelled the drain on the node, which unseals it and hands nothing back: a sandbox the drain suspended stays suspended until a call wakes it. The node stays cordoned until then. A v2 node in terminating may be undrained until its instance is fenced for termination, a 409 after.",
                     "parameters": [
                         { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
                     ],
@@ -158,6 +171,7 @@ fn admin_openapi_value() -> Value {
             "/nodes/{node_id}:terminate": {
                 "post": {
                     "summary": "Terminate a fully drained node",
+                    "description": "A v2 node moves from drained to terminating without asking the node; any other phase is a 409. The cluster controller's terminating tick then makes one fresh DrainNode call and fences the instance only if its report lists nothing pending or blocked and nothing names the node (no sandbox row outside failed and deleted, active or target, and no active execution); otherwise it returns the node to drained with why in drain_last_error, and the operator retries.",
                     "parameters": [
                         { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
                     ],
@@ -552,6 +566,27 @@ fn insert_node_maintenance_paths(paths: &mut Map<String, Value>) {
                 "responses": {
                     "200": { "description": "Node health" },
                     "404": { "description": "Node not found" }
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/nodes/{node_id}/drain-v2-preview".to_string(),
+        json!({
+            "get": {
+                "summary": "Preview what an evacuating v2 drain would find on one unsealed worker node now, changing nothing on it",
+                "parameters": [
+                    { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+                ],
+                "description": "It reports what a v2 drain evacuating now would find on this node: before its deadline a drain holds each running sandbox it could suspend, pending with the wait hold, whatever this preview lists for it. What the admin API would refuse a v2 drain of the node for (a node not managed by Kubernetes, or one without a recorded EC2 instance) is reported as node-level blockers, every refusal, where :drain answers with the first; when the node can't answer, the error lists them as refusals. Unlike a drain call, the preview doesn't read node-manager's orphan inventory (untracked runtime processes, orphan cache and run directories), so a drain may find more node-wide blockers. A node with a v2 drain recorded, a cancel pending included, isn't previewed. Once the caller is authorized, the request is bounded at 60 s, its database reads and the node call together.",
+                "responses": {
+                    "200": { "description": "What a drain would report: evacuated, pending (each sandbox's wait, whether it is running and whether a warm-pool member, and the node's reason) and blocked" },
+                    "409": { "description": "A v2 drain of the node is recorded (reason drain_v2_in_progress), or the node is sealed with no v2 drain recorded, an orphaned seal (reason orphaned_seal). With SPACE_DRAIN_V2_ENABLED on and no refusals listed, a :drain {engine: v2, hold_seconds} then :undrain heals it: the cluster controller's v2 loop finishes the undrain's cancel on the node. Otherwise send the node a DrainNode cancel under the generation it is sealed under (docs/troubleshooting.md)." },
+                    "400": { "description": "Not a worker node" },
+                    "404": { "description": "Node not found" },
+                    "501": { "description": "The node's sandbox-manager or node-api predates drain previews (reason node_version_unsupported); refusals lists what :drain would refuse the node for" },
+                    "502": { "description": "The node can't be reached or didn't answer within the bound (reason node_unreachable), or failed the preview (node_preview_failed); refusals lists what :drain would refuse the node for" },
+                    "503": { "description": "Another preview is in progress on the node (reason node_busy, with Retry-After): retry. Or the admin API's database ended or lost a read. With reason database_timeout, a read of the node's rows timed out, by the 60 s bound or, first under the defaults, by the database's own bounds (the pool's acquire timeout, statement_timeout or a cancel, or lock_timeout); the error names the read. Without a reason, a read lost a serialization, deadlock or lock race; retry." }
                 }
             }
         }),
