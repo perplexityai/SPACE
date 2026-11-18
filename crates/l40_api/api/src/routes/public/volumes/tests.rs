@@ -161,6 +161,18 @@ async fn independent_create_replay_listing_and_delete_survive_without_a_sandbox(
             .0,
         StatusCode::NOT_FOUND
     );
+    assert_eq!(
+        call_with_body(
+            &app,
+            "PATCH",
+            &foreign_path,
+            Some("foreign-grow"),
+            Some(json!({"size_gib":256}))
+        )
+        .await?
+        .0,
+        StatusCode::NOT_FOUND
+    );
     let (_, page) = call(&app, "GET", "/v1/volumes", None).await?;
     assert_eq!(page["volumes"].as_array().unwrap().len(), 1);
     assert_eq!(page["volumes"][0]["volume_id"], resource.id.to_string());
@@ -179,6 +191,89 @@ async fn independent_create_replay_listing_and_delete_survive_without_a_sandbox(
             None
         )
         .await?
+    );
+    let growth = call_with_body(
+        &app,
+        "PATCH",
+        &path,
+        Some("grow-independent"),
+        Some(json!({"size_gib":256})),
+    )
+    .await?;
+    assert_eq!(growth.0, StatusCode::ACCEPTED, "{growth:?}");
+    let growth: PublicOperationRecord = serde_json::from_value(growth.1)?;
+    let replay = call_with_body(
+        &app,
+        "PATCH",
+        &path,
+        Some("grow-independent"),
+        Some(json!({"size_gib":256})),
+    )
+    .await?;
+    assert_eq!(
+        serde_json::from_value::<PublicOperationRecord>(replay.1)?.id,
+        growth.id
+    );
+    assert_eq!(
+        call_with_body(
+            &app,
+            "PATCH",
+            &path,
+            Some("grow-independent"),
+            Some(json!({"size_gib":128}))
+        )
+        .await?
+        .0,
+        StatusCode::CONFLICT
+    );
+    let (_, growing) = call(&app, "GET", &path, None).await?;
+    assert_eq!(growing["size_gib"], 128);
+    assert_eq!(growing["target_size_gib"], 256);
+    assert_eq!(
+        call(&app, "DELETE", &path, Some("delete-during-growth"))
+            .await?
+            .0,
+        StatusCode::CONFLICT
+    );
+    let growth_claim = operations
+        .claim_operations(ClaimPublicOperations {
+            limits: ClaimLimits::any(1),
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::ResizeVolume],
+        })
+        .await?;
+    let growth_operation = &growth_claim.operations[0];
+    assert_eq!(growth_operation.id, growth.id);
+    assert_eq!(
+        crate::block_volumes::observe_operation(&db.pool, growth_operation)
+            .await
+            .state,
+        OperationState::Queued
+    );
+    let pending = store::resource::get(&db.pool, org, resource.id)
+        .await?
+        .unwrap();
+    assert!(store::resource::complete_growth(&db.pool, &pending).await?);
+    assert_eq!(
+        crate::block_volumes::observe_operation(&db.pool, growth_operation)
+            .await
+            .state,
+        OperationState::Succeeded
+    );
+    let (_, grown) = call(&app, "GET", &path, None).await?;
+    assert_eq!(grown["size_gib"], 256);
+    assert!(grown.get("target_size_gib").is_none());
+    assert_eq!(
+        call_with_body(
+            &app,
+            "PATCH",
+            &path,
+            Some("shrink"),
+            Some(json!({"size_gib":128}))
+        )
+        .await?
+        .0,
+        StatusCode::BAD_REQUEST
     );
     let deleted = call(&app, "DELETE", &path, Some("delete-independent")).await?;
     assert_eq!(deleted.0, StatusCode::ACCEPTED, "{deleted:?}");

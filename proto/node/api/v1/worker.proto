@@ -41,6 +41,7 @@ service WorkerApi {
 
   rpc SandboxStats(space.sandbox.manager.v1.StatsRequest) returns (space.sandbox.manager.v1.StatsResponse);
   rpc UpdateSandbox(space.sandbox.manager.v1.UpdateRequest) returns (space.sandbox.manager.v1.UpdateResponse);
+  rpc GrowSandboxBlockVolume(space.sandbox.manager.v1.GrowBlockVolumeRequest) returns (space.sandbox.manager.v1.GrowBlockVolumeResponse);
   rpc SetSandboxAutoLifecyclePolicy(space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest) returns (space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse);
   rpc TouchSandboxAutoLifecycle(space.sandbox.manager.v1.TouchAutoLifecycleRequest) returns (space.sandbox.manager.v1.TouchAutoLifecycleResponse);
   rpc SetSandboxNetworkPolicy(space.sandbox.manager.v1.SetNetworkPolicyRequest) returns (space.sandbox.manager.v1.SetNetworkPolicyResponse);

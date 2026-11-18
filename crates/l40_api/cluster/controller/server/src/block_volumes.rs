@@ -143,7 +143,7 @@ fn matches_resource(policy: &Policy, row: &BlockVolume, volume: &Volume) -> bool
         && volume.availability_zone == policy.availability_zone
         && volume.encrypted
         && volume.volume_type == "gp3"
-        && volume.size_gib == 128
+        && (volume.size_gib == 128 || (row.retained && volume.size_gib == 256))
         && u32::from(row.mount_spec.size_gib) == volume.size_gib
         && ownership
             .iter()
@@ -173,7 +173,8 @@ fn plan(
     cloud: Option<&Volume>,
 ) -> Result<Action, ReconcileError> {
     if row.availability_zone != policy.availability_zone
-        || u32::from(row.mount_spec.size_gib) != 128
+        || !(u32::from(row.mount_spec.size_gib) == 128
+            || (row.retained && u32::from(row.mount_spec.size_gib) == 256))
     {
         return Err(ReconcileError::Refused(
             "resource is outside the experiment envelope",
@@ -328,6 +329,34 @@ async fn tick<T: QueryTransport>(
         } else {
             candidates.first().copied()
         };
+        if let Some(resource) = store::resource::get(&mut *tx, row.org_id, row.id).await?
+            && resource.target_size_gib.is_some()
+        {
+            let disk = cloud.ok_or(ReconcileError::Refused("growing cloud disk missing"))?;
+            if !matches!(disk.size_gib, 128 | 256) {
+                return Err(ReconcileError::Refused("unexpected growing disk capacity"));
+            }
+            // Validate the normal identity and exact owner/attachment checks
+            // against either admitted geometry. Usable geometry stays unchanged.
+            let mut observed_geometry = row.clone();
+            observed_geometry.mount_spec.size_gib = disk
+                .size_gib
+                .try_into()
+                .map_err(|_| ReconcileError::Refused("invalid growing disk capacity"))?;
+            if plan(policy, &observed_geometry, Some(disk))? != Action::Wait {
+                return Err(ReconcileError::Refused("growth attachment is not stable"));
+            }
+            if independent::growth::reconcile(client, &resource, disk).await?
+                && !resource.backing_growth_ready
+            {
+                if !store::resource::mark_backing_growth_ready(&mut *tx, &resource).await? {
+                    return Err(ReconcileError::Refused("growth intent changed"));
+                }
+            } else {
+                store::observe(&mut *tx, &row, row.phase, None, None).await?;
+            }
+            return Ok(());
+        }
         match plan(policy, &row, cloud)? {
             Action::Wait => {
                 store::observe(

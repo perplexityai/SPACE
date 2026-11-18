@@ -1141,6 +1141,27 @@ impl VolumeManager for VolumeManagerService {
             .await
     }
 
+    async fn reconcile_block_volume_growth(
+        &self,
+        request: Request<pplx_space_node_api_client::proto::ReconcileBlockVolumeGrowthRequest>,
+    ) -> Result<
+        Response<pplx_space_node_api_client::proto::ReconcileBlockVolumeGrowthResponse>,
+        Status,
+    > {
+        let mut client = self.block_client(
+            &request,
+            request
+                .get_ref()
+                .fence
+                .as_ref()
+                .and_then(|f| f.execution.as_ref()),
+            "reconcile_block_volume_growth",
+        )?;
+        client
+            .reconcile_block_volume_growth(request.into_inner())
+            .await
+    }
+
     async fn release_block_volume_binding(
         &self,
         request: Request<pplx_space_node_api_client::proto::ReleaseBlockVolumeBindingRequest>,

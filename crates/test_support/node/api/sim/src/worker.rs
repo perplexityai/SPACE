@@ -450,6 +450,13 @@ impl SimWorkerApiService {
 
 #[tonic::async_trait]
 impl WorkerApi for SimWorkerApiService {
+    async fn grow_sandbox_block_volume(
+        &self,
+        _request: Request<pplx_space_sbx_mgr_client::proto::GrowBlockVolumeRequest>,
+    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::GrowBlockVolumeResponse>, Status> {
+        unimplemented()
+    }
+
     type SpacedListStream = BoxStream<sbx::SpacedFileInfo>;
     type SpacedReadStream = BoxStream<sbx::SpacedFileChunk>;
     type SpacedWatchStream = BoxStream<sbx::SpacedFileEvent>;

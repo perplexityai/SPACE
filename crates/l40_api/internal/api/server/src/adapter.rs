@@ -148,6 +148,12 @@ impl ClusterApiService {
 
 #[tonic::async_trait]
 impl ClusterApi for ClusterApiService {
+    async fn reconcile_block_volume_growth(
+        &self,
+        request: Request<crate::proto::ReconcileBlockVolumeGrowthRequest>,
+    ) -> Result<Response<crate::proto::ReconcileBlockVolumeGrowthResponse>, Status> {
+        ClusterApiService::reconcile_block_volume_growth(self, request).await
+    }
     async fn resolve_block_volume_binding(
         &self,
         request: Request<crate::proto::ResolveBlockVolumeBindingRequest>,

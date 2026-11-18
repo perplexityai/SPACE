@@ -7,6 +7,7 @@ use axum::{
 };
 use pplx_space_public_api::{
     CreateVolumeRequest, OperationKind, OperationTargetType, PublicOperationRecord, PublicVolume,
+    ResizeVolumeRequest,
 };
 use pplx_space_sandbox_store::block_volume as store;
 use sha2::{Digest, Sha256};
@@ -39,6 +40,119 @@ pub(super) async fn get(
         .map_err(database_error)?
         .ok_or_else(|| PublicApiError::not_found("volume not found"))?;
     Ok(Json(crate::block_volumes::public_volume(row)))
+}
+
+pub(super) async fn resize(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    owner: Option<Extension<AuthFederatedOwner>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<ResizeVolumeRequest>,
+) -> Result<(StatusCode, Json<PublicOperationRecord>), PublicApiError> {
+    if owner.is_some() {
+        return Err(PublicApiError::forbidden(
+            "federated independent volumes are unsupported",
+        ));
+    }
+    let admission = crate::block_volumes::independent_admission(
+        &pplx_space_env_vars::ProcessEnvironment,
+        org.id,
+        org.byok_enabled,
+    )
+    .map_err(super::sandboxes::controller_error)?;
+    let target_size = i32::try_from(request.size_gib.get())
+        .map_err(|_| PublicApiError::bad_request("volume size is outside the supported range"))?;
+    if !matches!(target_size, 128 | 256) {
+        return Err(PublicApiError::bad_request(
+            "volume growth currently supports 128 to 256 GiB",
+        ));
+    }
+    let key = idempotency_key(&headers)?;
+    let payload = serde_json::to_value(&request).map_err(|_| PublicApiError::internal())?;
+    let fingerprint =
+        pplx_space_public_api::RequestFingerprint::parse(hex::encode(Sha256::digest(
+            serde_json::to_vec(&serde_json::json!({
+                "volume_id": id, "request": payload,
+            }))
+            .map_err(|_| PublicApiError::internal())?,
+        )))
+        .map_err(|_| PublicApiError::internal())?;
+    let target = id.to_string();
+    let mut tx = state.pool.begin().await.map_err(database_error)?;
+    let (created, _) = create_operation_tx(
+        &mut tx,
+        CreatePublicOperation {
+            org_id: org.id,
+            actor_user_id: Some(actor.id),
+            api_product: ApiProduct::Native,
+            kind: OperationKind::ResizeVolume,
+            target_type: Some(OperationTargetType::Volume),
+            target_id: Some(&target),
+            payload_json: payload,
+            idempotency: Some(CreatePublicOperationIdempotency {
+                method: HttpOperationMethod::Patch,
+                path_template: OperationPathTemplate::new("/v1/volumes/{volume_id}"),
+                key: &key,
+                request_fingerprint: &fingerprint,
+            }),
+            traceparent: request_traceparent(),
+        },
+    )
+    .await?;
+    let operation = match created {
+        CreatePublicOperationResult::Created(operation) => {
+            let row = store::resource::get(&mut *tx, org.id, id)
+                .await
+                .map_err(database_error)?
+                .ok_or_else(|| PublicApiError::not_found("volume not found"))?;
+            if !row.retained || target_size < row.size_gib {
+                return Err(PublicApiError::bad_request(
+                    "only grow-only independent volume resizing is supported",
+                ));
+            }
+            let unchanged = target_size == row.size_gib
+                && row.target_size_gib.is_none()
+                && !row.delete_requested
+                && row.phase != store::VolumePhase::Deleted;
+            if !unchanged
+                && !store::resource::request_growth(
+                    &mut tx,
+                    org.id,
+                    id,
+                    target_size,
+                    operation.as_uuid(),
+                    &admission
+                        .qualified_growth_guest_images
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                )
+                .await
+                .map_err(database_error)?
+            {
+                return Err(PublicApiError::conflict_with_reason(
+                    "growth requires a fresh unreserved volume or a running read-write owner with no checkpoint or pending mutation",
+                    "volume_resize_not_ready",
+                ));
+            }
+            operation
+        }
+        CreatePublicOperationResult::Existing(operation) => operation,
+        CreatePublicOperationResult::IdempotencyConflict { .. } => {
+            return Err(PublicApiError::idempotency_conflict(
+                "idempotency key conflicts",
+            ));
+        }
+        CreatePublicOperationResult::AdmissionDenied => return Err(PublicApiError::internal()),
+    };
+    tx.commit().await.map_err(database_error)?;
+    let record = PublicOperationStore::new(state.pool)
+        .fetch_operation(org.id, operation)
+        .await?
+        .ok_or_else(PublicApiError::internal)?;
+    Ok((StatusCode::ACCEPTED, Json(record)))
 }
 
 pub(super) async fn delete(

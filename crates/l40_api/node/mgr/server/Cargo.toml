@@ -73,6 +73,7 @@ pplx-space-credmgr-client = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
+pplx-space-spaced-host-client = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }

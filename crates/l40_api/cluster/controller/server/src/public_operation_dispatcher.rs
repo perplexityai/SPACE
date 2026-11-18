@@ -212,6 +212,7 @@ pub trait PublicOperationExecutor: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct NativePublicOperationExecutor {
     volume_pool: PgPool,
+    volume_substrate: Substrate,
     /// The cluster activation limiter the executors below admit through. Held
     /// only so the caller has a limiter to start a liveness heartbeat from
     /// without constructing a second one (which would build a second, lazy
@@ -274,6 +275,7 @@ impl NativePublicOperationExecutor {
                 .with_egress_profiles(egress_profiles);
         Self {
             volume_pool: pool.clone(),
+            volume_substrate: substrate.clone(),
             cluster_admission,
             create_sandbox: CreateSandboxOperationExecutor::new(pool.clone(), controller.clone()),
             update_sandbox: UpdateSandboxOperationExecutor::new(pool.clone(), controller.clone()),
@@ -314,6 +316,7 @@ const NATIVE_PUBLIC_OPERATION_KINDS: &[OperationKind] = &[
     OperationKind::DeleteTemplate,
     OperationKind::DeleteVolume,
     OperationKind::CreateVolume,
+    OperationKind::ResizeVolume,
     OperationKind::ForkSandbox,
 ];
 
@@ -332,7 +335,17 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
             OperationKind::CreateSandbox => self.create_sandbox.execute(&operation).await.into(),
             OperationKind::UpdateSandbox => self.update_sandbox.execute(&operation).await.into(),
             OperationKind::DeleteTemplate => self.delete_template.execute(&operation).await.into(),
-            OperationKind::DeleteVolume | OperationKind::CreateVolume => {
+            OperationKind::DeleteVolume
+            | OperationKind::CreateVolume
+            | OperationKind::ResizeVolume => {
+                if operation.kind == OperationKind::ResizeVolume {
+                    pplx_space_api::block_volumes::reconcile_online_growth(
+                        &self.volume_pool,
+                        &self.volume_substrate,
+                        &operation,
+                    )
+                    .await;
+                }
                 pplx_space_api::block_volumes::observe_operation(&self.volume_pool, &operation)
                     .await
                     .into()

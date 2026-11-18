@@ -4022,7 +4022,9 @@ impl TryFrom<PublicOperationRow> for PublicOperationRecord {
                 .filter(|value| {
                     !(matches!(
                         kind,
-                        OperationKind::CreateVolume | OperationKind::DeleteVolume
+                        OperationKind::CreateVolume
+                            | OperationKind::DeleteVolume
+                            | OperationKind::ResizeVolume
                     ) && value.0.as_object().is_some_and(|object| object.is_empty()))
                 })
                 .map(|value| serde_json::from_value::<PublicOperationResult>(value.0))

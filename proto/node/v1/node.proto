@@ -7,6 +7,7 @@ service NodeManager {
   // Resolve and initialize only the control-plane-owned disk for this fenced
   // execution. No host device path is accepted.
   rpc PrepareBlockVolume(PrepareBlockVolumeRequest) returns (PrepareBlockVolumeResponse);
+  rpc GrowBlockVolume(GrowBlockVolumeRequest) returns (PrepareBlockVolumeResponse);
   rpc ActivateBlockVolume(ActivateBlockVolumeRequest) returns (PrepareBlockVolumeResponse);
   rpc PublishBlockVolumeCheckpoint(PublishBlockVolumeCheckpointRequest) returns (PrepareBlockVolumeResponse);
   // Request ACPI shutdown of the fenced execution; acknowledgement is not proof of exit.
@@ -712,6 +713,11 @@ message LaunchSandboxRequest {
 message PrepareBlockVolumeRequest {
   ExecutionFence execution_fence = 1;
   space.execution.v1.BlockVolumeExecution execution = 2;
+}
+message GrowBlockVolumeRequest {
+  ExecutionFence execution_fence = 1;
+  string sandbox_id = 2;
+  string operation_id = 3;
 }
 message PrepareBlockVolumeResponse {
   optional space.execution.v1.BlockVolumeBinding binding = 1;

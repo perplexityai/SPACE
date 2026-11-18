@@ -217,6 +217,7 @@ service ClusterApi {
   rpc CompleteBlockVolumeInitialization(CompleteBlockVolumeInitializationRequest) returns (BlockVolumeProgressResponse);
   rpc ActivateBlockVolume(ActivateBlockVolumeRequest) returns (BlockVolumeProgressResponse);
   rpc PublishBlockVolumeCheckpoint(PublishBlockVolumeCheckpointRequest) returns (BlockVolumeProgressResponse);
+  rpc ReconcileBlockVolumeGrowth(ReconcileBlockVolumeGrowthRequest) returns (ReconcileBlockVolumeGrowthResponse);
   rpc ReleaseBlockVolumeBinding(ReleaseBlockVolumeBindingRequest) returns (BlockVolumeProgressResponse);
 
   // BYOK volume encryption (per-sandbox DEK gate, KEK resolution, and wrap
@@ -226,6 +227,18 @@ service ClusterApi {
 }
 
 message ResolveBlockVolumeBindingRequest { space.execution.v1.BlockVolumeExecution execution = 1; }
+message ReconcileBlockVolumeGrowthRequest {
+  space.execution.v1.BlockVolumeFence fence = 1;
+  string operation_id = 2;
+  // Both zero means resolve only. Nonzero values acknowledge guest completion.
+  uint64 device_size_bytes = 3;
+  uint64 filesystem_size_bytes = 4;
+}
+message ReconcileBlockVolumeGrowthResponse {
+  uint32 size_gib = 1;
+  bool backing_ready = 2;
+  bool complete = 3;
+}
 message ResolveBlockVolumeBindingResponse { optional space.execution.v1.BlockVolumeBinding binding = 1; }
 message ClaimBlockVolumeInitializationRequest {
   space.execution.v1.BlockVolumeFence fence = 1;

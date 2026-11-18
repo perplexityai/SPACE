@@ -592,6 +592,7 @@ wire_enum_open_schema!(OperationKind, "operation kind", {
     DeleteTemplate => "delete_template",
     DeleteVolume => "delete_volume",
     CreateVolume => "create_volume",
+    ResizeVolume => "resize_volume",
     CreateSession => "create_session",
 });
 
@@ -1507,6 +1508,13 @@ pub struct CreateVolumeRequest {
     pub size_gib: pplx_space_execution_spec::BlockVolumeSizeGiB,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct ResizeVolumeRequest {
+    pub size_gib: pplx_space_execution_spec::BlockVolumeSizeGiB,
+}
+
 /// Organization-owned storage, optionally reserved by one sandbox.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
@@ -1516,6 +1524,8 @@ pub struct PublicVolume {
     #[cfg_attr(feature = "serde", serde(rename = "type"))]
     pub backend: pplx_space_execution_spec::BlockVolumeBackend,
     pub size_gib: u32,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub target_size_gib: Option<u32>,
     pub mount: Option<pplx_space_execution_spec::GuestBlockMountPath>,
     pub permissions: Option<pplx_space_execution_spec::BlockVolumePermissions>,
     pub retained: bool,

@@ -60,6 +60,52 @@ impl RetainedLiveDisk {
 }
 
 impl SandboxManagerService {
+    pub(super) async fn grow_block_volume_rpc(
+        &self,
+        request: Request<crate::proto::GrowBlockVolumeRequest>,
+    ) -> Result<Response<crate::proto::GrowBlockVolumeResponse>, Status> {
+        self.authorize_peer(&request, "GrowBlockVolume", ALLOW_SANDBOX_OPERATOR)?;
+        let req = request.into_inner();
+        let sandbox = self.lookup_sandbox(&req.sandbox_id)?;
+        if !self.retained_block_volumes {
+            return Err(Status::failed_precondition("retained disks are disabled"));
+        }
+        if self.shutdown_token.is_cancelled() {
+            return Err(Status::unavailable("sandbox manager is shutting down"));
+        }
+        let guard = self
+            .cleanup_lock(&sandbox.id)
+            .try_lock_owned()
+            .map_err(|_| Status::unavailable("sandbox lifecycle mutation is busy"))?;
+        let service = self.clone();
+        // Retain lifecycle ownership if the upstream request times out while
+        // resize2fs or a completion receipt is still in flight.
+        self.task_tracker
+            .spawn(async move {
+                let _guard = guard;
+                let sandbox = service.lookup_sandbox(&sandbox.id)?;
+                let mut node = service.node_manager.connect().await.map_err(|error| {
+                    Status::unavailable(format!("connect disk growth node: {error}"))
+                })?;
+                let result = node
+                    .grow_block_volume(pplx_space_node_mgr_client::proto::GrowBlockVolumeRequest {
+                        sandbox_id: sandbox.id.clone(),
+                        execution_fence: sandbox.node_execution_fence(),
+                        operation_id: req.operation_id,
+                    })
+                    .await?
+                    .into_inner();
+                let binding = result
+                    .binding
+                    .ok_or_else(|| Status::failed_precondition("growth binding disappeared"))?;
+                Ok(Response::new(crate::proto::GrowBlockVolumeResponse {
+                    size_gib: binding.size_gib,
+                }))
+            })
+            .await
+            .map_err(|error| Status::internal(format!("growth task: {error}")))?
+    }
+
     pub(super) fn has_retained_block(&self, id: &str) -> Result<bool, Status> {
         crate::db::read::sandbox_view(&*self.db_conn()?, id)
             .has_retained_block_volume()

@@ -45,6 +45,12 @@ async fn observe_rpc<T>(
 
 #[tonic::async_trait]
 impl NodeManager for NodeManagerService {
+    async fn grow_block_volume(
+        &self,
+        request: Request<crate::proto::GrowBlockVolumeRequest>,
+    ) -> Result<Response<crate::proto::PrepareBlockVolumeResponse>, Status> {
+        NodeManagerService::grow_block_volume(self, request).await
+    }
     async fn prepare_block_volume(
         &self,
         request: Request<crate::proto::PrepareBlockVolumeRequest>,

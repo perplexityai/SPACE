@@ -97,10 +97,35 @@ qualification cap. It accepts 1 or 2; omission preserves the older two-resource
 ceiling. Reservations count all non-deleted resources, including retained
 and cleanup-pending disks, rather than only currently attached disks.
 
-Dynamic grow-only resize is the next implementation gate, not an implemented
-PATCH endpoint in this checkpoint. Success must include running-guest device
-and ext4 growth, not only backing-volume expansion. Same-node/cross-node restore,
-live resize, retained reuse and paired NVMe/EBS fio require deployed proof.
+`PATCH /v1/volumes/{volume_id}` accepts `{"size_gib":256}` with the usual
+idempotency key and returns a durable resize operation. The bounded experiment
+supports a single 128→256-GiB growth of an independent volume that is either
+fresh and unbound, or mounted read-write by its current running execution.
+Shrinking, read-only mounts, suspended disks and runtime hotplug are rejected.
+Attached growth additionally requires the sandbox's immutable guest content hash
+in the admission policy's `qualified_growth_guest_images` array. Its default
+empty set rejects growth on older guests before any cloud mutation; qualifying
+mount support alone does not qualify online growth.
+This implementation still requires deployed qualification; its existence is not
+evidence of a successful running-guest resize.
+
+For a running sandbox, the controller observes the exact EBS modification and
+capacity before the node refreshes the existing Firecracker drive and requests
+guest ext4 growth. Advertised usable capacity remains 128 GiB until the current
+execution acknowledges completion. The node persists its new binding geometry
+before the authority atomically publishes 256 GiB and clears pending intent.
+An uncertain response retries the same operation rather than submitting a
+second cloud mutation.
+
+Pending growth excludes checkpoint publication, mount reassignment and explicit
+volume deletion. A database lifecycle barrier also prevents suspend, stop and
+sandbox deletion from overtaking accepted growth, including mixed-version
+writers. Those requests must retry after completion; resize does not pause
+workload execution. An unavailable worker can leave growth blocked and requires
+recovery rather than forced detach or an invented success receipt. Retain
+compatible controllers and node binaries while growth or grown resources exist.
+Same-node/cross-node restore, live resize, retained reuse and paired NVMe/EBS fio
+require deployed proof.
 
 Device preparation now checks capacity from the authenticated binding rather
 than assuming a fixed host-device size. A missing capacity on an older binding

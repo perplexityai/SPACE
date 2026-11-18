@@ -6879,6 +6879,7 @@ dependencies = [
  "pplx-space-observability",
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
+ "pplx-space-spaced-host-client",
  "pplx-space-sqlite",
  "pplx-space-test-env",
  "pplx-space-test-hooks",

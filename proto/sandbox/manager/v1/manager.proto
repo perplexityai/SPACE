@@ -219,6 +219,7 @@ service SandboxManager {
 
   // Update resource limits (cgroup) for a running sandbox.
   rpc Update(UpdateRequest) returns (UpdateResponse);
+  rpc GrowBlockVolume(GrowBlockVolumeRequest) returns (GrowBlockVolumeResponse);
 
   // Set or replace the resolved auto lifecycle policy for a sandbox.
   rpc SetAutoLifecyclePolicy(SetAutoLifecyclePolicyRequest) returns (SetAutoLifecyclePolicyResponse);
@@ -1671,6 +1672,12 @@ message StatsResponse {
   uint64 bytes_forwarded = 14;
   uint64 tcp_denied_connections = 15;
 }
+
+message GrowBlockVolumeRequest {
+  string sandbox_id = 1;
+  string operation_id = 2;
+}
+message GrowBlockVolumeResponse { uint32 size_gib = 1; }
 
 message UpdateRequest {
   string sandbox_id = 1;

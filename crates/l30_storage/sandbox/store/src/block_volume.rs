@@ -506,6 +506,7 @@ pub async fn publish_checkpoint(
          WHERE id = $1 AND execution_id = $2 AND attachment_epoch = $3
            AND disk_generation = $4 AND phase IN ('attached', 'releasing')
            AND initialization = 'ready' AND ever_exposed AND NOT delete_requested
+           AND target_size_gib IS NULL
            AND (checkpoint_id IS NULL OR checkpoint_id = $5)"
     ))
     .bind(volume_id)

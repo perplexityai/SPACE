@@ -3,6 +3,12 @@ use crate::proto::{CleanupTargetBatch, ScanCleanupTargetsRequest};
 
 #[tonic::async_trait]
 impl SandboxManager for SandboxManagerService {
+    async fn grow_block_volume(
+        &self,
+        request: Request<crate::proto::GrowBlockVolumeRequest>,
+    ) -> Result<Response<crate::proto::GrowBlockVolumeResponse>, Status> {
+        self.grow_block_volume_rpc(request).await
+    }
     async fn guest_update_status(
         &self,
         request: Request<crate::proto::GuestUpdateStatusRequest>,

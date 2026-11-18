@@ -90,6 +90,16 @@ impl Drop for KeptCallReport {
 }
 
 impl RuntimeClient {
+    pub async fn grow_block_volume(
+        &mut self,
+        request: pplx_space_sbx_mgr_client::proto::GrowBlockVolumeRequest,
+    ) -> Result<
+        tonic::Response<pplx_space_sbx_mgr_client::proto::GrowBlockVolumeResponse>,
+        tonic::Status,
+    > {
+        self.worker.grow_sandbox_block_volume(request).await
+    }
+
     /// A client on `channel`, which was dialed at `endpoint`.
     pub(super) fn new(channel: Channel, endpoint: impl Into<std::sync::Arc<str>>) -> Self {
         let transport = node_api_channel(channel.clone(), SpaceBearerToken::NodeApi);

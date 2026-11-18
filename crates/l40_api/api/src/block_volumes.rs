@@ -30,11 +30,76 @@ pub(crate) fn public_volume(
         backend: pplx_space_execution_spec::BlockVolumeBackend::Ebs,
         size_gib: u32::try_from(row.size_gib)
             .expect("database constraints require positive block-volume capacity"),
+        target_size_gib: row.target_size_gib.map(|size| {
+            u32::try_from(size).expect("database constraints require positive target capacity")
+        }),
         mount: row.mount_spec.as_ref().map(|mount| mount.mount.clone()),
         permissions: row.mount_spec.as_ref().map(|mount| mount.permissions),
         retained: row.retained,
         state,
         delete_requested: row.delete_requested,
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum OnlineGrowthError {
+    #[error("read pending volume growth: {0}")]
+    Store(#[from] sqlx::Error),
+    #[error("resolve running volume owner: {0}")]
+    Runtime(#[from] ControllerError),
+    #[error("grow running volume: {0}")]
+    Node(#[from] tonic::Status),
+    #[error("growth acknowledgement timed out: {0}")]
+    Timeout(#[from] tokio::time::error::Elapsed),
+}
+
+/// Cloud reconciliation and guest completion share the same durable operation.
+/// A timeout leaves the node-owned mutation running and is safe to observe again.
+pub async fn reconcile_online_growth(
+    pool: &sqlx::PgPool,
+    substrate: &crate::controllers::substrate::Substrate,
+    operation: &crate::public_operations::ClaimedPublicOperation,
+) {
+    use crate::controllers::substrate::SubstrateAdapter;
+    let result: Result<(), OnlineGrowthError> = async {
+        let Some(id) = operation
+            .target_id
+            .as_deref()
+            .and_then(|id| id.parse().ok())
+        else {
+            return Ok(());
+        };
+        let Some(row) =
+            pplx_space_sandbox_store::block_volume::resource::get(pool, operation.org_id, id)
+                .await?
+        else {
+            return Ok(());
+        };
+        if row.target_size_gib.is_none()
+            || !row.backing_growth_ready
+            || row.resize_operation_id != Some(operation.id.as_uuid())
+        {
+            return Ok(());
+        }
+        let Some(sandbox) = row.sandbox_id else {
+            return Ok(());
+        };
+        let Some(mut client) = substrate.probe_runtime_client(sandbox).await? else {
+            return Ok(());
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.grow_block_volume(pplx_space_sbx_mgr_client::proto::GrowBlockVolumeRequest {
+                sandbox_id: sandbox.to_string(),
+                operation_id: operation.id.as_uuid().to_string(),
+            }),
+        )
+        .await??;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, operation_id = %operation.id, "online disk growth awaits reconciliation");
     }
 }
 
@@ -66,7 +131,16 @@ pub async fn observe_operation(
                     store::VolumePhase::Requested | store::VolumePhase::Provisioning
                 ))
                 || (operation.kind == pplx_space_public_api::OperationKind::DeleteVolume
-                    && row.phase == store::VolumePhase::Deleted) =>
+                    && row.phase == store::VolumePhase::Deleted)
+                || (operation.kind == pplx_space_public_api::OperationKind::ResizeVolume
+                    && !row.delete_requested
+                    && row.phase != store::VolumePhase::Deleted
+                    && row.target_size_gib.is_none()
+                    && operation
+                        .payload
+                        .get("size_gib")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|requested| i64::from(row.size_gib) >= requested)) =>
         {
             Result {
                 state: OperationState::Succeeded,
@@ -83,7 +157,11 @@ pub async fn observe_operation(
         }
         Ok(Some(row))
             if row.delete_requested
-                || operation.kind == pplx_space_public_api::OperationKind::CreateVolume =>
+                || matches!(
+                    operation.kind,
+                    pplx_space_public_api::OperationKind::CreateVolume
+                        | pplx_space_public_api::OperationKind::ResizeVolume
+                ) =>
         {
             Result::workflow_progress(
                 "waiting for confirmed volume backing operation",
@@ -255,6 +333,8 @@ pub(crate) struct Admission {
     pub(crate) availability_zone: String,
     #[serde(default)]
     qualified_guest_images: BTreeMap<ContentHash, u32>,
+    #[serde(default)]
+    pub(crate) qualified_growth_guest_images: BTreeSet<ContentHash>,
 }
 
 fn default_resource_limit() -> u32 {
@@ -285,6 +365,27 @@ pub(crate) fn admit(
     runtime: RuntimeKind,
     byok: bool,
 ) -> Result<Option<Admission>, ControllerError> {
+    admit_capacity(env, mounts, org, runtime, byok, false)
+}
+
+pub(crate) fn admit_reference_mount(
+    env: &dyn pplx_space_env_vars::Environment,
+    mounts: &[BlockVolumeMount],
+    org: OrgId,
+    runtime: RuntimeKind,
+    byok: bool,
+) -> Result<Option<Admission>, ControllerError> {
+    admit_capacity(env, mounts, org, runtime, byok, true)
+}
+
+fn admit_capacity(
+    env: &dyn pplx_space_env_vars::Environment,
+    mounts: &[BlockVolumeMount],
+    org: OrgId,
+    runtime: RuntimeKind,
+    byok: bool,
+    referenced: bool,
+) -> Result<Option<Admission>, ControllerError> {
     if mounts.is_empty() {
         return Ok(None);
     }
@@ -293,7 +394,7 @@ pub(crate) fn admit(
             "the block-volume experiment permits one 128-GiB EBS disk",
         ));
     };
-    if u32::from(mount.size_gib) != 128 {
+    if u32::from(mount.size_gib) != 128 && !(referenced && u32::from(mount.size_gib) == 256) {
         return Err(ControllerError::bad_request(
             "the block-volume experiment permits one 128-GiB EBS disk",
         ));

@@ -20,7 +20,7 @@ const DEVICE: &str = "/dev/sdf";
 const VOLUME: &str = "vol-0123456789abcdef0";
 
 #[tokio::test]
-async fn independent_reconciler_recovers_lost_create_and_delete_receipts()
+async fn independent_reconciler_recovers_lost_create_growth_and_delete_receipts()
 -> pplx_space_test_env::TestResult {
     use axum::{Router, extract::State, http::StatusCode, routing::post};
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, pg_test_db};
@@ -31,6 +31,7 @@ async fn independent_reconciler_recovers_lost_create_and_delete_receipts()
         present: bool,
         create_calls: usize,
         delete_calls: usize,
+        modify_calls: usize,
         requests: Vec<BTreeMap<String, String>>,
         item: String,
     }
@@ -59,6 +60,22 @@ async fn independent_reconciler_recovers_lost_create_and_delete_receipts()
                 cloud.present = true;
                 // AWS performed the mutation, but the caller has no receipt.
                 (StatusCode::INTERNAL_SERVER_ERROR, "<Response><Errors><Error><Code>InternalError</Code><Message>lost receipt</Message></Error></Errors></Response>".into())
+            }
+            "DescribeVolumesModifications" => (
+                StatusCode::OK,
+                format!(
+                    "<DescribeVolumesModificationsResponse><volumeModificationSet>{}</volumeModificationSet></DescribeVolumesModificationsResponse>",
+                    if cloud.modify_calls > 0 {
+                        format!("<item><volumeId>{VOLUME}</volumeId><modificationState>optimizing</modificationState><originalSize>128</originalSize><targetSize>256</targetSize><originalVolumeType>gp3</originalVolumeType><targetVolumeType>gp3</targetVolumeType></item>")
+                    } else { String::new() },
+                ),
+            ),
+            "ModifyVolume" => {
+                cloud.modify_calls += 1;
+                cloud.item = cloud.item.replace("<size>128</size>", "<size>256</size>");
+                // Grow backing, but lose the receipt. The next tick must
+                // reconcile the exact modification rather than resubmit.
+                (StatusCode::INTERNAL_SERVER_ERROR, "<Response><Errors><Error><Code>InternalError</Code><Message>lost growth receipt</Message></Error></Errors></Response>".into())
             }
             "DeleteVolume" => {
                 cloud.delete_calls += 1;
@@ -137,6 +154,26 @@ async fn independent_reconciler_recovers_lost_create_and_delete_receipts()
     assert_eq!(available.phase, VolumePhase::Available);
     assert_eq!(available.aws_volume_id.as_deref(), Some(VOLUME));
     let mut tx = db.pool.begin().await?;
+    assert!(store::resource::request_growth(&mut tx, org, id, 256, Uuid::now_v7(), &[]).await?);
+    tx.commit().await?;
+    assert!(
+        independent::tick(&db.pool, &client, &policy, "test")
+            .await
+            .is_err()
+    );
+    let growing = store::resource::get(&db.pool, org, id).await?.unwrap();
+    assert_eq!(
+        (growing.size_gib, growing.target_size_gib),
+        (128, Some(256))
+    );
+    let mut tx = db.pool.begin().await?;
+    assert!(!store::resource::request_delete(&mut tx, org, id, Uuid::now_v7()).await?);
+    tx.rollback().await?;
+    independent::tick(&db.pool, &client, &policy, "test").await?;
+    let grown = store::resource::get(&db.pool, org, id).await?.unwrap();
+    assert_eq!((grown.size_gib, grown.target_size_gib), (256, None));
+    assert!(grown.resize_operation_id.is_some());
+    let mut tx = db.pool.begin().await?;
     assert!(store::resource::request_delete(&mut tx, org, id, Uuid::now_v7()).await?);
     tx.commit().await?;
     for _ in 0..2 {
@@ -155,6 +192,15 @@ async fn independent_reconciler_recovers_lost_create_and_delete_receipts()
     server.abort();
     let cloud = state.lock().unwrap();
     assert_eq!((cloud.create_calls, cloud.delete_calls), (1, 2));
+    assert_eq!(cloud.modify_calls, 1);
+    let modify = cloud
+        .requests
+        .iter()
+        .find(|request| request["Action"] == "ModifyVolume")
+        .unwrap();
+    assert_eq!(modify["VolumeId"], VOLUME);
+    assert_eq!(modify["Size"], "256");
+    assert!(!modify.contains_key("VolumeType") && !modify.contains_key("Iops"));
     let create = cloud
         .requests
         .iter()
@@ -428,6 +474,9 @@ fn independent_disks_reconcile_lost_receipts_but_refuse_foreign_identity_or_atta
         availability_zone: bound.availability_zone,
         aws_volume_id: None,
         size_gib: 128,
+        target_size_gib: None,
+        resize_operation_id: None,
+        backing_growth_ready: false,
         phase: VolumePhase::Requested,
         delete_requested: false,
         retained: true,

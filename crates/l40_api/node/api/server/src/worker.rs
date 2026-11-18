@@ -395,6 +395,7 @@ macro_rules! sandbox_scoped_requests {
 }
 
 sandbox_scoped_requests!(
+    pplx_space_sbx_mgr_client::proto::GrowBlockVolumeRequest,
     pplx_space_sbx_mgr_client::proto::StartRequest,
     pplx_space_sbx_mgr_client::proto::PauseRequest,
     pplx_space_sbx_mgr_client::proto::ResumeRequest,
@@ -733,6 +734,14 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::UpdateRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::UpdateResponse>, Status> {
         fwd_sbx!(self, "UpdateSandbox", update, r)
+    }
+
+    async fn grow_sandbox_block_volume(
+        &self,
+        r: Request<pplx_space_sbx_mgr_client::proto::GrowBlockVolumeRequest>,
+    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::GrowBlockVolumeResponse>, Status> {
+        require_policy_mutation_authority(&r)?;
+        fwd_sbx!(self, "GrowSandboxBlockVolume", grow_block_volume, r)
     }
 
     async fn set_sandbox_auto_lifecycle_policy(

@@ -144,6 +144,62 @@ impl Fence {
 }
 
 impl ClusterApiService {
+    pub(crate) async fn reconcile_block_volume_growth(
+        &self,
+        request: Request<ReconcileBlockVolumeGrowthRequest>,
+    ) -> Result<Response<ReconcileBlockVolumeGrowthResponse>, Status> {
+        let req = request.get_ref();
+        let fence = Fence::parse(req.fence.as_ref().ok_or_else(refused)?)?;
+        let operation: Uuid = req.operation_id.parse().map_err(invalid)?;
+        let (mut tx, bound) = self.lock_block_fence(&request, &fence).await?;
+        let mut resource = store::resource::get(&mut *tx, bound.org_id, fence.volume)
+            .await
+            .map_err(database)?
+            .ok_or_else(refused)?;
+        if resource.resize_operation_id != Some(operation)
+            || resource.delete_requested
+            || resource.phase != VolumePhase::Attached
+            || bound.mount_spec.permissions.is_read_only()
+        {
+            return Err(refused());
+        }
+        if req.device_size_bytes != 0 || req.filesystem_size_bytes != 0 {
+            const GIB: u64 = 1024 * 1024 * 1024;
+            if req.device_size_bytes != 256 * GIB
+                || req.filesystem_size_bytes <= 128 * GIB
+                || req.filesystem_size_bytes > req.device_size_bytes
+            {
+                return Err(Status::failed_precondition(
+                    "guest growth geometry is incomplete",
+                ));
+            }
+            if resource.target_size_gib.is_some() {
+                if !store::resource::complete_bound_growth(&mut *tx, &resource)
+                    .await
+                    .map_err(database)?
+                {
+                    return Err(refused());
+                }
+                resource = store::resource::get(&mut *tx, bound.org_id, fence.volume)
+                    .await
+                    .map_err(database)?
+                    .ok_or_else(refused)?;
+            }
+        }
+        let complete = resource.target_size_gib.is_none() && resource.size_gib == 256;
+        let response = ReconcileBlockVolumeGrowthResponse {
+            size_gib: resource
+                .target_size_gib
+                .unwrap_or(resource.size_gib)
+                .try_into()
+                .map_err(database)?,
+            backing_ready: resource.backing_growth_ready || complete,
+            complete,
+        };
+        tx.commit().await.map_err(database)?;
+        Ok(Response::new(response))
+    }
+
     async fn authenticate_block_origin<T>(
         &self,
         request: &Request<T>,

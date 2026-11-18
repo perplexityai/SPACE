@@ -1312,7 +1312,12 @@ impl SandboxController {
         let volume_mounts = reference_mount
             .as_ref()
             .map_or(req.volume_mounts.as_slice(), std::slice::from_ref);
-        let block_volume_admission = crate::block_volumes::admit(
+        let admit_volume = if reference_mount.is_some() {
+            crate::block_volumes::admit_reference_mount
+        } else {
+            crate::block_volumes::admit
+        };
+        let block_volume_admission = admit_volume(
             &pplx_space_env_vars::ProcessEnvironment,
             volume_mounts,
             create_owner.org_id,

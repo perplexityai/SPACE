@@ -3,12 +3,19 @@
 use super::*;
 use store::resource::{self, Resource};
 
+pub(super) mod growth;
+
 pub(super) fn plan(
     policy: &Policy,
     row: &Resource,
     cloud: Option<&Volume>,
 ) -> Result<Action, ReconcileError> {
-    if row.availability_zone != policy.availability_zone || row.size_gib != 128 {
+    if row.availability_zone != policy.availability_zone
+        || !matches!(row.size_gib, 128 | 256)
+        || row
+            .target_size_gib
+            .is_some_and(|target| row.size_gib != 128 || target != 256)
+    {
         return Err(ReconcileError::Refused(
             "resource is outside the experiment envelope",
         ));
@@ -32,7 +39,8 @@ pub(super) fn plan(
     if volume.availability_zone != row.availability_zone
         || !volume.encrypted
         || volume.volume_type != "gp3"
-        || volume.size_gib != 128
+        || (i64::from(volume.size_gib) != i64::from(row.size_gib)
+            && row.target_size_gib.map(i64::from) != Some(i64::from(volume.size_gib)))
         || volume.tags.get(LOGICAL_ID_TAG) != Some(&row.id.to_string())
         || volume.tags.get(RETAINED_TAG).map(String::as_str) != Some("true")
         || !policy
@@ -144,14 +152,26 @@ pub(super) async fn tick<T: QueryTransport>(
                 .await?;
             }
             Action::Observe(phase) => {
-                resource::observe(
-                    &mut *tx,
-                    &row,
-                    phase,
-                    cloud.map(|disk| disk.volume_id.as_str()),
-                    None,
-                )
-                .await?;
+                if row.target_size_gib.is_some() {
+                    let disk = cloud.ok_or(ReconcileError::Refused("growth disk is missing"))?;
+                    if phase != VolumePhase::Available || row.delete_requested {
+                        return Err(ReconcileError::Refused("growth disk is not available"));
+                    }
+                    if growth::reconcile(client, &row, disk).await? {
+                        resource::complete_growth(&mut *tx, &row).await?;
+                    } else {
+                        resource::observe(&mut *tx, &row, phase, None, None).await?;
+                    }
+                } else {
+                    resource::observe(
+                        &mut *tx,
+                        &row,
+                        phase,
+                        cloud.map(|disk| disk.volume_id.as_str()),
+                        None,
+                    )
+                    .await?;
+                }
             }
             Action::Delete => {
                 let disk = cloud.ok_or(ReconcileError::Refused("cloud disk missing"))?;

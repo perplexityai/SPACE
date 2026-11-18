@@ -23,6 +23,136 @@ async fn connect_volumes() -> Result<pplx_space_volmgr_client::ConnectedVolumeMa
 }
 
 impl NodeManagerService {
+    pub(super) async fn grow_block_volume(
+        &self,
+        request: Request<proto::GrowBlockVolumeRequest>,
+    ) -> Result<Response<proto::PrepareBlockVolumeResponse>, Status> {
+        self.authorize_peer(&request, "GrowBlockVolume", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
+        let sandbox =
+            super::trusted_paths::canonical_sandbox_id(&request.get_ref().sandbox_id)?.to_string();
+        let service = self.clone();
+        self.run_owned_device_operation(
+            &sandbox,
+            crate::lifecycle_limiter::LifecycleMethod::PrepareSandbox,
+            async move {
+                let req = request.into_inner();
+                let id = req.sandbox_id.as_str();
+                let local = service
+                    .check_execution(id, req.execution_fence.as_ref(), false)?
+                    .ok_or_else(refused)?;
+                let record = service
+                    .pool
+                    .retained_block_binding(id)
+                    .map_err(slot_store_status)?
+                    .ok_or_else(refused)?;
+                let mut binding = record.binding;
+                device::validate_binding(&binding)?;
+                if record.execution_id != local.current().to_string()
+                    || binding.read_only
+                    || !binding.initialization_ready
+                {
+                    return Err(refused());
+                }
+                let mut volumes = connect_volumes().await?;
+                let resolve = cluster::ReconcileBlockVolumeGrowthRequest {
+                    fence: binding.fence.clone(),
+                    operation_id: req.operation_id,
+                    device_size_bytes: 0,
+                    filesystem_size_bytes: 0,
+                };
+                let growth = volumes
+                    .reconcile_block_volume_growth(resolve.clone())
+                    .await?
+                    .into_inner();
+                if !growth.backing_ready || growth.size_gib != 256 {
+                    return Err(Status::unavailable("cloud disk growth is not ready"));
+                }
+                let mut grown = binding.clone();
+                grown.size_gib = growth.size_gib;
+                let verify = grown.clone();
+                let _pinned = service
+                    .off_runtime("verify grown retained device", move || {
+                        device::pin(
+                            &verify.aws_volume_id,
+                            verify.capacity().map_err(|_| refused())?,
+                        )
+                    })
+                    .await?;
+                if !growth.complete {
+                    let runtime = service
+                        .recorded_execution(id.to_owned())
+                        .await?
+                        .ok_or_else(refused)?;
+                    if runtime.runtime().kind != pplx_space_execution_spec::RuntimeKind::Firecracker
+                    {
+                        return Err(Status::failed_precondition(
+                            "unsupported online growth runtime",
+                        ));
+                    }
+                    let api = crate::fc_api::FcApiClient::new(format!(
+                        "{}/firecracker/{id}/root/firecracker.sock",
+                        super::JAIL_DIR,
+                    ));
+                    api.refresh_data_drive_capacity().await.map_err(|error| {
+                        Status::unavailable(format!("notify data drive growth: {error}"))
+                    })?;
+                    let config = pplx_space_spaced_host_client::SpacedHostClientConfig::default()
+                        .with_socket_path(pplx_space_host_layout::paths::spaced_host_socket(id));
+                    let guest =
+                        pplx_space_spaced_host_client::SpacedHostClient::new_with_config(config)
+                            .await
+                            .map_err(|error| {
+                                Status::unavailable(format!("connect growth guest: {error}"))
+                            })?;
+                    let observed = guest
+                        .grow_data_drive(
+                            pplx_space_spaced_host_client::proto::GrowDataDriveRequest {
+                                topology_version: binding.topology_version,
+                                mount: binding.mount.clone(),
+                                filesystem_uuid: binding.filesystem_uuid.clone(),
+                                size_gib: growth.size_gib,
+                            },
+                        )
+                        .await?;
+                    // Persist local geometry before releasing the central
+                    // checkpoint barrier. A lost central reply is reconciled
+                    // using the same operation, never the old device size.
+                    if !service
+                        .pool
+                        .save_retained_block_binding(id, &local.current().to_string(), &grown)
+                        .map_err(slot_store_status)?
+                    {
+                        return Err(refused());
+                    }
+                    let complete = volumes
+                        .reconcile_block_volume_growth(cluster::ReconcileBlockVolumeGrowthRequest {
+                            device_size_bytes: observed.device_size_bytes,
+                            filesystem_size_bytes: observed.filesystem_size_bytes,
+                            ..resolve
+                        })
+                        .await?
+                        .into_inner();
+                    if !complete.complete {
+                        return Err(refused());
+                    }
+                }
+                binding.size_gib = growth.size_gib;
+                if growth.complete
+                    && !service
+                        .pool
+                        .save_retained_block_binding(id, &local.current().to_string(), &binding)
+                        .map_err(slot_store_status)?
+                {
+                    return Err(refused());
+                }
+                Ok(Response::new(proto::PrepareBlockVolumeResponse {
+                    binding: Some(binding),
+                }))
+            },
+        )
+        .await
+    }
+
     /// Resume may follow a failed suspend publication. Withdraw that mutable
     /// checkpoint before making the still-attached VM writable again.
     pub(super) async fn invalidate_retained_checkpoint_before_resume(

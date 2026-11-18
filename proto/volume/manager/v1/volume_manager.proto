@@ -21,6 +21,8 @@ service VolumeManager {
         returns (space.node.api.v1.BlockVolumeProgressResponse);
     rpc PublishBlockVolumeCheckpoint(space.node.api.v1.PublishBlockVolumeCheckpointRequest)
         returns (space.node.api.v1.BlockVolumeProgressResponse);
+    rpc ReconcileBlockVolumeGrowth(space.node.api.v1.ReconcileBlockVolumeGrowthRequest)
+        returns (space.node.api.v1.ReconcileBlockVolumeGrowthResponse);
     rpc ReleaseBlockVolumeBinding(space.node.api.v1.ReleaseBlockVolumeBindingRequest)
         returns (space.node.api.v1.BlockVolumeProgressResponse);
 

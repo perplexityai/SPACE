@@ -252,6 +252,121 @@ async fn independent_reservation_survives_detach_and_releases_only_with_deleted_
 }
 
 #[tokio::test]
+async fn online_growth_holds_checkpoint_barrier_until_geometry_is_committed() -> TestResult {
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
+    let db = pg_test_db().await?;
+    let org = OrgId::from_uuid(SEED_ORG_ID);
+    let sandbox = SandboxId::new();
+    let volume = Uuid::now_v7();
+    let execution = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes
+         (id,user_id,org_id,lifecycle,network_policy_generation,active_node_id,content_hash)
+         VALUES ($1,$2,$3,'started',1,$4,'growth-qualified-guest')"
+    ))
+    .bind(sandbox)
+    .bind(SEED_USER_ID)
+    .bind(org)
+    .bind(NodeId::from_uuid(Uuid::from_u128(2)))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+         (sandbox_id,generation,pod_name,pod_namespace,state,active,route_activation_id)
+         VALUES ($1,1,'growth-test','test','running',TRUE,$2)"
+    ))
+    .bind(sandbox)
+    .bind(execution)
+    .execute(&db.pool)
+    .await?;
+    let mut tx = db.pool.begin().await?;
+    resource::reserve(
+        &mut tx,
+        resource::NewResource {
+            id: volume,
+            org_id: org,
+            managed_by: "test",
+            availability_zone: ZONE,
+            resource_limit: 1,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    let row = resource::get(&db.pool, org, volume).await?.unwrap();
+    assert!(resource::observe(&db.pool, &row, VolumePhase::Available, Some(CLOUD_ID), None).await?);
+    let mut tx = db.pool.begin().await?;
+    resource::bind(&mut tx, org, volume, sandbox, "test", ZONE, &mount_spec()).await?;
+    tx.commit().await?;
+    let bound = attach(&db.pool, sandbox, execution).await?;
+    let claim = Uuid::now_v7();
+    assert!(claim_initialization(&db.pool, volume, execution, 1, claim).await?);
+    assert!(
+        complete_initialization(&db.pool, volume, execution, 1, claim, bound.filesystem_uuid)
+            .await?
+    );
+    assert!(activate(&db.pool, volume, execution, 1, Uuid::now_v7(), None).await?);
+    let operation = Uuid::now_v7();
+    let mut tx = db.pool.begin().await?;
+    let guests = vec!["growth-qualified-guest".to_owned()];
+    assert!(
+        !resource::request_growth(&mut tx, OrgId::new(), volume, 256, operation, &guests).await?
+    );
+    assert!(!resource::request_growth(&mut tx, org, volume, 127, operation, &guests).await?);
+    assert!(!resource::request_growth(&mut tx, org, volume, 256, operation, &[]).await?);
+    assert!(resource::request_growth(&mut tx, org, volume, 256, operation, &guests).await?);
+    assert!(!resource::request_growth(&mut tx, org, volume, 256, Uuid::now_v7(), &guests).await?);
+    assert!(!resource::request_delete(&mut tx, org, volume, Uuid::now_v7()).await?);
+    tx.commit().await?;
+    let pending = resource::get(&db.pool, org, volume).await?.unwrap();
+    for statement in [
+        "UPDATE sandboxes SET lifecycle = 'suspending' WHERE id = $1",
+        "UPDATE sandboxes SET lifecycle = 'stopping' WHERE id = $1",
+        "DELETE FROM sandboxes WHERE id = $1",
+    ] {
+        let error = sqlx::query(statement)
+            .bind(sandbox)
+            .execute(&db.pool)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("55000"),
+        );
+    }
+    assert!(!resource::complete_growth(&db.pool, &pending).await?);
+    assert!(!resource::complete_bound_growth(&db.pool, &pending).await?);
+    let generation = get(&db.pool, sandbox).await?.unwrap().disk_generation;
+    assert!(!publish_checkpoint(&db.pool, volume, execution, 1, generation, Uuid::now_v7()).await?);
+    assert!(resource::mark_backing_growth_ready(&db.pool, &pending).await?);
+    assert!(!resource::complete_bound_growth(&db.pool, &pending).await?);
+    let ready = resource::get(&db.pool, org, volume).await?.unwrap();
+    assert_eq!(ready.size_gib, 128);
+    assert!(ready.backing_growth_ready);
+    assert!(resource::complete_bound_growth(&db.pool, &ready).await?);
+    assert!(!resource::complete_bound_growth(&db.pool, &ready).await?);
+    let complete = resource::get(&db.pool, org, volume).await?.unwrap();
+    assert_eq!(complete.size_gib, 256);
+    assert_eq!(complete.mount_spec.unwrap().size_gib.get(), 256);
+    assert_eq!(complete.target_size_gib, None);
+    assert_eq!(complete.resize_operation_id, Some(operation));
+    assert!(publish_checkpoint(&db.pool, volume, execution, 1, generation, Uuid::now_v7()).await?);
+    assert_eq!(
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'suspending' WHERE id = $1"
+        ))
+        .bind(sandbox)
+        .execute(&db.pool)
+        .await?
+        .rows_affected(),
+        1,
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn client_delete_requires_stopped_detached_checkpoint_free_owner_and_fences_attach()
 -> TestResult {
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};

@@ -194,7 +194,8 @@ pub(super) fn insert_sandbox_operation_paths(
                     "volume_id":{"type":"string","format":"uuid"},
                     "sandbox_id":{"type":["string","null"]},
                     "type":{"type":"string","enum":["ebs"]},
-                    "size_gib":{"type":"integer","minimum":128,"maximum":128},
+                    "size_gib":{"type":"integer","minimum":128,"maximum":256},
+                    "target_size_gib":{"type":"integer","minimum":128,"maximum":256},
                     "mount":{"type":["string","null"]},
                     "permissions":{"type":["string","null"],"enum":["read_write","read_only",null]},
                     "retained":{"type":"boolean"},
@@ -202,6 +203,26 @@ pub(super) fn insert_sandbox_operation_paths(
                     "delete_requested":{"type":"boolean"}
                 }
             }}}},"404":{"description":"Volume not found in the caller's owner scope"}}
+        }),
+    );
+    insert_public_route(
+        paths,
+        pplx_space_public_api::routes::RESIZE_VOLUME,
+        json!({
+            "summary":"Grow an independent volume",
+            "description":"Grow-only 128-to-256 GiB resize. Requires a fresh unreserved volume or a running read-write owner with no checkpoint. Attached growth completes only after backing capacity, VMM notification and guest filesystem expansion are confirmed. Pending growth blocks binding, deletion and checkpoint publication. Repeating the same completed absolute capacity is a no-op; shrinking is rejected.",
+            "parameters":[idempotency_key_parameter.clone()],
+            "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                "type":"object","additionalProperties":false,"required":["size_gib"],
+                "properties":{"size_gib":{"type":"integer","enum":[128,256]}}
+            }}}},
+            "responses":{
+                "202":{"description":"Growth operation","content":{"application/json":{"schema":{"$ref":"#/components/schemas/PublicOperationRecord"}}}},
+                "400":{"description":"Unsupported size, shrinking or admission disabled"},
+                "403":{"description":"Unsupported federated owner"},
+                "404":{"description":"Volume not found in the organization"},
+                "409":{"description":"Volume is reserved, initialized, deleting, already growing, or idempotency key conflicts"}
+            }
         }),
     );
     insert_public_route(
