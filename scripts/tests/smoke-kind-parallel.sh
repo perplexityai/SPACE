@@ -177,7 +177,7 @@ keep_failed_bench_logs() {
     result="$(cat "$dir/result" 2>/dev/null || echo unknown)"
     [[ "$result" == typed_exit_0 ]] && continue
     bench="$(kind_bench_dir "$i")"
-    mkdir -p "$dir/bench-logs"
+    mkdir -p "$dir/bench-logs" 2>/dev/null || continue
     cp -p "$bench"/home/.space-devbox/kind/*.log "$bench"/dockerd.log "$bench"/containerd.log \
       "$dir/bench-logs/" 2>/dev/null || true
   done
@@ -431,6 +431,9 @@ FINISHED=0
 on_exit() {
   local rc=$?
   trap - EXIT INT TERM
+  # Nothing in an exit handler may cut it short before the teardown; each step
+  # here tolerates its own failure.
+  set +e
   local pid
   # Only jobs still this shell's children: a finished one's PID may since
   # belong to anything.
@@ -813,7 +816,7 @@ await inventory || true
 FINISHED=1
 # Torn down before the summary, so its time is in it.
 if (( ! KEEP )); then
-  keep_failed_bench_logs
+  keep_failed_bench_logs || true
   phase run teardown teardown_all >"$OUT/teardown.log" 2>&1 || true
   rm -f "$HOST/shared-images.tar" "$HOST/rust/kind-rust.tar.gz"
   KEEP=2
