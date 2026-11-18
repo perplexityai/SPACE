@@ -350,7 +350,7 @@ sample_resources() {
   # The block device under $HOME, where the benches' data roots are: the
   # bring-ups were measured to be bound by its write throughput.
   local disk
-  disk="$(lsblk -no PKNAME "$(df --output=source "$KIND_BENCH_ROOT" | tail -n 1)" 2>/dev/null | head -n 1)"
+  disk="$(lsblk -no PKNAME "$(df --output=source "$KIND_BENCH_ROOT" | tail -n 1)" 2>/dev/null | head -n 1 || true)"
   [[ -n "$disk" ]] || disk="$(basename "$(df --output=source "$KIND_BENCH_ROOT" | tail -n 1)")"
   sectors() { awk -v d="$disk" '$3 == d {print $6, $10}' /proc/diskstats; }
   local prev cur cg bench_mem f prev_io cur_io

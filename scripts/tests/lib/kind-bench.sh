@@ -113,7 +113,7 @@ kind_bench_claim() {
   run="$(kind_bench_run_dir "$1")"
   for owned in "$dir" "$run"; do
     if [[ -e "$owned" ]] || sudo -n test -e "$owned"; then
-      kind_bench_log "bench $1: $owned exists and is not a bench's; remove it or choose another KIND_BENCH_ROOT"
+      kind_bench_log "bench $1: $owned exists and is not a bench's; remove it or choose another SPACE_KIND_BENCH_ROOT"
       return 1
     fi
   done

@@ -5,7 +5,8 @@
 # `smoke-kind-typed.sh all $SMOKE_SHARD`, its output kept in <log>.
 #
 # Usage: kind-parallel-typed.sh <log>
-# Exit status: smoke-kind-typed.sh's.
+# Exit status: smoke-kind-typed.sh's; 2 when no admin token can be had or the
+# data plane never answers, and a failed command's own status before that.
 # Env:   SMOKE_SHARD, SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE, SPACE_SMOKE_KIND_COLD_RECEIPTS
 set -euo pipefail
 
