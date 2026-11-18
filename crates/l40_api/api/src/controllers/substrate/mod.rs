@@ -748,8 +748,10 @@ pub enum SubstrateError {
     #[error("{message}")]
     Unsupported { message: String },
     /// A node that was already admin-terminated still appears in substrate
-    /// state and an upsert was attempted against it. Inventory callers
-    /// should skip; pod-placement callers should treat as a conflict.
+    /// state and an upsert was attempted against it, or a registration was
+    /// deferred, as a Node under a new UID that reports no instance yet for
+    /// a row whose v2 drain fenced its instance. Inventory callers should
+    /// skip; pod-placement callers should treat as a conflict.
     #[error("{message}")]
     NodeTombstoned { message: String },
     /// A marker-guarded evacuation restore claim

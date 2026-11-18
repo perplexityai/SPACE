@@ -36,6 +36,9 @@ pub enum K8sNodeRegistrationStep {
     UpsertNode,
     /// The ownership re-check after an upsert that returned no row.
     RecheckOwnership,
+    /// The check of a v2 drain's row before a new Node UID that reports no
+    /// instance takes it.
+    CheckUidChange,
     /// Clearing drain state when the Kubernetes Node UID changed.
     ClearDrain,
     /// The `node_k8s` upsert.
@@ -50,6 +53,7 @@ impl K8sNodeRegistrationStep {
             Self::CheckTombstone => "check tombstone",
             Self::UpsertNode => "upsert node",
             Self::RecheckOwnership => "re-check ownership",
+            Self::CheckUidChange => "check the v2 drain's Node UID",
             Self::ClearDrain => "clear drain state",
             Self::UpsertNodeK8s => "upsert node_k8s",
             Self::RecheckTombstone => "re-check tombstone",
@@ -77,6 +81,12 @@ pub enum K8sNodeRegistrationError {
     /// The node id belongs to a node another substrate manages.
     #[error("node id belongs to a non-Kubernetes node")]
     NotKubernetes,
+    /// A Node under a new UID that reports no instance would take the row of
+    /// a v2 drain. Deferred, as a tombstoned node is refused: the next
+    /// registration retries, once the Node reports its `providerID`, and
+    /// then keeps the drain for the same instance or clears it for another.
+    #[error("node has a v2 drain, and the Node under a new UID reports no instance yet")]
+    AwaitingInstance,
     #[error("Kubernetes node registration failed to {step}: {source}")]
     Query {
         step: K8sNodeRegistrationStep,
@@ -132,7 +142,10 @@ pub async fn register_k8s_node(
         return Err(K8sNodeRegistrationError::Tombstoned);
     }
 
-    let node_changed = sqlx::query_scalar::<_, bool>(sql!(
+    // Each row also says whether the node is a v2 drain's, which only such a
+    // row's fence check below needs: one more column of the row the
+    // statement already reads.
+    let upserted = sqlx::query_as::<_, (bool, bool)>(sql!(
         "WITH upsert AS (
                  INSERT INTO nodes (id, address, role, managed_by, state)
                  VALUES ($1, $2::INET, $3, $6, $4)
@@ -147,11 +160,12 @@ pub async fn register_k8s_node(
                      OR nodes.role IS DISTINCT FROM EXCLUDED.role
                      OR ($5 AND nodes.state IS DISTINCT FROM EXCLUDED.state)
                    )
-                 RETURNING TRUE AS changed
+                 RETURNING TRUE AS changed,
+                           COALESCE(nodes.drain_engine = 'v2', FALSE) AS v2
              )
-             SELECT changed FROM upsert
+             SELECT changed, v2 FROM upsert
              UNION ALL
-             SELECT FALSE FROM nodes
+             SELECT FALSE, COALESCE(drain_engine = 'v2', FALSE) FROM nodes
              WHERE id = $1
                AND managed_by = $6
                AND NOT EXISTS (SELECT 1 FROM upsert)"
@@ -166,8 +180,8 @@ pub async fn register_k8s_node(
     .await
     .step(K8sNodeRegistrationStep::UpsertNode)?;
 
-    let node_changed = match node_changed {
-        Some(changed) => changed,
+    let (node_changed, v2_drain) = match upserted {
+        Some(upserted) => upserted,
         None => {
             // The upsert returned no row. Under READ COMMITTED a
             // concurrent insert of this same node id can commit while our
@@ -180,24 +194,54 @@ pub async fn register_k8s_node(
             // returns nothing. Only a genuinely non-Kubernetes conflict
             // should abort the caller, so re-check node ownership with a
             // fresh statement snapshot before erroring.
-            let existing_is_k8s = sqlx::query_scalar::<_, bool>(sql!(
-                "SELECT TRUE FROM nodes WHERE id = $1 AND managed_by = $2"
+            let existing = sqlx::query_scalar::<_, bool>(sql!(
+                "SELECT COALESCE(drain_engine = 'v2', FALSE)
+                   FROM nodes WHERE id = $1 AND managed_by = $2"
             ))
             .bind(node_id)
             .bind(SubstrateKind::Kubernetes)
             .fetch_optional(&mut *conn)
             .await
-            .step(K8sNodeRegistrationStep::RecheckOwnership)?
-            .is_some();
+            .step(K8sNodeRegistrationStep::RecheckOwnership)?;
 
-            if !existing_is_k8s {
+            let Some(v2_drain) = existing else {
                 return Err(K8sNodeRegistrationError::NotKubernetes);
-            }
+            };
             // The node already exists as a Kubernetes row; the concurrent
             // writer established it and this upsert changed nothing.
-            false
+            (false, v2_drain)
         }
     };
+
+    // A v2 drain's node is its recorded instance: a Node under a new UID is
+    // that machine again only if it reports the same instance, and a
+    // replacement only if it reports another. One that reports none yet is
+    // deferred, under the row lock the upsert above took, so the next sync
+    // decides once the Node's `providerID` names its instance. A Node's
+    // `providerID` never changes once set, so without a UID change the
+    // instance can't change either. Only a v2 drain's row is checked, so no
+    // other row pays for it, and the check reads the registration's own
+    // columns, never the drain's status.
+    let awaiting_instance = instance_id.is_none()
+        && v2_drain
+        && sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM nodes n
+                   JOIN node_k8s k ON k.node_id = n.id
+                  WHERE n.id = $1
+                    AND n.drain_engine = 'v2'
+                    AND k.k8s_node_uid IS DISTINCT FROM $2
+             )"
+        ))
+        .bind(node_id)
+        .bind(node_uid)
+        .fetch_one(&mut *conn)
+        .await
+        .step(K8sNodeRegistrationStep::CheckUidChange)?;
+    if awaiting_instance {
+        return Err(K8sNodeRegistrationError::AwaitingInstance);
+    }
 
     // Detect same-name kube Node UID replacement BEFORE the upsert
     // below overwrites `node_k8s.k8s_node_uid`. If a replacement
@@ -214,21 +258,35 @@ pub async fn register_k8s_node(
     // set is worse than meaningless: the admin listing and `space-admin-cli get-node`
     // read the column independently of the phase, so a surviving mode makes
     // a node that is not draining report `drain_phase: null` next to
-    // `drain_mode: gentle`.
+    // `drain_mode: gentle`. A v2 drain's engine and status go with them for
+    // the same reason: its epoch and report are the replaced machine's.
+    //
+    // A v2 drain is the exception when the instance is unchanged: the same
+    // machine re-created its Node (a `kubectl delete node`, a kubelet
+    // restart), and its sandbox-manager is still sealed under the drain's
+    // generation, which only that drain's undrain or terminate settles. The
+    // registering Node's instance must be known and equal to the recorded
+    // one, `node_k8s.instance_id`; an unreported one was deferred above.
     let drain_cleared = sqlx::query(sql!(
-        "UPDATE nodes
+        "UPDATE nodes n
              SET drain_phase = NULL,
                  drain_mode = NULL,
                  drain_started_at = NULL,
-                 drain_last_error = NULL
-             WHERE id = $1
-               AND EXISTS (
-                 SELECT 1 FROM node_k8s
-                 WHERE node_id = $1 AND k8s_node_uid IS DISTINCT FROM $2
+                 drain_last_error = NULL,
+                 drain_engine = NULL,
+                 drain_status = NULL
+             FROM node_k8s k
+             WHERE n.id = $1
+               AND k.node_id = n.id
+               AND k.k8s_node_uid IS DISTINCT FROM $2
+               AND NOT COALESCE(
+                 n.drain_engine = 'v2' AND k.instance_id = $3::TEXT,
+                 FALSE
                )"
     ))
     .bind(node_id)
     .bind(node_uid)
+    .bind(instance_id.map(Ec2InstanceId::as_str))
     .execute(&mut *conn)
     .await
     .step(K8sNodeRegistrationStep::ClearDrain)?
