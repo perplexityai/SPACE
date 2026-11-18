@@ -1,160 +1,98 @@
-//! The canonical JSON encoder.
-//!
-//! The model types have no `Serialize`: these private wrappers are the only
-//! way to write them, so every caller produces the same bytes.
+//! The canonical encoder: the model converted to the private wire types.
 
-use pplx_space_firewall_rules::{
-    FirewallRuleRevision, Ipv4Prefix, Match, PayloadHeader, Read, Rule, Value,
-};
-use serde::ser::{Serialize, SerializeMap, SerializeStruct, Serializer};
+use pplx_space_firewall_rules::{FirewallRuleRevision, Match, PayloadHeader, Read, Rule, Value};
 
 use crate::SCHEMA_VERSION;
+use crate::wire::{
+    HeaderV1, MatchV1, Object, Op, PayloadReadV1, PrefixV1, ReadV1, RevisionV1, RuleV1,
+    TaggedValueV1, TcpOptionV1, ValueV1,
+};
 
 /// Writes `revision` in its canonical form: fields in grammar order, rules and
 /// comparisons in their own order, and no whitespace. Decoding the result
 /// gives back an equal revision, and equal revisions encode to equal bytes.
 pub fn encode_revision(revision: &FirewallRuleRevision) -> String {
-    match serde_json::to_string(&RevisionJson(revision)) {
+    match serde_json::to_string(&RevisionV1::from(revision)) {
         Ok(text) => text,
-        // Every map key is a string and no wrapper here returns an error, so
+        // Every map key is a string and no wire type returns an error, so
         // writing to a String cannot fail.
         Err(error) => unreachable!("revision serialization failed: {error}"),
     }
 }
 
-struct RevisionJson<'a>(&'a FirewallRuleRevision);
-
-impl Serialize for RevisionJson<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut document = serializer.serialize_struct("Revision", 2)?;
-        document.serialize_field("schema_version", &SCHEMA_VERSION)?;
-        document.serialize_field("rules", &Rules(self.0.rules()))?;
-        document.end()
-    }
-}
-
-struct Rules<'a>(&'a [Rule]);
-
-impl Serialize for Rules<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.0.iter().map(RuleJson))
-    }
-}
-
-struct RuleJson<'a>(&'a Rule);
-
-impl Serialize for RuleJson<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut rule = serializer.serialize_struct("Rule", 2)?;
-        rule.serialize_field("id", self.0.id().as_str())?;
-        rule.serialize_field("all_of", &Matches(self.0.all_of()))?;
-        rule.end()
-    }
-}
-
-struct Matches<'a>(&'a [Match]);
-
-impl Serialize for Matches<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.0.iter().map(MatchJson))
-    }
-}
-
-struct MatchJson<'a>(&'a Match);
-
-impl Serialize for MatchJson<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut comparison = serializer.serialize_struct("Match", 3)?;
-        comparison.serialize_field("left", &ReadJson(self.0.left()))?;
-        comparison.serialize_field("op", "==")?;
-        comparison.serialize_field("right", &ValueJson(self.0.right()))?;
-        comparison.end()
-    }
-}
-
-struct ReadJson<'a>(&'a Read);
-
-impl Serialize for ReadJson<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self.0 {
-            Read::Payload(header) => PayloadReadJson(header).serialize(serializer),
-            Read::TcpOption(name) => {
-                let mut read = serializer.serialize_map(Some(1))?;
-                read.serialize_entry("tcp option", &TcpOptionJson(name.as_str()))?;
-                read.end()
-            }
-            Read::MaskedPayload { header, mask } => {
-                let mut read = serializer.serialize_map(Some(1))?;
-                read.serialize_entry("&", &(PayloadReadJson(header), mask.get()))?;
-                read.end()
-            }
+impl From<&FirewallRuleRevision> for RevisionV1 {
+    fn from(revision: &FirewallRuleRevision) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            rules: revision
+                .rules()
+                .iter()
+                .map(|rule| Object(rule.into()))
+                .collect(),
         }
     }
 }
 
-struct PayloadReadJson<'a>(&'a PayloadHeader);
-
-impl Serialize for PayloadReadJson<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut read = serializer.serialize_map(Some(1))?;
-        read.serialize_entry("payload", &HeaderJson(self.0))?;
-        read.end()
-    }
-}
-
-struct HeaderJson<'a>(&'a PayloadHeader);
-
-impl Serialize for HeaderJson<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut header = serializer.serialize_struct("PayloadHeader", 2)?;
-        header.serialize_field("protocol", self.0.protocol().as_str())?;
-        header.serialize_field("field", self.0.field().as_str())?;
-        header.end()
-    }
-}
-
-struct TcpOptionJson<'a>(&'a str);
-
-impl Serialize for TcpOptionJson<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut option = serializer.serialize_struct("TcpOption", 1)?;
-        option.serialize_field("name", self.0)?;
-        option.end()
-    }
-}
-
-struct ValueJson<'a>(&'a Value);
-
-impl Serialize for ValueJson<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self.0 {
-            Value::Integer(value) => serializer.serialize_u64(*value),
-            Value::Ipv4(addr) => serializer.collect_str(addr),
-            Value::True => serializer.serialize_bool(true),
-            Value::Ipv4Prefix(prefix) => {
-                let mut value = serializer.serialize_map(Some(1))?;
-                value.serialize_entry("prefix", &PrefixJson(prefix))?;
-                value.end()
-            }
-            Value::Range(range) => {
-                let mut value = serializer.serialize_map(Some(1))?;
-                value.serialize_entry("range", &[range.start(), range.end()])?;
-                value.end()
-            }
+impl From<&Rule> for RuleV1 {
+    fn from(rule: &Rule) -> Self {
+        Self {
+            id: rule.id().as_str().to_owned(),
+            all_of: rule
+                .all_of()
+                .iter()
+                .map(|comparison| Object(comparison.into()))
+                .collect(),
         }
     }
 }
 
-struct PrefixJson<'a>(&'a Ipv4Prefix);
-
-impl Serialize for PrefixJson<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut prefix = serializer.serialize_struct("Ipv4Prefix", 2)?;
-        prefix.serialize_field("addr", &self.0.addr().to_string())?;
-        prefix.serialize_field("len", &self.0.prefix_len())?;
-        prefix.end()
+impl From<&Match> for MatchV1 {
+    fn from(comparison: &Match) -> Self {
+        Self {
+            left: comparison.left().into(),
+            op: Op::Eq,
+            right: comparison.right().into(),
+        }
     }
 }
 
-#[cfg(test)]
-mod tests;
+impl From<&Read> for ReadV1 {
+    fn from(read: &Read) -> Self {
+        match read {
+            Read::Payload(header) => Self::Payload(Object(header.into())),
+            Read::TcpOption(name) => Self::TcpOption(Object(TcpOptionV1 {
+                name: name.as_str().to_owned(),
+            })),
+            Read::MaskedPayload { header, mask } => Self::Masked(
+                Object(PayloadReadV1 {
+                    payload: Object(header.into()),
+                }),
+                *mask,
+            ),
+        }
+    }
+}
+
+impl From<&PayloadHeader> for HeaderV1 {
+    fn from(header: &PayloadHeader) -> Self {
+        Self {
+            protocol: header.protocol().as_str().to_owned(),
+            field: header.field().as_str().to_owned(),
+        }
+    }
+}
+
+impl From<&Value> for ValueV1 {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Integer(value) => Self::Integer(*value),
+            Value::Ipv4(addr) => Self::Ipv4(*addr),
+            Value::True => Self::Bool(true),
+            Value::Ipv4Prefix(prefix) => Self::Tagged(TaggedValueV1::Prefix(Object(PrefixV1 {
+                addr: prefix.addr(),
+                len: prefix.prefix_len(),
+            }))),
+            Value::Range(range) => Self::Tagged(TaggedValueV1::Range(range.start(), range.end())),
+        }
+    }
+}

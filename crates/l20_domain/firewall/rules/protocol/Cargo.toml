@@ -12,6 +12,6 @@ workspace = true
 
 [dependencies]
 pplx-space-firewall-rules = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
