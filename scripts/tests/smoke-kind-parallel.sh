@@ -151,8 +151,8 @@ registry_firewall_remove() {
 }
 
 # The benches' checkouts went with their directories; drop their entries from
-# the repository's worktree list. Only entries whose checkout was under
-# KIND_BENCH_ROOT and is gone: `git worktree prune` would also drop the
+# the repository's worktree list. Only entries whose checkout was a bench's,
+# <bench root>/<i>/src, and is gone: `git worktree prune` would also drop the
 # caller's own worktrees whose directories are missing just now (an unmounted
 # volume, a moved checkout), with their index and HEAD.
 prune_bench_worktrees() {
@@ -161,7 +161,7 @@ prune_bench_worktrees() {
   for entry in "$common"/worktrees/*; do
     [[ -f "$entry/gitdir" ]] || continue
     gitdir="$(<"$entry/gitdir")"
-    [[ "$gitdir" == "$KIND_BENCH_ROOT/"* && ! -e "$gitdir" ]] || continue
+    [[ "$gitdir" =~ ^"$KIND_BENCH_ROOT"/[0-9]+/src/\.git$ && ! -e "$gitdir" ]] || continue
     rm -rf -- "$entry"
   done
 }
