@@ -215,6 +215,42 @@ async fn independent_create_replay_listing_and_delete_survive_without_a_sandbox(
             .state,
         OperationState::Succeeded
     );
+    let resource = store::resource::get(&db.pool, org, resource.id)
+        .await?
+        .unwrap();
+    assert!(
+        store::resource::observe(&db.pool, &resource, store::VolumePhase::Deleted, None, None,)
+            .await?
+    );
+    let mut delete_claim = operations
+        .claim_operations(ClaimPublicOperations {
+            limits: ClaimLimits::any(1),
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::DeleteVolume],
+        })
+        .await?;
+    for (token, operation) in [
+        (claim.claim_token, create_operation.clone()),
+        (delete_claim.claim_token, delete_claim.operations.remove(0)),
+    ] {
+        let id = operation.id;
+        let observed = crate::block_volumes::observe_operation(&db.pool, &operation).await;
+        crate::public_operation_driver::drive_claimed_operation(
+            operations.clone(),
+            token,
+            crate::public_operation_driver::OperationExecutionConfig::default(),
+            operation,
+            crate::public_operation_driver::OperationExecutor::Dispatcher,
+            std::future::ready(observed.into()),
+        )
+        .await?;
+        let (status, record) = call(&app, "GET", &format!("/v1/operations/{id}"), None).await?;
+        assert_eq!(status, StatusCode::OK, "{record}");
+        let record: PublicOperationRecord = serde_json::from_value(record)?;
+        assert_eq!(record.state, OperationState::Succeeded);
+        assert_eq!(record.target_id, Some(resource.id.to_string()));
+        assert!(record.result.is_none());
+    }
     Ok(())
 }
 

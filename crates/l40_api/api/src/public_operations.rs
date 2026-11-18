@@ -3997,9 +3997,10 @@ impl TryFrom<PublicOperationRow> for PublicOperationRecord {
     type Error = PublicOperationStoreError;
 
     fn try_from(row: PublicOperationRow) -> Result<Self, Self::Error> {
+        let kind = parse_stored_enum("kind", &row.kind)?;
         Ok(Self {
             id: OperationId::from_uuid(row.operation_id),
-            kind: parse_stored_enum("kind", &row.kind)?,
+            kind,
             state: parse_stored_enum("state", &row.state)?,
             target_type: row
                 .target_type
@@ -4016,6 +4017,14 @@ impl TryFrom<PublicOperationRow> for PublicOperationRecord {
             terminal_error: row.terminal_error_json.map(|value| value.0),
             result: row
                 .result_json
+                // The generic driver persists an empty object for successful
+                // volume operations, which have no tagged public result.
+                .filter(|value| {
+                    !(matches!(
+                        kind,
+                        OperationKind::CreateVolume | OperationKind::DeleteVolume
+                    ) && value.0.as_object().is_some_and(|object| object.is_empty()))
+                })
                 .map(|value| serde_json::from_value::<PublicOperationResult>(value.0))
                 .transpose()
                 .map_err(PublicOperationStoreError::InvalidStoredResult)?,
