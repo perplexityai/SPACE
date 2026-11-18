@@ -1413,7 +1413,7 @@ fn paths_bracket_keys_that_dot_shorthand_cannot_name() {
 }
 
 #[test]
-fn from_slice_matches_from_str() {
+fn bytes_decode_like_text() {
     assert_eq!(
         decode_revision_bytes(ALL_VARIANTS.as_bytes()).unwrap(),
         decode(ALL_VARIANTS)

@@ -365,7 +365,7 @@ impl Generator {
         items[self.below(items.len() as u64) as usize]
     }
 
-    /// A read of any kind, from small pools so that equal rules recur.
+    /// A read of any kind, from small pools.
     fn read(&mut self) -> Read {
         let header = header(self.pick(&["ip", "tcp"]), self.pick(&["daddr", "dport"]));
         match self.below(3) {
@@ -378,7 +378,7 @@ impl Generator {
         }
     }
 
-    /// A value of any kind, from small pools so that equal rules recur.
+    /// A value of any kind, from small pools.
     fn value(&mut self) -> Value {
         match self.below(5) {
             0 => Value::Integer(self.below(3)),
@@ -447,7 +447,7 @@ fn expected_failure(base: &FirewallRuleRevision, edits: &[Edit]) -> Option<EditE
 #[test]
 fn generated_batches_keep_the_edit_and_diff_invariants() {
     let mut generator = Generator(0x5eed_f5ac);
-    let (mut successes, mut failures) = (0, 0);
+    let (mut successes, mut failures, mut identical) = (0, 0, 0);
     let (mut reads, mut values) = (HashSet::new(), HashSet::new());
     for _ in 0..2000 {
         let base_ids: Vec<&str> = ID_POOL
@@ -462,7 +462,12 @@ fn generated_batches_keep_the_edit_and_diff_invariants() {
                 let name = ID_POOL[generator.below(ID_POOL.len() as u64) as usize];
                 match generator.below(3) {
                     0 => Edit::Add(generator.rule(name)),
-                    1 => Edit::Replace(generator.rule(name)),
+                    // Half of the replacements of a present rule reuse
+                    // it unchanged, which the diff must leave out.
+                    1 => match base.rule(&id(name)) {
+                        Some(rule) if generator.below(2) == 0 => Edit::Replace(rule.clone()),
+                        _ => Edit::Replace(generator.rule(name)),
+                    },
                     _ => Edit::Remove(id(name)),
                 }
             })
@@ -484,14 +489,22 @@ fn generated_batches_keep_the_edit_and_diff_invariants() {
             }
             (None, Ok(change)) => {
                 successes += 1;
+                identical += edits
+                    .iter()
+                    .filter(|edit| match edit {
+                        Edit::Replace(rule) => base.rule(rule.id()) == Some(rule),
+                        _ => false,
+                    })
+                    .count();
                 assert_successful_change(&base, &edits, &change);
             }
             (expected, result) => panic!("expected failure {expected:?}, got {result:?}"),
         }
     }
-    // Every read and value kind is generated, and both outcomes are
-    // exercised in quantity.
+    // Every read and value kind is generated, and both outcomes and
+    // identical replacements are exercised in quantity.
     assert_eq!((reads.len(), values.len()), (3, 5));
+    assert!(identical > 50, "{identical} identical replacements");
     assert!(
         successes > 300 && failures > 300,
         "{successes} / {failures}"
