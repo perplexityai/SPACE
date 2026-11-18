@@ -308,6 +308,11 @@ locals {
       ami_id                                  = pool.ami_id
       capacity_reservation_preference         = pool.capacity_reservation_preference
       capacity_reservation_resource_group_arn = pool.capacity_reservation_resource_group_arn
+      # EKS keeps reporting a node group's update strategy once one has been
+      # set and has no way to clear it, so leaving it null plans a diff on
+      # every run for such a group. Builders pin EKS's default (surge-first)
+      # explicitly; changing only the strategy does not roll nodes.
+      update_strategy = name == "builders" ? "DEFAULT" : null
       additional_security_group_ids = concat(
         # general_nodes carries the shared-services access RDS/Redis admit.
         # cred-authority hosts credmgr-authority, which reads DATABASE_URL from
