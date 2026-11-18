@@ -1,7 +1,8 @@
 //! The drain's planner: what one call decides, a pure function of what it
-//! read.
+//! read, and node-manager's orphan inventory as the planner reads it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::time::Duration;
 
 use super::actions::DEFAULT_DRAIN_NODE_WINDOW;
@@ -612,4 +613,165 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
     }
     plan.start_in_window(rows, inputs, windowed);
     plan
+}
+
+/// What a call under a cancelled epoch decides, from the rows it read: the
+/// drain starts no suspend, and hands back each sandbox it suspended,
+/// `evacuated` once its snapshot is durable, its upload driven until then.
+/// Work still running on one is waited for, and an upload driven, whatever
+/// its row's lifecycle, so a record is kept while the window would count its
+/// sandbox in flight. A started sandbox the drain left paused is blocked,
+/// its record kept. The records with nothing left to hand back, their
+/// sandbox running again, stopped, failed or gone, and the ones the control
+/// plane names in `named` once nothing is in flight for them, are returned
+/// to be forgotten.
+pub(super) fn plan_cancel(
+    rows: &[DrainRow],
+    inputs: &PlanInputs,
+    named: &[String],
+) -> (DrainPlan, Vec<String>) {
+    use pplx_space_snapshot_model::ArtifactKind;
+    let mut plan = DrainPlan::default();
+    let mut forget = Vec::new();
+    for (id, evacuation) in &inputs.evacuations {
+        let Some(row) = rows.iter().find(|row| row.sandbox_id == *id) else {
+            forget.push(id.clone());
+            continue;
+        };
+        if let Some(action) = inputs.running.get(id) {
+            plan.wait_for_running(inputs, id, *action);
+            continue;
+        }
+        // A row being deleted takes its artifacts with it; it settles below.
+        if row.lifecycle.lifecycle() != SandboxState::Deleting
+            && let Some((artifact_id, kind)) = inputs.pending_pin(row)
+        {
+            plan.drive(
+                inputs,
+                PlannedAction::Upload {
+                    sandbox_id: id.clone(),
+                    artifact_id,
+                    kind,
+                },
+            );
+            continue;
+        }
+        if named.contains(id) {
+            forget.push(id.clone());
+            continue;
+        }
+        match row.lifecycle {
+            SandboxStatus::Owned {
+                cleanup: CleanupState::Failed,
+                ..
+            } => plan
+                .blocked
+                .push((Some(id.clone()), "cleanup failed".into())),
+            SandboxStatus::Unowned(SandboxState::Suspended) => match &row.pin {
+                Some((artifact, ArtifactKind::Full)) => {
+                    plan.evacuated
+                        .push((id.clone(), evacuation.prior, artifact.clone()));
+                }
+                _ => plan.blocked.push((
+                    Some(id.clone()),
+                    "the drain's suspend left the sandbox suspended without a durable snapshot"
+                        .into(),
+                )),
+            },
+            // The drain paused a started sandbox and didn't finish its
+            // suspend (a publication that failed rolls back to `paused`): the
+            // row no longer has the lifecycle the sandbox had. Kept and
+            // blocked until the control plane names it in `forget`; nothing
+            // here resumes it.
+            SandboxStatus::Unowned(SandboxState::Paused)
+                if evacuation.prior == DrainPrior::Started =>
+            {
+                plan.blocked.push((
+                    Some(id.clone()),
+                    "started before the drain, left paused by its suspend; kept until named in \
+                     forget"
+                        .into(),
+                ));
+            }
+            SandboxStatus::Unowned(
+                SandboxState::Started
+                | SandboxState::Paused
+                | SandboxState::Stopped
+                | SandboxState::Failed,
+            ) => forget.push(id.clone()),
+            other if inputs.unchanged.contains(id) => plan.blocked.push((
+                Some(id.clone()),
+                format!(
+                    "{} for over {} minutes, a transition the drain doesn't drive",
+                    other.legacy_label(),
+                    SETTLE_BOUND.as_secs() / 60
+                ),
+            )),
+            other => plan
+                .pending
+                .push((id.clone(), format!("settle:{}", other.legacy_label()))),
+        }
+    }
+    (plan, forget)
+}
+
+/// node-manager's orphan inventory, read as the drain needs it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct OrphanFindings {
+    pub(super) blocked: Vec<String>,
+    /// Cache and run directories, by the sandbox they're named for.
+    pub(super) dirs: Vec<(String, String)>,
+}
+
+/// The sandbox a node-manager directory candidate is named for.
+fn dir_sandbox(dir: &str) -> String {
+    Path::new(dir).file_name().map_or_else(
+        || dir.to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// The scanners of node-manager's orphan inventory, as its failure warnings
+/// name them (`<scanner>: <error>`), whose findings can hold neither a
+/// resident nor an artifact: network namespaces, cgroups, gateway run
+/// directories and nft rules. A failure of any other scanner (run and cache
+/// directories, processes, or one this build doesn't know) may have hidden
+/// a resident.
+const HARMLESS_ORPHAN_SCANNERS: [&str; 4] = ["Namespaces", "Cgroups", "GatewayRunDirs", "Nft"];
+
+/// Fold one inventory page into `findings`.
+pub(super) fn classify_orphan_page(
+    page: &pplx_space_node_mgr_client::proto::ListOrphanCandidatesResponse,
+    gateway_run_root: &str,
+    findings: &mut OrphanFindings,
+) {
+    for process in &page.orphaned_processes {
+        findings
+            .blocked
+            .push(format!("untracked runtime process {process}"));
+    }
+    for dir in &page.orphaned_cache_dirs {
+        findings
+            .dirs
+            .push((dir_sandbox(dir), format!("orphan cache directory {dir}")));
+    }
+    for dir in &page.orphaned_run_dirs {
+        if !Path::new(dir).starts_with(gateway_run_root) {
+            findings
+                .dirs
+                .push((dir_sandbox(dir), format!("orphan run directory {dir}")));
+        }
+    }
+    for warning in &page.warnings {
+        // A failure of a scanner this build doesn't know, or one it can't
+        // name, may have hidden a resident.
+        let harmless = warning
+            .split_once(':')
+            .is_some_and(|(scanner, _)| HARMLESS_ORPHAN_SCANNERS.contains(&scanner));
+        if !harmless {
+            findings
+                .blocked
+                .push(format!("orphan inventory scan failed: {warning}"));
+        }
+    }
 }
