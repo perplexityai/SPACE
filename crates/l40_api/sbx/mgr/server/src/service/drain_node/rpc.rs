@@ -30,7 +30,9 @@ impl SandboxManagerService {
             epoch,
             cancel,
             forget,
+            gentle_epoch,
         } = request.into_inner();
+        let (epoch, gentle) = drain_epoch(epoch, cancel, gentle_epoch)?;
         if cancel {
             self.activation_seal.unseal(&self.db, epoch)?;
             return Ok(Response::new(self.finish_cancel(epoch, &forget)));
@@ -47,20 +49,23 @@ impl SandboxManagerService {
             orphan_dirs: orphans.dirs,
             disk_headroom: read_disk_headroom().await,
         };
-        Ok(Response::new(self.finish_drain(epoch, &first, scans)))
+        Ok(Response::new(
+            self.finish_drain(epoch, gentle, &first, scans),
+        ))
     }
 
     /// Plan from the rows, record and start what the plan asks for, and
-    /// report. `first` is the seal as the call read it right after sealing,
-    /// before its scans; `scans` are what the scans that ran outside the rows
-    /// found.
+    /// report. `gentle` holds the started rows. `first` is the seal as the
+    /// call read it right after sealing, before its scans; `scans` are what
+    /// the scans that ran outside the rows found.
     pub(super) fn finish_drain(
         &self,
         epoch: u64,
+        gentle: bool,
         first: &ActivationSealStatus,
         scans: DrainScans,
     ) -> DrainNodeResponse {
-        let (mut plan, rows) = match self.read_drain_plan(epoch, scans.disk_headroom) {
+        let (mut plan, rows) = match self.read_drain_plan(epoch, gentle, scans.disk_headroom) {
             Ok(read) => read,
             Err(reason) => (
                 DrainPlan {
@@ -95,7 +100,10 @@ impl SandboxManagerService {
         // Every row that may hold a VM is pending or blocked, so a node with
         // nothing pending or blocked holds none.
         let done = continuous && plan.pending.is_empty() && plan.blocked.is_empty();
-        report(first, plan, done)
+        DrainNodeResponse {
+            gentle_epoch: gentle.then_some(epoch),
+            ..report(first, plan, done)
+        }
     }
 
     /// Under a cancelled `epoch`: forget the records with nothing left to
@@ -196,10 +204,12 @@ impl SandboxManagerService {
     fn read_drain_plan(
         &self,
         epoch: u64,
+        gentle: bool,
         disk_headroom: Option<u64>,
     ) -> Result<(DrainPlan, BTreeSet<String>), String> {
         let now = tokio::time::Instant::now();
         let (rows, inputs) = self.read_plan_inputs(epoch, disk_headroom, now)?;
+        let inputs = PlanInputs { gentle, ..inputs };
         let ids = rows.iter().map(|row| row.sandbox_id.clone()).collect();
         let plan = plan(&rows, &inputs);
         self.drain_actions
@@ -326,6 +336,7 @@ impl SandboxManagerService {
             disk_headroom,
             active_uploads,
             disk_waits: self.drain_actions.disk_waits_past_bound(epoch, now),
+            gentle: false,
         };
         Ok((rows, inputs))
     }
@@ -380,7 +391,15 @@ fn report(status: &ActivationSealStatus, plan: DrainPlan, done: bool) -> DrainNo
         pending: plan
             .pending
             .into_iter()
-            .map(|(sandbox_id, action)| DrainPending { sandbox_id, action })
+            .map(|(sandbox_id, action)| DrainPending {
+                sandbox_id,
+                reason: if action == HOLD {
+                    HOLD_REASON.to_owned()
+                } else {
+                    String::new()
+                },
+                action,
+            })
             .collect(),
         blocked: plan
             .blocked
@@ -388,6 +407,24 @@ fn report(status: &ActivationSealStatus, plan: DrainPlan, done: bool) -> DrainNo
             .map(|(sandbox_id, reason)| DrainBlocked { sandbox_id, reason })
             .collect(),
         done,
+        gentle_epoch: None,
+    }
+}
+
+/// The epoch a drain call names, and whether it drains gently: a gentle one
+/// names its epoch in `gentle_epoch` alone, with `epoch` 0 (which a node
+/// without gentle drains refuses before it seals) and no `cancel`.
+pub(super) fn drain_epoch(
+    epoch: u64,
+    cancel: bool,
+    gentle_epoch: u64,
+) -> Result<(u64, bool), Status> {
+    match (epoch, gentle_epoch) {
+        (_, 0) => Ok((epoch, false)),
+        (0, gentle_epoch) if !cancel => Ok((gentle_epoch, true)),
+        _ => Err(Status::invalid_argument(
+            "a gentle drain names its epoch in gentle_epoch alone, with epoch 0 and no cancel",
+        )),
     }
 }
 

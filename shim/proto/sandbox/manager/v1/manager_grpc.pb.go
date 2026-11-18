@@ -371,6 +371,22 @@ type SandboxManagerClient interface {
 	// snapshot is durable, with the lifecycle it had; a stopped one once its
 	// disk is. A `failed` row is not reported, and blocks nothing once its
 	// artifacts are durable.
+	//
+	// A gentle drain names its epoch in `gentle_epoch` and leaves `epoch` 0. It
+	// seals the node and walks every row as a forced drain does, except that it
+	// holds a sandbox in `started` that the node can make durable: it doesn't
+	// suspend it, and reports it `pending` with the action `hold` until it
+	// leaves `started` on its own (the node's idle auto-lifecycle, or a user's
+	// suspend, stop or delete). A started sandbox the node can't make durable
+	// (its suspend would be refused) is reported `blocked` with why, as under a
+	// forced drain, and a started sandbox the drain's own suspend is already
+	// running for is waited for (`suspend`). A row
+	// that suspends on its own is not the drain's: it is not reported
+	// evacuated, and its upload is finished like any other artifact without a
+	// durable copy. The answer echoes `gentle_epoch`. A forced call under the
+	// same epoch continues the same drain, holding nothing. A node that predates
+	// gentle drains reads `epoch` 0 and refuses the call before it seals
+	// anything, so a gentle drain never runs on it as a forced one.
 	DrainNode(ctx context.Context, in *DrainNodeRequest, opts ...grpc.CallOption) (*DrainNodeResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(ctx context.Context, in *GetNetworkPolicyRequest, opts ...grpc.CallOption) (*GetNetworkPolicyResponse, error)
@@ -1655,6 +1671,22 @@ type SandboxManagerServer interface {
 	// snapshot is durable, with the lifecycle it had; a stopped one once its
 	// disk is. A `failed` row is not reported, and blocks nothing once its
 	// artifacts are durable.
+	//
+	// A gentle drain names its epoch in `gentle_epoch` and leaves `epoch` 0. It
+	// seals the node and walks every row as a forced drain does, except that it
+	// holds a sandbox in `started` that the node can make durable: it doesn't
+	// suspend it, and reports it `pending` with the action `hold` until it
+	// leaves `started` on its own (the node's idle auto-lifecycle, or a user's
+	// suspend, stop or delete). A started sandbox the node can't make durable
+	// (its suspend would be refused) is reported `blocked` with why, as under a
+	// forced drain, and a started sandbox the drain's own suspend is already
+	// running for is waited for (`suspend`). A row
+	// that suspends on its own is not the drain's: it is not reported
+	// evacuated, and its upload is finished like any other artifact without a
+	// durable copy. The answer echoes `gentle_epoch`. A forced call under the
+	// same epoch continues the same drain, holding nothing. A node that predates
+	// gentle drains reads `epoch` 0 and refuses the call before it seals
+	// anything, so a gentle drain never runs on it as a forced one.
 	DrainNode(context.Context, *DrainNodeRequest) (*DrainNodeResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error)

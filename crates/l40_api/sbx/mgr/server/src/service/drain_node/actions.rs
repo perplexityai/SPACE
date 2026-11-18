@@ -297,7 +297,9 @@ impl SandboxManagerService {
             return Ok(());
         }
         match action {
-            PlannedAction::Suspend { sandbox_id } => self.drain_suspend(epoch, &sandbox_id).await,
+            PlannedAction::Suspend { sandbox_id, from } => {
+                self.drain_suspend(epoch, &sandbox_id, from).await
+            }
             PlannedAction::PublishDisk { sandbox_id } => {
                 self.publish_current_instance(sandbox_id, crate::proto::ArtifactKind::Disk)
                     .await
@@ -395,21 +397,25 @@ impl SandboxManagerService {
             }))
     }
 
-    /// The idle auto-suspend's suspend of a started or paused VM, for the
-    /// drain under `epoch`: under the wake and artifact locks, with a full
-    /// snapshot published and its upload enqueued before the runtime is torn
-    /// down. The lifecycle it suspends from is recorded under the wake lock
-    /// first, and only while the node is still sealed under `epoch`; a row
-    /// something else moved on first keeps its own lifecycle, which the next
-    /// call plans from.
-    pub(super) async fn drain_suspend(&self, epoch: u64, sandbox_id: &str) -> Result<(), Status> {
+    /// The idle auto-suspend's suspend of a VM in a lifecycle `from` allows,
+    /// for the drain under `epoch`: under the wake and artifact locks, with a
+    /// full snapshot published and its upload enqueued before the runtime is
+    /// torn down. The lifecycle it suspends from is checked against `from`
+    /// and recorded under the wake lock first, and only while the node is
+    /// still sealed under `epoch`; a row something else moved on first, a
+    /// gentle drain's paused row resumed meanwhile among them, keeps its own
+    /// lifecycle, which the next call plans from.
+    pub(super) async fn drain_suspend(
+        &self,
+        epoch: u64,
+        sandbox_id: &str,
+        from: SuspendFrom,
+    ) -> Result<(), Status> {
         let wake_lock = self.auto_lifecycle.wake_lock(sandbox_id);
         let wake_guard = wake_lock.lock_owned().await;
         let sandbox = self.lookup_sandbox(sandbox_id)?;
-        let prior = match sandbox.state.unowned() {
-            Some(SandboxState::Started) => DrainPrior::Started,
-            Some(SandboxState::Paused) => DrainPrior::Paused,
-            _ => return Ok(()),
+        let Some(prior) = from.prior(sandbox.state.unowned()) else {
+            return Ok(());
         };
         let Some(recorded) =
             self.activation_seal
