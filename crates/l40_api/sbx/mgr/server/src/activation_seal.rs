@@ -14,8 +14,11 @@
 //! every VM activation with a retryable `Unavailable`
 //! ([`ACTIVATION_SEAL_UNREADABLE_MARKER`]), since the row it couldn't read may
 //! say sealed. [`ActivationSeal::recover`] reads the row again in the
-//! background with a short bounded backoff and publishes what it reads under
-//! the state lock, before any activation is admitted. While it still can't
+//! background with a short bounded backoff, off the async runtime and without
+//! the state lock, so activations are refused, not blocked, meanwhile. It
+//! then publishes what it read under the state lock, only while the seal is
+//! still unknown: a seal or cancel that read the row in between wins. While
+//! it still can't
 //! read, it logs a warning every [`UNREADABLE_WARN_INTERVAL`] naming the
 //! error and how long the seal has been unknown.
 //!
@@ -130,13 +133,23 @@ impl SealState {
 
     /// Read the row again while the seal is unknown, and publish it once it
     /// reads, which the caller does under the state lock, so no activation is
-    /// admitted between the read and its publication. Logs the recovery once:
-    /// nothing makes a known seal unknown again.
+    /// admitted between the read and its publication.
     fn read_again(&mut self, conn: &crate::db::Connection) {
         if !self.is_unknown() {
             return;
         }
-        match crate::db::read::activation_seal(conn) {
+        self.publish_read(
+            crate::db::read::activation_seal(conn).map_err(|error| error.to_string()),
+        );
+    }
+
+    /// Publish a read of the row while the seal is unknown. Logs the
+    /// recovery once: nothing makes a known seal unknown again.
+    fn publish_read(&mut self, read: Result<Option<ActivationSealRecord>, String>) {
+        if !self.is_unknown() {
+            return;
+        }
+        match read {
             Ok(record) => {
                 self.record = Ok(record);
                 let unreadable_secs = self
@@ -168,7 +181,7 @@ impl SealState {
                 } else {
                     tracing::debug!(%error, "the activation seal is still unreadable");
                 }
-                self.record = Err(error.to_string());
+                self.record = Err(error);
             }
         }
     }
@@ -250,20 +263,37 @@ impl ActivationSeal {
                 () = shutdown.cancelled() => return,
                 () = tokio::time::sleep(delay) => {}
             }
-            let mut state = self.lock_state();
-            if !state.is_unknown() {
+            if !self.lock_state().is_unknown() {
                 return;
             }
-            // A poisoned database mutex is retried like a failed read.
-            if let Ok(conn) = db.lock() {
-                state.read_again(&conn);
-            }
-            if !state.is_unknown() {
+            // Off the runtime, holding only the database's own mutex: the
+            // state lock stays free for activations, which it refuses as
+            // retryable meanwhile, and for a seal or cancel.
+            let read_db = db.clone();
+            let read = tokio::task::spawn_blocking(move || {
+                read_db.lock().ok().map(|conn| {
+                    crate::db::read::activation_seal(&conn).map_err(|error| error.to_string())
+                })
+            })
+            .await;
+            // A poisoned database mutex, or a read that panicked, is retried
+            // like a failed read.
+            if let Ok(Some(read)) = read
+                && self.publish_recovered(read)
+            {
                 return;
             }
-            drop(state);
             delay = delay.saturating_mul(2).min(max);
         }
+    }
+
+    /// Publish a background read of the row under the state lock, only while
+    /// the seal is still unknown: a seal or cancel that read the row since
+    /// wins. Whether the seal is known now.
+    fn publish_recovered(&self, read: Result<Option<ActivationSealRecord>, String>) -> bool {
+        let mut state = self.lock_state();
+        state.publish_read(read);
+        !state.is_unknown()
     }
 
     /// Refuse an activation while sealed or unknown, without admitting it.

@@ -291,6 +291,62 @@ async fn the_background_read_publishes_the_seal_row_once_it_reads() {
     }
 }
 
+/// A seal call that reads the row between the background read and its
+/// publication wins: the background read's answer, older than the seal, is
+/// not published over it, and the retry ends with the seal known.
+#[test]
+fn a_seal_call_between_the_background_read_and_its_publication_wins() {
+    let db = SharedConnection::new(crate::db::test_conn());
+    hide_seal_table(&db);
+    let seal = ActivationSeal::load(&db.lock().unwrap());
+    restore_seal_table(&db, None);
+    // The background read finds a node never sealed...
+    let read =
+        crate::db::read::activation_seal(&db.lock().unwrap()).map_err(|error| error.to_string());
+    assert_eq!(read, Ok(None));
+    // ...and a seal call reads the row and seals before that is published.
+    seal.seal(&db, 9).unwrap();
+    assert!(seal.publish_recovered(read), "the seal is known");
+    assert_eq!(seal.status().sealed_epoch, Some(9));
+    let refused = seal.admit("cold", SANDBOX).unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    seal.assert_quiesced();
+}
+
+/// While the background read waits on the database, an activation is
+/// refused as retryable at once rather than blocked behind it: the read
+/// holds no state lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_activation_is_refused_not_blocked_while_the_background_read_waits() {
+    let db = SharedConnection::new(crate::db::test_conn());
+    hide_seal_table(&db);
+    let seal = Arc::new(ActivationSeal::load(&db.lock().unwrap()));
+    let shutdown = CancellationToken::new();
+    let held = db.clone();
+    let guard = held.lock().unwrap();
+    let retry = tokio::spawn(Arc::clone(&seal).recover(
+        db.clone(),
+        shutdown.clone(),
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    ));
+    // Long enough for the retry to be waiting on the held database.
+    std::thread::sleep(Duration::from_millis(200));
+    let (sent, received) = std::sync::mpsc::channel();
+    let checking = Arc::clone(&seal);
+    std::thread::spawn(move || {
+        let _ = sent.send(checking.check("cold", SANDBOX));
+    });
+    let refused = received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the check is not blocked behind the background read")
+        .unwrap_err();
+    assert_unreadable_refusal(&refused);
+    drop(guard);
+    shutdown.cancel();
+    retry.await.unwrap();
+}
+
 /// A seal that reads at startup starts no background read, and the retry of
 /// an unknown seal is one task that ends at shutdown, leaving the seal
 /// unknown and activations refused.
