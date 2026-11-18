@@ -566,6 +566,61 @@ async fn a_drained_node_is_not_called_and_releases() {
     assert!(!called(&sink, "release", &draining), "{:?}", sink.calls());
 }
 
+/// EC2's listing of one instance id reads as one state only when it lists
+/// the instance once; twice is no answer the loop acts on.
+#[test]
+fn ec2_states_read_as_evidence() {
+    for (states, evidence) in [
+        (&[][..], InstanceEvidence::NotListed),
+        (&["terminated"][..], InstanceEvidence::Terminated),
+        (&["shutting-down"][..], InstanceEvidence::ShuttingDown),
+        (&["running"][..], InstanceEvidence::Listed("running".into())),
+        (
+            &["terminated", "running"][..],
+            InstanceEvidence::Listed("listed 2 times".into()),
+        ),
+    ] {
+        let states: Vec<String> = states.iter().map(|state| (*state).to_owned()).collect();
+        assert_eq!(
+            InstanceEvidence::from_states(&states),
+            evidence,
+            "{states:?}"
+        );
+    }
+}
+
+/// With new v2 drains not admitted, the loop still owns the persisted ones:
+/// it drains a draining node to `drained` and cancels an undrained one. With
+/// no terminator that terminates, it never fences a `terminating` node,
+/// which waits unfenced with the refusal as its error.
+#[tokio::test]
+async fn the_loop_owns_persisted_drains_without_terminating() {
+    let draining = node(Some("draining"), Some(5));
+    let undrained = node(None, Some(5));
+    let terminating = node(Some("terminating"), Some(5));
+    let sink = FakeSink {
+        nodes: vec![draining.clone(), undrained.clone(), terminating.clone()],
+        responses: HashMap::from([
+            ((draining.id, false), Ok(response(5, &[]))),
+            ((undrained.id, true), Ok(cancelled(5))),
+        ]),
+        ..FakeSink::default()
+    };
+    let report = run_tick(&sink, &V2Terminator::Refuse).await;
+    assert_eq!(report.drained, [draining.id]);
+    assert_eq!(report.cancelled, [undrained.id]);
+    assert!(report.fenced.is_empty());
+    let calls = sink.calls();
+    assert!(
+        calls.contains(&format!("error {} {REFUSED_TERMINATE}", terminating.id)),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|call| call.starts_with("fence ")),
+        "{calls:?}"
+    );
+}
+
 /// A draining node that doesn't answer its `DrainNode` call reads 1 on the
 /// unanswered gauge, so a dead node pages as a blocked one does; one that
 /// answers reads 0.

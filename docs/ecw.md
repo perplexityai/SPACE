@@ -245,6 +245,8 @@ Lifecycle names differ across the two APIs:
 
 ECW does not expose the SPACE API's resident-memory pause/resume operations.
 
+When a cluster runs drain v2 (`SPACE_DRAIN_V2_ENABLED`), a sandbox can also be paused for you when an operator drains its node: the drain pauses a running sandbox the way an idle auto-pause does. Reconnect with `connect`, which restores it on another node. While the drain is still making the sandbox durable, the connect is refused with a `503`; retry it.
+
 Forks cold-boot a new sandbox from a durable disk artifact, without copying
 memory or changing the source lifecycle. Both live and suspended encrypted
 sources are supported within the same organization. Encrypted forks transfer

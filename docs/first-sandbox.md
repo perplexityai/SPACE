@@ -112,6 +112,8 @@ The inspection prints one page from each list. Applications should follow `next_
 
 Use a valid sandbox ID and an `Idempotency-Key` for each lifecycle mutation, then poll its operation. After wake, repeat the running-state and process-readiness checks before executing another command.
 
+A sandbox can also be suspended for you: by its idle policy, or, when a cluster runs drain v2 (`SPACE_DRAIN_V2_ENABLED`), when an operator drains its node, which suspends a running sandbox the way an idle auto-pause does. A create that sets no `auto_lifecycle` gets the default policy, which suspends the sandbox when it is idle and doesn't wake it on access (`wake.on` is empty). A command or file call to such a suspended sandbox gets `409` `conflict`, `sandbox is suspended, not running`, with the details `reason` `sandbox_not_running`, `state` `suspended`, and `wake`, which names the request to make: `POST /v1/sandboxes/{id}:wake`. Make it, poll its operation, and repeat the readiness checks. After a drain v2 suspend, the wake restores the sandbox on another node; while the drain is still making the sandbox durable it gets a `503` with `Retry-After`, so retry it then. An undrain doesn't wake what the drain suspended: the next call does.
+
 ## Delete the sandbox and clean up
 
 If you kept the sandbox or a step failed, inspect the run first. Then request deletion explicitly:
