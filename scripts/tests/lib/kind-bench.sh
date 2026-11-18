@@ -42,6 +42,12 @@ KIND_BENCH_ROOT="${KIND_BENCH_ROOT:-$HOME/.space-benches}"
 # works.
 KIND_BENCH_DOCKER_VERSION="${KIND_BENCH_DOCKER_VERSION:-29.8.2}"
 KIND_BENCH_DOCKER_DIR="${KIND_BENCH_DOCKER_DIR:-/opt/space-bench-docker/bin}"
+# The release archive's SHA-256 per architecture, for the pinned version;
+# another version needs KIND_BENCH_DOCKER_SHA256.
+declare -A KIND_BENCH_DOCKER_SHA256S=(
+  [x86_64]=995d1ef289677f74fd58d8d2c35727b6a4ee389c69db8638a3e42d0487aa5b0f
+  [aarch64]=76a624e4a8e5da654d1150e808175125efb5a6f1b6aa1cbd9caee18f51047a50
+)
 # The veths take /30s from 192.168.240.0/24 and the daemons /20 pools from
 # 192.168.0.0/16 below it, so 15 benches fit. Pools only need to be distinct
 # from the host's routes (a bench reaches the host's resolver and egress through
@@ -120,13 +126,23 @@ kind_bench_ensure_docker() {
   if [[ -x "$KIND_BENCH_DOCKER_DIR/dockerd" ]]; then
     return 0
   fi
-  local tmp
+  local tmp arch sha256
+  arch="$(uname -m)"
+  sha256="${KIND_BENCH_DOCKER_SHA256:-}"
+  if [[ -z "$sha256" && "$KIND_BENCH_DOCKER_VERSION" == 29.8.2 ]]; then
+    sha256="${KIND_BENCH_DOCKER_SHA256S[$arch]:-}"
+  fi
+  [[ -n "$sha256" ]] || {
+    kind_bench_log "no SHA-256 pinned for Docker $KIND_BENCH_DOCKER_VERSION on $arch; set KIND_BENCH_DOCKER_SHA256"
+    return 1
+  }
   tmp="$(mktemp -d)" || return 1
   kind_bench_log "installing Docker ${KIND_BENCH_DOCKER_VERSION} daemons into ${KIND_BENCH_DOCKER_DIR}"
   local status=0
   curl -fsSL --retry 3 -o "$tmp/docker.tgz" \
-    "https://download.docker.com/linux/static/stable/$(uname -m)/docker-${KIND_BENCH_DOCKER_VERSION}.tgz" \
+    "https://download.docker.com/linux/static/stable/$arch/docker-${KIND_BENCH_DOCKER_VERSION}.tgz" \
     || status=1
+  (( status )) || printf '%s  %s\n' "$sha256" "$tmp/docker.tgz" | sha256sum -c --quiet - || status=1
   (( status )) || tar -C "$tmp" -xzf "$tmp/docker.tgz" || status=1
   (( status )) || sudo -n install -d -m 0755 "$KIND_BENCH_DOCKER_DIR" || status=1
   (( status )) || sudo -n install -m 0755 "$tmp"/docker/* "$KIND_BENCH_DOCKER_DIR/" || status=1
