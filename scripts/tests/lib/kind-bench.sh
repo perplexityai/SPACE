@@ -440,10 +440,14 @@ kind_bench_checkout() {
       && git -C "$repo" worktree add --quiet --detach --force "$dest" HEAD \
       && rsync -a --from0 --files-from="$lists/changed" "$repo/" "$dest/"; } || status=1
   if (( ! status )); then
-    # A path removed only from the index (`git rm --cached`) is still in the
-    # working tree, so it is untracked and was copied: keep it.
+    # A path removed only from the index (`git rm --cached`) and still in the
+    # working tree is untracked and was copied: keep it. One that is also
+    # ignored was not copied, and like every ignored file it is absent from a
+    # bench, rather than left at HEAD's content.
     while IFS= read -r -d '' path; do
-      [[ -e "$repo/$path" || -L "$repo/$path" ]] && continue
+      if [[ -e "$repo/$path" || -L "$repo/$path" ]] && ! git -C "$repo" check-ignore -q -- "$path"; then
+        continue
+      fi
       rm -f -- "$dest/$path" || status=1
     done <"$lists/deleted"
   fi
