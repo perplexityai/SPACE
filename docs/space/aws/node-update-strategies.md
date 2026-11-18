@@ -150,9 +150,9 @@ time to become Ready.
 The target must carry the `space.pplx.net/rollout-cohort` taint and its
 matching node label, as `rollout-mng` declares them. The script refuses to
 start drains when target nodes lack the taint at startup, but it does not
-re-check taints for the rest of the rollout: nodes that register later are
-fenced only because the MNG declares the taint, so verify the target MNG's
-taint before starting. Use a `rollout-mng` or
+re-check the taints of target nodes that register later. Check that each
+new target node carries the taint as it joins during the rollout. Use a
+`rollout-mng` or
 `workers_rollout_cohorts` target. A `worker_capacity_groups` entry does not
 set either today, so it can be a rollout source but not a target.
 
