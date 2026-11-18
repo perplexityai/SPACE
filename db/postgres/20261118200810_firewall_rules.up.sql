@@ -264,7 +264,6 @@ CREATE TABLE firewall_rules_node_observations (
     accepted_round BIGINT,
     accepted_round_issued_at TIMESTAMPTZ,
     accepted_report JSONB,
-    accepted_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT firewall_rules_node_observations_pkey PRIMARY KEY (node_id),
     CONSTRAINT firewall_rules_node_observations_manager_epoch_check CHECK (
@@ -278,7 +277,6 @@ CREATE TABLE firewall_rules_node_observations (
     CONSTRAINT firewall_rules_node_observations_accepted_check CHECK (
         (accepted_round IS NULL) = (accepted_round_issued_at IS NULL)
         AND (accepted_round IS NULL) = (accepted_report IS NULL)
-        AND (accepted_round IS NULL) = (accepted_at IS NULL)
         AND (accepted_round IS NULL OR accepted_round >= 0)
         AND (accepted_round_issued_at IS NULL OR isfinite(accepted_round_issued_at))
     ),
@@ -300,4 +298,4 @@ COMMENT ON COLUMN firewall_rules_node_observations.pending_round_issued_at IS
 COMMENT ON COLUMN firewall_rules_node_observations.accepted_report IS
     'The latest accepted report, a JSON object';
 COMMENT ON COLUMN firewall_rules_node_observations.accepted_round_issued_at IS
-    'When the round of the latest accepted report was first issued, set with accepted_round, accepted_report and accepted_at';
+    'When the round of the latest accepted report was first issued, not when the report arrived; freshness is measured from it. Set with accepted_round and accepted_report';
