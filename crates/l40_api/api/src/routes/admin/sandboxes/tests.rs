@@ -51,22 +51,40 @@ fn admin_create_fingerprint_omits_node_pool_key_when_absent() {
 }
 
 #[test]
-fn admin_node_pool_requires_enabled_gate_and_kubernetes_substrate() {
+fn admin_node_pool_requires_enabled_gate_and_substrate_placement() {
     let node_pool = NodePoolName::parse("isolated-test-pool").unwrap();
+    let unsupported = |_: &NodePoolName| {
+        Err(SubstrateError::Unsupported {
+            message: "no node pools here".to_owned(),
+        })
+    };
 
-    let disabled = validate_admin_node_pool(Some(&node_pool), false, true).unwrap_err();
+    // The gate answers first: a substrate that would refuse is never asked.
+    let disabled = validate_admin_node_pool(Some(&node_pool), false, |_| {
+        panic!("the substrate must not be asked while placement is disabled")
+    })
+    .unwrap_err();
     assert_eq!(disabled.status, StatusCode::BAD_REQUEST);
     assert_eq!(disabled.message, "sandbox node-pool placement is disabled");
 
-    let unsupported = validate_admin_node_pool(Some(&node_pool), true, false).unwrap_err();
-    assert_eq!(unsupported.status, StatusCode::BAD_REQUEST);
+    let refused = validate_admin_node_pool(Some(&node_pool), true, unsupported).unwrap_err();
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
     assert_eq!(
-        unsupported.message,
+        refused.message,
         "sandbox node-pool placement requires the Kubernetes substrate"
     );
 
-    validate_admin_node_pool(Some(&node_pool), true, true).unwrap();
-    validate_admin_node_pool(None, false, false).unwrap();
+    let failed = validate_admin_node_pool(Some(&node_pool), true, |_| {
+        Err(SubstrateError::Unavailable {
+            message: "down".to_owned(),
+        })
+    })
+    .unwrap_err();
+    assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(failed.message, "Internal server error");
+
+    validate_admin_node_pool(Some(&node_pool), true, |_| Ok(())).unwrap();
+    validate_admin_node_pool(None, false, unsupported).unwrap();
 }
 
 #[test]

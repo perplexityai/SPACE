@@ -1012,6 +1012,13 @@ async fn direct_create_rejects_node_pool_placement() -> TestResult {
     };
 
     assert!(matches!(error, SubstrateError::Unsupported { .. }));
+    // The precheck answers a pin with the refusal the create would give.
+    let checked = fixture
+        .substrate
+        .check_node_pool_placement(&node_pool)
+        .unwrap_err();
+    assert!(matches!(checked, SubstrateError::Unsupported { .. }));
+    assert_eq!(checked.to_string(), error.to_string());
     Ok(())
 }
 

@@ -9,8 +9,8 @@ use pplx_space_auto_lifecycle::AutoLifecycleRuntimeState;
 use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, SandboxAutoLifecyclePatch};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    DEFAULT_TEMPLATE_TAG, SandboxId, SandboxLifecycle, TemplateDesiredState, TemplateName,
-    TemplateReference, TemplateTag, TemplateVisibility,
+    DEFAULT_TEMPLATE_TAG, NodePoolName, SandboxId, SandboxLifecycle, TemplateDesiredState,
+    TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
 };
 use pplx_space_content_digest::DigestPrefixResolveError;
 use pplx_space_execution_spec::RuntimeKind;
@@ -1238,6 +1238,15 @@ impl SandboxController {
 
     pub fn substrate_capabilities(&self) -> super::substrate::SubstrateCapabilities {
         self.substrate.capabilities()
+    }
+
+    /// Whether the substrate accepts a create pinned to a node pool (see
+    /// [`SubstrateAdapter::check_node_pool_placement`]).
+    pub fn check_node_pool_placement(
+        &self,
+        node_pool: &NodePoolName,
+    ) -> Result<(), SubstrateError> {
+        self.substrate.check_node_pool_placement(node_pool)
     }
 
     /// Whether this deployment records activating clients (see

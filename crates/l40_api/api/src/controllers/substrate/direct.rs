@@ -85,7 +85,7 @@
 //!
 //! | Refused or missing | Effect today | Owner | Removed by |
 //! |---|---|---|---|
-//! | Node-pool placement | [`SubstrateError::Unsupported`]: a create naming a node pool is refused | ac-pplx | Node-pool membership for registered nodes, read by core placement |
+//! | Node-pool placement | [`SubstrateError::Unsupported`] from `create_execution` and `check_node_pool_placement`: a create naming a node pool is refused, and the admin create answers 400 before enqueueing it | ac-pplx | Node-pool membership for registered nodes, read by core placement |
 //! | Forks (restoring a durable fork disk as a new sandbox) | `Unsupported`: the create is refused | ac-pplx | A Direct launch that stages the fork disk on the chosen node |
 //! | Cluster pool configs (`list_pool_configs`, `upsert_pool_config`, `disable_pool_config`) | `Unsupported` from the trait defaults | ac-pplx | Pool-config handling in the core for both substrates |
 //! | Cold create shape ([`SubstrateCapabilities::resolves_cold_create_shape`] is false) | The controller resolves no shape for a create that adopts no warm-pool sandbox, so no such create records a shape source on its `create_completed` event or a compute sample in the requested-size metrics, even one that names both vCPU and memory. A fallthrough create takes neither an enabled, non-encryptable pool config's nor the template's warm-pool policy's vCPU, memory, disk size and disk I/O limits; it asks the worker for a base-snapshot boot, which falls back to a cold boot. A create that leaves vCPU or memory unset keeps them unset on its row. Booting cold, the worker takes unset vCPU and memory from the template's metadata (2 vCPU and 1024 MiB when it has none) and caps memory by the node's memory policy | ac-pplx | Cold create shape resolution in the core for both substrates, after which `resolves_cold_create_shape` is deleted |
@@ -124,7 +124,7 @@ use pplx_space_accounts::NodeId;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
     ArtifactOrigin, ExecutionGeneration, ExecutionGenerationParseError, NodeManagedBy,
-    NodeRole as SpaceNodeRole, RouteGeneration, RouteGenerationParseError,
+    NodePoolName, NodeRole as SpaceNodeRole, RouteGeneration, RouteGenerationParseError,
     SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
     SandboxRouteIdentityInvariantError, SubstrateKind,
 };
@@ -4405,6 +4405,10 @@ impl SubstrateAdapter for DirectSubstrate {
         SubstrateCapabilities::DIRECT
     }
 
+    fn check_node_pool_placement(&self, node_pool: &NodePoolName) -> Result<(), SubstrateError> {
+        refuse_node_pool_placement(node_pool)
+    }
+
     fn pool_eligible_for_request(
         &self,
         boot_mode: CreateBootMode,
@@ -4769,11 +4773,7 @@ impl SubstrateAdapter for DirectSubstrate {
         request: CreateExecutionRequest<'a>,
     ) -> Result<CreateExecutionOutcome, SubstrateError> {
         if let Some(node_pool) = request.node_pool {
-            return Err(SubstrateError::Unsupported {
-                message: format!(
-                    "node-pool placement {node_pool} requires the Kubernetes substrate"
-                ),
-            });
+            refuse_node_pool_placement(node_pool)?;
         }
         ensure_direct_create_supported(request.restore_from.is_some())?;
         let one_shot_create = use_one_shot_create(
@@ -5597,6 +5597,13 @@ impl SubstrateAdapter for DirectSubstrate {
         // its SQL query.
         Ok(None)
     }
+}
+
+/// Direct's answer to any node-pool pin; see the module doc's gap table.
+fn refuse_node_pool_placement(node_pool: &NodePoolName) -> Result<(), SubstrateError> {
+    Err(SubstrateError::Unsupported {
+        message: format!("node-pool placement {node_pool} requires the Kubernetes substrate"),
+    })
 }
 
 fn ensure_direct_create_supported(fork_disk_restore: bool) -> Result<(), SubstrateError> {
