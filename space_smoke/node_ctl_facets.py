@@ -44,10 +44,12 @@ def sync_node_ctl_facet(
     facet: str,
     *,
     timeout: float,
+    deadline: float | None = None,
     wait: Callable[[float], None],
 ) -> FacetSync:
     """Run `facet` at full scope on that worker now; return once a run that started after
-    this call has finished, or once `timeout` seconds from the call have passed without one.
+    this call has finished, or once `timeout` seconds after the request, or the caller's
+    monotonic `deadline` if that is sooner, have passed without one.
 
     The facet's status has one-second resolution and also moves for
     node-ctl's own poll. The status read first names the latest run's start
@@ -60,12 +62,14 @@ def sync_node_ctl_facet(
     raises when node-ctl cannot be read or did not take the request.
     """
 
-    # From the call, so the status read, the second's wait and the request
-    # (each a node command with its own timeout) spend from the caller's time.
-    deadline = time.monotonic() + timeout
     before = control.node_ctl_facet_run(node_name, facet)
     wait(1)
     control.reconcile_node_ctl_facet(node_name, facet)
+    # The run's time counts from the request, as the template sync's window
+    # always has; a caller's own deadline caps it.
+    until = time.monotonic() + timeout
+    if deadline is not None:
+        until = min(until, deadline)
     while True:
         run = control.node_ctl_facet_run(node_name, facet)
         if (
@@ -74,6 +78,6 @@ def sync_node_ctl_facet(
             and run.last_completed_at >= run.last_started_at
         ):
             return FacetSync(before, run, time.monotonic())
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= until:
             return FacetSync(before, run, None)
         wait(0.5)

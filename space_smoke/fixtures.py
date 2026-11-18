@@ -1366,10 +1366,11 @@ class CommandSandboxFixture(ScenarioFixture):
         # stop released.
         deadline = deleted_at + LOCAL_CLEANUP_DEADLINE_SECONDS
         facets = self._node_ctl_facet_control
-        # A rootfs a poll already removed needs no run.
-        if facets is not None and control.sandbox_cache_dir_present(worker, sandbox_id):
-            self._run_cluster_deleted_eviction(facets, control, worker, sandbox_id, deadline)
-        while control.sandbox_cache_dir_present(worker, sandbox_id):
+        present = control.sandbox_cache_dir_present(worker, sandbox_id)
+        # A rootfs a poll already removed needs no run, and no second probe.
+        if present and facets is not None:
+            present = not self._run_cluster_deleted_eviction(facets, control, worker, sandbox_id, deadline)
+        while present:
             self.verify(
                 time.monotonic() < deadline,
                 "deleted stopped sandbox was not reclaimed by node reconciliation: "
@@ -1385,6 +1386,7 @@ class CommandSandboxFixture(ScenarioFixture):
                 },
             )
             self._context.wait(2)
+            present = control.sandbox_cache_dir_present(worker, sandbox_id)
         self.record("stopped_delete_local_cleanup", "retained rootfs removed")
         self.record("stopped_delete_local_cleanup_seconds", round(time.monotonic() - deleted_at, 1))
 
@@ -1395,8 +1397,9 @@ class CommandSandboxFixture(ScenarioFixture):
         worker: str,
         sandbox_id: str,
         deadline: float,
-    ) -> None:
-        """Run the worker's sandbox desired-state facet now rather than wait for its poll.
+    ) -> bool:
+        """Run the worker's sandbox desired-state facet now rather than wait for its poll;
+        return whether the rootfs was seen gone.
 
         The facet's full-scope run is what node-ctl's poll makes, and the one
         that evicts a cluster-deleted local row, so the rootfs leaves through
@@ -1415,13 +1418,14 @@ class CommandSandboxFixture(ScenarioFixture):
         for attempt in (1, 2):
             remaining = deadline - time.monotonic()
             if remaining <= 1:
-                return
+                return False
             try:
                 sync = sync_node_ctl_facet(
                     facets,
                     worker,
                     LOCAL_CLEANUP_FACET,
-                    timeout=min(LOCAL_CLEANUP_FACET_RUN_SECONDS, remaining),
+                    timeout=LOCAL_CLEANUP_FACET_RUN_SECONDS,
+                    deadline=deadline,
                     wait=self.wait,
                 )
             except (ScenarioTimedOut, SmokeConfigurationError):
@@ -1440,7 +1444,7 @@ class CommandSandboxFixture(ScenarioFixture):
                     "stopped_delete_eviction_run_failure",
                     {"attempt": attempt, "facet": LOCAL_CLEANUP_FACET, "error": failure[:1_000]},
                 )
-                return
+                return False
             self.record("stopped_delete_eviction_runs", attempt)
             settled = min(time.monotonic() + LOCAL_CLEANUP_TEARDOWN_SECONDS, deadline)
             while control.sandbox_cache_dir_present(worker, sandbox_id):
@@ -1448,7 +1452,8 @@ class CommandSandboxFixture(ScenarioFixture):
                     break
                 self._context.wait(1)
             else:
-                return  # gone; the caller's poll reads it once more
+                return True
+        return False
 
     def start_background_process(
         self, command: str, *, timeout: int = 60
