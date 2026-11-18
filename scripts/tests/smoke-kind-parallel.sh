@@ -472,11 +472,21 @@ on_exit() {
   # Nothing in an exit handler may cut it short before the teardown; each step
   # here tolerates its own failure.
   set +e
-  local pid
+  local pid signaled=()
   # Only jobs still this shell's children: a finished one's PID may since
   # belong to anything.
   for pid in ${BACKGROUND[@]+"${BACKGROUND[@]}"}; do
-    [[ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" == "$$" ]] && kill_tree "$pid"
+    if [[ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" == "$$" ]]; then
+      kill_tree "$pid"
+      signaled+=("$pid")
+    fi
+  done
+  # A job still setting up its bench could create the bench's namespace after
+  # the teardown has listed the benches, so the teardown waits for the jobs to
+  # end, at most 30 s in all, so that one ignoring TERM cannot hold the exit.
+  local deadline=$(( SECONDS + 30 ))
+  for pid in ${signaled[@]+"${signaled[@]}"}; do
+    while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do sleep 0.2; done
   done
   if (( KEEP == 1 )); then
     log "--keep: benches left up; remove them with: $0 teardown"
