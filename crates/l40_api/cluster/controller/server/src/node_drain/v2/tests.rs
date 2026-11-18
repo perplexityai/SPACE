@@ -1,0 +1,748 @@
+//! The v2 loop's decisions against a scripted sink and EC2.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
+
+use pplx_space_sbx_mgr_client::proto::DrainEvacuated;
+
+use super::*;
+
+#[derive(Default)]
+struct FakeSink {
+    nodes: Vec<V2Node>,
+    responses: HashMap<NodeId, Result<DrainNodeResponse, String>>,
+    records: HashMap<String, EvacuationRecord>,
+    cordon_error: Option<String>,
+    calls: Mutex<Vec<String>>,
+    /// When set, each `DrainNode` call waits here before it answers.
+    barrier: Option<tokio::sync::Barrier>,
+}
+
+impl FakeSink {
+    fn log(&self, entry: String) {
+        self.calls.lock().unwrap().push(entry);
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl DrainV2Sink for FakeSink {
+    async fn list_v2_nodes(&self) -> Result<Vec<V2Node>, String> {
+        Ok(self.nodes.clone())
+    }
+
+    async fn admit_evacuation(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
+        self.log(format!("admit {node_id} {epoch}"));
+        Ok(true)
+    }
+
+    async fn ensure_cordon(&self, node_id: NodeId) -> Result<(), String> {
+        self.log(format!("cordon {node_id}"));
+        self.cordon_error.clone().map_or(Ok(()), Err)
+    }
+
+    async fn drain_node(&self, node_id: NodeId, epoch: u64) -> Result<DrainNodeResponse, String> {
+        self.log(format!("drain_node {node_id} {epoch}"));
+        if let Some(barrier) = &self.barrier {
+            barrier.wait().await;
+        }
+        self.responses
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_else(|| Err("unscripted".into()))
+    }
+
+    async fn record_evacuation(
+        &self,
+        _node_id: NodeId,
+        evacuated: &DrainEvacuated,
+    ) -> Result<EvacuationRecord, String> {
+        self.log(format!("record {}", evacuated.sandbox_id));
+        Ok(self
+            .records
+            .get(&evacuated.sandbox_id)
+            .cloned()
+            .unwrap_or(EvacuationRecord::Recorded))
+    }
+
+    async fn record_report(
+        &self,
+        node_id: NodeId,
+        epoch: u64,
+        report: serde_json::Value,
+    ) -> Result<bool, String> {
+        self.log(format!("report {node_id} {epoch} {report}"));
+        Ok(true)
+    }
+
+    async fn advance_drained(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
+        self.log(format!("advance {node_id} {epoch}"));
+        Ok(true)
+    }
+
+    async fn record_error(&self, node_id: NodeId, message: &str) {
+        self.log(format!("error {node_id} {message}"));
+    }
+}
+
+/// The instance every test node records.
+const INSTANCE: &str = "i-0000000000000c0c0";
+
+/// EC2, scripted: each instance answers `running` unless scripted
+/// otherwise.
+struct FakeAuthority {
+    answers: HashMap<String, InstanceEvidence>,
+    described: Mutex<Vec<String>>,
+}
+
+impl FakeAuthority {
+    fn ok() -> Self {
+        Self {
+            answers: HashMap::new(),
+            described: Mutex::default(),
+        }
+    }
+
+    fn answering(evidence: InstanceEvidence) -> Self {
+        Self {
+            answers: HashMap::from([(INSTANCE.to_owned(), evidence)]),
+            ..Self::ok()
+        }
+    }
+
+    fn described(&self) -> Vec<String> {
+        self.described.lock().unwrap().clone()
+    }
+}
+
+impl V2InstanceAuthority for FakeAuthority {
+    async fn describe_instance(&self, instance_id: &str) -> InstanceEvidence {
+        self.described.lock().unwrap().push(instance_id.to_owned());
+        self.answers
+            .get(instance_id)
+            .cloned()
+            .unwrap_or_else(|| InstanceEvidence::Listed("running".to_owned()))
+    }
+}
+
+/// One tick with a fresh state, as a controller that just started runs it.
+async fn run_tick<S: DrainV2Sink, A: V2InstanceAuthority>(
+    sink: &S,
+    authority: &A,
+    max_evacuating: usize,
+) -> V2TickReport {
+    tick(sink, authority, max_evacuating, &V2LoopState::default()).await
+}
+
+fn node(phase: Option<&str>, epoch: Option<u64>) -> V2Node {
+    let id = NodeId::new();
+    V2Node {
+        id,
+        phase: phase.map(str::to_owned),
+        epoch,
+        unrecorded_since: BTreeMap::new(),
+        waiting: false,
+        instance_id: Some(INSTANCE.to_owned()),
+        heartbeat_fresh: true,
+    }
+}
+
+fn response(sealed_epoch: Option<u64>, done: bool, evacuated: &[&str]) -> DrainNodeResponse {
+    DrainNodeResponse {
+        sealed_epoch,
+        done,
+        evacuated: evacuated
+            .iter()
+            .map(|id| DrainEvacuated {
+                sandbox_id: (*id).to_owned(),
+                prior: DrainPrior::Started as i32,
+                artifact_id: "artifact".to_owned(),
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// A row without an epoch gets no node call at all: the seal it would set
+/// has no epoch the row records.
+#[tokio::test]
+async fn a_v2_node_without_an_epoch_gets_no_call() {
+    let sink = FakeSink {
+        nodes: vec![node(Some("draining"), None)],
+        ..FakeSink::default()
+    };
+    run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
+    assert!(sink.calls().is_empty(), "{:?}", sink.calls());
+}
+
+/// At most the cap's nodes evacuate: a waiting drain is admitted, oldest
+/// first, only to a free slot, and sealed in the tick that admits it. A
+/// drained node holds no slot. The ones still waiting are cordoned and get
+/// no `DrainNode` call, so nothing seals them.
+#[tokio::test]
+async fn waiting_drains_are_admitted_oldest_first_up_to_the_cap() {
+    let waiting = |epoch: u64| V2Node {
+        waiting: true,
+        ..node(Some("draining"), Some(epoch))
+    };
+    let evacuating = node(Some("draining"), Some(1));
+    let drained = node(Some("drained"), Some(2));
+    let (newest, oldest, middle) = (waiting(30), waiting(10), waiting(20));
+    let nodes = vec![
+        evacuating.clone(),
+        drained.clone(),
+        newest.clone(),
+        oldest.clone(),
+        middle.clone(),
+    ];
+    let sink = FakeSink {
+        responses: nodes
+            .iter()
+            .map(|node| (node.id, Ok(response(node.epoch, false, &[]))))
+            .collect(),
+        nodes,
+        ..FakeSink::default()
+    };
+    let report = run_tick(&sink, &FakeAuthority::ok(), 2).await;
+    assert_eq!(report.admitted, [oldest.id]);
+    let calls = sink.calls();
+    assert!(
+        calls.contains(&format!("admit {} 10", oldest.id)),
+        "{calls:?}"
+    );
+    for sealed in [&evacuating, &drained, &oldest] {
+        assert!(
+            calls.contains(&format!(
+                "drain_node {} {}",
+                sealed.id,
+                sealed.epoch.unwrap()
+            )),
+            "{calls:?}"
+        );
+    }
+    for held in [&newest, &middle] {
+        assert!(calls.contains(&format!("cordon {}", held.id)), "{calls:?}");
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with(&format!("drain_node {}", held.id))
+                    || call.starts_with(&format!("admit {}", held.id))),
+            "{calls:?}"
+        );
+    }
+}
+
+/// A node holds an evacuation slot from its admission while it evacuates. A
+/// waiting drain, a drained or terminating node, and a row gone hold none,
+/// so the oldest waiting drain beside it is admitted to the one slot.
+#[tokio::test]
+async fn a_node_holds_its_slot_until_it_leaves_v2() {
+    let waiting = |phase: Option<&str>| V2Node {
+        waiting: true,
+        ..node(phase, Some(5))
+    };
+    for (case, other, holds) in [
+        ("evacuating", Some(node(Some("draining"), Some(5))), true),
+        ("waiting", Some(waiting(Some("draining"))), false),
+        ("drained", Some(node(Some("drained"), Some(5))), false),
+        (
+            "terminating",
+            Some(node(Some("terminating"), Some(5))),
+            false,
+        ),
+        ("left v2", None, false),
+    ] {
+        // The oldest drain, so a waiting one beside it comes second.
+        let next = V2Node {
+            epoch: Some(1),
+            ..waiting(Some("draining"))
+        };
+        let nodes: Vec<V2Node> = other.iter().cloned().chain([next.clone()]).collect();
+        let sink = FakeSink {
+            responses: nodes
+                .iter()
+                .map(|node| (node.id, Ok(response(node.epoch, false, &[]))))
+                .collect(),
+            nodes,
+            ..FakeSink::default()
+        };
+        let report = run_tick(&sink, &FakeAuthority::ok(), 1).await;
+        let admitted: &[NodeId] = if holds { &[] } else { &[next.id] };
+        assert_eq!(report.admitted, admitted, "{case}");
+        assert_eq!(
+            sink.calls()
+                .iter()
+                .any(|call| call.starts_with(&format!("drain_node {}", next.id))),
+            !holds,
+            "{case}: {:?}",
+            sink.calls()
+        );
+    }
+}
+
+/// A tick calls its nodes at once: two nodes whose `DrainNode` calls each
+/// wait for the other both answer.
+#[tokio::test]
+async fn a_tick_calls_its_nodes_at_once() {
+    let nodes = vec![
+        node(Some("draining"), Some(1)),
+        node(Some("draining"), Some(1)),
+    ];
+    let sink = FakeSink {
+        responses: nodes
+            .iter()
+            .map(|node| (node.id, Ok(response(Some(1), false, &[]))))
+            .collect(),
+        nodes,
+        barrier: Some(tokio::sync::Barrier::new(2)),
+        ..FakeSink::default()
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES),
+    )
+    .await
+    .expect("the two calls wait for each other");
+}
+
+/// A draining node advances only on a `done` report under its own epoch with
+/// every evacuation recorded: not on a stale seal's report, a report that
+/// isn't done, or an evacuation still waiting. The control advances.
+#[tokio::test]
+async fn draining_advances_only_on_a_done_report_under_its_epoch() {
+    for (case, answer, record, advances) in [
+        (
+            "control",
+            response(Some(5), true, &["a"]),
+            EvacuationRecord::Recorded,
+            true,
+        ),
+        (
+            "a stale seal",
+            response(Some(4), true, &["a"]),
+            EvacuationRecord::Recorded,
+            false,
+        ),
+        (
+            "not done",
+            response(Some(5), false, &["a"]),
+            EvacuationRecord::Recorded,
+            false,
+        ),
+        (
+            "an evacuation waiting",
+            response(Some(5), true, &["a"]),
+            EvacuationRecord::NotYet("uploading".into()),
+            false,
+        ),
+    ] {
+        let draining = node(Some("draining"), Some(5));
+        let sink = FakeSink {
+            nodes: vec![draining.clone()],
+            responses: HashMap::from([(draining.id, Ok(answer))]),
+            records: HashMap::from([("a".to_owned(), record)]),
+            ..FakeSink::default()
+        };
+        let report = run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
+        assert_eq!(report.drained == [draining.id], advances, "{case}");
+        let calls = sink.calls();
+        assert_eq!(
+            calls.iter().any(|call| call.starts_with("advance")),
+            advances,
+            "{case}: {calls:?}"
+        );
+        // Cordon, then the call under the row's epoch, then each record,
+        // then the report.
+        let order: Vec<_> = calls
+            .iter()
+            .map(|call| call.split(' ').next().unwrap())
+            .collect();
+        assert_eq!(
+            &order[..4],
+            ["cordon", "drain_node", "record", "report"],
+            "{case}"
+        );
+        assert!(calls[1].ends_with(" 5"), "{case}: {calls:?}");
+    }
+}
+
+/// A drained node keeps reporting, so `:terminate` reads a current report,
+/// but never advances again.
+#[tokio::test]
+async fn a_drained_node_keeps_reporting_and_never_advances() {
+    let drained = node(Some("drained"), Some(5));
+    let sink = FakeSink {
+        nodes: vec![drained.clone()],
+        responses: HashMap::from([(drained.id, Ok(response(Some(5), true, &[])))]),
+        ..FakeSink::default()
+    };
+    run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
+    let calls = sink.calls();
+    assert!(
+        calls.iter().any(|call| call.starts_with("report")),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|call| call.starts_with("advance")),
+        "{calls:?}"
+    );
+}
+
+/// The report carries what the loop could not record yet.
+#[tokio::test]
+async fn the_report_names_the_evacuations_not_yet_recorded() {
+    let answer = response(Some(5), true, &["a", "b"]);
+    let json = report_json(
+        &answer,
+        &Recording {
+            records: vec![
+                ("a".into(), EvacuationRecord::Recorded),
+                ("b".into(), EvacuationRecord::NotYet("uploading".into())),
+            ],
+            since: BTreeMap::from([("b".into(), 1_000)]),
+            now: 1_060,
+        },
+    );
+    assert_eq!(
+        json["unrecorded"],
+        serde_json::json!([{"sandbox_id": "b", "reason": "uploading", "since": 1_000}])
+    );
+    assert_eq!(json["blocked"], serde_json::json!([]));
+    assert_eq!(json["sealed_epoch"], 5);
+    assert_eq!(json["evacuated"][0]["prior"], "started");
+}
+
+/// With new v2 drains not admitted, the loop still owns the persisted ones:
+/// it drains a draining node to `drained`, with no terminator to ask EC2.
+#[tokio::test]
+async fn the_loop_owns_persisted_drains_without_a_terminator() {
+    let draining = node(Some("draining"), Some(5));
+    let sink = FakeSink {
+        nodes: vec![draining.clone()],
+        responses: HashMap::from([(draining.id, Ok(response(Some(5), true, &[])))]),
+        ..FakeSink::default()
+    };
+    let report = run_tick(&sink, &V2Terminator::Refuse, DEFAULT_MAX_EVACUATING_NODES).await;
+    assert_eq!(report.drained, [draining.id]);
+}
+
+/// A draining node that doesn't answer its `DrainNode` call reads 1 on the
+/// unanswered gauge, so a dead node pages as a blocked one does; one that
+/// answers reads 0.
+#[tokio::test(flavor = "current_thread")]
+async fn a_node_that_does_not_answer_shows_on_the_unanswered_gauge() {
+    for (case, answer, unanswered) in [
+        ("dead", Err("unreachable".into()), 1.0),
+        ("answering", Ok(response(Some(5), false, &[])), 0.0),
+    ] {
+        let draining = node(Some("draining"), Some(5));
+        let sink = FakeSink {
+            nodes: vec![draining.clone()],
+            responses: HashMap::from([(draining.id, answer)]),
+            ..FakeSink::default()
+        };
+        let capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
+        run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
+        let values = capture.finish();
+        let gauge = values
+            .iter()
+            .find(|value| value.name == "node_drain.v2.unanswered")
+            .map(|value| value.value);
+        assert_eq!(gauge, Some(unanswered), "{case}: {values:?}");
+    }
+}
+
+/// A node that leaves the loop's listing, whatever took its row out of the
+/// drain (an operator's let-go, a registration that took the row), has its
+/// v2 gauges zeroed on the next tick, once; a node still listed goes on
+/// publishing its own.
+#[tokio::test(flavor = "current_thread")]
+async fn a_node_that_leaves_the_listing_has_its_v2_gauges_zeroed() {
+    let left = node(Some("draining"), Some(5));
+    let stays = node(Some("draining"), Some(6));
+    let sink = |nodes: Vec<V2Node>| FakeSink {
+        responses: nodes
+            .iter()
+            .map(|node| (node.id, Err("unreachable".to_owned())))
+            .collect(),
+        nodes,
+        ..FakeSink::default()
+    };
+    let both = sink(vec![left.clone(), stays.clone()]);
+    let only = sink(vec![stays.clone()]);
+    let state = V2LoopState::default();
+    let gauges = |values: &[pplx_space_metrics_emit::test_capture::CapturedValue],
+                  node: &V2Node| {
+        values
+            .iter()
+            .filter(|value| value.tags.contains(&format!("node:{}", node.id)))
+            .map(|value| (value.name.clone(), value.value))
+            .collect::<Vec<_>>()
+    };
+    tick(
+        &both,
+        &FakeAuthority::ok(),
+        DEFAULT_MAX_EVACUATING_NODES,
+        &state,
+    )
+    .await;
+    for (case, cleared) in [("left", true), ("already cleared", false)] {
+        let capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
+        tick(
+            &only,
+            &FakeAuthority::ok(),
+            DEFAULT_MAX_EVACUATING_NODES,
+            &state,
+        )
+        .await;
+        let values = capture.finish();
+        let zeroed: Vec<(String, f64)> = if cleared {
+            ["unanswered", "blocked", "pending"]
+                .map(|name| (format!("node_drain.v2.{name}"), 0.0))
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(gauges(&values, &left), zeroed, "{case}");
+        assert_eq!(
+            gauges(&values, &stays),
+            [("node_drain.v2.unanswered".to_owned(), 1.0)],
+            "{case}"
+        );
+    }
+}
+
+/// A cordon that fails keeps its error past the report, which clears the
+/// last error; one that succeeds leaves none.
+#[tokio::test]
+async fn a_failed_cordon_keeps_its_error_until_a_cordon_succeeds() {
+    for (case, cordon_error, keeps) in [
+        ("failed", Some("node unreachable".to_owned()), true),
+        ("converged", None, false),
+    ] {
+        let draining = node(Some("draining"), Some(5));
+        let sink = FakeSink {
+            nodes: vec![draining.clone()],
+            responses: HashMap::from([(draining.id, Ok(response(Some(5), false, &[])))]),
+            cordon_error,
+            ..FakeSink::default()
+        };
+        run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
+        let calls = sink.calls();
+        let report = calls
+            .iter()
+            .position(|call| call.starts_with("report"))
+            .expect("a report");
+        assert_eq!(
+            calls[report..].iter().any(|call| call
+                == &format!(
+                    "error {} cordon convergence failed: node unreachable",
+                    draining.id
+                )),
+            keeps,
+            "{case}: {calls:?}"
+        );
+    }
+}
+
+/// An evacuation unrecorded since a stored report longer than the bound is
+/// reported `blocked` and counted on the blocked gauge, its clock carried
+/// from that report; one unrecorded within the bound stays pending.
+#[tokio::test(flavor = "current_thread")]
+async fn an_evacuation_unrecorded_past_the_bound_is_blocked() {
+    let bound = i64::try_from(UNRECORDED_BOUND.as_secs()).unwrap();
+    for (case, since_ago, blocked) in [
+        ("past the bound", bound + 60, true),
+        ("within it", bound - 60, false),
+    ] {
+        let since = unix_now() - since_ago;
+        let draining = V2Node {
+            unrecorded_since: BTreeMap::from([("a".to_owned(), since)]),
+            ..node(Some("draining"), Some(5))
+        };
+        let sink = FakeSink {
+            nodes: vec![draining.clone()],
+            responses: HashMap::from([(draining.id, Ok(response(Some(5), false, &["a"])))]),
+            records: HashMap::from([(
+                "a".to_owned(),
+                EvacuationRecord::NotYet(
+                    "the row runs nowhere the control plane knows of yet".into(),
+                ),
+            )]),
+            ..FakeSink::default()
+        };
+        let capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
+        run_tick(&sink, &FakeAuthority::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
+        let gauges = capture.finish();
+        let stored = sink
+            .calls()
+            .into_iter()
+            .find_map(|call| {
+                call.strip_prefix(&format!("report {} 5 ", draining.id))
+                    .map(str::to_owned)
+            })
+            .expect("a report");
+        let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(stored["unrecorded"][0]["since"], since, "{case}");
+        let reasons: Vec<_> = stored["blocked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["reason"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            reasons,
+            if blocked {
+                vec![
+                    "not recorded for over 15 minutes: the row runs nowhere the control plane \
+                     knows of yet"
+                        .to_owned(),
+                ]
+            } else {
+                vec![]
+            },
+            "{case}"
+        );
+        let gauge = |name: &str| {
+            gauges
+                .iter()
+                .find(|value| value.name == name)
+                .map(|value| value.value)
+        };
+        assert_eq!(
+            (
+                gauge("node_drain.v2.blocked"),
+                gauge("node_drain.v2.pending")
+            ),
+            if blocked {
+                (Some(1.0), Some(0.0))
+            } else {
+                (Some(0.0), Some(1.0))
+            },
+            "{case}"
+        );
+    }
+}
+
+/// The gauges count each row once, and the report blocks an overdue
+/// evacuation only when the node doesn't block its sandbox already: a row
+/// the node reports twice pending (an activation and the window's `queued`)
+/// is one pending row, a row the node blocks whose evacuation is also
+/// overdue is one blocked row with the node's reason alone, and a row both
+/// pending and blocked counts as blocked. The controls: a row only
+/// unrecorded past the bound, one within it, one the window holds for disk,
+/// and a blocked entry without a sandbox.
+#[test]
+fn a_row_is_reported_once_however_many_reasons_name_it() {
+    use pplx_space_sbx_mgr_client::proto::{DrainBlocked, DrainPending};
+    let pending = |sandbox_id: &str, action: &str| DrainPending {
+        sandbox_id: sandbox_id.into(),
+        action: action.into(),
+        ..Default::default()
+    };
+    let blocked = |sandbox_id: Option<&str>, reason: &str| DrainBlocked {
+        sandbox_id: sandbox_id.map(str::to_owned),
+        reason: reason.into(),
+    };
+    let answer = DrainNodeResponse {
+        pending: vec![
+            pending("queued", "activation"),
+            pending("queued", "queued"),
+            pending("disk", "disk"),
+            pending("both", "upload"),
+        ],
+        blocked: vec![
+            blocked(Some("both"), "upload failed 3 times: denied"),
+            blocked(Some("blocked"), "the cache disk hasn't had room"),
+            blocked(None, "orphan inventory scan failed"),
+        ],
+        ..response(Some(5), false, &["blocked", "late", "fresh"])
+    };
+    let bound = i64::try_from(UNRECORDED_BOUND.as_secs()).unwrap();
+    let not_yet = || EvacuationRecord::NotYet("not projected yet".into());
+    let recording = Recording {
+        records: vec![
+            ("blocked".into(), not_yet()),
+            ("late".into(), not_yet()),
+            ("fresh".into(), not_yet()),
+        ],
+        since: BTreeMap::from([
+            ("blocked".into(), 0),
+            ("late".into(), 0),
+            ("fresh".into(), bound),
+        ]),
+        now: bound + 60,
+    };
+
+    assert_eq!(outstanding_rows(&answer, &recording), (4, 3));
+    let json = report_json(&answer, &recording);
+    let named: Vec<_> = json["blocked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["sandbox_id"].as_str().unwrap_or("-").to_owned())
+        .collect();
+    assert_eq!(named, ["both", "blocked", "-", "late"]);
+    assert_eq!(json["unrecorded"].as_array().unwrap().len(), 3);
+}
+
+/// A waiting drain is admitted only while its own heartbeat is fresh, and a
+/// node holding a slot frees it early only when EC2 lists its instance
+/// `shutting-down` or `terminated`: a stopped or unlisted instance, or no
+/// answer, keeps it.
+#[tokio::test]
+async fn slots_follow_the_heartbeat_and_irreversible_ec2_evidence() {
+    let waiting = |epoch: u64, fresh: bool| V2Node {
+        waiting: true,
+        heartbeat_fresh: fresh,
+        ..node(Some("draining"), Some(epoch))
+    };
+    let stale = waiting(1, false);
+    let fresh = waiting(2, true);
+    let sink = FakeSink {
+        responses: HashMap::from([(fresh.id, Ok(response(Some(2), false, &[])))]),
+        nodes: vec![stale.clone(), fresh.clone()],
+        ..FakeSink::default()
+    };
+    let authority = FakeAuthority::ok();
+    let report = run_tick(&sink, &authority, 1).await;
+    assert_eq!(report.admitted, [fresh.id], "only a fresh waiting node");
+    assert_eq!(
+        authority.described(),
+        [INSTANCE],
+        "EC2 is asked about the stale node only"
+    );
+
+    for (case, evidence, frees) in [
+        ("shutting-down", InstanceEvidence::ShuttingDown, true),
+        ("terminated", InstanceEvidence::Terminated, true),
+        ("stopped", InstanceEvidence::Listed("stopped".into()), false),
+        ("not listed", InstanceEvidence::NotListed, false),
+        (
+            "unknown",
+            InstanceEvidence::Unknown("timeout".into()),
+            false,
+        ),
+    ] {
+        for holder in [V2Node {
+            heartbeat_fresh: false,
+            ..node(Some("draining"), Some(1))
+        }] {
+            let next = waiting(9, true);
+            let sink = FakeSink {
+                responses: HashMap::from([(next.id, Ok(response(Some(9), false, &[])))]),
+                nodes: vec![holder.clone(), next.clone()],
+                ..FakeSink::default()
+            };
+            let report = run_tick(&sink, &FakeAuthority::answering(evidence.clone()), 1).await;
+            assert_eq!(
+                report.admitted == [next.id],
+                frees,
+                "{case} {:?}",
+                holder.phase
+            );
+        }
+    }
+}

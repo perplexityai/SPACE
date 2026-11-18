@@ -8,6 +8,8 @@ use crate::query::{
 const DESCRIBE_INSTANCES_ACTION: &str = "DescribeInstances";
 const EC2_API_VERSION: &str = "2016-11-15";
 const DESCRIBE_PAGE_SIZE: &str = "1000";
+/// EC2's limit on the values of one `DescribeInstances` filter.
+pub const MAX_FILTER_VALUES: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instance {
@@ -49,12 +51,45 @@ impl<T: QueryTransport> Client<T> {
         &self,
         private_dns_name: &str,
     ) -> Result<Vec<Instance>, AwsClientError> {
+        self.describe_instances_filtered("private-dns-name", &[private_dns_name])
+            .await
+    }
+
+    /// Every instance EC2 lists with one of `instance_ids`, across pages, in
+    /// calls of at most [`MAX_FILTER_VALUES`] ids each.
+    ///
+    /// Asks with an `instance-id` filter rather than `InstanceIds`: with an
+    /// explicit id list, one id EC2 doesn't know fails the whole call
+    /// (`InvalidInstanceID.NotFound`), while a filter leaves it out of the
+    /// answer. An instance EC2 has forgotten, about an hour after it
+    /// terminated, is therefore absent from the result, and so is an id in
+    /// the wrong region or account: the caller needs a control that an
+    /// absent id is not such a mistake.
+    pub async fn describe_instances_by_ids(
+        &self,
+        instance_ids: &[&str],
+    ) -> Result<Vec<Instance>, AwsClientError> {
+        let mut instances = Vec::new();
+        for chunk in instance_ids.chunks(MAX_FILTER_VALUES) {
+            instances.extend(
+                self.describe_instances_filtered("instance-id", chunk)
+                    .await?,
+            );
+        }
+        Ok(instances)
+    }
+
+    async fn describe_instances_filtered(
+        &self,
+        filter: &str,
+        values: &[&str],
+    ) -> Result<Vec<Instance>, AwsClientError> {
         let mut instances = Vec::new();
         let mut next_token = None;
 
         loop {
             let page = self
-                .describe_instances_page(private_dns_name, next_token.as_deref())
+                .describe_instances_page(filter, values, next_token.as_deref())
                 .await?;
             instances.extend(page.instances);
             let Some(token) = page.next_token else {
@@ -68,16 +103,20 @@ impl<T: QueryTransport> Client<T> {
 
     async fn describe_instances_page(
         &self,
-        private_dns_name: &str,
+        filter: &str,
+        values: &[&str],
         next_token: Option<&str>,
     ) -> Result<DescribeInstancesPage, AwsClientError> {
-        let mut params = vec![
-            ("Filter.1.Name", "private-dns-name".to_string()),
-            ("Filter.1.Value.1", private_dns_name.to_string()),
-            ("MaxResults", DESCRIBE_PAGE_SIZE.to_string()),
-        ];
+        let mut params: Vec<(String, String)> = vec![("Filter.1.Name".into(), filter.to_string())];
+        params.extend(
+            values
+                .iter()
+                .enumerate()
+                .map(|(n, value)| (format!("Filter.1.Value.{}", n + 1), (*value).to_string())),
+        );
+        params.push(("MaxResults".into(), DESCRIBE_PAGE_SIZE.to_string()));
         if let Some(next_token) = next_token {
-            params.push(("NextToken", next_token.to_string()));
+            params.push(("NextToken".into(), next_token.to_string()));
         }
 
         let body = self

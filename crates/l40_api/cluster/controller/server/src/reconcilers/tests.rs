@@ -1,5 +1,6 @@
 use super::{
-    ReconcilerRuntimeError, Supervision, TerminatorKind, build_if_enabled, supervise_reconcilers,
+    ReconcilerRuntimeError, Supervision, TerminatorBackend, TerminatorKind, build_if_enabled,
+    supervise_reconcilers,
 };
 use std::future::Future;
 use tokio::task::JoinError;
@@ -125,4 +126,50 @@ fn terminator_kind_rejects_unrecognized_value() {
         err,
         ReconcilerRuntimeError::InvalidTerminatorKind(ref value) if value == "kube_delete"
     ));
+}
+
+/// Each terminator kind loads its own backend, and only `aws` loads the
+/// AWS config, so a cluster that runs another terminator never initializes
+/// the AWS SDK for it.
+#[tokio::test]
+async fn each_terminator_kind_loads_its_backend() {
+    for name in ["aws", "kube-delete", "noop"] {
+        let kind = TerminatorKind::parse(Some(name)).unwrap();
+        let loaded = std::cell::Cell::new(false);
+        let backend = TerminatorBackend::load_with(kind, || async {
+            loaded.set(true);
+            aws_config::SdkConfig::builder().build()
+        })
+        .await;
+        let backend = match backend {
+            TerminatorBackend::Aws(_) => "aws",
+            TerminatorBackend::KubeDelete => "kube-delete",
+            TerminatorBackend::Noop => "noop",
+        };
+        assert_eq!(backend, name);
+        assert_eq!(loaded.get(), name == "aws", "{name}");
+    }
+}
+
+/// The v2 loop asks EC2 only under the `aws` backend; every other backend's
+/// authority reads every instance unknown.
+#[test]
+fn the_v2_loop_asks_ec2_only_under_aws() {
+    use crate::node_drain::v2::V2Terminator;
+    for (case, backend, asks_ec2) in [
+        (
+            "aws",
+            TerminatorBackend::Aws(Box::new(aws_config::SdkConfig::builder().build())),
+            true,
+        ),
+        ("kube-delete", TerminatorBackend::KubeDelete, false),
+        ("noop", TerminatorBackend::Noop, false),
+    ] {
+        let terminator = backend.v2_terminator();
+        assert_eq!(
+            matches!(terminator, V2Terminator::Ec2 { .. }),
+            asks_ec2,
+            "{case}"
+        );
+    }
 }

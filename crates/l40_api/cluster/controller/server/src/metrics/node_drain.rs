@@ -8,6 +8,47 @@ use pplx_space_common_core::types::NodeDrainMode;
 
 use pplx_space_metrics_emit::{counter, elapsed_ms, gauge, tag, timing_ms};
 
+/// What a v2 drain's node reported on the loop's last call, each resident
+/// counted once: residents it can't make durable (`blocked`, which keeps the
+/// drain from ending and is what to page on) and the rest with work still
+/// under way (`pending`, evacuations not yet recorded included).
+/// `unanswered` is 1 while the node didn't answer, which keeps the drain from
+/// ending just as `blocked` does.
+pub fn v2_report(node_id: &str, blocked: u64, pending: u64) {
+    gauge("node_drain.v2.unanswered", 0.0, &[tag("node", node_id)]);
+    gauge(
+        "node_drain.v2.blocked",
+        blocked as f64,
+        &[tag("node", node_id)],
+    );
+    gauge(
+        "node_drain.v2.pending",
+        pending as f64,
+        &[tag("node", node_id)],
+    );
+}
+
+/// A v2 drain's node didn't answer the loop's `DrainNode` call: dead,
+/// unreachable or failing. See [`v2_report`].
+pub fn v2_unanswered(node_id: &str) {
+    gauge("node_drain.v2.unanswered", 1.0, &[tag("node", node_id)]);
+}
+
+/// Zero a node's v2 gauges once it is no longer a v2 drain's: its row left
+/// the loop's listing. Left at their last values, a blocked or
+/// unanswered node would page after its drain ended. Only the v2 loop
+/// calls it, for nodes it listed, so a node no v2 drain touched never gets
+/// a v2 series.
+pub fn clear_v2_gauges(node_id: &str) {
+    for name in [
+        "node_drain.v2.unanswered",
+        "node_drain.v2.blocked",
+        "node_drain.v2.pending",
+    ] {
+        gauge(name, 0.0, &[tag("node", node_id)]);
+    }
+}
+
 /// Transition between two `nodes.drain_phase` values (driven by the reconciler).
 pub fn transition(from: &str, to: &str) {
     counter(

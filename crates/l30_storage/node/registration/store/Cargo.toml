@@ -14,7 +14,8 @@ postgres = ["node_k8s", "nodes"]
 workspace = true
 
 [dependencies]
-sqlx = { workspace = true, features = ["postgres"] }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["json", "postgres"] }
 thiserror = { workspace = true }
 
 # internal
@@ -22,6 +23,7 @@ pplx-space-accounts = { workspace = true, features = ["sqlx"] }
 pplx-space-common-core = { workspace = true, features = ["sqlx"] }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
+pplx-space-sandbox-residency = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 
 [dev-dependencies]

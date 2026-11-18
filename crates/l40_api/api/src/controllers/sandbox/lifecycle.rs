@@ -1161,9 +1161,13 @@ pub(super) async fn fetch_active_node_drain_state(
     // sandbox row, so they are one statement: a snapshot at least as
     // consistent as the two reads it replaces. `portable` is only consulted
     // first; the primary columns are ignored when it is true.
+    // A stopped row a drain released, its disk durable, is placed afresh by
+    // its start, so no drain phase on its last node holds it either.
     let portable_predicate = portable_for_restore_affinity("s");
+    let materializable =
+        pplx_space_sandbox_store::drain_restore::materializable_unplaced_stopped("s");
     let gate_query = format!(
-        "SELECT COALESCE(({portable_predicate}), FALSE) AS portable,
+        "SELECT COALESCE(({portable_predicate}) OR {materializable}, FALSE) AS portable,
                 n.drain_phase,
                 n.drain_mode,
                 n.id IS NOT NULL AS primary_found,

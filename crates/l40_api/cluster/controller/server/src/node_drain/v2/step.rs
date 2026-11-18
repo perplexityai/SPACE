@@ -1,0 +1,286 @@
+//! The per-node step: what one tick does to a node, and the drain call.
+
+use super::*;
+
+/// How long an evacuation may stay unrecorded before the report names it
+/// `blocked`: the node's own bound on a transition it doesn't drive.
+pub const UNRECORDED_BOUND: Duration = Duration::from_secs(15 * 60);
+
+/// What the loop recorded of one report: each evacuation's record, and
+/// since when each one still unrecorded has been, in Unix seconds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recording {
+    pub records: Vec<(String, EvacuationRecord)>,
+    pub since: BTreeMap<String, i64>,
+    pub now: i64,
+}
+
+impl Recording {
+    /// The unrecorded evacuations, with their reason and since when.
+    fn unrecorded(&self) -> impl Iterator<Item = (&str, &str, i64)> {
+        self.records
+            .iter()
+            .filter_map(|(sandbox_id, record)| match record {
+                EvacuationRecord::NotYet(reason) => Some((
+                    sandbox_id.as_str(),
+                    reason.as_str(),
+                    self.since.get(sandbox_id).copied().unwrap_or(self.now),
+                )),
+                EvacuationRecord::Recorded => None,
+            })
+    }
+
+    /// The unrecorded evacuations past [`UNRECORDED_BOUND`], with why.
+    fn overdue(&self) -> Vec<(&str, String)> {
+        let bound = i64::try_from(UNRECORDED_BOUND.as_secs()).unwrap_or(i64::MAX);
+        self.unrecorded()
+            .filter(|(_, _, since)| self.now.saturating_sub(*since) >= bound)
+            .map(|(sandbox_id, reason, _)| {
+                (
+                    sandbox_id,
+                    format!(
+                        "not recorded for over {} minutes: {reason}",
+                        UNRECORDED_BOUND.as_secs() / 60
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn all_recorded(&self) -> bool {
+        self.records.iter().all(|(_, record)| record.is_recorded())
+    }
+}
+
+/// The JSON `drain_status.report` holds: the node's answer and what the loop
+/// recorded of it. An evacuation unrecorded past [`UNRECORDED_BOUND`] is
+/// `blocked` as well, unless the node already reports its sandbox blocked.
+pub fn report_json(response: &DrainNodeResponse, recording: &Recording) -> serde_json::Value {
+    let prior = |value: i32| match DrainPrior::try_from(value) {
+        Ok(DrainPrior::Started) => "started",
+        Ok(DrainPrior::Paused) => "paused",
+        Ok(DrainPrior::Stopped) => "stopped",
+        _ => "unknown",
+    };
+    serde_json::json!({
+        "sealed_epoch": response.sealed_epoch,
+        "done": response.done,
+        "evacuated": response.evacuated.iter().map(|entry| serde_json::json!({
+            "sandbox_id": entry.sandbox_id,
+            "prior": prior(entry.prior),
+            "artifact_id": entry.artifact_id,
+        })).collect::<Vec<_>>(),
+        "pending": response.pending.iter().map(|entry| serde_json::json!({
+            "sandbox_id": entry.sandbox_id,
+            "action": entry.action,
+        })).collect::<Vec<_>>(),
+        "blocked": response.blocked.iter().map(|entry| serde_json::json!({
+            "sandbox_id": entry.sandbox_id,
+            "reason": entry.reason,
+        })).chain(overdue_unblocked(response, recording).map(|(sandbox_id, reason)| serde_json::json!({
+            "sandbox_id": sandbox_id,
+            "reason": reason,
+        }))).collect::<Vec<_>>(),
+        "unrecorded": recording.unrecorded().map(|(sandbox_id, reason, since)| serde_json::json!({
+            "sandbox_id": sandbox_id,
+            "reason": reason,
+            "since": since,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Record each evacuation `response` reports, carrying over since when each
+/// unrecorded one has been from the node's last stored report.
+async fn record_evacuations<S: DrainV2Sink>(
+    sink: &S,
+    node: &V2Node,
+    response: &DrainNodeResponse,
+) -> Recording {
+    let now = unix_now();
+    let mut recording = Recording {
+        now,
+        ..Recording::default()
+    };
+    for evacuated in &response.evacuated {
+        let record = match sink.record_evacuation(node.id, evacuated).await {
+            Ok(record) => record,
+            Err(error) => EvacuationRecord::NotYet(format!("recording failed: {error}")),
+        };
+        if !record.is_recorded() {
+            recording.since.insert(
+                evacuated.sandbox_id.clone(),
+                node.unrecorded_since
+                    .get(&evacuated.sandbox_id)
+                    .copied()
+                    .unwrap_or(now),
+            );
+        }
+        recording
+            .records
+            .push((evacuated.sandbox_id.clone(), record));
+    }
+    recording
+}
+
+/// The evacuations unrecorded past the bound whose sandbox the node doesn't
+/// already report blocked, with why.
+fn overdue_unblocked<'a>(
+    response: &'a DrainNodeResponse,
+    recording: &'a Recording,
+) -> impl Iterator<Item = (&'a str, String)> {
+    recording.overdue().into_iter().filter(|(sandbox_id, _)| {
+        !response
+            .blocked
+            .iter()
+            .any(|entry| entry.sandbox_id.as_deref() == Some(*sandbox_id))
+    })
+}
+
+/// How many of the node's rows `response` and the loop's `recording` of it
+/// leave blocked and pending, each row counted once: blocked when the node
+/// reports it blocked or its evacuation is unrecorded past the bound, else
+/// pending when the node reports it pending, its window's `queued` and
+/// `disk` among the reasons, or its evacuation is unrecorded within the
+/// bound. A blocked entry that names no sandbox counts on its own.
+pub(super) fn outstanding_rows(response: &DrainNodeResponse, recording: &Recording) -> (u64, u64) {
+    use std::collections::BTreeSet;
+    let mut blocked: BTreeSet<&str> = recording
+        .overdue()
+        .into_iter()
+        .map(|(sandbox_id, _)| sandbox_id)
+        .collect();
+    let mut unnamed = 0_u64;
+    for entry in &response.blocked {
+        match entry.sandbox_id.as_deref() {
+            Some(sandbox_id) => {
+                blocked.insert(sandbox_id);
+            }
+            None => unnamed += 1,
+        }
+    }
+    let pending: BTreeSet<&str> = response
+        .pending
+        .iter()
+        .map(|entry| entry.sandbox_id.as_str())
+        .chain(recording.unrecorded().map(|(sandbox_id, _, _)| sandbox_id))
+        .filter(|sandbox_id| !blocked.contains(sandbox_id))
+        .collect();
+    (blocked.len() as u64 + unnamed, pending.len() as u64)
+}
+
+/// Publish what `response` and the loop's `recording` of it leave to do,
+/// as [`outstanding_rows`] counts it.
+fn publish_report(node: &V2Node, response: &DrainNodeResponse, recording: &Recording) {
+    let (blocked, pending) = outstanding_rows(response, recording);
+    crate::metrics::node_drain::v2_report(&node.id.to_string(), blocked, pending);
+}
+
+pub(super) async fn step<S: DrainV2Sink>(
+    sink: &S,
+    node: &V2Node,
+    evidence: Option<&InstanceEvidence>,
+) -> Option<NodeStep> {
+    let Some(epoch) = node.epoch else {
+        // The admin route writes the epoch with the phase; a row without
+        // one gets no call, sealed under nothing.
+        tracing::warn!(node_id = %node.id, "node_drain v2: drain_status has no epoch");
+        return None;
+    };
+    if let Some(evidence) = evidence {
+        let instance = node.instance_id.as_deref().unwrap_or("<none>");
+        sink.record_error(
+            node.id,
+            &format!(
+                "the node's heartbeat is stale; EC2 answers {evidence} for its instance {instance}"
+            ),
+        )
+        .await;
+    }
+    match node.phase.as_deref() {
+        None => None,
+        Some("draining") if node.waiting => {
+            // Fenced, but not sealed: it waits for a slot.
+            if let Err(error) = sink.ensure_cordon(node.id).await {
+                sink.record_error(node.id, &format!("cordon convergence failed: {error}"))
+                    .await;
+            }
+            None
+        }
+        Some("draining") | Some("drained") => {
+            drain(sink, node, epoch).await.then_some(NodeStep::Drained)
+        }
+        Some(other) => {
+            tracing::warn!(node_id = %node.id, phase = other, "node_drain v2: unknown phase");
+            None
+        }
+    }
+}
+
+/// Ask the node, record what it reports, and advance a `draining` node that
+/// is done. Returns whether the node moved to `drained`.
+async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
+    let cordon_error = sink
+        .ensure_cordon(node.id)
+        .await
+        .err()
+        .map(|error| format!("cordon convergence failed: {error}"));
+    if let Some(error) = &cordon_error {
+        sink.record_error(node.id, error).await;
+    }
+    let response = match sink.drain_node(node.id, epoch).await {
+        Ok(response) => response,
+        Err(error) => {
+            crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
+            sink.record_error(node.id, &format!("DrainNode failed: {error}"))
+                .await;
+            return false;
+        }
+    };
+    let recording = record_evacuations(sink, node, &response).await;
+    publish_report(node, &response, &recording);
+    let all_recorded = recording.all_recorded();
+    if !response.blocked.is_empty() {
+        tracing::warn!(
+            node_id = %node.id,
+            blocked = response.blocked.len(),
+            "node_drain v2: the node reports residents it can't make durable; the drain \
+             can't end until they are resolved"
+        );
+    }
+    match sink
+        .record_report(node.id, epoch, report_json(&response, &recording))
+        .await
+    {
+        // Storing the report clears the last error; a cordon that failed
+        // this tick keeps its error until one succeeds.
+        Ok(true) => {
+            if let Some(error) = &cordon_error {
+                sink.record_error(node.id, error).await;
+            }
+        }
+        Ok(false) => return false,
+        Err(error) => {
+            sink.record_error(
+                node.id,
+                &format!("storing the drain report failed: {error}"),
+            )
+            .await;
+            return false;
+        }
+    }
+    if node.phase.as_deref() != Some("draining")
+        || !response.done
+        || response.sealed_epoch != Some(epoch)
+        || !all_recorded
+    {
+        return false;
+    }
+    match sink.advance_drained(node.id, epoch).await {
+        Ok(moved) => moved,
+        Err(error) => {
+            sink.record_error(node.id, &format!("advancing to drained failed: {error}"))
+                .await;
+            false
+        }
+    }
+}

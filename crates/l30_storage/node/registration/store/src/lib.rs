@@ -9,6 +9,7 @@ use pplx_space_accounts::NodeId;
 use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
 use pplx_space_sql_locator::sql;
 
+pub mod drain_v2;
 mod register;
 pub use register::{
     K8sNodeRegistration, K8sNodeRegistrationError, K8sNodeRegistrationStep, register_k8s_node,
