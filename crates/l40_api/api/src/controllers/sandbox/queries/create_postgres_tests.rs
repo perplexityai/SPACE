@@ -833,6 +833,13 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
         SubstrateCapabilities::KUBERNETES
     }
 
+    fn check_node_pool_placement(
+        &self,
+        _node_pool: &pplx_space_common_core::types::NodePoolName,
+    ) -> Result<(), SubstrateError> {
+        panic!("unused")
+    }
+
     async fn create_execution(
         &self,
         _request: CreateExecutionRequest<'_>,
@@ -1175,6 +1182,13 @@ impl SubstrateAdapter for NodeRpcStubbedKubernetes {
 
     fn capabilities(&self) -> SubstrateCapabilities {
         self.inner.capabilities()
+    }
+
+    fn check_node_pool_placement(
+        &self,
+        _node_pool: &pplx_space_common_core::types::NodePoolName,
+    ) -> Result<(), SubstrateError> {
+        panic!("unused")
     }
 
     async fn create_execution(

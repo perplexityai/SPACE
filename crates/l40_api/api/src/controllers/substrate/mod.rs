@@ -1185,8 +1185,6 @@ pub struct SubstrateCapabilities {
     /// node unchanged; Direct sends a custom vCPU or memory on its separate
     /// start call (see the [`direct`] module doc).
     pub resolves_cold_create_shape: bool,
-    /// Create requests may carry a Kubernetes node-pool placement pin.
-    pub supports_node_pool_placement: bool,
     /// The substrate has a node scheduling primitive for
     /// [`Substrate::set_node_schedulability`] to patch, and the cluster
     /// controller has a node-drain reconciler for it (opt-in through
@@ -1222,7 +1220,6 @@ impl SubstrateCapabilities {
         node_addressing: NodeAddressing::DirectEndpoint,
         registers_nodes_via_admin_api: true,
         resolves_cold_create_shape: false,
-        supports_node_pool_placement: false,
         supports_node_drain: false,
         uses_kubernetes_api: false,
         suspend_commits_lifecycle: false,
@@ -1234,7 +1231,6 @@ impl SubstrateCapabilities {
         node_addressing: NodeAddressing::SubstrateNodeId,
         registers_nodes_via_admin_api: false,
         resolves_cold_create_shape: true,
-        supports_node_pool_placement: true,
         supports_node_drain: true,
         uses_kubernetes_api: true,
         suspend_commits_lifecycle: true,
@@ -1279,6 +1275,14 @@ pub trait SubstrateAdapter: Send + Sync {
     /// What this substrate supports. Required, so every substrate (and the
     /// `Substrate` forwarding impl) states its answer.
     fn capabilities(&self) -> SubstrateCapabilities;
+
+    /// Whether this substrate accepts a create pinned to a node pool, so a
+    /// caller can refuse the create before enqueueing it. A substrate
+    /// without node-pool placement returns [`SubstrateError::Unsupported`],
+    /// the refusal [`Self::create_execution`] gives a create that carries a
+    /// pin. `Ok` does not mean `node_pool` exists or has room for the
+    /// execution.
+    fn check_node_pool_placement(&self, node_pool: &NodePoolName) -> Result<(), SubstrateError>;
 
     /// Create the active execution object for a newly-created sandbox.
     ///
@@ -2652,6 +2656,14 @@ impl SubstrateAdapter for Substrate {
             Inner::Direct(substrate) => substrate.capabilities(),
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.capabilities(),
+        }
+    }
+
+    fn check_node_pool_placement(&self, node_pool: &NodePoolName) -> Result<(), SubstrateError> {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.check_node_pool_placement(node_pool),
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.check_node_pool_placement(node_pool),
         }
     }
 

@@ -85,7 +85,7 @@
 //!
 //! | Refused or missing | Effect today | Owner | Removed by |
 //! |---|---|---|---|
-//! | Node-pool placement | [`SubstrateError::Unsupported`]: a create naming a node pool is refused | ac-pplx | Node-pool membership for registered nodes, read by core placement |
+//! | Node-pool placement | [`SubstrateError::Unsupported`] from `create_execution` and `check_node_pool_placement`: a create naming a node pool is refused, and the admin create answers 400 before enqueueing it | ac-pplx | Node-pool membership for registered nodes, read by core placement |
 //! | Forks (restoring a durable fork disk as a new sandbox) | `Unsupported`: the create is refused | ac-pplx | A Direct launch that stages the fork disk on the chosen node |
 //! | Cluster pool configs (`list_pool_configs`, `upsert_pool_config`, `disable_pool_config`) | `Unsupported` from the trait defaults | ac-pplx | Pool-config handling in the core for both substrates |
 //! | Warm-pool claims with custom vCPU or memory, or with volume encryption | The claim misses and the create boots cold | ac-pplx | Pool members of that shape, or an adoption that applies it |
@@ -122,7 +122,7 @@ use pplx_space_accounts::NodeId;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
     ArtifactOrigin, ExecutionGeneration, ExecutionGenerationParseError, NodeManagedBy,
-    NodeRole as SpaceNodeRole, RouteGeneration, RouteGenerationParseError,
+    NodePoolName, NodeRole as SpaceNodeRole, RouteGeneration, RouteGenerationParseError,
     SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
     SandboxRouteIdentityInvariantError, SubstrateKind,
 };
@@ -4403,6 +4403,10 @@ impl SubstrateAdapter for DirectSubstrate {
         SubstrateCapabilities::DIRECT
     }
 
+    fn check_node_pool_placement(&self, node_pool: &NodePoolName) -> Result<(), SubstrateError> {
+        refuse_node_pool_placement(node_pool)
+    }
+
     fn pool_eligible_for_request(
         &self,
         boot_mode: CreateBootMode,
@@ -4767,11 +4771,7 @@ impl SubstrateAdapter for DirectSubstrate {
         request: CreateExecutionRequest<'a>,
     ) -> Result<CreateExecutionOutcome, SubstrateError> {
         if let Some(node_pool) = request.node_pool {
-            return Err(SubstrateError::Unsupported {
-                message: format!(
-                    "node-pool placement {node_pool} requires the Kubernetes substrate"
-                ),
-            });
+            refuse_node_pool_placement(node_pool)?;
         }
         ensure_direct_create_supported(request.restore_from.is_some())?;
         let one_shot_create = use_one_shot_create(
@@ -5595,6 +5595,13 @@ impl SubstrateAdapter for DirectSubstrate {
         // its SQL query.
         Ok(None)
     }
+}
+
+/// Direct's answer to any node-pool pin; see the module doc's gap table.
+fn refuse_node_pool_placement(node_pool: &NodePoolName) -> Result<(), SubstrateError> {
+    Err(SubstrateError::Unsupported {
+        message: format!("node-pool placement {node_pool} requires the Kubernetes substrate"),
+    })
 }
 
 fn ensure_direct_create_supported(fork_disk_restore: bool) -> Result<(), SubstrateError> {

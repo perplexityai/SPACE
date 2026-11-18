@@ -23,9 +23,11 @@ use sha2::{Digest, Sha256};
 
 use super::audit::{self, AdminAuditTarget, AdminSandboxAuditEntry};
 use super::sandbox_id::{AdminSandboxIdError, parse_admin_sandbox_id};
+use crate::controllers::sandbox::SandboxController;
 use crate::controllers::sandbox::lifecycle::user_admission::{
     UserLifecycleRequest, admit_user_lifecycle,
 };
+use crate::controllers::substrate::SubstrateError;
 use crate::middleware::auth::AuthUser;
 use crate::models::{Sandbox, SandboxResponse, User};
 use crate::public_operations::{
@@ -182,15 +184,7 @@ pub async fn create_sandbox(
     let org_id = request.org_id;
     let requested_by =
         crate::public_sandbox_operations::admin_create_requested_by_enabled().then_some(actor.id);
-    if let Err(err) = admin_create_precheck(
-        &state.pool,
-        &request,
-        state
-            .sandbox_controller
-            .substrate_capabilities()
-            .supports_node_pool_placement,
-    )
-    .await
+    if let Err(err) = admin_create_precheck(&state.pool, &state.sandbox_controller, &request).await
     {
         tracing::warn!(%org_id, error = %err.message, "admin sandbox create failed");
         return err.into_response();
@@ -229,8 +223,8 @@ pub async fn create_sandbox(
 /// gate and the organization's existence.
 async fn admin_create_precheck(
     pool: &sqlx::PgPool,
+    sandbox_controller: &SandboxController,
     request: &AdminCreateSandboxRequest,
-    substrate_supports_node_pool_placement: bool,
 ) -> Result<(), AdminSandboxActionError> {
     let org_id = request.org_id;
     // Placement is off by default; a pin issued while the gate is off is
@@ -238,7 +232,7 @@ async fn admin_create_precheck(
     validate_admin_node_pool(
         request.node_pool.as_ref(),
         env_flag_var(SANDBOX_ALLOW_PLACEMENT_ENV, DEFAULT_SANDBOX_ALLOW_PLACEMENT),
-        substrate_supports_node_pool_placement,
+        |node_pool| sandbox_controller.check_node_pool_placement(node_pool),
     )?;
 
     let org_exists: bool = sqlx::query_scalar(sql!(
@@ -364,27 +358,35 @@ async fn create_sandbox_for_org(
     }
 }
 
+/// The placement gate runs first; the substrate is asked only once it is on.
 fn validate_admin_node_pool(
     node_pool: Option<&NodePoolName>,
     placement_enabled: bool,
-    substrate_supports_node_pool_placement: bool,
+    check_substrate_placement: impl FnOnce(&NodePoolName) -> Result<(), SubstrateError>,
 ) -> Result<(), AdminSandboxActionError> {
-    if node_pool.is_none() {
+    let Some(node_pool) = node_pool else {
         return Ok(());
-    }
+    };
     if !placement_enabled {
         return Err(AdminSandboxActionError::new(
             StatusCode::BAD_REQUEST,
             "sandbox node-pool placement is disabled",
         ));
     }
-    if !substrate_supports_node_pool_placement {
-        return Err(AdminSandboxActionError::new(
+    match check_substrate_placement(node_pool) {
+        Ok(()) => Ok(()),
+        Err(SubstrateError::Unsupported { .. }) => Err(AdminSandboxActionError::new(
             StatusCode::BAD_REQUEST,
             "sandbox node-pool placement requires the Kubernetes substrate",
-        ));
+        )),
+        Err(error) => {
+            tracing::warn!(%node_pool, %error, "sandbox node-pool placement check failed");
+            Err(AdminSandboxActionError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error",
+            ))
+        }
     }
-    Ok(())
 }
 
 fn admin_create_fingerprint(
