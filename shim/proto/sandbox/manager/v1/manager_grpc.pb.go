@@ -64,6 +64,8 @@ const (
 	SandboxManager_ListAutoLifecycleDeleteReceipts_FullMethodName        = "/space.sandbox.manager.v1.SandboxManager/ListAutoLifecycleDeleteReceipts"
 	SandboxManager_AcknowledgeAutoLifecycleDeleteReceipts_FullMethodName = "/space.sandbox.manager.v1.SandboxManager/AcknowledgeAutoLifecycleDeleteReceipts"
 	SandboxManager_ListPendingLocalBackups_FullMethodName                = "/space.sandbox.manager.v1.SandboxManager/ListPendingLocalBackups"
+	SandboxManager_DrainNode_FullMethodName                              = "/space.sandbox.manager.v1.SandboxManager/DrainNode"
+	SandboxManager_PreviewDrainNode_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/PreviewDrainNode"
 	SandboxManager_GetNetworkPolicy_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/GetNetworkPolicy"
 	SandboxManager_SetNetworkPolicy_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/SetNetworkPolicy"
 	SandboxManager_TemplateNetworkPolicyUpdated_FullMethodName           = "/space.sandbox.manager.v1.SandboxManager/TemplateNetworkPolicyUpdated"
@@ -311,6 +313,102 @@ type SandboxManagerClient interface {
 	// the call rather than silently shrinking the set, because a caller
 	// cannot distinguish a short answer from a complete one.
 	ListPendingLocalBackups(ctx context.Context, in *ListPendingLocalBackupsRequest, opts ...grpc.CallOption) (*ListPendingLocalBackupsResponse, error)
+	// ── Node drain (node-local) ───────────────────────────────────────────────
+	//
+	// Drain this node under `epoch`. Each call first seals the node's VM
+	// activations under `epoch`: a sealed node refuses every new VM activation
+	// (the cold boot of a sandbox, the restore of one from a snapshot, and the
+	// resume of a paused VM held in memory) and keeps teardown and durability
+	// work running. The seal refuses at this node only; it does not stop
+	// placement. On the Kubernetes substrate a create or a restore starts its VM
+	// inside the pod's sandbox creation, so the refusal goes to the kubelet,
+	// which retries the pod. Stop placement on the node before draining it. The
+	// seal is persisted before the call answers and survives a restart of
+	// sandbox-manager.
+	//
+	// The call then walks every row: a started or paused VM is suspended with a
+	// full snapshot and uploaded, a stopped sandbox's disk is published, a
+	// suspended sandbox whose row pins no artifact has its snapshot published
+	// and uploaded (it keeps its lifecycle and is never reported evacuated),
+	// and the upload of every artifact without a durable copy, named snapshots
+	// included, is finished. That work runs after the call answers; a later call
+	// reports it. Idempotent: a call repeats nothing in progress or done. Work
+	// that keeps failing, and a row that sits in a transition the drain doesn't
+	// drive, are reported blocked after a bound. The call reads node-manager's
+	// orphan inventory within a deadline well under a minute, and reports it
+	// blocked when it runs out.
+	//
+	// Epochs only move forward: an epoch below the current one is refused with
+	// `FailedPrecondition`, and so is the epoch of a cancelled drain. With
+	// `cancel`, the call cancels `epoch` instead: it clears the seal if it is
+	// under `epoch` or an earlier one, and remembers `epoch`, so no seal at or
+	// below it is taken again, even by a call that arrives after the cancel. A
+	// cancel below the current seal's epoch is refused with
+	// `FailedPrecondition`. A cancel starts no suspend and stops none already
+	// running; it hands back what the drain suspended: each cancel call reports
+	// every sandbox the drain suspended that it still holds, `evacuated` once
+	// its snapshot is durable (its upload driven as the drain drives it),
+	// `pending` until then, or `blocked` with why when it can't get there: a
+	// failed cleanup, no durable snapshot, work that keeps failing, a
+	// transition past the drain's bound, or a sandbox that was `started` before
+	// the drain and that the drain's suspend left `paused` (nothing resumes it;
+	// it stays blocked until named in `forget`). Once it is evacuated, the
+	// control plane can restore it to the lifecycle it had. The drain's record
+	// of a sandbox is kept until a cancel call names it in `forget`, a caller's
+	// own suspend takes it back, or the sandbox leaves the node; a record whose
+	// sandbox is running again, stopped, failed, or `paused` as it was before
+	// the drain is forgotten, with nothing to hand back. A cancel forgets
+	// records only while its epoch is still the node's current one: once a
+	// later drain seals, an older cancel's call forgets nothing and reports
+	// that, node-level, in `blocked`. A cancel answers `done` once nothing is
+	// left to hand back.
+	//
+	// `done` means the node may be terminated: sealed under `epoch` from before
+	// this call's walk to its end, no activation in flight at the walk's first
+	// read, no VM, nothing pending or blocked, and every scan that can reveal a
+	// resident or an artifact (sandbox-manager's rows and artifact registry,
+	// node-manager's untracked processes, cache and run directories)
+	// succeeded. A sandbox the drain suspended is reported evacuated once its
+	// snapshot is durable, with the lifecycle it had; a stopped one once its
+	// disk is. A `failed` row is not reported, and blocks nothing once its
+	// artifacts are durable.
+	//
+	// A gentle drain names its epoch in `gentle_epoch` and leaves `epoch` 0. It
+	// seals the node and walks every row as a forced drain does, except that it
+	// holds a sandbox in `started` that the node can make durable: it doesn't
+	// suspend it, and reports it `pending` with the action `hold` until it
+	// leaves `started` on its own (the node's idle auto-lifecycle, or a user's
+	// suspend, stop or delete). A started sandbox the node can't make durable
+	// (its suspend would be refused) is reported `blocked` with why, as under a
+	// forced drain, and a started sandbox the drain's own suspend is already
+	// running for is waited for (`suspend`). A row
+	// that suspends on its own is not the drain's: it is not reported
+	// evacuated, and its upload is finished like any other artifact without a
+	// durable copy. The answer echoes `gentle_epoch`. A forced call under the
+	// same epoch continues the same drain, holding nothing. A node that predates
+	// gentle drains reads `epoch` 0 and refuses the call before it seals
+	// anything, so a gentle drain never runs on it as a forced one.
+	DrainNode(ctx context.Context, in *DrainNodeRequest, opts ...grpc.CallOption) (*DrainNodeResponse, error)
+	// Report what a forced v2 drain would find on this node now, changing
+	// nothing: it runs a drain call's planner and its cache disk measurement,
+	// but never seals or unseals, starts no work and writes nothing, the
+	// drain's memory of earlier calls included. It plans as a forced drain. A gentle drain holds each
+	// started sandbox whose suspend is neither refused nor already running: it
+	// lists it `pending` with the action `hold`, whatever this preview lists
+	// for it (`suspend`, `queued`, `disk`, or blocked after repeated suspend
+	// failures), and the window slots that frees can start other work sooner.
+	// A row that has already sat in a transition the drain doesn't drive for
+	// over 15 minutes counts as blocked, as a drain would report it after
+	// waiting that long. A preview doesn't read node-manager's orphan inventory
+	// (untracked runtime processes, orphan cache and run directories), which a
+	// drain call does: node-manager keeps a few inventory scans for every
+	// caller on the node and evicts the least recently used, so a preview's
+	// scan could cut short a drain call's or node-ctl's. The answer names it in
+	// `unchecked`, and `would_finish` doesn't account for it. While the node's
+	// seal row couldn't be read at startup and nothing has read it since, a
+	// preview answers `Internal` with why rather than report a seal it can't
+	// see. A sandbox-manager that predates this RPC answers `Unimplemented`.
+	PreviewDrainNode(ctx context.Context, in *PreviewDrainNodeRequest, opts ...grpc.CallOption) (*PreviewDrainNodeResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(ctx context.Context, in *GetNetworkPolicyRequest, opts ...grpc.CallOption) (*GetNetworkPolicyResponse, error)
 	// Apply a sandbox's desired network policy on the node.
@@ -821,6 +919,26 @@ func (c *sandboxManagerClient) ListPendingLocalBackups(ctx context.Context, in *
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListPendingLocalBackupsResponse)
 	err := c.cc.Invoke(ctx, SandboxManager_ListPendingLocalBackups_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) DrainNode(ctx context.Context, in *DrainNodeRequest, opts ...grpc.CallOption) (*DrainNodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DrainNodeResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_DrainNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) PreviewDrainNode(ctx context.Context, in *PreviewDrainNodeRequest, opts ...grpc.CallOption) (*PreviewDrainNodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PreviewDrainNodeResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_PreviewDrainNode_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1525,6 +1643,102 @@ type SandboxManagerServer interface {
 	// the call rather than silently shrinking the set, because a caller
 	// cannot distinguish a short answer from a complete one.
 	ListPendingLocalBackups(context.Context, *ListPendingLocalBackupsRequest) (*ListPendingLocalBackupsResponse, error)
+	// ── Node drain (node-local) ───────────────────────────────────────────────
+	//
+	// Drain this node under `epoch`. Each call first seals the node's VM
+	// activations under `epoch`: a sealed node refuses every new VM activation
+	// (the cold boot of a sandbox, the restore of one from a snapshot, and the
+	// resume of a paused VM held in memory) and keeps teardown and durability
+	// work running. The seal refuses at this node only; it does not stop
+	// placement. On the Kubernetes substrate a create or a restore starts its VM
+	// inside the pod's sandbox creation, so the refusal goes to the kubelet,
+	// which retries the pod. Stop placement on the node before draining it. The
+	// seal is persisted before the call answers and survives a restart of
+	// sandbox-manager.
+	//
+	// The call then walks every row: a started or paused VM is suspended with a
+	// full snapshot and uploaded, a stopped sandbox's disk is published, a
+	// suspended sandbox whose row pins no artifact has its snapshot published
+	// and uploaded (it keeps its lifecycle and is never reported evacuated),
+	// and the upload of every artifact without a durable copy, named snapshots
+	// included, is finished. That work runs after the call answers; a later call
+	// reports it. Idempotent: a call repeats nothing in progress or done. Work
+	// that keeps failing, and a row that sits in a transition the drain doesn't
+	// drive, are reported blocked after a bound. The call reads node-manager's
+	// orphan inventory within a deadline well under a minute, and reports it
+	// blocked when it runs out.
+	//
+	// Epochs only move forward: an epoch below the current one is refused with
+	// `FailedPrecondition`, and so is the epoch of a cancelled drain. With
+	// `cancel`, the call cancels `epoch` instead: it clears the seal if it is
+	// under `epoch` or an earlier one, and remembers `epoch`, so no seal at or
+	// below it is taken again, even by a call that arrives after the cancel. A
+	// cancel below the current seal's epoch is refused with
+	// `FailedPrecondition`. A cancel starts no suspend and stops none already
+	// running; it hands back what the drain suspended: each cancel call reports
+	// every sandbox the drain suspended that it still holds, `evacuated` once
+	// its snapshot is durable (its upload driven as the drain drives it),
+	// `pending` until then, or `blocked` with why when it can't get there: a
+	// failed cleanup, no durable snapshot, work that keeps failing, a
+	// transition past the drain's bound, or a sandbox that was `started` before
+	// the drain and that the drain's suspend left `paused` (nothing resumes it;
+	// it stays blocked until named in `forget`). Once it is evacuated, the
+	// control plane can restore it to the lifecycle it had. The drain's record
+	// of a sandbox is kept until a cancel call names it in `forget`, a caller's
+	// own suspend takes it back, or the sandbox leaves the node; a record whose
+	// sandbox is running again, stopped, failed, or `paused` as it was before
+	// the drain is forgotten, with nothing to hand back. A cancel forgets
+	// records only while its epoch is still the node's current one: once a
+	// later drain seals, an older cancel's call forgets nothing and reports
+	// that, node-level, in `blocked`. A cancel answers `done` once nothing is
+	// left to hand back.
+	//
+	// `done` means the node may be terminated: sealed under `epoch` from before
+	// this call's walk to its end, no activation in flight at the walk's first
+	// read, no VM, nothing pending or blocked, and every scan that can reveal a
+	// resident or an artifact (sandbox-manager's rows and artifact registry,
+	// node-manager's untracked processes, cache and run directories)
+	// succeeded. A sandbox the drain suspended is reported evacuated once its
+	// snapshot is durable, with the lifecycle it had; a stopped one once its
+	// disk is. A `failed` row is not reported, and blocks nothing once its
+	// artifacts are durable.
+	//
+	// A gentle drain names its epoch in `gentle_epoch` and leaves `epoch` 0. It
+	// seals the node and walks every row as a forced drain does, except that it
+	// holds a sandbox in `started` that the node can make durable: it doesn't
+	// suspend it, and reports it `pending` with the action `hold` until it
+	// leaves `started` on its own (the node's idle auto-lifecycle, or a user's
+	// suspend, stop or delete). A started sandbox the node can't make durable
+	// (its suspend would be refused) is reported `blocked` with why, as under a
+	// forced drain, and a started sandbox the drain's own suspend is already
+	// running for is waited for (`suspend`). A row
+	// that suspends on its own is not the drain's: it is not reported
+	// evacuated, and its upload is finished like any other artifact without a
+	// durable copy. The answer echoes `gentle_epoch`. A forced call under the
+	// same epoch continues the same drain, holding nothing. A node that predates
+	// gentle drains reads `epoch` 0 and refuses the call before it seals
+	// anything, so a gentle drain never runs on it as a forced one.
+	DrainNode(context.Context, *DrainNodeRequest) (*DrainNodeResponse, error)
+	// Report what a forced v2 drain would find on this node now, changing
+	// nothing: it runs a drain call's planner and its cache disk measurement,
+	// but never seals or unseals, starts no work and writes nothing, the
+	// drain's memory of earlier calls included. It plans as a forced drain. A gentle drain holds each
+	// started sandbox whose suspend is neither refused nor already running: it
+	// lists it `pending` with the action `hold`, whatever this preview lists
+	// for it (`suspend`, `queued`, `disk`, or blocked after repeated suspend
+	// failures), and the window slots that frees can start other work sooner.
+	// A row that has already sat in a transition the drain doesn't drive for
+	// over 15 minutes counts as blocked, as a drain would report it after
+	// waiting that long. A preview doesn't read node-manager's orphan inventory
+	// (untracked runtime processes, orphan cache and run directories), which a
+	// drain call does: node-manager keeps a few inventory scans for every
+	// caller on the node and evicts the least recently used, so a preview's
+	// scan could cut short a drain call's or node-ctl's. The answer names it in
+	// `unchecked`, and `would_finish` doesn't account for it. While the node's
+	// seal row couldn't be read at startup and nothing has read it since, a
+	// preview answers `Internal` with why rather than report a seal it can't
+	// see. A sandbox-manager that predates this RPC answers `Unimplemented`.
+	PreviewDrainNode(context.Context, *PreviewDrainNodeRequest) (*PreviewDrainNodeResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error)
 	// Apply a sandbox's desired network policy on the node.
@@ -1730,6 +1944,12 @@ func (UnimplementedSandboxManagerServer) AcknowledgeAutoLifecycleDeleteReceipts(
 }
 func (UnimplementedSandboxManagerServer) ListPendingLocalBackups(context.Context, *ListPendingLocalBackupsRequest) (*ListPendingLocalBackupsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListPendingLocalBackups not implemented")
+}
+func (UnimplementedSandboxManagerServer) DrainNode(context.Context, *DrainNodeRequest) (*DrainNodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DrainNode not implemented")
+}
+func (UnimplementedSandboxManagerServer) PreviewDrainNode(context.Context, *PreviewDrainNodeRequest) (*PreviewDrainNodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PreviewDrainNode not implemented")
 }
 func (UnimplementedSandboxManagerServer) GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetNetworkPolicy not implemented")
@@ -2645,6 +2865,42 @@ func _SandboxManager_ListPendingLocalBackups_Handler(srv interface{}, ctx contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxManager_DrainNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DrainNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).DrainNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_DrainNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).DrainNode(ctx, req.(*DrainNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_PreviewDrainNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PreviewDrainNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).PreviewDrainNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_PreviewDrainNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).PreviewDrainNode(ctx, req.(*PreviewDrainNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SandboxManager_GetNetworkPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetNetworkPolicyRequest)
 	if err := dec(in); err != nil {
@@ -3482,6 +3738,14 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListPendingLocalBackups",
 			Handler:    _SandboxManager_ListPendingLocalBackups_Handler,
+		},
+		{
+			MethodName: "DrainNode",
+			Handler:    _SandboxManager_DrainNode_Handler,
+		},
+		{
+			MethodName: "PreviewDrainNode",
+			Handler:    _SandboxManager_PreviewDrainNode_Handler,
 		},
 		{
 			MethodName: "GetNetworkPolicy",
