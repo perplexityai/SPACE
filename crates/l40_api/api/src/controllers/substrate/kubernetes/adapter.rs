@@ -55,7 +55,6 @@ pub(super) use pooled::pooled_route_identity_adoption_request;
 use pooled::{pooled_wake_request, wait_for_pooled_split_receipt_capability};
 #[cfg(test)]
 use substrate_adapter::create_ready_timeout_error;
-use suspend::{GenerationSuspendOutcome, await_generation_suspend};
 pub use suspend::{GenerationTeardownEvidence, observe_generation_teardown_with_node_api};
 #[cfg(test)]
 use suspend::{await_suspend_continuation, poll_generation_suspend};
