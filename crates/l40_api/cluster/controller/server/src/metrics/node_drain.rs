@@ -8,6 +8,75 @@ use pplx_space_node_model::NodeDrainMode;
 
 use pplx_space_metrics_emit::{counter, elapsed_ms, gauge, tag, timing_ms};
 
+/// What a v2 drain's node reported on the loop's last call, each resident
+/// counted once: residents it can't make durable (`blocked`, which keeps the
+/// drain from ending and is what to page on), the ones with work still under
+/// way (`pending`, evacuations not yet recorded included), and the running
+/// sandboxes a gentle drain holds with nothing started for them (`held`,
+/// which go once they go idle or the drain turns forced).
+/// `unanswered` is 1 while the node didn't answer, which keeps the drain from
+/// ending just as `blocked` does.
+pub fn v2_report(node_id: &str, blocked: u64, pending: u64, held: u64) {
+    gauge("node_drain.v2.unanswered", 0.0, &[tag("node", node_id)]);
+    gauge(
+        "node_drain.v2.blocked",
+        blocked as f64,
+        &[tag("node", node_id)],
+    );
+    gauge(
+        "node_drain.v2.pending",
+        pending as f64,
+        &[tag("node", node_id)],
+    );
+    gauge("node_drain.v2.held", held as f64, &[tag("node", node_id)]);
+}
+
+/// A v2 drain's node didn't answer the loop's `DrainNode` call: dead,
+/// unreachable or failing. See [`v2_report`].
+pub fn v2_unanswered(node_id: &str) {
+    gauge("node_drain.v2.unanswered", 1.0, &[tag("node", node_id)]);
+}
+
+/// Zero a node's v2 gauges once it is no longer a v2 drain's: its cancel
+/// finished, or its row is gone. Left at their last values, a blocked or
+/// unanswered node would page after its drain ended. Only the v2 loop
+/// calls it, for nodes it listed, so a node no v2 drain touched never gets
+/// a v2 series.
+pub fn clear_v2_gauges(node_id: &str) {
+    for name in [
+        "node_drain.v2.unanswered",
+        "node_drain.v2.blocked",
+        "node_drain.v2.pending",
+        "node_drain.v2.held",
+    ] {
+        gauge(name, 0.0, &[tag("node", node_id)]);
+    }
+}
+
+/// Auto Scaling refused, or gave no answer to, the termination of a fenced
+/// node's instance; the node stays `terminating`, and the loop asks again
+/// on its dispatch backoff.
+pub fn v2_terminate_failure(node_id: &str) {
+    counter(
+        "node_drain.v2.terminate_failures",
+        1,
+        &[tag("node", node_id)],
+    );
+}
+
+/// The v2 loop deleted the row of a node whose fenced instance EC2 says is
+/// terminated.
+pub fn v2_node_deleted() {
+    counter("node_drain.v2.nodes_deleted", 1, &[]);
+}
+
+/// The v2 loop let a node go, `reason` being why: its instance terminated
+/// outside the drain, a fenced instance terminated with no dispatch
+/// confirmed, or a guard refused the delete of a terminated node's row.
+pub fn v2_let_go(reason: &str) {
+    counter("node_drain.v2.let_go", 1, &[tag("reason", reason)]);
+}
+
 /// Transition between two `nodes.drain_phase` values (driven by the reconciler).
 pub fn transition(from: &str, to: &str) {
     counter(
