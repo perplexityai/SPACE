@@ -1708,6 +1708,16 @@ impl KubernetesSubstrate {
         // reservation into the wake's detached leader.
         let mut intent = intent;
         intent.charge = charge.with_live(&crate::client_live_cap::LiveHandoff::new(live));
+        // Holds a claimed drain restore before any node work, so a test can
+        // act while it holds the row.
+        #[cfg(feature = "test-hooks")]
+        if matches!(intent.claim, RestoreClaimMode::DrainOperation(_))
+            && let Some(hold) =
+                pplx_space_test_hooks::test_hook_var("SPACE_DRAIN_RESTORE_TEST_HOLD_SECS")
+                    .and_then(|secs| secs.parse::<u64>().ok())
+        {
+            tokio::time::sleep(Duration::from_secs(hold)).await;
+        }
         let sandbox = self.store.require_sandbox(sandbox_id).await?;
         let activation = self
             .wake_execution_inner(
