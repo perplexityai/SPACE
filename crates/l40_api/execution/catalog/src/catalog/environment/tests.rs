@@ -67,11 +67,12 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         .map(|entry| entry.definition().reference())
         .collect();
     assert_eq!(references.len(), environments.len());
-    assert_eq!(environments.len(), 5);
+    assert_eq!(environments.len(), 6);
     for (environment, (runtime, kernel, state, memory_state)) in environments.iter().zip([
         ("1.15.1", "6.1.155", "9.0.0", true),
         ("1.17.0", "6.18.44", "12.0.0", true),
         ("1.17.0", "6.1.155", "12.0.0", true),
+        ("1.17.0", "6.1.155-bpf-modsig-nft", "12.0.0", false),
     ]) {
         let definition = environment.definition();
         let requirements = definition.execution_requirements().unwrap();
@@ -96,6 +97,16 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         environments[1].definition().reference().to_string(),
         "sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4"
     );
+    assert_eq!(
+        environments
+            .iter()
+            .find(|entry| entry.name() == "fc-1.17.0-linux-6.1.155-bpf-modsig-nft")
+            .unwrap()
+            .definition()
+            .reference()
+            .to_string(),
+        "sha256:9c71b05a2b42b3b4974a26b9804882ee7d4d680bd23f9decbcbb095e4833f1ed"
+    );
     let arm = CompiledEnvironment::for_architecture(Arch::Aarch64).unwrap();
     assert!(arm.is_empty(), "unqualified ARM64 must not be admitted");
     let ch =
@@ -108,7 +119,10 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         execution.components()[0].digest,
         Some(ch.kernel().unwrap().sha256)
     );
-    let x86_ch = &environments[3];
+    let x86_ch = environments
+        .iter()
+        .find(|entry| entry.name() == "ch-54.0-linux-7.2.8")
+        .unwrap();
     assert_eq!(
         x86_ch.definition().reference().to_string(),
         "sha256:853fb39900b9a5c43217acb836c1af91a1842833d8dc5282d90812429eff8eac"

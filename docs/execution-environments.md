@@ -622,8 +622,11 @@ or introduce separately qualified environments. See the
 
 The compiled execution catalog approves complete runtime, kernel and
 compatibility bindings independently of downloadable artifact pins. It includes
-three Linux/x86_64 bindings: E0 (Firecracker 1.15.1 / Linux 6.1.155),
-Firecracker 1.17.0 / Linux 6.1.155, and Firecracker 1.17.0 / Linux 6.18.44.
+four Firecracker Linux/x86_64 bindings: E0 (Firecracker 1.15.1 / Linux 6.1.155),
+Firecracker 1.17.0 / Linux 6.1.155, Firecracker 1.17.0 / Linux 6.18.44, and
+Firecracker 1.17.0 / Linux 6.1.155-bpf-modsig-nft, SPACE's own build of 6.1.155
+with the BPF/module-signing profile and built-in nf_tables
+(`templates/firecracker/kernel/`).
 The 1.17.0 / 6.18.44 binding has reference:
 
 ```text
@@ -635,6 +638,16 @@ The 1.17.0 / 6.1.155 binding has reference:
 ```text
 sha256:6e97c03b2523af6cc7b8e67bcde3fd89cf756c1958b10c24472aeadd68a32e0a
 ```
+
+The 1.17.0 / 6.1.155-bpf-modsig-nft binding has reference:
+
+```text
+sha256:9c71b05a2b42b3b4974a26b9804882ee7d4d680bd23f9decbcbb095e4833f1ed
+```
+
+It is a separate binding from 1.17.0 / 6.1.155: the kernels share a release
+number but not their bytes, so neither substitutes for the other and no upgrade
+or memory edge connects them.
 
 Installation does not select an environment. Node-manager loads an explicit
 allowed/default policy at startup. Absent settings retain E0 and historical
@@ -653,7 +666,10 @@ store and stages its kernel into the execution cache. Cache loss triggers
 reconstruction. Missing or corrupt non-default artifacts cannot replace or
 withdraw E0. Each compiled binding records its qualified lifecycle support; the
 1.17.0 / 6.18.44 and 1.17.0 / 6.1.155 bindings support cold execution and
-same-environment memory snapshots. Cross-environment restore requires a
+same-environment memory snapshots. 1.17.0 / 6.1.155-bpf-modsig-nft is not yet
+qualified for memory state, so it supports cold execution only: a running or
+paused sandbox on it cannot take a resident snapshot of either kind (disk or
+full), which refuses suspend, memory snapshots and forks from a live sandbox. Cross-environment restore requires a
 qualified compatible loader; each snapshot retains its original producer binding.
 The 6.1.155 kernel keeps its existing artifact identity when paired with 1.17.0.
 Non-default snapshot capture carries an environment reference alongside the
@@ -845,8 +861,8 @@ SPACE_DEFAULT_EXECUTION_ENVIRONMENT=e0
 ```
 
 On x86_64, absent settings mean `e0,legacy` and default `e0`. Compiled names
-include `e0`, `fc-1.17.0-linux-6.1.155`, `fc-1.17.0-linux-6.18.44`, and
-`ch-54.0-linux-7.2.8`.
+include `e0`, `fc-1.17.0-linux-6.1.155`, `fc-1.17.0-linux-6.18.44`,
+`fc-1.17.0-linux-6.1.155-bpf-modsig-nft`, and `ch-54.0-linux-7.2.8`.
 `legacy` is a separate permission for unbound historical contracts, not an
 environment reference or a selectable default on x86_64. The default must be
 allowed. Surrounding whitespace is ignored. Empty, duplicate or unknown names
