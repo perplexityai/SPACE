@@ -29,6 +29,7 @@ pplx-space-accounts = { workspace = true, features = ["sqlx"] }
 pplx-space-content-digest = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
 pplx-space-node-status-store = { workspace = true }
+pplx-space-rollout-queue = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 
 [dev-dependencies]

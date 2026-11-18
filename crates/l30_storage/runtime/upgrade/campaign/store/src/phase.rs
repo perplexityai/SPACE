@@ -5,8 +5,11 @@
 //! Each verb locks the campaign row before it writes, in the down
 //! migration's order, only moves a campaign from the phase it checked, so a
 //! phase an operator wrote first wins. The schema's trigger raises the
-//! generation in the same statement.
+//! generation in the same statement. Both run the steps of
+//! [`pplx_space_rollout_queue::pause_if_over_budget`] and
+//! [`pplx_space_rollout_queue::complete_if_drained`] on these tables.
 
+use pplx_space_rollout_queue::{Drain, Leasing, PhaseStore};
 use pplx_space_sql_locator::sql;
 use sqlx::{Acquire, PgConnection, Postgres};
 
@@ -26,57 +29,12 @@ pub async fn pause_if_over_budget(
     campaign_id: CampaignId,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = conn.begin().await?;
-    let paused = pause_if_over_budget_in(&mut tx, campaign_id).await;
-    end_transaction(tx, paused).await
-}
-
-async fn pause_if_over_budget_in(
-    tx: &mut PgConnection,
-    campaign_id: CampaignId,
-) -> Result<bool, sqlx::Error> {
-    let leasing: Vec<&str> = CampaignPhase::ALL
-        .iter()
-        .filter(|phase| phase.leases())
-        .map(|phase| phase.as_str())
-        .collect();
-    let Some(failure_budget) = sqlx::query_scalar::<_, i64>(sql!(
-        "SELECT failure_budget
-         FROM runtime_upgrade_campaigns
-         WHERE id = $1
-           AND phase = ANY($2)
-         FOR UPDATE"
-    ))
-    .bind(campaign_id)
-    .bind(&leasing)
-    .fetch_optional(&mut *tx)
-    .await?
-    else {
-        return Ok(false);
+    let mut reconciling = Reconciling {
+        tx: &mut tx,
+        campaign_id,
     };
-    let failed = sqlx::query_scalar::<_, i64>(sql!(
-        "SELECT count(*)
-         FROM runtime_upgrade_items
-         WHERE campaign_id = $1
-           AND phase = $2"
-    ))
-    .bind(campaign_id)
-    .bind(ItemPhase::Failed.as_str())
-    .fetch_one(&mut *tx)
-    .await?;
-    if failed < failure_budget {
-        return Ok(false);
-    }
-    sqlx::query(sql!(
-        "UPDATE runtime_upgrade_campaigns
-         SET phase = $2,
-             updated_by_user_id = NULL
-         WHERE id = $1"
-    ))
-    .bind(campaign_id)
-    .bind(CampaignPhase::Paused.as_str())
-    .execute(&mut *tx)
-    .await?;
-    Ok(true)
+    let paused = pplx_space_rollout_queue::pause_if_over_budget(&mut reconciling).await;
+    end_transaction(tx, paused).await
 }
 
 /// Complete `campaign_id` if it's rolling, no item is pending or in flight,
@@ -111,67 +69,134 @@ pub async fn complete_if_drained(
     campaign_id: CampaignId,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = conn.begin().await?;
-    let completed = complete_in(&mut tx, campaign_id).await;
+    let mut reconciling = Reconciling {
+        tx: &mut tx,
+        campaign_id,
+    };
+    let completed = pplx_space_rollout_queue::complete_if_drained(&mut reconciling).await;
     end_transaction(tx, completed).await
 }
 
-async fn complete_in(tx: &mut PgConnection, campaign_id: CampaignId) -> Result<bool, sqlx::Error> {
-    let Some((failure_budget, canary)) = sqlx::query_as::<_, (i64, bool)>(sql!(
-        "SELECT failure_budget, phase = $3
-         FROM runtime_upgrade_campaigns
-         WHERE id = $1
-           AND phase = ANY(ARRAY[$2, $3])
-         FOR UPDATE"
+/// How many of `campaign_id`'s items have failed.
+pub(crate) async fn count_failed(
+    tx: &mut PgConnection,
+    campaign_id: CampaignId,
+) -> Result<u64, sqlx::Error> {
+    let failed = sqlx::query_scalar::<_, i64>(sql!(
+        "SELECT count(*)
+         FROM runtime_upgrade_items
+         WHERE campaign_id = $1
+           AND phase = $2"
     ))
     .bind(campaign_id)
-    .bind(CampaignPhase::Rolling.as_str())
-    .bind(CampaignPhase::Canary.as_str())
-    .fetch_optional(&mut *tx)
-    .await?
-    else {
-        return Ok(false);
-    };
-    let open: Vec<&str> = [ItemPhase::Pending, ItemPhase::InFlight]
-        .iter()
-        .map(|phase| phase.as_str())
-        .collect();
-    // One statement, so both come from one snapshot taken after the lock.
-    // Each reads only its phases' range of the (campaign_id, phase) index.
-    let (open_items, failed, any_done) = sqlx::query_as::<_, (bool, i64, bool)>(sql!(
-        "SELECT EXISTS (
-                    SELECT 1
-                    FROM runtime_upgrade_items
-                    WHERE campaign_id = $1
-                      AND phase = ANY($2)),
-                (SELECT count(*)
-                 FROM runtime_upgrade_items
-                 WHERE campaign_id = $1
-                   AND phase = $3),
-                EXISTS (
-                    SELECT 1
-                    FROM runtime_upgrade_items
-                    WHERE campaign_id = $1
-                      AND phase = $4)"
-    ))
-    .bind(campaign_id)
-    .bind(&open)
     .bind(ItemPhase::Failed.as_str())
-    .bind(ItemPhase::Done.as_str())
     .fetch_one(&mut *tx)
     .await?;
-    if open_items || failed >= failure_budget || (canary && any_done) {
-        return Ok(false);
+    // count(*) is never negative.
+    Ok(u64::try_from(failed).unwrap_or(0))
+}
+
+/// [`pause_if_over_budget`]'s and [`complete_if_drained`]'s steps.
+struct Reconciling<'c> {
+    tx: &'c mut PgConnection,
+    campaign_id: CampaignId,
+}
+
+impl PhaseStore for Reconciling<'_> {
+    type Error = sqlx::Error;
+
+    async fn lock_leasing(&mut self) -> Result<Option<Leasing>, sqlx::Error> {
+        let leasing: Vec<&str> = CampaignPhase::ALL
+            .iter()
+            .filter(|phase| phase.leases())
+            .map(|phase| phase.as_str())
+            .collect();
+        let locked = sqlx::query_as::<_, (i64, bool)>(sql!(
+            "SELECT failure_budget, phase = $3
+             FROM runtime_upgrade_campaigns
+             WHERE id = $1
+               AND phase = ANY($2)
+             FOR UPDATE"
+        ))
+        .bind(self.campaign_id)
+        .bind(&leasing)
+        .bind(CampaignPhase::Canary.as_str())
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        Ok(locked.map(|(failure_budget, canary)| Leasing {
+            canary,
+            // The schema keeps it at least 1.
+            failure_budget: u64::try_from(failure_budget).unwrap_or(0),
+        }))
     }
-    sqlx::query(sql!(
-        "UPDATE runtime_upgrade_campaigns
-         SET phase = $2,
-             finished_at = clock_timestamp(),
-             updated_by_user_id = NULL
-         WHERE id = $1"
-    ))
-    .bind(campaign_id)
-    .bind(CampaignPhase::Completed.as_str())
-    .execute(&mut *tx)
-    .await?;
-    Ok(true)
+
+    async fn failed(&mut self) -> Result<u64, sqlx::Error> {
+        count_failed(self.tx, self.campaign_id).await
+    }
+
+    async fn drain(&mut self) -> Result<Drain, sqlx::Error> {
+        let open: Vec<&str> = [ItemPhase::Pending, ItemPhase::InFlight]
+            .iter()
+            .map(|phase| phase.as_str())
+            .collect();
+        // Each reads only its phases' range of the (campaign_id, phase)
+        // index.
+        let (open, failed, any_done) = sqlx::query_as::<_, (bool, i64, bool)>(sql!(
+            "SELECT EXISTS (
+                        SELECT 1
+                        FROM runtime_upgrade_items
+                        WHERE campaign_id = $1
+                          AND phase = ANY($2)),
+                    (SELECT count(*)
+                     FROM runtime_upgrade_items
+                     WHERE campaign_id = $1
+                       AND phase = $3),
+                    EXISTS (
+                        SELECT 1
+                        FROM runtime_upgrade_items
+                        WHERE campaign_id = $1
+                          AND phase = $4)"
+        ))
+        .bind(self.campaign_id)
+        .bind(&open)
+        .bind(ItemPhase::Failed.as_str())
+        .bind(ItemPhase::Done.as_str())
+        .fetch_one(&mut *self.tx)
+        .await?;
+        Ok(Drain {
+            open,
+            // count(*) is never negative.
+            failed: u64::try_from(failed).unwrap_or(0),
+            any_done,
+        })
+    }
+
+    async fn write_paused(&mut self) -> Result<(), sqlx::Error> {
+        sqlx::query(sql!(
+            "UPDATE runtime_upgrade_campaigns
+             SET phase = $2,
+                 updated_by_user_id = NULL
+             WHERE id = $1"
+        ))
+        .bind(self.campaign_id)
+        .bind(CampaignPhase::Paused.as_str())
+        .execute(&mut *self.tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn write_completed(&mut self) -> Result<(), sqlx::Error> {
+        sqlx::query(sql!(
+            "UPDATE runtime_upgrade_campaigns
+             SET phase = $2,
+                 finished_at = clock_timestamp(),
+                 updated_by_user_id = NULL
+             WHERE id = $1"
+        ))
+        .bind(self.campaign_id)
+        .bind(CampaignPhase::Completed.as_str())
+        .execute(&mut *self.tx)
+        .await?;
+        Ok(())
+    }
 }

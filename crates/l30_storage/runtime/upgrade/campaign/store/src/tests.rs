@@ -480,6 +480,52 @@ async fn leasing_stays_under_the_cluster_cap_counting_items_already_in_flight() 
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_lease_that_waits_on_another_lease_of_its_campaign_counts_what_that_one_took()
+-> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections(4).await?
+    else {
+        return Ok(());
+    };
+    let campaign = insert_campaign(
+        &db.pool,
+        CampaignSeed {
+            per_cluster: 1,
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+    pending_on(&db, campaign, None, 2).await?;
+    // The first lease's transaction stays open, holding the campaign row.
+    let mut first = db.pool.begin().await?;
+    assert_eq!(
+        lease_items(&mut *first, campaign, LEASE, SCAN).await?.len(),
+        1
+    );
+
+    let pool = db.pool.clone();
+    let second = tokio::spawn(async move {
+        let mut conn = pool.acquire().await?;
+        lease_items(&mut *conn, campaign, LEASE, SCAN).await
+    });
+    wait_for_lock_waiter(&db.pool).await?;
+    first.commit().await?;
+    let second = second.await??;
+    assert!(
+        second.is_empty(),
+        "the second lease went past the cap the first one filled: {second:?}"
+    );
+    assert_eq!(
+        item_counts(&db.pool, campaign).await?,
+        ItemCounts {
+            pending: 1,
+            in_flight: 1,
+            ..ItemCounts::default()
+        }
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn leasing_stays_under_the_per_node_cap_and_takes_other_nodes() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
