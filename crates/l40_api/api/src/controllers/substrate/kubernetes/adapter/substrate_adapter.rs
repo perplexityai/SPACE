@@ -940,6 +940,13 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 ),
             });
         }
+        // A stopped sandbox on a node a v2 drain drained moves off it first,
+        // and a handed-off one resumes its move: both land `stopped` on
+        // another node for the start below to boot, within the caller's one
+        // readiness window. Off, or for any other row, nothing is read.
+        let (sandbox, options) = self
+            .hand_off_stopped_at_start(metric_identity, sandbox, options)
+            .await?;
         // `start` on a `suspended`/`restoring` sandbox IS a restore: it loads a
         // snapshot and may leave live node work behind. Route it through the
         // shared wake/restore machinery (`wake_execution_inner` via

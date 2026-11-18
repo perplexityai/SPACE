@@ -1496,6 +1496,30 @@ impl KubernetesSubstrate {
                 Err(err) => return Err(err),
             }
         };
+        self.drive_claimed_restore(
+            metric_identity,
+            sandbox_id,
+            join_deadline,
+            intent,
+            restore_claim,
+        )
+        .await
+    }
+
+    /// Drive a restore whose claim `restore_claim` the caller already took,
+    /// within `join_deadline`: decide its live cap, charge it and wake it
+    /// with the claim preclaimed, its failure cleaned up as the claim's
+    /// kind says. The rest of [`Self::restore_execution_inner`] after its
+    /// claim, and the drive of a start's claim on a handed-off stopped row
+    /// (`execution::drain_restore`).
+    pub(super) async fn drive_claimed_restore(
+        &self,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
+        sandbox_id: SandboxId,
+        join_deadline: Instant,
+        intent: RestoreIntent,
+        restore_claim: RestoreClaim,
+    ) -> Result<ActivationCompletion, SubstrateError> {
         // The live cap runs before the charge, so a client at its cap is
         // refused before it spends a cluster token.
         let (charge, live) = match self
@@ -2663,6 +2687,8 @@ pub(super) fn restore_failure_should_revert_to_suspended(
     matches!(claim, Some(RestoreClaim::FreshFromSuspended { .. }))
         && wake_failure_should_revert_to_suspended(err, dispatch)
 }
+
+mod drain_restore;
 
 #[cfg(test)]
 mod tests;

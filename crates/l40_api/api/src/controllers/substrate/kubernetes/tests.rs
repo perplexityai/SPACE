@@ -25,6 +25,7 @@ pub(crate) use kubernetes_tests::{
 };
 
 mod activating_client;
+mod drain_restore;
 pub(super) mod environment_placement;
 mod native_pod_failover;
 mod node_instance;

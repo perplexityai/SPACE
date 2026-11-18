@@ -659,6 +659,57 @@ async fn a_stopped_evacuation_is_re_placed_only_after_its_local_copy_is_gone() -
     Ok(())
 }
 
+/// A re-placement a start claimed for a v2 drain's stopped handoff, which
+/// holds a live restore lease, isn't the sweep's to re-drive: it is listed
+/// only once the lease lapses. A claimed one without a lease, the sweep's
+/// own, is listed as before.
+#[tokio::test(flavor = "current_thread")]
+async fn a_re_placement_a_start_holds_is_listed_only_once_its_lease_lapses() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = forced_draining_node(&db.pool).await?;
+    let pin = LocalArtifactId::new();
+    let claimed = |lease: Option<&'static str>| {
+        let pool = db.pool.clone();
+        async move {
+            let sandbox_id = insert_sandbox(&pool, Some(node_id), "stopped").await?;
+            claim_and_publish(&pool, sandbox_id, node_id, pin, "ready").await?;
+            clear_placement(&pool, sandbox_id).await?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE sandboxes
+                    SET lifecycle = 'restoring',
+                        restore_lease_token = CASE WHEN {lease} IS NULL THEN NULL
+                                                   ELSE gen_random_uuid() END,
+                        restore_lease_expires_at = NOW() + {lease}::INTERVAL
+                  WHERE id = $1",
+                lease = lease.map_or("NULL".to_owned(), |lease| format!("'{lease}'"))
+            )))
+            .bind(sandbox_id)
+            .execute(&pool)
+            .await?;
+            TestResult::Ok(sandbox_id)
+        }
+    };
+    let held = claimed(Some("1 hour")).await?;
+    let lapsed = claimed(Some("-1 second")).await?;
+    let swept = claimed(None).await?;
+
+    let mut pending: Vec<SandboxId> = restore_pending(&db.pool)
+        .await?
+        .into_iter()
+        .map(|(sandbox_id, _)| sandbox_id)
+        .collect();
+    pending.sort();
+    let mut expected = vec![lapsed, swept];
+    expected.sort();
+    assert_eq!(
+        pending, expected,
+        "the start's live lease keeps {held} off the sweep"
+    );
+    Ok(())
+}
+
 /// What the drain's teardown does to the cluster row, applied directly: the
 /// placement clear that `forget_pod_tracking` performs.
 async fn clear_placement(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {
