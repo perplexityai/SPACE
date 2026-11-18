@@ -116,7 +116,10 @@ kind_bench_claim() {
     fi
   done
   mkdir -p "$dir" && : >"$dir/$KIND_BENCH_MARKER" || return 1
-  sudo -n install -d -m 0755 "$run" && sudo -n touch "$run/$KIND_BENCH_MARKER" || return 1
+  # The bench root it was created under, for its teardown (kind_bench_teardown).
+  sudo -n install -d -m 0755 "$run" \
+    && printf '%s\n' "$KIND_BENCH_ROOT" | sudo -n tee "$run/root" >/dev/null \
+    && sudo -n touch "$run/$KIND_BENCH_MARKER" || return 1
 }
 
 # The platform a bench needs before anything else, the lock included.
@@ -464,8 +467,13 @@ kind_bench_existing() {
     sudo -n ip netns list 2>/dev/null | awk '{print $1}' | sed -n "s/^${KIND_BENCH_PREFIX}-\([0-9][0-9]*\)$/\1/p"
     find /run -maxdepth 2 -path "/run/${KIND_BENCH_PREFIX}-*/$KIND_BENCH_MARKER" 2>/dev/null \
       | sed -n "s|^/run/${KIND_BENCH_PREFIX}-\([0-9][0-9]*\)/$KIND_BENCH_MARKER$|\1|p"
-    find "$KIND_BENCH_ROOT" -mindepth 2 -maxdepth 2 -name "$KIND_BENCH_MARKER" 2>/dev/null \
-      | sed -n "s|^$KIND_BENCH_ROOT/\([0-9][0-9]*\)/$KIND_BENCH_MARKER$|\1|p"
+    local marker bench
+    for marker in "$KIND_BENCH_ROOT"/*/"$KIND_BENCH_MARKER"; do
+      [[ -e "$marker" ]] || continue
+      bench="${marker%/*}"
+      bench="${bench##*/}"
+      [[ "$bench" =~ ^[0-9]+$ ]] && printf '%s\n' "$bench"
+    done
   } | sort -un || true
 }
 
@@ -482,6 +490,15 @@ kind_bench_teardown() {
   sock="$(kind_bench_socket "$i")"
   veth="$(kind_bench_veth "$i")"
   comment="$(kind_bench_comment "$i")"
+  # A bench created under another bench root keeps its data there: removing
+  # its namespace and /run state from here would leave that data with nothing
+  # to find it by.
+  local recorded
+  recorded="$(sudo -n cat "$run/root" 2>/dev/null || true)"
+  if [[ -n "$recorded" && "$recorded" != "$KIND_BENCH_ROOT" ]]; then
+    kind_bench_log "bench $i was created under $recorded; tear it down with SPACE_KIND_BENCH_ROOT=$recorded"
+    return 1
+  fi
   local dockerd_pid=""
   [[ -s "$run/docker.pid" ]] && dockerd_pid="$(sudo -n cat "$run/docker.pid" 2>/dev/null || true)"
 
@@ -551,7 +568,8 @@ kind_bench_teardown() {
   sudo -n ip link del "$veth" 2>/dev/null || true
   sudo -n ip netns del "$ns" 2>/dev/null || true
   # The daemon's cgroup parent, leaves first; a cgroup still holding a process
-  # stays, and says so.
+  # stays.
+  local kept=""
   if [[ -d "/sys/fs/cgroup/$ns" ]]; then
     # Whatever is still in the bench's cgroups dies with them.
     if [[ -e "/sys/fs/cgroup/$ns/cgroup.kill" ]]; then
@@ -562,7 +580,19 @@ kind_bench_teardown() {
       done
     fi
     find "/sys/fs/cgroup/$ns" -depth -type d -exec sudo -n rmdir {} \; 2>/dev/null || true
-    [[ ! -d "/sys/fs/cgroup/$ns" ]] || kind_bench_log "WARNING: /sys/fs/cgroup/$ns still holds processes"
+    [[ ! -d "/sys/fs/cgroup/$ns" ]] || kept="/sys/fs/cgroup/$ns still holds processes"
+  fi
+  # A mount still under the bench's directories would take the removal below
+  # into whatever is mounted there.
+  if awk -v a="$dir/" -v b="$run/" 'index($2, a) == 1 || index($2, b) == 1 { found = 1 } END { exit !found }' \
+      /proc/self/mounts; then
+    kept="${kept:+$kept; }a mount under $dir or $run remains"
+  fi
+  # Kept, the directories' markers find the bench again for the next teardown,
+  # which reports it until it is gone.
+  if [[ -n "$kept" ]]; then
+    kind_bench_log "WARNING: keeping bench $i's directories for the next teardown: $kept"
+    return 1
   fi
   local owned
   for owned in "$run" "$dir"; do
