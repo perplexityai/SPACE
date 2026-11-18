@@ -147,13 +147,17 @@ capacity can dip below that while a replacement target node boots, because
 a source terminate lowers the source at once and the target node takes
 time to become Ready.
 
-The target must be able to grow to `N + H`. A `rollout-mng` or
-`workers_rollout_cohorts` target takes its `max_size` from the caller, but a
-`worker_capacity_groups` entry has a Terraform-enforced ceiling of 99, so a
-capacity group used as the target needs `N + H <= 99`. A full 99-node
-source cannot roll into one such group with any headroom. Size groups that
-will be rolled this way with room for `H`, or first move some of the
-source's sandboxes elsewhere.
+The target must carry the `space.pplx.net/rollout-cohort` taint and its
+matching node label, as `rollout-mng` declares them; the script refuses to
+start drains when target nodes lack the taint. Use a `rollout-mng` or
+`workers_rollout_cohorts` target. A `worker_capacity_groups` entry does not
+set either today, so it can be a rollout source but not a target.
+
+The target must also be able to grow to `N + H`. A `rollout-mng` or
+`workers_rollout_cohorts` target takes its `max_size` from the caller. The
+99-node ceiling of a capacity group is a planning limit for the source:
+keep groups that will be rolled into a same-sized target small enough to
+leave room for `H`, or first move some of the source's sandboxes elsewhere.
 
 Tradeoffs:
 
