@@ -15,7 +15,6 @@ workspace = true
 # feature enabled here unifies into every release build that resolves the
 # whole workspace. The crate reads its own variables directly instead.
 pplx-space-accounts = { workspace = true, features = ["serde", "sqlx"] }
-pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-sandbox-model = { workspace = true, features = ["sqlx"] }
 pplx-space-env-vars = { workspace = true }
 pplx-space-snapshot-model = { workspace = true, features = ["sqlx"] }

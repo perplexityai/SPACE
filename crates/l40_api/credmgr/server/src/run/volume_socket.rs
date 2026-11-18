@@ -104,7 +104,7 @@ pub(super) fn preflight(path: &Path, standard_socket: &Path) -> io::Result<()> {
     if standard_socket.file_name() == Some(name) {
         let standard_parent = standard_socket
             .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
+            .filter(|parent| !parent.is_empty())
             .unwrap_or(Path::new("."));
         match fs::metadata(standard_parent) {
             Ok(standard)

@@ -580,6 +580,7 @@ async fn hold_org_quota_lock(
 
 /// Wait until some backend waits on an advisory lock, as a create queued
 /// on a held quota lock does.
+#[cfg(feature = "kubernetes")]
 async fn wait_for_advisory_lock_waiter(pool: &PgPool) -> TestDbResult<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {

@@ -342,11 +342,7 @@ impl tracing::field::Visit for JsonEventVisitor<'_> {
 }
 
 fn field_name(field: &tracing::field::Field) -> String {
-    field
-        .name()
-        .strip_prefix("r#")
-        .unwrap_or(field.name())
-        .to_string()
+    field.name().trim_prefix("r#").to_string()
 }
 
 fn span_value<S, N>(span: &SpanRef<'_, S>) -> serde_json::Value

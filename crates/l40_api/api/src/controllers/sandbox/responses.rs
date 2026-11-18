@@ -649,7 +649,7 @@ pub(super) fn sandbox_to_cached_response(
             observed.status.clone(),
             observed.node_id,
         ));
-        response.spaced_version = observed.spaced_version.clone();
+        response.spaced_version = observed.version.spaced_version.clone();
         response.pid = observed.pid.and_then(|value| u32::try_from(value).ok());
         response.namespace = observed.namespace.clone();
         response.uptime = observed.uptime.clone();
@@ -701,7 +701,7 @@ pub(super) fn observed_only_sandbox_response(
         active_node_id: None,
         active_node: None,
         runtime: None,
-        spaced_version: observed.spaced_version.clone(),
+        spaced_version: observed.version.spaced_version.clone(),
         pid: observed.pid.and_then(|value| u32::try_from(value).ok()),
         namespace: observed.namespace.clone(),
         uptime: observed.uptime.clone(),

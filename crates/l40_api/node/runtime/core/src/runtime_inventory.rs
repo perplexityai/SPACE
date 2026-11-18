@@ -585,15 +585,11 @@ impl FirecrackerDriver {
         &self,
         version: &RuntimeVersion,
     ) -> Result<semver::Version, RuntimeInventoryError> {
-        semver::Version::parse(
-            version
-                .as_str()
-                .strip_prefix('v')
-                .unwrap_or(version.as_str()),
-        )
-        .map_err(|source| RuntimeInventoryError::InvalidVersionOutput {
-            path: PathBuf::from("firecracker"),
-            output: format!("{version}: {source}"),
+        semver::Version::parse(version.as_str().trim_prefix('v')).map_err(|source| {
+            RuntimeInventoryError::InvalidVersionOutput {
+                path: PathBuf::from("firecracker"),
+                output: format!("{version}: {source}"),
+            }
         })
     }
 
@@ -601,15 +597,11 @@ impl FirecrackerDriver {
         &self,
         version: &StateFormatVersion,
     ) -> Result<semver::Version, RuntimeInventoryError> {
-        semver::Version::parse(
-            version
-                .as_str()
-                .strip_prefix('v')
-                .unwrap_or(version.as_str()),
-        )
-        .map_err(|source| RuntimeInventoryError::InvalidVersionOutput {
-            path: PathBuf::from("firecracker --snapshot-version"),
-            output: format!("{version}: {source}"),
+        semver::Version::parse(version.as_str().trim_prefix('v')).map_err(|source| {
+            RuntimeInventoryError::InvalidVersionOutput {
+                path: PathBuf::from("firecracker --snapshot-version"),
+                output: format!("{version}: {source}"),
+            }
         })
     }
 
@@ -617,10 +609,7 @@ impl FirecrackerDriver {
         &self,
         runtime_version: &RuntimeVersion,
     ) -> Result<StateFormatVersion, RuntimeInventoryError> {
-        let release = runtime_version
-            .as_str()
-            .strip_prefix('v')
-            .unwrap_or(runtime_version.as_str());
+        let release = runtime_version.as_str().trim_prefix('v');
         let state_format_version = FIRECRACKER_STATE_FORMAT_RELEASES
             .iter()
             .find(|entry| entry.runtime_version == release)
@@ -1407,7 +1396,7 @@ fn component_metadata_identity(
 fn version_from_dir(path: &Path) -> Option<RuntimeVersion> {
     path.file_name()
         .and_then(|value| value.to_str())
-        .and_then(|value| RuntimeVersion::parse(value.strip_prefix('v').unwrap_or(value)).ok())
+        .and_then(|value| RuntimeVersion::parse(value.trim_prefix('v')).ok())
 }
 
 /// Architecture of the host running execution inventory and launch admission.

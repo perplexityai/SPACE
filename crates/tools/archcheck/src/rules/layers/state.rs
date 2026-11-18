@@ -333,7 +333,7 @@ fn qualified((namespace, table): &Key) -> String {
 
 /// `db/<catalog>`, the catalog directory of `namespace`.
 fn catalog_dir(namespace: &str) -> String {
-    let catalog = namespace.strip_prefix("sqlite.").unwrap_or(namespace);
+    let catalog = namespace.trim_prefix("sqlite.");
     format!("{CATALOGS_DIR}/{catalog}")
 }
 

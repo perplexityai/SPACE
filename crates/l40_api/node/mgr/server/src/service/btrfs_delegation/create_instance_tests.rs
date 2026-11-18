@@ -10,7 +10,7 @@ use super::*;
 fn test_owners() -> InstanceOwners {
     let uid = nix::unistd::geteuid().as_raw();
     let egid = nix::unistd::getegid().as_raw();
-    let gid = nix::unistd::getgroups()
+    let gid = rustix::process::getgroups()
         .ok()
         .and_then(|groups| {
             groups

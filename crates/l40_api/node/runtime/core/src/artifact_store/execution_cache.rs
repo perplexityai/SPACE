@@ -551,11 +551,7 @@ pub(super) fn reclaim_empty_execution_target(
     let mut directories = std::collections::BTreeSet::from([target.to_owned()]);
     for file in files {
         let path = Path::new(file.path);
-        for parent in path
-            .ancestors()
-            .skip(1)
-            .filter(|path| !path.as_os_str().is_empty())
-        {
+        for parent in path.ancestors().skip(1).filter(|path| !path.is_empty()) {
             directories.insert(target.join(parent));
         }
     }

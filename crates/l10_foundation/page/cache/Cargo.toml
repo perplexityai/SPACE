@@ -12,8 +12,10 @@ workspace = true
 
 [dependencies]
 libc = { workspace = true }
-nix = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

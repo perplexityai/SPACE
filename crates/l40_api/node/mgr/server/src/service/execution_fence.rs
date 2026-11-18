@@ -33,7 +33,7 @@ impl NodeManagerService {
                         .map_err(|error| Status::unavailable(format!("read {root}: {error}")))?;
                     let name = entry.file_name();
                     let Some(name) = name.to_str() else { continue };
-                    let id = name.strip_prefix("sbx-").unwrap_or(name);
+                    let id = name.trim_prefix("sbx-");
                     if id.parse::<SandboxId>().is_ok()
                         && !crate::cgroup::sandbox_is_quiescent(id).map_err(|error| {
                             Status::unavailable(format!("inspect {id}: {error}"))

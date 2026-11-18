@@ -952,11 +952,7 @@ fn validate_guest_l2_ingress_native_binding(chain: &str) -> Result<(), FirewallV
         else {
             return false;
         };
-        device
-            .strip_prefix('"')
-            .and_then(|device| device.strip_suffix('"'))
-            .unwrap_or(device)
-            == crate::net::TAP_DEVICE
+        device.strip_circumfix('"', '"').unwrap_or(device) == crate::net::TAP_DEVICE
     });
     if !bound_to_tap {
         return Err(FirewallValidationError::Missing(

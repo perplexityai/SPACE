@@ -135,6 +135,7 @@ impl StorageVendStore for PgStorageVendStore {
             return Ok(None);
         };
 
+        let snapshot_id = snapshot_id.as_uuid();
         let node_rows: Vec<(String, String)> = sqlx::query_as(sql!(
             "WITH latest_execution AS (
                  SELECT k8s_node_name
@@ -264,10 +265,7 @@ impl StorageVendStore for PgStorageVendStore {
         // and, for releases registered before the prefix was required, the
         // bare hex. A published release must be found under either spelling.
         let canonical = hash.to_string();
-        let bare = canonical
-            .strip_prefix("sha256:")
-            .unwrap_or(&canonical)
-            .to_string();
+        let bare = canonical.trim_prefix("sha256:").to_string();
         let published: bool = sqlx::query_scalar(sql!(
             "SELECT EXISTS (
                  SELECT 1

@@ -26,7 +26,7 @@ mod postgres {
 
     use super::*;
     use crate::controllers::sandbox::SandboxController;
-    use crate::inline_operations::InlineOperationsConfig;
+    use crate::inline_operations::{InlineExecution, InlineOperationsConfig};
     use crate::public_operation_driver::{OperationExecutionConfig, OperationExecutor};
     use crate::public_operation_driver::{OperationExecutionResult, drive_claimed_operation};
     use crate::public_operations::{

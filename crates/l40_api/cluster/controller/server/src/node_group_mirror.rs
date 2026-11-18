@@ -34,6 +34,7 @@
 //! `crate::metrics::node_group_mirror` for what each series means.
 
 use std::collections::HashMap;
+use std::mem::DropGuard;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -640,35 +641,10 @@ async fn write_mirror(
 /// back through a release ping with no time limit, holding its pool slot for
 /// as long as a connection that stopped answering takes to fail.
 async fn load_node_groups(pool: &PgPool) -> Result<HashMap<String, NodeGroupId>, MirrorError> {
-    let mut conn = CloseUnlessReleased(Some(pool.acquire().await?));
-    let groups = store::group_ids_by_name(&mut **conn.get()).await?;
-    conn.release();
+    let mut conn = DropGuard::new(pool.acquire().await?, |mut conn| conn.close_on_drop());
+    let groups = store::group_ids_by_name(&mut **conn).await?;
+    drop(DropGuard::dismiss(conn));
     Ok(groups)
-}
-
-/// A pooled connection that is closed when dropped, unless [`Self::release`]
-/// hands it back to the pool first.
-struct CloseUnlessReleased(Option<sqlx::pool::PoolConnection<sqlx::Postgres>>);
-
-impl CloseUnlessReleased {
-    fn get(&mut self) -> &mut sqlx::pool::PoolConnection<sqlx::Postgres> {
-        self.0
-            .as_mut()
-            .expect("the connection is held until release or drop")
-    }
-
-    /// Return the connection to the pool as usual.
-    fn release(mut self) {
-        drop(self.0.take());
-    }
-}
-
-impl Drop for CloseUnlessReleased {
-    fn drop(&mut self) {
-        if let Some(conn) = self.0.as_mut() {
-            conn.close_on_drop();
-        }
-    }
 }
 
 mod store;

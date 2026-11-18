@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 libc = { workspace = true }
-nix = { workspace = true, features = ["net", "uio"] }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["net", "uio"] }

@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = []
-host-runtime = ["dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zeroize", "dep:pplx-space-transparent-proxy-socket", "dep:pplx-space-metrics-emit", "dep:pplx-space-uds-peer-auth", "dep:socket2"]
+host-runtime = ["pplx-space-sandbox-model/serde", "dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zeroize", "dep:pplx-space-transparent-proxy-socket", "dep:pplx-space-metrics-emit", "dep:pplx-space-uds-peer-auth", "dep:socket2"]
 # The node's root-owned store of runtime releases and guest kernels, which
 # node-manager publishes into.
 artifact-store = ["dep:rustix", "rustix/fs"]
@@ -44,13 +44,11 @@ tracing = { workspace = true }
 zstd = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-template-runtime = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-host-linux = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-file-io = { workspace = true, features = ["reflink"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-execution-common = { workspace = true }
@@ -59,9 +57,12 @@ pplx-space-guest-process = { workspace = true, features = ["serde"] }
 pplx-space-linux-ids = { workspace = true, features = ["serde"] }
 pplx-space-net-common = { workspace = true }
 pplx-space-metrics-emit = { workspace = true, optional = true }
-pplx-space-transparent-proxy-socket = { workspace = true, optional = true }
 pplx-space-network-roles = { workspace = true, features = ["serde"] }
 pplx-space-uds-peer-auth = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pplx-space-file-io = { workspace = true, features = ["reflink"] }
+pplx-space-transparent-proxy-socket = { workspace = true, optional = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

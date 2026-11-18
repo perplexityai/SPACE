@@ -1557,7 +1557,9 @@ mod response_tests {
             substrate_node_id: None,
             template: None,
             status: None,
-            spaced_version: None,
+            version: ObservedSpacedVersion {
+                spaced_version: None,
+            },
             pid: None,
             namespace: None,
             uptime: None,

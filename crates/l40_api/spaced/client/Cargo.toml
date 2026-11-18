@@ -13,7 +13,6 @@ workspace = true
 [dependencies]
 rand = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
-pplx-space-common-core = { workspace = true }
 pplx-space-guest-process = { workspace = true }
 pplx-space-durations = { workspace = true }
 thiserror = { workspace = true }

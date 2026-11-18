@@ -119,7 +119,7 @@ fn copy_path(source: &Path, destination: &Path, require_reflink: bool) -> io::Re
     };
     let parent = destination
         .parent()
-        .filter(|path| !path.as_os_str().is_empty())
+        .filter(|path| !path.is_empty())
         .unwrap_or_else(|| Path::new("."));
     // Creation applies the umask. Keeping this descriptor open also permits
     // cloning a read-only source without reopening a read-only destination.

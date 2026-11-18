@@ -11,23 +11,21 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-pplx-space-accounts = { workspace = true }
-pplx-space-execution-spec = { workspace = true }
-pplx-space-node-model = { workspace = true }
-pplx-space-sandbox-model = { workspace = true }
-pplx-space-template-model = { workspace = true }
+pplx-space-accounts = { workspace = true, optional = true }
+pplx-space-execution-spec = { workspace = true, optional = true }
+pplx-space-node-model = { workspace = true, optional = true }
+pplx-space-sandbox-model = { workspace = true, optional = true }
+pplx-space-template-model = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
-thiserror = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }
+thiserror = { workspace = true, optional = true }
 
 [features]
 default = []
 serde = [
     "dep:serde",
     "dep:serde_json",
+    "dep:thiserror",
     "pplx-space-accounts/serde",
     "pplx-space-execution-spec/serde",
     "pplx-space-node-model/serde",

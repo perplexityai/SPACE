@@ -125,16 +125,8 @@ async fn credentials(email: Option<String>, password_stdin: bool) -> Result<(Str
 
 #[cfg(unix)]
 async fn read_password() -> Result<String> {
-    use nix::sys::termios::{self, LocalFlags, SetArg, Termios};
-
-    struct RestoreTerminal(Termios);
-    impl Drop for RestoreTerminal {
-        fn drop(&mut self) {
-            if let Err(error) = termios::tcsetattr(io::stdin(), SetArg::TCSANOW, &self.0) {
-                eprintln!("Cannot restore terminal settings: {error}");
-            }
-        }
-    }
+    use nix::sys::termios::{self, LocalFlags, SetArg};
+    use std::mem::DropGuard;
 
     let original = termios::tcgetattr(io::stdin())?;
     let mut hidden = original.clone();
@@ -142,7 +134,11 @@ async fn read_password() -> Result<String> {
         .local_flags
         .remove(LocalFlags::ECHO | LocalFlags::ECHONL);
     termios::tcsetattr(io::stdin(), SetArg::TCSANOW, &hidden)?;
-    let _restore = RestoreTerminal(original);
+    let _restore = DropGuard::new(original, |original| {
+        if let Err(error) = termios::tcsetattr(io::stdin(), SetArg::TCSANOW, &original) {
+            eprintln!("Cannot restore terminal settings: {error}");
+        }
+    });
     eprint!("SPACE password: ");
     io::stderr().flush()?;
     let password = read_line().await?;

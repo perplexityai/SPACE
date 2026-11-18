@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 hyper-util = { workspace = true, features = ["tokio"] }
-pplx-space-artifact-model = { workspace = true }
+pplx-space-artifact-model = { workspace = true, features = ["serde"] }
 pplx-space-subject-model = { workspace = true, features = ["serde"] }
 prost = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -25,7 +25,6 @@ tower = { workspace = true }
 
 # internal
 pplx-space-accounts = { workspace = true, features = ["serde"] }
-pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-snapshot-model = { workspace = true }

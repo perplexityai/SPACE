@@ -223,7 +223,7 @@ pub(super) fn replace_target_directory(
     let relative = normalize_relative_path(relative)?;
     let parent = relative
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
+        .filter(|parent| !parent.is_empty())
         .ok_or_else(|| GuestBundleError::UnsafeTarget {
             path: relative.clone(),
         })?;
@@ -353,7 +353,7 @@ fn prepare_target_file(
     let relative = normalize_relative_path(relative)?;
     let parent = relative
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
+        .filter(|parent| !parent.is_empty())
         .ok_or_else(|| GuestBundleError::UnsafeTarget {
             path: relative.clone(),
         })?;
