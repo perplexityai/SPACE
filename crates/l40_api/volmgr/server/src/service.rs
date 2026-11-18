@@ -9,10 +9,9 @@ use crate::artifact::{ArtifactEntryRole, ArtifactId};
 use crate::crypto::wrap_aad;
 use crate::materialization::MaterializationMode;
 use pplx_space_accounts::OrgId;
+use pplx_space_artifact_model::{SnapshotArtifact, StorageUri, parse_snapshot_object_key};
+use pplx_space_common_core::types::SubjectId;
 use pplx_space_common_core::types::{KekProvider, MasterKeyIdentifier};
-use pplx_space_common_core::types::{
-    SnapshotArtifact, StorageUri, SubjectId, parse_snapshot_object_key,
-};
 use pplx_space_common_jobs::{
     BackgroundWorker, JobExecutor, JobFailure, JobFailureReason, JobPriority, PriorityBand,
     WorkerConfig,

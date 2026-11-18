@@ -366,7 +366,7 @@ pub(super) async fn require_artifact_backup_files(
         }
     }
     for file in files {
-        if file.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend {
+        if file.kind == pplx_space_artifact_model::SnapshotArtifact::RootfsBtrfsSend {
             // Disk artifacts never retain a source: they have no sidecar.
             let source_id = match kind {
                 pplx_space_snapshot_model::ArtifactKind::Full => {

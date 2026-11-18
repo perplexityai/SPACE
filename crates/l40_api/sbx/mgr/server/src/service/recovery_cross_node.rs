@@ -5,7 +5,7 @@ use super::suspend_snapshot_publication::{
 };
 use super::*;
 use crate::service::start_support::start_stage;
-use pplx_space_common_core::types::{ExactStorageUri, StorageUri};
+use pplx_space_artifact_model::{ExactStorageUri, StorageUri};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
@@ -652,14 +652,14 @@ fn validate_quarantine_recovery_artifact_identity(
 #[derive(Clone, Copy)]
 struct RestoringRowInput<'a> {
     meta: &'a crate::snapshot_upload::SnapshotMeta,
-    restore_source: &'a pplx_space_common_core::types::ExactStorageUri,
+    restore_source: &'a pplx_space_artifact_model::ExactStorageUri,
     disk_io_limits_override: Option<pplx_space_execution_spec::DiskIoLimits>,
 }
 
 impl<'a> RestoringRowInput<'a> {
     fn new(
         meta: &'a crate::snapshot_upload::SnapshotMeta,
-        restore_source: &'a pplx_space_common_core::types::ExactStorageUri,
+        restore_source: &'a pplx_space_artifact_model::ExactStorageUri,
         disk_io_limits_override: Option<pplx_space_execution_spec::DiskIoLimits>,
     ) -> Self {
         Self {
@@ -806,7 +806,7 @@ pub(super) fn insert_restoring_sandbox_row_from_snapshot(
     conn: &crate::db::Connection,
     canonical_id: &str,
     meta: &crate::snapshot_upload::SnapshotMeta,
-    restore_source: &pplx_space_common_core::types::ExactStorageUri,
+    restore_source: &pplx_space_artifact_model::ExactStorageUri,
     disk_io_limits_override: Option<pplx_space_execution_spec::DiskIoLimits>,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
     let sandbox_id = SandboxId::from_str(canonical_id).map_err(|source| {
@@ -1823,7 +1823,7 @@ impl SandboxManagerService {
             // the staged metadata to this same sandbox id.
             stopped_materialization_pin(&staged.meta, expected)?;
         }
-        let restore_source: pplx_space_common_core::types::ExactStorageUri = staged
+        let restore_source: pplx_space_artifact_model::ExactStorageUri = staged
             .storage_uri
             .parse()
             .map_err(|source| RestoreError::InvalidRestoreSource {
@@ -2439,7 +2439,7 @@ fn publish_rebound_sandbox_artifact_metadata(
                 "invalid restored artifact content hash: {error}"
             ))
         })?;
-    let sandbox_metadata = pplx_space_common_core::types::SandboxArtifactMetadata::new(
+    let sandbox_metadata = pplx_space_artifact_model::SandboxArtifactMetadata::new(
         sandbox_id,
         execution,
         template,

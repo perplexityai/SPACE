@@ -14,8 +14,8 @@ use super::PodIp;
 use crate::controllers::substrate::ExecutionIdentity;
 use crate::metrics::sandbox::api::RouteIdentityDecisionReason;
 use pplx_space_accounts::{NodeId, SandboxOwner, UserId};
+use pplx_space_artifact_model::{ExactStorageUri, StorageUri};
 use pplx_space_cluster_pool::WarmPoolStore;
-use pplx_space_common_core::types::{ExactStorageUri, StorageUri};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };

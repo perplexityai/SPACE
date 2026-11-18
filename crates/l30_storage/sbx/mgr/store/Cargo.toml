@@ -45,6 +45,7 @@ test-support = ["rusqlite/serialize"]
 [dependencies]
 dashmap = { workspace = true }
 jiff = { workspace = true }
+pplx-space-artifact-model = { workspace = true }
 pplx-space-node-model = { workspace = true }
 pplx-space-snapshot-model = { workspace = true }
 pplx-space-template-model = { workspace = true }

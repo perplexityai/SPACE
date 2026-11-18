@@ -980,7 +980,7 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
             if matches!(evidence, Evidence::Missing) {
                 std::fs::remove_file(&path).unwrap();
             } else {
-                let artifact = pplx_space_common_core::types::SandboxArtifactMetadata::new(
+                let artifact = pplx_space_artifact_model::SandboxArtifactMetadata::new(
                     created.sandbox_id.parse().unwrap(),
                     observed,
                     TEMPLATE.parse().unwrap(),

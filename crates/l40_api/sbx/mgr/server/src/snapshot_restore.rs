@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::future::{BoxFuture, join_all};
-use pplx_space_common_core::types::{ExactStorageUri, SnapshotArtifact};
+use pplx_space_artifact_model::{ExactStorageUri, SnapshotArtifact};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
@@ -156,7 +156,7 @@ pub enum RestoreError {
     InvalidRestoreSource {
         uri: String,
         #[source]
-        source: pplx_space_common_core::types::StorageUriParseError,
+        source: pplx_space_artifact_model::StorageUriParseError,
     },
     #[error("artifact snapshot {expected} does not match storage URI {storage_uri}")]
     ArtifactSnapshotUriMismatch {
@@ -548,7 +548,7 @@ pub(crate) enum RestoreArtifactLocationError {
     InvalidBase {
         uri: String,
         #[source]
-        source: pplx_space_common_core::types::StorageUriParseError,
+        source: pplx_space_artifact_model::StorageUriParseError,
     },
 }
 

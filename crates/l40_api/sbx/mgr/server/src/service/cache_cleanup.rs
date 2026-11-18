@@ -332,7 +332,7 @@ impl OrphanedSandboxRowMaterializationError {
 }
 
 enum RemoteRestoreProvenanceInspection {
-    Confirmed(pplx_space_common_core::types::ExactStorageUri),
+    Confirmed(pplx_space_artifact_model::ExactStorageUri),
     Absent,
     Unsafe { detail: String },
 }
@@ -366,7 +366,7 @@ fn inspect_remote_restore_provenance(
     }
     match crate::snapshot_restore::restore_source_from_artifact_location(
         &provenance.storage_uri,
-        pplx_space_common_core::types::SnapshotArtifact::Metadata,
+        pplx_space_artifact_model::SnapshotArtifact::Metadata,
     ) {
         Ok(source) => Ok(RemoteRestoreProvenanceInspection::Confirmed(source)),
         Err(error) => Ok(RemoteRestoreProvenanceInspection::Unsafe {
@@ -380,7 +380,7 @@ pub(super) enum CanonicalSuspendArtifactInspection {
     InterruptedRestore {
         metadata: Box<super::suspend_snapshot_publication::ValidatedSuspendSnapshotMetadata>,
         detail: String,
-        restore_source: pplx_space_common_core::types::ExactStorageUri,
+        restore_source: pplx_space_artifact_model::ExactStorageUri,
     },
     Unsafe {
         detail: String,

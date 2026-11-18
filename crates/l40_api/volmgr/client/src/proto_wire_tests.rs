@@ -1,6 +1,6 @@
 use prost::Message as _;
 
-use pplx_space_common_core::types::SnapshotArtifact as CoreArtifact;
+use pplx_space_artifact_model::SnapshotArtifact as CoreArtifact;
 
 use super::proto::{PullFileBatchEntry, PullFileRequest, PushFileBatchEntry, SnapshotArtifact};
 use super::{snapshot_artifact_from_proto, snapshot_artifact_to_proto};

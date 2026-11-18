@@ -200,7 +200,7 @@ impl TemplateManagerService {
                         build_dir.display()
                     )));
                 }
-                let rootfs = build_dir.join(pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE);
+                let rootfs = build_dir.join(pplx_space_artifact_model::TEMPLATE_ROOTFS_FILE);
                 match std::fs::symlink_metadata(&rootfs) {
                     Ok(metadata) if metadata.is_file() => Ok(()),
                     Ok(_) => Err(Status::failed_precondition(format!(

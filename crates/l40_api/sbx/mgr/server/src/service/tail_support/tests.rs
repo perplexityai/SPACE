@@ -104,7 +104,7 @@ fn restore_uses_explicit_or_captured_allocation_without_inventing_legacy_evidenc
 
 #[test]
 fn snapshot_identity_uses_durable_binding_when_artifact_metadata_is_missing_or_stale() {
-    use pplx_space_common_core::types::SandboxArtifactMetadata;
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::VcpuCount;
     let conn = crate::db::test_conn();

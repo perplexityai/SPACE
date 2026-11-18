@@ -26,6 +26,7 @@ anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 
 # internal
+pplx-space-artifact-model = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-execution-spec = { workspace = true }

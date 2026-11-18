@@ -888,7 +888,7 @@ done
 true
 """
 # The rootfs object each suspend codec publishes under the snapshot's storage
-# prefix (`SnapshotArtifact` in crates/libs/common/core/src/types/object_store.rs).
+# prefix (`SnapshotArtifact` in crates/l20_domain/artifact/model/src/object_store.rs).
 SUSPEND_ROOTFS_OBJECTS = {BTRFS_SEND_V1: ROOTFS_SEND_FILE, "full": "rootfs"}
 # The AWS CLI's refusal when nothing listens on the endpoint.
 _OBJECT_STORE_UNREACHABLE = "Could not connect to the endpoint URL"

@@ -1,7 +1,7 @@
 #[test]
 fn template_cache_paths_preserve_space_layout() {
     assert_eq!(
-        crate::types::template_build_dir(
+        crate::template_build_dir(
             "seed",
             "abc",
             pplx_space_template_model::TemplateCachePartition::Legacy
@@ -12,7 +12,7 @@ fn template_cache_paths_preserve_space_layout() {
         pplx_space_content_digest::Digest::sha256([2; 32]),
     );
     assert_eq!(
-        crate::types::template_snapshot_dir(
+        crate::template_snapshot_dir(
             "seed",
             "abc",
             pplx_space_template_model::TemplateCachePartition::Environment(environment),

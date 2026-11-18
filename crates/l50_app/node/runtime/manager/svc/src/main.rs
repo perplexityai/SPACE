@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
-use pplx_space_common_core::types::StorageUri;
+use pplx_space_artifact_model::StorageUri;
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_host_layout::paths;
 use pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot;

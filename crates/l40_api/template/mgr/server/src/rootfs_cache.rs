@@ -65,7 +65,7 @@ impl ExpandedRootfsError {
     }
 }
 
-use pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE;
+use pplx_space_artifact_model::TEMPLATE_ROOTFS_FILE;
 use pplx_space_page_cache as page_cache;
 use pplx_space_template_manifest::{TemplateManifest, TemplateMetadata};
 

@@ -90,7 +90,7 @@ pub async fn create_template_subvolume(
             // their cleanup-on-error guard would have wiped it if
             // their install failed.
             Ok(PathBuf::from(
-                pplx_space_common_core::types::template_build_dir(name, content_hash, partition),
+                pplx_space_artifact_model::template_build_dir(name, content_hash, partition),
             ))
         }
         Err(status) => Err(BtrfsViaNodemgrError::Rpc {

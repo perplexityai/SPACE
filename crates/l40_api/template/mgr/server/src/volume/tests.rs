@@ -81,7 +81,7 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
         ));
     }
 }
-use pplx_space_common_core::types::TEMPLATE_ROOTFS_ZSTD_FILE;
+use pplx_space_artifact_model::TEMPLATE_ROOTFS_ZSTD_FILE;
 
 #[test]
 fn volmgr_admission_rejection_is_retryable() {

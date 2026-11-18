@@ -59,7 +59,7 @@ use crate::{
     state::{SandboxState, SandboxStatus, SandboxStatusEventDetails},
 };
 use pplx_space_accounts::SandboxOwnerKind;
-use pplx_space_common_core::types::StorageUri;
+use pplx_space_artifact_model::StorageUri;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,

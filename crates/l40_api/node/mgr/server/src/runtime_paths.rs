@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use pplx_space_common_core::types::NodeSpacePath;
+use pplx_space_artifact_model::NodeSpacePath;
 use tonic::Status;
 
 const VMSTATE_ARTIFACT: &str = "vmstate";

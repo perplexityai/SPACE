@@ -589,7 +589,7 @@ pub(crate) fn template_base_snapshot_dir(
     vcpu: u32,
     memory_mib: u32,
 ) -> String {
-    pplx_space_common_core::types::template_snapshot_dir(
+    pplx_space_artifact_model::template_snapshot_dir(
         template,
         content_hash,
         partition,

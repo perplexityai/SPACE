@@ -19,7 +19,7 @@ use crate::guest_filesystem_flush::{
 use crate::node_state_sync::mark_sandbox_dirty;
 use crate::runtime_reconciliation::{mark_quarantined_best_effort, observe_vm_state};
 use crate::state::SandboxState;
-use pplx_space_common_core::types::SandboxArtifactMetadata;
+use pplx_space_artifact_model::SandboxArtifactMetadata;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };

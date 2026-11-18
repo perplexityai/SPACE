@@ -653,7 +653,7 @@ async fn retained_rootfs_inspection_errors_defer_recovery_without_selecting_temp
 async fn retained_instance_permission_recovery_and_repair_preserve_disk() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use crate::template_resolver::fake::FakeTemplateResolver;
-    use pplx_space_common_core::types::SandboxArtifactMetadata;
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_node_mgr_client::proto::{
         PrepareSandboxArtifactDirRequest, PrepareSandboxArtifactDirResponse,

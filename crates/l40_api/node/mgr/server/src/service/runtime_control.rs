@@ -1,7 +1,7 @@
 //! Derive runtime control from recorded execution, never a caller-selected socket.
 use super::validation::validate_sandbox_id;
 use super::*;
-use pplx_space_common_core::types::SandboxArtifactMetadata;
+use pplx_space_artifact_model::SandboxArtifactMetadata;
 use pplx_space_execution_spec::ExecutionMetadata;
 use std::io::Read;
 

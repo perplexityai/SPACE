@@ -13,8 +13,8 @@ use super::database_rows;
 use crate::db::Connection;
 use crate::state::{CleanupState, SandboxStatus, Teardown};
 use pplx_space_accounts::SandboxOwner;
+use pplx_space_artifact_model::ExactStorageUri;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::ExactStorageUri;
 use pplx_space_sandbox_model::{
     ExecutionGeneration, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRuntimeLabel,

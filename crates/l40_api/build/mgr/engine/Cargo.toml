@@ -27,6 +27,7 @@ hex = { workspace = true }
 jiff = { workspace = true }
 oci-spec = { workspace = true, features = ["image"] }
 object = { workspace = true }
+pplx-space-artifact-model = { workspace = true }
 pplx-space-template-model = { workspace = true }
 reqwest = { workspace = true, features = ["query"] }
 serde = { workspace = true, features = ["derive"] }

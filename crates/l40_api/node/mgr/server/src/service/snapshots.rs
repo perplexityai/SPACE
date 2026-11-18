@@ -35,14 +35,14 @@ pub(super) struct EncryptedCaptureTestIo {
 enum CaptureDestination {
     Plain(crate::runtime_paths::CreateSnapshotPaths),
     Encrypted(
-        pplx_space_common_core::types::NodeSpacePath,
+        pplx_space_artifact_model::NodeSpacePath,
         capture_receipt::CaptureReceipt,
     ),
 }
 
 enum RestoreSource {
     Plain(crate::runtime_paths::LoadSnapshotPaths),
-    Encrypted(pplx_space_common_core::types::NodeSpacePath),
+    Encrypted(pplx_space_artifact_model::NodeSpacePath),
 }
 
 const BTRFS_SNAPSHOTS_DIR_NAME: &str = "snapshots";
@@ -628,7 +628,7 @@ impl NodeManagerService {
     async fn create_encrypted_snapshot(
         &self,
         typed_sandbox_id: SandboxId,
-        mount_dir: &pplx_space_common_core::types::NodeSpacePath,
+        mount_dir: &pplx_space_artifact_model::NodeSpacePath,
         receipt: &mut capture_receipt::CaptureReceipt,
     ) -> Result<Response<CaptureVmStateResponse>, Status> {
         let sandbox_id = typed_sandbox_id.to_string();
@@ -688,7 +688,7 @@ impl NodeManagerService {
     async fn write_encrypted_snapshot_files(
         &self,
         sandbox_id: &str,
-        mount_dir: &pplx_space_common_core::types::NodeSpacePath,
+        mount_dir: &pplx_space_artifact_model::NodeSpacePath,
         receipt: &mut capture_receipt::CaptureReceipt,
     ) -> Result<(), Status> {
         #[cfg(test)]

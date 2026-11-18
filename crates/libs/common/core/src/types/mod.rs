@@ -29,19 +29,11 @@
 
 pub mod admin;
 pub mod kek;
-pub mod node_fs;
-pub mod object_store;
-#[cfg(feature = "serde")]
-pub mod sandbox_artifact;
 pub mod subject;
 
 #[cfg(feature = "serde")]
 pub use admin::*;
 pub use kek::*;
-pub use node_fs::*;
-pub use object_store::*;
-#[cfg(feature = "serde")]
-pub use sandbox_artifact::*;
 pub use subject::{SubjectId, SubjectIdParseError, SubjectKind};
 
 /// Transitional: `SandboxId` lives in `pplx-space-sandbox-model`. This re-export keeps the

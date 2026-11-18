@@ -13,7 +13,7 @@ use nix::sys::stat::{Mode, fchmod, mkdirat};
 use nix::unistd::{Gid, fchown};
 
 use crate::proto::CloneDirectoryIdentity;
-use pplx_space_common_core::types::SandboxArtifactMetadata;
+use pplx_space_artifact_model::SandboxArtifactMetadata;
 
 const DIRECTORY: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_DIRECTORY)

@@ -65,7 +65,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::{StorageUri, SubjectId, TEMPLATE_ROOTFS_FILE};
+use pplx_space_artifact_model::{StorageUri, TEMPLATE_ROOTFS_FILE};
+use pplx_space_common_core::types::SubjectId;
 use pplx_space_common_grpc::GrpcClientTrace;
 use pplx_space_content_digest::ContentHash;
 use pplx_space_host_layout::paths::{TEMPLATE_CACHE_DIR_MODE, TEMPLATE_CACHE_FILE_MODE};
@@ -1852,8 +1853,7 @@ async fn try_pull_from(
         manifest: probed_manifest,
         metadata: probed_metadata,
     } = probe_release_partition(&client, &subject, parts, name, content_hash, base_tags).await?;
-    let digest_dir =
-        pplx_space_common_core::types::template_build_dir(name, content_hash, partition);
+    let digest_dir = pplx_space_artifact_model::template_build_dir(name, content_hash, partition);
     match probed_partition_action(&db, Path::new(TEMPLATE_DIR), name, content_hash, partition)? {
         ProbedPartition::Present => {
             info!(

@@ -3,7 +3,7 @@
 
 use crate::proto::*;
 use crate::runtime_paths::SnapshotFiles;
-use pplx_space_common_core::types::NodeSpacePath;
+use pplx_space_artifact_model::NodeSpacePath;
 use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_mgr_client::execution_fence::ExecutionFence as ParsedExecutionFence;
 use pplx_space_sandbox_model::SandboxId;

@@ -495,7 +495,7 @@ fn storage_uri_uses_canonical_digest_prefix() {
 
     let uri = build_storage_uri(&config, &sample_template(), sample_hash());
     let parsed =
-        pplx_space_common_core::types::StorageUri::parse(&uri).expect("storage uri should parse");
+        pplx_space_artifact_model::StorageUri::parse(&uri).expect("storage uri should parse");
 
     assert_eq!(parsed.bucket, "bucket");
     assert_eq!(
@@ -518,7 +518,7 @@ fn storage_uri_keeps_explicit_path_style_override() {
 
     let uri = build_storage_uri(&config, &sample_template(), sample_hash());
     let parsed =
-        pplx_space_common_core::types::StorageUri::parse(&uri).expect("storage uri should parse");
+        pplx_space_artifact_model::StorageUri::parse(&uri).expect("storage uri should parse");
 
     assert_eq!(parsed.endpoint.as_deref(), Some("https://minio.internal"));
     assert!(!parsed.path_style);

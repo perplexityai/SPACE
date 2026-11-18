@@ -21,7 +21,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::materialization::MaterializationMode;
-use pplx_space_common_core::types::SnapshotArtifact;
+use pplx_space_artifact_model::SnapshotArtifact;
 use pplx_space_common_jobs::{Job, JobError, JobFailureReason};
 
 use crate::codec_admission::CodecPermit;

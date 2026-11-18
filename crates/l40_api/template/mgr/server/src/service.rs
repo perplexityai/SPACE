@@ -6,11 +6,11 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
-use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::{
+use pplx_space_artifact_model::{
     TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,
     TEMPLATE_ROOTFS_ZSTD_LEVEL,
 };
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_content_digest::{Digest, HashAlg};
 use pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS;
 use pplx_space_feature_flags::FeatureFlagClient;
@@ -450,7 +450,7 @@ pub struct TemplateManagerService {
 /// where `build_dir` is the content hash plus `@{environment}` outside the
 /// legacy cache partition.
 fn build_dir(name: &str, content_hash: &str, partition: TemplateCachePartition) -> String {
-    pplx_space_common_core::types::template_build_dir(name, content_hash, partition)
+    pplx_space_artifact_model::template_build_dir(name, content_hash, partition)
 }
 
 /// Path to the snapshots directory for a build: `{TEMPLATE_DIR}/{name}/snapshots/{build_dir}/{vcpu}vcpu-{memory_mib}mib/`
@@ -461,7 +461,7 @@ fn snapshot_dir(
     vcpu: u32,
     memory_mib: u32,
 ) -> String {
-    pplx_space_common_core::types::template_snapshot_dir(
+    pplx_space_artifact_model::template_snapshot_dir(
         name,
         content_hash,
         partition,

@@ -21,6 +21,7 @@ datadog-otel = ["otel", "datadog"]
 dashmap = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true, features = ["process", "signal", "fs", "user", "sched", "mount", "resource"] }
+pplx-space-artifact-model = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

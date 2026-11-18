@@ -1100,7 +1100,7 @@ async fn cloud_hypervisor_pre_capture_refusal_never_stops_the_runtime() {
         })
         .unwrap();
     let mut destination = super::CaptureDestination::Encrypted(
-        pplx_space_common_core::types::NodeSpacePath::parse(snapshot_volume(&sandbox.to_string()))
+        pplx_space_artifact_model::NodeSpacePath::parse(snapshot_volume(&sandbox.to_string()))
             .unwrap(),
         receipt,
     );

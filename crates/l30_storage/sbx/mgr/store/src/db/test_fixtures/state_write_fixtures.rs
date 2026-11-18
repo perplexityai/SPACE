@@ -500,7 +500,7 @@ pub fn stop(conn: &Connection, id: &str) {
 pub const RESTORE_STORAGE_URI: &str = "s3://snapshots/suspend/restore?region=us-east-1";
 
 /// The remote snapshot a seeded cross-node restore stages from.
-pub fn restore_source() -> pplx_space_common_core::types::ExactStorageUri {
+pub fn restore_source() -> pplx_space_artifact_model::ExactStorageUri {
     RESTORE_STORAGE_URI.parse().unwrap()
 }
 

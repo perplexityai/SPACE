@@ -54,7 +54,7 @@ fn restore_meta_with_process_env(
     }))
 }
 
-fn restore_source(sandbox_id: &str) -> pplx_space_common_core::types::ExactStorageUri {
+fn restore_source(sandbox_id: &str) -> pplx_space_artifact_model::ExactStorageUri {
     format!("s3://snapshots/suspend/{sandbox_id}/attempt-1?region=us-east-1")
         .parse()
         .unwrap()
@@ -1892,7 +1892,7 @@ async fn a_deferred_orphan_restore_never_logs_the_storage_uri() {
     // A URI shaped like a connection string with inline credentials, which is
     // what makes this a disclosure rather than noise.
     let uri = format!("s3://AKIAEXAMPLEKEYID:{SECRET}@storage.example.com/snapshots/x");
-    let source = pplx_space_common_core::types::ExactStorageUri::parse("::not-a-uri::")
+    let source = pplx_space_artifact_model::ExactStorageUri::parse("::not-a-uri::")
         .expect_err("a malformed URI should not parse");
     let error = crate::snapshot_restore::RestoreError::InvalidRestoreSource {
         uri: uri.clone(),
@@ -1944,7 +1944,7 @@ async fn a_deferred_orphan_restore_never_logs_the_storage_uri() {
     // against the real parser rather than against a literal this test chose, which
     // could not fail.
     let rejected = format!("s3://bucket/snap?endpoint=https://user:{SECRET}@minio.internal");
-    let parse_error = pplx_space_common_core::types::StorageUri::parse(&rejected)
+    let parse_error = pplx_space_artifact_model::StorageUri::parse(&rejected)
         .expect_err("a URI with an unsupported query param should not parse");
     assert!(
         parse_error.to_string().contains(SECRET),

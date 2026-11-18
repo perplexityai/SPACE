@@ -1385,12 +1385,12 @@ pub(super) fn validated_release_hash(value: &str) -> Result<String, Status> {
 pub(super) fn validated_storage_connection_strings(
     values: Vec<String>,
     trusted: &super::trusted_storage::TrustedTemplateStorageBuckets,
-) -> Result<Vec<pplx_space_common_core::types::ExactStorageUri>, Status> {
+) -> Result<Vec<pplx_space_artifact_model::ExactStorageUri>, Status> {
     dedupe_nonempty_strings(values, "storage_connection_string")?
         .into_iter()
         .map(|value| {
             // Connection strings and parser errors can contain endpoint credentials.
-            let uri = pplx_space_common_core::types::ExactStorageUri::parse(&value)
+            let uri = pplx_space_artifact_model::ExactStorageUri::parse(&value)
                 .map_err(|_| Status::invalid_argument("invalid template storage URI"))?;
             trusted
                 .check(uri.parsed())

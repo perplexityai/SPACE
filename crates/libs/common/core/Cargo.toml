@@ -13,12 +13,12 @@ workspace = true
 [dependencies]
 aws-lc-rs = { workspace = true, optional = true }
 pplx-space-accounts = { workspace = true }
+pplx-space-artifact-model = { workspace = true }
 pplx-space-byte-size = { workspace = true }
 pplx-space-content-digest = { workspace = true }
 pplx-space-durations = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
-pplx-space-host-layout = { workspace = true }
 pplx-space-job-id = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-linux-ids = { workspace = true }
@@ -35,7 +35,6 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }
 
 [dev-dependencies]
-pplx-space-cpu-arch = { workspace = true }
 pplx-space-guest-process = { workspace = true, features = ["serde"] }
 serde_json = { workspace = true }
 
@@ -58,6 +57,7 @@ serde = [
     "pplx-space-node-model/serde",
     "pplx-space-sandbox-model/serde",
     "pplx-space-snapshot-model/serde",
+    "pplx-space-artifact-model/serde",
 ]
 sqlx = [
     "dep:pplx-space-sql-codec",

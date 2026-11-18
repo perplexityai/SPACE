@@ -6,9 +6,9 @@ pub mod proto {
 
 /// Convert the domain snapshot identity to its volume-manager wire value.
 pub const fn snapshot_artifact_to_proto(
-    artifact: pplx_space_common_core::types::SnapshotArtifact,
+    artifact: pplx_space_artifact_model::SnapshotArtifact,
 ) -> proto::SnapshotArtifact {
-    use pplx_space_common_core::types::SnapshotArtifact as CoreArtifact;
+    use pplx_space_artifact_model::SnapshotArtifact as CoreArtifact;
 
     match artifact {
         CoreArtifact::Rootfs => proto::SnapshotArtifact::Rootfs,
@@ -25,8 +25,8 @@ pub const fn snapshot_artifact_to_proto(
 /// `UNSPECIFIED` represents legacy callers or non-snapshot transfers.
 pub const fn snapshot_artifact_from_proto(
     artifact: proto::SnapshotArtifact,
-) -> Option<pplx_space_common_core::types::SnapshotArtifact> {
-    use pplx_space_common_core::types::SnapshotArtifact as CoreArtifact;
+) -> Option<pplx_space_artifact_model::SnapshotArtifact> {
+    use pplx_space_artifact_model::SnapshotArtifact as CoreArtifact;
 
     match artifact {
         proto::SnapshotArtifact::Unspecified => None,
@@ -158,7 +158,7 @@ pub struct VerifiedReplicaProvenance {
     pub raw: bool,
     pub file_mode: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot_artifact: Option<pplx_space_common_core::types::SnapshotArtifact>,
+    pub snapshot_artifact: Option<pplx_space_artifact_model::SnapshotArtifact>,
     pub object_size: u64,
     pub object_etag: Option<String>,
     pub local_size: u64,
@@ -168,7 +168,7 @@ pub struct VerifiedReplicaProvenance {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedReplicaSource {
     pub subject_id: pplx_space_common_core::types::SubjectId,
-    pub storage_uri: pplx_space_common_core::types::ExactStorageUri,
+    pub storage_uri: pplx_space_artifact_model::ExactStorageUri,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -197,7 +197,7 @@ pub enum ReadVerifiedReplicaProvenanceError {
     StorageUri {
         path: PathBuf,
         #[source]
-        source: pplx_space_common_core::types::StorageUriParseError,
+        source: pplx_space_artifact_model::StorageUriParseError,
     },
 }
 
@@ -240,7 +240,7 @@ pub fn read_verified_replica_provenance(
             source,
         }
     })?;
-    let storage_uri = pplx_space_common_core::types::ExactStorageUri::parse(&provenance.s3_uri)
+    let storage_uri = pplx_space_artifact_model::ExactStorageUri::parse(&provenance.s3_uri)
         .map_err(|source| ReadVerifiedReplicaProvenanceError::StorageUri {
             path: provenance_path,
             source,

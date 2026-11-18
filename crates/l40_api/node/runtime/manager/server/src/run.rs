@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
 
-use pplx_space_common_core::types::StorageUri;
+use pplx_space_artifact_model::StorageUri;
 
 use pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot;
 

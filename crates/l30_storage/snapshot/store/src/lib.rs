@@ -4,8 +4,8 @@ use std::str::FromStr;
 
 use jiff::Timestamp;
 use pplx_space_accounts::{NodeId, OrgId};
-use pplx_space_common_core::types::ExactStorageUri;
-use pplx_space_common_core::types::{
+use pplx_space_artifact_model::ExactStorageUri;
+use pplx_space_artifact_model::{
     SnapshotArtifact as SnapshotArtifactFile, SnapshotArtifactParseError,
 };
 use pplx_space_content_digest::{Digest, DigestParseError};
