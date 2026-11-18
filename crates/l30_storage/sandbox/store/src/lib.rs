@@ -149,6 +149,7 @@ pub mod delete;
 pub mod deleted_rows;
 pub mod direct;
 pub mod drain;
+pub mod drain_terminate;
 pub mod ecw_credential_epochs;
 pub mod fork_source_lifecycle;
 pub mod ingest;
