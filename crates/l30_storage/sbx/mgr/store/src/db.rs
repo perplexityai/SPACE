@@ -42,6 +42,7 @@ pub use handle::OptionalExtension;
 use handle::db_private_outside_tests;
 pub use handle::{Connection, ConnectionGuard, Error, Result, SharedConnection, Transaction};
 
+pub mod activation_seal;
 pub mod auto_lifecycle_delete_receipts;
 pub mod cleanup_jobs;
 pub mod cleanup_target_scan;
@@ -139,6 +140,7 @@ pub mod read {
     pub use suspend_attempt::*;
     mod guest_update;
     pub use guest_update::*;
+    mod activation_seal;
     mod cleanup_job;
     mod counts;
     mod eviction;
@@ -147,6 +149,7 @@ pub mod read {
     mod sandbox;
     mod sandbox_view;
     mod state_page;
+    pub use activation_seal::*;
     pub use cleanup_job::*;
     pub use counts::*;
     pub use eviction::*;

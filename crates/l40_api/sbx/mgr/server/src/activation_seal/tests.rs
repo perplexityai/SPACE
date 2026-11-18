@@ -1,0 +1,375 @@
+use super::*;
+
+const SANDBOX: &str = "sandbox-1";
+
+fn record(db: &crate::db::SharedConnection) -> Option<ActivationSealRecord> {
+    crate::db::read::activation_seal(&db.lock().unwrap()).unwrap()
+}
+
+/// Sealing again under the current epoch changes nothing; a later epoch
+/// replaces it; an earlier epoch is refused, to seal or to cancel, and
+/// leaves the seal as it was; a zero or unstorable epoch is refused.
+#[test]
+fn seal_epochs_only_move_forward() {
+    let db = SharedConnection::new(crate::db::test_conn());
+    let seal = ActivationSeal::load(&db.lock().unwrap());
+
+    seal.seal(&db, 7).unwrap();
+    seal.seal(&db, 7).unwrap();
+    assert_eq!(seal.status().sealed_epoch, Some(7));
+    seal.seal(&db, 8).unwrap();
+    assert_eq!(seal.status().sealed_epoch, Some(8));
+
+    let written = Some(ActivationSealRecord {
+        epoch: 8,
+        sealed: true,
+    });
+    assert_eq!(record(&db), written);
+    for refused in [
+        seal.seal(&db, 7).unwrap_err(),
+        seal.unseal(&db, 7).unwrap_err(),
+    ] {
+        assert_eq!(
+            refused.code(),
+            tonic::Code::FailedPrecondition,
+            "{refused:?}"
+        );
+        assert_eq!(seal.status().sealed_epoch, Some(8));
+        assert_eq!(record(&db), written, "a refused call writes nothing");
+    }
+
+    for epoch in [0, u64::MAX] {
+        assert_eq!(
+            seal.seal(&db, epoch).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            seal.unseal(&db, epoch).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    assert_eq!(seal.status().sealed_epoch, Some(8));
+}
+
+/// A cancel of the current epoch unseals and is remembered: no seal at or
+/// below it is taken again, while a later epoch seals. A cancel that arrives
+/// before its seal (an undrain racing the drain's first call) still refuses
+/// that seal, a cancel below the remembered one keeps it, and a later cancel
+/// unseals an earlier seal. A restart keeps the cancel.
+#[test]
+fn a_cancelled_epoch_never_seals_again() {
+    let db = SharedConnection::new(crate::db::test_conn());
+    let seal = ActivationSeal::load(&db.lock().unwrap());
+    let cancelled = |epoch| {
+        Some(ActivationSealRecord {
+            epoch,
+            sealed: false,
+        })
+    };
+
+    seal.seal(&db, 5).unwrap();
+    seal.unseal(&db, 5).unwrap();
+    assert_eq!(seal.status().sealed_epoch, None);
+    assert_eq!(record(&db), cancelled(5));
+    seal.unseal(&db, 5).unwrap();
+    for stale in [4, 5] {
+        assert_eq!(
+            seal.seal(&db, stale).unwrap_err().code(),
+            tonic::Code::FailedPrecondition,
+            "{stale}"
+        );
+    }
+    assert_eq!(seal.status().sealed_epoch, None);
+
+    seal.unseal(&db, 9).unwrap();
+    assert_eq!(
+        seal.seal(&db, 9).unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    seal.unseal(&db, 3).unwrap();
+    assert_eq!(record(&db), cancelled(9));
+
+    seal.seal(&db, 10).unwrap();
+    seal.unseal(&db, 12).unwrap();
+    assert_eq!(seal.status().sealed_epoch, None);
+    assert_eq!(record(&db), cancelled(12));
+
+    let reloaded = ActivationSeal::load(&db.lock().unwrap());
+    assert_eq!(
+        reloaded.seal(&db, 11).unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    reloaded.seal(&db, 13).unwrap();
+    assert_eq!(reloaded.status().sealed_epoch, Some(13));
+}
+
+/// An activation reads the seal as the service last read or wrote it, never
+/// the database: a row written behind the seal's back changes nothing until
+/// the service is built again, which is when a restart reads it.
+#[test]
+fn an_activation_reads_the_seal_in_memory_not_the_database() {
+    let db = SharedConnection::new(crate::db::test_conn());
+    let seal = ActivationSeal::load(&db.lock().unwrap());
+    write_activation_seal(
+        &db.lock().unwrap(),
+        ActivationSealRecord {
+            epoch: 4,
+            sealed: true,
+        },
+    )
+    .unwrap();
+    drop(
+        seal.admit("cold", SANDBOX)
+            .expect("the seal in memory is unsealed"),
+    );
+
+    let restarted = ActivationSeal::load(&db.lock().unwrap());
+    let refused = restarted.admit("cold", SANDBOX).unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(refused.message().contains("epoch 4"), "{refused:?}");
+    seal.assert_quiesced();
+    restarted.assert_quiesced();
+}
+
+fn hide_seal_table(db: &SharedConnection) {
+    db.lock()
+        .unwrap()
+        .execute_batch("ALTER TABLE activation_seal RENAME TO activation_seal_hidden")
+        .unwrap();
+}
+
+/// Restore the table [`hide_seal_table`] hid, holding `row`.
+fn restore_seal_table(db: &SharedConnection, row: Option<ActivationSealRecord>) {
+    let conn = db.lock().unwrap();
+    conn.execute_batch("ALTER TABLE activation_seal_hidden RENAME TO activation_seal")
+        .unwrap();
+    if let Some(row) = row {
+        write_activation_seal(&conn, row).unwrap();
+    }
+}
+
+#[track_caller]
+fn assert_unreadable_refusal(refused: &Status) {
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
+    assert!(
+        refused
+            .message()
+            .contains(ACTIVATION_SEAL_UNREADABLE_MARKER),
+        "{refused:?}"
+    );
+}
+
+/// A seal row that can't be read at startup leaves the seal unknown, which
+/// refuses every activation as retryable rather than admit what a sealed row
+/// would refuse. A seal call reads the row again: one that still can't be
+/// read refuses the call and changes nothing, and once it reads, the seal it
+/// holds refuses activations from then on.
+#[test]
+fn an_unreadable_seal_refuses_activations_until_a_seal_call_reads_it() {
+    let db = SharedConnection::new(crate::db::test_conn());
+    hide_seal_table(&db);
+    let seal = ActivationSeal::load(&db.lock().unwrap());
+    assert_unreadable_refusal(&seal.admit("restore", SANDBOX).unwrap_err());
+    assert_unreadable_refusal(&seal.check("cold", SANDBOX).unwrap_err());
+    assert!(seal.status().in_flight.is_empty());
+    assert_eq!(seal.seal(&db, 6).unwrap_err().code(), tonic::Code::Internal);
+    assert_unreadable_refusal(&seal.check("cold", SANDBOX).unwrap_err());
+
+    restore_seal_table(
+        &db,
+        Some(ActivationSealRecord {
+            epoch: 5,
+            sealed: true,
+        }),
+    );
+    assert_unreadable_refusal(&seal.check("cold", SANDBOX).unwrap_err());
+    seal.seal(&db, 5).unwrap();
+    assert_eq!(seal.status().sealed_epoch, Some(5));
+    let refused = seal.admit("restore", SANDBOX).unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused.message().contains(ACTIVATIONS_SEALED_MARKER),
+        "{refused:?}"
+    );
+    seal.assert_quiesced();
+}
+
+/// The background read of a seal left unknown at startup keeps retrying
+/// while the row can't be read, refusing every activation meanwhile, and
+/// publishes the row once it reads: a node never sealed, or one whose drain
+/// was cancelled, admits activations again; a sealed one refuses them under
+/// its epoch. The retry ends there.
+#[tokio::test(start_paused = true)]
+async fn the_background_read_publishes_the_seal_row_once_it_reads() {
+    let cancelled = ActivationSealRecord {
+        epoch: 3,
+        sealed: false,
+    };
+    let sealed = ActivationSealRecord {
+        epoch: 4,
+        sealed: true,
+    };
+    for row in [None, Some(cancelled), Some(sealed)] {
+        let db = SharedConnection::new(crate::db::test_conn());
+        hide_seal_table(&db);
+        let seal = Arc::new(ActivationSeal::load(&db.lock().unwrap()));
+        let shutdown = CancellationToken::new();
+        let retry = tokio::spawn(Arc::clone(&seal).recover(
+            db.clone(),
+            shutdown.clone(),
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        ));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!retry.is_finished(), "{row:?}: retries while unreadable");
+        assert_unreadable_refusal(&seal.admit("cold", SANDBOX).unwrap_err());
+
+        restore_seal_table(&db, row);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(retry.is_finished(), "{row:?}: the retry ends once it reads");
+        retry.await.unwrap();
+        match row.filter(|row| row.sealed) {
+            None => drop(
+                seal.admit("cold", SANDBOX)
+                    .unwrap_or_else(|refused| panic!("{row:?}: {refused:?}")),
+            ),
+            Some(_) => {
+                let refused = seal.admit("cold", SANDBOX).unwrap_err();
+                assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{row:?}");
+                assert!(refused.message().contains("epoch 4"), "{refused:?}");
+            }
+        }
+        seal.assert_quiesced();
+    }
+}
+
+/// A seal call that reads the row between the background read and its
+/// publication wins: the background read's answer, older than the seal, is
+/// not published over it, and the retry ends with the seal known.
+#[test]
+fn a_seal_call_between_the_background_read_and_its_publication_wins() {
+    let db = SharedConnection::new(crate::db::test_conn());
+    hide_seal_table(&db);
+    let seal = ActivationSeal::load(&db.lock().unwrap());
+    restore_seal_table(&db, None);
+    // The background read finds a node never sealed...
+    let read =
+        crate::db::read::activation_seal(&db.lock().unwrap()).map_err(|error| error.to_string());
+    assert_eq!(read, Ok(None));
+    // ...and a seal call reads the row and seals before that is published.
+    seal.seal(&db, 9).unwrap();
+    assert!(seal.publish_recovered(read), "the seal is known");
+    assert_eq!(seal.status().sealed_epoch, Some(9));
+    let refused = seal.admit("cold", SANDBOX).unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    seal.assert_quiesced();
+}
+
+/// While the background read waits on the database, an activation is
+/// refused as retryable at once rather than blocked behind it: the read
+/// holds no state lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_activation_is_refused_not_blocked_while_the_background_read_waits() {
+    let db = SharedConnection::new(crate::db::test_conn());
+    hide_seal_table(&db);
+    let seal = Arc::new(ActivationSeal::load(&db.lock().unwrap()));
+    let shutdown = CancellationToken::new();
+    let held = db.clone();
+    let guard = held.lock().unwrap();
+    let retry = tokio::spawn(Arc::clone(&seal).recover(
+        db.clone(),
+        shutdown.clone(),
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    ));
+    // Long enough for the retry to be waiting on the held database.
+    std::thread::sleep(Duration::from_millis(200));
+    let (sent, received) = std::sync::mpsc::channel();
+    let checking = Arc::clone(&seal);
+    std::thread::spawn(move || {
+        let _ = sent.send(checking.check("cold", SANDBOX));
+    });
+    let refused = received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the check is not blocked behind the background read")
+        .unwrap_err();
+    assert_unreadable_refusal(&refused);
+    drop(guard);
+    shutdown.cancel();
+    retry.await.unwrap();
+}
+
+/// A seal that reads at startup starts no background read, and the retry of
+/// an unknown seal is one task that ends at shutdown, leaving the seal
+/// unknown and activations refused.
+#[tokio::test(start_paused = true)]
+async fn the_background_read_runs_only_while_the_seal_is_unknown() {
+    let db = SharedConnection::new(crate::db::test_conn());
+    let tracker = tokio_util::task::TaskTracker::new();
+    let known = Arc::new(ActivationSeal::load(&db.lock().unwrap()));
+    known.spawn_recovery(db.clone(), CancellationToken::new(), &tracker);
+    assert!(tracker.is_empty(), "a known seal needs no retry");
+
+    hide_seal_table(&db);
+    let unknown = Arc::new(ActivationSeal::load(&db.lock().unwrap()));
+    let shutdown = CancellationToken::new();
+    unknown.spawn_recovery(db.clone(), shutdown.clone(), &tracker);
+    assert_eq!(tracker.len(), 1);
+    shutdown.cancel();
+    tracker.close();
+    tokio::time::timeout(Duration::from_secs(1), tracker.wait())
+        .await
+        .expect("the retry ends at shutdown");
+    assert_unreadable_refusal(&unknown.check("cold", SANDBOX).unwrap_err());
+}
+
+/// The token ends its work's in-flight count however the work ends: it
+/// returns an error, it is cancelled, or it panics. A token that is never
+/// dropped stays counted, so the service tests' leak check fails on it.
+#[tokio::test]
+async fn in_flight_tokens_are_released_on_error_cancellation_and_panic() {
+    let seal = Arc::new(ActivationSeal::unsealed());
+
+    let failed = {
+        let seal = Arc::clone(&seal);
+        move || -> Result<(), &'static str> {
+            let _token = seal.admit("cold", SANDBOX).unwrap();
+            Err("launch failed")
+        }
+    };
+    failed().unwrap_err();
+    assert!(seal.status().in_flight.is_empty(), "error");
+
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let cancelled = tokio::spawn({
+        let seal = Arc::clone(&seal);
+        async move {
+            let _token = seal.admit("resident_resume", SANDBOX).unwrap();
+            let _ = held_tx.send(());
+            std::future::pending::<()>().await;
+        }
+    });
+    held_rx.await.unwrap();
+    assert_eq!(seal.status().in_flight.len(), 1);
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    assert!(seal.status().in_flight.is_empty(), "cancellation");
+
+    let panicked = tokio::spawn({
+        let seal = Arc::clone(&seal);
+        async move {
+            let _token = seal.admit("cold", SANDBOX).unwrap();
+            panic!("activation step panicked");
+        }
+    });
+    assert!(panicked.await.unwrap_err().is_panic());
+    assert!(seal.status().in_flight.is_empty(), "panic");
+
+    seal.assert_quiesced();
+    #[allow(clippy::mem_forget, reason = "the leak a forgotten token is")]
+    std::mem::forget(seal.admit("restore", SANDBOX).unwrap());
+    assert!(
+        std::panic::catch_unwind(|| seal.assert_quiesced()).is_err(),
+        "the leak check fails on a forgotten token"
+    );
+}
