@@ -1,4 +1,6 @@
 use pplx_space_accounts::NodeId;
+use pplx_space_node_drain::NodeDrainEngine;
+use pplx_space_node_registration_store::drain_v2 as node_drain_v2;
 
 use axum::{
     Extension, Json,
@@ -8,7 +10,8 @@ use axum::{
     response::IntoResponse,
 };
 use pplx_space_admin_protocol::{
-    AdminExecutionInventoryObservation, AdminNodeDrainability, AdminNodeHealthStatus,
+    AdminExecutionInventoryObservation, AdminNodeDrain, AdminNodeDrainBlocked,
+    AdminNodeDrainEvacuated, AdminNodeDrainPending, AdminNodeDrainability, AdminNodeHealthStatus,
     AdminNodeNetworkSlots, AdminNodeResponse, AdminNodeSchedulingStatus, AdminNodeSort,
     AdminNodeStatusSnapshot, DrainRequest, ForceUploadFailure, ForceUploadLocalSnapshotsResponse,
     GetAdminNodeFilters, ListAdminNodesFilters,
@@ -36,18 +39,20 @@ use crate::middleware::auth::AuthUser;
 use crate::models::User;
 use crate::routes::AppState;
 
-#[cfg(test)]
 mod drain_preview;
-#[cfg(test)]
 mod drain_v2;
 mod holds;
 mod read_state;
-#[cfg(test)]
 pub use drain_preview::DrainPreviewError;
-#[cfg(test)]
-use drain_v2::drain_v2_node_refusals;
-#[cfg(test)]
-pub use drain_v2::{NodeApiV2DrainProbe, V2DrainPreview, V2DrainProbe};
+pub(super) use drain_preview::preview_node_drain;
+pub use drain_v2::{
+    DRAIN_V2_ENABLED_ENV, DRAIN_V2_MAX_EVACUATING_NODES_ENV, NodeApiV2DrainProbe, V2DrainPreview,
+    V2DrainProbe, drain_v2_max_evacuating_nodes,
+};
+use drain_v2::{
+    DrainV2Write, drain_v2_node_refusals, drain_v2_write, v1_drain_refusal, v2_start_refusal,
+    v2_start_stopped_refusal, v2_undrain_transition,
+};
 pub(super) use holds::list_node_holds;
 use read_state::attach_node_read_state;
 
@@ -499,6 +504,7 @@ fn admin_node_response(
         None => (None, None),
     };
     let display_name = row.name.clone().or_else(|| row.substrate_node_id.clone());
+    let drain_phase = row.drain_phase.clone();
     let status = admin_node_status(&row);
     AdminNodeResponse {
         id: row.id,
@@ -510,7 +516,7 @@ fn admin_node_response(
         state: row.state,
         scheduling_status: row.scheduling_status,
         scheduling_reason: row.scheduling_reason,
-        drain_phase: row.drain_phase,
+        drain_phase: drain_phase.clone(),
         // NULL stays `None` — "no drain, so no mode" is worth distinguishing
         // from "gentle" on the operator surface. A present-but-unrecognized
         // value resolves to gentle (and logs a warn) rather than failing the
@@ -522,6 +528,13 @@ fn admin_node_response(
             .map(|raw| NodeDrainMode::from_column_str(Some(raw))),
         drain_started_at: format_optional_time(row.drain_started_at),
         drain_last_error: row.drain_last_error,
+        drain: drain_v2::v2_drain_view(
+            row.id,
+            row.drain_engine.as_deref(),
+            drain_phase.as_deref(),
+            row.drain_status.as_ref().map(|status| &status.0),
+        ),
+        drain_engine: row.drain_engine,
         terminate_decrement_capacity: row.terminate_decrement_capacity,
         node_group_id: row.node_group_id,
         k8s_node_name: row.substrate_node_id,
@@ -1640,6 +1653,37 @@ async fn apply_drain_action(
         .substrate_capabilities()
         .supports_node_drain;
 
+    // The start of a v2 drain asks the node what it holds first, outside the
+    // row lock below: a v2 drain never moves a stopped sandbox, so a node
+    // whose own preview lists one is refused.
+    if state.drain_v2_enabled
+        && matches!(action, DrainAction::Drain)
+        && drain_request.engine == Some(NodeDrainEngine::V2)
+    {
+        let node = match AdminNodeStore::new(state.pool.clone()).fetch(node_id).await {
+            Ok(Some(node)) => node,
+            Ok(None) => return api_error(StatusCode::NOT_FOUND, "Node not found").into_response(),
+            Err(err) => return db_error(err).into_response(),
+        };
+        if let Some(refusal) = v2_start_stopped_refusal(&state, &node).await {
+            audit::record(AdminAuditEntry {
+                actor: &actor,
+                action: action.label(),
+                node_id,
+                node_name: node.substrate_node_id.as_deref(),
+                from_phase: node.drain_phase.as_deref(),
+                to_phase: None,
+                from_drain_mode: None,
+                replace_after_terminate: requested_replace_after_terminate,
+                drain_mode: requested_mode,
+                success: false,
+                error: Some("conflict: the node holds stopped sandboxes"),
+                outcome_counts: None,
+            });
+            return refusal;
+        }
+    }
+
     // Phase 1 — DB transition under `FOR UPDATE`.
     //
     // Postgres is the source of truth. We validate the requested transition
@@ -1670,6 +1714,42 @@ async fn apply_drain_action(
     let mode_in_progress =
         audited_mode_in_progress(action, current.drain_phase.as_deref(), current_mode);
 
+    // The drain v2 columns, read under the same lock as the phase write.
+    let v2_columns = match node_drain_v2::drain_v2_columns(&mut *tx, node_id).await {
+        Ok(Some(columns)) => columns,
+        // The row is locked above, so it can't be gone here.
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "Node not found").into_response(),
+        Err(err) => return db_error(err).into_response(),
+    };
+    // With drain v2 on, v1 and v2 drains never run together: refuse every
+    // v1 `:drain`, before any check of a v1 drain's terms, so its answer
+    // names why.
+    if let Some(refusal) = v1_drain_refusal(
+        action,
+        drain_request
+            .engine
+            .filter(|_| matches!(action, DrainAction::Drain)),
+        v2_columns.engine,
+        // A `:drain` starts a drain exactly when the node has no phase.
+        current.drain_phase.is_none(),
+        state.drain_v2_enabled,
+    ) {
+        audit::record(AdminAuditEntry {
+            actor: &actor,
+            action: action.label(),
+            node_id,
+            node_name: current.substrate_node_id.as_deref(),
+            from_phase: current.drain_phase.as_deref(),
+            to_phase: None,
+            from_drain_mode: mode_in_progress,
+            replace_after_terminate: requested_replace_after_terminate,
+            drain_mode: requested_mode,
+            success: false,
+            error: Some("conflict: v1 drains are refused while drain v2 is on"),
+            outcome_counts: None,
+        });
+        return refusal;
+    }
     // The start-only precondition, checked against the locked row so nothing
     // can start a drain between this read and the write below.
     if refuses_existing_drain(
@@ -1701,78 +1781,82 @@ async fn apply_drain_action(
             .into_response();
     }
 
-    let transition = match validate_drain_transition(
-        current.drain_phase.as_deref(),
-        current_mode,
-        action,
-        requested_mode,
-    ) {
-        Ok(transition) => transition,
-        Err(TransitionError::Conflict {
-            current: current_phase,
-            allowed,
-        }) => {
-            audit::record(AdminAuditEntry {
-                actor: &actor,
-                action: action.label(),
-                node_id,
-                node_name: current.substrate_node_id.as_deref(),
-                from_phase: current_phase.as_deref(),
-                to_phase: None,
-                from_drain_mode: mode_in_progress,
-                replace_after_terminate: requested_replace_after_terminate,
-                drain_mode: requested_mode,
-                success: false,
-                error: Some("conflict: invalid drain-phase transition"),
-                outcome_counts: None,
-            });
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "drain-phase transition not allowed",
-                    "current_drain_phase": current_phase,
-                    "allowed_from": allowed,
-                })),
-            )
-                .into_response();
-        }
-        Err(TransitionError::ModeDowngrade { current_mode }) => {
-            // The requested mode is this handler's own binding. It is `Some` on
-            // every `:drain`, which is the only action that can reach this arm.
-            let attempted = requested_mode.unwrap_or_default();
-            audit::record(AdminAuditEntry {
-                actor: &actor,
-                action: action.label(),
-                node_id,
-                node_name: current.substrate_node_id.as_deref(),
-                from_phase: current.drain_phase.as_deref(),
-                to_phase: None,
-                from_drain_mode: Some(current_mode),
-                replace_after_terminate: requested_replace_after_terminate,
-                drain_mode: requested_mode,
-                success: false,
-                error: Some("conflict: drain mode downgrade refused"),
-                outcome_counts: None,
-            });
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "node is already draining in {current} mode; a drain cannot be \
-                         downgraded to {attempted} because the evacuation already in flight \
-                         cannot be un-run — suspends and cross-node restores have no inverse. \
-                         Use :undrain to abort the drain entirely.",
-                        current = current_mode.as_str(),
-                        attempted = attempted.as_str(),
-                    ),
-                    "current_drain_phase": current.drain_phase,
-                    "current_drain_mode": current_mode.as_str(),
-                    "requested_drain_mode": attempted.as_str(),
-                })),
-            )
-                .into_response();
-        }
-    };
+    let transition =
+        match v2_undrain_transition(action, current.drain_phase.as_deref(), &v2_columns)
+            .unwrap_or_else(|| {
+                validate_drain_transition(
+                    current.drain_phase.as_deref(),
+                    current_mode,
+                    action,
+                    requested_mode,
+                )
+            }) {
+            Ok(transition) => transition,
+            Err(TransitionError::Conflict {
+                current: current_phase,
+                allowed,
+            }) => {
+                audit::record(AdminAuditEntry {
+                    actor: &actor,
+                    action: action.label(),
+                    node_id,
+                    node_name: current.substrate_node_id.as_deref(),
+                    from_phase: current_phase.as_deref(),
+                    to_phase: None,
+                    from_drain_mode: mode_in_progress,
+                    replace_after_terminate: requested_replace_after_terminate,
+                    drain_mode: requested_mode,
+                    success: false,
+                    error: Some("conflict: invalid drain-phase transition"),
+                    outcome_counts: None,
+                });
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "drain-phase transition not allowed",
+                        "current_drain_phase": current_phase,
+                        "allowed_from": allowed,
+                    })),
+                )
+                    .into_response();
+            }
+            Err(TransitionError::ModeDowngrade { current_mode }) => {
+                // The requested mode is this handler's own binding. It is `Some` on
+                // every `:drain`, which is the only action that can reach this arm.
+                let attempted = requested_mode.unwrap_or_default();
+                audit::record(AdminAuditEntry {
+                    actor: &actor,
+                    action: action.label(),
+                    node_id,
+                    node_name: current.substrate_node_id.as_deref(),
+                    from_phase: current.drain_phase.as_deref(),
+                    to_phase: None,
+                    from_drain_mode: Some(current_mode),
+                    replace_after_terminate: requested_replace_after_terminate,
+                    drain_mode: requested_mode,
+                    success: false,
+                    error: Some("conflict: drain mode downgrade refused"),
+                    outcome_counts: None,
+                });
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "node is already draining in {current} mode; a drain cannot be \
+                             downgraded to {attempted} because the evacuation already in flight \
+                             cannot be un-run — suspends and cross-node restores have no inverse. \
+                             Use :undrain to abort the drain entirely.",
+                            current = current_mode.as_str(),
+                            attempted = attempted.as_str(),
+                        ),
+                        "current_drain_phase": current.drain_phase,
+                        "current_drain_mode": current_mode.as_str(),
+                        "requested_drain_mode": attempted.as_str(),
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     // Refuse a `:drain` that would change the terms of a drain already in
     // flight. Read under the same lock as the write, so the pair named in the
@@ -1811,6 +1895,77 @@ async fn apply_drain_action(
             .into_response();
     }
 
+    // The drain v2 engine: refuse what it can't run, and decide its write,
+    // under the same lock as the phase write.
+    let v2_write = match drain_v2_write(
+        action,
+        drain_request
+            .engine
+            .filter(|_| matches!(action, DrainAction::Drain)),
+        drain_request.hold_seconds,
+        requested_mode,
+        current.managed_by,
+        v2_columns.engine,
+        v2_columns.recorded_instance,
+        transition_starts_a_drain(&transition),
+        state.drain_v2_enabled,
+    ) {
+        Ok(write) => write,
+        Err((status, message)) => {
+            audit::record(AdminAuditEntry {
+                actor: &actor,
+                action: action.label(),
+                node_id,
+                node_name: current.substrate_node_id.as_deref(),
+                from_phase: current.drain_phase.as_deref(),
+                to_phase: None,
+                from_drain_mode: mode_in_progress,
+                replace_after_terminate: requested_replace_after_terminate,
+                drain_mode: requested_mode,
+                success: false,
+                error: Some(message),
+                outcome_counts: None,
+            });
+            return (status, Json(serde_json::json!({ "error": message }))).into_response();
+        }
+    };
+    // A v2 drain's start takes one of the cluster's evacuation slots, under
+    // the evacuation lock every v2 start takes, held until this transaction
+    // ends: the count and the start's write below are one decision. Only a
+    // start takes it; a repeat that shortens a drain in flight takes no
+    // other slot.
+    if matches!(v2_write, DrainV2Write::Start { .. }) {
+        let admission = match node_drain_v2::admit_v2_start(&mut tx, node_id).await {
+            Ok(admission) => admission,
+            Err(err) => return db_error(err).into_response(),
+        };
+        if let Some(refusal) = v2_start_refusal(admission, state.drain_v2_max_evacuating) {
+            audit::record(AdminAuditEntry {
+                actor: &actor,
+                action: action.label(),
+                node_id,
+                node_name: current.substrate_node_id.as_deref(),
+                from_phase: current.drain_phase.as_deref(),
+                to_phase: None,
+                from_drain_mode: mode_in_progress,
+                replace_after_terminate: requested_replace_after_terminate,
+                drain_mode: requested_mode,
+                success: false,
+                error: Some(if admission.heartbeat_fresh {
+                    "conflict: every v2 evacuation slot is held"
+                } else {
+                    "conflict: the node's heartbeat is stale"
+                }),
+                outcome_counts: None,
+            });
+            return refusal;
+        }
+    }
+    // A v2 node's `:terminate` is refused only on its phase: the cluster
+    // controller's terminating tick makes the fresh `DrainNode` call, fences
+    // only on an empty report and with nothing naming the node, and returns
+    // the node to `drained` with why otherwise. v1's occupancy count doesn't
+    // gate it.
     // Guard the destructive transition into `terminating`, on both halves of
     // occupancy. The check happens under the same `FOR UPDATE` lock as the phase
     // write, so it and the write agree on one snapshot.
@@ -1841,7 +1996,7 @@ async fn apply_drain_action(
     //   The sibling guard in `admin/node_groups.rs` also checks both halves,
     //   but reads `group_occupancy_in_tx`, which is not census-aware.
     //   Its refusal to move an organization can therefore count phantom rows.
-    if matches!(action, DrainAction::Terminate) {
+    if matches!(action, DrainAction::Terminate) && v2_columns.engine == NodeDrainEngine::V1 {
         let occupancy = match node_store::sandbox_occupancy_for_node_in_tx(
             &mut tx,
             node_id,
@@ -1925,6 +2080,52 @@ async fn apply_drain_action(
         }
         DrainTransition::NoChange => {}
     }
+    let v2_written = match v2_write {
+        DrainV2Write::None => Ok(None),
+        DrainV2Write::Start { hold_seconds } => {
+            node_drain_v2::start_v2_drain(&mut tx, node_id, hold_seconds)
+                .await
+                .map(|()| None)
+        }
+        DrainV2Write::Shorten { hold_seconds } => {
+            node_drain_v2::shorten_v2_hold(&mut tx, node_id, hold_seconds)
+                .await
+                .map(Some)
+        }
+        // The phase write above left the engine and the status: a v2 engine
+        // with no phase is the cancel the controller finishes.
+        DrainV2Write::Cancel => Ok(None),
+    };
+    match v2_written {
+        Ok(Some(node_drain_v2::HoldChange::Refused)) => {
+            audit::record(AdminAuditEntry {
+                actor: &actor,
+                action: action.label(),
+                node_id,
+                node_name: current.substrate_node_id.as_deref(),
+                from_phase: current.drain_phase.as_deref(),
+                to_phase: None,
+                from_drain_mode: mode_in_progress,
+                replace_after_terminate: requested_replace_after_terminate,
+                drain_mode: requested_mode,
+                success: false,
+                error: Some("conflict: a v2 drain's deadline only moves earlier"),
+                outcome_counts: None,
+            });
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "a v2 drain's deadline only moves earlier: hold_seconds counts \
+                              from the drain's start, and this one would end it later; \
+                              :undrain and drain again for a longer one",
+                    "drain_started_at": format_optional_time(current.drain_started_at),
+                })),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(err) => return db_error(err).into_response(),
+    }
     let new_phase = phase_after(&transition, current.drain_phase.as_deref());
 
     if let Err(err) = tx.commit().await {
@@ -1955,12 +2156,17 @@ async fn apply_drain_action(
     // `require_undrained` doesn't: it is refused before the commit. Closing it
     // means holding the row lock across the substrate call, which inverts the
     // dependency this ordering exists to fix.
-    let substrate_outcome = if supports_node_drain {
-        converge_substrate_schedulability(&state, &current, action).await
-    } else {
+    let substrate_outcome = if !supports_node_drain {
         // Only `:undrain` gets here. The substrate has no cordon to lift: no
         // admin action could have applied one.
         Ok(())
+    } else if v2_write == DrainV2Write::Cancel {
+        // The node may still be sealed until the controller cancels the
+        // epoch on it, and a pod placed there meanwhile would be refused:
+        // the controller lifts the cordon once the node answers unsealed.
+        Ok(())
+    } else {
+        converge_substrate_schedulability(&state, &current, action).await
     };
 
     if let Err(ref substrate_err) = substrate_outcome
