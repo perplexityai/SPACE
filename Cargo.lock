@@ -5376,6 +5376,7 @@ dependencies = [
  "pplx-space-public-api",
  "pplx-space-rpc-contracts",
  "pplx-space-runtime-environment-catalog-store",
+ "pplx-space-runtime-upgrade-campaign-store",
  "pplx-space-sandbox-model",
  "pplx-space-sandbox-pod",
  "pplx-space-sandbox-portability",
