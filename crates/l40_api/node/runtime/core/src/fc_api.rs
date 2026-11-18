@@ -1,6 +1,8 @@
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
-use pplx_space_execution_spec::{BalloonConfig, BalloonMode, RateLimiter, TokenBucket};
+use pplx_space_execution_spec::{
+    BalloonConfig, BalloonMode, GuestDataDrive, RateLimiter, TokenBucket,
+};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -129,6 +131,21 @@ impl FcApiClient {
     ) -> Result<(), FcApiError> {
         let body = load_snapshot_request_body(snapshot_path, mem_file_path)?;
         self.put("/snapshot/load", &body).await
+    }
+
+    /// Re-read the retained data device's capacity after in-place host growth.
+    /// The owner must verify the same pinned disk first. This deliberately
+    /// accepts no replacement path and does not change permissions or limits.
+    pub async fn refresh_data_drive_capacity(&self) -> Result<(), FcApiError> {
+        self.request(
+            "PATCH",
+            &format!("/drives/{}", GuestDataDrive::DRIVE_ID),
+            &serde_json::json!({
+                "drive_id": GuestDataDrive::DRIVE_ID,
+                "path_on_host": GuestDataDrive::JAIL_PATH,
+            }),
+        )
+        .await
     }
 
     /// Replace a drive's rate limiter. Valid once the VM exists, including

@@ -4,6 +4,31 @@ use crate::protocol::*;
 
 #[tonic::async_trait]
 impl Meta for SpacedHostService {
+    async fn grow_data_drive(
+        &self,
+        request: Request<proto::GrowDataDriveRequest>,
+    ) -> Result<Response<proto::GrowDataDriveResponse>, Status> {
+        let request = request.into_inner();
+        let response = self.call_bridge_guest_once(
+            "bridge_guest_grow_data_drive",
+            Requirement::Operations(&[GuestOperation::BlockVolumeGrow]),
+            BridgeGuestOperationBudget::FilesystemMutation,
+            |mut client| {
+                let request = pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveRequest {
+                    topology_version: request.topology_version,
+                    mount: request.mount.clone(),
+                    filesystem_uuid: request.filesystem_uuid.clone(),
+                    size_gib: request.size_gib,
+                };
+                async move { client.grow_data_drive(request).await }
+            },
+        ).await?;
+        Ok(Response::new(proto::GrowDataDriveResponse {
+            device_size_bytes: response.device_size_bytes,
+            filesystem_size_bytes: response.filesystem_size_bytes,
+        }))
+    }
+
     async fn mount_data_drive(
         &self,
         request: Request<proto::MountDataDriveRequest>,

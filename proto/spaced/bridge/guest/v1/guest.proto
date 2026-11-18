@@ -28,6 +28,7 @@ service Meta {
   rpc NotifyResume(NotifyResumeRequest) returns (NotifyResumeResponse);
   rpc FlushFilesystems(FlushFilesystemsRequest) returns (FlushFilesystemsResponse);
   rpc MountDataDrive(MountDataDriveRequest) returns (MountDataDriveResponse);
+  rpc GrowDataDrive(GrowDataDriveRequest) returns (GrowDataDriveResponse);
 }
 
 // Topology v1 has exactly one non-root virtio-blk device at /dev/vdb.
@@ -40,6 +41,19 @@ message MountDataDriveRequest {
   string filesystem_uuid = 4;
 }
 message MountDataDriveResponse { uint32 topology_version = 1; }
+
+// Requires BLOCK_VOLUME_GROW. The host must first enlarge the same backing
+// disk and notify the existing virtual drive. No format, replacement or shrink.
+message GrowDataDriveRequest {
+  uint32 topology_version = 1;
+  string mount = 2;
+  string filesystem_uuid = 3;
+  uint32 size_gib = 4;
+}
+message GrowDataDriveResponse {
+  uint64 device_size_bytes = 1;
+  uint64 filesystem_size_bytes = 2;
+}
 
 service Process {
   rpc Start(space.spaced.operations.v1.StartRequest) returns (stream space.spaced.operations.v1.ProcessEvent);

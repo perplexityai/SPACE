@@ -39,6 +39,7 @@ service Meta {
   // Callers must not also invoke FlushGuestFilesystems for the same snapshot.
   rpc PrepareSuspend(PrepareSuspendRequest) returns (PrepareSuspendResponse);
   rpc MountDataDrive(MountDataDriveRequest) returns (MountDataDriveResponse);
+  rpc GrowDataDrive(GrowDataDriveRequest) returns (GrowDataDriveResponse);
 }
 
 message MountDataDriveRequest {
@@ -48,6 +49,17 @@ message MountDataDriveRequest {
   string filesystem_uuid = 4;
 }
 message MountDataDriveResponse { uint32 topology_version = 1; }
+
+message GrowDataDriveRequest {
+  uint32 topology_version = 1;
+  string mount = 2;
+  string filesystem_uuid = 3;
+  uint32 size_gib = 4;
+}
+message GrowDataDriveResponse {
+  uint64 device_size_bytes = 1;
+  uint64 filesystem_size_bytes = 2;
+}
 
 service Process {
   rpc Start(space.spaced.operations.v1.StartRequest) returns (stream space.spaced.operations.v1.ProcessEvent);

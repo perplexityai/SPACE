@@ -4,6 +4,19 @@
 use super::*;
 
 impl SpacedHostClient {
+    /// Enlarge an existing data filesystem after the host drive has grown.
+    /// A lost reply is not replayed here; the lifecycle owner reconciles it.
+    pub async fn grow_data_drive(
+        &self,
+        request: proto::GrowDataDriveRequest,
+    ) -> Result<proto::GrowDataDriveResponse, tonic::Status> {
+        self.call_meta_once("grow_data_drive", |mut client| {
+            let request = request.clone();
+            async move { client.grow_data_drive(request).await }
+        })
+        .await
+    }
+
     /// Mount an already initialized topology-v1 data disk. Mount effects are
     /// single-attempt; callers may retry only the same filesystem identity.
     pub async fn mount_data_drive(

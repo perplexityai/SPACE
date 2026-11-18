@@ -151,6 +151,18 @@ struct ChangingGuest {
 }
 #[tonic::async_trait]
 impl pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_server::Meta for ChangingGuest {
+    async fn grow_data_drive(
+        &self,
+        _: Request<pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveRequest>,
+    ) -> Result<
+        Response<pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented(
+            "legacy guest has no data-drive growth RPC",
+        ))
+    }
+
     async fn mount_data_drive(
         &self,
         _: Request<pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveRequest>,

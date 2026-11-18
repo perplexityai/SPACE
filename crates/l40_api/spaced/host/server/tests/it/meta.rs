@@ -45,6 +45,70 @@ struct ReadyWaitGuest {
 struct ActiveWaitReadyCall(Arc<AtomicUsize>);
 
 #[tokio::test]
+async fn data_growth_requires_explicit_linux_support_and_never_replays_a_lost_reply() {
+    use pplx_space_spaced_guest_protocol::proto::platform::{
+        GuestOperation, GuestOs, GuestPlatformDescriptor,
+    };
+    for (os, advertised, lose_reply) in [
+        (GuestOs::Linux, false, false),
+        (GuestOs::Linux, true, false),
+        (GuestOs::Linux, true, true),
+        (GuestOs::Windows, true, false),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("guest.sock");
+        let guest = MockBridgeGuest {
+            version: "0.8.2",
+            platform: Some(GuestPlatformDescriptor {
+                os: os as i32,
+                operations: advertised
+                    .then_some(GuestOperation::BlockVolumeGrow as i32)
+                    .into_iter()
+                    .collect(),
+            }),
+            lost_reply_calls: lose_reply.then(|| Arc::new(AtomicUsize::new(0))),
+            ..Default::default()
+        };
+        let calls = guest.growth_requests.clone();
+        let task = start_mock_bridge_guest_with_service(socket.clone(), guest).await;
+        let fixture = HostFixture::start(Some(socket)).await;
+        let client = fixture.client().await;
+        let request = pplx_space_spaced_protocol::proto::host::GrowDataDriveRequest {
+            topology_version: 1,
+            mount: "/data/example".into(),
+            filesystem_uuid: "00000000-0000-7000-8000-000000000001".into(),
+            size_gib: 256,
+        };
+        let outcome = client.grow_data_drive(request).await;
+        if os != GuestOs::Linux || !advertised {
+            assert_eq!(outcome.unwrap_err().code(), tonic::Code::FailedPrecondition);
+            assert!(calls.lock().unwrap().is_empty());
+        } else {
+            if lose_reply {
+                assert_eq!(outcome.unwrap_err().code(), tonic::Code::Unavailable);
+            } else {
+                let response = outcome.unwrap();
+                assert_eq!(response.device_size_bytes, 256 * 1024 * 1024 * 1024);
+                assert_eq!(response.filesystem_size_bytes, response.device_size_bytes);
+            }
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![
+                    pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveRequest {
+                        topology_version: 1,
+                        mount: "/data/example".into(),
+                        filesystem_uuid: "00000000-0000-7000-8000-000000000001".into(),
+                        size_gib: 256,
+                    }
+                ],
+            );
+        }
+        fixture.stop().await;
+        task.abort();
+    }
+}
+
+#[tokio::test]
 async fn stop_quiesce_requires_explicit_support_and_never_leaks_into_suspend() {
     use pplx_space_spaced_guest_protocol::proto::platform::{
         GuestOperation, GuestOs, GuestPlatformDescriptor,
@@ -162,6 +226,18 @@ impl Drop for ActiveWaitReadyCall {
 
 #[tonic::async_trait]
 impl BridgeGuestMeta for ReadyWaitGuest {
+    async fn grow_data_drive(
+        &self,
+        _: Request<pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveRequest>,
+    ) -> Result<
+        Response<pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented(
+            "legacy guest has no data-drive growth RPC",
+        ))
+    }
+
     async fn mount_data_drive(
         &self,
         _: Request<pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveRequest>,

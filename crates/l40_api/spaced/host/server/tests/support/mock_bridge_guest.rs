@@ -52,6 +52,11 @@ pub(crate) struct MockBridgeGuest {
             Vec<pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveRequest>,
         >,
     >,
+    pub(crate) growth_requests: Arc<
+        std::sync::Mutex<
+            Vec<pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveRequest>,
+        >,
+    >,
     pub(crate) env_reply_failure: Option<(Arc<AtomicUsize>, tonic::Code)>,
     pub(crate) lost_reply_calls: Option<Arc<AtomicUsize>>,
 }
@@ -73,6 +78,7 @@ impl Default for MockBridgeGuest {
             flush_calls: Arc::default(),
             flush_requests: Arc::default(),
             mount_requests: Arc::default(),
+            growth_requests: Arc::default(),
             lost_reply_calls: None,
             env_reply_failure: None,
         }
@@ -562,6 +568,28 @@ impl Process for MockBridgeGuest {
 
 #[tonic::async_trait]
 impl Meta for MockBridgeGuest {
+    async fn grow_data_drive(
+        &self,
+        request: Request<
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveRequest,
+        >,
+    ) -> Result<
+        Response<pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveResponse>,
+        Status,
+    > {
+        self.growth_requests
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
+        self.lose_reply_after_effect()?;
+        Ok(Response::new(
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveResponse {
+                device_size_bytes: 256 * 1024 * 1024 * 1024,
+                filesystem_size_bytes: 256 * 1024 * 1024 * 1024,
+            },
+        ))
+    }
+
     async fn mount_data_drive(
         &self,
         request: Request<

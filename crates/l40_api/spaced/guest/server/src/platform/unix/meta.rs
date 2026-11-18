@@ -9,10 +9,10 @@ fn flush_filesystem_at_path_with_syncfs(
     syncfs(&root)
 }
 
-async fn run_filesystem_flush(
+async fn run_filesystem_flush<T: Send + 'static>(
     slots: Arc<Semaphore>,
-    flush: impl FnOnce() -> Result<(), Status> + Send + 'static,
-) -> Result<(), Status> {
+    flush: impl FnOnce() -> Result<T, Status> + Send + 'static,
+) -> Result<T, Status> {
     let permit = slots.try_acquire_owned().map_err(|_| {
         Status::resource_exhausted("guest filesystem flush already in progress; retry with backoff")
     })?;
@@ -212,6 +212,23 @@ fn require_activity_state(state: LocalActivityState) -> Result<LocalActivityStat
 
 #[tonic::async_trait]
 impl BridgeGuestMeta for SpacedGuestService {
+    async fn grow_data_drive(
+        &self,
+        request: Request<
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveRequest,
+        >,
+    ) -> Result<
+        Response<pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveResponse>,
+        Status,
+    > {
+        let request = request.into_inner();
+        let response = run_filesystem_flush(self.inner.filesystem_flush_slots.clone(), move || {
+            block_volume::grow_data_drive(request)
+        })
+        .await?;
+        Ok(Response::new(response))
+    }
+
     async fn mount_data_drive(
         &self,
         request: Request<

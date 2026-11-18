@@ -71,6 +71,15 @@ These runtime and guest protocol primitives do not expose a public volume API,
 provision storage, or add data-disk snapshots. A lifecycle integration must
 persist the disk dependency and restore its topology before loading VM memory.
 
+`GrowDataDrive` is a separate, additive operation requiring explicitly advertised
+Linux `BLOCK_VOLUME_GROW` support. An old or non-Linux guest is refused, not
+silently resized through another RPC. After the host has enlarged and notified
+the same drive, the guest verifies its exact size, writable mount and ext4 UUID,
+then grows ext4 in place through the kernel's resize ioctl. It never formats,
+replaces or shrinks the filesystem. Retries at the completed size are idempotent;
+growth shares the cancellation-safe filesystem-flush admission slot. This guest
+primitive alone does not implement the durable public resize operation.
+
 ## Service contracts
 
 At 1.0, backward compatibility throughout 1.x covers:

@@ -1,6 +1,19 @@
 //! Guest-only filesystem operations. Neither this module nor its RPC can
 //! identify, attach, format, or expose a host block device.
 
+#[cfg(target_os = "linux")]
+mod resize;
+#[cfg(target_os = "linux")]
+pub(super) use resize::grow_data_drive;
+#[cfg(not(target_os = "linux"))]
+pub(super) fn grow_data_drive(
+    _: pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveRequest,
+) -> Result<pplx_space_spaced_guest_protocol::proto::bridge_guest::GrowDataDriveResponse, Status> {
+    Err(Status::failed_precondition(
+        "data-drive growth requires a Linux guest",
+    ))
+}
+
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::MountDataDriveRequest;
 use tonic::Status;
 

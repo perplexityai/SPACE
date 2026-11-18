@@ -29,6 +29,15 @@ pub(super) fn service(
 
 #[tonic::async_trait]
 impl meta_server::Meta for Meta {
+    async fn grow_data_drive(
+        &self,
+        _: Request<GrowDataDriveRequest>,
+    ) -> Result<Response<GrowDataDriveResponse>, Status> {
+        Err(super::unsupported(
+            "data-drive growth requires a Linux guest",
+        ))
+    }
+
     async fn mount_data_drive(
         &self,
         _: Request<MountDataDriveRequest>,

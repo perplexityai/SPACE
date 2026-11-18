@@ -92,6 +92,7 @@ pub fn allowed_guest_operations(
             InteractiveProcessControl,
             BlockVolumeMount,
             BlockVolumeQuiesce,
+            BlockVolumeGrow,
         ],
         QualifiedGuestAgent::WindowsV1 => {
             &[Process, Files, Flush, Resume, InteractiveProcessControl]
