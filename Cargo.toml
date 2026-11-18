@@ -146,6 +146,7 @@ members = [
     "crates/l10_foundation/feature/flags",
     "crates/l20_domain/events",
     "crates/l30_storage/federated/grant/store",
+    "crates/l30_storage/firewall/rules/store",
     "crates/l40_api/ingress/admission",
     "crates/l10_foundation/metrics/emit",
     "crates/l10_foundation/grpc/metrics",

@@ -6106,6 +6106,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-firewall-rules-store"
+version = "0.8.2"
+
+[[package]]
 name = "pplx-space-grpc-lb"
 version = "0.8.2"
 dependencies = [
