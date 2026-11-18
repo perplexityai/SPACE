@@ -228,9 +228,7 @@ async fn answered_unavailable_is_not_sent_again() {
         ecw.kind,
         pplx_space_public_api_http::metrics::ResponseKind::RouteNotReady
     );
-    assert!(matches!(
-        native,
-        Err(RouteResolutionError::ResolutionFailed)
-    ));
+    // A session attach reads the marked answer as a route on its way.
+    assert!(matches!(native, Err(RouteResolutionError::SessionNotReady)));
     assert_eq!(cluster_api.resolves.load(Ordering::SeqCst), 2);
 }
