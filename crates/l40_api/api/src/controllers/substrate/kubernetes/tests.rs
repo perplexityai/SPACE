@@ -5727,6 +5727,215 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// With the restore dispatch fence on, a user restore fences its
+    /// execution when it claims it and clears the fence as it sends its Wake,
+    /// so a finished restore leaves nothing a re-drive could take over.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fenced_restore_clears_its_fence_as_it_sends_its_wake() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        // Arrange.
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        seed_restoring_sandbox_with_active_lease(&pool, sandbox_id, Duration::from_millis(200))
+            .await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        let wake_attempts = Arc::new(AtomicUsize::new(0));
+        let worker = start_sequenced_wake_worker(Arc::clone(&wake_attempts), Some(1), true).await?;
+        let mut substrate = substrate_with_store_client_and_proxy_port(
+            pool.clone(),
+            running_pod_kubernetes_client(Arc::new(Mutex::new(Vec::new())), "127.0.0.1"),
+            worker.port,
+        );
+        substrate.store = substrate
+            .store
+            .clone()
+            .with_restore_dispatch_fence(RestoreDispatchFence::Enabled);
+
+        // Act.
+        let binding = substrate
+            .wake_execution_with_metric_identity(
+                &sandbox,
+                Duration::from_secs(2),
+                SandboxApiMetricIdentity::ecw("connect"),
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+            )
+            .await?;
+
+        // Assert.
+        assert_eq!(binding.completion, ActivationCompletion::Owned);
+        let fenced: i64 = sqlx::query_scalar(sql!(
+            "SELECT COUNT(*) FROM sandbox_k8s_executions
+              WHERE sandbox_id = $1 AND restore_dispatch_fence_token IS NOT NULL"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(fenced, 0, "the Wake's dispatch clears the fence");
+        assert_eq!(wake_attempts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// An owner that claimed its restore and execution and died before
+    /// creating the pod leaves a `creating` execution nothing will ever
+    /// materialize. Once its fence expires, a re-drive takes the restore over,
+    /// creates the pod under the same generation itself instead of waiting for
+    /// the dead owner, and finishes the restore.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_takeover_creates_the_pod_its_dead_owner_never_created() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        // Arrange.
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        seed_restoring_sandbox_with_active_lease(&pool, sandbox_id, Duration::from_secs(5)).await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        let dead_owner: Uuid = sqlx::query_scalar(sql!(
+            "SELECT restore_lease_token FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
+        let wake_attempts = Arc::new(AtomicUsize::new(0));
+        let worker = start_sequenced_wake_worker(Arc::clone(&wake_attempts), Some(1), true).await?;
+        let mut substrate = substrate_with_store_client_and_proxy_port(
+            pool.clone(),
+            running_pod_kubernetes_client(Arc::clone(&captured_pod_creates), "127.0.0.1"),
+            worker.port,
+        );
+        substrate.store = substrate
+            .store
+            .clone()
+            .with_restore_dispatch_fence(RestoreDispatchFence::Enabled);
+        let claim = substrate
+            .store
+            .ensure_active_execution_claim_for_lifecycle(
+                sandbox_id,
+                SandboxLifecycle::Restoring,
+                Some(dead_owner),
+                Some((
+                    pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
+                    SandboxTransitionTargetState::Started,
+                )),
+            )
+            .await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET restore_dispatch_fence_expires_at = NOW() - INTERVAL '1 second'
+              WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+
+        // Act.
+        let binding = substrate
+            .wake_execution_with_metric_identity(
+                &sandbox,
+                Duration::from_secs(2),
+                SandboxApiMetricIdentity::ecw("connect"),
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+            )
+            .await?;
+
+        // Assert.
+        assert_eq!(binding.completion, ActivationCompletion::Owned);
+        assert_eq!(
+            i64::try_from(binding.execution_generation)?,
+            claim.row.generation
+        );
+        assert_eq!(
+            captured_pod_creates
+                .lock()
+                .expect("capture mutex poisoned")
+                .len(),
+            1,
+            "the re-drive creates the dead owner's pod itself"
+        );
+        assert_eq!(wake_attempts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// A restore a re-drive took over between the owner's execution claim and
+    /// its Wake sends no Wake: the owner confirms its lease token as it sends,
+    /// and finds another. The takeover is simulated by a trigger that changes
+    /// the row's token as soon as the owner fences its execution.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_restore_taken_over_before_its_wake_sends_none() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        // Arrange.
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        seed_restoring_sandbox_with_active_lease(&pool, sandbox_id, Duration::from_millis(200))
+            .await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        sqlx::query(
+            "CREATE FUNCTION take_over_on_fence() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 UPDATE sandboxes SET restore_lease_token = gen_random_uuid()
+                  WHERE id = NEW.sandbox_id;
+                 RETURN NEW;
+             END $$",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER take_over_on_fence
+                 AFTER UPDATE OF restore_dispatch_fence_token ON sandbox_k8s_executions
+                 FOR EACH ROW WHEN (NEW.restore_dispatch_fence_token IS NOT NULL)
+                 EXECUTE FUNCTION take_over_on_fence()",
+        )
+        .execute(&pool)
+        .await?;
+        let wake_attempts = Arc::new(AtomicUsize::new(0));
+        let worker = start_sequenced_wake_worker(Arc::clone(&wake_attempts), Some(1), true).await?;
+        let mut substrate = substrate_with_store_client_and_proxy_port(
+            pool.clone(),
+            running_pod_kubernetes_client(Arc::new(Mutex::new(Vec::new())), "127.0.0.1"),
+            worker.port,
+        );
+        substrate.store = substrate
+            .store
+            .clone()
+            .with_restore_dispatch_fence(RestoreDispatchFence::Enabled);
+
+        // Act.
+        let result = substrate
+            .wake_execution_with_metric_identity(
+                &sandbox,
+                Duration::from_secs(2),
+                SandboxApiMetricIdentity::ecw("connect"),
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+            )
+            .await;
+
+        // Assert.
+        assert!(
+            matches!(result, Err(SubstrateError::RestoreInFlight { .. })),
+            "a restore taken over before its Wake must answer retryably, got {result:?}"
+        );
+        assert_eq!(
+            wake_attempts.load(Ordering::SeqCst),
+            0,
+            "no Wake may reach the node for a restore another owner holds"
+        );
+        Ok(())
+    }
+
     /// A user request on a `restoring` row whose owner lapsed reclaims the
     /// restore under its own claim, drives it to `started` and only then
     /// gets a client: it never dials the restoring pod.

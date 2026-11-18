@@ -19,6 +19,7 @@ mod lifecycle_writer_tests;
 mod materialization_record_tests;
 mod node_registration_tests;
 mod owned_restore_completion_tests;
+mod restore_dispatch_fence_tests;
 mod restore_revert_tests;
 mod runtime_attribution_tests;
 mod runtime_upgrade_evidence_tests;
@@ -31,6 +32,15 @@ use node_registration_tests::{
     RegistrationCaller, RegistrationFootprint, insert_placeable_sandbox, registration_footprint,
 };
 use owned_restore_completion_tests::owned_restore_completion_requires_its_lease_and_a_routable_execution;
+use restore_dispatch_fence_tests::{
+    a_confirmed_dispatch_leaves_nothing_to_take_over,
+    a_dead_owners_unsent_restore_is_taken_over_once_its_fence_expires,
+    a_dispatched_restore_keeps_its_ownership_window,
+    a_re_drive_with_the_switch_off_takes_no_fence_over,
+    a_renewed_fence_keeps_a_live_owners_restore,
+    a_restore_without_its_owners_fence_keeps_its_ownership_window,
+    the_markerless_lease_claim_takes_over_an_expired_fence,
+};
 use restore_revert_tests::{
     failed_restore_revert_retires_only_its_own_proven_execution,
     without_retirement_a_failed_restore_revert_moves_only_the_lifecycle,
@@ -1544,6 +1554,13 @@ mod k8s_store_postgres_behaviors {
         a_fresh_stopped_claim_is_not_rolled_back_on_a_clean_failure,
         user_restore_lease_blocks_concurrent_redrive_until_expiry,
         expired_restore_lease_with_live_execution_stays_in_flight,
+        a_dead_owners_unsent_restore_is_taken_over_once_its_fence_expires,
+        the_markerless_lease_claim_takes_over_an_expired_fence,
+        a_dispatched_restore_keeps_its_ownership_window,
+        a_restore_without_its_owners_fence_keeps_its_ownership_window,
+        a_re_drive_with_the_switch_off_takes_no_fence_over,
+        a_renewed_fence_keeps_a_live_owners_restore,
+        a_confirmed_dispatch_leaves_nothing_to_take_over,
         clean_redrive_failure_releases_restore_lease_for_immediate_retry,
         stale_restore_rollback_is_guarded_by_lease_token,
         restore_rollback_requires_fresh_claim_and_clean_failure,

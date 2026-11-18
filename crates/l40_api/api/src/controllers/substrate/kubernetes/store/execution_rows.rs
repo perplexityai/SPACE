@@ -755,6 +755,10 @@ impl K8sStore {
         let claim = self
             .ensure_active_execution_claim_in(&mut tx, sandbox_id, activation_attempt)
             .await?;
+        if let Some(restore_lease_token) = restore_lease_token {
+            self.fence_unsent_user_restore_in(&mut tx, sandbox_id, restore_lease_token)
+                .await?;
+        }
 
         tx.commit()
             .await
