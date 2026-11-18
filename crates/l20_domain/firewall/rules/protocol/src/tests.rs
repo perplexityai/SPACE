@@ -2,14 +2,14 @@ use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 
 use pplx_space_firewall_rules::{
-    FirewallRuleRevision, HeaderField, HeaderProtocol, IntegerRange, Ipv4Prefix, Match,
-    PayloadHeader, Read, Rule, RuleId, TcpOptionName, Value,
+    FirewallRuleRevision, IntegerRange, Ipv4Prefix, Match, Name, PayloadHeader, Read, Rule, RuleId,
+    Value,
 };
 
 use crate::{DecodeError, decode_revision, encode_revision};
 
-/// Every read and value kind, in canonical form, as the previous hand-written
-/// encoder wrote it.
+/// Every read and value kind in canonical form: keys in grammar order, rules
+/// and comparisons in their own order, no whitespace, and names as written.
 const ALL_VARIANTS: &str = concat!(
     r#"{"schema_version":1,"rules":["#,
     r#"{"id":"first","all_of":["#,
@@ -26,8 +26,8 @@ const DPORT: &str = r#"{"payload":{"protocol":"tcp","field":"dport"}}"#;
 
 fn header(protocol: &str, field: &str) -> PayloadHeader {
     PayloadHeader {
-        protocol: HeaderProtocol::new(protocol).unwrap(),
-        field: HeaderField::new(field).unwrap(),
+        protocol: Name::new(protocol).unwrap(),
+        field: Name::new(field).unwrap(),
     }
 }
 
@@ -98,10 +98,7 @@ fn documents_round_trip_through_the_canonical_form() {
                     Read::Payload(header("ip", "daddr")),
                     Value::Ipv4(Ipv4Addr::new(192, 0, 2, 1)),
                 ),
-                eq(
-                    Read::TcpOption(TcpOptionName::new("mptcp").unwrap()),
-                    Value::True,
-                ),
+                eq(Read::TcpOption(Name::new("mptcp").unwrap()), Value::True),
                 eq(
                     Read::MaskedPayload {
                         header: header("tcp", "flags"),
@@ -153,7 +150,7 @@ fn documents_round_trip_through_the_canonical_form() {
         rule(
             r"\\",
             vec![eq(
-                Read::TcpOption(TcpOptionName::new(r#"opt "a" \b"#).unwrap()),
+                Read::TcpOption(Name::new(r#"opt "a" \b"#).unwrap()),
                 Value::True,
             )],
         ),
@@ -174,8 +171,8 @@ fn documents_round_trip_through_the_canonical_form() {
     }
 }
 
-/// The acceptance example as a caller writes it, and its canonical bytes as the
-/// previous hand-written encoder wrote them.
+/// The acceptance example as a caller writes it, with spaces and line breaks,
+/// and its canonical bytes: keys in grammar order and no whitespace.
 #[test]
 fn the_acceptance_example_encodes_to_the_golden_bytes() {
     let written = r#"{
@@ -261,8 +258,8 @@ fn the_version_is_read_before_the_grammar() {
 }
 
 /// One row for each rule the decoder enforces, in the format [`documents`]
-/// reads. Every document here was rejected before the derived wire types; the
-/// last group holds forms a plain derived `Deserialize` would accept.
+/// reads. The last group holds forms a plain derived `Deserialize` would
+/// accept.
 const REJECTED: &str = r##"
 # Not a revision object, trailing data, a number JSON cannot hold
 document "add rule ip filter output drop"

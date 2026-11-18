@@ -16,24 +16,21 @@ fn a_revision_rejects_a_repeated_rule_id() {
 
 #[test]
 fn names_follow_their_syntax_rules() {
-    let longest = "a".repeat(MAX_NAME_LEN);
-    let too_long = "a".repeat(MAX_NAME_LEN + 1);
-    for kind in [
-        NameKind::RuleId,
-        NameKind::HeaderProtocol,
-        NameKind::HeaderField,
-        NameKind::TcpOptionName,
-    ] {
-        let check = |value: &str| kind.validate(value);
+    let longest = "a".repeat(64);
+    let too_long = "a".repeat(65);
+    type Check = fn(&str) -> Result<(), NameError>;
+    let checks: [(&str, Check); 2] = [
+        ("rule ID", |value| RuleId::new(value).map(drop)),
+        ("name", |value| Name::new(value).map(drop)),
+    ];
+    for (kind, check) in checks {
         assert_eq!(check("!~"), Ok(()), "{kind}");
         assert_eq!(check(&longest), Ok(()), "{kind}");
-        assert_eq!(check(""), Err(NameError::Empty { kind }));
+        assert_eq!(check(""), Err(NameError::Empty), "{kind}");
         assert_eq!(
             check(&too_long),
-            Err(NameError::TooLong {
-                kind,
-                len: MAX_NAME_LEN + 1
-            })
+            Err(NameError::TooLong { len: 65 }),
+            "{kind}"
         );
         for (value, index, found) in [
             ("a\nb", 1, '\n'),
@@ -44,7 +41,7 @@ fn names_follow_their_syntax_rules() {
         ] {
             assert_eq!(
                 check(value),
-                Err(NameError::InvalidCharacter { kind, index, found }),
+                Err(NameError::InvalidCharacter { index, found }),
                 "{kind} {value:?}"
             );
         }
@@ -54,13 +51,10 @@ fn names_follow_their_syntax_rules() {
     assert_eq!(
         RuleId::new("a b"),
         Err(NameError::InvalidCharacter {
-            kind: NameKind::RuleId,
             index: 1,
             found: ' '
         })
     );
-    assert_eq!(HeaderProtocol::new(" a b ").unwrap().as_str(), " a b ");
-    assert_eq!(HeaderField::new(" a b ").unwrap().as_str(), " a b ");
-    assert_eq!(TcpOptionName::new(" a b ").unwrap().as_str(), " a b ");
-    assert_eq!(RuleId::try_from("web").unwrap().to_string(), "web");
+    assert_eq!(Name::new(" a b ").unwrap().as_str(), " a b ");
+    assert_eq!(RuleId::new("web").unwrap().to_string(), "web");
 }

@@ -5,169 +5,85 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 
-/// The longest name, in bytes, that any [`NameKind`] allows.
+/// The longest rule ID or name, in bytes.
 const MAX_NAME_LEN: usize = 64;
 
-/// Declares a name kept byte for byte as the caller wrote it, once it passes
-/// its kind's syntax rule. Runtime qualification decides whether a valid name
-/// means anything.
-macro_rules! name {
-    ($(#[$doc:meta])* $name:ident, $kind:expr) => {
-        $(#[$doc])*
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-        pub struct $name(String);
+/// The stable identity of a rule within a revision, by which a diff matches
+/// rules: 1 to 64 bytes of printable ASCII other than space (0x21 to 0x7E),
+/// kept as written.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RuleId(String);
 
-        impl $name {
-            pub fn new(value: impl Into<String>) -> Result<Self, NameError> {
-                let value = value.into();
-                $kind.validate(&value)?;
-                Ok(Self(value))
-            }
-
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-
-        // The syntax rule admits printable ASCII only, so writing a name raw
-        // cannot emit a control character, an escape sequence or an invisible
-        // character.
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.0)
-            }
-        }
-
-        impl TryFrom<String> for $name {
-            type Error = NameError;
-
-            fn try_from(value: String) -> Result<Self, NameError> {
-                Self::new(value)
-            }
-        }
-
-        impl TryFrom<&str> for $name {
-            type Error = NameError;
-
-            fn try_from(value: &str) -> Result<Self, NameError> {
-                Self::new(value)
-            }
-        }
-
-        impl From<$name> for String {
-            fn from(value: $name) -> Self {
-                value.0
-            }
-        }
-
-        impl AsRef<str> for $name {
-            fn as_ref(&self) -> &str {
-                &self.0
-            }
-        }
-    };
-}
-
-name!(
-    /// The stable identity of a rule within a revision, by which a diff
-    /// matches rules.
-    RuleId,
-    NameKind::RuleId
-);
-name!(
-    /// The protocol of a payload header read, such as `ip` or `tcp`.
-    HeaderProtocol,
-    NameKind::HeaderProtocol
-);
-name!(
-    /// The field of a payload header read, such as `daddr` or `dport`.
-    HeaderField,
-    NameKind::HeaderField
-);
-name!(
-    /// The name of a TCP option, such as `mptcp`.
-    TcpOptionName,
-    NameKind::TcpOptionName
-);
-
-/// The kinds of name, each with its syntax rule: 1 to 64 bytes of printable
-/// ASCII, 0x21 to 0x7E for a rule ID and 0x20 to 0x7E, which adds the space,
-/// for every other name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum NameKind {
-    RuleId,
-    HeaderProtocol,
-    HeaderField,
-    TcpOptionName,
-}
-
-impl NameKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::RuleId => "rule ID",
-            Self::HeaderProtocol => "protocol name",
-            Self::HeaderField => "field name",
-            Self::TcpOptionName => "TCP option name",
-        }
+impl RuleId {
+    pub fn new(value: impl Into<String>) -> Result<Self, NameError> {
+        let value = value.into();
+        validate(&value, |c| c.is_ascii_graphic())?;
+        Ok(Self(value))
     }
 
-    const fn allows(self, c: char) -> bool {
-        match self {
-            Self::RuleId => c.is_ascii_graphic(),
-            Self::HeaderProtocol | Self::HeaderField | Self::TcpOptionName => {
-                c.is_ascii_graphic() || c == ' '
-            }
-        }
-    }
-
-    const fn allowed(self) -> &'static str {
-        match self {
-            Self::RuleId => "printable ASCII other than space",
-            Self::HeaderProtocol | Self::HeaderField | Self::TcpOptionName => "printable ASCII",
-        }
-    }
-
-    fn validate(self, value: &str) -> Result<(), NameError> {
-        if value.is_empty() {
-            return Err(NameError::Empty { kind: self });
-        }
-        if value.len() > MAX_NAME_LEN {
-            return Err(NameError::TooLong {
-                kind: self,
-                len: value.len(),
-            });
-        }
-        match value.char_indices().find(|&(_, c)| !self.allows(c)) {
-            Some((index, found)) => Err(NameError::InvalidCharacter {
-                kind: self,
-                index,
-                found,
-            }),
-            None => Ok(()),
-        }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-impl fmt::Display for NameKind {
+/// A protocol, header field or TCP option name, such as `tcp`, `dport` or
+/// `mptcp`: 1 to 64 bytes of printable ASCII, space included (0x20 to 0x7E),
+/// kept as written. Runtime qualification decides whether a valid name means
+/// anything.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Name(String);
+
+impl Name {
+    pub fn new(value: impl Into<String>) -> Result<Self, NameError> {
+        let value = value.into();
+        validate(&value, |c| c.is_ascii_graphic() || c == ' ')?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+// The syntax rules admit printable ASCII only, so writing a rule ID or name
+// raw cannot emit a control character, an escape sequence or an invisible
+// character.
+impl fmt::Display for RuleId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&self.0)
     }
 }
 
-/// A name that breaks its kind's syntax rule.
+impl fmt::Display for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn validate(value: &str, allows: fn(char) -> bool) -> Result<(), NameError> {
+    if value.is_empty() {
+        return Err(NameError::Empty);
+    }
+    if value.len() > MAX_NAME_LEN {
+        return Err(NameError::TooLong { len: value.len() });
+    }
+    match value.char_indices().find(|&(_, c)| !allows(c)) {
+        Some((index, found)) => Err(NameError::InvalidCharacter { index, found }),
+        None => Ok(()),
+    }
+}
+
+/// A rule ID or name that breaks its syntax rule. The messages do not say which
+/// kind of name it was; the caller adds that.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum NameError {
-    #[error("a {kind} must not be empty")]
-    Empty { kind: NameKind },
-    #[error("a {kind} is at most {MAX_NAME_LEN} bytes, found {len}")]
-    TooLong { kind: NameKind, len: usize },
+    #[error("is empty")]
+    Empty,
+    #[error("is {len} bytes, more than {MAX_NAME_LEN}")]
+    TooLong { len: usize },
     /// `index` is the byte offset of the first character the rule refuses.
-    #[error("a {kind} may hold only {allowed}, found {found:?} at byte {index}", allowed = .kind.allowed())]
-    InvalidCharacter {
-        kind: NameKind,
-        index: usize,
-        found: char,
-    },
+    #[error("holds {found:?} at byte {index}, which its syntax rule refuses")]
+    InvalidCharacter { index: usize, found: char },
 }
 
 /// One complete snapshot of the firewall rules: an ordered list of rules with
@@ -260,7 +176,7 @@ pub enum Read {
     /// A payload header field.
     Payload(PayloadHeader),
     /// A TCP option.
-    TcpOption(TcpOptionName),
+    TcpOption(Name),
     /// A payload header field ANDed with a nonzero mask.
     MaskedPayload {
         header: PayloadHeader,
@@ -271,8 +187,8 @@ pub enum Read {
 /// A protocol header field, named as the caller wrote it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadHeader {
-    pub protocol: HeaderProtocol,
-    pub field: HeaderField,
+    pub protocol: Name,
+    pub field: Name,
 }
 
 /// The value a read is compared with.

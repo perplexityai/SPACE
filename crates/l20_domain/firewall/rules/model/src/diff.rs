@@ -6,10 +6,12 @@ use crate::model::{FirewallRuleRevision, Rule, RuleId};
 
 /// The rules that differ between a base and its candidate, in canonical order:
 /// replaced and removed rules in base order, then added rules in candidate
-/// order. Unchanged rules are absent.
+/// order. Unchanged rules are absent. Rule order is part of a revision, so the
+/// diff also reports whether the rules both revisions hold changed order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuleRevisionDiff {
     changes: Vec<RuleChange>,
+    reordered: bool,
 }
 
 impl RuleRevisionDiff {
@@ -17,8 +19,15 @@ impl RuleRevisionDiff {
         &self.changes
     }
 
+    /// Whether the rule IDs present in both revisions appear in a different
+    /// order. Additions and removals alone do not set it.
+    pub fn reordered(&self) -> bool {
+        self.reordered
+    }
+
+    /// Whether the revisions hold the same rules in the same order.
     pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
+        self.changes.is_empty() && !self.reordered
     }
 }
 
@@ -30,8 +39,7 @@ pub enum RuleChange {
     Removed(Rule),
 }
 
-/// Compares two revisions, matching rules by ID. Rule order is not compared,
-/// so a pure reorder yields an empty diff.
+/// Compares two revisions, matching rules by ID.
 pub fn diff(base: &FirewallRuleRevision, candidate: &FirewallRuleRevision) -> RuleRevisionDiff {
     let in_base: HashSet<&RuleId> = base.rules().iter().map(Rule::id).collect();
     let in_candidate: HashMap<&RuleId, &Rule> = candidate
@@ -56,7 +64,19 @@ pub fn diff(base: &FirewallRuleRevision, candidate: &FirewallRuleRevision) -> Ru
             changes.push(RuleChange::Added(after.clone()));
         }
     }
-    RuleRevisionDiff { changes }
+
+    let shared_in_base = base
+        .rules()
+        .iter()
+        .map(Rule::id)
+        .filter(|id| in_candidate.contains_key(id));
+    let shared_in_candidate = candidate
+        .rules()
+        .iter()
+        .map(Rule::id)
+        .filter(|id| in_base.contains(id));
+    let reordered = !shared_in_base.eq(shared_in_candidate);
+    RuleRevisionDiff { changes, reordered }
 }
 
 #[cfg(test)]

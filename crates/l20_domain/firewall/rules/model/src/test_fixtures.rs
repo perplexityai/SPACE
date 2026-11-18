@@ -4,8 +4,8 @@ use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 
 use crate::{
-    FirewallRuleRevision, HeaderField, HeaderProtocol, IntegerRange, Ipv4Prefix, Match,
-    PayloadHeader, Read, Rule, RuleId, TcpOptionName, Value,
+    FirewallRuleRevision, IntegerRange, Ipv4Prefix, Match, Name, PayloadHeader, Read, Rule, RuleId,
+    Value,
 };
 
 pub(crate) fn id(value: &str) -> RuleId {
@@ -14,8 +14,8 @@ pub(crate) fn id(value: &str) -> RuleId {
 
 pub(crate) fn header(protocol: &str, field: &str) -> PayloadHeader {
     PayloadHeader {
-        protocol: HeaderProtocol::new(protocol).unwrap(),
-        field: HeaderField::new(field).unwrap(),
+        protocol: Name::new(protocol).unwrap(),
+        field: Name::new(field).unwrap(),
     }
 }
 
@@ -99,7 +99,7 @@ pub(crate) fn acceptance_probe() -> Rule {
         "probe",
         vec![
             Match {
-                left: Read::TcpOption(TcpOptionName::new("mptcp").unwrap()),
+                left: Read::TcpOption(Name::new("mptcp").unwrap()),
                 right: Value::True,
             },
             Match {

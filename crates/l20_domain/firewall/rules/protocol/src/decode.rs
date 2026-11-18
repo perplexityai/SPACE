@@ -3,8 +3,8 @@
 //! prefixes, ranges and rule IDs.
 
 use pplx_space_firewall_rules::{
-    FirewallRuleRevision, HeaderField, HeaderProtocol, IntegerRange, Ipv4Prefix, Match, NameError,
-    PayloadHeader, PrefixLengthError, Read, ReversedRangeError, Rule, RuleId, TcpOptionName, Value,
+    FirewallRuleRevision, IntegerRange, Ipv4Prefix, Match, Name, NameError, PayloadHeader,
+    PrefixLengthError, Read, ReversedRangeError, Rule, RuleId, Value,
 };
 
 use crate::SCHEMA_VERSION;
@@ -59,7 +59,7 @@ fn decode_v1(revision: RevisionV1) -> Result<FirewallRuleRevision, DecodeError> 
 
 fn decode_rule(index: usize, rule: RuleV1) -> Result<Rule, DecodeError> {
     let id = RuleId::new(rule.id)
-        .map_err(|error| DecodeError::Invalid(format!("rules[{index}]: {error}")))?;
+        .map_err(|error| DecodeError::Invalid(format!("rules[{index}]: id {error}")))?;
     let at = format!("rules[{index}] ({:?})", id.as_str());
     let invalid = |error: &dyn std::fmt::Display| DecodeError::Invalid(format!("{at}: {error}"));
     let all_of = rule
@@ -74,8 +74,11 @@ fn decode_rule(index: usize, rule: RuleV1) -> Result<Rule, DecodeError> {
 /// Why a comparison does not convert to the model. The rule adds where.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InvalidMatch {
-    #[error(transparent)]
-    Name(#[from] NameError),
+    #[error("{field} {source}")]
+    Name {
+        field: &'static str,
+        source: NameError,
+    },
     #[error(transparent)]
     PrefixLength(#[from] PrefixLengthError),
     #[error(transparent)]
@@ -102,7 +105,7 @@ impl TryFrom<ReadV1> for Read {
         Ok(match read {
             ReadV1::Payload(Object(header)) => Read::Payload(header.try_into()?),
             ReadV1::TcpOption(Object(TcpOptionV1 { name })) => {
-                Read::TcpOption(TcpOptionName::new(name)?)
+                Read::TcpOption(name_of("tcp option name", name)?)
             }
             ReadV1::Masked(
                 Object(PayloadReadV1 {
@@ -118,14 +121,19 @@ impl TryFrom<ReadV1> for Read {
 }
 
 impl TryFrom<HeaderV1> for PayloadHeader {
-    type Error = NameError;
+    type Error = InvalidMatch;
 
     fn try_from(header: HeaderV1) -> Result<Self, Self::Error> {
         Ok(PayloadHeader {
-            protocol: HeaderProtocol::new(header.protocol)?,
-            field: HeaderField::new(header.field)?,
+            protocol: name_of("protocol", header.protocol)?,
+            field: name_of("field", header.field)?,
         })
     }
+}
+
+/// Checks a name, saying which one it is: the model's error does not.
+fn name_of(field: &'static str, value: String) -> Result<Name, InvalidMatch> {
+    Name::new(value).map_err(|source| InvalidMatch::Name { field, source })
 }
 
 impl TryFrom<ValueV1> for Value {

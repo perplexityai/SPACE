@@ -7,11 +7,13 @@
 //! decides whether a revision can run, and the caller that accepts a document
 //! limits rule count and `all_of` length.
 //!
-//! Loosening the [`NameKind`] rules later accepts every stored revision;
-//! tightening them would reject some, so it is not a compatible change.
+//! Loosening the [`RuleId`] and [`Name`] rules later accepts every stored
+//! revision; tightening them would reject some, so it is not a compatible
+//! change.
 //!
-//! A [`RuleRevisionDiff`] carries no identity of its base; the caller binds it
-//! to the base it was computed from.
+//! A [`RuleRevisionDiff`] lists the changed rules and reports whether the rules
+//! both revisions hold changed order. It carries no identity of its base; the
+//! caller binds it to the base it was computed from.
 
 mod diff;
 mod model;
@@ -21,7 +23,7 @@ mod test_fixtures;
 
 pub use diff::{RuleChange, RuleRevisionDiff, diff};
 pub use model::{
-    EmptyAllOfError, FirewallRuleRevision, HeaderField, HeaderProtocol, IntegerRange, Ipv4Prefix,
-    Match, NameError, NameKind, PayloadHeader, PrefixLengthError, Read, ReversedRangeError, Rule,
-    RuleId, RuleRevisionError, TcpOptionName, Value,
+    EmptyAllOfError, FirewallRuleRevision, IntegerRange, Ipv4Prefix, Match, Name, NameError,
+    PayloadHeader, PrefixLengthError, Read, ReversedRangeError, Rule, RuleId, RuleRevisionError,
+    Value,
 };
