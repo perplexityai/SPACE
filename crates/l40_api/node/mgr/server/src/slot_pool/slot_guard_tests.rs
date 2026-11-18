@@ -185,14 +185,20 @@ fn disarming_never_releases_early_and_suppresses_only_this_retry() {
 async fn releasing_an_owner_keeps_another_callers_pending_retry() {
     for kind in Kind::ALL {
         let (pool, mut jobs) = pool_with_wakeups(1);
+        // An ephemeral row reaches host networking only through the teardown.
         pool.db
             .lock()
             .unwrap()
-            .execute_batch("UPDATE network_slots SET state = 'dirty', generation = 7")
+            .execute_batch(
+                "UPDATE network_slots
+                 SET state = 'dirty', generation = 7, lease_kind = 'ephemeral'",
+            )
             .unwrap();
         let owner = kind.acquire(&pool, 0).unwrap();
         // A colliding reset retains its own retry obligation.
-        reset_slot(pool.clone(), 0).await;
+        let (teardown, teardowns) = refusing_teardown!();
+        reset_slot_with(pool.clone(), 0, teardown).await;
+        assert_eq!(teardowns.load(Ordering::SeqCst), 0, "{kind:?}");
         assert_eq!(record(&pool, 0).state, SlotState::Dirty, "{kind:?}");
         if let Owner::Reset(claim) = &owner {
             claim.disarm();

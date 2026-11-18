@@ -236,10 +236,28 @@ pub(super) enum ResetAttempt {
     ClaimHeld { sandbox_id: String },
 }
 
+/// Expands to a teardown that refuses and the count of its calls, for tests
+/// whose reset must never reach host networking. Each expansion owns its
+/// static, so concurrently running tests never share a count.
 #[cfg(test)]
-pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) -> ResetAttempt {
-    reset_slot_with(pool, slot_id, net::teardown_network).await
+macro_rules! refusing_teardown {
+    () => {{
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn refuse_teardown(
+            _: &str,
+            _: &crate::net::NetId,
+            _: Option<&str>,
+        ) -> Result<(), crate::net::NetworkTeardownError> {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::net::NetworkTeardownError::Remaining {
+                resource: "a slot this test does not own".into(),
+            })
+        }
+        (refuse_teardown, &CALLS)
+    }};
 }
+#[cfg(test)]
+pub(super) use refusing_teardown;
 
 pub(super) async fn reset_slot_with(
     pool: std::sync::Arc<NetworkPool>,

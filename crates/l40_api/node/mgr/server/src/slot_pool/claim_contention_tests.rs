@@ -204,13 +204,15 @@ async fn reset_slot_defers_a_claimed_sandbox_and_requeues_itself() {
         drain(&mut wakeups);
 
         let claim = holder.claim(&pool, &sandbox_id);
+        let (teardown, teardowns) = refusing_teardown!();
         assert_eq!(
-            reset_slot(pool.clone(), 0).await,
+            reset_slot_with(pool.clone(), 0, teardown).await,
             ResetAttempt::ClaimHeld {
                 sandbox_id: sandbox_id.clone()
             },
             "{holder:?}"
         );
+        assert_eq!(teardowns.load(Ordering::SeqCst), 0, "{holder:?}");
         let deferred = slot(&pool, 0);
         assert_eq!(
             (

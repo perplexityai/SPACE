@@ -849,12 +849,18 @@ mod slot_pool_tests {
         holder.disarm();
         // The holder is about to exit after observing a non-resettable row.
         // A release can enqueue another attempt before that holder drops.
+        // An ephemeral row reaches host networking only through the teardown.
         pool.db
             .lock()
             .unwrap()
-            .execute_batch("UPDATE network_slots SET state = 'dirty', generation = 7")
+            .execute_batch(
+                "UPDATE network_slots
+                 SET state = 'dirty', generation = 7, lease_kind = 'ephemeral'",
+            )
             .unwrap();
-        reset_slot(pool.clone(), 0).await;
+        let (teardown, teardowns) = refusing_teardown!();
+        reset_slot_with(pool.clone(), 0, teardown).await;
+        assert_eq!(teardowns.load(Ordering::SeqCst), 0);
         assert!(
             reset_candidates(&pool, u32::MAX)
                 .unwrap()
@@ -2705,7 +2711,9 @@ mod slot_pool_tests {
             .unwrap();
         }
 
-        reset_slot(std::sync::Arc::clone(&pool), 0).await;
+        let (teardown, teardowns) = refusing_teardown!();
+        reset_slot_with(std::sync::Arc::clone(&pool), 0, teardown).await;
+        assert_eq!(teardowns.load(Ordering::SeqCst), 0);
 
         let stale = record(&pool, 0);
         assert_eq!(stale.state, SlotState::Resetting);
@@ -2756,7 +2764,9 @@ mod slot_pool_tests {
             .unwrap();
         }
 
-        reset_slot(std::sync::Arc::clone(&pool), 0).await;
+        let (teardown, teardowns) = refusing_teardown!();
+        reset_slot_with(std::sync::Arc::clone(&pool), 0, teardown).await;
+        assert_eq!(teardowns.load(Ordering::SeqCst), 0);
 
         let stale = record(&pool, 0);
         assert_eq!(stale.state, SlotState::Dirty);
@@ -2811,14 +2821,17 @@ mod slot_pool_tests {
             .unwrap();
         }
 
+        let (teardown, teardowns) = refusing_teardown!();
         for _ in 1..MAX_SLOT_CLEANUP_RESET_RETRIES {
-            reset_slot(std::sync::Arc::clone(&pool), 0).await;
+            reset_slot_with(std::sync::Arc::clone(&pool), 0, teardown).await;
+            assert_eq!(teardowns.load(Ordering::SeqCst), 0);
             let stale = record(&pool, 0);
             assert_eq!(stale.state, SlotState::Dirty);
             assert_eq!(stale.health, SlotHealth::Degraded);
         }
 
-        reset_slot(std::sync::Arc::clone(&pool), 0).await;
+        reset_slot_with(std::sync::Arc::clone(&pool), 0, teardown).await;
+        assert_eq!(teardowns.load(Ordering::SeqCst), 0);
 
         let quarantined = record(&pool, 0);
         let expected_error = format!(
