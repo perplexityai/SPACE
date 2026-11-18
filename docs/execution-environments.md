@@ -2307,11 +2307,11 @@ describes the check and a read-only query that runs it. The check counts rows,
 not directories, so before starting one, follow steps 1 to 3 below: stop
 template-manager and sandbox-manager and keep the newer ones from restarting,
 copy the database, run step 2's checks, and remove the directories step 3
-lists. Then start the older template-manager, and the older sandbox-manager
-after it, as in step 5. One from #1277 on also reverses the newer
-`20261031050126_node_dirty_ref_revisions` in the same startup, so rolling back
-to it needs no other database step. One from before #1277 doesn't: it reverses
-this migration, then refuses a database that still records `20261031050126`.
+lists. One from #1277 on also reverses the newer
+`20261031050126_node_dirty_ref_revisions` at startup, along with this
+migration, so rolling back to it needs no other database step. One from before
+#1277 doesn't: it reverses this migration, then refuses a database that still
+records `20261031050126`.
 Before starting it, check that
 `sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` prints
 `20261031050126` and that
@@ -2323,15 +2323,17 @@ once with a migrator that bundles `20261031050126`, that is from #1235 on,
 such as the release you are rolling back from. It reverts only that migration.
 A migrator without it, the target's own included, refuses the database instead
 of running. The same run recovers a database on which such a
-template-manager already started and refused that version. If any build, tag
-pin or unfinished stamp job is outside the legacy partition, a release from
-this interval refuses the database instead of reversing the migration: use the
-procedure below.
+template-manager already started and refused that version. Then start the
+older template-manager, and the older sandbox-manager after it, as in step 5.
+If any build, tag pin or unfinished stamp job is outside the legacy partition,
+a release from this interval refuses the database instead of reversing the
+migration: use the procedure below.
 
 A template-manager from #988 until #1070 bundles this migration, with the same
 checksum, but not `20261031050126`. To roll back to one, stop template-manager,
 keep the newer one from restarting until the older one starts (at startup it
-re-applies the dirty-ref migration), and run the same two checks: if
+re-applies the dirty-ref migration), copy the database with its `-wal` and
+`-shm` files as step 2 describes, and run the same two checks: if
 `max(version)` prints `20261031050126` and the common check prints nothing,
 continue; if `max(version)` prints `20261026220935`, skip the `down`; and
 otherwise stop. If it printed
