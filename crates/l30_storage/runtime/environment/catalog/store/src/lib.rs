@@ -130,6 +130,30 @@ pub async fn list_unretired_within(
         .collect()
 }
 
+/// Whether the catalog certifies a cold-boot upgrade edge from `source` to
+/// `target`: `source` is unretired and lists `target` in its
+/// `upgrade_edges`. `false` when `source` isn't in the catalog. Accepts a
+/// pool or a transaction connection; takes no lock.
+pub async fn upgrade_edge_certified(
+    executor: impl sqlx::PgExecutor<'_>,
+    source: EnvironmentReference,
+    target: EnvironmentReference,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM runtime_environments
+             WHERE environment_ref = $1
+               AND retired_at IS NULL
+               AND $2 = ANY(upgrade_edges)
+         )"
+    ))
+    .bind(source.to_string())
+    .bind(target.to_string())
+    .fetch_one(executor)
+    .await
+}
+
 /// Which of `environments` the catalog holds as retired. Accepts a pool or a
 /// transaction connection; takes no lock.
 pub async fn retired_among(

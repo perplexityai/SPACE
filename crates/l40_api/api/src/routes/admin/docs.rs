@@ -7,6 +7,7 @@ use pplx_space_runtime_environment_policy_store::PolicyChangeReason;
 use serde_json::{Map, Value, json};
 
 mod cross_org;
+mod runtime_upgrade_campaigns;
 
 const ADMIN_LLMS_TXT: &str = "SPACE Admin API\n\n\
 - Admin OpenAPI: /openapi.json on admin.api.space hosts, /admin/api/openapi.json on shared hosts\n\
@@ -362,6 +363,7 @@ fn admin_openapi_value() -> Value {
     insert_audit_event_paths(paths);
     insert_debug_paths(paths);
     insert_runtime_environment_paths(paths);
+    runtime_upgrade_campaigns::insert_runtime_upgrade_campaign_paths(paths);
     cross_org::insert_admin_sandbox_session_paths(paths);
     spec
 }
@@ -1015,25 +1017,38 @@ fn insert_audit_event_paths(paths: &mut Map<String, Value>) {
     );
 }
 
-fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
-    let environment_ref = json!({
+/// An execution environment reference, as a schema.
+fn environment_ref_schema() -> Value {
+    json!({
         "type": "string",
         "pattern": "^(sha256|blake3):[0-9a-f]{64}$",
         "description": "Execution environment reference"
-    });
+    })
+}
+
+/// An optional `If-Match` header carrying a generation, optionally quoted,
+/// described by `description`.
+fn if_match_param(description: &str) -> Value {
+    json!({
+        "name": "If-Match",
+        "in": "header",
+        "required": false,
+        "schema": { "type": "string", "pattern": "^\"?[0-9]+\"?$" },
+        "description": description
+    })
+}
+
+fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
+    let environment_ref = environment_ref_schema();
     let reason = json!({
         "type": "string",
         "minLength": 1,
         "maxLength": PolicyChangeReason::MAX_CHARS,
         "description": "Why the policy changed. Recorded with the caller on the policy row, and on the environment's state row when the write changes it."
     });
-    let if_match = json!({
-        "name": "If-Match",
-        "in": "header",
-        "required": false,
-        "schema": { "type": "string", "pattern": "^\"?[0-9]+\"?$" },
-        "description": "The policy generation the caller last read, optionally quoted. The write applies only at that generation, compared under the policy row lock; absent, it's unconditional."
-    });
+    let if_match = if_match_param(
+        "The policy generation the caller last read, optionally quoted. The write applies only at that generation, compared under the policy row lock; absent, it's unconditional.",
+    );
     paths.insert(
         "/runtime-environments".to_string(),
         json!({

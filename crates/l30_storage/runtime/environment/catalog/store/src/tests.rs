@@ -647,3 +647,29 @@ async fn the_upgrade_predicate_is_never_null_so_it_negates_safely() -> TestResul
     assert_eq!(negated, Some(true));
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_upgrade_edge_is_certified_only_from_an_unretired_source_that_lists_it() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let (source, target, other) = (environment(0), environment(1), environment(2));
+    insert(&db.pool, &source.to_string(), false).await?;
+    sqlx::query(sql!(
+        "UPDATE runtime_environments SET upgrade_edges = ARRAY[$2] WHERE environment_ref = $1"
+    ))
+    .bind(source.to_string())
+    .bind(target.to_string())
+    .execute(&db.pool)
+    .await?;
+
+    assert!(upgrade_edge_certified(&db.pool, source, target).await?);
+    assert!(!upgrade_edge_certified(&db.pool, source, other).await?);
+    assert!(
+        !upgrade_edge_certified(&db.pool, target, source).await?,
+        "edges are directed, and the target has no row"
+    );
+    retire(&db.pool, source).await?;
+    assert!(!upgrade_edge_certified(&db.pool, source, target).await?);
+    Ok(())
+}

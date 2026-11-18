@@ -1,7 +1,7 @@
 //! `space-admin-cli runtime env ...`: the cluster's execution environment
 //! policy, through `/admin/api/v1/runtime-environments`. The server validates
 //! every write and enforces the policy rules; this module sends requests and
-//! renders what comes back.
+//! renders what comes back. `runtime campaign ...` lives in [`campaign`].
 
 use std::collections::BTreeMap;
 
@@ -134,6 +134,9 @@ struct Population {
     invalid: Counts,
 }
 
+/// The command that shows whether a policy write landed.
+const POLICY_CHECK: &str = "runtime env list";
+
 fn runtime_environments_url(base_url: &str, suffix: &str) -> String {
     format!("{base_url}{ADMIN_API_PREFIX}/runtime-environments{suffix}")
 }
@@ -148,7 +151,10 @@ impl AdminClient {
         &self,
         command: RuntimeCommands,
     ) -> Result<String, CliError> {
-        let RuntimeCommands::Env { command } = command;
+        let command = match command {
+            RuntimeCommands::Env { command } => command,
+            RuntimeCommands::Campaign { command } => return self.campaign_command(command).await,
+        };
         match command {
             RuntimeEnvCommands::List { json } => {
                 let body = self
@@ -174,7 +180,9 @@ impl AdminClient {
                         "reason": reason,
                         "strand": strand,
                     }));
-                let body = self.send_write(request, if_generation).await?;
+                let body = self
+                    .send_write(request, if_generation, POLICY_CHECK)
+                    .await?;
                 if json {
                     return Ok(body);
                 }
@@ -208,7 +216,9 @@ impl AdminClient {
                         "reason": reason,
                         "strand": strand,
                     }));
-                let body = self.send_write(request, if_generation).await?;
+                let body = self
+                    .send_write(request, if_generation, POLICY_CHECK)
+                    .await?;
                 if json {
                     return Ok(body);
                 }
@@ -236,13 +246,14 @@ impl AdminClient {
         }
     }
 
-    /// [`AdminClient::send`] for a policy write, conditional on the policy
-    /// generation when one is given. A transport failure may come after the
-    /// server committed, so say so.
+    /// [`AdminClient::send`] for a write, conditional on the generation when
+    /// one is given. A transport failure may come after the server committed,
+    /// so say so, naming the `check` command that shows whether it did.
     async fn send_write(
         &self,
         request: reqwest::RequestBuilder,
         if_generation: Option<u64>,
+        check: &str,
     ) -> Result<String, CliError> {
         let request = match if_generation {
             Some(generation) => request.header(reqwest::header::IF_MATCH, generation.to_string()),
@@ -250,8 +261,7 @@ impl AdminClient {
         };
         self.send(request).await.map_err(|error| match error {
             CliError::Transport(message) => CliError::Transport(format!(
-                "{message}; the write may have landed, so check with `runtime env list` before \
-                 retrying"
+                "{message}; the write may have landed, so check with `{check}` before retrying"
             )),
             other => other,
         })
@@ -531,6 +541,8 @@ fn render_population(population: &Population) -> String {
         population.generation
     )
 }
+
+mod campaign;
 
 #[cfg(test)]
 mod tests;

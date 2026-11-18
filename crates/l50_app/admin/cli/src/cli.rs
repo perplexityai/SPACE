@@ -141,6 +141,138 @@ pub(crate) enum RuntimeCommands {
         #[command(subcommand)]
         command: RuntimeEnvCommands,
     },
+    /// Start, pause, resume, abort and inspect runtime upgrade campaigns
+    /// (/admin/api/v1/runtime-upgrade-campaigns).
+    Campaign {
+        #[command(subcommand)]
+        command: RuntimeCampaignCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RuntimeCampaignCommands {
+    /// Start a campaign that moves one kind of subject from one environment
+    /// to another.
+    Start {
+        /// What the campaign upgrades.
+        #[arg(long, value_enum)]
+        kind: RuntimeCampaignKindArg,
+        /// The environment subjects move off.
+        #[arg(long = "from", value_name = "ENVIRONMENT")]
+        from: EnvironmentReference,
+        /// The environment subjects move to.
+        #[arg(long = "to", value_name = "ENVIRONMENT")]
+        to: EnvironmentReference,
+        /// Subjects upgraded before the campaign waits for a resume: 1 (the
+        /// server's default) or 0 to start rolling. Only 0 and 1 are
+        /// accepted, since a canary upgrades exactly one subject.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1))]
+        canary_size: Option<u64>,
+        /// Items in flight at once across the cluster.
+        #[arg(long, value_name = "N")]
+        wave_size: u64,
+        /// Items in flight at once on any one node, for kinds whose subjects
+        /// have a node (the server defaults to 1).
+        #[arg(long, value_name = "N")]
+        per_node: Option<u64>,
+        /// Failed items at which the campaign pauses itself.
+        #[arg(long, value_name = "N")]
+        failure_budget: u64,
+        /// For a sandbox campaign, also take running and paused sandboxes.
+        /// Only sandbox campaigns accept it; the server refuses it for
+        /// templates.
+        #[arg(long)]
+        include_running: bool,
+        /// Why, recorded with you on the campaign.
+        #[arg(long)]
+        reason: String,
+        /// Emit the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause a canary or rolling campaign.
+    Pause {
+        id: uuid::Uuid,
+        /// Why, recorded with you in the audit log.
+        #[arg(long)]
+        reason: String,
+        /// Apply only if the campaign is still at this generation (the one
+        /// `runtime campaign show` showed).
+        #[arg(long, value_name = "GENERATION")]
+        if_generation: Option<u64>,
+        /// Emit the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume a paused campaign, or move a canary whose item is done on to
+    /// rolling. A campaign with no done item goes back to canary.
+    Resume {
+        id: uuid::Uuid,
+        /// Why, recorded with you in the audit log.
+        #[arg(long)]
+        reason: String,
+        /// Return failed items to pending first, so a campaign at its
+        /// failure budget can resume.
+        #[arg(long)]
+        retry_failed: bool,
+        /// Apply only if the campaign is still at this generation (the one
+        /// `runtime campaign show` showed).
+        #[arg(long, value_name = "GENERATION")]
+        if_generation: Option<u64>,
+        /// Emit the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Abort a canary, rolling or paused campaign for good. Nothing already
+    /// upgraded is undone; items in flight stop at their next lease renewal,
+    /// and the source is free for a new campaign at once.
+    Abort {
+        id: uuid::Uuid,
+        /// Why, recorded with you in the audit log.
+        #[arg(long)]
+        reason: String,
+        /// Apply only if the campaign is still at this generation (the one
+        /// `runtime campaign show` showed).
+        #[arg(long, value_name = "GENERATION")]
+        if_generation: Option<u64>,
+        /// Emit the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one campaign: its settings, phase, generation and item counts.
+    Show {
+        id: uuid::Uuid,
+        /// Emit the raw JSON response instead of a formatted view.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every campaign in creation order, following each page.
+    List {
+        /// Only canary, rolling and paused campaigns.
+        #[arg(long)]
+        unfinished: bool,
+        /// Emit JSON: every page's campaigns in one `campaigns` array.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The kinds `POST /runtime-upgrade-campaigns` accepts. The server owns the
+/// vocabulary; this copy lists them in `--help` and refuses a misspelled one
+/// before anything is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RuntimeCampaignKindArg {
+    Templates,
+    Sandboxes,
+}
+
+impl RuntimeCampaignKindArg {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Templates => "templates",
+            Self::Sandboxes => "sandboxes",
+        }
+    }
 }
 
 #[derive(Subcommand)]

@@ -729,3 +729,57 @@ async fn only_releases_still_in_use_gate_a_block() -> TestResult {
     assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_block_waits_for_an_unfinished_template_campaign_off_the_environment() -> TestResult {
+    use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
+    use pplx_space_runtime_upgrade_campaign_store::{CampaignKind, CampaignPhase};
+
+    let Some(h) = harness().await? else {
+        return Ok(());
+    };
+    let (e0, e1) = (environment(0), environment(1));
+    let (status, _) = h.set_default(e1).await;
+    assert_eq!(status, StatusCode::OK);
+    // A finished template campaign and an unfinished sandbox campaign don't
+    // hold the block; an unfinished template campaign does.
+    for (kind, phase) in [
+        (CampaignKind::Templates, CampaignPhase::Completed),
+        (CampaignKind::Sandboxes, CampaignPhase::Rolling),
+        (CampaignKind::Templates, CampaignPhase::Paused),
+    ] {
+        insert_campaign(
+            &h.db.pool,
+            CampaignSeed {
+                from: e0,
+                to: e1,
+                kind,
+                phase,
+                ..CampaignSeed::default()
+            },
+        )
+        .await?;
+    }
+    let generation = h.generation().await?;
+
+    let (status, body) = h
+        .set_state(e0, json!({"state": "blocked", "reason": "0-day"}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error_contains(&body, "template runtime upgrade campaign");
+    assert_eq!(h.generation().await?, generation, "nothing changed");
+
+    // Deprecating doesn't stop the releases, so it isn't held.
+    let (status, body) = h
+        .set_state(e0, json!({"state": "deprecated", "reason": "superseded"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .set_state(
+            e0,
+            json!({"state": "blocked", "reason": "0-day", "strand": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(())
+}

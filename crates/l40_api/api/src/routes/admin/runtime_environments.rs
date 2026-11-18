@@ -15,12 +15,14 @@
 //! A write that commits also queues a `runtime-provisioning` reconcile on
 //! every worker and builder ([`enqueue_policy_reconcile`]).
 //!
+//! A block also needs `strand: true` while an unfinished template runtime
+//! upgrade campaign moves the environment's releases: blocking it mid-campaign
+//! stops the releases the campaign hasn't given a twin on its target yet.
+//!
 //! Not yet checked: that every node can run a new default (per-node usable
 //! environments are recorded, but a default change doesn't consult them yet),
-//! that a template
-//! campaign finished before a block (campaigns don't exist yet), and which
-//! nodes can't enforce a block (node status reports each node's applied
-//! generation; refusing on it is a later change).
+//! and which nodes can't enforce a block (node status reports each node's
+//! applied generation; refusing on it is a later change).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,21 +45,20 @@ use pplx_space_runtime_environment_policy_store::{
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use pplx_space_runtime_upgrade_campaign_store::{self as campaign_store, CampaignKind};
+
 use super::audit::{self, AdminRuntimeEnvironmentAuditEntry};
 use super::node_store::{AdminNodeRow, AdminNodeStore};
 use super::runtime_environment_store as store;
 use super::support::{
-    api_error, db_error, format_time, parse_if_match_generation, parse_json_body, read_db_error,
-    require_managing_org_admin,
+    ApiError, api_error, db_error, format_time, parse_environment_ref, parse_if_match_generation,
+    parse_json_body, read_db_error, require_managing_org_admin,
 };
 use super::templates::requeue_reconcile_targets_tx;
 use crate::middleware::auth::AuthUser;
 use crate::models::User;
 use crate::reconcile_queue::{ReconcileFacet, ReconcileReason, ReconcileRef};
 use crate::routes::AppState;
-
-/// A refusal from a parse helper, in the admin error shape.
-type ApiError = (StatusCode, Json<serde_json::Value>);
 
 /// Rows per `GET /runtime-environments/nodes` page, matching
 /// `GET /nodes/{node_id}/sandboxes`.
@@ -197,15 +198,6 @@ struct SetStateResponse {
     generation: u64,
     environment_ref: EnvironmentReference,
     state: &'static str,
-}
-
-fn parse_environment_ref(value: &str) -> Result<EnvironmentReference, ApiError> {
-    value.parse().map_err(|err| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            format!("invalid environment reference {value:?}: {err}"),
-        )
-    })
 }
 
 fn parse_state(value: &str) -> Result<RuntimeEnvironmentState, ApiError> {
@@ -673,6 +665,36 @@ pub(super) async fn set_runtime_environment_state(
     if let Some(expected) = expected.filter(|_| !precondition_holds(expected, generation)) {
         drop(tx);
         return audit.refuse_stale(expected, generation);
+    }
+    // Read inside the write's transaction under the advisory lock every
+    // template campaign start for this environment takes, so no campaign can
+    // start between this read and the block's commit. After the store's
+    // refusals and the generation check, like the strand check.
+    let template_campaign = if requested == RuntimeEnvironmentState::Blocked && !request.strand {
+        campaign_store::unfinished_from_locked(&mut tx, CampaignKind::Templates, environment).await
+    } else {
+        Ok(None)
+    };
+    match template_campaign {
+        Ok(None) => {}
+        Ok(Some(campaign_id)) => {
+            drop(tx);
+            return audit.refuse(
+                StatusCode::CONFLICT,
+                format!(
+                    "template runtime upgrade campaign {campaign_id} still moves environment \
+                     {environment}'s releases; let it complete or abort it before blocking, \
+                     or pass strand: true to block anyway"
+                ),
+            );
+        }
+        Err(err) => {
+            drop(tx);
+            return audit.fail(
+                "couldn't check for an unfinished template campaign",
+                db_error(err).into_response(),
+            );
+        }
     }
     // Refused only after the store's own refusals, which the write above has
     // already returned, so an operator isn't asked to acknowledge stranding
