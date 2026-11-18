@@ -84,13 +84,15 @@ kind_bench_comment() { printf '%s-%s\n' "$KIND_BENCH_PREFIX" "$1"; }
 # host-wide, whatever KIND_BENCH_ROOT a caller chose, and a run's stale-bench
 # cleanup would tear down another run's benches under it.
 kind_bench_lock() {
-  local lock="${KIND_BENCH_LOCK:-}"
-  if [[ -z "$lock" ]]; then
-    lock="/run/lock/$KIND_BENCH_PREFIX.lock"
-    [[ -d /run/lock ]] || lock="/run/$KIND_BENCH_PREFIX.lock"
-  fi
-  if [[ ! -w "$lock" ]]; then
-    sudo -n sh -c 'touch "$1" && chmod 0666 "$1"' _ "$lock" || kind_bench_die "cannot create the host lock $lock"
+  # In a directory only root can write, created here, so the lock file is
+  # always the one this function made. Fixed, like the bench names it guards:
+  # a second lock would let two runs tear down each other's benches.
+  local dir="/run/$KIND_BENCH_PREFIX.d"
+  local lock="$dir/lock"
+  if [[ ! -f "$lock" ]]; then
+    if ! sudo -n install -d -o root -m 0755 "$dir" || ! sudo -n install -o root -m 0666 /dev/null "$lock"; then
+      kind_bench_die "cannot create the host lock $lock"
+    fi
   fi
   exec 9>>"$lock"
   flock -n 9 || kind_bench_die "another bench run or teardown holds $lock"
