@@ -1798,13 +1798,22 @@ async fn of_two_concurrent_creates_for_one_source_exactly_one_succeeds() -> Test
 
 #[test]
 fn a_campaign_with_impossible_pacing_or_reason_is_refused_before_the_database() {
-    for (campaign, why) in [
+    for (campaign, why, refusal) in [
+        (
+            NewCampaign {
+                max_in_flight_per_cluster: 0,
+                ..new_campaign(10, CampaignKind::Sandboxes)
+            },
+            "no cluster room",
+            "max_in_flight_per_cluster must be at least 1",
+        ),
         (
             NewCampaign {
                 to: environment(10),
                 ..new_campaign(10, CampaignKind::Sandboxes)
             },
             "same source and target",
+            "the source and target must differ",
         ),
         (
             NewCampaign {
@@ -1812,6 +1821,7 @@ fn a_campaign_with_impossible_pacing_or_reason_is_refused_before_the_database() 
                 ..new_campaign(10, CampaignKind::Sandboxes)
             },
             "no per-node room",
+            "max_in_flight_per_node must be at least 1 and at most max_in_flight_per_cluster",
         ),
         (
             NewCampaign {
@@ -1819,6 +1829,7 @@ fn a_campaign_with_impossible_pacing_or_reason_is_refused_before_the_database() 
                 ..new_campaign(10, CampaignKind::Sandboxes)
             },
             "per-node above per-cluster",
+            "max_in_flight_per_node must be at least 1 and at most max_in_flight_per_cluster",
         ),
         (
             NewCampaign {
@@ -1826,6 +1837,7 @@ fn a_campaign_with_impossible_pacing_or_reason_is_refused_before_the_database() 
                 ..new_campaign(10, CampaignKind::Sandboxes)
             },
             "no budget",
+            "failure_budget must be at least 1",
         ),
         (
             NewCampaign {
@@ -1833,6 +1845,7 @@ fn a_campaign_with_impossible_pacing_or_reason_is_refused_before_the_database() 
                 ..new_campaign(10, CampaignKind::Templates)
             },
             "include_running on a template campaign",
+            "include_running applies only to sandbox campaigns",
         ),
         (
             NewCampaign {
@@ -1840,6 +1853,7 @@ fn a_campaign_with_impossible_pacing_or_reason_is_refused_before_the_database() 
                 ..new_campaign(10, CampaignKind::Sandboxes)
             },
             "empty reason",
+            "the reason must be 1 to 1024 characters with no NUL",
         ),
         (
             NewCampaign {
@@ -1847,6 +1861,7 @@ fn a_campaign_with_impossible_pacing_or_reason_is_refused_before_the_database() 
                 ..new_campaign(10, CampaignKind::Sandboxes)
             },
             "long reason",
+            "the reason must be 1 to 1024 characters with no NUL",
         ),
         (
             NewCampaign {
@@ -1854,15 +1869,10 @@ fn a_campaign_with_impossible_pacing_or_reason_is_refused_before_the_database() 
                 ..new_campaign(10, CampaignKind::Sandboxes)
             },
             "NUL in the reason",
+            "the reason must be 1 to 1024 characters with no NUL",
         ),
     ] {
-        assert!(
-            matches!(
-                super::create::validate(&campaign),
-                Err(CreateCampaignError::Invalid(_))
-            ),
-            "{why}"
-        );
+        assert_eq!(super::create::validate(&campaign), Err(refusal), "{why}");
     }
     super::create::validate(&NewCampaign {
         reason: "é".repeat(1024),

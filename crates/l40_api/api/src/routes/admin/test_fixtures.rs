@@ -213,3 +213,10 @@ impl AdminRouterHarness {
             .collect()
     }
 }
+
+/// Assert that an admin error body's `error` message contains `needle`.
+#[track_caller]
+pub(super) fn assert_error_contains(body: &serde_json::Value, needle: &str) {
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains(needle), "expected {needle:?} in {body}");
+}

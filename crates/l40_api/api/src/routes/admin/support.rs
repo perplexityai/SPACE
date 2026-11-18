@@ -35,6 +35,22 @@ pub(super) fn api_error(
     (status, Json(serde_json::json!({"error": message.into()})))
 }
 
+/// A refusal from a parse helper, in the admin error shape [`api_error`]
+/// builds.
+pub(super) type ApiError = (StatusCode, Json<serde_json::Value>);
+
+/// An execution environment reference from a request, or a 400 naming it.
+pub(super) fn parse_environment_ref(
+    value: &str,
+) -> Result<pplx_space_execution_spec::EnvironmentReference, ApiError> {
+    value.parse().map_err(|err| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("invalid environment reference {value:?}: {err}"),
+        )
+    })
+}
+
 /// An admin handler's response when a `SandboxController` call it delegates to
 /// failed.
 ///

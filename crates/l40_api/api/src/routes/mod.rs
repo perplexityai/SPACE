@@ -75,6 +75,11 @@ pub struct AppState {
     /// [`public::hidden_operations`].
     pub native_hidden_operations: public::hidden_operations::HiddenOperationsGate,
     pub ecw_credential_keyring: std::sync::Arc<pplx_space_ecw_credential::EcwCredentialKeyring>,
+    /// Campaign kinds the admin API starts runtime upgrade campaigns for:
+    /// those a cluster-controller driver moves. See
+    /// [`admin::RUNTIME_UPGRADE_DRIVEN_KINDS`].
+    pub runtime_upgrade_driven_kinds:
+        &'static [pplx_space_runtime_upgrade_campaign_store::CampaignKind],
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -277,6 +282,7 @@ impl AppState {
             feature_flags,
             native_hidden_operations,
             ecw_credential_keyring,
+            runtime_upgrade_driven_kinds: admin::RUNTIME_UPGRADE_DRIVEN_KINDS,
         })
     }
 
