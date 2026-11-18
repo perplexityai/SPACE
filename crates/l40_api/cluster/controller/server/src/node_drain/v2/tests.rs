@@ -24,6 +24,9 @@ struct FakeSink {
     fence: Option<Fence>,
     /// Whether a Node of the name exists; none when unset.
     nodes_present: Vec<String>,
+    /// The instance a present Node's `providerID` names, by Node name; none
+    /// when unset.
+    provider_instances: HashMap<String, String>,
     /// The terminated delete's answer; `Deleted` when unset.
     delete: Option<TerminatedDelete>,
     /// The escalation's answer; `Ok(true)` when unset.
@@ -183,6 +186,16 @@ impl DrainV2Sink for FakeSink {
     async fn node_exists(&self, k8s_node_name: &str) -> Result<bool, String> {
         self.log(format!("node_exists {k8s_node_name}"));
         Ok(self.nodes_present.iter().any(|name| name == k8s_node_name))
+    }
+
+    async fn node_machine(&self, k8s_node_name: &str) -> Result<NodeMachine, String> {
+        Ok(
+            if self.nodes_present.iter().any(|name| name == k8s_node_name) {
+                NodeMachine::Live(self.provider_instances.get(k8s_node_name).cloned())
+            } else {
+                NodeMachine::Gone
+            },
+        )
     }
 
     async fn delete_terminated(
@@ -1716,6 +1729,153 @@ async fn every_unfenced_v2_state_lets_go_once_ec2_says_terminated() {
             );
             assert!(authority.terminated().is_empty(), "{case}");
         }
+    }
+}
+
+/// The machines a let-go test's Node can stand for: gone, or live on the
+/// recorded instance, on another one, or naming none, with whether each
+/// lets the node go and the reason a wait records.
+const MACHINES: [(&str, Option<Option<&str>>, bool, &str); 4] = [
+    ("node gone", None, true, ""),
+    ("matching providerID", Some(Some(INSTANCE)), true, ""),
+    (
+        "stale instance id, live node",
+        Some(Some("i-0000000000000d0d0")),
+        false,
+        "is live on instance i-0000000000000d0d0",
+    ),
+    (
+        "no providerID, live node",
+        Some(None),
+        false,
+        "is live and names no EC2 instance",
+    ),
+];
+
+/// `sink` with `node`'s Kubernetes Node standing for `machine`.
+fn with_machine(sink: FakeSink, node: &V2Node, machine: Option<Option<&str>>) -> FakeSink {
+    let name = node.k8s_node_name.clone().unwrap();
+    FakeSink {
+        nodes_present: machine.map(|_| vec![name.clone()]).unwrap_or_default(),
+        provider_instances: machine
+            .flatten()
+            .map(|instance| HashMap::from([(name, instance.to_owned())]))
+            .unwrap_or_default(),
+        ..sink
+    }
+}
+
+/// An unfenced node is let go on EC2's `terminated` for its recorded
+/// instance only when that is the machine it registered: its Kubernetes
+/// Node is gone, or the Node's `providerID` names the recorded instance. A
+/// live Node on another instance (the recorded one is stale) or naming none
+/// is not let go: the drain waits and says why.
+#[tokio::test]
+async fn an_unfenced_let_go_needs_the_registered_machine() {
+    for (case, machine, lets_go, reason) in MACHINES {
+        let node = V2Node {
+            heartbeat_fresh: false,
+            ..node(Some("draining"), Some(5), false)
+        };
+        let sink = with_machine(
+            FakeSink {
+                nodes: vec![node.clone()],
+                ..FakeSink::default()
+            },
+            &node,
+            machine,
+        );
+        let authority = FakeAuthority::answering(InstanceEvidence::Terminated);
+        let report = run_tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES).await;
+        assert_eq!(
+            report.let_go == [node.id],
+            lets_go,
+            "{case}: {:?}",
+            sink.calls()
+        );
+        assert_eq!(called(&sink, "let_go", &node), lets_go, "{case}");
+        if !lets_go {
+            assert!(
+                sink.calls()
+                    .iter()
+                    .any(|call| call.starts_with(&format!("error {}", node.id))
+                        && call.contains(reason)
+                        && call.ends_with("not letting it go")),
+                "{case}: {:?}",
+                sink.calls()
+            );
+        }
+        assert!(authority.terminated().is_empty(), "{case}");
+    }
+}
+
+/// A fenced node whose termination the drain never confirmed is let go on
+/// the fenced instance's `terminated` only when that is the machine it
+/// registered, as an unfenced one is; otherwise it waits and says why, and
+/// dispatches nothing.
+#[tokio::test]
+async fn an_undispatched_fenced_let_go_needs_the_registered_machine() {
+    for (case, machine, lets_go, reason) in MACHINES {
+        let node = fenced(false);
+        let sink = with_machine(
+            FakeSink {
+                nodes: vec![node.clone()],
+                ..FakeSink::default()
+            },
+            &node,
+            machine,
+        );
+        let authority = FakeAuthority::answering(InstanceEvidence::Terminated);
+        let report = run_tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES).await;
+        assert_eq!(
+            report.let_go == [node.id],
+            lets_go,
+            "{case}: {:?}",
+            sink.calls()
+        );
+        if !lets_go {
+            assert!(
+                sink.calls()
+                    .iter()
+                    .any(|call| call.starts_with(&format!("error {}", node.id))
+                        && call.contains(reason)
+                        && call.ends_with("not letting it go")),
+                "{case}: {:?}",
+                sink.calls()
+            );
+        }
+        assert!(authority.terminated().is_empty(), "{case}");
+        assert!(!called(&sink, "delete", &node), "{case}");
+    }
+}
+
+/// A dispatched fenced node's row is deleted, or the node let go by the
+/// delete's guard, only once its Kubernetes Node is gone: a live Node holds
+/// it whatever its `providerID` names, the recorded instance or another.
+#[tokio::test]
+async fn a_dispatched_delete_waits_for_any_live_node() {
+    for (case, machine, _, _) in MACHINES {
+        let node = V2Node {
+            terminated_observed_at: Some(super::unix_now()),
+            ..fenced(true)
+        };
+        let sink = with_machine(
+            FakeSink {
+                nodes: vec![node.clone()],
+                ..FakeSink::default()
+            },
+            &node,
+            machine,
+        );
+        let authority = FakeAuthority::answering(InstanceEvidence::Terminated);
+        run_tick(&sink, &authority, DEFAULT_MAX_EVACUATING_NODES).await;
+        assert_eq!(
+            called(&sink, "delete", &node),
+            machine.is_none(),
+            "{case}: {:?}",
+            sink.calls()
+        );
+        assert!(!called(&sink, "let_go", &node), "{case}");
     }
 }
 

@@ -84,7 +84,12 @@
 //! stale), or for a fenced instance no dispatch was confirmed for, or when
 //! the delete of a terminated node's row finds a row or execution still
 //! naming it, the loop clears the v2 columns and the phase under the node's
-//! lock and records why in `drain_last_error`. The node is then a plain
+//! lock and records why in `drain_last_error`. The first two need the
+//! machine EC2 answered about to be the one the node registered: its
+//! Kubernetes Node is gone, or the Node's `providerID` names the instance.
+//! A live Node on another instance, or naming none, keeps the drain
+//! waiting, since a stale recorded instance would have EC2 answer about
+//! another machine; the delete already needs the Node gone. The node is then a plain
 //! crashed node to `lost_started_sandboxes`, `orphaned_nodes` and
 //! `orphaned_sandboxes`; the drain writes no row off. Any other answer, an
 //! EC2 error, or no answer is recorded and changes nothing. A node that
@@ -437,6 +442,16 @@ impl std::fmt::Display for DrainCallError {
 }
 
 /// What the v2 loop reads and writes.
+/// What the API server says of a node's machine ([`DrainV2Sink::node_machine`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeMachine {
+    /// The Node is gone.
+    Gone,
+    /// The Node is live, on the EC2 instance its AWS `providerID` names, or
+    /// on none it names.
+    Live(Option<String>),
+}
+
 pub trait DrainV2Sink: Send + Sync + 'static {
     fn list_v2_nodes(
         &self,
@@ -542,6 +557,13 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         &self,
         k8s_node_name: &str,
     ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
+    /// The machine the API server's Node named `k8s_node_name` runs on, by a
+    /// direct GET: gone only on its 404, else the EC2 instance its AWS
+    /// `providerID` names, if any.
+    fn node_machine(
+        &self,
+        k8s_node_name: &str,
+    ) -> impl std::future::Future<Output = Result<NodeMachine, String>> + Send;
     /// Delete the row of `node`, whose fenced instance `fence` EC2 says is
     /// terminated, or no longer lists after the row recorded it
     /// `terminated`, and whose Node is gone; let go of it instead when a row

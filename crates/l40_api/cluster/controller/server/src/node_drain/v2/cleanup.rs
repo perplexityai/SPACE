@@ -166,7 +166,9 @@ pub(super) async fn fence<S: DrainV2Sink, A: V2InstanceAuthority>(
 /// `terminated`; an instance it doesn't list, or no answer, dispatches
 /// nothing. Once the instance reads terminated, delete the row if the
 /// termination was confirmed and the Node is gone, or let the node go if it
-/// wasn't. Every path that waits defers the next check.
+/// wasn't and the machine EC2 answered about is the registered one
+/// ([`unregistered_machine`]). Every path that waits defers the next
+/// check.
 pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthority>(
     sink: &S,
     authority: &A,
@@ -199,6 +201,15 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
     };
     if !node.dispatched {
         if terminated {
+            if let Some(why) = unregistered_machine(sink, node, fence).await {
+                backoff.defer(node.id, now);
+                sink.record_error(
+                    node.id,
+                    &format!("fenced instance {fence} is terminated, but {why}; not letting it go"),
+                )
+                .await;
+                return None;
+            }
             let trace = format!(
                 "v2 drain let go: fenced instance {fence} terminated; dispatch unconfirmed"
             );
@@ -373,6 +384,38 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
 }
 
 /// Let `node` go, recording `trace`. Returns whether the row was cleared.
+/// Why the machine EC2 answered about as `instance` can't be taken for the
+/// one the node registered, if it can't. The drain lets a node go on EC2's
+/// `terminated` only when its Kubernetes Node is gone, or when the Node's
+/// AWS `providerID` names `instance`: a recorded instance can be stale (an
+/// older registration writer leaves it across a Node UID change, and a Node
+/// that reports no instance never corrects it), and then EC2's answer is
+/// about another machine. A live Node on another instance, or naming none,
+/// or a lookup that fails, is a machine EC2 said nothing about, so the
+/// drain waits.
+pub(super) async fn unregistered_machine<S: DrainV2Sink>(
+    sink: &S,
+    node: &V2Node,
+    instance: &str,
+) -> Option<String> {
+    let Some(node_name) = node.k8s_node_name.as_deref() else {
+        return Some("the node has no Kubernetes name to look up".to_owned());
+    };
+    match sink.node_machine(node_name).await {
+        Ok(NodeMachine::Gone) => None,
+        Ok(NodeMachine::Live(Some(named))) if named == instance => None,
+        Ok(NodeMachine::Live(Some(named))) => Some(format!(
+            "its Kubernetes Node {node_name} is live on instance {named}"
+        )),
+        Ok(NodeMachine::Live(None)) => Some(format!(
+            "its Kubernetes Node {node_name} is live and names no EC2 instance"
+        )),
+        Err(error) => Some(format!(
+            "looking up the Kubernetes Node {node_name} failed: {error}"
+        )),
+    }
+}
+
 pub(super) async fn let_go<S: DrainV2Sink>(
     sink: &S,
     node: &V2Node,

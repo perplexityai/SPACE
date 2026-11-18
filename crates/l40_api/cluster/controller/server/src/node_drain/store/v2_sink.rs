@@ -24,7 +24,7 @@ use pplx_space_node_registration_store::drain_v2::{
 use super::*;
 use crate::node_drain::guarded_delete::{self, GuardedDelete, NodeIdentity};
 use crate::node_drain::v2::{
-    DrainCallError, DrainV2Sink, EvacuationRecord, Fence, TerminatedDelete, V2Node,
+    DrainCallError, DrainV2Sink, EvacuationRecord, Fence, NodeMachine, TerminatedDelete, V2Node,
 };
 
 /// How long one `DrainNode` call may take; the node answers without waiting.
@@ -561,6 +561,23 @@ impl DrainV2Sink for SubstrateSink {
             kube::Api::all(self.substrate.kubernetes().k8s.client.clone());
         match tokio::time::timeout(NODE_LOOKUP_TIMEOUT, nodes.get_opt(k8s_node_name)).await {
             Ok(Ok(node)) => Ok(node.is_some()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err("the Node lookup timed out".to_owned()),
+        }
+    }
+
+    async fn node_machine(&self, k8s_node_name: &str) -> Result<NodeMachine, String> {
+        let nodes: kube::Api<k8s_openapi::api::core::v1::Node> =
+            kube::Api::all(self.substrate.kubernetes().k8s.client.clone());
+        match tokio::time::timeout(NODE_LOOKUP_TIMEOUT, nodes.get_opt(k8s_node_name)).await {
+            Ok(Ok(None)) => Ok(NodeMachine::Gone),
+            Ok(Ok(Some(node))) => Ok(NodeMachine::Live(
+                node.spec
+                    .as_ref()
+                    .and_then(|spec| spec.provider_id.as_deref())
+                    .and_then(pplx_space_k8s_node_id::Ec2InstanceId::from_provider_id)
+                    .map(|instance| instance.as_str().to_owned()),
+            )),
             Ok(Err(error)) => Err(error.to_string()),
             Err(_) => Err("the Node lookup timed out".to_owned()),
         }

@@ -236,6 +236,17 @@ pub(super) async fn step<S: DrainV2Sink, A: V2InstanceAuthority>(
     if let Some(evidence) = evidence {
         let instance = node.instance_id.as_deref().unwrap_or("<none>");
         if *evidence == InstanceEvidence::Terminated {
+            if let Some(why) = super::cleanup::unregistered_machine(sink, node, instance).await {
+                sink.record_error(
+                    node.id,
+                    &format!(
+                        "EC2 answers terminated for the node's recorded instance {instance}, \
+                         but {why}; not letting it go"
+                    ),
+                )
+                .await;
+                return None;
+            }
             let trace =
                 format!("v2 drain let go: instance {instance} terminated outside the drain");
             return let_go(sink, node, epoch, &trace)
