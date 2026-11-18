@@ -17,9 +17,7 @@ use pplx_space_api::controllers::substrate::{
     enqueue_artifact_backup_with_node_api, sandbox_state_with_node_api,
 };
 use pplx_space_api::reconcile_queue::{ReconcileRef, enqueue_sandbox_reconcile};
-use pplx_space_common_core::types::{
-    ArtifactKind, BackupSource, ExecutionGeneration, LocalArtifactId, SandboxId,
-};
+use pplx_space_common_core::types::{ArtifactKind, BackupSource, LocalArtifactId};
 use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -30,6 +28,7 @@ use pplx_space_rpc_contracts::node_drain_signals::{
     REUPLOAD_SANDBOX_RESTORING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
     SUSPEND_SANDBOX_FAILED_MARKER,
 };
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_pod::EvacuationPlacement;
 use pplx_space_sandbox_portability::{
     current_disk_artifact_backup_ready, drain_gate_blockers_for_node,
@@ -57,7 +56,7 @@ use super::{
     SUSPEND_EVACUABLE_LIFECYCLES, TerminationBlockingResidents, enabled_evacuable_lifecycles,
     is_evacuable_lifecycle, is_suspend_evacuable_lifecycle,
 };
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 fn emit_node_drain_event(
     sandbox_id: SandboxId,

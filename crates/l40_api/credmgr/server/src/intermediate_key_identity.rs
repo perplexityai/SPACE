@@ -15,12 +15,12 @@
 //! none — the provider decides whether that is fatal.
 
 use pplx_space_accounts::{FederatedGrantAudience, OrgId};
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_federated_grant_store::{
     FreshestLiveFederatedGrant, FreshestLiveFederatedGrantError, freshest_live_federated_grant,
     live_federated_grant_prefer_sandbox,
 };
 use pplx_space_federated_identity::FEDERATED_OWNER_GRANT_PURPOSE;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 
 /// `organizations.owner_source` for an org whose identity came from a trusted upstream client.

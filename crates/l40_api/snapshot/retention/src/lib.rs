@@ -125,10 +125,10 @@ use futures_util::{
     StreamExt,
     stream::{self, FuturesUnordered},
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::SandboxId;
 use uuid::Uuid;
 
 use backend::{DeletePrefixError, DeletePrefixOutcome, StorageBackendRegistry};

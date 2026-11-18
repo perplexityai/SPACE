@@ -3,7 +3,8 @@
 
 use std::collections::HashSet;
 
-use pplx_space_common_core::types::{ClientId, SandboxId};
+use pplx_space_common_core::types::ClientId;
+use pplx_space_sandbox_model::SandboxId;
 
 /// Which client ids one cap check counts. Admission builds it once per check,
 /// from one key-set snapshot, and passes the same value to the pending set,

@@ -509,9 +509,9 @@ pub struct SandboxPoolPodMetadata {
 
 pub struct SandboxPodCommon<'a> {
     pub pod_name: &'a str,
-    pub sandbox_id: pplx_space_common_core::types::SandboxId,
+    pub sandbox_id: pplx_space_sandbox_model::SandboxId,
     pub execution_generation: i64,
-    pub activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    pub activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub template: &'a str,
     pub content_hash: Option<&'a str>,
     pub env: &'a BTreeMap<String, String>,
@@ -750,7 +750,7 @@ impl EvacuationPlacement {
 }
 
 pub fn sandbox_pod_name(
-    sandbox_id: pplx_space_common_core::types::SandboxId,
+    sandbox_id: pplx_space_sandbox_model::SandboxId,
     execution_generation: i64,
 ) -> String {
     format!(

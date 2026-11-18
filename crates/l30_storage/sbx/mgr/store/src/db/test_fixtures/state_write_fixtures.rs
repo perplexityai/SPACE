@@ -11,13 +11,14 @@ use std::collections::BTreeMap;
 use crate::db::Connection;
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::{
-    ExecutionGeneration, LocalArtifactId, SandboxActivationAttemptId, SandboxCleanupEpisodeId,
-    SandboxId, SandboxQuarantineReasonCode, SandboxRuntimeLabel,
-};
+use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId,
+    SandboxQuarantineReasonCode, SandboxRuntimeLabel,
+};
 use rusqlite::params;
 use rusqlite::types::Value;
 

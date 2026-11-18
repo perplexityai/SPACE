@@ -8,7 +8,8 @@
 use super::{active_teardown_suspend_operation, db_private_outside_tests, immediate_transaction};
 use crate::db::{Connection, Result};
 use pplx_space_accounts::JobId;
-use pplx_space_common_core::types::{ExecutionGeneration, LocalArtifactId};
+use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_sandbox_model::ExecutionGeneration;
 use pplx_space_sql_locator::sql;
 use rusqlite::params;
 

@@ -42,7 +42,7 @@ async fn apply_guest_outcome(
 
 #[tokio::test]
 async fn only_degrading_transitions_gather_evidence_and_console_tails_are_rate_limited() {
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
     let state = Arc::new(Mutex::new(HashMap::from([(
         sandbox_id.clone(),
         test_health(),
@@ -116,7 +116,7 @@ async fn only_degrading_transitions_gather_evidence_and_console_tails_are_rate_l
 async fn guest_health_episode_emits_unresponsive_then_recovered_events() {
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
     let state = Arc::new(Mutex::new(HashMap::from([(
         sandbox_id.clone(),
         test_health(),
@@ -206,7 +206,7 @@ async fn guest_health_episode_emits_unresponsive_then_recovered_events() {
 /// the episode, or the next stall goes unreported.
 #[tokio::test]
 async fn guest_health_episode_closes_when_a_probe_finds_the_guest_healthy_after_a_sweep() {
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
     let state = Arc::new(Mutex::new(HashMap::from([(
         sandbox_id.clone(),
         test_health(),
@@ -602,7 +602,7 @@ async fn resource_sample_reads_the_vm_cgroup_under_the_mounted_parent() {
     // The node's sandbox cgroup parent as sandbox-manager's chart mounts it:
     // the parent's own files, a sidecar cgroup and the VM's jailer cgroup.
     let parent = tempfile::tempdir().unwrap();
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
     write_cgroup(parent.path(), 4);
     write_cgroup(&parent.path().join(format!("sbx-{sandbox_id}")), 3);
     let vm_cgroup = parent.path().join(&sandbox_id);
@@ -709,7 +709,7 @@ async fn resource_sample_reads_the_vm_cgroup_under_the_mounted_parent() {
 async fn cgroup_parent_is_the_mount_when_present_and_the_host_path_otherwise() {
     use pplx_space_node_runtime_core::cgroup_paths::{jailer_cgroup_path, jailer_cgroup_path_in};
 
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
     let mounted = tempfile::tempdir().unwrap();
     assert_eq!(choose_cgroup_parent(mounted.path()).await, mounted.path());
 

@@ -10,7 +10,7 @@
 //! stay here until store functions for these tables replace them.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 use time::OffsetDateTime;
@@ -19,7 +19,7 @@ use uuid::Uuid;
 /// A sandbox's open quarantine episode, from `sandbox_quarantine_state`.
 ///
 /// The vocabulary columns stay text so a value written by a newer build still
-/// reads; their closed sets live in `pplx_space_common_core::types`
+/// reads; their closed sets live in `pplx_space_sandbox_model`
 /// (`SandboxQuarantineSource`, `SandboxQuarantineReasonCode`,
 /// `SandboxQuarantineNextAction`).
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]

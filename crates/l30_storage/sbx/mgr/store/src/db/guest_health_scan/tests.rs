@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use crate::db::fixture::insert_test_sandbox;
 use crate::state::SandboxState;

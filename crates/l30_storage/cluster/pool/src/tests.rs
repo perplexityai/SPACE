@@ -3,10 +3,10 @@ use pplx_space_accounts::{OrgId, UserId};
 use std::time::Duration;
 
 use pplx_space_byte_size::MemorySize;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
 use pplx_space_execution_spec::VcpuCount;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_template_model::TemplateName;
 use sqlx::PgPool;
 use uuid::Uuid;

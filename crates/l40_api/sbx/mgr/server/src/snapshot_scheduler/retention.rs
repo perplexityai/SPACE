@@ -6,11 +6,12 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::metrics::snapshot::SchedulerCaptureSkip;
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
+use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
 };
+use pplx_space_sandbox_model::SandboxId;
 use tokio::sync::Mutex;
 
 use super::{CheckpointContext, SandboxSnapshotState};

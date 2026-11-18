@@ -15,7 +15,7 @@ thiserror = { workspace = true }
 tonic = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-host-layout = { workspace = true }

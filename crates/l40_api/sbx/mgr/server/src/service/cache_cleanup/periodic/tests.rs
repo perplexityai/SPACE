@@ -188,7 +188,7 @@ async fn orphan_quarantine_survives_inventory_once_its_runtime_is_gone() {
     std::os::unix::fs::symlink(cache.path(), sandbox_run_dir.join("fc.pid")).unwrap();
     let conn = crate::db::test_conn();
     let receiver = ExecutionFence::new(
-        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
         None,
     );
     // A live runtime without a cache root is materialized for a cleanup that

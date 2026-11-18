@@ -1,9 +1,9 @@
 use super::*;
 use crate::service::activation_support::internal_request;
-use pplx_space_common_core::types::{
+use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::{
     ExecutionGeneration, RouteGeneration, SandboxId, SandboxRuntimeLabel,
 };
-use pplx_space_node_model::NodeManagedBy;
 use tokio::sync::oneshot;
 
 #[test]

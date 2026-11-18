@@ -10,7 +10,7 @@
 //! never see a KEK or a wrap, only the resolved plaintext.
 
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_sql_locator::sql;
 use uuid::Uuid;

@@ -106,8 +106,8 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::{
     artifact_has_durable_copy, latest_full_snapshot_ready, restore_retry_source_snapshot_exists,
     sandbox_attached_anywhere, sandbox_attached_to_node, snapshot_durable_for_source_release,
@@ -153,7 +153,7 @@ pub use lifecycle::StoredSandboxLifecycle;
 
 /// The `sandboxes.metadata` document: caller-supplied labels, untyped by
 /// design. Distinct from the validated `SandboxMetadata` newtype in
-/// `pplx-space-common-core` — that one enforces a key/value vocabulary,
+/// `pplx-space-sandbox-model` — that one enforces a key/value vocabulary,
 /// this one is whatever a caller already stored. Unifying them is its own
 /// change.
 pub type SandboxMetadata = BTreeMap<String, SandboxMetadataValue>;

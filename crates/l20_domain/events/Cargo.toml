@@ -16,6 +16,7 @@ tracing = { workspace = true }
 # internal
 pplx-space-cluster-id = { workspace = true }
 pplx-space-common-core = { workspace = true }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
 
 [dev-dependencies]

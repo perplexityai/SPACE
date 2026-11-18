@@ -4,7 +4,7 @@ use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
     AutoLifecycleStage,
 };
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use uuid::Uuid;
 
 use super::*;
@@ -646,7 +646,7 @@ fn sandbox_idle_deadline_is_nullable_and_serialized_as_rfc3339() {
 
 #[test]
 fn only_a_resident_sandbox_reports_its_idle_deadline() {
-    use pplx_space_common_core::types::SandboxLifecycle;
+    use pplx_space_sandbox_model::SandboxLifecycle;
     // Only a started or paused sandbox is held by the node that publishes its
     // deadline; every other lifecycle, transitions included, reports none.
     let cases = [

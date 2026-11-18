@@ -26,7 +26,8 @@
 
 use async_trait::async_trait;
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::{KekProvider, MasterKeyIdentifier, SandboxId};
+use pplx_space_common_core::types::{KekProvider, MasterKeyIdentifier};
+use pplx_space_sandbox_model::SandboxId;
 
 /// Byte length and intended algorithm class of a freshly minted DEK.
 ///

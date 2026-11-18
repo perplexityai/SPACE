@@ -1,5 +1,5 @@
-use pplx_space_common_core::types::QuarantineRecoveryPlanRejectionCause;
 use pplx_space_metrics_emit::{counter, distribution, metric_vocabulary, tag};
+use pplx_space_sandbox_model::QuarantineRecoveryPlanRejectionCause;
 
 /// Records a designed `FAILED_PRECONDITION` from the legacy quarantine-recovery
 /// plan endpoint. The cause is bounded; sandbox and node identities belong in

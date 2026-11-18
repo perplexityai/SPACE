@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use pplx_space_common_core::types::{
+use pplx_space_sandbox_model::{
     SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
 use tokio_util::sync::CancellationToken;

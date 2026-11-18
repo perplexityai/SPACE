@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::error::Error as _;
 use std::str::FromStr;
@@ -10,8 +10,8 @@ use pplx_space_api_route::SpaceApiRoutePurpose as CommonSpaceApiRoutePurpose;
 use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Token, ed25519::decode_unverified_space_api_route_ed25519_claims,
 };
-use pplx_space_common_core::types::SpaceApiRouteIdentity;
 use pplx_space_node_api_client::proto::SpaceApiRouteToken as ProtoSpaceApiRouteToken;
+use pplx_space_sandbox_model::SpaceApiRouteIdentity;
 
 use super::*;
 

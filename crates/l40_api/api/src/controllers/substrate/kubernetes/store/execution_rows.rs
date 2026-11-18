@@ -418,7 +418,7 @@ impl K8sStore {
         tx: &mut Transaction<'_, Postgres>,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
         state: &str,
     ) -> Result<bool, SubstrateError> {
         let finished = sqlx::query(sql!(
@@ -712,7 +712,7 @@ impl K8sStore {
         expected_lifecycle: SandboxLifecycle,
         restore_lease_token: Option<Uuid>,
         activation_attempt: Option<(
-            pplx_space_common_core::types::SandboxActivationAttemptId,
+            pplx_space_sandbox_model::SandboxActivationAttemptId,
             SandboxTransitionTargetState,
         )>,
     ) -> Result<SandboxExecutionClaim, SubstrateError> {
@@ -770,7 +770,7 @@ impl K8sStore {
         tx: &mut Transaction<'_, Postgres>,
         sandbox_id: SandboxId,
         activation_attempt: Option<(
-            pplx_space_common_core::types::SandboxActivationAttemptId,
+            pplx_space_sandbox_model::SandboxActivationAttemptId,
             SandboxTransitionTargetState,
         )>,
     ) -> Result<SandboxExecutionClaim, SubstrateError> {
@@ -982,7 +982,7 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
         restore_lease_token: Option<Uuid>,
-        activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     ) -> Result<bool, SubstrateError> {
         let mut tx = self
             .pool
@@ -1076,7 +1076,7 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
         restore_lease_token: Option<Uuid>,
-        activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     ) -> Result<bool, SubstrateError> {
         let mut tx = self
             .pool

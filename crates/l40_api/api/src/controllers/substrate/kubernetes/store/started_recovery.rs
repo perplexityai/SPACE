@@ -402,7 +402,7 @@ impl K8sStore {
         }
         claim.row.state = ActiveExecutionState::Recovering;
         claim.row.activation_attempt_id = activation_attempt_id
-            .map(pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid);
+            .map(pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid);
         claim.row.route_activation_id = claim.row.activation_attempt_id;
 
         tx.commit()

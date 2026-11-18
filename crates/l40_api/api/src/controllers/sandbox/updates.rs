@@ -1,8 +1,8 @@
 use super::*;
 use crate::controllers::db_contention_error;
 use crate::controllers::substrate::RuntimeRpcError;
-use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_store::{self as sandbox_store, FieldPatch};
 use pplx_space_sbx_mgr_client::proto::access_idle_update::Operation as AccessIdleOperation;
 use pplx_space_sql_locator::sql;

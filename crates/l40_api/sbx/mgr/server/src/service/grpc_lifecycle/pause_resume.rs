@@ -577,7 +577,7 @@ impl SandboxManagerService {
             // leaves its substrate out can't pass for a Direct one. One that
             // names neither substrate nor pod for a sandbox the node doesn't
             // hold is an identity-free Direct activation.
-            let kubernetes = |identity: &pplx_space_common_core::types::SpaceApiRouteIdentity| {
+            let kubernetes = |identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity| {
                 identity.effective_substrate_kind()
                     == Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
             };

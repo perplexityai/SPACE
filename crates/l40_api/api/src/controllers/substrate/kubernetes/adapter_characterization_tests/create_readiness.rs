@@ -13,7 +13,7 @@ use axum::http::{Method, StatusCode};
 use futures_util::FutureExt as _;
 use k8s_openapi::api::core::v1::{Node, NodeAddress, NodeStatus};
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{SandboxActivationAttemptId, SandboxTransitionTargetState};
+use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxTransitionTargetState};
 use sqlx::{Postgres, Transaction};
 
 use super::super::scripted_test_doubles::{

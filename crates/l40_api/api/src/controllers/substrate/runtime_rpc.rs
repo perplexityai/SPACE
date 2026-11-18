@@ -1,8 +1,8 @@
 use std::future::Future;
 
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::client_connect_failure_cause;
 use pplx_space_grpc_metrics::ClientReplayOutcome;
+use pplx_space_sandbox_model::SandboxId;
 use tokio::time::Instant;
 
 use super::{ControllerError, RuntimeClient, Substrate, SubstrateAdapter};

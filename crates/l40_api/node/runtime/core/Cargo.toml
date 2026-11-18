@@ -44,6 +44,7 @@ zstd = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-template-runtime = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-host-linux = { workspace = true }

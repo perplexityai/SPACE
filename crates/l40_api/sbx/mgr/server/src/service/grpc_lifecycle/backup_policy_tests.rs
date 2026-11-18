@@ -18,13 +18,14 @@ use crate::service::tests::service_tests::insert_test_sandbox;
 use crate::service::{SandboxManagerService, SandboxManagerServiceOptions};
 use crate::state::{SandboxState, SandboxStatus};
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, BackupAttemptId, LocalArtifactId, SandboxId, SnapshotName,
+    ArtifactKind, ArtifactOrigin, BackupAttemptId, LocalArtifactId, SnapshotName,
 };
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto as policy_proto;
 use pplx_space_rpc_contracts::node_drain_signals::{
     REUPLOAD_ARTIFACT_MISSING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
 };
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -753,7 +754,7 @@ async fn an_upload_names_its_capture_generation_only_on_evidence() {
     )) {
         return;
     }
-    let generation = |n| pplx_space_common_core::types::ExecutionGeneration::new(n).unwrap();
+    let generation = |n| pplx_space_sandbox_model::ExecutionGeneration::new(n).unwrap();
     use crate::capture_record::RecordWriter::{CapturingTeardown as Teardown, Recovery};
     // (case, generation sent, caller vouches, record's generation and writer,
     // expected)

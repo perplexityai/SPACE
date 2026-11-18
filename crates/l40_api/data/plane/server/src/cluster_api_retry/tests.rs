@@ -8,10 +8,10 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request};
 use axum::response::Response;
 use pplx_space_accounts::{NodeId, OrgId};
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_node_api_client::proto::{
     DataPlaneBackendEndpoint, UnstableResolveSandboxServiceRouteResponse,
 };
+use pplx_space_sandbox_model::SandboxId;
 use prost::Message as _;
 use tokio_util::sync::CancellationToken;
 

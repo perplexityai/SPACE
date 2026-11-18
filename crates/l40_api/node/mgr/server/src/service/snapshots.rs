@@ -9,8 +9,8 @@ use super::validation::*;
 use super::*;
 use crate::snapshot_request::SnapshotStorage;
 
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_host_layout::identities::gids;
+use pplx_space_sandbox_model::SandboxId;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;

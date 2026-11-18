@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 /// Longest wait, in ticks of the failed-cleanup pass, between two attempts to
 /// retire one sandbox.

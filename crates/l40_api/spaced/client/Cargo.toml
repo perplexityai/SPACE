@@ -28,6 +28,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 pplx-space-host-layout = { workspace = true }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-spaced-guest-protocol = { workspace = true }
 pplx-space-spaced-protocol = { workspace = true }
 prost-types = { workspace = true }

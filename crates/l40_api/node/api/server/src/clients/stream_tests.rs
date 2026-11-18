@@ -335,7 +335,7 @@ impl http_body::Body for OnceBody {
 fn served_spaced_write() -> http::Request<tonic::body::Body> {
     use pplx_space_sbx_mgr_client::proto::{SpacedWriteOpen, spaced_write_request};
     let message = pplx_space_sbx_mgr_client::proto::SpacedWriteRequest {
-        sandbox_id: pplx_space_common_core::types::SandboxId::new().to_string(),
+        sandbox_id: pplx_space_sandbox_model::SandboxId::new().to_string(),
         operation: Some(pplx_space_sbx_mgr_client::operations::WriteRequest {
             message: Some(spaced_write_request::Message::Open(SpacedWriteOpen {
                 path: "/tmp/upload".to_string(),

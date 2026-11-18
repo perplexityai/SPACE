@@ -43,7 +43,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use crate::rootfs_dmcrypt::{
     DmCryptError, ReleaseDevice, crypt_mapper_numbers, luks_format_args, parse_device_numbers, run,

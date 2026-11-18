@@ -8,15 +8,16 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
-    BackupAttemptId, EcwCredentialEpoch, LocalArtifactId,
-    SANDBOX_FORK_SNAPSHOT_RETENTION_DEFAULT_GRACE_SECONDS,
-    SNAPSHOT_STORAGE_SWEEPER_DEFAULT_MIN_AGE_SECONDS, SandboxId, SandboxLifecycle,
-    SandboxLifecycleParseError,
+    BackupAttemptId, LocalArtifactId, SANDBOX_FORK_SNAPSHOT_RETENTION_DEFAULT_GRACE_SECONDS,
+    SNAPSHOT_STORAGE_SWEEPER_DEFAULT_MIN_AGE_SECONDS,
 };
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_public_api::{
     OperationId, OperationKind, OperationTargetType, PublicApiParseError, RequestFingerprint,
+};
+use pplx_space_sandbox_model::{
+    EcwCredentialEpoch, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
 };
 use pplx_space_template_model::TemplateReference;
 use serde::{Deserialize, Serialize};

@@ -7,12 +7,14 @@ use std::path::PathBuf;
 use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
 use crate::service::SandboxManagerServiceOptions;
 use crate::state::SandboxStatus;
-use pplx_space_common_core::types::{LocalArtifactId, SandboxActivationAttemptId};
-use pplx_space_common_core::types::{SandboxArtifactMetadata, SandboxId};
+use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_common_core::types::SandboxArtifactMetadata;
 use pplx_space_execution_spec::SnapshotExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CreateBtrfsSnapshotResponse, DeleteBtrfsSnapshotResponse, RestoreInstanceSnapshotResponse,
 };
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_sandbox_model::SandboxId;
 use std::sync::{Arc, Mutex};
 
 pub(in crate::service::runtime_upgrade) struct Fixture {
@@ -646,7 +648,7 @@ async fn the_stop_is_admitted_only_for_the_boots_execution() {
         let f = fixture(state, false, FakeNodeManager::default());
         let boot = SandboxActivationAttemptId::new();
         set_execution(&f, boot);
-        let sandbox_id: pplx_space_common_core::types::SandboxId = f.sandbox_id.parse().unwrap();
+        let sandbox_id: pplx_space_sandbox_model::SandboxId = f.sandbox_id.parse().unwrap();
 
         let refused = f
             .service
@@ -680,7 +682,7 @@ async fn the_stop_leaves_the_boots_execution_alone_once_it_is_at_rest() {
         let f = fixture(state, false, FakeNodeManager::default());
         let boot = SandboxActivationAttemptId::new();
         set_execution(&f, boot);
-        let sandbox_id: pplx_space_common_core::types::SandboxId = f.sandbox_id.parse().unwrap();
+        let sandbox_id: pplx_space_sandbox_model::SandboxId = f.sandbox_id.parse().unwrap();
 
         let refused = f
             .service
@@ -710,7 +712,7 @@ async fn a_stop_that_cant_open_its_claim_is_refused() {
     let f = fixture(SandboxState::Started, false, FakeNodeManager::default());
     let boot = SandboxActivationAttemptId::new();
     set_execution(&f, boot);
-    let sandbox_id: pplx_space_common_core::types::SandboxId = f.sandbox_id.parse().unwrap();
+    let sandbox_id: pplx_space_sandbox_model::SandboxId = f.sandbox_id.parse().unwrap();
     // A transaction left open makes the claim's own BEGIN fail.
     f.service.db.lock().unwrap().execute_batch("BEGIN").unwrap();
 

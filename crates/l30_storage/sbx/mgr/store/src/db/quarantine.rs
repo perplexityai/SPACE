@@ -135,7 +135,7 @@ impl RawSandboxStatePublicationMetadata {
         )?
         .parse()
         .map_err(
-            |error: pplx_space_common_core::types::SandboxTransitionReceiptKindParseError| {
+            |error: pplx_space_sandbox_model::SandboxTransitionReceiptKindParseError| {
                 DecodeSandboxStatePublicationMetadataError::Invalid {
                     field: SandboxStatePublicationMetadataField::TransitionReceiptKind,
                     message: error.to_string(),
@@ -148,7 +148,7 @@ impl RawSandboxStatePublicationMetadata {
         )?
         .parse()
         .map_err(
-            |error: pplx_space_common_core::types::SandboxTransitionTargetStateParseError| {
+            |error: pplx_space_sandbox_model::SandboxTransitionTargetStateParseError| {
                 DecodeSandboxStatePublicationMetadataError::Invalid {
                     field: SandboxStatePublicationMetadataField::TransitionReceiptTargetState,
                     message: error.to_string(),

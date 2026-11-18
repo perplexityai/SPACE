@@ -15,10 +15,10 @@
 use crate::metrics::sandbox::api::{SandboxApiMetricIdentity, WakeCompletionAction};
 use axum::http::StatusCode;
 use pplx_space_accounts::{NodeId, UserId};
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_db_test_fixtures::pg_test_db_with_max_connections;
 use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
 use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_sandbox_store::action_stamp::{ActionStamp, StartSubstrate};
 use pplx_space_sandbox_store::test_support::{known_defects, stored_lifecycle_matrix};

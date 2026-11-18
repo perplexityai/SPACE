@@ -1,5 +1,5 @@
-use pplx_space_common_core::types::SandboxLifecycle;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 use std::time::Duration;
 

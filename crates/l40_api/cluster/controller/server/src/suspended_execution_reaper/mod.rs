@@ -87,11 +87,11 @@ use crate::metrics::cluster_reconciler::{self as metrics, Loop, Mode, OutcomeEve
 use pplx_space_api::controllers::substrate::kubernetes::{
     K8sBlockingDeleteOutcome, KubernetesSubstrate, SandboxPodKey, SandboxPodView,
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::SandboxId;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;

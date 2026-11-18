@@ -3,7 +3,7 @@
 
 use std::{fmt, time::Instant};
 
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 use pplx_space_metrics_emit::{counter, elapsed_ms, tag, timing_ms};
 

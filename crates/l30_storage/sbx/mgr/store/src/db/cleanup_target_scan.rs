@@ -4,8 +4,8 @@ use super::inventory_read::{InventoryReadError, check_row};
 use crate::db::Connection;
 use crate::db::db_private_outside_tests;
 use pplx_space_accounts::SandboxOwner;
-use pplx_space_common_core::types::{SandboxId, SandboxRuntimeLabel};
 use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ENCODED_BYTES};
+use pplx_space_sandbox_model::{SandboxId, SandboxRuntimeLabel};
 use rusqlite::types::Type;
 
 use super::CleanupTarget;

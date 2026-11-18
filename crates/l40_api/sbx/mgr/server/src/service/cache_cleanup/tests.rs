@@ -121,10 +121,10 @@ fn orphan_materialization_requires_observed_authority_without_overwriting_a_new_
 
 #[tokio::test]
 async fn orphan_authority_reaches_cleanup_and_is_never_refreshed_on_rejection() {
-    use pplx_space_common_core::types::SandboxActivationAttemptId;
     use pplx_space_node_mgr_client::proto::{
         CleanupSandboxResponse, InspectSandboxRequest, InspectSandboxResponse,
     };
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
 
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("node.sock");

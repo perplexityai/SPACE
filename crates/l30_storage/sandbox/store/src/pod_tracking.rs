@@ -11,7 +11,7 @@
 //! relies on the row lock the caller took in it. What else the caller must
 //! have done first differs per function; see each function's doc.
 
-use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 
 use std::sync::LazyLock;
 

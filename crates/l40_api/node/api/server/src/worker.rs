@@ -15,13 +15,13 @@ use pplx_space_api_route::{
     SpaceApiBridgeCallerPolicy, WaitReadyCallPurpose, set_space_api_bridge_caller_policy,
     space_api_route_capability_presence, take_wait_ready_call_purpose, wait_ready_call_purpose,
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::{GrpcRetryContext, fwd_retry};
 use pplx_space_node_mgr_client::{CacheDiskSchedulingEffect, NodeResourceStatusReader};
 use pplx_space_rpc_auth::{
     NetworkPolicyMutationAuthority, NodeApiAuthenticatedCaller, WaitReadyLifecycleAuthority,
 };
 use pplx_space_sandbox_grpc::record_sandbox_id;
+use pplx_space_sandbox_model::SandboxId;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};

@@ -574,8 +574,8 @@ impl FileCallFailure for ControllerError {
     fn sandbox_not_running(
         &self,
     ) -> Option<(
-        pplx_space_common_core::types::SandboxId,
-        pplx_space_common_core::types::SandboxLifecycle,
+        pplx_space_sandbox_model::SandboxId,
+        pplx_space_sandbox_model::SandboxLifecycle,
     )> {
         self.sandbox_not_running_refusal()
             .map(|refusal| (refusal.sandbox_id, refusal.lifecycle))

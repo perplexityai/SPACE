@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::Mode;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::super::{disk::DirectoryBudget, trusted_paths};
 

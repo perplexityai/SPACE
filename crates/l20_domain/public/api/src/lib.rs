@@ -9,12 +9,12 @@ use pplx_space_common_core::types::SnapshotId;
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, SandboxAutoLifecyclePatch};
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_durations::SimpleDuration;
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_guest_process::EnvMap;
 pub use pplx_space_guest_process::{IdempotencyKey, ProcessId};
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_template_model::TemplateReference;
 use uuid::Uuid;
 

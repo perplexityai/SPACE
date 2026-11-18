@@ -23,7 +23,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt as _};
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_channel;
 use pplx_space_common_grpc::{
     DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY, GrpcRetryContext, UdsPerSandboxLimitExceeded,
@@ -35,6 +34,7 @@ use pplx_space_guest_process::{
 use pplx_space_node_api_client::{
     NodeApiOperationBudget, proto::worker_api_client::WorkerApiClient,
 };
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use pplx_space_sbx_mgr_client::proto::{
     SpacedCloseStdinRequest, SpacedConnectProcessRequest, SpacedListProcessesRequest,

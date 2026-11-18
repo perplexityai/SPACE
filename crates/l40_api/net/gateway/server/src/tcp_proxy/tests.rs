@@ -421,7 +421,7 @@ async fn failed_policy_refresh_cancels_established_tcp_connections() {
     let failed_loader: crate::state::PolicyLoader = Arc::new(|| {
         Box::pin(async {
             Err(crate::state::HydrateNetworkStateError::GetNetworkPolicy {
-                sandbox_id: pplx_space_common_core::types::SandboxId::new(),
+                sandbox_id: pplx_space_sandbox_model::SandboxId::new(),
                 source: tonic::Status::unavailable("forced policy refresh failure"),
             })
         })

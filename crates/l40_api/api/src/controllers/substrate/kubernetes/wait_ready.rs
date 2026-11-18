@@ -265,7 +265,7 @@ impl KubernetesSubstrate {
             return Err(
                 match sandbox
                     .lifecycle
-                    .parse::<pplx_space_common_core::types::SandboxLifecycle>()
+                    .parse::<pplx_space_sandbox_model::SandboxLifecycle>()
                 {
                     Ok(lifecycle) => ControllerError::sandbox_not_running(
                         crate::controllers::SandboxNotRunning {

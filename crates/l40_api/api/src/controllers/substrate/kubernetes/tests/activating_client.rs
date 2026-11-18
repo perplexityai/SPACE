@@ -4,8 +4,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use pplx_space_common_core::types::{
-    ClientId, SandboxActivationAttemptId, SandboxId, SandboxTransitionTargetState,
+use pplx_space_common_core::types::ClientId;
+use pplx_space_sandbox_model::{
+    SandboxActivationAttemptId, SandboxId, SandboxTransitionTargetState,
 };
 use pplx_space_sandbox_pod::SANDBOX_CLIENT_ID_LABEL;
 use pplx_space_sql_locator::sql;

@@ -15,13 +15,7 @@ use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_cluster_trigger_queue::{
     QueuedRefConflict, enqueue_triggers_conn, queue_node_reconcile_refs,
 };
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, SandboxActivationAttemptId,
-    SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
-    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxTransitionReceipt,
-    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
-    SandboxTransitionTargetState,
-};
+use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 use pplx_space_cpu_arch::Arch;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -31,6 +25,12 @@ use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_node_model::NodeRole;
 use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
+    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
+    SandboxTransitionReceiptKind, SandboxTransitionTargetState,
+};
 use pplx_space_sandbox_portability::{
     started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible,
 };
@@ -111,7 +111,7 @@ fn parse_published_transition_receipt(
     let kind = required(Some(&receipt.kind), Field::TransitionReceiptKind)?
         .parse()
         .map_err(
-            |error: pplx_space_common_core::types::SandboxTransitionReceiptKindParseError| {
+            |error: pplx_space_sandbox_model::SandboxTransitionReceiptKindParseError| {
                 PublishedTransitionReceiptError {
                     field: Field::TransitionReceiptKind,
                     message: error.to_string(),
@@ -124,7 +124,7 @@ fn parse_published_transition_receipt(
     )?
     .parse()
     .map_err(
-        |error: pplx_space_common_core::types::SandboxTransitionTargetStateParseError| {
+        |error: pplx_space_sandbox_model::SandboxTransitionTargetStateParseError| {
             PublishedTransitionReceiptError {
                 field: Field::TransitionReceiptTargetState,
                 message: error.to_string(),
@@ -1445,7 +1445,7 @@ pub async fn publish_sandbox_states(
         conn,
         node_id,
         states,
-        pplx_space_common_core::types::AbandonedRestoreRetirement::Disabled,
+        pplx_space_sandbox_model::AbandonedRestoreRetirement::Disabled,
     )
     .await
 }
@@ -1462,7 +1462,7 @@ pub async fn publish_sandbox_states_with_retirement(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     states: &[PublishedSandboxState],
-    retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
+    retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
 ) -> Result<SandboxPublicationOutcome, Status> {
     let mut states_by_id = BTreeMap::new();
     for state in states {
@@ -3426,7 +3426,7 @@ async fn apply_activation_receipts(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     rows: &[PublishedSandboxRow],
-    retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
+    retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
 ) -> Result<Vec<PostCommitSandboxEvent>, Status> {
     // These statements require an exact receipt kind. Empty receipt batches
     // cannot release or lock an execution, so ordinary reports need neither query.

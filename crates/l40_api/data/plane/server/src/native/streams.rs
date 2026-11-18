@@ -2,8 +2,8 @@
 //! WebSocket and SSE paths share.
 
 use super::*;
-use pplx_space_common_core::types::SandboxLifecycle;
 use pplx_space_public_api::SandboxLifecycleState;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 /// What the attach that may start a process can do with its input.
 #[derive(Clone, Copy, PartialEq, Eq)]

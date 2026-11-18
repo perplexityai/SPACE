@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
+use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CreateBtrfsSnapshotRequest, CreateBtrfsSnapshotResponse, DeleteBtrfsSnapshotRequest,
@@ -12,6 +12,7 @@ use pplx_space_node_mgr_client::proto::{
     ResolveExecutionEnvironmentResponse, RestoreInstanceSnapshotRequest,
     RestoreInstanceSnapshotResponse,
 };
+use pplx_space_sandbox_model::SandboxId;
 use tonic::Status;
 
 use super::super::node_effects::tests::{
@@ -1107,7 +1108,7 @@ async fn an_activated_upgrade_never_starts_its_sandbox_again() {
                     // the sandbox since the claim.
                     crate::db::RuntimeUpgradeActivationClaim::Start {
                         from_execution: Some(
-                            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+                            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
                         ),
                     },
                 )

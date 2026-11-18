@@ -16,10 +16,11 @@ use super::service_tests::{insert_test_sandbox, runtime_fields};
 use super::*;
 use crate::node_manager_transport::fake::{FakeNodeManager, StalledNodeManager};
 use crate::service::activation_support::internal_request;
-use pplx_space_common_core::types::{ExecutionGeneration, LocalArtifactId};
+use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_node_mgr_client::proto::{
     CleanupSandboxRequest, CleanupSandboxResponse, StopProcessRequest, StopProcessResponse,
 };
+use pplx_space_sandbox_model::ExecutionGeneration;
 
 /// A test service whose node-manager clients all come from `node_manager`.
 pub(crate) fn service_with_node_manager(

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures_util::{StreamExt, stream};
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use serde::Serialize;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;

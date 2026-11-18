@@ -88,7 +88,7 @@ impl SandboxManagerService {
 pub(super) async fn wait_service(
     connector: &crate::node_manager_transport::NodeManagerConnector,
     id: &str,
-    execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+    execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
     port: std::num::NonZeroU16,
     budget: Duration,
 ) -> Result<(), Status> {

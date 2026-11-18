@@ -1,6 +1,6 @@
 use super::*;
 use pplx_space_accounts::{OrgId, UserId};
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 /// `GET /admin/api/v1/debug/sandbox/{id}` takes the lock wait as a retryable
 /// 503 and never takes the write conflict.

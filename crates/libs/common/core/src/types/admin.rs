@@ -617,10 +617,10 @@ impl DrainRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ForceUploadLocalSnapshotsResponse {
     pub node_id: pplx_space_accounts::NodeId,
-    pub reuploaded: Vec<crate::types::SandboxId>,
+    pub reuploaded: Vec<pplx_space_sandbox_model::SandboxId>,
     pub failed: Vec<ForceUploadFailure>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deferred: Vec<crate::types::SandboxId>,
+    pub deferred: Vec<pplx_space_sandbox_model::SandboxId>,
     /// `true` when the server-side enumeration cap on the pinned-list
     /// query was hit and additional pinned sandboxes exist beyond
     /// what's listed in `reuploaded` + `failed` + `deferred`. Lets
@@ -635,7 +635,7 @@ pub struct ForceUploadLocalSnapshotsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForceUploadFailure {
-    pub sandbox_id: crate::types::SandboxId,
+    pub sandbox_id: pplx_space_sandbox_model::SandboxId,
     pub error: String,
 }
 

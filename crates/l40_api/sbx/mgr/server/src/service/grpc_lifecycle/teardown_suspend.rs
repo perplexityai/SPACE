@@ -82,7 +82,7 @@ pub(in crate::service) fn teardown_keyed_upload_use(
 }
 
 fn teardown_suspend_event_details(
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
     trigger: SandboxEventTrigger,
 ) -> SandboxEventDetails {
     SandboxEventDetails::default()
@@ -224,7 +224,7 @@ impl SandboxManagerService {
         // Runtime attachment establishes this node-local lease from the route
         // identity already passed down with the execution.
         let execution_generation =
-            pplx_space_common_core::types::ExecutionGeneration::new(req.execution_generation)
+            pplx_space_sandbox_model::ExecutionGeneration::new(req.execution_generation)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let span = tracing::Span::current();
         span.record("sandbox_id", tracing::field::display(sandbox_id));
@@ -484,7 +484,7 @@ impl SandboxManagerService {
     pub(super) fn close_terminal_teardown_suspend(
         &self,
         sandbox_id: &str,
-        generation: pplx_space_common_core::types::ExecutionGeneration,
+        generation: pplx_space_sandbox_model::ExecutionGeneration,
     ) -> Result<TerminalTeardownSuspend, Status> {
         let db = self.db_conn()?;
         let state = crate::db::read::sandbox(&db, sandbox_id)
@@ -624,7 +624,7 @@ impl SandboxManagerService {
     pub(in crate::service) fn spawn_teardown_suspend_driver(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
     ) -> TeardownSuspendDriverAdmission {
         let due = self.db_conn().and_then(|db| {
@@ -704,7 +704,7 @@ impl SandboxManagerService {
     pub(super) async fn drive_teardown_suspend(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
     ) -> Result<(), Status> {
         self.drive_teardown_suspend_in(
@@ -721,7 +721,7 @@ impl SandboxManagerService {
     pub(super) async fn drive_teardown_suspend_in(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
         cache_dir: &std::path::Path,
     ) -> Result<(), Status> {
@@ -750,7 +750,7 @@ impl SandboxManagerService {
     /// idempotent registration.
     async fn teardown_drive_refusal_verdict(
         &self,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         error: &Status,
     ) -> crate::snapshot_upload_jobs::RegistrationProbe {
         use crate::snapshot_upload_jobs::RegistrationProbe;
@@ -776,7 +776,7 @@ impl SandboxManagerService {
     pub(super) async fn settle_teardown_suspend_drive(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         result: Result<(), Status>,
     ) -> Result<(), Status> {
         let Err(error) = &result else {
@@ -845,7 +845,7 @@ impl SandboxManagerService {
     pub(super) async fn settle_teardown_suspend_driver_failure(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         result: Result<(), Status>,
         backup_lookup: Option<&OrgSnapshotConfigResolution>,
         release: Option<LocalArtifactId>,
@@ -917,7 +917,7 @@ impl SandboxManagerService {
     pub(super) fn record_teardown_suspend_driver_failure(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         error: &Status,
         backup_lookup: Option<&OrgSnapshotConfigResolution>,
     ) -> Result<(), Status> {
@@ -970,7 +970,7 @@ impl SandboxManagerService {
     async fn drive_teardown_suspend_inner(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
         cache_dir: &std::path::Path,
     ) -> Result<(), Status> {
@@ -1162,7 +1162,7 @@ impl SandboxManagerService {
     fn ensure_teardown_suspend_owner(
         &self,
         sandbox_id: &str,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
     ) -> Result<(), Status> {
         let status = {
             let db = self
@@ -1203,7 +1203,7 @@ impl SandboxManagerService {
     fn complete_teardown_suspend_operation(
         &self,
         sandbox_id: &str,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
     ) -> Result<(), Status> {
         let completed = {

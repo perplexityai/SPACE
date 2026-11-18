@@ -5,13 +5,13 @@
 //! keys, the `state_reconciliation_reason` Postgres enum (`ReconcileReason`),
 //! the facet and element references a reconcile trigger names, the facet and
 //! claim generation counters, and network-policy targets. It depends only on
-//! common-core's sandbox identifier, template-model's template name, sqlx and
-//! thiserror, so a crate that needs only this vocabulary can depend on it
+//! sandbox-model's sandbox identifier, template-model's template name, sqlx
+//! and thiserror, so a crate that needs only this vocabulary can depend on it
 //! without a service runtime.
 
 use std::{fmt, str::FromStr};
 
-use pplx_space_common_core::types::{SandboxId, SandboxIdParseError};
+use pplx_space_sandbox_model::{SandboxId, SandboxIdParseError};
 use pplx_space_template_model::{TemplateName, TemplateParseError};
 use thiserror::Error;
 

@@ -6,8 +6,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_host_layout::paths;
+use pplx_space_sandbox_model::SandboxId;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};

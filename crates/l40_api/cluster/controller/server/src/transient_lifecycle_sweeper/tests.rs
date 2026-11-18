@@ -104,9 +104,9 @@ use std::time::Duration;
 use pplx_space_api::controllers::substrate::{
     CommandReadyProbe, ObservedPodIdentity, PodIdentityFence,
 };
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_durations::PositiveDuration;
 use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use uuid::Uuid;
 
 use pplx_space_api::controllers::substrate::TeardownProgress;
@@ -2871,10 +2871,11 @@ mod postgres_backed {
     };
     use super::*;
     use pplx_space_accounts::NodeId;
-    use pplx_space_common_core::types::SandboxLifecycle;
-    use pplx_space_common_core::types::{SandboxId, SnapshotId};
+    use pplx_space_common_core::types::SnapshotId;
     use pplx_space_db_test_fixtures::try_pg_test_db;
     use pplx_space_node_model::SubstrateKind;
+    use pplx_space_sandbox_model::SandboxId;
+    use pplx_space_sandbox_model::SandboxLifecycle;
     use pplx_space_sandbox_store::sweeper::{
         AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL, REAP_COMMAND_READY_PENDING_SQL,
         REPAIR_FAILED_ACTIVE_EXECUTION_SQL, converge_restoring_query, fail_candidate_query,

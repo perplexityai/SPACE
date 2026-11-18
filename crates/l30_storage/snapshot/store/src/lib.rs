@@ -6,15 +6,16 @@ use jiff::Timestamp;
 use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactKindParseError, ArtifactOrigin, ArtifactOriginParseError,
-    ExactStorageUri, ExecutionGeneration, ExecutionGenerationParseError, LocalArtifactId,
-    SandboxId, SnapshotContentHash, SnapshotId, SnapshotKind, SnapshotKindParseError, SnapshotName,
-    SnapshotParseError, SnapshotState, SnapshotStateParseError,
+    ExactStorageUri, LocalArtifactId, SnapshotContentHash, SnapshotId, SnapshotKind,
+    SnapshotKindParseError, SnapshotName, SnapshotParseError, SnapshotState,
+    SnapshotStateParseError,
 };
 use pplx_space_common_core::types::{
     SnapshotArtifact as SnapshotArtifactFile, SnapshotArtifactParseError,
 };
 use pplx_space_content_digest::{Digest, DigestParseError};
 use pplx_space_execution_spec::SnapshotExecutionMetadata;
+use pplx_space_sandbox_model::{ExecutionGeneration, ExecutionGenerationParseError, SandboxId};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateName, TemplateParseError};
 use sqlx::FromRow;

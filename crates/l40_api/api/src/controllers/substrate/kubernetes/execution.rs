@@ -9,11 +9,11 @@ use crate::controllers::substrate::{
     ActivationOptions, CapPolicy, ChargeState, KeyResolution, RecoveryCharge,
 };
 use crate::metrics::sandbox::api::{RestoreClaimLap, WakeCoalesceOutcome};
-use pplx_space_common_core::types::{
-    SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
-};
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
+};
+use pplx_space_sandbox_model::{
+    SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
 };
 use pplx_space_sandbox_pod::EvacuationPlacement;
 use pplx_space_work_coalescer::{
@@ -1200,7 +1200,7 @@ impl KubernetesSubstrate {
         }
 
         let (wait_budget, phase_deadline) = ready_wait_bounds(timeout);
-        let requested_attempt_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+        let requested_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             SandboxTransitionTargetState::Started,
@@ -2058,7 +2058,7 @@ impl KubernetesSubstrate {
         // `CREATE_READY_BUDGET`), so the caller's effective readiness wait
         // is never shortened by the margin.
         let (wait_budget, phase_deadline) = ready_wait_bounds(timeout);
-        let requested_attempt_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+        let requested_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             restore_transition_target_state(target_state)?,

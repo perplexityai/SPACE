@@ -22,10 +22,6 @@ use pplx_space_auto_lifecycle::{
     AutoLifecycleActivitySource, AutoLifecycleIdleAction, AutoLifecyclePolicy,
     AutoLifecycleRuntimeState, AutoLifecycleTransition,
 };
-use pplx_space_common_core::types::{
-    ExecutionGeneration, IncompleteSandboxRouteIdentityError, SandboxCleanupEpisodeId, SandboxId,
-    SandboxQuarantineReasonCode, SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
-};
 use pplx_space_durations::parse_grpc_timeout;
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_guest_process::GuestUserName;
@@ -41,6 +37,10 @@ use pplx_space_node_mgr_client::proto::{
     ResumeSandboxRequest, StopProcessRequest, SyncGuestRequest,
 };
 use pplx_space_node_model::{NodeManagedBy, NodeRole};
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, IncompleteSandboxRouteIdentityError, SandboxCleanupEpisodeId, SandboxId,
+    SandboxQuarantineReasonCode, SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
+};
 use pplx_space_spaced_guest_protocol::{validate_duration, validate_optional_reason};
 use pplx_space_spaced_host_client::proto as host_proto;
 use pplx_space_spaced_protocol::proto::host_control::host_control_server::HostControl;

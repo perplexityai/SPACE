@@ -5,7 +5,8 @@
 use super::*;
 use crate::db::fixture::insert_test_sandbox;
 use crate::db::{ActivationKind, ActivationRouteAdmission};
-use pplx_space_common_core::types::{LocalArtifactId, SandboxCleanupEpisodeId, SandboxId};
+use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_sandbox_model::{SandboxCleanupEpisodeId, SandboxId};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -305,7 +306,7 @@ impl RuntimeUpgradeEffects for Arc<Fake> {
     async fn stop(
         &self,
         sandbox_id: &str,
-        execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+        execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) -> Result<(), Status> {
         self.called("stop");
         // Only ever the verified boot's own execution.
@@ -1132,7 +1133,7 @@ async fn an_upgrade_never_stops_an_execution_it_did_not_boot() {
                 "UPDATE sandboxes SET state = 'started', node_execution_id = ?2 WHERE id = ?1",
                 crate::db::fixture::params![
                     h.sandbox_id,
-                    pplx_space_common_core::types::SandboxActivationAttemptId::new().to_string()
+                    pplx_space_sandbox_model::SandboxActivationAttemptId::new().to_string()
                 ],
             )
             .unwrap();
@@ -1289,7 +1290,7 @@ async fn a_failed_boot_auto_lifecycle_then_stops_still_rolls_back() {
 
 #[test]
 fn a_refused_stop_is_a_no_op_only_once_the_boot_is_at_rest_or_replaced() {
-    use pplx_space_common_core::types::SandboxActivationAttemptId;
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
     let boot = SandboxActivationAttemptId::new();
     let refusal = Status::aborted("cleanup lifecycle changed from started to pausing");
     let other = Some(SandboxActivationAttemptId::new());

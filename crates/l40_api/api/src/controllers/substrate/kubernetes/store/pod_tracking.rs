@@ -409,7 +409,7 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) -> Result<bool, SubstrateError> {
         self.finish_execution_and_clear_pod_tracking_if_generation(
             sandbox_id,
@@ -477,7 +477,7 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
         state: &str,
         recovery_operation: StartedSuspendRecoveryOperation,
         cause: PodTrackingCleanupCause,

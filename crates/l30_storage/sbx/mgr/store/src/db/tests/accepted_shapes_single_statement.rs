@@ -12,8 +12,10 @@
 
 use crate::db::Connection;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, SandboxId, SandboxQuarantineNextAction,
-    SandboxQuarantineReasonCode, SandboxQuarantineSource, TransferScopeId,
+    ArtifactKind, ArtifactOrigin, LocalArtifactId, TransferScopeId,
+};
+use pplx_space_sandbox_model::{
+    SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
 
 use super::state_write_fixtures::{

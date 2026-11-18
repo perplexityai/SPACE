@@ -1,9 +1,8 @@
 use super::super::{CertificateContext, CertificateProvider};
 use super::*;
 use crate::state::{GatewayNetworkState, NetworkStateReason, PulledNetworkPolicy};
-use pplx_space_common_core::{
-    types::ExecutionGeneration, types::RouteGeneration, types::SandboxId,
-    types::SpaceApiRouteIdentity,
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxId, SpaceApiRouteIdentity,
 };
 
 #[test]

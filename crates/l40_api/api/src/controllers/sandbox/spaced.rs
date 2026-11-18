@@ -4,14 +4,14 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Authority, ed25519::SpaceApiRouteEd25519Token,
     ed25519::insert_space_api_route_ed25519_token,
 };
-use pplx_space_common_core::types::{
-    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
-    SandboxRouteIdentity,
-};
 use pplx_space_guest_process::{GuestUserName, ProcessId};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_api_client::NodeApiOperationBudget;
 use pplx_space_node_model::{NodeManagedBy, SubstrateKind};
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
+    SandboxRouteIdentity,
+};
 use std::future::Future;
 use tonic::Code;
 

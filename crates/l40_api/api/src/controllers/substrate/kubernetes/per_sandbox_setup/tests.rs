@@ -12,7 +12,7 @@ use crate::controllers::substrate::{
     ActorRef, CreateBootMode, CreateExecutionRequest, PooledExecutionClaim,
     PooledExecutionClaimRequest, SandboxResources, TemplateRef,
 };
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 fn actor() -> ActorRef {
     ActorRef::new(

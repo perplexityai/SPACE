@@ -3,11 +3,11 @@
 
 use std::sync::Arc;
 
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_guest_process::{GuestUserName, IdempotencyKey};
 use pplx_space_public_api::{
     FileEventKind, FileInfo, FileModifiedEntry, FileModifiedResponse, FileType,
 };
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_protocol::operations as spaced_ops;
 use pplx_space_sbx_mgr_protocol::proto::{
     SpacedDisableFileChangesRequest, SpacedEnableFileChangesRequest, SpacedFileEventKind,

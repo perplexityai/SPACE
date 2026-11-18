@@ -4,16 +4,16 @@ use pplx_space_accounts::NodeId;
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::types::{
-    ExecutionGeneration, LocalArtifactId, QuarantineRecoveryPlanRejectionCause,
-    SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxLifecycle,
-    SandboxQuarantineHistoryAction, SandboxQuarantineReasonCode, SandboxQuarantineRecoveryPolicy,
-    SandboxQuarantineSource, SandboxTransitionReceiptKind, SandboxTransitionTargetState,
-    SnapshotId,
-};
+use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_metrics::publication::{
     StatePublicationComponent, StatePublicationDisposition, StatePublicationField,
+};
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, QuarantineRecoveryPlanRejectionCause, SandboxActivationAttemptId,
+    SandboxCleanupEpisodeId, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineRecoveryPolicy, SandboxQuarantineSource,
+    SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
 use pplx_space_sandbox_portability::{
     current_suspend_origin_marker_snapshot_ready, exact_marker_snapshot_backup_current,
@@ -494,7 +494,7 @@ pub(super) async fn apply_activation_rollback_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     candidates: Vec<ActivationRollbackCandidate>,
-    retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
+    retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
 ) -> Result<Vec<ActivationRollbackCandidate>, Status> {
     let mut applied = Vec::with_capacity(candidates.len());
     for candidate in candidates {

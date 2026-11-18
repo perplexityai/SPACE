@@ -4,7 +4,6 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use pplx_space_accounts::SandboxOwner;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_net_common::proto::{
     NetworkPolicyApplyDecision, NetworkPolicySource, NetworkPolicyV1 as ProtoNetworkPolicyV1,
 };
@@ -25,6 +24,7 @@ use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_rpc_contracts::port_exposure_signals::{
     EXPOSE_TERMINAL_REASON_METADATA_KEY, EXPOSE_TERMINAL_REASON_STALE_POD_NETNS,
 };
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::{
     AcknowledgeAutoLifecycleDeleteReceiptsRequest, DisableSnapshotsRequest, EnableSnapshotsRequest,
     EvictClusterDeletedSandboxRequest, GetDiskUsageRequest as SbxGetDiskUsageRequest,
@@ -97,7 +97,7 @@ enum SandboxInventoryEnrichmentError {
     InvalidSandboxId {
         value: String,
         #[source]
-        source: pplx_space_common_core::types::SandboxIdParseError,
+        source: pplx_space_sandbox_model::SandboxIdParseError,
     },
 
     #[error("get sandbox network policies: {0}")]

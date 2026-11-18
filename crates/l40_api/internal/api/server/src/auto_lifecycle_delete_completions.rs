@@ -11,14 +11,14 @@ use pplx_space_auto_lifecycle_receipt::{
     AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT, AutoLifecyclePolicyFingerprint,
     AutoLifecyclePolicyFingerprintParseError,
 };
-use pplx_space_common_core::types::{
-    AutoLifecycleDeleteReceiptId, ExecutionGeneration, ExecutionGenerationParseError,
-    SandboxActivationAttemptId, SandboxId, SandboxIdParseError, SandboxLifecycle,
-    SandboxQuarantineReasonCode, SandboxQuarantineSource,
-};
 use pplx_space_postgres_pool::contention::{self, is_lock_not_available};
 use pplx_space_sandbox_metrics::publication::{
     AutoLifecycleDeleteCompletionDisposition, AutoLifecycleDeleteCompletionReason,
+};
+use pplx_space_sandbox_model::{
+    AutoLifecycleDeleteReceiptId, ExecutionGeneration, ExecutionGenerationParseError,
+    SandboxActivationAttemptId, SandboxId, SandboxIdParseError, SandboxLifecycle,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_sandbox_store::delete::delete_with_dependents;

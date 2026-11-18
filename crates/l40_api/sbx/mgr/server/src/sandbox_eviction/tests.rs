@@ -1221,7 +1221,7 @@ async fn eviction_proofs_use_known_identities_and_fail_closed() {
         pplx_space_node_api_client::cluster::connect(endpoint, "synthetic-proof-token")
             .await
             .unwrap();
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
 
     for marker in [true, false] {
         assert_eq!(
@@ -1551,7 +1551,7 @@ async fn legacy_reupload_refusals_classify_as_state_skips_or_retryable_failures(
         return;
     }
     use crate::state::{SandboxState, SandboxStatus};
-    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_sandbox_model::SandboxId;
 
     let service = SandboxManagerService::for_test(open_test_db());
     let unknown = service
@@ -1618,7 +1618,7 @@ async fn assert_missing_wiring_reupload_is_retried() {
     let service = SandboxManagerService::for_test(open_test_db());
     let refused = service
         .reupload_legacy_sandbox_for_eviction(
-            &pplx_space_common_core::types::SandboxId::new().to_string(),
+            &pplx_space_sandbox_model::SandboxId::new().to_string(),
         )
         .await
         .unwrap_err();

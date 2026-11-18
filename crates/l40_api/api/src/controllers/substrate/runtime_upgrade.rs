@@ -36,7 +36,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
+use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_execution_spec::{
     EnvironmentReference, INITIAL_FIRECRACKER_RUNTIME_VERSION,
     INITIAL_FIRECRACKER_STATE_FORMAT_VERSION,
@@ -44,6 +44,7 @@ use pplx_space_execution_spec::{
 use pplx_space_runtime_environment_policy_store::{
     RuntimeEnvironmentPolicy, RuntimeEnvironmentState,
 };
+use pplx_space_sandbox_model::SandboxId;
 
 #[cfg(test)]
 mod tests;

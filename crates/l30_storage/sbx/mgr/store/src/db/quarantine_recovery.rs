@@ -4,10 +4,10 @@ use super::*;
 
 /// Which recovery an eligible episode's evidence admits.
 ///
-/// Node-local, so it lives here rather than in common-core beside the other
+/// Node-local, so it lives here rather than in pplx-space-sandbox-model beside the other
 /// quarantine vocabularies: it is never persisted, never on the wire, has one
 /// reader, and carries a `LocalArtifactId` that only this node's SQLite knows.
-/// `QuarantineRecoveryNoProgressReason` is re-exported from common-core for the
+/// `QuarantineRecoveryNoProgressReason` is re-exported from pplx-space-sandbox-model for the
 /// opposite reason — its rendered form is written into
 /// `sandbox_quarantine_state.last_error`.
 ///

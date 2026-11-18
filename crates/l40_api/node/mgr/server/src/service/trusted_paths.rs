@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use nix::fcntl::{OFlag, open, openat};
 use nix::sys::stat::{Mode, fchmod};
 use nix::unistd::{Gid, Uid, fchown};
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use tonic::Status;
 
 const DIRECTORY: OFlag = OFlag::O_RDONLY

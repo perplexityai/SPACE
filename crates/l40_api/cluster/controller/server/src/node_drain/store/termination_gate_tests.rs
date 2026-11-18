@@ -16,7 +16,7 @@
 //! sharing is real rather than two agreeing restatements.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_sandbox_residency::CENSUS_PLACEMENT_SETTLE;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;

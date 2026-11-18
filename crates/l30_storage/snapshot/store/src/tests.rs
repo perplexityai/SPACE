@@ -7,7 +7,7 @@ use super::{
 use jiff::Timestamp;
 use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExactStorageUri, ExecutionGeneration, LocalArtifactId, SandboxId,
+    ArtifactKind, ArtifactOrigin, ExactStorageUri, LocalArtifactId,
     SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId, SnapshotKind,
     SnapshotName, SnapshotState,
 };
@@ -17,6 +17,7 @@ use pplx_space_db_test_fixtures::{
     SEED_ORG_ID as SEEDED_ORG_ID, SEED_USER_ID as SEEDED_USER_ID, try_pg_test_db,
 };
 use pplx_space_execution_spec::{ExecutionMetadata, HostCpu, SnapshotExecutionMetadata};
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateArtifactDigest, TemplateName};
 use pplx_space_test_env::TestResult;

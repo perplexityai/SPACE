@@ -24,6 +24,7 @@ kubernetes = [
     "dep:pplx-space-common-core",
     "dep:pplx-space-content-digest",
     "dep:pplx-space-execution-spec",
+    "dep:pplx-space-sandbox-model",
     "dep:pplx-space-sql-locator",
     "dep:pplx-space-template-model",
     "dep:serde",
@@ -36,6 +37,7 @@ kubernetes = [
 [dependencies]
 pplx-space-byte-size = { workspace = true, features = ["serde"], optional = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"], optional = true }
+pplx-space-sandbox-model = { workspace = true, features = ["sqlx"], optional = true }
 pplx-space-content-digest = { workspace = true, features = ["serde"], optional = true }
 pplx-space-execution-spec = { workspace = true, features = ["serde"], optional = true }
 pplx-space-sql-locator = { workspace = true, optional = true }

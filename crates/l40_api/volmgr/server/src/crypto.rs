@@ -18,7 +18,7 @@ pub use pplx_space_file_io::fs::{
 };
 
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use crate::artifact::ArtifactEntryRole;
 

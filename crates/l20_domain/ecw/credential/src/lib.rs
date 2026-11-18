@@ -11,7 +11,7 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use pplx_space_common_core::types::{EcwCredentialEpoch, SandboxId};
+use pplx_space_sandbox_model::{EcwCredentialEpoch, SandboxId};
 
 type HmacSha256 = Hmac<Sha256>;
 

@@ -5,11 +5,12 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use pplx_space_common_core::types::{LocalArtifactId, SandboxActivationAttemptId};
+use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
 use pplx_space_node_mgr_client::proto::{
     CreateBtrfsSnapshotRequest, DeleteBtrfsSnapshotRequest, RestoreInstanceSnapshotRequest,
 };
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
 use tonic::metadata::MetadataMap;
 use tonic::{Extensions, Request, Status};
 

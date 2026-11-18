@@ -1,5 +1,5 @@
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_public_api::PublicSandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 

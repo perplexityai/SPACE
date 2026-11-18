@@ -25,7 +25,7 @@ async fn retirement_failure_does_not_skip_locked_runtime_cleanup() {
                 ..Default::default()
             };
             let sandbox_id = SandboxId::new();
-            let execution_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+            let execution_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
             service
                 .execution_store
                 .write(sandbox_id, execution_id)
@@ -36,9 +36,8 @@ async fn retirement_failure_does_not_skip_locked_runtime_cleanup() {
                 .stop_sandbox_runtime_with(
                     StopSandboxRuntimeRequest {
                         sandbox_id: sandbox_id.to_string(),
-                        execution_id:
-                            pplx_space_common_core::types::SandboxActivationAttemptId::new()
-                                .to_string(),
+                        execution_id: pplx_space_sandbox_model::SandboxActivationAttemptId::new()
+                            .to_string(),
                         ..Default::default()
                     },
                     None,
@@ -135,7 +134,7 @@ async fn retirement_failure_does_not_skip_locked_runtime_cleanup() {
 
 #[tokio::test]
 async fn execution_checks_survive_supervisor_restart_and_reject_superseded_work() {
-    use pplx_space_common_core::types::SandboxActivationAttemptId;
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
     let temp = tempfile::tempdir().unwrap();
     let store = crate::execution_store::ExecutionStore::at(temp.path().join("executions"));
     let sandbox = SandboxId::new();
@@ -177,8 +176,8 @@ async fn execution_checks_survive_supervisor_restart_and_reject_superseded_work(
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn execution_binding_cannot_resurrect_work_from_an_exited_daemon() {
-    use pplx_space_common_core::types::SandboxActivationAttemptId;
     use pplx_space_node_runtime_core::proto::{BindExecutionRequest, RetireExecutionRequest};
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
     let temp = tempfile::tempdir().unwrap();
     let service = RuntimeSupervisorService {
         execution_store: crate::execution_store::ExecutionStore::at(temp.path().join("executions")),
@@ -602,7 +601,7 @@ async fn cpu_updates_require_execution_launch_evidence() {
         ..Default::default()
     };
     let sandbox = SandboxId::new();
-    let execution = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let execution = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     service.execution_store.write(sandbox, execution).unwrap();
     let request = |cpu| UpdateCgroupRequest {
         sandbox_id: sandbox.to_string(),
@@ -657,8 +656,7 @@ async fn cpu_updates_require_execution_launch_evidence() {
         );
     }
     let mut stale = request(Some(1));
-    stale.execution_id =
-        pplx_space_common_core::types::SandboxActivationAttemptId::new().to_string();
+    stale.execution_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new().to_string();
     assert_eq!(
         service
             .update_cgroup_owned(stale, None)
@@ -694,12 +692,12 @@ async fn cpu_updates_require_execution_launch_evidence() {
 
 #[tokio::test]
 async fn authentication_failure_preserves_status_and_existing_cpu_budget() {
-    use pplx_space_common_core::types::SandboxActivationAttemptId;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::VcpuCount;
     use pplx_space_node_runtime_core::{
         artifact_store::managed_release_directory, catalog::CompiledEnvironment,
     };
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
     let temp = tempfile::tempdir().unwrap();
     let service = RuntimeSupervisorService {
         execution_store: crate::execution_store::ExecutionStore::at(temp.path().join("executions")),
@@ -759,7 +757,7 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
         ..Default::default()
     };
     let sandbox = SandboxId::new();
-    let execution = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let execution = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     service.execution_store.write(sandbox, execution).unwrap();
     enum Invalid {
         IdentityMismatch,
@@ -856,7 +854,7 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
 
 #[tokio::test]
 async fn resident_execution_adoption_does_not_require_current_catalog_or_sources() {
-    use pplx_space_common_core::types::SandboxActivationAttemptId;
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
     for resident in [false, true] {
         for current in [false, true] {
             let temp = tempfile::tempdir().unwrap();

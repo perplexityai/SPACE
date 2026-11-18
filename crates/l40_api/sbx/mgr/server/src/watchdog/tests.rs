@@ -1,12 +1,12 @@
 use super::*;
 use pplx_space_accounts::NodeId;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::{
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::{
     ExecutionGeneration, RouteGeneration, SandboxId, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRuntimeLabel,
     SpaceApiRouteIdentity,
 };
-use pplx_space_k8s_ids::PodUid;
 
 #[tokio::test]
 async fn gateway_metric_registry_forgets_retired_builds() {

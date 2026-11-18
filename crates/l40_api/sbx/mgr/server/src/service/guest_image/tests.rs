@@ -1,10 +1,10 @@
 use super::*;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use pplx_space_accounts::SandboxOwner;
-use pplx_space_common_core::types::SandboxRuntimeLabel;
 use pplx_space_execution_spec::guest_image::{GuestDiskLayout, GuestNetwork, GuestReadiness};
 use pplx_space_node_mgr_client::proto::{ProbeGuestServiceRequest, ProbeGuestServiceResponse};
 use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::SandboxRuntimeLabel;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn image() -> GuestImageContract {
@@ -130,7 +130,7 @@ async fn service_readiness_retries_false_but_stops_at_execution_refusal_or_deadl
     ] {
         let calls = Arc::new(AtomicUsize::new(0));
         let id = SandboxId::new().to_string();
-        let execution = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+        let execution = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
         let node = FakeNodeManager::default()
             .unary("ProbeGuestService", {
                 let calls = Arc::clone(&calls);
@@ -177,7 +177,7 @@ async fn shutdown_inspection_requires_matching_execution_and_positive_process_ev
     use pplx_space_node_mgr_client::proto::{InspectSandboxRequest, InspectSandboxResponse};
     let id = SandboxId::new().to_string();
     let fence = ExecutionFence::new(
-        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
         None,
     );
     for case in 0..6 {
@@ -196,7 +196,7 @@ async fn shutdown_inspection_requires_matching_execution_and_positive_process_ev
             4 => {
                 response.execution_fence = Some(
                     ExecutionFence::new(
-                        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+                        pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
                         None,
                     )
                     .into(),
@@ -257,7 +257,7 @@ async fn shutdown_wait_finishes_on_exit_but_not_on_missing_process_evidence() {
     };
     let id = SandboxId::new().to_string();
     let fence = ExecutionFence::new(
-        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
         None,
     );
     for (pid, forced, expected) in [

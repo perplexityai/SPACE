@@ -15,6 +15,7 @@
 //!
 //! ```rust
 //! # use pplx_space_common_core::types::*;
+//! # use pplx_space_sandbox_model::*;
 //! let provider = KekProvider::parse("intermediate-key-broker").unwrap();
 //! assert_eq!(provider, KekProvider::IntermediateKeyBroker);
 //! assert_eq!(provider.as_str(), "external-branching");
@@ -61,6 +62,7 @@ const LEGACY_INTERMEDIATE_KEY_BROKER_PROVIDER: &str = "external-branching";
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_sandbox_model::*;
 /// assert_eq!(KekProvider::IntermediateKeyBroker.as_str(), "external-branching");
 /// assert_eq!(KekProvider::parse("in-memory").unwrap(), KekProvider::InMemory);
 /// ```
@@ -100,6 +102,7 @@ impl KekProvider {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_sandbox_model::*;
     /// assert_eq!(KekProvider::IntermediateKeyBroker.as_str(), "external-branching");
     /// ```
     pub const fn as_str(self) -> &'static str {
@@ -116,6 +119,7 @@ impl KekProvider {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_sandbox_model::*;
     /// assert_eq!(
     ///     KekProvider::parse("intermediate-key-broker").unwrap(),
     ///     KekProvider::IntermediateKeyBroker
@@ -221,6 +225,7 @@ pub struct MasterKeyIdentifierParseError;
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_sandbox_model::*;
 /// let id = MasterKeyIdentifier::parse("alias/example-org-default").unwrap();
 /// assert_eq!(id.as_str(), "alias/example-org-default");
 /// ```
@@ -295,7 +300,7 @@ const VOLUME_WRAP_AAD_PREFIX: &[u8] = b"space-rootfs-vol/v1";
 /// source of truth for that AAD across services; do not re-derive it locally.
 pub fn volume_wrap_aad(
     org_id: pplx_space_accounts::OrgId,
-    sandbox_id: &super::SandboxId,
+    sandbox_id: &pplx_space_sandbox_model::SandboxId,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(VOLUME_WRAP_AAD_PREFIX.len() + 1 + 16 + 16);
     out.extend_from_slice(VOLUME_WRAP_AAD_PREFIX);

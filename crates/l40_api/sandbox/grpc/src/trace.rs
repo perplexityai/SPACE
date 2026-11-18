@@ -1,7 +1,7 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{ExecutionGeneration, RouteGeneration, SandboxId};
 use pplx_space_common_grpc::{ClientSpanFields, RecordClientSpan};
 use pplx_space_network_roles::GuestPort;
+use pplx_space_sandbox_model::{ExecutionGeneration, RouteGeneration, SandboxId};
 
 /// Parsed request/runtime identity for independently exported RPC spans.
 /// [`Self::mark`] attaches it to a call as an in-process request extension,

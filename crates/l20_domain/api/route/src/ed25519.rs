@@ -9,8 +9,8 @@ use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair, VerificationAlgorit
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use pplx_space_cluster_id::ClusterId;
-use pplx_space_common_core::types::SandboxRouteIdentity;
 use pplx_space_network_roles::GuestPort;
+use pplx_space_sandbox_model::SandboxRouteIdentity;
 use serde::{Deserialize, Serialize};
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 

@@ -42,6 +42,7 @@ kube = { workspace = true, default-features = false, features = ["aws-lc-rs", "c
 pplx-space-accounts = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-content-digest = { workspace = true }

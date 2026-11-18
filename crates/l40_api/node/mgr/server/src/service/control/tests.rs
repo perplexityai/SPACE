@@ -110,7 +110,7 @@ async fn update_cgroup_forwards_current_execution_with_clamped_memory() {
         })),
         ..Default::default()
     });
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
     let fence = bind_test_execution(&service, &sandbox_id);
     let request = |execution_fence| UpdateCgroupRequest {
         sandbox_id: sandbox_id.clone(),
@@ -154,7 +154,7 @@ async fn update_cgroup_reports_a_supervisor_refusal_with_its_code() {
 
     // The unit-test service's own supervisor refuses every RPC.
     let service = service_for_unit_tests().await;
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
     let fence = bind_test_execution(&service, &sandbox_id);
 
     let error = service

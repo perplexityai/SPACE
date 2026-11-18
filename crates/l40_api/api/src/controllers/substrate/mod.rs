@@ -46,7 +46,6 @@ use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_bearer_token::SpaceBearerToken;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, BackupAttemptId, BackupSource, LocalArtifactId,
-    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
 };
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
@@ -56,6 +55,9 @@ use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyProto;
 use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodePoolName, NodeRole};
 use pplx_space_rpc_auth::SpaceBearerInterceptor;
+use pplx_space_sandbox_model::{
+    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
+};
 use pplx_space_template_model::TemplateName;
 
 /// Convert a request override at the V1-only sandbox-manager boundary.
@@ -220,7 +222,7 @@ impl ActivationCompletion {
     }
 }
 
-pub use pplx_space_common_core::types::AbandonedRestoreRetirement;
+pub use pplx_space_sandbox_model::AbandonedRestoreRetirement;
 
 /// Whether SPACE records which client's activation created a sandbox's
 /// runtime: the `sandboxes.activating_client_id` record, the
@@ -706,7 +708,7 @@ pub enum SubstrateError {
         message: String,
         lease_remaining: Duration,
         same_target: bool,
-        owner_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        owner_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     },
     /// Cluster activation admission rejected a freshly-won restore claim.
     /// The claim has already been released; the caller should retry after

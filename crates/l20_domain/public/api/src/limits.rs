@@ -9,10 +9,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use pplx_space_common_core::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES;
 use pplx_space_guest_process::{
     MAX_ENV_ENTRIES, MAX_ENV_KEY_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES,
 };
+use pplx_space_sandbox_model::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES;
 
 use crate::{
     CreateSandboxRequest, PublicSandboxMetadata, PublicSandboxMetadataValue, SandboxResources,

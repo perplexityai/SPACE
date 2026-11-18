@@ -3,8 +3,8 @@ use crate::controllers::db_contention_error;
 use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Authority, ed25519::insert_space_api_route_ed25519_token,
 };
-use pplx_space_common_core::types::{MAX_SANDBOX_PORT_EXPOSURES, SandboxId};
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
+use pplx_space_sandbox_model::{MAX_SANDBOX_PORT_EXPOSURES, SandboxId};
 use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::ReconcileReason;
 

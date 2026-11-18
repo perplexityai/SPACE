@@ -68,6 +68,7 @@ pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-byte-size = { workspace = true, features = ["serde"] }
 pplx-space-cluster-id = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-node-model = { workspace = true }
 pplx-space-rpc-contracts = { workspace = true }
 pplx-space-template-runtime = { workspace = true }

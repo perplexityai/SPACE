@@ -23,7 +23,7 @@ async fn every_failed_stop_preserves_the_active_lease_and_reservation() {
         service.pool.set_all_slots_ready_for_test();
         let id = SandboxId::new();
         let execution_fence = pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             None,
         );
         // Staging can fail before Allocate publishes node authority. Cleanup
@@ -432,7 +432,7 @@ impl CleanupNode {
             service,
             sandbox_id: SandboxId::new(),
             fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-                pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+                pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
                 None,
             ),
             _supervisor_socket: supervisor_socket,
@@ -615,7 +615,7 @@ async fn cleanup_refusal_keeps_the_lease_and_execution(
         CleanupRefusal::SupersededExecution => {
             request.execution_fence = Some(
                 pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-                    pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+                    pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
                     None,
                 )
                 .into(),

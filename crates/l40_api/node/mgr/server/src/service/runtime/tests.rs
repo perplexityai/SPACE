@@ -5,8 +5,8 @@ use crate::runtime_supervisor_client::tests::{
 };
 use crate::service::tests::service_tests::{bind_test_execution, service_for_unit_tests};
 use crate::slot_pool::{NewLeaseMemoryReservation, SlotState};
-use pplx_space_common_core::types::SandboxActivationAttemptId;
 use pplx_space_node_mgr_client::execution_fence::ExecutionFence;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
 use std::sync::{Arc, Mutex};
 use tonic::Code;
 

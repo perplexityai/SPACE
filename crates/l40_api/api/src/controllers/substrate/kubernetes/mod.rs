@@ -24,7 +24,7 @@ use kube::{
     api::{DeleteParams, PostParams, WatchEvent, WatchParams},
     runtime::reflector::{ObjectRef, Store},
 };
-use pplx_space_common_core::types::{SandboxId, StorageUri};
+use pplx_space_common_core::types::StorageUri;
 use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
 use pplx_space_k8s_node_id::space_k8s_node_id;
 use pplx_space_node_api_client::{
@@ -33,6 +33,7 @@ use pplx_space_node_api_client::{
     proto::worker_api_internal_client::WorkerApiInternalClient,
 };
 use pplx_space_node_model::NodeRole as SpaceNodeRole;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_pod::{
     DEFAULT_SANDBOX_PROXY_PORT, ForkDiskRestorePodContext,
     MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES, NodeGroupPlacement, NodeSelectorLabelsParseError,

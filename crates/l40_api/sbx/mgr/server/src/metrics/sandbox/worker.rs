@@ -17,7 +17,7 @@
 use std::{fmt, str::FromStr, time::Instant};
 
 use pplx_space_auto_lifecycle::AutoLifecycleIdleAction;
-use pplx_space_common_core::types::{
+use pplx_space_sandbox_model::{
     ExecutionReleaseDetachReason, ExecutionReleaseIntent, QuarantineRecoveryNoProgressReason,
 };
 

@@ -9,8 +9,8 @@ use crate::metrics::sandbox::worker::{
     InventoryReconcileOperation, InventoryReconcileOutcome, InventoryReconcileReason,
     inventory_reconcile,
 };
-use pplx_space_common_core::types::SandboxQuarantineReasonCode;
 use pplx_space_node_mgr_client::execution_fence::ExecutionFence;
+use pplx_space_sandbox_model::SandboxQuarantineReasonCode;
 
 mod periodic;
 #[cfg(test)]
@@ -639,10 +639,10 @@ fn insert_orphaned_sandbox_row_in_transaction(
                         network_policy_authority: crate::db::PolicyAuthority::Cluster,
                         auto_lifecycle_authority: crate::db::PolicyAuthority::Cluster,
                     },
-                    pplx_space_common_core::types::SandboxQuarantineSource::SbxManager,
+                    pplx_space_sandbox_model::SandboxQuarantineSource::SbxManager,
                     reason_code,
                     &reason,
-                    pplx_space_common_core::types::SandboxQuarantineNextAction::RequiresOperatorAttention,
+                    pplx_space_sandbox_model::SandboxQuarantineNextAction::RequiresOperatorAttention,
                 )?;
                 Ok(CommittedOrphanRowMaterialization {
                     disposition:
@@ -1452,7 +1452,7 @@ pub(super) fn inventory_cleanup_guard_for_test(sandbox_id: &str) -> CleanupLockT
 #[cfg(test)]
 pub(super) fn inventory_execution_for_test(_: SandboxId) -> Result<Option<ExecutionFence>, Status> {
     Ok(Some(ExecutionFence::new(
-        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
         None,
     )))
 }

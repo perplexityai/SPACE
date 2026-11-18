@@ -151,7 +151,7 @@ struct RedriveClaimGuard {
     pod_name: String,
     generation: i64,
     restore_lease_token: Option<Uuid>,
-    activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
 }
 
 impl RedriveClaimGuard {
@@ -166,7 +166,7 @@ impl RedriveClaimGuard {
         sandbox_id: SandboxId,
         claim: &SandboxExecutionClaim,
         restore_lease_token: Option<Uuid>,
-        activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     ) -> Self {
         Self {
             handles: Some((store.clone(), k8s.clone())),

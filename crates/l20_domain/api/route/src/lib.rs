@@ -10,7 +10,7 @@ pub mod ed25519;
 use std::fmt;
 use std::str::FromStr;
 
-use pplx_space_common_core::types::{SandboxRouteIdentity, SpaceApiRouteIdentity};
+use pplx_space_sandbox_model::{SandboxRouteIdentity, SpaceApiRouteIdentity};
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Request, Status};
 

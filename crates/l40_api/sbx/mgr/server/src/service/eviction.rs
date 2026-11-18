@@ -4,7 +4,8 @@
 //! exact machinery the Delete RPC drives so eviction cannot diverge from
 //! normal deletion semantics.
 
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
+use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::time::Duration;
 use tonic::Status;
@@ -152,7 +153,7 @@ pub(crate) enum EvictionClaim {
     /// [`Self::TeardownSuspendPermanentlyFailed`], the runtime may still be
     /// resident, and the `DeleteRow` cleanup tears it down.
     TeardownExecutionRetired {
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         staged_artifact: LocalArtifactId,
     },
 }
@@ -401,7 +402,7 @@ impl SandboxManagerService {
     pub(super) async fn release_retired_teardown_execution(
         &self,
         sandbox_id: &str,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         staged_artifact: LocalArtifactId,
     ) -> Result<(), Status> {
         // Ask the cluster only for a release the claim could take: one whose

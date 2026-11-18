@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 use std::collections::BTreeMap;
 use std::time::Duration;

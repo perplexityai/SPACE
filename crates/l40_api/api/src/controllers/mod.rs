@@ -89,8 +89,8 @@ enum ControllerErrorKind {
 /// in the lifecycle state it was refused in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SandboxNotRunning {
-    pub(crate) sandbox_id: pplx_space_common_core::types::SandboxId,
-    pub(crate) lifecycle: pplx_space_common_core::types::SandboxLifecycle,
+    pub(crate) sandbox_id: pplx_space_sandbox_model::SandboxId,
+    pub(crate) lifecycle: pplx_space_sandbox_model::SandboxLifecycle,
 }
 
 /// Why a template the caller may use resolved to no release.

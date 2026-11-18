@@ -54,8 +54,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::metrics::sandbox::api::client_live_cap::{self, Check, Decision, Reason};
-use pplx_space_common_core::types::{ClientId, SandboxId};
+use pplx_space_common_core::types::ClientId;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG};
+use pplx_space_sandbox_model::SandboxId;
 
 use crate::controllers::substrate::{
     CountedIds, LiveSandboxCount, LiveSandboxCountUnknown, Substrate,

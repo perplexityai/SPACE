@@ -52,9 +52,9 @@ use tonic::{Request, Response, Status};
 use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, BackupAttemptId, ExactStorageUri, ExecutionGeneration,
-    LocalArtifactId, SandboxId, SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash,
-    SnapshotId, SnapshotKind, SnapshotName, SnapshotState,
+    ArtifactKind, ArtifactOrigin, BackupAttemptId, ExactStorageUri, LocalArtifactId,
+    SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId, SnapshotKind,
+    SnapshotName, SnapshotState,
 };
 use pplx_space_content_digest::Digest;
 use pplx_space_events::{
@@ -63,6 +63,7 @@ use pplx_space_events::{
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_node_model::{NodeRole as SpaceNodeRole, SubstrateKind};
 use pplx_space_rpc_contracts::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,
     FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
@@ -355,7 +356,7 @@ pub struct ClusterApiService {
     /// Whether applying a node's rollback receipt for a restore may retire
     /// its execution as `replaced`. Off unless `from_env_with_security_state`
     /// reads it on, for the same reason.
-    abandoned_restore_retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
+    abandoned_restore_retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -640,7 +641,7 @@ impl ClusterApiService {
             runtime_provisioning_cohort:
                 runtime_provisioning_cohort::RuntimeProvisioningCohort::Disabled,
             abandoned_restore_retirement:
-                pplx_space_common_core::types::AbandonedRestoreRetirement::Disabled,
+                pplx_space_sandbox_model::AbandonedRestoreRetirement::Disabled,
         }
     }
 
@@ -711,7 +712,7 @@ impl ClusterApiService {
             runtime_provisioning_cohort::RuntimeProvisioningCohort::from_env()
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
         service.abandoned_restore_retirement =
-            pplx_space_common_core::types::AbandonedRestoreRetirement::from_env();
+            pplx_space_sandbox_model::AbandonedRestoreRetirement::from_env();
         Ok(service)
     }
 

@@ -3,7 +3,7 @@
 
 use std::str::FromStr;
 
-use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sql_locator::sql;
 use tonic::{Request, Response, Status};
 

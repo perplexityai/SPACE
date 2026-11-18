@@ -167,7 +167,7 @@ fn network_policy_target_from_proto(target: NetworkPolicyTargetRef) -> Result<St
         }
         Some(network_policy_target_ref::Target::SandboxId(sandbox_id)) => {
             let sandbox_id = sandbox_id
-                .parse::<pplx_space_common_core::types::SandboxId>()
+                .parse::<pplx_space_sandbox_model::SandboxId>()
                 .map_err(|error| error.to_string())?;
             Ok(NetworkPolicyTarget::sandbox(sandbox_id).as_element_string())
         }

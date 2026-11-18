@@ -4,8 +4,8 @@
 
 use std::{fmt, str::FromStr};
 
-use pplx_space_common_core::types::SandboxQuarantineReasonCode;
 use pplx_space_metrics_emit::{counter, tag};
+use pplx_space_sandbox_model::SandboxQuarantineReasonCode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AutoLifecycleDeleteAdmissionReason {

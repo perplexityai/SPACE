@@ -1311,9 +1311,9 @@ fn begin_request_carries_the_recorded_capture_host_cpu() {
 /// for a marked capture.
 #[test]
 fn begin_request_carries_the_capture_generation_mark() {
-    use pplx_space_common_core::types::ExecutionGeneration;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_spec::{ExecutionMetadata, SnapshotExecutionMetadata};
+    use pplx_space_sandbox_model::ExecutionGeneration;
 
     let artifact_id = "01939e3e-eeee-7000-8000-000000000051";
     for names_capture in [false, true] {

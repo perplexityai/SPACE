@@ -5,8 +5,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pplx_space_bearer_token::SPACE_INTERNAL_TOKEN_ENV;
-use pplx_space_common_core::types::{EcwCredentialEpoch, SandboxId};
 use pplx_space_postgres_pool::contention;
+use pplx_space_sandbox_model::{EcwCredentialEpoch, SandboxId};
 use pplx_space_sql_locator::sql;
 use subtle::ConstantTimeEq;
 

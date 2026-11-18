@@ -1,7 +1,7 @@
 use super::service_tests::{insert_test_sandbox, runtime_fields};
 use super::*;
 use crate::service::activation_support::internal_request;
-use pplx_space_common_core::types::ExecutionGeneration;
+use pplx_space_sandbox_model::ExecutionGeneration;
 
 #[tokio::test]
 async fn cancelled_cleanup_rpcs_preserve_admitted_termination_strength() {

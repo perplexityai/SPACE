@@ -9,6 +9,7 @@
 //!
 //! ```rust
 //! # use pplx_space_common_core::types::*;
+//! # use pplx_space_sandbox_model::*;
 //! let root = NodeSpacePath::parse("/space")?;
 //! let sandbox_id = SandboxId::from_uuid(uuid::Uuid::nil());
 //! let run_dir = NodeSandboxRunDir::new(&root, sandbox_id);
@@ -19,9 +20,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use super::sandbox::SandboxId;
 use super::snapshot::SnapshotName;
 use pplx_space_host_layout::paths::{SANDBOX_CACHE_DIR, SANDBOX_RUN_DIR, TEMPLATE_DIR};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_template_model::TemplateBuildId;
 
 /// Directory name used under a sandbox cache directory for snapshots.
@@ -63,6 +64,7 @@ pub fn template_snapshot_dir(
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_sandbox_model::*;
 /// assert!(NodeSpacePath::parse("relative/path").is_err());
 /// assert!(NodeSpacePath::parse("/space/../etc").is_err());
 /// ```
@@ -80,6 +82,7 @@ pub enum NodePathError {
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_sandbox_model::*;
 /// let root = NodeSpacePath::parse("/space")?;
 /// assert_eq!(root.as_path().to_string_lossy(), "/space");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -94,6 +97,7 @@ impl NodeSpacePath {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_sandbox_model::*;
     /// assert!(NodeSpacePath::parse("/space").is_ok());
     /// assert!(NodeSpacePath::parse("space").is_err());
     /// assert!(NodeSpacePath::parse("/space/../etc").is_err());
@@ -118,6 +122,7 @@ impl NodeSpacePath {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_sandbox_model::*;
     /// let root = NodeSpacePath::parse("/space")?;
     /// assert!(root.as_path().is_absolute());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -133,6 +138,7 @@ impl NodeSpacePath {
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_sandbox_model::*;
 /// let root = NodeSpacePath::parse("/space")?;
 /// let id = SandboxId::from_uuid(uuid::Uuid::nil());
 /// let dir = NodeSandboxRunDir::new(&root, id);
@@ -149,6 +155,7 @@ impl NodeSandboxRunDir {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_sandbox_model::*;
     /// let root = NodeSpacePath::parse("/space")?;
     /// let id = SandboxId::from_uuid(uuid::Uuid::nil());
     /// let dir = NodeSandboxRunDir::new(&root, id);
@@ -169,6 +176,7 @@ impl NodeSandboxRunDir {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_sandbox_model::*;
     /// let root = NodeSpacePath::parse("/space")?;
     /// let dir = NodeSandboxRunDir::new(&root, SandboxId::from_uuid(uuid::Uuid::nil()));
     /// assert!(dir.as_path().is_absolute());
@@ -185,6 +193,7 @@ impl NodeSandboxRunDir {
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_sandbox_model::*;
 /// # use pplx_space_template_model::{TemplateBuildId, TemplateName};
 /// # use pplx_space_content_digest::{ContentHash, Digest};
 /// let root = NodeSpacePath::parse("/space")?;
@@ -206,6 +215,7 @@ impl NodeTemplateRootfsPath {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_sandbox_model::*;
     /// # use pplx_space_template_model::{TemplateBuildId, TemplateName};
     /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let root = NodeSpacePath::parse("/space")?;
@@ -232,6 +242,7 @@ impl NodeTemplateRootfsPath {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_sandbox_model::*;
     /// # use pplx_space_template_model::{TemplateBuildId, TemplateName};
     /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let root = NodeSpacePath::parse("/space")?;
@@ -253,6 +264,7 @@ impl NodeTemplateRootfsPath {
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_sandbox_model::*;
 /// let root = NodeSpacePath::parse("/space")?;
 /// let id = SandboxId::from_uuid(uuid::Uuid::nil());
 /// let name = SnapshotName::parse("before-upgrade")?;
@@ -271,6 +283,7 @@ impl NodeSnapshotDir {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_sandbox_model::*;
     /// let root = NodeSpacePath::parse("/space")?;
     /// let name = SnapshotName::parse("base")?;
     /// let dir = NodeSnapshotDir::new(&root, SandboxId::from_uuid(uuid::Uuid::nil()), &name);
@@ -293,6 +306,7 @@ impl NodeSnapshotDir {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_sandbox_model::*;
     /// let root = NodeSpacePath::parse("/space")?;
     /// let name = SnapshotName::parse("base")?;
     /// let dir = NodeSnapshotDir::new(&root, SandboxId::from_uuid(uuid::Uuid::nil()), &name);

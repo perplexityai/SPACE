@@ -6,7 +6,7 @@ use crate::db::guest_updates::{
     self as store, Action, Admission, GuestIdentity, Intent, Outcome, Phase, Record,
 };
 use crate::service::cleanup_support::CleanupLockTryResult;
-use pplx_space_common_core::types::SandboxActivationAttemptId;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
 use pplx_space_spaced_guest_protocol::proto::update as wire;
 use pplx_space_spaced_host_client::RawSpacedHostGuestUpdateClient as Client;
 use pplx_space_spaced_update as model;

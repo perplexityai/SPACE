@@ -45,11 +45,11 @@ use std::time::{Duration, Instant};
 use crate::metrics::cluster_reconciler::{
     self as metrics, Loop, Mode, OutcomeEvent, RepairOutcome,
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::SandboxId;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 

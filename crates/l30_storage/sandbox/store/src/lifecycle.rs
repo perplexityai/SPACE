@@ -14,7 +14,7 @@
 
 use std::str::FromStr;
 
-use pplx_space_common_core::types::{SandboxLifecycle, SandboxLifecycleParseError};
+use pplx_space_sandbox_model::{SandboxLifecycle, SandboxLifecycleParseError};
 
 /// A `sandboxes.lifecycle` value as stored in Postgres: a live
 /// [`SandboxLifecycle`] state or the terminal tombstone.

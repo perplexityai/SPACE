@@ -144,7 +144,7 @@ mod postgres {
                             .expect("create has a target")
                             .parse()
                             .expect("target is a sandbox ID"),
-                        pplx_space_common_core::types::SandboxLifecycle::Started,
+                        pplx_space_sandbox_model::SandboxLifecycle::Started,
                         "sandbox created",
                     )
                     .into(),

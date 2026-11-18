@@ -17,7 +17,7 @@
 //! either list. A variant appended after the last one, or a tombstone given
 //! a position but not listed, still has to be listed by hand.
 
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 use crate::StoredSandboxLifecycle;
 

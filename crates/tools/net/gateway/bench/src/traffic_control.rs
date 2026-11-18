@@ -13,7 +13,6 @@ use pplx_space_api_route::{
     ed25519::insert_space_api_route_ed25519_token,
 };
 use pplx_space_cluster_id::ClusterId;
-use pplx_space_common_core::types::{SandboxRouteIdentity, SpaceApiRouteIdentity};
 use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 use pplx_space_net_common::{
     CredentialHeaderBindingV1, EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope,
@@ -24,6 +23,7 @@ use pplx_space_net_gateway_client::proto::{
     self, net_gateway_control_client::NetGatewayControlClient,
 };
 use pplx_space_network_roles::GuestPort;
+use pplx_space_sandbox_model::{SandboxRouteIdentity, SpaceApiRouteIdentity};
 use pplx_space_spaced_protocol::proto::{activity, host_control};
 use serde::Deserialize;
 use tokio::net::UnixListener;
@@ -360,7 +360,7 @@ fn identity(generation: u64, sandbox: &str) -> anyhow::Result<SandboxRouteIdenti
         route_generation: Some(generation.try_into()?),
         current_node_id: Some(NODE.parse()?),
         substrate_kind: Some(pplx_space_node_model::NodeManagedBy::Space),
-        execution_generation: Some(pplx_space_common_core::types::ExecutionGeneration::new(1)?),
+        execution_generation: Some(pplx_space_sandbox_model::ExecutionGeneration::new(1)?),
         activation_attempt_id: Some(ATTEMPT.parse()?),
         pod_uid: None,
     }

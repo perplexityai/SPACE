@@ -28,6 +28,7 @@ tonic = { workspace = true, default-features = false }
 # internal
 pplx-space-cluster-id = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-sandbox-model = { workspace = true, features = ["serde"] }
 pplx-space-env-vars = { workspace = true }
 pplx-space-network-roles = { workspace = true, features = ["serde"] }
 

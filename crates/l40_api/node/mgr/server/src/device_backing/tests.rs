@@ -66,7 +66,7 @@ fn backing_rejects_links_and_retains_the_opened_inode() {
 #[ignore = "requires root, loop/dm-crypt and an explicitly supplied disposable btrfs fixture directory"]
 async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
     use crate::{encrypted_volume, rootfs_dmcrypt};
-    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_sandbox_model::SandboxId;
     // CI includes ignored tests; host mutation still requires explicit opt-in.
     let Some(root) = std::env::var_os("SPACE_NODEMGR_TEST_BTRFS_DIR") else {
         eprintln!("not opted in: set SPACE_NODEMGR_TEST_BTRFS_DIR to a disposable btrfs directory");

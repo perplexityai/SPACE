@@ -24,6 +24,7 @@ pplx-space-k8s-ids = { workspace = true }
 pplx-space-linux-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-node-model = { workspace = true }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-sql-codec = { workspace = true, optional = true }
 pplx-space-template-model = { workspace = true }
@@ -55,6 +56,7 @@ serde = [
     "pplx-space-linux-ids/serde",
     "pplx-space-template-model/serde",
     "pplx-space-node-model/serde",
+    "pplx-space-sandbox-model/serde",
 ]
 sqlx = [
     "dep:pplx-space-sql-codec",
@@ -64,4 +66,5 @@ sqlx = [
     "pplx-space-accounts/sqlx",
     "pplx-space-template-model/sqlx",
     "pplx-space-node-model/sqlx",
+    "pplx-space-sandbox-model/sqlx",
 ]

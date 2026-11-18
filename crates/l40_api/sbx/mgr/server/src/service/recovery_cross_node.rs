@@ -5,12 +5,11 @@ use super::suspend_snapshot_publication::{
 };
 use super::*;
 use crate::service::start_support::start_stage;
-use pplx_space_common_core::types::{
-    ArtifactKind, ExactStorageUri, SandboxId, SnapshotId, StorageUri,
-};
+use pplx_space_common_core::types::{ArtifactKind, ExactStorageUri, SnapshotId, StorageUri};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_sandbox_model::SandboxId;
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
@@ -354,9 +353,8 @@ pub(super) enum CrossNodeRestoreTarget {
 pub(super) struct CrossNodeRestoreRequest<'a> {
     pub(super) sandbox_id: &'a str,
     pub(super) storage_uri: Option<&'a str>,
-    pub(super) execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
-    pub(super) activation_attempt_id:
-        Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    pub(super) execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+    pub(super) activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub(super) recovery: Option<QuarantineRecoveryContext<'a>>,
     pub(super) restore_artifact_as_new: Option<&'a RestoreArtifactAsNewContext>,
     pub(super) target: CrossNodeRestoreTarget,
@@ -1063,8 +1061,8 @@ fn claim_exchanged_restore_cleanup(
     db: &crate::db::SharedConnection,
     sandbox_id: &str,
     existing: &crate::db::RestoreTransferScopeRow,
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-    activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
+    activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
 ) -> Result<crate::db::RestoreTransferScopeRow, crate::snapshot_restore::RestoreError> {
     let db = db.lock().map_err(|_| {
         crate::snapshot_restore::RestoreError::Other("sandbox database mutex poisoned".to_string())
@@ -1226,8 +1224,8 @@ impl SandboxManagerService {
     pub(super) fn create_restore_transfer_scope(
         &self,
         sandbox_id: &str,
-        execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
-        activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     ) -> Result<pplx_space_common_core::types::TransferScopeId, crate::snapshot_restore::RestoreError>
     {
         let scope = pplx_space_common_core::types::TransferScopeId::new();
@@ -1263,8 +1261,8 @@ impl SandboxManagerService {
         &self,
         sandbox_id: &str,
         existing: &crate::db::RestoreTransferScopeRow,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) -> Result<
         Option<pplx_space_common_core::types::TransferScopeId>,
         crate::snapshot_restore::RestoreError,
@@ -1413,7 +1411,7 @@ impl SandboxManagerService {
         if let Some(row) = existing_row {
             if let Some(recovery) = recovery {
                 if recovery.plan.reason_code
-                    != pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing
+                    != pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing
                     || !matches!(
                         row.state.unowned(),
                         Some(SandboxState::Quarantined | SandboxState::Restoring)

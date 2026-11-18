@@ -6,7 +6,7 @@ use std::fmt;
 
 use pplx_space_accounts::OrgId;
 use pplx_space_common_core::types::{
-    SandboxId, SnapshotArtifact, SubjectId, TemplateArtifact, snapshot_shard,
+    SnapshotArtifact, SubjectId, TemplateArtifact, snapshot_shard,
 };
 use pplx_space_content_digest::ContentHash;
 use pplx_space_credmgr_client::{
@@ -15,6 +15,7 @@ use pplx_space_credmgr_client::{
     SUBJECT_ID_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
 };
 use pplx_space_host_layout::identities::users;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_template_model::TemplateName;
 
 use crate::auth::{ClientService, ResolvedCaller};

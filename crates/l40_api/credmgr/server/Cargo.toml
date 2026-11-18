@@ -21,6 +21,7 @@ datadog-otel = ["otel", "datadog"]
 [dependencies]
 pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
+pplx-space-sandbox-model = { workspace = true }
 aes-gcm = { workspace = true }
 async-trait = { workspace = true }
 aws-config = { workspace = true, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio", "sso"] }

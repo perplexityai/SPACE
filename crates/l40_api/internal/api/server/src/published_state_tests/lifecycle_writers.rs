@@ -24,10 +24,11 @@
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{SandboxId, SandboxQuarantineReasonCode, SnapshotId};
+use pplx_space_common_core::types::SnapshotId;
 use pplx_space_db_test_fixtures::{
     insert_ready_worker_node, pg_test_db, pg_test_db_with_max_connections,
 };
+use pplx_space_sandbox_model::{SandboxId, SandboxQuarantineReasonCode};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
 use pplx_space_sql_locator::sql;

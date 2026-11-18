@@ -16,6 +16,7 @@ workspace = true
 # whole workspace. The crate reads its own variables directly instead.
 pplx-space-accounts = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
+pplx-space-sandbox-model = { workspace = true, features = ["sqlx"] }
 pplx-space-env-vars = { workspace = true }
 sqlx = { workspace = true, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
 testcontainers = { workspace = true }

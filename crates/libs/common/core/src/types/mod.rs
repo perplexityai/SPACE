@@ -14,6 +14,7 @@
 //!
 //! ```rust
 //! # use pplx_space_common_core::types::*;
+//! # use pplx_space_sandbox_model::*;
 //! # use pplx_space_execution_spec::{ComputeShape, CpuLimit};
 //! # use pplx_space_byte_size::MemorySize;
 //! # use pplx_space_template_model::TemplateName;
@@ -33,8 +34,6 @@ pub mod node_fs;
 pub mod object_store;
 #[cfg(feature = "sqlx")]
 mod postgres;
-pub mod restore_retirement;
-pub mod sandbox;
 #[cfg(feature = "serde")]
 pub mod sandbox_artifact;
 pub mod snapshot;
@@ -46,9 +45,12 @@ pub use client_id::*;
 pub use kek::*;
 pub use node_fs::*;
 pub use object_store::*;
-pub use restore_retirement::*;
-pub use sandbox::*;
 #[cfg(feature = "serde")]
 pub use sandbox_artifact::*;
 pub use snapshot::*;
 pub use subject::{SubjectId, SubjectIdParseError, SubjectKind};
+
+/// Transitional: `SandboxId` lives in `pplx-space-sandbox-model`. This re-export keeps the
+/// old `types::SandboxId` path compiling for downstream crates until the common-core
+/// deletion removes it.
+pub use pplx_space_sandbox_model::SandboxId;

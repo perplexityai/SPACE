@@ -114,9 +114,9 @@ use pplx_space_api::controllers::substrate::kubernetes::{
     GenerationTeardownEvidence, KubernetesSubstrate,
 };
 use pplx_space_cluster_pool::{PoolError, WarmPoolStore};
-use pplx_space_common_core::types::{ExecutionGeneration, SandboxId, SandboxLifecycle};
 use pplx_space_durations::PositiveDuration;
 use pplx_space_node_model::{NodeDrainMode, SubstrateKind};
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, newest_full_snapshot_unambiguous,
     pod_less_drain_revert_loses_no_newer_bytes,

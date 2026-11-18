@@ -1,6 +1,7 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
+use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 use pplx_space_node_model::{NODE_DRAIN_MODE_GENTLE, NodeDrainPhase};
+use pplx_space_sandbox_model::SandboxId;
 
 use std::time::Duration;
 
@@ -2144,7 +2145,7 @@ async fn wake_signal_classifies_post_wake_flip_by_recency_not_lease(
     fixture: &PostgresStore,
 ) -> TestResult {
     use crate::controllers::sandbox::{POST_WAKE_LISTENER_REBIND_GRACE, fetch_sandbox_wake_signal};
-    use pplx_space_common_core::types::SandboxLifecycle;
+    use pplx_space_sandbox_model::SandboxLifecycle;
 
     let sandbox_id = SandboxId::new();
     insert_sandbox(&fixture.pool, sandbox_id, "suspended").await?;
@@ -4061,7 +4062,7 @@ async fn concurrent_handler_does_not_claim_g7_while_g6_create_is_in_flight(
         format!("space-sbx-{}-g6", sandbox_id.as_uuid().simple())
     );
 
-    let attempt_a = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let attempt_a = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     let initialized_claim = fixture
         .store
         .ensure_active_execution_claim_for_lifecycle(
@@ -4075,7 +4076,7 @@ async fn concurrent_handler_does_not_claim_g7_while_g6_create_is_in_flight(
         initialized_claim.row.generation,
         handler_a_claim.row.generation
     );
-    let attempt_b = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let attempt_b = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     let concurrent_error = fixture
         .store
         .assign_activation_attempt(
@@ -4099,7 +4100,7 @@ async fn concurrent_handler_does_not_claim_g7_while_g6_create_is_in_flight(
         .assign_activation_attempt(
             sandbox_id,
             handler_a_claim.row.generation,
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             SandboxTransitionTargetState::Paused,
         )
         .await
@@ -4240,7 +4241,7 @@ async fn concurrent_handler_does_not_claim_g7_while_g6_create_is_in_flight(
         .store
         .reconcile_activation_fence(
             sandbox_id,
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             Some(attempt_b),
             SandboxTransitionTargetState::Started,
         )
@@ -4258,7 +4259,7 @@ async fn activation_attempt_assignment_is_monotonic_after_lease_expiry(
 ) -> TestResult {
     let sandbox_id = SandboxId::new();
     insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
-    let attempt_a = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let attempt_a = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         Uuid::parse_str("019f8000-0000-7000-8000-000000000001")?,
     );
     let claim = fixture
@@ -4289,10 +4290,10 @@ async fn activation_attempt_assignment_is_monotonic_after_lease_expiry(
     .execute(&fixture.pool)
     .await?;
 
-    let attempt_b = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let attempt_b = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         Uuid::parse_str("019f8000-0000-7000-8000-000000000003")?,
     );
-    let delayed_proposal = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let delayed_proposal = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         Uuid::parse_str("019f8000-0000-7000-8000-000000000002")?,
     );
     let attempt_c = fixture
@@ -4386,9 +4387,9 @@ async fn activation_attempt_assignment_adopts_route_less_legacy_resident_after_a
 ) -> TestResult {
     let sandbox_id = SandboxId::new();
     insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
-    let stale_proposal = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let stale_proposal = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     let legacy_owner =
-        pplx_space_common_core::types::SandboxActivationAttemptId::new_after(stale_proposal)
+        pplx_space_sandbox_model::SandboxActivationAttemptId::new_after(stale_proposal)
             .expect("test activation identity space must have a successor");
     let execution = fixture
         .store
@@ -5129,8 +5130,8 @@ async fn forget_pod_tracking_if_generation_does_not_forget_successor_attempt(
         .store
         .ensure_active_execution_row(sandbox_id)
         .await?;
-    let stale_attempt = pplx_space_common_core::types::SandboxActivationAttemptId::new();
-    let successor_attempt = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let stale_attempt = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
+    let successor_attempt = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
             SET activation_attempt_id = $2,

@@ -20,8 +20,7 @@ use crate::node_state_sync::mark_sandbox_dirty;
 use crate::runtime_reconciliation::{mark_quarantined_best_effort, observe_vm_state};
 use crate::state::SandboxState;
 use pplx_space_common_core::types::{
-    ArtifactKind, LocalArtifactId, SandboxArtifactMetadata, SandboxId, SandboxQuarantineReasonCode,
-    SnapshotName,
+    ArtifactKind, LocalArtifactId, SandboxArtifactMetadata, SnapshotName,
 };
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
@@ -31,6 +30,7 @@ use pplx_space_node_mgr_client::proto::{
     CaptureVmStateRequest, PauseSandboxRequest, ResumeSandboxRequest, SyncGuestRequest,
 };
 use pplx_space_node_runtime_core::vm_state::VmState;
+use pplx_space_sandbox_model::{SandboxId, SandboxQuarantineReasonCode};
 
 const TICK_INTERVAL: Duration = Duration::from_secs(60);
 

@@ -3,8 +3,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::Pod;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::SandboxId;
 use serde_json::json;
 use uuid::Uuid;
 

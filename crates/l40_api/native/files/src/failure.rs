@@ -3,7 +3,7 @@
 use std::{fmt, time::Duration};
 
 use http::StatusCode;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
 /// A failed call to the sandbox, as [`file_call_error`] reads it.
 pub trait FileCallFailure: fmt::Display {

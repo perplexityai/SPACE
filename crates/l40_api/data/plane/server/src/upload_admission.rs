@@ -40,7 +40,7 @@ use crate::metrics::{TooManyRequestsReason, UploadAdmissionScope, UploadRejectRe
 use axum::body::Body;
 use axum::http::Version;
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 use rand::RngExt as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;

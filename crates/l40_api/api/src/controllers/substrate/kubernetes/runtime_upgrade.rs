@@ -14,8 +14,8 @@ use crate::controllers::substrate::SubstrateError;
 use crate::controllers::substrate::runtime_upgrade::{
     RuntimePlan, UpgradeActivation, attribute, decide, stranded_error,
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_runtime_environment_policy_store::RuntimeEnvironmentState;
+use pplx_space_sandbox_model::SandboxId;
 
 impl KubernetesSubstrate {
     /// The runtime upgrade an activation of `sandbox_id` asks the node for,

@@ -506,15 +506,14 @@ fn canonical_restore_exchange_publishes_replacement_and_scopes_the_old_root() {
     std::fs::write(staging_dir.join("replacement"), b"source-b").unwrap();
     std::fs::write(canonical_dir.join("remnant"), b"source-a").unwrap();
     let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
-    let execution_generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
-    let attempt_a = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let execution_generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
+    let attempt_a = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000001").unwrap(),
     );
-    let activation_attempt_id =
-        pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
-            uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000002").unwrap(),
-        );
-    let attempt_c = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let activation_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
+        uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000002").unwrap(),
+    );
+    let attempt_c = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         uuid::Uuid::parse_str("019c0000-0000-7000-8000-000000000003").unwrap(),
     );
     let mut staged = RestoreMetadataStaged {
@@ -626,8 +625,8 @@ fn same_source_exchange_receipt_recovers_cleanup_after_commit_gap() {
     std::fs::write(canonical_dir.join("partial"), b"old incomplete root").unwrap();
 
     let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
-    let execution_generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
-    let activation_attempt_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let execution_generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
+    let activation_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     let parsed_storage_uri = storage_uri.parse().unwrap();
     let mut staged = RestoreMetadataStaged {
         sandbox_dir: staging_dir.clone(),
@@ -1027,7 +1026,7 @@ async fn admission_rejection_preserves_completed_restore_work_for_retry() {
 
     let target = pplx_space_node_mgr_client::execution_fence::InstanceTarget::Execution(
         pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             None,
         ),
     );
@@ -1531,12 +1530,12 @@ fn plan_response(
 
 fn valid_plan_response() -> pplx_space_node_api_client::proto::GetQuarantineRecoveryPlanResponse {
     plan_response(
-        &pplx_space_common_core::types::SandboxCleanupEpisodeId::new().to_string(),
+        &pplx_space_sandbox_model::SandboxCleanupEpisodeId::new().to_string(),
         &uuid::Uuid::now_v7().to_string(),
         &LocalArtifactId::new().to_string(),
         "s3://snapshots/suspend/sandbox/snap?region=us-east-1",
         7,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed.as_str(),
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed.as_str(),
         pplx_space_node_api_client::proto::QuarantineRecoveryTargetState::Suspended as i32,
     )
 }
@@ -1567,7 +1566,7 @@ fn a_well_formed_plan_resolves_to_an_actionable_plan() {
     assert_eq!(plan.execution_generation.get(), 7);
     assert_eq!(
         plan.reason_code,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed
     );
 }
 
@@ -1627,10 +1626,9 @@ fn a_plan_targeting_an_unsupported_state_is_declined_not_attempted() {
 fn a_plan_for_a_never_recoverable_reason_is_declined() {
     let mut ineligible = valid_plan_response();
     // A reason this release parses but never recovers automatically.
-    ineligible.reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::PauseFailed
-            .as_str()
-            .to_string();
+    ineligible.reason_code = pplx_space_sandbox_model::SandboxQuarantineReasonCode::PauseFailed
+        .as_str()
+        .to_string();
     assert_eq!(
         malformed_reason(ineligible),
         crate::db::QuarantineRecoveryNoProgressReason::PlanReasonIneligible
@@ -1663,7 +1661,7 @@ fn a_malformed_plan_detail_is_bounded_before_it_reaches_a_log() {
     // The shape the production sites build: a bounded-looking field followed by a
     // parse error whose own Display embeds the same unbounded value.
     let hostile = "x".repeat(4096);
-    let reason_code: Result<pplx_space_common_core::types::SandboxQuarantineReasonCode, _> =
+    let reason_code: Result<pplx_space_sandbox_model::SandboxQuarantineReasonCode, _> =
         hostile.parse();
     let error = reason_code.expect_err("a 4 KiB reason code is not a known vocabulary member");
     let detail = format!("invalid recovery reason {hostile:?}: {error}");
@@ -1707,7 +1705,7 @@ fn a_hostile_plan_field_is_bounded_on_the_line_that_is_logged() {
 
     let hostile = "x".repeat(4096);
     let response = plan_response(
-        &pplx_space_common_core::types::SandboxCleanupEpisodeId::new().to_string(),
+        &pplx_space_sandbox_model::SandboxCleanupEpisodeId::new().to_string(),
         &uuid::Uuid::now_v7().to_string(),
         &LocalArtifactId::new().to_string(),
         "s3://snapshots/suspend/sandbox/snap?region=us-east-1",
@@ -1788,7 +1786,7 @@ async fn restore_template_lookup_uses_validated_owner(
 ) {
     use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
     use pplx_space_template_mgr_client::proto::GetTemplateResponse;
-    let id = pplx_space_common_core::types::SandboxId::new();
+    let id = pplx_space_sandbox_model::SandboxId::new();
     let expected = if local {
         TemplateLookupScope::LocalExecution
     } else {

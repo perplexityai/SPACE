@@ -9,7 +9,7 @@
 //! single action the sweep is allowed to take on that row.
 
 use pplx_space_api::controllers::substrate::ObservedSandboxState;
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 use super::probe::SweepCandidate;
 

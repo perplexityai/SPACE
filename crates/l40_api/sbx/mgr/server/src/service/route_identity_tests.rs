@@ -29,12 +29,12 @@ use pplx_space_auto_lifecycle::{
     AutoLifecyclePolicy, AutoLifecycleStage,
 };
 use pplx_space_cluster_id::{CLUSTER_ID_ENV, ClusterId};
-use pplx_space_common_core::types::{
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::{
     ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
     SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
-use pplx_space_k8s_ids::PodUid;
-use pplx_space_node_model::NodeManagedBy;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -328,7 +328,7 @@ async fn identity_equal_adoption_does_not_overwrite_an_owned_execution() {
                     &conn,
                     crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
                         receipt_id:
-                            pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+                            pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate(),
                         sandbox_id,
                         execution_generation: identity.execution_generation.unwrap(),
                         route_activation_id: identity.activation_attempt_id.unwrap(),

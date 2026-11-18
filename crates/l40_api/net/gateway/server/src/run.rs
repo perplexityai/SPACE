@@ -7,7 +7,7 @@
 //! deployment that needs private wiring can supply its own `main` against this
 //! library without copying any of the service.
 
-use pplx_space_common_core::types::{SandboxId, SpaceApiRouteIdentity};
+use pplx_space_sandbox_model::{SandboxId, SpaceApiRouteIdentity};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;

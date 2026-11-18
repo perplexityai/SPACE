@@ -9,7 +9,7 @@
 //! drains on that reading terminates a host with running sandboxes on it.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sql_locator::sql;

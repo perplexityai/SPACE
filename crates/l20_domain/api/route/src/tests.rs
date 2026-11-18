@@ -1,10 +1,10 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::{
     ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
     SandboxRouteIdentity, SpaceApiRouteIdentity,
 };
-use pplx_space_k8s_ids::PodUid;
-use pplx_space_node_model::NodeManagedBy;
 use tonic::metadata::{MetadataMap, MetadataValue};
 
 use super::*;

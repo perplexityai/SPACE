@@ -1,5 +1,6 @@
 use pplx_space_accounts::{JobId, UserId};
-use pplx_space_common_core::types::{SandboxId, SnapshotId};
+use pplx_space_common_core::types::SnapshotId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::activation::{
     WAKE_ROUTE_SECURITY_CONNECT_RETRY_POLICY, WAKE_ROUTE_SECURITY_SYNC_TIMEOUT,
@@ -283,16 +284,16 @@ pub(crate) mod service_tests {
         AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
     };
     use pplx_space_cluster_id::ClusterId;
-    use pplx_space_common_core::types::{
-        ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, RouteGeneration,
-        SandboxActivationAttemptId, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
-        SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRouteIdentity,
-        SpaceApiRouteIdentity,
-    };
+    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
     use pplx_space_host_layout::identities::{user_names, users};
     use pplx_space_k8s_ids::PodUid;
     use pplx_space_k8s_node_id::space_k8s_node_id;
     use pplx_space_node_model::NodeManagedBy;
+    use pplx_space_sandbox_model::{
+        ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId,
+        SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+        SandboxQuarantineSource, SandboxRouteIdentity, SpaceApiRouteIdentity,
+    };
 
     use prost::Message as _;
 
@@ -2407,7 +2408,7 @@ pub(crate) mod service_tests {
     async fn split_operation_wake_join_restart_receipt_proof() {
         use crate::db::SandboxStatePublicationMetadata;
         use crate::service::recovery::CleanupRecoveryAuthority;
-        use pplx_space_common_core::types::SandboxTransitionReceiptKind;
+        use pplx_space_sandbox_model::SandboxTransitionReceiptKind;
         // Exercise the real Wake join before dropping all request/service state.
         // The NULL injection models carrying B only in volatile request memory.
         for (persist_operation, allocated) in
@@ -3807,8 +3808,7 @@ pub(crate) mod service_tests {
             activation_attempt_id: Some(SandboxActivationAttemptId::new()),
             ..SpaceApiRouteIdentity::default()
         };
-        let pending_receipt_id =
-            pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate();
+        let pending_receipt_id = pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate();
         {
             let db = service.db.lock().unwrap();
             crate::db::update_space_api_route_identity(
@@ -3891,7 +3891,7 @@ pub(crate) mod service_tests {
             ..SpaceApiRouteIdentity::default()
         };
         let pending = crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
-            receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+            receipt_id: pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate(),
             sandbox_id,
             execution_generation: ExecutionGeneration::new(4).unwrap(),
             route_activation_id: attempt,
@@ -6845,8 +6845,8 @@ pub(crate) mod service_tests {
         std::fs::create_dir_all(&live_target).unwrap();
         std::os::unix::fs::symlink(&live_target, sandbox_run_dir.join("fc.pid")).unwrap();
         let receiver = pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
-            Some(pplx_space_common_core::types::SandboxActivationAttemptId::new()),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
+            Some(pplx_space_sandbox_model::SandboxActivationAttemptId::new()),
         );
 
         let report = reconcile_sandbox_inventory_ids(
@@ -7408,8 +7408,8 @@ pub(crate) mod service_tests {
                 vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
                 api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",
                 spaced_endpoint_proof: None,
-                space_api_route_identity:
-                    pplx_space_common_core::types::SpaceApiRouteIdentity::default(),
+                space_api_route_identity: pplx_space_sandbox_model::SpaceApiRouteIdentity::default(
+                ),
                 route_identity_provenance:
                     crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
             },
@@ -9234,7 +9234,7 @@ pub(crate) mod service_tests {
             vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
             api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",
             spaced_endpoint_proof: None,
-            space_api_route_identity: pplx_space_common_core::types::SpaceApiRouteIdentity {
+            space_api_route_identity: pplx_space_sandbox_model::SpaceApiRouteIdentity {
                 route_generation: Some(route_generation),
                 current_node_id: Some(NodeId::from_uuid(uuid::Uuid::from_u128(1))),
                 substrate_kind: Some(NodeManagedBy::Space),
@@ -9256,7 +9256,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Started);
         let generation = ExecutionGeneration::new(4).unwrap();
         let receipt = crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
-            receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+            receipt_id: pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate(),
             sandbox_id,
             execution_generation: generation,
             route_activation_id: SandboxActivationAttemptId::new(),
@@ -9310,7 +9310,7 @@ pub(crate) mod service_tests {
         crate::db::auto_lifecycle_delete_receipts::insert_pending_receipt(
             &conn,
             crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
-                receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+                receipt_id: pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate(),
                 sandbox_id,
                 execution_generation: generation,
                 route_activation_id: receipt_attempt,
@@ -10476,7 +10476,7 @@ pub(crate) mod service_tests {
     fn persisted_activation_owner_cannot_change_substrate_at_same_generation() {
         let sandbox_id = SandboxId::new();
         let current = RouteStreamEpochIdentity(
-            pplx_space_common_core::types::SandboxRouteIdentity::try_new(
+            pplx_space_sandbox_model::SandboxRouteIdentity::try_new(
                 sandbox_id,
                 RouteGeneration::new(1).unwrap(),
                 NodeId::new(),
@@ -10488,7 +10488,7 @@ pub(crate) mod service_tests {
             .unwrap(),
         );
         let replacement = RouteStreamEpochIdentity(
-            pplx_space_common_core::types::SandboxRouteIdentity::try_new(
+            pplx_space_sandbox_model::SandboxRouteIdentity::try_new(
                 sandbox_id,
                 RouteGeneration::new(1).unwrap(),
                 NodeId::new(),
@@ -11230,7 +11230,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Started);
         let receipt_generation = ExecutionGeneration::new(4).unwrap();
         let receipt = crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
-            receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+            receipt_id: pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate(),
             sandbox_id,
             execution_generation: receipt_generation,
             route_activation_id: SandboxActivationAttemptId::new(),
@@ -13380,11 +13380,10 @@ pub(crate) mod service_tests {
                     vsock_uds_path: "/space/run/firecracker/sandboxes/replacement/root/v.sock",
                     api_socket_path: "/space/run/firecracker/sandboxes/replacement/api.sock",
                     spaced_endpoint_proof: None,
-                    space_api_route_identity:
-                        pplx_space_common_core::types::SpaceApiRouteIdentity {
-                            execution_generation: Some(ExecutionGeneration::new(2).unwrap()),
-                            ..pplx_space_common_core::types::SpaceApiRouteIdentity::default()
-                        },
+                    space_api_route_identity: pplx_space_sandbox_model::SpaceApiRouteIdentity {
+                        execution_generation: Some(ExecutionGeneration::new(2).unwrap()),
+                        ..pplx_space_sandbox_model::SpaceApiRouteIdentity::default()
+                    },
                     route_identity_provenance:
                         crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
                 },
@@ -17241,8 +17240,8 @@ pub(crate) mod service_tests {
                 vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
                 api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",
                 spaced_endpoint_proof: None,
-                space_api_route_identity:
-                    pplx_space_common_core::types::SpaceApiRouteIdentity::default(),
+                space_api_route_identity: pplx_space_sandbox_model::SpaceApiRouteIdentity::default(
+                ),
                 route_identity_provenance:
                     crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
             },
@@ -20192,7 +20191,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
         let receipt = crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
-            receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
+            receipt_id: pplx_space_sandbox_model::AutoLifecycleDeleteReceiptId::generate(),
             sandbox_id,
             execution_generation: ExecutionGeneration::new(4).unwrap(),
             route_activation_id: SandboxActivationAttemptId::new(),

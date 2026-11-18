@@ -34,7 +34,8 @@ mod substrate_scope;
 mod kubernetes_tests {
 
     use pplx_space_accounts::UserId;
-    use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
+    use pplx_space_common_core::types::LocalArtifactId;
+    use pplx_space_sandbox_model::SandboxId;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -71,10 +72,7 @@ mod kubernetes_tests {
         ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV,
         ed25519::SpaceApiRouteEd25519Authority,
     };
-    use pplx_space_common_core::types::{
-        ArtifactKind, ArtifactOrigin, ExecutionGeneration, SandboxActivationAttemptId,
-        SandboxLifecycle, SandboxTransitionTargetState,
-    };
+    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
     use pplx_space_internal_api_server::publish_sandbox_states;
     use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
     use pplx_space_node_api_client::proto::PublishedSandboxState;
@@ -86,6 +84,10 @@ mod kubernetes_tests {
     use pplx_space_node_model::{
         NodeAddress, NodeGroup, NodeGroupName, NodeGroupPolicy,
         NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole, TemplateCompatSpec,
+    };
+    use pplx_space_sandbox_model::{
+        ExecutionGeneration, SandboxActivationAttemptId, SandboxLifecycle,
+        SandboxTransitionTargetState,
     };
     use pplx_space_sandbox_pod::{
         NodeGroupPlacement, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION,
@@ -312,8 +314,8 @@ mod kubernetes_tests {
     #[test]
     fn paused_restore_does_not_join_started_recovery() {
         let should_join = should_join_started_recovery(
-            pplx_space_common_core::types::SandboxLifecycle::Started,
-            pplx_space_common_core::types::SandboxLifecycle::Paused,
+            pplx_space_sandbox_model::SandboxLifecycle::Started,
+            pplx_space_sandbox_model::SandboxLifecycle::Paused,
         );
 
         assert!(!should_join);
@@ -3019,7 +3021,7 @@ mod kubernetes_tests {
                     ready_timeout,
                 },
                 None,
-                pplx_space_common_core::types::SandboxLifecycle::Paused,
+                pplx_space_sandbox_model::SandboxLifecycle::Paused,
             ),
             async {
                 // The worker keeps reporting missing runtime context, so the
@@ -4066,8 +4068,7 @@ mod kubernetes_tests {
             StartedRecoveryClaim::ExistingExecution { generation } => generation,
             claim => panic!("expected the tracked execution recovery claim, got {claim:?}"),
         };
-        let activation_attempt_id =
-            pplx_space_common_core::types::SandboxActivationAttemptId::new();
+        let activation_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
         let event_capture = SandboxEventCapture::default();
         let subscriber = tracing_subscriber::registry().with(event_capture.clone());
         let event_guard = tracing::subscriber::set_default(subscriber);
@@ -4229,7 +4230,7 @@ mod kubernetes_tests {
             StartedRecoveryClaim::ExistingExecution { generation } => generation,
             claim => panic!("expected the expired recovery to be reclaimed, got {claim:?}"),
         };
-        let fallback_attempt_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+        let fallback_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
 
         // Act.
         fallback_substrate
@@ -4668,7 +4669,7 @@ mod kubernetes_tests {
                 },
                 RestoreIntent::user(
                     crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
-                    WakeTarget::Explicit(pplx_space_common_core::types::SandboxLifecycle::Started),
+                    WakeTarget::Explicit(pplx_space_sandbox_model::SandboxLifecycle::Started),
                 ),
             )
             .await?;
@@ -4699,7 +4700,7 @@ mod kubernetes_tests {
                 },
                 RestoreIntent::user(
                     crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
-                    WakeTarget::Explicit(pplx_space_common_core::types::SandboxLifecycle::Started),
+                    WakeTarget::Explicit(pplx_space_sandbox_model::SandboxLifecycle::Started),
                 ),
             )
             .await
@@ -4867,7 +4868,7 @@ mod kubernetes_tests {
                 },
                 RestoreIntent::user(
                     crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
-                    WakeTarget::Explicit(pplx_space_common_core::types::SandboxLifecycle::Started),
+                    WakeTarget::Explicit(pplx_space_sandbox_model::SandboxLifecycle::Started),
                 ),
             )
             .await?;
@@ -7693,7 +7694,7 @@ mod kubernetes_tests {
             active_execution_generation: None,
             active_pod_uid: None,
             active_activation_attempt_id: None,
-            ecw_credential_epoch: pplx_space_common_core::types::EcwCredentialEpoch::new(1)
+            ecw_credential_epoch: pplx_space_sandbox_model::EcwCredentialEpoch::new(1)
                 .expect("credential epoch is valid"),
             target_node_id: None,
             placement_changed_at: None,
@@ -9476,7 +9477,7 @@ mod kubernetes_tests {
             .claim_active_execution_pod_materialization(
                 sandbox_id,
                 claim.row.generation,
-                pplx_space_common_core::types::SandboxLifecycle::Restoring,
+                pplx_space_sandbox_model::SandboxLifecycle::Restoring,
             )
             .await;
 
@@ -11618,7 +11619,7 @@ mod kubernetes_tests {
             test_sandbox_id(),
             "space-sbx-test".into(),
             1,
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             test_cancel_tracker(),
             tokio_util::task::TaskTracker::new(),
         );
@@ -11634,7 +11635,7 @@ mod kubernetes_tests {
             test_sandbox_id(),
             "space-sbx-test".into(),
             1,
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             test_cancel_tracker(),
             tokio_util::task::TaskTracker::new(),
         );
@@ -15529,7 +15530,7 @@ mod kubernetes_tests {
                   WHERE sandbox_id = $1 AND active",
             )
             .bind(sandbox_id)
-            .bind(pplx_space_common_core::types::SandboxActivationAttemptId::new())
+            .bind(pplx_space_sandbox_model::SandboxActivationAttemptId::new())
             .bind(expires_in)
             .execute(&pool)
             .await?;
@@ -15741,7 +15742,7 @@ mod kubernetes_tests {
               WHERE sandbox_id = $1 AND active",
         )
         .bind(in_flight)
-        .bind(pplx_space_common_core::types::SandboxActivationAttemptId::new())
+        .bind(pplx_space_sandbox_model::SandboxActivationAttemptId::new())
         .execute(&pool)
         .await?;
         for sandbox_id in [recreated, unrecorded, in_flight] {

@@ -142,7 +142,6 @@ use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
     AutoLifecycleStage,
 };
-use pplx_space_common_core::types::{SandboxActivationAttemptId, SandboxId};
 use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_spec::{
@@ -150,6 +149,7 @@ use pplx_space_execution_spec::{
 };
 use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
 use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
+use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
 use uuid::Uuid;
 
 #[test]
@@ -3696,7 +3696,7 @@ fn pool_adoption_rollback_restores_donor_route_identity() {
         },
     );
     let donor_identity_update = SpaceApiRouteIdentity {
-        route_generation: Some(pplx_space_common_core::types::RouteGeneration::new(7).unwrap()),
+        route_generation: Some(pplx_space_sandbox_model::RouteGeneration::new(7).unwrap()),
         ..Default::default()
     };
     update_space_api_route_identity(
@@ -3724,7 +3724,7 @@ fn pool_adoption_rollback_restores_donor_route_identity() {
     .unwrap()
     .unwrap();
     let adopted_identity = SpaceApiRouteIdentity {
-        route_generation: Some(pplx_space_common_core::types::RouteGeneration::new(8).unwrap()),
+        route_generation: Some(pplx_space_sandbox_model::RouteGeneration::new(8).unwrap()),
         ..Default::default()
     };
     update_space_api_route_identity(

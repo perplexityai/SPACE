@@ -121,7 +121,7 @@ fn validate_import_sandbox_header(
     validate_path_component("template_id", &header.template_id)?;
     validate_path_component("content_hash", &header.content_hash)?;
     if let Some(size_mib) = header.rootfs_size_mb {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(size_mib)
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(size_mib)
             .map_err(|error| Status::invalid_argument(format!("rootfs_size_mb: {error}")))?;
     }
     let process_env: BTreeMap<String, String> = header.env.clone().into_iter().collect();
@@ -481,7 +481,7 @@ async fn apply_sandbox_delta_import(
         &header.content_hash,
         std::path::PathBuf::from(&diff_file),
         std::path::PathBuf::from(format!("{}/rootfs.ext4", paths.instance_staging)),
-        pplx_space_common_core::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES,
+        pplx_space_sandbox_model::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES,
     )
     .await?;
     let _ = tokio::fs::remove_file(diff_file).await;

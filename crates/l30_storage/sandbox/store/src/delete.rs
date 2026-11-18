@@ -4,7 +4,7 @@
 //! (observed state, reconcile state and claimed warm-pool slots are deleted,
 //! and snapshot storage locations are detached).
 
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
 use pplx_space_sandbox_teardown::{
     delete_reconcile_state_for_elements, sandbox_reconcile_cleanup_refs,

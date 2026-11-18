@@ -3,7 +3,6 @@ use crate::metrics::sandbox::worker::{
     NetGatewayRouteSecurityPushOperation as Operation,
     NetGatewayRouteSecurityPushOutcome as Outcome, net_gateway_route_security_push,
 };
-use pplx_space_common_core::types::SpaceApiRouteIdentity;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
@@ -14,6 +13,7 @@ use pplx_space_net_common::{
 use pplx_space_sandbox_metrics::gateway_readiness::{
     self as readiness_metrics, Outcome as ReadinessOutcome,
 };
+use pplx_space_sandbox_model::SpaceApiRouteIdentity;
 
 const MAX_KNOWN_EGRESS_DOMAINS: usize = 64;
 

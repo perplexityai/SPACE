@@ -224,7 +224,7 @@ fn emit(pool: &NetworkPool) {
 #[tokio::test]
 async fn shutdown_stops_a_bounded_pass_of_wedged_probes() {
     use crate::slot_pool::{NetworkPoolConfig, NewLeaseMemoryReservation};
-    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_sandbox_model::SandboxId;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(32));

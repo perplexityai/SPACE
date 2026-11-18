@@ -4,7 +4,8 @@
 
 use super::*;
 use pplx_space_api::retry_deferral::defer_retry_wait;
-use pplx_space_common_core::types::{SandboxId, SnapshotId};
+use pplx_space_common_core::types::SnapshotId;
+use pplx_space_sandbox_model::SandboxId;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A wake behind a lingering prior-generation pod: until `fence_cleared`,

@@ -6,11 +6,11 @@
 /// current while it calls the services inside it.
 #[derive(Clone, Copy, Debug)]
 pub struct SandboxSpanLayer {
-    sandbox_id: pplx_space_common_core::types::SandboxId,
+    sandbox_id: pplx_space_sandbox_model::SandboxId,
 }
 
 impl SandboxSpanLayer {
-    pub fn new(sandbox_id: pplx_space_common_core::types::SandboxId) -> Self {
+    pub fn new(sandbox_id: pplx_space_sandbox_model::SandboxId) -> Self {
         Self { sandbox_id }
     }
 }
@@ -29,7 +29,7 @@ impl<S> tower::Layer<S> for SandboxSpanLayer {
 #[derive(Clone, Debug)]
 pub struct SandboxSpanService<S> {
     inner: S,
-    sandbox_id: pplx_space_common_core::types::SandboxId,
+    sandbox_id: pplx_space_sandbox_model::SandboxId,
 }
 
 impl<S, Request> tower::Service<Request> for SandboxSpanService<S>

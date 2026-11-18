@@ -466,7 +466,7 @@ fn immediate_error_loader(error: &'static str) -> PolicyLoader {
     Arc::new(move || {
         Box::pin(async move {
             Err(HydrateNetworkStateError::GetNetworkPolicy {
-                sandbox_id: pplx_space_common_core::types::SandboxId::new(),
+                sandbox_id: pplx_space_sandbox_model::SandboxId::new(),
                 source: tonic::Status::unavailable(error),
             })
         })

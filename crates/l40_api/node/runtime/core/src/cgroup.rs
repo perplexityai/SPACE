@@ -8,8 +8,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_execution_spec::VcpuCount;
+use pplx_space_sandbox_model::SandboxId;
 
 use crate::cgroup_paths::{CGROUP_BASE, jailer_cgroup_path};
 pub const DEFAULT_VCPU_COUNT: u32 = 2;

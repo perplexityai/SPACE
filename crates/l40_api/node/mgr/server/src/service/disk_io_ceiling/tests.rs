@@ -255,7 +255,7 @@ async fn sweep_rechecks_changed_vms_and_rejects_stale_targets_before_api_io() {
         .await
         .with_disk_io_ceiling(DiskIoCeiling::parse(Some("1000")).unwrap());
     service.pool.set_all_slots_ready_for_test();
-    let id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let id = pplx_space_sandbox_model::SandboxId::new().to_string();
     service
         .pool
         .allocate(

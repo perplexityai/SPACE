@@ -30,8 +30,8 @@ use pplx_space_accounts::OrgId;
 
 use std::path::{Component, Path, PathBuf};
 
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_host_layout::paths;
+use pplx_space_sandbox_model::SandboxId;
 use tonic::{Request, Response, Status};
 use zeroize::Zeroizing;
 

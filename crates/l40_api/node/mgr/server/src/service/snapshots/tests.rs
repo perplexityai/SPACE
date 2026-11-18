@@ -331,7 +331,7 @@ async fn service_with_stop(
     failures: usize,
 ) -> (
     crate::service::NodeManagerService,
-    pplx_space_common_core::types::SandboxId,
+    pplx_space_sandbox_model::SandboxId,
     tempfile::TempDir,
     crate::runtime_supervisor_client::tests::StubSupervisorServer,
 ) {
@@ -339,9 +339,9 @@ async fn service_with_stop(
         crate::runtime_supervisor_client::tests::flaky_stop_client(code, failures).await;
     let mut service = crate::service::tests::service_tests::service_for_unit_tests().await;
     service.runtime_supervisor = client;
-    let id = pplx_space_common_core::types::SandboxId::new();
+    let id = pplx_space_sandbox_model::SandboxId::new();
     let fence = pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
-        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
         None,
     );
     service.pool.bind_execution(&id.to_string(), fence).unwrap();
@@ -825,7 +825,7 @@ fn instance_restore_replaces_only_the_instance() {
 #[tokio::test]
 async fn instance_restore_accepts_only_internal_snapshots() {
     let service = crate::service::tests::service_tests::service_for_unit_tests().await;
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
     for name in [
         "d-1m-20260922T120000Z",
         "manual",
@@ -1056,8 +1056,8 @@ async fn abandoned_capture_handler_finishes_queued_running_and_stopping_attempts
 async fn cloud_hypervisor_pre_capture_refusal_never_stops_the_runtime() {
     use crate::runtime_supervisor_client::tests::{SupervisorScript, scripted_in_process_client};
     use crate::service::tests::service_tests::{bind_test_execution, service_for_unit_tests};
-    use pplx_space_common_core::types::SandboxId;
     use pplx_space_node_mgr_client::capture_receipt::{INTENT, REFUSED, STAGING_PREFIX};
+    use pplx_space_sandbox_model::SandboxId;
     let mut service = service_for_unit_tests().await;
     let sandbox = SandboxId::new();
     let artifact = pplx_space_common_core::types::LocalArtifactId::new();

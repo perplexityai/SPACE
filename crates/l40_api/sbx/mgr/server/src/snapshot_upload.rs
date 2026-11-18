@@ -37,9 +37,10 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use pplx_space_common_core::types::snapshot_shard;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, SandboxId, SnapshotArtifact, SnapshotName,
+    ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotArtifact, SnapshotName,
     snapshot_object_key,
 };
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
 use pplx_space_volmgr_client::proto::PushFileRequest;
 
@@ -177,7 +178,7 @@ pub struct SnapshotMeta {
     /// snapshots, whose ciphertext belongs to `sandbox_id`. Restore-as-new
     /// retains this identity until node-manager re-encrypts the child's COW.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rootfs_encryption_source: Option<pplx_space_common_core::types::SandboxId>,
+    pub rootfs_encryption_source: Option<pplx_space_sandbox_model::SandboxId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_artifact_id: Option<LocalArtifactId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -520,7 +521,7 @@ pub struct SnapshotUploadJobs {
     /// control plane can refuse a runtime it has superseded. Absent for backups that aren't bound
     /// to one execution, and in payloads persisted before the fence existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    pub execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
     /// `execution_generation` is the capturing execution's by evidence, not
     /// inferred, so the control plane records it to order captures (see
     /// `BeginArtifactBackupRequest.execution_generation_names_capture`). A

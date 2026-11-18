@@ -2152,10 +2152,8 @@ async fn node_placements_list_only_the_exact_stored_form_as_recognized() -> Test
         1,
     )
     .await?;
-    let started =
-        StoredSandboxLifecycle::Live(pplx_space_common_core::types::SandboxLifecycle::Started);
-    let failed =
-        StoredSandboxLifecycle::Live(pplx_space_common_core::types::SandboxLifecycle::Failed);
+    let started = StoredSandboxLifecycle::Live(pplx_space_sandbox_model::SandboxLifecycle::Started);
+    let failed = StoredSandboxLifecycle::Live(pplx_space_sandbox_model::SandboxLifecycle::Failed);
     let exact = node_placements::NodePlacementLifecycle::Stored(started);
     let spaced = node_placements::NodePlacementLifecycle::Unrecognized(" Started ".to_string());
     let dotted = node_placements::NodePlacementLifecycle::Unrecognized("FA\u{130}LED".to_string());
@@ -2233,7 +2231,7 @@ async fn node_placements_list_an_unrecognized_lifecycle_as_stored() -> TestResul
     let unrecognized =
         node_placements::NodePlacementLifecycle::Unrecognized("not-a-lifecycle".to_string());
     let failed = node_placements::NodePlacementLifecycle::Stored(StoredSandboxLifecycle::Live(
-        pplx_space_common_core::types::SandboxLifecycle::Failed,
+        pplx_space_sandbox_model::SandboxLifecycle::Failed,
     ));
     let filter = NodePlacementFilter::default();
 

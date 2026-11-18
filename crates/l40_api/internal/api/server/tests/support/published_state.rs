@@ -1,10 +1,11 @@
 //! Fixtures shared by public publication behavior tests and private unit tests.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
+use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_node_api_client::proto::PublishedSandboxState;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;

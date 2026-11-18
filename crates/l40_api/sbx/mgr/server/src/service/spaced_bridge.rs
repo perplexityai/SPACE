@@ -240,7 +240,7 @@ pub(super) enum ActivationEndpointProofRequirement {
 }
 
 pub(super) fn activation_endpoint_proof_requirement(
-    route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
     pool_template: Option<&str>,
 ) -> ActivationEndpointProofRequirement {
     if pool_template.is_some() && route_identity.is_absent() {
@@ -277,7 +277,7 @@ fn spaced_endpoint_runtime_identity(
 
 pub(super) fn endpoint_runtime_identity_for_activation(
     sandbox_id: &str,
-    route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
     spaced_host_pid: u32,
     runtime_pid: u32,
     sandbox_uid: u32,
@@ -461,7 +461,7 @@ fn endpoint_proof_error_status(error: crate::endpoint_proof::SpacedEndpointProof
 }
 
 fn node_endpoint_proof_status(
-    sandbox_id: pplx_space_common_core::types::SandboxId,
+    sandbox_id: pplx_space_sandbox_model::SandboxId,
     command: &'static str,
     error: Status,
 ) -> Status {
@@ -1354,7 +1354,7 @@ pub(super) fn endpoint_proof_after_readiness(
 
 pub(super) fn endpoint_proof_after_readiness_for(
     sandbox: &crate::db::SandboxRow,
-    route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
 ) -> Result<bool, Status> {
     use pplx_space_execution_spec::{RuntimeKind, guest_image::QualifiedGuestAgent};
     Ok(sandbox

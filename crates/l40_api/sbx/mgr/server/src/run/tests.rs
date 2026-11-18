@@ -1390,8 +1390,8 @@ async fn a_database_holding_a_recorded_capture_reopens_at_startup() {
     let path = dir.path().join("sandbox-manager.db");
     crate::db::migrate_at(&path).await.unwrap();
     let conn = crate::db::Connection::open_at(&path).unwrap();
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new();
-    let generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new();
+    let generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
     let staged = crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox(
         &conn, sandbox_id, generation,
     );

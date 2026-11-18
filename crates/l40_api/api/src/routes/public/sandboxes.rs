@@ -1,6 +1,6 @@
 use crate::routes::public::error::database_error;
 use pplx_space_accounts::{NodeId, OrgId, UserId};
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_sql_locator::sql;
 use std::{convert::Infallible, str::FromStr, time::Duration};
@@ -19,7 +19,6 @@ use axum::{
     },
 };
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::SandboxLifecycle;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_public_api::{
@@ -31,6 +30,7 @@ use pplx_space_public_api::{
     SandboxOperationResponse, SandboxResources, SandboxStatsResponse, UpdateSandboxRequest,
     routes as native_routes,
 };
+use pplx_space_sandbox_model::SandboxLifecycle;
 use pplx_space_state_reconciliation::{
     FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
     SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,

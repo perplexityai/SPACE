@@ -14,7 +14,7 @@ pub(super) struct GuestMaintenanceArgs {
     pub operation: Option<uuid::Uuid>,
     /// Expected execution; defaults to the current execution discovered from status.
     #[arg(long)]
-    pub expected_execution: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    pub expected_execution: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
 }
 
 #[derive(Debug, Clone, clap::Subcommand)]

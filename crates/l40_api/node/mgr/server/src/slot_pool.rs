@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use pplx_space_common_core::types::{SandboxId, SandboxIdParseError};
+use pplx_space_sandbox_model::{SandboxId, SandboxIdParseError};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;

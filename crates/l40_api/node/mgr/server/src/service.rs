@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_host_layout::{identities::gids, identities::group_names, identities::user_names};
 use pplx_space_node_runtime_core::runtime_inventory::{RuntimeInventory, RuntimeInventoryError};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use tonic::{Request, Response, Status};
 

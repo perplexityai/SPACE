@@ -24,6 +24,7 @@ uuid = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true, features = ["sqlx"] }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
