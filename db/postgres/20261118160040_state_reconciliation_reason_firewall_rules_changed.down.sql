@@ -1,4 +1,4 @@
--- Keeps security_policy_changed in state_reconciliation_reason; this down only
+-- Keeps firewall_rules_changed in state_reconciliation_reason; this down only
 -- removes the migration's history row.
 --
 -- Postgres cannot drop an enum value. Removing it would mean rebuilding the
