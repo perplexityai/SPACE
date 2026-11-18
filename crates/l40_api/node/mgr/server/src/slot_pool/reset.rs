@@ -121,9 +121,9 @@ fn classify_slot_validation_error(error: SlotValidationError) -> SlotResetError 
 /// A reset that collides with a held guard is not re-nudged on release. The
 /// scheduler's colliding attempt keeps that slot generation in its retry
 /// backoff (`POOL_FILL_RETRY_DELAY`, 30 s); only then can rediscovery, which
-/// scans one page every `REDISCOVERY_INTERVAL` (5 s) while reset capacity is
-/// free, pick it up, possibly after several pages to wrap back to it. A
-/// holder whose release latency matters must handle that itself.
+/// scans a page at least every `REDISCOVERY_INTERVAL` (5 s) while reset
+/// capacity is free, pick it up, possibly after several pages to wrap back to
+/// it. A holder whose release latency matters must handle that itself.
 /// Not `Clone`: the one value that inserted the entry is the one that removes it.
 pub(super) struct SlotGuard {
     pool: std::sync::Arc<NetworkPool>,
@@ -173,6 +173,8 @@ pub(super) struct ResetClaim {
     // Always `Some` until `drop` takes it.
     guard: Option<SlotGuard>,
     retry: AtomicBool,
+    // `schedule_reset_retry` outside tests.
+    notify: fn(std::sync::Arc<NetworkPool>, u32),
 }
 
 impl std::fmt::Debug for ResetClaim {
@@ -199,38 +201,40 @@ impl ResetClaim {
         Some(std::sync::Arc::new(Self {
             guard: Some(SlotGuard::try_acquire(pool, slot_id)?),
             retry: AtomicBool::new(true),
+            notify: schedule_reset_retry,
         }))
+    }
+
+    /// Lets a test observe the real final drop through `notify`.
+    #[cfg(test)]
+    pub(super) fn acquire_notifying(
+        pool: &std::sync::Arc<NetworkPool>,
+        slot_id: u32,
+        notify: fn(std::sync::Arc<NetworkPool>, u32),
+    ) -> Option<std::sync::Arc<Self>> {
+        let mut claim = Self::acquire(pool, slot_id)?;
+        // A new claim is unshared, so this always succeeds.
+        std::sync::Arc::get_mut(&mut claim)?.notify = notify;
+        Some(claim)
     }
 }
 
 impl Drop for ResetClaim {
     fn drop(&mut self) {
-        // The release-then-notify order lives in `release_then_notify`; keep it there.
         // Covers early DB errors, cancellation and panics as well as normal
         // retries. A completed/nontransitional row makes the next probe a no-op.
         if let Some(guard) = self.guard.take() {
-            release_then_notify(
-                guard,
-                self.retry.load(Ordering::Relaxed),
-                schedule_reset_retry,
-            );
+            // The retry only nudges the worker to rescan, so release the slot
+            // first: a scan that still sees it claimed would skip it. `drop`
+            // runs before field destruction, so this order must be explicit.
+            let armed = self.retry.load(Ordering::Relaxed);
+            let pool = guard.pool.clone();
+            let slot_id = guard.slot_id;
+            drop(guard);
+            if armed {
+                (self.notify)(pool, slot_id);
+            }
         }
-    }
-}
-
-/// The retry only nudges the worker to rescan, so release the slot first: a
-/// scan that still sees it claimed would skip it. `Drop::drop` runs before
-/// field destruction, so this order must be explicit.
-pub(super) fn release_then_notify(
-    guard: SlotGuard,
-    armed: bool,
-    notify: impl FnOnce(std::sync::Arc<NetworkPool>, u32),
-) {
-    let pool = guard.pool.clone();
-    let slot_id = guard.slot_id;
-    drop(guard);
-    if armed {
-        notify(pool, slot_id);
     }
 }
 

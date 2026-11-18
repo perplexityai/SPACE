@@ -143,26 +143,42 @@ fn armed_reset_release_frees_the_slot_then_wakes_the_scheduler() {
     assert_eq!(wakeups(&mut jobs), 1);
 }
 
+thread_local! {
+    /// Each recorded notification's slot and whether it was still registered.
+    static NOTIFICATIONS: std::cell::RefCell<Vec<(u32, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn record_notification(pool: std::sync::Arc<NetworkPool>, slot_id: u32) {
+    let still_held = held(&pool, slot_id);
+    NOTIFICATIONS.with_borrow_mut(|notifications| notifications.push((slot_id, still_held)));
+}
+
 #[test]
-fn final_release_removes_the_entry_before_notifying() {
-    for armed in [true, false] {
+fn final_drop_removes_the_entry_before_notifying() {
+    // `disarming_never_releases_early_and_suppresses_only_this_retry` covers
+    // disarmed drops through the production notifier.
+    for clones in [0, 2] {
+        let context = format!("{clones} clones");
+        NOTIFICATIONS.take();
         let (pool, mut jobs) = pool_with_wakeups(1);
-        let guard = SlotGuard::try_acquire(&pool, 0).unwrap();
-        let mut notified = false;
-        release_then_notify(guard, armed, |pool, slot_id| {
-            assert_eq!(slot_id, 0);
-            assert!(
-                !held(&pool, slot_id),
-                "notified while the slot was still claimed"
-            );
-            notified = true;
-        });
-        assert_eq!(notified, armed);
-        assert_free(&pool, 0, "released");
+        let claim = ResetClaim::acquire_notifying(&pool, 0, record_notification).unwrap();
+        // Only the last of these shared owners finalizes the claim.
+        for owner in vec![claim; clones + 1] {
+            assert_held(&pool, 0, &context);
+            assert!(NOTIFICATIONS.with_borrow(Vec::is_empty), "{context}");
+            drop(owner);
+        }
+        assert_eq!(
+            NOTIFICATIONS.take(),
+            vec![(0, false)],
+            "{context}: notified once, after the slot was released"
+        );
+        assert_free(&pool, 0, &context);
         assert_eq!(
             wakeups(&mut jobs),
             0,
-            "the injected notifier replaced the nudge"
+            "{context}: the recording notifier replaced the nudge"
         );
     }
 }
