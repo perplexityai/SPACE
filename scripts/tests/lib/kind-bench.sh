@@ -356,7 +356,7 @@ kind_bench_docker_up() {
       --data-root "$dir/docker" \
       --exec-root "$run/exec" \
       --host "unix://$sock" \
-      --group "$(id -g)" \
+      --group 0 \
       --pidfile "$run/docker.pid" \
       --containerd "$run/containerd.sock" \
       --containerd-namespace "$ns" \
@@ -366,9 +366,9 @@ kind_bench_docker_up() {
       </dev/null >"$dir/dockerd.log" 2>&1 9>&- &
   local _
   for _ in $(seq 1 90); do
-    # The socket is root:<caller's group> 0660 (--group), like a host
-    # daemon's docker group: the bench's commands run as the caller.
-    if sudo -n test -S "$sock" && kind_bench_docker_alive "$i"; then
+    # The socket is created root:root 0660 (--group 0), then given to the
+    # caller alone, as whom the bench's commands run.
+    if sudo -n test -S "$sock" && sudo -n chown "$(id -u)" "$sock" && kind_bench_docker_alive "$i"; then
       return 0
     fi
     sleep 1
