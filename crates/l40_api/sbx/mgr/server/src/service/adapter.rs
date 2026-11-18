@@ -101,6 +101,23 @@ impl SandboxManager for SandboxManagerService {
         SandboxManagerService::list_pending_local_backups(self, request).await
     }
 
+    async fn drain_node(
+        &self,
+        _request: Request<crate::proto::DrainNodeRequest>,
+    ) -> Result<Response<crate::proto::DrainNodeResponse>, Status> {
+        // Answered as by a server without the RPC until the drain is served.
+        Err(Status::unimplemented(""))
+    }
+
+    async fn preview_drain_node(
+        &self,
+        _request: Request<crate::proto::PreviewDrainNodeRequest>,
+    ) -> Result<Response<crate::proto::PreviewDrainNodeResponse>, Status> {
+        // Answered as by a server without the RPC until the preview is
+        // served.
+        Err(Status::unimplemented(""))
+    }
+
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         SandboxManagerService::list(self, request).await
     }
