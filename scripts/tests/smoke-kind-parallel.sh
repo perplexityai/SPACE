@@ -174,6 +174,12 @@ printf '%s\n' "$BENCHES" >"$OUT/bench-count"
 log "run $RUN_ID: output in $OUT"
 
 # One line per phase: <owner> <phase> <start epoch> <end epoch> <exit status>.
+#
+# A step's status is its own: every step runs as `phase ... || ...` or under
+# `if`, where bash ignores `set -e` for the whole step body, a subshell's
+# `set -e` and an asynchronous one's included (tried). So every command in a
+# step that can fail is followed by `|| return 1`: without it a failed Rust
+# build went on to save and hand over the image the host already had.
 TIMINGS="$OUT/timings.tsv"
 : >"$TIMINGS"
 phase() {
@@ -292,8 +298,7 @@ host_step() {
 }
 
 prepare_host() {
-  kind_bench_preflight
-  kind_bench_ensure_docker
+  kind_bench_ensure_docker || return 1
   kind_bench_raise_limits "$BENCHES"
   # socat forwards each bench's loopback to the layer cache; rsync copies the
   # checkout's uncommitted changes into each bench's.
@@ -305,7 +310,7 @@ prepare_host() {
   for tool in kind kubectl tilt helm aws uv jq curl; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       log "installing the Kind prerequisites ($tool is missing)"
-      bash "$REPO_ROOT/infra/space/kind/scripts/install-prereqs.sh"
+      bash "$REPO_ROOT/infra/space/kind/scripts/install-prereqs.sh" || return 1
       break
     fi
   done
@@ -318,18 +323,16 @@ prepare_host() {
   # exists, every container's /dev has the nodes.
   # shellcheck source=../lib/space-loop-devices.sh
   SPACE_LOOP_DEVICE_TARGET="${SPACE_LOOP_DEVICE_TARGET:-$(( 64 + 128 * BENCHES ))}" \
-    source "$REPO_ROOT/scripts/lib/space-loop-devices.sh"
+    source "$REPO_ROOT/scripts/lib/space-loop-devices.sh" || return 1
   space_loop_stage_pool log
   # Kind nodes share the host kernel and cannot load modules; CI loads the
   # BYOK targets on the runner the same way (kind-ci.yml, load-byok-targets).
   # shellcheck source=../lib/space-smoke-prereqs.sh
-  source "$REPO_ROOT/scripts/lib/space-smoke-prereqs.sh"
-  space_smoke_prepare_encrypted_targets
+  source "$REPO_ROOT/scripts/lib/space-smoke-prereqs.sh" || return 1
+  space_smoke_prepare_encrypted_targets || return 1
   # Staged once, mounted read-only into every bench's nodes.
-  SPACE_VENDOR_ROOT="${SPACE_VENDOR_ROOT:-$HOME/.space-devbox/space/vendor}"
-  export SPACE_VENDOR_ROOT
   if ! bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh" --check >/dev/null 2>&1; then
-    bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh"
+    bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh" || return 1
   fi
 }
 
@@ -338,14 +341,14 @@ start_registry() { # name port data-dir [env...]
   shift 3
   if [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != true ]]; then
     docker rm -f "$name" >/dev/null 2>&1 || true
-    mkdir -p "$data"
+    mkdir -p "$data" || return 1
     binds=(-p "$REGISTRY_IP:$port:5000")
     [[ "$port" == "$CACHE_PORT" ]] && binds+=(-p "127.0.0.1:$port:5000")
     local env=() setting
     for setting in "$@"; do env+=(-e "$setting"); done
     docker run -d --name "$name" --restart unless-stopped "${binds[@]}" \
       -v "$data:/var/lib/registry" -e REGISTRY_STORAGE_DELETE_ENABLED=true \
-      ${env[@]+"${env[@]}"} "$REGISTRY_IMAGE" >/dev/null
+      ${env[@]+"${env[@]}"} "$REGISTRY_IMAGE" >/dev/null || return 1
   fi
   local _
   for _ in $(seq 1 30); do
@@ -357,12 +360,12 @@ start_registry() { # name port data-dir [env...]
 
 start_registries() {
   if ! ip link show "$REGISTRY_LINK" >/dev/null 2>&1; then
-    sudo -n ip link add "$REGISTRY_LINK" type dummy
-    sudo -n ip addr add "$REGISTRY_IP/32" dev "$REGISTRY_LINK"
-    sudo -n ip link set "$REGISTRY_LINK" up
+    sudo -n ip link add "$REGISTRY_LINK" type dummy || return 1
+    sudo -n ip addr add "$REGISTRY_IP/32" dev "$REGISTRY_LINK" || return 1
+    sudo -n ip link set "$REGISTRY_LINK" up || return 1
   fi
   start_registry "$MIRROR_NAME" "$MIRROR_PORT" "$CACHE_ROOT/hub-mirror" \
-    REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io
+    REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io || return 1
   start_registry "$CACHE_NAME" "$CACHE_PORT" "$CACHE_ROOT/layer-cache"
 }
 
@@ -378,25 +381,28 @@ base_image_dockerfiles() {
 # The images every bench loads before it creates its cluster: the node images
 # the cluster config names, and the build bases.
 shared_images() {
-  local node base dockerfiles=() images=()
-  node="$(bash "$REPO_ROOT/infra/space/kind/scripts/kind-node-image.sh" ensure)"
-  base="$(bash "$REPO_ROOT/infra/space/kind/scripts/kind-node-image.sh" cluster-base)"
-  docker image inspect "$base" >/dev/null 2>&1 || docker pull -q "$base"
-  mapfile -t dockerfiles < <(base_image_dockerfiles)
-  bash "$REPO_ROOT/infra/space/kind/scripts/pull-base-images.sh" "${dockerfiles[@]}"
-  mapfile -t images < <(bash "$REPO_ROOT/infra/space/kind/scripts/pull-base-images.sh" --list "${dockerfiles[@]}")
+  local node base listed dockerfiles=() images=()
+  node="$(bash "$REPO_ROOT/infra/space/kind/scripts/kind-node-image.sh" ensure)" || return 1
+  base="$(bash "$REPO_ROOT/infra/space/kind/scripts/kind-node-image.sh" cluster-base)" || return 1
+  docker image inspect "$base" >/dev/null 2>&1 || docker pull -q "$base" || return 1
+  listed="$(base_image_dockerfiles)" || return 1
+  mapfile -t dockerfiles <<<"$listed"
+  bash "$REPO_ROOT/infra/space/kind/scripts/pull-base-images.sh" "${dockerfiles[@]}" || return 1
+  listed="$(bash "$REPO_ROOT/infra/space/kind/scripts/pull-base-images.sh" --list "${dockerfiles[@]}")" || return 1
+  mapfile -t images <<<"$listed"
   # `docker save` keeps tags, not digests, and an untagged load would be a
   # dangling image: save each name:tag@digest reference under its tag.
   local image saved=("$node")
   for image in "$base" "${images[@]}"; do
+    [[ -n "$image" ]] || continue
     if [[ "$image" == *@* ]]; then
-      docker tag "$image" "${image%@*}"
+      docker tag "$image" "${image%@*}" || return 1
       image="${image%@*}"
     fi
     saved+=("$image")
   done
-  printf '%s\n' "${saved[@]}" >"$HOST/shared-images.txt"
-  docker save -o "$HOST/shared-images.tar" "${saved[@]}"
+  printf '%s\n' "${saved[@]}" >"$HOST/shared-images.txt" || return 1
+  docker save -o "$HOST/shared-images.tar" "${saved[@]}" || return 1
 }
 
 # The handoff's identity checks read a GitHub run's coordinates; this run is
@@ -409,30 +415,33 @@ handoff_env() {
 }
 
 rust_image() {
-  local identity=() line
-  while IFS= read -r line; do identity+=("$line"); done < <(handoff_env)
+  local identity=() line listed
+  listed="$(handoff_env)" || return 1
+  while IFS= read -r line; do identity+=("$line"); done <<<"$listed"
   local reuse_out="$HOST/rust-reuse.out"
-  : >"$reuse_out"
+  : >"$reuse_out" || return 1
   # Main's image for identical Rust inputs, where the registry is readable.
   env "${identity[@]}" GITHUB_OUTPUT="$reuse_out" \
     python3 "$REPO_ROOT/infra/space/kind/scripts/rust-artifact-handoff.py" reuse \
     ghcr.io/perplexityai/space-kind-rust-artifacts || true
   if ! grep -q '^reused=true$' "$reuse_out"; then
-    bash "$REPO_ROOT/infra/space/kind/scripts/build-rust-artifacts.sh"
+    bash "$REPO_ROOT/infra/space/kind/scripts/build-rust-artifacts.sh" || return 1
   fi
-  install -d "$HOST/rust"
-  docker image save space-rust-build-kind:local | gzip -1 >"$HOST/rust/kind-rust.tar.gz"
+  install -d "$HOST/rust" || return 1
+  # pipefail (set at the top) makes a failed save fail the pipeline.
+  docker image save space-rust-build-kind:local | gzip -1 >"$HOST/rust/kind-rust.tar.gz" || return 1
   env "${identity[@]}" python3 "$REPO_ROOT/infra/space/kind/scripts/rust-artifact-handoff.py" \
-    record "$HOST/rust"
+    record "$HOST/rust" || return 1
 }
 
 # The layer cache every bench reads: the cached stages, exported as main CI
 # exports them to GHCR, and the whole UI build under its own scope.
 build_cache() {
   SPACE_KIND_BUILD_CACHE_REPOSITORY="$LAYER_CACHE" SPACE_KIND_BUILD_CACHE_WRITE=1 \
-    bash "$REPO_ROOT/infra/space/kind/scripts/runtime-image-cache.sh" publish
+    bash "$REPO_ROOT/infra/space/kind/scripts/runtime-image-cache.sh" publish || return 1
   bash "$REPO_ROOT/infra/space/kind/scripts/prebuild-ui-image.sh" \
-    --cache-to "type=registry,ref=$LAYER_CACHE:$UI_CACHE_SCOPE,mode=max,image-manifest=true,oci-mediatypes=true"
+    --cache-to "type=registry,ref=$LAYER_CACHE:$UI_CACHE_SCOPE,mode=max,image-manifest=true,oci-mediatypes=true" \
+    || return 1
 }
 
 # One seed for every bench: its inputs are the Rust image's guest binaries, the
@@ -441,7 +450,7 @@ build_cache() {
 # that key finds its seed up to date (build-seed.sh) and builds none.
 seed() {
   await rust || return 1
-  SPACE_SEED_OUTPUT_DIR="$SEED_DIR" bash "$REPO_ROOT/infra/space/kind/scripts/build-seed.sh"
+  SPACE_SEED_OUTPUT_DIR="$SEED_DIR" bash "$REPO_ROOT/infra/space/kind/scripts/build-seed.sh" || return 1
 }
 
 # The full inventory, for the coverage check, and a synced project
@@ -457,7 +466,7 @@ inventory() {
 bench_env() {
   local i="$1"
   local file="$OUT/benches/$i/bench.env"
-  kind_bench_write_env "$i" "$file"
+  kind_bench_write_env "$i" "$file" || return 1
   {
     printf 'SPACE_VENDOR_ROOT=%s\n' "$SPACE_VENDOR_ROOT"
     # CI's smoke job environment (kind-ci.yml), pinned the same way.
@@ -474,7 +483,7 @@ bench_env() {
     done
     handoff_env
     printf 'GITHUB_ENV=%s\n' "$OUT/benches/$i/handoff.env"
-  } >>"$file"
+  } >>"$file" || return 1
   printf '%s\n' "$file"
 }
 
@@ -511,12 +520,12 @@ run_bench() {
   local result=up_failed
   trap 'printf "%s\n" "$result" >"$dir/result"' EXIT
   phase "bench$i" docker bench_docker "$i" || return 1
-  env_file="$(bench_env "$i")"
+  env_file="$(bench_env "$i")" || return 1
   local src
   src="$(kind_bench_dir "$i")/src"
   phase "bench$i" checkout bench_checkout "$src" || return 1
   # Bench commands start in the bench's checkout (kind_bench_exec keeps $PWD).
-  cd "$src"
+  cd "$src" || return 1
   bx() { kind_bench_exec "$i" "$env_file" "$@"; }
   # The bench's own loopback end of the host's layer cache, in its namespaces,
   # so it ends with them.
@@ -540,7 +549,7 @@ run_bench() {
   await rust || return 1
   phase "bench$i" rust_handoff bx python3 "$src/infra/space/kind/scripts/rust-artifact-handoff.py" \
     load "$HOST/rust" || return 1
-  cat "$dir/handoff.env" >>"$env_file"
+  cat "$dir/handoff.env" >>"$env_file" || return 1
   # The host's seed and the key it was built with, where the bench's own seed
   # build looks (build-seed.sh); without them the bench builds its own.
   if await seed; then
@@ -577,6 +586,9 @@ if [[ -n "${stale// /}" ]]; then
   log "removing benches left by an earlier run: $stale"
   teardown_all
 fi
+
+# Staged once on the host, mounted read-only into every bench's nodes.
+export SPACE_VENDOR_ROOT="${SPACE_VENDOR_ROOT:-$HOME/.space-devbox/space/vendor}"
 
 sample_resources &
 BACKGROUND+=("$!")

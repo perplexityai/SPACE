@@ -90,14 +90,17 @@ kind_bench_ensure_docker() {
     return 0
   fi
   local tmp
-  tmp="$(mktemp -d)"
+  tmp="$(mktemp -d)" || return 1
   kind_bench_log "installing Docker ${KIND_BENCH_DOCKER_VERSION} daemons into ${KIND_BENCH_DOCKER_DIR}"
+  local status=0
   curl -fsSL --retry 3 -o "$tmp/docker.tgz" \
-    "https://download.docker.com/linux/static/stable/$(uname -m)/docker-${KIND_BENCH_DOCKER_VERSION}.tgz"
-  tar -C "$tmp" -xzf "$tmp/docker.tgz"
-  sudo -n install -d -m 0755 "$KIND_BENCH_DOCKER_DIR"
-  sudo -n install -m 0755 "$tmp"/docker/* "$KIND_BENCH_DOCKER_DIR/"
+    "https://download.docker.com/linux/static/stable/$(uname -m)/docker-${KIND_BENCH_DOCKER_VERSION}.tgz" \
+    || status=1
+  (( status )) || tar -C "$tmp" -xzf "$tmp/docker.tgz" || status=1
+  (( status )) || sudo -n install -d -m 0755 "$KIND_BENCH_DOCKER_DIR" || status=1
+  (( status )) || sudo -n install -m 0755 "$tmp"/docker/* "$KIND_BENCH_DOCKER_DIR/" || status=1
   rm -rf "$tmp"
+  return "$status"
 }
 
 # Host-global limits that N Kind stacks share and one stack never reaches:
@@ -221,7 +224,7 @@ kind_bench_docker_up() {
     } + (if $mirror == "" then {} else {
       "registry-mirrors": [$mirror],
       "insecure-registries": [$mirror | sub("^https?://"; "")]
-    } end)' | sudo -n tee "$run/daemon.json" >/dev/null
+    } end)' | sudo -n tee "$run/daemon.json" >/dev/null || return 1
   # setsid: the daemon outlives the shell that started it, and a Ctrl-C to the
   # run reaches it only through the teardown, in order.
   local cgroup
@@ -257,10 +260,10 @@ kind_bench_docker_up() {
 kind_bench_write_env() {
   local i="$1" file="$2" dir
   dir="$(kind_bench_dir "$i")"
-  install -d -m 0700 "$dir/home" "$dir/tmp" "$dir/home/.docker"
+  install -d -m 0700 "$dir/home" "$dir/tmp" "$dir/home/.docker" || return 1
   # The host user's registry credentials, so a bench pulls as the host does.
   if [[ -s "${DOCKER_CONFIG:-$HOME/.docker}/config.json" ]]; then
-    install -m 0600 "${DOCKER_CONFIG:-$HOME/.docker}/config.json" "$dir/home/.docker/config.json"
+    install -m 0600 "${DOCKER_CONFIG:-$HOME/.docker}/config.json" "$dir/home/.docker/config.json" || return 1
   fi
   {
     printf 'HOME=%s\n' "$dir/home"
@@ -278,7 +281,7 @@ kind_bench_write_env() {
     printf 'UV_CACHE_DIR=%s\n' "${UV_CACHE_DIR:-$HOME/.cache/uv}"
     printf 'UV_PYTHON_INSTALL_DIR=%s\n' "${UV_PYTHON_INSTALL_DIR:-$HOME/.local/share/uv/python}"
     printf 'SPACE_KIND_BENCH=%s\n' "$i"
-  } >"$file"
+  } >"$file" || return 1
 }
 
 # Run a command in bench <i> as the calling user, with exactly the variables
