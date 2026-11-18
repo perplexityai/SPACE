@@ -75,6 +75,10 @@ pub struct AppState {
     /// [`public::hidden_operations`].
     pub native_hidden_operations: public::hidden_operations::HiddenOperationsGate,
     pub ecw_credential_keyring: std::sync::Arc<pplx_space_ecw_credential::EcwCredentialKeyring>,
+    /// The node calls the admin API makes of a v2 node: the
+    /// `PreviewDrainNode` call `GET /nodes/{node_id}/drain-v2-preview` makes.
+    #[cfg(test)]
+    pub v2_drain_probe: std::sync::Arc<dyn admin::nodes::V2DrainProbe>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -277,6 +281,8 @@ impl AppState {
             feature_flags,
             native_hidden_operations,
             ecw_credential_keyring,
+            #[cfg(test)]
+            v2_drain_probe: std::sync::Arc::new(admin::nodes::NodeApiV2DrainProbe),
         })
     }
 

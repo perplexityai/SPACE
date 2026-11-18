@@ -25,7 +25,6 @@ kubernetes = [
     "dep:pplx-space-sandbox-pod",
     "dep:pplx-space-kube-client",
     "dep:pplx-space-k8s-node-id",
-    "dep:pplx-space-node-registration-store",
     "pplx-space-rpc-auth/k8s",
 ]
 otel = ["pplx-space-observability/otel"]
@@ -116,7 +115,7 @@ pplx-space-rpc-contracts = { workspace = true }
 pplx-space-sandbox-pod = { workspace = true, optional = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
-pplx-space-node-registration-store = { workspace = true, optional = true }
+pplx-space-node-registration-store = { workspace = true }
 pplx-space-cluster-trigger-queue = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
