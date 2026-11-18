@@ -66,7 +66,9 @@ const IDLE_WITNESS_SQL: &str = "COALESCE(
 db_private_outside_tests! {
     /// `(sandbox_id, idle witness)` of cold suspended sandboxes after the
     /// `(cursor_witness, cursor_sandbox_id)` keyset position, in witness then id
-    /// order.
+    /// order. A row a drain suspended is never one: its `drain_evacuations`
+    /// record, which an eviction deletes with the row, holds the lifecycle the
+    /// drain restores it to, kept until a cancel has handed the sandbox back.
     fn idle_suspended_candidates(
         conn: &Connection,
         cutoff: i64,
@@ -108,6 +110,9 @@ db_private_outside_tests! {
              SELECT 1 FROM sandbox_runtime_upgrades u
              WHERE u.sandbox_id = s.id
                AND u.phase IN {UNRETIRED_UPGRADE_PHASES_SQL}
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM drain_evacuations d WHERE d.sandbox_id = s.id
            )
          ORDER BY {IDLE_WITNESS_SQL} ASC, s.id ASC
          LIMIT ?4"
