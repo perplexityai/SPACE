@@ -858,10 +858,18 @@ pub(super) fn stale_existing_pod_reason(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WakeRpcErrorDisposition {
     ReadinessPoll(&'static str),
+    /// node-api did not accept this process's own credential. That is no
+    /// verdict on the sandbox: a Pod-bound token stops validating the moment
+    /// its Pod is deleted, while the process still runs out its termination.
+    /// The wake is retried as an operation, by whichever executor claims it.
+    CallerUnauthenticated,
     Fail,
 }
 
 pub(super) fn classify_wake_rpc_error(error: &tonic::Status) -> WakeRpcErrorDisposition {
+    if error.code() == Code::Unauthenticated {
+        return WakeRpcErrorDisposition::CallerUnauthenticated;
+    }
     if error.code() == Code::FailedPrecondition
         && error
             .message()

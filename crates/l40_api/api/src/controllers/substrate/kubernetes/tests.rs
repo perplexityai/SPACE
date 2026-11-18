@@ -2030,6 +2030,8 @@ mod kubernetes_tests {
         /// Every Wake received, in arrival order.
         pub(crate) received:
             Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
+        /// When set, every Wake is answered with this status instead.
+        pub(crate) rejection: Arc<std::sync::Mutex<Option<tonic::Status>>>,
     }
 
     #[tonic::async_trait]
@@ -2062,6 +2064,9 @@ mod kubernetes_tests {
             let request = request.into_inner();
             self.received.lock().unwrap().push(request.clone());
             let attempt = self.wake_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(rejection) = self.rejection.lock().unwrap().clone() {
+                return Err(rejection);
+            }
             if self
                 .succeed_after_attempt
                 .is_none_or(|succeed_after| attempt < succeed_after)
@@ -2100,6 +2105,7 @@ mod kubernetes_tests {
         pub(crate) port: u16,
         pub(crate) received:
             Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
+        pub(crate) rejection: Arc<std::sync::Mutex<Option<tonic::Status>>>,
         health_reporter: tonic_health::server::HealthReporter,
         shutdown: CancellationToken,
         task: JoinHandle<()>,
@@ -2145,11 +2151,13 @@ mod kubernetes_tests {
         );
         let worker_service = SimWorkerApiService::new(sim_state);
         let received = Arc::default();
+        let rejection = Arc::default();
         let service = SequencedWakeWorker {
             wake_attempts,
             succeed_after_attempt,
             echo_route_identity,
             received: Arc::clone(&received),
+            rejection: Arc::clone(&rejection),
         };
         let (health_reporter, health_service) = pplx_space_grpc_server::grpc_health_service();
         health_reporter
@@ -2183,6 +2191,7 @@ mod kubernetes_tests {
         Ok(SequencedWakeWorkerHandle {
             port,
             received,
+            rejection,
             health_reporter,
             shutdown,
             task,
@@ -2708,6 +2717,48 @@ mod kubernetes_tests {
         .await?;
         assert_eq!(active_generation, 1, "the restore pod must not be replaced");
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wake_rejecting_the_callers_credential_is_retryable() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+
+        // Arrange: node-api refuses this process's token, as it does once
+        // the API's Pod is deleted while the process still runs.
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        let (substrate, wake_attempts, _pod_gets, worker) =
+            paused_restore_test_subject(&db.pool, sandbox_id, Some(1), true).await?;
+        *worker.rejection.lock().unwrap() =
+            Some(tonic::Status::unauthenticated("token validation failed"));
+
+        // Act.
+        let result = substrate
+            .restore_evacuated_execution(
+                SandboxApiMetricIdentity::ecw("evacuation"),
+                sandbox_id,
+                ActivationOptions {
+                    blocking: true,
+                    ready_timeout: Duration::from_secs(2),
+                },
+                None,
+                SandboxLifecycle::Paused,
+            )
+            .await;
+
+        // Assert: a retryable answer, given at once, rather than a conflict
+        // that ends the operation.
+        let error = result.expect_err("a refused credential cannot wake the sandbox");
+        let status = crate::controllers::ControllerError::from(error).status();
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            wake_attempts.load(Ordering::SeqCst),
+            1,
+            "the credential will not validate again, so the wake must not be retried in place"
+        );
         Ok(())
     }
 

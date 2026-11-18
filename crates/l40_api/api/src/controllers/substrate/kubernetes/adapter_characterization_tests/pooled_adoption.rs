@@ -574,7 +574,10 @@ async fn started_pooled_adoption_refuses_a_worker_without_split_receipts() -> Te
 /// A started adoption that reaches command readiness releases the activation
 /// attempt it took, including after a Wake that first reported the runtime
 /// not ready; one whose Wake failed after being sent keeps it, because the
-/// node may still be acting on that Wake. Setup always precedes the Wake.
+/// node may still be acting on that Wake. A Wake refused for the adopter's
+/// own credential, as once the adopting API's Pod is deleted, says nothing
+/// about the sandbox and is answered retryably. Setup always precedes the
+/// Wake.
 #[rstest::rstest]
 #[case::ready_releases_the_attempt(1, None, Ok(()))]
 #[case::not_ready_wake_is_polled_until_ready(2, None, Ok(()))]
@@ -582,6 +585,11 @@ async fn started_pooled_adoption_refuses_a_worker_without_split_receipts() -> Te
     1,
     Some(tonic::Status::invalid_argument("wake request rejected")),
     Err(StatusCode::CONFLICT)
+)]
+#[case::refused_credential_is_retryable(
+    1,
+    Some(tonic::Status::unauthenticated("token validation failed")),
+    Err(StatusCode::SERVICE_UNAVAILABLE)
 )]
 #[tokio::test(flavor = "current_thread")]
 async fn started_pooled_adoption_releases_its_attempt_only_when_no_wake_may_be_pending(

@@ -533,6 +533,18 @@ impl KubernetesSubstrate {
                                     });
                                 }
                                 WakeRpcErrorDisposition::ReadinessPoll(_) => {}
+                                // The refusal is of this process's credential,
+                                // which a retry here would only send again:
+                                // hand the wake back for any executor to
+                                // re-drive. An earlier attempt may have landed,
+                                // so the dispatch status stays as it is.
+                                WakeRpcErrorDisposition::CallerUnauthenticated => {
+                                    return Err(SubstrateError::Unavailable {
+                                        message: format!(
+                                            "worker node-api did not accept this API process's credential: {error}"
+                                        ),
+                                    });
+                                }
                                 WakeRpcErrorDisposition::Fail => {
                                     return Err(SubstrateError::Conflict {
                                         message: format!("sandbox wake failed: {error}"),
