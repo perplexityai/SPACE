@@ -367,7 +367,7 @@ scenarios run unchanged. What isolates it
 
 - a network namespace with a veth to the host and NAT out, so each bench has
   its own loopback ports and its own Docker networks;
-- a dockerd of its own in that namespace (data root under
+- a dockerd and containerd of its own in that namespace (data root under
   `~/.space-benches/<i>`, containerd image store). It, its Kind nodes and the
   bench's commands run in the cgroup `/space-bench-<i>`, not the caller's: a
   caller in a CPU-capped container (as on a host whose own Docker is a
