@@ -581,3 +581,5 @@ unencrypted restore, and fork remain deployment checks.
 A software rollback must keep UID/GID 964, its client groups, and the restricted
 credential endpoint. Use an earlier release compatible with that configuration,
 not an ownership transition back to the shared account.
+
+<!-- Validation of the kind-smoke label on a path-unselected change. Do not merge. -->
