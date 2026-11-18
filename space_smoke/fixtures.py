@@ -1366,7 +1366,8 @@ class CommandSandboxFixture(ScenarioFixture):
         # stop released.
         deadline = deleted_at + LOCAL_CLEANUP_DEADLINE_SECONDS
         facets = self._node_ctl_facet_control
-        if facets is not None:
+        # A rootfs a poll already removed needs no run.
+        if facets is not None and control.sandbox_cache_dir_present(worker, sandbox_id):
             self._run_cluster_deleted_eviction(facets, control, worker, sandbox_id, deadline)
         while control.sandbox_cache_dir_present(worker, sandbox_id):
             self.verify(

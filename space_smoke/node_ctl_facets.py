@@ -28,7 +28,14 @@ class FacetSync:
 
     @property
     def succeeded(self) -> bool:
-        return self.completed_at is not None and self.latest.last_success_at == self.latest.last_completed_at
+        # The times have one-second resolution, so a run that failed in the
+        # second an earlier one succeeded would match on them alone; node-ctl
+        # clears last_error on every success and sets it on every failure.
+        return (
+            self.completed_at is not None
+            and self.latest.last_success_at == self.latest.last_completed_at
+            and not self.latest.last_error
+        )
 
 
 def sync_node_ctl_facet(
@@ -40,7 +47,7 @@ def sync_node_ctl_facet(
     wait: Callable[[float], None],
 ) -> FacetSync:
     """Run `facet` at full scope on that worker now; return once a run that started after
-    this call has finished, or once `timeout` seconds have passed without one.
+    this call has finished, or once `timeout` seconds from the call have passed without one.
 
     The facet's status has one-second resolution and also moves for
     node-ctl's own poll. The status read first names the latest run's start
@@ -53,10 +60,12 @@ def sync_node_ctl_facet(
     raises when node-ctl cannot be read or did not take the request.
     """
 
+    # From the call, so the status read, the second's wait and the request
+    # (each a node command with its own timeout) spend from the caller's time.
+    deadline = time.monotonic() + timeout
     before = control.node_ctl_facet_run(node_name, facet)
     wait(1)
     control.reconcile_node_ctl_facet(node_name, facet)
-    deadline = time.monotonic() + timeout
     while True:
         run = control.node_ctl_facet_run(node_name, facet)
         if (

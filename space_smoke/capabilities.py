@@ -903,7 +903,8 @@ class NodeCtlFacetRun:
     Times are unix seconds, 0 before the first run. node-ctl runs one work
     item at a time, so `running` false with `last_completed_at` no earlier
     than `last_started_at` means the latest started run has finished, and
-    `last_success_at` equal to `last_completed_at` that it succeeded.
+    `last_success_at` equal to `last_completed_at` with an empty `last_error`
+    that it succeeded (node-ctl clears the error on success, sets it on failure).
     """
 
     last_started_at: int

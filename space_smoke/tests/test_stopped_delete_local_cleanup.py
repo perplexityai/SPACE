@@ -224,6 +224,18 @@ class StoppedDeleteLocalCleanup(unittest.TestCase):
         self.assertGreaterEqual(after_delete, 50)
         self.assertEqual(context.evidence["stopped_delete_local_cleanup"], "retained rootfs removed")
 
+    def test_a_rootfs_already_gone_asks_for_no_run(self) -> None:
+        clock = _Clock()
+        # node-ctl's own poll evicts it the moment the delete lands.
+        node = _Node(clock, run_seconds=0)
+        node.poll_at = _poll_in(clock, 0)
+
+        context, seconds = _run(node)
+
+        self.assertEqual(node.reconciles, [])
+        self.assertEqual(seconds, 0)
+        self.assertNotIn("stopped_delete_eviction_runs", context.evidence)
+
     def test_a_rootfs_nothing_removes_fails_naming_the_directory(self) -> None:
         clock = _Clock()
         # Runs of the wrong facet, and no poll before the deadline.
@@ -267,6 +279,47 @@ class SyncNodeCtlFacet(unittest.TestCase):
 
         self.assertIsNone(sync.completed_at)
         self.assertFalse(sync.succeeded)
+
+    def test_a_run_that_failed_in_the_success_second_is_not_succeeded(self) -> None:
+        failed = NodeCtlFacetRun(
+            last_started_at=10, last_completed_at=12, last_success_at=12, running=False, last_error="boom"
+        )
+
+        self.assertFalse(FacetSync(failed, failed, 1.0).succeeded)
+
+    def test_the_timeout_counts_from_the_call(self) -> None:
+        clock = _Clock()
+        node = _Node(clock, run_seconds=120)
+        reads: list[float] = []
+
+        class _Slow:
+            # The first status read and the request each take 30 s, as a
+            # slow exec can on Kind; later reads are quick.
+            def node_ctl_facet_run(self, node_name: str, facet: str) -> NodeCtlFacetRun:
+                if not reads:
+                    clock.now += 30
+                reads.append(clock.now)
+                return node.node_ctl_facet_run(node_name, facet)
+
+            def reconcile_node_ctl_facet(self, node_name: str, facet: str) -> None:
+                clock.now += 30
+                node.reconcile_node_ctl_facet(node_name, facet)
+
+        start = clock.now
+
+        def wait(seconds: float) -> None:
+            clock.now += seconds
+
+        with mock.patch("space_smoke.node_ctl_facets.time.monotonic", clock.monotonic):
+            sync = sync_node_ctl_facet(
+                cast(NodeCtlFacetControl, _Slow()), WORKER, LOCAL_CLEANUP_FACET, timeout=20, wait=wait
+            )
+
+        self.assertIsNone(sync.completed_at)
+        # The read before the request and one read after it: the read and
+        # the request alone outlasted the timeout, so nothing polls past it.
+        self.assertEqual(len(reads), 2)
+        self.assertLess(clock.now - start, 2 * 30 + 2)
 
     def test_a_failed_run_is_finished_but_not_succeeded(self) -> None:
         clock = _Clock()
