@@ -1099,7 +1099,9 @@ jobs:
       # inputs or when this job missed rust_cache_refresh_misses Rust
       # compilations against it. Missing statistics also refresh it. Every
       # event logs the decision; only pushes to main save, and Main CI then
-      # deletes superseded snapshots.
+      # deletes superseded snapshots. It also warns, never fails, when the
+      # cache ended nearly full or a run that restored a snapshot for its own
+      # inputs hit few compilations: one pass has outgrown rust_cache_size.
       - name: Decide whether to refresh the Rust compiler cache
         id: refresh-rust-cache
         if: ${{ steps.scope.outputs.needed == 'true' && (success() && matrix.rust_cache == true) }}

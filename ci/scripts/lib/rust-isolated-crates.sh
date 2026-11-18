@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Lints workspace libraries one at a time, so a crate that uses a dependency
 # feature it gets only through workspace feature unification fails; the
-# workspace clippy cannot see that. GitHub CI runs this as its own job,
-# `run-rust-checks.sh isolated-crates`, beside the clippy and test jobs.
+# workspace clippy cannot see that. GitHub CI runs this as jobs of their own,
+# `run-rust-checks.sh isolated-crates` with SPACE_RUST_ISOLATED_SHARD set to
+# each shard K/N (isolated_crate_shard), beside the clippy and test jobs.
 #
 # It lives apart from run-rust-checks.sh so that a change to which crates it
 # picks keeps the Rust caches: their keys hash run-rust-checks.sh (see "Name
@@ -12,6 +13,8 @@
 # from the repository root:
 #
 #   bash -euo pipefail -c 'source ci/scripts/lib/rust-isolated-crates.sh; run_isolated_crate_checks'
+#
+# and with SPACE_RUST_ISOLATED_SHARD=K/N in the environment to run one shard.
 
 # The workspace libraries run_isolated_crate_checks lints, one per line: every
 # library, other than common-core, that reaches common-core at most directly.
@@ -422,6 +425,77 @@ print(
 PY
 }
 
+# The crates of LISTED (one per line) that shard SHARD of the job lints, in
+# LISTED's order, one per line. SHARD is K/N, the Kth of N shards. Every
+# shard computes the same partition from the same inputs and keeps its own
+# part, so the N parts together hold each listed crate exactly once; a shard
+# can get none, when fewer crates than shards are listed.
+#
+# The parts are balanced by cost, not count: one crate can cost as much as a
+# hundred small ones. A crate's cost is one plus the workspace crates its
+# lint builds, read from the declared dependencies in METADATA (cargo
+# metadata --no-deps): its own of every kind, and the normal and build
+# dependencies of those, optional ones included. Unlike a checked-in table, it
+# follows every Cargo.toml change, and it predicts a crate's cold lint time
+# better than the count of every package Cargo resolves for it: the workspace
+# crates are the ones built with that crate's own feature set. Largest first,
+# each crate joins the cheapest part so far, the lowest-numbered on a tie, so
+# no part costs more than any other by more than its largest crate. The
+# parts' sizes and costs go to stderr, so every shard's log shows the split.
+isolated_crate_shard() {
+    local metadata="$1" shard="$2" listed="$3"
+    python3 - "${metadata}" "${shard}" "${listed}" <<'PY'
+import json
+import re
+import sys
+
+metadata, shard, listed = sys.argv[1], sys.argv[2], sys.argv[3].split()
+match = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", shard)
+if not match or int(match[1]) > int(match[2]):
+    sys.exit(f"isolated_crate_shard: shard '{shard}' is not K/N with 1 <= K <= N")
+index, count = int(match[1]), int(match[2])
+with open(metadata) as metadata_file:
+    packages = {p["name"]: p for p in json.load(metadata_file)["packages"]}
+
+
+def cost(name):
+    if name not in packages:
+        return 1
+    seen = set()
+    pending = [d["name"] for d in packages[name]["dependencies"] if d["name"] in packages]
+    while pending:
+        dependency = pending.pop()
+        if dependency in seen or dependency == name:
+            continue
+        seen.add(dependency)
+        pending.extend(
+            d["name"]
+            for d in packages[dependency]["dependencies"]
+            if d["name"] in packages and d["kind"] in (None, "build")
+        )
+    return 1 + len(seen)
+
+
+crates = list(dict.fromkeys(listed))
+costs = {name: cost(name) for name in crates}
+parts = [{"cost": 0, "crates": set()} for _ in range(count)]
+for name in sorted(crates, key=lambda name: (-costs[name], name)):
+    part = min(parts, key=lambda part: part["cost"])
+    part["cost"] += costs[name]
+    part["crates"].add(name)
+print(
+    f"Shard {shard} of {len(crates)} crates; each shard's crates and cost "
+    f"(one plus the workspace crates each builds):",
+    file=sys.stderr,
+)
+for number, part in enumerate(parts, 1):
+    print(f"  {number}/{count}: {len(part['crates'])} crates, cost {part['cost']}", file=sys.stderr)
+for name in crates:
+    if name in parts[index - 1]["crates"]:
+        print(name)
+PY
+}
+
 # Whether the change since SPACE_RUST_LINT_BASE can affect any of the crates
 # named after TARGET_DIR, per affected_lint_crates; always without a base, as
 # in Main CI. run_clippy_checks uses it for its per-crate configurations.
@@ -476,6 +550,20 @@ run_isolated_crate_checks() {
         listed="${affected}"
         if [ -z "${listed}" ]; then
             echo "The change affects no crate linted alone."
+            return 0
+        fi
+        mapfile -t crates <<<"${listed}"
+    fi
+    # GitHub CI splits the crates across the job's shards; unset, as in a
+    # local run, this lints them all.
+    if [ -n "${SPACE_RUST_ISOLATED_SHARD:-}" ]; then
+        if ! listed="$(isolated_crate_shard "${target_dir}/metadata.json" \
+            "${SPACE_RUST_ISOLATED_SHARD}" "${listed}")"; then
+            echo "::error::Cannot pick shard ${SPACE_RUST_ISOLATED_SHARD}'s crates." >&2
+            return 1
+        fi
+        if [ -z "${listed}" ]; then
+            echo "Shard ${SPACE_RUST_ISOLATED_SHARD} has no crate to lint alone."
             return 0
         fi
         mapfile -t crates <<<"${listed}"

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Regression test for affected_lint_crates in
+# Regression test for affected_lint_crates and isolated_crate_shard in
 # ci/scripts/lib/rust-isolated-crates.sh, on a synthetic workspace: `a`, `b`
 # depending on `a`, `e` depending on `b`, `c` on its own, and `d`, which
 # includes a file from `a`'s directory by a literal path and another through
 # CARGO_MANIFEST_DIR. A local directory registry stands in for crates.io: `b`
-# uses its `leaf` and `c` its `mid`, which uses `leaf`.
+# uses its `leaf` and `c` its `mid`, which uses `leaf`. The shards are also
+# checked on a synthetic cost table and against the workflow's entries.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -188,6 +189,84 @@ mv "${fixture}/ci/check-scopes/rust.skip" "${tmp_dir}/rust.skip"
 (cd "${fixture}" && SPACE_RUST_LINT_BASE="${base}" lint_affects_any "${tmp_dir}/lint" a 2>/dev/null) ||
     { echo "a failed selection must answer affected" >&2; exit 1; }
 mv "${tmp_dir}/rust.skip" "${fixture}/ci/check-scopes/rust.skip"
+
+# isolated_crate_shard, on the fixture's crates. For every shard count,
+# more shards than crates included, the shards together list each crate
+# exactly once, each shard in the listed order; the same crates give the same
+# split whatever their order.
+fail() { echo "isolated_crate_shard: $*" >&2; failures+=("isolated_crate_shard: $*"); }
+shard() { isolated_crate_shard "$1" "$2" "$3" 2>/dev/null; }
+reversed="$(sort -r <<<"${listed}")"
+for count in 1 2 3 5 7; do
+    union=""
+    for ((index = 1; index <= count; index++)); do
+        part="$(shard "${tmp_dir}/metadata.json" "${index}/${count}" "${listed}")"
+        [[ "${part}" == "$(shard "${tmp_dir}/metadata.json" "${index}/${count}" "${listed}")" ]] ||
+            fail "shard ${index}/${count} differs between two runs"
+        [[ "$(sort <<<"${part}")" == "$(shard "${tmp_dir}/metadata.json" "${index}/${count}" "${reversed}" | sort)" ]] ||
+            fail "shard ${index}/${count} depends on the order of the list"
+        [[ "${part}" == "$(grep -Fx -f <(printf '%s\n' "${part}") <<<"${listed}")" ]] ||
+            fail "shard ${index}/${count} is not in the listed order: '${part}'"
+        union+="${part:+${part}$'\n'}"
+    done
+    [[ "$(sort <<<"${union%$'\n'}")" == "$(sort <<<"${listed}")" ]] ||
+        fail "the ${count} shards list '$(tr '\n' ' ' <<<"${union}")', not each library once"
+done
+# Five crates in seven shards: each of the first five gets one, the last two none.
+[[ "$(shard "${tmp_dir}/metadata.json" 5/7 "${listed}")" != "" ]] || fail "shard 5/7 is empty"
+[[ "$(shard "${tmp_dir}/metadata.json" 7/7 "${listed}")" == "" ]] || fail "shard 7/7 is not empty"
+# No crate, as when a pull request affects none: every shard is empty.
+for spec in 1/1 2/3; do
+    part="$(isolated_crate_shard "${tmp_dir}/metadata.json" "${spec}" "" 2>/dev/null)" ||
+        fail "shard ${spec} of no crate fails"
+    [[ -z "${part}" ]] || fail "shard ${spec} of no crate lists '${part}'"
+done
+# A shard that is not K/N with 1 <= K <= N fails rather than lint nothing.
+for spec in 0/2 3/2 1/0 2 x/y 1/2/3 ""; do
+    if isolated_crate_shard "${tmp_dir}/metadata.json" "${spec}" "${listed}" >/dev/null 2>&1; then
+        fail "shard '${spec}' is accepted"
+    fi
+done
+
+# Balance by cost, on a synthetic cost table. A crate costs one plus the
+# workspace packages its lint builds: its own dependencies of every kind,
+# optional ones included, and their normal and build dependencies, not their
+# dev-dependencies; a package outside the workspace counts for nothing.
+python3 - "${tmp_dir}/costs.json" <<'PY'
+import json
+import sys
+
+packages = {f"leaf{i:02}": [] for i in range(1, 12)}
+
+
+def dep(name, kind=None, optional=False):
+    return {"name": name, "kind": kind, "optional": optional}
+
+
+for name, cost in {"big": 12, "large": 10, "mid1": 6, "mid2": 5, "mid3": 4}.items():
+    packages[name] = [dep(f"leaf{i:02}") for i in range(1, cost)]
+for i in range(1, 7):
+    packages[f"s{i}"] = [dep("serde")]
+packages["helper"] = [dep("leaf01"), dep("leaf02", "build"), dep("leaf03", "dev")]
+packages["tested"] = [dep("helper", "dev"), dep("leaf04", optional=True), dep("serde")]
+with open(sys.argv[1], "w") as out:
+    json.dump({"packages": [{"name": n, "dependencies": d} for n, d in packages.items()]}, out)
+PY
+costs_of() {
+    isolated_crate_shard "${tmp_dir}/costs.json" "$1" "$2" 2>&1 >/dev/null | sed -n 's/^  //p' | tr '\n' ';'
+}
+[[ "$(costs_of 1/1 tested)" == "1/1: 1 crates, cost 5;" ]] ||
+    fail "tested should cost 5 (itself, helper, leaf01, leaf02, leaf04): $(costs_of 1/1 tested)"
+table=$'big\nlarge\nmid1\nmid2\nmid3\ns1\ns2\ns3\ns4\ns5\ns6'
+# Largest first, each to the cheapest shard so far: no shard costs more than
+# another by more than its largest crate. Three by count would put big,
+# large and mid1, costing 28, in one.
+for expected in "1/3=big s2 s4 s6" "2/3=large mid3" "3/3=mid1 mid2 s1 s3 s5"; do
+    part="$(shard "${tmp_dir}/costs.json" "${expected%%=*}" "${table}" | tr '\n' ' ')"
+    [[ "${part% }" == "${expected#*=}" ]] || fail "shard ${expected%%=*}: expected '${expected#*=}', got '${part% }'"
+done
+[[ "$(costs_of 1/3 "${table}")" == "1/3: 4 crates, cost 15;2/3: 2 crates, cost 14;3/3: 5 crates, cost 14;" ]] ||
+    fail "unexpected shard costs: $(costs_of 1/3 "${table}")"
 
 if [[ "${#failures[@]}" -ne 0 ]]; then
     printf 'rust-isolated-crates.sh: failed: %s\n' "${failures[@]}" >&2
