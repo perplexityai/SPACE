@@ -8006,6 +8006,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-security-policy"
+version = "0.8.2"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "pplx-space-semver"
 version = "0.8.2"
 dependencies = [

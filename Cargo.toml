@@ -178,6 +178,7 @@ members = [
     "crates/l20_domain/admin/protocol",
     "crates/l20_domain/archive/model",
     "crates/l20_domain/policy/authority",
+    "crates/l20_domain/security/policy",
     "crates/l10_foundation/linux/ids",
     "crates/l10_foundation/host/linux",
     "crates/l20_domain/host/layout",
