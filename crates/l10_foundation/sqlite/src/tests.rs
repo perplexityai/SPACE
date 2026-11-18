@@ -794,13 +794,14 @@ fn accepted_newer_migrations_parse_strictly() {
         &'static str,
         Result<&'static [(&'static str, i64)], &'static str>,
     );
-    let cases: [Case; 15] = [
+    let cases: [Case; 17] = [
         ("", Ok(&[])),
         (
             "sandbox-manager:20990101000000",
             Ok(&[("sandbox-manager", 20990101000000)]),
         ),
         ("test:3,common:2,test:3", Ok(&[("common", 2), ("test", 3)])),
+        (" test:3 ,\tcommon:2\n", Ok(&[("common", 2), ("test", 3)])),
         ("test", Err("test")),
         ("test:", Err("test:")),
         (":3", Err(":3")),
@@ -809,9 +810,10 @@ fn accepted_newer_migrations_parse_strictly() {
         ("test:x", Err("test:x")),
         ("test:+3", Err("test:+3")),
         ("test:3:4", Err("test:3:4")),
-        ("test:3 ", Err("test:3 ")),
+        ("test: 3", Err("test: 3")),
+        ("test :3", Err("test :3")),
         ("test:3,", Err("")),
-        ("test:3, common:2", Err(" common:2")),
+        ("test:3, ,common:2", Err(" ")),
         (
             "test:99999999999999999999",
             Err("test:99999999999999999999"),

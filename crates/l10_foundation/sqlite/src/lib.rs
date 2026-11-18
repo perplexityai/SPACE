@@ -149,10 +149,11 @@ pub async fn migrate_embedded(
     migrators: EmbeddedMigrators<'_>,
 ) -> SqliteResult<()> {
     let accepted = match std::env::var(ACCEPT_NEWER_MIGRATIONS) {
-        Ok(value) => AcceptedNewerMigrations::parse(&value)?,
-        Err(std::env::VarError::NotPresent) => AcceptedNewerMigrations::default(),
-        Err(error) => return Err(error).context(ACCEPT_NEWER_MIGRATIONS),
-    };
+        Ok(value) => AcceptedNewerMigrations::parse(&value),
+        Err(std::env::VarError::NotPresent) => Ok(AcceptedNewerMigrations::default()),
+        Err(error) => Err(error).context(ACCEPT_NEWER_MIGRATIONS),
+    }
+    .with_context(|| migrate_failure(db_name, db_path))?;
     if !accepted.0.is_empty() {
         tracing::info!(
             store = db_name,
@@ -171,12 +172,14 @@ async fn migrate_accepting(
     let checksums = AcceptedChecksums::embedded().context("invalid migration checksum manifest")?;
     migrate_once(db_name, db_path, migrators, &checksums, accepted)
         .await
-        .with_context(|| {
-            format!(
-                "failed to migrate {db_name} SQLite at {}",
-                db_path.display()
-            )
-        })
+        .with_context(|| migrate_failure(db_name, db_path))
+}
+
+fn migrate_failure(db_name: &str, db_path: &Path) -> String {
+    format!(
+        "failed to migrate {db_name} SQLite at {}",
+        db_path.display()
+    )
 }
 
 /// Use the existing shared history without moving or rewriting its rows.
@@ -207,6 +210,7 @@ impl AcceptedNewerMigrations {
             .split(',')
             .map(|entry| {
                 entry
+                    .trim_ascii()
                     .split_once(':')
                     .filter(|(store, version)| {
                         valid_store_name(store)
@@ -225,7 +229,7 @@ impl AcceptedNewerMigrations {
     }
 
     fn contains(&self, store: &str, version: i64) -> bool {
-        self.0.iter().any(|(s, v)| s == store && *v == version)
+        self.0.contains(&(store.to_owned(), version))
     }
 }
 
@@ -275,7 +279,7 @@ fn with_newer_placeholders(migrator: &Migrator, accepted: &[(i64, Vec<u8>)]) -> 
     for (version, checksum) in accepted {
         let mut placeholder = Migration::new(
             *version,
-            "newer migration accepted by SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS".into(),
+            format!("newer migration accepted by {ACCEPT_NEWER_MIGRATIONS}").into(),
             MigrationType::Simple,
             NEWER_PLACEHOLDER_SQL.into_sql_str(),
             false,
@@ -364,6 +368,7 @@ fn validate_public_history(
                     tracing::warn!(
                         store,
                         migration_version = version,
+                        recorded_checksum = %hex::encode(&checksum),
                         "{table} records newer migration {version}, which this release doesn't \
                          bundle; leaving it applied as {ACCEPT_NEWER_MIGRATIONS} accepts"
                     );

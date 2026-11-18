@@ -135,8 +135,9 @@ roll back to:
    accepted with whatever checksum the newer release recorded. If a node may
    have run a pre-release build, compare the recorded checksum
    (`SELECT lower(hex(checksum)) FROM _sqlx_migrations WHERE version = …`, or
-   `_space_common_schema_migrations` for `common`) with `shasum -a 384` of the
-   file you checked.
+   `_space_common_schema_migrations` for `common`; the warning that accepts the
+   row also logs it as `recorded_checksum`) with `shasum -a 384` of the file
+   you checked.
 3. If the target is compatible, set `SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS` to
    the comma-separated entries on every container that runs the store's
    migrations at startup: its `space-db-migrator <store> … up` init container
