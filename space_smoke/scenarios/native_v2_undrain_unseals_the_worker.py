@@ -1,11 +1,12 @@
-"""An undrain mid-drain cancels the v2 drain's epoch: the worker is unsealed and refuses it again."""
+"""An undrain mid-drain cancels the v2 drain's epoch: the worker is unsealed and admits activations again."""
 
 import space_smoke as smoke
 
 
 # The seal's forward-only epochs and the remembered cancel are crate tests
-# (`activation_seal/tests.rs`); the controller's cancel is
-# `node_drain/v2/tests.rs`. This is the round trip on a real worker.
+# (`activation_seal/tests.rs`), and only the control plane may call a
+# node's `DrainNode`, so no run sends a stale epoch; the controller's cancel
+# is `node_drain/v2/tests.rs`. This is the round trip on a real worker.
 @smoke.scenario(
     "native.v2_undrain_unseals_the_worker",
     api_surfaces=("native",),
@@ -16,7 +17,7 @@ def v2_undrain_unseals_the_worker(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain` seals the worker under the drain's epoch; `:undrain`
     before it finishes clears the phase, and the controller cancels the epoch
     on the node and clears the v2 columns. The worker is unsealed and admits
-    an activation again, and a seal under the cancelled epoch is refused."""
+    an activation again."""
 
     drain = test.drain_v2
 
@@ -46,6 +47,3 @@ def v2_undrain_unseals_the_worker(test: smoke.CommandSandboxFixture) -> None:
             resident.wake()
             observed = drain.run_on(resident, "true")
             test.verify(observed.exit_code == 0, "the unsealed worker did not run a restored sandbox")
-
-        with test.phase("a seal under the cancelled epoch is refused"):
-            drain.expect_stale_epoch_refused()

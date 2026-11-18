@@ -191,49 +191,6 @@ def _require_ok(result: CommandResult, action: str) -> str:
     return result.stdout
 
 
-def parse_drain_node_sealed_epoch(output: str) -> int | None:
-    """The `sealed_epoch=` line of a `space-sbxmgr drain-node` answer; refuses an answer without one."""
-
-    for raw in output.splitlines():
-        key, separator, value = raw.strip().partition("=")
-        if separator and key == "sealed_epoch":
-            return None if value == "none" else int(value)
-    raise ValueError(f"drain-node output lacks sealed_epoch: {output[:400]!r}")
-
-
-def parse_drain_node_report(output: str) -> dict[str, Any]:
-    """A `space-sbxmgr drain-node` answer in the shape the controller stores
-    as `drain_status.report`, without its `unrecorded` list."""
-
-    report: dict[str, Any] = {
-        "sealed_epoch": parse_drain_node_sealed_epoch(output),
-        "done": False,
-        "evacuated": [],
-        "pending": [],
-        "blocked": [],
-    }
-    for raw in output.splitlines():
-        key, separator, value = raw.strip().partition("=")
-        if not separator:
-            continue
-        if key == "done":
-            report["done"] = value == "true"
-        elif key == "evacuated":
-            sandbox_id, prior, artifact_id = value.split(" ", 2)
-            report["evacuated"].append(
-                {"sandbox_id": sandbox_id, "prior": prior, "artifact_id": artifact_id}
-            )
-        elif key == "pending":
-            sandbox_id, _, action = value.partition(" ")
-            report["pending"].append({"sandbox_id": sandbox_id, "action": action})
-        elif key == "blocked":
-            sandbox_id, _, reason = value.partition(" ")
-            report["blocked"].append(
-                {"sandbox_id": None if sandbox_id == "-" else sandbox_id, "reason": reason}
-            )
-    return report
-
-
 def _env_literals(
     entries: Any, keys: Sequence[str], *, owner: str, value_from_refusal: str
 ) -> dict[str, str | None]:
@@ -663,7 +620,6 @@ CORDONED_NODE_ANNOTATION = "space.pplx.net/smoke-cordoned-node"
 # Likewise the worker whose sandbox-manager activations its holder sealed, as
 # `<node> <epoch>`: the next holder unseals it under that epoch before it
 # uncordons, since nothing in SPACE ever unseals either.
-SEALED_ACTIVATIONS_ANNOTATION = "space.pplx.net/smoke-sealed-activations"
 # The public-API mutation Lease records what the rate-limiter scenario is about
 # to change before it changes it: the limiter env the public API Deployment
 # held (JSON, null for unset) and the Redis replica count it scales down from.
@@ -2189,28 +2145,6 @@ ON CONFLICT (key_hash) DO NOTHING;
                 if isinstance(annotations, dict)
                 else None
             )
-            sealed = (
-                annotations.get(SEALED_ACTIVATIONS_ANNOTATION)
-                if isinstance(annotations, dict)
-                else None
-            )
-            if isinstance(sealed, str) and sealed:
-                sealed_node, _, sealed_epoch = sealed.partition(" ")
-                if not sealed_node or not sealed_epoch.isdigit():
-                    raise SmokeConfigurationError(
-                        f"unrecognized activation seal recorded on Lease {name}: {sealed!r}"
-                    )
-                self._assert_lease_owned(ownership, "an orphaned-seal repair")
-                _require_ok(
-                    self._node_shell_exec(
-                        sealed_node,
-                        f"/space/bin/space-sbxmgr drain-node --cancel --epoch {int(sealed_epoch)}",
-                        timeout=60,
-                    ),
-                    f"unseal sandbox-manager activations on {sealed_node} "
-                    "orphaned by an expired smoke Lease",
-                )
-                self._annotate_lease(name, SEALED_ACTIVATIONS_ANNOTATION, None)
             if isinstance(recorded, str) and recorded:
                 self._assert_lease_owned(ownership, "an orphaned-cordon repair")
                 _require_ok(
@@ -6501,55 +6435,6 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         output = _require_ok(result, f"read sandbox-manager state of {canonical} on {node_name}")
         return parse_doctor_lifecycle(output)
-
-    # --- sandbox-manager activation seal ----------------------------------
-
-    def seal_activations(self, node_name: str, epoch: int) -> int | None:
-        ownership = self._cordon_lease_ownership
-        if ownership is None:
-            raise SmokeConfigurationError(
-                "refusing an activation seal without the caller's live worker-cordon Lease"
-            )
-        self._assert_lease_owned(ownership, f"sealing activations on {node_name}")
-        # Record first, as for a cordon: a run killed after this unseals on
-        # the next holder's repair, which an unsealed worker answers unchanged.
-        self._annotate_lease(
-            ownership.name, SEALED_ACTIVATIONS_ANNOTATION, f"{node_name} {int(epoch)}"
-        )
-        result = self._node_shell_exec(
-            node_name, f"/space/bin/space-sbxmgr drain-node --epoch {int(epoch)}", timeout=90
-        )
-        return parse_drain_node_sealed_epoch(
-            _require_ok(result, f"seal sandbox-manager activations on {node_name}")
-        )
-
-    def node_drain_report(self, node_name: str, epoch: int) -> dict[str, Any]:
-        ownership = self._cordon_lease_ownership
-        if ownership is None:
-            raise SmokeConfigurationError(
-                "refusing a drain call without the caller's live worker-cordon Lease"
-            )
-        self._assert_lease_owned(ownership, f"asking {node_name} for its drain report")
-        result = self._node_shell_exec(
-            node_name, f"/space/bin/space-sbxmgr drain-node --epoch {int(epoch)}", timeout=90
-        )
-        return parse_drain_node_report(
-            _require_ok(result, f"ask {node_name} for its drain report")
-        )
-
-    def unseal_activations(self, node_name: str, epoch: int) -> int | None:
-        result = self._node_shell_exec(
-            node_name,
-            f"/space/bin/space-sbxmgr drain-node --cancel --epoch {int(epoch)}",
-            timeout=60,
-        )
-        sealed_epoch = parse_drain_node_sealed_epoch(
-            _require_ok(result, f"unseal sandbox-manager activations on {node_name}")
-        )
-        ownership = self._cordon_lease_ownership
-        if ownership is not None:
-            self._annotate_lease(ownership.name, SEALED_ACTIVATIONS_ANNOTATION, None)
-        return sealed_epoch
 
     # --- template-manager startup recovery -------------------------------
 

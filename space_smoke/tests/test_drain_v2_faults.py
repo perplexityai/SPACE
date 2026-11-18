@@ -1,9 +1,8 @@
 """Contracts of the v2 drain fault scenarios' harness the bench cannot exercise.
 
-A passing bench shows a fault applied and lifted. It cannot show that the
-node's own report is read in full, that a drain-restore env value off the
-list is refused before any write, or that the unblock removes exactly the
-rules the block added and nothing else.
+A passing bench shows a fault applied and lifted. It cannot show that a
+drain-restore env value off the list is refused before any write, or that
+the unblock removes exactly the rules the block added and nothing else.
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ from space_smoke.adapters import (
     NODE_TRAFFIC_OBJECT_STORE,
     KindConfig,
     KindHarness,
-    parse_drain_node_report,
 )
 from space_smoke.drain_restore import (
     DRAIN_RESTORE_HOLD_ENV,
@@ -54,45 +52,6 @@ class _Executor:
 
 def _harness(executor: _Executor) -> KindHarness:
     return KindHarness(executor, KindConfig(), environment={})
-
-
-class NodeDrainReport(unittest.TestCase):
-    def test_every_line_of_the_nodes_answer_is_read(self) -> None:
-        report = parse_drain_node_report(
-            "sealed_epoch=7\n"
-            "done=false\n"
-            "evacuated=a started 01a\n"
-            "evacuated=b stopped 01b\n"
-            "pending=c upload\n"
-            "blocked=d upload failed 3 times: reset\n"
-            "blocked=- orphan inventory didn't finish within 20s\n"
-        )
-
-        self.assertEqual(
-            report,
-            {
-                "sealed_epoch": 7,
-                "done": False,
-                "evacuated": [
-                    {"sandbox_id": "a", "prior": "started", "artifact_id": "01a"},
-                    {"sandbox_id": "b", "prior": "stopped", "artifact_id": "01b"},
-                ],
-                "pending": [{"sandbox_id": "c", "action": "upload"}],
-                "blocked": [
-                    {"sandbox_id": "d", "reason": "upload failed 3 times: reset"},
-                    {"sandbox_id": None, "reason": "orphan inventory didn't finish within 20s"},
-                ],
-            },
-        )
-
-    def test_a_done_unsealed_answer_reads_as_such(self) -> None:
-        report = parse_drain_node_report("sealed_epoch=none\ndone=true\n")
-
-        self.assertEqual((report["sealed_epoch"], report["done"]), (None, True))
-
-    def test_an_answer_without_its_epoch_is_refused(self) -> None:
-        with self.assertRaises(ValueError):
-            parse_drain_node_report("done=true\n")
 
 
 class DrainRestoreEnv(unittest.TestCase):

@@ -1909,28 +1909,6 @@ class DrainV2Control(KindWorkerControl, DrainRestoreControl, Protocol):
         """The sandbox's disk snapshot ids."""
         ...
 
-    def seal_activations(self, node_name: str, epoch: int) -> int | None:
-        """`space-sbxmgr drain-node --epoch` on the worker, under the caller's
-        worker-cordon Lease; the epoch it answers sealed under.
-
-        The seal is recorded on the Lease before it is sent, and a successful
-        unseal clears it, so the Lease's next holder unseals a worker a killed
-        run left sealed.
-        """
-        ...
-
-    def node_drain_report(self, node_name: str, epoch: int) -> dict[str, Any]:
-        """`space-sbxmgr drain-node --epoch` on the worker, already sealed
-        under `epoch`, under the caller's worker-cordon Lease: the node's own
-        report, in `drain_status.report`'s shape, which no controller sees."""
-        ...
-
-    def unseal_activations(self, node_name: str, epoch: int) -> int | None:
-        """`space-sbxmgr drain-node --cancel` on the worker; the epoch it is
-        still sealed under, None once unsealed. An unsealed worker stays
-        unsealed."""
-        ...
-
     def drain_restore_operations(self, sandbox_id: str) -> list[tuple[str, int]]:
         """Each `drain_restore_sandbox` operation of the sandbox, oldest first:
         its state and attempts."""
