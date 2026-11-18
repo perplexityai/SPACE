@@ -141,7 +141,6 @@ default_benches() {
   local cpus mem_gib disk_gib by_cpu by_mem by_disk n
   cpus="$(nproc)"
   mem_gib=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
-  mkdir -p "$KIND_BENCH_ROOT"
   disk_gib=$(( $(df -k --output=avail "$KIND_BENCH_ROOT" | tail -n 1) / 1024 / 1024 ))
   by_cpu=$(( cpus / 8 ))
   by_mem=$(( mem_gib / 16 ))
@@ -154,6 +153,13 @@ default_benches() {
   (( n < 1 )) && n=1
   printf '%s\n' "$n"
 }
+
+# The benches' directories are the caller's; only their Docker data roots are
+# root's. Created before the default N reads its free disk.
+mkdir -p "$KIND_BENCH_ROOT" 2>/dev/null || sudo -n install -d -o "$(id -u)" -g "$(id -g)" "$KIND_BENCH_ROOT" \
+  || die "cannot create $KIND_BENCH_ROOT"
+[[ -O "$KIND_BENCH_ROOT" ]] || sudo -n chown "$(id -u):$(id -g)" "$KIND_BENCH_ROOT" \
+  || die "cannot own $KIND_BENCH_ROOT"
 
 if [[ -z "$BENCHES" ]]; then
   BENCHES="$(default_benches)"
@@ -610,9 +616,6 @@ host_step build-cache build_cache
 host_step seed seed
 host_step inventory inventory
 
-# The benches' directories are the caller's; only their Docker data roots are root's.
-mkdir -p "$KIND_BENCH_ROOT" 2>/dev/null || sudo -n install -d -o "$(id -u)" -g "$(id -g)" "$KIND_BENCH_ROOT"
-[[ -O "$KIND_BENCH_ROOT" ]] || sudo -n chown "$(id -u):$(id -g)" "$KIND_BENCH_ROOT"
 declare -A BENCH_PIDS=()
 for i in $(seq 1 "$BENCHES"); do
   mkdir -p "$OUT/benches/$i"
