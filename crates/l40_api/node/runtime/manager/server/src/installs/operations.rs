@@ -341,10 +341,8 @@ impl Installer {
             .get(line.runtime)
             .ok_or(SubmitOperationError::Disabled)?;
         let listed = source
-            .list(line, context.host_arch)
+            .find(line, context.host_arch, &version)
             .await?
-            .into_iter()
-            .find(|kernel| kernel.version == version)
             .ok_or(SubmitOperationError::NotOffered)?;
         let kernel = listed.download_request(expected_digest);
         if kernel.size > context.limits.max_bytes {
