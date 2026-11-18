@@ -808,7 +808,7 @@ run_bench() {
       SPACE_M1_GENERATOR_MIRROR="${SPACE_M1_GENERATOR_MIRROR:-}" \
       SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE="$dir/admin-token" \
       SPACE_SMOKE_KIND_COLD_RECEIPTS="$dir/cold-receipts" \
-      bash "$src/scripts/tests/lib/kind-parallel-typed.sh" "$dir/typed.log" || rc=$?
+      bash "$src/scripts/tests/lib/kind-typed-shard.sh" "$dir/typed.log" || rc=$?
   BENCH_RESULT="typed_exit_$rc"
 }
 

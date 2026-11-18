@@ -555,43 +555,16 @@ jobs:
           SPACE_M1_GENERATOR_MIRROR: ghcr.io/perplexityai/space-ci-mirror
           SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE: ${{ runner.temp }}/space-smoke-admin-token
           SPACE_SMOKE_KIND_COLD_RECEIPTS: ${{ runner.temp }}/space-smoke-cold-receipts
+        # The admin token, cold-receipts directory and data-plane wait are the
+        # script's, which every scripts/tests/smoke-kind-parallel.sh bench runs too.
         run: |
           set -euo pipefail
-          for tool in aws curl jq; do
-            if ! command -v "${tool}" >/dev/null 2>&1; then
-              echo "::error::The typed Kind smoke needs ${tool} on the runner"
-              exit 1
-            fi
-          done
           uv_bin="$(bash ci/scripts/ensure-uv.sh)"
           uv_dir="$(dirname "${uv_bin}")"
           export PATH="${uv_dir}:${PATH}"
-          install -d -m 0700 "${SPACE_SMOKE_KIND_COLD_RECEIPTS}"
-          curl -fsS -X POST http://localhost:8080/auth/v1/sessions \
-            -H 'content-type: application/json' \
-            -d '{"email":"root@local","password":"password"}' \
-            | jq -r '.token // empty' >"${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}"
-          chmod 0600 "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}"
-          if [[ ! -s "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}" ]]; then
-            echo "::error::Could not obtain an admin session token from the Kind API"
-            exit 1
-          fi
-          # Belt and braces for the baseline's wait: the typed scenarios talk to the data
-          # plane from their first command, so prove it answers before starting any of them.
-          for _ in $(seq 1 150); do
-            if curl -sf -m 2 http://127.0.0.1:8090/healthz >/dev/null 2>&1; then
-              break
-            fi
-            sleep 2
-          done
-          if ! curl -sf -m 2 http://127.0.0.1:8090/healthz >/dev/null 2>&1; then
-            echo "::error::The Kind data plane at 127.0.0.1:8090 never became healthy"
-            exit 1
-          fi
-          # Kept for the failure-telemetry step, which reads the failed
-          # scenarios' sandbox ids from it.
-          bash scripts/tests/smoke-kind-typed.sh all "${SMOKE_SHARD}" 2>&1 \
-            | tee "${RUNNER_TEMP}/kind-typed-smoke.log"
+          # The log is kept for the failure-telemetry step, which reads the
+          # failed scenarios' sandbox ids from it.
+          bash scripts/tests/lib/kind-typed-shard.sh "${RUNNER_TEMP}/kind-typed-smoke.log"
 
       # Every command below is bounded, and each step has a deadline: a wedged
       # apiserver, Tilt, or node must not hold the job until its own deadline and
