@@ -133,25 +133,63 @@ fi
 # not into a log.
 kind_bench_preflight
 
-# Default N: a bench is one 16-core CI runner's work, but mostly waiting. What
-# it holds is about 50 GB of disk under $KIND_BENCH_ROOT at its peak, 6 GiB of
-# memory, and bursts of CPU and disk writes while it comes up, all N at once
-# (measured; see "The whole suite on one host" in infra/space/kind/README.md).
+# Default N: the smallest of what the host's CPUs, available memory, free disk
+# and the bench volume's write throughput allow, at most 6. A bench is one
+# 16-core CI runner's work but mostly waits; it holds about 50 GB of disk at its
+# peak and 6 GiB of memory, and comes up in bursts of CPU and disk writes, all
+# N at once. Measured (see "The whole suite on one host" in
+# infra/space/kind/README.md):
+#   - CPUs / 8 and available memory / 16 GiB (MemAvailable, so other work on
+#     the host counts); free disk / 60 GB under $KIND_BENCH_ROOT.
+#   - Write throughput / 70 MB/s. A bench writes 55-60 GB while it comes up
+#     (55.5, 55.9, 57.0 and 59.8 GB per bench at N=1, 4, 5 and 4), and N
+#     bring-ups take as long as the volume needs for N times that: on a volume
+#     measured at 326 MB/s here (about 410 MB/s sustained with the page cache)
+#     the last baseline passed after 4:56 at N=1, 9:13 at N=4, 11:22 at N=5
+#     and 13:50 at N=6, while the typed phase shrinks as 48 min / N. The sum
+#     was lowest at N=4-5 (22:43-23:49) and N=6 no faster (25:12): about
+#     326 / 4.7 = 70 MB/s of the probe's figure per bench.
+#   - At most 6: the most benches measured, and N=6 was already slower than
+#     N=4-5 on that volume; only a faster volume would justify more.
+# The probe writes 1 GiB with O_DIRECT into a temporary file it removes, so
+# it measures the volume rather than the page cache (a few seconds).
+write_probe_mbps() {
+  local probe start end
+  probe="$(mktemp "$KIND_BENCH_ROOT/.write-probe.XXXXXX")" || return 1
+  start="$(date +%s%N)"
+  if ! dd if=/dev/zero of="$probe" bs=1M count=1024 oflag=direct conv=fsync status=none; then
+    rm -f "$probe"
+    return 1
+  fi
+  end="$(date +%s%N)"
+  rm -f "$probe"
+  # Bytes per microsecond are MB/s.
+  printf '%s\n' $(( 1024 * 1024 * 1024 * 1000 / (end - start) ))
+}
+
 default_benches() {
-  local cpus mem_gib disk_gib by_cpu by_mem by_disk n
+  local cpus mem_gib disk_gb mbps probe_start probe_seconds n by
   cpus="$(nproc)"
-  mem_gib=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
-  disk_gib=$(( $(df -k --output=avail "$KIND_BENCH_ROOT" | tail -n 1) / 1024 / 1024 ))
-  by_cpu=$(( cpus / 8 ))
-  by_mem=$(( mem_gib / 16 ))
-  by_disk=$(( disk_gib / 60 ))
-  n=$(( by_cpu < by_mem ? by_cpu : by_mem ))
-  (( by_disk < n )) && n=$by_disk
-  # Past six the bring-ups' disk and CPU contention outgrows what a shorter
-  # typed phase saves (measured from four to six).
-  (( n > 6 )) && n=6
+  mem_gib=$(( $(awk '/^MemAvailable:/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
+  disk_gb=$(( $(df -k --output=avail "$KIND_BENCH_ROOT" | tail -n 1) * 1024 / 1000000000 ))
+  probe_start="$(date +%s%N)"
+  mbps="$(write_probe_mbps)" || mbps=""
+  probe_seconds="$(awk -v s="$probe_start" -v e="$(date +%s%N)" 'BEGIN {printf "%.1f", (e - s) / 1e9}')"
+  local -a factors=()
+  n=6
+  by=$(( cpus / 8 )); factors+=("cpus $cpus -> $by"); (( by < n )) && n=$by
+  by=$(( mem_gib / 16 )); factors+=("available memory $mem_gib GiB -> $by"); (( by < n )) && n=$by
+  by=$(( disk_gb / 60 )); factors+=("free disk $disk_gb GB -> $by"); (( by < n )) && n=$by
+  if [[ -n "$mbps" ]]; then
+    by=$(( mbps / 70 )); factors+=("disk $mbps MB/s -> $by (${probe_seconds}s probe)"); (( by < n )) && n=$by
+  else
+    factors+=("disk write probe failed -> not counted")
+  fi
   (( n < 1 )) && n=1
-  printf '%s\n' "$n"
+  BENCHES="$n"
+  local joined
+  joined="$(printf '%s, ' "${factors[@]}")"
+  log "benches: $n (${joined%, }; cap 6; --benches overrides)"
 }
 
 # The benches' directories are the caller's; only their Docker data roots are
@@ -161,9 +199,16 @@ mkdir -p "$KIND_BENCH_ROOT" 2>/dev/null || sudo -n install -d -o "$(id -u)" -g "
 [[ -O "$KIND_BENCH_ROOT" ]] || sudo -n chown "$(id -u):$(id -g)" "$KIND_BENCH_ROOT" \
   || die "cannot own $KIND_BENCH_ROOT"
 
+# Before the default N reads the free disk, which an earlier run's benches
+# still hold.
+stale="$(kind_bench_existing | tr '\n' ' ')"
+if [[ -n "${stale// /}" ]]; then
+  log "removing benches left by an earlier run: $stale"
+  teardown_all
+fi
+
 if [[ -z "$BENCHES" ]]; then
-  BENCHES="$(default_benches)"
-  log "benches: $BENCHES (from $(nproc) CPUs, $(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 / 1024 )) GiB of memory and the free disk under $KIND_BENCH_ROOT; --benches overrides)"
+  default_benches
 fi
 if ! [[ "$BENCHES" =~ ^[1-9][0-9]*$ ]] || (( BENCHES > KIND_BENCH_MAX )); then
   die "--benches must be 1..$KIND_BENCH_MAX (got $BENCHES)"
@@ -593,11 +638,6 @@ if git -C "$REPO_ROOT" status --porcelain --untracked-files=no | grep -q .; then
   log "NOTE: the checkout has uncommitted changes; the Rust handoff identifies the image by commit"
 fi
 
-stale="$(kind_bench_existing | tr '\n' ' ')"
-if [[ -n "${stale// /}" ]]; then
-  log "removing benches left by an earlier run: $stale"
-  teardown_all
-fi
 
 # Staged once on the host, mounted read-only into every bench's nodes.
 export SPACE_VENDOR_ROOT="${SPACE_VENDOR_ROOT:-$HOME/.space-devbox/space/vendor}"
