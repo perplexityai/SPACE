@@ -210,6 +210,40 @@ node's root filesystem at `/host`, which puts sandbox-manager's database at
 `/host/space/run/sandbox-manager/sbx-manager.db`. Run `space-db-migrator`
 itself from the store's image.
 
+### What a refused rollback looks like
+
+A daemon that migrates its own store checks the database read-only before it
+reports itself ready to take over, with the decision its migration runner
+makes at startup: it accepts newer successful migrations as above, and it
+refuses what the runner refuses, with the runner's text. sandbox-manager,
+template-manager, node-manager and node-ctl check, and they roll out with
+surge (`maxUnavailable: 0`), so a successor starts beside its predecessor.
+While the predecessor holds the service mutex, a successor that would refuse
+the database stays Running but not Ready and checks again every five seconds.
+It logs `withholding takeover readiness` at warn with the refusal, which
+names the store, the database path and the runner's reason, once when found,
+again when it changes and every five minutes. The old pod keeps serving, and the
+rollout stalls with successors waiting on only as many nodes as `maxSurge`
+allows; the other nodes keep their old pods. A read that can't tell, because
+another connection held a lock it needed or the database changed while it was
+read, withholds readiness too and says it is checking again: it is neither an
+acceptance nor a refusal.
+
+To finish such a rollback, undo the refused rows with the newer image's
+`down`, as above: stop the old pod first; the successor then takes the mutex
+and exits with the refusal until the `down` is done, then starts. Rolling
+forward again replaces the waiting pods instead.
+
+A successor that finds the mutex free has no working pod to protect, so it
+takes the mutex and exits non-zero with the runner's refusal: after a direct
+restart, or when the predecessor has gone. volume-manager rolls out delete
+first, so its predecessor has stopped before its successor starts, and it
+doesn't check: its refusal alone stalls the rollout at `maxUnavailable` nodes.
+A release from before this check reports ready while it waits for the mutex,
+so a rollback it refuses replaces the working pod before the refusal shows. A
+`space-db-migrator <store> … up` init container's refusal keeps its pod from
+starting, so its rollout stalls too.
+
 ## Rollback-safe SQLite migrations
 
 Because the release before a SQLite migration runs on the schema the migration

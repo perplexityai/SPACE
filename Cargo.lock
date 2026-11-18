@@ -6389,6 +6389,7 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-grpc-server",
+ "pplx-space-service-mutex",
  "pplx-space-unix-socket-bind",
  "tempfile",
  "thiserror 2.0.20",

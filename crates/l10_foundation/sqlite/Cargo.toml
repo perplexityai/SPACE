@@ -15,6 +15,7 @@ hex = { workspace = true }
 rusqlite = { workspace = true }
 sqlx = { workspace = true, features = ["derive", "macros", "migrate", "runtime-tokio", "sqlite-bundled", "tls-rustls-aws-lc-rs"] }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 
 # internal

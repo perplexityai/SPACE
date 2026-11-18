@@ -6,12 +6,17 @@
 //! liveness onto two gRPC service names so the two probes can report
 //! independent signals:
 //!
-//! - `""` (default) and `"readiness"` report `NotServing` while an optional
-//!   dependency wait is pending, then follow the ownership lifecycle:
-//!   `Passive` → `SERVING` (ready to take over), `Starting` → `NotServing`
-//!   (mutex acquired, running migrations/recovery, production socket not yet
-//!   bound), `Active(path)` → forwards a fresh `Check` to the production
-//!   socket and returns whatever it answers.
+//! - `""` (default) and `"readiness"` follow the ownership lifecycle:
+//!   `Waiting` → `NotServing` (a dependency wait, or a takeover gate whose
+//!   check says active startup would fail, or can't tell yet, while the
+//!   predecessor still holds the mutex; see
+//!   [`LocalHealthServer::gate_takeover`]), `Passive` → `SERVING` (ready to
+//!   take over), `Starting` → `NotServing` (mutex acquired, running
+//!   migrations/recovery, production socket not yet bound), `Active(path)` →
+//!   forwards a fresh `Check` to the production socket and returns whatever
+//!   it answers. A surge rollout replaces the predecessor only once the
+//!   successor is `Passive`, so a gated successor stalls the rollout with the
+//!   predecessor still serving.
 //! - `"liveness"` returns `SERVING` while the process can respond to the RPC
 //!   and the caller's runtime has run its heartbeat task within
 //!   [`MAIN_RUNTIME_STALL_LIMIT`]. Daemons may opt in to forwarding liveness
@@ -27,9 +32,11 @@
 //! Generic across daemons: each service supplies its own logging name via
 //! [`local_health_pair`].
 
+use std::fmt::Display;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -44,6 +51,9 @@ use tonic_health::pb::health_server::{Health, HealthServer};
 use tonic_health::pb::{HealthCheckRequest, HealthCheckResponse};
 
 use pplx_space_grpc_server::{grpc_server_builder, grpc_trace_layer};
+use pplx_space_service_mutex::{
+    AcquireOutcome, ServiceMutex, TakeoverGate, TakeoverGateError, gate_takeover,
+};
 use pplx_space_unix_socket_bind::{BindUnixSocketError, UnixSocketOptions, bind_unix_socket};
 
 const ACTIVE_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
@@ -60,10 +70,16 @@ const HEALTH_THREAD_NAME: &str = "local-health";
 const LIVENESS_SERVICE: &str = "liveness";
 const READINESS_SERVICE: &str = "readiness";
 
+/// Readiness before activation: withheld while waiting, reported while
+/// passive, withheld again while starting.
+const WAITING: u8 = 0;
+const PASSIVE: u8 = 1;
+const STARTING: u8 = 2;
+
 pub struct LocalHealth {
     service_name: &'static str,
     liveness: LocalHealthLiveness,
-    readiness_withheld: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
     production_socket: Arc<OnceLock<PathBuf>>,
     main_runtime: Option<Arc<RuntimeHeartbeat>>,
 }
@@ -138,23 +154,27 @@ pub enum LocalHealthLiveness {
 /// → `Active` (via [`activate`](Self::activate)).
 #[derive(Clone)]
 pub struct LocalHealthActivator {
-    readiness_withheld: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
     production_socket: Arc<OnceLock<PathBuf>>,
 }
 
 impl LocalHealthActivator {
     /// Allows takeover after dependency checks, before acquiring ownership.
+    /// Has no effect once starting.
     pub fn mark_takeover_ready(&self) {
-        self.readiness_withheld.store(false, Ordering::SeqCst);
+        let _ = self
+            .phase
+            .compare_exchange(WAITING, PASSIVE, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     /// Records that this instance has acquired the service mutex and is
     /// running active-startup work (migrations, crash recovery, …) but has
     /// not yet bound its production socket. Readiness probes return
     /// `NotServing` from this point until [`activate`](Self::activate) is
-    /// called.
+    /// called. An instance can start from waiting, never having been ready,
+    /// when its takeover gate took a mutex no one held.
     pub fn mark_starting(&self) {
-        if self.readiness_withheld.swap(true, Ordering::SeqCst) {
+        if self.phase.swap(STARTING, Ordering::SeqCst) == STARTING {
             tracing::warn!("local health: mark_starting called twice");
         }
     }
@@ -197,21 +217,21 @@ fn local_health_pair_with_readiness(
     liveness: LocalHealthLiveness,
     readiness: InitialReadiness,
 ) -> (LocalHealth, LocalHealthActivator) {
-    let readiness_withheld = Arc::new(AtomicBool::new(matches!(
-        readiness,
-        InitialReadiness::Waiting
-    )));
+    let phase = Arc::new(AtomicU8::new(match readiness {
+        InitialReadiness::Passive => PASSIVE,
+        InitialReadiness::Waiting => WAITING,
+    }));
     let cell = Arc::new(OnceLock::new());
     (
         LocalHealth {
             service_name,
             liveness,
-            readiness_withheld: Arc::clone(&readiness_withheld),
+            phase: Arc::clone(&phase),
             production_socket: Arc::clone(&cell),
             main_runtime: None,
         },
         LocalHealthActivator {
-            readiness_withheld,
+            phase,
             production_socket: cell,
         },
     )
@@ -365,8 +385,11 @@ impl LocalHealthServer {
     }
 
     /// Starts with liveness available and takeover readiness withheld until
-    /// [`mark_takeover_ready`](Self::mark_takeover_ready). The initial state is
-    /// installed before serving, so no probe can authorize premature takeover.
+    /// [`mark_takeover_ready`](Self::mark_takeover_ready), which
+    /// [`gate_takeover`](Self::gate_takeover) and
+    /// [`take_over`](Self::take_over) call once their check allows it. The
+    /// initial state is installed before serving, so no probe can authorize
+    /// premature takeover.
     pub fn spawn_optional_waiting(
         socket_path: Option<&Path>,
         socket_options: UnixSocketOptions,
@@ -383,6 +406,63 @@ impl LocalHealthServer {
                 shutdown_token,
             ),
             None => Ok(Self::disabled()),
+        }
+    }
+
+    /// Runs [`gate_takeover`](pplx_space_service_mutex::gate_takeover) on the
+    /// mutex at `service_mutex`, keeping readiness withheld and liveness
+    /// answering while it holds, and marks takeover-ready when it opens.
+    /// Spawn the server waiting, with
+    /// [`spawn_optional_waiting`](Self::spawn_optional_waiting), so readiness
+    /// is withheld from the start. `check` is the daemon's prediction of its
+    /// active startup, such as whether its database migrations would be
+    /// refused.
+    pub async fn gate_takeover<C, Fut, B, E>(
+        &self,
+        service_mutex: &Path,
+        shutdown_token: &CancellationToken,
+        check: C,
+    ) -> Result<TakeoverGate, TakeoverGateError<E>>
+    where
+        C: FnMut() -> Fut,
+        Fut: Future<Output = Result<Option<B>, E>>,
+        B: Display + PartialEq,
+    {
+        let gate = gate_takeover(service_mutex, shutdown_token, check).await?;
+        if matches!(gate, TakeoverGate::Open) {
+            self.mark_takeover_ready();
+        }
+        Ok(gate)
+    }
+
+    /// [`gate_takeover`](Self::gate_takeover), then, once it opens,
+    /// [`ServiceMutex::acquire_with_timeout`]: the `timeout` budget starts
+    /// only after the gate, so a gated instance doesn't time out while its
+    /// predecessor serves. The caller marks starting on
+    /// [`AcquireOutcome::Acquired`], as after any acquire.
+    pub async fn take_over<C, Fut, B, E>(
+        &self,
+        service_mutex: &Path,
+        shutdown_token: &CancellationToken,
+        timeout: Duration,
+        check: C,
+    ) -> Result<AcquireOutcome, TakeoverGateError<E>>
+    where
+        C: FnMut() -> Fut,
+        Fut: Future<Output = Result<Option<B>, E>>,
+        B: Display + PartialEq,
+    {
+        match self
+            .gate_takeover(service_mutex, shutdown_token, check)
+            .await?
+        {
+            TakeoverGate::Open => {
+                ServiceMutex::acquire_with_timeout(service_mutex, shutdown_token, timeout)
+                    .await
+                    .map_err(TakeoverGateError::Mutex)
+            }
+            TakeoverGate::Acquired(mutex) => Ok(AcquireOutcome::Acquired(mutex)),
+            TakeoverGate::PassiveExit => Ok(AcquireOutcome::PassiveExit),
         }
     }
 
@@ -497,10 +577,10 @@ impl LocalHealth {
         if let Some(socket) = self.production_socket.get() {
             return self.production_status(socket).await;
         }
-        if self.readiness_withheld.load(Ordering::SeqCst) {
-            ServingStatus::NotServing
-        } else {
+        if self.phase.load(Ordering::SeqCst) == PASSIVE {
             ServingStatus::Serving
+        } else {
+            ServingStatus::NotServing
         }
     }
 

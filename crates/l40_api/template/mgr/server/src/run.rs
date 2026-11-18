@@ -13,7 +13,7 @@ use std::time::Duration;
 use pplx_space_host_layout::identities::group_names;
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
-use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
+use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex, TakeoverGateError};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::DB_PATH;
@@ -33,6 +33,13 @@ static COMMON_SCHEMA_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../.
 static TEMPLATE_MANAGER_MIGRATOR: sqlx::migrate::Migrator =
     sqlx::migrate!("../../../../../db/template-manager");
 
+fn migrators() -> pplx_space_sqlite::EmbeddedMigrators<'static> {
+    pplx_space_sqlite::EmbeddedMigrators {
+        service: &TEMPLATE_MANAGER_MIGRATOR,
+        common: Some(&COMMON_SCHEMA_MIGRATOR),
+    }
+}
+
 /// Everything [`run`] needs from the process that hosts it: the binary's
 /// flags, already parsed. Environment-driven tuning (cache budget, prefetch
 /// tags, node endpoints) stays with the code that reads it.
@@ -42,10 +49,11 @@ pub struct TemplateMgrRunConfig {
     /// mutex is acquired.
     pub socket_path: PathBuf,
     /// Instance-local health Unix socket, bound from startup so readiness can
-    /// pass while this instance is still passive.
+    /// pass while this instance is still passive, once its database would be
+    /// accepted.
     pub health_socket_path: Option<PathBuf>,
-    /// How long the passive instance waits for the predecessor to release the
-    /// service mutex before exiting non-zero.
+    /// How long the passive instance waits, once ready to take over, for the
+    /// predecessor to release the service mutex before exiting non-zero.
     pub service_mutex_timeout: Duration,
 }
 
@@ -64,6 +72,8 @@ pub enum RunTemplateMgrError {
     HealthSocket(#[source] pplx_space_local_health::LocalHealthServerError),
     #[error("failed to acquire the template-manager service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
+    #[error("failed to check the template-manager SQLite database before takeover: {0}")]
+    CheckMigrations(#[source] pplx_space_sqlite::SqliteError),
     #[error("failed to migrate the template-manager SQLite database: {0}")]
     Migrate(#[source] pplx_space_sqlite::SqliteError),
     #[error("failed to open the template-manager SQLite database: {0}")]
@@ -107,7 +117,7 @@ async fn run_service(
     shutdown_token: CancellationToken,
     service_mutex: &mut Option<ServiceMutex>,
 ) -> Result<(), RunTemplateMgrError> {
-    let health_server = LocalHealthServer::spawn_optional(
+    let health_server = LocalHealthServer::spawn_optional_waiting(
         config.health_socket_path.as_deref(),
         pplx_space_unix_socket_bind::UnixSocketOptions::new(0o660),
         SERVICE_NAME,
@@ -125,14 +135,24 @@ async fn run_service(
         "space-tmplmgr passive; waiting for service mutex"
     );
 
-    let acquired_mutex = match ServiceMutex::acquire_with_timeout(
-        SERVICE_MUTEX_PATH,
-        &shutdown_token,
-        config.service_mutex_timeout,
-    )
-    .await
-    .map_err(RunTemplateMgrError::ServiceMutex)?
-    {
+    let acquired_mutex = match health_server
+        .take_over(
+            std::path::Path::new(SERVICE_MUTEX_PATH),
+            &shutdown_token,
+            config.service_mutex_timeout,
+            || {
+                pplx_space_sqlite::check_migrate_embedded(
+                    "template-manager",
+                    std::path::Path::new(DB_PATH),
+                    migrators(),
+                )
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            TakeoverGateError::Check(error) => RunTemplateMgrError::CheckMigrations(error),
+            TakeoverGateError::Mutex(error) => RunTemplateMgrError::ServiceMutex(error),
+        })? {
         AcquireOutcome::Acquired(mutex) => mutex,
         AcquireOutcome::PassiveExit => {
             tracing::warn!("terminated while passive; exiting cleanly");
@@ -167,10 +187,7 @@ async fn run_service(
     pplx_space_sqlite::migrate_embedded(
         "template-manager",
         std::path::Path::new(DB_PATH),
-        pplx_space_sqlite::EmbeddedMigrators {
-            service: &TEMPLATE_MANAGER_MIGRATOR,
-            common: Some(&COMMON_SCHEMA_MIGRATOR),
-        },
+        migrators(),
     )
     .await
     .map_err(RunTemplateMgrError::Migrate)?;

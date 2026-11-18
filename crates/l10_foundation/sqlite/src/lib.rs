@@ -171,6 +171,58 @@ fn migrate_failure(db_name: &str, db_path: &Path) -> String {
     )
 }
 
+/// Whether [`migrate_embedded`] would refuse the database at `db_path` now,
+/// answered without writing anything, so that a passive instance can ask
+/// while another instance owns and writes the database. `Ok(None)` means the
+/// runner would accept it; a missing database records nothing and is
+/// accepted. The answer comes from the decision the runner's startup
+/// validation makes, so a refusal here has the runner's text.
+///
+/// [`MigrateBlock`] also says when this read couldn't tell, because another
+/// connection held a lock it needed or the database changed while it was
+/// read. That is neither an acceptance nor a refusal: ask again.
+pub async fn check_migrate_embedded(
+    db_name: &str,
+    db_path: &Path,
+    migrators: EmbeddedMigrators<'_>,
+) -> SqliteResult<Option<MigrateBlock>> {
+    let checksums = AcceptedChecksums::embedded().context("invalid migration checksum manifest")?;
+    check_once(
+        db_name,
+        db_path,
+        migrators,
+        &checksums,
+        RusqliteOpenOptions::default().busy_timeout,
+    )
+    .await
+    .with_context(|| check_failure(db_name, db_path))
+}
+
+/// [`check_migrate_embedded`] for a store without a shared catalog, as
+/// [`migrate`] is for [`migrate_embedded`].
+pub async fn check_migrate(
+    db_name: &str,
+    db_path: &Path,
+    migrator: &Migrator,
+) -> SqliteResult<Option<MigrateBlock>> {
+    check_migrate_embedded(
+        db_name,
+        db_path,
+        EmbeddedMigrators {
+            service: migrator,
+            common: None,
+        },
+    )
+    .await
+}
+
+fn check_failure(db_name: &str, db_path: &Path) -> String {
+    format!(
+        "failed to check {db_name} SQLite at {} against this release's migrations",
+        db_path.display()
+    )
+}
+
 /// Use the existing shared history without moving or rewriting its rows.
 pub fn common_migrator(migrator: &Migrator) -> Migrator {
     Migrator {
@@ -260,19 +312,48 @@ fn with_newer_placeholders(migrator: &Migrator, accepted: &[(i64, Vec<u8>)]) -> 
     }
 }
 
-fn validate_public_history(
-    store: &str,
-    conn: &Connection,
-    migrator: &Migrator,
-    common: bool,
-    checksums: &AcceptedChecksums,
-) -> SqliteResult<PublicHistory> {
-    let table = if common {
+fn history_table(common: bool) -> &'static str {
+    if common {
         COMMON_HISTORY_TABLE
     } else {
         SERVICE_HISTORY_TABLE
+    }
+}
+
+/// One recorded public-history row: `(version, success, checksum)`.
+type HistoryRow = (i64, bool, Vec<u8>);
+
+/// What validation reads from a database: each public history, empty when
+/// its table is missing, and the application schema outside them.
+struct RecordedSchema {
+    service: Vec<HistoryRow>,
+    common: Vec<HistoryRow>,
+    application: Vec<(String, String)>,
+}
+
+/// Reads what validation decides on in one read transaction, so that a
+/// reader beside a live writer sees one committed state of every table.
+fn read_recorded_schema(conn: &Connection, common: bool) -> SqliteResult<RecordedSchema> {
+    let transaction = conn
+        .unchecked_transaction()
+        .context("failed to begin reading public migration history")?;
+    let recorded = RecordedSchema {
+        service: read_public_history(&transaction, false)?,
+        common: if common {
+            read_public_history(&transaction, true)?
+        } else {
+            Vec::new()
+        },
+        application: public_application_schema(&transaction)?,
     };
-    let bundled = migrations_by_version(migrator);
+    transaction
+        .commit()
+        .context("failed to finish reading public migration history")?;
+    Ok(recorded)
+}
+
+fn read_public_history(conn: &Connection, common: bool) -> SqliteResult<Vec<HistoryRow>> {
+    let table = history_table(common);
     let exists: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = ?1)",
@@ -281,36 +362,129 @@ fn validate_public_history(
         )
         .context("failed to inspect public migration history")?;
     if !exists {
-        return Ok(PublicHistory {
-            missing: bundled.keys().min().copied(),
-            ..PublicHistory::empty(store, table)
-        });
+        return Ok(Vec::new());
     }
     let query = if common {
         "SELECT version, success, checksum FROM _space_common_schema_migrations ORDER BY version"
     } else {
         "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version"
     };
-    let mut statement = conn
-        .prepare(query)
-        .context("failed to read public migration history")?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, bool>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        })
-        .context("failed to query public migration history")?;
+    conn.prepare(query)
+        .context("failed to read public migration history")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .context("failed to query public migration history")?
+        .collect::<Result<_, _>>()
+        .context("invalid public migration history")
+}
+
+/// Why the runner refuses a database. Its text is the refusal
+/// [`migrate_embedded`] returns.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+enum Refusal {
+    #[error("{table} has failed, modified, or unbundled migration {version}; see db/README.md")]
+    Invalid { table: &'static str, version: i64 },
+    /// `table` records newer migration `newer` while `gap_table` doesn't
+    /// record bundled migration `missing`.
+    #[error("{}", gap_refusal(table, *newer, gap_table, *missing))]
+    GapBelowNewer {
+        table: &'static str,
+        newer: i64,
+        gap_table: &'static str,
+        missing: i64,
+    },
+    #[error(
+        "SQLite service history is present but shared history is missing; explicit repair is required"
+    )]
+    MissingSharedHistory,
+    #[error("SQLite has untracked application schema; see db/README.md")]
+    UntrackedSchema,
+}
+
+fn gap_refusal(table: &str, newer: i64, gap_table: &str, missing: i64) -> String {
+    if table == gap_table {
+        format!(
+            "{table} records newer migration {newer} but not bundled migration {missing}; \
+             see db/README.md"
+        )
+    } else {
+        format!(
+            "{table} records newer migration {newer} but {gap_table} does not record bundled \
+             migration {missing}; see db/README.md"
+        )
+    }
+}
+
+impl From<Refusal> for SqliteError {
+    fn from(refusal: Refusal) -> Self {
+        Self {
+            context: String::new(),
+            source: Box::new(refusal),
+        }
+    }
+}
+
+/// Why [`check_migrate_embedded`] holds takeover back: the runner would
+/// refuse the database, or the read couldn't tell whether it would.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrateBlock {
+    store: String,
+    db_path: PathBuf,
+    reason: BlockReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BlockReason {
+    /// The runner would refuse the database.
+    Refused(Refusal),
+    /// Another connection held a lock the read needed (`SQLITE_BUSY` or
+    /// `SQLITE_LOCKED`), with the error.
+    Locked(String),
+    /// The database changed while it was read as immutable.
+    Changed,
+}
+
+impl Display for MigrateBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (store, path) = (&self.store, self.db_path.display());
+        match &self.reason {
+            BlockReason::Refused(refusal) => {
+                write!(
+                    f,
+                    "this release refuses {store} SQLite at {path}: {refusal}"
+                )
+            }
+            BlockReason::Locked(error) => write!(
+                f,
+                "could not tell whether this release accepts {store} SQLite at {path}, because \
+                 another connection held a lock the read needed ({error}); checking again"
+            ),
+            BlockReason::Changed => write!(
+                f,
+                "could not tell whether this release accepts {store} SQLite at {path}, because \
+                 it changed while it was read; checking again"
+            ),
+        }
+    }
+}
+
+/// The decision over one public history's recorded rows.
+fn validate_public_history(
+    store: &str,
+    rows: &[HistoryRow],
+    migrator: &Migrator,
+    common: bool,
+    checksums: &AcceptedChecksums,
+) -> Result<PublicHistory, Refusal> {
+    let table = history_table(common);
+    let bundled = migrations_by_version(migrator);
     let newest_bundled = bundled.keys().max().copied();
     let mut recorded = BTreeSet::new();
     let mut history = PublicHistory::empty(store, table);
-    for row in rows {
-        let (version, success, checksum) = row.context("invalid public migration history")?;
+    for (version, success, checksum) in rows {
+        let (version, success) = (*version, *success);
         let valid = match bundled.get(&version) {
             Some(migration) => {
-                success && checksums.accepts(store, version, &migration.checksum, &checksum)
+                success && checksums.accepts(store, version, &migration.checksum, checksum)
             }
             // A newer release applied it, and the authoring rules keep its
             // schema usable by this release. A recorded version below the
@@ -324,15 +498,13 @@ fn validate_public_history(
                 && checksum.len() == CHECKSUM_LEN
                 && newest_bundled.is_none_or(|newest| version > newest) =>
             {
-                history.accepted_newer.push((version, checksum));
+                history.accepted_newer.push((version, checksum.clone()));
                 true
             }
             None => false,
         };
         if !valid {
-            return Err(SqliteError::message(format!(
-                "{table} has failed, modified, or unbundled migration {version}; see db/README.md"
-            )));
+            return Err(Refusal::Invalid { table, version });
         }
         recorded.insert(version);
         history.applied = true;
@@ -350,7 +522,7 @@ fn validate_public_history(
 /// of both catalogs below it, the shared one first, so one this release would
 /// still apply is missing from a damaged history, not pending; applying it
 /// would run its SQL on a schema it wasn't written for.
-fn refuse_gap_below_newer(histories: [&PublicHistory; 2]) -> SqliteResult<()> {
+fn refuse_gap_below_newer(histories: [&PublicHistory; 2]) -> Result<(), Refusal> {
     for gap in histories {
         let Some(missing) = gap.missing else {
             continue;
@@ -360,19 +532,12 @@ fn refuse_gap_below_newer(histories: [&PublicHistory; 2]) -> SqliteResult<()> {
             .chain(histories)
             .find_map(|history| Some((history, history.accepted_newer.first()?.0)));
         if let Some((history, newer)) = newer {
-            let table = history.table;
-            return Err(SqliteError::message(if history.table == gap.table {
-                format!(
-                    "{table} records newer migration {newer} but not bundled migration \
-                     {missing}; see db/README.md"
-                )
-            } else {
-                format!(
-                    "{table} records newer migration {newer} but {} does not record \
-                     bundled migration {missing}; see db/README.md",
-                    gap.table
-                )
-            }));
+            return Err(Refusal::GapBelowNewer {
+                table: history.table,
+                newer,
+                gap_table: gap.table,
+                missing,
+            });
         }
     }
     Ok(())
@@ -392,6 +557,83 @@ fn warn_accepted_newer(history: &PublicHistory) {
     }
 }
 
+/// The runner's decision on what a database records: what validation
+/// accepts, or why it refuses. The runner's startup validation and
+/// [`check_migrate_embedded`] both decide here, so they can't disagree. Only
+/// a failure to build the shared schema reference is an error.
+async fn decide(
+    db_name: &str,
+    recorded: &RecordedSchema,
+    migrators: EmbeddedMigrators<'_>,
+    checksums: &AcceptedChecksums,
+) -> SqliteResult<Result<ValidatedHistories, Refusal>> {
+    let validated = match decide_histories(db_name, recorded, migrators, checksums) {
+        Ok(validated) => validated,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    if !validated.service.applied {
+        let expected = match migrators.common.filter(|_| validated.common.applied) {
+            Some(common) => common_schema_reference(common).await?,
+            None => Vec::new(),
+        };
+        if recorded.application != expected {
+            return Ok(Err(Refusal::UntrackedSchema));
+        }
+    }
+    Ok(Ok(validated))
+}
+
+fn decide_histories(
+    db_name: &str,
+    recorded: &RecordedSchema,
+    migrators: EmbeddedMigrators<'_>,
+    checksums: &AcceptedChecksums,
+) -> Result<ValidatedHistories, Refusal> {
+    let service = validate_public_history(
+        db_name,
+        &recorded.service,
+        migrators.service,
+        false,
+        checksums,
+    )?;
+    let common = match migrators.common {
+        Some(common) => {
+            validate_public_history("common", &recorded.common, common, true, checksums)?
+        }
+        None => PublicHistory::empty("common", COMMON_HISTORY_TABLE),
+    };
+    refuse_gap_below_newer([&service, &common])?;
+    if service.applied && migrators.common.is_some() && !common.applied {
+        return Err(Refusal::MissingSharedHistory);
+    }
+    Ok(ValidatedHistories { service, common })
+}
+
+/// The application schema the shared catalog alone creates.
+async fn common_schema_reference(common: &Migrator) -> SqliteResult<Vec<(String, String)>> {
+    let reference = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .context("failed to open common schema reference")?;
+    let result = async {
+        common_migrator(common)
+            .run(&reference)
+            .await
+            .context("failed to migrate common schema reference")?;
+        sqlx::query_as::<_, (String, String)>(sql!(
+            "SELECT name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'
+             AND name NOT IN ('_sqlx_migrations', '_space_common_schema_migrations') ORDER BY name"
+        ))
+        .fetch_all(&reference)
+        .await
+        .context("failed to read common schema reference")
+    }
+    .await;
+    reference.close().await;
+    result
+}
+
 async fn validate_schema(
     db_name: &str,
     db_path: &Path,
@@ -399,48 +641,195 @@ async fn validate_schema(
     checksums: &AcceptedChecksums,
 ) -> SqliteResult<ValidatedHistories> {
     let conn = Connection::open(db_path).context("failed to open SQLite database")?;
-    let service = validate_public_history(db_name, &conn, migrators.service, false, checksums)?;
-    let common = match migrators.common {
-        Some(common) => validate_public_history("common", &conn, common, true, checksums)?,
-        None => PublicHistory::empty("common", COMMON_HISTORY_TABLE),
+    let recorded = read_recorded_schema(&conn, migrators.common.is_some())?;
+    drop(conn);
+    let validated = decide(db_name, &recorded, migrators, checksums).await??;
+    warn_accepted_newer(&validated.service);
+    warn_accepted_newer(&validated.common);
+    Ok(validated)
+}
+
+async fn check_once(
+    db_name: &str,
+    db_path: &Path,
+    migrators: EmbeddedMigrators<'_>,
+    checksums: &AcceptedChecksums,
+    busy_timeout: Duration,
+) -> SqliteResult<Option<MigrateBlock>> {
+    validate_catalogs(db_name, migrators, checksums)?;
+    let read = {
+        let db_path = db_path.to_path_buf();
+        let common = migrators.common.is_some();
+        tokio::task::spawn_blocking(move || read_without_writing(&db_path, common, busy_timeout))
+            .await
+            .context("the read-only check stopped before it finished")??
     };
-    refuse_gap_below_newer([&service, &common])?;
-    let (service_applied, common_applied) = (service.applied, common.applied);
-    if service_applied && migrators.common.is_some() && !common_applied {
-        return Err(SqliteError::message(
-            "SQLite service history is present but shared history is missing; explicit repair is required",
-        ));
-    }
-    if !service_applied {
-        let expected = if let Some(common) = migrators.common.filter(|_| common_applied) {
-            let reference = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .context("failed to open common schema reference")?;
-            let result = async {
-                common_migrator(common).run(&reference).await
-                    .context("failed to migrate common schema reference")?;
-                sqlx::query_as::<_, (String, String)>(sql!(
-                    "SELECT name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'
-                     AND name NOT IN ('_sqlx_migrations', '_space_common_schema_migrations') ORDER BY name"
-                ))
-                .fetch_all(&reference).await.context("failed to read common schema reference")
-            }.await;
-            reference.close().await;
-            result?
-        } else {
-            Vec::new()
+    let block = |reason| MigrateBlock {
+        store: db_name.to_owned(),
+        db_path: db_path.to_path_buf(),
+        reason,
+    };
+    let recorded = match read {
+        ReadWithoutWriting::Missing => return Ok(None),
+        ReadWithoutWriting::Unsettled(reason) => return Ok(Some(block(reason))),
+        ReadWithoutWriting::Recorded(recorded) => recorded,
+    };
+    Ok(decide(db_name, &recorded, migrators, checksums)
+        .await?
+        .err()
+        .map(|refusal| block(BlockReason::Refused(refusal))))
+}
+
+enum ReadWithoutWriting {
+    /// No database file is there.
+    Missing,
+    /// The read couldn't tell; see [`BlockReason`].
+    Unsettled(BlockReason),
+    Recorded(RecordedSchema),
+}
+
+/// What an immutable read relies on staying as it was: the main file's size
+/// and modification time, and that no `-wal` exists.
+#[derive(Debug, PartialEq, Eq)]
+struct DatabaseFiles {
+    main: (u64, std::time::SystemTime),
+    wal: bool,
+}
+
+impl DatabaseFiles {
+    /// The files at `db_path`, or `None` when no database file is there.
+    fn observe(db_path: &Path) -> SqliteResult<Option<Self>> {
+        let [_, wal, _] = database_files(db_path);
+        let main = match std::fs::metadata(db_path) {
+            Ok(metadata) => (
+                metadata.len(),
+                metadata.modified().with_context(|| {
+                    format!(
+                        "failed to read the modification time of {}",
+                        db_path.display()
+                    )
+                })?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to stat SQLite file {}", db_path.display()));
+            }
         };
-        if public_application_schema(&conn)? != expected {
-            return Err(SqliteError::message(
-                "SQLite has untracked application schema; see db/README.md",
-            ));
+        let wal = wal
+            .try_exists()
+            .with_context(|| format!("failed to stat SQLite file {}", wal.display()))?;
+        Ok(Some(Self { main, wal }))
+    }
+}
+
+/// Reads what validation decides on without creating or changing any file.
+fn read_without_writing(
+    db_path: &Path,
+    common: bool,
+    busy_timeout: Duration,
+) -> SqliteResult<ReadWithoutWriting> {
+    match DatabaseFiles::observe(db_path)? {
+        None => Ok(ReadWithoutWriting::Missing),
+        Some(before) => read_observed(db_path, &before, common, busy_timeout),
+    }
+}
+
+/// [`read_without_writing`] of the files `before` describes.
+///
+/// A read-only connection still creates a missing `-wal` and `-shm` and
+/// leaves them behind. Without a `-wal`, no WAL-mode connection has the
+/// database open, as each keeps one while it does, and the main file holds
+/// every commit, so it is read as immutable, which opens nothing else and
+/// takes no lock. A writer can open the database during that read: it
+/// creates a `-wal` before it writes, and only a checkpoint, which changes the
+/// main file, writes the main file. So when a `-wal` has appeared or the main
+/// file has changed by the end of the read, what was read may be torn, and
+/// the read is unsettled. With a `-wal`, the database is read through it as
+/// any reader does, under SQLite's locks, which sees a live writer's
+/// commits; a lock the read can't get within `busy_timeout` leaves it
+/// unsettled too, and so does a `-wal` gone by the time the read starts. The
+/// runner validates again once it holds the service mutex, so a read that
+/// raced a writer can delay takeover but never replaces that validation.
+fn read_observed(
+    db_path: &Path,
+    before: &DatabaseFiles,
+    common: bool,
+    busy_timeout: Duration,
+) -> SqliteResult<ReadWithoutWriting> {
+    use rusqlite::OpenFlags;
+
+    let immutable = !before.wal;
+    let conn = Connection::open_with_flags(
+        read_only_uri(db_path, immutable),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
+        format!(
+            "failed to open SQLite database {} read-only",
+            db_path.display()
+        )
+    })?;
+    conn.busy_timeout(busy_timeout)
+        .with_context(|| format!("failed to set busy timeout for {}", db_path.display()))?;
+    // The last writer to close removes the `-wal`; reading after that would
+    // create it again.
+    if !immutable && DatabaseFiles::observe(db_path)?.is_none_or(|now| !now.wal) {
+        return Ok(ReadWithoutWriting::Unsettled(BlockReason::Changed));
+    }
+    let recorded = read_recorded_schema(&conn, common);
+    drop(conn);
+    if immutable && DatabaseFiles::observe(db_path)?.as_ref() != Some(before) {
+        return Ok(ReadWithoutWriting::Unsettled(BlockReason::Changed));
+    }
+    match recorded {
+        Ok(recorded) => Ok(ReadWithoutWriting::Recorded(recorded)),
+        Err(error) if is_locked(&error) => Ok(ReadWithoutWriting::Unsettled(BlockReason::Locked(
+            error.to_string(),
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `error` is SQLite's `SQLITE_BUSY` or `SQLITE_LOCKED`.
+fn is_locked(error: &SqliteError) -> bool {
+    error
+        .source
+        .downcast_ref::<rusqlite::Error>()
+        .and_then(rusqlite::Error::sqlite_error_code)
+        .is_some_and(|code| {
+            matches!(
+                code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+        })
+}
+
+/// A `file:` URI for `db_path`, escaping what SQLite's URI parser would
+/// otherwise read as a query, fragment or escape.
+fn read_only_uri(db_path: &Path, immutable: bool) -> String {
+    let path = db_path.display().to_string();
+    let mut uri = String::from(if path.starts_with('/') {
+        "file://"
+    } else {
+        "file:"
+    });
+    for c in path.chars() {
+        match c {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3f"),
+            '#' => uri.push_str("%23"),
+            c => uri.push(c),
         }
     }
-    warn_accepted_newer(&service);
-    warn_accepted_newer(&common);
-    Ok(ValidatedHistories { service, common })
+    uri.push_str(if immutable {
+        "?mode=ro&immutable=1"
+    } else {
+        "?mode=ro"
+    });
+    uri
 }
 
 fn public_application_schema(conn: &Connection) -> SqliteResult<Vec<(String, String)>> {
@@ -523,9 +912,10 @@ pub fn restrict_database_permissions(db_path: &Path) -> SqliteResult<()> {
     Ok(())
 }
 
-async fn migrate_once(
+/// Refuse a bundled migration whose source the checksum manifest doesn't
+/// list, whatever the database records.
+fn validate_catalogs(
     db_name: &str,
-    db_path: &Path,
     migrators: EmbeddedMigrators<'_>,
     checksums: &AcceptedChecksums,
 ) -> SqliteResult<()> {
@@ -537,6 +927,16 @@ async fn migrate_once(
             .validate("common", common)
             .context("unlisted common migration checksum")?;
     }
+    Ok(())
+}
+
+async fn migrate_once(
+    db_name: &str,
+    db_path: &Path,
+    migrators: EmbeddedMigrators<'_>,
+    checksums: &AcceptedChecksums,
+) -> SqliteResult<()> {
+    validate_catalogs(db_name, migrators, checksums)?;
     let span = tracing::info_span!(
         "sqlite.migrate",
         db.system = "sqlite",

@@ -1,4 +1,5 @@
 use super::*;
+use pplx_space_service_mutex::ServiceMutex;
 
 #[test]
 fn configuration_precedence_and_owned_sections() {

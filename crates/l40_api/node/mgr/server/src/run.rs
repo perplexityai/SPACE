@@ -13,7 +13,7 @@ use std::time::Duration;
 use pplx_space_host_layout::identities::group_names;
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
-use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
+use pplx_space_service_mutex::{AcquireOutcome, TakeoverGateError};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -101,10 +101,11 @@ pub struct NodeMgrRunConfig {
     /// mutex is acquired.
     pub socket_path: PathBuf,
     /// Instance-local health Unix socket, bound from startup so readiness can
-    /// pass while this instance is still passive.
+    /// pass while this instance is still passive, once its database would be
+    /// accepted.
     pub health_socket_path: Option<PathBuf>,
-    /// How long the passive instance waits for the predecessor to release the
-    /// service mutex before exiting non-zero.
+    /// How long the passive instance waits, once ready to take over, for the
+    /// predecessor to release the service mutex before exiting non-zero.
     pub service_mutex_timeout: Duration,
     /// Node-manager TOML config path. A missing file is the default config.
     pub config_path: PathBuf,
@@ -202,6 +203,8 @@ pub enum RunNodeMgrError {
     InvalidSandboxCgroupMemory { memory_mib: u64, headroom_mib: u64 },
     #[error("failed to apply sandbox parent disk I/O reservation: {0}")]
     ApplyParentDiskIoReservation(String),
+    #[error("failed to check node-manager's SQLite database before takeover: {0}")]
+    CheckMigrations(#[source] pplx_space_sqlite::SqliteError),
     #[error("failed to migrate node-manager's SQLite database: {0}")]
     Migrate(#[source] pplx_space_sqlite::SqliteError),
     /// Incompatible ownership or slot-store state found before any host limit
@@ -614,7 +617,7 @@ pub async fn run(
     let btrfs_balance_enabled = crate::service::btrfs_balance::enabled_from_env();
     validate_runtime_groups()?;
 
-    let health_server = LocalHealthServer::spawn_optional(
+    let health_server = LocalHealthServer::spawn_optional_waiting(
         cli.health_socket_path.as_deref(),
         pplx_space_unix_socket_bind::UnixSocketOptions::new(0o660),
         SERVICE_NAME,
@@ -632,14 +635,19 @@ pub async fn run(
         "space-node-manager passive; waiting for service mutex"
     );
 
-    let service_mutex = match ServiceMutex::acquire_with_timeout(
-        SERVICE_MUTEX_PATH,
-        &shutdown_token,
-        cli.service_mutex_timeout,
-    )
-    .await
-    .map_err(RunNodeMgrError::ServiceMutex)?
-    {
+    let db_path = Path::new(pplx_space_host_layout::paths::NODE_MANAGER_DB);
+    let service_mutex = match health_server
+        .take_over(
+            Path::new(SERVICE_MUTEX_PATH),
+            &shutdown_token,
+            cli.service_mutex_timeout,
+            || pplx_space_sqlite::check_migrate("node-manager", db_path, &NODE_MANAGER_MIGRATOR),
+        )
+        .await
+        .map_err(|error| match error {
+            TakeoverGateError::Check(error) => RunNodeMgrError::CheckMigrations(error),
+            TakeoverGateError::Mutex(error) => RunNodeMgrError::ServiceMutex(error),
+        })? {
         AcquireOutcome::Acquired(mutex) => mutex,
         AcquireOutcome::PassiveExit => {
             tracing::warn!("terminated while passive; exiting cleanly");
@@ -658,7 +666,6 @@ pub async fn run(
 
     // Reject incompatible ownership before any host limit can shrink beneath
     // live sandboxes. Pool construction repeats this check before row repair.
-    let db_path = Path::new(pplx_space_host_layout::paths::NODE_MANAGER_DB);
     pplx_space_sqlite::migrate("node-manager", db_path, &NODE_MANAGER_MIGRATOR)
         .await
         .map_err(RunNodeMgrError::Migrate)?;

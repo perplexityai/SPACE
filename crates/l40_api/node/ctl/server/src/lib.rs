@@ -36,7 +36,7 @@ use pplx_space_node_mgr_client::{
     NodeResourceStatusReader,
 };
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
-use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
+use pplx_space_service_mutex::{AcquireOutcome, TakeoverGateError};
 use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
@@ -203,10 +203,11 @@ pub struct NodeCtlRunConfig {
     /// acquired.
     pub socket_path: PathBuf,
     /// Instance-local health Unix socket, bound from startup so readiness can
-    /// pass while this instance is still passive.
+    /// pass while this instance is still passive, once its database would be
+    /// accepted.
     pub health_socket_path: Option<PathBuf>,
-    /// How long the passive instance waits for the predecessor to release the
-    /// service mutex before exiting non-zero.
+    /// How long the passive instance waits, once ready to take over, for the
+    /// predecessor to release the service mutex before exiting non-zero.
     pub service_mutex_timeout: Duration,
     /// The group the production socket must be given. Production uses
     /// [`DEFAULT_NODE_CTL_SOCKET_GROUP`]; tests name a group they belong to.
@@ -250,6 +251,8 @@ pub enum RunNodeCtlError {
     HealthSocket(#[source] pplx_space_local_health::LocalHealthServerError),
     #[error("failed to acquire the node-ctl service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
+    #[error("failed to check node-ctl's SQLite database before takeover: {0}")]
+    CheckMigrations(#[source] pplx_space_sqlite::SqliteError),
     #[error("failed to migrate node-ctl's SQLite database: {0}")]
     Migrate(#[source] pplx_space_sqlite::SqliteError),
     #[error("failed to open node-ctl's SQLite database: {0}")]
@@ -556,7 +559,7 @@ pub async fn run(
     let node_id = resolve_node_id(Path::new(NODE_ID_PATH))?;
     let node_role = resolve_node_role(&cli, &config)?;
 
-    let health_server = LocalHealthServer::spawn_optional(
+    let health_server = LocalHealthServer::spawn_optional_waiting(
         cli.health_socket_path.as_deref(),
         pplx_space_unix_socket_bind::UnixSocketOptions::new(0o660),
         SERVICE_NAME,
@@ -575,14 +578,18 @@ pub async fn run(
         "space-node-ctl passive; waiting for service mutex"
     );
 
-    let service_mutex = match ServiceMutex::acquire_with_timeout(
-        &service_mutex_path,
-        &shutdown_token,
-        cli.service_mutex_timeout,
-    )
-    .await
-    .map_err(RunNodeCtlError::ServiceMutex)?
-    {
+    let service_mutex = match health_server
+        .take_over(
+            &service_mutex_path,
+            &shutdown_token,
+            cli.service_mutex_timeout,
+            || pplx_space_sqlite::check_migrate("node-ctl", &cli.db_path, &NODE_CTL_MIGRATOR),
+        )
+        .await
+        .map_err(|error| match error {
+            TakeoverGateError::Check(error) => RunNodeCtlError::CheckMigrations(error),
+            TakeoverGateError::Mutex(error) => RunNodeCtlError::ServiceMutex(error),
+        })? {
         AcquireOutcome::Acquired(mutex) => mutex,
         AcquireOutcome::PassiveExit => {
             tracing::warn!("terminated while passive; exiting cleanly");

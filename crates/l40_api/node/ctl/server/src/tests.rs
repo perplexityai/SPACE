@@ -1,4 +1,5 @@
 use super::*;
+use pplx_space_service_mutex::ServiceMutex;
 
 #[test]
 fn poll_interval_is_bounded_by_what_the_cluster_window_covers() {
