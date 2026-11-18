@@ -489,7 +489,10 @@ included, runs in the lane.
 
 For a full validation of the lane on one host, run the whole suite with
 [the parallel runner](#the-whole-suite-on-one-host), which builds the release
-image once and hands it to every bench:
+image once and hands it to every bench. This lane has not yet been run through
+the runner; until it has, a failure there may be a gap between the runner and
+the lane's CI job rather than a lane defect, and the single-cluster run below
+settles which:
 
 ```bash
 SPACE_KIND_RUST_BUILD=release bash scripts/tests/smoke-kind-parallel.sh
@@ -581,10 +584,16 @@ and names the teardown that switches it.
   included.
 
 For a full validation of the lane on one host, run the whole suite with
-[the parallel runner](#the-whole-suite-on-one-host):
+[the parallel runner](#the-whole-suite-on-one-host), with CI's known-failures
+list. This lane has not yet been run through the runner, whose benches run
+`smoke-kind-e2e.sh` as their baseline where the lane's CI job runs `up.sh` and
+`examples/first_sandbox.py`; until it has, a failure there may be a gap
+between the two rather than a lane defect, and the single-cluster run below
+settles which:
 
 ```bash
 SPACE_KIND_SUBSTRATE=direct SPACE_KIND_STORAGE_CREDENTIALS=static \
+  SPACE_SMOKE_SUBSTRATE=direct SPACE_SMOKE_KNOWN_FAILURES=ci/kind-direct-known-failures.txt \
   bash scripts/tests/smoke-kind-parallel.sh
 ```
 
