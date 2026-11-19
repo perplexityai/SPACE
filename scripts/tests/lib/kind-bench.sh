@@ -134,12 +134,14 @@ kind_bench_preflight() {
   sudo -n true 2>/dev/null || kind_bench_die "benches need passwordless sudo (network namespaces, dockerd)"
   [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] || kind_bench_die "benches need readable and writable /dev/kvm"
   local tool
-  # curl too: installing the bench daemons downloads them before anything
-  # else is installed.
-  for tool in ip nsenter setpriv iptables curl; do
+  for tool in ip nsenter setpriv iptables; do
     command -v "$tool" >/dev/null 2>&1 || sudo -n sh -c "command -v $tool" >/dev/null 2>&1 \
       || kind_bench_die "benches need $tool on the host"
   done
+  # curl runs as the caller: it downloads the bench daemons and the Kind
+  # prerequisites, and probes the registries. Nothing the run installs
+  # provides it.
+  command -v curl >/dev/null 2>&1 || kind_bench_die "benches need curl on your PATH"
   if awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf | grep -Eq '^(127\.|::1$)'; then
     kind_bench_die "/etc/resolv.conf names a loopback resolver, which a bench's network namespace cannot reach"
   fi

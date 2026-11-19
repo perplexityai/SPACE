@@ -373,8 +373,8 @@ holds the host at a time (a lock on `/run/space-bench.d`), and a run first
 removes the benches an interrupted or `--keep` run left; only directories
 marked as a bench's when it was created are ever deleted.
 
-It needs Linux with cgroup v2, read-write `/dev/kvm`, passwordless sudo, `curl`,
-`iptables`, and Docker Engine 28 or later on this host (the endpoint the docker
+It needs Linux with cgroup v2, read-write `/dev/kvm`, passwordless sudo, `curl`
+on the caller's `PATH`, `iptables`, and Docker Engine 28 or later on this host (the endpoint the docker
 CLI resolves from `DOCKER_HOST`, `DOCKER_CONTEXT` or the active context must be a
 Unix socket or a loopback address) with the containerd image store. It refuses
 a host whose `/etc/resolv.conf` names a loopback resolver (such as
