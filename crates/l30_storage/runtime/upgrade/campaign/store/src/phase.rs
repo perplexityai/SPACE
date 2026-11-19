@@ -1,5 +1,6 @@
 //! Campaign phase changes the reconciler makes on its own: pausing at the
-//! failure budget and completing a drained campaign.
+//! failure budget and completing a drained campaign. Operator changes are in
+//! [`crate::admin`].
 //!
 //! Each verb locks the campaign row before it writes, in the down
 //! migration's order, only moves a campaign from the phase it checked, so a
