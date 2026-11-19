@@ -93,7 +93,8 @@
 #                                   (default: the runtime Dockerfiles' bookworm base)
 #   SPACE_KIND_BUILD_CACHE_REPOSITORY  optional registry layer cache; unset leaves
 #                                     local builds unchanged
-#   SPACE_KIND_BUILD_CACHE_WRITE       1 exports layers (trusted main CI only);
+#   SPACE_KIND_BUILD_CACHE_WRITE       1 exports layers (trusted main CI only,
+#                                     or anyone to a loopback registry);
 #                                     default 0 imports without exporting
 #                                     (both: infra/space/kind/lib/build-cache.sh)
 # In Actions, the exposed runtime also imports existing GHA layers until the

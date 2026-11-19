@@ -3,7 +3,7 @@
 from collections.abc import Mapping
 from typing import Any
 
-from space_smoke.registry import Scenario
+from space_smoke.registry import Scenario, ScenarioRegistry
 
 # Rounded Kind wall-clock seconds, including scenario setup and cleanup. These
 # are scheduling hints, not timeouts or an allowlist. New/renamed scenarios get
@@ -166,6 +166,38 @@ _DURATION_SECONDS = {
 # and then its native ones, so its time is the sum of both passes: they are
 # balanced together, not each on its own.
 JOINT_SURFACES = ("ecw", "native")
+
+
+def joint_inventories(
+    registry: ScenarioRegistry,
+    *,
+    template: str | None,
+    tiers: tuple[str, ...],
+    include_scenarios: tuple[str, ...],
+    backend: str,
+    browser_selection: str,
+) -> dict[str, tuple[Scenario[Any], ...]]:
+    """Each joint surface's eligible inventory, as a sharded `--all` pass filters it.
+
+    The tiers and extra scenarios, the surface, the backend, then browser
+    withholding; mode-dependent skips come after the partition. Every pass of
+    a sharded run partitions these, and so does anything that checks the
+    run's coverage (scripts/tests/lib/kind_parallel_report.py).
+    """
+
+    selected = registry.select(
+        category=None, template=template, tiers=tiers, include_scenarios=include_scenarios,
+    )
+    return {
+        surface: tuple(
+            scenario
+            for scenario in selected
+            if surface in scenario.api_surfaces
+            and backend in scenario.backends
+            and (browser_selection != "withhold" or scenario.browser is None)
+        )
+        for surface in JOINT_SURFACES
+    }
 
 
 def select_shard(

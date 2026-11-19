@@ -12,7 +12,10 @@
 # same environment as the bring-up (SPACE_CI_IMAGE_MIRROR and
 # SPACE_KIND_BUILD_CACHE_REPOSITORY), so both builds compute the same keys.
 #
-# Usage: infra/space/kind/scripts/prebuild-ui-image.sh
+# Usage: infra/space/kind/scripts/prebuild-ui-image.sh [docker build options...]
+#   Extra options, such as a --cache-from or --cache-to, are added to the build;
+#   scripts/tests/smoke-kind-parallel.sh builds the UI once and imports it into
+#   each of its benches this way.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."
@@ -25,4 +28,4 @@ done < <(grep -oE '"--build-arg NEXT_PUBLIC_[A-Z_]+=[^ "]+' Tiltfile | sed 's/^"
 
 bash infra/space/kind/scripts/pull-base-images.sh docker/Dockerfile.ui
 exec bash infra/space/kind/scripts/runtime-image-cache.sh build space-ui \
-    --provenance=false --sbom=false -t space-ui:prebuilt "${args[@]}" .
+    --provenance=false --sbom=false -t space-ui:prebuilt "${args[@]}" "$@" .

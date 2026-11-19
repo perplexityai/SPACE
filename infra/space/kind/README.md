@@ -335,6 +335,159 @@ consume fourteen concurrent runners; queue time remains a separate constraint.
 At fourteen, the leader-election brownout's shard holds it alone and is the
 slowest, so more shards would not shorten the run.
 
+## The whole suite on one host
+
+`scripts/tests/smoke-kind-parallel.sh` runs every CI smoke shard's work on one
+Linux/KVM host at once, as N isolated benches side by side. It is the default
+way to run the whole typed suite **on a dedicated Linux KVM development host
+whose owner has agreed to the host-wide changes listed below**. It has been run
+on two host shapes so far, 32 CPUs with 123 GiB of memory and 48 CPUs with
+185 GiB, each with the bench data on one network block volume of about
+330 MB/s and the host's Docker in a sidecar container. On any other machine,
+bring up one stack and run `scripts/tests/smoke-kind-typed.sh all` (see
+[CI smoke partitions](#ci-smoke-partitions)).
+
+```bash
+scripts/tests/smoke-kind-parallel.sh --benches 4            # one command, one summary
+scripts/tests/smoke-kind-parallel.sh --benches 4 --keep     # leave the benches up
+scripts/tests/smoke-kind-parallel.sh teardown               # remove what a run left
+```
+
+Bench `i` of `N` is one CI shard runner: it runs the baseline
+(`smoke-kind-e2e.sh`) and then `smoke-kind-typed.sh all i/N`, so the benches
+together run both API surfaces' inventory once each. The summary
+(`summary.md`, `summary.json` and `timeline.txt` in the run's output directory,
+printed at the end) lists each bench's phase times and SUITE counts, every
+scenario that did not pass with its log, and checks that the benches cover the
+inventory exactly once: each (surface, scenario) pair has one `=== RUN`, or was
+skipped by a bench's mode after the partition, which counts as covered. The
+script exits as the typed suite ranks a suite: 1 when a scenario failed that
+the known-failures list (`SPACE_SMOKE_KNOWN_FAILURES`) did not excuse; else 2
+when a bench did not come up, a scenario was inconclusive or did not finish, a
+pass exited 2 outside any scenario, the coverage check failed, the checkout
+changed during the run, or the run's teardown left benches on the host; else
+42 when a scenario warned; else 0. A failure that list excused is listed as
+`known failure` and does not fail the run.
+
+The checkout must not change during a run: no edits, checkouts or commits
+until it ends. Each bench copies it, with its uncommitted changes, when it
+starts, and the host builds Rust, the images and the seed from it. The
+summary names the commit and a fingerprint of the uncommitted changes
+recorded at the start. Each bench checks its copy against that record, and
+the checkout is checked again after each host step. Any mismatch makes the
+run incomplete (exit 2, unless a scenario failure gives 1), and the summary
+says the checkout changed during the run.
+
+Without `--benches` it picks N
+from the host's CPUs, available memory, free disk and a short write-throughput
+probe of the bench volume, and prints each factor. One run or teardown
+holds the host at a time (a lock on `/run/space-bench.d`), and a run first
+removes the benches an interrupted or `--keep` run left; only directories
+marked as a bench's when it was created are ever deleted.
+
+It needs Linux with cgroup v2, read-write `/dev/kvm`, passwordless sudo, `curl`
+on the caller's `PATH`, `iptables`, and Docker Engine 28 or later on this host
+(the endpoint the docker CLI resolves from `DOCKER_HOST`, `DOCKER_CONTEXT` or
+the active context must be a Unix socket or a loopback address) with the
+containerd image store. It refuses a host whose `/etc/resolv.conf` names a
+loopback resolver (such as systemd-resolved's `127.0.0.53` stub) or that has a
+route in 192.168.0.0/16 other than its own benches', a bench root or
+`--out` directory inside the checkout, and a bench root whose resolved path
+holds anything but letters, digits and `._/+-`. What it changes on the host:
+
+- **Kernel and limits:** raises the inotify and aio limits (only ever upward),
+  sets `net.ipv4.ip_forward=1`, loads the device-mapper crypt and snapshot
+  modules, and stages loop-device nodes in `/dev`.
+- **Packages:** installs socat and rsync with `apt-get`, and the Kind
+  prerequisites (`install-prereqs.sh`), when they are missing.
+- **Docker:** installs Docker's static release under
+  `/opt/space-bench-docker/<version>`, and starts two registry containers on the
+  host's Docker (`--restart unless-stopped`) that keep running between runs.
+- **Network:** a dummy interface `space-be0` holding 192.168.241.1, with the
+  alias `space-bench registries` by which runs and `teardown` know it as theirs
+  (a run refuses an interface of that name without both, and `teardown` leaves
+  it), a mangle-table chain that accepts connections to that address only from
+  the host and the benches' links, and per bench a network namespace, a veth
+  and iptables rules.
+- **Per bench:** cgroups under `/sys/fs/cgroup/space-bench-<i>`, a dockerd and
+  containerd running as root with their data under the bench root, and a
+  worktree of the checkout.
+
+A run's exit removes its benches; `teardown` also stops the registries and
+removes the interface and the chain. The registries' data and the seed stay in
+`<bench root>/cache` (default `~/.space-benches/cache`); to reclaim the space,
+run `teardown` first (the registries keep running between runs with that
+directory mounted), then delete it yourself (with `sudo`: the registries write
+as root). The registries take no credentials: the layer cache is local to the
+host, and any local user can write it. The loop nodes, the raised limits, the
+modules, the installed packages, the static Docker release and the lock
+directory stay.
+
+Each bench keeps every default name and port (`space-local`, API
+`127.0.0.1:8080`, data plane `:8090`, Tilt `:10350`), so the bring-up and the
+scenarios run unchanged. What isolates it
+(`scripts/tests/lib/kind-bench.sh`):
+
+- a network namespace with a veth to the host and NAT out, so each bench has
+  its own loopback ports and its own Docker networks;
+- a dockerd and containerd of its own in that namespace (data root under
+  `~/.space-benches/<i>`, or `$SPACE_KIND_BENCH_ROOT/<i>`, containerd image
+  store; a root on another volume must be a directory the caller owns, such as
+  one made with `sudo install -d -o "$USER" /mnt/data/benches`). Its socket
+  belongs to the caller alone. The host's Docker bind-mounts `<bench root>/cache`:
+  where that daemon does not see the bench volume (a sidecar with its own
+  `/tmp`, say), make `cache` a symbolic link to a directory it does see, and the
+  runner resolves it. It, its Kind nodes and the
+  bench's commands run in the cgroup `/space-bench-<i>`, not the caller's: a
+  caller in a CPU-capped container (as on a host whose own Docker is a
+  sidecar) would otherwise throttle every bench's image unpacking;
+- a PID namespace with its own `/proc`: the bring-up finds its Tilt and
+  port-forwards by scanning processes, and with one shared process table the
+  benches stopped each other's watchers;
+- its own `HOME`, `TMPDIR`, kubeconfig and Tilt state, and its own worktree of
+  the checkout (with the uncommitted changes copied in): N bring-ups writing
+  one tree raced in Helm's chart vendoring.
+
+What is the same on every bench is done once on the host: the Rust artifact
+image is built once and handed to each bench as CI hands it to its shards
+(`rust-artifact-handoff.py record`/`load`, `SPACE_KIND_RUST_ARTIFACTS=prebuilt`);
+the node images and build bases are saved once and loaded into each bench; the
+seed is built once and copied in; the host's loop-device pool and inotify
+limits are raised before any bench starts (loop devices are kernel-global, but
+a container's `/dev` holds only the nodes its host had when it was created; see
+`scripts/lib/space-loop-devices.sh`). Two registries on the host's
+Docker, kept across runs under `<bench root>/cache`, serve every bench: a
+pull-through Docker Hub mirror, so an image costs one pull from the host's
+egress rather than one per bench, and the layer cache
+([CI layer cache](#ci-layer-cache)) as a loopback registry, into which the host
+exports the runtime images' dependency stages and the whole UI build.
+
+What it costs, measured on a 32-CPU, 123 GiB host whose bench data is on one
+network block volume (about 330 MB/s of writes), with a warm Rust target
+directory, for the 118 (surface, scenario) pairs of the routine tiers:
+
+| N | wall-clock | until the last baseline passed | slowest typed shard |
+|---|---|---|---|
+| 4 | 23-25 min | 9-10.5 min | 12-13 min |
+| 5 | 23 min | 11 min | 10.5 min |
+| 6 | 25 min | 13.5 min | 10 min |
+
+The typed phase is mostly waiting and scales as the serial suite (about
+48 minutes) over N; at N=6 the scenarios took 7% longer in sum than their
+hints. The bring-ups are not: each bench writes 50-65 GB (image loads, the
+nodes' containerd stores, `kind load` of every image into every node it runs
+on) and holds about 50 GB at its peak, so N bring-ups contend for that volume's
+write throughput (I/O pressure above 60%) and for CPU, and take about two
+minutes longer per bench. On such a host the fastest N is 4 to 5; N=8 does not
+fit 393 GB. The default N is the smallest of CPUs / 8, available memory / 16 GiB, free
+disk / 60 GB and the volume's probed write MB/s / 70, at most 6; on that
+volume the probe reads 320-350 MB/s and chooses 4. The 70 MB/s per bench comes
+from these runs: a bench wrote 55.5, 55.9, 57.0 and 59.8 GB while it came up
+(at N=1, 4, 5 and 4); on a volume probed at 326 MB/s the last baseline passed
+after 4:56 at N=1, 9:13 at N=4, 11:22 at N=5 and 13:50 at N=6, and the whole
+run was shortest at N=4-5 (22:43-23:49), with N=6 no faster (25:12), or about
+326 / 4.7 MB/s per bench. Six is the most benches that have run.
+
 ## Release-build lane
 
 Every Kind binary is normally built with the `test-hooks` feature (see
@@ -400,8 +553,19 @@ those reservations bring its available space under the floor, the larger of
 setting the charts keep at 1 GiB. Every other scenario, the concurrent ones
 included, runs in the lane.
 
-Bring a cluster up in the lane and run it as CI does (with the admin token and
-cold-receipts setup of [CI smoke partitions](#ci-smoke-partitions)):
+For a full validation of the lane on one host, run the whole suite with
+[the parallel runner](#the-whole-suite-on-one-host), which builds the release
+image once and hands it to every bench. This lane has not yet been run through
+the runner; until it has, a failure there may be a gap between the runner and
+the lane's CI job rather than a lane defect, and the single-cluster run below
+settles which:
+
+```bash
+SPACE_KIND_RUST_BUILD=release bash scripts/tests/smoke-kind-parallel.sh
+```
+
+To bring one cluster up in the lane and run it as CI does (with the admin token
+and cold-receipts setup of [CI smoke partitions](#ci-smoke-partitions)):
 
 ```bash
 SPACE_KIND_RUST_BUILD=release SPACE_KIND_TELEMETRY_MODE=otel \
@@ -485,7 +649,21 @@ and names the teardown that switches it.
   withholds the scenario on every substrate, the required Kubernetes lane
   included.
 
-Bring a cluster up in the lane, run the baseline, then the typed suite:
+For a full validation of the lane on one host, run the whole suite with
+[the parallel runner](#the-whole-suite-on-one-host), with CI's known-failures
+list. This lane has not yet been run through the runner, whose benches run
+`smoke-kind-e2e.sh` as their baseline where the lane's CI job runs `up.sh` and
+`examples/first_sandbox.py`; until it has, a failure there may be a gap
+between the two rather than a lane defect, and the single-cluster run below
+settles which:
+
+```bash
+SPACE_KIND_SUBSTRATE=direct SPACE_KIND_STORAGE_CREDENTIALS=static \
+  SPACE_SMOKE_SUBSTRATE=direct SPACE_SMOKE_KNOWN_FAILURES=ci/kind-direct-known-failures.txt \
+  bash scripts/tests/smoke-kind-parallel.sh
+```
+
+To bring one cluster up in the lane, run the baseline, then the typed suite:
 
 ```bash
 export SPACE_KIND_SUBSTRATE=direct SPACE_KIND_STORAGE_CREDENTIALS=static

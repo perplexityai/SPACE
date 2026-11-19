@@ -50,6 +50,47 @@ cleanup path, exit status, and pipeline gate it had. Remove it from the legacy
 script once the typed scenario has passed on the environments that ran it, and
 retire the script when no tests remain in it.
 
+## The whole Kind suite on one host
+
+On a dedicated Linux KVM development host whose owner has agreed to the
+host-wide changes below, a full Kubernetes Kind validation is
+`bash scripts/tests/smoke-kind-parallel.sh`, and its `summary.md` (with
+`summary.json`) is the evidence: one table across benches, every scenario that
+did not pass with its log, and a check that the benches cover the inventory
+exactly once (each (surface, scenario) pair has one `=== RUN`, or was skipped
+by a bench's mode after the partition, which counts as covered). Its exit
+status ranks as a typed suite's does: `1` when a scenario failed that
+`SPACE_SMOKE_KNOWN_FAILURES` did not excuse, else `2` for an
+incomplete run (a bench down, an inconclusive scenario, a coverage gap, a
+checkout that changed during the run, a failed teardown), else
+`42` for a warning, else `0`. Don't run the CI shards one after another on one
+stack instead.
+
+The runner changes the host beyond its benches, and some changes stay: it
+raises kernel limits, loads device-mapper modules and stages loop-device nodes,
+installs packages and Docker's static release under `/opt`, adds iptables rules,
+a dummy interface and two registry containers that keep running between runs,
+and holds about 50 GB of disk per bench. It has been run on two host shapes so
+far (32 CPUs with 123 GiB and 48 CPUs with 185 GiB, each with one ~330 MB/s
+volume). Don't start it without the host
+owner's go-ahead, even with passwordless sudo. On any other machine, and against
+a stack that is already up or to reproduce one shard, use
+`smoke-kind-typed.sh all [i/N]`.
+
+The runner starts N isolated benches side by side, each one CI shard runner
+(its own network and PID namespaces, dockerd and checkout), builds Rust and the
+shared images once, and picks N from the host's CPUs, available memory, free
+disk and a short write-throughput probe of the bench volume (`--benches N`
+overrides). It takes about 23 minutes at N=4 or 5 on that host shape with a
+warm Rust target directory. An unexcused scenario failure here fails the run
+with exit `1`; one the known-failures list excused is listed as
+`known failure` and leaves the exit status as the rest of the run sets it. If
+a failed scenario passes when rerun, report both runs. Call a failure
+contention only when it fails beside other benches more than once and passes
+each time with `--benches 1`. "The whole suite on one host" in
+`infra/space/kind/README.md` lists every host change, what each bench shares,
+and what it costs.
+
 ## Scenario-scoped cluster knobs (kind)
 
 Some kind-chart values are cross-deployment invariants, not free knobs: the

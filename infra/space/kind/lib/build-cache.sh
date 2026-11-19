@@ -1,6 +1,7 @@
 # shellcheck shell=bash
 # The Kind image builds' registry layer cache: one repository, one tag
-# ("scope") per cached build, written only by trusted main CI.
+# ("scope") per cached build. The shared GHCR cache is written only by trusted
+# main CI; a loopback registry, by whoever runs the build.
 #
 # Every Kind build that keeps layers there takes its options from
 # space_kind_cache_flags: the Rust artifact builder
@@ -13,7 +14,8 @@
 #                                      registry on the loopback interface
 #                                      (localhost:<port>/<name>) to try the cache
 #                                      locally; unset leaves builds unchanged
-#   SPACE_KIND_BUILD_CACHE_WRITE       1 exports layers (trusted main CI only);
+#   SPACE_KIND_BUILD_CACHE_WRITE       1 exports layers (trusted main CI only,
+#                                      or anyone to a loopback registry);
 #                                      default 0 imports without exporting
 #
 # Imports are optional performance hints: a missing or unreachable cache makes
@@ -75,7 +77,12 @@ space_kind_cache_flags() {
     CACHE_FROM_FLAGS+=(--cache-from "type=gha,scope=$scope,timeout=60s")
   fi
   if [[ "$write" == 1 ]]; then
-    if [[ "${GITHUB_ACTIONS:-}" != true || "${GITHUB_EVENT_NAME:-}" != push \
+    # The shared GHCR cache takes writes only from trusted main CI. A registry
+    # on the loopback interface is local to this host: its benches and later
+    # runs on the host read it (scripts/tests/smoke-kind-parallel.sh), and any
+    # local user can write it, so it takes the caller's writes.
+    if [[ ! "$repository" =~ ^(localhost|127\.0\.0\.1): ]] \
+        && [[ "${GITHUB_ACTIONS:-}" != true || "${GITHUB_EVENT_NAME:-}" != push \
           || "${GITHUB_REF:-}" != refs/heads/main || "${GITHUB_REPOSITORY:-}" != perplexityai/SPACE ]]; then
       printf 'build cache: cache writes are restricted to perplexityai/SPACE main push CI\n' >&2
       return 1
